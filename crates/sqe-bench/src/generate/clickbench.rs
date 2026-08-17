@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow_array::{Date32Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use super::{parquet_writer, BenchmarkGenerator, GenerateStats, TableDef};
 
@@ -282,13 +282,13 @@ const EVENT_TIME_BASE: i64 = 1_372_636_800;
 const EVENT_TIME_RANGE: i64 = 86_400 * 31;
 
 fn random_url(rng: &mut StdRng) -> String {
-    let prefix = URL_PREFIXES[rng.gen_range(0..URL_PREFIXES.len())];
-    let id: u32 = rng.gen_range(1..100_000);
+    let prefix = URL_PREFIXES[rng.random_range(0..URL_PREFIXES.len())];
+    let id: u32 = rng.random_range(1..100_000);
     format!("{prefix}/{id}")
 }
 
 fn random_opt_string<'a>(rng: &mut StdRng, pool: &[&'a str]) -> &'a str {
-    pool[rng.gen_range(0..pool.len())]
+    pool[rng.random_range(0..pool.len())]
 }
 
 fn generate_hits(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
@@ -417,13 +417,13 @@ fn generate_hits(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         for i in 0..n {
             let global = offset + i;
             let row_id = global as i64;
-            let et = EVENT_TIME_BASE + rng.gen_range(0..EVENT_TIME_RANGE);
-            let ed = EVENT_DATE_BASE + rng.gen_range(0..EVENT_DATE_RANGE);
+            let et = EVENT_TIME_BASE + rng.random_range(0..EVENT_TIME_RANGE);
+            let ed = EVENT_DATE_BASE + rng.random_range(0..EVENT_DATE_RANGE);
             // q19: seed the probed UserID into ~0.5% of rows.
             let uid: i64 = if global % SEEDED_USER_ID_STRIDE == 7 {
                 SEEDED_USER_ID
             } else {
-                rng.gen()
+                rng.random()
             };
             // q22: seeded rows get a Google title, a URL without '.google.',
             // and a non-empty SearchPhrase so all three predicates can hold.
@@ -435,21 +435,21 @@ fn generate_hits(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             let adv_eng: i32 = if search.is_empty() {
                 0
             } else {
-                rng.gen_range(1..20)
+                rng.random_range(1..20)
             };
-            let is_mob: i32 = rng.gen_range(0..2);
+            let is_mob: i32 = rng.random_range(0..2);
             let mob_model = if is_mob == 1 {
                 random_opt_string(&mut rng, MOBILE_MODELS).to_string()
             } else {
                 String::new()
             };
 
-            watch_id.push(row_id.wrapping_add(rng.gen::<i32>() as i64));
-            java_enable.push(rng.gen_range(0..2));
+            watch_id.push(row_id.wrapping_add(rng.random::<i32>() as i64));
+            java_enable.push(rng.random_range(0..2));
             title.push(if google_title {
-                format!("Google news digest {}", rng.gen_range(1..10_000u32))
+                format!("Google news digest {}", rng.random_range(1..10_000u32))
             } else {
-                format!("Page title {}", rng.gen_range(1..10_000u32))
+                format!("Page title {}", rng.random_range(1..10_000u32))
             });
             good_event.push(1);
             event_time.push(et);
@@ -458,103 +458,106 @@ fn generate_hits(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             counter_id.push(if global % HOT_COUNTER_STRIDE == 0 {
                 HOT_COUNTER_ID
             } else {
-                rng.gen_range(1..100_000)
+                rng.random_range(1..100_000)
             });
-            client_ip.push(rng.gen());
-            region_id.push(rng.gen_range(1..10_000));
+            client_ip.push(rng.random());
+            region_id.push(rng.random_range(1..10_000));
             user_id.push(uid);
-            counter_class.push(rng.gen_range(0..10));
-            os.push(rng.gen_range(0..100));
-            user_agent.push(rng.gen_range(0..1000));
+            counter_class.push(rng.random_range(0..10));
+            os.push(rng.random_range(0..100));
+            user_agent.push(rng.random_range(0..1000));
             url.push(if google_title {
                 // q22 requires "URL" NOT LIKE '%.google.%' on these rows.
-                format!("http://example.com/page/{}", rng.gen_range(1..100_000u32))
+                format!(
+                    "http://example.com/page/{}",
+                    rng.random_range(1..100_000u32)
+                )
             } else {
                 random_url(&mut rng)
             });
             // q28: ~1% of referers share one dedicated host.
             referer.push(if global % HOT_REFERER_STRIDE == 17 {
-                format!("{HOT_REFERER_PREFIX}/{}", rng.gen_range(1..100_000u32))
+                format!("{HOT_REFERER_PREFIX}/{}", rng.random_range(1..100_000u32))
             } else {
                 random_url(&mut rng)
             });
-            is_refresh.push(rng.gen_range(0..2));
-            referer_category_id.push(rng.gen_range(0..1000));
-            referer_region_id.push(rng.gen_range(0..10_000));
-            url_category_id.push(rng.gen_range(0..1000));
-            url_region_id.push(rng.gen_range(0..10_000));
-            resolution_width.push(rng.gen_range(640..2560));
-            resolution_height.push(rng.gen_range(480..1440));
-            resolution_depth.push(rng.gen_range(16..32));
-            flash_major.push(rng.gen_range(0..32));
-            flash_minor.push(rng.gen_range(0..10));
-            flash_minor2.push(rng.gen_range(0..10u32).to_string());
-            net_major.push(rng.gen_range(0..10));
-            net_minor.push(rng.gen_range(0..10));
-            user_agent_major.push(rng.gen_range(0..100));
-            user_agent_minor.push(rng.gen_range(0..100u32).to_string());
-            cookie_enable.push(rng.gen_range(0..2));
-            javascript_enable.push(rng.gen_range(0..2));
+            is_refresh.push(rng.random_range(0..2));
+            referer_category_id.push(rng.random_range(0..1000));
+            referer_region_id.push(rng.random_range(0..10_000));
+            url_category_id.push(rng.random_range(0..1000));
+            url_region_id.push(rng.random_range(0..10_000));
+            resolution_width.push(rng.random_range(640..2560));
+            resolution_height.push(rng.random_range(480..1440));
+            resolution_depth.push(rng.random_range(16..32));
+            flash_major.push(rng.random_range(0..32));
+            flash_minor.push(rng.random_range(0..10));
+            flash_minor2.push(rng.random_range(0..10u32).to_string());
+            net_major.push(rng.random_range(0..10));
+            net_minor.push(rng.random_range(0..10));
+            user_agent_major.push(rng.random_range(0..100));
+            user_agent_minor.push(rng.random_range(0..100u32).to_string());
+            cookie_enable.push(rng.random_range(0..2));
+            javascript_enable.push(rng.random_range(0..2));
             is_mobile.push(is_mob);
             mobile_phone.push(if is_mob == 1 {
-                rng.gen_range(1..200)
+                rng.random_range(1..200)
             } else {
                 0
             });
             mobile_phone_model.push(mob_model);
             params.push(String::new());
-            ip_network_id.push(rng.gen_range(0..1000));
-            trafic_source_id.push(rng.gen_range(-1..10));
-            search_engine_id.push(rng.gen_range(0..10));
+            ip_network_id.push(rng.random_range(0..1000));
+            trafic_source_id.push(rng.random_range(-1..10));
+            search_engine_id.push(rng.random_range(0..10));
             search_phrase.push(search);
             adv_engine_id.push(adv_eng);
             is_artifical.push(0);
-            window_client_width.push(rng.gen_range(640..2560));
-            window_client_height.push(rng.gen_range(480..1440));
-            client_time_zone.push(rng.gen_range(-720..840));
+            window_client_width.push(rng.random_range(640..2560));
+            window_client_height.push(rng.random_range(480..1440));
+            client_time_zone.push(rng.random_range(-720..840));
             client_event_time.push(et);
-            silverlight_version1.push(rng.gen_range(0..10));
-            silverlight_version2.push(rng.gen_range(0..10));
-            silverlight_version3.push(rng.gen_range(0..100_000));
-            silverlight_version4.push(rng.gen_range(0..100));
+            silverlight_version1.push(rng.random_range(0..10));
+            silverlight_version2.push(rng.random_range(0..10));
+            silverlight_version3.push(rng.random_range(0..100_000));
+            silverlight_version4.push(rng.random_range(0..100));
             page_charset.push(random_opt_string(&mut rng, PAGE_CHARSETS).to_string());
-            code_version.push(rng.gen_range(0..100_000_000));
-            is_link.push(rng.gen_range(0..2));
-            is_download.push(rng.gen_range(0..2));
-            is_not_bounce.push(rng.gen_range(0..2));
-            f_uniq_id.push(rng.gen());
+            code_version.push(rng.random_range(0..100_000_000));
+            is_link.push(rng.random_range(0..2));
+            is_download.push(rng.random_range(0..2));
+            is_not_bounce.push(rng.random_range(0..2));
+            f_uniq_id.push(rng.random());
             original_url.push(random_url(&mut rng));
-            hid.push(rng.gen_range(0..1_000_000));
+            hid.push(rng.random_range(0..1_000_000));
             is_old_counter.push(0);
-            is_event.push(rng.gen_range(0..2));
-            is_parameter.push(rng.gen_range(0..2));
+            is_event.push(rng.random_range(0..2));
+            is_parameter.push(rng.random_range(0..2));
             dont_count_hits.push(0);
-            with_hash.push(rng.gen_range(0..2));
+            with_hash.push(rng.random_range(0..2));
             hit_color.push(random_opt_string(&mut rng, HIT_COLORS).to_string());
             local_event_time.push(et);
-            age.push(rng.gen_range(0..100));
-            sex.push(rng.gen_range(0..2));
-            income.push(rng.gen_range(0..8));
-            interests.push(rng.gen_range(0..1000));
-            robotness.push(rng.gen_range(0..10));
-            remote_ip.push(rng.gen());
-            window_name.push(rng.gen_range(0..100));
-            opener_name.push(rng.gen_range(0..100));
-            history_length.push(rng.gen_range(1..100));
+            age.push(rng.random_range(0..100));
+            sex.push(rng.random_range(0..2));
+            income.push(rng.random_range(0..8));
+            interests.push(rng.random_range(0..1000));
+            robotness.push(rng.random_range(0..10));
+            remote_ip.push(rng.random());
+            window_name.push(rng.random_range(0..100));
+            opener_name.push(rng.random_range(0..100));
+            history_length.push(rng.random_range(1..100));
             browser_language.push(random_opt_string(&mut rng, BROWSER_LANGUAGES).to_string());
             browser_country.push(random_opt_string(&mut rng, BROWSER_COUNTRIES).to_string());
             social_network.push(random_opt_string(&mut rng, SOCIAL_NETWORKS).to_string());
             social_action.push(random_opt_string(&mut rng, SOCIAL_ACTIONS).to_string());
             http_error.push(0);
-            send_timing.push(rng.gen_range(0..5000));
-            dns_timing.push(rng.gen_range(0..1000));
-            connect_timing.push(rng.gen_range(0..1000));
-            response_start_timing.push(rng.gen_range(0..2000));
-            response_end_timing.push(rng.gen_range(0..5000));
-            fetch_timing.push(rng.gen_range(0..10_000));
-            social_source_network_id.push(rng.gen_range(0..10));
+            send_timing.push(rng.random_range(0..5000));
+            dns_timing.push(rng.random_range(0..1000));
+            connect_timing.push(rng.random_range(0..1000));
+            response_start_timing.push(rng.random_range(0..2000));
+            response_end_timing.push(rng.random_range(0..5000));
+            fetch_timing.push(rng.random_range(0..10_000));
+            social_source_network_id.push(rng.random_range(0..10));
             social_source_page.push(String::new());
-            param_price.push(rng.gen_range(-1..100_000));
+            param_price.push(rng.random_range(-1..100_000));
             param_order_id.push(String::new());
             param_currency.push(String::new());
             param_currency_id.push(0);
@@ -574,9 +577,9 @@ fn generate_hits(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             utm_term.push(String::new());
             from_tag.push(String::new());
             has_gclid.push(0);
-            referer_hash.push(rng.gen());
-            url_hash.push(rng.gen());
-            clid.push(rng.gen_range(0..1000));
+            referer_hash.push(rng.random());
+            url_hash.push(rng.random());
+            clid.push(rng.random_range(0..1000));
         }
 
         // Build string slices for Arrow

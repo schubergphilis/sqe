@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use rand::Rng;
+use rand::RngExt;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
@@ -218,7 +218,7 @@ impl AuthCodeService {
 ///
 /// Per RFC 7636 §4.1: the verifier must be 43–128 unreserved ASCII characters.
 fn generate_code_verifier() -> String {
-    let bytes: Vec<u8> = (0..32).map(|_| rand::thread_rng().gen::<u8>()).collect();
+    let bytes: Vec<u8> = (0..32).map(|_| rand::rng().random::<u8>()).collect();
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
@@ -235,10 +235,10 @@ fn compute_code_challenge(verifier: &str) -> String {
 /// Generate a random alphanumeric string of `len` characters.
 fn generate_random_string(len: usize) -> String {
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..len)
         .map(|_| {
-            let idx = rng.gen_range(0..CHARSET.len());
+            let idx = rng.random_range(0..CHARSET.len());
             CHARSET[idx] as char
         })
         .collect()

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow_array::{Date32Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use super::{parquet_writer, BenchmarkGenerator, GenerateStats, TableDef};
 
@@ -87,15 +87,15 @@ const BATCH_SIZE: usize = 10_000;
 fn random_word(rng: &mut StdRng, len: usize) -> String {
     const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
     (0..len)
-        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+        .map(|_| CHARS[rng.random_range(0..CHARS.len())] as char)
         .collect()
 }
 
 fn random_sentence(rng: &mut StdRng) -> String {
-    let words = rng.gen_range(4..12usize);
+    let words = rng.random_range(4..12usize);
     let mut parts = Vec::with_capacity(words);
     for _ in 0..words {
-        let len = rng.gen_range(3..10usize);
+        let len = rng.random_range(3..10usize);
         parts.push(random_word(rng, len));
     }
     parts.join(" ")
@@ -143,15 +143,15 @@ const DATE_START: i32 = 10227;
 const DATE_RANGE: i32 = 2190; // ~6 years
 
 fn random_date(rng: &mut StdRng) -> i32 {
-    DATE_START + rng.gen_range(0..DATE_RANGE)
+    DATE_START + rng.random_range(0..DATE_RANGE)
 }
 
 fn random_time_str(rng: &mut StdRng) -> String {
     format!(
         "{:02}:{:02}:{:02}",
-        rng.gen_range(0..24u32),
-        rng.gen_range(0..60u32),
-        rng.gen_range(0..60u32),
+        rng.random_range(0..24u32),
+        rng.random_range(0..60u32),
+        rng.random_range(0..60u32),
     )
 }
 
@@ -201,35 +201,35 @@ fn generate_web_clickstreams(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             if session_remaining == 0 {
                 // A session is 2..=6 clicks under one (user, date). The user
                 // is null at the same ~30% rate as before (logged-out clicks).
-                session_remaining = rng.gen_range(2..=6);
-                session_user = if rng.gen_bool(0.70) {
-                    Some(rng.gen_range(1..=num_users))
+                session_remaining = rng.random_range(2..=6);
+                session_user = if rng.random_bool(0.70) {
+                    Some(rng.random_range(1..=num_users))
                 } else {
                     None
                 };
-                session_date = rng.gen_range(1..=num_date_sks);
+                session_date = rng.random_range(1..=num_date_sks);
             }
             session_remaining -= 1;
 
             // ~5% of clicks have nulls in optional FK columns (abandoned sessions)
-            let is_sale = rng.gen_bool(0.60);
-            let has_keyword = rng.gen_bool(0.30);
+            let is_sale = rng.random_bool(0.60);
+            let has_keyword = rng.random_bool(0.30);
 
             wcs_click_date_sk.push(Some(session_date));
-            wcs_click_time_sk.push(Some(rng.gen_range(0..num_time_sks)));
+            wcs_click_time_sk.push(Some(rng.random_range(0..num_time_sks)));
             wcs_sales_sk.push(if is_sale {
-                Some(rng.gen_range(1..=num_sales))
+                Some(rng.random_range(1..=num_sales))
             } else {
                 None
             });
-            wcs_item_sk.push(Some(rng.gen_range(1..=num_items)));
-            wcs_web_page_sk.push(Some(rng.gen_range(1..=num_web_pages)));
+            wcs_item_sk.push(Some(rng.random_range(1..=num_items)));
+            wcs_web_page_sk.push(Some(rng.random_range(1..=num_web_pages)));
             wcs_user_sk.push(session_user);
             wcs_referrer_url.push(Some(
-                REFERRER_DOMAINS[rng.gen_range(0..REFERRER_DOMAINS.len())].to_string(),
+                REFERRER_DOMAINS[rng.random_range(0..REFERRER_DOMAINS.len())].to_string(),
             ));
             wcs_search_keywords.push(if has_keyword {
-                Some(SEARCH_KEYWORDS[rng.gen_range(0..SEARCH_KEYWORDS.len())].to_string())
+                Some(SEARCH_KEYWORDS[rng.random_range(0..SEARCH_KEYWORDS.len())].to_string())
             } else {
                 None
             });
@@ -287,22 +287,22 @@ fn generate_product_reviews(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
         for i in 0..n {
             let sk = (offset + i + 1) as i64;
-            let has_order = rng.gen_bool(0.85);
+            let has_order = rng.random_bool(0.85);
 
             pr_review_sk.push(sk);
             pr_review_date.push(Some(random_date(&mut rng)));
             pr_review_time.push(Some(random_time_str(&mut rng)));
-            pr_review_rating.push(rng.gen_range(1..=5i32));
-            pr_item_sk.push(Some(rng.gen_range(1..=num_items)));
-            pr_user_sk.push(Some(rng.gen_range(1..=num_users)));
+            pr_review_rating.push(rng.random_range(1..=5i32));
+            pr_item_sk.push(Some(rng.random_range(1..=num_items)));
+            pr_user_sk.push(Some(rng.random_range(1..=num_users)));
             pr_order_sk.push(if has_order {
-                Some(rng.gen_range(1..=num_orders))
+                Some(rng.random_range(1..=num_orders))
             } else {
                 None
             });
             pr_review_content.push(Some(random_sentence(&mut rng)));
             pr_title.push(Some(
-                REVIEW_TITLES[rng.gen_range(0..REVIEW_TITLES.len())].to_string(),
+                REVIEW_TITLES[rng.random_range(0..REVIEW_TITLES.len())].to_string(),
             ));
         }
 
