@@ -50,7 +50,7 @@
 
 > **DOCUMENTED 2026-08-16, issue #428 leftovers:** #405/#411 shipped as restartable-not-HA and HashJoin-cannot-spill. #396 documented. #406/#407 first slices landed. #390 planted in !857. #412/#415 remain documented/spiked engine work, not leftover tracking. Remaining #428 items stay on the GitLab issue.
 
-> **IN PROGRESS 2026-08-17:** workspace `rand` 0.8 -> 0.10 after the #390 plants. API rename only (`random_range` / `RngExt`). rusqlite stays 0.39. A 0.10 data set is a new draw; committed Flight baselines from 0.8 generate are not byte-comparable until regenerate + compare-trino.
+> **FIXED 2026-08-17:** workspace `rand` 0.8 -> 0.10 after the #390 plants. API rename only (`random_range` / `RngExt`). rusqlite stays 0.39. SF1 generate + compare-trino on the 0.10 draw: TPC-DS **99/99, 0 vacuous-bug** (q17=3, q29=1, q79=100, q85=1). SSB 13/13, TPC-BB 10/10, TPC-C 8/8, TPC-E 11/11, ClickBench 41/43 (2 both-empty, 0 vacuous-bug). TPC-H 20/22 with 0 vacuous-bug (q21 Trino timeout, q22 both timeout). Bank not compared (RustFS dropped mid first pass).
 
 > **FIXED 2026-08-12, suite hygiene: `make test-access-control` leaked its own grants between runs, so two denial-baseline tests failed on any stack the suite had already used.**
 >
