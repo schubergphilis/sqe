@@ -24,8 +24,8 @@ use sqe_catalog::FooterCache;
 use sqe_core::{parse_memory_limit, FlightCompression, SqeConfig};
 use sqe_metrics::WorkerMetricsRegistry;
 use sqe_spill::{
-    LocalSegmentStore, MemoryGovernor, ResizableFairSpillPool, S3SegmentStore, S3SpillConfig,
-    SpillManager, TieredSegmentStore,
+    ByteBudget, LocalSegmentStore, MemoryGovernor, ResizableFairSpillPool, S3SegmentStore,
+    S3SpillConfig, SpillManager, TieredSegmentStore,
 };
 
 use crate::advertise::derive_advertise_url;
@@ -108,7 +108,16 @@ pub fn build_worker_service_with_hot_reload(
         .with_worker_secret(config.worker.worker_secret.clone())
         .with_shuffle_memory_budget_atom(Arc::clone(&hot.shuffle_budget_bytes))
         .with_scan_timeout_atom(Arc::clone(&hot.scan_timeout_secs))
-        .with_memory_governor(memory_governor.clone());
+        .with_memory_governor(memory_governor.clone())
+        // #407: encoded Flight frames are charged against their own budget.
+        // No pool reservation: IPC frames are not DataFusion allocations, and
+        // budgets.configured_need_bytes already reserves this capacity at boot.
+        .with_flight_budget(ByteBudget::with_granularity(
+            "flight",
+            budgets.flight_budget_bytes,
+            budgets.budget_granularity_bytes,
+            None,
+        ));
     if let Some(sm) = spill_manager {
         service = service.with_spill_manager(sm);
     }

@@ -496,6 +496,11 @@ while keeping resident scan and Flight buffers within configured budgets.
 - [x] Implement an `AccountedFlightStream` or equivalent encoder ownership
       wrapper. It must retain the Arrow permit while encoding and charge
       encoded `FlightData` until gRPC releases/sends it.
+      (This box was ticked when only the first half shipped: `AccountedEncodeStream`
+      held the Arrow permit, but encoded `FlightData` was written to a GAUGE that
+      nothing gated on, so the encoded copy stayed unbounded under concurrency.
+      Audit #407 found the gap; `accounted_frame_stream` closes it. A half-done
+      item reads exactly like a done one on a checklist.)
 - [x] Ensure cancellation or client disconnect drops queued and encoding
       permits immediately.
 - [ ] Keep decode concurrency and byte admission separate: concurrency protects

@@ -122,6 +122,11 @@ pub fn resolve_memory_budgets(config: &SqeConfig) -> anyhow::Result<ResolvedMemo
         memory_limit_bytes: memory_limit,
         governor_pool_bytes: governor_pool,
         shuffle_budget_bytes: resolved.shuffle_memory_budget.max(64 * 1024),
+        // Same floor as shuffle: a budget below one accounting unit would round
+        // to zero capacity, and `ByteBudget` then rejects every frame with
+        // ItemTooLarge, silently turning the charge off (issue #407).
+        flight_budget_bytes: resolved.flight_budget.max(64 * 1024),
+        budget_granularity_bytes: resolved.budget_granularity,
         process_headroom_bytes: resolved.process_headroom,
         configured_need_bytes: configured_need,
         scan_timeout_secs: config.worker.scan_timeout_secs,
@@ -133,6 +138,10 @@ pub struct ResolvedMemoryBudgets {
     pub memory_limit_bytes: usize,
     pub governor_pool_bytes: usize,
     pub shuffle_budget_bytes: usize,
+    /// Capacity for the encoded-Flight-frame budget (issue #407).
+    pub flight_budget_bytes: usize,
+    /// Accounting unit for the byte budgets built from these values.
+    pub budget_granularity_bytes: usize,
     pub process_headroom_bytes: usize,
     pub configured_need_bytes: u64,
     pub scan_timeout_secs: u64,
@@ -483,6 +492,26 @@ prometheus_port = {prometheus_port}
         SqeConfig::load(f.path().to_str().unwrap()).expect("minimal worker config")
     }
 
+    /// `[worker.memory] flight_budget` is counted in `configured_need_bytes` at
+    /// startup, so the worker already reserves headroom for encoded Flight
+    /// frames. It has to reach the service that charges them, or the reservation
+    /// pays for a budget nothing draws from (issue #407).
+    #[test]
+    fn resolve_forwards_the_flight_budget() {
+        let cfg = minimal_cfg(50052, 9090);
+        let budgets = resolve_memory_budgets(&cfg).expect("resolve");
+        // Default is a tenth of the worker memory limit.
+        assert_eq!(
+            budgets.flight_budget_bytes,
+            budgets.memory_limit_bytes / 10,
+            "flight budget must be resolved from worker.memory, not dropped"
+        );
+        assert!(
+            budgets.budget_granularity_bytes > 0,
+            "granularity is needed to build the ByteBudget"
+        );
+    }
+
     #[test]
     fn port_change_warns_and_does_not_mutate_boot_listen_identity() {
         let boot_cfg = minimal_cfg(50052, 9090);
@@ -521,6 +550,8 @@ prometheus_port = {prometheus_port}
             memory_limit_bytes: 400 * 1024 * 1024,
             governor_pool_bytes: 250 * 1024 * 1024,
             shuffle_budget_bytes: 80 * 1024 * 1024,
+            flight_budget_bytes: 40 * 1024 * 1024,
+            budget_granularity_bytes: 64 * 1024,
             process_headroom_bytes: 256 * 1024 * 1024,
             configured_need_bytes: 400 * 1024 * 1024 + 256 * 1024 * 1024,
             scan_timeout_secs: 120,
@@ -562,6 +593,8 @@ prometheus_port = {prometheus_port}
             memory_limit_bytes: 16 * 1024 * 1024, // below reserved
             governor_pool_bytes: 32 * 1024 * 1024,
             shuffle_budget_bytes: 8 * 1024 * 1024,
+            flight_budget_bytes: 4 * 1024 * 1024,
+            budget_granularity_bytes: 64 * 1024,
             process_headroom_bytes: 1024 * 1024,
             configured_need_bytes: 17 * 1024 * 1024,
             scan_timeout_secs: 30,
