@@ -50,6 +50,8 @@
 
 > **DOCUMENTED 2026-08-16, issue #428 leftovers:** #405/#411 shipped as restartable-not-HA and HashJoin-cannot-spill. #396 documented. #406/#407 first slices landed. #390 planted in !857. #412/#415 remain documented/spiked engine work, not leftover tracking. Remaining #428 items stay on the GitLab issue.
 
+> **IN PROGRESS 2026-08-17:** workspace `rand` 0.8 -> 0.10 after the #390 plants. API rename only (`random_range` / `RngExt`). rusqlite stays 0.39. A 0.10 data set is a new draw; committed Flight baselines from 0.8 generate are not byte-comparable until regenerate + compare-trino.
+
 > **FIXED 2026-08-12, suite hygiene: `make test-access-control` leaked its own grants between runs, so two denial-baseline tests failed on any stack the suite had already used.**
 >
 > `denied_before_any_grant` and `all_tables_in_schema_grant_covers_the_namespace` both time out after 120 s with `still allowed for alice with 3 rows`. The cause is in Ranger, not in the assertion: a policy named `grant-1786370165684` grants role `analyst` sixteen access types on `sales_wh.ac.orders`, and alice is in `analyst`.

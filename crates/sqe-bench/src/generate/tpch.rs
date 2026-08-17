@@ -26,7 +26,7 @@ fn decimal_15_2_array(values: Vec<f64>) -> Decimal128Array {
         .expect("Decimal128(15, 2) is valid for TPC-H money/quantity columns")
 }
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use super::{
     parallel_generate_table, parquet_writer, BenchmarkGenerator, GenerateConfig, GenerateStats,
@@ -166,7 +166,7 @@ const ORDER_DATE_RANGE: i32 = DATE_RANGE - 121;
 
 /// An order date bounded so the lineitem ship/commit/receipt chain stays in range.
 fn random_order_date(rng: &mut StdRng) -> i32 {
-    DATE_START + rng.gen_range(0..ORDER_DATE_RANGE)
+    DATE_START + rng.random_range(0..ORDER_DATE_RANGE)
 }
 
 /// TPC-H spec retail price for a part, a deterministic function of the part key,
@@ -409,12 +409,12 @@ const PART_COLORS: &[&str] = &[
 fn random_word(rng: &mut StdRng, len: usize) -> String {
     const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
     (0..len)
-        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+        .map(|_| CHARS[rng.random_range(0..CHARS.len())] as char)
         .collect()
 }
 
 fn random_address(rng: &mut StdRng) -> String {
-    let len = rng.gen_range(10..40usize);
+    let len = rng.random_range(10..40usize);
     random_word(rng, len)
 }
 
@@ -422,17 +422,17 @@ fn random_phone(rng: &mut StdRng, nationkey: i32) -> String {
     format!(
         "{:02}-{:03}-{:03}-{:04}",
         10 + (nationkey % 25),
-        rng.gen_range(100..999i32),
-        rng.gen_range(100..999i32),
-        rng.gen_range(1000..9999i32),
+        rng.random_range(100..999i32),
+        rng.random_range(100..999i32),
+        rng.random_range(1000..9999i32),
     )
 }
 
 fn random_comment(rng: &mut StdRng) -> String {
-    let words = rng.gen_range(3..8usize);
+    let words = rng.random_range(3..8usize);
     let mut parts = Vec::with_capacity(words);
     for _ in 0..words {
-        let len = rng.gen_range(3..10usize);
+        let len = rng.random_range(3..10usize);
         parts.push(random_word(rng, len));
     }
     parts.join(" ")
@@ -530,13 +530,13 @@ fn generate_supplier_range(
 
         for i in 0..n {
             let key = (offset + i + 1) as i32;
-            let nk = rng.gen_range(0..25i32);
+            let nk = rng.random_range(0..25i32);
             s_suppkey.push(key);
             s_name.push(format!("Supplier#{:09}", key));
             s_address.push(random_address(&mut rng));
             s_nationkey.push(nk);
             s_phone.push(random_phone(&mut rng, nk));
-            s_acctbal.push((rng.gen_range(-99_999..99_999_i32) as f64) / 100.0);
+            s_acctbal.push((rng.random_range(-99_999..99_999_i32) as f64) / 100.0);
             s_comment.push(random_comment(&mut rng));
         }
 
@@ -597,14 +597,15 @@ fn generate_customer_range(
 
         for i in 0..n {
             let key = (offset + i + 1) as i32;
-            let nk = rng.gen_range(0..25i32);
+            let nk = rng.random_range(0..25i32);
             c_custkey.push(key);
             c_name.push(format!("Customer#{:09}", key));
             c_address.push(random_address(&mut rng));
             c_nationkey.push(nk);
             c_phone.push(random_phone(&mut rng, nk));
-            c_acctbal.push((rng.gen_range(-99_999..99_999_i32) as f64) / 100.0);
-            c_mktsegment.push(MARKET_SEGMENTS[rng.gen_range(0..MARKET_SEGMENTS.len())].to_string());
+            c_acctbal.push((rng.random_range(-99_999..99_999_i32) as f64) / 100.0);
+            c_mktsegment
+                .push(MARKET_SEGMENTS[rng.random_range(0..MARKET_SEGMENTS.len())].to_string());
             c_comment.push(random_comment(&mut rng));
         }
 
@@ -668,15 +669,15 @@ fn generate_part_range(
 
         for i in 0..n {
             let key = (offset + i + 1) as i32;
-            let mfgr_num = rng.gen_range(1..=5i32);
-            let brand_num = rng.gen_range(1..=5i32);
+            let mfgr_num = rng.random_range(1..=5i32);
+            let brand_num = rng.random_range(1..=5i32);
 
             // Part name: 5 random colours joined by spaces (TPC-H spec)
-            let color1 = PART_COLORS[rng.gen_range(0..PART_COLORS.len())];
-            let color2 = PART_COLORS[rng.gen_range(0..PART_COLORS.len())];
-            let color3 = PART_COLORS[rng.gen_range(0..PART_COLORS.len())];
-            let color4 = PART_COLORS[rng.gen_range(0..PART_COLORS.len())];
-            let color5 = PART_COLORS[rng.gen_range(0..PART_COLORS.len())];
+            let color1 = PART_COLORS[rng.random_range(0..PART_COLORS.len())];
+            let color2 = PART_COLORS[rng.random_range(0..PART_COLORS.len())];
+            let color3 = PART_COLORS[rng.random_range(0..PART_COLORS.len())];
+            let color4 = PART_COLORS[rng.random_range(0..PART_COLORS.len())];
+            let color5 = PART_COLORS[rng.random_range(0..PART_COLORS.len())];
 
             p_partkey.push(key);
             p_name.push(format!("{color1} {color2} {color3} {color4} {color5}"));
@@ -684,12 +685,13 @@ fn generate_part_range(
             p_brand.push(format!("Brand#{mfgr_num}{brand_num}"));
             p_type.push(format!(
                 "{} {} {}",
-                PART_TYPE_SYL1[rng.gen_range(0..PART_TYPE_SYL1.len())],
-                PART_TYPE_SYL2[rng.gen_range(0..PART_TYPE_SYL2.len())],
-                PART_TYPE_SYL3[rng.gen_range(0..PART_TYPE_SYL3.len())],
+                PART_TYPE_SYL1[rng.random_range(0..PART_TYPE_SYL1.len())],
+                PART_TYPE_SYL2[rng.random_range(0..PART_TYPE_SYL2.len())],
+                PART_TYPE_SYL3[rng.random_range(0..PART_TYPE_SYL3.len())],
             ));
-            p_size.push(rng.gen_range(1..=50i32));
-            p_container.push(PART_CONTAINERS[rng.gen_range(0..PART_CONTAINERS.len())].to_string());
+            p_size.push(rng.random_range(1..=50i32));
+            p_container
+                .push(PART_CONTAINERS[rng.random_range(0..PART_CONTAINERS.len())].to_string());
             p_retailprice.push(part_retailprice(key));
             p_comment.push(random_comment(&mut rng));
         }
@@ -763,8 +765,8 @@ fn generate_partsupp_range(
             let suppkey = 1 + ((part_idx - 1 + supp_offset_idx as i32) % num_suppliers.max(1));
             ps_partkey.push(part_idx);
             ps_suppkey.push(suppkey);
-            ps_availqty.push(rng.gen_range(1..=9999i32));
-            ps_supplycost.push((rng.gen_range(100..100000i32) as f64) / 100.0);
+            ps_availqty.push(rng.random_range(1..=9999i32));
+            ps_supplycost.push((rng.random_range(100..100000i32) as f64) / 100.0);
             ps_comment.push(random_comment(&mut rng));
 
             supp_offset_idx += 1;
@@ -831,7 +833,7 @@ fn generate_orders_range(
 
         for i in 0..n {
             let key = (offset + i + 1) as i64;
-            let clerk_num = rng.gen_range(1..=1000i32);
+            let clerk_num = rng.random_range(1..=1000i32);
 
             // o_orderstatus follows the line items: 'O' when every line is still
             // open (orderdate at/after the cutoff so all shipdates are after it),
@@ -850,16 +852,16 @@ fn generate_orders_range(
             // dbgen never assigns orders to custkeys divisible by 3, leaving a
             // third of customers orderless. q22 selects on NOT EXISTS(orders)
             // and returns nothing when every customer has orders.
-            let mut ck = rng.gen_range(1..=num_customers);
+            let mut ck = rng.random_range(1..=num_customers);
             if ck % 3 == 0 {
                 ck -= 1;
             }
             o_custkey.push(ck.max(1));
             o_orderstatus.push(status.to_string());
-            o_totalprice.push((rng.gen_range(10_000..50_000_000_i64) as f64) / 100.0);
+            o_totalprice.push((rng.random_range(10_000..50_000_000_i64) as f64) / 100.0);
             o_orderdate.push(orderdate);
             o_orderpriority
-                .push(ORDER_PRIORITIES[rng.gen_range(0..ORDER_PRIORITIES.len())].to_string());
+                .push(ORDER_PRIORITIES[rng.random_range(0..ORDER_PRIORITIES.len())].to_string());
             o_clerk.push(format!("Clerk#{clerk_num:09}"));
             o_shippriority.push(0i32);
             o_comment.push(random_comment(&mut rng));
@@ -934,31 +936,31 @@ fn generate_lineitem_range(
         let mut l_comment = Vec::with_capacity(n);
 
         for i in 0..n {
-            let orderkey = rng.gen_range(1..=num_orders);
-            let partkey = rng.gen_range(1..=num_parts);
+            let orderkey = rng.random_range(1..=num_orders);
+            let partkey = rng.random_range(1..=num_parts);
             // Same (partkey -> supplier) association the partsupp table uses, so
             // every lineitem (partkey, suppkey) pair joins to a partsupp row
             // (q09/q11 read ps_supplycost through this join).
-            let suppkey = 1 + (partkey - 1 + rng.gen_range(0..4i32)) % num_suppliers.max(1);
+            let suppkey = 1 + (partkey - 1 + rng.random_range(0..4i32)) % num_suppliers.max(1);
             let linenumber = ((offset + i) % 7 + 1) as i32;
-            let quantity = rng.gen_range(1..=50i32) as f64;
-            let discount = rng.gen_range(0..=10i32) as f64 / 100.0;
-            let tax = rng.gen_range(0..=8i32) as f64 / 100.0;
+            let quantity = rng.random_range(1..=50i32) as f64;
+            let discount = rng.random_range(0..=10i32) as f64 / 100.0;
+            let tax = rng.random_range(0..=8i32) as f64 / 100.0;
             // l_extendedprice is quantity * retail price; the discount is applied
             // later in revenue, not baked into extendedprice.
             let extendedprice = quantity * part_retailprice(partkey);
             // Spec date chain: ship within 121d of the order, commit 30..90d after
             // the order, receipt 1..30d after ship (so receipt is always > ship).
             let orderdate = random_order_date(&mut rng);
-            let shipdate = orderdate + rng.gen_range(1..=121i32);
-            let commitdate = orderdate + rng.gen_range(30..=90i32);
-            let receiptdate = shipdate + rng.gen_range(1..=30i32);
+            let shipdate = orderdate + rng.random_range(1..=121i32);
+            let commitdate = orderdate + rng.random_range(30..=90i32);
+            let receiptdate = shipdate + rng.random_range(1..=30i32);
             // Derived from the dates relative to the cutoff: 'O' if not yet shipped
             // by the cutoff; returnflag 'N' if not yet received, else 'R'/'A'.
             let linestatus = if shipdate > CURRENT_DATE { "O" } else { "F" };
             let returnflag = if receiptdate > CURRENT_DATE {
                 "N"
-            } else if rng.gen_bool(0.5) {
+            } else if rng.random_bool(0.5) {
                 "R"
             } else {
                 "A"
@@ -977,8 +979,9 @@ fn generate_lineitem_range(
             l_shipdate.push(shipdate);
             l_commitdate.push(commitdate);
             l_receiptdate.push(receiptdate);
-            l_shipinstruct.push(SHIP_INSTRUCTS[rng.gen_range(0..SHIP_INSTRUCTS.len())].to_string());
-            l_shipmode.push(SHIP_MODES[rng.gen_range(0..SHIP_MODES.len())].to_string());
+            l_shipinstruct
+                .push(SHIP_INSTRUCTS[rng.random_range(0..SHIP_INSTRUCTS.len())].to_string());
+            l_shipmode.push(SHIP_MODES[rng.random_range(0..SHIP_MODES.len())].to_string());
             l_comment.push(random_comment(&mut rng));
         }
 

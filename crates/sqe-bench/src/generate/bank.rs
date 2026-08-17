@@ -31,7 +31,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use super::{parallel_generate_table, BenchmarkGenerator, GenerateConfig, GenerateStats, TableDef};
 
@@ -361,7 +361,7 @@ const DESC_MERCHANTS: &[&str] = &[
 fn rand_ref<const N: usize>(rng: &mut StdRng) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     (0..N)
-        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())] as char)
         .collect()
 }
 
@@ -403,15 +403,15 @@ pub fn customer_range(
             c_id.push(id);
             c_name.push(format!(
                 "{} {}",
-                FIRST_NAMES[rng.gen_range(0..FIRST_NAMES.len())],
-                SURNAMES[rng.gen_range(0..SURNAMES.len())]
+                FIRST_NAMES[rng.random_range(0..FIRST_NAMES.len())],
+                SURNAMES[rng.random_range(0..SURNAMES.len())]
             ));
             // Date of birth between 1940-01-01 and 2004-12-31.
-            c_dob.push(rng.gen_range(-10_957..12_784i32));
-            c_country.push(COUNTRIES[rng.gen_range(0..COUNTRIES.len())]);
-            c_segment.push(SEGMENTS[rng.gen_range(0..SEGMENTS.len())]);
+            c_dob.push(rng.random_range(-10_957..12_784i32));
+            c_country.push(COUNTRIES[rng.random_range(0..COUNTRIES.len())]);
+            c_segment.push(SEGMENTS[rng.random_range(0..SEGMENTS.len())]);
             // Customer since between 2005-01-01 and 2026-05-31.
-            c_created.push(rng.gen_range(12_784..20_604i32));
+            c_created.push(rng.random_range(12_784..20_604i32));
         }
 
         let batch = RecordBatch::try_new(
@@ -461,11 +461,11 @@ pub fn account_range(
             a_id.push(id);
             a_c_id.push(account_customer(id, &plan));
             a_iban.push(format!("NL{:02}SQEB{:010}", id % 89 + 10, id));
-            a_type.push(ACCOUNT_TYPES[rng.gen_range(0..ACCOUNT_TYPES.len())]);
+            a_type.push(ACCOUNT_TYPES[rng.random_range(0..ACCOUNT_TYPES.len())]);
             a_currency.push(account_currency(id));
-            a_status.push(STATUSES[rng.gen_range(0..STATUSES.len())]);
+            a_status.push(STATUSES[rng.random_range(0..STATUSES.len())]);
             // Opened between 2010-01-01 and 2026-05-31.
-            a_opened.push(rng.gen_range(14_610..20_604i32));
+            a_opened.push(rng.random_range(14_610..20_604i32));
         }
 
         let batch = RecordBatch::try_new(
@@ -512,15 +512,15 @@ pub fn kyc_profile_range(
 
         for i in 0..n {
             k_c_id.push((offset + i) as i64);
-            k_risk.push(RISK_RATINGS[rng.gen_range(0..RISK_RATINGS.len())]);
+            k_risk.push(RISK_RATINGS[rng.random_range(0..RISK_RATINGS.len())]);
             // 0.5% politically exposed, 0.1% sanctions hits.
-            k_pep.push(rng.gen_range(0..1000u32) < 5);
-            k_sanctions.push(rng.gen_range(0..1000u32) < 1);
+            k_pep.push(rng.random_range(0..1000u32) < 5);
+            k_sanctions.push(rng.random_range(0..1000u32) < 1);
             // Last review between 2024-01-01 and 2026-05-31; next one year on.
-            let last = rng.gen_range(19_723..20_604i32);
+            let last = rng.random_range(19_723..20_604i32);
             k_last.push(last);
             k_next.push(last + 365);
-            k_source.push(SOURCES_OF_FUNDS[rng.gen_range(0..SOURCES_OF_FUNDS.len())]);
+            k_source.push(SOURCES_OF_FUNDS[rng.random_range(0..SOURCES_OF_FUNDS.len())]);
         }
 
         let batch = RecordBatch::try_new(
@@ -596,7 +596,7 @@ pub fn transaction_day_shard(
             // Draw unconditionally so the rng sequence (and every non-ring
             // row) is identical whether or not this row joins the ring.
             let drawn_a_id =
-                rng.gen_range(accounts.start..accounts.end.max(accounts.start + 1)) as i64;
+                rng.random_range(accounts.start..accounts.end.max(accounts.start + 1)) as i64;
             let ring_account =
                 FRAUD_RING_START + (id / FRAUD_RING_STRIDE).rem_euclid(FRAUD_RING_COUNT);
             let use_ring = FRAUD_RING_DAYS.contains(&day)
@@ -606,25 +606,25 @@ pub fn transaction_day_shard(
             t_a_id.push(a_id);
             t_cp_iban.push(format!(
                 "{}{:02}BANK{:010}",
-                COUNTRIES[rng.gen_range(0..COUNTRIES.len())],
-                rng.gen_range(10..99),
-                rng.gen_range(0..9_999_999_999u64)
+                COUNTRIES[rng.random_range(0..COUNTRIES.len())],
+                rng.random_range(10..99),
+                rng.random_range(0..9_999_999_999u64)
             ));
-            t_cp_bic.push(BICS[rng.gen_range(0..BICS.len())]);
+            t_cp_bic.push(BICS[rng.random_range(0..BICS.len())]);
             // Skewed magnitudes: cents in [10^2, 10^7) with small amounts
             // dominating, resembling retail payment flows.
-            let mag = rng.gen_range(0..5u32);
+            let mag = rng.random_range(0..5u32);
             let base = 10i64.pow(mag + 2);
-            t_amount.push(rng.gen_range(base / 2..base * 5));
+            t_amount.push(rng.random_range(base / 2..base * 5));
             t_currency.push(account_currency(a_id));
             // Draw unconditionally to keep the rng aligned; ring rows are
             // forced to debit so they land in q03's outgoing-transaction filter.
-            let debit = rng.gen_range(0..2) == 0 || use_ring;
+            let debit = rng.random_range(0..2) == 0 || use_ring;
             t_direction.push(if debit { "debit" } else { "credit" });
-            t_channel.push(CHANNELS[rng.gen_range(0..CHANNELS.len())]);
-            t_category.push(CATEGORIES[rng.gen_range(0..CATEGORIES.len())]);
+            t_channel.push(CHANNELS[rng.random_range(0..CHANNELS.len())]);
+            t_category.push(CATEGORIES[rng.random_range(0..CATEGORIES.len())]);
             // 97% settled, 2% pending, 1% rejected.
-            let s = rng.gen_range(0..100u32);
+            let s = rng.random_range(0..100u32);
             t_status.push(if s < 97 {
                 "settled"
             } else {
@@ -637,12 +637,12 @@ pub fn transaction_day_shard(
             // implausible number of rows).
             t_description.push(format!(
                 "{} {} e2e {}",
-                DESC_MERCHANTS[rng.gen_range(0..DESC_MERCHANTS.len())],
-                DESC_VERBS[rng.gen_range(0..DESC_VERBS.len())],
+                DESC_MERCHANTS[rng.random_range(0..DESC_MERCHANTS.len())],
+                DESC_VERBS[rng.random_range(0..DESC_VERBS.len())],
                 rand_ref::<24>(&mut rng)
             ));
-            t_balance_after.push(rng.gen_range(-10_000_000..1_000_000_000i64));
-            t_country.push(COUNTRIES[rng.gen_range(0..COUNTRIES.len())]);
+            t_balance_after.push(rng.random_range(-10_000_000..1_000_000_000i64));
+            t_country.push(COUNTRIES[rng.random_range(0..COUNTRIES.len())]);
         }
 
         let batch = RecordBatch::try_new(
@@ -702,9 +702,9 @@ pub fn account_balance_day_shard(
             let a_id = (next + i as u64) as i64;
             b_day.push(day);
             b_a_id.push(a_id);
-            b_balance.push(rng.gen_range(-50_000_000..5_000_000_000i64));
+            b_balance.push(rng.random_range(-50_000_000..5_000_000_000i64));
             b_currency.push(account_currency(a_id));
-            b_txn_count.push(rng.gen_range(0..200i32));
+            b_txn_count.push(rng.random_range(0..200i32));
         }
 
         let batch = RecordBatch::try_new(

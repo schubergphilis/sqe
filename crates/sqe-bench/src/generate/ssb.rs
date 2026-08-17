@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow_array::{Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use super::{parquet_writer, BenchmarkGenerator, GenerateStats, TableDef};
 
@@ -371,12 +371,12 @@ fn seed_salt() -> u64 {
 fn random_word(rng: &mut StdRng, len: usize) -> String {
     const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
     (0..len)
-        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+        .map(|_| CHARS[rng.random_range(0..CHARS.len())] as char)
         .collect()
 }
 
 fn random_address(rng: &mut StdRng) -> String {
-    let len = rng.gen_range(10..40usize);
+    let len = rng.random_range(10..40usize);
     random_word(rng, len)
 }
 
@@ -384,9 +384,9 @@ fn random_phone(rng: &mut StdRng, nation_idx: usize) -> String {
     format!(
         "{:02}-{:03}-{:03}-{:04}",
         10 + (nation_idx % 25),
-        rng.gen_range(100..999i32),
-        rng.gen_range(100..999i32),
-        rng.gen_range(1000..9999i32),
+        rng.random_range(100..999i32),
+        rng.random_range(100..999i32),
+        rng.random_range(1000..9999i32),
     )
 }
 
@@ -395,7 +395,7 @@ fn random_phone(rng: &mut StdRng, nation_idx: usize) -> String {
 /// q3.3/q3.4 probe literals like 'UNITED KI1', so any other format makes them
 /// select nothing.
 fn random_city(rng: &mut StdRng, nation_name: &str) -> String {
-    format!("{:<9.9}{}", nation_name, rng.gen_range(0..10u32))
+    format!("{:<9.9}{}", nation_name, rng.random_range(0..10u32))
 }
 
 // ---------------------------------------------------------------------------
@@ -532,7 +532,7 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
         for i in 0..n {
             let key = (offset + i + 1) as i32;
-            let nation_idx = rng.gen_range(0..NATIONS.len());
+            let nation_idx = rng.random_range(0..NATIONS.len());
             let (nation_name, region_idx) = NATIONS[nation_idx];
             let region_name = REGIONS[region_idx];
 
@@ -543,7 +543,8 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             c_nation.push(nation_name.to_string());
             c_region.push(region_name.to_string());
             c_phone.push(random_phone(&mut rng, nation_idx));
-            c_mktsegment.push(MARKET_SEGMENTS[rng.gen_range(0..MARKET_SEGMENTS.len())].to_string());
+            c_mktsegment
+                .push(MARKET_SEGMENTS[rng.random_range(0..MARKET_SEGMENTS.len())].to_string());
         }
 
         let name_refs: Vec<&str> = c_name.iter().map(|s| s.as_str()).collect();
@@ -596,7 +597,7 @@ fn generate_supplier(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
         for i in 0..n {
             let key = (offset + i + 1) as i32;
-            let nation_idx = rng.gen_range(0..NATIONS.len());
+            let nation_idx = rng.random_range(0..NATIONS.len());
             let (nation_name, region_idx) = NATIONS[nation_idx];
             let region_name = REGIONS[region_idx];
 
@@ -660,26 +661,27 @@ fn generate_part(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
         for i in 0..n {
             let key = (offset + i + 1) as i32;
-            let mfgr_num = rng.gen_range(1..=5i32);
-            let cat_num = rng.gen_range(1..=5i32);
+            let mfgr_num = rng.random_range(1..=5i32);
+            let cat_num = rng.random_range(1..=5i32);
             // ssb-dbgen brand = category + zero-padded 01..40, e.g.
             // 'MFGR#2221'. Queries q2.2/q2.3 probe 4-digit brand literals.
-            let brand_num = rng.gen_range(1..=40i32);
-            let color = PART_COLORS[rng.gen_range(0..PART_COLORS.len())];
+            let brand_num = rng.random_range(1..=40i32);
+            let color = PART_COLORS[rng.random_range(0..PART_COLORS.len())];
 
             p_partkey.push(key);
             p_name.push(format!(
                 "{} {}",
                 color,
-                PART_COLORS[rng.gen_range(0..PART_COLORS.len())]
+                PART_COLORS[rng.random_range(0..PART_COLORS.len())]
             ));
             p_mfgr.push(format!("MFGR#{}", mfgr_num));
             p_category.push(format!("MFGR#{}{}", mfgr_num, cat_num));
             p_brand.push(format!("MFGR#{}{}{:02}", mfgr_num, cat_num, brand_num));
             p_color.push(color.to_string());
-            p_type.push(PART_TYPES[rng.gen_range(0..PART_TYPES.len())].to_string());
-            p_size.push(rng.gen_range(1..=50i32));
-            p_container.push(PART_CONTAINERS[rng.gen_range(0..PART_CONTAINERS.len())].to_string());
+            p_type.push(PART_TYPES[rng.random_range(0..PART_TYPES.len())].to_string());
+            p_size.push(rng.random_range(1..=50i32));
+            p_container
+                .push(PART_CONTAINERS[rng.random_range(0..PART_CONTAINERS.len())].to_string());
         }
 
         let name_refs: Vec<&str> = p_name.iter().map(|s| s.as_str()).collect();
@@ -732,9 +734,9 @@ fn generate_lineorder(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // State for multi-line orders
     let mut order_key: i64 = 0;
     let mut line_number: i32 = 1;
-    let mut order_idx: usize = rng.gen_range(0..n_dates);
+    let mut order_idx: usize = rng.random_range(0..n_dates);
     let mut order_date: i32 = date_keys[order_idx];
-    let mut order_total: f64 = (rng.gen_range(10_000..5_000_000_i64) as f64) / 100.0;
+    let mut order_total: f64 = (rng.random_range(10_000..5_000_000_i64) as f64) / 100.0;
 
     let mut offset = 0usize;
     while offset < total {
@@ -760,32 +762,33 @@ fn generate_lineorder(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         for _ in 0..n {
             if line_number == 1 {
                 order_key += 1;
-                order_idx = rng.gen_range(0..n_dates);
+                order_idx = rng.random_range(0..n_dates);
                 order_date = date_keys[order_idx];
-                order_total = (rng.gen_range(10_000..5_000_000_i64) as f64) / 100.0;
+                order_total = (rng.random_range(10_000..5_000_000_i64) as f64) / 100.0;
             }
 
-            let partkey = rng.gen_range(1..=num_parts.max(1));
-            let suppkey = 1 + (partkey + rng.gen_range(0..4i32)) % num_suppliers.max(1);
-            let quantity = rng.gen_range(1..=50i32);
+            let partkey = rng.random_range(1..=num_parts.max(1));
+            let suppkey = 1 + (partkey + rng.random_range(0..4i32)) % num_suppliers.max(1);
+            let quantity = rng.random_range(1..=50i32);
             let base_price = 900.0 + (partkey as f64 / 10.0) % 2000.0;
             let extended_price = quantity as f64 * base_price;
-            let discount_pct = rng.gen_range(0..=10i32); // integer percent
+            let discount_pct = rng.random_range(0..=10i32); // integer percent
             let revenue = extended_price * (1.0 - discount_pct as f64 / 100.0);
-            let supply_cost = base_price * 0.6 + (rng.gen_range(0..100) as f64);
-            let tax_pct = rng.gen_range(0..=8i32);
+            let supply_cost = base_price * 0.6 + (rng.random_range(0..100) as f64);
+            let tax_pct = rng.random_range(0..=8i32);
             // Commit date is the order date advanced 1..121 days (SSB inherits the
             // TPC-H ship-window), expressed via the ordered date-key list.
-            let commit_date = date_keys[(order_idx + rng.gen_range(1..=121usize)).min(n_dates - 1)];
+            let commit_date =
+                date_keys[(order_idx + rng.random_range(1..=121usize)).min(n_dates - 1)];
 
             lo_orderkey.push(order_key);
             lo_linenumber.push(line_number);
-            lo_custkey.push(rng.gen_range(1..=num_customers.max(1)));
+            lo_custkey.push(rng.random_range(1..=num_customers.max(1)));
             lo_partkey.push(partkey);
             lo_suppkey.push(suppkey);
             lo_orderdate.push(order_date);
             lo_orderpriority
-                .push(ORDER_PRIORITIES[rng.gen_range(0..ORDER_PRIORITIES.len())].to_string());
+                .push(ORDER_PRIORITIES[rng.random_range(0..ORDER_PRIORITIES.len())].to_string());
             lo_shippriority.push(0i32);
             lo_quantity.push(quantity);
             lo_extendedprice.push(extended_price);
@@ -795,11 +798,11 @@ fn generate_lineorder(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             lo_supplycost.push(supply_cost);
             lo_tax.push(tax_pct);
             lo_commitdate.push(commit_date);
-            lo_shipmode.push(SHIP_MODES[rng.gen_range(0..SHIP_MODES.len())].to_string());
+            lo_shipmode.push(SHIP_MODES[rng.random_range(0..SHIP_MODES.len())].to_string());
 
             // Advance line_number; when it exceeds a random 1..=7 bound, reset
             line_number += 1;
-            if line_number > rng.gen_range(1..=7i32) {
+            if line_number > rng.random_range(1..=7i32) {
                 line_number = 1;
             }
         }

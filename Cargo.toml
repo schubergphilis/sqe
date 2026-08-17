@@ -154,26 +154,14 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # Data generation
 csv = "1"
-# HELD at 0.8: sqe-bench generators seed StdRng explicitly
-# (`StdRng::seed_from_u64`) and rand does not guarantee identical output
-# across releases, so bumping silently changes generated benchmark data
-# for the same seed -- invalidating comparability with the committed
-# baselines in benchmarks/results/ and the DuckDB-oracle fidelity checks.
-# 475 call sites across 9 files would also need the gen_range ->
-# random_range / thread_rng -> rng renames. Bump deliberately, with a
-# generator re-validation, not as part of a dependency refresh.
-# HELD at 0.8 -- the 0.10 migration was attempted and reverted (see #390).
-# rand does not guarantee output stability across releases and the sqe-bench
-# generators seed StdRng explicitly, so 0.10 changes the data produced for a
-# given seed. Measured effect at SF1 TPC-DS: matched 99/99 with 0 vacuous-bug
-# before, 97/99 with 2 after -- q29 and q85 return zero rows where the spec
-# says non-empty. Both need sales-to-returns chains with correlated customer
-# demographics, so the new sampling changed that correlation. All 4360 unit
-# tests and the 230-query suite still pass, which is exactly why this needs a
-# differential compare-trino run rather than a green build to validate.
-# The API rename itself is mechanical (486 sites, gen_range -> random_range,
-# and rand::Rng -> rand::RngExt for the generation methods).
-rand = "0.8"
+# rand 0.10. Output for a given StdRng seed is not stable across rand
+# releases. The 0.8 -> 0.10 bump was attempted and reverted once (#390):
+# unplanted TPC-DS q29/q85 went empty. Those coincidences are now planted
+# (!857). A 0.10 data set is a new draw, not comparable to 0.8 baselines
+# in benchmarks/results/ without a fresh generate + compare-trino.
+# API: gen_range -> random_range, gen_bool -> random_bool, gen -> random,
+# thread_rng -> rng, Rng -> RngExt. rusqlite stays on 0.39 (#389).
+rand = "0.10"
 
 # Crypto
 sha2 = "0.11"
