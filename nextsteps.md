@@ -42,6 +42,22 @@
 
 > **DOCUMENTED 2026-08-16, issue #411:** HashJoin cannot spill (DF#17267). `JoinStrategyRule` rewrites to SMJ only on an exact over-threshold build estimate. Unknown Iceberg stats keep HashJoin. Rewriting on Unknown doubled TPC-DS at SF1.
 
+> **CLOSED 2026-08-17, issue #387: the two dind integration jobs are gone; the suites are local gates now.** `integration-test` and `distributed-smoke` both needed a privileged `docker:dind` sidecar the shared runners answer `no route to host` on, so neither ever executed a line of SQE code. Carrying them as `allow_failure: true` was worse than deleting them: a permanently-yellow job reads as coverage, and two real main breakages hid behind exactly that. The suites themselves are unchanged and now run via `make test-integration` / `make test-distributed` (`FILTER=` selects one test, `make test-integration-down` tears the stack down).
+>
+> Two defects in the local path were fixed while making it the gate, both of which would have made the new target a worse experience than the script it wraps. `scripts/integration-test.sh` defaults `RUST_MIN_STACK` to 8 MiB to mirror production `WORKER_STACK_BYTES`, but an unfiltered run passes `--ignored`, which force-runs the write e2e suites, and those SIGABRT below 32 MiB; the make target exports 33554432, the value every other coordinator suite in the repo uses. And a fixed-port collision surfaced as `Bind for 0.0.0.0:18181 failed: port is already allocated` fourteen lines into the compose bring-up without naming the holder, which is the single most common local failure because the bench, parity and quickstart rigs publish overlapping ports. `scripts/integration-preflight.sh` now names the container and the `docker rm -f` that clears it.
+>
+> The preflight accepts ports held by THIS project's own containers, so the intended fast rerun (stack left up, idempotent bootstrap) is not blocked, and rejects everything else. Matching is against `docker compose ps` output rather than a name prefix, which is load-bearing: the stale rig that exposed the bug was `sqlengine-rand-010-polaris-1`, sharing the `sqlengine-` prefix while belonging to a different project. Both branches verified against a live conflict.
+>
+> **First real run of the new gate, and it found three things.** 215 passed, 7 failed. Four of the seven were impossible by construction: `rewrite_data_files_distributed_parity` (three cases) and `compaction_distributed_benchmark` need live `sqe-worker` processes on `:50052` and `:50053`, and the `DISTRIBUTED=0` skip list only named `test_distributed_select` because it was written before those tests existed. So a default run reported four failures no healthy machine could avoid, which is the same disease as a permanently-yellow CI job. They are in the skip list now.
+>
+> Two of the remaining three were stale-schema dead weight, the same class as the CLOSED #377: `incremental_scan_e2e` ordered by `timestamp_ms`, a `table_snapshots` column #320 removed in favour of `committed_at`. #377 only covered the `v3_e2e` pair, so these two survived its fix. One word per site.
+>
+> The last one is issue #431, filed rather than fixed. `test_error_classification_live` expects `CATALOG_ERROR` for a DELETE on a missing table and gets `TABLE_NOT_FOUND`. The expectation looks like the stale side (the same test expects `TABLE_NOT_FOUND` for SELECT on a missing table, and the more specific code is the more useful one), but that is an inference: `git log -L` on those lines reaches only the `b9e2094` main-wipe revert, so which side moved is not recoverable cheaply. Changing an expected error classification as a drive-by is a behaviour decision, not test cleanup.
+>
+> **Measured after the fixes: 217 passed, 1 failed, the failure being #431 alone.** That is what makes the target a usable gate: green except for one tracked red, so anything else red is yours.
+>
+> **Still standing, deliberately not touched:** `scenario-test`, `access-control-test` and `scenario-test-aws` use the same dind sidecar and carry the same zero signal on the shared runners. They were kept because they are the only CI-side coverage of the quickstarts and the policy path, and because removing the access-control gate was not in scope. `scenario-test`'s main-push rule has no `allow_failure`, so it remains a red-main hazard on a broken runner.
+
 > **FIXED 2026-08-17, aikido CI findings #430 / #392 / #394:** Aikido fingerprints an issue on (rule, FILE), never the line, so `unpinned-image` + `.gitlab-ci.yml` is ONE issue showing whichever image the scanner reaches first. #393 was `rust:slim`, then #430 was `alpine:3.24`; pinning alpine alone would have retitled #430 to `docker:29`, not closed it. All six `image:` lines are now digest-pinned (!863). `docker:29-dind` is out of scope because `services:` entries are never scanned. #392 was NOT a duplicated-pin problem in this repo: the scanner walked the root file before its includes, so `$AIKIDO_TOOLS_IMAGE` read as unresolvable even though guardrails.yml pins it to a digest; fixed centrally with a two-pass gather (aikido!129), no `ref:` bump needed. #394 (`curl | bash` for cargo-binstall) is real and lives in aikido's `test-rust.yml`; the pinned+checksummed install is in the same MR but clears here only after an aikido release and a `ref:` bump, which would also restore Harbor mirroring (v0.9.5 predates aikido!126).
 
 > **FIXED 2026-08-16, issue #390:** TPC-DS q17/q29/q85 no longer depend on RNG luck. q17 and q29 plant the three-leg (store, return, catalog) coincidence; q29 forces the return date. `customer_demographics` marital/education is sk-derived; web order 1 is planted at $125 in 2000 for q85.
@@ -565,7 +581,7 @@ See [AUDIT.md](AUDIT.md) for the full report. Completed 2026-04-08.
 | `fmt_val` | All Arrow data types render correctly (Utf8View, UInt32/64, Float32, decimals, dates) | `sqe-cli/src/fmt_val.rs` |
 | Iceberg scan | Partition pruning is applied; snapshot time-travel works | `sqe-catalog/src/` |
 | Policy rewriter | Column masks block predicate pushdown; row filters are transparent | `sqe-policy/src/` |
-| Integration tests | All tests in `tests/` pass against a live Iceberg/MinIO stack | `scripts/integration-test.sh` |
+| Integration tests | All tests pass against a live Iceberg/S3 stack | `make test-integration` (local only, #387) |
 | Docker build | `docker build` completes cleanly using pre-compiled binaries | `Dockerfile` |
 
 ### 1c. Audit Commands
@@ -577,8 +593,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 # Tests (unit)
 cargo test --all
 
-# Integration tests (requires running stack)
-./scripts/integration-test.sh
+# Integration tests (brings up its own stack; local only, no CI job -- #387)
+make test-integration
 
 # Security advisory scan
 cargo audit
