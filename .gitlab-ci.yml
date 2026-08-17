@@ -10,6 +10,18 @@ workflow:
     - if: '$CI_COMMIT_TAG'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
+# Auto-cancel superseded pipelines. The project setting
+# (Settings > CI/CD > auto_cancel_pending_pipelines) is already `enabled`, but it
+# only cancels jobs marked `interruptible`, and nothing here was. Measured
+# consequence: three pushes to one MR left three pipelines running side by side,
+# each carrying a 20-minute cargo-gate and a 20-minute aikido-test-rust, so two
+# superseded commits burned ~80 minutes of runner time nobody would ever read.
+#
+# `default:` covers jobs pulled in from the aikido includes too, which is the
+# point: the expensive ones are not defined in this file.
+default:
+  interruptible: true
+
 # HARBOR RELEASE MIRRORING: the `ref:` below must be an aikido release that
 # contains aikido-publish-release-image (vpf-data-ai/aikido!126). v0.9.5 does
 # NOT. Without that job a vX.Y.Z tag pipeline pushes :vX.Y.Z + :stable to the
@@ -52,6 +64,11 @@ variables:
 # script against ci/templates/deploy.yml and keep the --target line.
 aikido-build:
   timeout: 3h
+  # Never cancel a push mid-layer. On main this kaniko run pushes $AIKIDO_IMAGE,
+  # and a half-written manifest is worse than a wasted run, so this job opts out
+  # of the `default: interruptible: true` above. Same reasoning for the publish,
+  # SBOM-of-image and release/signing jobs overridden below.
+  interruptible: false
   script:
     - |
       set -euo pipefail
@@ -279,6 +296,28 @@ vendored-profile-drift:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       changes:
         - "crates/sqe-policy/assets/*.json"
+
+# ── Publish / release jobs opt out of auto-cancel ──────────────
+# These come from the aikido deploy.yml and release.yml includes, so the
+# `default: interruptible: true` at the top of this file would otherwise make
+# them cancellable. Anything that pushes an image, writes a tag/release, or
+# signs an artifact must run to completion once started: a cancelled publish
+# leaves the registry or the release inconsistent, which is a worse outcome than
+# the runner minutes auto-cancel is there to save.
+#
+# aikido-build carries its own `interruptible: false` at its override above.
+aikido-publish-image:
+  interruptible: false
+aikido-image-sbom:
+  interruptible: false
+aikido-mbom:
+  interruptible: false
+aikido-release:
+  interruptible: false
+aikido-release-image:
+  interruptible: false
+aikido-sign-image:
+  interruptible: false
 
 # ===== repo-specific integration suites (docker-in-docker), hosted here =====
 #
