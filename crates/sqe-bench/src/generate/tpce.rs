@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow_array::{Date32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use super::{parquet_writer, BenchmarkGenerator, GenerateStats, TableDef};
 
@@ -62,7 +62,7 @@ fn dim_card_usize(scale: f64, base: f64) -> usize {
     ((scale * base) as usize).max(DIM_MIN)
 }
 
-/// Same as [`dim_card_usize`] but typed for `rng.gen_range(1..=n)` callers.
+/// Same as [`dim_card_usize`] but typed for `rng.random_range(1..=n)` callers.
 fn dim_card_i64(scale: f64, base: f64) -> i64 {
     dim_card_usize(scale, base) as i64
 }
@@ -76,7 +76,7 @@ const DATE_START: i32 = 10957; // days since 1970-01-01 to 2000-01-01
 const DATE_RANGE: i32 = 2192; // ~6 years in days
 
 fn random_date(rng: &mut StdRng) -> i32 {
-    DATE_START + rng.gen_range(0..DATE_RANGE)
+    DATE_START + rng.random_range(0..DATE_RANGE)
 }
 
 // ---------------------------------------------------------------------------
@@ -87,12 +87,12 @@ const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
 
 fn random_word(rng: &mut StdRng, len: usize) -> String {
     (0..len)
-        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+        .map(|_| CHARS[rng.random_range(0..CHARS.len())] as char)
         .collect()
 }
 
 fn random_name(rng: &mut StdRng) -> String {
-    let len = rng.gen_range(4..12usize);
+    let len = rng.random_range(4..12usize);
     let mut s = random_word(rng, len);
     if let Some(c) = s.get_mut(0..1) {
         c.make_ascii_uppercase();
@@ -102,23 +102,23 @@ fn random_name(rng: &mut StdRng) -> String {
 
 fn random_email(rng: &mut StdRng, id: i64) -> String {
     let domain = ["example.com", "mail.net", "broker.org", "finance.io"];
-    format!("user{}@{}", id, domain[rng.gen_range(0..domain.len())])
+    format!("user{}@{}", id, domain[rng.random_range(0..domain.len())])
 }
 
 fn random_phone(rng: &mut StdRng) -> String {
     format!(
         "{:03}-{:03}-{:04}",
-        rng.gen_range(200..999u32),
-        rng.gen_range(100..999u32),
-        rng.gen_range(1000..9999u32),
+        rng.random_range(200..999u32),
+        rng.random_range(100..999u32),
+        rng.random_range(1000..9999u32),
     )
 }
 
 fn random_text(rng: &mut StdRng, min_words: usize, max_words: usize) -> String {
-    let words = rng.gen_range(min_words..=max_words);
+    let words = rng.random_range(min_words..=max_words);
     let mut parts = Vec::with_capacity(words);
     for _ in 0..words {
-        let len = rng.gen_range(3..10usize);
+        let len = rng.random_range(3..10usize);
         parts.push(random_word(rng, len));
     }
     parts.join(" ")
@@ -685,7 +685,7 @@ fn generate_taxrate() -> (SchemaRef, Vec<RecordBatch>) {
     for i in 0..total {
         tx_id.push(format!("TX{i:04}"));
         tx_name.push(format!("Tax Rate {i}"));
-        tx_rate.push((rng.gen_range(5..35u32) as f64) / 100.0);
+        tx_rate.push((rng.random_range(5..35u32) as f64) / 100.0);
     }
 
     let id_refs: Vec<&str> = tx_id.iter().map(|s| s.as_str()).collect();
@@ -784,7 +784,7 @@ fn generate_commission_rate() -> (SchemaRef, Vec<RecordBatch>) {
                     cr_ex_id.push(ex.0.to_string());
                     cr_from_qty.push(from_qty);
                     cr_to_qty.push(to_qty);
-                    cr_rate.push((rng.gen_range(10..500u32) as f64) / 10000.0);
+                    cr_rate.push((rng.random_range(10..500u32) as f64) / 10000.0);
                 }
             }
         }
@@ -875,12 +875,12 @@ fn generate_address(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             ad_id.push(id);
             ad_line1.push(format!(
                 "{} {}",
-                rng.gen_range(1..9999u32),
+                rng.random_range(1..9999u32),
                 random_name(&mut rng)
             ));
-            ad_line2.push(format!("Apt {}", rng.gen_range(1..500u32)));
-            ad_zc_code.push(format!("{:05}", rng.gen_range(0..14741u32)));
-            ad_ctry.push(COUNTRIES[rng.gen_range(0..COUNTRIES.len())].to_string());
+            ad_line2.push(format!("Apt {}", rng.random_range(1..500u32)));
+            ad_zc_code.push(format!("{:05}", rng.random_range(0..14741u32)));
+            ad_ctry.push(COUNTRIES[rng.random_range(0..COUNTRIES.len())].to_string());
         }
 
         let line1_refs: Vec<&str> = ad_line1.iter().map(|s| s.as_str()).collect();
@@ -941,22 +941,22 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             c_id.push(id);
             c_tax_id.push(tax_id_for(id));
             c_st_id.push(
-                STATUS_TYPES[rng.gen_range(0..STATUS_TYPES.len())]
+                STATUS_TYPES[rng.random_range(0..STATUS_TYPES.len())]
                     .0
                     .to_string(),
             );
             c_l_name.push(random_name(&mut rng));
             c_f_name.push(random_name(&mut rng));
             c_m_name.push(random_word(&mut rng, 1).to_uppercase());
-            c_gndr.push(GENDERS[rng.gen_range(0..GENDERS.len())].to_string());
-            c_tier.push(rng.gen_range(1..=3i32));
+            c_gndr.push(GENDERS[rng.random_range(0..GENDERS.len())].to_string());
+            c_tier.push(rng.random_range(1..=3i32));
             // DOB: 1940-2000 range
-            c_dob.push(DATE_START - 10957 + rng.gen_range(0..21915i32));
-            c_ad_id.push(rng.gen_range(1..=num_addr));
-            c_ctry_1.push(COUNTRIES[rng.gen_range(0..COUNTRIES.len())].to_string());
-            c_area_1.push(AREA_CODES[rng.gen_range(0..AREA_CODES.len())].to_string());
+            c_dob.push(DATE_START - 10957 + rng.random_range(0..21915i32));
+            c_ad_id.push(rng.random_range(1..=num_addr));
+            c_ctry_1.push(COUNTRIES[rng.random_range(0..COUNTRIES.len())].to_string());
+            c_area_1.push(AREA_CODES[rng.random_range(0..AREA_CODES.len())].to_string());
             c_local_1.push(random_phone(&mut rng));
-            c_ext_1.push(format!("{}", rng.gen_range(1000..9999u32)));
+            c_ext_1.push(format!("{}", rng.random_range(1000..9999u32)));
             c_email_1.push(random_email(&mut rng, id));
             c_email_2.push(random_email(&mut rng, id + 1_000_000));
         }
@@ -1026,11 +1026,11 @@ fn generate_customer_account(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         for i in 0..n {
             let id = (offset + i + 1) as i64;
             ca_id.push(id);
-            ca_b_id.push(rng.gen_range(1..=num_brokers));
-            ca_c_id.push(rng.gen_range(1..=num_customers));
+            ca_b_id.push(rng.random_range(1..=num_brokers));
+            ca_c_id.push(rng.random_range(1..=num_customers));
             ca_name.push(format!("Account#{id:08}"));
-            ca_tax_st.push(rng.gen_range(0..=2i32));
-            ca_bal.push((rng.gen_range(0..1_000_000_i64) as f64) / 100.0);
+            ca_tax_st.push(rng.random_range(0..=2i32));
+            ca_bal.push((rng.random_range(0..1_000_000_i64) as f64) / 100.0);
         }
 
         let name_refs: Vec<&str> = ca_name.iter().map(|s| s.as_str()).collect();
@@ -1072,8 +1072,8 @@ fn generate_customer_taxrate(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let mut cx_c_id = Vec::with_capacity(n);
 
         for _ in 0..n {
-            cx_tx_id.push(format!("TX{:04}", rng.gen_range(0..num_taxrates)));
-            cx_c_id.push(rng.gen_range(1..=num_customers));
+            cx_tx_id.push(format!("TX{:04}", rng.random_range(0..num_taxrates)));
+            cx_c_id.push(rng.random_range(1..=num_customers));
         }
 
         let tx_refs: Vec<&str> = cx_tx_id.iter().map(|s| s.as_str()).collect();
@@ -1114,8 +1114,8 @@ fn generate_account_permission(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
         for i in 0..n {
             let id = (offset + i + 1) as i64;
-            ap_ca_id.push(rng.gen_range(1..=num_accounts));
-            ap_acl.push(if rng.gen_bool(0.5) { "0" } else { "1" }.to_string());
+            ap_ca_id.push(rng.random_range(1..=num_accounts));
+            ap_acl.push(if rng.random_bool(0.5) { "0" } else { "1" }.to_string());
             ap_tax_id.push(tax_id_for(id));
             ap_l_name.push(random_name(&mut rng));
             ap_f_name.push(random_name(&mut rng));
@@ -1165,7 +1165,7 @@ fn generate_broker(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             let id = (offset + i + 1) as i64;
             b_id.push(id);
             b_st_id.push(
-                STATUS_TYPES[rng.gen_range(0..STATUS_TYPES.len())]
+                STATUS_TYPES[rng.random_range(0..STATUS_TYPES.len())]
                     .0
                     .to_string(),
             );
@@ -1174,8 +1174,8 @@ fn generate_broker(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                 random_name(&mut rng),
                 random_name(&mut rng)
             ));
-            b_num_trades.push(rng.gen_range(0..100_000i32));
-            b_comm_total.push((rng.gen_range(0..10_000_000_i64) as f64) / 100.0);
+            b_num_trades.push(rng.random_range(0..100_000i32));
+            b_comm_total.push((rng.random_range(0..10_000_000_i64) as f64) / 100.0);
         }
 
         let st_refs: Vec<&str> = b_st_id.iter().map(|s| s.as_str()).collect();
@@ -1225,7 +1225,7 @@ fn generate_company(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             let id = (offset + i + 1) as i64;
             co_id.push(id);
             co_st_id.push(
-                STATUS_TYPES[rng.gen_range(0..STATUS_TYPES.len())]
+                STATUS_TYPES[rng.random_range(0..STATUS_TYPES.len())]
                     .0
                     .to_string(),
             );
@@ -1234,14 +1234,14 @@ fn generate_company(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                 random_name(&mut rng),
                 random_name(&mut rng)
             ));
-            co_in_id.push(format!("IN{:04}", rng.gen_range(0..102u32)));
-            co_sp_rate.push(SP_RATES[rng.gen_range(0..SP_RATES.len())].to_string());
+            co_in_id.push(format!("IN{:04}", rng.random_range(0..102u32)));
+            co_sp_rate.push(SP_RATES[rng.random_range(0..SP_RATES.len())].to_string());
             co_ceo.push(format!(
                 "{} {}",
                 random_name(&mut rng),
                 random_name(&mut rng)
             ));
-            co_ad_id.push(rng.gen_range(1..=num_addr));
+            co_ad_id.push(rng.random_range(1..=num_addr));
             co_desc.push(random_text(&mut rng, 5, 15));
             co_open_date.push(random_date(&mut rng));
         }
@@ -1293,9 +1293,9 @@ fn generate_company_competitor(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let mut cp_in_id = Vec::with_capacity(n);
 
         for _ in 0..n {
-            cp_co_id.push(rng.gen_range(1..=num_co));
-            cp_comp_co_id.push(rng.gen_range(1..=num_co));
-            cp_in_id.push(format!("IN{:04}", rng.gen_range(0..102u32)));
+            cp_co_id.push(rng.random_range(1..=num_co));
+            cp_comp_co_id.push(rng.random_range(1..=num_co));
+            cp_in_id.push(format!("IN{:04}", rng.random_range(0..102u32)));
         }
 
         let in_refs: Vec<&str> = cp_in_id.iter().map(|s| s.as_str()).collect();
@@ -1348,12 +1348,12 @@ fn generate_security(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         for i in 0..n {
             let idx = offset + i;
             let symb = symb_for_idx(idx);
-            let high =
-                (rng.gen_range(50..500u32) as f64) + (rng.gen_range(0..100u32) as f64) / 100.0;
-            let low = high * (0.5 + rng.gen_range(0..50u32) as f64 / 100.0);
+            let high = (rng.random_range(50..500u32) as f64)
+                + (rng.random_range(0..100u32) as f64) / 100.0;
+            let low = high * (0.5 + rng.random_range(0..50u32) as f64 / 100.0);
             s_symb.push(symb);
             s_issue.push(
-                if rng.gen_bool(0.8) {
+                if rng.random_bool(0.8) {
                     "COMMON"
                 } else {
                     "PREFERRED"
@@ -1361,23 +1361,29 @@ fn generate_security(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
                 .to_string(),
             );
             s_st_id.push(
-                STATUS_TYPES[rng.gen_range(0..STATUS_TYPES.len())]
+                STATUS_TYPES[rng.random_range(0..STATUS_TYPES.len())]
                     .0
                     .to_string(),
             );
             s_name.push(format!("{} Inc", random_name(&mut rng)));
-            s_ex_id.push(EXCHANGES[rng.gen_range(0..EXCHANGES.len())].0.to_string());
-            s_co_id.push(rng.gen_range(1..=num_co));
-            s_num_out.push(rng.gen_range(1_000_000..1_000_000_000_i64));
+            s_ex_id.push(
+                EXCHANGES[rng.random_range(0..EXCHANGES.len())]
+                    .0
+                    .to_string(),
+            );
+            s_co_id.push(rng.random_range(1..=num_co));
+            s_num_out.push(rng.random_range(1_000_000..1_000_000_000_i64));
             s_start_date.push(random_date(&mut rng));
             s_exch_date.push(random_date(&mut rng));
-            s_pe.push((rng.gen_range(5..50u32) as f64) + (rng.gen_range(0..100u32) as f64) / 100.0);
+            s_pe.push(
+                (rng.random_range(5..50u32) as f64) + (rng.random_range(0..100u32) as f64) / 100.0,
+            );
             s_52wk_high.push(high);
             s_52wk_high_date.push(random_date(&mut rng));
             s_52wk_low.push(low);
             s_52wk_low_date.push(random_date(&mut rng));
-            s_dividend.push((rng.gen_range(0..500u32) as f64) / 100.0);
-            s_yield.push((rng.gen_range(0..800u32) as f64) / 10000.0);
+            s_dividend.push((rng.random_range(0..500u32) as f64) / 100.0);
+            s_yield.push((rng.random_range(0..800u32) as f64) / 10000.0);
         }
 
         let symb_refs: Vec<&str> = s_symb.iter().map(|s| s.as_str()).collect();
@@ -1436,16 +1442,16 @@ fn generate_daily_market(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let mut dm_vol = Vec::with_capacity(n);
 
         for _ in 0..n {
-            let close =
-                (rng.gen_range(10..500u32) as f64) + (rng.gen_range(0..100u32) as f64) / 100.0;
-            let high = close * (1.0 + rng.gen_range(0..10u32) as f64 / 100.0);
-            let low = close * (1.0 - rng.gen_range(0..10u32) as f64 / 100.0);
+            let close = (rng.random_range(10..500u32) as f64)
+                + (rng.random_range(0..100u32) as f64) / 100.0;
+            let high = close * (1.0 + rng.random_range(0..10u32) as f64 / 100.0);
+            let low = close * (1.0 - rng.random_range(0..10u32) as f64 / 100.0);
             dm_date.push(random_date(&mut rng));
-            dm_s_symb.push(symb_for_idx(rng.gen_range(0..num_symb)));
+            dm_s_symb.push(symb_for_idx(rng.random_range(0..num_symb)));
             dm_close.push(close);
             dm_high.push(high);
             dm_low.push(low);
-            dm_vol.push(rng.gen_range(10_000..10_000_000_i64));
+            dm_vol.push(rng.random_range(10_000..10_000_000_i64));
         }
 
         let symb_refs: Vec<&str> = dm_s_symb.iter().map(|s| s.as_str()).collect();
@@ -1498,22 +1504,22 @@ fn generate_financial(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let mut fi_out_dilut = Vec::with_capacity(n);
 
         for _ in 0..n {
-            let rev = (rng.gen_range(1_000_000..1_000_000_000_i64) as f64) / 100.0;
-            let earn = rev * (rng.gen_range(5..25u32) as f64 / 100.0);
-            fi_co_id.push(rng.gen_range(1..=num_co));
-            fi_year.push(rng.gen_range(2000..=2005i32));
-            fi_qtr.push(rng.gen_range(1..=4i32));
+            let rev = (rng.random_range(1_000_000..1_000_000_000_i64) as f64) / 100.0;
+            let earn = rev * (rng.random_range(5..25u32) as f64 / 100.0);
+            fi_co_id.push(rng.random_range(1..=num_co));
+            fi_year.push(rng.random_range(2000..=2005i32));
+            fi_qtr.push(rng.random_range(1..=4i32));
             fi_qtr_start_date.push(random_date(&mut rng));
             fi_revenue.push(rev);
             fi_net_earn.push(earn);
-            fi_basic_eps.push((rng.gen_range(100..2000u32) as f64) / 100.0);
-            fi_dilut_eps.push((rng.gen_range(100..2000u32) as f64) / 100.0);
+            fi_basic_eps.push((rng.random_range(100..2000u32) as f64) / 100.0);
+            fi_dilut_eps.push((rng.random_range(100..2000u32) as f64) / 100.0);
             fi_margin.push(earn / rev);
-            fi_inventory.push((rng.gen_range(0..100_000_000_i64) as f64) / 100.0);
-            fi_assets.push((rng.gen_range(10_000_000..10_000_000_000_i64) as f64) / 100.0);
-            fi_liability.push((rng.gen_range(1_000_000..5_000_000_000_i64) as f64) / 100.0);
-            fi_out_basic.push(rng.gen_range(1_000_000..1_000_000_000_i64));
-            fi_out_dilut.push(rng.gen_range(1_000_000..1_000_000_000_i64));
+            fi_inventory.push((rng.random_range(0..100_000_000_i64) as f64) / 100.0);
+            fi_assets.push((rng.random_range(10_000_000..10_000_000_000_i64) as f64) / 100.0);
+            fi_liability.push((rng.random_range(1_000_000..5_000_000_000_i64) as f64) / 100.0);
+            fi_out_basic.push(rng.random_range(1_000_000..1_000_000_000_i64));
+            fi_out_dilut.push(rng.random_range(1_000_000..1_000_000_000_i64));
         }
 
         batches.push(
@@ -1563,13 +1569,13 @@ fn generate_last_trade(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
         for i in 0..n {
             let idx = offset + i;
-            let price =
-                (rng.gen_range(10..500u32) as f64) + (rng.gen_range(0..100u32) as f64) / 100.0;
+            let price = (rng.random_range(10..500u32) as f64)
+                + (rng.random_range(0..100u32) as f64) / 100.0;
             lt_s_symb.push(symb_for_idx(idx));
             lt_dts.push(random_date(&mut rng));
             lt_price.push(price);
-            lt_open_price.push(price * (0.95 + rng.gen_range(0..10u32) as f64 / 100.0));
-            lt_vol.push(rng.gen_range(0..10_000_000_i64));
+            lt_open_price.push(price * (0.95 + rng.random_range(0..10u32) as f64 / 100.0));
+            lt_vol.push(rng.random_range(0..10_000_000_i64));
         }
 
         let symb_refs: Vec<&str> = lt_s_symb.iter().map(|s| s.as_str()).collect();
@@ -1619,7 +1625,7 @@ fn generate_news_item(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             ni_summary.push(random_text(&mut rng, 10, 30));
             ni_item.push(random_text(&mut rng, 50, 100));
             ni_dts.push(random_date(&mut rng));
-            ni_source.push(format!("Source{}", rng.gen_range(1..=20u32)));
+            ni_source.push(format!("Source{}", rng.random_range(1..=20u32)));
             ni_author.push(format!(
                 "{} {}",
                 random_name(&mut rng),
@@ -1671,8 +1677,8 @@ fn generate_news_xref(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let mut nx_co_id = Vec::with_capacity(n);
 
         for _ in 0..n {
-            nx_ni_id.push(rng.gen_range(1..=num_news));
-            nx_co_id.push(rng.gen_range(1..=num_co));
+            nx_ni_id.push(rng.random_range(1..=num_news));
+            nx_co_id.push(rng.random_range(1..=num_co));
         }
 
         batches.push(
@@ -1722,31 +1728,31 @@ fn generate_trade(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
         for i in 0..n {
             let id = (offset + i + 1) as i64;
-            let tt_idx = rng.gen_range(0..TRADE_TYPES.len());
-            let price = (rng.gen_range(100..50000u32) as f64) / 100.0;
+            let tt_idx = rng.random_range(0..TRADE_TYPES.len());
+            let price = (rng.random_range(100..50000u32) as f64) / 100.0;
             t_id.push(id);
             t_dts.push(random_date(&mut rng));
             t_st_id.push(
-                STATUS_TYPES[rng.gen_range(0..STATUS_TYPES.len())]
+                STATUS_TYPES[rng.random_range(0..STATUS_TYPES.len())]
                     .0
                     .to_string(),
             );
             t_tt_id.push(TRADE_TYPES[tt_idx].0.to_string());
-            t_is_cash.push(rng.gen_range(0..=1i32));
-            t_s_symb.push(symb_for_idx(rng.gen_range(0..num_symb)));
-            t_qty.push(rng.gen_range(1..10000i32));
+            t_is_cash.push(rng.random_range(0..=1i32));
+            t_s_symb.push(symb_for_idx(rng.random_range(0..num_symb)));
+            t_qty.push(rng.random_range(1..10000i32));
             t_bid_price.push(price);
-            t_ca_id.push(rng.gen_range(1..=num_accounts));
+            t_ca_id.push(rng.random_range(1..=num_accounts));
             t_exec_name.push(format!(
                 "{} {}",
                 random_name(&mut rng),
                 random_name(&mut rng)
             ));
-            t_trade_price.push(price * (0.99 + rng.gen_range(0..3u32) as f64 / 100.0));
-            t_chrg.push((rng.gen_range(0..2000u32) as f64) / 100.0);
-            t_comm.push((rng.gen_range(0..1000u32) as f64) / 100.0);
-            t_tax.push((rng.gen_range(0..500u32) as f64) / 100.0);
-            t_lifo.push(rng.gen_range(0..=1i32));
+            t_trade_price.push(price * (0.99 + rng.random_range(0..3u32) as f64 / 100.0));
+            t_chrg.push((rng.random_range(0..2000u32) as f64) / 100.0);
+            t_comm.push((rng.random_range(0..1000u32) as f64) / 100.0);
+            t_tax.push((rng.random_range(0..500u32) as f64) / 100.0);
+            t_lifo.push(rng.random_range(0..=1i32));
         }
 
         let st_refs: Vec<&str> = t_st_id.iter().map(|s| s.as_str()).collect();
@@ -1800,10 +1806,10 @@ fn generate_trade_history(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let mut th_st_id = Vec::with_capacity(n);
 
         for _ in 0..n {
-            th_t_id.push(rng.gen_range(1..=num_trades));
+            th_t_id.push(rng.random_range(1..=num_trades));
             th_dts.push(random_date(&mut rng));
             th_st_id.push(
-                STATUS_TYPES[rng.gen_range(0..STATUS_TYPES.len())]
+                STATUS_TYPES[rng.random_range(0..STATUS_TYPES.len())]
                     .0
                     .to_string(),
             );
@@ -1850,16 +1856,16 @@ fn generate_trade_request(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let mut tr_b_id = Vec::with_capacity(n);
 
         for _ in 0..n {
-            tr_t_id.push(rng.gen_range(1..=num_trades));
+            tr_t_id.push(rng.random_range(1..=num_trades));
             tr_tt_id.push(
-                TRADE_TYPES[rng.gen_range(0..TRADE_TYPES.len())]
+                TRADE_TYPES[rng.random_range(0..TRADE_TYPES.len())]
                     .0
                     .to_string(),
             );
-            tr_s_symb.push(symb_for_idx(rng.gen_range(0..num_symb)));
-            tr_qty.push(rng.gen_range(1..10000i32));
-            tr_bid_price.push((rng.gen_range(100..50000u32) as f64) / 100.0);
-            tr_b_id.push(rng.gen_range(1..=num_brokers));
+            tr_s_symb.push(symb_for_idx(rng.random_range(0..num_symb)));
+            tr_qty.push(rng.random_range(1..10000i32));
+            tr_bid_price.push((rng.random_range(100..50000u32) as f64) / 100.0);
+            tr_b_id.push(rng.random_range(1..=num_brokers));
         }
 
         let tt_refs: Vec<&str> = tr_tt_id.iter().map(|s| s.as_str()).collect();
@@ -1903,10 +1909,10 @@ fn generate_settlement(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let mut se_amt = Vec::with_capacity(n);
 
         for _ in 0..n {
-            se_t_id.push(rng.gen_range(1..=num_trades));
-            se_cash_type.push(CASH_TYPES[rng.gen_range(0..CASH_TYPES.len())].to_string());
+            se_t_id.push(rng.random_range(1..=num_trades));
+            se_cash_type.push(CASH_TYPES[rng.random_range(0..CASH_TYPES.len())].to_string());
             se_cash_due_date.push(random_date(&mut rng));
-            se_amt.push((rng.gen_range(100..1_000_000_i64) as f64) / 100.0);
+            se_amt.push((rng.random_range(100..1_000_000_i64) as f64) / 100.0);
         }
 
         let ct_refs: Vec<&str> = se_cash_type.iter().map(|s| s.as_str()).collect();
@@ -1947,9 +1953,9 @@ fn generate_cash_transaction(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let mut ct_name = Vec::with_capacity(n);
 
         for _ in 0..n {
-            ct_t_id.push(rng.gen_range(1..=num_trades));
+            ct_t_id.push(rng.random_range(1..=num_trades));
             ct_dts.push(random_date(&mut rng));
-            ct_amt.push((rng.gen_range(100..1_000_000_i64) as f64) / 100.0);
+            ct_amt.push((rng.random_range(100..1_000_000_i64) as f64) / 100.0);
             ct_name.push(format!("Transaction {}", random_text(&mut rng, 2, 5)));
         }
 
@@ -1995,12 +2001,12 @@ fn generate_holding(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let mut h_qty = Vec::with_capacity(n);
 
         for _ in 0..n {
-            h_t_id.push(rng.gen_range(1..=num_trades));
-            h_ca_id.push(rng.gen_range(1..=num_accounts));
-            h_s_symb.push(symb_for_idx(rng.gen_range(0..num_symb)));
+            h_t_id.push(rng.random_range(1..=num_trades));
+            h_ca_id.push(rng.random_range(1..=num_accounts));
+            h_s_symb.push(symb_for_idx(rng.random_range(0..num_symb)));
             h_dts.push(random_date(&mut rng));
-            h_price.push((rng.gen_range(100..50000u32) as f64) / 100.0);
-            h_qty.push(rng.gen_range(1..10000i32));
+            h_price.push((rng.random_range(100..50000u32) as f64) / 100.0);
+            h_qty.push(rng.random_range(1..10000i32));
         }
 
         let symb_refs: Vec<&str> = h_s_symb.iter().map(|s| s.as_str()).collect();
@@ -2043,10 +2049,10 @@ fn generate_holding_history(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let mut hh_after_qty = Vec::with_capacity(n);
 
         for _ in 0..n {
-            let before = rng.gen_range(0..10000i32);
-            let delta = rng.gen_range(-before..=10000i32 - before);
-            hh_h_t_id.push(rng.gen_range(1..=num_trades));
-            hh_t_id.push(rng.gen_range(1..=num_trades));
+            let before = rng.random_range(0..10000i32);
+            let delta = rng.random_range(-before..=10000i32 - before);
+            hh_h_t_id.push(rng.random_range(1..=num_trades));
+            hh_t_id.push(rng.random_range(1..=num_trades));
             hh_before_qty.push(before);
             hh_after_qty.push(before + delta);
         }
@@ -2087,9 +2093,9 @@ fn generate_holding_summary(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let mut hs_qty = Vec::with_capacity(n);
 
         for _ in 0..n {
-            hs_ca_id.push(rng.gen_range(1..=num_accounts));
-            hs_s_symb.push(symb_for_idx(rng.gen_range(0..num_symb)));
-            hs_qty.push(rng.gen_range(-50000..50000i32));
+            hs_ca_id.push(rng.random_range(1..=num_accounts));
+            hs_s_symb.push(symb_for_idx(rng.random_range(0..num_symb)));
+            hs_qty.push(rng.random_range(-50000..50000i32));
         }
 
         let symb_refs: Vec<&str> = hs_s_symb.iter().map(|s| s.as_str()).collect();
@@ -2128,7 +2134,7 @@ fn generate_watch_list(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
         for i in 0..n {
             wl_id.push((offset + i + 1) as i64);
-            wl_c_id.push(rng.gen_range(1..=num_customers));
+            wl_c_id.push(rng.random_range(1..=num_customers));
         }
 
         batches.push(
@@ -2164,8 +2170,8 @@ fn generate_watch_item(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let mut wi_s_symb = Vec::with_capacity(n);
 
         for _ in 0..n {
-            wi_wl_id.push(rng.gen_range(1..=num_wl));
-            wi_s_symb.push(symb_for_idx(rng.gen_range(0..num_symb)));
+            wi_wl_id.push(rng.random_range(1..=num_wl));
+            wi_s_symb.push(symb_for_idx(rng.random_range(0..num_symb)));
         }
 
         let symb_refs: Vec<&str> = wi_s_symb.iter().map(|s| s.as_str()).collect();
