@@ -169,6 +169,42 @@ mod row_group_prune {
     use datafusion::physical_plan::PhysicalExpr;
     use parquet::file::metadata::ParquetMetaData;
 
+    /// Kill switch for worker row-group statistics pruning.
+    ///
+    /// Set `SQE_WORKER_ROW_GROUP_PRUNING=0` (or `false`/`off`/`no`) to skip it.
+    /// An env var rather than a config field on purpose: it exists so pruning
+    /// on and pruning off can be A/B'd on ONE binary, and so an operator can
+    /// disable a change that silently narrows what a worker reads without
+    /// waiting for a release.
+    ///
+    /// Read once and cached: the value cannot change within a process, and a
+    /// per-file `std::env::var` on the scan path would be a lock acquisition
+    /// per file for no reason.
+    pub(super) fn pruning_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            enabled_from_env(std::env::var("SQE_WORKER_ROW_GROUP_PRUNING").ok().as_deref())
+        })
+    }
+
+    /// The switch's parsing, split out so it is testable without touching the
+    /// process environment. Tests that set env vars race every other test in
+    /// the binary: an earlier version of this file did exactly that and made
+    /// `statistics_pruning_keeps_only_the_matching_row_group` fail depending on
+    /// thread interleaving.
+    ///
+    /// Unset, or any value that is not a recognised negative, leaves pruning
+    /// ON, so a typo cannot silently disable a scan optimization.
+    pub(super) fn enabled_from_env(value: Option<&str>) -> bool {
+        match value {
+            Some(raw) => !matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            None => true,
+        }
+    }
+
     /// Largest `InList` a conjunct may carry and still be handed to
     /// `PruningPredicate`.
     ///
@@ -981,7 +1017,10 @@ async fn open_parquet_stream(
         // every row group its morsel covered and leaned entirely on the
         // RowFilter. The bounds conjuncts that ride each ticket (a hash join's
         // sealed min/max) are exactly what min/max pruning can use.
-        if let Some(ref predicate) = pruning_predicate {
+        if let (Some(predicate), true) = (
+            pruning_predicate.as_ref(),
+            row_group_prune::pruning_enabled(),
+        ) {
             let candidates: Vec<usize> = match selected {
                 Some(ref groups) => groups.clone(),
                 None => (0..n_groups).collect(),
@@ -1692,6 +1731,21 @@ mod tests {
                 groups.iter().all(|g| *g == 1),
                 "pruning widened the selection to {groups:?}"
             ),
+        }
+    }
+
+    /// The switch's parsing, tested without touching the process environment
+    /// (a test that sets env vars races every other test in this binary).
+    #[test]
+    fn kill_switch_recognises_negatives_and_defaults_on() {
+        use row_group_prune::enabled_from_env;
+        assert!(enabled_from_env(None), "unset leaves pruning on");
+        for off in ["0", "false", "OFF", "no", " off "] {
+            assert!(!enabled_from_env(Some(off)), "'{off}' must disable pruning");
+        }
+        // A typo must NOT silently disable a scan optimization.
+        for on in ["1", "true", "yes", "", "flase"] {
+            assert!(enabled_from_env(Some(on)), "'{on}' must leave pruning on");
         }
     }
 
