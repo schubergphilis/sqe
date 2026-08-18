@@ -63,6 +63,39 @@ base64 costs 1.34x instead of 2.9x, a 2.2x reduction in ticket bytes, and the
 budget is now derived from the wire ceiling (`max_message_bytes / 4 * 3`, the
 exact inverse of base64's expansion) rather than guessed.
 
+## The refusal, reproduced and then fixed
+
+Native two-worker rig (no docker image), SSB SF10 on the already-loaded test
+stack, distribution forced (`distribution_threshold = "1MB"`,
+`distribution_file_threshold = 1`), `runtime_filter_inlist_max_values` raised to
+1,000,000. Same rig, same config, same data; only the binaries differ.
+
+| | pre-fix | fixed |
+|---|---|---|
+| suite | 12 pass, **1 error** | **13 pass, 0 error** |
+| queries distributed | 12 (1 fell back to local) | 13 |
+| filters pushed | 204 | 221 |
+| worker refusals | **22** | 0 |
+| tickets shed / over budget | n/a | 0 / 0 |
+| q4.1 | error after 606 ms, 0 rows | pass, 6,352 ms, 35 rows |
+| suite total | 34,722 ms | 40,549 ms |
+
+The refused message was **9,145,356 bytes against a 4,194,304 limit**, and the
+size is the tell: 9,145,356 / 3,145,728 = 2.907, so the ticket carried a
+predicate sitting exactly on the old 3 MiB raw budget. The guard passed it, and
+the wire expanded it past the ceiling. That is the miscalibration, measured.
+
+The suite total went **up**, and the reason is not a regression: q4.1 went from
+erroring at 606 ms to running for 6,352 ms, which is +5.75 s of the +5.83 s
+total. Every other query is flat inside rep-to-rep noise. A failed query costs
+almost nothing on the clock, so a suite total that includes one is not
+comparable to a suite total that does not. This pair is a correctness result
+(the query now returns its 35 rows), not a speed result.
+
+Neither run belongs in `benchmarks/results/` as a baseline. Both use a forced
+distribution threshold and a non-default InList cap, so they measure this defect
+and nothing else.
+
 ## What this licenses
 
 - Quoting "coordinator-to-worker throughput is no longer window-capped" only
@@ -70,7 +103,9 @@ exact inverse of base64's expansion) rather than guessed.
   speedup on any rig in this repo.
 - Raising `runtime_filter_inlist_max_values` far enough that SF10 SSB partkey
   membership survives (the #415 drop), because the 4 MiB ceiling is no longer
-  the binding constraint. Whether that *helps* is still unmeasured.
+  the binding constraint. Whether that *helps* is still unmeasured: the arm
+  above pushes 221 filters and drops 0 conjuncts, but its total is not
+  comparable to the shipped-cap arm.
 
 ## What it does not
 
