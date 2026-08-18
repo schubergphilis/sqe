@@ -138,6 +138,144 @@ fn decode_pushed_predicate(task: &ScanTask) -> Option<Expr> {
 /// (before projection), so a predicate column outside the projection still
 /// resolves. Returns `None` on any planning error (non-fatal: skip worker-side
 /// filtering for this file).
+/// Row-group pruning for a worker scan task (#369, worker half).
+///
+/// The coordinator's local scan path prunes row groups four ways before it
+/// decodes anything: manifest bounds, row-group min/max statistics, the page
+/// index, and (for sealed membership sets) parquet bloom filters. All of that
+/// lives in the vendored iceberg-rust reader, which the worker does not use.
+/// The worker reads parquet directly, selects row groups ONLY by the ticket's
+/// morsel range, and uses the pushed predicate solely for a two-phase
+/// `RowFilter`. So the same scan prunes strictly worse when it is distributed,
+/// and the bounds conjuncts that already ride every ticket are ignored.
+///
+/// This closes the statistics half with DataFusion's own public
+/// `RowGroupAccessPlanFilter::prune_by_statistics`, so the min/max semantics,
+/// null-count handling and type coercions stay upstream's problem rather than
+/// becoming a second implementation to keep in sync. The bloom half is not
+/// here: DataFusion keeps `prune_by_bloom_filters` and `BloomFilterStatistics`
+/// `pub(crate)`, so it cannot be reused, and probing needs data written with
+/// bloom filters (the bench's `--bloom-filter` is opt-in and off by default).
+mod row_group_prune {
+    use std::sync::Arc;
+
+    use arrow_schema::SchemaRef;
+    use datafusion::datasource::physical_plan::parquet::{
+        ParquetAccessPlan, ParquetFileMetrics, RowGroupAccessPlanFilter,
+    };
+    use datafusion::physical_expr::expressions::{BinaryExpr, InListExpr};
+    use datafusion::physical_optimizer::pruning::PruningPredicate;
+    use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+    use datafusion::physical_plan::PhysicalExpr;
+    use parquet::file::metadata::ParquetMetaData;
+
+    /// Largest `InList` a conjunct may carry and still be handed to
+    /// `PruningPredicate`.
+    ///
+    /// Pruning rewrites `col IN (a, b, c)` into a disjunction over min/max, so
+    /// cost grows with the list. A sealed hash-join runtime filter can carry
+    /// tens of thousands of keys (up to `runtime_filter_inlist_max_values`,
+    /// 65536 by default, and SF10 SSB partkey reaches it), and building that
+    /// predicate costs more than the pruning can return. The vendored iceberg
+    /// stats evaluator draws the same line at 200 literals.
+    ///
+    /// Conjuncts over the cap are DROPPED from the pruning predicate only.
+    /// They still apply as a `RowFilter`, so the scan's result is unchanged;
+    /// membership pruning for large key sets is a bloom-filter job (#369's
+    /// other half), not a min/max one.
+    const MAX_PRUNING_INLIST_VALUES: usize = 200;
+
+    /// Split `expr` at top-level ANDs and keep the conjuncts worth pruning on.
+    ///
+    /// Only top-level ANDs split: a conjunct under an OR cannot be dropped
+    /// without changing what the predicate means, and dropping half of an OR
+    /// would make the pruning predicate WRONG rather than merely weaker.
+    pub(super) fn stats_prunable_conjuncts(
+        expr: &Arc<dyn PhysicalExpr>,
+        out: &mut Vec<Arc<dyn PhysicalExpr>>,
+    ) {
+        if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
+            if *binary.op() == datafusion::logical_expr::Operator::And {
+                stats_prunable_conjuncts(binary.left(), out);
+                stats_prunable_conjuncts(binary.right(), out);
+                return;
+            }
+        }
+        if !oversized_inlist(expr) {
+            out.push(Arc::clone(expr));
+        }
+    }
+
+    /// True when this expression tree contains an `InList` above the cap.
+    fn oversized_inlist(expr: &Arc<dyn PhysicalExpr>) -> bool {
+        if let Some(in_list) = expr.downcast_ref::<InListExpr>() {
+            if in_list.list().len() > MAX_PRUNING_INLIST_VALUES {
+                return true;
+            }
+        }
+        expr.children().iter().any(|child| oversized_inlist(child))
+    }
+
+    /// Row groups that survive min/max pruning, given the candidates the
+    /// morsel selection already allows.
+    ///
+    /// Returns `None` when nothing could be pruned, so the caller leaves the
+    /// existing selection untouched. Pruning is an optimization and never a
+    /// correctness requirement: an unsupported predicate, a schema mismatch, or
+    /// a missing statistic all keep every candidate.
+    pub(super) fn prune_row_groups(
+        metadata: &ParquetMetaData,
+        file_schema: &SchemaRef,
+        predicate: &Arc<dyn PhysicalExpr>,
+        candidates: &[usize],
+        file_path: &str,
+    ) -> Option<Vec<usize>> {
+        let n_groups = metadata.num_row_groups();
+        if n_groups == 0 || candidates.is_empty() {
+            return None;
+        }
+
+        let mut conjuncts = Vec::new();
+        stats_prunable_conjuncts(predicate, &mut conjuncts);
+        let combined = conjuncts.into_iter().reduce(|left, right| {
+            Arc::new(BinaryExpr::new(
+                left,
+                datafusion::logical_expr::Operator::And,
+                right,
+            )) as Arc<dyn PhysicalExpr>
+        })?;
+
+        let pruning = PruningPredicate::try_new(combined, Arc::clone(file_schema)).ok()?;
+
+        // `prune_by_statistics` asserts the access plan covers every row group,
+        // so start from all-scan and skip the ones the morsel already excluded.
+        let mut plan = ParquetAccessPlan::new_all(n_groups);
+        for idx in 0..n_groups {
+            if !candidates.contains(&idx) {
+                plan.skip(idx);
+            }
+        }
+
+        let mut filter = RowGroupAccessPlanFilter::new(plan);
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let file_metrics = ParquetFileMetrics::new(0, file_path, &metrics_set);
+        filter.prune_by_statistics(
+            file_schema.as_ref(),
+            metadata.file_metadata().schema_descr(),
+            metadata.row_groups(),
+            &pruning,
+            &file_metrics,
+        );
+
+        let kept: Vec<usize> = filter.row_group_indexes().collect();
+        if kept.len() == candidates.len() {
+            None
+        } else {
+            Some(kept)
+        }
+    }
+}
+
 fn build_physical_predicate(
     predicate: &Expr,
     file_schema: &SchemaRef,
@@ -707,9 +845,10 @@ async fn open_parquet_stream(
     // the worker decodes predicate columns first and skips non-matching rows.
     // Skipping this is always safe: the coordinator keeps the authoritative
     // FilterExec above the distributed scan.
-    if let Some(predicate) = predicate {
+    let pruning_predicate: Option<Arc<dyn PhysicalExpr>> = if let Some(predicate) = predicate {
         let file_schema = builder.schema().clone();
-        if let Some(filter) = build_physical_predicate(predicate, &file_schema, &task.fragment_id) {
+        let built = build_physical_predicate(predicate, &file_schema, &task.fragment_id);
+        if let Some(ref filter) = built {
             if late_materialize::is_late_materialization_beneficial(
                 Some(filter.as_ref()),
                 &task.projected_columns,
@@ -718,7 +857,7 @@ async fn open_parquet_stream(
                     late_materialize::classify_columns(filter.as_ref(), &task.projected_columns);
                 let predicate_schema =
                     late_materialize::build_predicate_schema(&classification, &file_schema);
-                match late_materialize::remap_predicate_columns(&filter, &predicate_schema) {
+                match late_materialize::remap_predicate_columns(filter, &predicate_schema) {
                     Ok(remapped_predicate) => {
                         let row_filter = late_materialize::build_row_filter(
                             remapped_predicate,
@@ -735,7 +874,12 @@ async fn open_parquet_stream(
                 }
             }
         }
-    }
+        // Kept for row-group pruning below, whether or not late materialization
+        // wanted a RowFilter: the two are independent uses of one predicate.
+        built
+    } else {
+        None
+    };
 
     // Phase 2 morsel: restrict row groups when the ticket carries an explicit
     // row-group range and/or a compressed byte range. Byte ranges are resolved
@@ -824,6 +968,40 @@ async fn open_parquet_stream(
                 } else {
                     selected = Some(by_byte);
                 }
+            }
+        }
+
+        // Row-group statistics pruning (#369, worker half). Runs AFTER the
+        // morsel selection so it only ever narrows what this fragment owns,
+        // and never widens it: `candidates` is the morsel's own set, or the
+        // whole file when the ticket carries no morsel restriction.
+        //
+        // The coordinator's local path prunes here via the vendored iceberg
+        // reader; the worker did not, so every distributed fragment decoded
+        // every row group its morsel covered and leaned entirely on the
+        // RowFilter. The bounds conjuncts that ride each ticket (a hash join's
+        // sealed min/max) are exactly what min/max pruning can use.
+        if let Some(ref predicate) = pruning_predicate {
+            let candidates: Vec<usize> = match selected {
+                Some(ref groups) => groups.clone(),
+                None => (0..n_groups).collect(),
+            };
+            if let Some(kept) = row_group_prune::prune_row_groups(
+                meta,
+                &builder.schema().clone(),
+                predicate,
+                &candidates,
+                file_path,
+            ) {
+                debug!(
+                    fragment_id = %task.fragment_id,
+                    file = %file_path,
+                    candidates = candidates.len(),
+                    kept = kept.len(),
+                    pruned = candidates.len().saturating_sub(kept.len()),
+                    "Row-group statistics pruning applied"
+                );
+                selected = Some(kept);
             }
         }
 
@@ -1432,6 +1610,185 @@ mod tests {
             predicate_proto,
             limit,
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Row-group statistics pruning (#369, worker half).
+    // -------------------------------------------------------------------------
+
+    /// Build a 3-row-group Parquet file with disjoint value ranges per group
+    /// (0..9, 100..109, 200..209) and return its metadata plus arrow schema.
+    fn three_row_group_metadata() -> (Arc<ParquetMetaData>, SchemaRef) {
+        use arrow_array::Int64Array;
+        use bytes::Bytes;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        // One row group per write: max_row_group_size 10 with 10-row batches.
+        let props = WriterProperties::builder().set_max_row_group_size(10).build();
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+            for base in [0i64, 100, 200] {
+                let values: Vec<i64> = (base..base + 10).collect();
+                let batch =
+                    RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(values))])
+                        .unwrap();
+                writer.write(&batch).unwrap();
+                writer.flush().unwrap();
+            }
+            writer.close().unwrap();
+        }
+        let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(buf)).unwrap();
+        let metadata = reader.metadata().clone();
+        assert_eq!(metadata.num_row_groups(), 3, "fixture must have 3 row groups");
+        (metadata, schema)
+    }
+
+    fn physical(expr: datafusion::logical_expr::Expr, schema: &SchemaRef) -> Arc<dyn PhysicalExpr> {
+        build_physical_predicate(&expr, schema, "test").expect("physical predicate")
+    }
+
+    /// The whole point: a predicate that only the last row group can satisfy
+    /// must leave exactly that row group. Before this, a worker fragment
+    /// decoded all three.
+    #[test]
+    fn statistics_pruning_keeps_only_the_matching_row_group() {
+        let (metadata, schema) = three_row_group_metadata();
+        let predicate = physical(col("a").gt(lit(150i64)), &schema);
+        let kept = row_group_prune::prune_row_groups(
+            &metadata,
+            &schema,
+            &predicate,
+            &[0, 1, 2],
+            "s3://b/f.parquet",
+        )
+        .expect("pruning should fire");
+        assert_eq!(kept, vec![2], "only the 200..209 group can match a > 150");
+    }
+
+    /// Pruning must never widen a morsel. A fragment that owns row group 1 must
+    /// not gain row group 2 just because 2 also matches the predicate: the two
+    /// morsels run as independent fragments with no dedup, so widening would
+    /// duplicate rows in the result.
+    #[test]
+    fn statistics_pruning_never_widens_the_morsel_selection() {
+        let (metadata, schema) = three_row_group_metadata();
+        let predicate = physical(col("a").gt(lit(50i64)), &schema);
+        let kept = row_group_prune::prune_row_groups(
+            &metadata,
+            &schema,
+            &predicate,
+            &[1],
+            "s3://b/f.parquet",
+        );
+        match kept {
+            None => {}
+            Some(groups) => assert!(
+                groups.iter().all(|g| *g == 1),
+                "pruning widened the selection to {groups:?}"
+            ),
+        }
+    }
+
+    /// A predicate no row group can satisfy prunes the fragment to nothing,
+    /// which is the case that saves the most I/O.
+    #[test]
+    fn statistics_pruning_can_eliminate_every_row_group() {
+        let (metadata, schema) = three_row_group_metadata();
+        let predicate = physical(col("a").gt(lit(10_000i64)), &schema);
+        let kept = row_group_prune::prune_row_groups(
+            &metadata,
+            &schema,
+            &predicate,
+            &[0, 1, 2],
+            "s3://b/f.parquet",
+        )
+        .expect("pruning should fire");
+        assert!(kept.is_empty());
+    }
+
+    /// A predicate every row group satisfies changes nothing, and returning
+    /// `None` is what tells the caller to leave the morsel selection alone.
+    #[test]
+    fn statistics_pruning_returns_none_when_nothing_is_pruned() {
+        let (metadata, schema) = three_row_group_metadata();
+        let predicate = physical(col("a").gt_eq(lit(0i64)), &schema);
+        assert!(row_group_prune::prune_row_groups(
+            &metadata,
+            &schema,
+            &predicate,
+            &[0, 1, 2],
+            "s3://b/f.parquet",
+        )
+        .is_none());
+    }
+
+    /// A sealed hash-join membership set can carry tens of thousands of keys.
+    /// Handing that to `PruningPredicate` costs more than it returns, so the
+    /// conjunct is dropped from the PRUNING predicate only. It still applies as
+    /// a RowFilter, so results are unchanged.
+    #[test]
+    fn oversized_inlist_is_excluded_from_the_pruning_predicate() {
+        let (metadata, schema) = three_row_group_metadata();
+        let big: Vec<datafusion::logical_expr::Expr> =
+            (0..1_000i64).map(lit).collect();
+        let predicate = physical(col("a").in_list(big, false), &schema);
+        assert!(
+            row_group_prune::prune_row_groups(
+                &metadata,
+                &schema,
+                &predicate,
+                &[0, 1, 2],
+                "s3://b/f.parquet",
+            )
+            .is_none(),
+            "a 1000-value InList must not drive min/max pruning"
+        );
+    }
+
+    /// The mixed shape every distributed ticket actually carries: sealed bounds
+    /// ANDed with a large membership set. The bounds must still prune even
+    /// though the membership half is dropped.
+    #[test]
+    fn bounds_still_prune_when_anded_with_an_oversized_inlist() {
+        let (metadata, schema) = three_row_group_metadata();
+        let big: Vec<datafusion::logical_expr::Expr> =
+            (0..1_000i64).map(|v| lit(v * 3)).collect();
+        let expr = col("a")
+            .gt(lit(150i64))
+            .and(col("a").in_list(big, false));
+        let predicate = physical(expr, &schema);
+        let kept = row_group_prune::prune_row_groups(
+            &metadata,
+            &schema,
+            &predicate,
+            &[0, 1, 2],
+            "s3://b/f.parquet",
+        )
+        .expect("the bounds conjunct should still prune");
+        assert_eq!(kept, vec![2]);
+    }
+
+    /// Conjunct selection splits only at top-level ANDs. An oversized InList
+    /// under an OR must NOT be dropped: dropping one side of a disjunction
+    /// makes the pruning predicate wrong, not merely weaker.
+    #[test]
+    fn oversized_inlist_under_an_or_disables_pruning_rather_than_being_dropped() {
+        let (_metadata, schema) = three_row_group_metadata();
+        let big: Vec<datafusion::logical_expr::Expr> = (0..1_000i64).map(lit).collect();
+        let expr = col("a").gt(lit(150i64)).or(col("a").in_list(big, false));
+        let predicate = physical(expr, &schema);
+        let mut conjuncts = Vec::new();
+        row_group_prune::stats_prunable_conjuncts(&predicate, &mut conjuncts);
+        assert!(
+            conjuncts.is_empty(),
+            "the whole OR must be discarded, not half of it"
+        );
     }
 
     #[test]
