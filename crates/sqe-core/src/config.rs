@@ -330,7 +330,15 @@ pub struct QueryConfig {
     pub distributed_scan_pushdown: bool,
     /// Maximum distinct build-side join keys materialized as an IN-list
     /// dynamic filter (DataFusion's
-    /// `optimizer.hash_join_inlist_pushdown_max_distinct_values`). Above
+    /// `optimizer.hash_join_inlist_pushdown_max_distinct_values`).
+    ///
+    /// **Raising this is not free in distributed mode.** A `ScanTask` ticket
+    /// crosses in one gRPC message and SQE sets no `max_decoding_message_size`,
+    /// so tonic's 4 MiB default applies. Measured 2026-08-18 on SF10 SSB with
+    /// this at 1000000 and `runtime_filter_inlist_max_size = "64MB"`: workers
+    /// refused 9.1 MB messages with "decoded message length too large" and
+    /// fragments failed instead of running slower. The default keeps every
+    /// measured SSB build well clear of that ceiling. Above
     /// this the filter degrades to an opaque hash-table probe that cannot
     /// be pushed into Iceberg scans or shipped to workers, so only min/max
     /// bounds prune -- which is worthless on uniformly distributed join

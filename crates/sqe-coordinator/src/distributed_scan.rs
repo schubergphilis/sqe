@@ -52,24 +52,16 @@ const WORKER_SECRET_HEADER: &str = "x-sqe-worker-secret";
 /// (file paths, credentials, predicate, and limit included).
 const SCAN_SIGNATURE_HEADER: &str = "x-sqe-scan-signature";
 
-/// Ceiling on the serialized pushed predicate inside ONE `ScanTask` ticket.
-///
-/// A ticket rides one gRPC message and tonic's default decode limit is 4 MiB,
-/// which SQE never raises (there is no `max_decoding_message_size` anywhere in
-/// the tree). 3 MiB leaves headroom for the rest of the ticket (file paths,
-/// schema, projection, credentials) so an oversized runtime-filter InList
-/// degrades to "not pushed" instead of "worker refused the ticket". Pushing is
-/// an optimization, so dropping it cannot change results.
-///
-/// Scope, honestly: this bounds ONE ticket's predicate. It does NOT explain or
-/// fix the refusals measured on 2026-08-18, where SF10 SSB with
-/// `runtime_filter_inlist_max_values = 1000000` / `..._max_size = "64MB"` had
-/// workers reject 9.1 MB messages ("decoded message length too large") while
-/// this guard never fired, so the oversized message is aggregated somewhere
-/// else on the wire (the plan codec JSON-encodes a whole `scan_tasks` vector,
-/// which multiplies a per-task predicate). The shipped 65536-value cap does not
-/// reach it: the same rig at the default is 13/13 with zero refusals.
-const MAX_PUSHED_PREDICATE_BYTES: usize = 3 * 1024 * 1024;
+// The ticket-predicate budget lives in `scan_pushdown`
+// (`MAX_PUSHED_PREDICATE_BYTES`), next to the serialization it guards.
+//
+// Scope, honestly: it bounds ONE ticket's predicate. It does NOT explain the
+// refusals measured on 2026-08-18, where SF10 SSB with
+// `runtime_filter_inlist_max_values = 1000000` had workers reject 9.1 MB
+// messages ("decoded message length too large") while this guard never fired,
+// so that oversized message is aggregated somewhere else on the wire. The
+// shipped 65536-value cap does not reach it: the same rig at the default is
+// 13/13 with zero refusals.
 
 /// Compute the HMAC-SHA256 tag (lowercase hex) over `bytes` keyed by `secret`.
 ///
@@ -586,8 +578,8 @@ impl ExecutionPlan for DistributedScanExec {
                         .chain(snapshots)
                         .reduce(|a, b| a.and(b))
                     {
-                        match combined.to_bytes() {
-                            Ok(bytes) if bytes.len() > MAX_PUSHED_PREDICATE_BYTES => {
+                        match crate::scan_pushdown::serialize_pushed_predicate(&combined) {
+                            crate::scan_pushdown::PushedPredicate::TooLarge(len) => {
                                 // A ScanTask ticket rides one gRPC message, and
                                 // tonic's default decode limit is 4 MiB, which SQE
                                 // does not raise. A large InList membership set
@@ -601,15 +593,15 @@ impl ExecutionPlan for DistributedScanExec {
                                 predicate_too_large.add(1);
                                 warn!(
                                     fragment_id = %task.fragment_id,
-                                    bytes = bytes.len(),
-                                    budget = MAX_PUSHED_PREDICATE_BYTES,
+                                    bytes = len,
+                                    budget = crate::scan_pushdown::MAX_PUSHED_PREDICATE_BYTES,
                                     dynamic_filters = snapshot_count,
                                     "dynamic filter predicate exceeds the ticket budget; \
                                      shipping without it"
                                 );
                             }
-                            Ok(bytes) => {
-                                task.predicate_proto = Some(bytes.to_vec());
+                            crate::scan_pushdown::PushedPredicate::Fits(bytes) => {
+                                task.predicate_proto = Some(bytes);
                                 dynamic_filters_pushed.add(snapshot_count);
                                 info!(
                                     fragment_id = %task.fragment_id,
@@ -617,7 +609,7 @@ impl ExecutionPlan for DistributedScanExec {
                                     "ANDed dynamic join filter snapshots into worker predicate"
                                 );
                             }
-                            Err(e) => warn!(
+                            crate::scan_pushdown::PushedPredicate::Failed(e) => warn!(
                                 fragment_id = %task.fragment_id,
                                 error = %e,
                                 "failed to serialize dynamic filter snapshot; shipping unfiltered"
