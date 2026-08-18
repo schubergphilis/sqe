@@ -342,112 +342,39 @@ aikido-sign-image:
 # socket-mounted shell runner); until then, do not reintroduce an
 # allow_failure-only variant.
 
-# ── Quickstart scenario tests (Tier 2) ─────────────────────────
-# Tier 2 of scripts/test.sh: runs every SELF_CONTAINED quickstart through its
-# run.sh --check. Each scenario brings up its own docker-compose stack (Polaris,
-# Nessie, Unity, etc.) and asserts the demo invariants with the shared
-# _shared/lib.sh helpers. The heavy `distributed` scenario is deliberately NOT
-# in the self-contained set, so it does not run here; invoke it on demand with
-# `scripts/test.sh scenario distributed`. Generous timeout: each scenario builds
-# or pulls images.
+# ── Quickstart + access-control suites: REMOVED (issue #387) ───
+# `scenario-test` and `access-control-test` are gone, for the same reason the two
+# integration jobs above them were, and with harder evidence.
 #
-# NOTE ON SIGNAL: this job needs the same dind sidecar that #387 documents as
-# unreachable on the shared runners, so it cannot fail meaningfully there
-# either. Unlike the removed integration jobs it is kept, because it is the only
-# CI-side coverage of the quickstarts and it does run on a healthy runner. Gate
-# quickstart changes on a local `scripts/test.sh scenario all`.
-scenario-test:
-  stage: test
-  image: docker:29@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07
-  services:
-    - name: docker:29-dind
-      alias: docker
-      command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
-  variables:
-    DOCKER_HOST: tcp://docker:2375
-    DOCKER_TLS_CERTDIR: ""
-    DOCKER_DRIVER: overlay2
-  before_script:
-    # Same Alpine toolchain as integration-test: the embedded-* scenarios build
-    # sqe-cli, and several scenarios drive the stack with bash/curl/python3.
-    - apk add --no-cache bash curl docker-compose rust cargo cmake protobuf-dev openssl-dev pkgconfig clang mold python3
-  script:
-    - ./scripts/test.sh scenario all
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'
-    # Path-matching MR pipelines: opt-in (manual) and non-blocking, like
-    # integration-test. `scenario all` builds several SQE images, so a touched
-    # quickstart file must not silently spend the better part of an hour.
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes:
-        - quickstart/**/*
-        - crates/**/*
-        - scripts/test.sh
-        - docker-compose*.yml
-      when: manual
-      allow_failure: true
-    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
-      changes:
-        - quickstart/**/*
-        - crates/**/*
-        - scripts/test.sh
-        - docker-compose*.yml
-  timeout: 2h
-
-# ── Access-control e2e (Polaris + Ranger + Keycloak) ───────────
-# The Rust access-control suite (crates/sqe-coordinator/tests/it/
-# access_control_e2e.rs) against the polaris-ranger-keycloak quickstart stack:
-# grant/revoke, Ranger deny precedence, column masks, keyed hash masks, row
-# filters, tag-based masks and tag fail-closed. Same docker-in-docker setup as
-# scenario-test, plus a Rust toolchain because the tests ARE a cargo test binary.
+# Measured on main before removal: `scenario-test` was 0 for 6 (5 failed, 1
+# skipped, 1 canceled) and `access-control-test` 0 for 1. Neither has ever
+# passed. Every failure is the same one #387 documents, before any SQE code runs:
 #
-# NOTE ON SIGNAL: while the shared dind runner is unhealthy this job cannot fail
-# meaningfully, so a green pipeline here is not evidence. Gate policy changes on
-# a local `make test-access-control` until dind is trustworthy again.
-access-control-test:
-  stage: test
-  image: docker:29@sha256:12e683a161823b2a839aeea999b9d960e6e1f9a97b1679ad6b441982e2d9cf07
-  services:
-    - name: docker:29-dind
-      alias: docker
-      command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
-  variables:
-    DOCKER_HOST: tcp://docker:2375
-    DOCKER_TLS_CERTDIR: ""
-    DOCKER_DRIVER: overlay2
-    # Ranger Admin's first boot is 2-4 minutes locally; the script polls with
-    # this deadline before giving up and reporting the last HTTP status. The
-    # deadline covers readiness polling only, NOT the image pulls that precede
-    # it, so a cold dind runner spends its pull time against the job's 1h
-    # timeout rather than this one. Raise both together if pulls dominate.
-    AC_RANGER_TIMEOUT: "600"
-  before_script:
-    - apk add --no-cache bash curl docker-compose rust cargo cmake protobuf-dev openssl-dev pkgconfig clang mold python3
-  script:
-    - ./scripts/access-control-test.sh
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes:
-        - crates/sqe-policy/**/*
-        - crates/sqe-coordinator/src/policy_wiring.rs
-        - crates/sqe-coordinator/tests/it/access_control_e2e.rs
-        - crates/sqe-coordinator/tests/it/common/**/*
-        - quickstart/polaris-ranger-keycloak/**/*
-        - scripts/access-control-test.sh
-        - tests/sqe-ranger-test.toml
-      when: manual
-      allow_failure: true
-    - if: '$CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"'
-      changes:
-        - crates/sqe-policy/**/*
-        - crates/sqe-coordinator/src/policy_wiring.rs
-        - crates/sqe-coordinator/tests/it/access_control_e2e.rs
-        - crates/sqe-coordinator/tests/it/common/**/*
-        - quickstart/polaris-ranger-keycloak/**/*
-        - scripts/access-control-test.sh
-        - tests/sqe-ranger-test.toml
-  timeout: 1h
+#   *** WARNING: Service ...docker-0 probably didn't start properly.
+#   Health check error: ..."-wait-for-service" timeout
+#   waiting for TCP connection to <id> on [2375 2376]...
+#
+# The reason this could not stay as a known-red job: both sit in the `test`
+# stage, so a failure SKIPS everything downstream. `aikido-build`,
+# `aikido-publish-image`, `aikido-image-sbom`, `aikido-mbom` and `aikido-release`
+# were all skipped on every main pipeline where `scenario-test` ran. A broken
+# dind sidecar was not just painting main red, it was blocking the container
+# image build and publish, which is a second cause of a stale published image on
+# top of the aikido!126 Harbor gap.
+#
+# `allow_failure: true` was rejected: a permanently-yellow job reads as coverage
+# and provides none, which is the exact anti-pattern the integration-job removal
+# was about.
+#
+# Both suites are unchanged and run locally:
+#
+#   scripts/test.sh scenario all        # every SELF_CONTAINED quickstart
+#   scripts/test.sh scenario distributed
+#   make test-access-control            # Ranger/Polaris/Keycloak e2e
+#   make test-access-control-spark      # the same gates through Spark
+#
+# Re-adding either requires a runner with a working dind sidecar (or a
+# socket-mounted shell runner). Do not reintroduce an allow_failure-only variant.
 
 # ── AWS cloud-backed scenario tests (opt-in, needs AWS creds) ──
 # Runs the AWS quickstarts (aws-glue, aws-s3-tables, glue-lake-formation) end to
