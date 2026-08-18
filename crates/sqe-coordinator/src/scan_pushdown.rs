@@ -119,13 +119,23 @@ pub struct LenientConversion {
     pub dropped: Vec<String>,
 }
 
-/// Ceiling on the serialized predicate inside ONE `ScanTask` ticket.
+/// Raw `datafusion-proto` budget for the predicate inside ONE `ScanTask`,
+/// derived from the gRPC message ceiling on the coordinator/worker link.
 ///
-/// A ticket rides one gRPC message and tonic's default decode limit is 4 MiB,
-/// which SQE never raises (there is no `max_decoding_message_size` anywhere in
-/// the tree). 3 MiB leaves headroom for the rest of the ticket (file paths,
-/// schema, projection, credentials).
-pub const MAX_PUSHED_PREDICATE_BYTES: usize = 3 * 1024 * 1024;
+/// The ticket carries the predicate base64-encoded, which costs exactly 4/3,
+/// so three quarters of the wire limit is the most raw `Expr` that can fit
+/// even before the rest of the ticket (file paths, projection, credentials) is
+/// counted. Deriving it keeps this guard and the encoded-ticket check in
+/// `distributed_scan::encode_ticket_within_limit` from disagreeing.
+///
+/// The first version of this budget was a flat 3 MiB and claimed to keep
+/// tickets under tonic's 4 MiB decode default. It did not: the predicate rode
+/// the JSON ticket as an array of decimal numbers, a measured 2.9x expansion,
+/// so 3 MiB of `Expr` became an ~8.9 MB ticket, which is the size the workers
+/// were observed refusing (#432).
+pub fn raw_predicate_budget(max_message_bytes: usize) -> usize {
+    max_message_bytes / 4 * 3
+}
 
 /// What happened when a combined predicate was serialized for a `ScanTask`.
 #[derive(Debug)]
@@ -141,11 +151,12 @@ pub enum PushedPredicate {
 }
 
 /// Serialize a predicate for a `ScanTask`, refusing one that cannot fit.
-pub fn serialize_pushed_predicate(expr: &Expr) -> PushedPredicate {
+///
+/// `max_raw_bytes` comes from [`raw_predicate_budget`]. This is the cheap
+/// early-out; the encoded ticket is checked again at dispatch.
+pub fn serialize_pushed_predicate(expr: &Expr, max_raw_bytes: usize) -> PushedPredicate {
     match expr.to_bytes() {
-        Ok(bytes) if bytes.len() > MAX_PUSHED_PREDICATE_BYTES => {
-            PushedPredicate::TooLarge(bytes.len())
-        }
+        Ok(bytes) if bytes.len() > max_raw_bytes => PushedPredicate::TooLarge(bytes.len()),
         Ok(bytes) => PushedPredicate::Fits(bytes.to_vec()),
         Err(e) => PushedPredicate::Failed(e.to_string()),
     }
@@ -582,17 +593,36 @@ mod tests {
     /// raised produced 9.1 MB messages against tonic's 4 MiB default.
     #[test]
     fn oversized_predicate_is_refused_not_pushed() {
-        // ~500K i64 literals serializes well past the 3 MiB budget.
-        let big: Vec<Expr> = (0..500_000i64).map(lit).collect();
+        // 20K i64 literals against a 4 KiB budget: the budget is the variable
+        // under test, so it is passed in rather than sized to a huge literal
+        // list.
+        let big: Vec<Expr> = (0..20_000i64).map(lit).collect();
         let expr = col("b").in_list(big, false);
-        match serialize_pushed_predicate(&expr) {
+        let budget = 4 * 1024;
+        match serialize_pushed_predicate(&expr, budget) {
             PushedPredicate::TooLarge(len) => {
-                assert!(
-                    len > MAX_PUSHED_PREDICATE_BYTES,
-                    "reported length {len} must exceed the budget"
-                );
+                assert!(len > budget, "reported length {len} must exceed the budget");
             }
             other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    /// The budget must leave room for base64: a raw predicate at the budget
+    /// still has to fit the wire limit once encoded. 3/4 is exactly the
+    /// inverse of base64's 4/3 expansion.
+    #[test]
+    fn raw_budget_survives_base64_expansion() {
+        for wire_limit in [4 * 1024 * 1024usize, 16 * 1024 * 1024, 64 * 1024 * 1024] {
+            let raw = raw_predicate_budget(wire_limit);
+            let encoded = raw.div_ceil(3) * 4;
+            assert!(
+                encoded <= wire_limit,
+                "raw budget {raw} base64-encodes to {encoded}, over the {wire_limit} wire limit"
+            );
+            assert!(
+                raw > wire_limit / 2,
+                "budget {raw} is needlessly tight for a {wire_limit} limit"
+            );
         }
     }
 
@@ -600,10 +630,11 @@ mod tests {
     #[test]
     fn small_predicate_fits_the_ticket_budget() {
         let expr = col("a").gt_eq(lit(3i64)).and(col("a").lt_eq(lit(17i64)));
-        match serialize_pushed_predicate(&expr) {
+        let budget = raw_predicate_budget(16 * 1024 * 1024);
+        match serialize_pushed_predicate(&expr, budget) {
             PushedPredicate::Fits(bytes) => {
                 assert!(!bytes.is_empty());
-                assert!(bytes.len() <= MAX_PUSHED_PREDICATE_BYTES);
+                assert!(bytes.len() <= budget);
                 // and it round-trips, so the worker can rebuild it
                 let back = Expr::from_bytes(&bytes).expect("roundtrip");
                 assert_eq!(back, expr);

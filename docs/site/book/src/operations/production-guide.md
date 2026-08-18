@@ -172,6 +172,31 @@ These are reliability fixes, not optional optimizations:
 4. jemalloc A/B for glibc RSS parking after large sorts
 5. Do **not** move coordinator to `memory_pool = "fair"`
 
+Coordinator-to-worker HTTP/2 windows are tuned by default as of 2026-08-18 and
+worth checking if you pinned an older config. Before that fix, the coordinator's
+worker channels ran on h2's 65,535-byte stream and connection windows, which cap
+one stream at `window / RTT` no matter how much bandwidth the link has: about
+64 MB/s across a 1 ms hop, 6 MB/s across 10 ms. The connection window is shared,
+so every scan fragment multiplexed to the same worker drew from the same 64 KB.
+The defaults are now 8 MB per stream and 16 MB per connection, matching what the
+coordinator's own Flight SQL server already used. Loopback rigs never showed the
+old ceiling; a separate-host deployment does.
+
+```toml
+[coordinator.transport]
+initial_stream_window_size = 8388608       # 8 MB
+initial_connection_window_size = 16777216  # 16 MB
+max_decoding_message_bytes = 16777216      # 16 MB, both ends of the worker link
+```
+
+`max_decoding_message_bytes` replaces tonic's 4 MiB receive default on the
+worker's Flight server and on the coordinator's clients. Workers read it from
+the same `[coordinator.transport]` section, so one value covers both ends. A
+scan ticket that would still exceed it sheds its pushed runtime-filter
+predicate and ships the fragment unfiltered rather than failing; watch the
+`ticket_predicate_dropped_oversize` metric if scans get slower after raising
+`runtime_filter_inlist_max_values`.
+
 ---
 
 ## Production baseline (`sqe.toml`)

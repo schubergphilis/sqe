@@ -675,7 +675,7 @@ pub struct CoordinatorConfig {
 /// 30 s HTTP/2 keepalive interval (10 s timeout), 60 s TCP keepalive.
 /// They lift Flight throughput on SF10+ workloads and keep long-running
 /// connections alive across NAT / load-balancer idle timeouts.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Copy)]
 pub struct GrpcTransportConfig {
     /// Per-stream receive window in bytes.
     #[serde(default = "default_initial_stream_window_size")]
@@ -695,6 +695,22 @@ pub struct GrpcTransportConfig {
     /// TCP keepalive in seconds. 0 disables.
     #[serde(default = "default_tcp_keepalive_secs")]
     pub tcp_keepalive_secs: u64,
+    /// Maximum inbound gRPC message size in bytes, applied to the worker's
+    /// Flight server and to the coordinator's clients for workers (#432).
+    ///
+    /// tonic defaults this to 4 MiB on the receive side and leaves the send
+    /// side unbounded, so an oversized scan ticket is encoded happily and then
+    /// refused by the worker with `decoded message length too large`. Workers
+    /// read this from the same `[coordinator.transport]` section the
+    /// coordinator does, so one value covers both ends of the link.
+    ///
+    /// Raising a decode ceiling widens what an unauthenticated peer could make
+    /// a process buffer. That is acceptable here and only here: the
+    /// coordinator/worker link requires `worker_secret` and a per-ticket HMAC
+    /// (#206), and the Flight SQL port that faces users is unaffected. Keep it
+    /// finite; do not set it to `usize::MAX`.
+    #[serde(default = "default_max_decoding_message_bytes")]
+    pub max_decoding_message_bytes: usize,
 }
 
 impl Default for GrpcTransportConfig {
@@ -706,6 +722,7 @@ impl Default for GrpcTransportConfig {
             http2_keepalive_interval_secs: default_http2_keepalive_interval_secs(),
             http2_keepalive_timeout_secs: default_http2_keepalive_timeout_secs(),
             tcp_keepalive_secs: default_tcp_keepalive_secs(),
+            max_decoding_message_bytes: default_max_decoding_message_bytes(),
         }
     }
 }
@@ -727,6 +744,9 @@ fn default_http2_keepalive_timeout_secs() -> u64 {
 }
 fn default_tcp_keepalive_secs() -> u64 {
     60
+}
+fn default_max_decoding_message_bytes() -> usize {
+    16 * 1024 * 1024
 }
 
 impl std::fmt::Debug for CoordinatorConfig {

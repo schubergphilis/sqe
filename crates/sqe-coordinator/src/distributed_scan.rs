@@ -41,6 +41,18 @@ use crate::worker_registry::WorkerRegistry;
 /// or falling back to local execution.
 const DEFAULT_MAX_RETRIES: u32 = 2;
 
+/// Fallback inbound gRPC message ceiling when no config was plumbed in.
+/// Mirrors `GrpcTransportConfig::max_decoding_message_bytes`'s default; both
+/// exist so a `DistributedScanExec` built in a test is not silently pinned to
+/// tonic's 4 MiB (#432).
+const DEFAULT_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Bytes reserved for gRPC/Flight framing when checking a ticket against the
+/// message ceiling. The `Ticket` proto wraps the ScanTask JSON in a length
+/// prefix and field tag; a KB of headroom keeps a ticket that measures just
+/// under the limit from crossing it on the wire.
+const TICKET_FRAMING_HEADROOM_BYTES: usize = 4 * 1024;
+
 /// Metadata header carrying the coordinator/worker shared secret. The
 /// worker rejects `do_get` calls that don't carry it (issue #22).
 const WORKER_SECRET_HEADER: &str = "x-sqe-worker-secret";
@@ -134,6 +146,11 @@ pub struct DistributedScanExec {
     worker_connect_timeout: std::time::Duration,
     /// gRPC request timeout for `do_get`. Issue #29.
     worker_rpc_timeout: std::time::Duration,
+    /// Inbound gRPC message ceiling on the coordinator/worker link (#432).
+    /// Bounds both what this coordinator will accept back from a worker and
+    /// the size of the ticket it is willing to send, since the worker enforces
+    /// the same number on its own server.
+    max_message_bytes: usize,
     /// Per-operator metrics so EXPLAIN ANALYZE and passive query profiles
     /// show real elapsed/rows for this node instead of blanks.
     metrics: ExecutionPlanMetricsSet,
@@ -215,6 +232,7 @@ impl DistributedScanExec {
             worker_secret: String::new(),
             worker_connect_timeout: std::time::Duration::from_secs(5),
             worker_rpc_timeout: std::time::Duration::from_secs(630),
+            max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
             metrics: ExecutionPlanMetricsSet::new(),
             pushed_down_filters: vec![],
         }
@@ -237,6 +255,7 @@ impl DistributedScanExec {
             worker_secret: self.worker_secret.clone(),
             worker_connect_timeout: self.worker_connect_timeout,
             worker_rpc_timeout: self.worker_rpc_timeout,
+            max_message_bytes: self.max_message_bytes,
             metrics: self.metrics.clone(),
             pushed_down_filters: filters,
         }
@@ -324,6 +343,16 @@ impl DistributedScanExec {
     ) -> Self {
         self.worker_connect_timeout = connect_timeout;
         self.worker_rpc_timeout = rpc_timeout;
+        self
+    }
+
+    /// Set the inbound gRPC message ceiling for this link (#432). Must match
+    /// the workers' `[coordinator.transport].max_decoding_message_bytes`; the
+    /// coordinator uses it both to bound what it accepts and to decide when a
+    /// ticket is too large to send.
+    #[must_use = "with_message_limit consumes self; bind the returned scan"]
+    pub fn with_message_limit(mut self, max_message_bytes: usize) -> Self {
+        self.max_message_bytes = max_message_bytes;
         self
     }
 }
@@ -452,6 +481,12 @@ impl ExecutionPlan for DistributedScanExec {
         // because the serialized predicate would not fit in one gRPC message.
         let predicate_too_large =
             MetricBuilder::new(&self.metrics).counter("dynamic_filter_predicate_too_large", partition);
+        // Tickets larger than this are refused before dispatch: the worker
+        // enforces the same ceiling on its own server, so sending one buys a
+        // guaranteed `decoded message length too large` instead of a scan.
+        let max_message_bytes = self.max_message_bytes;
+        let ticket_predicate_dropped = MetricBuilder::new(&self.metrics)
+            .counter("ticket_predicate_dropped_oversize", partition);
         let initial_worker_url = self.worker_urls[partition].clone();
         let schema = self.schema.clone();
         let schema_for_stream = self.schema.clone();
@@ -463,8 +498,11 @@ impl ExecutionPlan for DistributedScanExec {
         let local_executor = self.local_executor.clone();
         let fragment_callback = self.fragment_callback.0.clone();
         let worker_secret = self.worker_secret.clone();
-        let worker_connect_timeout = self.worker_connect_timeout;
-        let worker_rpc_timeout = self.worker_rpc_timeout;
+        let dispatch_limits = DispatchLimits {
+            connect_timeout: self.worker_connect_timeout,
+            rpc_timeout: self.worker_rpc_timeout,
+            max_message_bytes: self.max_message_bytes,
+        };
 
         let dispatch_span = info_span!(
             "dispatch_to_worker",
@@ -578,23 +616,27 @@ impl ExecutionPlan for DistributedScanExec {
                         .chain(snapshots)
                         .reduce(|a, b| a.and(b))
                     {
-                        match crate::scan_pushdown::serialize_pushed_predicate(&combined) {
+                        match crate::scan_pushdown::serialize_pushed_predicate(
+                            &combined,
+                            crate::scan_pushdown::raw_predicate_budget(max_message_bytes),
+                        ) {
                             crate::scan_pushdown::PushedPredicate::TooLarge(len) => {
-                                // A ScanTask ticket rides one gRPC message, and
-                                // tonic's default decode limit is 4 MiB, which SQE
-                                // does not raise. A large InList membership set
-                                // (raise `runtime_filter_inlist_max_size` and SF10
-                                // SSB partkey gets there) therefore does not make
-                                // the query slower, it makes the worker refuse the
-                                // ticket: "decoded message length too large". The
-                                // push is an optimization, so drop it and keep the
-                                // pre-push predicate; the coordinator's filter is
-                                // authoritative either way.
+                                // A ScanTask ticket rides one gRPC message, so a
+                                // large InList membership set (raise
+                                // `runtime_filter_inlist_max_size` and SF10 SSB
+                                // partkey gets there) does not make the query
+                                // slower, it makes the worker refuse the ticket:
+                                // "decoded message length too large". The push is
+                                // an optimization, so drop it and keep the pre-push
+                                // predicate; the coordinator's filter is
+                                // authoritative either way. The ceiling is now
+                                // configurable and enforced on both ends (#432).
                                 predicate_too_large.add(1);
                                 warn!(
                                     fragment_id = %task.fragment_id,
                                     bytes = len,
-                                    budget = crate::scan_pushdown::MAX_PUSHED_PREDICATE_BYTES,
+                                    budget =
+                                        crate::scan_pushdown::raw_predicate_budget(max_message_bytes),
                                     dynamic_filters = snapshot_count,
                                     "dynamic filter predicate exceeds the ticket budget; \
                                      shipping without it"
@@ -656,8 +698,8 @@ impl ExecutionPlan for DistributedScanExec {
                     channel_pool.as_deref(),
                     &parent_cx,
                     &worker_secret,
-                    worker_connect_timeout,
-                    worker_rpc_timeout,
+                    &dispatch_limits,
+                    &ticket_predicate_dropped,
                 )
                 .await
                 {
@@ -835,39 +877,111 @@ impl ExecutionPlan for DistributedScanExec {
 /// worker that accepts the TCP connection but never replies on the gRPC
 /// stream surfaces as `DeadlineExceeded` instead of stalling the coordinator's
 /// query-semaphore permit indefinitely (issue #29).
+/// gRPC settings for dispatching one fragment, identical across retries.
+/// Bundled so `dispatch_to_worker` stays inside clippy's argument budget as
+/// the message ceiling joins the two timeouts (#432).
+struct DispatchLimits {
+    /// Caps TCP+TLS+HTTP/2 handshake. Issue #29.
+    connect_timeout: std::time::Duration,
+    /// Caps the `do_get` round-trip. Issue #29.
+    rpc_timeout: std::time::Duration,
+    /// Inbound gRPC message ceiling on this link, enforced on both ends.
+    max_message_bytes: usize,
+}
+
+/// Serialize a ticket, dropping the pushed predicate if that is the only way
+/// to stay under the link's gRPC message ceiling (#432).
+///
+/// The predicate is a pure optimization: the coordinator keeps the
+/// authoritative `FilterExec` above `DistributedScanExec`, so a worker that
+/// receives no predicate returns more rows, never wrong ones. Shipping an
+/// oversized ticket instead buys `decoded message length too large` and a
+/// failed fragment, so degrading here is strictly better.
+///
+/// Checking the encoded ticket rather than the predicate alone is deliberate.
+/// A raw-byte budget on the `Expr` cannot see base64 expansion, the file-path
+/// list, or the projection, and the earlier 3 MiB raw budget admitted tickets
+/// that measured 8-9 MB on the wire.
+fn encode_ticket_within_limit(
+    task: &ScanTask,
+    worker_url: &str,
+    max_message_bytes: usize,
+    ticket_predicate_dropped: &datafusion::physical_plan::metrics::Count,
+) -> Result<Vec<u8>, DataFusionError> {
+    let ticket_bytes = task
+        .to_bytes()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    let budget = max_message_bytes.saturating_sub(TICKET_FRAMING_HEADROOM_BYTES);
+    if ticket_bytes.len() <= budget || task.predicate_proto.is_none() {
+        return Ok(ticket_bytes);
+    }
+
+    let mut stripped = task.clone();
+    stripped.predicate_proto = None;
+    let fallback = stripped
+        .to_bytes()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    ticket_predicate_dropped.add(1);
+    warn!(
+        fragment_id = %task.fragment_id,
+        worker = %worker_url,
+        ticket_bytes = ticket_bytes.len(),
+        stripped_bytes = fallback.len(),
+        max_message_bytes,
+        "ticket exceeds the gRPC message ceiling; dropping the pushed predicate \
+         and shipping the fragment unfiltered"
+    );
+    Ok(fallback)
+}
+
 async fn dispatch_to_worker(
     task: &ScanTask,
     worker_url: &str,
     pool: Option<&ChannelPool>,
     parent_cx: &opentelemetry::Context,
     worker_secret: &str,
-    connect_timeout: std::time::Duration,
-    rpc_timeout: std::time::Duration,
+    limits: &DispatchLimits,
+    ticket_predicate_dropped: &datafusion::physical_plan::metrics::Count,
 ) -> Result<FlightRecordBatchStream, DataFusionError> {
-    let ticket_bytes = task
-        .to_bytes()
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let ticket_bytes = encode_ticket_within_limit(
+        task,
+        worker_url,
+        limits.max_message_bytes,
+        ticket_predicate_dropped,
+    )?;
 
     let channel = match pool {
         Some(pool) => pool.get(worker_url).await.map_err(|e| {
             pool.invalidate(worker_url);
             DataFusionError::Execution(format!("Failed to connect to worker {worker_url}: {e}"))
         })?,
-        None => tonic::transport::Endpoint::new(worker_url.to_string())
-            .map_err(|e| {
+        // No pool: build a one-off channel. The HTTP/2 windows come from
+        // `GrpcTransportConfig::default()` rather than the deployment's
+        // config, which is not threaded this deep. Production always passes a
+        // pool, so this is the test/local path; the defaults are the tuned
+        // values, never tonic's 64 KB.
+        None => crate::transport::apply_grpc_transport_endpoint(
+            tonic::transport::Endpoint::new(worker_url.to_string()).map_err(|e| {
                 DataFusionError::Execution(format!(
                     "Failed to create endpoint for worker {worker_url}: {e}"
                 ))
-            })?
-            .connect_timeout(connect_timeout)
-            .timeout(rpc_timeout)
+            })?,
+            &sqe_core::config::GrpcTransportConfig::default(),
+        )
+        .connect_timeout(limits.connect_timeout)
+            .timeout(limits.rpc_timeout)
             .connect()
             .await
             .map_err(|e| {
                 DataFusionError::Execution(format!("Failed to connect to worker {worker_url}: {e}"))
             })?,
     };
-    let mut client = FlightServiceClient::new(channel);
+    // Match the worker's own inbound ceiling on the response direction: a
+    // large Flight batch coming back must not die on tonic's 4 MiB default.
+    let mut client =
+        FlightServiceClient::new(channel).max_decoding_message_size(limits.max_message_bytes);
 
     // Sign the exact ticket bytes (#206) before they are moved into the Ticket.
     // Signing the wire bytes rather than a re-serialized struct guarantees the
@@ -909,7 +1023,7 @@ async fn dispatch_to_worker(
     // channels share one budget rather than the old fixed 30s pool default.
     // The explicit wrap stays as the uniform per-deployment ceiling. (#237 /
     // COORD-05: the pool timeout previously ignored `worker_rpc_timeout`.)
-    let response = tokio::time::timeout(rpc_timeout, client.do_get(request))
+    let response = tokio::time::timeout(limits.rpc_timeout, client.do_get(request))
         .await
         .map_err(|_| {
             if let Some(pool) = pool {
@@ -917,7 +1031,7 @@ async fn dispatch_to_worker(
             }
             DataFusionError::Execution(format!(
                 "Worker {worker_url} do_get exceeded {}s rpc timeout",
-                rpc_timeout.as_secs()
+                limits.rpc_timeout.as_secs()
             ))
         })?
         .map_err(|e| {
@@ -1394,6 +1508,75 @@ mod tests {
             predicate_proto: None,
             limit: None,
         }
+    }
+
+    /// An oversized ticket must lose its predicate, not its fragment. The
+    /// worker enforces the same ceiling, so sending it buys "decoded message
+    /// length too large"; shipping unfiltered is correct because the
+    /// coordinator's FilterExec stays above the scan (#432).
+    #[test]
+    fn oversized_ticket_sheds_its_predicate_and_still_dispatches() {
+        let metrics = ExecutionPlanMetricsSet::new();
+        let dropped = MetricBuilder::new(&metrics).counter("ticket_predicate_dropped_oversize", 0);
+
+        let mut task = make_task("frag-big");
+        task.predicate_proto = Some(vec![7u8; 256 * 1024]);
+        let limit = 64 * 1024;
+
+        let bytes = encode_ticket_within_limit(&task, "http://w1:50052", limit, &dropped).unwrap();
+
+        assert_eq!(dropped.value(), 1, "the drop must be counted, not silent");
+        assert!(
+            bytes.len() <= limit,
+            "stripped ticket is {} bytes, still over the {limit} ceiling",
+            bytes.len()
+        );
+        let decoded = ScanTask::from_bytes(&bytes).unwrap();
+        assert!(decoded.predicate_proto.is_none());
+        assert_eq!(
+            decoded.fragment_id, "frag-big",
+            "the fragment itself must survive"
+        );
+    }
+
+    /// The common case is untouched: a ticket under the ceiling keeps its
+    /// predicate and increments nothing.
+    #[test]
+    fn ticket_within_the_ceiling_keeps_its_predicate() {
+        let metrics = ExecutionPlanMetricsSet::new();
+        let dropped = MetricBuilder::new(&metrics).counter("ticket_predicate_dropped_oversize", 0);
+
+        let mut task = make_task("frag-small");
+        task.predicate_proto = Some(vec![3u8; 512]);
+
+        let bytes =
+            encode_ticket_within_limit(&task, "http://w1:50052", 16 * 1024 * 1024, &dropped)
+                .unwrap();
+
+        assert_eq!(dropped.value(), 0);
+        assert_eq!(
+            ScanTask::from_bytes(&bytes).unwrap().predicate_proto,
+            Some(vec![3u8; 512])
+        );
+    }
+
+    /// A ticket over the ceiling with nothing to shed is passed through rather
+    /// than failed here: the dispatch error is the honest signal, and the scan
+    /// still has retry and local fallback below it.
+    #[test]
+    fn oversized_ticket_without_a_predicate_is_not_rewritten() {
+        let metrics = ExecutionPlanMetricsSet::new();
+        let dropped = MetricBuilder::new(&metrics).counter("ticket_predicate_dropped_oversize", 0);
+
+        let mut task = make_task("frag-paths");
+        task.data_file_paths = (0..2_000)
+            .map(|i| format!("s3://bucket/very/long/prefix/that/repeats/file-{i}.parquet"))
+            .collect();
+
+        let bytes = encode_ticket_within_limit(&task, "http://w1:50052", 4 * 1024, &dropped).unwrap();
+
+        assert_eq!(dropped.value(), 0);
+        assert!(bytes.len() > 4 * 1024);
     }
 
     #[test]
