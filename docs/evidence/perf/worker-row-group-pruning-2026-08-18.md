@@ -100,3 +100,58 @@ a bloom-enabled reload first, and it is the piece that would let large sealed
 membership sets prune (see the #415 measurement: transporting an exact
 membership set as an `InList` is a 16% net LOSS at SF10 precisely because it
 prunes rows after row-group selection instead of pruning row groups).
+
+## The bloom half was built, measured, and NOT shipped
+
+Written, run against bloom-enabled data, and then removed from this branch. The
+result is a clean negative and worth keeping.
+
+`BENCH_BLOOM_FILTER=1` reload of SSB SF10, then a worker-side probe: extract
+`col IN (literal, ...)` conjuncts from the pushed predicate, resolve each column
+to its parquet leaf, load that row group's SBBF via the public
+`get_row_group_column_bloom_filter`, and prune the row group when every key
+tests bloom-negative.
+
+**It never probed a single row group.** Across four runs, `probed = 0`,
+`no_bloom = 0`, `pruned = 0`, with 234 probe attempts logged.
+
+The reason is not that the keys fail to arrive. They do, and more than expected:
+of the fragments carrying membership conjuncts, 84 carried
+`[lo_orderdate, lo_custkey, lo_suppkey]`, 36 carried
+`[lo_orderdate, lo_partkey, lo_suppkey]`, and 14 carried all four. High
+cardinality scattered keys reach the worker as `InList`s under the shipped cap.
+
+The reason is that **statistics pruning has already emptied those exact
+fragments**. Of 71 pruning events on one worker, 61 ended with `kept: 0`: the
+sealed bounds eliminate every row group the fragment owned. Ten kept one or two
+groups. So the candidate set the bloom probe inherits is empty precisely where
+the membership sets are richest.
+
+Which follows from where both filters come from. Bounds and membership are two
+halves of the same sealed dynamic filter. If the build side has finished, the
+worker gets both, and at SF10 SSB the bounds alone are selective enough to
+eliminate whole files. If it has not finished, it gets neither. There is no
+regime in this workload where membership is available and bounds are not.
+
+Reversing the order would not help: probing first would prune row groups that
+statistics would have pruned anyway, at the cost of a ranged read per
+(row group, column) to load each SBBF.
+
+So the condition for revisiting is specific, and this workload does not meet it:
+a join whose keys are scattered across the probe side's key domain AND whose
+sealed bounds are unselective, i.e. a dimension key with no correlation to the
+fact table's physical ordering. SSB's `lo_orderdate` correlates strongly with
+file layout, which is exactly why bounds win.
+
+Shipping the probe anyway would have added a per-task key materialization and a
+ranged read for zero measured benefit. That is the same mistake as shipping an
+unmeasured guard, so it stays out.
+
+### A rig caveat that outlives this experiment
+
+The bloom-enabled reload put the rig into a slower, high-variance regime:
+the same distributed SSB SF10 suite measured 76-109 s afterwards against 44 s
+before, with one arm spreading 40 s across two reps. Absolute times either side
+of that reload are not comparable, and the -12.5% statistics result above was
+taken before it on a rig whose per-arm spread was about 2 s. Any follow-up
+timing work needs a fresh stable baseline first.
