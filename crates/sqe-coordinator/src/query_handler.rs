@@ -2721,12 +2721,14 @@ impl QueryHandler {
             physical_plan
         };
 
-        // Probe-side scan parallelization (issue #235). Opt-in: bumps the
-        // probe-side Iceberg scan of CollectLeft joins to N output partitions
-        // so the fact-table decode runs across cores; build-side scans are
-        // never touched (the q72 regression guard). Default off until validated
-        // on a clean (non-swapping) benchmark rig. Uses the real session config
-        // so EnforceDistribution sees the configured target_partitions.
+        // Probe-side scan parallelization (issue #235). Default ON since
+        // 2026-07-08: bumps the probe-side Iceberg scan of CollectLeft joins to
+        // N output partitions so the fact-table decode runs across cores;
+        // build-side scans are never touched (the q72 regression guard). Uses
+        // the real session config so EnforceDistribution sees the configured
+        // target_partitions. Runs BEFORE ParallelScanRule and takes the scans
+        // it can, which is why that rule fires twice instead of 26 times on a
+        // three-suite SF1 sweep (measured 2026-08-18, issue #414).
         let physical_plan = if self.config.query.parallel_probe_scan {
             let state = ctx.state();
             let rule = crate::parallel_probe_scan::ParallelProbeScanRule::new();
@@ -2741,14 +2743,16 @@ impl QueryHandler {
             physical_plan
         };
 
-        // Single-node parallel scan (issue #131 follow-up). Opt-in: gives each
-        // qualifying Iceberg scan N output partitions, choosing partitioning the
-        // parent can consume so EnforceDistribution inserts no redundant gather.
-        // Build-side and single-partition-ordered scans stay serial (the q72
-        // guard falls out of `required_input_distribution`). Runs after the
-        // probe rule so join distribution is final; distinct from it (that keeps
-        // CollectLeft and parallelizes only the probe). Default off until the
-        // q72 benchmark gate passes.
+        // Single-node parallel scan (issue #131 follow-up). Default ON since
+        // 2026-07-08: gives each qualifying Iceberg scan N output partitions,
+        // choosing partitioning the parent can consume so EnforceDistribution
+        // inserts no redundant gather. Build-side and single-partition-ordered
+        // scans stay serial (the q72 guard falls out of
+        // `required_input_distribution`). Runs after the probe rule so join
+        // distribution is final. It covers what that rule does not reach
+        // (Partitioned-mode joins, join-free plans above the size gate), but the
+        // two OVERLAP rather than complement: the probe rule has already bumped
+        // most scans past `partition_count() == 1` by the time this runs.
         let physical_plan = if self.config.query.parallel_scan {
             let byte_threshold =
                 sqe_core::parse_memory_limit(&self.config.query.distribution_threshold)

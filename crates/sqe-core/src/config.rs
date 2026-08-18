@@ -291,10 +291,13 @@ pub struct QueryConfig {
     /// q21 12.3s -> 9.0s; suite totals vs Trino improve to tpch 63.0s vs
     /// 109.3s and tpcds 212.5s vs 313.7s with SSB at parity, 22/22 + 13/13 +
     /// 99/99 rows matched. The only measured cost is ~1.5s on tpcds q39
-    /// (still ahead of Trino). Complements `parallel_probe_scan` (CollectLeft
-    /// probes); this rule covers scans under `Partitioned`-mode joins and
-    /// join-free plans above the size gate. Set to false to restore serial
-    /// scans outside CollectLeft probes.
+    /// (still ahead of Trino). This rule covers scans under `Partitioned`-mode
+    /// joins and join-free plans above the size gate, but it OVERLAPS
+    /// `parallel_probe_scan` rather than complementing it: that rule runs first
+    /// and bumps most scans past the `partition_count() == 1` precondition, so
+    /// with both flags on this one fires twice on a three-suite SF1 sweep
+    /// instead of 26 times (measured 2026-08-18, issue #414). Set to false to
+    /// restore serial scans outside CollectLeft probes.
     #[serde(default = "default_true")]
     pub parallel_scan: bool,
     /// Swap the dimension scan onto the build side of star-tail CollectLeft

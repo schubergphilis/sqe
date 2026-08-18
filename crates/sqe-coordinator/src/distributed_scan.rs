@@ -52,6 +52,25 @@ const WORKER_SECRET_HEADER: &str = "x-sqe-worker-secret";
 /// (file paths, credentials, predicate, and limit included).
 const SCAN_SIGNATURE_HEADER: &str = "x-sqe-scan-signature";
 
+/// Ceiling on the serialized pushed predicate inside ONE `ScanTask` ticket.
+///
+/// A ticket rides one gRPC message and tonic's default decode limit is 4 MiB,
+/// which SQE never raises (there is no `max_decoding_message_size` anywhere in
+/// the tree). 3 MiB leaves headroom for the rest of the ticket (file paths,
+/// schema, projection, credentials) so an oversized runtime-filter InList
+/// degrades to "not pushed" instead of "worker refused the ticket". Pushing is
+/// an optimization, so dropping it cannot change results.
+///
+/// Scope, honestly: this bounds ONE ticket's predicate. It does NOT explain or
+/// fix the refusals measured on 2026-08-18, where SF10 SSB with
+/// `runtime_filter_inlist_max_values = 1000000` / `..._max_size = "64MB"` had
+/// workers reject 9.1 MB messages ("decoded message length too large") while
+/// this guard never fired, so the oversized message is aggregated somewhere
+/// else on the wire (the plan codec JSON-encodes a whole `scan_tasks` vector,
+/// which multiplies a per-task predicate). The shipped 65536-value cap does not
+/// reach it: the same rig at the default is 13/13 with zero refusals.
+const MAX_PUSHED_PREDICATE_BYTES: usize = 3 * 1024 * 1024;
+
 /// Compute the HMAC-SHA256 tag (lowercase hex) over `bytes` keyed by `secret`.
 ///
 /// Returns `None` when `secret` is empty: an empty key means the deployment
@@ -431,6 +450,16 @@ impl ExecutionPlan for DistributedScanExec {
         let pushed_down_filters = self.pushed_down_filters.clone();
         let dynamic_filters_pushed =
             MetricBuilder::new(&self.metrics).counter("dynamic_filters_pushed", partition);
+        // Conjuncts of a dynamic filter snapshot that had no logical form and
+        // were therefore NOT pushed to the worker (issue #415). Non-zero means
+        // the worker's predicate is wider than the coordinator's join filter:
+        // correct results, more rows over Flight than necessary.
+        let dynamic_filter_conjuncts_dropped = MetricBuilder::new(&self.metrics)
+            .counter("dynamic_filter_conjuncts_dropped", partition);
+        // Fragments that had a convertible dynamic filter but could not carry it
+        // because the serialized predicate would not fit in one gRPC message.
+        let predicate_too_large =
+            MetricBuilder::new(&self.metrics).counter("dynamic_filter_predicate_too_large", partition);
         let initial_worker_url = self.worker_urls[partition].clone();
         let schema = self.schema.clone();
         let schema_for_stream = self.schema.clone();
@@ -524,13 +553,26 @@ impl ExecutionPlan for DistributedScanExec {
                     if crate::scan_pushdown::is_trivially_true(&resolved) {
                         continue;
                     }
-                    match crate::scan_pushdown::physical_filter_to_logical_lenient(&resolved) {
-                        Some(logical) => snapshots.push(logical),
-                        None => tracing::debug!(
+                    // Report what the conversion had to leave behind. A
+                    // snapshot that keeps only its min/max bounds and drops
+                    // the `hash_lookup` membership term still counts as a
+                    // successful push, so without this the lost selectivity
+                    // is invisible -- the case issue #415 is about.
+                    let report =
+                        crate::scan_pushdown::physical_filter_to_logical_reporting(&resolved);
+                    if !report.dropped.is_empty() {
+                        dynamic_filter_conjuncts_dropped.add(report.dropped.len());
+                        tracing::debug!(
                             fragment_id = %task.fragment_id,
                             filter = %resolved,
-                            "dynamic filter snapshot not convertible to a logical Expr; skipping"
-                        ),
+                            dropped = ?report.dropped,
+                            kept = report.expr.is_some(),
+                            "dynamic filter conjunct(s) had no logical form; \
+                             worker predicate is wider than the join filter"
+                        );
+                    }
+                    if let Some(logical) = report.expr {
+                        snapshots.push(logical);
                     }
                 }
                 if !snapshots.is_empty() {
@@ -545,6 +587,27 @@ impl ExecutionPlan for DistributedScanExec {
                         .reduce(|a, b| a.and(b))
                     {
                         match combined.to_bytes() {
+                            Ok(bytes) if bytes.len() > MAX_PUSHED_PREDICATE_BYTES => {
+                                // A ScanTask ticket rides one gRPC message, and
+                                // tonic's default decode limit is 4 MiB, which SQE
+                                // does not raise. A large InList membership set
+                                // (raise `runtime_filter_inlist_max_size` and SF10
+                                // SSB partkey gets there) therefore does not make
+                                // the query slower, it makes the worker refuse the
+                                // ticket: "decoded message length too large". The
+                                // push is an optimization, so drop it and keep the
+                                // pre-push predicate; the coordinator's filter is
+                                // authoritative either way.
+                                predicate_too_large.add(1);
+                                warn!(
+                                    fragment_id = %task.fragment_id,
+                                    bytes = bytes.len(),
+                                    budget = MAX_PUSHED_PREDICATE_BYTES,
+                                    dynamic_filters = snapshot_count,
+                                    "dynamic filter predicate exceeds the ticket budget; \
+                                     shipping without it"
+                                );
+                            }
                             Ok(bytes) => {
                                 task.predicate_proto = Some(bytes.to_vec());
                                 dynamic_filters_pushed.add(snapshot_count);
