@@ -155,3 +155,55 @@ before, with one arm spreading 40 s across two reps. Absolute times either side
 of that reload are not comparable, and the -12.5% statistics result above was
 taken before it on a rig whose per-arm spread was about 2 s. Any follow-up
 timing work needs a fresh stable baseline first.
+
+## Follow-up: how far the -12.5% claim actually extends
+
+!879 shipped this default-on, measured on SSB SF10 only, so the next question was
+whether it holds or regresses on other suites. Answered, and the answer bounds
+the claim rather than extending it.
+
+**At SF1 the pruning never fires.** Instrumented count of
+`Row-group statistics pruning applied` per suite, one settled run, workers at
+debug:
+
+| suite | scale | result | pruning events |
+|---|---|---|---|
+| tpch | 1 | 22/22, 34,672 ms | **0** |
+| tpcds | 1 | 99/99, 43,951 ms | **0** |
+| ssb | 10 | 13/13, 44,930 ms | 87 |
+
+So a TPC-H / TPC-DS SF1 A/B measures nothing: at SF1 the files are small enough
+that a fragment's morsel covers a single row group, `kept.len()` equals
+`candidates.len()`, and the pruner returns `None` without touching the
+selection. An earlier forced-distribution SF1 A/B appeared to show tpch -18% and
+tpcds -21%; **those numbers are noise and must not be quoted.** Instrumenting
+the arm is what caught it, the same lesson as the vacuous distributed suite
+earlier in this branch's history.
+
+Two things follow. The change carries no risk at SF1 because it does not
+engage. And "validated beyond SSB" is NOT established: validating on TPC-H needs
+TPC-H at SF10, which is not loaded.
+
+### A 60-second timeout that was not this change
+
+One tpcds SF1 arm came back 97/99 with q38 and q54 erroring at exactly 60,002 ms
+and 60,001 ms, against 99/99 in the other three arms. Two independent lines of
+evidence clear the pruning change:
+
+- **q38 and q54 in isolation, eight alternating arms:** 0.4 s to 1.3 s every
+  time, no timeouts, no broken pipes, and `pruning_fired = 0`. The pruning code
+  is not even active on those two queries.
+- **`PruningPredicate::try_new` build cost is bounded**, so a per-file rebuild
+  cannot stall a query: 251 us at 200 literals, 331 us at 3,200, 640 us at
+  6,400, 2.4 ms at 25,600. Even 80 files in one fragment is about 200 ms. This
+  matters because the InList cap checks per-node length, so a CASE-of-InLists
+  (the shape behind the older q21 16s-to-24s regression) passes through with
+  thousands of literals and no single oversized node. It is cheap anyway.
+
+The actual cause was transport churn: the coordinator logged repeated
+`do_get failed ... BrokenPipe` and both workers logged
+`error trying to set TCP_NODELAY: Invalid argument (os error 22)` 101 times.
+The workers were advertising the host's LAN address (192.168.1.229), so every
+fragment crossed the LAN stack. Setting `advertise_url = "http://127.0.0.1:5005N"`
+in the rig's worker configs removes that path, and the rig returned to the ~44 s
+SSB SF10 regime afterwards.
