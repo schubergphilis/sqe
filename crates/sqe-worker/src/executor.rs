@@ -1667,7 +1667,7 @@ mod tests {
         let schema: SchemaRef =
             Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         // One row group per write: max_row_group_size 10 with 10-row batches.
-        let props = WriterProperties::builder().set_max_row_group_size(10).build();
+        let props = WriterProperties::builder().set_max_row_group_row_count(Some(10)).build();
         let mut buf = Vec::new();
         {
             let mut writer =
