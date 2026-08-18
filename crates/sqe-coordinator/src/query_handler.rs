@@ -3723,6 +3723,12 @@ impl QueryHandler {
                         self.config.coordinator.worker_connect_timeout_secs,
                     ),
                     std::time::Duration::from_secs(self.config.coordinator.worker_rpc_timeout_secs),
+                )
+                .with_message_limit(
+                    self.config
+                        .coordinator
+                        .transport
+                        .max_decoding_message_bytes,
                 );
 
         // Attach worker registry for health tracking / failover

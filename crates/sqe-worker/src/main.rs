@@ -73,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     server_builder
-        .add_service(flight_service.into_server())
+        .add_service(flight_service.into_server(config.coordinator.transport.max_decoding_message_bytes))
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
 

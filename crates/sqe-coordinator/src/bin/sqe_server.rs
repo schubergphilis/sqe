@@ -857,6 +857,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             sqe_coordinator::channel_pool::ChannelPool::shared_with_timeouts(
                 std::time::Duration::from_secs(config.coordinator.worker_connect_timeout_secs),
                 std::time::Duration::from_secs(config.coordinator.worker_rpc_timeout_secs),
+                &config.coordinator.transport,
             ),
             config.coordinator.max_workers,
             config.coordinator.health_check_max_failures,
@@ -1694,7 +1695,7 @@ async fn run_worker(config: SqeConfig, config_path: String) -> anyhow::Result<()
     }
 
     server_builder
-        .add_service(flight_service.into_server())
+        .add_service(flight_service.into_server(config.coordinator.transport.max_decoding_message_bytes))
         .serve_with_shutdown(
             addr,
             shutdown_with_drain(ready.clone(), config.coordinator.shutdown_drain_secs),

@@ -1,0 +1,96 @@
+{
+  "benchmark": "ssb",
+  "scale_factor": 10.0,
+  "protocol": "flight",
+  "timestamp": "2026-08-18T13:31:27",
+  "summary": {
+    "total": 13,
+    "pass": 12,
+    "fail": 0,
+    "diff": 0,
+    "skip": 0,
+    "error": 1,
+    "total_duration_ms": 34722
+  },
+  "queries": [
+    {
+      "id": "q1.1",
+      "status": "pass",
+      "duration_ms": 1506,
+      "rows": 1
+    },
+    {
+      "id": "q1.2",
+      "status": "pass",
+      "duration_ms": 976,
+      "rows": 1
+    },
+    {
+      "id": "q1.3",
+      "status": "pass",
+      "duration_ms": 1318,
+      "rows": 1
+    },
+    {
+      "id": "q2.1",
+      "status": "pass",
+      "duration_ms": 4518,
+      "rows": 280
+    },
+    {
+      "id": "q2.2",
+      "status": "pass",
+      "duration_ms": 3548,
+      "rows": 56
+    },
+    {
+      "id": "q2.3",
+      "status": "pass",
+      "duration_ms": 3525,
+      "rows": 7
+    },
+    {
+      "id": "q3.1",
+      "status": "pass",
+      "duration_ms": 3384,
+      "rows": 150
+    },
+    {
+      "id": "q3.2",
+      "status": "pass",
+      "duration_ms": 3202,
+      "rows": 600
+    },
+    {
+      "id": "q3.3",
+      "status": "pass",
+      "duration_ms": 3044,
+      "rows": 24
+    },
+    {
+      "id": "q3.4",
+      "status": "pass",
+      "duration_ms": 1877,
+      "rows": 4
+    },
+    {
+      "id": "q4.1",
+      "status": "error",
+      "duration_ms": 606,
+      "rows": 0,
+      "message": "Failed to collect record batches: Tonic error: code: 'Internal error', message: \"Execution error: Worker http://127.0.0.1:50053 do_get failed: code: 'Operation was attempted past the valid range', message: \\\"Error, decoded message length too large: found 9145356 bytes, the limit is: 4194304 bytes\\\"\""
+    },
+    {
+      "id": "q4.2",
+      "status": "pass",
+      "duration_ms": 3296,
+      "rows": 100
+    },
+    {
+      "id": "q4.3",
+      "status": "pass",
+      "duration_ms": 3922,
+      "rows": 794
+    }
+  ]
+}
