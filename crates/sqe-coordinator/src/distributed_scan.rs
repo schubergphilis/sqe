@@ -59,7 +59,7 @@ const SCAN_SIGNATURE_HEADER: &str = "x-sqe-scan-signature";
 // refusals measured on 2026-08-18, where SF10 SSB with
 // `runtime_filter_inlist_max_values = 1000000` had workers reject 9.1 MB
 // messages ("decoded message length too large") while this guard never fired,
-// so that oversized message is aggregated somewhere else on the wire. The
+// so that oversized message is aggregated somewhere else on the wire (#432). The
 // shipped 65536-value cap does not reach it: the same rig at the default is
 // 13/13 with zero refusals.
 

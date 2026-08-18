@@ -150,7 +150,7 @@ single-ticket predicate guard added on this branch (`MAX_PUSHED_PREDICATE_BYTES`
 never fired during those runs, so the oversized message is aggregated elsewhere
 on the wire; the plan codec JSON-encodes an entire `scan_tasks` vector, which
 would multiply a per-task predicate. That is a lead, not a diagnosis, and it is
-tracked separately.
+tracked in issue #432.
 
 The shipped configuration does not reach any of this: same rig, same data, cap
 at the default, 13/13 with zero refusals.
