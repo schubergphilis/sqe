@@ -97,10 +97,47 @@ pub fn is_trivially_true(expr: &Arc<dyn PhysicalExpr>) -> bool {
 /// why the split happens only at top-level ANDs and the strict converter
 /// handles everything below.
 pub fn physical_filter_to_logical_lenient(expr: &Arc<dyn PhysicalExpr>) -> Option<Expr> {
+    physical_filter_to_logical_reporting(expr).expr
+}
+
+/// What a lenient conversion kept, and what it had to drop.
+///
+/// Dropping a conjunct only WIDENS the pushed predicate, so the result stays
+/// correct: the worker ships rows it did not have to ship and the
+/// coordinator's join discards them. The problem is that the widening was
+/// invisible. A snapshot whose membership term is dropped converts
+/// *successfully* -- bounds survive, the push is logged as a win, and nothing
+/// records that the selective half stayed behind. `dropped` names each term
+/// so the loss reaches a log line and a metric (issue #415).
+#[derive(Debug, Default)]
+pub struct LenientConversion {
+    /// The surviving predicate, or `None` when no conjunct converted.
+    pub expr: Option<Expr>,
+    /// `Display` text of every top-level conjunct with no logical form.
+    /// A `HashTableLookupExpr` membership probe shows up here as
+    /// `hash_lookup`, which is the whole selectivity of a star join.
+    pub dropped: Vec<String>,
+}
+
+/// [`physical_filter_to_logical_lenient`] plus a record of what it dropped.
+pub fn physical_filter_to_logical_reporting(expr: &Arc<dyn PhysicalExpr>) -> LenientConversion {
+    let mut dropped = Vec::new();
+    let converted = lenient_walk(expr, &mut dropped);
+    LenientConversion {
+        expr: converted,
+        dropped,
+    }
+}
+
+/// Split at top-level ANDs, convert each conjunct strictly, and record the
+/// text of the ones that do not convert. Only top-level ANDs split: dropping
+/// a term inside an OR or a NOT would NARROW the predicate, not widen it,
+/// and that would change results.
+fn lenient_walk(expr: &Arc<dyn PhysicalExpr>, dropped: &mut Vec<String>) -> Option<Expr> {
     if let Some(b) = expr.downcast_ref::<PhysBinaryExpr>() {
         if *b.op() == datafusion::logical_expr::Operator::And {
-            let left = physical_filter_to_logical_lenient(b.left());
-            let right = physical_filter_to_logical_lenient(b.right());
+            let left = lenient_walk(b.left(), dropped);
+            let right = lenient_walk(b.right(), dropped);
             return match (left, right) {
                 (Some(l), Some(r)) => Some(l.and(r)),
                 (Some(l), None) => Some(l),
@@ -109,7 +146,13 @@ pub fn physical_filter_to_logical_lenient(expr: &Arc<dyn PhysicalExpr>) -> Optio
             };
         }
     }
-    physical_filter_to_logical(expr)
+    match physical_filter_to_logical(expr) {
+        Some(converted) => Some(converted),
+        None => {
+            dropped.push(expr.to_string());
+            None
+        }
+    }
 }
 
 /// Convert a *snapshot* of a dynamic join filter (a `PhysicalExpr`) back into
@@ -457,6 +500,48 @@ mod tests {
         assert_eq!(logical, col("a").gt_eq(lit(3i64)));
         // strict conversion still refuses the same expr
         assert!(physical_filter_to_logical(&both).is_none());
+    }
+
+    /// The dropped conjunct must be REPORTED, not silently swallowed. A
+    /// snapshot that keeps only its bounds looks like a successful push;
+    /// without this the lost membership term shows up nowhere at all
+    /// (issue #415).
+    #[test]
+    fn lenient_conversion_reports_dropped_conjuncts() {
+        use datafusion::physical_expr::expressions::CaseExpr;
+        let s = schema();
+        let ge: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            pcol("a", &s).unwrap(),
+            Operator::GtEq,
+            plit(3i64),
+        ));
+        let opaque: Arc<dyn PhysicalExpr> = Arc::new(
+            CaseExpr::try_new(None, vec![(plit(true), plit(true))], Some(plit(false))).unwrap(),
+        );
+        let both: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(ge, Operator::And, opaque));
+
+        let report = physical_filter_to_logical_reporting(&both);
+        assert_eq!(report.expr, Some(col("a").gt_eq(lit(3i64))));
+        assert_eq!(report.dropped.len(), 1, "the opaque term must be reported");
+        assert!(
+            report.dropped[0].contains("CASE"),
+            "dropped text should name the term: {}",
+            report.dropped[0]
+        );
+    }
+
+    /// A fully unconvertible snapshot reports its one dropped term and
+    /// keeps nothing, so the caller can tell "nothing pushed" from
+    /// "bounds pushed, membership dropped".
+    #[test]
+    fn fully_unconvertible_snapshot_reports_one_drop() {
+        use datafusion::physical_expr::expressions::CaseExpr;
+        let case: Arc<dyn PhysicalExpr> = Arc::new(
+            CaseExpr::try_new(None, vec![(plit(true), plit(1i64))], Some(plit(0i64))).unwrap(),
+        );
+        let report = physical_filter_to_logical_reporting(&case);
+        assert!(report.expr.is_none());
+        assert_eq!(report.dropped.len(), 1);
     }
 
     #[test]

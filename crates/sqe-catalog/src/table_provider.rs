@@ -277,8 +277,14 @@ impl TableProvider for SqeTableProvider {
         // single-threaded hash build that is also fragmented into many tiny
         // round-robin batches. tpcds q72 SF1 regressed 5-6x (~17s -> ~100s)
         // until the wiring was removed; see issue #131 and the 2026-08-15
-        // audit follow-up #414. Default-on waits for a cost gate that keeps
-        // CollectLeft on the build side. `parallel_probe_scan` stays opt-in.
+        // audit follow-up #414.
+        //
+        // The parallelism arrived anyway, from the other end: the coordinator's
+        // `ParallelProbeScanRule` / `ParallelScanRule` bump scan partition counts
+        // AFTER planning, so the join mode is already decided and no build side is
+        // coalesced. Both ship on by default (since 2026-07-08). That is why this
+        // wiring stays off rather than waiting on a cost gate: the cost gate would
+        // have to re-derive a join decision the post-planning rules never disturb.
         //
         // The `with_target_partitions` setter on IcebergScanExec is kept so a
         // follow-up can re-introduce parallel scan once a proper hash-aware
