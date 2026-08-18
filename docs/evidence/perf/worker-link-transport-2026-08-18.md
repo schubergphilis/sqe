@@ -127,3 +127,74 @@ and nothing else.
   `SqePhysicalCodec` has no caller outside its own tests, so hoisting the
   shared fields would be optimizing dead code. Fix it when a real plan-fragment
   path starts using it.
+
+## Follow-on: now that the big membership set CAN cross, should it?
+
+The transport fix makes an obvious next move available: raise
+`runtime_filter_inlist_max_values` so the SF10 SSB partkey membership set
+survives instead of being dropped (#415). Measured, and the answer is no.
+
+Three arms, native two-worker rig, SSB SF10, distribution forced, interleaved,
+all on the fixed binaries. Arm B is only runnable at all because of the fix
+above; before it, q4.1 errored.
+
+| arm | cap | dropped conjuncts | suite mean |
+|---|---|---|---|
+| A | 65,536 (shipped) | 34 | 46,929 ms |
+| B | 1,000,000 | 0 | 54,520 ms (+16.2%) |
+| C | 1,000,000, `distributed_scan_pushdown = false` | 0 | 45,706 ms (-2.6%) |
+
+Per query (means), the cost lands exactly where the membership set is largest:
+
+| q | A | B | C | B-A | C-A |
+|---|---|---|---|---|---|
+| q4.1 | 6,446 | 9,496 | 7,288 | **+3,050** | +842 |
+| q4.2 | 4,322 | 5,840 | 5,006 | **+1,518** | +684 |
+| q2.3 | 4,742 | 5,482 | 3,874 | +739 | -868 |
+| q3.2 | 3,861 | 4,526 | 3,405 | +664 | -456 |
+| q3.3 | 3,854 | 4,422 | 3,404 | +569 | -450 |
+| q1.1 | 2,077 | 1,754 | 2,151 | -323 | +74 |
+
+Arm C is the discriminator: it materializes the same large `InList` on the
+coordinator but ships nothing. C tracks A (slightly better), so **coordinator-side
+materialization is close to free and the +16% is transport plus worker-side
+evaluation**. Raising the cap alone, without pushing, costs nothing.
+
+### The filter works. It just does not pay.
+
+Worker-side counters, scraped from each worker's `/metrics` before teardown,
+because the coordinator's `sqe.scan.*` fields only observe its own local dim
+scans (82 MB / 72 files / 2.4M rows, byte-identical in every arm) and say
+nothing about the workers:
+
+| arm | worker rows scanned | worker bytes read |
+|---|---|---|
+| A (34 dropped) | 6,968,724 | 110,378,809,632 |
+| B (0 dropped) | 5,100,172 (**-26.8%**) | 110,378,809,632 (identical) |
+
+So the membership set does prune: a quarter of the rows the workers would
+otherwise emit. And it prunes **rows only, never bytes** - the fetch and decode
+volume is identical to the byte, because a runtime `InList` arrives as a
+`RowFilter` after the row groups have already been chosen. Paying full I/O and
+full decode to emit 27% fewer rows, while evaluating a ~200K-value `InList`
+rebuilt per `FileScanTask`, is a net loss of 16%.
+
+### What this means for #415
+
+The issue's premise inverts. The dropped `hash_lookup` conjunct is not a missed
+optimization worth transporting; transporting it, exactly and correctly, makes
+SF10 SSB slower. Two things have to be true together for it to pay, and a bloom
+only delivers the first:
+
+1. cheap to represent and evaluate (a bloom: ~150 KB instead of 4.2 MB, and a
+   few hashes per row instead of a rebuilt InList), and
+2. able to prune at **row-group** level so bytes fall, not just rows - which is
+   #369's runtime-filter-to-bloom probe, not this issue.
+
+The prior #369 attempt regressed TPC-H SF10 q21 from 16s to 24s by unioning
+CASE-of-InLists into one uncapped non-pruning `RowFilter`, which is the same
+failure mode measured here from the other direction. The lever is bytes.
+
+Corollary worth keeping: the shipped cap of 65,536 is doing the right thing at
+SF10, and `dynamic_filter_conjuncts_dropped` being non-zero is not by itself a
+problem to fix.
