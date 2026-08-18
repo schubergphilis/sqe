@@ -85,6 +85,14 @@ size is the tell: 9,145,356 / 3,145,728 = 2.907, so the ticket carried a
 predicate sitting exactly on the old 3 MiB raw budget. The guard passed it, and
 the wire expanded it past the ceiling. That is the miscalibration, measured.
 
+**Which of the three changes actually fixed it.** Not the encoded-ticket guard:
+`ticket_predicate_dropped_oversize` is 0, so it never fired. base64 took the
+same predicate from 9,145,356 bytes to about 4.2 MB, and 3,145,728 * 4/3 =
+4,194,304 exactly, so base64 alone lands the predicate ON tonic's old 4 MiB
+default and the rest of the ticket puts it over. The raised ceiling is
+load-bearing here too. The guard is insurance that has not yet fired in a real
+run, and it should be described that way.
+
 The suite total went **up**, and the reason is not a regression: q4.1 went from
 erroring at 606 ms to running for 6,352 ms, which is +5.75 s of the +5.83 s
 total. Every other query is flat inside rep-to-rep noise. A failed query costs
