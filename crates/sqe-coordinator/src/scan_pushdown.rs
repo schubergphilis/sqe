@@ -119,6 +119,38 @@ pub struct LenientConversion {
     pub dropped: Vec<String>,
 }
 
+/// Ceiling on the serialized predicate inside ONE `ScanTask` ticket.
+///
+/// A ticket rides one gRPC message and tonic's default decode limit is 4 MiB,
+/// which SQE never raises (there is no `max_decoding_message_size` anywhere in
+/// the tree). 3 MiB leaves headroom for the rest of the ticket (file paths,
+/// schema, projection, credentials).
+pub const MAX_PUSHED_PREDICATE_BYTES: usize = 3 * 1024 * 1024;
+
+/// What happened when a combined predicate was serialized for a `ScanTask`.
+#[derive(Debug)]
+pub enum PushedPredicate {
+    /// Serialized and within the ticket budget.
+    Fits(Vec<u8>),
+    /// Serialized but too large to cross in one gRPC message. Pushing is an
+    /// optimization, so the caller ships the pre-push predicate instead of
+    /// handing the worker a ticket it will refuse to decode.
+    TooLarge(usize),
+    /// `datafusion-proto` could not encode the expression at all.
+    Failed(String),
+}
+
+/// Serialize a predicate for a `ScanTask`, refusing one that cannot fit.
+pub fn serialize_pushed_predicate(expr: &Expr) -> PushedPredicate {
+    match expr.to_bytes() {
+        Ok(bytes) if bytes.len() > MAX_PUSHED_PREDICATE_BYTES => {
+            PushedPredicate::TooLarge(bytes.len())
+        }
+        Ok(bytes) => PushedPredicate::Fits(bytes.to_vec()),
+        Err(e) => PushedPredicate::Failed(e.to_string()),
+    }
+}
+
 /// [`physical_filter_to_logical_lenient`] plus a record of what it dropped.
 pub fn physical_filter_to_logical_reporting(expr: &Arc<dyn PhysicalExpr>) -> LenientConversion {
     let mut dropped = Vec::new();
@@ -542,6 +574,42 @@ mod tests {
         let report = physical_filter_to_logical_reporting(&case);
         assert!(report.expr.is_none());
         assert_eq!(report.dropped.len(), 1);
+    }
+
+    /// A predicate too big to cross in one gRPC message must be REFUSED, not
+    /// handed to a worker that answers "decoded message length too large" and
+    /// fails the fragment. Measured on 2026-08-18: SF10 SSB with the InList cap
+    /// raised produced 9.1 MB messages against tonic's 4 MiB default.
+    #[test]
+    fn oversized_predicate_is_refused_not_pushed() {
+        // ~500K i64 literals serializes well past the 3 MiB budget.
+        let big: Vec<Expr> = (0..500_000i64).map(lit).collect();
+        let expr = col("b").in_list(big, false);
+        match serialize_pushed_predicate(&expr) {
+            PushedPredicate::TooLarge(len) => {
+                assert!(
+                    len > MAX_PUSHED_PREDICATE_BYTES,
+                    "reported length {len} must exceed the budget"
+                );
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    /// The common case still rides: a small predicate serializes and fits.
+    #[test]
+    fn small_predicate_fits_the_ticket_budget() {
+        let expr = col("a").gt_eq(lit(3i64)).and(col("a").lt_eq(lit(17i64)));
+        match serialize_pushed_predicate(&expr) {
+            PushedPredicate::Fits(bytes) => {
+                assert!(!bytes.is_empty());
+                assert!(bytes.len() <= MAX_PUSHED_PREDICATE_BYTES);
+                // and it round-trips, so the worker can rebuild it
+                let back = Expr::from_bytes(&bytes).expect("roundtrip");
+                assert_eq!(back, expr);
+            }
+            other => panic!("expected Fits, got {other:?}"),
+        }
     }
 
     #[test]
