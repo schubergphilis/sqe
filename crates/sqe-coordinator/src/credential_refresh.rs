@@ -300,6 +300,12 @@ async fn push_credentials_to_worker_inner(
                 .await?
         }
     };
+    // Deliberately left on tonic's default decode ceiling, unlike the scan
+    // client in `distributed_scan.rs` (#432). A `refresh_credentials` action
+    // carries a small credential blob and its `ActionResult` is smaller still,
+    // so neither direction approaches 4 MiB. The pooled path still picks up the
+    // configured HTTP/2 windows; only this fallback `Endpoint` does not, and it
+    // pushes no bulk data either.
     let mut client = FlightServiceClient::new(channel);
 
     let action = Action {
