@@ -52,6 +52,17 @@ const WORKER_SECRET_HEADER: &str = "x-sqe-worker-secret";
 /// (file paths, credentials, predicate, and limit included).
 const SCAN_SIGNATURE_HEADER: &str = "x-sqe-scan-signature";
 
+// The ticket-predicate budget lives in `scan_pushdown`
+// (`MAX_PUSHED_PREDICATE_BYTES`), next to the serialization it guards.
+//
+// Scope, honestly: it bounds ONE ticket's predicate. It does NOT explain the
+// refusals measured on 2026-08-18, where SF10 SSB with
+// `runtime_filter_inlist_max_values = 1000000` had workers reject 9.1 MB
+// messages ("decoded message length too large") while this guard never fired,
+// so that oversized message is aggregated somewhere else on the wire (#432). The
+// shipped 65536-value cap does not reach it: the same rig at the default is
+// 13/13 with zero refusals.
+
 /// Compute the HMAC-SHA256 tag (lowercase hex) over `bytes` keyed by `secret`.
 ///
 /// Returns `None` when `secret` is empty: an empty key means the deployment
@@ -431,6 +442,16 @@ impl ExecutionPlan for DistributedScanExec {
         let pushed_down_filters = self.pushed_down_filters.clone();
         let dynamic_filters_pushed =
             MetricBuilder::new(&self.metrics).counter("dynamic_filters_pushed", partition);
+        // Conjuncts of a dynamic filter snapshot that had no logical form and
+        // were therefore NOT pushed to the worker (issue #415). Non-zero means
+        // the worker's predicate is wider than the coordinator's join filter:
+        // correct results, more rows over Flight than necessary.
+        let dynamic_filter_conjuncts_dropped = MetricBuilder::new(&self.metrics)
+            .counter("dynamic_filter_conjuncts_dropped", partition);
+        // Fragments that had a convertible dynamic filter but could not carry it
+        // because the serialized predicate would not fit in one gRPC message.
+        let predicate_too_large =
+            MetricBuilder::new(&self.metrics).counter("dynamic_filter_predicate_too_large", partition);
         let initial_worker_url = self.worker_urls[partition].clone();
         let schema = self.schema.clone();
         let schema_for_stream = self.schema.clone();
@@ -524,13 +545,26 @@ impl ExecutionPlan for DistributedScanExec {
                     if crate::scan_pushdown::is_trivially_true(&resolved) {
                         continue;
                     }
-                    match crate::scan_pushdown::physical_filter_to_logical_lenient(&resolved) {
-                        Some(logical) => snapshots.push(logical),
-                        None => tracing::debug!(
+                    // Report what the conversion had to leave behind. A
+                    // snapshot that keeps only its min/max bounds and drops
+                    // the `hash_lookup` membership term still counts as a
+                    // successful push, so without this the lost selectivity
+                    // is invisible -- the case issue #415 is about.
+                    let report =
+                        crate::scan_pushdown::physical_filter_to_logical_reporting(&resolved);
+                    if !report.dropped.is_empty() {
+                        dynamic_filter_conjuncts_dropped.add(report.dropped.len());
+                        tracing::debug!(
                             fragment_id = %task.fragment_id,
                             filter = %resolved,
-                            "dynamic filter snapshot not convertible to a logical Expr; skipping"
-                        ),
+                            dropped = ?report.dropped,
+                            kept = report.expr.is_some(),
+                            "dynamic filter conjunct(s) had no logical form; \
+                             worker predicate is wider than the join filter"
+                        );
+                    }
+                    if let Some(logical) = report.expr {
+                        snapshots.push(logical);
                     }
                 }
                 if !snapshots.is_empty() {
@@ -544,9 +578,30 @@ impl ExecutionPlan for DistributedScanExec {
                         .chain(snapshots)
                         .reduce(|a, b| a.and(b))
                     {
-                        match combined.to_bytes() {
-                            Ok(bytes) => {
-                                task.predicate_proto = Some(bytes.to_vec());
+                        match crate::scan_pushdown::serialize_pushed_predicate(&combined) {
+                            crate::scan_pushdown::PushedPredicate::TooLarge(len) => {
+                                // A ScanTask ticket rides one gRPC message, and
+                                // tonic's default decode limit is 4 MiB, which SQE
+                                // does not raise. A large InList membership set
+                                // (raise `runtime_filter_inlist_max_size` and SF10
+                                // SSB partkey gets there) therefore does not make
+                                // the query slower, it makes the worker refuse the
+                                // ticket: "decoded message length too large". The
+                                // push is an optimization, so drop it and keep the
+                                // pre-push predicate; the coordinator's filter is
+                                // authoritative either way.
+                                predicate_too_large.add(1);
+                                warn!(
+                                    fragment_id = %task.fragment_id,
+                                    bytes = len,
+                                    budget = crate::scan_pushdown::MAX_PUSHED_PREDICATE_BYTES,
+                                    dynamic_filters = snapshot_count,
+                                    "dynamic filter predicate exceeds the ticket budget; \
+                                     shipping without it"
+                                );
+                            }
+                            crate::scan_pushdown::PushedPredicate::Fits(bytes) => {
+                                task.predicate_proto = Some(bytes);
                                 dynamic_filters_pushed.add(snapshot_count);
                                 info!(
                                     fragment_id = %task.fragment_id,
@@ -554,7 +609,7 @@ impl ExecutionPlan for DistributedScanExec {
                                     "ANDed dynamic join filter snapshots into worker predicate"
                                 );
                             }
-                            Err(e) => warn!(
+                            crate::scan_pushdown::PushedPredicate::Failed(e) => warn!(
                                 fragment_id = %task.fragment_id,
                                 error = %e,
                                 "failed to serialize dynamic filter snapshot; shipping unfiltered"

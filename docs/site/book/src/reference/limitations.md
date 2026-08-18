@@ -95,7 +95,7 @@ Hash joins are not spillable upstream (DataFusion #17267). SQE rewrites a hash j
 
 Parallel I/O already happens inside a scan (prefetch, manifest concurrency). The plan still advertises a single output partition so broadcast / CollectLeft joins stay cheap. Wiring `target_partitions` to the DataFusion default flipped joins to CollectLeft and regressed TPC-DS q72 5-6x (issue #414, related #87 / #131).
 
-`parallel_probe_scan` exists and stays **opt-in**. It helps SSB-style scan-bound shapes and costs TPC-DS about +26% at SF1. Default-on waits for a cost gate that keeps CollectLeft on the build side. Leave the flag off unless you have measured the workload.
+`parallel_probe_scan` and `parallel_scan` ship **on**, and have since 2026-07-08. Both work around the single-partition scan with a post-planning optimizer rule instead of wiring `target_partitions`, so a `CollectLeft` build side is never coalesced and the q72 regression cannot recur. The earlier "+26% on TPC-DS at SF1" figure does not reproduce: a four-arm A/B at SF1 puts the suite total at +4.0%, inside a 5% noise floor, with the cost concentrated in about eight window/rollup queries (q67 +45%, q30 +79%, q31, q22, q29, q47) and wins elsewhere (TPC-H q12 -19%). The two flags also overlap rather than complement: with both on, the probe rule takes the scans first and `parallel_scan` fires twice instead of 26 times. Turn `parallel_probe_scan` off for a TPC-DS-shaped workload of small window and rollup queries; leave it on otherwise. The SF1 A/B that measured this is recorded in the repo under `docs/evidence/perf/`.
 
 ### TPC-BB wall time is mostly q01
 
