@@ -1738,6 +1738,17 @@ mod tests {
         let big: Vec<datafusion::logical_expr::Expr> =
             (0..1_000i64).map(lit).collect();
         let predicate = physical(col("a").in_list(big, false), &schema);
+
+        // Assert on conjunct SELECTION, not just on the outcome: DataFusion
+        // declines to prune a large InList usefully anyway, so an
+        // outcome-only assertion passes with the cap removed and pins nothing.
+        let mut conjuncts = Vec::new();
+        row_group_prune::stats_prunable_conjuncts(&predicate, &mut conjuncts);
+        assert!(
+            conjuncts.is_empty(),
+            "a 1000-value InList must be excluded from the pruning predicate"
+        );
+
         assert!(
             row_group_prune::prune_row_groups(
                 &metadata,
@@ -1747,7 +1758,7 @@ mod tests {
                 "s3://b/f.parquet",
             )
             .is_none(),
-            "a 1000-value InList must not drive min/max pruning"
+            "and it must not drive min/max pruning"
         );
     }
 
