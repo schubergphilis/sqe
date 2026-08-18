@@ -258,13 +258,40 @@ The AWS `run.sh` scripts do not yet support `--check`; the `scenario-test-aws` j
 
 ## CI
 
+Every suite that needs a compose stack runs **locally**, not in CI. The jobs that
+used to run them (`integration-test`, `distributed-smoke`, `scenario-test`,
+`access-control-test`) all required a privileged `docker:dind` sidecar, and the
+sidecar never passed its health check on the shared runners. None of them ever
+executed a line of engine code there.
+
+Keeping them as non-blocking jobs was worse than removing them. A permanently
+yellow job reads as coverage when there is none, and two real breakages on the
+default branch hid behind exactly that. `scenario-test` was worse again: it sat in
+the `test` stage, so its failure skipped the container build and publish jobs
+behind it.
+
+| Suite | Local command |
+|---|---|
+| Engine integration | `make test-integration` (`FILTER=name` for one test) |
+| Distributed dispatch | `make test-distributed` |
+| Quickstart scenarios | `scripts/test.sh scenario all` (11 self-contained) |
+| Distributed scenario | `scripts/test.sh scenario distributed` |
+| Access control | `make test-access-control` |
+| Access control via Spark | `make test-access-control-spark` |
+
+Run the ones your change touches before merging. `make test-integration` brings up
+its own Polaris and RustFS stack, preflights the fixed host ports, and names any
+container already holding one.
+
+One CI job still stands up a stack:
+
 | Job | Tier | Runs | When |
 |---|---|---|---|
-| `integration-test` | Tier 1 | `scripts/integration-test.sh` | Scheduled pipelines, merge-to-main push; manual (non-blocking) on MR pipelines |
-| `scenario-test` | Tier 2 | `scripts/test.sh scenario all` (11 self-contained) | Scheduled pipelines and merge-to-main push (on changes to `quickstart/`, `crates/`, `scripts/test.sh`, or compose files); manual (non-blocking) on matching MR pipelines |
 | `scenario-test-aws` | Tier 2 (cloud) | the three AWS quickstart `run.sh` flows | Manual only; gated on `RUN_AWS_SCENARIOS=1` and AWS credentials, never automatic |
 
-All three jobs run docker-in-docker (a `docker:24-dind` sidecar) so each can stand up its own compose stack. `scenario-test` skips the heavy `distributed` scenario; run it on demand with `scripts/test.sh scenario distributed`. The AWS scenarios cost real money against a real account, which is why they are manual and credential-gated.
+The AWS scenarios cost real money against a real account, which is why they are
+manual and credential-gated. Restoring any of the removed jobs needs a runner with
+a working dind sidecar, or a shell runner with a mounted docker socket.
 
 ## Benchmark testing
 
