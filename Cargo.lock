@@ -6690,6 +6690,7 @@ dependencies = [
  "arrow",
  "arrow-array",
  "arrow-schema",
+ "base64 0.23.1",
  "datafusion",
  "futures",
  "serde",

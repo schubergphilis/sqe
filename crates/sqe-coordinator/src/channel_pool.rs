@@ -12,14 +12,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
+use sqe_core::config::GrpcTransportConfig;
 use tokio::sync::Mutex;
 use tonic::transport::{Channel, Endpoint};
+
+use crate::transport::apply_grpc_transport_endpoint;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ChannelPoolConfig {
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
     pub keep_alive: Option<Duration>,
+    /// HTTP/2 receive windows for the pooled channel. tonic leaves both at
+    /// h2's 65,535-byte default, which caps each worker's scan stream at
+    /// `window / RTT`. See `transport::apply_grpc_transport_endpoint`.
+    pub transport: GrpcTransportConfig,
 }
 
 impl Default for ChannelPoolConfig {
@@ -28,6 +35,7 @@ impl Default for ChannelPoolConfig {
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(30),
             keep_alive: Some(Duration::from_secs(30)),
+            transport: GrpcTransportConfig::default(),
         }
     }
 }
@@ -64,10 +72,15 @@ impl ChannelPool {
     /// freshly-connected channels share one budget. Without this, a pooled
     /// channel would be killed at the 30s default even on a deployment that
     /// configured a longer rpc timeout (COORD-05 / #237).
-    pub fn shared_with_timeouts(connect_timeout: Duration, request_timeout: Duration) -> Arc<Self> {
+    pub fn shared_with_timeouts(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        transport: &GrpcTransportConfig,
+    ) -> Arc<Self> {
         Arc::new(Self::new(ChannelPoolConfig {
             connect_timeout,
             request_timeout,
+            transport: *transport,
             ..ChannelPoolConfig::default()
         }))
     }
@@ -89,9 +102,12 @@ impl ChannelPool {
             return Ok(ch.clone());
         }
 
-        let mut endpoint = Endpoint::new(url.to_string())?
-            .connect_timeout(self.config.connect_timeout)
-            .timeout(self.config.request_timeout);
+        let mut endpoint = apply_grpc_transport_endpoint(
+            Endpoint::new(url.to_string())?,
+            &self.config.transport,
+        )
+        .connect_timeout(self.config.connect_timeout)
+        .timeout(self.config.request_timeout);
         if let Some(ka) = self.config.keep_alive {
             endpoint = endpoint
                 .keep_alive_timeout(ka)
@@ -135,11 +151,50 @@ mod tests {
     }
 
     #[test]
+    fn pool_windows_are_never_tonic_defaults() {
+        // h2 falls back to 65,535 bytes when tonic is handed `None`, which
+        // caps a worker's scan stream at window/RTT. Both the shipped default
+        // and an explicitly configured transport must clear that by orders of
+        // magnitude; a regression here is invisible on loopback.
+        const H2_DEFAULT_WINDOW: u32 = 65_535;
+
+        let shipped = ChannelPoolConfig::default().transport;
+        assert!(
+            shipped.initial_stream_window_size > H2_DEFAULT_WINDOW * 16,
+            "stream window {} is at or near h2's default",
+            shipped.initial_stream_window_size
+        );
+        assert!(
+            shipped.initial_connection_window_size >= shipped.initial_stream_window_size,
+            "connection window must not be tighter than one stream's"
+        );
+
+        let configured = GrpcTransportConfig {
+            initial_stream_window_size: 4 * 1024 * 1024,
+            initial_connection_window_size: 12 * 1024 * 1024,
+            ..GrpcTransportConfig::default()
+        };
+        let pool = ChannelPool::shared_with_timeouts(
+            Duration::from_secs(7),
+            Duration::from_secs(630),
+            &configured,
+        );
+        assert_eq!(pool.config.transport.initial_stream_window_size, 4 * 1024 * 1024);
+        assert_eq!(
+            pool.config.transport.initial_connection_window_size,
+            12 * 1024 * 1024
+        );
+    }
+
+    #[test]
     fn shared_with_timeouts_carries_configured_request_timeout() {
         // A deployment configures a 630s rpc timeout; the pooled-channel
         // request_timeout must follow it, not fall back to the 30s default.
-        let pool =
-            ChannelPool::shared_with_timeouts(Duration::from_secs(7), Duration::from_secs(630));
+        let pool = ChannelPool::shared_with_timeouts(
+            Duration::from_secs(7),
+            Duration::from_secs(630),
+            &GrpcTransportConfig::default(),
+        );
         assert_eq!(pool.config.request_timeout, Duration::from_secs(630));
         assert_eq!(pool.config.connect_timeout, Duration::from_secs(7));
         assert_ne!(

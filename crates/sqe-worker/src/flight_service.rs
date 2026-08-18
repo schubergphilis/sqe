@@ -881,8 +881,16 @@ impl WorkerFlightService {
         ))
     }
 
-    pub fn into_server(self) -> FlightServiceServer<Self> {
-        FlightServiceServer::new(self)
+    /// Wrap this service in a tonic server with an explicit inbound message
+    /// ceiling (#432).
+    ///
+    /// tonic's 4 MiB receive default silently caps how large a scan ticket may
+    /// be, and a ticket carrying a pushed runtime-filter predicate over a few
+    /// hundred thousand distinct keys clears it. The coordinator refuses to
+    /// send an oversized ticket in the first place, so this is the second of
+    /// two guards, not the only one.
+    pub fn into_server(self, max_decoding_message_bytes: usize) -> FlightServiceServer<Self> {
+        FlightServiceServer::new(self).max_decoding_message_size(max_decoding_message_bytes)
     }
 }
 
