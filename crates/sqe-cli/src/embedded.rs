@@ -420,6 +420,15 @@ pub struct EmbeddedClient {
     /// database and table name, not the root, so two roots' manifests
     /// never collide in it.
     hive_manifest_cache: Arc<sqe_catalog::hive::provider::HiveMetadataCache>,
+    /// Every Hive root attached in this process, by the catalog name it was
+    /// registered under. `attach_hive_root` populates this at the same time
+    /// it registers the provider with DataFusion; DDL that needs to reach
+    /// the manifest store directly (`CREATE EXTERNAL TABLE`, `DROP TABLE`,
+    /// `SHOW CREATE TABLE`) resolves through here rather than downcasting
+    /// the `Arc<dyn CatalogProvider>` DataFusion holds. Also doubles as the
+    /// answer to "is `spec.catalog` a Hive root at all": a name absent from
+    /// this map is either not attached or is some other kind of catalog.
+    hive_roots: HashMap<String, Arc<sqe_catalog::hive::provider::HiveCatalogProvider>>,
 }
 
 impl EmbeddedClient {
@@ -435,6 +444,7 @@ impl EmbeddedClient {
             secrets: SecretStore::new(),
             attached_catalogs: HashMap::new(),
             hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
+            hive_roots: HashMap::new(),
         })
     }
 
@@ -454,6 +464,7 @@ impl EmbeddedClient {
             secrets: SecretStore::new(),
             attached_catalogs: HashMap::new(),
             hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
+            hive_roots: HashMap::new(),
         })
     }
 
@@ -475,6 +486,7 @@ impl EmbeddedClient {
             secrets: SecretStore::new(),
             attached_catalogs: HashMap::new(),
             hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
+            hive_roots: HashMap::new(),
         })
     }
 
@@ -530,6 +542,10 @@ impl EmbeddedClient {
             self.hive_manifest_cache.clone(),
             std::time::Duration::from_secs(60),
         );
+        // Tracked separately from `ctx.register_catalog` (which only wants
+        // the trait object) so DDL can reach `HiveCatalogProvider::store()`
+        // and `invalidate_table_names()` directly instead of downcasting.
+        self.hive_roots.insert(name.to_string(), provider.clone());
         self.ctx.register_catalog(name.to_string(), provider);
         Ok(())
     }
@@ -557,6 +573,35 @@ impl SqlClient for EmbeddedClient {
                 }
                 sqe_sql::StatementKind::ShowSecrets => {
                     return self.embedded_handle_show_secrets();
+                }
+                sqe_sql::StatementKind::CreateExternalTable(spec) => {
+                    return self.embedded_handle_create_external_table(&spec).await;
+                }
+                // DROP TABLE / SHOW CREATE TABLE are NOT SQE-specific syntax
+                // (DataFusion parses both natively), so unlike the arms
+                // above these only intercept when the target is a Hive
+                // root; anything else falls through to the existing path a
+                // few lines down, unchanged. That existing path is real for
+                // non-Hive tables: `ctx.sql("DROP TABLE ...")` reaches
+                // `IcebergSchemaProvider::deregister_table`, which really
+                // calls `catalog.drop_table` (`vendor/iceberg-rust/.../
+                // schema.rs`). It would be a silent no-op for a Hive table
+                // though: `HiveSchemaProvider` inherits the default
+                // `SchemaProvider::deregister_table`, which just returns
+                // `Ok(None)` without touching the manifest, so a Hive DROP
+                // TABLE must be handled here instead of being allowed to
+                // fall through.
+                sqe_sql::StatementKind::Drop(ref stmt) => {
+                    if let Some(result) = self.embedded_handle_drop_hive_table(stmt).await? {
+                        return Ok(result);
+                    }
+                }
+                sqe_sql::StatementKind::ShowCreateTable(ref stmt) => {
+                    if let Some(result) =
+                        self.embedded_handle_show_create_hive_table(stmt).await?
+                    {
+                        return Ok(result);
+                    }
                 }
                 _ => {}
             }
@@ -699,6 +744,164 @@ impl EmbeddedClient {
                 .collect(),
         })
     }
+
+    /// `CREATE EXTERNAL TABLE` in embedded mode: write `spec`'s sidecar
+    /// manifest into the resolved Hive root's warehouse.
+    ///
+    /// There is no "current" Hive root a session falls back to (unlike a
+    /// DataFusion default catalog/schema), so `spec.catalog` must name an
+    /// attached root explicitly; a 1- or 2-part table name errors rather
+    /// than guessing.
+    async fn embedded_handle_create_external_table(
+        &mut self,
+        spec: &sqe_sql::hive_ddl::HiveTableSpec,
+    ) -> Result<QueryResult, Box<dyn std::error::Error>> {
+        let catalog_name = spec.catalog.as_deref().ok_or_else(
+            || -> Box<dyn std::error::Error> {
+                "CREATE EXTERNAL TABLE needs a catalog-qualified name in embedded mode \
+                 (e.g. `lake.sales.orders`); there is no \"current\" Hive root to fall \
+                 back to"
+                    .into()
+            },
+        )?;
+        let provider = self
+            .hive_roots
+            .get(catalog_name)
+            .cloned()
+            .ok_or_else(|| -> Box<dyn std::error::Error> {
+                format!(
+                    "hive root '{catalog_name}' is not attached; attach it with \
+                     --hive-root {catalog_name}=<url> (or ATTACH ... TYPE hive_external) \
+                     before creating tables in it"
+                )
+                .into()
+            })?;
+
+        // "default", not a value read back from the session config: every
+        // `WarehouseMode` in `build_embedded_context` hardcodes
+        // "default"/"default", so there is no other schema this could ever
+        // resolve to.
+        let database = spec
+            .database
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+
+        let owner = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "embedded".to_string());
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let manifest = sqe_catalog::hive::manifest::HiveManifest::from_spec(
+            spec,
+            &database,
+            &owner,
+            &created_at,
+        );
+
+        provider.store().put(&manifest, spec.if_not_exists).await?;
+        // So a `SHOW TABLES` (or a plan that calls `table_exist`) issued
+        // right after sees the new table instead of a stale listing cached
+        // for up to `cache_ttl` (60s in `attach_hive_root`).
+        provider.invalidate_table_names(&database);
+
+        Ok(QueryResult {
+            columns: vec![],
+            rows: vec![],
+        })
+    }
+
+    /// `DROP TABLE` against a Hive root: delete the manifest, never the
+    /// data. `Ok(None)` means "not a Hive drop" (no catalog qualifier, an
+    /// unattached or non-Hive catalog, or more than one name), so the
+    /// caller falls through to DataFusion's own drop path unchanged.
+    ///
+    /// That fall-through path is real, not inert, for a non-Hive table:
+    /// `ctx.sql("DROP TABLE ...")` reaches
+    /// `IcebergSchemaProvider::deregister_table`
+    /// (`vendor/iceberg-rust/crates/integrations/datafusion/src/schema.rs`),
+    /// which calls `catalog.drop_table` and genuinely drops it. It would be
+    /// a silent no-op for a Hive table, though: `HiveSchemaProvider`
+    /// inherits DataFusion's default `deregister_table`, which just returns
+    /// `Ok(None)` without touching the manifest. That is exactly why a Hive
+    /// drop must be intercepted here rather than allowed to fall through.
+    async fn embedded_handle_drop_hive_table(
+        &mut self,
+        stmt: &sqlparser::ast::Statement,
+    ) -> Result<Option<QueryResult>, Box<dyn std::error::Error>> {
+        let sqlparser::ast::Statement::Drop {
+            names,
+            if_exists,
+            purge,
+            ..
+        } = stmt
+        else {
+            return Ok(None);
+        };
+        // Only a single, 3-part name resolving to an attached Hive root is
+        // handled here. `DROP TABLE a, b` naming a Hive table alongside
+        // anything else has no single manifest to delete, so it is left to
+        // fall through rather than silently handling only the first name.
+        let [name] = names.as_slice() else {
+            return Ok(None);
+        };
+        let parts = object_name_parts(name);
+        let [catalog, database, table] = parts.as_slice() else {
+            return Ok(None);
+        };
+        let Some(provider) = self.hive_roots.get(catalog).cloned() else {
+            return Ok(None);
+        };
+
+        if *purge {
+            return Err(format!(
+                "DROP TABLE ... PURGE is not supported for Hive external tables \
+                 ({database}.{table}): PURGE deletes the underlying data, which an \
+                 external table's DROP never does"
+            )
+            .into());
+        }
+
+        match provider.store().delete(database, table).await {
+            Ok(()) => {}
+            Err(sqe_catalog::hive::HiveError::NotFound(_)) if *if_exists => {}
+            Err(e) => return Err(e.into()),
+        }
+        provider.invalidate_table_names(database);
+
+        Ok(Some(QueryResult {
+            columns: vec![],
+            rows: vec![],
+        }))
+    }
+
+    /// `SHOW CREATE TABLE` against a Hive root: render Athena/Glue-style DDL
+    /// from the manifest. `Ok(None)` means "not a Hive table", so the
+    /// caller falls through to whatever embedded mode already does for
+    /// other tables (today, DataFusion has no native `SHOW CREATE TABLE`;
+    /// unrelated to this task).
+    async fn embedded_handle_show_create_hive_table(
+        &mut self,
+        stmt: &sqlparser::ast::Statement,
+    ) -> Result<Option<QueryResult>, Box<dyn std::error::Error>> {
+        let sqlparser::ast::Statement::ShowCreate { obj_name, .. } = stmt else {
+            return Ok(None);
+        };
+        let parts = object_name_parts(obj_name);
+        let [catalog, database, table] = parts.as_slice() else {
+            return Ok(None);
+        };
+        let Some(provider) = self.hive_roots.get(catalog).cloned() else {
+            return Ok(None);
+        };
+
+        let manifest = provider.store().get(database, table).await?;
+        let spec = hive_spec_from_manifest(catalog, &manifest);
+        let ddl = render_hive_create_table_ddl(&spec);
+
+        Ok(Some(QueryResult {
+            columns: vec!["Create Table".to_string()],
+            rows: vec![vec![ddl]],
+        }))
+    }
 }
 
 /// Render a sequence of [`RecordBatch`]es into the CLI's column-name +
@@ -729,6 +932,150 @@ fn record_batches_to_query_result(
         }
     }
     QueryResult { columns, rows }
+}
+
+/// Lowercase an unquoted identifier, preserve a quoted one. Mirrors the
+/// private `ident_text` in `sqe_sql::hive_ddl` (issue #337 folding), which
+/// this module cannot call directly since it is not exported; kept
+/// consistent so a `DROP TABLE`/`SHOW CREATE TABLE` reference folds the same
+/// way the `CREATE EXTERNAL TABLE` for the same object did.
+fn ident_text(i: &sqlparser::ast::Ident) -> String {
+    match i.quote_style {
+        Some(_) => i.value.clone(),
+        None => i.value.to_ascii_lowercase(),
+    }
+}
+
+/// The dotted parts of an object name, folded via [`ident_text`].
+fn object_name_parts(name: &sqlparser::ast::ObjectName) -> Vec<String> {
+    name.0
+        .iter()
+        .filter_map(|p| p.as_ident().map(ident_text))
+        .collect()
+}
+
+/// The inverse of `HiveManifest::from_spec`: rebuild a `HiveTableSpec` from
+/// a stored manifest, so `SHOW CREATE TABLE` renders DDL through the same
+/// `HiveTableSpec -> text` path a `CREATE EXTERNAL TABLE` statement went
+/// through instead of a bespoke, independently-drifting formatter.
+///
+/// Two fields cannot round-trip because the manifest never carried them:
+/// `if_not_exists` is a creation-time modifier, not part of the table
+/// definition, so it is always `false` here. `stored_as` is discarded by
+/// `from_spec` in favor of the derived Hadoop `input_format`/`output_format`
+/// classes, so this always leaves it `None` and carries the classes
+/// explicitly instead; `render_hive_create_table_ddl` renders that as
+/// `STORED AS INPUTFORMAT '...' OUTPUTFORMAT '...'`, which is also what real
+/// Hive's own `SHOW CREATE TABLE` normalizes a `STORED AS
+/// TEXTFILE`/`PARQUET`/... keyword into.
+fn hive_spec_from_manifest(
+    catalog: &str,
+    m: &sqe_catalog::hive::manifest::HiveManifest,
+) -> sqe_sql::hive_ddl::HiveTableSpec {
+    let glue_to_hive = |c: &sqe_catalog::hive::manifest::GlueColumn| sqe_sql::hive_ddl::HiveColumn {
+        name: c.name.clone(),
+        sql_type: c.r#type.clone(),
+        comment: c.comment.clone(),
+    };
+    sqe_sql::hive_ddl::HiveTableSpec {
+        catalog: Some(catalog.to_string()),
+        database: Some(m.database_name.clone()),
+        name: m.name.clone(),
+        if_not_exists: false,
+        comment: m.description.clone(),
+        columns: m.storage_descriptor.columns.iter().map(glue_to_hive).collect(),
+        partition_keys: m.partition_keys.iter().map(glue_to_hive).collect(),
+        location: m.storage_descriptor.location.clone(),
+        serde_class: m.storage_descriptor.serde_info.serialization_library.clone(),
+        serde_properties: m.storage_descriptor.serde_info.parameters.clone(),
+        stored_as: None,
+        input_format: m.storage_descriptor.input_format.clone(),
+        output_format: m.storage_descriptor.output_format.clone(),
+        table_properties: m.parameters.clone(),
+    }
+}
+
+/// Render `spec` as Athena/Glue-compatible `CREATE EXTERNAL TABLE` DDL.
+///
+/// Round-trip contract: `sqe_sql::hive_ddl::try_extract_hive_table` on the
+/// output must produce a `HiveTableSpec` equal to `spec`. Pinned by the
+/// embedded test `show_create_table_renders_athena_compatible_ddl`.
+fn render_hive_create_table_ddl(spec: &sqe_sql::hive_ddl::HiveTableSpec) -> String {
+    let table_ref = match (&spec.catalog, &spec.database) {
+        (Some(c), Some(d)) => format!("{c}.{d}.{}", spec.name),
+        (None, Some(d)) => format!("{d}.{}", spec.name),
+        _ => spec.name.clone(),
+    };
+
+    let mut out = format!("CREATE EXTERNAL TABLE {table_ref} (\n");
+    let cols: Vec<String> = spec
+        .columns
+        .iter()
+        .map(|c| format!("   {} {}", c.name, c.sql_type))
+        .collect();
+    out.push_str(&cols.join(",\n"));
+    out.push_str("\n)");
+
+    if !spec.partition_keys.is_empty() {
+        let pk: Vec<String> = spec
+            .partition_keys
+            .iter()
+            .map(|c| format!("{} {}", c.name, c.sql_type))
+            .collect();
+        out.push_str(&format!("\nPARTITIONED BY ({})", pk.join(", ")));
+    }
+
+    if let Some(class) = &spec.serde_class {
+        out.push_str(&format!("\nROW FORMAT SERDE '{}'", sql_quote(class)));
+        if !spec.serde_properties.is_empty() {
+            out.push_str(&format!(
+                "\nWITH SERDEPROPERTIES ({})",
+                render_props(&spec.serde_properties)
+            ));
+        }
+    }
+
+    if let (Some(i), Some(o)) = (&spec.input_format, &spec.output_format) {
+        out.push_str(&format!(
+            "\nSTORED AS INPUTFORMAT '{}' OUTPUTFORMAT '{}'",
+            sql_quote(i),
+            sql_quote(o)
+        ));
+    }
+
+    out.push_str(&format!("\nLOCATION '{}'", sql_quote(&spec.location)));
+
+    if !spec.table_properties.is_empty() {
+        out.push_str(&format!(
+            "\nTBLPROPERTIES ({})",
+            render_props(&spec.table_properties)
+        ));
+    }
+
+    out
+}
+
+/// `'k' = 'v'` pairs, comma-joined, for `WITH SERDEPROPERTIES (...)` and
+/// `TBLPROPERTIES (...)`. `BTreeMap` iteration is already deterministically
+/// ordered, which only matters here for a stable rendering across calls;
+/// the parsed-back `BTreeMap` is unordered-equal regardless.
+fn render_props(props: &std::collections::BTreeMap<String, String>) -> String {
+    props
+        .iter()
+        .map(|(k, v)| format!("'{}' = '{}'", sql_quote(k), sql_quote(v)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Escape a value for a single-quoted SQL string literal by doubling any
+/// embedded quote. The values rendered here (Hadoop class names,
+/// delimiters, property keys/values, file paths) never contain a backslash
+/// that would need `hive_ddl::decode_hive_escape`-style handling in
+/// practice; if one ever did, re-parsing would pass it through unchanged
+/// rather than misinterpreting it, since that function only recognizes a
+/// fixed, short list of escape sequences and leaves everything else alone.
+fn sql_quote(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 #[cfg(test)]
@@ -1483,6 +1830,259 @@ mod tests {
         assert!(
             msg.contains("guarded"),
             "error should name the catalog: {msg}"
+        );
+    }
+
+    /// Build an embedded client with a Hive root on a temp dir holding a
+    /// partitioned CSV tree (two partitions, three rows total). No manifest
+    /// is written here; each test creates the table itself via `CREATE
+    /// EXTERNAL TABLE`. Files are literally named `a.csv` so
+    /// `drop_removes_the_manifest_and_leaves_the_data` can assert on a
+    /// stable path. Returns the client and the temp dir, whose `data` and
+    /// `wh` subdirectories are the fixture's data and warehouse roots.
+    async fn client_with_hive_root() -> (EmbeddedClient, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        for (dt, rows) in [
+            ("2026-01-01", "1,10.5\n2,20.0\n"),
+            ("2026-01-02", "3,30.5\n"),
+        ] {
+            let partition = data.join(format!("dt={dt}"));
+            std::fs::create_dir_all(&partition).expect("mkdir partition");
+            std::fs::write(partition.join("a.csv"), format!("id,amount\n{rows}"))
+                .expect("write csv");
+        }
+        let client = client_over_root(dir.path()).await;
+        (client, dir)
+    }
+
+    /// A fresh `EmbeddedClient` with `lake` attached at `<root_dir>/wh`, the
+    /// same warehouse-root convention `client_with_hive_root` uses. Shares
+    /// no state with any other client returned by this function: a new
+    /// `SessionContext`, a new process-local `HiveMetadataCache`, and a new
+    /// `HiveManifestStore` handle, all independently pointed at the same
+    /// on-disk root.
+    async fn client_over_root(root_dir: &std::path::Path) -> EmbeddedClient {
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
+        client
+            .attach_hive_root("lake", &format!("file://{}/wh", root_dir.display()))
+            .await
+            .expect("attach hive root");
+        client
+    }
+
+    #[tokio::test]
+    async fn create_external_table_then_select_round_trips_in_embedded_mode() {
+        let (mut c, dir) = client_with_hive_root().await;
+        let data = dir.path().join("data");
+        let sql = format!(
+            "CREATE EXTERNAL TABLE lake.sales.orders (id BIGINT, amount DOUBLE) \
+             PARTITIONED BY (dt string) \
+             ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE \
+             LOCATION 'file://{}' \
+             TBLPROPERTIES ('skip.header.line.count' = '1')",
+            data.display()
+        );
+        c.execute(&sql).await.expect("create");
+        let r = c
+            .execute("SELECT count(*) AS n FROM lake.sales.orders")
+            .await
+            .expect("select");
+        assert!(format!("{r:?}").contains('3'), "expected 3 rows, got {r:?}");
+    }
+
+    #[tokio::test]
+    async fn the_definition_survives_a_new_client_because_it_is_in_the_root() {
+        let (mut c, dir) = client_with_hive_root().await;
+        let data = dir.path().join("data");
+        c.execute(&format!(
+            "CREATE EXTERNAL TABLE lake.sales.orders (id BIGINT, amount DOUBLE) \
+             PARTITIONED BY (dt string) \
+             ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE \
+             LOCATION 'file://{}' \
+             TBLPROPERTIES ('skip.header.line.count' = '1')",
+            data.display()
+        ))
+        .await
+        .expect("create");
+
+        // A fresh client over the same root, which is the whole point of the
+        // sidecar manifest: no shared process state, no metastore.
+        let mut c2 = client_over_root(dir.path()).await;
+        let r = c2
+            .execute("SELECT count(*) AS n FROM lake.sales.orders")
+            .await
+            .expect("select");
+        assert!(
+            format!("{r:?}").contains('3'),
+            "definition did not survive: {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_removes_the_manifest_and_leaves_the_data() {
+        let (mut c, dir) = client_with_hive_root().await;
+        let data = dir.path().join("data");
+        c.execute(&format!(
+            "CREATE EXTERNAL TABLE lake.sales.orders (id BIGINT) \
+             ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE \
+             LOCATION 'file://{}'",
+            data.display()
+        ))
+        .await
+        .expect("create");
+        c.execute("DROP TABLE lake.sales.orders")
+            .await
+            .expect("drop");
+        assert!(
+            c.execute("SELECT 1 FROM lake.sales.orders").await.is_err(),
+            "table should be gone"
+        );
+        assert!(
+            data.join("dt=2026-01-01/a.csv").exists(),
+            "DROP TABLE must never delete data"
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_table_purge_is_rejected_by_name() {
+        // Not in the original brief; added because "PURGE is rejected"
+        // (Step 3 of the task brief) had no test pinning it.
+        let (mut c, dir) = client_with_hive_root().await;
+        let data = dir.path().join("data");
+        c.execute(&format!(
+            "CREATE EXTERNAL TABLE lake.sales.orders (id BIGINT) \
+             ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE \
+             LOCATION 'file://{}'",
+            data.display()
+        ))
+        .await
+        .expect("create");
+
+        let err = c
+            .execute("DROP TABLE lake.sales.orders PURGE")
+            .await
+            .expect_err("PURGE must be rejected");
+        assert!(
+            format!("{err}").contains("PURGE"),
+            "error should name PURGE: {err}"
+        );
+        assert!(
+            dir.path().join("wh/sales/orders/_sqe/table.json").exists(),
+            "a rejected PURGE must not drop the manifest as a side effect"
+        );
+    }
+
+    #[tokio::test]
+    async fn show_create_table_renders_athena_compatible_ddl() {
+        let (mut c, dir) = client_with_hive_root().await;
+        let data = dir.path().join("data");
+        c.execute(&format!(
+            "CREATE EXTERNAL TABLE lake.sales.orders (id BIGINT, amount DOUBLE) \
+             PARTITIONED BY (dt string) \
+             ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE \
+             LOCATION 'file://{}'",
+            data.display()
+        ))
+        .await
+        .expect("create");
+
+        let r = c
+            .execute("SHOW CREATE TABLE lake.sales.orders")
+            .await
+            .expect("show");
+        assert_eq!(r.rows.len(), 1, "expected exactly one DDL row: {r:?}");
+        let ddl = r.rows[0][0].clone();
+        for needle in ["CREATE EXTERNAL TABLE", "PARTITIONED BY", "LOCATION"] {
+            assert!(ddl.contains(needle), "missing {needle} in: {ddl}");
+        }
+
+        // Round trip, read against the manifest by its literal on-disk path
+        // (not by rebuilding a `HiveManifestStore`, which would only prove
+        // the renderer agrees with itself): the rendered DDL must re-parse
+        // to a spec equal to what the manifest on disk actually holds.
+        let manifest_bytes =
+            std::fs::read(dir.path().join("wh/sales/orders/_sqe/table.json"))
+                .expect("read manifest from disk");
+        let manifest: sqe_catalog::hive::manifest::HiveManifest =
+            serde_json::from_slice(&manifest_bytes).expect("parse manifest json");
+        let expected = hive_spec_from_manifest("lake", &manifest);
+
+        let stmts =
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, &ddl)
+                .expect("rendered DDL must parse");
+        let reparsed = sqe_sql::hive_ddl::try_extract_hive_table(&stmts[0])
+            .expect("rendered DDL must extract")
+            .expect("rendered DDL must still be CREATE EXTERNAL TABLE");
+
+        assert_eq!(reparsed, expected, "SHOW CREATE TABLE did not round-trip");
+
+        // Literal anchors independent of `assert_eq!` above: a bug shared
+        // between the renderer and `hive_spec_from_manifest` (e.g. both
+        // silently dropping partition_keys) would satisfy that assertion
+        // without actually rendering the real definition.
+        assert_eq!(
+            reparsed
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "amount"]
+        );
+        assert_eq!(
+            reparsed
+                .partition_keys
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dt"]
+        );
+        assert_eq!(reparsed.location, format!("file://{}", data.display()));
+    }
+
+    #[tokio::test]
+    async fn create_external_table_as_select_fails_at_the_parser_not_at_our_handler() {
+        // sqlparser dispatches `CREATE EXTERNAL TABLE` to its own
+        // `parse_create_external_table`, which has no `AS`/`parse_query`
+        // path in any dialect: `ct.query` is unconditionally `None`
+        // whenever `ct.external` is true. The rejection this test pins
+        // happens at the parser boundary, first in
+        // `sqe_sql::parse_and_classify` (which then fails the whole `if
+        // let Ok(kind) = ...` in `execute`), then again in DataFusion's own
+        // parser once the SQL falls through to `ctx.sql()`, not in any
+        // handler this task adds. No code in this task can ever see this
+        // shape.
+        let (mut c, dir) = client_with_hive_root().await;
+        let err = c
+            .execute(&format!(
+                "CREATE EXTERNAL TABLE lake.sales.t \
+                 ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE \
+                 LOCATION 'file://{}' AS SELECT 1",
+                dir.path().display()
+            ))
+            .await
+            .expect_err("must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("AS") || msg.to_lowercase().contains("parse"),
+            "expected a parser-level rejection, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn creating_a_table_in_a_root_that_is_not_attached_names_the_missing_root() {
+        let (mut c, _dir) = client_with_hive_root().await;
+        let err = c
+            .execute(
+                "CREATE EXTERNAL TABLE nosuch.sales.t (id INT) \
+                 ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE \
+                 LOCATION 'file:///tmp/'",
+            )
+            .await
+            .expect_err("must reject");
+        assert!(
+            format!("{err}").contains("nosuch"),
+            "should name the root: {err}"
         );
     }
 }

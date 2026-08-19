@@ -31,7 +31,12 @@ const KNOWN_SQE_PROPERTIES: &[&str] = &["sqe.secret"];
 
 /// A backend-neutral column: sqlparser's `ColumnDef` boiled down to the
 /// three facts that matter for a Hive-style external table.
-#[derive(Debug)]
+///
+/// `PartialEq` is derived for the embedded-mode `SHOW CREATE TABLE`
+/// round-trip check: the rendered DDL is re-parsed through
+/// `try_extract_hive_table` and the resulting spec compared for equality
+/// against the spec it was rendered from.
+#[derive(Debug, PartialEq)]
 pub struct HiveColumn {
     pub name: String,
     pub sql_type: String,
@@ -40,7 +45,11 @@ pub struct HiveColumn {
 
 /// Neutral extraction of an Athena/Glue `CREATE EXTERNAL TABLE`, independent
 /// of both sqlparser's AST shape and any DataFusion/object-store type.
-#[derive(Debug)]
+///
+/// `PartialEq` is derived for the same reason as on [`HiveColumn`]: the
+/// embedded-mode `SHOW CREATE TABLE` round-trip test needs to assert spec
+/// equality, not a substring match on the rendered DDL text.
+#[derive(Debug, PartialEq)]
 pub struct HiveTableSpec {
     pub catalog: Option<String>,
     pub database: Option<String>,
