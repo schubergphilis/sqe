@@ -1,4 +1,5 @@
 use sqe_sql::hive_ddl::{secret_name, try_extract_hive_table};
+use sqe_sql::{parse_and_classify, CatalogKind, StatementKind};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
@@ -203,4 +204,29 @@ fn map_nested_type_is_rejected_by_the_parser_not_this_module() {
         result.is_err(),
         "expected a parse error for MAP<...> under GenericDialect, got: {result:?}"
     );
+}
+
+#[test]
+fn classifier_routes_external_create_away_from_the_iceberg_path() {
+    let kind = parse_and_classify(
+        "CREATE EXTERNAL TABLE lake.sales.orders (id INT) STORED AS PARQUET LOCATION 's3://b/p/'",
+    )
+    .expect("classify");
+    match kind {
+        StatementKind::CreateExternalTable(spec) => assert_eq!(spec.name, "orders"),
+        other => panic!("expected CreateExternalTable, got {other:?}"),
+    }
+}
+
+#[test]
+fn classifier_leaves_plain_create_table_on_the_iceberg_path() {
+    let kind = parse_and_classify("CREATE TABLE t (id INT)").expect("classify");
+    assert!(matches!(kind, StatementKind::CreateTable(_)));
+}
+
+#[test]
+fn hive_external_is_its_own_attach_kind_and_hive_still_means_hms() {
+    assert_eq!(CatalogKind::parse("hive_external"), Some(CatalogKind::HiveExternal));
+    assert_eq!(CatalogKind::parse("hive"), Some(CatalogKind::Hms));
+    assert_eq!(CatalogKind::HiveExternal.name(), "hive_external");
 }

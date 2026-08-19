@@ -68,12 +68,22 @@ pub async fn build_catalog(
         CatalogKind::Hms => build_hms(location, options, secrets).await,
         CatalogKind::Jdbc => build_jdbc(location, options, secrets).await,
         CatalogKind::Hadoop => Err(error_not_yet("hadoop")),
+        // `hive_external` roots hold plain files, not Iceberg table
+        // metadata, so `build_catalog` (an `iceberg::Catalog` factory) is
+        // the wrong dispatch for it. The classifier routes
+        // `CREATE EXTERNAL TABLE` and `ATTACH ... TYPE hive_external`
+        // to their own handler instead of reaching here.
+        CatalogKind::HiveExternal => Err(error_dispatched_elsewhere("hive_external")),
     };
     result.map_err(|e| format!("ATTACH (TYPE {}) failed: {e}", kind.name()))
 }
 
 fn error_not_yet(kind: &str) -> String {
     format!("TYPE {kind} not yet supported in this build")
+}
+
+fn error_dispatched_elsewhere(kind: &str) -> String {
+    format!("TYPE {kind} is not an Iceberg catalog and is dispatched separately")
 }
 
 // ---------------------------------------------------------------------------
