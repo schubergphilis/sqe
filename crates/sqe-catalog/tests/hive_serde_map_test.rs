@@ -134,6 +134,18 @@ fn hive_scalar_types_map_to_arrow() {
     );
 }
 
+// Team-lead ruling: erroring on a bare `decimal` (no precision or scale) is
+// the safer-looking choice and the wrong one, since Hive and Athena both
+// default it to decimal(10,0) and Athena parity is the point of this
+// feature.
+#[test]
+fn a_bare_decimal_with_no_precision_defaults_to_hives_ten_zero() {
+    assert_eq!(
+        arrow_type("decimal").expect("bare decimal"),
+        DataType::Decimal128(10, 0)
+    );
+}
+
 // The tests above only exercise `resolve_format`, which stops at a
 // `ResolvedFormat` value. Nothing yet called `listing_options`, so the three
 // requirements the brief calls highest-risk (`collect_stat` off, an empty
