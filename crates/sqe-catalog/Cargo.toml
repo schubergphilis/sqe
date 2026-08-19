@@ -93,10 +93,11 @@ s3tables = [
 # Hive-style external tables (Athena/Glue CREATE EXTERNAL TABLE over CSV,
 # line-delimited JSON, and Parquet) with definitions in a sidecar manifest.
 # Distinct from `hms`, which is Hive Metastore holding Iceberg tables. Adds no
-# new dependencies: the readers are already compiled for the file TVFs.
-# `thiserror` is already in the workspace lockfile for other crates, but this
-# is the first `dep:`-gated use of it in sqe-catalog, kept optional so a
-# build without this feature does not add the edge.
+# new crates to the workspace: the readers are already compiled for the file
+# TVFs, and `thiserror` is already in the workspace lockfile for other
+# crates. It does add sqe-catalog's own first direct edge to `thiserror`,
+# kept optional and `dep:`-gated behind this feature (for its `HiveError`
+# type) so a build without the feature does not add the edge.
 hive-external = ["dep:thiserror"]
 # Delta Lake read support (delta-rs) is REMOVED for the DataFusion 54 bump.
 # deltalake-core 0.32.1 targets DataFusion 53.1, so its `DeltaTableProvider`
