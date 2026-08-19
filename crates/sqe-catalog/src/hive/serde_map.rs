@@ -185,9 +185,18 @@ fn single_byte(props: &BTreeMap<String, String>, keys: &[&str]) -> Result<Option
     let byte = match bytes {
         [b] => *b,
         _ => {
+            // Names the byte length, not just "must be one byte", because
+            // the most likely real-world cause is an octal escape above
+            // \177 (a delimiter byte 128-255): `sqe_sql::hive_ddl` decodes
+            // that correctly, but it needs two bytes to encode as UTF-8, and
+            // `serde_properties` is a `BTreeMap<String, String>`, not
+            // `Vec<u8>`. Without naming that, the error reads like a parser
+            // bug rather than the real constraint it is.
             return Err(HiveError::Validation(format!(
-                "{key} = `{value}` must be exactly one byte"
-            )))
+                "{key} = `{value}` is {} bytes, not one: a delimiter byte above 127 is not \
+                 supported here because this property is stored as UTF-8 text, not raw bytes",
+                bytes.len()
+            )));
         }
     };
     Ok(Some(byte))
