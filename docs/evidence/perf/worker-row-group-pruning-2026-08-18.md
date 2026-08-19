@@ -184,6 +184,61 @@ Two things follow. The change carries no risk at SF1 because it does not
 engage. And "validated beyond SSB" is NOT established: validating on TPC-H needs
 TPC-H at SF10, which is not loaded.
 
+### TPC-H at SF10: loaded, measured, and the pruning still never fires
+
+The gap above ("validated beyond SSB is not established") is now closed, and the
+answer narrows the claim further. TPC-H SF10 loaded, distribution forced, one
+binary via the kill switch, interleaved:
+
+| arm | suite (ms) | rows scanned | pruning events |
+|---|---|---|---|
+| OFF | 106,484 / 94,516 | 419,271,505 | 0 |
+| ON | 97,648 | 419,271,505 | **0** |
+
+**Zero pruning events on TPC-H SF10**, so the -8% that arm shows is noise, the
+same trap as the SF1 numbers above. Rows scanned are identical to the row.
+
+It is not that predicates fail to arrive: the coordinator pushed **89** dynamic
+filters with **0** conjuncts dropped. Pruning is evaluated on every file and
+prunes nothing. That is the mechanism worth keeping:
+
+**Row-group min/max pruning pays only when the pushed bounds are narrow relative
+to the data's physical clustering.** TPC-H's pushed filters are join-key bounds
+(orderkey, partkey, suppkey) whose [min, max] spans nearly the whole key domain,
+so no row group can be excluded. SSB's are `lo_orderdate` bounds, and the fact
+table is written in date order, so 61 of 71 pruning events eliminate a fragment
+outright. Same code, same scale, opposite outcome, decided by clustering.
+
+The coordinator already encodes this insight for its own tier-1 path as the
+`runtime_filter_clustering_skip` gate (#132), which skips registration when the
+data is uniform on the filter columns. The worker needs no such gate because the
+inert path costs sub-3ms per file and returns without touching the selection.
+
+So the honest scope of !879: **-12.5% on SSB SF10, inert on TPC-H SF10 and on
+both suites at SF1, with no measurable cost when inert.**
+
+### Two apparent ON-arm regressions, both from a suspended host
+
+One tpcds SF1 arm returned 97/99 with q38 and q54 at exactly 60,00x ms, and one
+tpch SF10 arm returned 21/22 with q22 failing after 2 ms. Both were the LAST arm
+of their script, and both are rig artifacts of the most mundane kind:
+
+| tpch SF10 arm | started | gap |
+|---|---|---|
+| OFF-1 | 18:54:43 | |
+| ON-1 | 18:56:33 | 110 s |
+| OFF-2 | 18:58:18 | 105 s |
+| ON-2 (the failure) | 20:07:17 | **4,139 s** |
+
+Three arms 105-110 s apart, then a 69-minute gap: the host went idle between
+them, and the arm that resumed did so on stale sockets. That also explains the
+101 `TCP_NODELAY: Invalid argument` warnings and the repeated `BrokenPipe`.
+
+The clincher is that `pruning_fired = 0` in both failing arms. The flag under
+test changed nothing observable in the very runs that failed, so it cannot be
+the cause. **A long unattended A/B on a laptop needs its inter-arm timestamps
+checked before any arm is read as a regression.**
+
 ### A 60-second timeout that was not this change
 
 One tpcds SF1 arm came back 97/99 with q38 and q54 erroring at exactly 60,002 ms
