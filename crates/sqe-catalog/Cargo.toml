@@ -19,12 +19,12 @@ repository.workspace = true
 # Tables SDK); hadoop adds ~0 (no new deps); sql-postgres ~5-10 MB; hms
 # ~10-15 MB; glue ~50-80 MB (aws-sdk-glue is the heavyweight); s3tables
 # adds ~5-10 MB on top of glue's AWS SDK runtime.
-default = ["rest", "rest-sigv4"]
+default = ["rest", "rest-sigv4", "hive-external"]
 # Umbrella for the legacy default: every supported backend compiled in.
 # Use when packaging an image that needs to dispatch to Polaris, Glue,
 # S3 Tables, Hive Metastore, Hadoop warehouses, and Postgres-backed SQL
 # catalogs.
-full-backends = ["rest", "rest-sigv4", "sql-postgres", "hms", "glue", "hadoop", "s3tables"]
+full-backends = ["rest", "rest-sigv4", "sql-postgres", "hms", "glue", "hadoop", "s3tables", "hive-external"]
 # REST catalog (the protocol Polaris and Nessie both speak). Activating
 # the feature pulls in `iceberg-catalog-rest`, compiles the
 # `rest_catalog` module, and registers the loader's REST builder.
@@ -90,6 +90,11 @@ s3tables = [
     "dep:aws-credential-types",
     "rest-sigv4",
 ]
+# Hive-style external tables (Athena/Glue CREATE EXTERNAL TABLE over CSV,
+# line-delimited JSON, and Parquet) with definitions in a sidecar manifest.
+# Distinct from `hms`, which is Hive Metastore holding Iceberg tables. Adds no
+# new dependencies: the readers are already compiled for the file TVFs.
+hive-external = []
 # Delta Lake read support (delta-rs) is REMOVED for the DataFusion 54 bump.
 # deltalake-core 0.32.1 targets DataFusion 53.1, so its `DeltaTableProvider`
 # implements an older DataFusion's `TableProvider` trait and will not satisfy
@@ -103,6 +108,7 @@ sqe-core = { path = "../sqe-core" }
 sqe-sql = { path = "../sqe-sql" }
 sqe-policy = { path = "../sqe-policy" }
 sqe-metrics = { path = "../sqe-metrics" }
+thiserror = { workspace = true }
 datafusion = { workspace = true }
 datafusion-expr = { workspace = true }
 object_store = { workspace = true }
@@ -175,6 +181,7 @@ aws-credential-types = { version = "1.3", optional = true }
 [dev-dependencies]
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
+sqlparser = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing-subscriber = { workspace = true }
