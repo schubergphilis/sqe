@@ -113,12 +113,52 @@ pub async fn partitioned_csv_root_with_renamed_column() -> Fixture {
 }
 
 /// Same shape plus a `__HIVE_DEFAULT_PARTITION__` directory, which Hive writes
-/// for a NULL partition value.
+/// for a NULL partition value. Two rows in that partition, not one: a
+/// `GROUP BY dt` over a single default-partition row would fold into "one
+/// group" whether or not the sentinel-to-NULL conversion worked at all, so
+/// proving the fold requires at least two sentinel-valued rows that must
+/// land in the same NULL group, alongside the two other partitions' rows
+/// staying in their own groups.
 pub async fn root_with_default_partition() -> Fixture {
     let f = partitioned_csv_root().await;
     let data_path = f.dir.path().join("data");
-    write_partition(&data_path, "__HIVE_DEFAULT_PARTITION__", "4,40.5\n");
+    write_partition(&data_path, "__HIVE_DEFAULT_PARTITION__", "4,40.5\n5,45.0\n");
     f
+}
+
+/// A manifest that loads successfully (passes `HiveManifest::parse` and the
+/// `[storage.tvf]` location check) but names a `ROW FORMAT SERDE` class
+/// `resolve_format` does not recognize, so `HiveSchemaProvider::table` fails
+/// AFTER `store.get()` returns the manifest, not before. Used to exercise
+/// the failure-path half of "cache before build": a test that only checks
+/// cache state before and after a successful `ctx.sql(...)` cannot tell
+/// "insert before the fallible steps" apart from "insert as the last
+/// statement before `Ok`", since both look identical when nothing fails.
+pub async fn root_with_unsupported_serde() -> Fixture {
+    let dir = tempfile::tempdir().expect("tmp");
+    let data_path = dir.path().join("data");
+    std::fs::create_dir_all(&data_path).expect("mkdir data");
+    write_partition(&data_path, "2026-01-01", "1,10.5\n");
+
+    let root = format!("file://{}/wh", dir.path().display());
+    let data = format!("file://{}", data_path.display());
+    let ddl = format!(
+        "CREATE EXTERNAL TABLE sales.orders (id BIGINT, amount DOUBLE) \
+         PARTITIONED BY (dt string) \
+         ROW FORMAT SERDE 'com.example.NotARealSerde' \
+         STORED AS TEXTFILE LOCATION '{data}'"
+    );
+    let stmts = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, &ddl)
+        .expect("parse");
+    let spec = sqe_sql::hive_ddl::try_extract_hive_table(&stmts[0])
+        .expect("extract")
+        .expect("external");
+    let m = HiveManifest::from_spec(&spec, "sales", "test", "2026-08-19T00:00:00Z");
+    local_store(&root)
+        .put(&m, false)
+        .await
+        .expect("put manifest");
+    Fixture { dir, root }
 }
 
 /// Register the root as catalog `lake` and return the provider so a test can

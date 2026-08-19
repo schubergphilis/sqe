@@ -670,6 +670,14 @@ impl SchemaProvider for HiveSchemaProvider {
         // this call returns. If the insert moved below the table build and
         // the build failed partway, a later retry could rewrite against an
         // empty cache and deny rather than mask.
+        //
+        // `a_failed_table_build_still_leaves_the_manifest_cached` (see
+        // hive_provider_test.rs) pins this ordering: moving this insert to
+        // just before the final `Ok` return, as a mutation check, makes that
+        // test fail while leaving every happy-path test (including
+        // `loading_a_table_populates_the_metadata_cache_before_returning`)
+        // green, which is exactly why the happy-path test alone was not
+        // enough.
         self.cache.insert(&self.database, name, manifest.clone());
 
         let resolved = resolve_format(&manifest).map_err(to_df)?;
