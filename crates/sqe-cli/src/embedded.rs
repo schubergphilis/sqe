@@ -557,8 +557,8 @@ impl SqlClient for EmbeddedClient {
         // Intercept ATTACH / DETACH / CREATE SECRET / DROP SECRET / SHOW SECRETS
         // before DataFusion's parser sees the SQL — these are SQE-specific
         // syntax extensions that DataFusion has no AST for.
-        if let Ok(kind) = sqe_sql::parse_and_classify(sql) {
-            match kind {
+        match sqe_sql::parse_and_classify(sql) {
+            Ok(kind) => match kind {
                 sqe_sql::StatementKind::Attach(stmt) => {
                     return self.embedded_handle_attach(&stmt).await;
                 }
@@ -585,12 +585,21 @@ impl SqlClient for EmbeddedClient {
                 // non-Hive tables: `ctx.sql("DROP TABLE ...")` reaches
                 // `IcebergSchemaProvider::deregister_table`, which really
                 // calls `catalog.drop_table` (`vendor/iceberg-rust/.../
-                // schema.rs`). It would be a silent no-op for a Hive table
-                // though: `HiveSchemaProvider` inherits the default
-                // `SchemaProvider::deregister_table`, which just returns
-                // `Ok(None)` without touching the manifest, so a Hive DROP
-                // TABLE must be handled here instead of being allowed to
-                // fall through.
+                // schema.rs`). For a Hive table it would not be a silent
+                // no-op, but it would still be wrong: `HiveSchemaProvider`
+                // inherits the default `SchemaProvider::deregister_table`,
+                // and DataFusion 54.1's default for that is a loud
+                // `exec_err!("schema provider does not support
+                // deregistering tables")`, not `Ok(None)`. `SessionContext::
+                // drop_table` then discards that error and reports
+                // `Table '{name}' doesn't exist.` instead (`if_exists` is
+                // false, so the match falls to its generic arm), which is a
+                // real table given a false, misleading error rather than
+                // ever actually being dropped. That is why a Hive drop must
+                // be handled here instead of being allowed to fall through:
+                // not to prevent a silent success, but to make DROP TABLE
+                // work at all for a Hive table instead of always failing
+                // with the wrong reason.
                 sqe_sql::StatementKind::Drop(ref stmt) => {
                     if let Some(result) = self.embedded_handle_drop_hive_table(stmt).await? {
                         return Ok(result);
@@ -604,7 +613,27 @@ impl SqlClient for EmbeddedClient {
                     }
                 }
                 _ => {}
+            },
+            // Our own classifier rejected this statement with a specific,
+            // useful reason (e.g. `hive_ddl::column_of`'s "nested type ...
+            // on column ..." naming both). Falling through silently would
+            // hand the SQL to DataFusion's own `CREATE EXTERNAL TABLE`
+            // grammar (a structurally different one, driven by its own
+            // `DFParser`, not this crate's extractor), which either cannot
+            // parse Hive-only clauses at all or, in the narrow case where it
+            // can, fails registration against a Hive schema provider with
+            // "schema provider does not support registering tables" --
+            // correct on its face, but actively misleading about why.
+            // Narrowed on purpose to the one shape this crate actually
+            // classifies: an ordinary statement our classifier cannot parse
+            // for an unrelated reason (a typo, a dialect feature we don't
+            // handle) must keep reaching DataFusion's parser unchanged, not
+            // get reframed as a Hive diagnostic that has nothing to do with
+            // it.
+            Err(e) if looks_like_create_external_table(sql) => {
+                return Err(e.into());
             }
+            Err(_) => {}
         }
 
         // V12: pre-rewrite `'hf://...'` quoted literals to their HTTPS
@@ -932,6 +961,41 @@ fn record_batches_to_query_result(
         }
     }
     QueryResult { columns, rows }
+}
+
+/// True when `sql`, after skipping leading whitespace and SQL comments,
+/// begins with the words `CREATE EXTERNAL TABLE` (case-insensitive, any
+/// amount of whitespace between them). Used only to decide whether a
+/// `sqe_sql::parse_and_classify` failure is "ours" and should be surfaced
+/// directly instead of falling through to DataFusion's own, structurally
+/// different `CREATE EXTERNAL TABLE` grammar. Deliberately the narrowest
+/// check that does the job: a textual prefix match, not a parse attempt,
+/// so a statement this crate cannot classify for any other reason is never
+/// mistaken for one of ours.
+fn looks_like_create_external_table(sql: &str) -> bool {
+    let mut s = sql;
+    loop {
+        let trimmed = s.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("--") {
+            s = rest.split_once('\n').map(|(_, r)| r).unwrap_or("");
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("/*") {
+            s = rest.split_once("*/").map(|(_, r)| r).unwrap_or("");
+            continue;
+        }
+        s = trimmed;
+        break;
+    }
+    let head = s
+        .chars()
+        .take(64)
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase();
+    head.starts_with("CREATE EXTERNAL TABLE")
 }
 
 /// Lowercase an unquoted identifier, preserve a quoted one. Mirrors the
@@ -2083,6 +2147,50 @@ mod tests {
         assert!(
             format!("{err}").contains("nosuch"),
             "should name the root: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_external_table_with_nested_type_surfaces_our_error_not_datafusions() {
+        // The narrowing's whole point: our own extractor already computes
+        // the specific, useful diagnostic (naming the type and the
+        // column). Without the guard this reaches DataFusion's own,
+        // structurally different `CREATE EXTERNAL TABLE` grammar instead,
+        // which either can't parse the shape at all or, if it can (a bare
+        // `STORED AS ... LOCATION ...` with no Hive-only clause), fails
+        // with "schema provider does not support registering tables" --
+        // technically true, actively misleading, and not the reason at all.
+        let mut c = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
+        let err = c
+            .execute(
+                "CREATE EXTERNAL TABLE lake.sales.badtype (tags ARRAY<STRING>) \
+                 STORED AS PARQUET LOCATION 'file:///tmp/does-not-matter'",
+            )
+            .await
+            .expect_err("must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("nested type") && msg.contains("tags"),
+            "expected our own nested-type diagnostic naming the column, got: {msg}"
+        );
+        assert!(
+            !msg.contains("schema provider") && !msg.contains("registering"),
+            "must not be DataFusion's misleading schema-provider error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_unparseable_statement_still_falls_through_to_datafusion() {
+        // The narrowing must not widen into swallowing every classifier
+        // failure: something that isn't shaped like `CREATE EXTERNAL
+        // TABLE` at all must still reach DataFusion's own parser and
+        // surface DataFusion's own error, unchanged.
+        let mut c = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
+        let err = c.execute("SELEC 1").await.expect_err("must reject");
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains("hive_external") && !msg.contains("Hive external table"),
+            "an unrelated parse failure must not be reframed as a Hive diagnostic: {msg}"
         );
     }
 }
