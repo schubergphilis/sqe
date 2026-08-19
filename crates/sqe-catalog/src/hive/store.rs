@@ -186,12 +186,17 @@ impl HiveManifestStore {
     /// List database names one level under the warehouse root.
     ///
     /// A candidate directory only counts as a database if it has at least
-    /// one table with a manifest under it (via [`HiveManifestStore::
-    /// list_tables`]), same principle as `list_tables` not inferring a
-    /// table from a bare directory: the warehouse root can hold things
-    /// other than database directories (a table's own data directory, a
-    /// staging area, ...), and a bare directory listing cannot tell those
-    /// apart from a database.
+    /// one table with a manifest under it, same principle as `list_tables`
+    /// not inferring a table from a bare directory: the warehouse root can
+    /// hold things other than database directories (a table's own data
+    /// directory, a staging area, ...), and a bare directory listing cannot
+    /// tell those apart from a database.
+    ///
+    /// This uses [`HiveManifestStore::has_any_table`] rather than
+    /// `list_tables(..).is_empty()`: `list_databases` only needs one bit per
+    /// candidate ("does this hold at least one table"), not every table
+    /// name, so it stops as soon as it finds the first manifest instead of
+    /// enumerating and `head`-ing every table under every candidate.
     pub async fn list_databases(&self) -> Result<Vec<String>, HiveError> {
         let prefix = self.root.prefix();
         let list_prefix = if prefix.as_ref().is_empty() {
@@ -210,13 +215,38 @@ impl HiveManifestStore {
             let Some(name) = candidate.filename() else {
                 continue;
             };
-            if !self.list_tables(name).await?.is_empty() {
+            if self.has_any_table(name).await? {
                 names.push(name.to_string());
             }
         }
         names.sort();
         names.dedup();
         Ok(names)
+    }
+
+    /// `true` as soon as `database` has at least one table with a manifest
+    /// under it. Stops at the first match rather than enumerating every
+    /// candidate, unlike `list_tables`, which genuinely needs every name.
+    async fn has_any_table(&self, database: &str) -> Result<bool, HiveError> {
+        let db_prefix = self.database_prefix(database);
+        let result = self
+            .store
+            .list_with_delimiter(Some(&db_prefix))
+            .await
+            .map_err(|e| store_err(&db_prefix, e))?;
+
+        for candidate in &result.common_prefixes {
+            let Some(name) = candidate.filename() else {
+                continue;
+            };
+            let manifest_path = self.manifest_path(database, name);
+            match self.store.head(&manifest_path).await {
+                Ok(_) => return Ok(true),
+                Err(object_store::Error::NotFound { .. }) => continue,
+                Err(e) => return Err(store_err(&manifest_path, e)),
+            }
+        }
+        Ok(false)
     }
 
     /// List table names one level under `<root>/<database>` that actually
