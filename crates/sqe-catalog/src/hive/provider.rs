@@ -563,6 +563,31 @@ impl HiveCatalogProvider {
     pub fn manifest_cache(&self) -> Arc<HiveMetadataCache> {
         Arc::clone(&self.manifest_cache)
     }
+
+    /// The shared manifest store backing this catalog. Embedded-mode DDL
+    /// (`CREATE EXTERNAL TABLE` / `DROP TABLE` / `SHOW CREATE TABLE`) writes,
+    /// deletes, and reads manifests directly through this handle rather than
+    /// through a DataFusion `SchemaProvider` method, since none of those
+    /// three statements has a DataFusion-native path that reaches a Hive
+    /// manifest.
+    pub fn store(&self) -> Arc<HiveManifestStore> {
+        Arc::clone(&self.store)
+    }
+
+    /// Drop any cached `table_names()` result for `database`. Call after DDL
+    /// that creates or drops a table so the next `SHOW TABLES` / planning
+    /// lookup sees the change without waiting for the cache TTL. Mirrors
+    /// `SqeSchemaProvider::invalidate_table_names` (`schema_provider.rs`).
+    ///
+    /// `HiveSchemaProvider::table()` itself needs no matching invalidation:
+    /// it calls `store.get()` unconditionally on every lookup (see its own
+    /// doc comment on cache-before-build ordering) rather than reading
+    /// through `manifest_cache` first, so a manifest write or delete is
+    /// visible to the next `table()` call with no cache to invalidate.
+    /// `table_names_cache` is the only stale-listing risk.
+    pub fn invalidate_table_names(&self, database: &str) {
+        self.table_names_cache.invalidate(database);
+    }
 }
 
 impl CatalogProvider for HiveCatalogProvider {
