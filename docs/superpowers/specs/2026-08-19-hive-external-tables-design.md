@@ -318,7 +318,7 @@ One object per table, under the warehouse root. The data lives wherever
   "name": "orders",
   "owner": "jacob",
   "created_at": "2026-08-19T10:00:00Z",
-  "comment": null,
+  "description": null,
   "partition_keys": [ { "name": "dt", "type": "string", "comment": null } ],
   "parameters": {
     "skip.header.line.count": "1",
@@ -350,7 +350,10 @@ One object per table, under the warehouse root. The data lives wherever
 ```
 
 Field names above the `sqe` key mirror Glue's `TableInput` and
-`StorageDescriptor`. A future Glue or HMS backend maps the top level onto
+`StorageDescriptor`, including the asymmetry that the table-level comment is
+`description` (Glue's `Description`) while a column's is `comment` (Glue's
+`Comment`). An earlier draft of this document called the table-level one
+`comment`, which would have broken the mapping this shape exists to enable. A future Glue or HMS backend maps the top level onto
 `TableInput` and the `sqe` block onto Glue table `Parameters`, so no cycle has
 to reshape the format.
 
