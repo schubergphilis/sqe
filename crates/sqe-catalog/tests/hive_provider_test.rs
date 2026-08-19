@@ -1,5 +1,6 @@
 #![cfg(feature = "hive-external")]
 
+use datafusion::arrow::array::Array;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 mod hive_fixture;
@@ -144,6 +145,39 @@ async fn loading_a_table_populates_the_metadata_cache_before_returning() {
 }
 
 #[tokio::test]
+async fn a_failed_table_build_still_leaves_the_manifest_cached() {
+    // The happy-path test above cannot distinguish "insert before the
+    // fallible build steps" from "insert as the last statement before Ok":
+    // both look identical when nothing fails. This is the failure-path half
+    // of that property. `root_with_unsupported_serde` loads a manifest that
+    // `store.get()` accepts (it is well-formed and its location passes the
+    // TVF allowlist) but whose SerDe class `resolve_format` rejects, so
+    // `table()` fails AFTER the manifest is loaded and cached, not before.
+    // If the cache insert in `HiveSchemaProvider::table` ever moved past
+    // `resolve_format` (or any later fallible step), this test would start
+    // failing on the second assertion while the query still correctly
+    // errors on the first, which is exactly the gap a happy-path-only test
+    // cannot see.
+    let f = hive_fixture::root_with_unsupported_serde().await;
+    let ctx = SessionContext::new();
+    let provider = register_hive_root(&ctx, &f).await;
+    assert!(
+        provider.manifest_cache().get("sales", "orders").is_none(),
+        "cold"
+    );
+    let result = ctx.sql("SELECT 1 FROM lake.sales.orders LIMIT 1").await;
+    assert!(
+        result.is_err(),
+        "an unsupported SerDe class must fail table resolution: {result:?}"
+    );
+    assert!(
+        provider.manifest_cache().get("sales", "orders").is_some(),
+        "the manifest must still be cached even though table() errored \
+         after loading it, not before"
+    );
+}
+
+#[tokio::test]
 async fn hive_default_partition_reads_as_null() {
     let f = hive_fixture::root_with_default_partition().await;
     let ctx = SessionContext::new();
@@ -155,12 +189,18 @@ async fn hive_default_partition_reads_as_null() {
         .collect()
         .await
         .expect("collect");
-    let text = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
-        .expect("fmt")
-        .to_string();
-    assert!(
-        text.contains('1'),
-        "__HIVE_DEFAULT_PARTITION__ must read as NULL: {text}"
+    let n = batches
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .expect("count(*) always returns a row")
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .expect("count(*) is Int64")
+        .value(0);
+    assert_eq!(
+        n, 2,
+        "both __HIVE_DEFAULT_PARTITION__ rows must read as NULL"
     );
 }
 
@@ -195,30 +235,65 @@ async fn selecting_the_default_partition_column_returns_null_not_the_sentinel() 
 
 #[tokio::test]
 async fn grouping_by_the_default_partition_column_folds_into_one_null_group() {
-    // Same point from the aggregation side: if the sentinel were still a
-    // string at the value level, GROUP BY would bucket it separately from
-    // genuine NULLs instead of folding into the same NULL group.
+    // No WHERE filter: the fixture has two rows in `dt=2026-01-01`, one in
+    // `dt=2026-01-02`, and two in the default partition. Grouping a single
+    // default-partition row would fold into "one group" whether or not the
+    // sentinel-to-NULL conversion worked at all (grouping one row by any key
+    // is trivially one group); this needs two sentinel-valued rows that must
+    // fold together, alongside two other groups that must stay separate, and
+    // it checks all of that at the array level, not by pretty-printed text.
     let f = hive_fixture::root_with_default_partition().await;
     let ctx = SessionContext::new();
     register_hive_root(&ctx, &f).await;
     let batches = ctx
-        .sql("SELECT dt, count(*) AS n FROM lake.sales.orders WHERE dt IS NULL GROUP BY dt")
+        .sql("SELECT dt, count(*) AS n FROM lake.sales.orders GROUP BY dt")
         .await
         .expect("plan")
         .collect()
         .await
         .expect("collect");
-    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+    let mut null_group_count: Option<i64> = None;
+    let mut other_group_counts: Vec<i64> = Vec::new();
+    for batch in &batches {
+        let dt = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .expect("dt is Utf8");
+        let n = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .expect("count(*) is Int64");
+        for row in 0..batch.num_rows() {
+            if dt.is_null(row) {
+                assert!(
+                    null_group_count.is_none(),
+                    "must be exactly one NULL group, found a second"
+                );
+                null_group_count = Some(n.value(row));
+            } else {
+                assert_ne!(
+                    dt.value(row),
+                    "__HIVE_DEFAULT_PARTITION__",
+                    "no group key must be the literal sentinel"
+                );
+                other_group_counts.push(n.value(row));
+            }
+        }
+    }
+
     assert_eq!(
-        rows, 1,
-        "exactly one NULL group, not a second string-keyed group"
+        null_group_count,
+        Some(2),
+        "both default-partition rows must fold into the one NULL group"
     );
-    let text = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
-        .expect("fmt")
-        .to_string();
-    assert!(
-        !text.contains("__HIVE_DEFAULT_PARTITION__"),
-        "the group key must not be the literal sentinel: {text}"
+    other_group_counts.sort_unstable();
+    assert_eq!(
+        other_group_counts,
+        vec![1, 2],
+        "the two real dt values must remain their own separate groups"
     );
 }
 
