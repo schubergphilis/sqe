@@ -129,10 +129,24 @@ pub struct HiveManifest {
     pub sqe: SqeExtensions,
 }
 
-/// `TEXTFILE`/`PARQUET` etc. as given by `STORED AS`, lowered onto the Hadoop
-/// input/output format classes Hive itself would use. Only engaged when the
-/// spec gave `stored_as` but not an explicit `INPUTFORMAT`/`OUTPUTFORMAT`
-/// pair.
+/// `TEXTFILE`/`PARQUET`/etc. as given by `STORED AS`, lowered onto the real
+/// Hadoop input/output format classes Hive itself records for that keyword
+/// (verified against Hive's own `SHOW CREATE TABLE` output). Only engaged
+/// when the spec gave `stored_as` but not an explicit
+/// `INPUTFORMAT`/`OUTPUTFORMAT` pair.
+///
+/// Every standard keyword is covered, not just the two formats this release
+/// can read: an ORC or Avro table that fell through this match as `(None,
+/// None)` would forget its own format the moment it round-tripped through
+/// the manifest, which breaks the promise that a later Glue or HMS backend
+/// is a field mapping rather than a redesign. `kind_from_input_format` in
+/// `serde_map.rs` is what actually restricts cycle 1 to csv/json/parquet; it
+/// rejects every other class by the name recorded here, so a table stored as
+/// ORC gets a message naming `OrcInputFormat`, not a class this code made up.
+///
+/// `_ => (None, None)` is kept for a keyword this function does not
+/// recognize at all, so an unknown future keyword still fails loudly
+/// downstream instead of being silently renamed into a known class.
 fn formats_from_stored_as(stored_as: &str) -> (Option<String>, Option<String>) {
     match stored_as.to_ascii_uppercase().as_str() {
         "TEXTFILE" => (
@@ -143,7 +157,50 @@ fn formats_from_stored_as(stored_as: &str) -> (Option<String>, Option<String>) {
             Some("org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat".to_string()),
             Some("org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat".to_string()),
         ),
+        "ORC" => (
+            Some("org.apache.hadoop.hive.ql.io.orc.OrcInputFormat".to_string()),
+            Some("org.apache.hadoop.hive.ql.io.orc.OrcOutputFormat".to_string()),
+        ),
+        "AVRO" => (
+            Some("org.apache.hadoop.hive.ql.io.avro.AvroContainerInputFormat".to_string()),
+            Some("org.apache.hadoop.hive.ql.io.avro.AvroContainerOutputFormat".to_string()),
+        ),
+        "SEQUENCEFILE" => (
+            Some("org.apache.hadoop.mapred.SequenceFileInputFormat".to_string()),
+            Some("org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat".to_string()),
+        ),
+        "RCFILE" => (
+            Some("org.apache.hadoop.hive.ql.io.RCFileInputFormat".to_string()),
+            Some("org.apache.hadoop.hive.ql.io.RCFileOutputFormat".to_string()),
+        ),
+        // Not a native Hive storage keyword (Hive's own grammar has no
+        // `STORED AS JSON`; sqlparser-rs itself rejects it, only `JSONFILE`
+        // parses), but Athena/Glue tooling writes tables this way, and
+        // `JSONFILE` does reach here. Both fall onto TextInputFormat, same
+        // as TEXTFILE; what makes it a JSON table is the default SerDe class
+        // `from_spec` attaches below when no explicit one was given.
+        "JSON" | "JSONFILE" => (
+            Some("org.apache.hadoop.mapred.TextInputFormat".to_string()),
+            Some("org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat".to_string()),
+        ),
         _ => (None, None),
+    }
+}
+
+/// The SerDe class Glue would record for a `STORED AS` keyword when the DDL
+/// gave no explicit `ROW FORMAT SERDE`. Only JSON and Parquet need this:
+/// Glue's crawler always attaches a SerDe class to those two, where TEXTFILE
+/// legitimately has none (delimited text needs no SerDe beyond
+/// `LazySimpleSerDe`, which `serde_map.rs` already defaults to). An explicit
+/// `ROW FORMAT SERDE` in the DDL always wins; see the `.or(...)` at the call
+/// site in [`HiveManifest::from_spec`].
+fn default_serde_for_stored_as(stored_as: &str) -> Option<String> {
+    match stored_as.to_ascii_uppercase().as_str() {
+        "JSON" | "JSONFILE" => Some("org.openx.data.jsonserde.JsonSerDe".to_string()),
+        "PARQUET" => {
+            Some("org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe".to_string())
+        }
+        _ => None,
     }
 }
 
@@ -167,6 +224,10 @@ impl HiveManifest {
             .as_deref()
             .map(formats_from_stored_as)
             .unwrap_or((None, None));
+        let derived_serde = spec
+            .stored_as
+            .as_deref()
+            .and_then(default_serde_for_stored_as);
 
         HiveManifest {
             manifest_version: MANIFEST_VERSION,
@@ -186,7 +247,9 @@ impl HiveManifest {
                 output_format: spec.output_format.clone().or(derived_output),
                 compressed: false,
                 serde_info: SerdeInfo {
-                    serialization_library: spec.serde_class.clone(),
+                    // An explicit ROW FORMAT SERDE always wins over the
+                    // STORED AS default, as Hive does.
+                    serialization_library: spec.serde_class.clone().or(derived_serde),
                     parameters: spec.serde_properties.clone(),
                 },
                 columns: spec.columns.iter().map(glue_column_of).collect(),
