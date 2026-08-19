@@ -114,8 +114,12 @@ pub struct HiveManifest {
     pub owner: Option<String>,
     #[serde(default)]
     pub created_at: Option<String>,
+    /// Glue's `TableInput` calls this `Description`, not `Comment` (that
+    /// name is reserved for the column-level field on `GlueColumn`), so this
+    /// field mirrors `description` to keep the promise that a later Glue or
+    /// HMS backend is a field mapping rather than a redesign.
     #[serde(default)]
-    pub comment: Option<String>,
+    pub description: Option<String>,
     #[serde(default)]
     pub partition_keys: Vec<GlueColumn>,
     #[serde(default)]
@@ -171,7 +175,7 @@ impl HiveManifest {
             name: spec.name.clone(),
             owner: Some(owner.to_string()),
             created_at: Some(created_at.to_string()),
-            comment: spec.comment.clone(),
+            description: spec.comment.clone(),
             partition_keys: spec.partition_keys.iter().map(glue_column_of).collect(),
             // Copied verbatim so `sqe.secret` and any other property (e.g.
             // `classification`) both survive the round trip untouched.

@@ -49,6 +49,7 @@ fn uses_glue_field_names_so_a_future_glue_backend_is_a_mapping() {
         "manifest_version",
         "table_type",
         "database_name",
+        "description",
         "partition_keys",
         "parameters",
         "storage_descriptor",
@@ -64,6 +65,20 @@ fn uses_glue_field_names_so_a_future_glue_backend_is_a_mapping() {
         );
     }
     assert!(sd["serde_info"].get("serialization_library").is_some());
+
+    // Descend into GlueColumn: a `#[serde(rename = ...)]` there would change
+    // serialize and deserialize together, so a round-trip test alone would
+    // stay green while the on-disk JSON silently stopped matching Glue.
+    let column = &sd["columns"][0];
+    for key in ["name", "type", "comment"] {
+        assert!(column.get(key).is_some(), "missing GlueColumn key {key}");
+    }
+
+    // Same for the sqe extension block.
+    let sqe = json.get("sqe").expect("sqe");
+    for key in ["secret", "column_tags", "partition_index", "statistics"] {
+        assert!(sqe.get(key).is_some(), "missing sqe key {key}");
+    }
 }
 
 #[test]
@@ -156,5 +171,55 @@ fn empty_location_is_rejected() {
     assert!(
         format!("{err:?}").to_lowercase().contains("location"),
         "got {err:?}"
+    );
+}
+
+#[test]
+fn empty_name_is_rejected() {
+    let mut m = HiveManifest::from_spec(&spec_of(DDL), "sales", "j", "t");
+    m.name = String::new();
+    let bytes = m.to_bytes().expect("bytes");
+    let err = HiveManifest::parse(&bytes, &ManifestLimits::default()).expect_err("must reject");
+    assert!(
+        format!("{err:?}").contains("name must not be empty"),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn empty_database_name_is_rejected() {
+    let mut m = HiveManifest::from_spec(&spec_of(DDL), "sales", "j", "t");
+    m.database_name = String::new();
+    let bytes = m.to_bytes().expect("bytes");
+    let err = HiveManifest::parse(&bytes, &ManifestLimits::default()).expect_err("must reject");
+    assert!(
+        format!("{err:?}").contains("database_name must not be empty"),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn a_table_type_other_than_external_table_is_rejected() {
+    let mut m = HiveManifest::from_spec(&spec_of(DDL), "sales", "j", "t");
+    m.table_type = "MANAGED_TABLE".to_string();
+    let bytes = m.to_bytes().expect("bytes");
+    let err = HiveManifest::parse(&bytes, &ManifestLimits::default()).expect_err("must reject");
+    assert!(
+        format!("{err:?}").contains("MANAGED_TABLE"),
+        "error should name the bad value: {err:?}"
+    );
+}
+
+#[test]
+fn a_column_name_repeated_between_columns_and_partition_keys_is_rejected() {
+    let mut m = HiveManifest::from_spec(&spec_of(DDL), "sales", "j", "t");
+    // `id` is already a storage_descriptor column; force the partition key
+    // to collide with it.
+    m.partition_keys[0].name = "id".to_string();
+    let bytes = m.to_bytes().expect("bytes");
+    let err = HiveManifest::parse(&bytes, &ManifestLimits::default()).expect_err("must reject");
+    assert!(
+        format!("{err:?}").contains("id"),
+        "error should name the duplicated column: {err:?}"
     );
 }
