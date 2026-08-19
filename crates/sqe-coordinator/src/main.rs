@@ -391,6 +391,15 @@ async fn async_main() -> anyhow::Result<()> {
     // No-op when the flag is false (the default).
     sqe_coordinator::maybe_warn_superdebug(&audit, &config);
 
+    // Process-wide, LIVE Hive registries. `build_policy_enforcer` reads
+    // `hive_catalogs` on every policy-key resolution rather than a snapshot
+    // (ATTACH is a later, per-session statement), and `hive_manifest_cache`
+    // is the same cache instance every per-session Hive provider will read
+    // from (Task 8+). Both must be the SAME `Arc` everywhere; a second
+    // instance of either would compile and route nothing.
+    let hive_catalogs = Arc::new(sqe_policy::plan_rewriter::HiveCatalogs::new());
+    let hive_manifest_cache = Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new());
+
     // AUTH-01: build the enforcer + store from config.policy.engine.
     // table_cache is passed so the rewriter can wire CacheTagSource for
     // tag-based column masking (Task 4). A clone is taken here; the original
@@ -398,6 +407,8 @@ async fn async_main() -> anyhow::Result<()> {
     let (policy_enforcer, policy_store) = sqe_coordinator::policy_wiring::build_policy_enforcer(
         &config.policy,
         Some(table_cache.clone()),
+        hive_catalogs.clone(),
+        hive_manifest_cache.clone(),
         Some(Arc::clone(&metrics)),
     )?;
     if config.policy.engine != sqe_core::config::PolicyEngine::Passthrough {
