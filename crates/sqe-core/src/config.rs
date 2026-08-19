@@ -51,6 +51,12 @@ pub struct SqeConfig {
     /// operator opts in. See [`MaintenanceConfig`].
     #[serde(default)]
     pub maintenance: MaintenanceConfig,
+    /// Hive-style external-table warehouse roots to attach at startup, plus
+    /// the manifest size/shape caps every root enforces. See [`HiveConfig`].
+    /// Empty `roots` (the default) attaches nothing; `ATTACH ... TYPE
+    /// hive_external` remains the per-session alternative once wired.
+    #[serde(default)]
+    pub hive: HiveConfig,
 }
 
 /// Controls adaptive sort stripping behavior.
@@ -2089,6 +2095,64 @@ pub struct StorageConfig {
     /// endpoints (IMDS / GCP / Azure IMDS) on `http://169.254.169.254`.
     #[serde(default)]
     pub tvf: TvfPolicy,
+}
+
+/// One Hive-style external-table warehouse root to attach at coordinator
+/// startup, the `[[hive.roots]]` TOML equivalent of `ATTACH <location> AS
+/// <name> (TYPE hive_external)`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct HiveRootConfig {
+    /// SQL identifier the root is exposed as (`<name>.<database>.<table>`).
+    pub name: String,
+    /// Warehouse root location (`s3://bucket/prefix/`, a local path, ...).
+    pub location: String,
+    /// Optional named secret (see `CREATE SECRET`) used when a manifest
+    /// under this root does not name its own `sqe.secret`. Currently
+    /// unused by `build_hive_root`/`session_hive_catalog`, which resolve a
+    /// secret from the manifest itself; reserved for a root-level default.
+    #[serde(default)]
+    pub secret: Option<String>,
+}
+
+fn default_hive_manifest_max_bytes() -> usize {
+    1 << 20
+}
+
+fn default_hive_manifest_max_columns() -> usize {
+    4096
+}
+
+fn default_hive_manifest_max_partition_keys() -> usize {
+    32
+}
+
+/// `[hive]`: warehouse roots to attach at coordinator startup, plus the
+/// manifest size/shape caps enforced on every root. The three caps default
+/// to the exact values `hive::manifest::ManifestLimits::default()` uses
+/// (`1048576` bytes, `4096` columns, `32` partition keys); a mismatch
+/// between the config default and the code default would be a config
+/// surface that silently lies about what it controls.
+#[derive(Debug, Deserialize, Clone)]
+pub struct HiveConfig {
+    #[serde(default)]
+    pub roots: Vec<HiveRootConfig>,
+    #[serde(default = "default_hive_manifest_max_bytes")]
+    pub manifest_max_bytes: usize,
+    #[serde(default = "default_hive_manifest_max_columns")]
+    pub manifest_max_columns: usize,
+    #[serde(default = "default_hive_manifest_max_partition_keys")]
+    pub manifest_max_partition_keys: usize,
+}
+
+impl Default for HiveConfig {
+    fn default() -> Self {
+        Self {
+            roots: Vec::new(),
+            manifest_max_bytes: default_hive_manifest_max_bytes(),
+            manifest_max_columns: default_hive_manifest_max_columns(),
+            manifest_max_partition_keys: default_hive_manifest_max_partition_keys(),
+        }
+    }
 }
 
 /// Security policy for table-valued-function path arguments.
@@ -6002,6 +6066,7 @@ partial_progress_batch = 5
             query_cache: QueryCacheConfig::default(),
             query_history: QueryHistoryConfig::default(),
             maintenance: MaintenanceConfig::default(),
+            hive: HiveConfig::default(),
         }
     }
 

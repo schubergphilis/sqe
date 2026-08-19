@@ -79,6 +79,18 @@ struct Cli {
     #[arg(long, value_parser = parse_catalog_spec, conflicts_with_all = ["memory", "warehouse"])]
     catalog: Vec<(String, std::path::PathBuf)>,
 
+    /// Attach a Hive-style external-table warehouse root. Format
+    /// `NAME=URL`, repeatable. For example: `--hive-root lake=s3://bucket/wh/`
+    /// then query with `SELECT * FROM lake.sales.orders`. A Hive root is
+    /// not an Iceberg catalog (there is no metadata catalog behind it, just
+    /// sidecar manifests under the root), so `--hive-root` can be combined
+    /// with any of `--catalog`, `--warehouse`, `--memory`, or
+    /// `--catalog-backend`. Requires `--embedded`. `NAME` still must not
+    /// collide with an attached Iceberg catalog's name, or a 3-part
+    /// reference is ambiguous.
+    #[arg(long, value_parser = parse_hive_root_spec)]
+    hive_root: Vec<(String, String)>,
+
     /// Skip persistent catalogs entirely. `CREATE TABLE` works
     /// within the session via DataFusion's in-memory catalog but
     /// nothing survives the process. Mutually exclusive with
@@ -187,6 +199,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     error_render::set_raw_errors(cli.raw_errors);
 
+    if !cli.hive_root.is_empty() && !cli.embedded {
+        return Err("--hive-root requires --embedded; SQL ATTACH ... TYPE hive_external \
+                     against a remote coordinator is not wired yet"
+            .into());
+    }
+
     let scheme = if cli.tls { "https" } else { "http" };
 
     let mut client: Box<dyn SqlClient> = if cli.embedded {
@@ -221,7 +239,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .catalog_name
                 .clone()
                 .unwrap_or_else(|| backend_label.to_string());
-            let client = embedded::EmbeddedClient::with_backend(limit, backend, &name).await?;
+            let mut client = embedded::EmbeddedClient::with_backend(limit, backend, &name).await?;
+            attach_hive_roots(&mut client, &cli.hive_root).await?;
             eprintln!(
                 "sqe-cli {} embedded engine ({} memory pool, {} catalog: {})",
                 sqe_core::VERSION,
@@ -249,7 +268,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 embedded::WarehouseMode::default_persistent()
             };
-            let client = embedded::EmbeddedClient::with_warehouse(limit, &mode).await?;
+            let mut client = embedded::EmbeddedClient::with_warehouse(limit, &mode).await?;
+            attach_hive_roots(&mut client, &cli.hive_root).await?;
             eprintln!(
                 "sqe-cli {} embedded engine ({} memory pool, {})",
                 sqe_core::VERSION,
@@ -688,6 +708,44 @@ fn parse_catalog_spec(s: &str) -> Result<(String, std::path::PathBuf), String> {
         ));
     }
     Ok((name.to_string(), std::path::PathBuf::from(path)))
+}
+
+/// Register every `--hive-root NAME=URL` root before the REPL starts (or
+/// before the one-shot `-e`/`-f` execution), so `lake.sales.orders`
+/// resolves from the very first statement instead of requiring a
+/// follow-up `ATTACH`.
+async fn attach_hive_roots(
+    client: &mut embedded::EmbeddedClient,
+    roots: &[(String, String)],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (name, location) in roots {
+        client.attach_hive_root(name, location).await?;
+    }
+    Ok(())
+}
+
+/// Parse `NAME=URL` for the repeatable `--hive-root` flag. Same shape as
+/// `parse_catalog_spec`, except the location is a URL string, not a local
+/// `PathBuf`: a Hive root is commonly `s3://...`, and forcing it through
+/// `PathBuf` would mangle a scheme.
+fn parse_hive_root_spec(s: &str) -> Result<(String, String), String> {
+    let (name, location) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected NAME=URL, got `{s}`"))?;
+    let name = name.trim();
+    let location = location.trim();
+    if name.is_empty() {
+        return Err(format!("hive root name is empty in `{s}`"));
+    }
+    if location.is_empty() {
+        return Err(format!("hive root location is empty in `{s}`"));
+    }
+    if name.contains('.') {
+        return Err(format!(
+            "hive root name `{name}` cannot contain `.` (it would clash with 3-part SQL names)"
+        ));
+    }
+    Ok((name.to_string(), location.to_string()))
 }
 
 fn dirs_home() -> std::path::PathBuf {
