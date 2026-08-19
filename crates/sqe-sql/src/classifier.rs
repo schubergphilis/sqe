@@ -668,10 +668,15 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
 
         // CREATE TABLE ... AS SELECT (CTAS) vs regular CREATE TABLE (columns)
         Statement::CreateTable(ref ct) => {
-            // EXTERNAL is checked before CTAS: `CREATE EXTERNAL TABLE ... AS
-            // SELECT` is a write, which is cycle 4, and the DDL handler
-            // rejects it with that message rather than silently creating an
-            // Iceberg table.
+            // EXTERNAL is checked before CTAS, on purpose: sqlparser's
+            // GenericDialect does not currently accept `external: true`
+            // together with a trailing `AS SELECT` at all (it errors at
+            // parse time, verified for several clause orderings), so this
+            // ordering is defensive against a future sqlparser version that
+            // does accept the combination. If that ever happens, this
+            // ordering makes it route to the Hive path (and be rejected
+            // there) instead of silently falling through to CTAS and
+            // creating an Iceberg table.
             if ct.external {
                 if let Some(spec) = crate::hive_ddl::try_extract_hive_table(&stmt)? {
                     return Ok(StatementKind::CreateExternalTable(Box::new(spec)));

@@ -1311,14 +1311,14 @@ impl QueryHandler {
 
                 // `CREATE EXTERNAL TABLE` (Hive/Athena) is classified separately
                 // from the Iceberg create path (see `sqe_sql::classifier`), but
-                // the coordinator handler that registers it as a scan target
-                // lands in a later cycle. This arm exists only so the match
+                // the coordinator handler that registers it as a scan target is
+                // a later task in this cycle. This arm exists only so the match
                 // stays exhaustive; it is not a "backend missing" error.
-                StatementKind::CreateExternalTable(_) => Err(SqeError::NotImplemented(
-                    "CREATE EXTERNAL TABLE is parsed but not yet dispatched. A later cycle \
-                     wires this into the coordinator's write path."
-                        .into(),
-                )),
+                StatementKind::CreateExternalTable(_) => {
+                    Err(SqeError::NotImplemented(
+                        "CREATE EXTERNAL TABLE is parsed but not yet dispatched.".into(),
+                    ))
+                }
 
                 StatementKind::Ctas(stmt) => {
                     if let Statement::CreateTable(ref ct) = **stmt {
