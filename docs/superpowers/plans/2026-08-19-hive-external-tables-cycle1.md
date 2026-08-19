@@ -2788,11 +2788,20 @@ Follow the voice rules: no emdash, no endash, no Unicode arrows, no AI tells, sh
 - [ ] **Step 2: Verify the style gate**
 
 ```bash
-grep -n '—\|–\|→' docs/site/book/src/reference/hive-external-tables.md || echo "clean"
-./scripts/leak-scan.sh 2>&1 | tail -5
+python3 - <<'EOF'
+import pathlib
+bad = {'\u2014': 'emdash', '\u2013': 'endash', '\u2192': 'arrow'}
+t = pathlib.Path("docs/site/book/src/reference/hive-external-tables.md").read_text()
+hits = [(i + 1, bad[ch]) for i, line in enumerate(t.splitlines()) for ch in line if ch in bad]
+print(f"forbidden characters: {len(hits)}", hits[:10])
+EOF
+./scripts/leak-scan.sh
+echo "leak-scan exit: $?"
 ```
 
-Expected: no character hits, no leaks. `docs/site/` must be publish-clean.
+Expected: `forbidden characters: 0`, and a clean leak scan. `docs/site/` must be publish-clean.
+
+Use the per-character scan above rather than a `grep` alternation. A `grep '—\|–'` pattern depends on the grep flavour treating `\|` as alternation in a basic regular expression, and under ANSI-C quoting (`$'...'`) it silently matches nothing at all regardless of file content, which makes the gate report success on a file full of emdashes. An implementer on this feature hit exactly that and shipped six emdashes past a passing check.
 
 - [ ] **Step 3: Update project state**
 
