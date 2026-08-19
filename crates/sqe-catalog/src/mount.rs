@@ -143,11 +143,25 @@ use sqe_core::config::{StorageConfig, TvfCaller};
 /// responsibility (this function has no registry to check against; see the
 /// module doc comment on `sqe_policy::plan_rewriter::HiveCatalogs` for why
 /// that check belongs where ATTACH is dispatched, not here).
+///
+/// `limits` bounds an untrusted input: a manifest is a file anyone who can
+/// write to the warehouse prefix can plant, and `max_bytes`/`max_columns`/
+/// `max_partition_keys` are what stop a hostile one from being parsed (see
+/// `HiveManifest::parse`, which every `HiveManifestStore::get` runs through).
+/// An earlier draft of this function hardcoded `ManifestLimits::default()`
+/// here, which meant `[hive].manifest_max_bytes` et al. parsed from config
+/// and enforced nothing -- an operator lowering the cap after a security
+/// review would get silent non-enforcement, which is worse than not
+/// offering the knob. Callers should source `limits` from `HiveConfig` when
+/// one is available; `ManifestLimits::default()` (which is what `HiveConfig`
+/// itself defaults to) is the right choice only when there is no config to
+/// read one from.
 #[cfg(feature = "hive-external")]
 pub async fn build_hive_root(
     location: &str,
     _options: &BTreeMap<String, OptionValue>,
     storage: &StorageConfig,
+    limits: crate::hive::manifest::ManifestLimits,
     caller: TvfCaller,
 ) -> Result<Arc<crate::hive::store::HiveManifestStore>, String> {
     let trimmed = location.trim();
@@ -169,7 +183,7 @@ pub async fn build_hive_root(
     Ok(Arc::new(crate::hive::store::HiveManifestStore::new(
         root,
         store,
-        crate::hive::manifest::ManifestLimits::default(),
+        limits,
         storage.tvf.clone(),
         caller,
     )))

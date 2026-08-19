@@ -492,6 +492,14 @@ impl EmbeddedClient {
     /// process's config and credentials, the same trust boundary the file
     /// TVFs (`read_parquet`, ...) use. Local paths and `http(s)://` are
     /// allowed for the same reason `build_embedded_context` allows them.
+    ///
+    /// Manifest caps use `ManifestLimits::default()`: `sqe-cli` never loads
+    /// a `SqeConfig`/TOML (unlike the coordinator, which will read
+    /// `[hive].manifest_max_bytes` et al. once Task 10 wires `[hive].roots`
+    /// into a running server), so there is no `HiveConfig` here to source
+    /// an override from. `ManifestLimits::default()` is exactly what
+    /// `HiveConfig`'s own defaults resolve to, so this is not a weaker cap,
+    /// just one with no CLI flag to change it yet.
     pub async fn attach_hive_root(&mut self, name: &str, location: &str) -> anyhow::Result<()> {
         if self.ctx.catalog(name).is_some() {
             anyhow::bail!("catalog '{name}' is already attached; DETACH it first");
@@ -506,6 +514,7 @@ impl EmbeddedClient {
             location,
             &std::collections::BTreeMap::new(),
             &storage,
+            sqe_catalog::hive::manifest::ManifestLimits::default(),
             caller.clone(),
         )
         .await
