@@ -145,13 +145,18 @@ fn extract(ct: &CreateTable) -> Result<HiveTableSpec, SqeError> {
                         HiveDelimiter::FieldsEscapedBy => "escape.delim",
                         HiveDelimiter::NullDefinedAs => "serialization.null.format",
                     };
-                    serde_properties.insert(key.to_string(), d.char.value.clone());
+                    serde_properties.insert(key.to_string(), decode_hive_escape(&d.char.value));
                 }
             }
             None => {}
         }
         if let Some(props) = &fmts.serde_properties {
-            serde_properties.extend(props.iter().filter_map(option_pair));
+            serde_properties.extend(
+                props
+                    .iter()
+                    .filter_map(option_pair)
+                    .map(|(k, v)| (k, decode_hive_escape(&v))),
+            );
         }
     }
 
@@ -261,6 +266,67 @@ fn column_of(c: &ColumnDef) -> Result<HiveColumn, SqeError> {
             _ => None,
         }),
     })
+}
+
+/// Decode a Hive/Java-style backslash escape in a SerDe or `ROW FORMAT
+/// DELIMITED` property value.
+///
+/// sqlparser-rs's `GenericDialect` tokenizer treats backslash as a literal
+/// character inside a single-quoted string, unlike Hive's own DDL lexer,
+/// which processes these escapes before the SerDe or `LazySimpleSerDe`
+/// delimiter code ever sees the value. Decoding here, rather than in
+/// `sqe-catalog`'s `serde_map`, keeps the manifest holding the byte Hive and
+/// Glue would actually store: `escapeChar = '\\'` (Hive's own escape for a
+/// literal backslash) must persist as one backslash character, not two, or
+/// a manifest round-trip would hold a value no real Hive deployment would
+/// ever produce.
+///
+/// Only a sequence this function actually recognizes is collapsed: `\\`,
+/// `\t`, `\n`, `\r`, `\0`, and Hive's own three-digit octal escape `\NNN`
+/// (octal `000` through `377`, i.e. byte values 0-255) -- `FIELDS
+/// TERMINATED BY '\001'` for Hive's ctrl-A default is the single most
+/// common form of this in real DDL. A value this function does not
+/// recognize, including one that is already a single character, or a lone
+/// backslash followed by a character with no defined escape, passes
+/// through unchanged: a manifest written by hand or by real Glue must keep
+/// meaning what it already means, and a false-positive decode would rewrite
+/// a property nobody asked to have rewritten.
+///
+/// Octal values above `\177` (127) decode to a Unicode codepoint in the
+/// Latin-1 supplement (`char::from` is a lossless byte-to-codepoint
+/// mapping), which needs two bytes to encode as UTF-8. `serde_map::
+/// single_byte` downstream still requires exactly one byte, so those values
+/// are correctly decoded here but rejected there -- the same outcome Hive
+/// itself would have when persisting that property as UTF-8-encoded text.
+/// Every byte value Hive actually uses for a delimiter (control characters
+/// 000-037, and printable ASCII) is inside the one-byte range.
+fn decode_hive_escape(value: &str) -> String {
+    let bytes = value.as_bytes();
+    match bytes {
+        [b'\\', b'\\'] => "\\".to_string(),
+        [b'\\', b't'] => "\t".to_string(),
+        [b'\\', b'n'] => "\n".to_string(),
+        [b'\\', b'r'] => "\r".to_string(),
+        [b'\\', b'0'] => "\0".to_string(),
+        [b'\\', d0, d1, d2] if is_octal_triplet(*d0, *d1, *d2) => {
+            let n = (d0 - b'0') as u32 * 64 + (d1 - b'0') as u32 * 8 + (d2 - b'0') as u32;
+            char::from(n as u8).to_string()
+        }
+        _ => value.to_string(),
+    }
+}
+
+/// Three octal digits (`000` through `377`, Hive's actual escape range: byte
+/// values 0-255). `is_octal_digit` alone would accept `\777`, which is not a
+/// valid Hive octal escape and would silently truncate to a wrong byte via
+/// `as u8`; this rejects anything whose value would exceed 255 so it falls
+/// through to the pass-through arm instead.
+fn is_octal_triplet(d0: u8, d1: u8, d2: u8) -> bool {
+    is_octal_digit(d0) && is_octal_digit(d1) && is_octal_digit(d2) && d0 <= b'3'
+}
+
+fn is_octal_digit(b: u8) -> bool {
+    (b'0'..=b'7').contains(&b)
 }
 
 /// The literal text of a `SqlOption::KeyValue` value, unquoted.

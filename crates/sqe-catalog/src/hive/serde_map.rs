@@ -159,12 +159,20 @@ fn kind_from_input_format(m: &HiveManifest) -> Result<HiveFileFormat, HiveError>
     }
 }
 
-/// Reads the first present key in `keys` from `props` and decodes it to
-/// exactly one byte. A raw single character passes through unchanged; a
-/// two-character backslash escape (`\\`, `\t`, `\n`, `\r`, `\0`) decodes to
-/// the byte it names, matching how Hive's own DDL lexer unescapes SerDe
-/// property literals before sqlparser-rs's generic-dialect tokenizer ever
-/// sees them. Anything else is rejected, naming the key and the value.
+/// Reads the first present key in `keys` from `props` and requires its
+/// value to be exactly one byte.
+///
+/// No escape decoding happens here: `sqe_sql::hive_ddl` already resolved
+/// any Hive/Java-style backslash escape (`\\`, `\t`, octal `\NNN`, etc.)
+/// before the value ever reached the manifest, so by the time it is stored
+/// here it already holds the byte Hive or Glue itself would. Doing that
+/// decoding at consumption time instead would mean the manifest on disk
+/// held the sqlparser-rs transport artifact (two literal backslash
+/// characters for `escapeChar = '\\'`, say) rather than the one byte Hive
+/// means, which breaks the same field-mapping promise the ORC/Avro/etc.
+/// class-name fidelity in `manifest.rs` protects. A value that is not
+/// exactly one byte here is therefore a real problem, and is rejected
+/// naming the key and the value, not silently reinterpreted.
 fn single_byte(props: &BTreeMap<String, String>, keys: &[&str]) -> Result<Option<u8>, HiveError> {
     let Some((key, value)) = keys
         .iter()
@@ -176,11 +184,6 @@ fn single_byte(props: &BTreeMap<String, String>, keys: &[&str]) -> Result<Option
     let bytes = value.as_bytes();
     let byte = match bytes {
         [b] => *b,
-        [b'\\', b'\\'] => b'\\',
-        [b'\\', b't'] => b'\t',
-        [b'\\', b'n'] => b'\n',
-        [b'\\', b'r'] => b'\r',
-        [b'\\', b'0'] => 0,
         _ => {
             return Err(HiveError::Validation(format!(
                 "{key} = `{value}` must be exactly one byte"
@@ -197,7 +200,14 @@ pub fn arrow_type(sql_type: &str) -> Result<DataType, HiveError> {
     let t = sql_type.trim().to_ascii_lowercase();
 
     if let Some(rest) = t.strip_prefix("decimal") {
-        let inner = rest.trim().trim_start_matches('(').trim_end_matches(')');
+        let rest = rest.trim();
+        if rest.is_empty() {
+            // Hive and Athena both default a bare `decimal` (no precision or
+            // scale given) to `decimal(10,0)`. Athena parity is the point of
+            // this feature, so this defaults rather than errors.
+            return Ok(DataType::Decimal128(10, 0));
+        }
+        let inner = rest.trim_start_matches('(').trim_end_matches(')');
         let (p, s) = inner
             .split_once(',')
             .ok_or_else(|| HiveError::Validation(format!("type `{sql_type}` is not supported")))?;

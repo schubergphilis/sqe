@@ -66,6 +66,71 @@ fn extracts_every_clause_of_the_full_form() {
 }
 
 #[test]
+fn octal_field_delimiter_decodes_to_hives_own_ctrl_a_default_byte() {
+    // '\001' is Hive's own way of spelling FIELDS TERMINATED BY ctrl-A, and
+    // it is the single most common delimiter idiom in real Hive DDL because
+    // ctrl-A is Hive's default field delimiter. This asserts the decoded
+    // byte is the same 0x01 that a table declared with no delimiter at all
+    // defaults to (see sqe-catalog's HIVE_DEFAULT_DELIM /
+    // lazy_simple_serde_with_no_delimiter_defaults_to_ctrl_a_like_hive):
+    // that equivalence, not just "some decoding happened", is the point.
+    let s = spec(
+        "CREATE EXTERNAL TABLE t (id INT) ROW FORMAT DELIMITED FIELDS TERMINATED BY '\\001' \
+         STORED AS TEXTFILE LOCATION 's3://b/p/'",
+    );
+    let delim = s.serde_properties.get("field.delim").expect("field.delim");
+    assert_eq!(delim.as_bytes(), b"\x01", "decoded value: {delim:?}");
+}
+
+#[test]
+fn escape_char_backslash_escape_decodes_to_one_byte() {
+    // The case that motivated moving this decoding here: sqlparser-rs's
+    // GenericDialect does not process backslash escapes inside a
+    // single-quoted string literal, so the SQL text `'\\'` (a Hive escape
+    // for one literal backslash) arrives as two raw backslash characters.
+    // Undecoded, that 2-byte value would persist in the manifest, where
+    // real Hive/Glue would hold exactly one backslash.
+    let s = spec(
+        "CREATE EXTERNAL TABLE t (id INT) ROW FORMAT SERDE \
+         'org.apache.hadoop.hive.serde2.OpenCSVSerde' WITH SERDEPROPERTIES \
+         ('escapeChar' = '\\\\') LOCATION 's3://b/p/'",
+    );
+    let escape = s.serde_properties.get("escapeChar").expect("escapeChar");
+    assert_eq!(escape.as_bytes(), b"\\", "decoded value: {escape:?}");
+}
+
+#[test]
+fn an_unrecognized_backslash_sequence_passes_through_unchanged() {
+    // A property this function does not recognize as an escape must not be
+    // silently rewritten: a manifest written by hand or by real Glue has to
+    // keep meaning what it already says.
+    let s = spec(
+        "CREATE EXTERNAL TABLE t (id INT) ROW FORMAT SERDE \
+         'org.apache.hadoop.hive.serde2.OpenCSVSerde' WITH SERDEPROPERTIES \
+         ('escapeChar' = '\\x') LOCATION 's3://b/p/'",
+    );
+    let escape = s.serde_properties.get("escapeChar").expect("escapeChar");
+    assert_eq!(
+        escape.as_bytes(),
+        b"\\x",
+        "an unrecognized escape must pass through untouched: {escape:?}"
+    );
+}
+
+#[test]
+fn a_plain_single_character_property_is_left_untouched() {
+    let s = spec(
+        "CREATE EXTERNAL TABLE t (id INT) ROW FORMAT SERDE \
+         'org.apache.hadoop.hive.serde2.OpenCSVSerde' WITH SERDEPROPERTIES \
+         ('separatorChar' = ';') LOCATION 's3://b/p/'",
+    );
+    assert_eq!(
+        s.serde_properties.get("separatorChar").map(String::as_str),
+        Some(";")
+    );
+}
+
+#[test]
 fn row_format_delimited_becomes_lazy_simple_serde_with_field_delim() {
     let s = spec(
         "CREATE EXTERNAL TABLE t (id INT) ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' \
@@ -226,7 +291,10 @@ fn classifier_leaves_plain_create_table_on_the_iceberg_path() {
 
 #[test]
 fn hive_external_is_its_own_attach_kind_and_hive_still_means_hms() {
-    assert_eq!(CatalogKind::parse("hive_external"), Some(CatalogKind::HiveExternal));
+    assert_eq!(
+        CatalogKind::parse("hive_external"),
+        Some(CatalogKind::HiveExternal)
+    );
     assert_eq!(CatalogKind::parse("hive"), Some(CatalogKind::Hms));
     assert_eq!(CatalogKind::HiveExternal.name(), "hive_external");
 }
