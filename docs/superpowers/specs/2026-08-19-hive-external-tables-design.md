@@ -105,10 +105,23 @@ falls back to a full recursive LIST of the table prefix followed by in-memory
 filtering. On a lake with tens of thousands of partitions that listing dominates
 the query.
 
-**8. Grant-based policy needs no changes.**
-`crates/sqe-policy/src/plan_rewriter.rs:113` keys policy on the stringified
-table reference, so a Hive table resolving as `lake.sales.orders` is governed
-like any other table.
+**8. The policy key drops the catalog.**
+`crates/sqe-policy/src/plan_rewriter.rs:725` (`resolve_policy_key`) returns
+`(namespace, table)` from the schema and table components only. The test at line
+1522 asserts it: `TableReference::full("cat", "hr", "employees")` keys as
+`("hr", "employees")`.
+
+So a grant, row filter, or column mask written for the Iceberg table
+`hr.employees` would also govern a Hive table `lake.hr.employees`. That is
+privilege escalation, because the person who picks the Hive table's name is
+whoever can write a manifest, and its LOCATION points wherever their credentials
+reach. Cycle 1 needs an explicit resource-naming rule, recorded below.
+
+**9. DataFusion's listing cache is off on purpose.**
+`crates/sqe-catalog/src/lazy_object_store.rs:64` builds the runtime with
+`with_list_files_cache_limit(0)`. That is the #363 fix: an infinite-TTL listing
+cache served a stale file size and produced a corrupt-footer error that
+self-healed only on restart. Cycle 1 does not re-enable it.
 
 ## Cycle 1 scope
 
@@ -123,7 +136,8 @@ In:
 - LOCATION through the fail-closed `[storage.tvf]` allowlist, at create and at
   every load
 - `CatalogRoutedTagSource` so Hive tables are not denied and not unmasked
-- Statistics from file size and Parquet footers, TTL-cached partition listing
+- Size-only statistics, so planning does not read a footer per file
+- A resource-naming rule that keeps Hive and Iceberg policy keys disjoint
 - Coordinator-local execution in server mode
 
 Out, by cycle:
@@ -376,6 +390,31 @@ In server mode, Hive scans execute coordinator-local, as the file TVFs do today.
 Server mode does not mean distributed scan parity, and the docs say so until
 cycle 5.
 
+## Statement dispatch
+
+Every handler that resolves a table name now has a Hive root to consider. The
+branch lives in one place, a `resolve_table_kind(table_ref)` helper in the
+coordinator that answers Iceberg or Hive from the registered catalogs, so no
+handler grows its own detection.
+
+| Statement | Cycle 1 behavior |
+|---|---|
+| `CREATE EXTERNAL TABLE` | Supported. Routed to the Hive DDL handler |
+| `DROP TABLE` | Supported. Deletes the manifest, never the data. `PURGE` rejected |
+| `SHOW TABLES`, `SHOW SCHEMAS`, `information_schema` | Supported through the provider |
+| `SHOW CREATE TABLE` | Supported. Renders Athena-compatible DDL from the manifest |
+| `DESCRIBE`, `SHOW COLUMNS` | Supported through the provider schema |
+| `SHOW STATS`, `ANALYZE` | Rejected, naming cycle 2 |
+| `ALTER TABLE ADD/DROP PARTITION`, `MSCK REPAIR`, `SHOW PARTITIONS` | Rejected, naming cycle 2 |
+| `SET TAGS`, `SET MASKING POLICY` | Rejected, naming cycle 3 |
+| `INSERT`, CTAS, `MERGE`, `UPDATE`, `DELETE`, `TRUNCATE`, `INSERT OVERWRITE` | Rejected, naming cycle 4 |
+| `ALTER TABLE` rename, column add/drop/rename, `DROP NESTED COLUMN`, `COMMENT ON`, `ALTER TABLE SET TBLPROPERTIES` | Rejected. Schema evolution on an external table is a manifest edit, and it is not cycle-1 work |
+| `PARTITION EVOLUTION`, `RefDdl` (branches and tags), time travel | Rejected. These are Iceberg snapshot features with no Hive equivalent |
+
+Every rejection names `hive_external` and the cycle that will support it, so the
+message tells an operator what to do rather than only what failed. Each row is a
+test case, which is how the list stays true as the cycles land.
+
 ## Credentials
 
 Session credentials by default, so a Hive read runs as the calling user and the
@@ -390,9 +429,38 @@ a location the deployment forbids.
 
 ## Policy, tags, audit
 
-Grant-based row filters and column masks work with no change, because
-`plan_rewriter.rs:113` keys on the stringified table reference and a Hive table
-resolves as `lake.sales.orders`.
+### Resource naming
+
+Finding 8 rules out relying on the existing key as-is. The rule for cycle 1:
+
+**A Hive table's policy namespace is `<root>.<database>`, and an Iceberg table's
+stays the dotted Iceberg namespace.** The Hive root name is part of the key; the
+Iceberg catalog name still is not. So `lake.sales.orders` keys as
+`("lake.sales", "orders")` and no grant written for Iceberg `sales` can reach it.
+
+This is deliberately asymmetric, because making the catalog part of the key for
+every table kind would invalidate every Ranger policy already written against
+the `hive_database` convention. That change is worth doing and is not cycle-1
+work.
+
+Two guards come with the rule:
+
+- `ATTACH ... TYPE hive_external` rejects a root name that collides with a
+  registered catalog name.
+- The residual collision is an Iceberg multi-level namespace whose dotted form
+  equals `<root>.<database>`, for example an Iceberg namespace literally named
+  `lake.sales`. Cycle 1 does not detect that. It is recorded as a known
+  limitation, the mitigation is the root-naming convention, and the permanent
+  fix is catalog-in-key for all table kinds.
+
+The change is confined to `resolve_policy_key`, which gains a branch that
+prefixes the root name when the reference names a Hive catalog. The rewriter's
+enforcement logic is untouched: it resolves whatever key that function returns,
+so grant-based row filters and column masks apply to Hive tables through the
+existing path. A test pins the Iceberg key so the branch cannot change it.
+
+### Tag routing
+
 
 A `CatalogRoutedTagSource` in the coordinator is required, not optional. It
 dispatches on catalog name: Iceberg catalogs to the existing `CacheTagSource`,
@@ -405,6 +473,18 @@ returns zero rows.
 unreadable manifest, which fails closed exactly as the Iceberg source does. It
 does not invent a third state.
 
+Routing defaults matter as much as the routes. An unknown or unmatched catalog
+name routes to the Iceberg `CacheTagSource`, which fails closed. It never routes
+to `Some(empty)`. A permissive default in a dispatcher is a silent mask bypass,
+and the dispatcher is the one place where adding a catalog kind later could
+introduce one.
+
+`TagSource::column_tags` is synchronous, so `HiveTagSource` can only answer from
+cache. The invariant it depends on: plan rewriting runs after LogicalPlan
+construction, which has already forced `HiveSchemaProvider::table()` and
+therefore the manifest load. That ordering is load-bearing, so it is asserted by
+a test rather than left as a comment.
+
 Audit events are emitted from the Hive DDL handler.
 `crates/sqe-coordinator/src/audit_resources.rs:80` only sees DataFusion
 `CreateExternalTable` logical plans, and the server path does not produce one.
@@ -415,11 +495,17 @@ agree on identity.
 
 | Lever | Cycle 1 | Later |
 |---|---|---|
-| Partition listing | TTL-cached partition list per table, so repeat queries skip the LIST. Reuses the catalog-cache TTL and admin-invalidation pattern rather than adding a mechanism | Cycle 2 persists `sqe.partition_index` and adds partition projection, which removes listing on a cold cache too |
-| Parquet pruning | Row-group pruning from footer statistics, footers reused through the existing `footer_cache.rs` | |
+| Partition listing | No caching. Every query lists, subject to the leading-equality prefix optimization from finding 7. Finding 9 rules out re-enabling DataFusion's listing cache | Cycle 2 is the listing cycle: `sqe.partition_index` persisted in the manifest, invalidated by manifest ETag rather than by a timer, plus partition projection so a cold read lists nothing |
+| Parquet pruning | Row-group pruning from footer statistics at execution time, footers reused through the existing `footer_cache.rs` | |
 | Scan parallelism | Parquet split by row group using the existing `task_split_target_size`; CSV and JSON parallelized across files up to `target_partitions` | Cycle 5 moves scans onto workers |
-| Optimizer statistics | Cardinality from file count and bytes, and from Parquet footer row counts | Cycle 2 `ANALYZE TABLE` persists into `sqe.statistics` |
+| Optimizer statistics | Size-only: cardinality estimated from file count and bytes, with `ListingOptions::with_collect_stat(false)`. Collecting real statistics reads a Parquet footer per file at plan time, which is the latency this row exists to avoid | Cycle 2 `ANALYZE TABLE` persists real counts into `sqe.statistics`, so planning gets accurate without paying per-query |
 | Pushdown | Parquet gets projection and predicate pushdown. CSV and JSON get projection only, filters above the scan | |
+
+Cycle 1 delegates file listing to `ListingTable`. Cycle 2 is where the provider
+starts building the file list itself from the partition index, because that is
+what an index is for. Splitting it that way keeps cycle 1's provider small and
+keeps the invalidation question, which is what #363 was really about, inside the
+cycle that introduces cached state.
 
 Statistics are not optional polish. `JoinStrategyRule` and
 `star_schema_reorder` plan from statistics, and the SMJ regression in !724 showed
@@ -459,9 +545,14 @@ TDD per the repo rules. Test first, then implementation.
   Parquet. Header on and off, ordinal binding for CSV, name binding for Parquet
   after a column reorder, typed partition values, `__HIVE_DEFAULT_PARTITION__`,
   and partition pruning with and without an equality-pinned leading column.
-- `sqe-coordinator`: a Hive query is not denied with a tag source active, a
-  manifest cache miss does deny, grant-based row filter and column mask apply,
-  an audit event is emitted with the three-part name.
+- `sqe-coordinator`: a Hive query is not denied with a tag source active; a
+  manifest cache miss does deny; an unmatched catalog name routes to the
+  fail-closed Iceberg source; a grant written for Iceberg `hr.employees` does
+  NOT govern Hive `lake.hr.employees` (finding 8); a grant written for
+  `lake.hr` does; the manifest is in cache by the time the rewriter runs; an
+  audit event is emitted with the same name policy used.
+- `sqe-coordinator` dispatch: one case per row of the statement dispatch table,
+  asserting support or a rejection naming `hive_external` and its cycle.
 - Integration: a MinIO or RustFS-backed root through `make test-integration`,
   covering `ATTACH`, `CREATE EXTERNAL TABLE`, `SHOW TABLES`, a partitioned read,
   and `DROP TABLE` leaving the data in place.
