@@ -199,7 +199,7 @@ CREATE EXTERNAL TABLE [IF NOT EXISTS] [catalog.][db.]name (
 [PARTITIONED BY (col type, ...)]
 [ROW FORMAT DELIMITED FIELDS TERMINATED BY 'c' [ESCAPED BY 'c'] [LINES TERMINATED BY 'c']
  | ROW FORMAT SERDE 'class' [WITH SERDEPROPERTIES ('k' = 'v', ...)]]
-[STORED AS TEXTFILE | PARQUET | JSON | CSV
+[STORED AS TEXTFILE | PARQUET | JSONFILE | ORC | AVRO | SEQUENCEFILE | RCFILE
  | STORED AS INPUTFORMAT 'class' OUTPUTFORMAT 'class']
 LOCATION 'url'
 [TBLPROPERTIES ('k' = 'v', ...)]
@@ -236,8 +236,25 @@ three formats, and anything else is rejected with the class name in the message.
 `ROW FORMAT DELIMITED FIELDS TERMINATED BY` is sugar for `LazySimpleSerDe` with
 `field.delim`.
 
-`STORED AS TEXTFILE` maps to csv, `PARQUET` to parquet, `JSON` and `JSONFILE`
-to json, and `CSV` to csv. `STORED AS INPUTFORMAT` accepts
+`STORED AS TEXTFILE` maps to csv, `PARQUET` to parquet, and `JSONFILE` to json.
+
+Bare `STORED AS JSON` does NOT parse; sqlparser accepts only `JSONFILE`. An
+earlier draft of this document said otherwise, from a probe that used
+DataFusion's own SQL parser, which extends sqlparser with its own external-table
+handling and format keywords. The engine's path uses sqlparser directly. The
+practical cost is small, because Athena's canonical JSON DDL is
+`ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'`, which parses and
+resolves to the same reader. A `JSON` to `JSONFILE` alias with a friendly error
+is deferred.
+
+Every `STORED AS` keyword is recorded in the manifest with the genuine Hadoop
+input and output format classes that Hive and Glue use, including `ORC`, `AVRO`,
+`SEQUENCEFILE`, and `RCFILE`, which this cycle cannot read. Recording them and
+rejecting by class name at read time keeps the manifest faithful and lets the
+error say what the table actually is. An earlier design dropped unrecognized
+keywords, which left an ORC manifest unable to state that it was ORC.
+
+`STORED AS INPUTFORMAT` accepts
 `org.apache.hadoop.mapred.TextInputFormat` and
 `org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat`, and rejects
 anything else. When both a SerDe and a `STORED AS` are given and they disagree,
