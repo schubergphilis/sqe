@@ -1340,6 +1340,12 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     // No-op when the flag is false (the default).
     sqe_coordinator::maybe_warn_superdebug(&audit, &config);
 
+    // Process-wide, LIVE Hive registries; see the matching comment in
+    // `main.rs`. Both Arcs must be the same instance every other Hive
+    // consumer receives (Task 8+).
+    let hive_catalogs = Arc::new(sqe_policy::plan_rewriter::HiveCatalogs::new());
+    let hive_manifest_cache = Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new());
+
     // AUTH-01: build the enforcer + store from config.policy.engine.
     // table_cache is passed so the rewriter can wire CacheTagSource for
     // tag-based column masking (Task 4). A clone is taken here; the original
@@ -1347,6 +1353,8 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     let (policy_enforcer, policy_store) = sqe_coordinator::policy_wiring::build_policy_enforcer(
         &config.policy,
         Some(table_cache.clone()),
+        hive_catalogs.clone(),
+        hive_manifest_cache.clone(),
         Some(Arc::clone(&metrics)),
     )?;
     if config.policy.engine != sqe_core::config::PolicyEngine::Passthrough {
@@ -1695,7 +1703,9 @@ async fn run_worker(config: SqeConfig, config_path: String) -> anyhow::Result<()
     }
 
     server_builder
-        .add_service(flight_service.into_server(config.coordinator.transport.max_decoding_message_bytes))
+        .add_service(
+            flight_service.into_server(config.coordinator.transport.max_decoding_message_bytes),
+        )
         .serve_with_shutdown(
             addr,
             shutdown_with_drain(ready.clone(), config.coordinator.shutdown_drain_secs),
