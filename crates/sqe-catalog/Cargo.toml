@@ -94,7 +94,10 @@ s3tables = [
 # line-delimited JSON, and Parquet) with definitions in a sidecar manifest.
 # Distinct from `hms`, which is Hive Metastore holding Iceberg tables. Adds no
 # new dependencies: the readers are already compiled for the file TVFs.
-hive-external = []
+# `thiserror` is already in the workspace lockfile for other crates, but this
+# is the first `dep:`-gated use of it in sqe-catalog, kept optional so a
+# build without this feature does not add the edge.
+hive-external = ["dep:thiserror"]
 # Delta Lake read support (delta-rs) is REMOVED for the DataFusion 54 bump.
 # deltalake-core 0.32.1 targets DataFusion 53.1, so its `DeltaTableProvider`
 # implements an older DataFusion's `TableProvider` trait and will not satisfy
@@ -108,7 +111,7 @@ sqe-core = { path = "../sqe-core" }
 sqe-sql = { path = "../sqe-sql" }
 sqe-policy = { path = "../sqe-policy" }
 sqe-metrics = { path = "../sqe-metrics" }
-thiserror = { workspace = true }
+thiserror = { workspace = true, optional = true }
 datafusion = { workspace = true }
 datafusion-expr = { workspace = true }
 object_store = { workspace = true }

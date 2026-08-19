@@ -188,8 +188,13 @@ impl HiveManifest {
                 columns: spec.columns.iter().map(glue_column_of).collect(),
                 sort_columns: Vec::new(),
             },
+            // `secret` is left `None` here: `parameters` already carries
+            // `sqe.secret` verbatim from `table_properties`, and `secret()`
+            // reads that first. Writing it into both places would give a
+            // hand-edited `parameters["sqe.secret"]` a stale twin in `sqe`
+            // that silently disagrees with it.
             sqe: SqeExtensions {
-                secret: spec.table_properties.get("sqe.secret").cloned(),
+                secret: None,
                 column_tags: BTreeMap::new(),
                 partition_index: None,
                 statistics: None,
