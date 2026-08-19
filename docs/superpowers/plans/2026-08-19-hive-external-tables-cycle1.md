@@ -2417,10 +2417,12 @@ Append to the test module in `crates/sqe-cli/src/embedded.rs`:
     #[tokio::test]
     async fn create_external_table_as_select_fails_at_the_parser_not_at_our_handler() {
         // Corrected from the original plan text, which assumed this shape
-        // reaches the Hive DDL handler. It does not: sqlparser's
-        // GenericDialect rejects `external: true` combined with a trailing
-        // `AS SELECT` at parse time, for every clause ordering, so no handler
-        // can ever see it. The test pins where the boundary actually is
+        // reaches the Hive DDL handler. It does not, and the guarantee is
+        // structural rather than dialect-specific: sqlparser dispatches
+        // CREATE EXTERNAL TABLE to its own `parse_create_external_table`
+        // (parser/mod.rs:6394), which never calls `parse_query` and has no
+        // `AS` path at all, so `ct.query` is unconditionally None whenever
+        // `ct.external` is true, in every dialect. No handler can ever see it. The test pins where the boundary actually is
         // instead of asserting a message no code produces. The
         // EXTERNAL-before-CTAS ordering in the classifier stays as defensive
         // code for a future sqlparser that does accept the shape.
