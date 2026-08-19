@@ -38,6 +38,7 @@ async fn attach_rejects_a_root_location_that_fails_the_allowlist() {
         "file:///etc",
         &BTreeMap::new(),
         &StorageConfig::default(),
+        sqe_catalog::hive::manifest::ManifestLimits::default(),
         sqe_core::config::TvfCaller::default(),
     )
     .await;
@@ -75,6 +76,7 @@ async fn attach_accepts_an_s3_root_without_touching_the_network() {
         "s3://bucket/wh/",
         &BTreeMap::new(),
         &storage,
+        sqe_catalog::hive::manifest::ManifestLimits::default(),
         sqe_core::config::TvfCaller::default(),
     )
     .await
@@ -113,6 +115,7 @@ async fn attach_accepts_an_empty_local_root() {
         &location,
         &BTreeMap::new(),
         &storage,
+        sqe_catalog::hive::manifest::ManifestLimits::default(),
         sqe_core::config::TvfCaller::trusted_local(),
     )
     .await
@@ -141,6 +144,7 @@ async fn session_hive_catalog_resolves_a_table_written_through_the_shared_root()
         &format!("file://{}", dir.path().display()),
         &BTreeMap::new(),
         &storage,
+        sqe_catalog::hive::manifest::ManifestLimits::default(),
         caller.clone(),
     )
     .await
@@ -183,6 +187,74 @@ async fn session_hive_catalog_resolves_a_table_written_through_the_shared_root()
     let schema = provider.schema("sales").expect("schema");
     let tables = schema.table_names();
     assert_eq!(tables, vec!["orders".to_string()]);
+}
+
+/// `build_hive_root`'s `limits` parameter must actually reach the store it
+/// builds, not just exist on the signature: this proves the wiring, not the
+/// plumbing. A `ManifestLimits` struct arriving intact would pass a test
+/// that only inspected the value handed to `build_hive_root`; this instead
+/// builds a root with a deliberately tiny `max_bytes`, writes a manifest
+/// that exceeds it (writing is not size-checked; see `HiveManifestStore::put`),
+/// and asserts that *reading it back* through the very store `build_hive_root`
+/// returned fails with the size error. If a future change dropped `limits`
+/// on the way through and hardcoded `ManifestLimits::default()` again (as an
+/// earlier draft of this function did), this test would still pass with a
+/// small manifest but must fail here because the manifest is deliberately
+/// bigger than the tiny cap and default's 1MB cap would let it through.
+#[tokio::test]
+async fn build_hive_root_wires_max_bytes_into_the_store_it_returns() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).expect("mkdir");
+    let storage = StorageConfig {
+        tvf: sqe_core::config::TvfPolicy {
+            allow_local_paths: true,
+            ..Default::default()
+        },
+        ..StorageConfig::default()
+    };
+    let tiny_limits = sqe_catalog::hive::manifest::ManifestLimits {
+        max_bytes: 32,
+        ..Default::default()
+    };
+    let root = sqe_catalog::mount::build_hive_root(
+        &format!("file://{}", dir.path().display()),
+        &BTreeMap::new(),
+        &storage,
+        tiny_limits,
+        sqe_core::config::TvfCaller::trusted_local(),
+    )
+    .await
+    .expect("build root");
+
+    let ddl = format!(
+        "CREATE EXTERNAL TABLE sales.orders (id BIGINT) STORED AS PARQUET LOCATION 'file://{}'",
+        data.display()
+    );
+    let stmts = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, &ddl)
+        .expect("parse");
+    let spec = sqe_sql::hive_ddl::try_extract_hive_table(&stmts[0])
+        .expect("extract")
+        .expect("external");
+    let manifest = sqe_catalog::hive::manifest::HiveManifest::from_spec(
+        &spec,
+        "sales",
+        "jacob",
+        "2026-08-19T00:00:00Z",
+    );
+    // `put` does not size-check (only `get`/`parse` does), so this succeeds
+    // even though the serialized manifest is well over 32 bytes.
+    root.put(&manifest, false).await.expect("put manifest");
+
+    let err = root
+        .get("sales", "orders")
+        .await
+        .expect_err("a manifest over the 32-byte cap must be refused on read");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("byte cap") || msg.contains("exceeds"),
+        "expected a size-cap error, got: {msg}"
+    );
 }
 
 /// Counts `get_opts(head=true)` and `list` calls so a "no network touched"
@@ -312,6 +384,7 @@ async fn a_missing_manifest_secret_errors_naming_the_secret() {
         &format!("file://{}", dir.path().display()),
         &BTreeMap::new(),
         &storage,
+        sqe_catalog::hive::manifest::ManifestLimits::default(),
         caller.clone(),
     )
     .await
