@@ -2801,7 +2801,7 @@ echo "leak-scan exit: $?"
 
 Expected: `forbidden characters: 0`, and a clean leak scan. `docs/site/` must be publish-clean.
 
-Use the per-character scan above rather than a `grep` alternation. A `grep '—\|–'` pattern depends on the grep flavour treating `\|` as alternation in a basic regular expression, and under ANSI-C quoting (`$'...'`) it silently matches nothing at all regardless of file content, which makes the gate report success on a file full of emdashes. An implementer on this feature hit exactly that and shipped six emdashes past a passing check.
+Use the per-character scan above rather than a `grep` alternation. A grep pattern that alternates the forbidden characters with `\|` depends on the grep flavour treating that as alternation in a basic regular expression, and under ANSI-C quoting (`$'...'`) it silently matches nothing at all regardless of file content, which makes the gate report success on a file full of them. An implementer on this feature hit exactly that and shipped six past a passing check. Refer to the characters by codepoint (U+2014, U+2013, U+2192) rather than writing them literally, so that a document about the rule does not itself violate it.
 
 - [ ] **Step 3: Update project state**
 
