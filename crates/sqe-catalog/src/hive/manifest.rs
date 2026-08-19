@@ -147,6 +147,18 @@ pub struct HiveManifest {
 /// `_ => (None, None)` is kept for a keyword this function does not
 /// recognize at all, so an unknown future keyword still fails loudly
 /// downstream instead of being silently renamed into a known class.
+///
+/// Against the pinned sqlparser-rs 0.62, this arm is provably unreachable:
+/// its `FileFormat` enum has exactly seven variants, and all seven are
+/// matched above (`TEXTFILE`, `PARQUET`, `ORC`, `AVRO`, `SEQUENCEFILE`,
+/// `RCFILE`, `JSONFILE`; bare `JSON` does not parse at all, see the comment
+/// on that arm). Breadcrumb for whoever bumps sqlparser next: if a future
+/// version adds an eighth `FileFormat` variant, a table declared with it
+/// falls through to this arm and fails downstream in `kind_from_input_format`
+/// with a message that does NOT name the offending keyword, because nothing
+/// retains the raw `STORED AS` text once it falls through unmapped. Add the
+/// new variant's real Hadoop classes here rather than leaving it caught by
+/// this arm.
 fn formats_from_stored_as(stored_as: &str) -> (Option<String>, Option<String>) {
     match stored_as.to_ascii_uppercase().as_str() {
         "TEXTFILE" => (
