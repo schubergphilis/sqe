@@ -126,19 +126,30 @@ so cycle 1 needs no new parser. `CreateTable` carries `external: true`,
 `IOF { input_format, output_format }`, `file_format`, `location`, and
 `table_options: CreateTableOptions::TableProperties(..)`.
 
-Two forms do not parse, in either dialect:
+Two things do not parse, in either dialect:
 
 ```
 ... LOCATION 's3://b/p/' WITH (SECRET = 'partner')
 => Expected: end of statement, found: WITH
-CREATE EXTERNAL TABLE t (b ARRAY<STRING>) ...
-=> Expected: ',' or ')' after column definition, found: <
+CREATE EXTERNAL TABLE t (c MAP<STRING,INT>) ...
+=> Expected: '(', found: <
 ```
 
 The first removes the need for a grammar extension: the secret goes in
 `TBLPROPERTIES ('sqe.secret' = 'name')`, which parses today and is where Glue
-and Athena put everything else anyway. The second bounds cycle 1 to scalar
-column types.
+and Athena put everything else anyway.
+
+The second needs a correction to an earlier reading of this same probe. The
+failure is `MAP<...>` specifically, not angle-bracket types as a class:
+`supports_map_literal_with_angle_brackets()` is false in every dialect except
+Spark's. `ARRAY<STRING>` and `STRUCT<x:INT>` both parse under `GenericDialect`
+and render with their brackets intact, so they reach the extraction layer and
+are rejected there by name.
+
+The consequence for cycle 1 is the same either way, scalar columns and scalar
+partition keys, but the rejection lives in two places and the error a user sees
+differs: a clear SQE message for `array` and `struct`, and a raw sqlparser
+message for `map`. Both are documented, and neither is silent.
 
 **10. DataFusion's listing cache is off on purpose.**
 `crates/sqe-catalog/src/lazy_object_store.rs:64` builds the runtime with
