@@ -7,6 +7,7 @@
 //! mapping rather than a redesign.
 
 pub mod manifest;
+pub mod serde_map;
 
 /// Errors from the Hive external-table path.
 ///
