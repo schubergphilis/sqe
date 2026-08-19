@@ -16,7 +16,7 @@
 - **Clippy is strict:** `cargo clippy --all-targets --all-features -- -D warnings` must pass. Never pipe a gate command into `tail`; the exit code you see would be `tail`'s.
 - **Never run `cargo fmt --all`.** Main is not rustfmt-clean. Format only files you touched: `cargo fmt -- <paths>`.
 - **Feature gate:** all new `sqe-catalog` code sits behind the `hive-external` cargo feature, default-on. Named to avoid confusion with `hms`, which is Hive Metastore for Iceberg tables.
-- **Branch:** `feat/hive-external-tables-cycle1`. Never push to main. One MR.
+- **Branch:** `feat/hive-external-tables-cycle1`, cut from `docs/hive-external-tables-design`, NOT from main. The spec and this plan live on that branch and main does not have them yet. If the docs branch has already merged, cut from main. Never push to main. One MR.
 - **Manifest path:** `<root>/<database>/<table>/_sqe/table.json`
 - **Manifest version:** `manifest_version: 1`. Unknown higher version is rejected, unknown fields inside version 1 are ignored.
 - **Attach kind keyword:** `hive_external`. `hive` is already bound to `Hms` at `crates/sqe-sql/src/attach.rs:64`.
@@ -243,8 +243,8 @@ Create `crates/sqe-sql/src/hive_ddl.rs`. Key shape:
 use std::collections::BTreeMap;
 
 use sqlparser::ast::{
-    ColumnDef, ColumnOption, CreateTable, CreateTableOptions, Expr, HiveDistributionStyle,
-    HiveIOFormat, HiveRowDelimiter, HiveRowFormat, Ident, SqlOption, Statement, Value,
+    ColumnDef, ColumnOption, CreateTable, CreateTableOptions, Expr, HiveDelimiter,
+    HiveDistributionStyle, HiveIOFormat, HiveRowFormat, Ident, SqlOption, Statement, Value,
 };
 use sqe_core::SqeError;
 
@@ -313,14 +313,15 @@ fn extract(ct: &CreateTable) -> Result<HiveTableSpec, SqeError> {
             Some(HiveRowFormat::SERDE { class }) => serde_class = Some(class.clone()),
             Some(HiveRowFormat::DELIMITED { delimiters }) => {
                 serde_class = Some(LAZY_SIMPLE_SERDE.to_string());
+                // `HiveRowDelimiter` is a struct, not an enum: it holds a
+                // `delimiter: HiveDelimiter` and a `char: Ident`. Match on the
+                // inner field, not on the struct name.
                 for d in delimiters {
                     let key = match d.delimiter {
-                        HiveRowDelimiter::FieldsTerminatedBy => "field.delim",
-                        HiveRowDelimiter::LinesTerminatedBy => "line.delim",
-                        HiveRowDelimiter::CollectionItemsTerminatedBy => "colelction.delim",
-                        HiveRowDelimiter::MapKeysTerminatedBy => "mapkey.delim",
-                        HiveRowDelimiter::EscapedBy => "escape.delim",
-                        HiveRowDelimiter::NullDefinedAs => "serialization.null.format",
+                        HiveDelimiter::FieldsTerminatedBy => "field.delim",
+                        HiveDelimiter::LinesTerminatedBy => "line.delim",
+                        HiveDelimiter::CollectionItemsTerminatedBy => "collection.delim",
+                        HiveDelimiter::MapKeysTerminatedBy => "mapkey.delim",
                     };
                     serde_properties.insert(key.to_string(), d.char.value.clone());
                 }
@@ -456,7 +457,7 @@ pub fn secret_name(spec: &HiveTableSpec) -> Option<&str> {
 }
 ```
 
-Every rejection uses `SqeError::InvalidArgument` and names the offending item. If `HiveRowDelimiter` variant names differ in the pinned sqlparser, run `cargo doc -p sqlparser --open` and match the actual names; the mapping to Hive property keys stays as written.
+Every rejection uses `SqeError::InvalidArgument` and names the offending item. `HiveDelimiter`'s variant list is small and may differ in the pinned sqlparser; confirm it with `grep -n "pub enum HiveDelimiter" -A 12 $(ls -d ~/.cargo/registry/src/*/sqlparser-0.62.0)/src/ast/mod.rs` and keep the mapping to Hive property keys as written.
 
 Add to `crates/sqe-sql/src/lib.rs`:
 
@@ -1364,22 +1365,70 @@ manifest pointing at a service-account token is refused with Forbidden."
 - Consumes: `HiveManifestStore` (Task 5), `resolve_format` / `listing_options` / `arrow_type` (Task 4).
 - Produces:
   ```rust
-  pub struct HiveCatalogProvider { /* root name, store, moka cache */ }
+  pub struct HiveCatalogProvider {
+      name: String,
+      store: Arc<HiveManifestStore>,
+      data_store_factory: Arc<dyn HiveDataStoreFactory>,
+      runtime: Arc<RuntimeEnv>,
+      manifest_cache: Arc<HiveMetadataCache>,
+      table_names_cache: moka::sync::Cache<String, Arc<Vec<String>>>,
+  }
+  pub struct HiveSchemaProvider {
+      database: String,
+      store: Arc<HiveManifestStore>,
+      data_store_factory: Arc<dyn HiveDataStoreFactory>,
+      runtime: Arc<RuntimeEnv>,
+      cache: Arc<HiveMetadataCache>,
+      table_names_cache: moka::sync::Cache<String, Arc<Vec<String>>>,
+  }
   impl HiveCatalogProvider {
-      pub fn new(name: String, store: Arc<HiveManifestStore>, data_store_factory: Arc<dyn HiveDataStoreFactory>, cache_ttl: Duration) -> Self;
+      /// Built PER SESSION. `data_store_factory` carries that session's
+      /// credentials and `runtime` is that session's `RuntimeEnv`; both are
+      /// session-scoped, so the provider must be too.
+      pub fn new(
+          name: String,
+          store: Arc<HiveManifestStore>,
+          data_store_factory: Arc<dyn HiveDataStoreFactory>,
+          runtime: Arc<RuntimeEnv>,
+          manifest_cache: Arc<HiveMetadataCache>,
+          cache_ttl: Duration,
+      ) -> Self;
       pub fn manifest_cache(&self) -> Arc<HiveMetadataCache>;
   }
   pub trait HiveDataStoreFactory: Send + Sync + std::fmt::Debug {
-      /// Build an object store for a table's data location, using session
-      /// credentials or the named secret. `secret` is a name, never material.
+      /// Build an object store for a table's data location. The implementation
+      /// holds the session's credentials; `secret` is a name resolved against
+      /// the SecretStore, never material carried in a manifest.
       fn store_for(&self, location: &str, secret: Option<&str>) -> Result<Arc<dyn ObjectStore>, HiveError>;
   }
   pub struct HiveMetadataCache { /* moka: "<db>.<table>" -> HiveManifest */ }
   impl HiveMetadataCache {
       pub fn get(&self, database: &str, table: &str) -> Option<HiveManifest>;
+      pub fn insert(&self, database: &str, table: &str, m: HiveManifest);
   }
   ```
-  `HiveCatalogProvider` implements `datafusion::catalog::CatalogProvider`, and its inner `HiveSchemaProvider` implements `SchemaProvider`. `HiveSchemaProvider::table` inserts the loaded manifest into `HiveMetadataCache` before returning, which is the ordering the synchronous `TagSource` in Task 9 depends on.
+
+  **Two lifetimes, deliberately different.** The provider is per session because
+  a Hive read must run as the calling user, and `SchemaProvider::table()` takes
+  no session argument, so the credentials have to be baked into the provider
+  instance. There is no other place to put them.
+
+  `HiveMetadataCache` is the exception: one process-wide instance, injected into
+  every per-session provider. It has to be shared, because the `TagSource` in
+  Task 7 is constructed once at `main.rs:398` and is synchronous, so it can only
+  read a cache that outlives any one session. Sharing is safe: a manifest's
+  content does not depend on who read it, and reading one grants no data access.
+  Tags in it are not secrets; the mask decision is still made per user.
+
+  `runtime` is the session's `RuntimeEnv`. `ListingTable` resolves its object
+  store from the session registry at scan time, so the store must be registered
+  on the same runtime the query executes against. Registering on a fresh runtime
+  would produce a scan that cannot find its bucket.
+
+  `HiveCatalogProvider` implements `datafusion::catalog::CatalogProvider`, and
+  `HiveSchemaProvider` implements `SchemaProvider`. `table()` inserts the
+  manifest into `HiveMetadataCache` before returning, which is the ordering the
+  synchronous `TagSource` depends on.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1725,7 +1774,21 @@ Without this task every Hive query returns zero rows in any deployment with a ta
 - Produces:
   ```rust
   // sqe-policy
-  pub struct HiveCatalogs(pub std::collections::HashSet<String>);
+  /// LIVE set of attached Hive warehouse-root names. Interior mutability is
+  /// required, not stylistic: `build_policy_enforcer` runs once at
+  /// `main.rs:398`, process-wide, while `ATTACH ... TYPE hive_external` is a
+  /// runtime statement. A snapshot taken at construction would go stale, the
+  /// Iceberg branch would win, and `lake.hr.employees` would silently key as
+  /// `("hr", "employees")`. That is the exact escalation the naming rule
+  /// exists to prevent, so it must not be reachable through staleness.
+  pub struct HiveCatalogs(std::sync::RwLock<std::collections::HashSet<String>>);
+  impl HiveCatalogs {
+      pub fn new() -> Self;
+      pub fn insert(&self, root: &str);
+      pub fn remove(&self, root: &str);
+      pub fn contains_name(&self, catalog: Option<&str>) -> bool;
+      pub fn is_empty(&self) -> bool;
+  }
   impl PolicyPlanRewriter { pub fn with_hive_catalogs(self, c: Arc<HiveCatalogs>) -> Self; }
 
   // sqe-coordinator
@@ -1856,6 +1919,48 @@ fn an_unknown_catalog_routes_to_the_fail_closed_source_not_to_empty() {
 }
 
 #[test]
+fn a_root_attached_after_the_rewriter_was_built_still_gets_the_hive_key() {
+    // The regression guard for the staleness path. The enforcer is built once
+    // process-wide; ATTACH happens later. If the set were snapshotted, this
+    // key would come back as ("sales", "orders") and the table would inherit
+    // any grant written for an Iceberg namespace named `sales`.
+    let cats = Arc::new(sqe_policy::plan_rewriter::HiveCatalogs::default());
+    let r = datafusion::common::TableReference::full("lake", "sales", "orders");
+    assert_eq!(
+        sqe_policy::plan_rewriter::resolve_policy_key_for_test(&r, &cats),
+        Some(("sales".to_string(), "orders".to_string())),
+        "before ATTACH the root is unknown, so the Iceberg branch is correct"
+    );
+    cats.insert("lake");
+    assert_eq!(
+        sqe_policy::plan_rewriter::resolve_policy_key_for_test(&r, &cats),
+        Some(("lake.sales".to_string(), "orders".to_string())),
+        "after ATTACH the same reference must key under the root"
+    );
+}
+
+#[test]
+fn a_root_attached_after_construction_reaches_the_hive_tag_source() {
+    let (cache, cats) = fixture_with_cached_manifest_unattached("lake", "sales", "orders");
+    let routed = sqe_coordinator::hive_tag_source::CatalogRoutedTagSource::new(
+        cats.clone(),
+        Arc::new(sqe_coordinator::hive_tag_source::HiveTagSource::new(cache)),
+        Arc::new(AlwaysUnknown),
+    );
+    assert_eq!(
+        routed.column_tags(Some("lake"), &["sales".to_string()], "orders"),
+        None,
+        "not attached yet, so the fail-closed source answers"
+    );
+    cats.insert("lake");
+    assert_eq!(
+        routed.column_tags(Some("lake"), &["sales".to_string()], "orders"),
+        Some(HashMap::new()),
+        "a router that snapshotted the set at construction would still deny here"
+    );
+}
+
+#[test]
 fn tags_recorded_in_the_manifest_are_returned() {
     let (cache, hive_catalogs) = fixture_with_tagged_manifest("lake", "sales", "orders", "ssn", "PII");
     let routed = sqe_coordinator::hive_tag_source::CatalogRoutedTagSource::new(
@@ -1868,7 +1973,9 @@ fn tags_recorded_in_the_manifest_are_returned() {
 }
 ```
 
-Write both `fixture_*` helpers inline in the test file: build a `HiveManifest` from a DDL string, set `sqe.column_tags` for the tagged case, insert it into a fresh `HiveMetadataCache`, and return that plus an `Arc<HiveCatalogs>` containing the root name.
+Write the three `fixture_*` helpers inline in the test file: build a `HiveManifest` from a DDL string, set `sqe.column_tags` for the tagged case, insert it into a fresh `HiveMetadataCache`, and return that plus an `Arc<HiveCatalogs>`. `fixture_with_cached_manifest` returns a set that already contains the root; `fixture_with_cached_manifest_unattached` returns an empty one so the test can attach mid-flight.
+
+`resolve_policy_key` is private, so expose `resolve_policy_key_for_test` from `sqe-policy` under `#[doc(hidden)]` rather than making the real function public. The key rule is internal; only the test needs the door.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -1884,16 +1991,38 @@ Expected: `resolve_policy_key` takes 1 argument, not 2. `unresolved module hive_
 In `crates/sqe-policy/src/plan_rewriter.rs`:
 
 ```rust
-/// Catalog names that hold Hive external tables rather than Iceberg tables.
+/// Live set of catalog names that hold Hive external tables rather than
+/// Iceberg tables. Empty in every Iceberg-only deployment, which is why the
+/// Hive branch below cannot change an existing key.
 ///
-/// Empty in every Iceberg-only deployment, which is why the Hive branch below
-/// cannot change an existing key.
+/// Read through a lock on every key resolution rather than snapshotted at
+/// construction. The rewriter is built once, process-wide, at `main.rs:398`;
+/// `ATTACH ... TYPE hive_external` happens later, per session. A stale set
+/// sends a Hive table down the Iceberg branch, where it would inherit any
+/// grant written for a same-named Iceberg namespace.
 #[derive(Debug, Default)]
-pub struct HiveCatalogs(pub std::collections::HashSet<String>);
+pub struct HiveCatalogs(std::sync::RwLock<std::collections::HashSet<String>>);
 
 impl HiveCatalogs {
-    fn contains(&self, catalog: Option<&str>) -> bool {
-        catalog.is_some_and(|c| self.0.contains(c))
+    pub fn insert(&self, root: &str) {
+        // A poisoned lock here would mean a panic while holding it, and
+        // failing closed is not an option because the caller has no error
+        // path. Clear the poison and continue: the set is a name registry,
+        // not state that can be left half-written.
+        self.0.write().unwrap_or_else(|e| e.into_inner()).insert(root.to_string());
+    }
+
+    pub fn remove(&self, root: &str) {
+        self.0.write().unwrap_or_else(|e| e.into_inner()).remove(root);
+    }
+
+    pub fn contains_name(&self, catalog: Option<&str>) -> bool {
+        let Some(c) = catalog else { return false };
+        self.0.read().unwrap_or_else(|e| e.into_inner()).contains(c)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 }
 
@@ -1919,7 +2048,7 @@ fn resolve_policy_key(
     // The asymmetry is deliberate: adding the catalog to the Iceberg key would
     // invalidate every Ranger policy already written against the
     // `hive_database` convention. Making both symmetric is its own change.
-    if hive_catalogs.contains(table_ref.catalog()) {
+    if hive_catalogs.contains_name(table_ref.catalog()) {
         let root = table_ref.catalog().unwrap_or_default();
         return Some((format!("{root}.{namespace}"), table.to_string()));
     }
@@ -1983,23 +2112,24 @@ In `crates/sqe-coordinator/src/policy_wiring.rs:89`, wrap the existing source in
             if let Some(cache) = table_cache {
                 let iceberg: Arc<dyn TagSource> =
                     Arc::new(crate::tag_source_impl::CacheTagSource::new(Arc::new(cache)));
-                let tag_src: Arc<dyn TagSource> = match hive_catalogs.as_ref() {
-                    // No Hive root attached: keep the Iceberg source
-                    // untouched, so an Iceberg-only deployment sees no change.
-                    Some(hc) if !hc.0.is_empty() => Arc::new(CatalogRoutedTagSource::new(
-                        hc.clone(),
-                        Arc::new(HiveTagSource::new(hive_cache.clone())),
-                        iceberg,
-                    )),
-                    _ => iceberg,
-                };
-                rewriter = rewriter.with_tag_source(tag_src).with_hive_catalogs(
-                    hive_catalogs.clone().unwrap_or_default(),
-                );
+                // Wrap unconditionally, and let the router read the live set.
+                // Deciding here on `is_empty()` would bake in whatever was
+                // attached at process start, and a later ATTACH would never
+                // reach the Hive source. When the set is empty the router
+                // delegates every call to `iceberg`, so an Iceberg-only
+                // deployment behaves identically.
+                let tag_src: Arc<dyn TagSource> = Arc::new(CatalogRoutedTagSource::new(
+                    hive_catalogs.clone(),
+                    Arc::new(HiveTagSource::new(hive_manifest_cache.clone())),
+                    iceberg,
+                ));
+                rewriter = rewriter
+                    .with_tag_source(tag_src)
+                    .with_hive_catalogs(hive_catalogs.clone());
             }
 ```
 
-Add the same wiring at `crates/sqe-coordinator/src/main.rs:282`.
+`build_policy_enforcer` gains two parameters: `hive_catalogs: Arc<HiveCatalogs>` and `hive_manifest_cache: Arc<HiveMetadataCache>`. Both are created in `main.rs` before the call at line 398 and are the same instances the ATTACH handler and every per-session provider receive. Construct them once and pass the same `Arc` everywhere; two instances would look correct and route nothing.
 
 - [ ] **Step 4: Run to verify passing**
 
@@ -2047,18 +2177,44 @@ catalog routes to the fail-closed source, never to known-no-tags."
 - Produces:
   ```rust
   // sqe-catalog::mount
-  pub async fn build_hive_catalog(
+  /// Validate a root and build the shared, session-independent half.
+  /// Returns the manifest store, which every session's provider borrows.
+  pub async fn build_hive_root(
       location: &str,
       options: &BTreeMap<String, OptionValue>,
-      secrets: &dyn SecretStore,
       storage: &StorageConfig,
-  ) -> Result<Arc<HiveCatalogProvider>, String>;
+      caller: TvfCaller,
+  ) -> Result<Arc<HiveManifestStore>, String>;
+
+  /// Build the per-session provider over a shared root. `credentials` and
+  /// `runtime` are this session's, which is what makes a Hive read run as the
+  /// calling user. `manifest_cache` is the process-wide instance from Task 7.
+  pub fn session_hive_catalog(
+      name: &str,
+      root: Arc<HiveManifestStore>,
+      credentials: SessionStorageCredentials,
+      secrets: Arc<dyn SecretStore>,
+      runtime: Arc<RuntimeEnv>,
+      manifest_cache: Arc<HiveMetadataCache>,
+      cache_ttl: Duration,
+  ) -> Arc<HiveCatalogProvider>;
 
   // sqe-core::config
   pub struct HiveRootConfig { pub name: String, pub location: String, pub secret: Option<String> }
   pub struct HiveConfig { pub roots: Vec<HiveRootConfig>, pub manifest_max_bytes: usize, pub manifest_max_columns: usize, pub manifest_max_partition_keys: usize }
   ```
-  `build_hive_catalog` is a sibling of `build_catalog`, not a variant of it: `build_catalog` returns `Arc<dyn iceberg::Catalog>`, which a Hive root is not.
+  These are siblings of `build_catalog`, not variants of it: `build_catalog` returns `Arc<dyn iceberg::Catalog>`, which a Hive root is not.
+
+  The split is the credential model. A root is validated and its manifest store
+  built once, because the manifest is the same object for everyone. The provider
+  is built per session, because `SchemaProvider::table()` takes no session and
+  the calling user's credentials therefore have to live in the provider
+  instance. Building the provider once at ATTACH time would make every user read
+  as whoever attached, which is the service-account model this engine rejects.
+
+  `SessionStorageCredentials` is the session's existing vended-credential
+  handle; reuse whatever `session_context.rs` already threads to the Iceberg
+  scan path rather than introducing a parallel type.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2074,13 +2230,12 @@ use sqe_core::InMemorySecretStore;
 
 #[tokio::test]
 async fn attach_rejects_a_root_location_that_fails_the_allowlist() {
-    let secrets = InMemorySecretStore::default();
     // Default storage config denies local paths, matching the coordinator.
-    let err = sqe_catalog::mount::build_hive_catalog(
+    let err = sqe_catalog::mount::build_hive_root(
         "file:///etc",
         &BTreeMap::new(),
-        &secrets,
         &StorageConfig::default(),
+        sqe_core::config::TvfCaller::Remote,
     )
     .await
     .expect_err("must refuse");
@@ -2089,7 +2244,6 @@ async fn attach_rejects_a_root_location_that_fails_the_allowlist() {
 
 #[tokio::test]
 async fn attach_accepts_an_s3_root_without_touching_the_network() {
-    let secrets = InMemorySecretStore::default();
     let storage = StorageConfig {
         tvf: sqe_core::config::TvfPolicy {
             allowed_object_store_prefixes: vec!["s3://bucket/".to_string()],
@@ -2099,11 +2253,11 @@ async fn attach_accepts_an_s3_root_without_touching_the_network() {
     };
     // ATTACH must not list or HEAD: a root is registered lazily, so attaching
     // an empty or not-yet-created prefix has to succeed.
-    sqe_catalog::mount::build_hive_catalog(
+    sqe_catalog::mount::build_hive_root(
         "s3://bucket/wh/",
         &BTreeMap::new(),
-        &secrets,
         &storage,
+        sqe_core::config::TvfCaller::Remote,
     )
     .await
     .expect("attach should not require the prefix to exist");
@@ -2132,11 +2286,12 @@ fn parse_and_classify_accepts_the_hive_external_attach_form() {
 cargo test -p sqe-catalog --features hive-external --test hive_mount_test 2>&1 | tail -20
 ```
 
-Expected: `build_hive_catalog` not found.
+Expected: `build_hive_root` not found.
 
 - [ ] **Step 3: Implement**
 
-- `build_hive_catalog` in `mount.rs`: validate `location` through `storage.tvf.check_path`, resolve an optional `SECRET` option into a `HiveDataStoreFactory`, build the `HiveManifestStore` with limits from config, and return the provider. Never LIST or HEAD at attach time, so attaching an empty prefix works.
+- `build_hive_root` in `mount.rs`: validate `location` through `storage.tvf.check_path`, build the `HiveManifestStore` with limits from config, and return it. Never LIST or HEAD at attach time, so attaching a prefix that does not exist yet works. Also insert the root name into the shared `HiveCatalogs` from Task 7, and remove it on `DETACH`; a root registered for reads but missing from that set is the staleness bug by another route.
+- `session_hive_catalog` in `mount.rs`: build a `HiveDataStoreFactory` closing over the session credentials and the `SecretStore`, then construct the provider with the session's `RuntimeEnv` and the process-wide manifest cache. The factory resolves `manifest.secret()` against the `SecretStore` when present and falls back to session credentials when absent.
 - In `sqe-core/src/config.rs`, add `HiveConfig` with the three caps defaulting to `1048576`, `4096`, and `32`, plus `roots`. Wire it under `[hive]` in the TOML, with `[[hive.roots]]` entries.
 - In `sqe-cli/src/main.rs`, add `--hive-root NAME=URL` as a repeatable arg, documented like `--catalog`, and note in the help text that it can be combined with any catalog mode because a Hive root is not an Iceberg catalog.
 - In `embedded.rs`, register each root before the REPL starts.
@@ -2157,9 +2312,13 @@ Expected: 3 passed, `sqe-cli` builds, clippy clean.
 git add crates/sqe-catalog/src/mount.rs crates/sqe-core/src/config.rs crates/sqe-cli/src crates/sqe-catalog/tests/hive_mount_test.rs
 git commit -m "feat: attach a Hive warehouse root by SQL, config, or CLI flag
 
-build_hive_catalog is a sibling of build_catalog rather than a variant:
-build_catalog returns an iceberg::Catalog, and a Hive root is a DataFusion
-CatalogProvider. ATTACH validates the root through the allowlist but never
+build_hive_root and session_hive_catalog are siblings of build_catalog rather
+than variants: build_catalog returns an iceberg::Catalog, and a Hive root is a
+DataFusion CatalogProvider. The split is the credential model. The root and
+its manifest store are shared, because the manifest is the same object for
+everyone; the provider is per session, because SchemaProvider::table() takes no
+session and the calling user's credentials therefore have to live in the
+provider instance. ATTACH validates the root through the allowlist but never
 lists or HEADs, so attaching a prefix that does not exist yet works."
 ```
 
@@ -2466,7 +2625,8 @@ Expected: `unresolved module hive_ddl_handler`.
 - `hive_ddl_handler.rs` with `resolve_table_kind` consulting the registered Hive roots, `create_external_table` (mirroring the embedded handler, sharing the manifest-building code via `sqe-catalog`, not by copy), `drop_table`, and `reject_unsupported(statement, cycle)` producing `SqeError::Unsupported` with a message of the form: `hive_external: <statement> is not supported for Hive external tables in this release; cycle <n> adds it`.
 - In `query_handler.rs`, add the `CreateExternalTable` arm next to the existing `CreateTable` arm at line 1306. For every statement kind in the spec's dispatch table, branch on `resolve_table_kind` and call `reject_unsupported` for the Hive case, leaving the Iceberg path untouched.
 - Emit the audit event from `create_external_table` and `drop_table` using the same three-part name the policy key uses, so audit and policy agree on identity.
-- In `session_context.rs`, register each configured Hive root on the session, and pass the root-name set into `policy_wiring` so Task 7's routing activates.
+- In `session_context.rs`, call `session_hive_catalog` for every configured or attached root while building each user's session, passing that session's credentials and `RuntimeEnv`. The shared `HiveManifestStore`, `HiveCatalogs`, and `HiveMetadataCache` come from the process-wide set built in `main.rs`.
+- `ATTACH` mid-session registers the provider on the current session context and inserts the name into `HiveCatalogs`, then calls `invalidate_session_cache(&username)` so the next statement rebuilds against the new root.
 
 - [ ] **Step 4: Run to verify passing**
 
@@ -2662,5 +2822,13 @@ Do not use `--auto-merge`: it merges immediately with no pipeline running. Push 
 **Two spec items deliberately spread rather than given their own task.** Statistics live in Task 6 with the provider that consumes them, because a `Statistics` value with no provider to attach it to cannot be tested. Audit lives in Task 10 with the handler that emits it.
 
 **Known gap, stated rather than hidden.** The spec's `sqe.partition_index` and `sqe.statistics` slots are defined in Task 3 and left `None` for cycle 1. That is intentional: they are cycle-2 fields, and the reason they exist now is that a manifest in object storage read by mixed engine versions is a wire format.
+
+**Two lifetimes, called out because getting them wrong is silent.** The
+`HiveManifestStore`, `HiveCatalogs`, and `HiveMetadataCache` are process-wide
+single instances created in `main.rs`; the `HiveCatalogProvider` is per session
+so a read runs as the calling user. Passing a second instance of any of the
+three would compile, look right, and route nothing: the tag source would read a
+cache no provider writes to, or the policy key would consult a set ATTACH never
+updates. Task 8 and Task 10 both say to pass the same `Arc`.
 
 **Type consistency check.** `HiveTableSpec`, `HiveColumn`, `HiveManifest`, `StorageDescriptor`, `SerdeInfo`, `GlueColumn`, `SqeExtensions`, `ManifestLimits`, `HiveError`, `ResolvedFormat`, `HiveFileFormat`, `HiveManifestStore`, `HiveCatalogProvider`, `HiveSchemaProvider`, `HiveMetadataCache`, `HiveDataStoreFactory`, `HiveCatalogs`, `HiveTagSource`, `CatalogRoutedTagSource`, `HiveDdlHandler`, and `TableKind` are each defined once, in the task that creates them, and referenced with the same spelling afterwards. `resolve_policy_key` gains its second parameter in Task 7 and every call site is updated in that same task.
