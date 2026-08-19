@@ -117,7 +117,30 @@ privilege escalation, because the person who picks the Hive table's name is
 whoever can write a manifest, and its LOCATION points wherever their credentials
 reach. Cycle 1 needs an explicit resource-naming rule, recorded below.
 
-**9. DataFusion's listing cache is off on purpose.**
+**9. sqlparser already parses the whole Athena DDL, and two things it does not.**
+sqlparser 0.62 parses the full form in both `GenericDialect` and `HiveDialect`,
+so cycle 1 needs no new parser. `CreateTable` carries `external: true`,
+`hive_distribution: PARTITIONED { columns }` with typed partition keys,
+`hive_formats.row_format` as `SERDE { class }` or `DELIMITED { delimiters }`,
+`hive_formats.serde_properties`, `hive_formats.storage` as `FileFormat` or
+`IOF { input_format, output_format }`, `file_format`, `location`, and
+`table_options: CreateTableOptions::TableProperties(..)`.
+
+Two forms do not parse, in either dialect:
+
+```
+... LOCATION 's3://b/p/' WITH (SECRET = 'partner')
+=> Expected: end of statement, found: WITH
+CREATE EXTERNAL TABLE t (b ARRAY<STRING>) ...
+=> Expected: ',' or ')' after column definition, found: <
+```
+
+The first removes the need for a grammar extension: the secret goes in
+`TBLPROPERTIES ('sqe.secret' = 'name')`, which parses today and is where Glue
+and Athena put everything else anyway. The second bounds cycle 1 to scalar
+column types.
+
+**10. DataFusion's listing cache is off on purpose.**
 `crates/sqe-catalog/src/lazy_object_store.rs:64` builds the runtime with
 `with_list_files_cache_limit(0)`. That is the #363 fix: an infinite-TTL listing
 cache served a stale file size and produced a corrupt-footer error that
@@ -148,6 +171,7 @@ Out, by cycle:
 - Worker execution of Hive scans (cycle 5)
 - ORC, Avro, SequenceFile, RCFile. Rejected by name, not silently
 - Bucketed tables, skewed tables, Hive views, `STORED BY` handlers
+- Hive angle-bracket nested types. Rejected by name (finding 9)
 
 ## SQL surface
 
@@ -168,12 +192,22 @@ CREATE EXTERNAL TABLE [IF NOT EXISTS] [catalog.][db.]name (
  | STORED AS INPUTFORMAT 'class' OUTPUTFORMAT 'class']
 LOCATION 'url'
 [TBLPROPERTIES ('k' = 'v', ...)]
-[WITH (SECRET = 'name')]
 ```
 
-`WITH (SECRET = ...)` is the one addition to Athena's grammar. Everything else
-is accepted as Athena writes it, so a DDL script copied out of Athena runs
-unchanged when it uses a supported format.
+There are no grammar extensions. Every clause above is Athena's own, and
+sqlparser 0.62 parses all of it (finding 9), so a DDL script copied out of
+Athena runs unchanged when it uses a supported format. SQE-specific settings
+ride in `TBLPROPERTIES` under an `sqe.` prefix, which is where Glue and Athena
+already put engine-specific settings:
+
+| Property | Meaning |
+|---|---|
+| `sqe.secret` | Name of a secret to use for this table's location instead of session credentials |
+
+An unrecognized `sqe.`-prefixed property is an error. A non-prefixed unknown
+property is preserved in the manifest and ignored, because Athena DDL carries
+properties (`classification`, `compressionType`, `EXTERNAL`) that are metadata
+for other tools.
 
 ### SerDe allow-list
 
@@ -243,12 +277,17 @@ case-insensitively for Parquet and JSON binding.
 1. `OpenCSVSerde` in Athena types every column as string. SQE honors the
    declared column types and casts. Athena's behavior is a workaround for its
    own SerDe, not a semantic anyone wants.
-2. `projection.*` partition projection properties are rejected in cycle 1 with a
+2. Hive angle-bracket nested types (`array<string>`, `map<string,int>`,
+   `struct<x:int>`) are rejected with an error naming the type, because
+   sqlparser parses neither form (finding 9). Cycle 1 is scalar columns and
+   scalar partition keys. A pre-parse type rewrite is cycle-2 work, and the
+   error says so.
+3. `projection.*` partition projection properties are rejected in cycle 1 with a
    message pointing at cycle 2, rather than being ignored. Ignoring them would
    silently produce a full table scan where the user asked for a computed
    partition set.
-3. `has_encrypted_data`, `STORED BY`, bucketing, and skew clauses are rejected.
-4. `DROP TABLE ... PURGE` is rejected. `DROP TABLE` removes the manifest and
+4. `has_encrypted_data`, `STORED BY`, bucketing, and skew clauses are rejected.
+5. `DROP TABLE ... PURGE` is rejected. `DROP TABLE` removes the manifest and
    never touches data, so there is no purge semantics to offer yet.
 
 ## Manifest format
@@ -272,7 +311,8 @@ One object per table, under the warehouse root. The data lives wherever
   "partition_keys": [ { "name": "dt", "type": "string", "comment": null } ],
   "parameters": {
     "skip.header.line.count": "1",
-    "classification": "csv"
+    "classification": "csv",
+    "sqe.secret": "partner"
   },
   "storage_descriptor": {
     "location": "s3://raw/orders/",
@@ -418,8 +458,8 @@ test case, which is how the list stays true as the cycles land.
 ## Credentials
 
 Session credentials by default, so a Hive read runs as the calling user and the
-no-service-account model holds. `WITH (SECRET = 'name')` names a secret for
-buckets outside the user's token scope. The manifest stores the secret **name**
+no-service-account model holds. `TBLPROPERTIES ('sqe.secret' = 'name')` names a
+secret for buckets outside the user's token scope. The manifest stores the secret **name**
 only; material is resolved per session against the existing `SecretStore`, and a
 missing secret is an error at query time naming the secret.
 
@@ -495,7 +535,7 @@ agree on identity.
 
 | Lever | Cycle 1 | Later |
 |---|---|---|
-| Partition listing | No caching. Every query lists, subject to the leading-equality prefix optimization from finding 7. Finding 9 rules out re-enabling DataFusion's listing cache | Cycle 2 is the listing cycle: `sqe.partition_index` persisted in the manifest, invalidated by manifest ETag rather than by a timer, plus partition projection so a cold read lists nothing |
+| Partition listing | No caching. Every query lists, subject to the leading-equality prefix optimization from finding 7. Finding 10 rules out re-enabling DataFusion's listing cache | Cycle 2 is the listing cycle: `sqe.partition_index` persisted in the manifest, invalidated by manifest ETag rather than by a timer, plus partition projection so a cold read lists nothing |
 | Parquet pruning | Row-group pruning from footer statistics at execution time, footers reused through the existing `footer_cache.rs` | |
 | Scan parallelism | Parquet split by row group using the existing `task_split_target_size`; CSV and JSON parallelized across files up to `target_partitions` | Cycle 5 moves scans onto workers |
 | Optimizer statistics | Size-only: cardinality estimated from file count and bytes, with `ListingOptions::with_collect_stat(false)`. Collecting real statistics reads a Parquet footer per file at plan time, which is the latency this row exists to avoid | Cycle 2 `ANALYZE TABLE` persists real counts into `sqe.statistics`, so planning gets accurate without paying per-query |
