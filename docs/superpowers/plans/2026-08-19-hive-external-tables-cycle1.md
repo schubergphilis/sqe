@@ -2652,6 +2652,12 @@ Expected: `unresolved module hive_ddl_handler`.
 3. `main.rs` builds `hive_catalogs: Arc<HiveCatalogs>` and `hive_manifest_cache: Arc<HiveMetadataCache>` process-wide near lines 395-401 but passes them only to `build_policy_enforcer`. `QueryHandler::new` receives a bare `RuntimeCatalogRegistry::default()` with access to neither, so `handle_attach` and `handle_detach` currently have no wire on which to reach the `HiveCatalogs` registry. Thread both through. This is load-bearing: a root registered for reads but absent from `HiveCatalogs` keys every table in it under the Iceberg convention, which is the privilege escalation Task 7 closed, reached through a different door.
 
 Task 8 left the `HiveExternal` arms in `query_handler.rs` and `runtime_catalog.rs` with messages that are accurate as of its own change. Replace them with real dispatch, and make sure no message survives that claims something is wired when it is not.
+
+Two more items inherited from Task 8:
+
+4. `HiveConfig`'s three manifest caps are wired on the embedded path only, because `build_hive_root` takes a `limits` parameter and the embedded caller has no TOML to read. When you wire `[hive].roots` into a live coordinator, build the limits from `HiveConfig`'s three fields rather than passing `ManifestLimits::default()`, or an operator who lowers `manifest_max_bytes` after a security review gets a config that is accepted and not applied.
+
+5. An operator who writes `[[hive.roots]]` into a coordinator TOML today gets it silently accepted and inert. Once you wire it, that is fixed by construction; until then nothing warns. If any path remains where a configured root is parsed but not registered, log a startup warning naming the root, so the failure is visible rather than a table that mysteriously does not exist.
 - `ATTACH` mid-session registers the provider on the current session context and inserts the name into `HiveCatalogs`, then calls `invalidate_session_cache(&username)` so the next statement rebuilds against the new root.
 
 - [ ] **Step 4: Run to verify passing**
