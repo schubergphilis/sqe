@@ -230,3 +230,26 @@ fn hive_external_is_its_own_attach_kind_and_hive_still_means_hms() {
     assert_eq!(CatalogKind::parse("hive"), Some(CatalogKind::Hms));
     assert_eq!(CatalogKind::HiveExternal.name(), "hive_external");
 }
+
+#[test]
+fn create_external_table_as_select_does_not_parse_under_generic_dialect() {
+    // Pins the actual boundary rather than asserting a CTAS-specific
+    // rejection message: sqlparser's GenericDialect rejects `external: true`
+    // combined with a trailing `AS SELECT` at the parser level, for every
+    // clause ordering tried, well before `classify` ever sees a `CreateTable`
+    // AST. The classifier's EXTERNAL-before-CTAS ordering is defensive for a
+    // future sqlparser version that accepts the combination; today it is
+    // unreachable.
+    for sql in [
+        "CREATE EXTERNAL TABLE t (id INT) STORED AS PARQUET LOCATION 's3://b/p/' AS SELECT 1",
+        "CREATE EXTERNAL TABLE t AS SELECT 1",
+        "CREATE EXTERNAL TABLE t (id INT) AS SELECT 1",
+        "CREATE EXTERNAL TABLE t LOCATION 's3://b/p/' AS SELECT 1",
+    ] {
+        let result = parse_and_classify(sql);
+        assert!(
+            result.is_err(),
+            "expected a parse error for `{sql}`, got: {result:?}"
+        );
+    }
+}
