@@ -29,14 +29,20 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::{CatalogProvider, ScanArgs, ScanResult, SchemaProvider, Session};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion::common::{Constraints, Statistics};
+use datafusion::common::{Constraints, ScalarValue, Statistics};
 use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::logical_expr::dml::InsertOp;
-use datafusion::logical_expr::{lit, Expr, LogicalPlan, TableProviderFilterPushDown, TableType};
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::logical_expr::{
+    lit, Expr, LogicalPlan, Operator, TableProviderFilterPushDown, TableType,
+};
+use datafusion::physical_expr::expressions::{
+    binary as phys_binary, case as phys_case, col as phys_col, lit as phys_lit,
+};
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use futures::TryStreamExt;
 use moka::sync::Cache as SyncCache;
 use object_store::{ObjectMeta, ObjectStore};
@@ -66,8 +72,8 @@ const MANIFEST_CACHE_CAPACITY: u64 = 16_384;
 /// `parse_partitions_for_path`/`try_into_partitioned_file`
 /// (`datafusion-catalog-listing`) read the raw path segment after `=` and
 /// pass it straight through `ScalarValue::try_from_string`, which is just
-/// `ScalarValue::from(value).cast_to(target_type)` — there is no string that
-/// casts to a null scalar, and the crate's own doc comment on
+/// `ScalarValue::from(value).cast_to(target_type)`. No string casts to a
+/// null scalar that way, and the crate's own doc comment on
 /// `try_into_partitioned_file` states outright that "hive-style partition
 /// values are never null" as a design assumption. So a `dt=
 /// __HIVE_DEFAULT_PARTITION__` directory is read as the literal string
@@ -80,7 +86,7 @@ const MANIFEST_CACHE_CAPACITY: u64 = 16_384;
 /// pruning-eligible (its `can_be_evaluated_for_partition_pruning` accepts any
 /// expression referencing only partition columns, `IsNull`/`IsNotNull`
 /// included), so DataFusion trusts the scan's pruning entirely and never
-/// re-checks with a `Filter` node above it — which is exactly why the
+/// re-checks with a `Filter` node above it. That is exactly why the
 /// rewrite has to happen before the file listing, not after.
 const HIVE_DEFAULT_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
 
@@ -171,7 +177,7 @@ fn table_location_url(location: &str) -> Result<ListingTableUrl, HiveError> {
         .map_err(|e| HiveError::Validation(format!("invalid location `{location}`: {e}")))
 }
 
-/// The Arrow schema for the columns physically stored in the data files —
+/// The Arrow schema for the columns physically stored in the data files:
 /// `storage_descriptor.columns` only, NOT `partition_keys`.
 ///
 /// `ListingTable::try_new` appends the partition columns itself (as
@@ -195,7 +201,7 @@ fn file_schema_of(manifest: &HiveManifest) -> Result<Schema, HiveError> {
     Ok(Schema::new(fields))
 }
 
-/// `(name, type)` pairs for `manifest.partition_keys`, in declared order —
+/// `(name, type)` pairs for `manifest.partition_keys`, in declared order:
 /// what `ListingOptions::with_table_partition_cols` and, in turn,
 /// `ListingTable::try_new`'s schema-building append, consume.
 fn partition_columns_of(manifest: &HiveManifest) -> Result<Vec<(String, DataType)>, HiveError> {
@@ -249,6 +255,81 @@ fn rewrite_default_partition_node(
     }
 }
 
+/// Wraps `plan`'s output in a `ProjectionExec` that turns the literal
+/// sentinel value into a real NULL for every string-typed partition column,
+/// so `SELECT dt` and `GROUP BY dt` agree with the `IS NULL` filter rewrite
+/// above about what the value actually is.
+///
+/// Filter rewriting alone was not enough: it made `WHERE dt IS NULL` return
+/// the right rows, but a plain `SELECT dt` on the same table still returned
+/// the literal string `__HIVE_DEFAULT_PARTITION__`, and a `GROUP BY dt` would
+/// have bucketed those rows under that string instead of folding them into
+/// the NULL group. That mix, correct filtering but a wrong projected value,
+/// is worse than either consistent choice, since two clauses of the same
+/// query would disagree about what the value is. This closes the gap on the
+/// projection side to match.
+///
+/// Scoped to string-typed partition columns (`Utf8`/`LargeUtf8`/`Utf8View`):
+/// Hive's sentinel is always that fixed string literal, written to the
+/// directory name regardless of the partition column's declared type, but a
+/// non-string partition column carrying that literal directory name would
+/// already have failed earlier, in `ListingTable`'s own file-listing
+/// (`ScalarValue::try_from_string("__HIVE_DEFAULT_PARTITION__", non_utf8_ty)`
+/// does not parse), so this function never actually sees one.
+///
+/// A no-op (returns `plan` unchanged) when no partition column appears in
+/// the output schema at all, which happens whenever a query's projection
+/// does not select or need one.
+fn nullify_default_partition_columns(
+    plan: Arc<dyn ExecutionPlan>,
+    partition_columns: &[String],
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    let schema = plan.schema();
+    let is_rewritable_partition_column = |name: &str, dt: &DataType| {
+        partition_columns.contains(&name.to_string())
+            && matches!(
+                dt,
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+            )
+    };
+
+    if !schema
+        .fields()
+        .iter()
+        .any(|f| is_rewritable_partition_column(f.name(), f.data_type()))
+    {
+        return Ok(plan);
+    }
+
+    let exprs = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let name = f.name().clone();
+            let base = phys_col(&name, schema.as_ref())?;
+            let expr: Arc<dyn PhysicalExpr> =
+                if is_rewritable_partition_column(&name, f.data_type()) {
+                    let is_sentinel = phys_binary(
+                        Arc::clone(&base),
+                        Operator::Eq,
+                        phys_lit(HIVE_DEFAULT_PARTITION),
+                        schema.as_ref(),
+                    )?;
+                    phys_case(
+                        None,
+                        vec![(is_sentinel, phys_lit(ScalarValue::Utf8(None)))],
+                        Some(base),
+                    )?
+                } else {
+                    base
+                };
+            Ok((expr, name))
+        })
+        .collect::<DFResult<Vec<(Arc<dyn PhysicalExpr>, String)>>>()?;
+
+    Ok(Arc::new(ProjectionExec::try_new(exprs, plan)?))
+}
+
 /// Wraps a `ListingTable`, delegating every `TableProvider` method to it
 /// except [`TableProvider::schema`] (partition columns forced nullable; see
 /// below), [`TableProvider::statistics`] (size-derived; see `stats.rs`), and
@@ -268,21 +349,20 @@ fn rewrite_default_partition_node(
 /// # Why `schema()` cannot just delegate
 ///
 /// `ListingTable::try_new` hardcodes every partition column as
-/// `Field::new(name, ty, false)` — NOT NULLABLE, unconditionally, with no
+/// `Field::new(name, ty, false)`, NOT NULLABLE, unconditionally, with no
 /// config knob to change it. Probing confirmed the consequence: DataFusion's
 /// own logical optimizer folds `dt IS NULL` to a constant `false`
 /// (`EmptyRelation`, seen directly in `EXPLAIN`) using exactly that
-/// nullability fact, before the query ever reaches this wrapper's `scan()`
-/// — [`normalize_default_partition_filters`]'s rewrite runs too late to see
+/// nullability fact, before the query ever reaches this wrapper's `scan()`.
+/// [`normalize_default_partition_filters`]'s rewrite runs too late to see
 /// a filter the optimizer already deleted. So this wrapper's `schema()`
-/// returns `self.inner.schema()` with every column in `partition_columns` remarked
-/// nullable, which is metadata-only: the physical scan still runs against
-/// `ListingTable`'s own (non-nullable) internal schema, and produces the
-/// literal sentinel value regardless, exactly as before. It is the filter
-/// rewrite, not this schema, that turns that literal into "no row" or "every
-/// row" for a NULL-partition comparison; this override exists only so the
-/// optimizer does not delete the filter before the rewrite gets a chance to
-/// run.
+/// returns `self.inner.schema()` with every column in `partition_columns`
+/// remarked nullable, purely so the optimizer keeps the filter instead of
+/// deleting it before the rewrite gets a chance to run. That alone does not
+/// make the projected value correct: see
+/// [`nullify_default_partition_columns`] for the other half, which turns the
+/// literal sentinel into a real NULL in `scan()`'s physical output so
+/// `SELECT dt` and `WHERE dt IS NULL` agree on what the value is.
 #[derive(Debug)]
 struct HiveTableProvider {
     inner: Arc<ListingTable>,
@@ -355,7 +435,11 @@ impl TableProvider for HiveTableProvider {
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let rewritten = normalize_default_partition_filters(filters, &self.partition_columns)?;
-        self.inner.scan(state, projection, &rewritten, limit).await
+        let plan = self
+            .inner
+            .scan(state, projection, &rewritten, limit)
+            .await?;
+        nullify_default_partition_columns(plan, &self.partition_columns)
     }
 
     async fn scan_with_args<'a>(
@@ -374,7 +458,9 @@ impl TableProvider for HiveTableProvider {
             .with_projection(args.projection())
             .with_limit(args.limit());
         new_args = new_args.with_filters(rewritten.as_deref());
-        self.inner.scan_with_args(state, new_args).await
+        let result = self.inner.scan_with_args(state, new_args).await?;
+        let plan = nullify_default_partition_columns(result.into_inner(), &self.partition_columns)?;
+        Ok(ScanResult::new(plan))
     }
 
     fn supports_filters_pushdown(
