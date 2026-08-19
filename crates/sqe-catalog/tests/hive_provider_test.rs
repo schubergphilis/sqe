@@ -164,6 +164,64 @@ async fn hive_default_partition_reads_as_null() {
     );
 }
 
+#[tokio::test]
+async fn selecting_the_default_partition_column_returns_null_not_the_sentinel() {
+    // A plain SELECT and an IS NULL filter must agree on what the value is.
+    // Filter-rewriting alone made `WHERE dt IS NULL` return the right rows
+    // without making the projected value itself NULL; this pins the other
+    // half (nullify_default_partition_columns's ProjectionExec wrap).
+    let f = hive_fixture::root_with_default_partition().await;
+    let ctx = SessionContext::new();
+    register_hive_root(&ctx, &f).await;
+    let batches = ctx
+        .sql("SELECT dt FROM lake.sales.orders WHERE id = 4")
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("collect");
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 1);
+    let batch = batches
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .expect("the one matching row must be in some batch");
+    let dt_col = batch.column(0);
+    assert!(
+        dt_col.is_null(0),
+        "the value at the array level must be null, not the literal sentinel: {dt_col:?}"
+    );
+}
+
+#[tokio::test]
+async fn grouping_by_the_default_partition_column_folds_into_one_null_group() {
+    // Same point from the aggregation side: if the sentinel were still a
+    // string at the value level, GROUP BY would bucket it separately from
+    // genuine NULLs instead of folding into the same NULL group.
+    let f = hive_fixture::root_with_default_partition().await;
+    let ctx = SessionContext::new();
+    register_hive_root(&ctx, &f).await;
+    let batches = ctx
+        .sql("SELECT dt, count(*) AS n FROM lake.sales.orders WHERE dt IS NULL GROUP BY dt")
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("collect");
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        rows, 1,
+        "exactly one NULL group, not a second string-keyed group"
+    );
+    let text = datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+        .expect("fmt")
+        .to_string();
+    assert!(
+        !text.contains("__HIVE_DEFAULT_PARTITION__"),
+        "the group key must not be the literal sentinel: {text}"
+    );
+}
+
 /// Not exercised by any assertion above, but a schema built from the
 /// declared columns and partition keys must put partition columns LAST
 /// (Hive's own column order): a caller that projects `SELECT *` must see
