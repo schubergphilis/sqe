@@ -154,3 +154,53 @@ fn partition_key_repeated_in_column_list_is_rejected() {
         "message should name the duplicated column, got: {msg}"
     );
 }
+
+#[test]
+fn array_nested_type_is_rejected_and_named() {
+    // ARRAY<...> parses fine under GenericDialect and reaches column_of,
+    // so the rejection happens here, not at the parser.
+    let msg = err("CREATE EXTERNAL TABLE t (id INT, tags ARRAY<STRING>) \
+         STORED AS PARQUET LOCATION 's3://b/p/'");
+    assert!(
+        msg.contains("array<string>"),
+        "message should name the nested type, got: {msg}"
+    );
+    assert!(
+        msg.contains("tags"),
+        "message should name the offending column, got: {msg}"
+    );
+}
+
+#[test]
+fn struct_nested_type_is_rejected_and_named() {
+    // STRUCT<...> also parses under GenericDialect
+    // (supports_struct_literal() is true there) and reaches column_of.
+    let msg = err("CREATE EXTERNAL TABLE t (id INT, s STRUCT<x:INT>) \
+         STORED AS PARQUET LOCATION 's3://b/p/'");
+    assert!(
+        msg.contains("struct<x int>"),
+        "message should name the nested type, got: {msg}"
+    );
+    assert!(
+        msg.contains("`s`"),
+        "message should name the offending column, got: {msg}"
+    );
+}
+
+#[test]
+fn map_nested_type_is_rejected_by_the_parser_not_this_module() {
+    // MAP<...> with angle brackets is not reachable here: GenericDialect's
+    // supports_map_literal_with_angle_brackets() is false (true only for
+    // SparkDialect), so `Parser::parse_sql` itself fails on the `<` before
+    // any CreateTable AST exists for try_extract_hive_table to inspect.
+    // This pins that boundary rather than implying hive_ddl handles it.
+    let result = Parser::parse_sql(
+        &GenericDialect {},
+        "CREATE EXTERNAL TABLE t (id INT, m MAP<STRING,INT>) \
+         STORED AS PARQUET LOCATION 's3://b/p/'",
+    );
+    assert!(
+        result.is_err(),
+        "expected a parse error for MAP<...> under GenericDialect, got: {result:?}"
+    );
+}
