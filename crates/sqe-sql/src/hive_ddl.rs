@@ -1,9 +1,16 @@
 //! Extraction of Athena/Glue `CREATE EXTERNAL TABLE` into a neutral spec.
 //!
-//! sqlparser 0.62 parses the whole Athena form already, in both
+//! sqlparser 0.62 parses the full Athena clause set already, in both
 //! `GenericDialect` and `HiveDialect`, so this module reads the AST rather
 //! than parsing text. It stays free of DataFusion and object-store types:
 //! `sqe-catalog` depends on `sqe-sql`, never the reverse.
+//!
+//! Hive angle-bracket nested types are not uniformly supported by either
+//! dialect: `ARRAY<...>` and `STRUCT<...>` parse fine and reach `column_of`
+//! below, which rejects them by name; `MAP<...>` does not parse at all under
+//! `GenericDialect` or `HiveDialect` (only `SparkDialect` accepts the
+//! angle-bracket map form), so it fails inside `Parser::parse_sql` before
+//! this module ever sees a `CreateTable` AST.
 //!
 //! Spec: `docs/superpowers/specs/2026-08-19-hive-external-tables-design.md`
 
