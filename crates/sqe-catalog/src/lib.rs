@@ -10,6 +10,8 @@ pub mod file_tvf_common;
 pub mod footer_cache;
 pub mod grant_chameleon;
 pub mod hf_tree_cache;
+#[cfg(feature = "hive-external")]
+pub mod hive;
 #[cfg(feature = "rest")]
 pub mod iceberg_metadata_tvf;
 pub mod iceberg_scan;
