@@ -22,7 +22,8 @@
 - **Attach kind keyword:** `hive_external`. `hive` is already bound to `Hms` at `crates/sqe-sql/src/attach.rs:64`.
 - **Policy key:** a Hive table's policy namespace is `<root>.<database>`. Iceberg keys are unchanged.
 - **Secret:** `TBLPROPERTIES ('sqe.secret' = '<name>')`. There is no `WITH (SECRET = ...)` clause; it does not parse.
-- **Formats:** csv, json (line-delimited), parquet. ORC, Avro, SequenceFile, RCFile rejected by name.
+- **Formats:** csv, json (line-delimited), parquet. ORC, Avro, SequenceFile, RCFile are recorded with their real Hadoop classes and rejected by class at read time.
+- **`STORED AS CSV` DOES NOT PARSE.** sqlparser's `FileFormat` enum has exactly seven variants: TEXTFILE, SEQUENCEFILE, ORC, PARQUET, AVRO, RCFILE, JSONFILE. There is no CSV and no JSON. Every DDL string in this plan uses `ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE` for a comma-separated file, because bare TEXTFILE defaults to Hive's ctrl-A delimiter. An earlier draft of this plan used `STORED AS CSV` in nine places, which came from a probe run against DataFusion's own SQL parser rather than the sqlparser path this feature uses.
 - **Types:** scalar columns and scalar partition keys only. `array<...>`, `map<...>`, `struct<...>` rejected by name.
 - **CSV header default is OFF** (Hive), which inverts DataFusion's `CsvFormat` default. `skip.header.line.count = 1` turns it on, `0` off, anything above 1 is an error.
 - **CSV field delimiter default is `\x01`** (Hive `LazySimpleSerDe`), not comma.
@@ -1592,7 +1593,7 @@ fn local_store(root: &str) -> HiveManifestStore {
 /// header row.
 async fn put_csv_manifest(root: &str, data: &str) {
     let ddl = format!(
-        "CREATE EXTERNAL TABLE sales.orders (id BIGINT, amount DOUBLE)          PARTITIONED BY (dt string) STORED AS CSV LOCATION '{data}'          TBLPROPERTIES ('skip.header.line.count' = '1')"
+        "CREATE EXTERNAL TABLE sales.orders (id BIGINT, amount DOUBLE)          PARTITIONED BY (dt string) ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE LOCATION '{data}'          TBLPROPERTIES ('skip.header.line.count' = '1')"
     );
     let stmts = sqlparser::parser::Parser::parse_sql(
         &sqlparser::dialect::GenericDialect {},
@@ -2349,7 +2350,7 @@ Append to the test module in `crates/sqe-cli/src/embedded.rs`:
         let data = dir.path().join("data");
         let sql = format!(
             "CREATE EXTERNAL TABLE lake.sales.orders (id BIGINT, amount DOUBLE) \
-             PARTITIONED BY (dt string) STORED AS CSV LOCATION 'file://{}' \
+             PARTITIONED BY (dt string) ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE LOCATION 'file://{}' \
              TBLPROPERTIES ('skip.header.line.count' = '1')",
             data.display()
         );
@@ -2364,7 +2365,7 @@ Append to the test module in `crates/sqe-cli/src/embedded.rs`:
         let data = dir.path().join("data");
         c.execute(&format!(
             "CREATE EXTERNAL TABLE lake.sales.orders (id BIGINT, amount DOUBLE) \
-             PARTITIONED BY (dt string) STORED AS CSV LOCATION 'file://{}' \
+             PARTITIONED BY (dt string) ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE LOCATION 'file://{}' \
              TBLPROPERTIES ('skip.header.line.count' = '1')",
             data.display()
         ))
@@ -2383,7 +2384,7 @@ Append to the test module in `crates/sqe-cli/src/embedded.rs`:
         let (mut c, dir) = client_with_hive_root().await;
         let data = dir.path().join("data");
         c.execute(&format!(
-            "CREATE EXTERNAL TABLE lake.sales.orders (id BIGINT) STORED AS CSV LOCATION 'file://{}'",
+            "CREATE EXTERNAL TABLE lake.sales.orders (id BIGINT) ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE LOCATION 'file://{}'",
             data.display()
         ))
         .await
@@ -2402,7 +2403,7 @@ Append to the test module in `crates/sqe-cli/src/embedded.rs`:
         let data = dir.path().join("data");
         c.execute(&format!(
             "CREATE EXTERNAL TABLE lake.sales.orders (id BIGINT, amount DOUBLE) \
-             PARTITIONED BY (dt string) STORED AS CSV LOCATION 'file://{}'",
+             PARTITIONED BY (dt string) ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE LOCATION 'file://{}'",
             data.display()
         ))
         .await
@@ -2429,7 +2430,7 @@ Append to the test module in `crates/sqe-cli/src/embedded.rs`:
         let (mut c, dir) = client_with_hive_root().await;
         let err = c
             .execute(&format!(
-                "CREATE EXTERNAL TABLE lake.sales.t STORED AS CSV LOCATION 'file://{}' AS SELECT 1",
+                "CREATE EXTERNAL TABLE lake.sales.t ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE LOCATION 'file://{}' AS SELECT 1",
                 dir.path().display()
             ))
             .await
@@ -2445,7 +2446,7 @@ Append to the test module in `crates/sqe-cli/src/embedded.rs`:
     async fn creating_a_table_in_a_root_that_is_not_attached_names_the_missing_root() {
         let (mut c, _dir) = client_with_hive_root().await;
         let err = c
-            .execute("CREATE EXTERNAL TABLE nosuch.sales.t (id INT) STORED AS CSV LOCATION 'file:///tmp/'")
+            .execute("CREATE EXTERNAL TABLE nosuch.sales.t (id INT) ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE LOCATION 'file:///tmp/'")
             .await
             .expect_err("must reject");
         assert!(format!("{err}").contains("nosuch"), "should name the root: {err}");
@@ -2496,7 +2497,7 @@ cargo build -p sqe-cli --profile dev-release
 mkdir -p /tmp/hive-probe/data/dt=2026-01-01
 printf 'id,amount\n1,10.5\n2,20.0\n' > /tmp/hive-probe/data/dt=2026-01-01/a.csv
 target/dev-release/sqe-cli --embedded --memory --hive-root lake=file:///tmp/hive-probe/wh -e \
-  "CREATE EXTERNAL TABLE lake.sales.orders (id BIGINT, amount DOUBLE) PARTITIONED BY (dt string) STORED AS CSV LOCATION 'file:///tmp/hive-probe/data' TBLPROPERTIES ('skip.header.line.count'='1')"
+  "CREATE EXTERNAL TABLE lake.sales.orders (id BIGINT, amount DOUBLE) PARTITIONED BY (dt string) ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE LOCATION 'file:///tmp/hive-probe/data' TBLPROPERTIES ('skip.header.line.count'='1')"
 target/dev-release/sqe-cli --embedded --memory --hive-root lake=file:///tmp/hive-probe/wh -e \
   "SELECT * FROM lake.sales.orders"
 cat /tmp/hive-probe/wh/sales/orders/_sqe/table.json
@@ -2699,7 +2700,7 @@ async fn hive_external_table_round_trips_on_object_storage() {
     c.execute("ATTACH 's3://warehouse/wh/' AS lake (TYPE hive_external)").await.expect("attach");
     c.execute(
         "CREATE EXTERNAL TABLE lake.sales.orders (id BIGINT, amount DOUBLE) \
-         PARTITIONED BY (dt string) STORED AS CSV LOCATION 's3://raw/orders/' \
+         PARTITIONED BY (dt string) ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE LOCATION 's3://raw/orders/' \
          TBLPROPERTIES ('skip.header.line.count' = '1')",
     )
     .await
