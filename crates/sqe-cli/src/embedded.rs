@@ -413,6 +413,13 @@ pub struct EmbeddedClient {
     /// optional secret name they reference. Used by `DROP SECRET` to guard
     /// against removing secrets while catalogs depend on them.
     attached_catalogs: HashMap<String, Option<String>>,
+    /// Manifest cache shared by every Hive root attached in this process,
+    /// the single-process embedded equivalent of the coordinator's one
+    /// `HiveMetadataCache` instance (`main.rs`). One instance per
+    /// `EmbeddedClient`, not per root: the cache key already includes the
+    /// database and table name, not the root, so two roots' manifests
+    /// never collide in it.
+    hive_manifest_cache: Arc<sqe_catalog::hive::provider::HiveMetadataCache>,
 }
 
 impl EmbeddedClient {
@@ -427,6 +434,7 @@ impl EmbeddedClient {
             iceberg_catalogs: HashMap::new(),
             secrets: SecretStore::new(),
             attached_catalogs: HashMap::new(),
+            hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
         })
     }
 
@@ -445,6 +453,7 @@ impl EmbeddedClient {
             iceberg_catalogs,
             secrets: SecretStore::new(),
             attached_catalogs: HashMap::new(),
+            hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
         })
     }
 
@@ -465,7 +474,55 @@ impl EmbeddedClient {
             iceberg_catalogs: HashMap::new(),
             secrets: SecretStore::new(),
             attached_catalogs: HashMap::new(),
+            hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
         })
+    }
+
+    /// Attach a Hive-style external-table warehouse root under `name`.
+    ///
+    /// Registers before the REPL starts (called from `main.rs` for
+    /// `--hive-root NAME=URL`), but nothing about it is start-up-only: the
+    /// same two calls (`build_hive_root` then `session_hive_catalog`) are
+    /// what a later `ATTACH <location> AS <name> (TYPE hive_external)`
+    /// would run in embedded mode too, once that SQL form is intercepted
+    /// here the way `ATTACH ... TYPE iceberg_rest` already is.
+    ///
+    /// Embedded mode authenticates object-storage reads with
+    /// `TvfCaller::trusted_local()`: the local user already owns this
+    /// process's config and credentials, the same trust boundary the file
+    /// TVFs (`read_parquet`, ...) use. Local paths and `http(s)://` are
+    /// allowed for the same reason `build_embedded_context` allows them.
+    pub async fn attach_hive_root(&mut self, name: &str, location: &str) -> anyhow::Result<()> {
+        if self.ctx.catalog(name).is_some() {
+            anyhow::bail!("catalog '{name}' is already attached; DETACH it first");
+        }
+
+        let mut storage = StorageConfig::default();
+        storage.tvf.allow_local_paths = true;
+        storage.tvf.allow_http = true;
+        let caller = sqe_core::config::TvfCaller::trusted_local();
+
+        let root = sqe_catalog::mount::build_hive_root(
+            location,
+            &std::collections::BTreeMap::new(),
+            &storage,
+            caller.clone(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("--hive-root {name}={location}: {e}"))?;
+
+        let provider = sqe_catalog::mount::session_hive_catalog(
+            name,
+            root,
+            &storage,
+            &self.secrets,
+            caller,
+            self.ctx.runtime_env(),
+            self.hive_manifest_cache.clone(),
+            std::time::Duration::from_secs(60),
+        );
+        self.ctx.register_catalog(name.to_string(), provider);
+        Ok(())
     }
 }
 

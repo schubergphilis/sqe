@@ -87,6 +87,302 @@ fn error_dispatched_elsewhere(kind: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Hive-style external tables (`TYPE hive_external`).
+//
+// `build_hive_root` and `session_hive_catalog` are siblings of
+// `build_catalog`, not variants of it: `build_catalog` returns an
+// `iceberg::Catalog`, and a Hive root is a DataFusion `CatalogProvider`
+// with no Iceberg metadata behind it at all. Both live behind the
+// `hive-external` cargo feature, matching the `hive` module they build on.
+//
+// The two-function split is a lifetime split, not (as an earlier draft of
+// this design assumed) a credential split: there is no per-user
+// object-store credential source for an arbitrary raw prefix the way
+// Polaris vends per-table S3 credentials against a caller's bearer token
+// for Iceberg reads. Inventing that vending mechanism is a subsystem, not
+// this task, so cycle 1 authenticates Hive table reads with the engine's
+// own `StorageConfig` credentials, or with a named `SECRET` from the
+// manifest -- exactly how the file TVFs (`read_parquet`, ...) already
+// authenticate. See `EngineHiveDataStoreFactory` below.
+//
+// What still requires two functions, and still requires `session_hive_catalog`
+// to run once per session rather than once at ATTACH time, is the runtime
+// binding: `HiveCatalogProvider` closes over a `RuntimeEnv` at construction,
+// and `DataFusion`'s `SchemaProvider::table()` registers the table's object
+// store into THAT runtime's registry (see `HiveSchemaProvider::table` in
+// `hive/provider.rs`). Every session builds its own `RuntimeEnv`. A provider
+// built once at ATTACH time and shared across sessions would carry
+// whichever session's runtime happened to build it, and every OTHER
+// session's scans would look up their bucket in a registry that is not
+// theirs and fail to resolve it. `build_hive_root` builds the part that
+// really is shared (the manifest store: a manifest means the same thing to
+// every reader), and `session_hive_catalog` builds the part that cannot be
+// (the provider, bound to one session's runtime).
+//
+// Authorization, unlike the credential, does stay per user: `TvfCaller` is
+// threaded into `TvfPolicy::check_path`'s `{user}`-prefix substitution, and
+// Hive tables sit under the policy layer's row filters / column masks /
+// grants (Task 7), so a per-user decision still gates what a query can see
+// even though the object-store credential is shared.
+#[cfg(feature = "hive-external")]
+use datafusion::execution::runtime_env::RuntimeEnv;
+#[cfg(feature = "hive-external")]
+use object_store::ObjectStore;
+#[cfg(feature = "hive-external")]
+use sqe_core::config::{StorageConfig, TvfCaller};
+
+/// Validate a Hive warehouse root and build the shared, session-independent
+/// manifest store every session's provider borrows.
+///
+/// Never lists or HEADs the root: a root is registered lazily (there is no
+/// notion of "creating" a Hive warehouse root the way `CREATE SCHEMA` creates
+/// an Iceberg namespace), so attaching a prefix that does not exist yet, or
+/// is still empty, must succeed. The only check performed is the
+/// `[storage.tvf]` allowlist via `storage.tvf.check_path`, and that a root
+/// name does not collide with an already-registered catalog is the caller's
+/// responsibility (this function has no registry to check against; see the
+/// module doc comment on `sqe_policy::plan_rewriter::HiveCatalogs` for why
+/// that check belongs where ATTACH is dispatched, not here).
+#[cfg(feature = "hive-external")]
+pub async fn build_hive_root(
+    location: &str,
+    _options: &BTreeMap<String, OptionValue>,
+    storage: &StorageConfig,
+    caller: TvfCaller,
+) -> Result<Arc<crate::hive::store::HiveManifestStore>, String> {
+    let trimmed = location.trim();
+    if trimmed.is_empty() {
+        return Err("location must not be empty for TYPE hive_external".to_string());
+    }
+
+    storage
+        .tvf
+        .check_path(trimmed, &caller, false)
+        .map_err(|e| format!("ATTACH (TYPE hive_external) failed: {e}"))?;
+
+    let root = datafusion::datasource::listing::ListingTableUrl::parse(trimmed).map_err(|e| {
+        format!("ATTACH (TYPE hive_external) failed: invalid location '{trimmed}': {e}")
+    })?;
+    let store = hive_object_store_for_location(trimmed, storage)
+        .map_err(|e| format!("ATTACH (TYPE hive_external) failed: {e}"))?;
+
+    Ok(Arc::new(crate::hive::store::HiveManifestStore::new(
+        root,
+        store,
+        crate::hive::manifest::ManifestLimits::default(),
+        storage.tvf.clone(),
+        caller,
+    )))
+}
+
+/// Build the per-session Hive catalog provider over a shared root.
+///
+/// `runtime` is this session's `RuntimeEnv` and `caller` is this session's
+/// identity for the `[storage.tvf]` allowlist check; both are session-scoped
+/// for the reason explained in this module's doc comment above
+/// `build_hive_root`: the provider registers each table's object store into
+/// `runtime`'s registry at `table()` time, so a provider built for one
+/// session and reused by another would register into (and look up from) a
+/// registry that is not the calling session's. `manifest_cache` is the one
+/// exception -- a process-wide singleton, shared across every session, the
+/// same instance passed to `build_policy_enforcer` at startup.
+#[cfg(feature = "hive-external")]
+#[allow(clippy::too_many_arguments)]
+pub fn session_hive_catalog(
+    name: &str,
+    root: Arc<crate::hive::store::HiveManifestStore>,
+    storage: &StorageConfig,
+    secrets: &SecretStore,
+    caller: TvfCaller,
+    runtime: Arc<RuntimeEnv>,
+    manifest_cache: Arc<crate::hive::provider::HiveMetadataCache>,
+    cache_ttl: std::time::Duration,
+) -> Arc<crate::hive::provider::HiveCatalogProvider> {
+    let factory: Arc<dyn crate::hive::provider::HiveDataStoreFactory> =
+        Arc::new(EngineHiveDataStoreFactory {
+            storage: storage.clone(),
+            secrets: secrets.clone(),
+            caller,
+        });
+    Arc::new(crate::hive::provider::HiveCatalogProvider::new(
+        name.to_string(),
+        root,
+        factory,
+        runtime,
+        manifest_cache,
+        cache_ttl,
+    ))
+}
+
+/// `HiveDataStoreFactory` backed by the engine's own storage credentials
+/// (`StorageConfig`), or by a named `SECRET` referenced from the manifest's
+/// `sqe.secret` table property when present. There is deliberately no
+/// per-user credential path here (see the module doc comment above
+/// `build_hive_root`): every session's factory reads with the same engine
+/// key unless the table's own manifest names a secret. `caller` still gates
+/// WHICH locations this session may reach via `TvfPolicy::check_path`, so
+/// authorization stays per user even though the credential does not.
+#[cfg(feature = "hive-external")]
+struct EngineHiveDataStoreFactory {
+    storage: StorageConfig,
+    secrets: SecretStore,
+    caller: TvfCaller,
+}
+
+#[cfg(feature = "hive-external")]
+impl std::fmt::Debug for EngineHiveDataStoreFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `StorageConfig` and `SecretStore` hold credential material and
+        // don't derive `Debug` for it; nothing here is useful in a log line
+        // beyond the caller identity.
+        f.debug_struct("EngineHiveDataStoreFactory")
+            .field("caller", &self.caller)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "hive-external")]
+impl crate::hive::provider::HiveDataStoreFactory for EngineHiveDataStoreFactory {
+    fn store_for(
+        &self,
+        location: &str,
+        secret: Option<&str>,
+    ) -> Result<Arc<dyn ObjectStore>, crate::hive::HiveError> {
+        self.storage
+            .tvf
+            .check_path(location, &self.caller, false)
+            .map_err(crate::hive::HiveError::Forbidden)?;
+
+        match secret {
+            Some(secret_name) => {
+                let resolved = self.secrets.get(secret_name).map_err(|e| {
+                    crate::hive::HiveError::Validation(format!(
+                        "secret '{secret_name}' could not be resolved: {e}"
+                    ))
+                })?;
+                store_for_secret(location, secret_name, &resolved, &self.storage)
+            }
+            None => hive_object_store_for_location(location, &self.storage)
+                .map_err(crate::hive::HiveError::Store),
+        }
+    }
+}
+
+/// Build an `Arc<dyn ObjectStore>` for a Hive root or table location from
+/// the engine's own `StorageConfig`, dispatching on URL scheme. Only local
+/// paths and `s3://` / `s3a://` are wired; other schemes return a clear
+/// "not yet supported" error rather than silently mis-routing (an azure or
+/// gcs URL falling through to `LocalFileSystem` would be a much worse bug
+/// than refusing it).
+#[cfg(feature = "hive-external")]
+fn hive_object_store_for_location(
+    location: &str,
+    storage: &StorageConfig,
+) -> Result<Arc<dyn ObjectStore>, String> {
+    let lower = location.to_lowercase();
+    if lower.starts_with("s3://") || lower.starts_with("s3a://") {
+        let bucket = crate::file_tvf_common::extract_bucket(location)
+            .ok_or_else(|| format!("could not parse bucket from S3 URL '{location}'"))?;
+        let s3 = crate::file_tvf_common::build_s3_store_for_bucket(bucket, storage)
+            .map_err(|e| format!("failed to build S3 client for '{location}': {e}"))?;
+        Ok(Arc::new(s3))
+    } else if lower.starts_with("abfss://")
+        || lower.starts_with("abfs://")
+        || lower.starts_with("az://")
+        || lower.starts_with("azure://")
+        || lower.starts_with("gs://")
+        || lower.starts_with("gcs://")
+    {
+        Err(format!(
+            "hive_external: object store scheme in '{location}' is not yet wired for TYPE \
+             hive_external roots (local paths and s3:// only in this build)"
+        ))
+    } else {
+        // Bare path or `file://`: the `[storage.tvf]` allowlist check
+        // (`allow_local_paths`) already gated whether this is reachable at
+        // all; the store itself is unrestricted, same as `hive_store_test.rs`'s
+        // `store_for` helper and the embedded CLI's file TVFs.
+        Ok(Arc::new(object_store::local::LocalFileSystem::new()))
+    }
+}
+
+/// A manifest's `sqe.secret` names a `Secret::Aws`; anything else is a
+/// misconfiguration, not a fallback opportunity, so it errors naming the
+/// secret rather than silently falling back to engine credentials.
+#[cfg(feature = "hive-external")]
+fn store_for_secret(
+    location: &str,
+    secret_name: &str,
+    secret: &sqe_core::Secret,
+    storage: &StorageConfig,
+) -> Result<Arc<dyn ObjectStore>, crate::hive::HiveError> {
+    let lower = location.to_lowercase();
+    if !(lower.starts_with("s3://") || lower.starts_with("s3a://")) {
+        // No SECRET-driven credential path for non-S3 schemes yet; fall
+        // back to the engine-config dispatch (which itself refuses
+        // unsupported schemes with a clear message).
+        return hive_object_store_for_location(location, storage)
+            .map_err(crate::hive::HiveError::Store);
+    }
+
+    let sqe_core::Secret::Aws {
+        access_key,
+        secret_key,
+        session_token: _,
+        region,
+        profile: _,
+    } = secret
+    else {
+        return Err(crate::hive::HiveError::Validation(format!(
+            "secret '{secret_name}' is type {} but a Hive table's SECRET expects aws",
+            secret.type_name()
+        )));
+    };
+
+    let bucket = crate::file_tvf_common::extract_bucket(location).ok_or_else(|| {
+        crate::hive::HiveError::Validation(format!(
+            "could not parse bucket from S3 URL '{location}'"
+        ))
+    })?;
+
+    let mut builder = object_store::aws::AmazonS3Builder::new().with_bucket_name(bucket);
+    let access = access_key
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(storage.s3_access_key.as_str());
+    if !access.is_empty() {
+        builder = builder.with_access_key_id(access);
+    }
+    let secret_val = secret_key
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(storage.s3_secret_key.expose());
+    if !secret_val.is_empty() {
+        builder = builder.with_secret_access_key(secret_val);
+    }
+    let reg = region
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(storage.s3_region.as_str());
+    if !reg.is_empty() {
+        builder = builder.with_region(reg);
+    }
+    if !storage.s3_endpoint.is_empty() {
+        builder = builder.with_endpoint(storage.s3_endpoint.as_str());
+    }
+    if storage.s3_path_style {
+        builder = builder.with_virtual_hosted_style_request(false);
+    }
+    if storage.s3_allow_http || storage.s3_endpoint.starts_with("http://") {
+        builder = builder.with_allow_http(true);
+    }
+    let s3 = builder
+        .build()
+        .map_err(|e| crate::hive::HiveError::Store(e.to_string()))?;
+    Ok(Arc::new(s3))
+}
+
+// ---------------------------------------------------------------------------
 // Per-backend builders.
 //
 // Each helper is small on purpose: pull the options it needs, build
@@ -909,5 +1205,89 @@ mod jdbc_url_tests {
     fn a_url_without_a_scheme_is_an_error_not_a_guess() {
         let err = splice_basic_into_url("db.example.com/iceberg", "u", "p").unwrap_err();
         assert!(err.contains("scheme"), "unexpected message: {err}");
+    }
+}
+
+/// `store_for_secret` is private to this module (the public seam is
+/// `EngineHiveDataStoreFactory::store_for`, reached indirectly through
+/// `HiveCatalogProvider::table()` in the integration test suite), so its
+/// AWS-credential-building branch is exercised directly here instead of
+/// through the vacuous "does `SecretStore::get` round-trip" test an earlier
+/// draft of `hive_mount_test.rs` had, which never called any of this
+/// module's code at all.
+#[cfg(all(test, feature = "hive-external"))]
+mod hive_secret_store_tests {
+    use super::*;
+
+    #[test]
+    fn a_resolvable_aws_secret_builds_an_s3_store() {
+        let secret = sqe_core::Secret::Aws {
+            access_key: Some("ak".to_string()),
+            secret_key: Some("sk".to_string()),
+            session_token: None,
+            region: Some("eu-west-1".to_string()),
+            profile: None,
+        };
+        let store = store_for_secret(
+            "s3://bucket/wh/orders/",
+            "my-aws",
+            &secret,
+            &StorageConfig::default(),
+        );
+        assert!(store.is_ok(), "a resolvable aws secret must build a store: {store:?}");
+    }
+
+    #[test]
+    fn a_wrong_kind_secret_errors_naming_the_secret_and_the_expected_type() {
+        let secret = sqe_core::Secret::Bearer {
+            token: "tok".to_string(),
+        };
+        let err = store_for_secret(
+            "s3://bucket/wh/orders/",
+            "my-secret",
+            &secret,
+            &StorageConfig::default(),
+        )
+        .expect_err("a bearer secret is not aws");
+        let msg = format!("{err}");
+        assert!(msg.contains("my-secret"), "should name the secret: {msg}");
+        assert!(msg.contains("aws"), "should name the expected type: {msg}");
+    }
+
+    #[test]
+    fn a_non_s3_location_ignores_the_secret_and_falls_back_to_engine_config() {
+        // No SECRET-driven credential path for local paths yet; the
+        // engine-config dispatch handles it (and, with local paths
+        // disallowed only via `[storage.tvf]`, not via this function,
+        // succeeds unconditionally here).
+        let secret = sqe_core::Secret::Aws {
+            access_key: Some("ak".to_string()),
+            secret_key: Some("sk".to_string()),
+            session_token: None,
+            region: None,
+            profile: None,
+        };
+        let store = store_for_secret("/tmp/whatever", "my-aws", &secret, &StorageConfig::default());
+        assert!(store.is_ok(), "local fallback must not fail: {store:?}");
+    }
+}
+
+/// Debug impl coverage for `EngineHiveDataStoreFactory`: `StorageConfig`
+/// does not derive `Debug`, which is exactly why this type needs a manual
+/// impl rather than `#[derive(Debug)]`; this test pins that the manual impl
+/// actually compiles and runs, not just that it exists.
+#[cfg(all(test, feature = "hive-external"))]
+mod hive_factory_debug_tests {
+    use super::*;
+
+    #[test]
+    fn debug_impl_does_not_panic_and_omits_credential_fields() {
+        let factory = EngineHiveDataStoreFactory {
+            storage: StorageConfig::default(),
+            secrets: SecretStore::new(),
+            caller: TvfCaller::for_user("alice".to_string(), Vec::new()),
+        };
+        let out = format!("{factory:?}");
+        assert!(out.contains("alice"), "got {out}");
     }
 }
