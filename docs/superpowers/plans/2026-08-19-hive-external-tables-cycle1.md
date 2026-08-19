@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - **No emdash, endash, or Unicode arrows** anywhere, including doc comments. Use `->` inside code blocks only.
-- **Clippy is strict:** `cargo clippy --all-targets --all-features -- -D warnings` must pass. Never pipe a gate command into `tail`; the exit code you see would be `tail`'s.
+- **Clippy:** `cargo clippy --all-targets --all-features -- -D warnings` is the repo's stated gate and it does NOT pass on this tree. `crates/sqe-catalog/src/rest_catalog.rs` carries two pre-existing warnings unrelated to this feature: `too_many_arguments` (8/7) at line 1019 and `field_reassign_with_default` at lines 2135-2136. For any task touching `sqe-catalog`, run clippy WITHOUT `-D warnings` and require zero warnings whose path is under `crates/sqe-catalog/src/hive/` or your own test files, against that baseline of exactly two warnings in `rest_catalog.rs`. Do not fix the pre-existing two; they belong in their own MR. For every other crate, `-D warnings` must pass. Never pipe a gate command into `tail`; the exit code you see would be `tail`'s.
 - **Never run `cargo fmt --all`.** Main is not rustfmt-clean. Format only files you touched: `cargo fmt -- <paths>`.
 - **Feature gate:** all new `sqe-catalog` code sits behind the `hive-external` cargo feature, default-on. Named to avoid confusion with `hms`, which is Hive Metastore for Iceberg tables.
 - **Branch:** `feat/hive-external-tables-cycle1`, cut from `docs/hive-external-tables-design`, NOT from main. The spec and this plan live on that branch and main does not have them yet. If the docs branch has already merged, cut from main. Never push to main. One MR.
@@ -2415,7 +2415,15 @@ Append to the test module in `crates/sqe-cli/src/embedded.rs`:
     }
 
     #[tokio::test]
-    async fn create_external_table_as_select_is_rejected_with_the_cycle_that_adds_it() {
+    async fn create_external_table_as_select_fails_at_the_parser_not_at_our_handler() {
+        // Corrected from the original plan text, which assumed this shape
+        // reaches the Hive DDL handler. It does not: sqlparser's
+        // GenericDialect rejects `external: true` combined with a trailing
+        // `AS SELECT` at parse time, for every clause ordering, so no handler
+        // can ever see it. The test pins where the boundary actually is
+        // instead of asserting a message no code produces. The
+        // EXTERNAL-before-CTAS ordering in the classifier stays as defensive
+        // code for a future sqlparser that does accept the shape.
         let (mut c, dir) = client_with_hive_root().await;
         let err = c
             .execute(&format!(
@@ -2425,7 +2433,10 @@ Append to the test module in `crates/sqe-cli/src/embedded.rs`:
             .await
             .expect_err("must reject");
         let msg = format!("{err}");
-        assert!(msg.contains("hive_external"), "message should name the feature: {msg}");
+        assert!(
+            msg.contains("AS") || msg.to_lowercase().contains("parse"),
+            "expected a parser-level rejection, got: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -2546,6 +2557,8 @@ async fn unsupported_statements_are_rejected_by_name_with_their_cycle() {
         ("SHOW PARTITIONS lake.sales.orders", 2),
         ("ALTER TABLE lake.sales.orders SET TAGS ('ssn' = 'PII')", 3),
         ("INSERT INTO lake.sales.orders VALUES (1, 2.0, '2026-01-01')", 4),
+        // No CTAS row: `CREATE EXTERNAL TABLE ... AS SELECT` does not parse,
+        // so it never reaches dispatch. Task 9 pins that boundary instead.
         ("DELETE FROM lake.sales.orders WHERE id = 1", 4),
         ("UPDATE lake.sales.orders SET amount = 1 WHERE id = 1", 4),
         ("TRUNCATE TABLE lake.sales.orders", 4),
