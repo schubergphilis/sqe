@@ -166,7 +166,9 @@ In:
 - Sidecar manifest read and write, versioned, Glue-shaped
 - `ATTACH` of a Hive warehouse root, plus TOML config for server mode
 - Hive-style `k=v/` partition discovery with typed partition values
-- Credential binding: session credentials by default, optional named secret
+- Credential binding: engine storage credentials or a named secret, with
+  per-user authorization through the allowlist and the policy layer. See the
+  Credentials section, which reverses this document's original decision
 - LOCATION through the fail-closed `[storage.tvf]` allowlist, at create and at
   every load
 - `CatalogRoutedTagSource` so Hive tables are not denied and not unmasked
@@ -488,15 +490,46 @@ test case, which is how the list stays true as the cycles land.
 
 ## Credentials
 
-Session credentials by default, so a Hive read runs as the calling user and the
-no-service-account model holds. `TBLPROPERTIES ('sqe.secret' = 'name')` names a
-secret for buckets outside the user's token scope. The manifest stores the secret **name**
-only; material is resolved per session against the existing `SecretStore`, and a
-missing secret is an error at query time naming the secret.
+**This section reverses an earlier decision in this document.** The original
+text said session credentials by default, so that a Hive read would run as the
+calling user and the no-service-account model would hold unchanged. That is not
+implementable in cycle 1, and the reason is structural rather than a matter of
+effort.
 
-A secret referenced in a manifest is not an authorization decision. The
-allowlist and the policy layer still apply, so a secret cannot be used to reach
-a location the deployment forbids.
+Iceberg reads get per-user credentials because Polaris vends them per table
+against the user's bearer token. No equivalent exists for an arbitrary
+`s3://raw/orders/` prefix. The engine has no mechanism to vend object-store
+credentials for a location that is not a table in a catalog it manages, and
+building one is a subsystem rather than a task. A probe of the actual code found
+no `SessionStorageCredentials`-shaped handle anywhere, and the closest thing
+`session_context.rs` threads per session is the raw bearer token plus a
+`TvfCaller`, neither of which can construct an S3 client for a raw prefix.
+
+So a Hive table read authenticates to object storage with engine credentials
+from `StorageConfig`, or with a named secret when the manifest carries
+`sqe.secret`. That is precisely how the file TVFs already work, which makes it
+the existing precedent rather than a new exception.
+
+**Authorization stays per user, in two places that already exist.** The
+`[storage.tvf]` allowlist is evaluated with a `TvfCaller`, and
+`allowed_object_store_prefixes` supports `{user}` substitution, so which
+prefixes a given user may reach is a per-user decision enforced on every
+manifest load. And Hive tables sit under the policy layer, so grants, row
+filters, and column masks apply per user like any other table. The guard is per
+user even though the credential is not.
+
+The honest summary: for Iceberg tables SQE has no service account, and for Hive
+external tables it effectively does, bounded by a per-user prefix allowlist and
+per-user policy. Any deployment where that distinction matters should keep Hive
+roots out of buckets whose contents are not uniformly readable by the engine
+identity. A real per-user credential path for raw prefixes is later work and is
+not pretended to exist here.
+
+The manifest stores the secret **name** only, never material; it is resolved
+against the existing `SecretStore` at query time, and a missing secret is an
+error naming the secret. A secret referenced in a manifest is not an
+authorization decision: the allowlist and the policy layer still apply, so a
+secret cannot be used to reach a location the deployment forbids.
 
 ## Policy, tags, audit
 
