@@ -113,6 +113,24 @@ fn oversized_manifest_is_rejected_before_parsing() {
     );
 }
 
+// Not in the brief's test list: added to pin the parse-order requirement
+// itself, which `oversized_manifest_is_rejected_before_parsing` above
+// cannot distinguish (it feeds a *valid* manifest that happens to be over
+// the cap, so it passes whether the size check runs before or after
+// deserialization). This one feeds bytes that are both oversized and not
+// valid JSON; a size-check-after-deserialize implementation would report a
+// JSON error here instead of a size error.
+#[test]
+fn oversized_garbage_is_rejected_on_size_not_on_deserialize_failure() {
+    let limits = ManifestLimits::default();
+    let garbage = vec![b'x'; limits.max_bytes + 1];
+    let err = HiveManifest::parse(&garbage, &limits).expect_err("must reject");
+    assert!(
+        format!("{err:?}").to_lowercase().contains("size"),
+        "got {err:?}"
+    );
+}
+
 #[test]
 fn too_many_columns_is_rejected() {
     let limits = ManifestLimits {
