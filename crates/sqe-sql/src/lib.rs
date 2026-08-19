@@ -5,6 +5,7 @@ pub mod catalog_qualifiers;
 pub mod classifier;
 pub mod ctas_compat;
 pub mod ddl;
+pub mod hive_ddl;
 pub mod nested_row_cast;
 pub mod paren_less_values;
 pub mod partition;
