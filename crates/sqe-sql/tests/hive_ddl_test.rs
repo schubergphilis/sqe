@@ -70,10 +70,14 @@ fn octal_field_delimiter_decodes_to_hives_own_ctrl_a_default_byte() {
     // '\001' is Hive's own way of spelling FIELDS TERMINATED BY ctrl-A, and
     // it is the single most common delimiter idiom in real Hive DDL because
     // ctrl-A is Hive's default field delimiter. This asserts the decoded
-    // byte is the same 0x01 that a table declared with no delimiter at all
-    // defaults to (see sqe-catalog's HIVE_DEFAULT_DELIM /
-    // lazy_simple_serde_with_no_delimiter_defaults_to_ctrl_a_like_hive):
-    // that equivalence, not just "some decoding happened", is the point.
+    // byte equals 0x01, the same literal value sqe-catalog's
+    // HIVE_DEFAULT_DELIM constant uses for a table declared with no
+    // delimiter at all (see
+    // lazy_simple_serde_with_no_delimiter_defaults_to_ctrl_a_like_hive in
+    // that crate). This test does not compare against that other test's
+    // computed value directly, since the two live in different crates; it
+    // asserts against the same hardcoded 0x01 independently. The point is
+    // that 0x01 specifically, not just "some decoding happened".
     let s = spec(
         "CREATE EXTERNAL TABLE t (id INT) ROW FORMAT DELIMITED FIELDS TERMINATED BY '\\001' \
          STORED AS TEXTFILE LOCATION 's3://b/p/'",
