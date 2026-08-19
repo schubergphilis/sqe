@@ -1,10 +1,16 @@
 #![cfg(feature = "hive-external")]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use datafusion::datasource::listing::ListingTableUrl;
+use futures::stream::BoxStream;
 use object_store::local::LocalFileSystem;
-use object_store::ObjectStore;
+use object_store::path::Path as ObjectPath;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+};
 use sqe_catalog::hive::manifest::{HiveManifest, ManifestLimits};
 use sqe_catalog::hive::store::HiveManifestStore;
 use sqe_core::config::{TvfCaller, TvfPolicy};
@@ -151,5 +157,175 @@ async fn list_tables_finds_manifests_by_prefix() {
     assert_eq!(
         s.list_databases().await.expect("dbs"),
         vec!["sales".to_string()]
+    );
+}
+
+/// Wraps a real `ObjectStore` and can (a) count `head()`-style `get_opts`
+/// calls, to pin `list_databases`'s early exit, and (b) deny
+/// `PutMode::Create`, to exercise `put`'s non-atomic head-then-put fallback
+/// for stores that do not support a conditional put. `LocalFileSystem`
+/// itself supports `PutMode::Create` natively (see the report), so this
+/// wrapper is the only way to reach that fallback in a test.
+#[derive(Debug)]
+struct WrappedStore {
+    inner: Arc<dyn ObjectStore>,
+    head_calls: Arc<AtomicUsize>,
+    deny_conditional_put: bool,
+}
+
+impl std::fmt::Display for WrappedStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WrappedStore({:?})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for WrappedStore {
+    async fn put_opts(
+        &self,
+        location: &ObjectPath,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        if self.deny_conditional_put && opts.mode == PutMode::Create {
+            return Err(object_store::Error::NotSupported {
+                source: "conditional put is not supported by this test double".into(),
+            });
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        location: &ObjectPath,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+    async fn get_opts(
+        &self,
+        location: &ObjectPath,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        if options.head {
+            self.head_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.get_opts(location, options).await
+    }
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+    ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+        self.inner.delete_stream(locations)
+    }
+    fn list(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(
+        &self,
+        from: &ObjectPath,
+        to: &ObjectPath,
+        opts: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+#[tokio::test]
+async fn list_databases_stops_at_the_first_table_found() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).expect("mkdir");
+
+    let head_calls = Arc::new(AtomicUsize::new(0));
+    let wrapped: Arc<dyn ObjectStore> = Arc::new(WrappedStore {
+        inner: Arc::new(LocalFileSystem::new()),
+        head_calls: head_calls.clone(),
+        deny_conditional_put: false,
+    });
+    let url = ListingTableUrl::parse(format!("file://{}", dir.path().display())).expect("url");
+    let s = HiveManifestStore::new(
+        url,
+        wrapped,
+        ManifestLimits::default(),
+        permissive(),
+        TvfCaller::trusted_local(),
+    );
+
+    // Three tables in the same database, all with manifests: whichever one
+    // list_with_delimiter happens to visit first already satisfies
+    // has_any_table, so the early exit must land on exactly one head() call
+    // no matter the listing order.
+    for name in ["orders", "customers", "accounts"] {
+        let mut m = manifest(&format!("file://{}", data.display()));
+        m.name = name.to_string();
+        s.put(&m, false).await.expect("put");
+    }
+    // `put(.., false)` is an unconditional put and issues no head() calls;
+    // this is a sanity check, not a reset, so the count below is entirely
+    // attributable to list_databases.
+    assert_eq!(head_calls.load(Ordering::SeqCst), 0);
+
+    let dbs = s.list_databases().await.expect("dbs");
+    assert_eq!(dbs, vec!["sales".to_string()]);
+    assert_eq!(
+        head_calls.load(Ordering::SeqCst),
+        1,
+        "list_databases must stop at the first table found, not head every \
+         table in the database"
+    );
+}
+
+#[tokio::test]
+async fn if_not_exists_falls_back_when_the_store_has_no_conditional_put() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).expect("mkdir");
+
+    let wrapped: Arc<dyn ObjectStore> = Arc::new(WrappedStore {
+        inner: Arc::new(LocalFileSystem::new()),
+        head_calls: Arc::new(AtomicUsize::new(0)),
+        deny_conditional_put: true,
+    });
+    let url = ListingTableUrl::parse(format!("file://{}", dir.path().display())).expect("url");
+    let s = HiveManifestStore::new(
+        url,
+        wrapped,
+        ManifestLimits::default(),
+        permissive(),
+        TvfCaller::trusted_local(),
+    );
+
+    let m = manifest(&format!("file://{}", data.display()));
+    s.put(&m, true)
+        .await
+        .expect("first put must succeed via the non-atomic fallback");
+
+    let mut m2 = m.clone();
+    m2.owner = Some("someone-else".into());
+    let err = s
+        .put(&m2, true)
+        .await
+        .expect_err("the fallback must not clobber an existing manifest either");
+    assert!(
+        matches!(err, sqe_catalog::hive::HiveError::Validation(_)),
+        "got {err:?}"
+    );
+    assert_eq!(
+        s.get("sales", "orders")
+            .await
+            .expect("get")
+            .owner
+            .as_deref(),
+        Some("jacob"),
+        "the fallback's head-then-put must have refused the second write"
     );
 }
