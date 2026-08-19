@@ -8,6 +8,7 @@
 
 pub mod manifest;
 pub mod serde_map;
+pub mod store;
 
 /// Errors from the Hive external-table path.
 ///
