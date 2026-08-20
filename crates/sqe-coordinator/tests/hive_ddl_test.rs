@@ -929,3 +929,68 @@ async fn resolve_table_kind_for_session_promotes_a_partial_reference_under_a_hiv
         TableKind::Iceberg
     ));
 }
+
+/// The other half of the review's fix: `ATTACH ... TYPE hive_external`
+/// itself must refuse a name that collides with the session default
+/// catalog, the same way `attach_configured_hive_roots` refuses it for a
+/// `[[hive.roots]]` entry (see `sqe-coordinator/src/runtime_catalog.rs`'s
+/// matching test). `minimal_config`'s legacy `[catalog]` block resolves to
+/// the default catalog name `"iceberg"` (`SqeConfig::LEGACY_CATALOG_NAME`),
+/// so attaching a Hive root under that exact name must be refused rather
+/// than silently succeeding and leaving `resolve_policy_key`/
+/// `CatalogRoutedTagSource` blind to it for any two-part reference.
+///
+/// Mutation-checked: removing the `stmt.name == default_catalog` check in
+/// `handle_attach` made this test fail (the ATTACH succeeded).
+#[tokio::test]
+async fn attach_refuses_a_name_matching_the_session_default_catalog() {
+    let root_dir = tempfile::tempdir().expect("tempdir");
+    let audit_dir = tempfile::tempdir().expect("tempdir");
+    let log_path = audit_dir.path().join("audit.jsonl");
+    let audit = Arc::new(AuditLogger::new(log_path.to_str().unwrap()).expect("audit logger opens"));
+    let mock = mock_polaris().await;
+
+    let config = minimal_config(&mock.uri());
+    assert_eq!(
+        config.resolve_default_catalog(),
+        "iceberg",
+        "this test's premise: the legacy [catalog] block resolves to 'iceberg'"
+    );
+    let tracker = Arc::new(QueryTracker::new(&config.query_history));
+    let handler = QueryHandler::new(
+        Arc::new(PassthroughEnforcer),
+        None,
+        config,
+        None,
+        None,
+        None,
+        Some(audit.clone()),
+        tracker,
+        None,
+        None,
+        None,
+        RuntimeCatalogRegistry::new(),
+        SecretStore::new(),
+    )
+    .expect("QueryHandler::new")
+    .with_hive_registries(Arc::new(HiveCatalogs::new()), Arc::new(HiveMetadataCache::new()));
+
+    let session = dummy_session();
+    let sql = format!(
+        "ATTACH 'file://{}/wh' AS iceberg (TYPE hive_external)",
+        root_dir.path().display()
+    );
+    let err = handler
+        .execute(&session, &sql, None)
+        .await
+        .expect_err("attaching a Hive root named like the default catalog must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("iceberg"), "{msg}");
+    assert_eq!(
+        handler.resolve_table_kind(&TableReference::full("iceberg", "sales", "orders")),
+        TableKind::Iceberg,
+        "the refused ATTACH must not have registered 'iceberg' as a Hive root"
+    );
+
+    drop((audit_dir, mock));
+}

@@ -128,12 +128,18 @@ fn error_dispatched_elsewhere(kind: &str) -> String {
 // evaluating that first user's prefix allowlist against a different user's
 // query -- a per-user authorization boundary silently collapsed into a
 // single-tenant one, not a plumbing bug. `build_hive_root` builds the part
-// that really is shared and caller-independent (the manifest store: a
-// manifest means the same thing to every reader), and `session_hive_catalog`
-// builds the part that is not (the provider, bound to one session's
-// caller). Nothing may cache a `HiveCatalogProvider` across sessions,
-// regardless of what the runtime situation looks like on whatever path is
-// calling it.
+// that is session-INDEPENDENT (the manifest store: a manifest means the
+// same thing to every reader), not caller-independent: the store
+// (`HiveManifestStore`, `hive/store.rs`) still carries a `TvfCaller`, fixed
+// at construction from whichever caller `build_hive_root` was given
+// (`trusted_startup_config()` for `[[hive.roots]]`, or the attaching
+// session's own caller for `ATTACH`), and `check_path` gates every
+// `put`/`get` against that one caller for the LIFETIME of the store, not
+// against whoever is reading right now. `session_hive_catalog` builds the
+// part that is session-BOUND (the provider, whose data-store factory
+// carries the CURRENT session's caller for actual table scans). Nothing
+// may cache a `HiveCatalogProvider` across sessions, regardless of what
+// the runtime situation looks like on whatever path is calling it.
 #[cfg(feature = "hive-external")]
 use datafusion::execution::runtime_env::RuntimeEnv;
 #[cfg(feature = "hive-external")]

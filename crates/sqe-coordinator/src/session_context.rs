@@ -682,10 +682,16 @@ pub async fn create_session_context(
             // to another user's query -- see `mount.rs`'s module doc
             // comment above `build_hive_root` for the full case. Nothing
             // here may be cached across sessions except `hive_roots` (the
-            // shared, session-independent `HiveManifestStore` per root,
-            // which carries no caller) and `hive_manifest_cache` (the one
-            // process-wide manifest cache every session's provider reads
-            // through).
+            // shared, session-independent `HiveManifestStore` per root --
+            // session-independent because it is built once at `ATTACH`
+            // time, NOT because it carries no caller: it does, baked in
+            // from whichever session ran the `ATTACH` (or
+            // `trusted_startup_config()` for a `[[hive.roots]]` entry), and
+            // every later session's manifest reads are gated against that
+            // one caller, not their own -- see `runtime_catalog.rs`'s "Hive
+            // lane" comment for the full case) and `hive_manifest_cache`
+            // (the one process-wide manifest cache every session's provider
+            // reads through).
             //
             // `cache_ttl` (60s) matches the embedded CLI's
             // `attach_hive_root` and `HiveConfig`'s own manifest-cap

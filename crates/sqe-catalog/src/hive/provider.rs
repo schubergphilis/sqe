@@ -4,13 +4,24 @@
 //!
 //! # Two lifetimes, deliberately different
 //!
-//! [`HiveCatalogProvider`] is built PER SESSION: a Hive read must run as the
-//! calling user, and [`SchemaProvider::table`] takes no session argument, so
-//! the credentials (carried by `data_store_factory`) have to be baked into
-//! the provider instance. `runtime` is that session's `RuntimeEnv` for the
-//! same reason `ListingTable` resolves its object store from the session's
-//! registry at scan time; registering on a fresh runtime would produce a
-//! scan that cannot find its bucket.
+//! [`HiveCatalogProvider`] is built PER SESSION. Two answers to "why"
+//! looked right and were not; both are recorded in `mount.rs`'s module doc
+//! above `build_hive_root` so this does not silently disagree with the
+//! corrected one. It is NOT because a Hive read needs per-user vended
+//! credentials: reads use the engine's own `StorageConfig` credentials, or
+//! a named `SECRET`, exactly like the file TVFs. It is NOT because each
+//! session needs its own `RuntimeEnv`: production shares ONE `RuntimeEnv`/
+//! `ObjectStoreRegistry` across every session
+//! (`SessionContext::new_with_config_rt`), so a shared provider would not
+//! be resolving against a stale one. The real reason: `data_store_factory`
+//! carries this session's `TvfCaller`, and `TvfPolicy::check_path` gates
+//! every table load on it, including the `{user}`-substituted
+//! `allowed_object_store_prefixes` check. A provider built once and reused
+//! would carry the FIRST session's caller into every later session's table
+//! loads. `runtime` is still that session's `RuntimeEnv` (there being only
+//! one in production does not make passing it optional; a fallback/test
+//! path can build its own), matching how `ListingTable` resolves its
+//! object store from the session's registry at scan time.
 //!
 //! [`HiveMetadataCache`] is the opposite: ONE process-wide instance, injected
 //! into every per-session provider. It has to be shared because the policy
@@ -21,8 +32,9 @@
 //! user.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -112,8 +124,28 @@ pub trait HiveDataStoreFactory: Send + Sync + fmt::Debug {
 /// the moka TTL/capacity eviction; a manifest change (e.g. `ALTER TABLE`)
 /// self-heals the next time `HiveSchemaProvider::table` reloads it, which is
 /// on every uncached call.
+/// Who currently owns a bucket-level object-store registration: the table
+/// that last (successfully) claimed it, and the `sqe.secret` name it read
+/// under (`None` for engine-default credentials).
+struct ObjectStoreOwner {
+    table_ref: String,
+    secret: Option<String>,
+}
+
 pub struct HiveMetadataCache {
     inner: SyncCache<String, HiveManifest>,
+    /// Guards against the collision `register_object_store` cannot see on
+    /// its own: DataFusion's `ObjectStoreRegistry` keys purely on
+    /// `scheme://host:port` (see `object_store_bucket_key`), discarding the
+    /// path, so two Hive tables in the SAME bucket with DIFFERENT
+    /// `sqe.secret` credentials would otherwise silently collide --
+    /// whichever table is scanned last in this process wins the
+    /// registration for every table in that bucket until something
+    /// re-registers it. `claim_object_store_bucket` is called before every
+    /// `register_object_store`, so the collision is a loud refusal instead
+    /// of quietly-wrong data (where the mismatched credential happens to
+    /// still work) or a confusing 403 (where it does not).
+    object_store_owners: Mutex<HashMap<String, ObjectStoreOwner>>,
 }
 
 impl fmt::Debug for HiveMetadataCache {
@@ -136,6 +168,7 @@ impl HiveMetadataCache {
             inner: SyncCache::builder()
                 .max_capacity(MANIFEST_CACHE_CAPACITY)
                 .build(),
+            object_store_owners: Mutex::new(HashMap::new()),
         }
     }
 
@@ -150,6 +183,68 @@ impl HiveMetadataCache {
     pub fn insert(&self, database: &str, table: &str, m: HiveManifest) {
         self.inner.insert(Self::key(database, table), m);
     }
+
+    /// Claim `bucket_key` for `table_ref` reading under `secret`, or refuse
+    /// naming both tables and both secrets when a DIFFERENT table already
+    /// claimed this bucket under a DIFFERENT secret. A no-op success (same
+    /// owner, or a new owner agreeing on the same secret) updates nothing;
+    /// the FIRST successful claim for a given bucket sticks.
+    ///
+    /// Known gap, accepted rather than fixed this round: this never
+    /// evicts, so `DROP TABLE` followed by `CREATE EXTERNAL TABLE` on the
+    /// SAME bucket under a DIFFERENT secret still refuses until the
+    /// coordinator restarts. Narrow and rare against the two-tables-one-
+    /// bucket case this exists to catch; a clear, if occasionally
+    /// premature, refusal beats silently wrong data either way.
+    pub fn claim_object_store_bucket(
+        &self,
+        bucket_key: &str,
+        table_ref: &str,
+        secret: Option<&str>,
+    ) -> Result<(), String> {
+        let mut owners = self
+            .object_store_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = owners.get(bucket_key) {
+            if existing.table_ref != table_ref && existing.secret.as_deref() != secret {
+                return Err(format!(
+                    "hive_external: table '{table_ref}' would register object-store \
+                     credentials for bucket '{bucket_key}' under secret {secret:?}, but \
+                     table '{}' already registered that bucket under secret {:?}. \
+                     DataFusion's object-store registry keys by bucket, not by table, so two \
+                     Hive tables in the same bucket must read under the same credentials, or a \
+                     scan spanning both would silently read one table's data under the other's \
+                     credentials",
+                    existing.table_ref, existing.secret
+                ));
+            }
+            return Ok(());
+        }
+        owners.insert(
+            bucket_key.to_string(),
+            ObjectStoreOwner {
+                table_ref: table_ref.to_string(),
+                secret: secret.map(str::to_string),
+            },
+        );
+        Ok(())
+    }
+}
+
+/// The bucket-only key `datafusion_execution::object_store`'s registry
+/// computes internally (`format!("{scheme}://{host}:{port}")`, discarding
+/// the path) before looking up or inserting a store. Not exported by
+/// DataFusion, so duplicated here deliberately: `claim_object_store_bucket`
+/// needs to detect a collision on the SAME key `register_object_store`
+/// will use, or the check and the actual registration could disagree about
+/// what counts as "the same bucket".
+fn object_store_bucket_key(url: &url::Url) -> String {
+    format!(
+        "{}://{}",
+        url.scheme(),
+        &url[url::Position::BeforeHost..url::Position::AfterPort]
+    )
 }
 
 /// `HiveError` from the manifest/data-store path becomes a `DataFusionError`
@@ -720,6 +815,22 @@ impl SchemaProvider for HiveSchemaProvider {
         let data_store = self
             .data_store_factory
             .store_for(&manifest.storage_descriptor.location, manifest.secret())
+            .map_err(to_df)?;
+
+        // Refuse a credential collision BEFORE registering: DataFusion's
+        // `ObjectStoreRegistry` keys purely on `scheme://host:port`
+        // (`object_store_bucket_key`, matching what `register_object_store`
+        // itself keys on), discarding the path, so two Hive tables in this
+        // same bucket under different `sqe.secret` credentials would
+        // otherwise silently collide on this single key -- whichever is
+        // scanned last in this process wins the registration for every
+        // table in the bucket. See `HiveMetadataCache::claim_object_store_bucket`'s
+        // own doc comment for the full case and its accepted gap.
+        let bucket_key = object_store_bucket_key(url.as_ref());
+        let table_ref = format!("{}.{name}", self.database);
+        self.cache
+            .claim_object_store_bucket(&bucket_key, &table_ref, manifest.secret())
+            .map_err(HiveError::Forbidden)
             .map_err(to_df)?;
 
         // The session's own runtime, not a fresh one: `ListingTable`

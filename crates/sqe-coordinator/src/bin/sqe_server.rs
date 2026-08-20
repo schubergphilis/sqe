@@ -1354,6 +1354,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         &config.storage,
         &runtime_catalogs,
         &hive_catalogs,
+        &config.resolve_default_catalog(),
     )
     .await
     .map_err(|e| anyhow::anyhow!(e))?;
