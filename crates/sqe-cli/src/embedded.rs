@@ -973,29 +973,7 @@ fn record_batches_to_query_result(
 /// so a statement this crate cannot classify for any other reason is never
 /// mistaken for one of ours.
 fn looks_like_create_external_table(sql: &str) -> bool {
-    let mut s = sql;
-    loop {
-        let trimmed = s.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("--") {
-            s = rest.split_once('\n').map(|(_, r)| r).unwrap_or("");
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_prefix("/*") {
-            s = rest.split_once("*/").map(|(_, r)| r).unwrap_or("");
-            continue;
-        }
-        s = trimmed;
-        break;
-    }
-    let head = s
-        .chars()
-        .take(64)
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_uppercase();
-    head.starts_with("CREATE EXTERNAL TABLE")
+    sqe_sql::is_create_external_table(sql)
 }
 
 /// Lowercase an unquoted identifier, preserve a quoted one. Mirrors the
