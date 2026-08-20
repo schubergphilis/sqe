@@ -386,3 +386,149 @@ async fn drop_secret_rejected_without_admin_role() {
 
     assert!(err.to_string().contains("403"), "expected 403: {err}");
 }
+
+// ---------------------------------------------------------------------------
+// ATTACH / DETACH ... TYPE hive_external
+//
+// Unlike the other `CatalogKind`s (which need `sql-sqlite`, a network REST
+// endpoint, or an AWS backend and so are covered by the sqlite-gated
+// `runtime_catalog_test.rs`), a Hive root is just files under a `LOCATION`:
+// `build_hive_root` only needs `[storage.tvf] allow_local_paths = true` to
+// accept a local temp dir, so this dispatch is cheaply testable right here.
+// ---------------------------------------------------------------------------
+
+fn make_handler_allowing_local_paths(
+    secrets: SecretStore,
+    catalogs: RuntimeCatalogRegistry,
+) -> QueryHandler {
+    let mut config = minimal_config();
+    config.storage.tvf.allow_local_paths = true;
+    let tracker = Arc::new(QueryTracker::new(&config.query_history));
+    QueryHandler::new(
+        Arc::new(PassthroughEnforcer),
+        None,
+        config,
+        None,
+        None,
+        None,
+        None,
+        tracker,
+        None,
+        None,
+        None,
+        catalogs,
+        secrets,
+    )
+    .expect("QueryHandler::new")
+}
+
+#[tokio::test]
+async fn attach_hive_external_root_succeeds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handler =
+        make_handler_allowing_local_paths(SecretStore::new(), RuntimeCatalogRegistry::new());
+    let session = dummy_session();
+
+    let sql = format!(
+        "ATTACH 'file://{}' AS lake (TYPE hive_external)",
+        dir.path().display()
+    );
+    let result = handler.execute(&session, &sql, None).await;
+    assert!(result.is_ok(), "unexpected error: {:?}", result);
+    assert_eq!(
+        result.unwrap().iter().map(|b| b.num_rows()).sum::<usize>(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn attach_hive_external_root_rejects_local_path_without_allow_local_paths() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // `make_handler`, not `make_handler_allowing_local_paths`: the default
+    // config leaves `[storage.tvf] allow_local_paths` false, and `trusted`
+    // (which a Hive ATTACH does not set for a session caller anyway) would
+    // not bypass this gate regardless -- see `check_path`'s local-path
+    // branch.
+    let handler = make_handler(SecretStore::new(), RuntimeCatalogRegistry::new());
+    let session = dummy_session();
+
+    let sql = format!(
+        "ATTACH 'file://{}' AS lake (TYPE hive_external)",
+        dir.path().display()
+    );
+    let err = handler
+        .execute(&session, &sql, None)
+        .await
+        .expect_err("local paths disabled by default");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("local filesystem paths are disabled"),
+        "{msg}"
+    );
+}
+
+#[tokio::test]
+async fn attach_hive_external_root_duplicate_name_errors() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handler =
+        make_handler_allowing_local_paths(SecretStore::new(), RuntimeCatalogRegistry::new());
+    let session = dummy_session();
+    let sql = format!(
+        "ATTACH 'file://{}' AS lake (TYPE hive_external)",
+        dir.path().display()
+    );
+    handler
+        .execute(&session, &sql, None)
+        .await
+        .expect("first attach");
+
+    let err = handler
+        .execute(&session, &sql, None)
+        .await
+        .expect_err("duplicate attach must fail");
+    assert!(
+        err.to_string().contains("already attached"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn detach_hive_external_root_then_reattach_succeeds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handler =
+        make_handler_allowing_local_paths(SecretStore::new(), RuntimeCatalogRegistry::new());
+    let session = dummy_session();
+    let sql = format!(
+        "ATTACH 'file://{}' AS lake (TYPE hive_external)",
+        dir.path().display()
+    );
+    handler
+        .execute(&session, &sql, None)
+        .await
+        .expect("attach");
+
+    handler
+        .execute(&session, "DETACH lake", None)
+        .await
+        .expect("detach");
+
+    // Re-attaching under the same name only succeeds if DETACH actually
+    // forgot it -- a stronger proof than asserting DETACH returned Ok.
+    handler
+        .execute(&session, &sql, None)
+        .await
+        .expect("re-attach after detach");
+}
+
+#[tokio::test]
+async fn detach_unknown_name_errors() {
+    let handler =
+        make_handler_allowing_local_paths(SecretStore::new(), RuntimeCatalogRegistry::new());
+    let session = dummy_session();
+
+    let err = handler
+        .execute(&session, "DETACH nope", None)
+        .await
+        .expect_err("unknown name must error");
+    assert!(err.to_string().contains("not attached"), "{err}");
+}

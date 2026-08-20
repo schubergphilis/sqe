@@ -1346,6 +1346,18 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     let hive_catalogs = Arc::new(sqe_policy::plan_rewriter::HiveCatalogs::new());
     let hive_manifest_cache = Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new());
 
+    // Attach every `[[hive.roots]]` configured root before the first
+    // session context is ever built; see the matching comment in `main.rs`.
+    let runtime_catalogs = sqe_coordinator::RuntimeCatalogRegistry::default();
+    sqe_coordinator::runtime_catalog::attach_configured_hive_roots(
+        &config.hive,
+        &config.storage,
+        &runtime_catalogs,
+        &hive_catalogs,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e))?;
+
     // AUTH-01: build the enforcer + store from config.policy.engine.
     // table_cache is passed so the rewriter can wire CacheTagSource for
     // tag-based column masking (Task 4). A clone is taken here; the original
@@ -1394,12 +1406,13 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             query_cache,
             grant_backend,
             lineage_obs,
-            sqe_coordinator::RuntimeCatalogRegistry::default(),
+            runtime_catalogs,
             sqe_core::SecretStore::from_optional_path(&config.session.secrets_path)
                 .map_err(|e| anyhow::anyhow!(e))?,
         )?
         .with_table_cache(table_cache)
-        .with_session_manager(session_manager.clone()),
+        .with_session_manager(session_manager.clone())
+        .with_hive_registries(hive_catalogs.clone(), hive_manifest_cache.clone()),
     );
 
     // Spawn background memory metrics reporter (updates gauges every 1s for Grafana)

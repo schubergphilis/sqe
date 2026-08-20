@@ -2267,10 +2267,14 @@ pub struct TvfCaller {
     /// Roles from the caller's JWT (`roles_claim`), matched against
     /// `[storage.tvf] object_store_admin_roles`.
     pub roles: Vec<String>,
-    /// `true` only for the embedded (in-process, single-tenant) CLI where
-    /// the caller already owns the process, its config, and its
-    /// credentials. Skips object-store prefix gating entirely. The
-    /// coordinator must NEVER set this for remote sessions.
+    /// `true` for a caller that already owns whatever it is reading, so
+    /// object-store prefix gating is skipped entirely: the embedded CLI
+    /// (`trusted_local`) and coordinator startup validating its own
+    /// operator-supplied TOML (`trusted_startup_config`). The coordinator
+    /// must NEVER set this for a remote session's query or DDL -- both
+    /// constructors below exist so a grep for `trusted: true` finds only
+    /// those two non-session call sites, never one that could be confused
+    /// with `for_user`.
     pub trusted: bool,
 }
 
@@ -2287,6 +2291,24 @@ impl TvfCaller {
     /// Trusted local caller (embedded CLI). Object-store prefix gating is
     /// skipped — the local user owns the config and the credentials in it.
     pub fn trusted_local() -> Self {
+        Self {
+            username: None,
+            roles: Vec::new(),
+            trusted: true,
+        }
+    }
+
+    /// Trusted caller for validating operator-declared configuration at
+    /// coordinator startup (`[[hive.roots]]`), before any session exists to
+    /// build a `for_user` caller from. Same effect as `trusted_local` --
+    /// object-store prefix gating is skipped, local/http paths still need
+    /// `[storage.tvf] allow_local_paths` / `allow_http` regardless of
+    /// `trusted` (see `check_path`) -- but kept as its own name rather than
+    /// reused from the embedded-CLI constructor: an operator's TOML and a
+    /// single-tenant local process are trusted for different reasons, and
+    /// conflating them would make a future audit of "where is `trusted`
+    /// set" have to reason about both at once.
+    pub fn trusted_startup_config() -> Self {
         Self {
             username: None,
             roles: Vec::new(),
@@ -8203,6 +8225,32 @@ otlp_endpoint = ""
         assert!(policy
             .check_path("s3://bucket/x.csv", &TvfCaller::trusted_local(), false)
             .is_ok());
+    }
+
+    /// `trusted_startup_config` must bypass the object-store gate the same
+    /// way `trusted_local` does -- coordinator startup has no session to
+    /// build a `for_user` caller from, so a fail-closed default TvfPolicy
+    /// must not reject every operator-declared `[[hive.roots]]` `s3://` URL.
+    #[test]
+    fn tvf_object_store_trusted_startup_config_bypass() {
+        let policy = TvfPolicy::default();
+        assert!(policy
+            .check_path("s3://bucket/warehouse/", &TvfCaller::trusted_startup_config(), false)
+            .is_ok());
+    }
+
+    /// Unlike the object-store branch, `trusted` has no effect on the
+    /// local-path gate (`check_path`'s `allow_local_paths` branch never
+    /// reads `caller.trusted`), so a startup-config caller reading a local
+    /// path still needs the operator to opt in explicitly. Pins that
+    /// asymmetry so a future `check_path` refactor cannot silently start
+    /// trusting local paths too.
+    #[test]
+    fn tvf_local_path_ignores_trusted_startup_config() {
+        let policy = TvfPolicy::default();
+        assert!(policy
+            .check_path("/warehouse/lake", &TvfCaller::trusted_startup_config(), false)
+            .is_err());
     }
 
     #[test]

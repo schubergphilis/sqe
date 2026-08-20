@@ -99,10 +99,22 @@ fn session(token: &str, catalog: Option<&str>, schema: Option<&str>) -> Session 
 async fn build_ctx(config: &SqeConfig, session: &Session) -> (String, String, bool) {
     let tracker = Arc::new(QueryTracker::new(&config.query_history));
     let registry = RuntimeCatalogRegistry::default();
-    let (ctx, _catalog) =
-        create_session_context(config, session, None, &tracker, None, None, None, &registry)
-            .await
-            .expect("create_session_context succeeds against mock Polaris");
+    let hive_manifest_cache = Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new());
+    let secrets = sqe_core::SecretStore::new();
+    let (ctx, _catalog) = create_session_context(
+        config,
+        session,
+        None,
+        &tracker,
+        None,
+        None,
+        None,
+        &registry,
+        &hive_manifest_cache,
+        &secrets,
+    )
+    .await
+    .expect("create_session_context succeeds against mock Polaris");
 
     let cfg = ctx.copied_config();
     let opts = cfg.options();
@@ -132,8 +144,19 @@ async fn system_jdbc_enumerates_session_catalog_tables() {
 
     let tracker = Arc::new(QueryTracker::new(&config.query_history));
     let registry = RuntimeCatalogRegistry::default();
+    let hive_manifest_cache = Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new());
+    let secrets = sqe_core::SecretStore::new();
     let (ctx, _catalog) = create_session_context(
-        &config, &session, None, &tracker, None, None, None, &registry,
+        &config,
+        &session,
+        None,
+        &tracker,
+        None,
+        None,
+        None,
+        &registry,
+        &hive_manifest_cache,
+        &secrets,
     )
     .await
     .expect("session context builds");
@@ -186,8 +209,19 @@ async fn current_catalog_and_schema_return_session_values() {
 
     let tracker = Arc::new(QueryTracker::new(&config.query_history));
     let registry = RuntimeCatalogRegistry::default();
+    let hive_manifest_cache = Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new());
+    let secrets = sqe_core::SecretStore::new();
     let (ctx, _catalog) = create_session_context(
-        &config, &session, None, &tracker, None, None, None, &registry,
+        &config,
+        &session,
+        None,
+        &tracker,
+        None,
+        None,
+        None,
+        &registry,
+        &hive_manifest_cache,
+        &secrets,
     )
     .await
     .expect("session context builds");
