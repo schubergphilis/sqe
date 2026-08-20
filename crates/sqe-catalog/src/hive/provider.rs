@@ -186,16 +186,35 @@ impl HiveMetadataCache {
 
     /// Claim `bucket_key` for `table_ref` reading under `secret`, or refuse
     /// naming both tables and both secrets when a DIFFERENT table already
-    /// claimed this bucket under a DIFFERENT secret. A no-op success (same
-    /// owner, or a new owner agreeing on the same secret) updates nothing;
-    /// the FIRST successful claim for a given bucket sticks.
+    /// claimed this bucket under a DIFFERENT secret.
+    ///
+    /// A successful claim (no mismatch) ALWAYS updates the stored record to
+    /// `(table_ref, secret)`, even when the claimant is the SAME table as
+    /// before: `register_object_store` is about to overwrite whatever
+    /// store DataFusion had registered for this bucket with the one built
+    /// from THIS claim, so the record has to track "whichever claim most
+    /// recently succeeded", the same last-write-wins semantics the
+    /// registry itself has, or it goes stale and starts comparing future
+    /// claims against a secret nothing is actually registered under
+    /// anymore. An earlier version of this function returned `Ok(())` on a
+    /// same-table match WITHOUT updating the record, which reopened the
+    /// exact hole this guard exists to close: table A claims under `s1`,
+    /// A's manifest changes to `s2` and re-claims (allowed, but the record
+    /// stayed `(A, s1)`), then table B claims under `s1` -- table differs
+    /// but the STALE secret matches, so B is wrongly allowed and its `s1`
+    /// store silently replaces A's `s2` store in the registry. Updating
+    /// the record on every non-refused claim closes that, and as a side
+    /// effect also removes the mirror-image bug (a table legitimately
+    /// re-claiming under a new secret being refused because the record
+    /// still showed the old one).
     ///
     /// Known gap, accepted rather than fixed this round: this never
-    /// evicts, so `DROP TABLE` followed by `CREATE EXTERNAL TABLE` on the
-    /// SAME bucket under a DIFFERENT secret still refuses until the
-    /// coordinator restarts. Narrow and rare against the two-tables-one-
-    /// bucket case this exists to catch; a clear, if occasionally
-    /// premature, refusal beats silently wrong data either way.
+    /// evicts on `DROP TABLE`, so a table dropped and never re-created
+    /// leaves a stale-but-harmless record (nothing will ever claim its
+    /// exact `table_ref` again, and a genuinely different table sharing
+    /// its bucket is still compared against the last REAL claim, which is
+    /// correct); only a same-table re-claim needed the fix above, and it
+    /// has it.
     pub fn claim_object_store_bucket(
         &self,
         bucket_key: &str,
@@ -219,7 +238,6 @@ impl HiveMetadataCache {
                     existing.table_ref, existing.secret
                 ));
             }
-            return Ok(());
         }
         owners.insert(
             bucket_key.to_string(),
@@ -951,5 +969,86 @@ mod tests {
         assert_eq!(cache.get("sales", "orders").unwrap().name, m.name);
         assert!(cache.get("sales", "other").is_none());
         assert!(cache.get("other", "orders").is_none());
+    }
+
+    #[test]
+    fn claim_object_store_bucket_allows_a_different_table_under_the_same_secret() {
+        let cache = HiveMetadataCache::new();
+        cache
+            .claim_object_store_bucket("s3://bucket", "sales.orders", Some("s1"))
+            .expect("first claim");
+        cache
+            .claim_object_store_bucket("s3://bucket", "sales.shipments", Some("s1"))
+            .expect("same secret, different table, must not be refused");
+    }
+
+    #[test]
+    fn claim_object_store_bucket_refuses_a_different_table_under_a_different_secret() {
+        let cache = HiveMetadataCache::new();
+        cache
+            .claim_object_store_bucket("s3://bucket", "sales.orders", Some("s1"))
+            .expect("first claim");
+        let err = cache
+            .claim_object_store_bucket("s3://bucket", "sales.shipments", Some("s2"))
+            .expect_err("different table, different secret, must be refused");
+        assert!(err.contains("sales.orders"), "{err}");
+        assert!(err.contains("sales.shipments"), "{err}");
+        assert!(err.contains("s1"), "{err}");
+        assert!(err.contains("s2"), "{err}");
+    }
+
+    /// The sequence the review's fix-round found: a same-table re-claim
+    /// under a NEW secret must update the stored record, not leave it
+    /// stale. Pins both symptoms the review traced from that staleness.
+    ///
+    /// Mutation-checked: reverting the fix (returning early on a
+    /// same-table match without updating the record, the function's exact
+    /// shape before this fix) makes this test fail -- in practice on the
+    /// "B under A's current secret must be allowed" assertion first (the
+    /// premature-refusal half surfaces before the wrongly-allowed-old-
+    /// secret half gets a chance to run), which is itself proof the
+    /// record went stale on the first re-claim.
+    #[test]
+    fn a_same_table_reclaim_under_a_new_secret_updates_the_record() {
+        let cache = HiveMetadataCache::new();
+
+        // A claims under s1.
+        cache
+            .claim_object_store_bucket("s3://bucket", "sales.a", Some("s1"))
+            .expect("A's first claim");
+
+        // A's manifest changes to s2 and re-claims. Must succeed (same
+        // table), and must actually update the record -- not a no-op.
+        cache
+            .claim_object_store_bucket("s3://bucket", "sales.a", Some("s2"))
+            .expect("A re-claiming under a new secret must not be refused");
+
+        // A legitimate table B arriving under A's NEW secret (s2) must not
+        // be refused because of a stale record still showing s1 (the
+        // "premature refusal" half of the bug).
+        cache
+            .claim_object_store_bucket("s3://bucket", "sales.b_same_secret", Some("s2"))
+            .expect("B under A's current secret must be allowed");
+
+        // Reset to a clean two-claimant state to isolate the other half:
+        // table B arriving under A's OLD secret (s1) must now be REFUSED,
+        // because what is actually registered for this bucket is s2's
+        // store, not s1's. A stale record showing (A, s1) would wrongly
+        // allow this and let B's s1 store silently replace A's s2 store.
+        let cache2 = HiveMetadataCache::new();
+        cache2
+            .claim_object_store_bucket("s3://bucket", "sales.a", Some("s1"))
+            .expect("A's first claim");
+        cache2
+            .claim_object_store_bucket("s3://bucket", "sales.a", Some("s2"))
+            .expect("A re-claiming under a new secret must not be refused");
+        let err = cache2
+            .claim_object_store_bucket("s3://bucket", "sales.b_old_secret", Some("s1"))
+            .expect_err(
+                "B claiming under A's OLD, no-longer-registered secret must be refused, \
+                 not silently allowed to overwrite A's current store",
+            );
+        assert!(err.contains("sales.a"), "{err}");
+        assert!(err.contains("sales.b_old_secret"), "{err}");
     }
 }
