@@ -10,13 +10,15 @@
 //! single-process `HashMap`, and authenticates with the caller's real
 //! session identity instead of `TvfCaller::trusted_local()`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::common::TableReference;
 use sqe_catalog::hive::manifest::HiveManifest;
-use sqe_core::{SecretStore, Session, SqeError};
+use sqe_core::{SecretStore, Session, SessionUser, SqeError};
 use sqe_metrics::audit::{Actor, AuditEvent, AuditKind, AuditLogger, ObjectType, Outcome, Resource};
-use sqe_policy::plan_rewriter::HiveCatalogs;
+use sqe_policy::plan_rewriter::{policy_denies_all, resolve_effective_policy, HiveCatalogs};
+use sqe_policy::PolicyStore;
 use sqe_sql::hive_ddl::HiveTableSpec;
 
 use crate::runtime_catalog::RuntimeCatalogRegistry;
@@ -57,6 +59,15 @@ pub struct HiveDdlHandler {
     hive_catalogs: Option<Arc<HiveCatalogs>>,
     secrets: SecretStore,
     audit: Option<Arc<AuditLogger>>,
+    /// `None` means policy enforcement is disabled cluster-wide (no `[policy]`
+    /// backend configured), the same condition under which `QueryHandler`
+    /// runs `PassthroughEnforcer` on the Iceberg read path. Mirrors that:
+    /// `None` here means "no gate", not "deny everything" -- `resolve_policy`
+    /// returns the default (unrestricted) `ResolvedPolicy` rather than
+    /// refusing, or a cluster with policy off would lose Hive metadata
+    /// listing while Iceberg metadata listing kept working.
+    policy_store: Option<Arc<dyn PolicyStore>>,
+    mask_precedence: sqe_core::config::MaskPrecedence,
 }
 
 /// The wiring-gap refusal shared by every write path below. Named the same
@@ -71,6 +82,19 @@ fn hive_registries_not_wired() -> SqeError {
     )
 }
 
+/// Whether `err` is `drop_table`'s "table not found" error, for the caller's
+/// `DROP TABLE IF EXISTS` handling. A named, grep-able equivalent of
+/// `catalog_ops::is_table_not_found`'s role on the Iceberg drop path, not a
+/// fix for the string-substring coupling either one has against its own
+/// backend's error text: `drop_table` returns a plain `SqeError`, not a
+/// typed `HiveError`, by the time it reaches the caller (`store.delete`'s
+/// `Err` is mapped to `SqeError::Execution` inside `drop_table` itself), so
+/// there is nothing more structured than the message to match on without a
+/// wider change to how `drop_table` reports failure.
+pub(crate) fn hive_drop_target_missing(err: &SqeError) -> bool {
+    err.to_string().contains("table not found")
+}
+
 impl HiveDdlHandler {
     pub fn new(runtime_catalogs: RuntimeCatalogRegistry, secrets: SecretStore) -> Self {
         Self {
@@ -78,7 +102,24 @@ impl HiveDdlHandler {
             hive_catalogs: None,
             secrets,
             audit: None,
+            policy_store: None,
+            mask_precedence: sqe_core::config::MaskPrecedence::default(),
         }
+    }
+
+    /// Wire the SAME `PolicyStore` and `mask_precedence` `QueryHandler` backs
+    /// its Iceberg read path with, so `SHOW TABLES`/`SHOW CREATE TABLE`
+    /// against a Hive root are gated by the identical policy, not a second,
+    /// independently-derived one. Called from `QueryHandler::new`.
+    #[must_use = "with_policy consumes self; bind the returned HiveDdlHandler"]
+    pub fn with_policy(
+        mut self,
+        policy_store: Option<Arc<dyn PolicyStore>>,
+        mask_precedence: sqe_core::config::MaskPrecedence,
+    ) -> Self {
+        self.policy_store = policy_store;
+        self.mask_precedence = mask_precedence;
+        self
     }
 
     /// Wire the process-wide `hive_catalogs` registry and audit sink. Called
@@ -100,12 +141,16 @@ impl HiveDdlHandler {
     /// attached Hive root? Only a fully-qualified (`catalog.schema.table`)
     /// reference can, since a Hive table is always addressed by its
     /// attached root's name; a bare or partial reference (no catalog part)
-    /// falls to `TableKind::Iceberg` here, the same outcome an unqualified
-    /// name resolving against a non-Hive default catalog would produce. A
-    /// caller whose session default catalog happens to be a Hive root and
-    /// who addresses a table by its bare name is not covered by this
-    /// resolver; today that surfaces as a table-not-found on the Iceberg
-    /// path rather than as a Hive-aware answer.
+    /// falls to `TableKind::Iceberg` here.
+    ///
+    /// This only looks at `table_ref` itself. A bare or partial reference
+    /// under a session whose DEFAULT catalog is a Hive root still needs a
+    /// Hive answer once that default is filled in -- `resolve_table_kind_for_session`
+    /// below does that promotion first and is what every dispatch-site
+    /// rejection check (`reject_if_hive_table`) actually calls; this method
+    /// is for the one caller that already has a `Full` reference in hand
+    /// (`CREATE EXTERNAL TABLE`/`DROP TABLE`/`SHOW CREATE TABLE`/`SHOW
+    /// TABLES`, all of which require one).
     pub fn resolve_table_kind(&self, table_ref: &TableReference) -> TableKind {
         if let TableReference::Full {
             catalog,
@@ -122,6 +167,50 @@ impl HiveDdlHandler {
             }
         }
         TableKind::Iceberg
+    }
+
+    /// Same branch point as `resolve_table_kind`, but promotes a `Bare`/
+    /// `Partial` reference to `Full` using the session's default catalog
+    /// first, so a Hive root set as the session default is not missed.
+    ///
+    /// `resolve_table_kind` alone erred safely only by accident: a write
+    /// statement (`DELETE`/`UPDATE`/`ANALYZE`/...) against an unqualified
+    /// reference under a Hive-root default catalog does not always fail
+    /// downstream. Under `polaris-auto` catalog discovery it does (the
+    /// Hive root name does not resolve as an Iceberg catalog, so the
+    /// session falls back and the Iceberg write path errors as
+    /// "unknown catalog"), but under `static` discovery
+    /// (`session_context.rs`'s `create_session_context`) the session
+    /// silently falls back to `config.resolve_default_catalog()` instead,
+    /// which could be a real, different Iceberg catalog -- letting a
+    /// `DELETE FROM sales.orders` meant for a Hive table silently target a
+    /// same-named table in the wrong catalog instead of being rejected.
+    /// This closes that gap by resolving the SAME way before the
+    /// Hive-or-Iceberg question is even asked.
+    ///
+    /// Only the catalog component matters for the answer this returns
+    /// (`is_hive_root` inspects nothing else), so a `Bare` reference is
+    /// promoted with a placeholder `"default"` schema -- consistent with
+    /// `catalog_ops::parse_table_ref`'s own fallback for a one-part name --
+    /// rather than threading the session's default schema through for a
+    /// value this method never uses.
+    pub fn resolve_table_kind_for_session(
+        &self,
+        default_catalog: Option<&str>,
+        table_ref: &TableReference,
+    ) -> TableKind {
+        if matches!(table_ref, TableReference::Full { .. }) {
+            return self.resolve_table_kind(table_ref);
+        }
+        let Some(catalog) = default_catalog else {
+            return TableKind::Iceberg;
+        };
+        let (schema, table) = match table_ref {
+            TableReference::Partial { schema, table } => (schema.to_string(), table.to_string()),
+            TableReference::Bare { table } => ("default".to_string(), table.to_string()),
+            TableReference::Full { .. } => unreachable!("handled above"),
+        };
+        self.resolve_table_kind(&TableReference::full(catalog.to_string(), schema, table))
     }
 
     /// Build the standard rejection for a statement this release does not
@@ -203,8 +292,9 @@ impl HiveDdlHandler {
     /// `DROP TABLE` against a Hive root: delete the manifest, never the
     /// data. Callers decide whether `table_ref` even names a Hive table
     /// (via `resolve_table_kind`) before calling this; `if_exists` handling
-    /// is the caller's job too, by matching the returned error the same
-    /// way the Iceberg drop path matches `is_table_not_found`.
+    /// is the caller's job too, by matching the returned error via
+    /// `hive_drop_target_missing` below, the same way the Iceberg drop path
+    /// matches `catalog_ops::is_table_not_found`.
     pub async fn drop_table(
         &self,
         session: &Session,
@@ -249,7 +339,23 @@ impl HiveDdlHandler {
     /// `SHOW CREATE TABLE` against a Hive root: render Athena/Glue-style
     /// DDL from the manifest, through the same shared renderer the
     /// embedded client uses (`sqe_catalog::hive::render_hive_create_table_ddl`).
-    pub async fn show_create_table(&self, table_ref: &TableReference) -> Result<String, SqeError> {
+    ///
+    /// Gated: a caller with no privilege on the table gets the SAME "table
+    /// not found" wording an absent table would, so a denial cannot be told
+    /// apart from a table that never existed (the project's no-information-
+    /// leakage convention; see `resolve_policy`'s doc comment). A caller with
+    /// partial access sees the DDL with restricted columns silently dropped
+    /// from the column list, mirroring how `information_schema.columns`
+    /// already treats a restricted Iceberg column as invisible rather than
+    /// erroring. Column masks are NOT reflected here (masking is a data-time
+    /// rewrite, not a schema change; the Iceberg `SHOW CREATE TABLE` path
+    /// does not filter for masks either, only `information_schema.columns`
+    /// itself would, and that is a value question, not a name/type one).
+    pub async fn show_create_table(
+        &self,
+        user: &SessionUser,
+        table_ref: &TableReference,
+    ) -> Result<String, SqeError> {
         let TableReference::Full {
             catalog,
             schema,
@@ -267,19 +373,107 @@ impl HiveDdlHandler {
             .get(schema, table)
             .await
             .map_err(|e| SqeError::Execution(e.to_string()))?;
-        let spec = sqe_catalog::hive::hive_spec_from_manifest(catalog, &manifest);
+
+        let policy = self.resolve_policy(user, schema, table, &manifest).await;
+        if policy_denies_all(&policy) {
+            // Identical wording to `HiveManifestStore::get`'s own not-found
+            // error (see `HiveError::NotFound`'s `Display`): a caller with
+            // zero privilege must not be able to distinguish "denied" from
+            // "never existed" by the error text alone.
+            return Err(SqeError::Execution(format!(
+                "hive_external: table not found: {schema}.{table}"
+            )));
+        }
+
+        let mut spec = sqe_catalog::hive::hive_spec_from_manifest(catalog, &manifest);
+        spec.columns
+            .retain(|c| !policy.restricted_columns.contains(&c.name));
+        spec.partition_keys
+            .retain(|c| !policy.restricted_columns.contains(&c.name));
         Ok(sqe_catalog::hive::render_hive_create_table_ddl(&spec))
     }
 
     /// `SHOW TABLES FROM <root>.<database>`: list tables via the manifest
     /// store, in the same Trino-compatible bare-name shape
-    /// `handle_show_tables` already uses for Iceberg.
-    pub async fn list_tables(&self, root: &str, database: &str) -> Result<Vec<String>, SqeError> {
+    /// `handle_show_tables` already uses for Iceberg, filtered to the tables
+    /// `user` has any privilege on at all (a fully-denied table is omitted,
+    /// never erred on -- the same "invisible, not an error" convention
+    /// `show_create_table` above and `information_schema.columns` both
+    /// follow for restricted columns, applied here at table granularity).
+    ///
+    /// Unlike the Iceberg `SHOW TABLES` path (which is filtered for free by
+    /// Polaris authorizing `list_tables` against the caller's own OIDC
+    /// token), a Hive root has no external metastore to delegate to: the
+    /// manifest store is read with the coordinator's own object-store
+    /// credentials, the same ones for every caller. This gate is the only
+    /// thing standing between "engine can read it" and "user can see it",
+    /// so it fetches and resolves a policy for every candidate table rather
+    /// than trusting the listing to already be scoped. That is an N+1
+    /// manifest read per `SHOW TABLES` call; acceptable for a first cut,
+    /// worth caching if a Hive root's table count grows large enough to
+    /// notice.
+    pub async fn list_tables(
+        &self,
+        user: &SessionUser,
+        root: &str,
+        database: &str,
+    ) -> Result<Vec<String>, SqeError> {
         let store = self.store_for(root)?;
-        store
+        let names = store
             .list_tables(database)
             .await
-            .map_err(|e| SqeError::Execution(e.to_string()))
+            .map_err(|e| SqeError::Execution(e.to_string()))?;
+
+        let mut visible = Vec::with_capacity(names.len());
+        for name in names {
+            let manifest = match store.get(database, &name).await {
+                Ok(m) => m,
+                // A table that vanished between `list_tables` and `get`
+                // (dropped concurrently) is omitted rather than erroring the
+                // whole listing.
+                Err(_) => continue,
+            };
+            let policy = self.resolve_policy(user, database, &name, &manifest).await;
+            if !policy_denies_all(&policy) {
+                visible.push(name);
+            }
+        }
+        Ok(visible)
+    }
+
+    /// Resolve `user`'s effective policy against a Hive table, using the
+    /// SAME resolution the plan rewriter runs for a real Iceberg scan
+    /// (`resolve_effective_policy`: resource policy, then tag-derived masks
+    /// and filters, with the configured mask/tag precedence) -- not a
+    /// second, hand-rolled authorization check. `policy_store: None` means
+    /// policy enforcement is off cluster-wide, in which case this returns
+    /// the default (unrestricted) policy, matching `PassthroughEnforcer`'s
+    /// effect on the Iceberg read path.
+    ///
+    /// Column tags come straight from the manifest already in hand
+    /// (`manifest.sqe.column_tags`), not `HiveMetadataCache`/`HiveTagSource`:
+    /// that cache is populated as a side effect of `HiveSchemaProvider::table()`
+    /// during planning, which neither `show_create_table` nor `list_tables`
+    /// goes through (there is no LogicalPlan here), so it may not be warm.
+    /// Reading the manifest's own field is both simpler and never stale.
+    async fn resolve_policy(
+        &self,
+        user: &SessionUser,
+        database: &str,
+        table: &str,
+        manifest: &HiveManifest,
+    ) -> sqe_policy::ResolvedPolicy {
+        let Some(store) = self.policy_store.as_deref() else {
+            return sqe_policy::ResolvedPolicy::default();
+        };
+        let col_tags: HashMap<String, Vec<String>> = manifest
+            .sqe
+            .column_tags
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        resolve_effective_policy(store, user, table, database, &col_tags, self.mask_precedence)
+            .await
     }
 
     fn store_for(

@@ -27,7 +27,8 @@ use sqe_core::config::{PolicyEngine, TvfCaller};
 use sqe_core::{SecretStore, Session, SqeConfig};
 use sqe_metrics::audit::AuditLogger;
 use sqe_policy::plan_rewriter::HiveCatalogs;
-use sqe_policy::PassthroughEnforcer;
+use sqe_policy::policy_store::InMemoryPolicyStore;
+use sqe_policy::{PassthroughEnforcer, PolicyStore, ResolvedPolicy};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -283,6 +284,70 @@ async fn handler_with_root_and_tag_source(catalog: &str) -> Harness {
     )
     .expect("QueryHandler::new")
     .with_hive_registries(hive_catalogs, hive_manifest_cache);
+
+    let session = dummy_session();
+    let sql = format!(
+        "ATTACH 'file://{}/wh' AS {catalog} (TYPE hive_external)",
+        root_dir.path().display()
+    );
+    handler
+        .execute(&session, &sql, None)
+        .await
+        .expect("attach hive root");
+
+    let data_dir = root_dir.path().join("data");
+    write_csv_fixture(&data_dir);
+    handler
+        .execute(&session, &create_orders_ddl(&data_dir, catalog), None)
+        .await
+        .expect("create orders");
+
+    Harness {
+        handler,
+        session,
+        audit,
+        log_path,
+        _dirs: vec![root_dir, audit_dir],
+        _mock: mock,
+    }
+}
+
+/// Same as `handler_with_root`, but wired with a caller-supplied
+/// `InMemoryPolicyStore` instead of `build_policy_enforcer`'s throwaway
+/// empty one, so a test can populate it with `add_table_policy` and see
+/// `HiveDdlHandler`'s `SHOW TABLES` / `SHOW CREATE TABLE` gate act on a
+/// real per-table policy. `policy_enforcer` stays `PassthroughEnforcer`:
+/// these tests pin `HiveDdlHandler::resolve_policy` directly, not the plan
+/// rewriter's SELECT path, so a real `PolicyPlanRewriter` is not needed.
+async fn handler_with_root_and_policy(catalog: &str, store: Arc<InMemoryPolicyStore>) -> Harness {
+    let root_dir = tempfile::tempdir().expect("tempdir");
+    let audit_dir = tempfile::tempdir().expect("tempdir");
+    let log_path = audit_dir.path().join("audit.jsonl");
+    let audit = Arc::new(AuditLogger::new(log_path.to_str().unwrap()).expect("audit logger opens"));
+    let mock = mock_polaris().await;
+
+    let config = minimal_config(&mock.uri());
+    let tracker = Arc::new(QueryTracker::new(&config.query_history));
+    let handler = QueryHandler::new(
+        Arc::new(PassthroughEnforcer),
+        Some(store as Arc<dyn PolicyStore>),
+        config,
+        None,
+        None,
+        None,
+        Some(audit.clone()),
+        tracker,
+        None,
+        None,
+        None,
+        RuntimeCatalogRegistry::new(),
+        SecretStore::new(),
+    )
+    .expect("QueryHandler::new")
+    .with_hive_registries(
+        Arc::new(HiveCatalogs::new()),
+        Arc::new(HiveMetadataCache::new()),
+    );
 
     let session = dummy_session();
     let sql = format!(
@@ -670,4 +735,197 @@ async fn create_external_table_rejects_an_unknown_secret_reference() {
         msg.contains("does-not-exist"),
         "should name the missing secret: {msg}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Policy gating on the Hive metadata-read paths (fix round: SHOW TABLES /
+// SHOW CREATE TABLE against a Hive root previously read the manifest store
+// with the coordinator's own credentials and returned everything, with
+// nothing gating it the way `session_catalog.list_namespaces()`'s Polaris
+// authorization gates the Iceberg equivalents, and the way
+// `information_schema.columns`'s own `PolicyStore::resolve()` call gates
+// Iceberg `SHOW CREATE TABLE`'s column list). `HiveDdlHandler::resolve_policy`
+// now runs the SAME `resolve_effective_policy` the plan rewriter and `SHOW
+// EFFECTIVE POLICY` already use, so there is one policy-resolution path,
+// not a second one invented for Hive.
+// ---------------------------------------------------------------------------
+
+/// A table denied outright (the plan rewriter's `lit(false)` deny-all
+/// sentinel) must be invisible to both `SHOW TABLES` and `SHOW CREATE
+/// TABLE` against a Hive root -- omitted from the listing, and erring with
+/// the SAME "table not found" wording an absent table gets, so a denial
+/// cannot be told apart from a table that never existed (the project's
+/// no-information-leakage convention).
+///
+/// Mutation-checked: with the `policy_denies_all` guard removed from both
+/// `HiveDdlHandler::show_create_table` and `list_tables`, this test failed
+/// -- `SHOW TABLES` still listed `orders` and `SHOW CREATE TABLE` returned
+/// the full DDL -- confirming the gate, not something else, is what this
+/// test pins.
+#[tokio::test]
+async fn a_fully_denied_hive_table_is_invisible_to_show_tables_and_show_create_table() {
+    let store = Arc::new(InMemoryPolicyStore::new());
+    store
+        .add_table_policy(
+            "sales",
+            "orders",
+            ResolvedPolicy {
+                row_filters: vec![datafusion::logical_expr::lit(false)],
+                ..Default::default()
+            },
+        )
+        .await;
+    let h = handler_with_root_and_policy("lake", store).await;
+
+    let show_tables = h
+        .execute_for_test("SHOW TABLES FROM lake.sales")
+        .await
+        .expect("SHOW TABLES itself must not error on a denied table, only omit it");
+    let names: Vec<String> = show_tables
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_string::<i32>()
+                .iter()
+                .filter_map(|s| s.map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        !names.contains(&"orders".to_string()),
+        "a fully-denied table must not appear in SHOW TABLES, got {names:?}"
+    );
+
+    let err = h
+        .execute_for_test("SHOW CREATE TABLE lake.sales.orders")
+        .await
+        .expect_err("SHOW CREATE TABLE on a fully-denied table must refuse");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("table not found"),
+        "a denied table's SHOW CREATE TABLE error must read like a missing \
+         table's, not confirm the table exists: {msg}"
+    );
+}
+
+/// A table with a partial column restriction (not a deny-all) must still
+/// appear in `SHOW TABLES` -- the restriction is column-level, not
+/// table-level -- and `SHOW CREATE TABLE` must render successfully with the
+/// restricted column silently dropped from the column list, mirroring how
+/// `information_schema.columns` already treats a restricted Iceberg column
+/// as invisible rather than erroring.
+///
+/// Mutation-checked: removing the `spec.columns.retain(...)` line made this
+/// test fail (`amount` still appeared in the rendered DDL).
+#[tokio::test]
+async fn a_column_restricted_hive_table_hides_only_that_column_in_show_create_table() {
+    let store = Arc::new(InMemoryPolicyStore::new());
+    store
+        .add_table_policy(
+            "sales",
+            "orders",
+            ResolvedPolicy {
+                restricted_columns: vec!["amount".to_string()],
+                ..Default::default()
+            },
+        )
+        .await;
+    let h = handler_with_root_and_policy("lake", store).await;
+
+    let show_tables = h
+        .execute_for_test("SHOW TABLES FROM lake.sales")
+        .await
+        .expect("SHOW TABLES should work");
+    let names: Vec<String> = show_tables
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_string::<i32>()
+                .iter()
+                .filter_map(|s| s.map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        names,
+        vec!["orders".to_string()],
+        "a column restriction is not a table-level denial: {names:?}"
+    );
+
+    let show_create = h
+        .execute_for_test("SHOW CREATE TABLE lake.sales.orders")
+        .await
+        .expect("SHOW CREATE TABLE should still succeed for a partially-restricted table");
+    let ddl = show_create[0].column(0).as_string::<i32>().value(0);
+    assert!(
+        !ddl.contains("amount"),
+        "the restricted column must not appear in the rendered DDL: {ddl}"
+    );
+    for needle in ["id", "CREATE EXTERNAL TABLE"] {
+        assert!(ddl.contains(needle), "missing {needle} in: {ddl}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `resolve_table_kind_for_session` (fix round: a Bare/Partial reference
+// under a session whose default catalog IS a Hive root must still be
+// caught by `reject_if_hive_table`, not fall through to the Iceberg write
+// path because `resolve_table_kind` alone only matches a `Full` reference).
+// ---------------------------------------------------------------------------
+
+/// `DELETE FROM sales.orders` (a two-part, catalog-less reference) under a
+/// session whose default catalog is the attached Hive root must still be
+/// rejected as unsupported for a Hive external table, not silently
+/// resolved against whatever Iceberg catalog the write path's own fallback
+/// would otherwise pick.
+///
+/// Mutation-checked: reverting `reject_if_hive_table` to call
+/// `resolve_table_kind` directly (skipping the session-default-catalog
+/// promotion) made this test fail -- the statement no longer errored with
+/// `hive_external`/`cycle 4`, confirming it would otherwise have proceeded
+/// into the Iceberg write path instead of being rejected.
+#[tokio::test]
+async fn an_unqualified_reference_under_a_hive_default_catalog_is_still_rejected() {
+    let h = handler_with_root("lake").await;
+    let mut session = h.session.clone();
+    session.default_catalog = Some("lake".to_string());
+
+    let result = h
+        .handler
+        .execute(&session, "DELETE FROM sales.orders", None)
+        .await;
+    let err = result.expect_err(
+        "DELETE against a two-part reference under a Hive default catalog must be rejected, \
+         not silently proceed",
+    );
+    let msg = err.to_string();
+    assert!(msg.contains("hive_external"), "{msg}");
+    assert!(msg.contains("DELETE"), "{msg}");
+    assert!(msg.contains("cycle 4"), "{msg}");
+}
+
+/// The `resolve_table_kind_for_session` promotion itself, isolated from
+/// statement dispatch: a `Partial` reference (`sales.orders`, no catalog)
+/// resolves to `TableKind::Hive` when `default_catalog` names an attached
+/// Hive root, and stays `TableKind::Iceberg` when it does not (no
+/// regression on the pre-existing, unqualified-reference behaviour).
+#[tokio::test]
+async fn resolve_table_kind_for_session_promotes_a_partial_reference_under_a_hive_default() {
+    let h = handler_with_root("lake").await;
+    let partial = TableReference::from("sales.orders");
+
+    assert!(matches!(
+        h.handler
+            .resolve_table_kind_for_session(Some("lake"), &partial),
+        TableKind::Hive { .. }
+    ));
+    assert!(matches!(
+        h.handler
+            .resolve_table_kind_for_session(Some("some_other_iceberg_catalog"), &partial),
+        TableKind::Iceberg
+    ));
+    assert!(matches!(
+        h.handler.resolve_table_kind_for_session(None, &partial),
+        TableKind::Iceberg
+    ));
 }

@@ -692,9 +692,21 @@ pub async fn create_session_context(
             // defaults' sibling: how long a `HiveCatalogProvider`'s own
             // `table_names()` listing is cached before the next `SHOW
             // TABLES` re-lists. A fresh provider's cache starts empty, so
-            // DDL against a Hive table only needs the surrounding
-            // `invalidate_all_session_caches()` (issued by the DDL
-            // handler), not a matching invalidation here.
+            // the CALLING session always sees a `CREATE EXTERNAL TABLE` or
+            // `DROP TABLE` it just issued: `HiveDdlHandler` invalidates
+            // that session's own cached `SessionContext`
+            // (`invalidate_session_cache`, per-user, not the root-level
+            // ATTACH/DETACH convention's `invalidate_all_session_caches`),
+            // which forces this whole function to rebuild on that
+            // session's very next call, and a rebuild means a fresh,
+            // empty-cache provider here. A DIFFERENT session that already
+            // has a live `HiveCatalogProvider` for this root is not
+            // touched by that invalidation and keeps serving its own
+            // provider's `table_names()` cache until it naturally expires,
+            // up to the 60s TTL below -- a stale listing for that long is
+            // expected, correct behaviour, not a bug, but it is easy to
+            // misread this loop as re-registering every session's provider
+            // on every DDL statement, which it does not.
             for (name, store) in &hive_roots {
                 let hive_caller = sqe_core::config::TvfCaller::for_user(
                     session.user.username.clone(),
