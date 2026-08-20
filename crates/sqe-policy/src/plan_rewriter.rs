@@ -1724,6 +1724,39 @@ mod tests {
         );
     }
 
+    /// The residual gap the security review found and `attach_configured_hive_roots`
+    /// (`runtime_catalog.rs`) now refuses at the door, not here: this
+    /// function itself only matches `TableReference::Full`, so a two-part
+    /// reference (`table_ref.catalog() == None`) ALWAYS takes the Iceberg
+    /// branch, even when `hive_catalogs` names a root that happens to equal
+    /// what the caller's session default catalog resolved from. Every other
+    /// test above uses `TableReference::full`; this one pins the
+    /// non-`Full` case explicitly, so a future refactor that "helpfully"
+    /// tries to promote the reference here (which the review deliberately
+    /// deferred: a late change to a security-critical path, versus a cheap,
+    /// fail-closed refusal at attach time) does not silently reopen the
+    /// escalation this key decides. The Hive root name intentionally
+    /// matches a real Iceberg namespace here to make the collision
+    /// concrete, not just type-shaped.
+    #[test]
+    fn a_two_part_reference_never_takes_the_hive_branch_even_if_the_name_matches() {
+        let partial = datafusion::common::TableReference::partial("lake", "orders");
+        let bare = datafusion::common::TableReference::bare("orders");
+        let cats = hive_only("lake");
+
+        assert_eq!(
+            resolve_policy_key(&partial, &cats),
+            Some(("lake".to_string(), "orders".to_string())),
+            "a Partial reference must resolve as an ordinary Iceberg namespace named 'lake', \
+             not the Hive root 'lake'"
+        );
+        assert_eq!(
+            resolve_policy_key(&bare, &cats),
+            Some(("default".to_string(), "orders".to_string())),
+            "a Bare reference has no catalog component to match against at all"
+        );
+    }
+
     #[test]
     fn a_root_attached_after_the_rewriter_was_built_still_gets_the_hive_key() {
         // The regression guard for the staleness path. The enforcer is built

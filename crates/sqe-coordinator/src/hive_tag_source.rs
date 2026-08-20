@@ -53,11 +53,28 @@ impl TagSource for HiveTagSource {
 /// `hive_catalogs` goes to `hive`, everything else goes to `fallback`.
 ///
 /// `fallback` is the fail-closed Iceberg source in production wiring. An
-/// unmatched or unknown catalog (including `None`, which no attached Hive
-/// root ever is) always goes to `fallback` and never returns `Some(empty)` of
-/// its own accord: a permissive default in a dispatcher is a silent mask
-/// bypass, and this is exactly where a future third catalog kind would
-/// introduce one if the default here were anything but "ask the fallback".
+/// unmatched or unknown catalog goes to `fallback` and this never returns
+/// `Some(empty)` of its own accord: a permissive default in a dispatcher is
+/// a silent mask bypass, and this is exactly where a future third catalog
+/// kind would introduce one if the default here were anything but "ask the
+/// fallback".
+///
+/// A `None` catalog (a two-part reference, `sales.orders`) also goes to
+/// `fallback` -- but this is NOT because "no attached Hive root ever is"
+/// `None` in some self-evident sense (an earlier version of this comment
+/// claimed exactly that, and it was false: DataFusion resolves a two-part
+/// reference against the session's default catalog at table-lookup time
+/// while leaving the STORED `TableReference` on the scan node as `Partial`,
+/// catalog `None`, so if a Hive root's name were ever the session default
+/// catalog, this dispatcher would still see `None` here and route to
+/// `fallback` regardless). It holds because `attach_configured_hive_roots`
+/// (`runtime_catalog.rs`) and `handle_attach`'s `hive_external` branch
+/// (`query_handler.rs`) both refuse to attach a Hive root whose name equals
+/// `config.resolve_default_catalog()`. That refusal, not an assumption
+/// about `None`, is what makes a `None` catalog here safe to always treat
+/// as non-Hive: a two-part reference can only ever resolve against an
+/// Iceberg default catalog, because a Hive one is never allowed to hold
+/// that name.
 ///
 /// `hive_catalogs` is read on every call, not cached at construction, so a
 /// root attached after this router was built is routed correctly the very

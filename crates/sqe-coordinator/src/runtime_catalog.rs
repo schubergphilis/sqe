@@ -233,9 +233,21 @@ impl RuntimeCatalogRegistry {
     // `build_hive_root` for the full case). A provider built once and
     // reused across sessions would carry one session's caller into every
     // other session's table loads. Only the underlying `HiveManifestStore`
-    // -- which validates through `[storage.tvf]` once and then reads/writes
-    // manifests, holding no per-caller state -- is session-independent, so
-    // that is all this lane stores. It is a second map, not a second
+    // is session-independent, so that is all this lane stores -- but
+    // "session-independent" does not mean caller-free. `HiveManifestStore`
+    // (`hive/store.rs`) DOES carry a `TvfCaller` (its `caller` field, used
+    // in `put`/`get`'s `check_path` calls): the caller of whichever session
+    // ran the `ATTACH` (or `trusted_startup_config()` for a `[[hive.roots]]`
+    // entry), baked in once and shared by every later session's reads. For
+    // a config-attached root that caller is `trusted`, so `check_path`'s
+    // object-store branch never evaluates `allowed_object_store_prefixes`
+    // at all (`file://`/`http(s)://` are still gated); for an
+    // `ATTACH`-created root it is the attaching session's real caller, so
+    // every later reader's manifest load is authorized against whoever
+    // attached, not against themselves -- fail-closed (a false denial for
+    // a more-privileged later reader), not an escalation.
+    //
+    // It is a second map, not a second
     // `AttachedCatalog` field, because the two kinds cannot share one
     // representation: an Iceberg entry's `provider` is exactly the thing
     // every session reuses unchanged, and a Hive entry's `store` is
@@ -347,11 +359,29 @@ impl RuntimeCatalogRegistry {
 /// registry `resolve_policy_key` reads live: a root missing from it would
 /// key every table under the Iceberg namespace convention instead (#7's
 /// escalation, reached from the config-file door instead of `ATTACH`).
+///
+/// `default_catalog` must be `config.resolve_default_catalog()`. A root
+/// named the same as the session's default catalog is refused outright
+/// (see the name check below): `resolve_policy_key` (`sqe-policy`) and
+/// `CatalogRoutedTagSource` (`hive_tag_source.rs`) both dispatch on
+/// `table_ref.catalog()` alone, which is `None` for a two-part reference
+/// (`sales.orders`) -- DataFusion preserves the AS-WRITTEN reference in
+/// the scan, it does not fill in the resolved default catalog. A two-part
+/// reference under a Hive-named default catalog would therefore take the
+/// Iceberg branch of BOTH functions regardless of what the reference
+/// actually resolves against, either denying every row (no tag-source
+/// cache entry -> `lit(false)`) or, worse, inheriting whatever grants
+/// exist for a same-named Iceberg namespace. Refusing the name collision
+/// here closes both symptoms at the one place a two-part reference could
+/// ever reach a Hive table this way, without touching either dispatch
+/// site (see the report for why promoting the reference inside the
+/// policy path is deliberately deferred, not overlooked).
 pub async fn attach_configured_hive_roots(
     hive_config: &sqe_core::config::HiveConfig,
     storage: &sqe_core::config::StorageConfig,
     registry: &RuntimeCatalogRegistry,
     hive_catalogs: &sqe_policy::plan_rewriter::HiveCatalogs,
+    default_catalog: &str,
 ) -> Result<(), String> {
     let limits = sqe_catalog::hive::manifest::ManifestLimits {
         max_bytes: hive_config.manifest_max_bytes,
@@ -359,6 +389,16 @@ pub async fn attach_configured_hive_roots(
         max_partition_keys: hive_config.manifest_max_partition_keys,
     };
     for root in &hive_config.roots {
+        if root.name == default_catalog {
+            return Err(format!(
+                "[[hive.roots]] '{}' collides with the session default catalog '{default_catalog}': \
+                 a two-part table reference under this default resolves to a Hive table without \
+                 either the policy key or the tag route ever seeing its catalog name, so a root \
+                 cannot share a name with the default catalog. Rename the root or set \
+                 query.default_catalog to something else",
+                root.name
+            ));
+        }
         let store = sqe_catalog::mount::build_hive_root(
             &root.location,
             &std::collections::BTreeMap::new(),
@@ -620,12 +660,41 @@ mod hive_lane_tests {
         let registry = RuntimeCatalogRegistry::new();
         let hive_catalogs = sqe_policy::plan_rewriter::HiveCatalogs::new();
 
-        attach_configured_hive_roots(&hive_config, &storage, &registry, &hive_catalogs)
+        attach_configured_hive_roots(&hive_config, &storage, &registry, &hive_catalogs, "iceberg")
             .await
             .expect("attach_configured_hive_roots");
 
         assert!(registry.is_hive_root("lake").expect("is_hive_root"));
         assert!(hive_catalogs.contains_name(Some("lake")));
+    }
+
+    /// The collision this task's security review found: a root named the
+    /// same as the session default catalog must be refused, naming both,
+    /// rather than attached silently. Mutation-checked: removing the
+    /// `root.name == default_catalog` check made this test fail (the
+    /// attach succeeded).
+    #[tokio::test]
+    async fn attach_configured_hive_roots_refuses_a_name_matching_the_default_catalog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut storage = sqe_core::config::StorageConfig::default();
+        storage.tvf.allow_local_paths = true;
+        let hive_config = sqe_core::config::HiveConfig {
+            roots: vec![sqe_core::config::HiveRootConfig {
+                name: "lake".to_string(),
+                location: format!("file://{}", dir.path().display()),
+                secret: None,
+            }],
+            ..sqe_core::config::HiveConfig::default()
+        };
+        let registry = RuntimeCatalogRegistry::new();
+        let hive_catalogs = sqe_policy::plan_rewriter::HiveCatalogs::new();
+
+        let err = attach_configured_hive_roots(&hive_config, &storage, &registry, &hive_catalogs, "lake")
+            .await
+            .expect_err("a root named like the default catalog must be refused");
+        assert!(err.contains("lake"), "{err}");
+        assert!(!registry.is_hive_root("lake").unwrap_or(false));
+        assert!(!hive_catalogs.contains_name(Some("lake")));
     }
 
     /// An unreachable location (no `allow_local_paths`, so `check_path`
@@ -649,6 +718,7 @@ mod hive_lane_tests {
             &sqe_core::config::StorageConfig::default(),
             &registry,
             &hive_catalogs,
+            "iceberg",
         )
         .await
         .expect_err("local paths are disabled by default");

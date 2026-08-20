@@ -1,7 +1,15 @@
 #![cfg(feature = "hive-external")]
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use datafusion::arrow::array::Array;
 use datafusion::prelude::{SessionConfig, SessionContext};
+
+use sqe_catalog::hive::manifest::{HiveManifest, ManifestLimits};
+use sqe_catalog::hive::provider::{HiveCatalogProvider, HiveMetadataCache};
+use sqe_catalog::hive::store::HiveManifestStore;
+use sqe_core::config::{TvfCaller, TvfPolicy};
 
 mod hive_fixture;
 use hive_fixture::{partitioned_csv_root, register_hive_root};
@@ -317,4 +325,142 @@ async fn select_star_orders_partition_columns_after_declared_columns() {
         .map(|f| f.name().to_string())
         .collect();
     assert_eq!(names, vec!["id", "amount", "dt"], "got {names:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Object-store bucket collision guard (security review fix round)
+// ---------------------------------------------------------------------------
+
+/// A local, un-credentialed store built the same way `hive_fixture`'s
+/// `local_store` does, but exposed here so this file can write two
+/// manifests with different `sqe.secret` names without threading that
+/// concern through the shared fixture module.
+fn local_store_for_test(root: &str) -> HiveManifestStore {
+    HiveManifestStore::new(
+        datafusion::datasource::listing::ListingTableUrl::parse(root).expect("root url"),
+        Arc::new(object_store::local::LocalFileSystem::new()),
+        ManifestLimits::default(),
+        TvfPolicy {
+            allow_local_paths: true,
+            ..TvfPolicy::default()
+        },
+        TvfCaller::trusted_local(),
+    )
+}
+
+/// Two Hive tables under one warehouse root, both `file://` (no host
+/// component, so both resolve to the SAME `object_store_bucket_key`,
+/// `file://`, the exact collision `HiveMetadataCache::claim_object_store_bucket`
+/// exists to catch), declared with DIFFERENT `sqe.secret` names. This
+/// fixture bypasses `HiveDdlHandler::create_external_table` entirely (it
+/// writes manifests directly, the same way `hive_fixture` does), so the
+/// secret names never need to resolve against a real `SecretStore` --
+/// only the manifest's declared name matters to the guard being tested.
+async fn two_tables_one_bucket_different_secrets() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("tmp");
+    let root = format!("file://{}/wh", dir.path().display());
+
+    for (table, data_sub, secret) in
+        [("orders", "data-orders", "secret-a"), ("shipments", "data-shipments", "secret-b")]
+    {
+        let data_path = dir.path().join(data_sub);
+        std::fs::create_dir_all(&data_path).expect("mkdir data");
+        std::fs::write(data_path.join("part-0.csv"), "id\n1\n").expect("write csv");
+        let data = format!("file://{}", data_path.display());
+        let ddl = format!(
+            "CREATE EXTERNAL TABLE sales.{table} (id BIGINT) \
+             ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' \
+             STORED AS TEXTFILE LOCATION '{data}' \
+             TBLPROPERTIES ('skip.header.line.count' = '1', 'sqe.secret' = '{secret}')"
+        );
+        let stmts =
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, &ddl)
+                .expect("parse");
+        let spec = sqe_sql::hive_ddl::try_extract_hive_table(&stmts[0])
+            .expect("extract")
+            .expect("external");
+        let m = HiveManifest::from_spec(&spec, "sales", "test", "2026-08-19T00:00:00Z");
+        local_store_for_test(&root)
+            .put(&m, false)
+            .await
+            .expect("put manifest");
+    }
+    (dir, root)
+}
+
+/// Two Hive tables in one bucket under different `sqe.secret` credentials
+/// must be refused, naming both tables and both secrets, rather than
+/// letting the second `register_object_store` silently overwrite the
+/// first's entry in DataFusion's bucket-keyed registry -- which would make
+/// a join across both tables read one of them under the other's
+/// credentials.
+///
+/// `IgnoringFactory` below mirrors `hive_fixture`'s own `LocalFactory`: it
+/// ignores `secret` entirely and always returns a fresh
+/// `LocalFileSystem`. That is deliberate -- it proves this is
+/// `HiveMetadataCache`'s new collision guard doing the refusing, not
+/// `EngineHiveDataStoreFactory`'s credential resolution (which this test
+/// does not exercise at all).
+#[tokio::test]
+async fn two_hive_tables_in_one_bucket_with_different_secrets_are_refused() {
+    let (dir, root) = two_tables_one_bucket_different_secrets().await;
+    let ctx = SessionContext::new();
+
+    #[derive(Debug)]
+    struct IgnoringFactory;
+    impl sqe_catalog::hive::provider::HiveDataStoreFactory for IgnoringFactory {
+        fn store_for(
+            &self,
+            _location: &str,
+            _secret: Option<&str>,
+        ) -> Result<Arc<dyn object_store::ObjectStore>, sqe_catalog::hive::HiveError> {
+            Ok(Arc::new(object_store::local::LocalFileSystem::new()))
+        }
+    }
+
+    let provider = Arc::new(HiveCatalogProvider::new(
+        "lake".to_string(),
+        Arc::new(local_store_for_test(&root)),
+        Arc::new(IgnoringFactory),
+        ctx.runtime_env(),
+        Arc::new(HiveMetadataCache::new()),
+        Duration::from_secs(60),
+    ));
+    ctx.register_catalog("lake", provider);
+
+    // The first table scans fine and claims the bucket for 'secret-a'.
+    ctx.sql("SELECT id FROM lake.sales.orders")
+        .await
+        .expect("first table plans")
+        .collect()
+        .await
+        .expect("first table scans");
+
+    // Re-scanning the SAME table must stay fine (same owner, not a
+    // collision) before the actual collision case is checked.
+    ctx.sql("SELECT id FROM lake.sales.orders")
+        .await
+        .expect("re-scanning the same table must not be refused")
+        .collect()
+        .await
+        .expect("re-scan collects");
+
+    // The second table, same bucket, a DIFFERENT secret -> refused. The
+    // error can surface from planning (`ctx.sql`) or from execution
+    // (`collect`) depending on when DataFusion calls `SchemaProvider::table`;
+    // check whichever branch actually produced it.
+    let msg = match ctx.sql("SELECT id FROM lake.sales.shipments").await {
+        Err(e) => e.to_string(),
+        Ok(df) => df
+            .collect()
+            .await
+            .expect_err("the second table's different-secret bucket claim must be refused")
+            .to_string(),
+    };
+    assert!(msg.contains("orders"), "{msg}");
+    assert!(msg.contains("shipments"), "{msg}");
+    assert!(msg.contains("secret-a"), "{msg}");
+    assert!(msg.contains("secret-b"), "{msg}");
+
+    drop(dir);
 }

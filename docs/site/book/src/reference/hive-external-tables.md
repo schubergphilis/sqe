@@ -157,7 +157,7 @@ In server mode, Hive scans execute coordinator-local, the same way the file tabl
 |---|---|
 | `CREATE EXTERNAL TABLE` | Supported |
 | `DROP TABLE` | Supported. Deletes the manifest, never the data. `PURGE` rejected |
-| `SHOW TABLES FROM <root>.<database>`, `DESCRIBE`, `SHOW COLUMNS`, `information_schema` | Supported |
+| `SHOW TABLES FROM <root>.<database>`, `DESCRIBE`, `SHOW COLUMNS`, `information_schema` | Supported. `SHOW TABLES` and `SHOW CREATE TABLE` are policy-gated: a fully-denied table is omitted/errors like a missing one, and a restricted column is dropped from `SHOW CREATE TABLE`'s rendered DDL. `information_schema` itself is not policy-filtered for a Hive root, same as it is not for an Iceberg catalog: this is pre-existing parity, not a Hive-specific gap |
 | `SHOW CREATE TABLE` | Supported. Renders Athena-compatible DDL from the manifest |
 | `SHOW SCHEMAS`, `SHOW SCHEMAS IN <root>` | `SHOW SCHEMAS` is not parsed at all in embedded mode, against a Hive root or an Iceberg catalog alike: this is a pre-existing embedded-mode gap, not something this feature introduces. In server mode it works for Iceberg catalogs, but has no dedicated path for a Hive root yet and fails with a generic catalog error. `SELECT catalog_name, schema_name FROM information_schema.schemata WHERE catalog_name = '<root>'` works in both modes and lists the root's databases; use that, or `SHOW TABLES FROM <root>.<database>` against a database you already know |
 | `ANALYZE` | Rejected, naming cycle 2 |
@@ -186,7 +186,7 @@ Every rejection names `hive_external` and, where one is planned, the cycle that 
 
 **Server mode runs Hive scans on the coordinator, not on workers.** A distributed deployment gets no scan parallelism across workers for a Hive table today. Size the coordinator accordingly, or wait for cycle 5.
 
-**A grant against an Iceberg namespace never governs a same-named Hive database, and vice versa**, except in the one undetected corner case: an Iceberg namespace whose dotted name literally equals `<root>.<database>`. Name your Hive roots to avoid that collision until a later cycle closes it structurally.
+**A grant against an Iceberg namespace never governs a same-named Hive database, and vice versa.** A prior draft of this page understated the actual exposure here: the policy engine and the tag route both key off the table reference's catalog component, and a two-part reference (`sales.orders`, no catalog) carries no catalog component at all. Attaching a Hive root under the SAME name as the session's default catalog would have let an unqualified reference reach that root while policy resolution still took the Iceberg branch. SQE now refuses to attach a Hive root under that name, at both `[[hive.roots]]` startup and `ATTACH`, so the collision cannot occur. One narrower corner case remains open: an Iceberg namespace whose dotted name literally equals `<root>.<database>` still produces the same policy key as a Hive table in that root's database. Name your Hive roots to avoid that collision until a later cycle closes it structurally.
 
 ## What is next
 

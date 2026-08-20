@@ -6212,6 +6212,34 @@ impl QueryHandler {
                         .to_string(),
                 ));
             };
+            // Refuse a name collision with the session default catalog. See
+            // `attach_configured_hive_roots`'s doc comment (`runtime_catalog.rs`)
+            // for the full case: `resolve_policy_key` and
+            // `CatalogRoutedTagSource` both dispatch on `table_ref.catalog()`
+            // alone, which is `None` for a two-part reference, so a Hive root
+            // sharing the default catalog's name would let a two-part
+            // reference reach it while both the policy key and the tag route
+            // take the Iceberg branch regardless.
+            let default_catalog = self.config.resolve_default_catalog();
+            if stmt.name == default_catalog {
+                return Err(SqeError::Execution(format!(
+                    "hive_external: '{}' collides with the session default catalog '{default_catalog}': \
+                     a two-part table reference under this default resolves to a Hive table \
+                     without either the policy key or the tag route ever seeing its catalog \
+                     name, so a root cannot share a name with the default catalog. ATTACH it \
+                     under a different name, or change query.default_catalog",
+                    stmt.name
+                )));
+            }
+            // This ATTACHING session's caller is baked into `build_hive_root`'s
+            // `HiveManifestStore` below, and every LATER session that reads
+            // through this root shares that same store (and thus this same
+            // caller) for `check_path` on every manifest load -- see
+            // `runtime_catalog.rs`'s "Hive lane" comment for the full case.
+            // Fail-closed: it can only cause a false denial for a more-
+            // privileged later reader, never let a less-privileged one read
+            // more than the attacher could, since the gate never loosens
+            // for anyone.
             let caller = sqe_core::config::TvfCaller::for_user(
                 session.user.username.clone(),
                 session.user.roles.clone(),
