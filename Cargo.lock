@@ -6574,6 +6574,7 @@ dependencies = [
  "hmac 0.13.0",
  "iceberg",
  "moka",
+ "object_store",
  "opentelemetry",
  "opentelemetry_sdk",
  "parquet",

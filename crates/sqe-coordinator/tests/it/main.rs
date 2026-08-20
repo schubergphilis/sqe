@@ -31,6 +31,7 @@ mod equality_delete_integration;
 mod flight_sql_smoke;
 mod grant_dispatch_test;
 mod grant_introspection_gate_test;
+mod hive_external_e2e;
 mod in_subquery_view_rewrite;
 mod incremental_scan_e2e;
 mod insert_overwrite_e2e;
