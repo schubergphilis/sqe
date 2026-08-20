@@ -2829,7 +2829,7 @@ t = pathlib.Path("docs/site/book/src/reference/hive-external-tables.md").read_te
 hits = [(i + 1, bad[ch]) for i, line in enumerate(t.splitlines()) for ch in line if ch in bad]
 print(f"forbidden characters: {len(hits)}", hits[:10])
 EOF
-./scripts/leak-scan.sh
+scripts/leak-scan-site.sh
 echo "leak-scan exit: $?"
 ```
 

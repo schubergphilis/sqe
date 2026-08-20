@@ -180,7 +180,7 @@ Every rejection names `hive_external` and, where one is planned, the cycle that 
 
 **`array`, `struct`, and `map` columns are not supported.** A table with a nested column needs those columns projected out at the source or flattened before SQE reads it. There is no workaround inside SQE for cycle 1.
 
-**No `MSCK REPAIR TABLE` or `SHOW PARTITIONS` yet.** A table with partitions added out of band from `CREATE EXTERNAL TABLE` still reads correctly through directory listing; there is no persisted partition catalog to repair or show. Cycle 2 changes that.
+**No `MSCK REPAIR TABLE` or `SHOW PARTITIONS` yet.** Both fail with a generic not-implemented error rather than one naming `hive_external`, because neither statement reaches SQE's own statement classifier at all. A table with partitions added out of band from `CREATE EXTERNAL TABLE` still reads correctly through directory listing; there is no persisted partition catalog to repair or show. Cycle 2 changes that, and the error becomes specific at the same time.
 
 **`SHOW SCHEMAS FROM <root>` fails in server mode.** It works in the embedded CLI. In server mode, use `SHOW TABLES FROM <root>.<database>` against a database name you already know, or query `information_schema` directly.
 
