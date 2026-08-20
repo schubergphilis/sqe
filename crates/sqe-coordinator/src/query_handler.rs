@@ -192,6 +192,23 @@ pub struct QueryHandler {
     /// same idle worker; incremented on assignment, decremented on fragment
     /// completion via [`ReservationGuard`].
     worker_load: Arc<crate::worker_registry::WorkerLoadTracker>,
+    /// Live registry of Hive-external catalog names, read by
+    /// `resolve_policy_key` (via `PolicyPlanRewriter`) to decide whether a
+    /// table keys under its warehouse root or the Iceberg convention.
+    /// `ATTACH ... TYPE hive_external` / `DETACH` insert/remove here so
+    /// policy resolution sees a root attached mid-session on its very next
+    /// statement. Defaults to an empty, private instance so a QueryHandler
+    /// built without `with_hive_registries` (most tests) behaves exactly as
+    /// it did before this field existed; the production binaries
+    /// (`main.rs`, `bin/sqe_server.rs`) inject the SAME `Arc` this
+    /// QueryHandler's `PolicyPlanRewriter` was built with -- a second,
+    /// independent instance here would compile and route nothing.
+    hive_catalogs: Arc<sqe_policy::plan_rewriter::HiveCatalogs>,
+    /// Process-wide cache of parsed Hive manifests, shared by every
+    /// session's `HiveCatalogProvider` (`create_session_context`) and by
+    /// the `HiveTagSource` the policy rewriter reads column tags through.
+    /// Same defaulting rationale as `hive_catalogs`.
+    hive_manifest_cache: Arc<sqe_catalog::hive::provider::HiveMetadataCache>,
 }
 
 impl QueryHandler {
@@ -321,7 +338,30 @@ impl QueryHandler {
             runtime_catalogs,
             secrets,
             worker_load: Arc::new(crate::worker_registry::WorkerLoadTracker::new()),
+            hive_catalogs: Arc::new(sqe_policy::plan_rewriter::HiveCatalogs::new()),
+            hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
         })
+    }
+
+    /// Replace the default, private `hive_catalogs` / `hive_manifest_cache`
+    /// with the process-wide instances the caller's `PolicyPlanRewriter` and
+    /// `CatalogRoutedTagSource` were built from (see `main.rs` /
+    /// `bin/sqe_server.rs`). Skipping this call leaves both empty, which is
+    /// correct for any test or embedding that never attaches a Hive root:
+    /// `ATTACH ... TYPE hive_external` still works (it only needs
+    /// `runtime_catalogs`), but the attached name would not reach policy
+    /// resolution or tag routing, silently keying it under the Iceberg
+    /// convention instead of failing loudly -- so production wiring MUST
+    /// call this.
+    #[must_use = "with_hive_registries consumes self; bind the returned QueryHandler"]
+    pub fn with_hive_registries(
+        mut self,
+        hive_catalogs: Arc<sqe_policy::plan_rewriter::HiveCatalogs>,
+        hive_manifest_cache: Arc<sqe_catalog::hive::provider::HiveMetadataCache>,
+    ) -> Self {
+        self.hive_catalogs = hive_catalogs;
+        self.hive_manifest_cache = hive_manifest_cache;
+        self
     }
 
     /// Attach the session manager so `SET WRITE_BRANCH` can mutate session state.
@@ -1658,7 +1698,7 @@ impl QueryHandler {
                 // not an admin.
                 StatementKind::Attach(stmt) => {
                     self.require_admin(session, "ATTACH")?;
-                    self.handle_attach(stmt).await
+                    self.handle_attach(session, stmt).await
                 }
                 StatementKind::Detach(stmt) => {
                     self.require_admin(session, "DETACH")?;
@@ -3776,6 +3816,8 @@ impl QueryHandler {
             self.metrics.as_ref(),
             self.table_cache.as_ref(),
             &self.runtime_catalogs,
+            &self.hive_manifest_cache,
+            &self.secrets,
         )
         .await
     }
@@ -5872,8 +5914,44 @@ impl QueryHandler {
 
     async fn handle_attach(
         &self,
+        session: &Session,
         stmt: &sqe_sql::AttachStatement,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // `TYPE hive_external` is not an Iceberg catalog (see `build_catalog`'s
+        // own comment), so it does not go through `runtime_catalogs.attach()`:
+        // that builds an `iceberg::Catalog` and would fail with "dispatched
+        // separately" for this kind. `hive_catalogs.insert` is the security
+        // requirement, not bookkeeping: `resolve_policy_key` reads this set
+        // live to decide whether the root's tables key under its own name or
+        // the Iceberg namespace convention (see the type's own doc comment).
+        if stmt.kind == sqe_sql::CatalogKind::HiveExternal {
+            let caller = sqe_core::config::TvfCaller::for_user(
+                session.user.username.clone(),
+                session.user.roles.clone(),
+            );
+            let limits = sqe_catalog::hive::manifest::ManifestLimits {
+                max_bytes: self.config.hive.manifest_max_bytes,
+                max_columns: self.config.hive.manifest_max_columns,
+                max_partition_keys: self.config.hive.manifest_max_partition_keys,
+            };
+            let store = sqe_catalog::mount::build_hive_root(
+                &stmt.location,
+                &stmt.options,
+                &self.config.storage,
+                limits,
+                caller,
+            )
+            .await
+            .map_err(SqeError::Execution)?;
+            self.runtime_catalogs
+                .attach_hive_root(&stmt.name, store)
+                .map_err(SqeError::Execution)?;
+            self.hive_catalogs.insert(&stmt.name);
+            crate::session_context::invalidate_all_session_caches().await;
+            info!(catalog = %stmt.name, kind = "hive_external", "ATTACH complete");
+            return Ok(vec![]);
+        }
+
         self.runtime_catalogs
             .attach(stmt, &self.secrets)
             .await
@@ -5887,6 +5965,24 @@ impl QueryHandler {
         &self,
         stmt: &sqe_sql::DetachStatement,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // Mirror `handle_attach`'s branch: a name attached as a Hive root
+        // lives in the registry's Hive lane, not the Iceberg one, and must
+        // also leave `hive_catalogs` so a same-named Iceberg namespace
+        // cannot inherit its policy key once the root is gone.
+        if self
+            .runtime_catalogs
+            .is_hive_root(&stmt.name)
+            .map_err(SqeError::Execution)?
+        {
+            self.runtime_catalogs
+                .detach_hive_root(&stmt.name)
+                .map_err(SqeError::Execution)?;
+            self.hive_catalogs.remove(&stmt.name);
+            crate::session_context::invalidate_all_session_caches().await;
+            info!(catalog = %stmt.name, "DETACH complete");
+            return Ok(vec![]);
+        }
+
         self.runtime_catalogs
             .detach(&stmt.name)
             .map_err(SqeError::Execution)?;
