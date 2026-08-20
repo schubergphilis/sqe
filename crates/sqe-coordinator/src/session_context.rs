@@ -667,14 +667,25 @@ pub async fn create_session_context(
             // hive_external` since) with a freshly built, SESSION-SCOPED
             // `HiveCatalogProvider`. Unlike the Iceberg providers just
             // above -- built once and cloned unchanged into every session
-            // -- a Hive provider cannot be reused across sessions: it
-            // registers each table's object store into `ctx.runtime_env()`
-            // at scan time, so a provider built for one session's runtime
-            // would hold a stale one in another's. `hive_roots` (the shared,
-            // session-independent `HiveManifestStore` per root) and
-            // `hive_manifest_cache` (the one process-wide manifest cache
-            // every session's provider reads through) are exactly what stay
-            // constant across sessions; everything else here is rebuilt.
+            // -- a Hive provider cannot be reused across sessions. NOT
+            // because of `ctx.runtime_env()`: this path shares one
+            // `RuntimeEnv`/`ObjectStoreRegistry` across every session
+            // (`Arc::clone(rt)` a few hundred lines up), so a cached
+            // provider would not be looking anything up in a stale
+            // runtime. The real reason is `hive_caller` below: it is built
+            // fresh per session from `session.user`, and
+            // `TvfPolicy::check_path` gates each table load on it,
+            // including the `{user}`-substituted `allowed_object_store_prefixes`
+            // check. A provider built once and reused would carry the
+            // FIRST session's caller into every later session's table
+            // loads, silently applying one user's object-store allowlist
+            // to another user's query -- see `mount.rs`'s module doc
+            // comment above `build_hive_root` for the full case. Nothing
+            // here may be cached across sessions except `hive_roots` (the
+            // shared, session-independent `HiveManifestStore` per root,
+            // which carries no caller) and `hive_manifest_cache` (the one
+            // process-wide manifest cache every session's provider reads
+            // through).
             //
             // `cache_ttl` (60s) matches the embedded CLI's
             // `attach_hive_root` and `HiveConfig`'s own manifest-cap
