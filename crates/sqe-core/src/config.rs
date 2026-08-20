@@ -2275,6 +2275,15 @@ pub struct TvfCaller {
     /// constructors below exist so a grep for `trusted: true` finds only
     /// those two non-session call sites, never one that could be confused
     /// with `for_user`.
+    ///
+    /// This field is `pub`, like the rest of the struct, so nothing at the
+    /// type level stops a struct literal from setting it directly and
+    /// bypassing both named constructors. The two constructors are not an
+    /// access-control boundary; they are the reviewable surface. A caller
+    /// site that writes `trusted: true` outside `trusted_local()` or
+    /// `trusted_startup_config()` is the thing to look for in review, and
+    /// grepping the token `trusted: true` (or either constructor's name)
+    /// finds every place that ever sets it -- there is no other way to.
     pub trusted: bool,
 }
 
@@ -2298,13 +2307,27 @@ impl TvfCaller {
         }
     }
 
-    /// Trusted caller for validating operator-declared configuration at
-    /// coordinator startup (`[[hive.roots]]`), before any session exists to
-    /// build a `for_user` caller from. Same effect as `trusted_local` --
-    /// object-store prefix gating is skipped, local/http paths still need
-    /// `[storage.tvf] allow_local_paths` / `allow_http` regardless of
-    /// `trusted` (see `check_path`) -- but kept as its own name rather than
-    /// reused from the embedded-CLI constructor: an operator's TOML and a
+    /// Trusted caller representing OPERATOR-AUTHORED CONFIGURATION,
+    /// nothing else. Used exactly once in this codebase: coordinator
+    /// startup, validating a `[[hive.roots]]` entry from the TOML file the
+    /// operator deployed, before any session or request exists to build a
+    /// `for_user` caller from.
+    ///
+    /// MUST NEVER be constructed for anything that carries a user
+    /// identity, or on any path reachable from a request a caller sent --
+    /// an authenticated session's ATTACH, a TVF call, a query. Those go
+    /// through `for_user`, always. This constructor bypassing
+    /// object-store prefix gating is only safe because its one call site
+    /// runs before the coordinator accepts any connection; the same
+    /// bypass on a session path would let an authenticated-but-otherwise-
+    /// unprivileged caller read any `s3://`/`gs://`/`abfss://` location
+    /// the engine's own credentials can reach.
+    ///
+    /// Same effect as `trusted_local` -- object-store prefix gating is
+    /// skipped, local/http paths still need `[storage.tvf]
+    /// allow_local_paths` / `allow_http` regardless of `trusted` (see
+    /// `check_path`) -- but kept as its own name rather than reused from
+    /// the embedded-CLI constructor: an operator's TOML and a
     /// single-tenant local process are trusted for different reasons, and
     /// conflating them would make a future audit of "where is `trusted`
     /// set" have to reason about both at once.
