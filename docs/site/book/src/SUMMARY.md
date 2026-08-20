@@ -77,6 +77,7 @@
 - [Limitations and Known Gaps](./reference/limitations.md)
 - [SQL at a glance](./reference/sql-cheatsheet.md)
 - [SQE vs Trino, DuckDB, Spark](./reference/vs-other-engines.md)
+- [Hive External Tables](./reference/hive-external-tables.md)
 
 ---
 
