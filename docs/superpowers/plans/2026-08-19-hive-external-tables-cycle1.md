@@ -2685,6 +2685,24 @@ CreateExternalTable plans and the server path produces none."
 
 ---
 
+### Task 10b: The Hive DDL handler in server mode
+
+Task 10 split on a real seam. Task 10a landed the structural wiring: a Hive lane on `RuntimeCatalogRegistry`, a per-session provider hook in `create_session_context`, the two process-wide registries threaded into `QueryHandler`, `[[hive.roots]]` attaching at startup, and `ATTACH` / `DETACH ... TYPE hive_external` working. This task adds the DDL and the dispatch rejections.
+
+**Three findings from Task 10a's probe, recorded so you inherit them rather than rediscover them.**
+
+1. **Move the renderer before you use it.** `hive_spec_from_manifest` and `render_hive_create_table_ddl` are module-private free functions in `crates/sqe-cli/src/embedded.rs`. The coordinator cannot call them. Move them into `sqe-catalog::hive` and have the embedded client call them there, so both paths share one implementation. Do NOT copy them: Task 9's own `SHOW CREATE TABLE` test comment warns that the renderer and the spec-from-manifest converter must stay in lockstep or the round-trip drifts, and two copies is how that happens.
+
+2. **Invalidation scope differs by statement, and copying the wrong convention is invisible to tests.** Task 10a made `ATTACH` and `DETACH` invalidate ALL session caches, which was correct there because the change is root-level and other sessions would otherwise disagree with `resolve_policy_key` about which convention a table keys under. That argument does NOT apply to creating or dropping one table. Follow the existing Iceberg convention in `query_handler.rs` instead: `CreateTable` calls `invalidate_session_cache` per user, while `CreateSchema` and `DropSchema` call `invalidate_all_session_caches`. Table-level Hive DDL is in the first category. Re-derive the category rather than copying Task 10a's choice.
+
+3. **Do not port `looks_like_create_external_table`.** It exists in the embedded client because that path has two classification routes, its own and a fallback to DataFusion's native grammar via `ctx.sql()`. The coordinator has one classification path with an immediate `?` and never falls through to a second parse for DDL, so the problem class does not exist server-side.
+
+**Two rows are deliberately absent from the dispatch-table test.** `MSCK REPAIR TABLE` and `SHOW PARTITIONS` cannot be dispatched by coordinator wiring alone: `MSCK` parses in sqlparser 0.62 but `sqe-sql`'s `classify()` has no arm for it and falls to the wildcard, and `SHOW PARTITIONS` has no dedicated AST at all and lands in `Statement::ShowVariable`. Both therefore produce a generic not-implemented error, which is accurate but does not name `hive_external` or its cycle. Leave a comment in the test saying so. Adding `StatementKind` variants for them would edit a crate `sqe-cli` and `sqe-trino-compat` depend on, and cycle 2 adds those arms when it implements the statements.
+
+Everything else in Task 10's brief that is not structural applies here: the `HiveDdlHandler`, `resolve_table_kind` as the single branch point, `reject_unsupported` naming `hive_external` and the cycle, audit events emitted from the handler using the same three-part name the policy key uses, and every remaining placeholder message made true.
+
+---
+
 ### Task 11: Integration test on object storage
 
 **Files:**
