@@ -234,7 +234,7 @@ fn build_lineage_insert_plan(
 /// Extract the target table `ObjectName` from a `Statement::Delete`. Centralises
 /// the FromTable + TableFactor matching so a future sqlparser variant change only
 /// needs to be patched once.
-fn delete_target_object_name(stmt: &Statement) -> sqe_core::Result<&ObjectName> {
+pub(crate) fn delete_target_object_name(stmt: &Statement) -> sqe_core::Result<&ObjectName> {
     let delete = match stmt {
         Statement::Delete(d) => d,
         other => {
@@ -278,7 +278,7 @@ fn try_resolve_delete_target_ident(stmt: &Statement, session: &Session) -> Optio
 }
 
 /// Extract the target table `ObjectName` from a `Statement::Update`.
-fn update_target_object_name(stmt: &Statement) -> sqe_core::Result<&ObjectName> {
+pub(crate) fn update_target_object_name(stmt: &Statement) -> sqe_core::Result<&ObjectName> {
     let table_factor = match stmt {
         Statement::Update(update) => &update.table,
         other => {
