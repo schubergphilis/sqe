@@ -159,7 +159,7 @@ In server mode, Hive scans execute coordinator-local, the same way the file tabl
 | `DROP TABLE` | Supported. Deletes the manifest, never the data. `PURGE` rejected |
 | `SHOW TABLES FROM <root>.<database>`, `DESCRIBE`, `SHOW COLUMNS`, `information_schema` | Supported |
 | `SHOW CREATE TABLE` | Supported. Renders Athena-compatible DDL from the manifest |
-| `SHOW SCHEMAS FROM <root>` | Supported in embedded mode, where an unrecognized statement falls through to DataFusion's own handling. Server mode has no dedicated Hive path for it yet and fails with a generic catalog error rather than a Hive-specific one; use `SHOW TABLES FROM <root>.<database>` against a database you already know instead |
+| `SHOW SCHEMAS`, `SHOW SCHEMAS IN <root>` | `SHOW SCHEMAS` is not parsed at all in embedded mode, against a Hive root or an Iceberg catalog alike: this is a pre-existing embedded-mode gap, not something this feature introduces. In server mode it works for Iceberg catalogs, but has no dedicated path for a Hive root yet and fails with a generic catalog error. `SELECT catalog_name, schema_name FROM information_schema.schemata WHERE catalog_name = '<root>'` works in both modes and lists the root's databases; use that, or `SHOW TABLES FROM <root>.<database>` against a database you already know |
 | `ANALYZE` | Rejected, naming cycle 2 |
 | `ALTER TABLE ... ADD PARTITION` | Rejected, naming cycle 2 |
 | `MSCK REPAIR TABLE`, `SHOW PARTITIONS` | Rejected with a generic not-implemented error. These statements do not yet reach SQE's own statement classifier at all, so the message does not yet name `hive_external` or a cycle. Cycle 2 adds the classifier arms when it implements the statements, and the message becomes specific for free |
@@ -182,7 +182,7 @@ Every rejection names `hive_external` and, where one is planned, the cycle that 
 
 **No `MSCK REPAIR TABLE` or `SHOW PARTITIONS` yet.** Both fail with a generic not-implemented error rather than one naming `hive_external`, because neither statement reaches SQE's own statement classifier at all. A table with partitions added out of band from `CREATE EXTERNAL TABLE` still reads correctly through directory listing; there is no persisted partition catalog to repair or show. Cycle 2 changes that, and the error becomes specific at the same time.
 
-**`SHOW SCHEMAS FROM <root>` fails in server mode.** It works in the embedded CLI. In server mode, use `SHOW TABLES FROM <root>.<database>` against a database name you already know, or query `information_schema` directly.
+**`SHOW SCHEMAS` does not list a Hive root's databases.** This is not a Hive-specific gap: `SHOW SCHEMAS` is not parsed in embedded mode at all, against any catalog kind, and in server mode it has no dedicated Hive path yet, so it fails with a generic catalog error against a Hive root. `SELECT catalog_name, schema_name FROM information_schema.schemata WHERE catalog_name = '<root>'` works in both modes and is the reliable way to list a root's databases; `SHOW TABLES FROM <root>.<database>` works too once you know the database name.
 
 **Server mode runs Hive scans on the coordinator, not on workers.** A distributed deployment gets no scan parallelism across workers for a Hive table today. Size the coordinator accordingly, or wait for cycle 5.
 
