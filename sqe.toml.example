@@ -192,6 +192,28 @@ s3_path_style = true
 # then still have to pass allowed_object_store_prefixes / object_store_admin_roles.
 # allow_inline_credentials = false
 
+# ── Hive-style external tables (CREATE EXTERNAL TABLE, Athena/Glue DDL) ──
+# Read-only in cycle 1: CSV, line-delimited JSON, and Parquet, against a
+# sidecar JSON manifest under an attached warehouse root, no metastore.
+# See docs/site/book/src/reference/hive-external-tables.md.
+#
+# [hive]
+# Manifest caps enforced on every root, at CREATE EXTERNAL TABLE and on
+# every load: the manifest is untrusted input, planted by anyone who can
+# write to the warehouse prefix. These three match
+# hive::manifest::ManifestLimits::default() exactly; a mismatch here would
+# be a config surface that silently does nothing.
+# manifest_max_bytes = 1048576          # 1 MiB
+# manifest_max_columns = 4096
+# manifest_max_partition_keys = 32
+#
+# Warehouse roots attached before the first query, the config equivalent
+# of ATTACH '<location>' AS <name> (TYPE hive_external). Repeatable.
+# [[hive.roots]]
+# name     = "lake"
+# location = "s3://raw-lake/warehouse/"
+# secret   = "partner"  # optional; a table's own TBLPROPERTIES 'sqe.secret' wins
+
 # ── Wire-protocol security ────────────────────────────────────
 [security]
 # trusted_proxies = ["10.0.0.1"]  # IPs allowed to set x-forwarded-for for audit IPs
