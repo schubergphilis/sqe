@@ -20,8 +20,22 @@
 /// the keyword pair when it appears as a whole token, outside string
 /// literals. Returns the original string unchanged when the clause is
 /// absent.
+///
+/// `CREATE EXTERNAL TABLE` (Hive/Athena/Spark external tables, see
+/// `sqe_sql::hive_ddl`) is skipped entirely, even when the clause is
+/// present: this module's own doc comment explains why the rewrite exists
+/// at all -- sqlparser-rs already accepts Hive-style `PARTITIONED BY (col1
+/// STRING, col2 INT)` natively as a column-definition list, which is
+/// exactly the form `CREATE EXTERNAL TABLE` uses. Rewriting it to
+/// `PARTITION BY` sends it down the Iceberg transform-expression grammar
+/// instead, where a typed column def like `dt string` is not a valid
+/// expression and the parse fails with a confusing "found: PARTITION"
+/// error that has nothing to do with the actual problem. The two grammars
+/// are mutually exclusive by construction (a `CREATE EXTERNAL TABLE` is
+/// never an Iceberg CTAS), so the statement kind alone decides which one
+/// applies.
 pub fn normalize_partitioned_by(sql: &str) -> String {
-    if !contains_partitioned_by_keyword(sql) {
+    if !contains_partitioned_by_keyword(sql) || is_create_external_table(sql) {
         return sql.to_string();
     }
     let bytes = sql.as_bytes();
@@ -98,6 +112,40 @@ fn contains_partitioned_by_keyword(sql: &str) -> bool {
     upper.contains("PARTITIONED BY")
 }
 
+/// Whether `sql`, after skipping leading whitespace and SQL comments,
+/// begins with `CREATE EXTERNAL TABLE` (case-insensitive). A textual prefix
+/// check rather than a parse attempt, deliberately: this runs before any
+/// parser sees the SQL, so there is no AST to inspect yet. Mirrors
+/// `sqe-cli::embedded`'s `looks_like_create_external_table` (comment-skip
+/// included, so the two agree on a leading `-- ...`/`/* ... */` the same
+/// way; keep them in sync rather than letting one drift narrower than the
+/// other).
+fn is_create_external_table(sql: &str) -> bool {
+    let mut s = sql;
+    loop {
+        let trimmed = s.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("--") {
+            s = rest.split_once('\n').map(|(_, r)| r).unwrap_or("");
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("/*") {
+            s = rest.split_once("*/").map(|(_, r)| r).unwrap_or("");
+            continue;
+        }
+        s = trimmed;
+        break;
+    }
+    let head: String = s
+        .chars()
+        .take(64)
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase();
+    head.starts_with("CREATE EXTERNAL TABLE")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +177,28 @@ mod tests {
         let sql = "CREATE TABLE t (id BIGINT) PartiTioned bY (id)";
         let out = normalize_partitioned_by(sql);
         assert!(out.contains("PARTITION BY (id)"));
+    }
+
+    /// A Hive `CREATE EXTERNAL TABLE`'s `PARTITIONED BY (col type)` clause
+    /// must survive untouched: rewriting it to `PARTITION BY` sends a typed
+    /// column def into the Iceberg transform-expression grammar, which does
+    /// not accept it (`dt string` is not a valid expression), breaking a
+    /// statement sqlparser-rs already parses correctly on its own.
+    #[test]
+    fn create_external_table_partitioned_by_is_left_untouched() {
+        let sql = "CREATE EXTERNAL TABLE t (id BIGINT) PARTITIONED BY (dt STRING) \
+                    LOCATION 's3://bucket/t/'";
+        assert_eq!(normalize_partitioned_by(sql), sql);
+    }
+
+    /// A leading comment must not defeat the `CREATE EXTERNAL TABLE`
+    /// detection, the same way `looks_like_create_external_table` in
+    /// `sqe-cli::embedded` skips comments before its own prefix check.
+    #[test]
+    fn create_external_table_partitioned_by_survives_a_leading_comment() {
+        let sql = "-- a comment\nCREATE EXTERNAL TABLE t (id BIGINT) \
+                    PARTITIONED BY (dt STRING) LOCATION 's3://bucket/t/'";
+        assert_eq!(normalize_partitioned_by(sql), sql);
     }
 
     #[test]

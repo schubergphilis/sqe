@@ -6,11 +6,14 @@
 //! Glue's `TableInput`, so storing definitions in Glue or HMS later is a field
 //! mapping rather than a redesign.
 
+pub mod ddl_render;
 pub mod manifest;
 pub mod provider;
 pub mod serde_map;
 pub mod stats;
 pub mod store;
+
+pub use ddl_render::{hive_spec_from_manifest, render_hive_create_table_ddl};
 
 /// Errors from the Hive external-table path.
 ///
