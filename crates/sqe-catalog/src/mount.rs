@@ -106,24 +106,34 @@ fn error_dispatched_elsewhere(kind: &str) -> String {
 // authenticate. See `EngineHiveDataStoreFactory` below.
 //
 // What still requires two functions, and still requires `session_hive_catalog`
-// to run once per session rather than once at ATTACH time, is the runtime
-// binding: `HiveCatalogProvider` closes over a `RuntimeEnv` at construction,
-// and `DataFusion`'s `SchemaProvider::table()` registers the table's object
-// store into THAT runtime's registry (see `HiveSchemaProvider::table` in
-// `hive/provider.rs`). Every session builds its own `RuntimeEnv`. A provider
-// built once at ATTACH time and shared across sessions would carry
-// whichever session's runtime happened to build it, and every OTHER
-// session's scans would look up their bucket in a registry that is not
-// theirs and fail to resolve it. `build_hive_root` builds the part that
-// really is shared (the manifest store: a manifest means the same thing to
-// every reader), and `session_hive_catalog` builds the part that cannot be
-// (the provider, bound to one session's runtime).
+// to run once per session rather than once at ATTACH time, is the CALLER
+// binding, not a runtime one. Two earlier answers to "why per session" were
+// wrong, and are recorded here so a future reader does not re-derive them and
+// re-believe them. The first said credentials, which the paragraph above
+// already withdraws: reads use engine credentials or a named secret, not a
+// per-user vended one. The second said each session builds its own
+// `RuntimeEnv`, so a shared provider would hold a stale one. That is true
+// only of the fallback and test paths in `create_session_context`; production
+// takes `SessionContext::new_with_config_rt(session_config, Arc::clone(rt))`,
+// so every session shares ONE `RuntimeEnv` and ONE `ObjectStoreRegistry`. A
+// provider cached across sessions would not, on that path, register into or
+// look up from the wrong runtime -- there is only one runtime to get wrong.
 //
-// Authorization, unlike the credential, does stay per user: `TvfCaller` is
-// threaded into `TvfPolicy::check_path`'s `{user}`-prefix substitution, and
-// Hive tables sit under the policy layer's row filters / column masks /
-// grants (Task 7), so a per-user decision still gates what a query can see
-// even though the object-store credential is shared.
+// The real, binding constraint is the per-session `TvfCaller` embedded in
+// `EngineHiveDataStoreFactory` below. `TvfPolicy::check_path` gates on that
+// caller when a table loads, and the caller carries the username and roles
+// that `{user}` substitution in `[storage.tvf] allowed_object_store_prefixes`
+// depends on. A `HiveCatalogProvider` built once and reused across sessions
+// would carry ONE session's caller into every OTHER session's table loads,
+// evaluating that first user's prefix allowlist against a different user's
+// query -- a per-user authorization boundary silently collapsed into a
+// single-tenant one, not a plumbing bug. `build_hive_root` builds the part
+// that really is shared and caller-independent (the manifest store: a
+// manifest means the same thing to every reader), and `session_hive_catalog`
+// builds the part that is not (the provider, bound to one session's
+// caller). Nothing may cache a `HiveCatalogProvider` across sessions,
+// regardless of what the runtime situation looks like on whatever path is
+// calling it.
 #[cfg(feature = "hive-external")]
 use datafusion::execution::runtime_env::RuntimeEnv;
 #[cfg(feature = "hive-external")]
@@ -191,15 +201,22 @@ pub async fn build_hive_root(
 
 /// Build the per-session Hive catalog provider over a shared root.
 ///
-/// `runtime` is this session's `RuntimeEnv` and `caller` is this session's
-/// identity for the `[storage.tvf]` allowlist check; both are session-scoped
-/// for the reason explained in this module's doc comment above
-/// `build_hive_root`: the provider registers each table's object store into
-/// `runtime`'s registry at `table()` time, so a provider built for one
-/// session and reused by another would register into (and look up from) a
-/// registry that is not the calling session's. `manifest_cache` is the one
-/// exception -- a process-wide singleton, shared across every session, the
-/// same instance passed to `build_policy_enforcer` at startup.
+/// `caller` is this session's identity for the `[storage.tvf]` allowlist
+/// check, and it is the reason this function must run once per session
+/// rather than once at ATTACH time: see this module's doc comment above
+/// `build_hive_root` for why (in short, `TvfPolicy::check_path` gates on
+/// `caller` at table load, and `caller` carries the username/roles that
+/// `{user}` substitution depends on, so a provider built for one session
+/// and reused by another would apply that FIRST session's allowlist to
+/// every other session's query). `runtime` is session-scoped too, but only
+/// because `create_session_context` has one to hand this function, not
+/// because reusing a provider would break on the runtime side -- production
+/// shares one `RuntimeEnv` across every session already, so `runtime`
+/// alone is not what makes caching a provider unsafe. `manifest_cache` is
+/// the one argument that really is a process-wide singleton, shared across
+/// every session, the same instance passed to `build_policy_enforcer` at
+/// startup. Nothing here may be cached and reused across sessions except
+/// `manifest_cache`.
 #[cfg(feature = "hive-external")]
 #[allow(clippy::too_many_arguments)]
 pub fn session_hive_catalog(

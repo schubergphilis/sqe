@@ -89,13 +89,30 @@ impl RuntimeCatalogRegistry {
         stmt: &AttachStatement,
         secrets: &SecretStore,
     ) -> Result<(), String> {
-        // 1) Refuse duplicate name (case-sensitive).
+        // 1) Refuse duplicate name (case-sensitive). Checks BOTH lanes: the
+        //    two share one SQL catalog-name namespace (see the "Hive lane"
+        //    section below), and checking only `self.inner` here would let
+        //    `ATTACH ... TYPE iceberg_rest` steal a name an attached Hive
+        //    root already holds. `attach_hive_root` already checks this
+        //    direction; this is the other half of that symmetry.
         {
             let r = self
                 .inner
                 .read()
                 .map_err(|_| "registry poisoned".to_string())?;
             if r.contains_key(&stmt.name) {
+                return Err(format!(
+                    "catalog '{}' is already attached; DETACH it first",
+                    stmt.name
+                ));
+            }
+        }
+        {
+            let hive = self
+                .hive_roots
+                .read()
+                .map_err(|_| "hive registry poisoned".to_string())?;
+            if hive.contains_key(&stmt.name) {
                 return Err(format!(
                     "catalog '{}' is already attached; DETACH it first",
                     stmt.name
@@ -208,17 +225,21 @@ impl RuntimeCatalogRegistry {
     // Hive lane
     //
     // A Hive root's `HiveCatalogProvider` is rebuilt PER SESSION by
-    // `create_session_context` (a provider registers each table's object
-    // store into that session's own `RuntimeEnv`, so a provider shared
-    // across sessions would hold a stale one). Only the underlying
-    // `HiveManifestStore` -- which validates through `[storage.tvf]` once
-    // and then reads/writes manifests, holding no session state -- is
-    // session-independent, so that is all this lane stores. It is a
-    // second map, not a second `AttachedCatalog` field, because the two
-    // kinds cannot share one representation: an Iceberg entry's `provider`
-    // is exactly the thing every session reuses unchanged, and a Hive
-    // entry's `store` is exactly the thing no session may reuse the
-    // provider built from.
+    // `create_session_context`. NOT because each session has its own
+    // `RuntimeEnv` -- production shares one across every session, so that
+    // is not the reason -- but because the provider's data-store factory
+    // embeds that session's `TvfCaller`, and `TvfPolicy::check_path` gates
+    // every table load on it (see `mount.rs`'s module doc comment above
+    // `build_hive_root` for the full case). A provider built once and
+    // reused across sessions would carry one session's caller into every
+    // other session's table loads. Only the underlying `HiveManifestStore`
+    // -- which validates through `[storage.tvf]` once and then reads/writes
+    // manifests, holding no per-caller state -- is session-independent, so
+    // that is all this lane stores. It is a second map, not a second
+    // `AttachedCatalog` field, because the two kinds cannot share one
+    // representation: an Iceberg entry's `provider` is exactly the thing
+    // every session reuses unchanged, and a Hive entry's `store` is
+    // exactly the thing no session may reuse the provider built from.
     //
     // Both lanes share one SQL catalog-name namespace, so attach/detach on
     // either checks the other for a collision.
@@ -482,6 +503,44 @@ mod hive_lane_tests {
         async fn update_table(&self, _commit: iceberg::TableCommit) -> iceberg::Result<iceberg::table::Table> {
             unimplemented!("test stub")
         }
+    }
+
+    /// The other half of the symmetry: `attach()` (the Iceberg lane) must
+    /// also refuse a name an attached Hive root already holds, not just the
+    /// reverse (`attach_hive_root_rejects_name_already_attached_as_iceberg`
+    /// below). Before this check existed, `ATTACH ... AS lake (TYPE
+    /// iceberg_rest)` would succeed while `lake` was an attached Hive root
+    /// -- self-consistent rather than an escalation (the Hive provider
+    /// still wins DataFusion's catalog registration, and `hive_catalogs`
+    /// still keys those tables Hive-side), but only by accident of which
+    /// registration loop runs last, which a later refactor could silently
+    /// reverse.
+    ///
+    /// `TYPE sqlite` needs the `sql-sqlite` feature to actually build a
+    /// catalog, but the collision check runs before `build_catalog` is
+    /// ever called, so this test does not need that feature: it proves the
+    /// check fires, not that a sqlite catalog can be built.
+    #[tokio::test]
+    async fn attach_rejects_name_already_attached_as_hive_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = RuntimeCatalogRegistry::new();
+        let store = local_hive_store(dir.path()).await;
+        registry
+            .attach_hive_root("lake", store)
+            .expect("hive attach");
+
+        let secrets = sqe_core::SecretStore::new();
+        let attach_stmt = sqe_sql::AttachStatement {
+            name: "lake".to_string(),
+            location: "sqlite://:memory:".to_string(),
+            kind: sqe_sql::CatalogKind::Sqlite,
+            options: std::collections::BTreeMap::new(),
+        };
+        let err = registry
+            .attach(&attach_stmt, &secrets)
+            .await
+            .expect_err("must not shadow an attached hive root");
+        assert!(err.contains("already attached"), "{err}");
     }
 
     /// The two lanes share one SQL catalog-name namespace: a Hive root

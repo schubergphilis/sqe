@@ -534,10 +534,14 @@ impl fmt::Debug for HiveCatalogProvider {
 }
 
 impl HiveCatalogProvider {
-    /// Built PER SESSION. `data_store_factory` carries that session's
-    /// credentials and `runtime` is that session's `RuntimeEnv`; both are
-    /// session-scoped, so the provider must be too. `manifest_cache` is the
-    /// one exception: a process-wide singleton, shared across every session.
+    /// Built PER SESSION. The binding reason is `data_store_factory`, which
+    /// carries that session's `TvfCaller` (see `mount.rs`'s module doc
+    /// comment above `build_hive_root` for why reusing it across sessions
+    /// would be a per-user authorization bug, not a plumbing one); `runtime`
+    /// is also session-scoped but is not itself why the provider must be
+    /// rebuilt (production shares one `RuntimeEnv` across every session).
+    /// `manifest_cache` is the one exception: a process-wide singleton,
+    /// shared across every session.
     pub fn new(
         name: String,
         store: Arc<HiveManifestStore>,
