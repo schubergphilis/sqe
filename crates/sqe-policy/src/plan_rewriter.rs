@@ -462,6 +462,26 @@ impl PolicyEnforcer for PolicyPlanRewriter {
     }
 }
 
+/// True when `policy`'s row filters carry the deny-all `lit(false)` sentinel
+/// (resolve failure, breaker-open, unknown-tag state, or a fully-restricted
+/// table). The one place this check lives: `summarise_policies` below, the
+/// `SHOW EFFECTIVE POLICY` diagnostic, and any table-level gate outside the
+/// plan rewriter (e.g. a Hive DDL/introspection path with no LogicalPlan to
+/// run the rewriter over) all call this instead of re-deriving the
+/// literal-equality check by hand.
+pub fn policy_denies_all(policy: &ResolvedPolicy) -> bool {
+    policy.row_filters.iter().any(is_deny_all_expr)
+}
+
+/// The single `lit(false)` equality check `policy_denies_all` and
+/// `summarise_policies`'s per-filter loop both need. Not `pub`: callers
+/// outside this module want the whole-policy answer (`policy_denies_all`),
+/// not a per-`Expr` one.
+fn is_deny_all_expr(f: &Expr) -> bool {
+    let deny = lit(false);
+    f == &deny
+}
+
 /// Fold the per-table resolved policies into a single audit summary.
 ///
 /// `denied` is true when any policy injected a deny-all `lit(false)` row filter
@@ -470,7 +490,6 @@ impl PolicyEnforcer for PolicyPlanRewriter {
 /// so the count reflects real, user-visible row filters only. Masked and
 /// restricted column names are deduplicated and sorted for stable audit output.
 fn summarise_policies(table_policies: &HashMap<String, ResolvedPolicy>) -> PolicySummary {
-    let deny = lit(false);
     let mut row_filters_applied = 0usize;
     let mut masked: HashSet<String> = HashSet::new();
     let mut restricted: HashSet<String> = HashSet::new();
@@ -478,7 +497,7 @@ fn summarise_policies(table_policies: &HashMap<String, ResolvedPolicy>) -> Polic
 
     for policy in table_policies.values() {
         for f in &policy.row_filters {
-            if f == &deny {
+            if is_deny_all_expr(f) {
                 denied = true;
             } else {
                 row_filters_applied += 1;

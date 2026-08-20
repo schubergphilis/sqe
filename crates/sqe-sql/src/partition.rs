@@ -115,16 +115,12 @@ fn contains_partitioned_by_keyword(sql: &str) -> bool {
 /// Whether `sql`, after skipping leading whitespace and SQL comments,
 /// begins with `CREATE EXTERNAL TABLE` (case-insensitive). A textual prefix
 /// check rather than a parse attempt, deliberately: this runs before any
-/// parser sees the SQL, so there is no AST to inspect yet. Mirrors
-/// `sqe-cli::embedded`'s `looks_like_create_external_table` (comment-skip
-/// included, so the two agree on a leading `-- ...`/`/* ... */` the same
-/// way; keep them in sync rather than letting one drift narrower than the
-/// other).
-/// Detect a `CREATE EXTERNAL TABLE` statement by its leading keywords,
-/// skipping past any leading comments first. Shared with `sqe-cli`'s
-/// `embedded.rs` (its own dual-parse-path dispatch needs the identical
-/// check), so this is the one copy; both call sites must agree on what
-/// counts as a `CREATE EXTERNAL TABLE` or one of the two paths silently
+/// parser sees the SQL, so there is no AST to inspect yet.
+///
+/// Shared with `sqe-cli`'s `embedded.rs` (its own dual-parse-path dispatch
+/// needs the identical check), so this is the one copy; both call sites
+/// must agree on what counts as a `CREATE EXTERNAL TABLE`, including how a
+/// leading `-- ...`/`/* ... */` comment is skipped, or one path silently
 /// diverges from the other.
 pub fn is_create_external_table(sql: &str) -> bool {
     let mut s = sql;

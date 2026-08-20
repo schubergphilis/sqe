@@ -246,11 +246,17 @@ pub struct QueryHandler {
     hive_manifest_cache: Arc<sqe_catalog::hive::provider::HiveMetadataCache>,
     /// Server-mode Hive DDL: `resolve_table_kind` (the single Hive/Iceberg
     /// branch point), `CREATE EXTERNAL TABLE`, `DROP TABLE`, `SHOW CREATE
-    /// TABLE`. Holds a live clone of `runtime_catalogs`, so an `ATTACH`
-    /// mid-session is visible on its very next call, not stale from
+    /// TABLE`, `SHOW TABLES`. Holds a live clone of `runtime_catalogs`, so an
+    /// `ATTACH` mid-session is visible on its very next call, not stale from
     /// construction. Its own `hive_catalogs` mirrors the `Option` on this
     /// struct: `None` until `with_hive_registries` runs, refusing rather
-    /// than writing a manifest the policy layer cannot see.
+    /// than writing a manifest the policy layer cannot see. Also wired with
+    /// this handler's `policy_store` and `config.policy.mask_precedence` (via
+    /// `with_policy`, at construction) so `SHOW TABLES`/`SHOW CREATE TABLE`
+    /// against a Hive root are gated by the SAME policy resolution the plan
+    /// rewriter applies to a real Iceberg scan, since a Hive manifest store
+    /// has no external metastore to delegate that filtering to the way
+    /// Polaris does for Iceberg.
     hive_ddl_handler: crate::hive_ddl_handler::HiveDdlHandler,
 }
 
@@ -353,7 +359,8 @@ impl QueryHandler {
         let profile_mode = sqe_core::ProfileMode::parse(&config.query.query_profile);
 
         let mut hive_ddl_handler =
-            crate::hive_ddl_handler::HiveDdlHandler::new(runtime_catalogs.clone(), secrets.clone());
+            crate::hive_ddl_handler::HiveDdlHandler::new(runtime_catalogs.clone(), secrets.clone())
+                .with_policy(policy_store.clone(), config.policy.mask_precedence);
         if let Some(ref a) = audit {
             hive_ddl_handler = hive_ddl_handler.with_audit(Arc::clone(a));
         }
@@ -428,6 +435,20 @@ impl QueryHandler {
     /// Iceberg" instead of each growing their own detection.
     pub fn resolve_table_kind(&self, table_ref: &TableReference) -> crate::hive_ddl_handler::TableKind {
         self.hive_ddl_handler.resolve_table_kind(table_ref)
+    }
+
+    /// The session-default-catalog-aware variant (see
+    /// [`crate::hive_ddl_handler::HiveDdlHandler::resolve_table_kind_for_session`]),
+    /// exposed the same way and for the same reason as `resolve_table_kind`
+    /// above: `reject_if_hive_table` and integration tests share this one
+    /// answer rather than each re-deriving the promotion.
+    pub fn resolve_table_kind_for_session(
+        &self,
+        default_catalog: Option<&str>,
+        table_ref: &TableReference,
+    ) -> crate::hive_ddl_handler::TableKind {
+        self.hive_ddl_handler
+            .resolve_table_kind_for_session(default_catalog, table_ref)
     }
 
     /// Attach the session manager so `SET WRITE_BRANCH` can mutate session state.
@@ -1294,6 +1315,7 @@ impl QueryHandler {
                             .any(|op| matches!(op, sqlparser::ast::AlterTableOperation::AddPartitions { .. }))
                         {
                             self.reject_if_hive_table(
+                                session,
                                 &table_reference_of(&alter.name),
                                 "ALTER TABLE ... ADD PARTITION",
                                 2,
@@ -1367,7 +1389,10 @@ impl QueryHandler {
                                 .await
                             {
                                 Ok(()) => true,
-                                Err(e) if *if_exists && e.to_string().contains("table not found") => {
+                                Err(e)
+                                    if *if_exists
+                                        && crate::hive_ddl_handler::hive_drop_target_missing(&e) =>
+                                {
                                     true
                                 }
                                 Err(e) => return Err(e),
@@ -1384,6 +1409,7 @@ impl QueryHandler {
                 StatementKind::Rename(stmt) => {
                     if let Statement::AlterTable(ref alter) = **stmt {
                         self.reject_if_hive_table(
+                            session,
                             &table_reference_of(&alter.name),
                             "ALTER TABLE ... RENAME",
                             0,
@@ -1424,6 +1450,7 @@ impl QueryHandler {
                 }
                 StatementKind::SetTags(stmt) => {
                     self.reject_if_hive_table(
+                        session,
                         &TableReference::from(stmt.table.as_str()),
                         "ALTER TABLE ... SET TAGS",
                         3,
@@ -1556,7 +1583,7 @@ impl QueryHandler {
                 StatementKind::Insert(stmt) => {
                     if let Statement::Insert(ref ins) = **stmt {
                         if let sqlparser::ast::TableObject::TableName(ref name) = ins.table {
-                            self.reject_if_hive_table(&table_reference_of(name), "INSERT", 4)?;
+                            self.reject_if_hive_table(session, &table_reference_of(name), "INSERT", 4)?;
                         }
                         let select_sql = ins
                             .source
@@ -1588,7 +1615,7 @@ impl QueryHandler {
 
                 StatementKind::Delete(stmt) => {
                     if let Ok(name) = crate::write_handler::delete_target_object_name(stmt) {
-                        self.reject_if_hive_table(&table_reference_of(name), "DELETE", 4)?;
+                        self.reject_if_hive_table(session, &table_reference_of(name), "DELETE", 4)?;
                     }
                     let (ctx, session_catalog) = self.create_session_context(session).await?;
                     // Dispatch on `write.delete.mode` table property. Default CoW
@@ -1608,7 +1635,7 @@ impl QueryHandler {
 
                 StatementKind::Update(stmt) => {
                     if let Ok(name) = crate::write_handler::update_target_object_name(stmt) {
-                        self.reject_if_hive_table(&table_reference_of(name), "UPDATE", 4)?;
+                        self.reject_if_hive_table(session, &table_reference_of(name), "UPDATE", 4)?;
                     }
                     let (ctx, session_catalog) = self.create_session_context(session).await?;
                     // Dispatch on `write.update.mode` table property. Default CoW
@@ -1650,7 +1677,10 @@ impl QueryHandler {
                             self.hive_ddl_handler.resolve_table_kind(&table_ref),
                             crate::hive_ddl_handler::TableKind::Hive { .. }
                         ) {
-                            let ddl = self.hive_ddl_handler.show_create_table(&table_ref).await?;
+                            let ddl = self
+                                .hive_ddl_handler
+                                .show_create_table(&session.user, &table_ref)
+                                .await?;
                             let schema = Arc::new(Schema::new(vec![Field::new(
                                 "Create Table",
                                 DataType::Utf8,
@@ -1680,6 +1710,7 @@ impl QueryHandler {
                 // TRUNCATE TABLE — rewrite as DELETE FROM (no WHERE clause)
                 StatementKind::Truncate(ref table_name) => {
                     self.reject_if_hive_table(
+                        session,
                         &TableReference::from(table_name.as_str()),
                         "TRUNCATE TABLE",
                         4,
@@ -1821,6 +1852,7 @@ impl QueryHandler {
                 StatementKind::Comment(ref stmt) => {
                     if let Statement::Comment { object_name, .. } = stmt.as_ref() {
                         self.reject_if_hive_table(
+                            session,
                             &table_reference_of(object_name),
                             "COMMENT ON TABLE",
                             0,
@@ -1841,7 +1873,7 @@ impl QueryHandler {
                 // stats collection is currently a no-op (#329). A missing table
                 // still errors, like a SELECT would.
                 StatementKind::Analyze(ref table_name) => {
-                    self.reject_if_hive_table(&TableReference::from(table_name.as_str()), "ANALYZE", 2)?;
+                    self.reject_if_hive_table(session, &TableReference::from(table_name.as_str()), "ANALYZE", 2)?;
                     self.handle_analyze(session, table_name).await
                 }
 
@@ -4448,7 +4480,10 @@ impl QueryHandler {
                                 .to_string(),
                         )
                     })?;
-                let mut names = self.hive_ddl_handler.list_tables(root, &database).await?;
+                let mut names = self
+                    .hive_ddl_handler
+                    .list_tables(&session.user, root, &database)
+                    .await?;
                 names.sort();
                 let schema = Arc::new(Schema::new(vec![Field::new(
                     "Table",
@@ -5618,11 +5653,11 @@ impl QueryHandler {
 
         // Deny-all sentinel: the resolver signals a fully-denied table by
         // pushing `lit(false)` into row_filters. Surface it as a single `denied`
-        // row rather than counting it as a normal filter.
-        let denied = policy
-            .row_filters
-            .iter()
-            .any(|e| matches!(e, datafusion::logical_expr::Expr::Literal(sv, _) if sv == &datafusion::scalar::ScalarValue::Boolean(Some(false))));
+        // row rather than counting it as a normal filter. Same check
+        // `HiveDdlHandler`'s SHOW TABLES / SHOW CREATE TABLE gate uses, and
+        // `summarise_policies`'s own audit-summary fold, all funneled through
+        // one function so "denied" means the same thing everywhere.
+        let denied = sqe_policy::plan_rewriter::policy_denies_all(policy);
 
         if denied {
             push("denied", None, "access denied (deny-all policy)", "policy");
@@ -7351,11 +7386,20 @@ fn table_reference_of(name: &sqlparser::ast::ObjectName) -> TableReference {
 }
 
 /// Checks `table_name` (a catalog-qualified reference, either an
-/// `ObjectName` or a raw dotted string) against `resolve_table_kind` and,
-/// if it names a table in an attached Hive root, returns the standard
-/// rejection naming `statement_label` and `cycle`. `Ok(())` covers both "it
-/// is an Iceberg table" and "it is unqualified, so there is nothing Hive to
-/// reject" -- the Iceberg dispatch downstream is unchanged either way.
+/// `ObjectName` or a raw dotted string) against
+/// `resolve_table_kind_for_session` and, if it names a table in an attached
+/// Hive root, returns the standard rejection naming `statement_label` and
+/// `cycle`. `Ok(())` covers both "it is an Iceberg table" and "it is
+/// unqualified with no Hive-root default catalog to promote against" --
+/// the Iceberg dispatch downstream is unchanged either way.
+///
+/// Resolves through `session`'s default catalog for a `Bare`/`Partial`
+/// reference rather than calling `resolve_table_kind` directly: an
+/// unqualified reference under a session whose default catalog IS a Hive
+/// root must still be caught here, or the write path below resolves it
+/// against a same-named Iceberg catalog instead of being rejected (see
+/// `resolve_table_kind_for_session`'s own doc comment for the concrete
+/// failure this closes).
 ///
 /// `statement_label` must be a short, fixed description (e.g. `"ANALYZE"`),
 /// never the raw SQL text: interpolating user SQL into the rejection is how
@@ -7365,11 +7409,15 @@ fn table_reference_of(name: &sqlparser::ast::ObjectName) -> TableReference {
 impl QueryHandler {
     fn reject_if_hive_table(
         &self,
+        session: &Session,
         table_ref: &TableReference,
         statement_label: &str,
         cycle: u8,
     ) -> sqe_core::Result<()> {
-        match self.hive_ddl_handler.resolve_table_kind(table_ref) {
+        match self
+            .hive_ddl_handler
+            .resolve_table_kind_for_session(session.default_catalog.as_deref(), table_ref)
+        {
             crate::hive_ddl_handler::TableKind::Hive { .. } => {
                 Err(self.hive_ddl_handler.reject_unsupported(statement_label, cycle))
             }
