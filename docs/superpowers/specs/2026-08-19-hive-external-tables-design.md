@@ -380,6 +380,32 @@ Types are stored as SQL type text (`bigint`, `varchar(32)`, `decimal(18,2)`,
 `array<string>`) and parsed to Arrow on load. The manifest does not pin an Arrow
 or DataFusion version.
 
+### The partition index, decided 2026-08-20
+
+The `sqe.partition_index` slot holds the partition list itself, not a cache
+pointer. Cycle 2 populates it, and the two DDL statements that maintain it are
+the ones Hive users already know:
+
+- `MSCK REPAIR TABLE` re-lists the table's location and rewrites the whole
+  index, so it is the recovery path when files arrived out of band.
+- `ALTER TABLE ... ADD PARTITION` appends one entry, so a pipeline that knows
+  what it just wrote never pays for a re-scan.
+
+Each entry carries the partition key values and the location, because a Hive
+partition may live outside the table prefix, which is the case
+`list_with_delimiter` discovery cannot express at all. An index present means
+reads plan from it instead of listing, which is what removes the listing cost
+that finding 7 bounds. An index absent keeps today's discovery behavior, so an
+un-repaired table still works.
+
+Two consequences worth stating before cycle 2 starts. The index can go stale
+when files arrive out of band, so `MSCK REPAIR` is the documented remedy rather
+than a background scan, and the cycle must decide whether a stale index that
+omits a real partition is a wrong answer or a missing one. And the index becomes
+the largest thing in the manifest, so `manifest_max_bytes` and a new
+partition-count cap are what stop a million-partition table from producing an
+unreadable object.
+
 Slots reserved now and populated later: `sqe.partition_index` (cycle 2),
 `sqe.column_tags` (cycle 3), `sqe.statistics` (cycle 2 `ANALYZE`). A manifest in
 object storage read by mixed engine versions is a wire format, so it is
