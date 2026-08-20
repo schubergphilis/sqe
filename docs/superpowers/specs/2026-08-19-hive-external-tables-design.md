@@ -475,9 +475,26 @@ New module `crates/sqe-catalog/src/hive/`:
 
 `HiveSchemaProvider::table(name)` loads the manifest through the metadata cache,
 maps the SerDe to a `FileFormat`, builds `ListingOptions` with
-`table_partition_cols`, binds an object store from session credentials or the
+`table_partition_cols`, binds an object store from engine credentials or the
 named secret, and returns a `ListingTable`. `table_names()` comes from the
 cached LIST.
+
+**Why the provider is per session, stated correctly.** Two earlier answers to
+this were wrong. The first said credentials, which the Credentials section
+withdraws: reads use engine credentials or a named secret. The second said each
+session builds its own `RuntimeEnv`, so a shared provider would hold a stale
+runtime. Production does not do that either; it takes
+`SessionContext::new_with_config_rt(session_config, Arc::clone(rt))`, so every
+session shares one runtime and one object-store registry, and only the fallback
+and test paths build their own.
+
+The actual constraint is the per-session `TvfCaller` embedded in the provider's
+data-store factory. That caller is what `check_path` gates on when a table
+loads, and it carries the username and roles the `{user}` substitution in
+`allowed_object_store_prefixes` depends on. So reusing a provider across
+sessions would evaluate one user's prefix allowlist against another user's
+query. That is a per-user authorization boundary rather than a plumbing detail,
+which is why the provider is rebuilt per session and why nothing may cache it.
 
 Embedded mode intercepts `StatementKind::CreateExternalTable` in
 `EmbeddedClient::execute` alongside the existing `ATTACH` and `CREATE SECRET`
