@@ -506,6 +506,14 @@ In server mode, Hive scans execute coordinator-local, as the file TVFs do today.
 Server mode does not mean distributed scan parity, and the docs say so until
 cycle 5.
 
+That is now a structural fact rather than an intention. The distribution
+entry point matches on `IcebergScanExec` specifically, so a Hive `ListingTable`
+scan cannot reach a worker at all. Nothing enforces the boundary by
+configuration and nothing can accidentally cross it, which also means no test
+is missing here: there is no code path to test. Cycle 5's work is therefore
+additive, teaching the planner a second scan shape, rather than removing a
+guard.
+
 ## Statement dispatch
 
 Every handler that resolves a table name now has a Hive root to consider. The
