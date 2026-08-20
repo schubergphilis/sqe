@@ -124,3 +124,8 @@ tempfile = { workspace = true }
 wiremock = { workspace = true }
 datafusion-functions-json = { workspace = true }
 datafusion = { workspace = true }
+# Test-only: the Hive external-table object-storage e2e test (Task 11)
+# uploads fixture files to real RustFS and reads back the manifest/data
+# objects directly, the same client `sqe-catalog`'s hive/store.rs uses in
+# production (`AmazonS3Builder`). Not a production dependency of this crate.
+object_store = { workspace = true }

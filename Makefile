@@ -231,6 +231,7 @@ test:
 #
 #   make test-integration                             full suite (Polaris + RustFS)
 #   make test-integration FILTER=test_ctas_roundtrip   one test by substring
+#   make test-integration FILTER=hive_external         Hive external tables on real RustFS
 #   make test-distributed                             coordinator + 2 workers
 #   make test-integration-down                        tear the stack back down
 #
