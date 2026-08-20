@@ -397,7 +397,54 @@ async fn drop_secret_rejected_without_admin_role() {
 // accept a local temp dir, so this dispatch is cheaply testable right here.
 // ---------------------------------------------------------------------------
 
+/// Wires fresh, private `hive_catalogs`/`hive_manifest_cache` instances,
+/// simulating a correctly-wired production binary (`main.rs` /
+/// `bin/sqe_server.rs` call `with_hive_registries` with the SAME `Arc`
+/// their `PolicyPlanRewriter` was built from; a test has no rewriter to
+/// share with, so a fresh instance is the closest correct analogue). Use
+/// `make_handler_missing_hive_registries` instead to prove what happens
+/// when a deployment forgets that call.
+fn make_handler_with_hive_registries(
+    secrets: SecretStore,
+    catalogs: RuntimeCatalogRegistry,
+    allow_local_paths: bool,
+) -> QueryHandler {
+    let mut config = minimal_config();
+    config.storage.tvf.allow_local_paths = allow_local_paths;
+    let tracker = Arc::new(QueryTracker::new(&config.query_history));
+    QueryHandler::new(
+        Arc::new(PassthroughEnforcer),
+        None,
+        config,
+        None,
+        None,
+        None,
+        None,
+        tracker,
+        None,
+        None,
+        None,
+        catalogs,
+        secrets,
+    )
+    .expect("QueryHandler::new")
+    .with_hive_registries(
+        Arc::new(sqe_policy::plan_rewriter::HiveCatalogs::new()),
+        Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
+    )
+}
+
 fn make_handler_allowing_local_paths(
+    secrets: SecretStore,
+    catalogs: RuntimeCatalogRegistry,
+) -> QueryHandler {
+    make_handler_with_hive_registries(secrets, catalogs, true)
+}
+
+/// Deliberately never calls `with_hive_registries` -- the deployment-forgot
+/// scenario `hive_catalogs`'s own doc comment warns about: `ATTACH` looking
+/// like it worked while the policy layer never learns the root exists.
+fn make_handler_missing_hive_registries(
     secrets: SecretStore,
     catalogs: RuntimeCatalogRegistry,
 ) -> QueryHandler {
@@ -422,6 +469,35 @@ fn make_handler_allowing_local_paths(
     .expect("QueryHandler::new")
 }
 
+/// The fix for the latent escalation the team-lead's review found: a
+/// `QueryHandler` built without `with_hive_registries` must REFUSE `ATTACH
+/// ... TYPE hive_external` rather than silently attach into a private
+/// registry the policy layer cannot see. Mutation check: reverting
+/// `hive_catalogs`'s default from `None` back to `Some(Arc::new(HiveCatalogs::new()))`
+/// makes this test fail because the attach now succeeds -- that failure is
+/// the proof the guard is the thing closing the gap, not incidental.
+#[tokio::test]
+async fn attach_hive_external_root_refused_when_hive_registries_are_not_wired() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handler =
+        make_handler_missing_hive_registries(SecretStore::new(), RuntimeCatalogRegistry::new());
+    let session = dummy_session();
+
+    let sql = format!(
+        "ATTACH 'file://{}' AS lake (TYPE hive_external)",
+        dir.path().display()
+    );
+    let err = handler
+        .execute(&session, &sql, None)
+        .await
+        .expect_err("must refuse without the shared hive registries wired");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("hive_external") && msg.contains("with_hive_registries"),
+        "error should name the wiring gap, not a generic failure: {msg}"
+    );
+}
+
 #[tokio::test]
 async fn attach_hive_external_root_succeeds() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -444,12 +520,17 @@ async fn attach_hive_external_root_succeeds() {
 #[tokio::test]
 async fn attach_hive_external_root_rejects_local_path_without_allow_local_paths() {
     let dir = tempfile::tempdir().expect("tempdir");
-    // `make_handler`, not `make_handler_allowing_local_paths`: the default
-    // config leaves `[storage.tvf] allow_local_paths` false, and `trusted`
-    // (which a Hive ATTACH does not set for a session caller anyway) would
-    // not bypass this gate regardless -- see `check_path`'s local-path
-    // branch.
-    let handler = make_handler(SecretStore::new(), RuntimeCatalogRegistry::new());
+    // Hive registries ARE wired here (unlike `make_handler`'s bare
+    // default): this test is exercising `check_path`'s local-path gate
+    // specifically, and must not be shadowed by the (separate)
+    // hive-registries-not-wired refusal proven in
+    // `attach_hive_external_root_refused_when_hive_registries_are_not_wired`.
+    // The default config leaves `[storage.tvf] allow_local_paths` false,
+    // and `trusted` (which a Hive ATTACH does not set for a session caller
+    // anyway) would not bypass this gate regardless -- see `check_path`'s
+    // local-path branch.
+    let handler =
+        make_handler_with_hive_registries(SecretStore::new(), RuntimeCatalogRegistry::new(), false);
     let session = dummy_session();
 
     let sql = format!(

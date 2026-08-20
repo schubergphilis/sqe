@@ -197,17 +197,51 @@ pub struct QueryHandler {
     /// table keys under its warehouse root or the Iceberg convention.
     /// `ATTACH ... TYPE hive_external` / `DETACH` insert/remove here so
     /// policy resolution sees a root attached mid-session on its very next
-    /// statement. Defaults to an empty, private instance so a QueryHandler
-    /// built without `with_hive_registries` (most tests) behaves exactly as
-    /// it did before this field existed; the production binaries
-    /// (`main.rs`, `bin/sqe_server.rs`) inject the SAME `Arc` this
-    /// QueryHandler's `PolicyPlanRewriter` was built with -- a second,
-    /// independent instance here would compile and route nothing.
-    hive_catalogs: Arc<sqe_policy::plan_rewriter::HiveCatalogs>,
+    /// statement.
+    ///
+    /// `None` until `with_hive_registries` is called, and `handle_attach`'s
+    /// `hive_external` branch REFUSES to attach when it is `None`, rather
+    /// than falling back to a fresh private registry. A private default
+    /// would look like it worked: `ATTACH` would succeed, the root would
+    /// become readable, and `resolve_policy_key` -- consulting the real
+    /// registry this QueryHandler's `PolicyPlanRewriter` was built with,
+    /// which never heard about the attach -- would key every table in that
+    /// root under the Iceberg namespace convention instead. A grant written
+    /// for a same-named Iceberg namespace would then govern those tables:
+    /// exactly the escalation Task 7 exists to close, reached through a
+    /// wiring gap instead of a parser gap, and invisible to a type check,
+    /// a test, or a review of the call site, because the code looks
+    /// complete either way. Refusing instead of silently misrouting is the
+    /// only way to make that gap loud. Production binaries (`main.rs`,
+    /// `bin/sqe_server.rs`) call `with_hive_registries` with the SAME `Arc`
+    /// the `PolicyPlanRewriter` was built from; a second, independent
+    /// instance here would compile and route nothing, which is exactly why
+    /// this is not "any registry", it is "that one or none".
+    hive_catalogs: Option<Arc<sqe_policy::plan_rewriter::HiveCatalogs>>,
     /// Process-wide cache of parsed Hive manifests, shared by every
     /// session's `HiveCatalogProvider` (`create_session_context`) and by
     /// the `HiveTagSource` the policy rewriter reads column tags through.
-    /// Same defaulting rationale as `hive_catalogs`.
+    ///
+    /// Unlike `hive_catalogs`, this one is NOT `Option`: it stays a plain
+    /// `Arc`, always valid, because its un-wired failure mode is the safe
+    /// direction rather than the dangerous one. `create_session_context`'s
+    /// per-session loop only ever touches this cache when
+    /// `runtime_catalogs.hive_roots()` is non-empty, which (after the
+    /// `hive_catalogs` guard above) can only happen via
+    /// `attach_configured_hive_roots` at startup -- not reachable by any
+    /// SQL a session can send. If a deployment's startup code called that
+    /// but forgot `with_hive_registries`, this field would be a private
+    /// cache instead of the one instance `HiveTagSource` (built from the
+    /// SAME `Arc` in `main.rs`/`bin/sqe_server.rs`) reads through. The
+    /// `HiveCatalogProvider` built from the private cache would still
+    /// resolve the table for scanning, populating the wrong cache; the
+    /// policy rewriter's lookup against the right one would then miss,
+    /// and a cache miss is treated as "tags unknown", not "no tags" (see
+    /// `hive_tag_source.rs`), which the rewriter turns into a `lit(false)`
+    /// row filter. The query still runs; it returns zero rows. That is
+    /// Task 7's fail-closed contract doing its job on a wiring bug it was
+    /// never told about, not a hole -- confirmed by reading the source,
+    /// not assumed.
     hive_manifest_cache: Arc<sqe_catalog::hive::provider::HiveMetadataCache>,
 }
 
@@ -338,28 +372,32 @@ impl QueryHandler {
             runtime_catalogs,
             secrets,
             worker_load: Arc::new(crate::worker_registry::WorkerLoadTracker::new()),
-            hive_catalogs: Arc::new(sqe_policy::plan_rewriter::HiveCatalogs::new()),
+            hive_catalogs: None,
             hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
         })
     }
 
-    /// Replace the default, private `hive_catalogs` / `hive_manifest_cache`
-    /// with the process-wide instances the caller's `PolicyPlanRewriter` and
+    /// Wire the process-wide `hive_catalogs` / `hive_manifest_cache`
+    /// instances the caller's `PolicyPlanRewriter` and
     /// `CatalogRoutedTagSource` were built from (see `main.rs` /
-    /// `bin/sqe_server.rs`). Skipping this call leaves both empty, which is
-    /// correct for any test or embedding that never attaches a Hive root:
-    /// `ATTACH ... TYPE hive_external` still works (it only needs
-    /// `runtime_catalogs`), but the attached name would not reach policy
-    /// resolution or tag routing, silently keying it under the Iceberg
-    /// convention instead of failing loudly -- so production wiring MUST
-    /// call this.
+    /// `bin/sqe_server.rs`).
+    ///
+    /// Skipping this call does NOT default to a private registry: it
+    /// leaves `hive_catalogs` at `None`, and `ATTACH ... TYPE
+    /// hive_external` REFUSES rather than attaching into a registry the
+    /// policy layer cannot see (see the field's own doc comment for why a
+    /// silent fallback there is a privilege-escalation footgun, not a
+    /// convenience). A QueryHandler that never attaches a Hive root --
+    /// which is every test and embedding except the two production
+    /// binaries -- is unaffected either way. Production wiring MUST call
+    /// this.
     #[must_use = "with_hive_registries consumes self; bind the returned QueryHandler"]
     pub fn with_hive_registries(
         mut self,
         hive_catalogs: Arc<sqe_policy::plan_rewriter::HiveCatalogs>,
         hive_manifest_cache: Arc<sqe_catalog::hive::provider::HiveMetadataCache>,
     ) -> Self {
-        self.hive_catalogs = hive_catalogs;
+        self.hive_catalogs = Some(hive_catalogs);
         self.hive_manifest_cache = hive_manifest_cache;
         self
     }
@@ -5925,6 +5963,22 @@ impl QueryHandler {
         // live to decide whether the root's tables key under its own name or
         // the Iceberg namespace convention (see the type's own doc comment).
         if stmt.kind == sqe_sql::CatalogKind::HiveExternal {
+            // REFUSE before touching `runtime_catalogs` at all: attaching the
+            // root and only then discovering there is nowhere to register its
+            // name would make the root readable while leaving
+            // `resolve_policy_key` blind to it -- the exact escalation this
+            // guard exists to prevent, just reached one step later. See the
+            // `hive_catalogs` field's own doc comment for the full case.
+            let Some(hive_catalogs) = self.hive_catalogs.as_ref() else {
+                return Err(SqeError::Execution(
+                    "hive_external: this coordinator was started without the shared Hive \
+                     registries wired (QueryHandler::with_hive_registries was not called); \
+                     that is a deployment wiring bug, not a mistake in this SQL, and ATTACH \
+                     ... TYPE hive_external is refused rather than attaching a root the \
+                     policy layer would not see"
+                        .to_string(),
+                ));
+            };
             let caller = sqe_core::config::TvfCaller::for_user(
                 session.user.username.clone(),
                 session.user.roles.clone(),
@@ -5946,7 +6000,7 @@ impl QueryHandler {
             self.runtime_catalogs
                 .attach_hive_root(&stmt.name, store)
                 .map_err(SqeError::Execution)?;
-            self.hive_catalogs.insert(&stmt.name);
+            hive_catalogs.insert(&stmt.name);
             crate::session_context::invalidate_all_session_caches().await;
             info!(catalog = %stmt.name, kind = "hive_external", "ATTACH complete");
             return Ok(vec![]);
@@ -5977,7 +6031,25 @@ impl QueryHandler {
             self.runtime_catalogs
                 .detach_hive_root(&stmt.name)
                 .map_err(SqeError::Execution)?;
-            self.hive_catalogs.remove(&stmt.name);
+            // `handle_attach`'s guard means this root could only have been
+            // attached while `hive_catalogs` was `Some`, so this is normally
+            // populated. Not blocking on `None` regardless: DETACH only
+            // removes access, never grants it, so there is no escalation to
+            // guard against here the way there is on the attach side -- but
+            // warn, since a `None` here on a root that exists at all means
+            // the deployment was misconfigured for the whole time this root
+            // was attached (see the field's doc comment).
+            match self.hive_catalogs.as_ref() {
+                Some(hive_catalogs) => hive_catalogs.remove(&stmt.name),
+                None => warn!(
+                    catalog = %stmt.name,
+                    "hive_external: DETACH removed a root from the catalog registry, but \
+                     this QueryHandler has no shared hive_catalogs to remove it from; the \
+                     name may still be misclassified under the Iceberg policy-key convention \
+                     for any table that shares its namespace -- this coordinator was started \
+                     without with_hive_registries"
+                ),
+            }
             crate::session_context::invalidate_all_session_caches().await;
             info!(catalog = %stmt.name, "DETACH complete");
             return Ok(vec![]);
