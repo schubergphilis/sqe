@@ -120,7 +120,13 @@ fn contains_partitioned_by_keyword(sql: &str) -> bool {
 /// included, so the two agree on a leading `-- ...`/`/* ... */` the same
 /// way; keep them in sync rather than letting one drift narrower than the
 /// other).
-fn is_create_external_table(sql: &str) -> bool {
+/// Detect a `CREATE EXTERNAL TABLE` statement by its leading keywords,
+/// skipping past any leading comments first. Shared with `sqe-cli`'s
+/// `embedded.rs` (its own dual-parse-path dispatch needs the identical
+/// check), so this is the one copy; both call sites must agree on what
+/// counts as a `CREATE EXTERNAL TABLE` or one of the two paths silently
+/// diverges from the other.
+pub fn is_create_external_table(sql: &str) -> bool {
     let mut s = sql;
     loop {
         let trimmed = s.trim_start();

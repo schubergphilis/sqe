@@ -35,7 +35,7 @@ pub use ctas_compat::rewrite_ctas_compat;
 pub use ddl::{try_parse_ref_ddl, BranchRetention, RefDdl};
 pub use nested_row_cast::rewrite_nested_row_cast;
 pub use paren_less_values::rewrite_paren_less_values;
-pub use partition::normalize_partitioned_by;
+pub use partition::{is_create_external_table, normalize_partitioned_by};
 pub use partition_evolution::{try_parse_partition_evolution, PartitionEvolution};
 pub use pipeline_types::{pre_parse_pipeline, ClassifiableSql, UserSql};
 pub use procedures::{try_parse_call, NamespaceRef, ProcedureCall, ReprojectScope, TableRef};
