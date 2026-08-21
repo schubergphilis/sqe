@@ -103,7 +103,7 @@ Port, credentials, region, and default size. Copy to `.env` to override. The buc
 
 ## Output
 
-`OUTPUT.md` is a real captured run at the default `--size-mb 64` (51MB on disk, 3.96M rows across the four tables): 3,355,440 Parquet, 516,220 CSV, 46,600 JSON, 46,603 ndjson. It contains the object listing, the DDL, every query result, a real manifest, and the process-2 re-attach.
+`OUTPUT.md` is a real captured run at the default `--size-mb 64` (51MB on disk, 3.96M rows across the four tables): 3,355,440 Parquet, 516,220 CSV, 46,600 JSON, 46,603 ndjson. It contains the object listing, the DDL, every query result, a real manifest, and the process-2 re-attach. The manifest's `owner` field is whoever ran the capture, taken from the OS user, so it will read differently on your machine; nothing else in the file varies between runs at the same size.
 
 The 1024MB size has also been run green end to end: 63.4M rows across the four tables, 73 seconds from generation to the last assertion, on a laptop.
 
