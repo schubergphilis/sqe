@@ -94,6 +94,7 @@ validated from a clean state.
 | [`embedded-sqlite-catalog`](./embedded-sqlite-catalog/) | Local persistent Iceberg catalog backed by SQLite (no server) | **validated 2026-06-06** |
 | [`quack`](./quack/) | SQE's DuckDB Quack RPC, both ways: a DuckDB 1.5.3 CLI queries SQE, and SQE's `quack_query()` pulls from a DuckDB server (pre-release protocol) | **validated 2026-06-07** |
 | [`attach-catalogs`](./attach-catalogs/) | Attach multiple persistent catalogs in embedded mode + cross-catalog JOIN | **validated 2026-06-06** |
+| [`hive-external-s3`](./hive-external-s3/) | Hive external tables on S3-compatible storage: Athena `CREATE EXTERNAL TABLE` over partitioned Parquet, CSV, and line-delimited JSON, then a second process re-attaches and reads the same tables from the sidecar manifests | **validated 2026-08-20** |
 
 ### D. Operations
 
