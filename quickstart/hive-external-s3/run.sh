@@ -9,6 +9,9 @@
 #
 #   ./run.sh                    # full run, captures OUTPUT.md
 #   ./run.sh --check            # full run, then assert the invariants
+#   ./run.sh --server           # same SQL, same assertions, through a real
+#                               # sqe-server over Flight SQL instead of the
+#                               # in-process engine
 #   ./run.sh --size-mb 1024     # bigger data set (5120 = the 5GB ceiling)
 #   ./run.sh --regen            # regenerate + re-upload even if data is present
 #   ./run.sh --down             # stop the store, keep the bucket volume
@@ -19,15 +22,17 @@ cd "$(dirname "$0")"
 
 CHECK=0
 REGEN=0
+MODE=embedded
 SIZE_MB="${SIZE_MB:-64}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --check) CHECK=1 ;;
     --regen) REGEN=1 ;;
+    --server) MODE=server ;;
     --size-mb) shift; SIZE_MB="${1:-}" ;;
     --down) docker compose down; ok "stopped (volume kept)"; exit 0 ;;
     --clean) docker compose down -v; rm -rf ./data ./.venv; ok "stopped, volume and ./data removed"; exit 0 ;;
-    *) die "unknown arg: $1 (use --check, --regen, --size-mb N, --down, --clean)" ;;
+    *) die "unknown arg: $1 (use --check, --server, --regen, --size-mb N, --down, --clean)" ;;
   esac
   shift
 done
@@ -40,6 +45,8 @@ S3_ACCESS_KEY="${S3_ACCESS_KEY:-s3admin}"
 S3_SECRET_KEY="${S3_SECRET_KEY:-s3admin}"
 S3_REGION="${S3_REGION:-us-east-1}"
 S3_URL="http://localhost:${S3_PORT}"
+FLIGHT_PORT="${FLIGHT_PORT:-50151}"
+TRINO_PORT="${TRINO_PORT:-18081}"
 BUCKET=lake                      # fixed: create-tables.sql names it literally
 ROOT="s3://${BUCKET}/wh/"        # manifests
 DATA="s3://${BUCKET}/data/"      # table data, deliberately not under the root
@@ -57,6 +64,21 @@ if [ -z "$SQE" ]; then
 fi
 [ -z "$SQE" ] && command -v sqe-cli >/dev/null 2>&1 && SQE="$(command -v sqe-cli)"
 [ -n "$SQE" ] || die "sqe-cli not found. Build it: (cd ../.. && cargo build --release -p sqe-cli), or set SQE_CLI."
+# Print the binary and its build date. `target/release` is preferred over
+# `target/dev-release`, so a stale release build silently wins over a fresh
+# dev one; seeing the date is what turns that from a mystery into a one-line
+# diagnosis. It has already cost this quickstart two debugging detours.
+ok "engine: $SQE (built $(date -r "$SQE" '+%Y-%m-%d %H:%M' 2>/dev/null || echo unknown))"
+
+SQE_SERVER="${SQE_SERVER:-}"
+if [ "$MODE" = server ] && [ -z "$SQE_SERVER" ]; then
+  for cand in ../../target/release/sqe-server ../../target/dev-release/sqe-server; do
+    [ -x "$cand" ] && SQE_SERVER="$cand" && break
+  done
+  [ -z "$SQE_SERVER" ] && command -v sqe-server >/dev/null 2>&1 && SQE_SERVER="$(command -v sqe-server)"
+  [ -n "$SQE_SERVER" ] || die "sqe-server not found. Build it: (cd ../.. && cargo build --release -p sqe-coordinator --bin sqe-server), or set SQE_SERVER."
+  ok "server: $SQE_SERVER (built $(date -r "$SQE_SERVER" '+%Y-%m-%d %H:%M' 2>/dev/null || echo unknown))"
+fi
 
 # The secret goes in the environment, not on the command line, where `ps` and
 # shell history would both keep a copy. The endpoint is a flag to show the
@@ -65,10 +87,102 @@ export SQE_STORAGE__S3_ACCESS_KEY="$S3_ACCESS_KEY"
 export SQE_STORAGE__S3_SECRET_KEY="$S3_SECRET_KEY"
 export SQE_STORAGE__S3_REGION="$S3_REGION"
 
-# sqe(): one embedded engine process per call. Every call is a cold start with
-# nothing but the warehouse root, which is what makes the re-attach step below
-# mean something.
-sqe() { "$SQE" --embedded --memory --s3-endpoint "$S3_URL" --hive-root "lake=${ROOT}" "$@"; }
+# sqe(): how a statement reaches the engine, and the ONLY thing that differs
+# between the two modes. Everything downstream (the DDL, the queries, the
+# assertions) is byte-identical, which is the point of --server: the same SQL
+# and the same manifests, one in-process engine and one over the wire.
+#
+# embedded: one engine process per call, a cold start with nothing but the
+# warehouse root, which is what makes the re-attach step below mean something.
+# server: a client call against a long-lived sqe-server that attached the root
+# from `[[hive.roots]]` in sqe.toml at startup.
+sqe() {
+  if [ "$MODE" = server ]; then
+    SQE_PASSWORD=anonymous "$SQE" --host localhost --port "$FLIGHT_PORT" --user anonymous "$@"
+  else
+    "$SQE" --embedded --memory --s3-endpoint "$S3_URL" --hive-root "lake=${ROOT}" "$@"
+  fi
+}
+
+# list_tables(): the statement that lists a Hive root's tables is NOT the same
+# in both modes, and neither mode can use the other's.
+#   embedded: `SHOW TABLES FROM <root>.<db>` is not parsed at all (a
+#             pre-existing embedded gap, against any catalog kind), so
+#             information_schema is the only way.
+#   server:   `SHOW TABLES` works and is policy-gated, while
+#             `information_schema.tables` enumerates EVERY registered catalog,
+#             including the deliberately unreachable Iceberg one in sqe.toml,
+#             and fails on it before it ever reaches the WHERE clause.
+# Measured both ways; see the README.
+list_tables() {
+  if [ "$MODE" = server ]; then
+    sqe -e "SHOW TABLES FROM lake.demo"
+  else
+    sqe -e "SELECT table_name FROM information_schema.tables WHERE table_catalog = 'lake' AND table_schema = 'demo' ORDER BY table_name"
+  fi
+}
+
+SERVER_PID=""
+SERVER_LOG="./server.log"
+
+# start_server: boots sqe-server on sqe.toml. RUST_LOG defaults to info, not
+# warn: readiness and the "did the root actually attach" assertion both read
+# INFO lines out of the log, so a quieter default would make the wait time out
+# on a perfectly healthy server. The TOML stays static and
+# readable; anything .env can change is passed as an SQE_* env override, which
+# is the same mechanism a container deployment uses.
+start_server() {
+  # Preflight both ports. Without this, a coordinator left over from a previous
+  # run (or anything else on 18081) fails the bind deep inside startup and the
+  # user sees "sqe-server exited during startup" with no cause.
+  local p
+  for p in "$FLIGHT_PORT" "$TRINO_PORT"; do
+    if lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then
+      die "port $p is already in use (a coordinator from a previous run?). Free it, or set FLIGHT_PORT / TRINO_PORT in .env"
+    fi
+  done
+  step "starting sqe-server on :${FLIGHT_PORT} (config: sqe.toml)"
+  SQE_CONFIG=./sqe.toml \
+  SQE_COORDINATOR__FLIGHT_SQL_PORT="$FLIGHT_PORT" \
+  SQE_COORDINATOR__TRINO_HTTP_PORT="$TRINO_PORT" \
+  SQE_STORAGE__S3_ENDPOINT="$S3_URL" \
+  RUST_LOG="${RUST_LOG:-info}" \
+    "$SQE_SERVER" > "$SERVER_LOG" 2>&1 &
+  SERVER_PID=$!
+  printf '    waiting for the coordinator '
+  local i
+  for i in $(seq 1 60); do
+    if grep -q "coordinator listening" "$SERVER_LOG" 2>/dev/null \
+       || lsof -nP -iTCP:"$FLIGHT_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+      echo " ready"
+      # The root has to appear as an attached catalog, or every later failure
+      # would be a confusing "unknown catalog" instead of this one.
+      # A server that boots but attaches nothing is almost always a binary
+      # older than the Hive support itself: `[[hive.roots]]` is simply unknown
+      # config to it, so it starts perfectly and serves no Hive catalog. That
+      # is invisible unless something checks, which is what this is.
+      grep -q '"kind":"hive_external"' "$SERVER_LOG" \
+        || die "sqe-server started but attached no hive_external root.
+       Binary: $SQE_SERVER (built $(date -r "$SQE_SERVER" '+%Y-%m-%d %H:%M' 2>/dev/null || echo unknown))
+       Most likely that binary predates Hive external tables and ignores
+       [[hive.roots]] entirely. Rebuild it, or point SQE_SERVER at a current
+       build. Full log: $SERVER_LOG"
+      ok "hive root attached from [[hive.roots]] at startup"
+      return 0
+    fi
+    kill -0 "$SERVER_PID" 2>/dev/null || { echo; tail -20 "$SERVER_LOG"; die "sqe-server exited during startup"; }
+    printf '.'; sleep 1
+  done
+  echo; tail -20 "$SERVER_LOG"; die "sqe-server did not report listening"
+}
+
+stop_server() {
+  [ -n "$SERVER_PID" ] || return 0
+  kill "$SERVER_PID" 2>/dev/null || true
+  wait "$SERVER_PID" 2>/dev/null || true
+  SERVER_PID=""
+}
+trap stop_server EXIT
 
 # --- the S3 client ---------------------------------------------------------
 # Host `aws` if present, otherwise the aws-cli container on the compose
@@ -183,14 +297,33 @@ else
 fi
 
 # --- process 1: define and query ------------------------------------------
-OUT=OUTPUT.md
+# Two committed captures, one per deployment shape, so neither run overwrites
+# the other's evidence.
+if [ "$MODE" = server ]; then OUT=OUTPUT-server.md; else OUT=OUTPUT.md; fi
 capture_begin "$OUT"
 {
   echo "# Captured output"
   echo
-  echo "_Generated by \`./run.sh --size-mb ${SIZE_MB}\` on $(date -u +%Y-%m-%dT%H:%M:%SZ)._"
+  echo "_Generated by \`./run.sh --size-mb ${SIZE_MB}$([ "$MODE" = server ] && echo ' --server')\` on $(date -u +%Y-%m-%dT%H:%M:%SZ)._"
+  echo
+  if [ "$MODE" = server ]; then
+    echo "Mode: **server**. Every statement below crossed a Flight SQL connection to a real"
+    echo "\`sqe-server\` process that attached the warehouse root from \`[[hive.roots]]\` in"
+    echo "\`sqe.toml\`. The SQL is byte-identical to the embedded run."
+    echo
+    echo "Two statements in \`queries.sql\` are EXPECTED to fail here, and the failure is the"
+    echo "interesting part: \`information_schema.tables\` and \`DESCRIBE\` enumerate every"
+    echo "registered catalog, so they trip over this config's deliberately unreachable Iceberg"
+    echo "catalog before they ever reach the Hive root. \`SHOW TABLES FROM lake.demo\` works in"
+    echo "server mode and is what the re-attach section uses; embedded mode is the reverse."
+  else
+    echo "Mode: **embedded**. Every statement below ran in an in-process engine started for"
+    echo "that one call."
+  fi
   echo
 } > "$OUT"
+
+[ "$MODE" = server ] && start_server
 
 step "process 1: CREATE EXTERNAL TABLE x4 (Athena DDL), then query"
 # --stop-on-error: a half-created set of tables would make every later step
@@ -237,6 +370,16 @@ ok "manifest read from $MANIFEST_KEY"
 # Process 1 is already gone: every sqe() call above was its own process, with
 # an ephemeral --memory engine that persisted nothing locally. This step proves
 # the definitions live in the bucket, not in the engine.
+if [ "$MODE" = server ]; then
+  # The embedded path gets its process boundary for free (every sqe() call is
+  # its own engine). A server does not: it is long-lived, so the only honest
+  # way to prove the definitions live in the bucket is to kill it and boot a
+  # new one that re-reads [[hive.roots]] and the manifests from scratch.
+  step "restarting the coordinator, so process 2 really is a new process"
+  stop_server
+  start_server
+fi
+
 step "process 2: a fresh engine re-attaches the same root"
 {
   echo
@@ -246,7 +389,7 @@ step "process 2: a fresh engine re-attaches the same root"
   echo 'nothing else: no DDL, no schema, no file paths.'
   echo
   echo '```'
-  sqe -e "SELECT table_name FROM information_schema.tables WHERE table_catalog = 'lake' AND table_schema = 'demo' ORDER BY table_name" 2>&1
+  list_tables 2>&1
   sqe -e "SELECT COUNT(*) AS parquet_rows FROM lake.demo.events_parquet" 2>&1
   sqe -e "SHOW CREATE TABLE lake.demo.events_parquet" 2>&1
   echo '```'

@@ -161,6 +161,12 @@ Cycle 2 removes the listing cost by persisting the partition list itself in the 
 
 ## Server mode
 
+Verified through a real `sqe-server` process over Flight SQL, not only in-process: the quickstart's `./run.sh --server` boots a coordinator that attaches its root from `[[hive.roots]]`, runs the same DDL and the same queries as the embedded path, restarts the coordinator, and reads the tables back from the manifests. Same row counts, same rendered DDL.
+
+Two things a server-mode deployment needs that embedded mode does not. `[storage.tvf] allowed_object_store_prefixes` is mandatory: server mode fails closed on object-store paths, so with no allowlist every `s3://` read is denied, including the manifest load behind a Hive table. And nothing else has to be reachable. A coordinator whose `[catalog]` points at an Iceberg endpoint nobody is listening on still boots, attaches its Hive roots, and answers every Hive query, which is what a Hive-only deployment looks like.
+
+The exception is metadata statements that enumerate catalogs. `information_schema.tables` and `DESCRIBE` walk **every** registered catalog before any `WHERE` clause narrows them, so an unreachable Iceberg catalog fails those statements even for a query that only named a Hive root. `SHOW TABLES FROM <root>.<database>` does not, and is the reliable listing in server mode. In embedded mode it is the reverse: `SHOW TABLES` is not parsed and `information_schema` is what works.
+
 In server mode, Hive scans execute coordinator-local, the same way the file table-valued functions do today. Coordinator-local execution is not distributed scan parity. Worker execution of Hive scans is cycle 5, because `ScanTask` today is shaped for Parquet and Iceberg field IDs, and giving it a Hive-shaped alternative is its own protocol change.
 
 ## Statement support today
