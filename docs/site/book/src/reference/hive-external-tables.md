@@ -35,6 +35,18 @@ location = "s3://bucket/wh/"
 sqe-cli --embedded --hive-root lake=s3://bucket/wh/
 ```
 
+Against anything other than real AWS S3, the embedded CLI also needs to be told where the store is:
+
+```bash
+sqe-cli --embedded \
+  --s3-endpoint http://localhost:9000 \
+  --hive-root lake=s3://bucket/wh/
+```
+
+Embedded mode loads no `sqe.toml`, so `--s3-endpoint`, `--s3-access-key`, `--s3-secret-key`, and `--s3-region` are how it learns about a store. Each falls back to `SQE_STORAGE__S3_*` (the coordinator's own config names) and then to the standard `AWS_*` variables, so `AWS_ENDPOINT_URL` and `AWS_ACCESS_KEY_ID` work as you would expect. Prefer the environment for the secret; a command line is visible in `ps`. An endpoint override switches addressing to path-style, because `bucket.host:port` does not resolve for a self-hosted store; `--s3-virtual-hosted` turns that back off for a store with wildcard DNS. Without any of this the engine talks to real AWS and, with no static key, falls through to the instance-metadata service and times out.
+
+A runnable end-to-end example, including the data generator and the assertions, is in [`quickstart/hive-external-s3/`](https://github.com/getsqe/sqe/tree/main/quickstart/hive-external-s3).
+
 A root name cannot collide with a registered catalog name; `ATTACH` rejects the collision. `TYPE hive` still means Hive Metastore for Iceberg tables. `TYPE hive_external` is a different thing: a warehouse root for tables that are not Iceberg at all.
 
 Attaching a root does not list or read anything. The check is a path-reachability check against the storage allowlist described below, not a network call against the root's contents.

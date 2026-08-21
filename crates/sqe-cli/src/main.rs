@@ -91,6 +91,42 @@ struct Cli {
     #[arg(long, value_parser = parse_hive_root_spec)]
     hive_root: Vec<(String, String)>,
 
+    /// S3 endpoint override for object-store reads, e.g.
+    /// `http://localhost:9000`. Required for any S3-compatible store that
+    /// is not AWS itself (MinIO, RustFS, Ceph RGW, Garage). Without it the
+    /// engine talks to real AWS and, with no static key, falls through to
+    /// the instance-metadata service. An endpoint override also switches
+    /// addressing to path-style (`host:port/bucket/key`), since
+    /// `bucket.host:port` does not resolve for a self-hosted store; pass
+    /// `--s3-virtual-hosted` to keep virtual-hosted addressing.
+    /// Falls back to `SQE_STORAGE__S3_ENDPOINT`, then `AWS_ENDPOINT_URL_S3`,
+    /// then `AWS_ENDPOINT_URL`. Applies to the file TVFs
+    /// (`read_parquet`/`read_csv`/`read_json`) and to `--hive-root`.
+    #[arg(long)]
+    s3_endpoint: Option<String>,
+
+    /// S3 access key id. Falls back to `SQE_STORAGE__S3_ACCESS_KEY`, then
+    /// `AWS_ACCESS_KEY_ID`.
+    #[arg(long)]
+    s3_access_key: Option<String>,
+
+    /// S3 secret access key. Prefer the environment
+    /// (`SQE_STORAGE__S3_SECRET_KEY` or `AWS_SECRET_ACCESS_KEY`): a secret
+    /// on the command line lands in shell history and in `ps` output.
+    #[arg(long)]
+    s3_secret_key: Option<String>,
+
+    /// S3 region. Falls back to `SQE_STORAGE__S3_REGION`, then
+    /// `AWS_REGION`, then `AWS_DEFAULT_REGION`.
+    #[arg(long)]
+    s3_region: Option<String>,
+
+    /// Keep virtual-hosted-style addressing (`bucket.host`) even with
+    /// `--s3-endpoint` set. Only useful for a self-hosted store configured
+    /// with a wildcard DNS domain (MinIO's `MINIO_DOMAIN`).
+    #[arg(long, default_value_t = false)]
+    s3_virtual_hosted: bool,
+
     /// Skip persistent catalogs entirely. `CREATE TABLE` works
     /// within the session via DataFusion's in-memory catalog but
     /// nothing survives the process. Mutually exclusive with
@@ -205,6 +241,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into());
     }
 
+    // Object-store settings, resolved once: flags first, then
+    // `SQE_STORAGE__S3_*`, then the standard `AWS_*` variables. Embedded
+    // mode loads no `sqe.toml`, so this is the only way it learns about an
+    // S3-compatible store that is not AWS.
+    let s3_options = embedded::EmbeddedS3Options::resolve_from_env(&embedded::EmbeddedS3Options {
+        endpoint: cli.s3_endpoint.clone(),
+        access_key: cli.s3_access_key.clone(),
+        secret_key: cli.s3_secret_key.clone(),
+        region: cli.s3_region.clone(),
+        virtual_hosted: cli.s3_virtual_hosted,
+    });
+
     let scheme = if cli.tls { "https" } else { "http" };
 
     let mut client: Box<dyn SqlClient> = if cli.embedded {
@@ -239,7 +287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .catalog_name
                 .clone()
                 .unwrap_or_else(|| backend_label.to_string());
-            let mut client = embedded::EmbeddedClient::with_backend(limit, backend, &name).await?;
+            let mut client = embedded::EmbeddedClient::with_backend(limit, backend, &name, &s3_options).await?;
             attach_hive_roots(&mut client, &cli.hive_root).await?;
             eprintln!(
                 "sqe-cli {} embedded engine ({} memory pool, {} catalog: {})",
@@ -268,7 +316,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 embedded::WarehouseMode::default_persistent()
             };
-            let mut client = embedded::EmbeddedClient::with_warehouse(limit, &mode).await?;
+            let mut client = embedded::EmbeddedClient::with_warehouse(limit, &mode, &s3_options).await?;
             attach_hive_roots(&mut client, &cli.hive_root).await?;
             eprintln!(
                 "sqe-cli {} embedded engine ({} memory pool, {})",

@@ -111,15 +111,147 @@ impl WarehouseMode {
     }
 }
 
+/// How the embedded engine reaches S3-compatible object storage.
+///
+/// Embedded mode never loads an `sqe.toml`, so every `StorageConfig` it
+/// built used to be `StorageConfig::default()`: empty endpoint, empty
+/// keys. An `s3://` read then went to the real AWS endpoint and, with no
+/// static key, on to the instance-metadata service, so
+/// `--hive-root lake=s3://bucket/wh/` against MinIO, RustFS, Ceph RGW, or
+/// Garage failed with a `169.254.169.254` connect timeout that names
+/// nothing a user can act on. `AmazonS3Builder::new()` reads no
+/// environment variables of its own, so the usual `AWS_*` exports did not
+/// rescue it either: all three endpoint spellings (`AWS_ENDPOINT_URL`,
+/// `AWS_ENDPOINT_URL_S3`, `AWS_ENDPOINT`) were measured against a running
+/// RustFS and all three produced the same IMDS timeout.
+///
+/// [`EmbeddedS3Options::resolve`] is where flags and environment meet, and
+/// [`EmbeddedS3Options::to_storage_config`] is the single place the result
+/// becomes a [`StorageConfig`], so the file TVFs (`read_parquet`,
+/// `read_csv`, `read_json`) and Hive external-table roots always read the
+/// same store with the same credentials. Wiring one and not the other
+/// would produce an engine where `SELECT * FROM lake.sales.orders` works
+/// and `read_csv('s3://…')` mysteriously does not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EmbeddedS3Options {
+    /// Endpoint override, e.g. `http://localhost:9000`. Unset means real
+    /// AWS S3.
+    pub endpoint: Option<String>,
+    pub access_key: Option<String>,
+    pub secret_key: Option<String>,
+    pub region: Option<String>,
+    /// Force virtual-hosted addressing (`bucket.host`) even when an
+    /// endpoint override is set. See [`Self::to_storage_config`] for why
+    /// an endpoint override otherwise implies path-style.
+    pub virtual_hosted: bool,
+}
+
+impl EmbeddedS3Options {
+    /// Resolve each setting from the CLI flag first, then the
+    /// `SQE_STORAGE__S3_*` variables the coordinator's own config honors,
+    /// then the standard `AWS_*` variables.
+    ///
+    /// `env` is a lookup function rather than a direct `std::env::var`
+    /// call so this stays testable: process environment is global state,
+    /// and a test that mutates it races every other test in the binary.
+    pub fn resolve<F>(flags: &EmbeddedS3Options, env: F) -> Self
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let pick = |flag: &Option<String>, names: &[&str]| -> Option<String> {
+            if let Some(v) = flag.as_deref().filter(|v| !v.is_empty()) {
+                return Some(v.to_string());
+            }
+            names
+                .iter()
+                .filter_map(|n| env(n))
+                .find(|v| !v.is_empty())
+        };
+
+        Self {
+            endpoint: pick(
+                &flags.endpoint,
+                &[
+                    "SQE_STORAGE__S3_ENDPOINT",
+                    "AWS_ENDPOINT_URL_S3",
+                    "AWS_ENDPOINT_URL",
+                ],
+            ),
+            access_key: pick(
+                &flags.access_key,
+                &["SQE_STORAGE__S3_ACCESS_KEY", "AWS_ACCESS_KEY_ID"],
+            ),
+            secret_key: pick(
+                &flags.secret_key,
+                &["SQE_STORAGE__S3_SECRET_KEY", "AWS_SECRET_ACCESS_KEY"],
+            ),
+            region: pick(
+                &flags.region,
+                &["SQE_STORAGE__S3_REGION", "AWS_REGION", "AWS_DEFAULT_REGION"],
+            ),
+            virtual_hosted: flags.virtual_hosted,
+        }
+    }
+
+    /// Same as [`Self::resolve`] against the real process environment.
+    pub fn resolve_from_env(flags: &EmbeddedS3Options) -> Self {
+        Self::resolve(flags, |name| std::env::var(name).ok())
+    }
+
+    /// The engine-wide [`StorageConfig`] for this process.
+    ///
+    /// Local paths and `http(s)://` are allowed here for the same reason
+    /// [`build_embedded_context`] used to allow them inline: the embedded
+    /// CLI runs as the local user, who already owns this config, its
+    /// credentials, and a shell. The server fails closed instead, because
+    /// there the caller is a remote authenticated identity, not the owner
+    /// of the process.
+    ///
+    /// An endpoint override implies path-style addressing unless
+    /// `virtual_hosted` says otherwise. A custom endpoint in practice
+    /// means a self-hosted store reached as `host:port`, where
+    /// `bucket.host` does not resolve at all; defaulting the other way
+    /// turns every MinIO or RustFS quickstart into a DNS puzzle. Real AWS,
+    /// with no endpoint override, keeps virtual-hosted addressing.
+    pub fn to_storage_config(&self) -> StorageConfig {
+        let mut storage = StorageConfig::default();
+        storage.tvf.allow_local_paths = true;
+        storage.tvf.allow_http = true;
+
+        if let Some(endpoint) = &self.endpoint {
+            storage.s3_endpoint = endpoint.clone();
+        }
+        if let Some(key) = &self.access_key {
+            storage.s3_access_key = key.clone();
+        }
+        if let Some(key) = &self.secret_key {
+            storage.s3_secret_key = sqe_core::SecretString::new(key.clone());
+        }
+        if let Some(region) = &self.region {
+            storage.s3_region = region.clone();
+        }
+        storage.s3_path_style = self.endpoint.is_some() && !self.virtual_hosted;
+        storage
+    }
+}
+
 /// Build a [`SessionContext`] suitable for embedded queries.
 ///
 /// `memory_limit_bytes` caps the per-process query memory; values
 /// below 64MB are clamped to that floor because DataFusion's hash
 /// joins cannot make forward progress with smaller pools.
 ///
+/// `storage` is the engine's object-store configuration, normally from
+/// [`EmbeddedS3Options::to_storage_config`]. The file TVFs are registered
+/// with it, and [`EmbeddedClient::attach_hive_root`] reads Hive manifests
+/// and data with the same one.
+///
 /// Use [`build_embedded_context_with_warehouse`] when you also want
 /// a persistent Iceberg catalog attached.
-pub fn build_embedded_context(memory_limit_bytes: usize) -> anyhow::Result<SessionContext> {
+pub fn build_embedded_context(
+    memory_limit_bytes: usize,
+    storage: &StorageConfig,
+) -> anyhow::Result<SessionContext> {
     let session_config = SessionConfig::new()
         .with_information_schema(true)
         .with_default_catalog_and_schema("default", "default")
@@ -211,30 +343,53 @@ pub fn build_embedded_context(memory_limit_bytes: usize) -> anyhow::Result<Sessi
     // the locally-configured key keep working without an
     // `allowed_object_store_prefixes` list. The server constructs TVFs with
     // the session's authenticated identity instead and fails closed.
-    let mut tvf_storage = StorageConfig::default();
-    tvf_storage.tvf.allow_local_paths = true;
-    tvf_storage.tvf.allow_http = true;
+    //
+    // `storage` arrives from `EmbeddedS3Options::to_storage_config`, which
+    // is also what `attach_hive_root` passes to the Hive manifest store and
+    // data-store factory. One config, so `read_csv('s3://…')` and
+    // `SELECT * FROM <hive-root>.db.table` cannot disagree about which
+    // endpoint or key to use.
+    let tvf_storage = storage.clone();
     let tvf_caller = sqe_core::config::TvfCaller::trusted_local();
+    // `with_runtime_env` is not optional for object-store paths. Each TVF
+    // builds its S3/Azure/GCS client during schema inference and registers
+    // it on a throwaway context; without the session's own `RuntimeEnv`
+    // getting that same registration, planning succeeds and EXECUTION fails
+    // with DataFusion's "No suitable object store found for s3://…", which
+    // reads like an engine bug and is really a missing registration. The
+    // coordinator already wires it (`session_context.rs`); embedded mode did
+    // not, so every `read_csv('s3://…')` in embedded mode failed this way,
+    // inline credentials or not.
+    let tvf_runtime = ctx.runtime_env();
     ctx.register_udtf(
         "read_parquet",
-        Arc::new(sqe_catalog::read_parquet::ReadParquetFunction::with_caller(
-            tvf_storage.clone(),
-            tvf_caller.clone(),
-        )),
+        Arc::new(
+            sqe_catalog::read_parquet::ReadParquetFunction::with_caller(
+                tvf_storage.clone(),
+                tvf_caller.clone(),
+            )
+            .with_runtime_env(Arc::clone(&tvf_runtime)),
+        ),
     );
     ctx.register_udtf(
         "read_csv",
-        Arc::new(sqe_catalog::read_csv::ReadCsvFunction::with_caller(
-            tvf_storage.clone(),
-            tvf_caller.clone(),
-        )),
+        Arc::new(
+            sqe_catalog::read_csv::ReadCsvFunction::with_caller(
+                tvf_storage.clone(),
+                tvf_caller.clone(),
+            )
+            .with_runtime_env(Arc::clone(&tvf_runtime)),
+        ),
     );
     ctx.register_udtf(
         "read_json",
-        Arc::new(sqe_catalog::read_json::ReadJsonFunction::with_caller(
-            tvf_storage.clone(),
-            tvf_caller.clone(),
-        )),
+        Arc::new(
+            sqe_catalog::read_json::ReadJsonFunction::with_caller(
+                tvf_storage.clone(),
+                tvf_caller.clone(),
+            )
+            .with_runtime_env(Arc::clone(&tvf_runtime)),
+        ),
     );
     // V11 Delta Lake reader (`read_delta` TVF) is temporarily disabled for the
     // DataFusion 54 bump: delta-rs (deltalake-core) has no DF 54 release yet, so
@@ -267,8 +422,9 @@ pub fn build_embedded_context(memory_limit_bytes: usize) -> anyhow::Result<Sessi
 pub async fn build_embedded_context_with_warehouse(
     memory_limit_bytes: usize,
     mode: &WarehouseMode,
+    storage: &StorageConfig,
 ) -> anyhow::Result<(SessionContext, IcebergCatalogMap)> {
-    let ctx = build_embedded_context(memory_limit_bytes)?;
+    let ctx = build_embedded_context(memory_limit_bytes, storage)?;
     let mut iceberg_catalogs: IcebergCatalogMap = HashMap::new();
 
     let catalogs = match mode {
@@ -381,8 +537,9 @@ pub async fn build_embedded_context_with_backend(
     memory_limit_bytes: usize,
     backend: &sqe_core::config::CatalogBackend,
     catalog_name: &str,
+    storage: &StorageConfig,
 ) -> anyhow::Result<SessionContext> {
-    let ctx = build_embedded_context(memory_limit_bytes)?;
+    let ctx = build_embedded_context(memory_limit_bytes, storage)?;
     let catalog = sqe_catalog::SessionCatalog::build_backend_catalog(backend)
         .await
         .map_err(|e| anyhow::anyhow!("failed to build `{catalog_name}` catalog: {e}"))?;
@@ -429,6 +586,11 @@ pub struct EmbeddedClient {
     /// answer to "is `spec.catalog` a Hive root at all": a name absent from
     /// this map is either not attached or is some other kind of catalog.
     hive_roots: HashMap<String, Arc<sqe_catalog::hive::provider::HiveCatalogProvider>>,
+    /// The engine's object-store configuration, as resolved once from
+    /// `--s3-*` flags and the environment. Held so a Hive root attached
+    /// after start-up reads with the same endpoint and credentials the file
+    /// TVFs were registered with; see [`EmbeddedS3Options`].
+    storage: StorageConfig,
 }
 
 impl EmbeddedClient {
@@ -438,13 +600,15 @@ impl EmbeddedClient {
     /// [`Self::with_warehouse`].
     #[allow(dead_code)]
     pub fn new(memory_limit_bytes: usize) -> anyhow::Result<Self> {
+        let storage = EmbeddedS3Options::default().to_storage_config();
         Ok(Self {
-            ctx: build_embedded_context(memory_limit_bytes)?,
+            ctx: build_embedded_context(memory_limit_bytes, &storage)?,
             iceberg_catalogs: HashMap::new(),
             secrets: SecretStore::new(),
             attached_catalogs: HashMap::new(),
             hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
             hive_roots: HashMap::new(),
+            storage,
         })
     }
 
@@ -455,9 +619,11 @@ impl EmbeddedClient {
     pub async fn with_warehouse(
         memory_limit_bytes: usize,
         mode: &WarehouseMode,
+        s3: &EmbeddedS3Options,
     ) -> anyhow::Result<Self> {
+        let storage = s3.to_storage_config();
         let (ctx, iceberg_catalogs) =
-            build_embedded_context_with_warehouse(memory_limit_bytes, mode).await?;
+            build_embedded_context_with_warehouse(memory_limit_bytes, mode, &storage).await?;
         Ok(Self {
             ctx,
             iceberg_catalogs,
@@ -465,6 +631,7 @@ impl EmbeddedClient {
             attached_catalogs: HashMap::new(),
             hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
             hive_roots: HashMap::new(),
+            storage,
         })
     }
 
@@ -477,9 +644,16 @@ impl EmbeddedClient {
         memory_limit_bytes: usize,
         backend: sqe_core::config::CatalogBackend,
         catalog_name: &str,
+        s3: &EmbeddedS3Options,
     ) -> anyhow::Result<Self> {
-        let ctx =
-            build_embedded_context_with_backend(memory_limit_bytes, &backend, catalog_name).await?;
+        let storage = s3.to_storage_config();
+        let ctx = build_embedded_context_with_backend(
+            memory_limit_bytes,
+            &backend,
+            catalog_name,
+            &storage,
+        )
+        .await?;
         Ok(Self {
             ctx,
             iceberg_catalogs: HashMap::new(),
@@ -487,6 +661,7 @@ impl EmbeddedClient {
             attached_catalogs: HashMap::new(),
             hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
             hive_roots: HashMap::new(),
+            storage,
         })
     }
 
@@ -518,9 +693,7 @@ impl EmbeddedClient {
             anyhow::bail!("catalog '{name}' is already attached; DETACH it first");
         }
 
-        let mut storage = StorageConfig::default();
-        storage.tvf.allow_local_paths = true;
-        storage.tvf.allow_http = true;
+        let storage = self.storage.clone();
         let caller = sqe_core::config::TvfCaller::trusted_local();
 
         let root = sqe_catalog::mount::build_hive_root(
@@ -1001,6 +1174,131 @@ fn object_name_parts(name: &sqlparser::ast::ObjectName) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// A stub environment, so these tests never touch process-global
+    /// `std::env` and cannot race the rest of the binary.
+    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn s3_flag_beats_sqe_env_which_beats_aws_env() {
+        let env = env_of(&[
+            ("SQE_STORAGE__S3_ENDPOINT", "http://from-sqe-env:9000"),
+            ("AWS_ENDPOINT_URL", "http://from-aws-env:9000"),
+            ("SQE_STORAGE__S3_ACCESS_KEY", "sqe-key"),
+            ("AWS_ACCESS_KEY_ID", "aws-key"),
+            ("AWS_SECRET_ACCESS_KEY", "aws-secret"),
+            ("AWS_DEFAULT_REGION", "eu-west-1"),
+        ]);
+        let resolved = EmbeddedS3Options::resolve(
+            &EmbeddedS3Options {
+                endpoint: Some("http://from-flag:9000".to_string()),
+                ..EmbeddedS3Options::default()
+            },
+            env,
+        );
+        // Flag wins where given.
+        assert_eq!(resolved.endpoint.as_deref(), Some("http://from-flag:9000"));
+        // `SQE_STORAGE__*` wins over `AWS_*` for the same setting.
+        assert_eq!(resolved.access_key.as_deref(), Some("sqe-key"));
+        // `AWS_*` still fills what neither a flag nor `SQE_STORAGE__*` set.
+        assert_eq!(resolved.secret_key.as_deref(), Some("aws-secret"));
+        assert_eq!(resolved.region.as_deref(), Some("eu-west-1"));
+    }
+
+    #[test]
+    fn an_empty_flag_value_falls_through_to_the_environment() {
+        // `--s3-endpoint ""` is a user saying nothing, not a user asking for
+        // an empty endpoint: an empty string in `StorageConfig` means "real
+        // AWS" and would silently ignore the environment they did set.
+        let resolved = EmbeddedS3Options::resolve(
+            &EmbeddedS3Options {
+                endpoint: Some(String::new()),
+                ..EmbeddedS3Options::default()
+            },
+            env_of(&[("AWS_ENDPOINT_URL", "http://rustfs:9000")]),
+        );
+        assert_eq!(resolved.endpoint.as_deref(), Some("http://rustfs:9000"));
+    }
+
+    #[test]
+    fn aws_endpoint_url_s3_is_preferred_over_the_generic_spelling() {
+        let resolved = EmbeddedS3Options::resolve(
+            &EmbeddedS3Options::default(),
+            env_of(&[
+                ("AWS_ENDPOINT_URL", "http://generic:9000"),
+                ("AWS_ENDPOINT_URL_S3", "http://s3-specific:9000"),
+            ]),
+        );
+        assert_eq!(resolved.endpoint.as_deref(), Some("http://s3-specific:9000"));
+    }
+
+    #[test]
+    fn an_endpoint_override_implies_path_style_addressing() {
+        let storage = EmbeddedS3Options {
+            endpoint: Some("http://localhost:19100".to_string()),
+            ..EmbeddedS3Options::default()
+        }
+        .to_storage_config();
+        // `bucket.localhost:19100` does not resolve; path-style is the only
+        // addressing that reaches a self-hosted store.
+        assert!(storage.s3_path_style);
+        assert_eq!(storage.s3_endpoint, "http://localhost:19100");
+    }
+
+    #[test]
+    fn virtual_hosted_opts_back_out_of_path_style() {
+        let storage = EmbeddedS3Options {
+            endpoint: Some("http://minio.example:9000".to_string()),
+            virtual_hosted: true,
+            ..EmbeddedS3Options::default()
+        }
+        .to_storage_config();
+        assert!(!storage.s3_path_style);
+    }
+
+    #[test]
+    fn no_endpoint_override_keeps_virtual_hosted_addressing_for_real_aws() {
+        let storage = EmbeddedS3Options::default().to_storage_config();
+        assert!(!storage.s3_path_style);
+        assert!(storage.s3_endpoint.is_empty());
+    }
+
+    #[test]
+    fn credentials_land_in_the_storage_config_and_the_secret_stays_wrapped() {
+        let storage = EmbeddedS3Options {
+            access_key: Some("AKIAEXAMPLE".to_string()),
+            secret_key: Some("s3cr3t".to_string()),
+            region: Some("us-east-1".to_string()),
+            ..EmbeddedS3Options::default()
+        }
+        .to_storage_config();
+        assert_eq!(storage.s3_access_key, "AKIAEXAMPLE");
+        assert_eq!(storage.s3_secret_key.expose(), "s3cr3t");
+        assert_eq!(storage.s3_region, "us-east-1");
+        // The secret must not leak through Debug: the CLI prints its
+        // resolved config on some error paths, and `ps` already saw the flag.
+        assert!(
+            !format!("{:?}", storage.s3_secret_key).contains("s3cr3t"),
+            "SecretString must redact on Debug"
+        );
+    }
+
+    #[test]
+    fn embedded_storage_trusts_the_local_user_for_files_and_http() {
+        // Embedded mode runs as the local user, who owns this config and a
+        // shell already. The server fails closed instead; if this ever
+        // flips, `read_csv('/tmp/x.csv')` stops working in the CLI.
+        let storage = EmbeddedS3Options::default().to_storage_config();
+        assert!(storage.tvf.allow_local_paths);
+        assert!(storage.tvf.allow_http);
+    }
+
     #[tokio::test]
     async fn embedded_client_executes_select_literal() {
         let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
@@ -1151,7 +1449,7 @@ mod tests {
                 },
             ],
         };
-        let result = EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode).await;
+        let result = EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode, &EmbeddedS3Options::default()).await;
         let err = result.map(|_| ()).expect_err("duplicate names must error");
         let msg = format!("{err}");
         assert!(
@@ -1230,7 +1528,7 @@ mod tests {
             ],
         };
 
-        let mut c = EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode)
+        let mut c = EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode, &EmbeddedS3Options::default())
             .await
             .expect("two-catalog client builds");
 
@@ -1316,7 +1614,7 @@ mod tests {
             let mut c = bounded(
                 "phase1_open",
                 90,
-                EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode),
+                EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode, &EmbeddedS3Options::default()),
             )
             .await
             .expect("first client");
@@ -1342,7 +1640,7 @@ mod tests {
         let mut c = bounded(
             "phase2_open",
             90,
-            EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode),
+            EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode, &EmbeddedS3Options::default()),
         )
         .await
         .expect("client builds against existing warehouse");
@@ -1382,7 +1680,7 @@ mod tests {
     #[tokio::test]
     async fn memory_mode_skips_warehouse_setup() {
         let mode = WarehouseMode::Memory;
-        let mut c = EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode)
+        let mut c = EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode, &EmbeddedS3Options::default())
             .await
             .expect("memory client builds without disk");
         // Sanity: the session works.
