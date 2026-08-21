@@ -52,6 +52,12 @@ pub enum CatalogKind {
     Jdbc,
     Sqlite,
     Hadoop,
+    /// A Hive/Athena-style external table root: plain files under a
+    /// `LOCATION`, not an Iceberg catalog. Distinct from `Hms`, which is
+    /// the Hive Metastore holding Iceberg table metadata; `hive` keeps
+    /// meaning `Hms` for backward compatibility, so this kind needs its
+    /// own keyword, `hive_external`.
+    HiveExternal,
 }
 
 impl CatalogKind {
@@ -65,6 +71,7 @@ impl CatalogKind {
             "jdbc" => Some(Self::Jdbc),
             "sqlite" => Some(Self::Sqlite),
             "hadoop" => Some(Self::Hadoop),
+            "hive_external" => Some(Self::HiveExternal),
             _ => None,
         }
     }
@@ -79,6 +86,7 @@ impl CatalogKind {
             Self::Jdbc => "jdbc",
             Self::Sqlite => "sqlite",
             Self::Hadoop => "hadoop",
+            Self::HiveExternal => "hive_external",
         }
     }
 }

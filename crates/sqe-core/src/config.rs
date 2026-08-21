@@ -51,6 +51,12 @@ pub struct SqeConfig {
     /// operator opts in. See [`MaintenanceConfig`].
     #[serde(default)]
     pub maintenance: MaintenanceConfig,
+    /// Hive-style external-table warehouse roots to attach at startup, plus
+    /// the manifest size/shape caps every root enforces. See [`HiveConfig`].
+    /// Empty `roots` (the default) attaches nothing; `ATTACH ... TYPE
+    /// hive_external` remains the per-session alternative once wired.
+    #[serde(default)]
+    pub hive: HiveConfig,
 }
 
 /// Controls adaptive sort stripping behavior.
@@ -2091,6 +2097,64 @@ pub struct StorageConfig {
     pub tvf: TvfPolicy,
 }
 
+/// One Hive-style external-table warehouse root to attach at coordinator
+/// startup, the `[[hive.roots]]` TOML equivalent of `ATTACH <location> AS
+/// <name> (TYPE hive_external)`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct HiveRootConfig {
+    /// SQL identifier the root is exposed as (`<name>.<database>.<table>`).
+    pub name: String,
+    /// Warehouse root location (`s3://bucket/prefix/`, a local path, ...).
+    pub location: String,
+    /// Optional named secret (see `CREATE SECRET`) used when a manifest
+    /// under this root does not name its own `sqe.secret`. Currently
+    /// unused by `build_hive_root`/`session_hive_catalog`, which resolve a
+    /// secret from the manifest itself; reserved for a root-level default.
+    #[serde(default)]
+    pub secret: Option<String>,
+}
+
+fn default_hive_manifest_max_bytes() -> usize {
+    1 << 20
+}
+
+fn default_hive_manifest_max_columns() -> usize {
+    4096
+}
+
+fn default_hive_manifest_max_partition_keys() -> usize {
+    32
+}
+
+/// `[hive]`: warehouse roots to attach at coordinator startup, plus the
+/// manifest size/shape caps enforced on every root. The three caps default
+/// to the exact values `hive::manifest::ManifestLimits::default()` uses
+/// (`1048576` bytes, `4096` columns, `32` partition keys); a mismatch
+/// between the config default and the code default would be a config
+/// surface that silently lies about what it controls.
+#[derive(Debug, Deserialize, Clone)]
+pub struct HiveConfig {
+    #[serde(default)]
+    pub roots: Vec<HiveRootConfig>,
+    #[serde(default = "default_hive_manifest_max_bytes")]
+    pub manifest_max_bytes: usize,
+    #[serde(default = "default_hive_manifest_max_columns")]
+    pub manifest_max_columns: usize,
+    #[serde(default = "default_hive_manifest_max_partition_keys")]
+    pub manifest_max_partition_keys: usize,
+}
+
+impl Default for HiveConfig {
+    fn default() -> Self {
+        Self {
+            roots: Vec::new(),
+            manifest_max_bytes: default_hive_manifest_max_bytes(),
+            manifest_max_columns: default_hive_manifest_max_columns(),
+            manifest_max_partition_keys: default_hive_manifest_max_partition_keys(),
+        }
+    }
+}
+
 /// Security policy for table-valued-function path arguments.
 ///
 /// All defaults are fail-closed: cloud object stores (`s3://`, `abfss://`,
@@ -2203,10 +2267,23 @@ pub struct TvfCaller {
     /// Roles from the caller's JWT (`roles_claim`), matched against
     /// `[storage.tvf] object_store_admin_roles`.
     pub roles: Vec<String>,
-    /// `true` only for the embedded (in-process, single-tenant) CLI where
-    /// the caller already owns the process, its config, and its
-    /// credentials. Skips object-store prefix gating entirely. The
-    /// coordinator must NEVER set this for remote sessions.
+    /// `true` for a caller that already owns whatever it is reading, so
+    /// object-store prefix gating is skipped entirely: the embedded CLI
+    /// (`trusted_local`) and coordinator startup validating its own
+    /// operator-supplied TOML (`trusted_startup_config`). The coordinator
+    /// must NEVER set this for a remote session's query or DDL -- both
+    /// constructors below exist so a grep for `trusted: true` finds only
+    /// those two non-session call sites, never one that could be confused
+    /// with `for_user`.
+    ///
+    /// This field is `pub`, like the rest of the struct, so nothing at the
+    /// type level stops a struct literal from setting it directly and
+    /// bypassing both named constructors. The two constructors are not an
+    /// access-control boundary; they are the reviewable surface. A caller
+    /// site that writes `trusted: true` outside `trusted_local()` or
+    /// `trusted_startup_config()` is the thing to look for in review, and
+    /// grepping the token `trusted: true` (or either constructor's name)
+    /// finds every place that ever sets it -- there is no other way to.
     pub trusted: bool,
 }
 
@@ -2223,6 +2300,38 @@ impl TvfCaller {
     /// Trusted local caller (embedded CLI). Object-store prefix gating is
     /// skipped — the local user owns the config and the credentials in it.
     pub fn trusted_local() -> Self {
+        Self {
+            username: None,
+            roles: Vec::new(),
+            trusted: true,
+        }
+    }
+
+    /// Trusted caller representing OPERATOR-AUTHORED CONFIGURATION,
+    /// nothing else. Used exactly once in this codebase: coordinator
+    /// startup, validating a `[[hive.roots]]` entry from the TOML file the
+    /// operator deployed, before any session or request exists to build a
+    /// `for_user` caller from.
+    ///
+    /// MUST NEVER be constructed for anything that carries a user
+    /// identity, or on any path reachable from a request a caller sent --
+    /// an authenticated session's ATTACH, a TVF call, a query. Those go
+    /// through `for_user`, always. This constructor bypassing
+    /// object-store prefix gating is only safe because its one call site
+    /// runs before the coordinator accepts any connection; the same
+    /// bypass on a session path would let an authenticated-but-otherwise-
+    /// unprivileged caller read any `s3://`/`gs://`/`abfss://` location
+    /// the engine's own credentials can reach.
+    ///
+    /// Same effect as `trusted_local` -- object-store prefix gating is
+    /// skipped, local/http paths still need `[storage.tvf]
+    /// allow_local_paths` / `allow_http` regardless of `trusted` (see
+    /// `check_path`) -- but kept as its own name rather than reused from
+    /// the embedded-CLI constructor: an operator's TOML and a
+    /// single-tenant local process are trusted for different reasons, and
+    /// conflating them would make a future audit of "where is `trusted`
+    /// set" have to reason about both at once.
+    pub fn trusted_startup_config() -> Self {
         Self {
             username: None,
             roles: Vec::new(),
@@ -6002,6 +6111,7 @@ partial_progress_batch = 5
             query_cache: QueryCacheConfig::default(),
             query_history: QueryHistoryConfig::default(),
             maintenance: MaintenanceConfig::default(),
+            hive: HiveConfig::default(),
         }
     }
 
@@ -8138,6 +8248,32 @@ otlp_endpoint = ""
         assert!(policy
             .check_path("s3://bucket/x.csv", &TvfCaller::trusted_local(), false)
             .is_ok());
+    }
+
+    /// `trusted_startup_config` must bypass the object-store gate the same
+    /// way `trusted_local` does -- coordinator startup has no session to
+    /// build a `for_user` caller from, so a fail-closed default TvfPolicy
+    /// must not reject every operator-declared `[[hive.roots]]` `s3://` URL.
+    #[test]
+    fn tvf_object_store_trusted_startup_config_bypass() {
+        let policy = TvfPolicy::default();
+        assert!(policy
+            .check_path("s3://bucket/warehouse/", &TvfCaller::trusted_startup_config(), false)
+            .is_ok());
+    }
+
+    /// Unlike the object-store branch, `trusted` has no effect on the
+    /// local-path gate (`check_path`'s `allow_local_paths` branch never
+    /// reads `caller.trusted`), so a startup-config caller reading a local
+    /// path still needs the operator to opt in explicitly. Pins that
+    /// asymmetry so a future `check_path` refactor cannot silently start
+    /// trusting local paths too.
+    #[test]
+    fn tvf_local_path_ignores_trusted_startup_config() {
+        let policy = TvfPolicy::default();
+        assert!(policy
+            .check_path("/warehouse/lake", &TvfCaller::trusted_startup_config(), false)
+            .is_err());
     }
 
     #[test]

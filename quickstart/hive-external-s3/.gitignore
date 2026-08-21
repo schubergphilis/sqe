@@ -1,0 +1,6 @@
+# Generated fixtures and the pyarrow venv. `./run.sh --clean` removes both.
+data/
+.venv/
+.env
+# sqe-server's log from ./run.sh --server
+server.log

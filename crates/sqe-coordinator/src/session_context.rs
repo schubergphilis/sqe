@@ -186,7 +186,7 @@ async fn build_session_catalog(
 /// On a cache hit the `SessionContext` and `SessionCatalog` are cloned in O(1)
 /// and returned immediately, skipping all registration work.
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(skip(config, session, policy_store, query_tracker, runtime, prom_metrics, table_cache, runtime_catalogs), fields(username = %session.user.username))]
+#[tracing::instrument(skip(config, session, policy_store, query_tracker, runtime, prom_metrics, table_cache, runtime_catalogs, hive_manifest_cache, secrets), fields(username = %session.user.username))]
 pub async fn create_session_context(
     config: &SqeConfig,
     session: &Session,
@@ -196,6 +196,8 @@ pub async fn create_session_context(
     prom_metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
     table_cache: Option<&TableMetadataCache>,
     runtime_catalogs: &RuntimeCatalogRegistry,
+    hive_manifest_cache: &Arc<sqe_catalog::hive::provider::HiveMetadataCache>,
+    secrets: &sqe_core::SecretStore,
 ) -> sqe_core::Result<(SessionContext, Arc<SessionCatalog>)> {
     // --- Cache key: username + token fingerprint + session catalog/schema ---
     // Different tokens from the same user must not share a stale SessionCatalog.
@@ -220,6 +222,12 @@ pub async fn create_session_context(
     let username = session.user.username.clone();
     let attached_providers = runtime_catalogs
         .providers()
+        .map_err(sqe_core::SqeError::Catalog)?;
+    // Snapshot taken at the same moment as `attached_providers` above, for
+    // the same reason: it reflects the registry state at the moment of this
+    // cache miss, not whatever it grows to while the closure below awaits.
+    let hive_roots = runtime_catalogs
+        .hive_roots()
         .map_err(sqe_core::SqeError::Catalog)?;
     let result = SESSION_CONTEXT_CACHE
         .try_get_with(cache_key.clone(), async {
@@ -652,6 +660,75 @@ pub async fn create_session_context(
             // the cache miss.
             for (name, provider) in &attached_providers {
                 ctx.register_catalog(name.clone(), Arc::clone(provider));
+            }
+
+            // Register every Hive-style external-table warehouse root
+            // (`[[hive.roots]]` at startup, or `ATTACH ... TYPE
+            // hive_external` since) with a freshly built, SESSION-SCOPED
+            // `HiveCatalogProvider`. Unlike the Iceberg providers just
+            // above -- built once and cloned unchanged into every session
+            // -- a Hive provider cannot be reused across sessions. NOT
+            // because of `ctx.runtime_env()`: this path shares one
+            // `RuntimeEnv`/`ObjectStoreRegistry` across every session
+            // (`Arc::clone(rt)` a few hundred lines up), so a cached
+            // provider would not be looking anything up in a stale
+            // runtime. The real reason is `hive_caller` below: it is built
+            // fresh per session from `session.user`, and
+            // `TvfPolicy::check_path` gates each table load on it,
+            // including the `{user}`-substituted `allowed_object_store_prefixes`
+            // check. A provider built once and reused would carry the
+            // FIRST session's caller into every later session's table
+            // loads, silently applying one user's object-store allowlist
+            // to another user's query -- see `mount.rs`'s module doc
+            // comment above `build_hive_root` for the full case. Nothing
+            // here may be cached across sessions except `hive_roots` (the
+            // shared, session-independent `HiveManifestStore` per root --
+            // session-independent because it is built once at `ATTACH`
+            // time, NOT because it carries no caller: it does, baked in
+            // from whichever session ran the `ATTACH` (or
+            // `trusted_startup_config()` for a `[[hive.roots]]` entry), and
+            // every later session's manifest reads are gated against that
+            // one caller, not their own -- see `runtime_catalog.rs`'s "Hive
+            // lane" comment for the full case) and `hive_manifest_cache`
+            // (the one process-wide manifest cache every session's provider
+            // reads through).
+            //
+            // `cache_ttl` (60s) matches the embedded CLI's
+            // `attach_hive_root` and `HiveConfig`'s own manifest-cap
+            // defaults' sibling: how long a `HiveCatalogProvider`'s own
+            // `table_names()` listing is cached before the next `SHOW
+            // TABLES` re-lists. A fresh provider's cache starts empty, so
+            // the CALLING session always sees a `CREATE EXTERNAL TABLE` or
+            // `DROP TABLE` it just issued: `HiveDdlHandler` invalidates
+            // that session's own cached `SessionContext`
+            // (`invalidate_session_cache`, per-user, not the root-level
+            // ATTACH/DETACH convention's `invalidate_all_session_caches`),
+            // which forces this whole function to rebuild on that
+            // session's very next call, and a rebuild means a fresh,
+            // empty-cache provider here. A DIFFERENT session that already
+            // has a live `HiveCatalogProvider` for this root is not
+            // touched by that invalidation and keeps serving its own
+            // provider's `table_names()` cache until it naturally expires,
+            // up to the 60s TTL below -- a stale listing for that long is
+            // expected, correct behaviour, not a bug, but it is easy to
+            // misread this loop as re-registering every session's provider
+            // on every DDL statement, which it does not.
+            for (name, store) in &hive_roots {
+                let hive_caller = sqe_core::config::TvfCaller::for_user(
+                    session.user.username.clone(),
+                    session.user.roles.clone(),
+                );
+                let hive_provider = sqe_catalog::mount::session_hive_catalog(
+                    name,
+                    Arc::clone(store),
+                    &global_storage,
+                    secrets,
+                    hive_caller,
+                    ctx.runtime_env(),
+                    Arc::clone(hive_manifest_cache),
+                    std::time::Duration::from_secs(60),
+                );
+                ctx.register_catalog(name.clone(), hive_provider);
             }
 
             // Register the sha256() scalar function for column masking.

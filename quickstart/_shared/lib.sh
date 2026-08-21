@@ -73,6 +73,19 @@ assert_not_empty() {
   fi
 }
 
+# assert_eq <label> <actual> <expected> - exact string equality. Use when the
+# invariant is "these two runs agree", where a substring match would pass on a
+# value that merely contains the expected one (12 contains 1).
+assert_eq() {
+  local label=$1 actual=$2 expected=$3
+  if [ "$actual" = "$expected" ]; then
+    ok "$label"; CHECK_PASS=$((CHECK_PASS + 1))
+  else
+    warn "$label (expected '$expected', got '$actual')"
+    CHECK_FAIL=$((CHECK_FAIL + 1))
+  fi
+}
+
 # assert_not_contains <label> <output> <forbidden-substring>
 assert_not_contains() {
   local label=$1 output=$2 forbidden=$3

@@ -1,0 +1,89 @@
+# Server-mode config for the Hive external-tables quickstart.
+#
+# Used by `./run.sh --server`, which runs the same DDL and the same queries as
+# the embedded path but through a real `sqe-server` process over Flight SQL.
+# The point is that the SQL and the manifests do not change: only how the
+# statement reaches the engine does.
+#
+# There is deliberately NO Iceberg catalog service in this file that has to be
+# running. A Hive external table has no catalog behind it, so a coordinator
+# serving only Hive roots needs the object store and nothing else. `[catalog]`
+# below still has to be present because the config struct requires it, and it
+# points at a URL nobody is listening on: any Iceberg statement fails, every
+# Hive statement works. That is the claim being tested.
+
+[coordinator]
+# Offset from the production default (50051) so this can run alongside another
+# coordinator or a compose stack that already took the standard ports.
+flight_sql_port = 50151
+trino_http_port = 18081
+mode = "hybrid"
+flight_compression = "none"
+
+[worker]
+memory_limit = "2GB"
+spill_dir = "/tmp/sqe-hive-quickstart-spill"
+
+# ── Authentication ────────────────────────────────────────────────────────
+# DEV ONLY. Every connection is accepted as one "anonymous" identity with the
+# admin role, which is what lets this quickstart run with no IdP. SQE logs a
+# security warning on startup when this provider is active. For real auth see
+# the polaris-keycloak-* quickstarts.
+[auth]
+keycloak_url = ""
+realm = ""
+client_id = ""
+client_secret = ""
+ssl_verification = false
+
+[[auth.providers]]
+type = "anonymous"
+user = "anonymous"
+roles = ["admin"]
+
+# ── Catalog: present because the struct requires it, not because it is used ──
+# Nothing listens on this port. It exists so the shape of the config is honest
+# about what a Hive-only deployment still has to declare today.
+[catalog]
+polaris_url = "http://127.0.0.1:1/iceberg"
+warehouse = "unused"
+
+# ── Storage: the only thing a Hive root actually needs ────────────────────
+[storage]
+s3_endpoint = "http://localhost:19100"
+s3_region = "us-east-1"
+s3_access_key = "s3admin"
+s3_secret_key = "s3admin"
+# A self-hosted store is reached as host:port, where `bucket.host:port` does
+# not resolve, so addressing has to be path-style.
+s3_path_style = true
+s3_allow_http = true
+
+# Server mode fails closed on object-store paths: with no allowlist, EVERY
+# `s3://` read is denied, including the manifest load behind a Hive table.
+# This is the per-user authorization gate for Hive reads, and it is checked on
+# every manifest load rather than only at CREATE time, because reads use the
+# engine's credentials and not the caller's. `{user}` substitution is
+# available; this quickstart has one identity, so it names the bucket flatly.
+[storage.tvf]
+allowed_object_store_prefixes = ["s3://lake/"]
+
+# ── Hive roots, attached at startup ───────────────────────────────────────
+# The config equivalent of `ATTACH 's3://lake/wh/' AS lake (TYPE hive_external)`.
+# Attaching does not list or read anything: it is a path check against the
+# allowlist above, not a network call, so a wrong bucket here fails at the
+# first query rather than at boot.
+[hive]
+manifest_max_bytes = 1048576
+manifest_max_columns = 4096
+manifest_max_partition_keys = 32
+
+[[hive.roots]]
+name = "lake"
+location = "s3://lake/wh/"
+
+[policy]
+engine = "passthrough"
+
+[session]
+idle_timeout_secs = 900

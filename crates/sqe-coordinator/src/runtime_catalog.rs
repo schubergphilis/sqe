@@ -67,6 +67,9 @@ type ProviderList = Vec<(String, Arc<dyn CatalogProvider>)>;
 #[derive(Default, Clone)]
 pub struct RuntimeCatalogRegistry {
     inner: Arc<RwLock<HashMap<String, AttachedCatalog>>>,
+    /// The Hive lane. See the "Hive lane" section below for why this is a
+    /// second map rather than a second field on `AttachedCatalog`.
+    hive_roots: Arc<RwLock<HashMap<String, Arc<sqe_catalog::hive::store::HiveManifestStore>>>>,
 }
 
 impl RuntimeCatalogRegistry {
@@ -86,13 +89,30 @@ impl RuntimeCatalogRegistry {
         stmt: &AttachStatement,
         secrets: &SecretStore,
     ) -> Result<(), String> {
-        // 1) Refuse duplicate name (case-sensitive).
+        // 1) Refuse duplicate name (case-sensitive). Checks BOTH lanes: the
+        //    two share one SQL catalog-name namespace (see the "Hive lane"
+        //    section below), and checking only `self.inner` here would let
+        //    `ATTACH ... TYPE iceberg_rest` steal a name an attached Hive
+        //    root already holds. `attach_hive_root` already checks this
+        //    direction; this is the other half of that symmetry.
         {
             let r = self
                 .inner
                 .read()
                 .map_err(|_| "registry poisoned".to_string())?;
             if r.contains_key(&stmt.name) {
+                return Err(format!(
+                    "catalog '{}' is already attached; DETACH it first",
+                    stmt.name
+                ));
+            }
+        }
+        {
+            let hive = self
+                .hive_roots
+                .read()
+                .map_err(|_| "hive registry poisoned".to_string())?;
+            if hive.contains_key(&stmt.name) {
                 return Err(format!(
                     "catalog '{}' is already attached; DETACH it first",
                     stmt.name
@@ -199,5 +219,510 @@ impl RuntimeCatalogRegistry {
             .filter(|c| c.secret_ref.as_deref() == Some(secret_name))
             .map(|c| c.name.clone())
             .collect())
+    }
+
+    // -----------------------------------------------------------------------
+    // Hive lane
+    //
+    // A Hive root's `HiveCatalogProvider` is rebuilt PER SESSION by
+    // `create_session_context`. NOT because each session has its own
+    // `RuntimeEnv` -- production shares one across every session, so that
+    // is not the reason -- but because the provider's data-store factory
+    // embeds that session's `TvfCaller`, and `TvfPolicy::check_path` gates
+    // every table load on it (see `mount.rs`'s module doc comment above
+    // `build_hive_root` for the full case). A provider built once and
+    // reused across sessions would carry one session's caller into every
+    // other session's table loads. Only the underlying `HiveManifestStore`
+    // is session-independent, so that is all this lane stores -- but
+    // "session-independent" does not mean caller-free. `HiveManifestStore`
+    // (`hive/store.rs`) DOES carry a `TvfCaller` (its `caller` field, used
+    // in `put`/`get`'s `check_path` calls): the caller of whichever session
+    // ran the `ATTACH` (or `trusted_startup_config()` for a `[[hive.roots]]`
+    // entry), baked in once and shared by every later session's reads. For
+    // a config-attached root that caller is `trusted`, so `check_path`'s
+    // object-store branch never evaluates `allowed_object_store_prefixes`
+    // at all (`file://`/`http(s)://` are still gated); for an
+    // `ATTACH`-created root it is the attaching session's real caller, so
+    // every later reader's manifest load is authorized against whoever
+    // attached, not against themselves -- fail-closed (a false denial for
+    // a more-privileged later reader), not an escalation.
+    //
+    // It is a second map, not a second
+    // `AttachedCatalog` field, because the two kinds cannot share one
+    // representation: an Iceberg entry's `provider` is exactly the thing
+    // every session reuses unchanged, and a Hive entry's `store` is
+    // exactly the thing no session may reuse the provider built from.
+    //
+    // Both lanes share one SQL catalog-name namespace, so attach/detach on
+    // either checks the other for a collision.
+
+    /// Attach a Hive-style external-table warehouse root's manifest store
+    /// under `name`. Errors if `name` is already attached, in either lane.
+    pub fn attach_hive_root(
+        &self,
+        name: &str,
+        store: Arc<sqe_catalog::hive::store::HiveManifestStore>,
+    ) -> Result<(), String> {
+        {
+            let iceberg = self
+                .inner
+                .read()
+                .map_err(|_| "registry poisoned".to_string())?;
+            if iceberg.contains_key(name) {
+                return Err(format!(
+                    "catalog '{name}' is already attached; DETACH it first"
+                ));
+            }
+        }
+        let mut hive = self
+            .hive_roots
+            .write()
+            .map_err(|_| "hive registry poisoned".to_string())?;
+        if hive.contains_key(name) {
+            return Err(format!(
+                "catalog '{name}' is already attached; DETACH it first"
+            ));
+        }
+        hive.insert(name.to_string(), store);
+        info!(catalog = %name, kind = "hive_external", "Catalog attached at runtime");
+        Ok(())
+    }
+
+    /// Detach a Hive root by name. Errors if the name is not an attached
+    /// Hive root (including when it names an attached Iceberg catalog
+    /// instead -- callers distinguish the two lanes with `is_hive_root`
+    /// before choosing which detach to call).
+    pub fn detach_hive_root(&self, name: &str) -> Result<(), String> {
+        let mut hive = self
+            .hive_roots
+            .write()
+            .map_err(|_| "hive registry poisoned".to_string())?;
+        if hive.remove(name).is_none() {
+            return Err(format!("catalog '{name}' is not attached"));
+        }
+        info!(catalog = %name, "Catalog detached at runtime");
+        Ok(())
+    }
+
+    /// Whether `name` is an attached Hive root. Used by `DETACH` dispatch
+    /// to pick the right lane, and by callers that need to tell a Hive
+    /// catalog name apart from an Iceberg one without a full policy-key
+    /// resolution.
+    pub fn is_hive_root(&self, name: &str) -> Result<bool, String> {
+        let hive = self
+            .hive_roots
+            .read()
+            .map_err(|_| "hive registry poisoned".to_string())?;
+        Ok(hive.contains_key(name))
+    }
+
+    /// All attached `(name, store)` pairs, sorted by name.
+    ///
+    /// Called by `create_session_context` to build and register a fresh,
+    /// session-scoped `HiveCatalogProvider` over each root for every
+    /// `SessionContext` it builds -- the Hive-lane counterpart of
+    /// `providers()` above, which registers the Iceberg lane's providers
+    /// as-is instead of rebuilding them.
+    pub fn hive_roots(
+        &self,
+    ) -> Result<Vec<(String, Arc<sqe_catalog::hive::store::HiveManifestStore>)>, String> {
+        let hive = self
+            .hive_roots
+            .read()
+            .map_err(|_| "hive registry poisoned".to_string())?;
+        let mut pairs: Vec<_> = hive
+            .iter()
+            .map(|(name, store)| (name.clone(), Arc::clone(store)))
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(pairs)
+    }
+}
+
+/// Attach every `[[hive.roots]]` configured root at coordinator startup,
+/// mirroring the `[catalogs.*]` static-config loop for Iceberg catalogs
+/// (`create_session_context`'s `flattened` loop). Shared by both
+/// coordinator binaries (`main.rs`, `bin/sqe_server.rs`) so they cannot
+/// drift on this the way their `hive_catalogs`/`hive_manifest_cache`
+/// constructions above them are already (independently) duplicated.
+///
+/// `TvfCaller::trusted_startup_config()` is required, not incidental:
+/// `build_hive_root`'s `check_path` gate is fail-closed by default and
+/// there is no session/user identity yet at startup to build a `for_user`
+/// caller from. An operator's own TOML is trusted the same way the
+/// embedded CLI trusts `--hive-root`; a local-path root still needs
+/// `[storage.tvf] allow_local_paths = true` regardless, since `trusted`
+/// only bypasses the object-store branch of `check_path` (see that
+/// function's own comment).
+///
+/// Also inserts each attached name into `hive_catalogs`, the security
+/// registry `resolve_policy_key` reads live: a root missing from it would
+/// key every table under the Iceberg namespace convention instead (#7's
+/// escalation, reached from the config-file door instead of `ATTACH`).
+///
+/// `default_catalog` must be `config.resolve_default_catalog()`. A root
+/// named the same as the session's default catalog is refused outright
+/// (see the name check below): `resolve_policy_key` (`sqe-policy`) and
+/// `CatalogRoutedTagSource` (`hive_tag_source.rs`) both dispatch on
+/// `table_ref.catalog()` alone, which is `None` for a two-part reference
+/// (`sales.orders`) -- DataFusion preserves the AS-WRITTEN reference in
+/// the scan, it does not fill in the resolved default catalog. A two-part
+/// reference under a Hive-named default catalog would therefore take the
+/// Iceberg branch of BOTH functions regardless of what the reference
+/// actually resolves against, either denying every row (no tag-source
+/// cache entry -> `lit(false)`) or, worse, inheriting whatever grants
+/// exist for a same-named Iceberg namespace. Refusing the name collision
+/// here closes both symptoms at the one place a two-part reference could
+/// ever reach a Hive table this way, without touching either dispatch
+/// site (see the report for why promoting the reference inside the
+/// policy path is deliberately deferred, not overlooked).
+pub async fn attach_configured_hive_roots(
+    hive_config: &sqe_core::config::HiveConfig,
+    storage: &sqe_core::config::StorageConfig,
+    registry: &RuntimeCatalogRegistry,
+    hive_catalogs: &sqe_policy::plan_rewriter::HiveCatalogs,
+    default_catalog: &str,
+) -> Result<(), String> {
+    let limits = sqe_catalog::hive::manifest::ManifestLimits {
+        max_bytes: hive_config.manifest_max_bytes,
+        max_columns: hive_config.manifest_max_columns,
+        max_partition_keys: hive_config.manifest_max_partition_keys,
+    };
+    for root in &hive_config.roots {
+        if root.name == default_catalog {
+            return Err(format!(
+                "[[hive.roots]] '{}' collides with the session default catalog '{default_catalog}': \
+                 a two-part table reference under this default resolves to a Hive table without \
+                 either the policy key or the tag route ever seeing its catalog name, so a root \
+                 cannot share a name with the default catalog. Rename the root or set \
+                 query.default_catalog to something else",
+                root.name
+            ));
+        }
+        let store = sqe_catalog::mount::build_hive_root(
+            &root.location,
+            &std::collections::BTreeMap::new(),
+            storage,
+            limits,
+            sqe_core::config::TvfCaller::trusted_startup_config(),
+        )
+        .await
+        .map_err(|e| format!("[[hive.roots]] {}={}: {e}", root.name, root.location))?;
+        registry.attach_hive_root(&root.name, store)?;
+        hive_catalogs.insert(&root.name);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod hive_lane_tests {
+    use super::*;
+
+    async fn local_hive_store(
+        dir: &std::path::Path,
+    ) -> Arc<sqe_catalog::hive::store::HiveManifestStore> {
+        let mut storage = sqe_core::config::StorageConfig::default();
+        storage.tvf.allow_local_paths = true;
+        sqe_catalog::mount::build_hive_root(
+            &format!("file://{}", dir.display()),
+            &std::collections::BTreeMap::new(),
+            &storage,
+            sqe_catalog::hive::manifest::ManifestLimits::default(),
+            sqe_core::config::TvfCaller::trusted_local(),
+        )
+        .await
+        .expect("build_hive_root")
+    }
+
+    #[tokio::test]
+    async fn attach_hive_root_then_lists_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = RuntimeCatalogRegistry::new();
+        let store = local_hive_store(dir.path()).await;
+
+        registry.attach_hive_root("lake", store).expect("attach");
+
+        assert!(registry.is_hive_root("lake").expect("is_hive_root"));
+        let roots = registry.hive_roots().expect("hive_roots");
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].0, "lake");
+    }
+
+    #[tokio::test]
+    async fn attach_hive_root_rejects_duplicate_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = RuntimeCatalogRegistry::new();
+        let store = local_hive_store(dir.path()).await;
+        registry
+            .attach_hive_root("lake", Arc::clone(&store))
+            .expect("first attach");
+
+        let err = registry
+            .attach_hive_root("lake", store)
+            .expect_err("duplicate attach must fail");
+        assert!(err.contains("already attached"), "{err}");
+    }
+
+    /// Minimal `iceberg::Catalog` stub so the cross-lane collision test below
+    /// can populate the Iceberg lane without a real backend (no `sql-sqlite`
+    /// feature, no network). Every method is unreachable: the test only
+    /// exercises registry bookkeeping, never catalog behavior.
+    #[derive(Debug)]
+    struct UnreachableCatalog;
+
+    #[async_trait::async_trait]
+    impl iceberg::Catalog for UnreachableCatalog {
+        async fn list_namespaces(
+            &self,
+            _parent: Option<&iceberg::NamespaceIdent>,
+        ) -> iceberg::Result<Vec<iceberg::NamespaceIdent>> {
+            unimplemented!("test stub")
+        }
+        async fn create_namespace(
+            &self,
+            _namespace: &iceberg::NamespaceIdent,
+            _properties: HashMap<String, String>,
+        ) -> iceberg::Result<iceberg::Namespace> {
+            unimplemented!("test stub")
+        }
+        async fn get_namespace(
+            &self,
+            _namespace: &iceberg::NamespaceIdent,
+        ) -> iceberg::Result<iceberg::Namespace> {
+            unimplemented!("test stub")
+        }
+        async fn namespace_exists(&self, _namespace: &iceberg::NamespaceIdent) -> iceberg::Result<bool> {
+            unimplemented!("test stub")
+        }
+        async fn update_namespace(
+            &self,
+            _namespace: &iceberg::NamespaceIdent,
+            _properties: HashMap<String, String>,
+        ) -> iceberg::Result<()> {
+            unimplemented!("test stub")
+        }
+        async fn drop_namespace(&self, _namespace: &iceberg::NamespaceIdent) -> iceberg::Result<()> {
+            unimplemented!("test stub")
+        }
+        async fn list_tables(
+            &self,
+            _namespace: &iceberg::NamespaceIdent,
+        ) -> iceberg::Result<Vec<iceberg::TableIdent>> {
+            unimplemented!("test stub")
+        }
+        async fn create_table(
+            &self,
+            _namespace: &iceberg::NamespaceIdent,
+            _creation: iceberg::TableCreation,
+        ) -> iceberg::Result<iceberg::table::Table> {
+            unimplemented!("test stub")
+        }
+        async fn load_table(&self, _table: &iceberg::TableIdent) -> iceberg::Result<iceberg::table::Table> {
+            unimplemented!("test stub")
+        }
+        async fn drop_table(&self, _table: &iceberg::TableIdent) -> iceberg::Result<()> {
+            unimplemented!("test stub")
+        }
+        async fn table_exists(&self, _table: &iceberg::TableIdent) -> iceberg::Result<bool> {
+            unimplemented!("test stub")
+        }
+        async fn rename_table(
+            &self,
+            _src: &iceberg::TableIdent,
+            _dest: &iceberg::TableIdent,
+        ) -> iceberg::Result<()> {
+            unimplemented!("test stub")
+        }
+        async fn register_table(
+            &self,
+            _table: &iceberg::TableIdent,
+            _metadata_location: String,
+        ) -> iceberg::Result<iceberg::table::Table> {
+            unimplemented!("test stub")
+        }
+        async fn update_table(&self, _commit: iceberg::TableCommit) -> iceberg::Result<iceberg::table::Table> {
+            unimplemented!("test stub")
+        }
+    }
+
+    /// The other half of the symmetry: `attach()` (the Iceberg lane) must
+    /// also refuse a name an attached Hive root already holds, not just the
+    /// reverse (`attach_hive_root_rejects_name_already_attached_as_iceberg`
+    /// below). Before this check existed, `ATTACH ... AS lake (TYPE
+    /// iceberg_rest)` would succeed while `lake` was an attached Hive root
+    /// -- self-consistent rather than an escalation (the Hive provider
+    /// still wins DataFusion's catalog registration, and `hive_catalogs`
+    /// still keys those tables Hive-side), but only by accident of which
+    /// registration loop runs last, which a later refactor could silently
+    /// reverse.
+    ///
+    /// `TYPE sqlite` needs the `sql-sqlite` feature to actually build a
+    /// catalog, but the collision check runs before `build_catalog` is
+    /// ever called, so this test does not need that feature: it proves the
+    /// check fires, not that a sqlite catalog can be built.
+    #[tokio::test]
+    async fn attach_rejects_name_already_attached_as_hive_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = RuntimeCatalogRegistry::new();
+        let store = local_hive_store(dir.path()).await;
+        registry
+            .attach_hive_root("lake", store)
+            .expect("hive attach");
+
+        let secrets = sqe_core::SecretStore::new();
+        let attach_stmt = sqe_sql::AttachStatement {
+            name: "lake".to_string(),
+            location: "sqlite://:memory:".to_string(),
+            kind: sqe_sql::CatalogKind::Sqlite,
+            options: std::collections::BTreeMap::new(),
+        };
+        let err = registry
+            .attach(&attach_stmt, &secrets)
+            .await
+            .expect_err("must not shadow an attached hive root");
+        assert!(err.contains("already attached"), "{err}");
+    }
+
+    /// The two lanes share one SQL catalog-name namespace: a Hive root
+    /// cannot steal a name an Iceberg `ATTACH` already holds, and (proven
+    /// separately by `detach_hive_root_then_forgets_it` below) neither can
+    /// `DETACH` cross the boundary and silently no-op the wrong lane.
+    ///
+    /// Populates the Iceberg lane directly (module-private field access)
+    /// rather than through `attach()`, which would need a real backend
+    /// (`sql-sqlite` feature, or network for a REST/Glue/HMS catalog) --
+    /// this test cares about the name-collision check, not catalog
+    /// construction.
+    #[tokio::test]
+    async fn attach_hive_root_rejects_name_already_attached_as_iceberg() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = RuntimeCatalogRegistry::new();
+        let iceberg_catalog: Arc<dyn iceberg::Catalog> = Arc::new(UnreachableCatalog);
+        let provider: Arc<dyn CatalogProvider> = Arc::new(
+            datafusion::catalog::MemoryCatalogProvider::new(),
+        );
+        registry.inner.write().unwrap().insert(
+            "lake".to_string(),
+            AttachedCatalog {
+                name: "lake".to_string(),
+                kind: sqe_sql::CatalogKind::IcebergRest,
+                catalog: iceberg_catalog,
+                provider,
+                secret_ref: None,
+            },
+        );
+
+        let store = local_hive_store(dir.path()).await;
+        let err = registry
+            .attach_hive_root("lake", store)
+            .expect_err("must not shadow an attached iceberg catalog");
+        assert!(err.contains("already attached"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn detach_hive_root_then_forgets_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = RuntimeCatalogRegistry::new();
+        let store = local_hive_store(dir.path()).await;
+        registry.attach_hive_root("lake", store).expect("attach");
+
+        registry.detach_hive_root("lake").expect("detach");
+
+        assert!(!registry.is_hive_root("lake").expect("is_hive_root"));
+        assert!(registry.hive_roots().expect("hive_roots").is_empty());
+    }
+
+    #[tokio::test]
+    async fn detach_hive_root_unknown_name_errors() {
+        let registry = RuntimeCatalogRegistry::new();
+        let err = registry
+            .detach_hive_root("nope")
+            .expect_err("unknown name must error");
+        assert!(err.contains("not attached"), "{err}");
+    }
+
+    /// Proves the actual startup wiring this task adds: `[[hive.roots]]`
+    /// entries land in the registry AND in `hive_catalogs` (the live set
+    /// `resolve_policy_key` reads), not just one or the other.
+    #[tokio::test]
+    async fn attach_configured_hive_roots_populates_both_registries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut storage = sqe_core::config::StorageConfig::default();
+        storage.tvf.allow_local_paths = true;
+        let hive_config = sqe_core::config::HiveConfig {
+            roots: vec![sqe_core::config::HiveRootConfig {
+                name: "lake".to_string(),
+                location: format!("file://{}", dir.path().display()),
+                secret: None,
+            }],
+            ..sqe_core::config::HiveConfig::default()
+        };
+        let registry = RuntimeCatalogRegistry::new();
+        let hive_catalogs = sqe_policy::plan_rewriter::HiveCatalogs::new();
+
+        attach_configured_hive_roots(&hive_config, &storage, &registry, &hive_catalogs, "iceberg")
+            .await
+            .expect("attach_configured_hive_roots");
+
+        assert!(registry.is_hive_root("lake").expect("is_hive_root"));
+        assert!(hive_catalogs.contains_name(Some("lake")));
+    }
+
+    /// The collision this task's security review found: a root named the
+    /// same as the session default catalog must be refused, naming both,
+    /// rather than attached silently. Mutation-checked: removing the
+    /// `root.name == default_catalog` check made this test fail (the
+    /// attach succeeded).
+    #[tokio::test]
+    async fn attach_configured_hive_roots_refuses_a_name_matching_the_default_catalog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut storage = sqe_core::config::StorageConfig::default();
+        storage.tvf.allow_local_paths = true;
+        let hive_config = sqe_core::config::HiveConfig {
+            roots: vec![sqe_core::config::HiveRootConfig {
+                name: "lake".to_string(),
+                location: format!("file://{}", dir.path().display()),
+                secret: None,
+            }],
+            ..sqe_core::config::HiveConfig::default()
+        };
+        let registry = RuntimeCatalogRegistry::new();
+        let hive_catalogs = sqe_policy::plan_rewriter::HiveCatalogs::new();
+
+        let err = attach_configured_hive_roots(&hive_config, &storage, &registry, &hive_catalogs, "lake")
+            .await
+            .expect_err("a root named like the default catalog must be refused");
+        assert!(err.contains("lake"), "{err}");
+        assert!(!registry.is_hive_root("lake").unwrap_or(false));
+        assert!(!hive_catalogs.contains_name(Some("lake")));
+    }
+
+    /// An unreachable location (no `allow_local_paths`, so `check_path`
+    /// fails closed) must fail the whole startup loop with a message that
+    /// names the offending root, not silently skip it or panic.
+    #[tokio::test]
+    async fn attach_configured_hive_roots_fails_closed_on_a_bad_root() {
+        let hive_config = sqe_core::config::HiveConfig {
+            roots: vec![sqe_core::config::HiveRootConfig {
+                name: "lake".to_string(),
+                location: "/no/such/warehouse".to_string(),
+                secret: None,
+            }],
+            ..sqe_core::config::HiveConfig::default()
+        };
+        let registry = RuntimeCatalogRegistry::new();
+        let hive_catalogs = sqe_policy::plan_rewriter::HiveCatalogs::new();
+
+        let err = attach_configured_hive_roots(
+            &hive_config,
+            &sqe_core::config::StorageConfig::default(),
+            &registry,
+            &hive_catalogs,
+            "iceberg",
+        )
+        .await
+        .expect_err("local paths are disabled by default");
+        assert!(err.contains("lake"), "{err}");
+        assert!(!hive_catalogs.contains_name(Some("lake")));
     }
 }

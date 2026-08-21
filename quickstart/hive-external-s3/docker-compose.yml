@@ -1,0 +1,43 @@
+# S3-compatible object storage for the Hive external-tables quickstart.
+#
+# RustFS is a small, Apache-2.0, S3-compatible store. Nothing here is
+# RustFS-specific: MinIO, Ceph RGW, Garage, or a real S3 bucket work the
+# same way, which is the point. SQE talks S3 and nothing else.
+#
+# Port 19100 is offset from the integration stack's 19000 (docker-compose.test.yml)
+# so this quickstart can run while that stack is up.
+services:
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: hive-quickstart-rustfs
+    environment:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:-s3admin}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:-s3admin}
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_VOLUMES: /data
+    volumes:
+      - rustfs-data:/data
+    ports:
+      - "${S3_PORT:-19100}:9000"
+
+
+  # S3 client for bootstrapping the bucket and uploading fixtures, for hosts
+  # without the aws CLI installed. `profiles` keeps it out of `up`; run.sh
+  # invokes it with `docker compose run --rm awscli ...`. It reaches the store
+  # on the compose network (http://rustfs:9000) while the engine reaches the
+  # same bucket from the host on localhost.
+  awscli:
+    image: amazon/aws-cli:latest
+    profiles: ["tools"]
+    depends_on:
+      - rustfs
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-s3admin}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-s3admin}
+      AWS_DEFAULT_REGION: ${S3_REGION:-us-east-1}
+    volumes:
+      - .:/work
+    working_dir: /work
+
+volumes:
+  rustfs-data:

@@ -12,6 +12,8 @@ pub mod distributed_scan;
 pub mod explain;
 pub mod flight_sql;
 pub mod flight_sql_helpers;
+pub mod hive_ddl_handler;
+pub mod hive_tag_source;
 pub mod maintenance;
 pub mod maintenance_lease;
 pub mod maintenance_log;

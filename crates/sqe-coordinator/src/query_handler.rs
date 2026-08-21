@@ -5,6 +5,7 @@ use arrow_array::RecordBatch;
 use arrow_array::{builder::StringBuilder, ArrayRef, BooleanArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::TableReference;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::JoinType;
@@ -192,6 +193,71 @@ pub struct QueryHandler {
     /// same idle worker; incremented on assignment, decremented on fragment
     /// completion via [`ReservationGuard`].
     worker_load: Arc<crate::worker_registry::WorkerLoadTracker>,
+    /// Live registry of Hive-external catalog names, read by
+    /// `resolve_policy_key` (via `PolicyPlanRewriter`) to decide whether a
+    /// table keys under its warehouse root or the Iceberg convention.
+    /// `ATTACH ... TYPE hive_external` / `DETACH` insert/remove here so
+    /// policy resolution sees a root attached mid-session on its very next
+    /// statement.
+    ///
+    /// `None` until `with_hive_registries` is called, and `handle_attach`'s
+    /// `hive_external` branch REFUSES to attach when it is `None`, rather
+    /// than falling back to a fresh private registry. A private default
+    /// would look like it worked: `ATTACH` would succeed, the root would
+    /// become readable, and `resolve_policy_key` -- consulting the real
+    /// registry this QueryHandler's `PolicyPlanRewriter` was built with,
+    /// which never heard about the attach -- would key every table in that
+    /// root under the Iceberg namespace convention instead. A grant written
+    /// for a same-named Iceberg namespace would then govern those tables:
+    /// exactly the escalation Task 7 exists to close, reached through a
+    /// wiring gap instead of a parser gap, and invisible to a type check,
+    /// a test, or a review of the call site, because the code looks
+    /// complete either way. Refusing instead of silently misrouting is the
+    /// only way to make that gap loud. Production binaries (`main.rs`,
+    /// `bin/sqe_server.rs`) call `with_hive_registries` with the SAME `Arc`
+    /// the `PolicyPlanRewriter` was built from; a second, independent
+    /// instance here would compile and route nothing, which is exactly why
+    /// this is not "any registry", it is "that one or none".
+    hive_catalogs: Option<Arc<sqe_policy::plan_rewriter::HiveCatalogs>>,
+    /// Process-wide cache of parsed Hive manifests, shared by every
+    /// session's `HiveCatalogProvider` (`create_session_context`) and by
+    /// the `HiveTagSource` the policy rewriter reads column tags through.
+    ///
+    /// Unlike `hive_catalogs`, this one is NOT `Option`: it stays a plain
+    /// `Arc`, always valid, because its un-wired failure mode is the safe
+    /// direction rather than the dangerous one. `create_session_context`'s
+    /// per-session loop only ever touches this cache when
+    /// `runtime_catalogs.hive_roots()` is non-empty, which (after the
+    /// `hive_catalogs` guard above) can only happen via
+    /// `attach_configured_hive_roots` at startup -- not reachable by any
+    /// SQL a session can send. If a deployment's startup code called that
+    /// but forgot `with_hive_registries`, this field would be a private
+    /// cache instead of the one instance `HiveTagSource` (built from the
+    /// SAME `Arc` in `main.rs`/`bin/sqe_server.rs`) reads through. The
+    /// `HiveCatalogProvider` built from the private cache would still
+    /// resolve the table for scanning, populating the wrong cache; the
+    /// policy rewriter's lookup against the right one would then miss,
+    /// and a cache miss is treated as "tags unknown", not "no tags" (see
+    /// `hive_tag_source.rs`), which the rewriter turns into a `lit(false)`
+    /// row filter. The query still runs; it returns zero rows. That is
+    /// Task 7's fail-closed contract doing its job on a wiring bug it was
+    /// never told about, not a hole -- confirmed by reading the source,
+    /// not assumed.
+    hive_manifest_cache: Arc<sqe_catalog::hive::provider::HiveMetadataCache>,
+    /// Server-mode Hive DDL: `resolve_table_kind` (the single Hive/Iceberg
+    /// branch point), `CREATE EXTERNAL TABLE`, `DROP TABLE`, `SHOW CREATE
+    /// TABLE`, `SHOW TABLES`. Holds a live clone of `runtime_catalogs`, so an
+    /// `ATTACH` mid-session is visible on its very next call, not stale from
+    /// construction. Its own `hive_catalogs` mirrors the `Option` on this
+    /// struct: `None` until `with_hive_registries` runs, refusing rather
+    /// than writing a manifest the policy layer cannot see. Also wired with
+    /// this handler's `policy_store` and `config.policy.mask_precedence` (via
+    /// `with_policy`, at construction) so `SHOW TABLES`/`SHOW CREATE TABLE`
+    /// against a Hive root are gated by the SAME policy resolution the plan
+    /// rewriter applies to a real Iceberg scan, since a Hive manifest store
+    /// has no external metastore to delegate that filtering to the way
+    /// Polaris does for Iceberg.
+    hive_ddl_handler: crate::hive_ddl_handler::HiveDdlHandler,
 }
 
 impl QueryHandler {
@@ -292,6 +358,13 @@ impl QueryHandler {
 
         let profile_mode = sqe_core::ProfileMode::parse(&config.query.query_profile);
 
+        let mut hive_ddl_handler =
+            crate::hive_ddl_handler::HiveDdlHandler::new(runtime_catalogs.clone(), secrets.clone())
+                .with_policy(policy_store.clone(), config.policy.mask_precedence);
+        if let Some(ref a) = audit {
+            hive_ddl_handler = hive_ddl_handler.with_audit(Arc::clone(a));
+        }
+
         Ok(Self {
             policy_enforcer,
             policy_store,
@@ -321,7 +394,61 @@ impl QueryHandler {
             runtime_catalogs,
             secrets,
             worker_load: Arc::new(crate::worker_registry::WorkerLoadTracker::new()),
+            hive_catalogs: None,
+            hive_manifest_cache: Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
+            hive_ddl_handler,
         })
+    }
+
+    /// Wire the process-wide `hive_catalogs` / `hive_manifest_cache`
+    /// instances the caller's `PolicyPlanRewriter` and
+    /// `CatalogRoutedTagSource` were built from (see `main.rs` /
+    /// `bin/sqe_server.rs`).
+    ///
+    /// Skipping this call does NOT default to a private registry: it
+    /// leaves `hive_catalogs` at `None`, and `ATTACH ... TYPE
+    /// hive_external` REFUSES rather than attaching into a registry the
+    /// policy layer cannot see (see the field's own doc comment for why a
+    /// silent fallback there is a privilege-escalation footgun, not a
+    /// convenience). A QueryHandler that never attaches a Hive root --
+    /// which is every test and embedding except the two production
+    /// binaries -- is unaffected either way. Production wiring MUST call
+    /// this.
+    #[must_use = "with_hive_registries consumes self; bind the returned QueryHandler"]
+    pub fn with_hive_registries(
+        mut self,
+        hive_catalogs: Arc<sqe_policy::plan_rewriter::HiveCatalogs>,
+        hive_manifest_cache: Arc<sqe_catalog::hive::provider::HiveMetadataCache>,
+    ) -> Self {
+        self.hive_ddl_handler = self
+            .hive_ddl_handler
+            .with_hive_registries(Arc::clone(&hive_catalogs));
+        self.hive_catalogs = Some(hive_catalogs);
+        self.hive_manifest_cache = hive_manifest_cache;
+        self
+    }
+
+    /// The single Hive/Iceberg branch point (see
+    /// [`crate::hive_ddl_handler::HiveDdlHandler::resolve_table_kind`]).
+    /// Exposed on `QueryHandler` so dispatch sites in this file and
+    /// integration tests share one answer for "is this table Hive or
+    /// Iceberg" instead of each growing their own detection.
+    pub fn resolve_table_kind(&self, table_ref: &TableReference) -> crate::hive_ddl_handler::TableKind {
+        self.hive_ddl_handler.resolve_table_kind(table_ref)
+    }
+
+    /// The session-default-catalog-aware variant (see
+    /// [`crate::hive_ddl_handler::HiveDdlHandler::resolve_table_kind_for_session`]),
+    /// exposed the same way and for the same reason as `resolve_table_kind`
+    /// above: `reject_if_hive_table` and integration tests share this one
+    /// answer rather than each re-deriving the promotion.
+    pub fn resolve_table_kind_for_session(
+        &self,
+        default_catalog: Option<&str>,
+        table_ref: &TableReference,
+    ) -> crate::hive_ddl_handler::TableKind {
+        self.hive_ddl_handler
+            .resolve_table_kind_for_session(default_catalog, table_ref)
     }
 
     /// Attach the session manager so `SET WRITE_BRANCH` can mutate session state.
@@ -619,6 +746,18 @@ impl QueryHandler {
         known.insert("system".to_string());
         known.insert("datafusion".to_string());
         known.extend(self.runtime_catalogs.list().map_err(SqeError::Catalog)?);
+        // `runtime_catalogs.list()` only sees the Iceberg lane (`ATTACH ...
+        // TYPE iceberg_rest` and friends); a Hive root lives in a second,
+        // separate map (see `RuntimeCatalogRegistry`'s "Hive lane" doc
+        // comment) and would otherwise fail this pre-flight check as an
+        // "unknown catalog" before ever reaching `resolve_table_kind`.
+        known.extend(
+            self.runtime_catalogs
+                .hive_roots()
+                .map_err(SqeError::Catalog)?
+                .into_iter()
+                .map(|(name, _)| name),
+        );
 
         // Fast path: every qualifier is statically known — done, no Polaris.
         if qualifiers.iter().all(|q| known.contains(q)) {
@@ -1158,6 +1297,33 @@ impl QueryHandler {
                                 "materialized views are not supported".to_string(),
                             )),
                         }
+                    } else if let sqlparser::ast::Statement::AlterTable(ref alter) = stmt.as_ref()
+                    {
+                        // The only ALTER TABLE shape that reaches this
+                        // catch-all: every other variant already has a
+                        // dedicated StatementKind (AlterSchema, AlterTableProps,
+                        // SetTags, RefDdl, PartitionEvolution, DropNestedColumn,
+                        // and Rename above), so an AlterTable statement here is
+                        // ADD PARTITION (or another op this release has no
+                        // dedicated arm for). Only ADD PARTITION gets the
+                        // Hive-specific naming; anything else falls to the
+                        // generic error below unchanged, same as before this
+                        // branch existed.
+                        if alter
+                            .operations
+                            .iter()
+                            .any(|op| matches!(op, sqlparser::ast::AlterTableOperation::AddPartitions { .. }))
+                        {
+                            self.reject_if_hive_table(
+                                session,
+                                &table_reference_of(&alter.name),
+                                "ALTER TABLE ... ADD PARTITION",
+                                2,
+                            )?;
+                        }
+                        Err(SqeError::NotImplemented(format!(
+                            "Utility statement not supported: {stmt}"
+                        )))
                     } else {
                         Err(SqeError::NotImplemented(format!(
                             "Utility statement not supported: {stmt}"
@@ -1193,11 +1359,62 @@ impl QueryHandler {
                 // below: snapshots are shared state, so INSERT/DELETE/UPDATE/MERGE
                 // must invalidate every user's snapshot-bound TableProvider.
                 StatementKind::Drop(stmt) => {
-                    self.catalog_ops.drop_table(session, stmt).await?;
+                    // DROP TABLE supports multiple names, but (like
+                    // `catalog_ops.drop_table` below) only the first is
+                    // acted on; a mixed Hive/Iceberg multi-name drop is not
+                    // a new problem this branch introduces.
+                    let hive_drop = if let Statement::Drop {
+                        names,
+                        if_exists,
+                        purge,
+                        ..
+                    } = stmt.as_ref()
+                    {
+                        names.first().map(|name| {
+                            (table_reference_of(name), *if_exists, *purge)
+                        })
+                    } else {
+                        None
+                    };
+                    let routed_to_hive = match &hive_drop {
+                        Some((table_ref, if_exists, purge))
+                            if matches!(
+                                self.hive_ddl_handler.resolve_table_kind(table_ref),
+                                crate::hive_ddl_handler::TableKind::Hive { .. }
+                            ) =>
+                        {
+                            match self
+                                .hive_ddl_handler
+                                .drop_table(session, table_ref, *purge)
+                                .await
+                            {
+                                Ok(()) => true,
+                                Err(e)
+                                    if *if_exists
+                                        && crate::hive_ddl_handler::hive_drop_target_missing(&e) =>
+                                {
+                                    true
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        _ => false,
+                    };
+                    if !routed_to_hive {
+                        self.catalog_ops.drop_table(session, stmt).await?;
+                    }
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
                     Ok(vec![])
                 }
                 StatementKind::Rename(stmt) => {
+                    if let Statement::AlterTable(ref alter) = **stmt {
+                        self.reject_if_hive_table(
+                            session,
+                            &table_reference_of(&alter.name),
+                            "ALTER TABLE ... RENAME",
+                            0,
+                        )?;
+                    }
                     // Cross-user: the table name itself changes; other users'
                     // SessionContexts hold the old name in their catalog
                     // provider's cached namespace listings.
@@ -1232,6 +1449,12 @@ impl QueryHandler {
                     Ok(vec![])
                 }
                 StatementKind::SetTags(stmt) => {
+                    self.reject_if_hive_table(
+                        session,
+                        &TableReference::from(stmt.table.as_str()),
+                        "ALTER TABLE ... SET TAGS",
+                        3,
+                    )?;
                     self.catalog_ops.set_column_tags(session, stmt).await?;
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
                     // Tag->column associations changed; flush cached tag policies so
@@ -1309,6 +1532,20 @@ impl QueryHandler {
                     result
                 }
 
+                // `CREATE EXTERNAL TABLE` (Hive/Athena) is classified separately
+                // from the Iceberg create path (see `sqe_sql::classifier`).
+                // Table-level Hive DDL invalidates only the caller's own
+                // session cache (matching `CreateTable`'s convention below),
+                // not every session: unlike `ATTACH`/`DETACH` (root-level,
+                // which other sessions' `resolve_policy_key` calls could
+                // disagree about), a new table under an already-attached
+                // root carries no such cross-session policy-key ambiguity.
+                StatementKind::CreateExternalTable(ref spec) => {
+                    let result = self.hive_ddl_handler.create_external_table(session, spec).await;
+                    crate::session_context::invalidate_session_cache(&session.user.username).await;
+                    result.map(|()| Vec::new())
+                }
+
                 StatementKind::Ctas(stmt) => {
                     if let Statement::CreateTable(ref ct) = **stmt {
                         if let Some(ref query) = ct.query {
@@ -1345,6 +1582,9 @@ impl QueryHandler {
 
                 StatementKind::Insert(stmt) => {
                     if let Statement::Insert(ref ins) = **stmt {
+                        if let sqlparser::ast::TableObject::TableName(ref name) = ins.table {
+                            self.reject_if_hive_table(session, &table_reference_of(name), "INSERT", 4)?;
+                        }
                         let select_sql = ins
                             .source
                             .as_ref()
@@ -1374,6 +1614,9 @@ impl QueryHandler {
                 }
 
                 StatementKind::Delete(stmt) => {
+                    if let Ok(name) = crate::write_handler::delete_target_object_name(stmt) {
+                        self.reject_if_hive_table(session, &table_reference_of(name), "DELETE", 4)?;
+                    }
                     let (ctx, session_catalog) = self.create_session_context(session).await?;
                     // Dispatch on `write.delete.mode` table property. Default CoW
                     // matches prior behaviour; `merge-on-read` routes to position
@@ -1391,6 +1634,9 @@ impl QueryHandler {
                 }
 
                 StatementKind::Update(stmt) => {
+                    if let Ok(name) = crate::write_handler::update_target_object_name(stmt) {
+                        self.reject_if_hive_table(session, &table_reference_of(name), "UPDATE", 4)?;
+                    }
                     let (ctx, session_catalog) = self.create_session_context(session).await?;
                     // Dispatch on `write.update.mode` table property. Default CoW
                     // matches prior behaviour; `merge-on-read` routes to the
@@ -1425,6 +1671,31 @@ impl QueryHandler {
 
                 // SHOW CREATE TABLE — reconstruct DDL from information_schema
                 StatementKind::ShowCreateTable(ref stmt) => {
+                    if let Statement::ShowCreate { obj_name, .. } = stmt.as_ref() {
+                        let table_ref = table_reference_of(obj_name);
+                        if matches!(
+                            self.hive_ddl_handler.resolve_table_kind(&table_ref),
+                            crate::hive_ddl_handler::TableKind::Hive { .. }
+                        ) {
+                            let ddl = self
+                                .hive_ddl_handler
+                                .show_create_table(&session.user, &table_ref)
+                                .await?;
+                            let schema = Arc::new(Schema::new(vec![Field::new(
+                                "Create Table",
+                                DataType::Utf8,
+                                false,
+                            )]));
+                            let batch = RecordBatch::try_new(
+                                schema,
+                                vec![Arc::new(arrow_array::StringArray::from(vec![ddl])) as ArrayRef],
+                            )
+                            .map_err(|e| {
+                                SqeError::Execution(format!("Failed to create result batch: {e}"))
+                            })?;
+                            return Ok(vec![batch]);
+                        }
+                    }
                     let (ctx, session_catalog) = self.create_session_context(session).await?;
                     self.handle_show_create_table(session, stmt, &ctx, &session_catalog)
                         .await
@@ -1438,6 +1709,12 @@ impl QueryHandler {
 
                 // TRUNCATE TABLE — rewrite as DELETE FROM (no WHERE clause)
                 StatementKind::Truncate(ref table_name) => {
+                    self.reject_if_hive_table(
+                        session,
+                        &TableReference::from(table_name.as_str()),
+                        "TRUNCATE TABLE",
+                        4,
+                    )?;
                     tracing::info!("TRUNCATE TABLE {table_name} → DELETE FROM {table_name}");
                     let delete_sql = format!("DELETE FROM {table_name}");
                     let delete_kind = sqe_sql::parse_and_classify(&delete_sql)?;
@@ -1573,6 +1850,14 @@ impl QueryHandler {
 
                 // COMMENT ON TABLE/COLUMN — store as Iceberg table property
                 StatementKind::Comment(ref stmt) => {
+                    if let Statement::Comment { object_name, .. } = stmt.as_ref() {
+                        self.reject_if_hive_table(
+                            session,
+                            &table_reference_of(object_name),
+                            "COMMENT ON TABLE",
+                            0,
+                        )?;
+                    }
                     let (_, session_catalog) = self.create_session_context(session).await?;
                     self.handle_comment_on(session, stmt, &session_catalog)
                         .await
@@ -1588,6 +1873,7 @@ impl QueryHandler {
                 // stats collection is currently a no-op (#329). A missing table
                 // still errors, like a SELECT would.
                 StatementKind::Analyze(ref table_name) => {
+                    self.reject_if_hive_table(session, &TableReference::from(table_name.as_str()), "ANALYZE", 2)?;
                     self.handle_analyze(session, table_name).await
                 }
 
@@ -1647,7 +1933,7 @@ impl QueryHandler {
                 // not an admin.
                 StatementKind::Attach(stmt) => {
                     self.require_admin(session, "ATTACH")?;
-                    self.handle_attach(stmt).await
+                    self.handle_attach(session, stmt).await
                 }
                 StatementKind::Detach(stmt) => {
                     self.require_admin(session, "DETACH")?;
@@ -3765,6 +4051,8 @@ impl QueryHandler {
             self.metrics.as_ref(),
             self.table_cache.as_ref(),
             &self.runtime_catalogs,
+            &self.hive_manifest_cache,
+            &self.secrets,
         )
         .await
     }
@@ -4176,6 +4464,42 @@ impl QueryHandler {
         // qualifier (discovered under polaris-auto); the schema part is parsed
         // separately by parse_show_tables_namespace.
         let catalog = show_tables_catalog(filter);
+        // A Hive root is not an Iceberg catalog: `show_catalog` only knows
+        // `[catalogs.*]` config and Polaris discovery, so a Hive root's name
+        // would otherwise fail as "Unknown catalog". Answer directly from
+        // the manifest store instead, in the same Trino single-`Table`-column
+        // shape the Iceberg path below produces.
+        if let Some(root) = catalog.as_deref() {
+            if self.runtime_catalogs.is_hive_root(root).unwrap_or(false) {
+                let database = parse_show_tables_namespace(filter)
+                    .or_else(|| session.default_schema.clone())
+                    .ok_or_else(|| {
+                        SqeError::Execution(
+                            "SHOW TABLES against a Hive root needs a database (e.g. \
+                             `SHOW TABLES FROM lake.sales`)"
+                                .to_string(),
+                        )
+                    })?;
+                let mut names = self
+                    .hive_ddl_handler
+                    .list_tables(&session.user, root, &database)
+                    .await?;
+                names.sort();
+                let schema = Arc::new(Schema::new(vec![Field::new(
+                    "Table",
+                    DataType::Utf8,
+                    false,
+                )]));
+                let mut table_builder = StringBuilder::new();
+                for name in &names {
+                    table_builder.append_value(name);
+                }
+                let table_array: ArrayRef = Arc::new(table_builder.finish());
+                let batch = RecordBatch::try_new(schema, vec![table_array])
+                    .map_err(|e| SqeError::Execution(format!("Failed to create result batch: {e}")))?;
+                return Ok(vec![batch]);
+            }
+        }
         let session_catalog = self.show_catalog(session, catalog.as_deref()).await?;
 
         // Explicit `FROM <schema>` wins; otherwise fall back to the session
@@ -5329,11 +5653,11 @@ impl QueryHandler {
 
         // Deny-all sentinel: the resolver signals a fully-denied table by
         // pushing `lit(false)` into row_filters. Surface it as a single `denied`
-        // row rather than counting it as a normal filter.
-        let denied = policy
-            .row_filters
-            .iter()
-            .any(|e| matches!(e, datafusion::logical_expr::Expr::Literal(sv, _) if sv == &datafusion::scalar::ScalarValue::Boolean(Some(false))));
+        // row rather than counting it as a normal filter. Same check
+        // `HiveDdlHandler`'s SHOW TABLES / SHOW CREATE TABLE gate uses, and
+        // `summarise_policies`'s own audit-summary fold, all funneled through
+        // one function so "denied" means the same thing everywhere.
+        let denied = sqe_policy::plan_rewriter::policy_denies_all(policy);
 
         if denied {
             push("denied", None, "access denied (deny-all policy)", "policy");
@@ -5861,8 +6185,88 @@ impl QueryHandler {
 
     async fn handle_attach(
         &self,
+        session: &Session,
         stmt: &sqe_sql::AttachStatement,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // `TYPE hive_external` is not an Iceberg catalog (see `build_catalog`'s
+        // own comment), so it does not go through `runtime_catalogs.attach()`:
+        // that builds an `iceberg::Catalog` and would fail with "dispatched
+        // separately" for this kind. `hive_catalogs.insert` is the security
+        // requirement, not bookkeeping: `resolve_policy_key` reads this set
+        // live to decide whether the root's tables key under its own name or
+        // the Iceberg namespace convention (see the type's own doc comment).
+        if stmt.kind == sqe_sql::CatalogKind::HiveExternal {
+            // REFUSE before touching `runtime_catalogs` at all: attaching the
+            // root and only then discovering there is nowhere to register its
+            // name would make the root readable while leaving
+            // `resolve_policy_key` blind to it -- the exact escalation this
+            // guard exists to prevent, just reached one step later. See the
+            // `hive_catalogs` field's own doc comment for the full case.
+            let Some(hive_catalogs) = self.hive_catalogs.as_ref() else {
+                return Err(SqeError::Execution(
+                    "hive_external: this coordinator was started without the shared Hive \
+                     registries wired (QueryHandler::with_hive_registries was not called); \
+                     that is a deployment wiring bug, not a mistake in this SQL, and ATTACH \
+                     ... TYPE hive_external is refused rather than attaching a root the \
+                     policy layer would not see"
+                        .to_string(),
+                ));
+            };
+            // Refuse a name collision with the session default catalog. See
+            // `attach_configured_hive_roots`'s doc comment (`runtime_catalog.rs`)
+            // for the full case: `resolve_policy_key` and
+            // `CatalogRoutedTagSource` both dispatch on `table_ref.catalog()`
+            // alone, which is `None` for a two-part reference, so a Hive root
+            // sharing the default catalog's name would let a two-part
+            // reference reach it while both the policy key and the tag route
+            // take the Iceberg branch regardless.
+            let default_catalog = self.config.resolve_default_catalog();
+            if stmt.name == default_catalog {
+                return Err(SqeError::Execution(format!(
+                    "hive_external: '{}' collides with the session default catalog '{default_catalog}': \
+                     a two-part table reference under this default resolves to a Hive table \
+                     without either the policy key or the tag route ever seeing its catalog \
+                     name, so a root cannot share a name with the default catalog. ATTACH it \
+                     under a different name, or change query.default_catalog",
+                    stmt.name
+                )));
+            }
+            // This ATTACHING session's caller is baked into `build_hive_root`'s
+            // `HiveManifestStore` below, and every LATER session that reads
+            // through this root shares that same store (and thus this same
+            // caller) for `check_path` on every manifest load -- see
+            // `runtime_catalog.rs`'s "Hive lane" comment for the full case.
+            // Fail-closed: it can only cause a false denial for a more-
+            // privileged later reader, never let a less-privileged one read
+            // more than the attacher could, since the gate never loosens
+            // for anyone.
+            let caller = sqe_core::config::TvfCaller::for_user(
+                session.user.username.clone(),
+                session.user.roles.clone(),
+            );
+            let limits = sqe_catalog::hive::manifest::ManifestLimits {
+                max_bytes: self.config.hive.manifest_max_bytes,
+                max_columns: self.config.hive.manifest_max_columns,
+                max_partition_keys: self.config.hive.manifest_max_partition_keys,
+            };
+            let store = sqe_catalog::mount::build_hive_root(
+                &stmt.location,
+                &stmt.options,
+                &self.config.storage,
+                limits,
+                caller,
+            )
+            .await
+            .map_err(SqeError::Execution)?;
+            self.runtime_catalogs
+                .attach_hive_root(&stmt.name, store)
+                .map_err(SqeError::Execution)?;
+            hive_catalogs.insert(&stmt.name);
+            crate::session_context::invalidate_all_session_caches().await;
+            info!(catalog = %stmt.name, kind = "hive_external", "ATTACH complete");
+            return Ok(vec![]);
+        }
+
         self.runtime_catalogs
             .attach(stmt, &self.secrets)
             .await
@@ -5876,6 +6280,42 @@ impl QueryHandler {
         &self,
         stmt: &sqe_sql::DetachStatement,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // Mirror `handle_attach`'s branch: a name attached as a Hive root
+        // lives in the registry's Hive lane, not the Iceberg one, and must
+        // also leave `hive_catalogs` so a same-named Iceberg namespace
+        // cannot inherit its policy key once the root is gone.
+        if self
+            .runtime_catalogs
+            .is_hive_root(&stmt.name)
+            .map_err(SqeError::Execution)?
+        {
+            self.runtime_catalogs
+                .detach_hive_root(&stmt.name)
+                .map_err(SqeError::Execution)?;
+            // `handle_attach`'s guard means this root could only have been
+            // attached while `hive_catalogs` was `Some`, so this is normally
+            // populated. Not blocking on `None` regardless: DETACH only
+            // removes access, never grants it, so there is no escalation to
+            // guard against here the way there is on the attach side -- but
+            // warn, since a `None` here on a root that exists at all means
+            // the deployment was misconfigured for the whole time this root
+            // was attached (see the field's doc comment).
+            match self.hive_catalogs.as_ref() {
+                Some(hive_catalogs) => hive_catalogs.remove(&stmt.name),
+                None => warn!(
+                    catalog = %stmt.name,
+                    "hive_external: DETACH removed a root from the catalog registry, but \
+                     this QueryHandler has no shared hive_catalogs to remove it from; the \
+                     name may still be misclassified under the Iceberg policy-key convention \
+                     for any table that shares its namespace -- this coordinator was started \
+                     without with_hive_registries"
+                ),
+            }
+            crate::session_context::invalidate_all_session_caches().await;
+            info!(catalog = %stmt.name, "DETACH complete");
+            return Ok(vec![]);
+        }
+
         self.runtime_catalogs
             .detach(&stmt.name)
             .map_err(SqeError::Execution)?;
@@ -6962,6 +7402,56 @@ fn info_schema_columns_query(table_name: &str) -> String {
         "SELECT column_name, data_type, is_nullable \
          FROM {from} WHERE {where_clause} ORDER BY ordinal_position"
     )
+}
+
+/// Build a `TableReference` from a `sqlparser::ast::ObjectName`, for
+/// `resolve_table_kind`. Goes through `ObjectName`'s own `Display` (which
+/// respects quote style) and `TableReference::parse_str`'s reparse, rather
+/// than a bespoke splitter, so a quoted identifier is treated the same way
+/// DataFusion's own planner treats one.
+fn table_reference_of(name: &sqlparser::ast::ObjectName) -> TableReference {
+    TableReference::from(name.to_string())
+}
+
+/// Checks `table_name` (a catalog-qualified reference, either an
+/// `ObjectName` or a raw dotted string) against
+/// `resolve_table_kind_for_session` and, if it names a table in an attached
+/// Hive root, returns the standard rejection naming `statement_label` and
+/// `cycle`. `Ok(())` covers both "it is an Iceberg table" and "it is
+/// unqualified with no Hive-root default catalog to promote against" --
+/// the Iceberg dispatch downstream is unchanged either way.
+///
+/// Resolves through `session`'s default catalog for a `Bare`/`Partial`
+/// reference rather than calling `resolve_table_kind` directly: an
+/// unqualified reference under a session whose default catalog IS a Hive
+/// root must still be caught here, or the write path below resolves it
+/// against a same-named Iceberg catalog instead of being rejected (see
+/// `resolve_table_kind_for_session`'s own doc comment for the concrete
+/// failure this closes).
+///
+/// `statement_label` must be a short, fixed description (e.g. `"ANALYZE"`),
+/// never the raw SQL text: interpolating user SQL into the rejection is how
+/// an unrelated coincidental substring match (e.g. the cycle number
+/// appearing inside a literal in the statement) could make a test pass
+/// without `reject_unsupported` having run at all.
+impl QueryHandler {
+    fn reject_if_hive_table(
+        &self,
+        session: &Session,
+        table_ref: &TableReference,
+        statement_label: &str,
+        cycle: u8,
+    ) -> sqe_core::Result<()> {
+        match self
+            .hive_ddl_handler
+            .resolve_table_kind_for_session(session.default_catalog.as_deref(), table_ref)
+        {
+            crate::hive_ddl_handler::TableKind::Hive { .. } => {
+                Err(self.hive_ddl_handler.reject_unsupported(statement_label, cycle))
+            }
+            crate::hive_ddl_handler::TableKind::Iceberg => Ok(()),
+        }
+    }
 }
 
 /// Build Trino's `SHOW STATS FOR <table>` result set: one row per column
