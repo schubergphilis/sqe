@@ -2,3 +2,5 @@
 data/
 .venv/
 .env
+# sqe-server's log from ./run.sh --server
+server.log

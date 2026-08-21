@@ -38,11 +38,15 @@ The `aws` CLI is optional. Without it, `run.sh` uses the `amazon/aws-cli` contai
 ```bash
 ./run.sh                    # full run, captures OUTPUT.md
 ./run.sh --check            # full run, then assert the invariants
+./run.sh --server           # the same SQL through a real sqe-server
+./run.sh --server --check   # ...with the same 21 assertions
 ./run.sh --size-mb 1024     # more data (5120 is the generator's ceiling)
 ./run.sh --regen            # regenerate and re-upload even if data is present
 ./run.sh --down             # stop the store, keep the bucket
 ./run.sh --clean            # stop, delete the bucket volume, ./data and ./.venv
 ```
+
+`--server` needs `sqe-server` built too: `cargo build --release -p sqe-coordinator --bin sqe-server`.
 
 A first run from nothing takes well under a minute at the default size. Re-runs skip generation and upload when the data already matches the requested size, so iterating on the SQL is fast.
 
@@ -64,6 +68,14 @@ Four things are worth following.
 **Partition columns come from the path.** `dt=2026-01-02/region=eu/` is where `dt` and `region` come from; they are declared in `PARTITIONED BY`, never in the column list, and they land last in the schema. Pinning the leading partition columns with `=` is what narrows the listing; a range or an `IN` list lists the whole table and filters in memory.
 
 **Every `sqe-cli` call in `run.sh` is its own process.** The engine runs with `--memory`, so it persists nothing locally. The queries after the "process 2" heading are a cold start that attaches the root and nothing else: no DDL, no schema, no paths. Whatever they return came out of the bucket.
+
+## The same SQL, two deployment shapes
+
+`--server` changes exactly one thing: how a statement reaches the engine. It starts a real `sqe-server`, which attaches the warehouse root from `[[hive.roots]]` in `sqe.toml` at startup, and `sqe-cli` connects over Flight SQL. The DDL file, the query file, and all 21 assertions are the same ones the embedded path runs, and the row counts come out identical, because both are reading the same manifests out of the same bucket.
+
+The re-attach proof works differently in the two modes, and it has to. Embedded gets its process boundary for free: every `sqe-cli --embedded` call is a new engine. A server is long-lived, so the script kills the coordinator and boots a new one, which re-reads `[[hive.roots]]` and every manifest from scratch. That is a stronger claim than the embedded one, and it is the reason `OUTPUT-server.md` has a "restarting the coordinator" step where `OUTPUT.md` does not.
+
+`sqe.toml` deliberately points `[catalog]` at a port nobody is listening on. A Hive external table has no catalog service behind it, so a coordinator serving only Hive roots should not need one, and this proves it: the server boots, attaches the root, and answers every Hive query. Two statements do fail as a result, which is the interesting part. See the mode-asymmetry gotcha below.
 
 ## Configuration explained
 
@@ -88,6 +100,15 @@ The DDL, with a comment per clause explaining why it is there. Two clauses trip 
 
 - `STORED AS CSV` and `STORED AS JSON` do not parse. The format keywords are `TEXTFILE`, `SEQUENCEFILE`, `ORC`, `PARQUET`, `AVRO`, `RCFILE`, `JSONFILE`. For comma-separated data the working form is `ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE`.
 - Bare `TEXTFILE` means Hive's control-A delimiter (`\001`), not comma. Declare the delimiter or get a one-column table, exactly as in Athena.
+
+### `sqe.toml` (server mode only)
+
+Annotated per section. The parts that matter for Hive:
+
+- `[[hive.roots]]` with `name` and `location` is the config equivalent of `ATTACH ... TYPE hive_external`. The startup attach is a path check against the allowlist, not a network call, so a wrong bucket fails at the first query rather than at boot.
+- `[storage.tvf] allowed_object_store_prefixes` is **not optional in server mode.** Server mode fails closed on object-store paths: with no allowlist, every `s3://` read is denied, including the manifest load behind a Hive table. Embedded mode skips this gate because the local user already owns the process, its config and its credentials; a coordinator serving remote identities does not get that assumption.
+- `[[auth.providers]] type = "anonymous"` accepts every connection as one identity. DEV ONLY, and the server logs a security error on startup saying so. It is what lets this quickstart run with no IdP.
+- Anything `.env` can change is passed to the server as an `SQE_*` env override rather than templated into the file, so the TOML stays readable as documentation. That is the same mechanism a container deployment uses.
 
 ### `gen_data.py`
 
@@ -130,7 +151,16 @@ Before any of that, the run verifies that every object's listed size matches the
 
 **JSON means line-delimited JSON.** One object per line, in both the `.json` and `.ndjson` tables here. A `[{...},{...}]` array document is not readable, in SQE or in Athena. The file extension is irrelevant; the framing is what matters.
 
-**`SHOW TABLES` and `SHOW SCHEMAS` are not parsed in embedded mode.** Not a Hive gap: it is the same against an Iceberg catalog. `queries.sql` uses `information_schema.tables` and `information_schema.schemata` instead, which work in both embedded and server mode.
+**Listing a root's tables takes a different statement in each mode, and neither works in the other.** Measured both ways:
+
+| | `SHOW TABLES FROM lake.demo` | `information_schema.tables` |
+|---|---|---|
+| embedded | not parsed at all (a pre-existing embedded gap, against any catalog kind) | works |
+| server | works, and is policy-gated | fails here |
+
+The server-mode failure is worth understanding, because it is not Hive-specific. `information_schema` enumerates **every** registered catalog before any `WHERE` clause is applied, so an unreachable Iceberg catalog fails the whole query even when you asked only about a Hive root. This `sqe.toml` points at a dead Iceberg endpoint on purpose, so that failure shows up in `OUTPUT-server.md` for both `information_schema.tables` and `DESCRIBE`. On a coordinator whose Polaris is reachable, both work; on one whose Polaris is *down*, expect the same failure this capture shows. `run.sh` picks the right statement per mode; `queries.sql` keeps the embedded-canonical form so the file stays copy-pasteable for the common case.
+
+**A binary older than the feature boots fine and serves nothing.** `[[hive.roots]]` is unknown config to a pre-Hive `sqe-server`, so it starts perfectly, attaches no root, and every query fails with "unknown catalog". `run.sh` prefers `target/release` over `target/dev-release`, so a stale release build silently wins over a fresh dev one. Both binary paths and their build dates are printed at startup, and the server-mode path hard-fails with that diagnosis if no root attaches. This cost two debugging detours while building the quickstart; `SQE_CLI` and `SQE_SERVER` override the search.
 
 **Reads use the engine's credentials, not the caller's.** An Iceberg read gets per-user credentials because Polaris vends them per table; nothing plays that role for a raw `s3://` prefix. In embedded mode this distinction is moot (one local user, who owns the config). On a shared coordinator it matters: bound exposure with `[storage.tvf] allowed_object_store_prefixes` and grants, and keep Hive roots out of buckets that should not be uniformly readable by the engine's identity.
 
