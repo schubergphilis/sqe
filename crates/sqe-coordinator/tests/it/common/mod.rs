@@ -324,6 +324,8 @@ pub async fn setup_ranger_handler_sharing(
     let (enforcer, store) = sqe_coordinator::policy_wiring::build_policy_enforcer(
         &config.policy,
         Some(table_cache.clone()),
+        Arc::new(sqe_policy::plan_rewriter::HiveCatalogs::new()),
+        Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
         None,
     )
     .expect("build ranger policy enforcer");

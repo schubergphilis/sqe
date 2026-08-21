@@ -386,3 +386,325 @@ async fn drop_secret_rejected_without_admin_role() {
 
     assert!(err.to_string().contains("403"), "expected 403: {err}");
 }
+
+// ---------------------------------------------------------------------------
+// ATTACH / DETACH ... TYPE hive_external
+//
+// Unlike the other `CatalogKind`s (which need `sql-sqlite`, a network REST
+// endpoint, or an AWS backend and so are covered by the sqlite-gated
+// `runtime_catalog_test.rs`), a Hive root is just files under a `LOCATION`:
+// `build_hive_root` only needs `[storage.tvf] allow_local_paths = true` to
+// accept a local temp dir, so this dispatch is cheaply testable right here.
+// ---------------------------------------------------------------------------
+
+/// Wires the CALLER's `hive_catalogs` instance, simulating a correctly-wired
+/// production binary (`main.rs` / `bin/sqe_server.rs` call
+/// `with_hive_registries` with the SAME `Arc` their `PolicyPlanRewriter` was
+/// built from). Takes the `Arc` as a parameter rather than allocating one
+/// internally and discarding it: a test that only checks `execute()`'s
+/// `Ok`/`Err` cannot tell an `ATTACH` that inserted into `hive_catalogs`
+/// apart from one that only updated `runtime_catalogs` and left the name
+/// out of the set `resolve_policy_key` reads -- exactly the escalation this
+/// whole feature exists to close, reachable through the SQL surface instead
+/// of the `[[hive.roots]]` one. Callers that only care about dispatch
+/// succeeding/failing pass a throwaway `Arc::new(HiveCatalogs::new())`;
+/// callers that need to prove the mutation (see
+/// `attach_hive_external_root_inserts_into_hive_catalogs` and
+/// `detach_hive_external_root_removes_from_hive_catalogs` below) keep their
+/// own clone to assert against afterward. Use
+/// `make_handler_missing_hive_registries` instead to prove what happens
+/// when a deployment forgets `with_hive_registries` entirely.
+fn make_handler_with_hive_registries(
+    secrets: SecretStore,
+    catalogs: RuntimeCatalogRegistry,
+    allow_local_paths: bool,
+    hive_catalogs: Arc<sqe_policy::plan_rewriter::HiveCatalogs>,
+) -> QueryHandler {
+    let mut config = minimal_config();
+    config.storage.tvf.allow_local_paths = allow_local_paths;
+    let tracker = Arc::new(QueryTracker::new(&config.query_history));
+    QueryHandler::new(
+        Arc::new(PassthroughEnforcer),
+        None,
+        config,
+        None,
+        None,
+        None,
+        None,
+        tracker,
+        None,
+        None,
+        None,
+        catalogs,
+        secrets,
+    )
+    .expect("QueryHandler::new")
+    .with_hive_registries(
+        hive_catalogs,
+        Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
+    )
+}
+
+fn make_handler_allowing_local_paths(
+    secrets: SecretStore,
+    catalogs: RuntimeCatalogRegistry,
+) -> QueryHandler {
+    make_handler_with_hive_registries(
+        secrets,
+        catalogs,
+        true,
+        Arc::new(sqe_policy::plan_rewriter::HiveCatalogs::new()),
+    )
+}
+
+/// Deliberately never calls `with_hive_registries` -- the deployment-forgot
+/// scenario `hive_catalogs`'s own doc comment warns about: `ATTACH` looking
+/// like it worked while the policy layer never learns the root exists.
+fn make_handler_missing_hive_registries(
+    secrets: SecretStore,
+    catalogs: RuntimeCatalogRegistry,
+) -> QueryHandler {
+    let mut config = minimal_config();
+    config.storage.tvf.allow_local_paths = true;
+    let tracker = Arc::new(QueryTracker::new(&config.query_history));
+    QueryHandler::new(
+        Arc::new(PassthroughEnforcer),
+        None,
+        config,
+        None,
+        None,
+        None,
+        None,
+        tracker,
+        None,
+        None,
+        None,
+        catalogs,
+        secrets,
+    )
+    .expect("QueryHandler::new")
+}
+
+/// The fix for the latent escalation the team-lead's review found: a
+/// `QueryHandler` built without `with_hive_registries` must REFUSE `ATTACH
+/// ... TYPE hive_external` rather than silently attach into a private
+/// registry the policy layer cannot see. Mutation check: reverting
+/// `hive_catalogs`'s default from `None` back to `Some(Arc::new(HiveCatalogs::new()))`
+/// makes this test fail because the attach now succeeds -- that failure is
+/// the proof the guard is the thing closing the gap, not incidental.
+#[tokio::test]
+async fn attach_hive_external_root_refused_when_hive_registries_are_not_wired() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handler =
+        make_handler_missing_hive_registries(SecretStore::new(), RuntimeCatalogRegistry::new());
+    let session = dummy_session();
+
+    let sql = format!(
+        "ATTACH 'file://{}' AS lake (TYPE hive_external)",
+        dir.path().display()
+    );
+    let err = handler
+        .execute(&session, &sql, None)
+        .await
+        .expect_err("must refuse without the shared hive registries wired");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("hive_external") && msg.contains("with_hive_registries"),
+        "error should name the wiring gap, not a generic failure: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn attach_hive_external_root_succeeds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handler =
+        make_handler_allowing_local_paths(SecretStore::new(), RuntimeCatalogRegistry::new());
+    let session = dummy_session();
+
+    let sql = format!(
+        "ATTACH 'file://{}' AS lake (TYPE hive_external)",
+        dir.path().display()
+    );
+    let result = handler.execute(&session, &sql, None).await;
+    assert!(result.is_ok(), "unexpected error: {:?}", result);
+    assert_eq!(
+        result.unwrap().iter().map(|b| b.num_rows()).sum::<usize>(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn attach_hive_external_root_rejects_local_path_without_allow_local_paths() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Hive registries ARE wired here (unlike `make_handler`'s bare
+    // default): this test is exercising `check_path`'s local-path gate
+    // specifically, and must not be shadowed by the (separate)
+    // hive-registries-not-wired refusal proven in
+    // `attach_hive_external_root_refused_when_hive_registries_are_not_wired`.
+    // The default config leaves `[storage.tvf] allow_local_paths` false,
+    // and `trusted` (which a Hive ATTACH does not set for a session caller
+    // anyway) would not bypass this gate regardless -- see `check_path`'s
+    // local-path branch.
+    let handler = make_handler_with_hive_registries(
+        SecretStore::new(),
+        RuntimeCatalogRegistry::new(),
+        false,
+        Arc::new(sqe_policy::plan_rewriter::HiveCatalogs::new()),
+    );
+    let session = dummy_session();
+
+    let sql = format!(
+        "ATTACH 'file://{}' AS lake (TYPE hive_external)",
+        dir.path().display()
+    );
+    let err = handler
+        .execute(&session, &sql, None)
+        .await
+        .expect_err("local paths disabled by default");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("local filesystem paths are disabled"),
+        "{msg}"
+    );
+}
+
+#[tokio::test]
+async fn attach_hive_external_root_duplicate_name_errors() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handler =
+        make_handler_allowing_local_paths(SecretStore::new(), RuntimeCatalogRegistry::new());
+    let session = dummy_session();
+    let sql = format!(
+        "ATTACH 'file://{}' AS lake (TYPE hive_external)",
+        dir.path().display()
+    );
+    handler
+        .execute(&session, &sql, None)
+        .await
+        .expect("first attach");
+
+    let err = handler
+        .execute(&session, &sql, None)
+        .await
+        .expect_err("duplicate attach must fail");
+    assert!(
+        err.to_string().contains("already attached"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn detach_hive_external_root_then_reattach_succeeds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handler =
+        make_handler_allowing_local_paths(SecretStore::new(), RuntimeCatalogRegistry::new());
+    let session = dummy_session();
+    let sql = format!(
+        "ATTACH 'file://{}' AS lake (TYPE hive_external)",
+        dir.path().display()
+    );
+    handler
+        .execute(&session, &sql, None)
+        .await
+        .expect("attach");
+
+    handler
+        .execute(&session, "DETACH lake", None)
+        .await
+        .expect("detach");
+
+    // Re-attaching under the same name only succeeds if DETACH actually
+    // forgot it -- a stronger proof than asserting DETACH returned Ok.
+    handler
+        .execute(&session, &sql, None)
+        .await
+        .expect("re-attach after detach");
+}
+
+/// The escalation this feature set exists to close, proven through the SQL
+/// surface rather than the `[[hive.roots]]` config one
+/// (`attach_configured_hive_roots_populates_both_registries` in
+/// `runtime_catalog.rs` already covers that path). Asserting only
+/// `execute().is_ok()` (as the pre-existing
+/// `attach_hive_external_root_succeeds` does) cannot tell an `ATTACH` that
+/// inserted into `hive_catalogs` apart from one that only updated
+/// `runtime_catalogs`: `resolve_policy_key` would key that root's tables
+/// under the Iceberg convention either way, and no test asserting `Ok`
+/// would notice. Holding the same `Arc` the handler was built with and
+/// asserting `contains_name` after `ATTACH` is the only way to see the
+/// mutation this test is named for.
+#[tokio::test]
+async fn attach_hive_external_root_inserts_into_hive_catalogs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hive_catalogs = Arc::new(sqe_policy::plan_rewriter::HiveCatalogs::new());
+    let handler = make_handler_with_hive_registries(
+        SecretStore::new(),
+        RuntimeCatalogRegistry::new(),
+        true,
+        Arc::clone(&hive_catalogs),
+    );
+    let session = dummy_session();
+    let sql = format!(
+        "ATTACH 'file://{}' AS lake (TYPE hive_external)",
+        dir.path().display()
+    );
+
+    handler.execute(&session, &sql, None).await.expect("attach");
+
+    assert!(
+        hive_catalogs.contains_name(Some("lake")),
+        "ATTACH must insert into hive_catalogs, not just runtime_catalogs"
+    );
+}
+
+/// The `DETACH` half of the same proof: the pre-existing
+/// `detach_hive_external_root_then_reattach_succeeds` only shows
+/// `runtime_catalogs` forgot the name (a re-attach needs that), not that
+/// `hive_catalogs.remove` ever ran. If it never ran, `lake` would stay
+/// keyed under the Hive convention in `resolve_policy_key` for a namespace
+/// that, after detach, might be reused by an unrelated Iceberg catalog of
+/// the same name.
+#[tokio::test]
+async fn detach_hive_external_root_removes_from_hive_catalogs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hive_catalogs = Arc::new(sqe_policy::plan_rewriter::HiveCatalogs::new());
+    let handler = make_handler_with_hive_registries(
+        SecretStore::new(),
+        RuntimeCatalogRegistry::new(),
+        true,
+        Arc::clone(&hive_catalogs),
+    );
+    let session = dummy_session();
+    let sql = format!(
+        "ATTACH 'file://{}' AS lake (TYPE hive_external)",
+        dir.path().display()
+    );
+    handler.execute(&session, &sql, None).await.expect("attach");
+    assert!(
+        hive_catalogs.contains_name(Some("lake")),
+        "precondition: attach must have inserted"
+    );
+
+    handler
+        .execute(&session, "DETACH lake", None)
+        .await
+        .expect("detach");
+
+    assert!(
+        !hive_catalogs.contains_name(Some("lake")),
+        "DETACH must remove from hive_catalogs, not just runtime_catalogs"
+    );
+}
+
+#[tokio::test]
+async fn detach_unknown_name_errors() {
+    let handler =
+        make_handler_allowing_local_paths(SecretStore::new(), RuntimeCatalogRegistry::new());
+    let session = dummy_session();
+
+    let err = handler
+        .execute(&session, "DETACH nope", None)
+        .await
+        .expect_err("unknown name must error");
+    assert!(err.to_string().contains("not attached"), "{err}");
+}

@@ -27,7 +27,7 @@ aws = ["sqe-catalog/glue", "sqe-catalog/s3tables"]
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }
-sqe-catalog = { path = "../sqe-catalog", default-features = false, features = ["rest", "rest-sigv4", "sql-sqlite", "hadoop"] }
+sqe-catalog = { path = "../sqe-catalog", default-features = false, features = ["rest", "rest-sigv4", "sql-sqlite", "hadoop", "hive-external"] }
 sqe-sql = { path = "../sqe-sql" }
 sqe-trino-functions = { path = "../sqe-trino-functions" }
 sqe-trino-compat = { path = "../sqe-trino-compat" }
@@ -63,6 +63,13 @@ reqwest = { workspace = true }
 url = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
+# Hive external-table DDL in embedded mode (Task 9): destructuring
+# `Statement::Drop` / `Statement::ShowCreate` to branch on a Hive root
+# before falling through to DataFusion's own DDL path.
+sqlparser = { workspace = true }
+# `HiveManifest::from_spec`'s `created_at` and this crate's own manifest
+# `owner`/timestamp stamping for CREATE EXTERNAL TABLE.
+chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

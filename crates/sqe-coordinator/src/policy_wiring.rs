@@ -22,6 +22,13 @@ use sqe_policy::{PassthroughEnforcer, PolicyEnforcer, PolicyStore};
 /// row filters are resolved from Iceberg table properties. When `None` (or
 /// `Passthrough` engine), `NoopTagSource` is used (no tag masking).
 ///
+/// `hive_catalogs` and `hive_manifest_cache` are the process-wide, LIVE
+/// registries `ATTACH ... TYPE hive_external` updates at runtime (Task 8+).
+/// The caller must pass the SAME `Arc`s given to every other consumer
+/// (the ATTACH handler, every per-session Hive provider): two separate
+/// instances would compile and look correct while routing nothing, because
+/// the tag source would read a cache no provider ever writes to.
+///
 /// `metrics`, when present, is attached to the Ranger store so policy resolve
 /// latency, cache hit/miss, and circuit-breaker state are exported. Pass `None`
 /// in tests that do not serve metrics.
@@ -29,6 +36,8 @@ use sqe_policy::{PassthroughEnforcer, PolicyEnforcer, PolicyStore};
 pub fn build_policy_enforcer(
     config: &PolicyConfig,
     table_cache: Option<sqe_catalog::TableMetadataCache>,
+    hive_catalogs: Arc<sqe_policy::plan_rewriter::HiveCatalogs>,
+    hive_manifest_cache: Arc<sqe_catalog::hive::provider::HiveMetadataCache>,
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
 ) -> anyhow::Result<(Arc<dyn PolicyEnforcer>, Option<Arc<dyn PolicyStore>>)> {
     let mask_key: Option<Arc<Vec<u8>>> = if config.mask_key.is_empty() {
@@ -74,9 +83,18 @@ pub fn build_policy_enforcer(
     match store {
         None => Ok((Arc::new(PassthroughEnforcer), None)),
         Some(store) => {
+            // `with_hive_catalogs` is wired unconditionally, NOT inside the
+            // `table_cache` branch below. `resolve_policy_key` uses it to key
+            // the resource policy (`store.resolve`) for every scan, which
+            // runs regardless of whether a tag source is configured; gating
+            // it on `table_cache` would leave a Hive table keyed under the
+            // Iceberg convention (issue's exact escalation) in any
+            // deployment that resolves resource policies but has no metadata
+            // cache wired.
             let mut rewriter = PolicyPlanRewriter::new(store.clone())
                 .with_mask_key(mask_key)
-                .with_mask_precedence(config.mask_precedence);
+                .with_mask_precedence(config.mask_precedence)
+                .with_hive_catalogs(hive_catalogs.clone());
 
             // Wire the tag source. `CacheTagSource` reads `sqe.column-tags`
             // table properties from the shared metadata cache with zero extra
@@ -85,8 +103,23 @@ pub fn build_policy_enforcer(
             // `NoopTagSource` (already the default; this block is explicit for
             // clarity).
             if let Some(cache) = table_cache {
-                let tag_src =
+                let iceberg: Arc<dyn sqe_policy::TagSource> =
                     Arc::new(crate::tag_source_impl::CacheTagSource::new(Arc::new(cache)));
+                // Wrap unconditionally, and let the router read the live
+                // `hive_catalogs` set on every call. Deciding here whether to
+                // wrap based on `hive_catalogs.is_empty()` would bake in
+                // whatever was attached at process start, and a later ATTACH
+                // would never reach the Hive source (Task 8+). When the set
+                // is empty the router delegates every call to `iceberg`, so
+                // an Iceberg-only deployment behaves identically to before.
+                let tag_src: Arc<dyn sqe_policy::TagSource> =
+                    Arc::new(crate::hive_tag_source::CatalogRoutedTagSource::new(
+                        hive_catalogs.clone(),
+                        Arc::new(crate::hive_tag_source::HiveTagSource::new(
+                            hive_manifest_cache.clone(),
+                        )),
+                        iceberg,
+                    ));
                 rewriter = rewriter.with_tag_source(tag_src);
             }
             // else: NoopTagSource stays (set in PolicyPlanRewriter::new).
@@ -158,10 +191,25 @@ mod tests {
     use super::*;
     use sqe_core::config::{PolicyConfig, PolicyEngine};
 
+    /// Fresh, empty Hive registries. Every test here is Iceberg-only, so an
+    /// empty `HiveCatalogs` must leave `build_policy_enforcer`'s behavior
+    /// unchanged from before Task 7.
+    fn no_hive() -> (
+        Arc<sqe_policy::plan_rewriter::HiveCatalogs>,
+        Arc<sqe_catalog::hive::provider::HiveMetadataCache>,
+    ) {
+        (
+            Arc::new(sqe_policy::plan_rewriter::HiveCatalogs::new()),
+            Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
+        )
+    }
+
     #[test]
     fn passthrough_yields_no_store() {
         let config = PolicyConfig::default();
-        let (_enforcer, store) = build_policy_enforcer(&config, None, None).unwrap();
+        let (hive_catalogs, hive_manifest_cache) = no_hive();
+        let (_enforcer, store) =
+            build_policy_enforcer(&config, None, hive_catalogs, hive_manifest_cache, None).unwrap();
         assert!(store.is_none());
     }
 
@@ -171,7 +219,10 @@ mod tests {
             engine: PolicyEngine::Ranger,
             ..Default::default()
         };
-        assert!(build_policy_enforcer(&config, None, None).is_err());
+        let (hive_catalogs, hive_manifest_cache) = no_hive();
+        assert!(
+            build_policy_enforcer(&config, None, hive_catalogs, hive_manifest_cache, None).is_err()
+        );
     }
 
     #[test]
@@ -180,7 +231,9 @@ mod tests {
             engine: PolicyEngine::InMemory,
             ..Default::default()
         };
-        let (_enforcer, store) = build_policy_enforcer(&config, None, None).unwrap();
+        let (hive_catalogs, hive_manifest_cache) = no_hive();
+        let (_enforcer, store) =
+            build_policy_enforcer(&config, None, hive_catalogs, hive_manifest_cache, None).unwrap();
         assert!(store.is_some());
     }
 
@@ -195,7 +248,8 @@ mod tests {
         };
         config.ranger.url = "http://ranger.example:6080".to_string();
         config.mask_key = String::new();
-        let result = build_policy_enforcer(&config, None, None);
+        let (hive_catalogs, hive_manifest_cache) = no_hive();
+        let result = build_policy_enforcer(&config, None, hive_catalogs, hive_manifest_cache, None);
         assert!(
             result.is_ok(),
             "ranger + empty mask_key must build (warn, not reject): {:?}",
@@ -296,10 +350,12 @@ catalog_url = "http://localhost:59997"
             engine: PolicyEngine::Ranger,
             ..Default::default()
         };
-        let msg = match build_policy_enforcer(&config, None, None) {
-            Ok(_) => panic!("ranger with an empty url must be rejected"),
-            Err(e) => format!("{e}"),
-        };
+        let (hive_catalogs, hive_manifest_cache) = no_hive();
+        let msg =
+            match build_policy_enforcer(&config, None, hive_catalogs, hive_manifest_cache, None) {
+                Ok(_) => panic!("ranger with an empty url must be rejected"),
+                Err(e) => format!("{e}"),
+            };
         assert!(msg.contains("policy.ranger.url"), "got: {msg}");
     }
 
@@ -313,7 +369,30 @@ catalog_url = "http://localhost:59997"
         };
         config.ranger.url = "http://ranger.example:6080".to_string();
         let metrics = std::sync::Arc::new(sqe_metrics::MetricsRegistry::new().unwrap());
-        let (_enforcer, store) = build_policy_enforcer(&config, None, Some(metrics)).unwrap();
+        let (hive_catalogs, hive_manifest_cache) = no_hive();
+        let (_enforcer, store) = build_policy_enforcer(
+            &config,
+            None,
+            hive_catalogs,
+            hive_manifest_cache,
+            Some(metrics),
+        )
+        .unwrap();
         assert!(store.is_some());
+    }
+
+    /// Task 7: a Hive-registered catalog must not change the passthrough
+    /// (no-store) outcome, and the returned enforcer must still be usable.
+    /// This is a narrow smoke test; `plan_rewriter.rs`'s own unit tests cover
+    /// the actual key-routing behavior in depth.
+    #[test]
+    fn a_registered_hive_catalog_does_not_disturb_passthrough() {
+        let config = PolicyConfig::default();
+        let hive_catalogs = Arc::new(sqe_policy::plan_rewriter::HiveCatalogs::new());
+        hive_catalogs.insert("lake");
+        let hive_manifest_cache = Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new());
+        let (_enforcer, store) =
+            build_policy_enforcer(&config, None, hive_catalogs, hive_manifest_cache, None).unwrap();
+        assert!(store.is_none());
     }
 }

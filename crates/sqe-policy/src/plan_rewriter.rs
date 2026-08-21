@@ -45,6 +45,11 @@ pub struct PolicyPlanRewriter {
     tag_source: Arc<dyn TagSource>,
     /// Which mask wins when a column has both a resource mask and a tag mask.
     mask_precedence: sqe_core::config::MaskPrecedence,
+    /// Live registry of Hive-external catalog names, consulted by
+    /// `resolve_policy_key` so a Hive table keys under its warehouse root
+    /// instead of the Iceberg convention. Defaults to empty, which is why an
+    /// Iceberg-only deployment never takes the Hive branch.
+    hive_catalogs: Arc<HiveCatalogs>,
 }
 
 impl PolicyPlanRewriter {
@@ -54,6 +59,7 @@ impl PolicyPlanRewriter {
             mask_key: None,
             tag_source: Arc::new(NoopTagSource),
             mask_precedence: sqe_core::config::MaskPrecedence::default(),
+            hive_catalogs: Arc::new(HiveCatalogs::default()),
         }
     }
 
@@ -80,6 +86,16 @@ impl PolicyPlanRewriter {
         self.tag_source = tag_source;
         self
     }
+
+    /// Inject the live registry of Hive-external catalog names. `ATTACH ...
+    /// TYPE hive_external` and `DETACH` update the SAME `Arc` at runtime, so
+    /// the rewriter (built once, process-wide) sees a root attached after
+    /// startup instead of keying it under the Iceberg convention forever.
+    #[must_use = "with_hive_catalogs consumes self; bind the returned rewriter"]
+    pub fn with_hive_catalogs(mut self, hive_catalogs: Arc<HiveCatalogs>) -> Self {
+        self.hive_catalogs = hive_catalogs;
+        self
+    }
 }
 
 #[async_trait]
@@ -92,6 +108,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         let store = self.store.clone();
         let mask_key = self.mask_key.clone();
         let tag_source = self.tag_source.clone();
+        let hive_catalogs = self.hive_catalogs.clone();
         let username = user.username.clone();
         let user_clone = user.clone();
 
@@ -151,7 +168,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
             // reference. This MUST match the write path's scheme
             // (the full dotted namespace, see `resolve_policy_key`), otherwise
             // reads and writes resolve different policies for the same table.
-            let Some((namespace, table)) = resolve_policy_key(table_ref) else {
+            let Some((namespace, table)) = resolve_policy_key(table_ref, &hive_catalogs) else {
                 // FAIL CLOSED: a reference we cannot confidently map to a
                 // policy key must never pass through. Deny all rows rather
                 // than risk leaking an unguarded table (issue #205).
@@ -445,6 +462,26 @@ impl PolicyEnforcer for PolicyPlanRewriter {
     }
 }
 
+/// True when `policy`'s row filters carry the deny-all `lit(false)` sentinel
+/// (resolve failure, breaker-open, unknown-tag state, or a fully-restricted
+/// table). The one place this check lives: `summarise_policies` below, the
+/// `SHOW EFFECTIVE POLICY` diagnostic, and any table-level gate outside the
+/// plan rewriter (e.g. a Hive DDL/introspection path with no LogicalPlan to
+/// run the rewriter over) all call this instead of re-deriving the
+/// literal-equality check by hand.
+pub fn policy_denies_all(policy: &ResolvedPolicy) -> bool {
+    policy.row_filters.iter().any(is_deny_all_expr)
+}
+
+/// The single `lit(false)` equality check `policy_denies_all` and
+/// `summarise_policies`'s per-filter loop both need. Not `pub`: callers
+/// outside this module want the whole-policy answer (`policy_denies_all`),
+/// not a per-`Expr` one.
+fn is_deny_all_expr(f: &Expr) -> bool {
+    let deny = lit(false);
+    f == &deny
+}
+
 /// Fold the per-table resolved policies into a single audit summary.
 ///
 /// `denied` is true when any policy injected a deny-all `lit(false)` row filter
@@ -453,7 +490,6 @@ impl PolicyEnforcer for PolicyPlanRewriter {
 /// so the count reflects real, user-visible row filters only. Masked and
 /// restricted column names are deduplicated and sorted for stable audit output.
 fn summarise_policies(table_policies: &HashMap<String, ResolvedPolicy>) -> PolicySummary {
-    let deny = lit(false);
     let mut row_filters_applied = 0usize;
     let mut masked: HashSet<String> = HashSet::new();
     let mut restricted: HashSet<String> = HashSet::new();
@@ -461,7 +497,7 @@ fn summarise_policies(table_policies: &HashMap<String, ResolvedPolicy>) -> Polic
 
     for policy in table_policies.values() {
         for f in &policy.row_filters {
-            if f == &deny {
+            if is_deny_all_expr(f) {
                 denied = true;
             } else {
                 row_filters_applied += 1;
@@ -722,32 +758,106 @@ fn is_reserved_virtual_ref(table_ref: &datafusion::common::TableReference) -> bo
     )
 }
 
-fn resolve_policy_key(table_ref: &datafusion::common::TableReference) -> Option<(String, String)> {
+/// Live set of catalog names that hold Hive external tables rather than
+/// Iceberg tables. Consulted by `resolve_policy_key` on every scan; empty in
+/// every Iceberg-only deployment, which is why the Hive branch there cannot
+/// change an existing key.
+///
+/// Read through a lock on every key resolution rather than snapshotted at
+/// construction. `build_policy_enforcer` runs the rewriter's constructor once,
+/// process-wide, at coordinator startup; `ATTACH ... TYPE hive_external`
+/// happens later, per session. A snapshot taken at construction would go
+/// stale the moment a root was attached: the Iceberg branch would keep
+/// winning, and `lake.hr.employees` would silently key as `("hr",
+/// "employees")`, inheriting whatever grant governs an Iceberg namespace
+/// named `hr`. That is the exact escalation this type exists to prevent, so
+/// it must not be reachable through staleness.
+#[derive(Debug, Default)]
+pub struct HiveCatalogs(std::sync::RwLock<std::collections::HashSet<String>>);
+
+impl HiveCatalogs {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&self, root: &str) {
+        // A poisoned lock means some other thread panicked while holding it.
+        // Failing closed is not an option here: the caller (ATTACH/DETACH)
+        // has no error path to report it through. The set is a name
+        // registry, not state that can be left half-written, so clearing
+        // the poison and continuing is safe.
+        self.0
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(root.to_string());
+    }
+
+    pub fn remove(&self, root: &str) {
+        self.0
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(root);
+    }
+
+    pub fn contains_name(&self, catalog: Option<&str>) -> bool {
+        let Some(c) = catalog else { return false };
+        self.0.read().unwrap_or_else(|e| e.into_inner()).contains(c)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+}
+
+/// Derive the `(namespace, table)` policy key from a structured DataFusion
+/// `TableReference`.
+///
+/// The Iceberg branch is unchanged from issue #205: the FULL (possibly
+/// multi-level) namespace string, falling back to `"default"` for a bare
+/// table. This used to take only the last dotted component, which collided
+/// (`sales` and `a.b.sales` both resolved to the Ranger database `sales`), so
+/// truncating again would reopen that hole.
+///
+/// The Hive branch is new: when `table_ref`'s catalog name is registered in
+/// `hive_catalogs`, the key carries that root name (`"{root}.{namespace}"`)
+/// instead. Whoever can write a Hive manifest picks the table's name and its
+/// `LOCATION`, so sharing a key with a same-named Iceberg table would be
+/// privilege escalation, not a coincidence to shrug off. The asymmetry is
+/// deliberate: every Ranger policy already written against the
+/// `hive_database` convention keys on the bare Iceberg namespace, and making
+/// both branches symmetric would be its own migration, not this one.
+fn resolve_policy_key(
+    table_ref: &datafusion::common::TableReference,
+    hive_catalogs: &HiveCatalogs,
+) -> Option<(String, String)> {
     let table = table_ref.table();
     if table.is_empty() {
         return None;
     }
 
-    // The FULL (possibly multi-level) namespace string.
-    //
-    // This used to take only the last dotted component, which collided: Iceberg
-    // namespaces `sales` and `a.b.sales` both resolved to the Ranger database
-    // `sales`, so a policy written for one fired on the other. `hive_database`
-    // documents the intended convention as the dotted string itself, which is also
-    // what Kyuubi uses, so the truncation was the odd one out.
-    //
-    // `policy_matches_table` still accepts a policy naming only the last component,
-    // as a logged compatibility path: policies written against the old key would
-    // otherwise stop firing, and for a mask or row filter that means protection
-    // silently disappearing on upgrade.
-    //
-    // A bare table name with no schema falls back to "default", unchanged.
     let namespace = match table_ref.schema() {
         Some(schema) if !schema.is_empty() => schema.to_string(),
         _ => "default".to_string(),
     };
 
+    if hive_catalogs.contains_name(table_ref.catalog()) {
+        let root = table_ref.catalog().unwrap_or_default();
+        return Some((format!("{root}.{namespace}"), table.to_string()));
+    }
+
     Some((namespace, table.to_string()))
+}
+
+/// Test-only door into `resolve_policy_key`. The key rule itself stays
+/// private; only the coordinator's cross-crate regression test (proving a
+/// root attached after the rewriter was built still resolves under the Hive
+/// branch) needs to reach it, not the public API.
+#[doc(hidden)]
+pub fn resolve_policy_key_for_test(
+    table_ref: &datafusion::common::TableReference,
+    hive_catalogs: &HiveCatalogs,
+) -> Option<(String, String)> {
+    resolve_policy_key(table_ref, hive_catalogs)
 }
 
 /// Widen a `TableScan`'s projection so a row filter can reference a column the
@@ -1496,15 +1606,23 @@ mod tests {
     }
 
     // ── resolve_policy_key (issue #205) ──────────────────────────
-    // The policy key MUST match the write path, which uses
-    // `namespace().last()`. For a multi-level schema "ns1.ns2" the key is
-    // ("ns2", table). A bare table falls back to "default".
+    // The Iceberg key keeps the FULL dotted namespace ("ns1.ns2", not just
+    // "ns2"); a bare table falls back to "default". `hive_catalogs` is
+    // empty for all of these, so the Hive branch never fires.
+
+    /// A `HiveCatalogs` whose only member is `name`, built through the same
+    /// public API `ATTACH` will use, not by poking the private field.
+    fn hive_only(name: &str) -> HiveCatalogs {
+        let hc = HiveCatalogs::default();
+        hc.insert(name);
+        hc
+    }
 
     #[test]
     fn resolve_policy_key_bare_table_uses_default_namespace() {
         let r = datafusion::common::TableReference::bare("employees");
         assert_eq!(
-            resolve_policy_key(&r),
+            resolve_policy_key(&r, &HiveCatalogs::default()),
             Some(("default".to_string(), "employees".to_string()))
         );
     }
@@ -1513,7 +1631,7 @@ mod tests {
     fn resolve_policy_key_two_part_uses_schema_as_namespace() {
         let r = datafusion::common::TableReference::partial("hr", "employees");
         assert_eq!(
-            resolve_policy_key(&r),
+            resolve_policy_key(&r, &HiveCatalogs::default()),
             Some(("hr".to_string(), "employees".to_string()))
         );
     }
@@ -1522,7 +1640,7 @@ mod tests {
     fn resolve_policy_key_three_part_uses_schema_as_namespace() {
         let r = datafusion::common::TableReference::full("cat", "hr", "employees");
         assert_eq!(
-            resolve_policy_key(&r),
+            resolve_policy_key(&r, &HiveCatalogs::default()),
             Some(("hr".to_string(), "employees".to_string()))
         );
     }
@@ -1536,7 +1654,7 @@ mod tests {
         // `sales`, so a policy written for one fired on the other.
         let r = datafusion::common::TableReference::full("cat", "ns1.ns2", "employees");
         assert_eq!(
-            resolve_policy_key(&r),
+            resolve_policy_key(&r, &HiveCatalogs::default()),
             Some(("ns1.ns2".to_string(), "employees".to_string()))
         );
     }
@@ -1547,8 +1665,8 @@ mod tests {
         // the key `sales`.
         let shallow = datafusion::common::TableReference::full("cat", "sales", "orders");
         let deep = datafusion::common::TableReference::full("cat", "a.b.sales", "orders");
-        let shallow_key = resolve_policy_key(&shallow).expect("shallow");
-        let deep_key = resolve_policy_key(&deep).expect("deep");
+        let shallow_key = resolve_policy_key(&shallow, &HiveCatalogs::default()).expect("shallow");
+        let deep_key = resolve_policy_key(&deep, &HiveCatalogs::default()).expect("deep");
         assert_ne!(
             shallow_key, deep_key,
             "two distinct Iceberg namespaces must not resolve to the same policy key"
@@ -1562,7 +1680,103 @@ mod tests {
         // An empty table component cannot be confidently keyed; the caller
         // treats None as deny-all rather than passthrough.
         let r = datafusion::common::TableReference::bare("");
-        assert_eq!(resolve_policy_key(&r), None);
+        assert_eq!(resolve_policy_key(&r, &HiveCatalogs::default()), None);
+    }
+
+    // ── resolve_policy_key: Hive routing (Task 7) ─────────────────
+    // A Hive table's key must carry its warehouse-root name, never collide
+    // with a same-named Iceberg table, and leave the Iceberg branch alone.
+
+    #[test]
+    fn hive_table_key_carries_the_root_name() {
+        let r = datafusion::common::TableReference::full("lake", "sales", "orders");
+        assert_eq!(
+            resolve_policy_key(&r, &hive_only("lake")),
+            Some(("lake.sales".to_string(), "orders".to_string()))
+        );
+    }
+
+    #[test]
+    fn an_iceberg_key_is_unchanged_by_the_hive_branch() {
+        // Regression guard: every Ranger policy already written against the
+        // hive_database convention keys on the bare namespace. The Hive branch
+        // must not touch that, whether or not some OTHER catalog is Hive-routed.
+        let r = datafusion::common::TableReference::full("iceberg", "hr", "employees");
+        assert_eq!(
+            resolve_policy_key(&r, &hive_only("lake")),
+            Some(("hr".to_string(), "employees".to_string()))
+        );
+        assert_eq!(
+            resolve_policy_key(&r, &HiveCatalogs::default()),
+            Some(("hr".to_string(), "employees".to_string()))
+        );
+    }
+
+    #[test]
+    fn an_iceberg_grant_cannot_reach_a_hive_table_of_the_same_name() {
+        let iceberg = datafusion::common::TableReference::full("iceberg", "hr", "employees");
+        let hive = datafusion::common::TableReference::full("lake", "hr", "employees");
+        let cats = hive_only("lake");
+        assert_ne!(
+            resolve_policy_key(&iceberg, &cats),
+            resolve_policy_key(&hive, &cats),
+            "same-named tables in different catalog kinds must not share a policy key"
+        );
+    }
+
+    /// The residual gap the security review found and `attach_configured_hive_roots`
+    /// (`runtime_catalog.rs`) now refuses at the door, not here: this
+    /// function itself only matches `TableReference::Full`, so a two-part
+    /// reference (`table_ref.catalog() == None`) ALWAYS takes the Iceberg
+    /// branch, even when `hive_catalogs` names a root that happens to equal
+    /// what the caller's session default catalog resolved from. Every other
+    /// test above uses `TableReference::full`; this one pins the
+    /// non-`Full` case explicitly, so a future refactor that "helpfully"
+    /// tries to promote the reference here (which the review deliberately
+    /// deferred: a late change to a security-critical path, versus a cheap,
+    /// fail-closed refusal at attach time) does not silently reopen the
+    /// escalation this key decides. The Hive root name intentionally
+    /// matches a real Iceberg namespace here to make the collision
+    /// concrete, not just type-shaped.
+    #[test]
+    fn a_two_part_reference_never_takes_the_hive_branch_even_if_the_name_matches() {
+        let partial = datafusion::common::TableReference::partial("lake", "orders");
+        let bare = datafusion::common::TableReference::bare("orders");
+        let cats = hive_only("lake");
+
+        assert_eq!(
+            resolve_policy_key(&partial, &cats),
+            Some(("lake".to_string(), "orders".to_string())),
+            "a Partial reference must resolve as an ordinary Iceberg namespace named 'lake', \
+             not the Hive root 'lake'"
+        );
+        assert_eq!(
+            resolve_policy_key(&bare, &cats),
+            Some(("default".to_string(), "orders".to_string())),
+            "a Bare reference has no catalog component to match against at all"
+        );
+    }
+
+    #[test]
+    fn a_root_attached_after_the_rewriter_was_built_still_gets_the_hive_key() {
+        // The regression guard for the staleness path. The enforcer is built
+        // once process-wide; ATTACH happens later. If the set were
+        // snapshotted, this key would come back as ("sales", "orders") and
+        // the table would inherit any grant written for an Iceberg namespace
+        // named `sales`.
+        let cats = HiveCatalogs::default();
+        let r = datafusion::common::TableReference::full("lake", "sales", "orders");
+        assert_eq!(
+            resolve_policy_key_for_test(&r, &cats),
+            Some(("sales".to_string(), "orders".to_string())),
+            "before ATTACH the root is unknown, so the Iceberg branch is correct"
+        );
+        cats.insert("lake");
+        assert_eq!(
+            resolve_policy_key_for_test(&r, &cats),
+            Some(("lake.sales".to_string(), "orders".to_string())),
+            "after ATTACH the same reference must key under the root"
+        );
     }
 
     // ── is_reserved_virtual_ref ──────────────────────────────────
