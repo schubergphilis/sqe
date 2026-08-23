@@ -117,6 +117,75 @@ async fn put_refuses_a_forbidden_location_up_front() {
 }
 
 #[tokio::test]
+async fn an_index_entry_pointing_at_a_forbidden_location_is_refused_on_load() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).expect("mkdir");
+
+    // Plant a manifest whose table location is fine but whose index entry
+    // points at a mounted secret. The attacker path is exactly the one that
+    // makes the index dangerous: read planning would trust entry locations
+    // as file sources without ever listing them.
+    let mut planted = manifest(&format!("file://{}", data.display()));
+    planted.sqe.partition_index =
+        Some(sqe_catalog::hive::manifest::PartitionIndex {
+            format_version: sqe_catalog::hive::manifest::PARTITION_INDEX_FORMAT_VERSION,
+            entries: vec![sqe_catalog::hive::manifest::PartitionIndexEntry {
+                values: std::collections::BTreeMap::from([(
+                    "dt".to_string(),
+                    "2026-01-02".to_string(),
+                )]),
+                location: "file:///var/run/secrets/kubernetes.io/serviceaccount/".to_string(),
+                file_count: 1,
+                total_bytes: 16,
+            }],
+        });
+    store_for(dir.path(), permissive())
+        .put(&planted, false)
+        .await
+        .expect("plant");
+
+    let guarded = store_for(dir.path(), TvfPolicy::default());
+    let err = guarded
+        .get("sales", "orders")
+        .await
+        .expect_err("must refuse");
+    assert!(
+        matches!(err, sqe_catalog::hive::HiveError::Forbidden(_)),
+        "an index entry location must pass the allowlist on every load; got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn put_refuses_an_index_entry_at_a_forbidden_location_up_front() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).expect("mkdir");
+
+    let mut m = manifest(&format!("file://{}", data.display()));
+    m.sqe.partition_index = Some(sqe_catalog::hive::manifest::PartitionIndex {
+        format_version: sqe_catalog::hive::manifest::PARTITION_INDEX_FORMAT_VERSION,
+        entries: vec![sqe_catalog::hive::manifest::PartitionIndexEntry {
+            values: std::collections::BTreeMap::from([(
+                "dt".to_string(),
+                "2026-01-02".to_string(),
+            )]),
+            location: "file:///etc/".to_string(),
+            file_count: 0,
+            total_bytes: 0,
+        }],
+    });
+    let err = store_for(dir.path(), TvfPolicy::default())
+        .put(&m, false)
+        .await
+        .expect_err("must refuse");
+    assert!(
+        matches!(err, sqe_catalog::hive::HiveError::Forbidden(_)),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn if_not_exists_does_not_overwrite() {
     let dir = tempfile::tempdir().expect("tmp");
     let data = dir.path().join("data");

@@ -59,6 +59,39 @@ fn fixed_width(dt: &DataType) -> Option<usize> {
 /// `row_width_hint` (`Inexact`, since it is only ever an estimate). Column
 /// statistics are left at their unknown default: nothing here reads a byte
 /// of the files themselves.
+/// Size-derived statistics from index metadata (file counts/sizes captured
+/// at ADD/REPAIR time) so planning does not LIST the table prefix.
+pub fn size_only_from_index(
+    total_bytes: u64,
+    row_width_hint: usize,
+    schema: &Schema,
+) -> Statistics {
+    let total_bytes = total_bytes as usize;
+    let row_width_hint = row_width_hint.max(1);
+    Statistics {
+        num_rows: Precision::Inexact(total_bytes / row_width_hint),
+        total_byte_size: Precision::Exact(total_bytes),
+        column_statistics: vec![ColumnStatistics::new_unknown(); schema.fields().len()],
+    }
+}
+
+/// Planning statistics from a prior `ANALYZE TABLE`: exact row count, size
+/// still from the index byte total when known.
+pub fn analyzed_statistics(
+    row_count: u64,
+    total_bytes: Option<u64>,
+    schema: &Schema,
+) -> Statistics {
+    Statistics {
+        num_rows: Precision::Exact(row_count as usize),
+        total_byte_size: match total_bytes {
+            Some(b) => Precision::Exact(b as usize),
+            None => Precision::Absent,
+        },
+        column_statistics: vec![ColumnStatistics::new_unknown(); schema.fields().len()],
+    }
+}
+
 pub fn size_only_statistics(
     files: &[ObjectMeta],
     row_width_hint: usize,

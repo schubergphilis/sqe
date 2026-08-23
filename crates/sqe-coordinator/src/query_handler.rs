@@ -422,7 +422,8 @@ impl QueryHandler {
     ) -> Self {
         self.hive_ddl_handler = self
             .hive_ddl_handler
-            .with_hive_registries(Arc::clone(&hive_catalogs));
+            .with_hive_registries(Arc::clone(&hive_catalogs))
+            .with_manifest_cache(Arc::clone(&hive_manifest_cache));
         self.hive_catalogs = Some(hive_catalogs);
         self.hive_manifest_cache = hive_manifest_cache;
         self
@@ -1182,14 +1183,14 @@ impl QueryHandler {
         let execution_future = async {
             match &kind {
                 StatementKind::Query(_) => {
-                    self.execute_query(
+                    Box::pin(self.execute_query(
                         session,
                         sql,
                         &query_id,
                         &plan_metrics,
                         &mut captured_plan,
                         &mut policy_summary,
-                    )
+                    ))
                     .await
                 }
 
@@ -1546,6 +1547,30 @@ impl QueryHandler {
                     result.map(|()| Vec::new())
                 }
 
+                // Cycle-2 Hive partition maintenance. Each resolves the
+                // table kind first: a Hive table executes against its
+                // manifest index, anything else keeps today's generic
+                // not-supported error (there is no Iceberg ADD/DROP
+                // PARTITION path; Iceberg partition evolution is a different
+                // statement with its own variant).
+                //
+                // The bodies live in dedicated methods that are Box::pinned
+                // at the call site: the dispatch match compiles every arm's
+                // future into ONE type, and these arms' futures (manifest
+                // store round-trips, listing, audit) are large enough that
+                // unboxed they overflowed a 2 MB tokio worker stack.
+                StatementKind::HivePartitionDdl(ref ddl) => {
+                    Box::pin(self.handle_hive_partition_ddl(session, ddl)).await
+                }
+
+                StatementKind::MsckRepairTable(ref table_name) => {
+                    Box::pin(self.handle_hive_msck_repair(session, table_name)).await
+                }
+
+                StatementKind::ShowPartitions(ref table_name) => {
+                    Box::pin(self.handle_hive_show_partitions(session, table_name)).await
+                }
+
                 StatementKind::Ctas(stmt) => {
                     if let Statement::CreateTable(ref ct) = **stmt {
                         if let Some(ref query) = ct.query {
@@ -1873,8 +1898,7 @@ impl QueryHandler {
                 // stats collection is currently a no-op (#329). A missing table
                 // still errors, like a SELECT would.
                 StatementKind::Analyze(ref table_name) => {
-                    self.reject_if_hive_table(session, &TableReference::from(table_name.as_str()), "ANALYZE", 2)?;
-                    self.handle_analyze(session, table_name).await
+                    Box::pin(self.handle_analyze_dispatch(session, table_name)).await
                 }
 
                 StatementKind::Merge(stmt) => {
@@ -6141,6 +6165,26 @@ impl QueryHandler {
         build_show_stats_batch(&column_names, row_count)
     }
 
+    async fn handle_analyze_dispatch(
+        &self,
+        session: &Session,
+        table_name: &str,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let table_ref = TableReference::from(table_name);
+        if matches!(
+            self.hive_ddl_handler
+                .resolve_table_kind_for_session(session.default_catalog.as_deref(), &table_ref),
+            crate::hive_ddl_handler::TableKind::Hive { .. }
+        ) {
+            return self
+                .hive_ddl_handler
+                .analyze_table(session, &table_ref)
+                .await
+                .map(|_| Vec::new());
+        }
+        self.handle_analyze(session, table_name).await
+    }
+
     /// ANALYZE [catalog.][schema.]table [WITH (...)] — Trino's table-statistics
     /// command. SQE resolves and loads the table (so a missing table errors the
     /// same way a SELECT would) and returns a successful empty result. Computing
@@ -6248,6 +6292,10 @@ impl QueryHandler {
                 max_bytes: self.config.hive.manifest_max_bytes,
                 max_columns: self.config.hive.manifest_max_columns,
                 max_partition_keys: self.config.hive.manifest_max_partition_keys,
+                max_partition_index_entries: self
+                    .config
+                    .hive
+                    .manifest_max_partition_index_entries,
             };
             let store = sqe_catalog::mount::build_hive_root(
                 &stmt.location,
@@ -7451,6 +7499,120 @@ impl QueryHandler {
             }
             crate::hive_ddl_handler::TableKind::Iceberg => Ok(()),
         }
+    }
+
+    /// Cycle-2 Hive partition maintenance (`ALTER TABLE ... ADD/DROP
+    /// PARTITION`). A Hive table executes against its manifest index;
+    /// anything else keeps today's generic not-supported error (there is no
+    /// Iceberg ADD/DROP PARTITION path; Iceberg partition evolution is a
+    /// different statement with its own variant).
+    async fn handle_hive_partition_ddl(
+        &self,
+        session: &Session,
+        ddl: &sqe_sql::hive_partitions::HivePartitionDdl,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let table_ref = TableReference::from(ddl.table.as_str());
+        if !matches!(
+            self.hive_ddl_handler
+                .resolve_table_kind_for_session(session.default_catalog.as_deref(), &table_ref),
+            crate::hive_ddl_handler::TableKind::Hive { .. }
+        ) {
+            return Err(SqeError::NotImplemented(format!(
+                "Utility statement not supported: ALTER TABLE {} ADD/DROP PARTITION is only \
+                 supported for hive_external tables",
+                ddl.table
+            )));
+        }
+        match &ddl.action {
+            sqe_sql::hive_partitions::HivePartitionAction::Add {
+                if_not_exists,
+                partitions,
+            } => {
+                for p in partitions {
+                    let spec = sqe_catalog::hive::partition::PartitionSpec {
+                        values: p.values.clone(),
+                        location: p.location.clone(),
+                    };
+                    self.hive_ddl_handler
+                        .add_partition(session, &table_ref, spec, *if_not_exists)
+                        .await?;
+                }
+            }
+            sqe_sql::hive_partitions::HivePartitionAction::Drop {
+                if_exists,
+                partitions,
+                purge,
+            } => {
+                for p in partitions {
+                    let spec = sqe_catalog::hive::partition::PartitionSpec {
+                        values: p.values.clone(),
+                        location: None,
+                    };
+                    self.hive_ddl_handler
+                        .drop_partition(session, &table_ref, spec, *if_exists, *purge)
+                        .await?;
+                }
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// `MSCK REPAIR TABLE` against a Hive root.
+    async fn handle_hive_msck_repair(
+        &self,
+        session: &Session,
+        table_name: &str,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let table_ref = TableReference::from(table_name);
+        if !matches!(
+            self.hive_ddl_handler
+                .resolve_table_kind_for_session(session.default_catalog.as_deref(), &table_ref),
+            crate::hive_ddl_handler::TableKind::Hive { .. }
+        ) {
+            return Err(SqeError::NotImplemented(
+                "MSCK REPAIR TABLE is only supported for hive_external tables".to_string(),
+            ));
+        }
+        self.hive_ddl_handler
+            .msck_repair(session, &table_ref)
+            .await
+            .map(|_| Vec::new())
+    }
+
+    /// `SHOW PARTITIONS <t>` against a Hive root: one `partition` column,
+    /// one row per partition, Athena-style `k=v` specs.
+    async fn handle_hive_show_partitions(
+        &self,
+        session: &Session,
+        table_name: &str,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let table_ref = TableReference::from(table_name);
+        if !matches!(
+            self.hive_ddl_handler
+                .resolve_table_kind_for_session(session.default_catalog.as_deref(), &table_ref),
+            crate::hive_ddl_handler::TableKind::Hive { .. }
+        ) {
+            return Err(SqeError::NotImplemented(
+                "SHOW PARTITIONS is only supported for hive_external tables".to_string(),
+            ));
+        }
+        let specs = self
+            .hive_ddl_handler
+            .show_partitions(&session.user, &table_ref)
+            .await?;
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new(
+                "partition",
+                datafusion::arrow::datatypes::DataType::Utf8,
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(datafusion::arrow::array::StringArray::from(specs))],
+        )
+        .map_err(|e| SqeError::Execution(e.to_string()))?;
+        Ok(vec![batch])
     }
 }
 

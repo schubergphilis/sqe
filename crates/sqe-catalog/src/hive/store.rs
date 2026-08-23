@@ -60,6 +60,36 @@ impl HiveManifestStore {
             .join(MANIFEST_FILENAME)
     }
 
+    /// The object store this root was built with. Index maintenance
+    /// (`MSCK REPAIR`, `ADD PARTITION` metadata capture) lists data
+    /// locations through it; `partition.rs` refuses a location whose
+    /// scheme/host differs from this root's, rather than silently listing
+    /// the wrong bucket.
+    pub fn object_store(&self) -> Arc<dyn ObjectStore> {
+        Arc::clone(&self.store)
+    }
+
+    /// The parsed warehouse-root URL.
+    pub fn root_url(&self) -> &ListingTableUrl {
+        &self.root
+    }
+
+    /// The manifest caps this store enforces, for writers that must
+    /// fail-closed against the same caps a reader will apply.
+    pub fn limits(&self) -> &ManifestLimits {
+        &self.limits
+    }
+
+    /// Run `[storage.tvf] check_path` on a data location. `ADD PARTITION`
+    /// must call this *before* LISTing the new entry: `put` also checks
+    /// index locations, but that is too late if the LIST already walked a
+    /// forbidden prefix.
+    pub fn check_location(&self, location: &str) -> Result<(), HiveError> {
+        self.tvf
+            .check_path(location, &self.caller, false)
+            .map_err(HiveError::Forbidden)
+    }
+
     /// The database-level prefix, `<root_path>/<database>`.
     fn database_prefix(&self, database: &str) -> Path {
         self.root.prefix().clone().join(database)
@@ -79,6 +109,16 @@ impl HiveManifestStore {
         self.tvf
             .check_path(&m.storage_descriptor.location, &self.caller, false)
             .map_err(HiveError::Forbidden)?;
+        // Same guard for index entry locations: ADD PARTITION can point an
+        // entry anywhere, and the create-time check is the only one that can
+        // refuse before a bad location is persisted at all.
+        if let Some(index) = &m.sqe.partition_index {
+            for entry in &index.entries {
+                self.tvf
+                    .check_path(&entry.location, &self.caller, false)
+                    .map_err(HiveError::Forbidden)?;
+            }
+        }
 
         let path = self.manifest_path(&m.database_name, &m.name);
         let bytes = Bytes::from(m.to_bytes()?);
@@ -140,6 +180,24 @@ impl HiveManifestStore {
         }
     }
 
+    /// HEAD the sidecar object and return its ETag, if the store provides one.
+    /// `NotFound` if the manifest does not exist. Used by `HiveMetadataCache`
+    /// so a changed object reloads the index without a timer.
+    pub async fn manifest_etag(
+        &self,
+        database: &str,
+        table: &str,
+    ) -> Result<Option<String>, HiveError> {
+        let path = self.manifest_path(database, table);
+        match self.store.head(&path).await {
+            Ok(meta) => Ok(meta.e_tag),
+            Err(object_store::Error::NotFound { .. }) => {
+                Err(HiveError::NotFound(format!("{database}.{table}")))
+            }
+            Err(e) => Err(store_err(&path, e)),
+        }
+    }
+
     /// Load a manifest, validating its location on every call.
     pub async fn get(&self, database: &str, table: &str) -> Result<HiveManifest, HiveError> {
         let path = self.manifest_path(database, table);
@@ -167,6 +225,20 @@ impl HiveManifestStore {
         self.tvf
             .check_path(&manifest.storage_descriptor.location, &self.caller, false)
             .map_err(HiveError::Forbidden)?;
+
+        // SECURITY: index entry locations get exactly the same treatment as
+        // `storage_descriptor.location`, for exactly the same reason. A
+        // planted manifest's index entries are attacker-chosen URLs; letting
+        // read planning trust them without the allowlist would reintroduce
+        // through the index door the bypass this check closed on the table
+        // door.
+        if let Some(index) = &manifest.sqe.partition_index {
+            for entry in &index.entries {
+                self.tvf
+                    .check_path(&entry.location, &self.caller, false)
+                    .map_err(HiveError::Forbidden)?;
+            }
+        }
 
         Ok(manifest)
     }

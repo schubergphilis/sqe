@@ -2126,12 +2126,16 @@ fn default_hive_manifest_max_partition_keys() -> usize {
     32
 }
 
+fn default_hive_manifest_max_partition_index_entries() -> usize {
+    100_000
+}
+
 /// `[hive]`: warehouse roots to attach at coordinator startup, plus the
-/// manifest size/shape caps enforced on every root. The three caps default
+/// manifest size/shape caps enforced on every root. The four caps default
 /// to the exact values `hive::manifest::ManifestLimits::default()` uses
-/// (`1048576` bytes, `4096` columns, `32` partition keys); a mismatch
-/// between the config default and the code default would be a config
-/// surface that silently lies about what it controls.
+/// (`1048576` bytes, `4096` columns, `32` partition keys, `100000` index
+/// entries); a mismatch between the config default and the code default
+/// would be a config surface that silently lies about what it controls.
 #[derive(Debug, Deserialize, Clone)]
 pub struct HiveConfig {
     #[serde(default)]
@@ -2142,6 +2146,8 @@ pub struct HiveConfig {
     pub manifest_max_columns: usize,
     #[serde(default = "default_hive_manifest_max_partition_keys")]
     pub manifest_max_partition_keys: usize,
+    #[serde(default = "default_hive_manifest_max_partition_index_entries")]
+    pub manifest_max_partition_index_entries: usize,
 }
 
 impl Default for HiveConfig {
@@ -2151,6 +2157,8 @@ impl Default for HiveConfig {
             manifest_max_bytes: default_hive_manifest_max_bytes(),
             manifest_max_columns: default_hive_manifest_max_columns(),
             manifest_max_partition_keys: default_hive_manifest_max_partition_keys(),
+            manifest_max_partition_index_entries:
+                default_hive_manifest_max_partition_index_entries(),
         }
     }
 }

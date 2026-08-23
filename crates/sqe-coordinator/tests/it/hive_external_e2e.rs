@@ -399,6 +399,49 @@ async fn hive_external_table_round_trips_on_object_storage() {
     );
 
     handler
+        .execute(&session, "MSCK REPAIR TABLE lake.sales.orders", None)
+        .await
+        .expect("msck repair");
+    let parts = handler
+        .execute(&session, "SHOW PARTITIONS lake.sales.orders", None)
+        .await
+        .expect("show partitions");
+    let part_text = datafusion::arrow::util::pretty::pretty_format_batches(&parts)
+        .expect("fmt")
+        .to_string();
+    assert!(
+        part_text.contains("dt=2026-01-01") && part_text.contains("dt=2026-01-02"),
+        "SHOW PARTITIONS after repair: {part_text}"
+    );
+    handler
+        .execute(
+            &session,
+            "ALTER TABLE lake.sales.orders DROP PARTITION (dt='2026-01-02')",
+            None,
+        )
+        .await
+        .expect("drop partition");
+    assert_eq!(
+        count_of(&handler, &session, "SELECT count(*) FROM lake.sales.orders").await,
+        2,
+        "indexed read after DROP PARTITION must omit the dropped partition"
+    );
+    handler
+        .execute(
+            &session,
+            "ALTER TABLE lake.sales.orders ADD PARTITION (dt='2026-01-02') \
+             LOCATION 's3://warehouse/hive-t11-raw/orders/dt=2026-01-02/'",
+            None,
+        )
+        .await
+        .expect("add partition");
+    assert_eq!(
+        count_of(&handler, &session, "SELECT count(*) FROM lake.sales.orders").await,
+        3,
+        "ADD PARTITION must restore the omitted partition without a full prefix LIST"
+    );
+
+    handler
         .execute(&session, "DROP TABLE lake.sales.orders", None)
         .await
         .expect("drop");

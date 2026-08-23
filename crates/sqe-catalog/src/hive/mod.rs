@@ -8,6 +8,9 @@
 
 pub mod ddl_render;
 pub mod manifest;
+pub mod partition;
+pub mod projection;
+pub mod prune;
 pub mod provider;
 pub mod serde_map;
 pub mod stats;
