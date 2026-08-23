@@ -7629,8 +7629,10 @@ type = "aws"
 
     #[test]
     fn max_sql_bytes_zero_is_unlimited_outside_production() {
-        let mut config = QueryConfig::default();
-        config.max_sql_bytes = 0;
+        let config = QueryConfig {
+            max_sql_bytes: 0,
+            ..Default::default()
+        };
         assert!(config.check_sql_bytes(&"x".repeat(2_000_000)).is_ok());
     }
 
