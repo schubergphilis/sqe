@@ -1,0 +1,67 @@
+{
+  "plan": "hive-external-cycle2-bitcoin-public-slice",
+  "generated_at_rfc3339": "2026-08-23T10:55:41.220279+00:00",
+  "profile": "dev-release",
+  "cases": [
+    {
+      "name": "btc_count_full",
+      "format": "parquet",
+      "partitions": 449,
+      "rows_per_partition": 0,
+      "predicate": null,
+      "listing_cold_ms": 196.40675,
+      "listing_warm_ms": 54.671083,
+      "indexed_cold_ms": 120.847667,
+      "indexed_warm_ms": 23.03175,
+      "projection_cold_ms": null,
+      "projection_warm_ms": null,
+      "msck_ms": 48.348292,
+      "rows": 45869
+    },
+    {
+      "name": "btc_count_pin_2024_01_01",
+      "format": "parquet",
+      "partitions": 449,
+      "rows_per_partition": 0,
+      "predicate": "date = '2024-01-01'",
+      "listing_cold_ms": 99.11487500000001,
+      "listing_warm_ms": 47.924375,
+      "indexed_cold_ms": 1.908208,
+      "indexed_warm_ms": 0.717042,
+      "projection_cold_ms": 11.198208,
+      "projection_warm_ms": 3.058,
+      "msck_ms": null,
+      "rows": 155
+    },
+    {
+      "name": "btc_sum_tx_pin_2024_01_01",
+      "format": "parquet",
+      "partitions": 449,
+      "rows_per_partition": 0,
+      "predicate": "date = '2024-01-01'",
+      "listing_cold_ms": 95.94949999999999,
+      "listing_warm_ms": 48.622666,
+      "indexed_cold_ms": 1.486875,
+      "indexed_warm_ms": 0.870458,
+      "projection_cold_ms": null,
+      "projection_warm_ms": null,
+      "msck_ms": null,
+      "rows": 657752
+    },
+    {
+      "name": "btc_sum_tx_full",
+      "format": "parquet",
+      "partitions": 449,
+      "rows_per_partition": 0,
+      "predicate": null,
+      "listing_cold_ms": null,
+      "listing_warm_ms": null,
+      "indexed_cold_ms": 144.001083,
+      "indexed_warm_ms": 26.563416999999998,
+      "projection_cold_ms": null,
+      "projection_warm_ms": null,
+      "msck_ms": null,
+      "rows": 36977562
+    }
+  ]
+}
