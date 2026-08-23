@@ -130,7 +130,7 @@ Four things worth separating.
 
 **DuckDB can query the public bucket today and SQE cannot.** 1.1 s cold and 370 ms warm for a one-day pin straight off `s3://`, no credentials. SQE needs engine credentials for any object-store read, which is why this comparison ran on copied files.
 
-Fairness notes, because they change how much the table is worth: both engines hit a hot page cache, neither run is cold-disk, the SQE build is `dev-release`, and 15 MiB of data is not a decode benchmark. What it measures is planning, and planning is what cycle 2 changed.
+Fairness notes, because they change how much the table is worth: both engines hit a hot page cache, neither run is cold-disk, the SQE build is `dev-release`, and 15 MiB of data is not a decode benchmark. The two warm numbers are not defined identically either, so treat the warm column as a band rather than a measurement: DuckDB's is the median of six repeats, SQE's is the third. What the table measures is planning, and planning is what cycle 2 changed.
 
 ## Partition projection is implemented, and it is not always the fast path
 
