@@ -1016,6 +1016,7 @@ impl SessionCatalog {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         catalog_url: &str,
         warehouse: &str,
@@ -2132,13 +2133,14 @@ mod cache_capacity_tests {
     use std::collections::HashMap;
 
     fn storage_with_keys() -> StorageConfig {
-        let mut s = StorageConfig::default();
-        s.s3_endpoint = "http://s3.local".to_string();
-        s.s3_region = "us-east-1".to_string();
-        s.s3_access_key = "AKIAEXAMPLE".to_string();
-        s.s3_secret_key = sqe_core::SecretString::new("secret".to_string());
-        s.s3_path_style = true;
-        s
+        StorageConfig {
+            s3_endpoint: "http://s3.local".to_string(),
+            s3_region: "us-east-1".to_string(),
+            s3_access_key: "AKIAEXAMPLE".to_string(),
+            s3_secret_key: sqe_core::SecretString::new("secret".to_string()),
+            s3_path_style: true,
+            ..Default::default()
+        }
     }
 
     #[test]
