@@ -367,8 +367,10 @@ async fn add_partition_cap_leaves_the_index_unchanged() {
     let dir = tempfile::tempdir().expect("tmp");
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    let mut limits = ManifestLimits::default();
-    limits.max_partition_index_entries = 1;
+    let limits = ManifestLimits {
+        max_partition_index_entries: 1,
+        ..Default::default()
+    };
     let store = store_for_limits(dir.path(), limits);
     let mut m = manifest(&format!("file://{}", data.display()));
     store.put(&m, false).await.unwrap();
