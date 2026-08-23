@@ -200,12 +200,13 @@ s3_path_style = true
 # [hive]
 # Manifest caps enforced on every root, at CREATE EXTERNAL TABLE and on
 # every load: the manifest is untrusted input, planted by anyone who can
-# write to the warehouse prefix. These three match
+# write to the warehouse prefix. These four match
 # hive::manifest::ManifestLimits::default() exactly; a mismatch here would
 # be a config surface that silently does nothing.
 # manifest_max_bytes = 1048576          # 1 MiB
 # manifest_max_columns = 4096
 # manifest_max_partition_keys = 32
+# manifest_max_partition_index_entries = 100000
 #
 # Warehouse roots attached before the first query, the config equivalent
 # of ATTACH '<location>' AS <name> (TYPE hive_external). Repeatable.
