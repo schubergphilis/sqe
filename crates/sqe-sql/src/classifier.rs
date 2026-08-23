@@ -182,6 +182,19 @@ pub enum StatementKind {
     DropSecret(Box<DropSecretStatement>),
     /// `SHOW SECRETS` — list secret names and their kinds (never the values).
     ShowSecrets,
+    /// `MSCK REPAIR TABLE <t>` — rebuild a Hive external table's partition
+    /// index from storage. sqlparser parses this natively (`Statement::Msck`);
+    /// only `REPAIR` (and no ADD/DROP/SYNC PARTITIONS suffix) is accepted.
+    MsckRepairTable(String),
+    /// `SHOW PARTITIONS <t>` — list a Hive external table's partitions.
+    /// sqlparser delivers this as a generic `ShowVariable`, so it is
+    /// intercepted by prefix before parsing.
+    ShowPartitions(String),
+    /// `ALTER TABLE ... ADD/DROP PARTITION` on a Hive external table.
+    /// Pre-parsed because sqlparser 0.62 cannot express `LOCATION` after an
+    /// added partition spec or `PURGE` after a dropped one; see
+    /// [`crate::hive_partitions`].
+    HivePartitionDdl(Box<crate::hive_partitions::HivePartitionDdl>),
 }
 
 impl StatementKind {
@@ -242,6 +255,9 @@ impl StatementKind {
             StatementKind::CreateSecret(_) => "create_secret",
             StatementKind::DropSecret(_) => "drop_secret",
             StatementKind::ShowSecrets => "show_secrets",
+            StatementKind::MsckRepairTable(_) => "msckrepairtable",
+            StatementKind::ShowPartitions(_) => "showpartitions",
+            StatementKind::HivePartitionDdl(_) => "hivepartitionddl",
         }
     }
 
@@ -406,6 +422,31 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
         return Ok(StatementKind::ShowStats(table));
     }
 
+    // Pre-scan for SHOW PARTITIONS <table>. sqlparser delivers this as a
+    // generic ShowVariable (the same mis-classification SHOW STATS and
+    // SHOW TAGS suffer), so intercept by prefix. The bare form with no
+    // table yields a precise error rather than a variable-not-found one.
+    if upper.starts_with("SHOW PARTITIONS") {
+        let rest = trimmed["SHOW PARTITIONS".len()..].trim();
+        let table = rest.trim_end_matches(';').trim().to_string();
+        if table.is_empty() {
+            return Err(sqe_core::SqeError::Execution(
+                "SHOW PARTITIONS requires: SHOW PARTITIONS <table>".to_string(),
+            ));
+        }
+        // LIKE / WHERE / extra clauses are not implemented. Swallowing them
+        // into the table name would make `SHOW PARTITIONS t LIKE 'dt%'`
+        // look up a table that does not exist instead of naming the gap.
+        if table.split_whitespace().count() > 1 {
+            return Err(sqe_core::SqeError::Execution(
+                "SHOW PARTITIONS does not support LIKE or extra clauses; use \
+                 SHOW PARTITIONS <table>"
+                    .to_string(),
+            ));
+        }
+        return Ok(StatementKind::ShowPartitions(table));
+    }
+
     // Pre-scan for ANALYZE [TABLE] <table> [WITH (...)]. sqlparser's
     // `parse_analyze` stops at the `WITH` keyword, so Trino's
     // `ANALYZE t WITH (...)` form leaves trailing tokens and fails to parse.
@@ -540,6 +581,17 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
         }
         if let Some(ref_ddl) = try_parse_ref_ddl(trimmed)? {
             return Ok(StatementKind::RefDdl(Box::new(ref_ddl)));
+        }
+        // Pre-scan for ALTER TABLE ... ADD/DROP PARTITION (Hive-style,
+        // concrete partition values, optional LOCATION / PURGE). Tried
+        // BEFORE the partition-evolution parser: both start with
+        // "ADD/DROP PARTITION", but the evolution form continues with
+        // FIELD and this one with `(`. Each returns Ok(None) for the
+        // other's shape, so the order is belt-and-braces rather than
+        // load-bearing -- but keeping the paren form first means a future
+        // loosening of either parser cannot silently capture the other.
+        if let Some(ddl) = crate::hive_partitions::try_parse_hive_partition_ddl(trimmed)? {
+            return Ok(StatementKind::HivePartitionDdl(Box::new(ddl)));
         }
         // Pre-scan for ALTER TABLE ... ADD/DROP/REPLACE PARTITION FIELD. The
         // transform expression form is non-standard and sqlparser-rs models
@@ -870,6 +922,29 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
 
         // COMMENT ON TABLE/COLUMN — store as Iceberg table property
         Statement::Comment { .. } => Ok(StatementKind::Comment(Box::new(stmt))),
+
+        // MSCK [REPAIR] TABLE — Hive partition maintenance. Only the REPAIR
+        // form with no ADD/DROP/SYNC PARTITIONS suffix is a cycle-2
+        // statement; the other shapes get a rejection naming what was
+        // actually written rather than "Statement type not supported".
+        Statement::Msck(ref msck) => {
+            let table = msck.table_name.to_string();
+            if !msck.repair {
+                return Err(sqe_core::SqeError::NotImplemented(
+                    "bare MSCK TABLE is not supported; use MSCK REPAIR TABLE to rebuild the \
+                     hive_external partition index"
+                        .to_string(),
+                ));
+            }
+            if msck.partition_action.is_some() {
+                return Err(sqe_core::SqeError::NotImplemented(
+                    "MSCK REPAIR TABLE ... ADD/DROP/SYNC PARTITIONS is not supported; \
+                     plain MSCK REPAIR TABLE rebuilds the whole hive_external partition index"
+                        .to_string(),
+                ));
+            }
+            Ok(StatementKind::MsckRepairTable(table))
+        }
 
         _ => Err(sqe_core::SqeError::NotImplemented(format!(
             "Statement type not supported: {stmt}"

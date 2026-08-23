@@ -15,6 +15,8 @@ use std::sync::Arc;
 
 use datafusion::common::TableReference;
 use sqe_catalog::hive::manifest::HiveManifest;
+use sqe_catalog::hive::partition::parse_projection;
+use sqe_catalog::hive::provider::HiveMetadataCache;
 use sqe_core::{SecretStore, Session, SessionUser, SqeError};
 use sqe_metrics::audit::{Actor, AuditEvent, AuditKind, AuditLogger, ObjectType, Outcome, Resource};
 use sqe_policy::plan_rewriter::{policy_denies_all, resolve_effective_policy, HiveCatalogs};
@@ -68,6 +70,7 @@ pub struct HiveDdlHandler {
     /// listing while Iceberg metadata listing kept working.
     policy_store: Option<Arc<dyn PolicyStore>>,
     mask_precedence: sqe_core::config::MaskPrecedence,
+    manifest_cache: Option<Arc<HiveMetadataCache>>,
 }
 
 /// The wiring-gap refusal shared by every write path below. Named the same
@@ -104,6 +107,7 @@ impl HiveDdlHandler {
             audit: None,
             policy_store: None,
             mask_precedence: sqe_core::config::MaskPrecedence::default(),
+            manifest_cache: None,
         }
     }
 
@@ -129,6 +133,18 @@ impl HiveDdlHandler {
     pub fn with_hive_registries(mut self, hive_catalogs: Arc<HiveCatalogs>) -> Self {
         self.hive_catalogs = Some(hive_catalogs);
         self
+    }
+
+    #[must_use = "with_manifest_cache consumes self; bind the returned HiveDdlHandler"]
+    pub fn with_manifest_cache(mut self, cache: Arc<HiveMetadataCache>) -> Self {
+        self.manifest_cache = Some(cache);
+        self
+    }
+
+    fn invalidate_manifest(&self, database: &str, table: &str) {
+        if let Some(cache) = &self.manifest_cache {
+            cache.invalidate(database, table);
+        }
     }
 
     #[must_use = "with_audit consumes self; bind the returned HiveDdlHandler"]
@@ -279,12 +295,15 @@ impl HiveDdlHandler {
         let created_at = chrono::Utc::now().to_rfc3339();
         let manifest =
             HiveManifest::from_spec(spec, &database, &session.user.username, &created_at);
+        parse_projection(&manifest.parameters, &manifest.partition_keys)
+            .map_err(|e| SqeError::Execution(e.to_string()))?;
 
         store
             .put(&manifest, spec.if_not_exists)
             .await
             .map_err(|e| SqeError::Execution(e.to_string()))?;
 
+        self.invalidate_manifest(&database, &spec.name);
         self.emit_audit_event(session, catalog_name, &database, &spec.name, "CREATE EXTERNAL TABLE");
         Ok(())
     }
@@ -332,6 +351,7 @@ impl HiveDdlHandler {
             .await
             .map_err(|e| SqeError::Execution(e.to_string()))?;
 
+        self.invalidate_manifest(schema, table);
         self.emit_audit_event(session, catalog, schema, table, "DROP TABLE");
         Ok(())
     }
@@ -441,6 +461,204 @@ impl HiveDdlHandler {
         Ok(visible)
     }
 
+    /// `ALTER TABLE ... ADD PARTITION` against a Hive root: append one
+    /// index entry and rewrite the manifest. Data files are never touched.
+    pub async fn add_partition(
+        &self,
+        session: &Session,
+        table_ref: &TableReference,
+        spec: sqe_catalog::hive::partition::PartitionSpec,
+        if_not_exists: bool,
+    ) -> Result<(), SqeError> {
+        let (root, database, table) = self.full_hive_name(table_ref)?;
+        let store = self.store_for(&root)?;
+        let mut manifest = store
+            .get(&database, &table)
+            .await
+            .map_err(|e| SqeError::Execution(e.to_string()))?;
+        self.refuse_if_denied(
+            &session.user,
+            &database,
+            &table,
+            &manifest,
+            "ALTER TABLE ADD PARTITION",
+        )
+        .await?;
+
+        sqe_catalog::hive::partition::add_partition(&store, &mut manifest, &spec, if_not_exists)
+            .await
+            .map_err(|e| SqeError::Execution(e.to_string()))?;
+
+        self.invalidate_manifest(&database, &table);
+        self.emit_audit_event(session, &root, &database, &table, "ALTER TABLE ADD PARTITION");
+        Ok(())
+    }
+
+    /// `ALTER TABLE ... DROP PARTITION` against a Hive root: remove the
+    /// index entry, never the data. `purge` is rejected here (cycle 4 owns
+    /// data deletion), matching `drop_table`'s PURGE wording.
+    pub async fn drop_partition(
+        &self,
+        session: &Session,
+        table_ref: &TableReference,
+        spec: sqe_catalog::hive::partition::PartitionSpec,
+        if_exists: bool,
+        purge: bool,
+    ) -> Result<(), SqeError> {
+        let (root, database, table) = self.full_hive_name(table_ref)?;
+        if purge {
+            return Err(SqeError::Execution(format!(
+                "hive_external: ALTER TABLE ... DROP PARTITION ... PURGE is not supported for \
+                 Hive external tables ({database}.{table}): PURGE deletes the underlying data, \
+                 which cycle 4 does not implement yet"
+            )));
+        }
+        let store = self.store_for(&root)?;
+        let mut manifest = store
+            .get(&database, &table)
+            .await
+            .map_err(|e| SqeError::Execution(e.to_string()))?;
+        self.refuse_if_denied(
+            &session.user,
+            &database,
+            &table,
+            &manifest,
+            "ALTER TABLE DROP PARTITION",
+        )
+        .await?;
+
+        sqe_catalog::hive::partition::drop_partition(&store, &mut manifest, &spec, if_exists)
+            .await
+            .map_err(|e| SqeError::Execution(e.to_string()))?;
+
+        self.invalidate_manifest(&database, &table);
+        self.emit_audit_event(session, &root, &database, &table, "ALTER TABLE DROP PARTITION");
+        Ok(())
+    }
+
+    /// `MSCK REPAIR TABLE` against a Hive root: rebuild the whole partition
+    /// index from storage. Returns the number of partitions found. Junk
+    /// paths (non-`k=v` dirs, untypeable values, files at the table root)
+    /// are skipped. Projection-enabled tables are a successful no-op.
+    pub async fn msck_repair(
+        &self,
+        session: &Session,
+        table_ref: &TableReference,
+    ) -> Result<usize, SqeError> {
+        let (root, database, table) = self.full_hive_name(table_ref)?;
+        let store = self.store_for(&root)?;
+        let mut manifest = store
+            .get(&database, &table)
+            .await
+            .map_err(|e| SqeError::Execution(e.to_string()))?;
+        self.refuse_if_denied(
+            &session.user,
+            &database,
+            &table,
+            &manifest,
+            "MSCK REPAIR TABLE",
+        )
+        .await?;
+
+        let count = sqe_catalog::hive::partition::msck_repair(
+            &store,
+            &mut manifest,
+            store.limits().max_partition_index_entries,
+        )
+        .await
+        .map_err(|e| SqeError::Execution(e.to_string()))?;
+
+        self.invalidate_manifest(&database, &table);
+        self.emit_audit_event(session, &root, &database, &table, "MSCK REPAIR TABLE");
+        Ok(count)
+    }
+
+    /// `SHOW PARTITIONS <t>` against a Hive root: from the index when
+    /// present, from a listing when not. Gated like `show_create_table`: a
+    /// fully-denied caller gets the same "table not found" wording an
+    /// absent table gets.
+    pub async fn show_partitions(
+        &self,
+        user: &SessionUser,
+        table_ref: &TableReference,
+    ) -> Result<Vec<String>, SqeError> {
+        let (root, database, table) = self.full_hive_name(table_ref)?;
+        let store = self.store_for(&root)?;
+        let manifest = store
+            .get(&database, &table)
+            .await
+            .map_err(|e| SqeError::Execution(e.to_string()))?;
+
+        let policy = self.resolve_policy(user, &database, &table, &manifest).await;
+        if policy_denies_all(&policy) {
+            return Err(SqeError::Execution(format!(
+                "hive_external: table not found: {database}.{table}"
+            )));
+        }
+
+        Ok(sqe_catalog::hive::partition::list_partitions(
+            &store,
+            &manifest,
+        )
+        .await
+        .map_err(|e| SqeError::Execution(e.to_string()))?
+        .into_iter()
+        .map(|p| p.spec)
+        .collect())
+    }
+
+    /// `ANALYZE TABLE` against a Hive root: persist row counts into
+    /// `sqe.statistics`. Gated like a read.
+    pub async fn analyze_table(
+        &self,
+        session: &Session,
+        table_ref: &TableReference,
+    ) -> Result<sqe_catalog::hive::manifest::HiveTableStatistics, SqeError> {
+        let (root, database, table) = self.full_hive_name(table_ref)?;
+        let store = self.store_for(&root)?;
+        let mut manifest = store
+            .get(&database, &table)
+            .await
+            .map_err(|e| SqeError::Execution(e.to_string()))?;
+
+        let policy = self
+            .resolve_policy(&session.user, &database, &table, &manifest)
+            .await;
+        if policy_denies_all(&policy) {
+            return Err(SqeError::Execution(format!(
+                "hive_external: ANALYZE TABLE denied on {database}.{table}"
+            )));
+        }
+
+        let stats = sqe_catalog::hive::partition::analyze_table(&store, &mut manifest)
+            .await
+            .map_err(|e| SqeError::Execution(e.to_string()))?;
+        self.invalidate_manifest(&database, &table);
+        self.emit_audit_event(session, &root, &database, &table, "ANALYZE TABLE");
+        Ok(stats)
+    }
+
+    /// Decompose a catalog-qualified reference into `(root, database,
+    /// table)` or refuse. Every cycle-2 statement addresses a Hive table by
+    /// its attached root's name, same rule as `DROP TABLE`.
+    fn full_hive_name(
+        &self,
+        table_ref: &TableReference,
+    ) -> Result<(String, String, String), SqeError> {
+        match self.resolve_table_kind(table_ref) {
+            crate::hive_ddl_handler::TableKind::Hive {
+                root,
+                database,
+                table,
+            } => Ok((root, database, table)),
+            crate::hive_ddl_handler::TableKind::Iceberg => Err(SqeError::Execution(
+                "hive_external: this statement needs a catalog-qualified Hive table name \
+                 (e.g. `lake.sales.orders`)"
+                    .to_string(),
+            )),
+        }
+    }
+
     /// Resolve `user`'s effective policy against a Hive table, using the
     /// SAME resolution the plan rewriter runs for a real Iceberg scan
     /// (`resolve_effective_policy`: resource policy, then tag-derived masks
@@ -474,6 +692,23 @@ impl HiveDdlHandler {
             .collect();
         resolve_effective_policy(store, user, table, database, &col_tags, self.mask_precedence)
             .await
+    }
+
+    async fn refuse_if_denied(
+        &self,
+        user: &SessionUser,
+        database: &str,
+        table: &str,
+        manifest: &HiveManifest,
+        statement: &str,
+    ) -> Result<(), SqeError> {
+        let policy = self.resolve_policy(user, database, table, manifest).await;
+        if policy_denies_all(&policy) {
+            return Err(SqeError::Execution(format!(
+                "hive_external: {statement} denied on {database}.{table}"
+            )));
+        }
+        Ok(())
     }
 
     fn store_for(

@@ -23,6 +23,17 @@ use super::HiveError;
 /// field this release does not know about yet.
 pub const MANIFEST_VERSION: u32 = 1;
 
+/// The index format version this release writes and the highest version it
+/// will read, checked the same way [`MANIFEST_VERSION`] is: a newer index
+/// inside a known manifest version is rejected rather than parsed
+/// best-effort. The outer `manifest_version` stays 1 because this slot was
+/// reserved from the first write; only its *contents* are versioned here.
+pub const PARTITION_INDEX_FORMAT_VERSION: u32 = 1;
+
+/// Hive's sentinel for a partition whose value is NULL. Stored verbatim in
+/// an index entry's `values` map and normalized to NULL on read.
+pub const HIVE_DEFAULT_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
+
 /// Caps applied to a manifest before it is trusted. `Default` gives the
 /// hard-coded values; Task 6 exposes them as `[hive_external]` config so an
 /// operator can tighten or loosen them.
@@ -31,6 +42,10 @@ pub struct ManifestLimits {
     pub max_bytes: usize,
     pub max_columns: usize,
     pub max_partition_keys: usize,
+    /// Bounds `sqe.partition_index.entries` at ADD time, REPAIR time, and
+    /// load. Enforced on load because the manifest is untrusted input: a
+    /// planted million-entry index must fail closed, not OOM the reader.
+    pub max_partition_index_entries: usize,
 }
 
 impl Default for ManifestLimits {
@@ -39,8 +54,41 @@ impl Default for ManifestLimits {
             max_bytes: 1 << 20,
             max_columns: 4096,
             max_partition_keys: 32,
+            max_partition_index_entries: 100_000,
         }
     }
+}
+
+/// One persisted partition: its key values and where its files live. The
+/// location is carried per entry because a Hive partition may live outside
+/// the table prefix (`ALTER TABLE ... ADD PARTITION ... LOCATION 's3://...'`),
+/// which directory-name discovery cannot express at all.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PartitionIndexEntry {
+    /// Partition key name to raw string value, as written in the path or the
+    /// DDL. Typed on read against the declared partition-key types.
+    pub values: BTreeMap<String, String>,
+    /// Where this partition's files live. Validated through the
+    /// `[storage.tvf]` allowlist on every load, exactly like
+    /// `storage_descriptor.location`.
+    pub location: String,
+    /// File count under this location, captured when the entry was added or
+    /// repaired. Feeds size-only statistics so planning does not list.
+    #[serde(default)]
+    pub file_count: u64,
+    /// Total bytes under this location, captured alongside `file_count`.
+    #[serde(default)]
+    pub total_bytes: u64,
+}
+
+/// The persisted partition list in `sqe.partition_index`. Present means
+/// reads plan from it instead of listing the table location; absent keeps
+/// cycle-1 discovery behavior.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PartitionIndex {
+    pub format_version: u32,
+    #[serde(default)]
+    pub entries: Vec<PartitionIndexEntry>,
 }
 
 /// A Glue-style column: `StorageDescriptor.Columns[]` and
@@ -91,7 +139,7 @@ pub struct SqeExtensions {
     #[serde(default)]
     pub column_tags: BTreeMap<String, Vec<String>>,
     #[serde(default)]
-    pub partition_index: Option<serde_json::Value>,
+    pub partition_index: Option<PartitionIndex>,
     #[serde(default)]
     pub statistics: Option<serde_json::Value>,
 }
@@ -361,6 +409,19 @@ impl HiveManifest {
             }
         }
 
+        if let Some(index) = &manifest.sqe.partition_index {
+            validate_partition_index(
+                index,
+                &manifest.partition_keys,
+                limits.max_partition_index_entries,
+            )?;
+        }
+
+        // Projection config is untrusted input, same as SerDe classes: a
+        // planted manifest with projection.dt.type=banana must fail closed
+        // rather than being half-interpreted into a full scan.
+        super::projection::parse_projection(&manifest.parameters, &manifest.partition_keys)?;
+
         Ok(manifest)
     }
 
@@ -380,5 +441,125 @@ impl HiveManifest {
             .get("sqe.secret")
             .map(String::as_str)
             .or(self.sqe.secret.as_deref())
+    }
+
+    /// Persisted `ANALYZE TABLE` counts, if any.
+    pub fn hive_statistics(&self) -> Option<HiveTableStatistics> {
+        self.sqe
+            .statistics
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+}
+
+/// `sqe.statistics` payload written by `ANALYZE TABLE`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HiveTableStatistics {
+    pub row_count: u64,
+    #[serde(default)]
+    pub entries: Vec<HivePartitionStatistics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HivePartitionStatistics {
+    pub values: BTreeMap<String, String>,
+    pub row_count: u64,
+}
+
+/// Validate an untrusted `sqe.partition_index` against the manifest's own
+/// partition-key declarations. Runs on every load, same rule as the
+/// `storage_descriptor.location` check: anyone who can write to the
+/// warehouse prefix can plant an index, so its contents are network input,
+/// not engine-authored state.
+fn validate_partition_index(
+    index: &PartitionIndex,
+    partition_keys: &[GlueColumn],
+    max_entries: usize,
+) -> Result<(), HiveError> {
+    if index.format_version > PARTITION_INDEX_FORMAT_VERSION {
+        return Err(HiveError::Validation(format!(
+            "partition index format_version {} is newer than this engine understands (max {})",
+            index.format_version, PARTITION_INDEX_FORMAT_VERSION
+        )));
+    }
+    if index.entries.len() > max_entries {
+        return Err(HiveError::Validation(format!(
+            "partition index has {} entries, exceeding the cap of {}. Raise \
+             [hive] manifest_max_partition_index_entries if the table genuinely has this many.",
+            index.entries.len(),
+            max_entries
+        )));
+    }
+
+    for entry in &index.entries {
+        if entry.location.is_empty() {
+            return Err(HiveError::Validation(
+                "partition index entry location must not be empty".to_string(),
+            ));
+        }
+
+        // Exact set match: a partial value set is a malformed index. A read
+        // that prunes on a key the entry omits would silently widen to
+        // "unknown", and silently widening is how a stale or planted index
+        // becomes a wrong answer instead of a missing one.
+        let declared: std::collections::BTreeSet<&str> =
+            partition_keys.iter().map(|k| k.name.as_str()).collect();
+        let given: std::collections::BTreeSet<&str> = entry.values.keys().map(String::as_str).collect();
+        if declared != given {
+            let missing: Vec<&str> = declared.difference(&given).copied().collect();
+            let extra: Vec<&str> = given.difference(&declared).copied().collect();
+            return Err(HiveError::Validation(format!(
+                "partition index entry values do not match the declared partition keys \
+                 (missing: {missing:?}, unexpected: {extra:?})"
+            )));
+        }
+
+        // The sentinel is NULL by definition and skips typed parsing.
+        for (key, value) in &entry.values {
+            if value == HIVE_DEFAULT_PARTITION {
+                continue;
+            }
+            let declared_type = partition_keys
+                .iter()
+                .find(|k| &k.name == key)
+                .map(|k| k.r#type.as_str())
+                .unwrap_or_default();
+            parse_typed_partition_value(value, declared_type).map_err(|e| {
+                HiveError::Validation(format!("partition index entry `{key}={value}`: {e}"))
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Check a raw partition-value string against the declared partition-key
+/// type. Partition keys are scalar-only in this release; the supported set
+/// is cycle-1 path discovery's (`string`/`varchar`/`int`/`bigint`/`date`),
+/// with anything else accepted only when it parses as a plain string.
+pub(crate) fn parse_typed_partition_value(
+    raw: &str,
+    sql_type: &str,
+) -> Result<(), HiveError> {
+    let base = sql_type.trim().to_ascii_lowercase();
+    let base = base.split('(').next().unwrap_or(&base).trim();
+
+    match base {
+        "string" | "varchar" | "char" => Ok(()),
+        "tinyint" | "smallint" | "int" | "integer" | "bigint" => raw.parse::<i64>().map(|_| ()).map_err(
+            |_| HiveError::Validation(format!(
+                "`{raw}` does not parse as {sql_type}"
+            )),
+        ),
+        "date" => chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+            .map(|_| ())
+            .map_err(|_| {
+                HiveError::Validation(format!(
+                    "`{raw}` does not parse as {sql_type} (expected YYYY-MM-DD)"
+                ))
+            }),
+        other => Err(HiveError::Validation(format!(
+            "`{other}` is not a supported partition-key type in this release"
+        ))),
     }
 }
