@@ -21,7 +21,7 @@ Hive tables are CSV, line-delimited JSON, or Parquet, resolved by `serde_map::re
 Three consequences for the wire format:
 
 - The values are **per partition**, so a task must not span partitions unless it carries a value map per file.
-- The output schema is `file_schema` ++ `partition_columns`, and the split index `n_file` is load-bearing. The worker needs both, not just a column list.
+- The output schema is `file_schema` ++ `partition_columns`, and the split index `n_file` is load-bearing. The worker needs the FULL schema: the first draft of this design said "file schema", which is wrong and was caught while implementing. A partition column is not in the data file, so a file-only schema carries no type for it and the worker would default it to Utf8 -- silently changing an integer partition key's type between execution paths.
 - `partition_scalar` types the literal from the *field's* data type, with a string fallback. That typing must be identical on both paths or a partition column silently changes type between coordinator-local and distributed execution.
 
 ## Wire format
@@ -50,10 +50,11 @@ pub struct HiveScanDescriptor {
     /// no order; the projection indexes by position, so the order must be
     /// carried explicitly rather than inferred from iteration.
     pub partition_columns: Vec<String>,
-    /// Arrow schema of the DATA FILE, serialized. The worker needs the split
-    /// point between file and partition columns, and needs the field types to
-    /// reproduce `partition_scalar` exactly.
-    pub file_schema_json: String,
+    /// The FULL schema, serialized: file columns then partition columns.
+    /// NOT the file schema -- a partition column is absent from the data file,
+    /// so a file-only schema carries no type for it. The split point is
+    /// derived as `len() - partition_columns.len()`.
+    pub full_schema_json: String,
 }
 ```
 

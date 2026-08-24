@@ -59,11 +59,20 @@ pub struct HiveScanDescriptor {
     /// position, and `partition_values` is a map with no meaningful order.
     #[serde(default)]
     pub partition_columns: Vec<String>,
-    /// Arrow schema of the DATA FILE, JSON-serialized. Gives the worker both
-    /// the file/partition split point and the field types needed to reproduce
-    /// the coordinator's literal typing exactly.
+    /// The FULL Arrow schema, JSON-serialized: file columns followed by
+    /// partition columns, in that order.
+    ///
+    /// It must be the full schema, not the file schema. `attach_partition_values`
+    /// types each partition literal from `full_schema.field(i)`, and a partition
+    /// column does not appear in the data file at all, so a file-only schema
+    /// carries no type for it and the worker would have to guess (in practice:
+    /// default everything to Utf8, changing an integer partition key's type
+    /// between coordinator-local and distributed execution of the same query).
+    ///
+    /// The split point is derived, not carried: file columns are everything
+    /// before `len() - partition_columns.len()`.
     #[serde(default)]
-    pub file_schema_json: String,
+    pub full_schema_json: String,
 }
 
 /// Lightweight message sent from coordinator to worker describing
@@ -332,7 +341,7 @@ mod tests {
             // Deliberately NOT alphabetical: this is the order the projection
             // indexes by, and a BTreeMap would sort it to dt,region.
             partition_columns: vec!["region".to_string(), "dt".to_string()],
-            file_schema_json: "{\"fields\":[]}".to_string(),
+            full_schema_json: "{\"fields\":[]}".to_string(),
         }
     }
 
