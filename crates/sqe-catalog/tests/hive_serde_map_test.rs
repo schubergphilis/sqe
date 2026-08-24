@@ -155,16 +155,18 @@ fn a_bare_decimal_with_no_precision_defaults_to_hives_ten_zero() {
 // dropping `.with_has_header(...)` from `listing_options` would all still
 // leave every test above green.
 #[test]
-fn listing_options_wires_collect_stat_extension_and_header_through_to_datafusion() {
+fn listing_options_wires_extension_and_header_through_to_datafusion() {
     let headerless =
         manifest("CREATE EXTERNAL TABLE t (id INT) STORED AS TEXTFILE LOCATION 's3://b/p/'");
     let r = resolve_format(&headerless).expect("resolve");
     let opts = listing_options(&r, Vec::new()).expect("listing options");
 
-    assert!(
-        !opts.collect_stat,
-        "statistics collection must stay off: it reads a footer per file"
-    );
+    // DataFusion 55 removed `ListingOptions::collect_stat`; the setting moved to
+    // the session (`datafusion.execution.collect_statistics`), so there is no
+    // per-table field left to assert. The guarantee this test used to protect
+    // now has to be made on the session, and HiveTableProvider's own
+    // `statistics()` override is what keeps the planner off ListingTable's
+    // numbers either way.
     assert_eq!(
         opts.file_extension, "",
         "must pick up Hive's extensionless part files"

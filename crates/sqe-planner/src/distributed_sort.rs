@@ -26,7 +26,11 @@
 use std::fmt;
 use std::sync::Arc;
 
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
+use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::apply_expression_roots;
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Result, ScalarValue};
 use datafusion::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -316,6 +320,16 @@ impl ExecutionPlan for DistributedSortExec {
         self.input.schema()
     }
 
+    /// SQE PATCH (DataFusion 55): report the sort key expressions. These are
+    /// real `PhysicalExpr` roots owned by this node, so hiding them would make
+    /// them invisible to expression rewriting and display.
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        apply_expression_roots(self.sort_exprs.iter().map(|s| &s.expr), f)
+    }
+
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -324,9 +338,26 @@ impl ExecutionPlan for DistributedSortExec {
         vec![&self.input]
     }
 
+    /// DataFusion 55 deprecated this but kept it a *required* trait method; this
+    /// is upstream's own migration shim. Real logic is in `replace_children`.
+    #[allow(deprecated)]
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        // DataFusion 55 replaced with_new_children. `Keep` only *permits*
+        // skipping property recomputation; this node rebuilds and recomputes
+        // unconditionally, valid under both modes.
+        _options: ReplaceChildrenOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::Internal(
@@ -482,7 +513,7 @@ impl PhysicalOptimizerRule for DistributedSortRule {
 /// Returns 0 if statistics are unavailable, which means the rule will
 /// conservatively keep the local sort.
 fn estimate_data_size(plan: &Arc<dyn ExecutionPlan>) -> usize {
-    let stats = match plan.partition_statistics(None) {
+    let stats = match StatisticsContext::new().compute(plan.as_ref(), &StatisticsArgs::new()) {
         Ok(stats) => stats,
         Err(_) => return 0,
     };
@@ -765,7 +796,7 @@ mod tests {
         ));
 
         let new_input = make_memory_plan(schema);
-        let new_exec = exec.with_new_children(vec![new_input]).unwrap();
+        let new_exec = exec.replace_children(vec![new_input], ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute)).unwrap();
         assert_eq!(new_exec.name(), "DistributedSortExec");
     }
 
@@ -787,10 +818,10 @@ mod tests {
             None,
         ));
 
-        let result = exec.with_new_children(vec![
+        let result = exec.replace_children(vec![
             make_memory_plan(schema.clone()),
             make_memory_plan(schema),
-        ]);
+        ], ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute));
         assert!(result.is_err());
     }
 

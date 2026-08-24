@@ -19,6 +19,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::vec;
 
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::arrow::array::{BooleanArray, RecordBatch};
 use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
@@ -35,6 +36,7 @@ use datafusion::physical_plan::filter_pushdown::{
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     ColumnarValue, DisplayAs, ExecutionPlan, Partitioning, PlanProperties,
+    apply_expression_roots,
 };
 use datafusion::prelude::Expr;
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -206,6 +208,18 @@ impl ExecutionPlan for IcebergTableScan {
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
+    }
+
+    /// SQE PATCH: DataFusion 55 requires every `ExecutionPlan` to expose the
+    /// physical expressions it holds. This node holds the runtime filters
+    /// absorbed from a hash-join build side, so report those rather than
+    /// claiming to be expression-free: they are real `PhysicalExpr` roots and
+    /// DataFusion traverses them for rewriting and display.
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        apply_expression_roots(self.runtime_filters.iter(), f)
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

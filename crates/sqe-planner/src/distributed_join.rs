@@ -20,8 +20,11 @@
 
 use std::sync::Arc;
 
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
+use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::arrow::compute::SortOptions;
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::Result;
 use datafusion::config::ConfigOptions;
 use datafusion::logical_expr::JoinType;
@@ -281,6 +284,17 @@ impl ExecutionPlan for BroadcastJoinPlan {
         self.inner_join.schema()
     }
 
+    /// SQE PATCH (DataFusion 55): this node owns no physical expressions of its
+    /// own. `inner_as_plan` is `inner_join` upcast and is returned from
+    /// `children()`, so the `HashJoinExec`'s expressions are visited when the
+    /// traversal descends into that child.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
         self.inner_join.properties()
     }
@@ -289,9 +303,29 @@ impl ExecutionPlan for BroadcastJoinPlan {
         vec![&self.inner_as_plan]
     }
 
+    /// DataFusion 55 deprecated this but kept it a *required* trait method, and
+    /// its own migration example is exactly this shim. The real logic lives in
+    /// `replace_children`; this forwards with `Recompute`, which is what
+    /// `with_new_children` always meant.
+    #[allow(deprecated)]
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        // DataFusion 55 replaced with_new_children. `Keep` only *permits*
+        // skipping property recomputation; these nodes rebuild and recompute
+        // unconditionally, which is valid under both modes (recomputing when
+        // Keep was allowed is redundant, never wrong), so it is not consulted.
+        _options: ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(datafusion::error::DataFusionError::Internal(
@@ -527,6 +561,16 @@ impl ExecutionPlan for ShuffleHashJoinPlan {
         self.properties.eq_properties.schema().clone()
     }
 
+    /// SQE PATCH (DataFusion 55): the join keys here are column *names*
+    /// (`Vec<String>`), resolved on the worker, not `PhysicalExpr`s, so this
+    /// node owns no expressions to report.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
         &self.properties
     }
@@ -535,9 +579,29 @@ impl ExecutionPlan for ShuffleHashJoinPlan {
         vec![&self.build_side, &self.probe_side]
     }
 
+    /// DataFusion 55 deprecated this but kept it a *required* trait method, and
+    /// its own migration example is exactly this shim. The real logic lives in
+    /// `replace_children`; this forwards with `Recompute`, which is what
+    /// `with_new_children` always meant.
+    #[allow(deprecated)]
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        // DataFusion 55 replaced with_new_children. `Keep` only *permits*
+        // skipping property recomputation; these nodes rebuild and recompute
+        // unconditionally, which is valid under both modes (recomputing when
+        // Keep was allowed is redundant, never wrong), so it is not consulted.
+        _options: ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if children.len() != 2 {
             return Err(datafusion::error::DataFusionError::Internal(
@@ -695,7 +759,7 @@ impl PhysicalOptimizerRule for PreSortedJoinRule {
 /// Uses `total_byte_size` from the plan's statistics if available.
 /// Returns `0` if statistics are unavailable.
 fn estimate_side_size(plan: &Arc<dyn ExecutionPlan>) -> usize {
-    let stats = match plan.partition_statistics(None) {
+    let stats = match StatisticsContext::new().compute(plan.as_ref(), &StatisticsArgs::new()) {
         Ok(stats) => stats,
         Err(_) => return 0,
     };
@@ -1083,7 +1147,7 @@ mod tests {
 
         let new_left = make_memory_plan(schema.clone());
         let new_right = make_memory_plan(schema.clone());
-        let result = plan.with_new_children(vec![new_left, new_right]);
+        let result = plan.replace_children(vec![new_left, new_right], ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute));
         assert!(result.is_ok());
 
         let new_plan = result.unwrap();
@@ -1102,7 +1166,7 @@ mod tests {
             4,
         ));
 
-        let result = plan.with_new_children(vec![make_memory_plan(schema.clone())]);
+        let result = plan.replace_children(vec![make_memory_plan(schema.clone())], ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute));
         assert!(result.is_err());
     }
 

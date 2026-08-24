@@ -928,13 +928,19 @@ fn widen_scan_for_row_filters(
         })
         .collect();
 
-    let wider = datafusion::logical_expr::TableScan::try_new(
+    // DataFusion 55 deprecated TableScan::try_new in favour of TableScanBuilder.
+    // This is a copy of `scan` with a wider projection, so carry the statistics
+    // requests across too: the builder defaults them to empty, and silently
+    // dropping them here would quietly change what the scan asks for.
+    let wider = datafusion::logical_expr::TableScanBuilder::new(
         scan.table_name.clone(),
         scan.source.clone(),
-        Some(widened),
-        scan.filters.clone(),
-        scan.fetch,
     )
+    .with_projection(Some(widened))
+    .with_filters(scan.filters.clone())
+    .with_fetch(scan.fetch)
+    .with_statistics_requests(scan.statistics_requests.clone())
+    .build()
     .ok()?;
     Some((LogicalPlan::TableScan(wider), restore))
 }

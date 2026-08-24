@@ -1528,6 +1528,9 @@ mod tests {
     use std::fmt;
 
     use datafusion::common::Result as DFResult;
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
+    use datafusion::physical_expr::PhysicalExpr;
     use datafusion::execution::TaskContext;
     use datafusion::physical_expr::EquivalenceProperties;
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -1571,6 +1574,14 @@ mod tests {
             "MetricsStubExec"
         }
 
+        /// SQE PATCH (DataFusion 55): metrics-only test stub, no expressions.
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+        ) -> DFResult<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
         fn properties(&self) -> &Arc<PlanProperties> {
             &self.props
         }
@@ -1579,9 +1590,29 @@ mod tests {
             vec![]
         }
 
+        /// DataFusion 55 deprecated this but kept it a *required* trait method, and
+        /// its own migration example is exactly this shim. The real logic lives in
+        /// `replace_children`; this forwards with `Recompute`, which is what
+        /// `with_new_children` always meant.
+        #[allow(deprecated)]
         fn with_new_children(
             self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DFResult<Arc<dyn ExecutionPlan>> {
+            self.replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+        }
+
+        fn replace_children(
+            self: Arc<Self>,
             _children: Vec<Arc<dyn ExecutionPlan>>,
+            // DataFusion 55 replaced with_new_children. `Keep` only *permits*
+            // skipping property recomputation; these nodes rebuild and recompute
+            // unconditionally, which is valid under both modes (recomputing when
+            // Keep was allowed is redundant, never wrong), so it is not consulted.
+            _options: ReplaceChildrenOptions,
         ) -> DFResult<Arc<dyn ExecutionPlan>> {
             Ok(self)
         }

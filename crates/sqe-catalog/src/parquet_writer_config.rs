@@ -421,7 +421,7 @@ mod tests {
         let bf = w
             .bloom_filter_properties(&ColumnPath::new(vec!["id".to_string()]))
             .expect("id should have bloom filter");
-        assert!((bf.fpp - DEFAULT_BLOOM_FILTER_FPP).abs() < f64::EPSILON);
+        assert!((bf.fpp() - DEFAULT_BLOOM_FILTER_FPP).abs() < f64::EPSILON);
 
         assert!(
             w.bloom_filter_properties(&ColumnPath::new(vec!["name".to_string()]))
@@ -441,7 +441,7 @@ mod tests {
         let bf = w
             .bloom_filter_properties(&ColumnPath::new(vec!["id".to_string()]))
             .expect("id should have bloom filter");
-        assert!((bf.fpp - 0.05).abs() < f64::EPSILON);
+        assert!((bf.fpp() - 0.05).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -454,7 +454,7 @@ mod tests {
         let bf = w
             .bloom_filter_properties(&ColumnPath::new(vec!["id".to_string()]))
             .expect("id should have bloom filter");
-        assert!((bf.fpp - DEFAULT_BLOOM_FILTER_FPP).abs() < f64::EPSILON);
+        assert!((bf.fpp() - DEFAULT_BLOOM_FILTER_FPP).abs() < f64::EPSILON);
     }
 
     #[test]

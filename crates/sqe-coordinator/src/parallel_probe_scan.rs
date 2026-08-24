@@ -28,8 +28,7 @@ use std::sync::Arc;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::Result;
 use datafusion::config::ConfigOptions;
-use datafusion::physical_optimizer::enforce_distribution::EnforceDistribution;
-use datafusion::physical_optimizer::enforce_sorting::EnforceSorting;
+use datafusion::physical_optimizer::ensure_requirements::EnsureRequirements;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
@@ -104,12 +103,14 @@ impl PhysicalOptimizerRule for ParallelProbeScanRule {
         // with correct exchanges (the final aggregate must still see a coalesced
         // / hash-partitioned input). Only probe-side scans changed, so a
         // CollectLeft build is never coalesced -> no q72-class regression.
-        let redistributed = EnforceDistribution::new().optimize(rewritten, config)?;
-        // Then EnforceSorting, matching DataFusion's stock pipeline order. This
-        // drops any sort that EnforceDistribution stranded below a repartition
-        // (its ordering is destroyed by the exchange and re-established above it)
-        // -- the redundant wide-row sort that OOMs on rollup inputs.
-        let resorted = EnforceSorting::new().optimize(redistributed, config)?;
+        // DataFusion 55 merged EnforceDistribution and EnforceSorting into
+        // EnsureRequirements, which settles distribution before sorting per
+        // operator in a single pass -- the same order this ran them in. Sorting
+        // still sees the distribution-fixed plan, so a sort stranded below a
+        // repartition (its ordering destroyed by the exchange and re-established
+        // above it) is still dropped: the redundant wide-row sort that OOMs on
+        // rollup inputs.
+        let resorted = EnsureRequirements::new().optimize(rewritten, config)?;
         let single = restore_single_partition_root(resorted);
         let restored = restore_stranded_global_fetch(single);
         Ok(reapply_erased_root_fetch(restored, pre_fetch))
@@ -685,7 +686,7 @@ mod tests {
         // input through unchanged, but it lists the subquery plans as extra
         // children — the walk must descend into child 0, not stop at the
         // multi-child node (q14 returned 749 rows on the rig before this).
-        use datafusion::logical_expr::execution_props::ScalarSubqueryResults;
+        use datafusion::logical_expr::physical_planning_context::ScalarSubqueryResults;
         let scalar_wrap: Arc<dyn ExecutionPlan> = Arc::new(ScalarSubqueryExec::new(
             per_partition_sort_with_fetch(100),
             vec![],

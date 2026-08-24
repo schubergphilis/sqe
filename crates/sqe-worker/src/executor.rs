@@ -8,6 +8,7 @@ use arrow_schema::SchemaRef;
 use datafusion::common::DFSchema;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryLimit};
 use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::physical_expr::create_physical_expr;
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::SessionContext;
@@ -17,6 +18,7 @@ use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+#[allow(deprecated)]
 use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::file::metadata::ParquetMetaData;
@@ -164,7 +166,7 @@ mod row_group_prune {
         ParquetAccessPlan, ParquetFileMetrics, RowGroupAccessPlanFilter,
     };
     use datafusion::physical_expr::expressions::{BinaryExpr, InListExpr};
-    use datafusion::physical_optimizer::pruning::PruningPredicate;
+    use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
     use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
     use datafusion::physical_plan::PhysicalExpr;
     use parquet::file::metadata::ParquetMetaData;
@@ -281,7 +283,10 @@ mod row_group_prune {
             )) as Arc<dyn PhysicalExpr>
         })?;
 
-        let pruning = PruningPredicate::try_new(combined, Arc::clone(file_schema)).ok()?;
+        let pruning = PruningPredicateBuilder::new()
+            .with_file_schema(Arc::clone(file_schema))
+            .try_build(combined)
+            .ok()?;
 
         // `prune_by_statistics` asserts the access plan covers every row group,
         // so start from all-scan and skip the ones the morsel already excluded.
@@ -325,7 +330,15 @@ fn build_physical_predicate(
         }
     };
     let ctx = SessionContext::new();
-    match create_physical_expr(predicate, &df_schema, ctx.state().execution_props()) {
+    match create_physical_expr(
+        predicate,
+        &df_schema,
+        ctx.state().execution_props(),
+        // DataFusion 55 added a planning context for subqueries and lambda
+        // scoping. A worker-side scan predicate has neither, so the default is
+        // correct.
+        &PhysicalPlanningContext::default(),
+    ) {
         Ok(expr) => Some(expr),
         Err(e) => {
             warn!(fragment_id = %fragment_id, error = %e, "Physical predicate build failed");
@@ -798,6 +811,13 @@ pub async fn execute_scan_streaming_with_store(
 /// entirely: the size is fed straight to `ParquetObjectReader::with_file_size`.
 /// When it is `None` (size missing for this file), the function falls back to a
 /// single `head()` to learn the size.
+#[allow(deprecated)] // parquet 59.2.0 deprecated ParquetObjectReader in favour of a
+// hand-written AsyncFileReader / SpawnedReader. Unlike the DataFusion 55
+// statistics deprecation, this one is behaviour-identical if left alone: the
+// struct is unchanged, only marked. The replacement moves scan-path I/O onto a
+// dedicated runtime, which is a performance change that belongs in its own
+// benchmarked MR rather than riding along with a version bump.
+// See https://github.com/apache/arrow-rs/issues/10308
 async fn open_parquet_stream(
     task: &ScanTask,
     file_path: &str,
@@ -1086,6 +1106,13 @@ async fn open_parquet_stream(
 }
 
 #[tracing::instrument(skip(task, metrics, session_ctx, credential_rx, footer_cache, filter_expr, coordinator_metrics), fields(fragment_id = %task.fragment_id, file_count = task.data_file_paths.len()))]
+#[allow(deprecated)] // parquet 59.2.0 deprecated ParquetObjectReader in favour of a
+// hand-written AsyncFileReader / SpawnedReader. Unlike the DataFusion 55
+// statistics deprecation, this one is behaviour-identical if left alone: the
+// struct is unchanged, only marked. The replacement moves scan-path I/O onto a
+// dedicated runtime, which is a performance change that belongs in its own
+// benchmarked MR rather than riding along with a version bump.
+// See https://github.com/apache/arrow-rs/issues/10308
 pub async fn execute_scan(
     task: &ScanTask,
     metrics: Option<&Arc<WorkerMetricsRegistry>>,
