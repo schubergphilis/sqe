@@ -35,6 +35,8 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use arrow::error::ArrowError;
 use async_trait::async_trait;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -327,6 +329,16 @@ impl ExecutionPlan for IncrementalScanExec {
     fn name(&self) -> &str {
         "IncrementalScanExec"
     }
+    /// SQE PATCH (DataFusion 55): leaf node holding no physical expressions.
+    /// Its filtering is expressed as an Iceberg `Predicate`, not a
+    /// `PhysicalExpr`.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }

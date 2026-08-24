@@ -7,6 +7,9 @@ use arrow::array::BooleanArray;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
+use datafusion::physical_plan::apply_expression_roots;
 use datafusion::common::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -756,7 +759,15 @@ impl IcebergScanExec {
         let ctx = SessionContext::new();
         let state = ctx.state();
         let physical_expr =
-            match create_physical_expr(&combined, &df_schema, state.execution_props()) {
+            match create_physical_expr(
+                &combined,
+                &df_schema,
+                state.execution_props(),
+                // DataFusion 55 added a planning context for subqueries and
+                // lambda scoping. This predicate is a plain conjunction built
+                // for pruning, with neither, so the default is correct.
+                &PhysicalPlanningContext::default(),
+            ) {
                 Ok(e) => e,
                 Err(e) => {
                     warn!(error=%e, "Physical expr failed");
@@ -888,6 +899,17 @@ impl ExecutionPlan for IcebergScanExec {
     fn schema(&self) -> SchemaRef {
         self.projected_schema.clone()
     }
+    /// SQE PATCH (DataFusion 55): report the filters pushed into this scan.
+    /// This is a leaf node, so nothing else in the plan tree owns them; if they
+    /// are not reported here they are invisible to DataFusion's expression
+    /// traversal. `pushed_down_filters` holds the hash-join dynamic filters.
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        apply_expression_roots(self.pushed_down_filters.iter(), f)
+    }
+
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }

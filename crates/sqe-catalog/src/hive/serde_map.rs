@@ -286,8 +286,18 @@ pub fn listing_options(
         HiveFileFormat::Parquet => std::sync::Arc::new(ParquetFormat::default()),
     };
 
+    // DataFusion 55 removed `ListingOptions::with_collect_stat`. The knob now
+    // lives only on the session (`datafusion.execution.collect_statistics`,
+    // default true), so a Hive table can no longer opt out per-table.
+    //
+    // Correctness is unaffected: HiveTableProvider overrides
+    // `TableProvider::statistics()` and returns its own size-derived value, so
+    // the planner never sees ListingTable's. What changes is cost. With the
+    // session default, ListingTable::scan may stat each file while planning,
+    // which is the per-file work the partition index exists to avoid. Set
+    // `datafusion.execution.collect_statistics = false` on the session if that
+    // shows up on wide tables.
     Ok(ListingOptions::new(format)
         .with_file_extension(&r.file_extension)
-        .with_table_partition_cols(partition_cols)
-        .with_collect_stat(false))
+        .with_table_partition_cols(partition_cols))
 }
