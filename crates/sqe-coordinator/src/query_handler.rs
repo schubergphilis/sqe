@@ -7051,7 +7051,10 @@ fn strip_self_join_dynamic_filters(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn Exec
         let Some(hj) = node.downcast_ref::<HashJoinExec>() else {
             return Ok(Transformed::no(node));
         };
-        if *hj.join_type() != JoinType::Inner || hj.dynamic_filter_expr().is_none() {
+        // DataFusion 55: dynamic_filter_expr is deprecated. This is only a
+        // presence check, and dynamic_expressions_produced() is built from the
+        // same Option, so is_empty() is exactly is_none().
+        if *hj.join_type() != JoinType::Inner || hj.dynamic_expressions_produced().is_empty() {
             return Ok(Transformed::no(node));
         }
         let mut left = std::collections::HashSet::new();

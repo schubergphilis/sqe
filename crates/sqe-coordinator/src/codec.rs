@@ -4,7 +4,7 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::physical_plan::{
-    DefaultPhysicalProtoConverter, PhysicalExtensionCodec, PhysicalProtoConverterExtension,
+    PhysicalExtensionCodec, PhysicalProtoConverterExtension,
 };
 use datafusion_proto::protobuf;
 use prost::Message;
@@ -120,6 +120,7 @@ impl PhysicalExtensionCodec for SqePhysicalCodec {
 
 #[cfg(test)]
 mod tests {
+    use datafusion_proto::physical_plan::DefaultPhysicalProtoConverter;
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::execution::TaskContext;

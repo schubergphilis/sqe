@@ -19,7 +19,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use datafusion::common::ScalarValue;
 use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -430,6 +429,7 @@ mod tests {
     use datafusion::error::Result as DFResult;
     use datafusion::execution::{SendableRecordBatchStream, TaskContext};
     use datafusion::common::tree_node::TreeNodeRecursion;
+    use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
     use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion::physical_plan::{DisplayAs, DisplayFormatType, Partitioning, PlanProperties};
