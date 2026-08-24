@@ -105,7 +105,7 @@ const MANIFEST_CACHE_CAPACITY: u64 = 16_384;
 /// included), so DataFusion trusts the scan's pruning entirely and never
 /// re-checks with a `Filter` node above it. That is exactly why the
 /// rewrite has to happen before the file listing, not after.
-const HIVE_DEFAULT_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
+pub use super::manifest::HIVE_DEFAULT_PARTITION;
 
 /// Builds an object store for a table's data location. The implementation
 /// holds the session's credentials; `secret` is a name resolved against the
@@ -768,7 +768,14 @@ fn attach_partition_values(
     Ok(Arc::new(ProjectionExec::try_new(exprs, plan)?))
 }
 
-fn partition_scalar(raw: &str, dt: &DataType) -> ScalarValue {
+/// Type a directory-encoded partition value against the column's declared
+/// Arrow type.
+///
+/// `pub` because cycle 5 runs the same materialization on a WORKER, from a
+/// `HiveScanDescriptor`, and two copies of this rule would drift. The symptom
+/// of drift is not a crash: it is a partition column silently changing type
+/// between coordinator-local and distributed execution of the same query.
+pub fn partition_scalar(raw: &str, dt: &DataType) -> ScalarValue {
     if raw == HIVE_DEFAULT_PARTITION {
         return match dt {
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {

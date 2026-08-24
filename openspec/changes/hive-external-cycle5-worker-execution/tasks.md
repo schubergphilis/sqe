@@ -2,16 +2,16 @@
 
 ## 1. Wire format
 
-- [ ] 1.1 `HiveScanDescriptor` in `scan_task.rs`: format, SerDe params, partition values, partition column order, file schema.
-- [ ] 1.2 Optional `hive` field on `ScanTask`, `skip_serializing_if = "Option::is_none"`, version bumped to 3.
-- [ ] 1.3 Test: an Iceberg `ScanTask` serializes byte-identically to its v2 encoding. This is the regression guard for the whole change.
-- [ ] 1.4 Test: a v3 worker accepts a v2 ticket, and a v2 worker rejects a v3 Hive ticket by version rather than misreading it.
+- [x] 1.1 `HiveScanDescriptor` in `scan_task.rs`: format, SerDe params, partition values, partition column order, file schema.
+- [x] 1.2 Optional `hive` field on `ScanTask`, `skip_serializing_if = "Option::is_none"`, version bumped to 3.
+- [x] 1.3 Test: an Iceberg `ScanTask` serializes byte-identically to its v2 encoding. This is the regression guard for the whole change.
+- [x] 1.4 Test: a v3 worker accepts a v2 ticket, and a v2 worker rejects a v3 Hive ticket by version rather than misreading it.
 
 ## 2. Worker: partition materialization (Parquet only)
 
-- [ ] 2.1 Rebuild `attach_partition_values`' projection worker-side from the descriptor.
-- [ ] 2.2 Reuse `partition_scalar`'s typing exactly. Extract it to a shared crate rather than reimplementing: two copies of this typing rule WILL drift, and the symptom is a partition column changing type between execution paths.
-- [ ] 2.3 Test: `__HIVE_DEFAULT_PARTITION__` and a typed (non-string) partition key both materialize identically to the coordinator-local path.
+- [x] 2.1 Rebuild `attach_partition_values`' projection worker-side from the descriptor.
+- [x] 2.2 Reuse `partition_scalar`'s typing exactly. Extract it to a shared crate rather than reimplementing: two copies of this typing rule WILL drift, and the symptom is a partition column changing type between execution paths.
+- [x] 2.3 Test: `__HIVE_DEFAULT_PARTITION__` and a typed (non-string) partition key both materialize identically to the coordinator-local path.
 
 ## 3. Coordinator: task splitting
 
