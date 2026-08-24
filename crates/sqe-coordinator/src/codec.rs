@@ -3,7 +3,9 @@ use std::sync::Arc;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion_proto::physical_plan::PhysicalExtensionCodec;
+use datafusion_proto::physical_plan::{
+    DefaultPhysicalProtoConverter, PhysicalExtensionCodec, PhysicalProtoConverterExtension,
+};
 use datafusion_proto::protobuf;
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -36,7 +38,15 @@ impl SqePhysicalCodec {
 }
 
 impl PhysicalExtensionCodec for SqePhysicalCodec {
-    fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> DFResult<()> {
+    fn try_encode(
+        &self,
+        node: Arc<dyn ExecutionPlan>,
+        buf: &mut Vec<u8>,
+        // DataFusion 55 threads a converter through so a codec can recurse into
+        // nested plan nodes. This codec serializes DistributedScanExec to
+        // self-contained JSON and has no nested nodes, so it is unused.
+        _proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> DFResult<()> {
         if let Some(scan) = node.downcast_ref::<DistributedScanExec>() {
             let proto_schema: protobuf::Schema =
                 scan.schema().as_ref().try_into().map_err(|e| {
@@ -72,6 +82,7 @@ impl PhysicalExtensionCodec for SqePhysicalCodec {
         buf: &[u8],
         _inputs: &[Arc<dyn ExecutionPlan>],
         _ctx: &TaskContext,
+        _proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let encoded: EncodedDistributedScan =
             serde_json::from_slice(buf).map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -154,11 +165,17 @@ mod tests {
         let codec = SqePhysicalCodec::new();
         let mut buf = Vec::new();
         codec
-            .try_encode(original.clone() as Arc<dyn ExecutionPlan>, &mut buf)
+            .try_encode(
+                original.clone() as Arc<dyn ExecutionPlan>,
+                &mut buf,
+                &DefaultPhysicalProtoConverter {},
+            )
             .expect("encode failed");
 
         let ctx = Arc::new(TaskContext::default());
-        let decoded = codec.try_decode(&buf, &[], &ctx).expect("decode failed");
+        let decoded = codec
+            .try_decode(&buf, &[], &ctx, &DefaultPhysicalProtoConverter {})
+            .expect("decode failed");
 
         let decoded_scan = decoded
             .downcast_ref::<DistributedScanExec>()
@@ -179,7 +196,11 @@ mod tests {
         let empty = Arc::new(EmptyExec::new(schema));
         let codec = SqePhysicalCodec::new();
         let mut buf = Vec::new();
-        let result = codec.try_encode(empty as Arc<dyn ExecutionPlan>, &mut buf);
+        let result = codec.try_encode(
+            empty as Arc<dyn ExecutionPlan>,
+            &mut buf,
+            &DefaultPhysicalProtoConverter {},
+        );
         assert!(result.is_err());
     }
 }
