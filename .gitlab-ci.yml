@@ -195,16 +195,26 @@ aikido-sbom:
 # longer compiles the workspace. Nearly every commit here touches Rust; if that
 # stops being true, override `rules:` on the job below rather than upstream.
 
-# The platform job caches only `.cargo-home/registry/`; the local cargo-gate also
-# cached `target/`. Re-added here rather than upstream because it is a per-repo
-# call: an --all-features `target/` for this workspace is several GB that GitLab
-# uploads at the end of every run, and this repo has already been paying for it.
-# `.cargo/registry` is NOT the path any more — aikido redirects CARGO_HOME to
-# `.cargo-home` so the registry lands somewhere GitLab can cache.
-aikido-test-rust:
-  cache:
-    key: "aikido-test-rust-$CI_COMMIT_REF_SLUG"
-    paths: ["target/", ".cargo-home/registry/"]
+# NO `cache:` override for aikido-test-rust, and specifically no `target/`.
+# The deleted cargo-gate cached `target/` + `.cargo/registry/` and that had never
+# once worked. Measured on the first run of the platform gate (job 5218015):
+#
+#   target/: found 33219 matching artifact files and directories
+#   .cargo-home/registry/: found 50578 matching artifact files and directories
+#   FATAL: 400 Bad Request. EntityTooLarge: Your proposed upload is larger than
+#          the S3 maximum allowed size of 5 GiB
+#   Failed to create cache
+#   Job succeeded
+#
+# A rejected cache does not fail the job, so every run spent ~13 minutes zipping
+# 83797 files, stored nothing, and went green. That is why every restore logged
+# "Failed to extract cache", and why the old 28m27s cargo-gate builds were always
+# cold rather than warm. The platform default (registry only) is inherited as-is.
+#
+# To make `target/` cacheable, first get it under 5 GiB: `[profile.test] debug =
+# "line-tables-only"` and `incremental = false` (debuginfo is most of the bytes,
+# incremental fragments most of the 33219 files). aikido-test-rust prints both
+# sizes in its after_script every run, so there is a number to check against.
 
 # The vendored grant profile must be the platform's current one.
 #
