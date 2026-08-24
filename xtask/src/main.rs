@@ -18,7 +18,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Recompute the Iceberg compatibility matrix state and write docs/iceberg-matrix-state.json.
+    /// Recompute the Iceberg compatibility matrix state and write docs/evidence/iceberg-matrix-state.json.
     MatrixReport(matrix_report::Args),
 }
 
