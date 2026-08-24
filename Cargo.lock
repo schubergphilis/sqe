@@ -2021,7 +2021,6 @@ dependencies = [
  "arrow 58.4.0",
  "arrow-schema 58.4.0",
  "async-trait",
- "bzip2",
  "chrono",
  "datafusion-catalog 54.1.0",
  "datafusion-catalog-listing 54.1.0",
@@ -2031,7 +2030,6 @@ dependencies = [
  "datafusion-datasource-arrow 54.1.0",
  "datafusion-datasource-csv 54.1.0",
  "datafusion-datasource-json 54.1.0",
- "datafusion-datasource-parquet 54.1.0",
  "datafusion-execution 54.1.0",
  "datafusion-expr 54.1.0",
  "datafusion-expr-common 54.1.0",
@@ -2048,21 +2046,17 @@ dependencies = [
  "datafusion-physical-plan 54.1.0",
  "datafusion-session 54.1.0",
  "datafusion-sql 54.1.0",
- "flate2",
  "futures",
  "indexmap 2.14.0",
  "itertools 0.14.0",
- "liblzma",
  "log",
  "object_store",
  "parking_lot",
- "parquet 58.4.0",
  "sqlparser",
  "tempfile",
  "tokio",
  "url",
  "uuid",
- "zstd",
 ]
 
 [[package]]
@@ -2084,7 +2078,7 @@ dependencies = [
  "datafusion-datasource-arrow 55.0.0",
  "datafusion-datasource-csv 55.0.0",
  "datafusion-datasource-json 55.0.0",
- "datafusion-datasource-parquet 55.0.0",
+ "datafusion-datasource-parquet",
  "datafusion-execution 55.0.0",
  "datafusion-expr 55.0.0",
  "datafusion-expr-common 55.0.0",
@@ -2109,7 +2103,7 @@ dependencies = [
  "log",
  "object_store",
  "parking_lot",
- "parquet 59.2.0",
+ "parquet",
  "sqlparser",
  "tempfile",
  "tokio",
@@ -2233,8 +2227,6 @@ dependencies = [
  "libc",
  "log",
  "object_store",
- "parquet 58.4.0",
- "recursive",
  "sqlparser",
  "tokio",
  "uuid",
@@ -2260,7 +2252,7 @@ dependencies = [
  "log",
  "num-traits",
  "object_store",
- "parquet 59.2.0",
+ "parquet",
  "recursive",
  "sqlparser",
  "tokio",
@@ -2297,10 +2289,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b840a8bce0bcbf5afad02946d438591e7c373f7afccaf3d874c04485772514dd"
 dependencies = [
  "arrow 58.4.0",
- "async-compression",
  "async-trait",
  "bytes",
- "bzip2",
  "chrono",
  "datafusion-common 54.1.0",
  "datafusion-common-runtime 54.1.0",
@@ -2311,19 +2301,15 @@ dependencies = [
  "datafusion-physical-expr-common 54.1.0",
  "datafusion-physical-plan 54.1.0",
  "datafusion-session 54.1.0",
- "flate2",
  "futures",
  "glob",
  "itertools 0.14.0",
- "liblzma",
  "log",
  "object_store",
  "parking_lot",
  "rand 0.9.5",
  "tokio",
- "tokio-util",
  "url",
- "zstd",
 ]
 
 [[package]]
@@ -2508,37 +2494,6 @@ dependencies = [
 
 [[package]]
 name = "datafusion-datasource-parquet"
-version = "54.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cc35b92cd560082155e80d9c826929c852d3c51543f4affd3a51c464a0aab3a"
-dependencies = [
- "arrow 58.4.0",
- "async-trait",
- "bytes",
- "datafusion-common 54.1.0",
- "datafusion-common-runtime 54.1.0",
- "datafusion-datasource 54.1.0",
- "datafusion-execution 54.1.0",
- "datafusion-expr 54.1.0",
- "datafusion-functions 54.1.0",
- "datafusion-functions-aggregate-common 54.1.0",
- "datafusion-physical-expr 54.1.0",
- "datafusion-physical-expr-adapter 54.1.0",
- "datafusion-physical-expr-common 54.1.0",
- "datafusion-physical-plan 54.1.0",
- "datafusion-pruning 54.1.0",
- "datafusion-session 54.1.0",
- "futures",
- "itertools 0.14.0",
- "log",
- "object_store",
- "parking_lot",
- "parquet 58.4.0",
- "tokio",
-]
-
-[[package]]
-name = "datafusion-datasource-parquet"
 version = "55.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c0b0dc1453952952fd5c69ad1c7f6042176e69ed233011d47e07cf74ed0949e"
@@ -2566,7 +2521,7 @@ dependencies = [
  "log",
  "object_store",
  "parking_lot",
- "parquet 59.2.0",
+ "parquet",
  "tokio",
 ]
 
@@ -2648,7 +2603,6 @@ dependencies = [
  "datafusion-physical-expr-common 54.1.0",
  "indexmap 2.14.0",
  "itertools 0.14.0",
- "recursive",
  "serde_json",
  "sqlparser",
 ]
@@ -2711,8 +2665,6 @@ dependencies = [
  "arrow 58.4.0",
  "arrow-buffer 58.4.0",
  "base64 0.22.1",
- "blake2",
- "blake3",
  "chrono",
  "chrono-tz",
  "datafusion-common 54.1.0",
@@ -2725,12 +2677,10 @@ dependencies = [
  "hex",
  "itertools 0.14.0",
  "log",
- "md-5 0.11.0",
  "memchr",
  "num-traits",
  "rand 0.9.5",
  "regex",
- "sha2 0.11.0",
  "uuid",
 ]
 
@@ -3018,7 +2968,6 @@ dependencies = [
  "indexmap 2.14.0",
  "itertools 0.14.0",
  "log",
- "recursive",
  "regex",
  "regex-syntax",
 ]
@@ -3061,7 +3010,6 @@ dependencies = [
  "itertools 0.14.0",
  "parking_lot",
  "petgraph",
- "recursive",
  "tokio",
 ]
 
@@ -3169,7 +3117,6 @@ dependencies = [
  "datafusion-physical-plan 54.1.0",
  "datafusion-pruning 54.1.0",
  "itertools 0.14.0",
- "recursive",
 ]
 
 [[package]]
@@ -3276,7 +3223,7 @@ dependencies = [
  "datafusion-datasource-arrow 55.0.0",
  "datafusion-datasource-csv 55.0.0",
  "datafusion-datasource-json 55.0.0",
- "datafusion-datasource-parquet 55.0.0",
+ "datafusion-datasource-parquet",
  "datafusion-execution 55.0.0",
  "datafusion-expr 55.0.0",
  "datafusion-functions-table 55.0.0",
@@ -3386,7 +3333,6 @@ dependencies = [
  "datafusion-functions-nested 54.1.0",
  "indexmap 2.14.0",
  "log",
- "recursive",
  "regex",
  "sqlparser",
 ]
@@ -4379,15 +4325,15 @@ dependencies = [
  "anyhow",
  "apache-avro",
  "array-init",
- "arrow-arith 58.4.0",
- "arrow-array 58.4.0",
- "arrow-buffer 58.4.0",
- "arrow-cast 58.4.0",
- "arrow-ord 58.4.0",
- "arrow-row 58.4.0",
- "arrow-schema 58.4.0",
- "arrow-select 58.4.0",
- "arrow-string 58.4.0",
+ "arrow-arith 59.2.0",
+ "arrow-array 59.2.0",
+ "arrow-buffer 59.2.0",
+ "arrow-cast 59.2.0",
+ "arrow-ord 59.2.0",
+ "arrow-row 59.2.0",
+ "arrow-schema 59.2.0",
+ "arrow-select 59.2.0",
+ "arrow-string 59.2.0",
  "as-any",
  "async-trait",
  "backon",
@@ -4408,8 +4354,8 @@ dependencies = [
  "murmur3",
  "once_cell",
  "opendal",
- "ordered-float 4.6.0",
- "parquet 58.4.0",
+ "ordered-float",
+ "parquet",
  "rand 0.8.7",
  "reqsign",
  "reqwest 0.12.28",
@@ -4536,10 +4482,10 @@ dependencies = [
  "anyhow",
  "async-trait",
  "dashmap",
- "datafusion 54.1.0",
+ "datafusion 55.0.0",
  "futures",
  "iceberg",
- "parquet 58.4.0",
+ "parquet",
  "tokio",
  "tracing",
  "uuid",
@@ -4699,12 +4645,6 @@ dependencies = [
  "similar",
  "tempfile",
 ]
-
-[[package]]
-name = "integer-encoding"
-version = "3.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8bb03732005da905c88227371639bf1ad885cc712789c011c31c5fb3ab3ccf02"
 
 [[package]]
 name = "integer-encoding"
@@ -5595,15 +5535,6 @@ dependencies = [
 
 [[package]]
 name = "ordered-float"
-version = "2.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68f19d67e5a2795c94e73e0bb1cc1a7edeb2e28efd39e2e1c9b7a40c1108b11c"
-dependencies = [
- "num-traits",
-]
-
-[[package]]
-name = "ordered-float"
 version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7bb71e1b3fa6ca1c61f383464aaf2bb0e2f8e772a1f01d486832464de363b951"
@@ -5660,45 +5591,6 @@ dependencies = [
 
 [[package]]
 name = "parquet"
-version = "58.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d298093b2dec60289dce0684c986d0f7679e9dd15771c2c65406e1aaf604a704"
-dependencies = [
- "ahash",
- "arrow-array 58.4.0",
- "arrow-buffer 58.4.0",
- "arrow-data 58.4.0",
- "arrow-ipc 58.4.0",
- "arrow-schema 58.4.0",
- "arrow-select 58.4.0",
- "base64 0.22.1",
- "brotli",
- "bytes",
- "chrono",
- "flate2",
- "futures",
- "half",
- "hashbrown 0.17.1",
- "lz4_flex 0.13.1",
- "num-bigint 0.4.8",
- "num-integer",
- "num-traits",
- "object_store",
- "parquet-variant",
- "parquet-variant-compute",
- "parquet-variant-json",
- "paste",
- "seq-macro",
- "simdutf8",
- "snap",
- "thrift",
- "tokio",
- "twox-hash",
- "zstd",
-]
-
-[[package]]
-name = "parquet"
 version = "59.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7065842956a20c2a536924ce8e4d9955f7422451511b9eb7500d7bfe5077e59c"
@@ -5723,6 +5615,9 @@ dependencies = [
  "num-integer",
  "num-traits",
  "object_store",
+ "parquet-variant",
+ "parquet-variant-compute",
+ "parquet-variant-json",
  "seq-macro",
  "simdutf8",
  "snap",
@@ -5733,12 +5628,12 @@ dependencies = [
 
 [[package]]
 name = "parquet-variant"
-version = "58.4.0"
+version = "59.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fc70e87931167a4a3fde2ee923023a0624367691e3fd503476a1084dda5a054"
+checksum = "3f7e5fff3ed0c07514a7fb8bee3f2ea5a53f36939410ecac4a466620213539a8"
 dependencies = [
- "arrow 58.4.0",
- "arrow-schema 58.4.0",
+ "arrow 59.2.0",
+ "arrow-schema 59.2.0",
  "chrono",
  "half",
  "indexmap 2.14.0",
@@ -5749,12 +5644,12 @@ dependencies = [
 
 [[package]]
 name = "parquet-variant-compute"
-version = "58.4.0"
+version = "59.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "823a9ecee8fd83a68f7165ef13acc840c4d7ed995838ba99d4714b20a2b5e780"
+checksum = "ba4d3de89dab8d1aaaf601ae8d71bd07ea88cfca9efc1df5815b982c30f631e1"
 dependencies = [
- "arrow 58.4.0",
- "arrow-schema 58.4.0",
+ "arrow 59.2.0",
+ "arrow-schema 59.2.0",
  "chrono",
  "half",
  "indexmap 2.14.0",
@@ -5766,12 +5661,12 @@ dependencies = [
 
 [[package]]
 name = "parquet-variant-json"
-version = "58.4.0"
+version = "59.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f37a91177e2dddb10333546952fcf2b7674b97ebd9449432f24b883d6ea8108"
+checksum = "fb19dfe1bd24c17addd761ba4f7000f615e2fa12525871c7baa835dbb3d7f147"
 dependencies = [
- "arrow-schema 58.4.0",
- "base64 0.22.1",
+ "arrow-schema 59.2.0",
+ "base64 0.23.1",
  "chrono",
  "parquet-variant",
  "serde_json",
@@ -5841,10 +5736,10 @@ dependencies = [
  "async-recursion",
  "bytes",
  "faststr",
- "integer-encoding 4.1.0",
+ "integer-encoding",
  "lazy_static",
  "linkedbytes",
- "ordered-float 4.6.0",
+ "ordered-float",
  "paste",
  "serde",
  "smallvec",
@@ -7381,7 +7276,7 @@ dependencies = [
  "iceberg",
  "iceberg-catalog-rest",
  "object_store",
- "parquet 59.2.0",
+ "parquet",
  "rand 0.10.2",
  "reqwest 0.13.4",
  "serde",
@@ -7427,7 +7322,7 @@ dependencies = [
  "object_store",
  "opentelemetry",
  "opentelemetry_sdk",
- "parquet 59.2.0",
+ "parquet",
  "prometheus",
  "regex",
  "reqwest 0.13.4",
@@ -7508,7 +7403,7 @@ dependencies = [
  "futures",
  "hmac 0.13.0",
  "iceberg",
- "parquet 59.2.0",
+ "parquet",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -7554,7 +7449,7 @@ dependencies = [
  "object_store",
  "opentelemetry",
  "opentelemetry_sdk",
- "parquet 59.2.0",
+ "parquet",
  "prometheus",
  "prost",
  "reqwest 0.13.4",
@@ -7865,7 +7760,7 @@ dependencies = [
  "if-addrs",
  "object_store",
  "opentelemetry",
- "parquet 59.2.0",
+ "parquet",
  "prometheus",
  "serde",
  "serde_json",
@@ -8280,17 +8175,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "thrift"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e54bc85fc7faa8bc175c4bab5b92ba8d9a3ce893d0e9f42cc455c8ab16a9e09"
-dependencies = [
- "byteorder",
- "integer-encoding 3.0.4",
- "ordered-float 2.10.1",
 ]
 
 [[package]]
