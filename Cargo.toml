@@ -23,7 +23,7 @@ members = [
     "xtask",
 ]
 # Exclude vendored trees. They are referenced via path / [patch], not members.
-exclude = ["vendor/iceberg-rust", "vendor/jiter"]
+exclude = ["vendor/iceberg-rust", "vendor/jiter", "vendor/datafusion-functions-json"]
 
 [workspace.package]
 version = "0.37.0"
@@ -264,3 +264,7 @@ strip = false            # Keep symbols; benchmarks want readable traces.
 # python feature remains off for SQE builds; the lock still records pyo3.
 [patch.crates-io]
 jiter = { path = "vendor/jiter" }
+# Upstream has no DataFusion 55 release; 0.54.2 pins `datafusion ^54` and was the
+# only thing holding DF 54 + arrow 58 in the tree. See
+# vendor/datafusion-functions-json/Cargo.toml for the retirement condition.
+datafusion-functions-json = { path = "vendor/datafusion-functions-json" }
