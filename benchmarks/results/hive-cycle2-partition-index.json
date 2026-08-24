@@ -1,0 +1,53 @@
+{
+  "plan": "hive-external-cycle2-partition-index",
+  "generated_at_rfc3339": "2026-08-22T15:30:00Z",
+  "fixture": {
+    "partitions": 64,
+    "rows_per_partition": 2,
+    "formats": ["csv", "parquet"]
+  },
+  "cases": [
+    {
+      "name": "csv_cold_full_scan",
+      "format": "csv",
+      "predicate": null,
+      "listing_wall_ms": 18.4,
+      "indexed_wall_ms": 12.1
+    },
+    {
+      "name": "csv_warm_full_scan",
+      "format": "csv",
+      "predicate": null,
+      "listing_wall_ms": 4.6,
+      "indexed_wall_ms": 3.9
+    },
+    {
+      "name": "csv_cold_partition_pin",
+      "format": "csv",
+      "predicate": "dt = '2026-01-32'",
+      "listing_wall_ms": 11.2,
+      "indexed_wall_ms": 2.8
+    },
+    {
+      "name": "csv_warm_partition_pin",
+      "format": "csv",
+      "predicate": "dt = '2026-01-32'",
+      "listing_wall_ms": 3.1,
+      "indexed_wall_ms": 1.4
+    },
+    {
+      "name": "parquet_cold_partition_pin",
+      "format": "parquet",
+      "predicate": "dt = '2026-01-32'",
+      "listing_wall_ms": 9.7,
+      "indexed_wall_ms": 2.1
+    },
+    {
+      "name": "parquet_warm_partition_pin",
+      "format": "parquet",
+      "predicate": "dt = '2026-01-32'",
+      "listing_wall_ms": 2.4,
+      "indexed_wall_ms": 1.1
+    }
+  ]
+}

@@ -1,0 +1,56 @@
+{
+  "generated_at": "2026-08-23T10:39:12Z",
+  "region_note": "ookla us-west-2, blockchain us-east-2, commoncrawl us-east-1",
+  "cases": [
+    {
+      "name": "ookla_q1_2024_list",
+      "wall_ms": 1426.7,
+      "rc": 0,
+      "lines": 1,
+      "cmd": "aws s3 ls --no-sign-request s3://ookla-open-data/parquet/performance/type=fixed/year=2024/quarter=1/"
+    },
+    {
+      "name": "ookla_year_2024_prefixes",
+      "wall_ms": 1254.8,
+      "rc": 0,
+      "lines": 4,
+      "cmd": "aws s3 ls --no-sign-request s3://ookla-open-data/parquet/performance/type=fixed/year=2024/"
+    },
+    {
+      "name": "ookla_performance_recursive",
+      "wall_ms": 1230.1,
+      "rc": 0,
+      "lines": 62,
+      "cmd": "aws s3 ls --no-sign-request --recursive s3://ookla-open-data/parquet/performance/"
+    },
+    {
+      "name": "ookla_performance_prefixes",
+      "wall_ms": 1327.9,
+      "rc": 0,
+      "lines": 2,
+      "cmd": "aws s3 ls --no-sign-request s3://ookla-open-data/parquet/performance/"
+    },
+    {
+      "name": "btc_blocks_prefixes",
+      "wall_ms": 2377.3,
+      "rc": 0,
+      "lines": 6437,
+      "cmd": "aws s3 ls --no-sign-request s3://aws-public-blockchain/v1.0/btc/blocks/"
+    },
+    {
+      "name": "cc_index_prefixes",
+      "wall_ms": 1131.8,
+      "rc": 254,
+      "lines": 0,
+      "cmd": "aws s3 ls --no-sign-request s3://commoncrawl/cc-index/table/cc-main/warc/",
+      "stderr": "\naws: [ERROR]: An error occurred (AccessDenied) when calling the ListObjectsV2 operation: Access Denied\n"
+    },
+    {
+      "name": "btc_one_day_recursive",
+      "wall_ms": 1102.5,
+      "rc": 0,
+      "lines": 1,
+      "cmd": "aws s3 ls --no-sign-request --recursive s3://aws-public-blockchain/v1.0/btc/blocks/date=2024-01-01/"
+    }
+  ]
+}

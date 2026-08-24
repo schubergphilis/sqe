@@ -2,7 +2,7 @@
 
 SQE reads Hive-style external tables on S3-compatible storage with Athena and Glue `CREATE EXTERNAL TABLE` syntax. No metastore is involved. The table definition lives in a small JSON manifest next to the data, in a warehouse root you attach. Any process that can read that root, the embedded CLI, a coordinator, a future worker, resolves the same table.
 
-Cycle 1 is the read path: attach a root, create and drop tables, read CSV, line-delimited JSON, and Parquet, with Hive-style partitions. It is the first of five planned cycles. Four things are explicitly out of scope and covered at the end: explicit partition DDL, tag-based masks and filters, writes, and worker-side execution.
+Cycle 2 is the partition-index path: `MSCK REPAIR TABLE`, `ALTER TABLE ... ADD/DROP PARTITION`, `SHOW PARTITIONS`, Athena partition projection, and `ANALYZE TABLE`. Cycle 1 remains the read path underneath. Three things stay out of scope and are covered at the end: tag-based masks and filters, writes, and worker-side execution.
 
 There are no SQE grammar extensions. Every clause below is Athena's own. SQE-specific settings ride inside `TBLPROPERTIES` under an `sqe.` prefix, which is where Glue and Athena put engine-specific settings anyway. Today there is exactly one: `sqe.secret`.
 
@@ -120,7 +120,7 @@ Octal escapes work in delimiters, so `FIELDS TERMINATED BY '\001'` behaves exact
 
 1. **`OpenCSVSerde` types every column as string in Athena.** SQE honors your declared column types and casts. Athena's all-string behavior is a workaround for its own SerDe, not a semantic anyone actually wants.
 2. **Hive angle-bracket nested types are rejected.** `array<string>`, `struct<x:int>`, and `map<string,int>` all fail. `array` and `struct` parse and are rejected by name with the column named in the error; `map` fails inside the parser itself, before SQE ever sees it, because sqlparser only supports Spark's angle-bracket map literal. Cycle 1 is scalar columns and scalar partition keys only.
-3. **`projection.*` partition-projection properties are rejected**, not ignored, with a message pointing at cycle 2. Ignoring them would silently turn a computed partition set into a full table scan.
+3. **`projection.*` partition-projection properties are implemented.** Unknown keys and malformed types error by name at CREATE and on every manifest load. They are never silently ignored.
 4. **`has_encrypted_data`, `STORED BY`, bucketing, and skew clauses are rejected.**
 5. **`DROP TABLE ... PURGE` is rejected.** `DROP TABLE` deletes the manifest and never touches data, so there is no purge semantics to offer yet.
 
@@ -149,15 +149,13 @@ The asymmetry is deliberate. Without it, a grant written for Iceberg `sales.empl
 
 ## Performance, plainly
 
-**Cycle 1 lists on every query.** There is no persisted partition index yet. What prunes the listing today is pinning the leading partition columns with equality: `WHERE dt = '2026-01-02'` narrows the listing to that prefix. A range predicate, an `IN` list, or a filter on a partition column that is not the leading one falls back to listing the entire table prefix and filtering in memory. On a table with tens of thousands of partitions, that listing dominates the query.
+**A populated `sqe.partition_index` plans from the index.** Equality, `IN`, range, and `IS NULL` predicates on partition columns prune entries before any file group is built. An absent index keeps cycle-1 listing, including leading-equality prefix pruning. Projection-enabled tables compute the partition set at plan time and never list the table prefix to discover partitions.
 
 **Compressed CSV and JSON are one file per thread.** Neither format is splittable once compressed, so a single large compressed file runs on a single thread regardless of how many cores are available. Size files with that in mind: many moderately sized files parallelize; one giant file does not, no matter the partition count.
 
 Parquet gets real row-group pruning from footer statistics and splits by row group for parallelism. CSV and JSON get file-level parallelism up to `target_partitions`, and only projection pushdown, not predicate pushdown; filters run above the scan.
 
-Cycle 1 uses size-derived statistics (file count and byte size), not a Parquet footer read per file at plan time, so a join against a Hive table does not plan blind while staying cheap to plan. Cycle 2's `ANALYZE TABLE` replaces this with persisted real counts.
-
-Cycle 2 removes the listing cost by persisting the partition list itself in the manifest, maintained by `MSCK REPAIR TABLE` (full re-list) and `ALTER TABLE ... ADD PARTITION` (one entry, no re-scan).
+Without a prior `ANALYZE TABLE`, planning uses size-derived statistics from the index (file counts and bytes captured at ADD/REPAIR time) or from a one-shot listing when there is no index. `ANALYZE TABLE` persists real row counts into `sqe.statistics` and planning uses those when present. Parquet counts come from footers; CSV and JSON pay a full decode once.
 
 ## Server mode
 
@@ -171,16 +169,18 @@ In server mode, Hive scans execute coordinator-local, the same way the file tabl
 
 ## Statement support today
 
-| Statement | Cycle 1 behavior |
+| Statement | Behavior |
 |---|---|
 | `CREATE EXTERNAL TABLE` | Supported |
 | `DROP TABLE` | Supported. Deletes the manifest, never the data. `PURGE` rejected |
 | `SHOW TABLES FROM <root>.<database>`, `DESCRIBE`, `SHOW COLUMNS`, `information_schema` | Supported. `SHOW TABLES` and `SHOW CREATE TABLE` are policy-gated: a fully-denied table is omitted/errors like a missing one, and a restricted column is dropped from `SHOW CREATE TABLE`'s rendered DDL. `information_schema` itself is not policy-filtered for a Hive root, same as it is not for an Iceberg catalog: this is pre-existing parity, not a Hive-specific gap |
 | `SHOW CREATE TABLE` | Supported. Renders Athena-compatible DDL from the manifest |
 | `SHOW SCHEMAS`, `SHOW SCHEMAS IN <root>` | `SHOW SCHEMAS` is not parsed at all in embedded mode, against a Hive root or an Iceberg catalog alike: this is a pre-existing embedded-mode gap, not something this feature introduces. In server mode it works for Iceberg catalogs, but has no dedicated path for a Hive root yet and fails with a generic catalog error. `SELECT catalog_name, schema_name FROM information_schema.schemata WHERE catalog_name = '<root>'` works in both modes and lists the root's databases; use that, or `SHOW TABLES FROM <root>.<database>` against a database you already know |
-| `ANALYZE` | Rejected, naming cycle 2 |
-| `ALTER TABLE ... ADD PARTITION` | Rejected, naming cycle 2 |
-| `MSCK REPAIR TABLE`, `SHOW PARTITIONS` | Rejected with a generic not-implemented error. These statements do not yet reach SQE's own statement classifier at all, so the message does not yet name `hive_external` or a cycle. Cycle 2 adds the classifier arms when it implements the statements, and the message becomes specific for free |
+| `ANALYZE TABLE` | Supported on Hive tables. Persists row counts into `sqe.statistics`. Same policy gate as reads. Iceberg `ANALYZE` remains a no-op (#329) |
+| `ALTER TABLE ... ADD PARTITION` | Supported. Appends one index entry, never touches data. `IF NOT EXISTS` honored. Refused on projection-enabled tables |
+| `ALTER TABLE ... DROP PARTITION` | Supported. Removes the index entry, never the data. `PURGE` rejected, naming cycle 4. Refused on projection-enabled tables (projection owns the partition set) |
+| `MSCK REPAIR TABLE` | Supported. Relists the table location and rewrites the index. The remedy for a stale index. Junk paths (non-`k=v` dirs, untypeable values, files at the table root) are skipped, matching Hive and Athena. No-op on projection-enabled tables |
+| `SHOW PARTITIONS` | Supported. Reads the index when present, lists when absent |
 | `ALTER TABLE ... SET TAGS`, masking policy statements | Rejected, naming cycle 3 |
 | `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE` | Rejected, naming cycle 4 |
 | `ALTER TABLE` rename, column add/drop/rename, `COMMENT ON` | Rejected outright. Schema evolution on an external table is a manifest edit, not scheduled work |
@@ -190,7 +190,7 @@ Every rejection names `hive_external` and, where one is planned, the cycle that 
 
 ## Known limitations, and what to do about them
 
-**Every query lists the partition directory unless the leading partition columns are equality-pinned.** On a large partition count this dominates query time. Restructure filters to pin the leading partition columns with `=` where you can, and expect the listing cost until cycle 2's partition index ships.
+**A stale index omits partitions, never invents them.** Files that landed out of band after the last `MSCK REPAIR` or `ADD PARTITION` are invisible until you repair. SQE does not list the table prefix at plan time to double-check the index, because that listing is the cost the index exists to remove. `MSCK REPAIR TABLE` is the named recovery path. Deleting the `sqe.partition_index` slot from the manifest restores cycle-1 discovery.
 
 **A compressed CSV or JSON file is one thread, however many cores you have.** Split large compressed files at write time rather than relying on in-engine parallelism to compensate.
 
@@ -198,7 +198,7 @@ Every rejection names `hive_external` and, where one is planned, the cycle that 
 
 **`array`, `struct`, and `map` columns are not supported.** A table with a nested column needs those columns projected out at the source or flattened before SQE reads it. There is no workaround inside SQE for cycle 1.
 
-**No `MSCK REPAIR TABLE` or `SHOW PARTITIONS` yet.** Both fail with a generic not-implemented error rather than one naming `hive_external`, because neither statement reaches SQE's own statement classifier at all. A table with partitions added out of band from `CREATE EXTERNAL TABLE` still reads correctly through directory listing; there is no persisted partition catalog to repair or show. Cycle 2 changes that, and the error becomes specific at the same time.
+**Partition projection.** `projection.enabled=true` plus per-column `projection.<col>.type` of `enum`, `integer`, `date`, or `injected` computes the partition set at plan time. Locations follow the standard `k=v/` layout under the table location. `injected` columns take an equality or `IN` literal from the query when one is present, and NULL (`__HIVE_DEFAULT_PARTITION__`) otherwise. `ADD PARTITION` / `DROP PARTITION` on a projected table is an error: projection owns the partition set. `MSCK REPAIR TABLE` succeeds as a no-op, so an ETL script that always repairs after a load does not fail. Unknown `projection.*` keys fail at CREATE and on every load, naming the key.
 
 **`SHOW SCHEMAS` does not list a Hive root's databases.** This is not a Hive-specific gap: `SHOW SCHEMAS` is not parsed in embedded mode at all, against any catalog kind, and in server mode it has no dedicated Hive path yet, so it fails with a generic catalog error against a Hive root. `SELECT catalog_name, schema_name FROM information_schema.schemata WHERE catalog_name = '<root>'` works in both modes and is the reliable way to list a root's databases; `SHOW TABLES FROM <root>.<database>` works too once you know the database name.
 
@@ -208,4 +208,4 @@ Every rejection names `hive_external` and, where one is planned, the cycle that 
 
 ## What is next
 
-Cycle 2 adds explicit partition DDL (`ALTER TABLE ... ADD/DROP PARTITION`, `MSCK REPAIR TABLE`, `SHOW PARTITIONS`), Athena-style partition projection, and the persisted partition index that removes the per-query listing cost described above. Cycle 3 adds tag-based row filters and column masks on Hive scans. Cycle 4 adds writes (`INSERT INTO`, CTAS) into partition directories. Cycle 5 moves Hive scan execution onto workers.
+Cycle 3 adds tag-based row filters and column masks on Hive scans. Cycle 4 adds writes (`INSERT INTO`, CTAS) into partition directories. Cycle 5 moves Hive scan execution onto workers.
