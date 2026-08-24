@@ -406,5 +406,5 @@ scenario-test-aws:
 
 # ── Iceberg matrix score regression guard ─────────────────────
 # Runs `cargo xtask matrix-report --min-percent N` where N is the current
-# baseline. If the committed docs/iceberg-matrix-state.json drops below the
+# baseline. If the committed docs/evidence/iceberg-matrix-state.json drops below the
 # baseline, the job fails. Bump MATRIX_MIN_PERCENT when a phase lands.
