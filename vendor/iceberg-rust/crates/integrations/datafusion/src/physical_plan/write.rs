@@ -19,6 +19,8 @@ use std::fmt::{Debug, Formatter};
 use std::str::FromStr;
 use std::sync::Arc;
 
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::arrow::array::{ArrayRef, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{
     DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
@@ -146,6 +148,15 @@ impl ExecutionPlan for IcebergWriteExec {
     fn maintains_input_order(&self) -> Vec<bool> {
         // Maintains ordering in the sense that the written file will reflect the ordering of the input.
         vec![true; self.children().len()]
+    }
+
+    /// SQE PATCH: DataFusion 55 trait requirement. This node holds no
+    /// physical expressions, so the traversal simply continues.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

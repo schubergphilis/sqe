@@ -18,6 +18,8 @@
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::arrow::array::{Array, ArrayRef, RecordBatch, StringArray, UInt64Array};
 use datafusion::arrow::datatypes::{
     DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
@@ -126,6 +128,15 @@ impl DisplayAs for IcebergCommitExec {
 impl ExecutionPlan for IcebergCommitExec {
     fn name(&self) -> &str {
         "IcebergCommitExec"
+    }
+
+    /// SQE PATCH: DataFusion 55 trait requirement. This node holds no
+    /// physical expressions, so the traversal simply continues.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

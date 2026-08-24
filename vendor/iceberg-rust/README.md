@@ -94,6 +94,42 @@ for taking apache cherry-picks. Use 0.10.0 as the audit baseline for the next
 apache sweep instead: apache `main` is roughly four months past this fork's
 `dev_rebase_main_20260303` base.
 
+## DataFusion 55 / Arrow 59 readiness (probed 2026-08-24)
+
+Probed against renovate MR !886 (root bump: datafusion 54->55, arrow/parquet
+58->59). Verdict: **this fork is not what blocks that upgrade.**
+
+- **Arrow 58->59 on `iceberg` core: free.** Bumping the nine `arrow-*` pins and
+  `parquet` in this workspace's `[workspace.dependencies]` gives a clean
+  `cargo check -p iceberg`, zero errors, zero source changes.
+- **DataFusion 54->55 on `iceberg-datafusion`: six mechanical errors**, all in
+  upstream code, none in the SQE patch families below. Fixed here:
+  - `datafusion::sql::TableReference` moved to `datafusion::common`.
+  - `ExecutionPlan` gained a required `apply_expressions`. Implemented on four
+    nodes: `IcebergTableScan` reports its `runtime_filters` via
+    `apply_expression_roots` (they are real `PhysicalExpr` roots and DataFusion
+    traverses them), while `commit`, `metadata_scan` and `write` hold no
+    expressions and return `Continue`.
+  - `CreateExternalTable::location` became `locations: Vec<String>`. An Iceberg
+    static table is exactly one metadata file, so the factory refuses any other
+    count instead of silently taking the first entry.
+
+That patch families 1 (`expr::dynamic`), 8 (SBBF probing) and 9 (fetch/decode
+pipelining) needed no changes is the useful part: the DF 55 churn did not touch
+the physical-expr surfaces they ride on.
+
+### What actually blocks the upgrade
+
+`datafusion-functions-json`. Its newest release is **0.54.2**, which requires
+`datafusion ^54`, and `cargo tree -i datafusion@54.1.0` shows it is the *only*
+reason DataFusion 54 stays in the tree. That drags arrow 58 in beside arrow 59
+and produces the dual-version type clash that failed !886's `cargo-gate`
+("there are multiple different versions of crate `arrow_schema`"). Nothing in
+this vendor tree can fix it. Three ways out: wait for an upstream 0.55, vendor
+and bump it locally (there is precedent, `[patch.crates-io] jiter`), or drop the
+JSON UDFs and lose that SQL surface. It is registered in exactly four places
+(`register_all`), so the mechanical cost of any option is small.
+
 ## SQE-only patches in this vendor copy
 
 These patch families ride on top of the upstream snapshot. Each is
