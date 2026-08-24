@@ -4,9 +4,9 @@ Current state of SQE against the [icebergmatrix.org](https://icebergmatrix.org) 
 
 **Score: 167/189 (88.4%)**  |  **Stretch: 170/189 (90%)**
 
-Last generated: 2026-05-05T15:00:00Z  |  Source: `fix/score-recount-after-merges: post !129 + !130 score is 167, not 166`
+Last generated: 2026-06-03T00:00:00Z  |  Source: `chore/bump-iceberg-rust-9491dcab: re-validated against vendored RW fork c034b19105fa (snapshot-summary panic fix #161 + V3 puffin file reader). Both are bug-fixes; no cell flips. The V3 puffin read fix is not yet verified end-to-end (needs the docker-compose stack), so no V3 deletion-vector cell changes. Score holds 167/189.`
 
-Regenerate: `python3 scripts/render-iceberg-matrix.py`. Source of truth: `docs/iceberg-matrix-state.json`.
+Regenerate: `python3 scripts/render-iceberg-matrix.py`. Source of truth: `docs/evidence/iceberg-matrix-state.json`.
 
 > **Side-by-side with every other engine:** see [`docs/iceberg-matrix-compare.md`](./iceberg-matrix-compare.md) for the V2/V3 comparison across SQE, Spark, Flink, PyIceberg, DuckDB, ClickHouse, Doris, Daft, Snowflake, Databricks, EMR, Glue, Athena, Redshift, BigQuery, Dataproc, Fabric, Synapse, Managed Flink, Firehose, and Kafka Connect.
 
@@ -122,7 +122,7 @@ Peer scores from icebergmatrix.org as of 2026-04-29.
 
 ## Caveats
 
-Cells marked `partial` or `unknown` have specific gaps documented in `docs/iceberg-matrix-state.json` under `caveats`. Key ones:
+Cells marked `partial` or `unknown` have specific gaps documented in `docs/evidence/iceberg-matrix-state.json` under `caveats`. Key ones:
 
 - **snowflake-horizon-catalog (v2)**: No live integration test.
 - **snowflake-horizon-catalog (v3)**: No live integration test against Horizon.
@@ -147,7 +147,7 @@ Not captured in the rubric but material to picking SQE:
 ## Contributing
 
 1. Make the change in code.
-2. Update the matching entry in `docs/iceberg-matrix-state.json`.
+2. Update the matching entry in `docs/evidence/iceberg-matrix-state.json`.
 3. Run `cargo xtask matrix-report` to verify the aggregate score.
 4. Raise `MATRIX_MIN_PERCENT` in `.gitlab-ci.yml` if the new score clears the next 1% threshold.
 5. Regenerate this file: `python3 scripts/render-iceberg-matrix.py`.
@@ -156,7 +156,7 @@ For the public matrix submission workflow see `openspec/changes/iceberg-matrix-p
 
 ## See also
 
-- [Full openspec change](../../../openspec/changes/iceberg-matrix-parity/proposal.md) with proposal, design, 8 spec files, and tasks
-- [Source roadmap](../plans/2026-04-24-iceberg-matrix-parity.md) with upstream research and deferral rationale
+- [Full openspec change](../openspec/changes/iceberg-matrix-parity/proposal.md) with proposal, design, 8 spec files, and tasks
+- [Source roadmap](./superpowers/plans/2026-04-24-iceberg-matrix-parity.md) with upstream research and deferral rationale
 - [Matrix parity workflow](./matrix-parity-workflow.md) for per-phase branching conventions
 - [Tracking issue body](./matrix-parity-tracking-issue.md)
