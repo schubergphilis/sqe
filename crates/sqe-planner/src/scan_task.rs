@@ -1,6 +1,70 @@
 use serde::{Deserialize, Serialize};
 
-use crate::scan_morsel::{SCAN_TASK_VERSION_CURRENT, SCAN_TASK_VERSION_V1, SCAN_TASK_VERSION_V2};
+use std::collections::BTreeMap;
+
+use crate::scan_morsel::{
+    SCAN_TASK_VERSION_CURRENT, SCAN_TASK_VERSION_V1, SCAN_TASK_VERSION_V2, SCAN_TASK_VERSION_V3,
+};
+
+
+/// File format of a Hive external table's data files.
+///
+/// Deliberately a wire-local enum rather than a re-export of
+/// `sqe_catalog::hive::serde_map::HiveFileFormat`. `sqe-planner` does not
+/// depend on `sqe-catalog`, and more importantly a wire type should not move
+/// every time an internal enum gains a variant: a format the worker cannot
+/// read must fail the fallback check at planning time, not deserialize into
+/// something a new worker guesses at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HiveScanFormat {
+    Csv,
+    Json,
+    Parquet,
+}
+
+/// Everything a worker needs to open a Hive external table's files that an
+/// Iceberg task does not carry. Present ONLY on a Hive task; `None` keeps the
+/// ticket byte-identical to v2 (see `hive_task_absent_is_byte_identical_to_v2`).
+///
+/// Why the partition data is shaped this way, rather than just a value map:
+/// `HiveTableProvider::attach_partition_values` builds a `ProjectionExec` that
+/// emits a column reference for indices `< file_schema.len()` and a typed
+/// LITERAL above that, indexing `partition_columns` BY POSITION. So the worker
+/// needs the declared order (a `BTreeMap` has its own, unrelated) and the file
+/// schema (to know the split point, and to type each literal from the field's
+/// own data type). A value map alone would silently reorder columns.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HiveScanDescriptor {
+    /// How to open the files. `Parquet` uses the same reader as an Iceberg task.
+    pub format: HiveScanFormat,
+    /// CSV field delimiter. Ignored for `Json` and `Parquet`.
+    #[serde(default)]
+    pub delimiter: u8,
+    /// CSV quote character, if the SerDe declared one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<u8>,
+    /// CSV escape character, if the SerDe declared one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escape: Option<u8>,
+    /// Whether the first line of each CSV file is a header to skip.
+    #[serde(default)]
+    pub has_header: bool,
+    /// Directory-encoded partition values for this task's files, keyed by
+    /// partition column name. A task carries ONE map, so a task must not span
+    /// partitions.
+    #[serde(default)]
+    pub partition_values: BTreeMap<String, String>,
+    /// Declared partition key order. Load-bearing: the projection indexes by
+    /// position, and `partition_values` is a map with no meaningful order.
+    #[serde(default)]
+    pub partition_columns: Vec<String>,
+    /// Arrow schema of the DATA FILE, JSON-serialized. Gives the worker both
+    /// the file/partition split point and the field types needed to reproduce
+    /// the coordinator's literal typing exactly.
+    #[serde(default)]
+    pub file_schema_json: String,
+}
 
 /// Lightweight message sent from coordinator to worker describing
 /// which Parquet files to scan and how to access them.
@@ -107,6 +171,14 @@ pub struct ScanTask {
     /// row-count-monotonic and order-insensitive. `None` otherwise.
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Present only for a Hive external table scan.
+    ///
+    /// `skip_serializing_if` is what keeps every Iceberg ticket byte-identical
+    /// to its v2 encoding, which matters because this field sits on the path
+    /// every distributed Iceberg query already uses. That property is asserted
+    /// by a test rather than trusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hive: Option<HiveScanDescriptor>,
 }
 
 /// Wire codec for [`ScanTask::predicate_proto`]: writes base64, reads either
@@ -178,6 +250,7 @@ impl std::fmt::Debug for ScanTask {
             .field("s3_allow_http", &self.s3_allow_http)
             .field("has_predicate", &self.predicate_proto.is_some())
             .field("limit", &self.limit)
+            .field("hive", &self.hive.as_ref().map(|h| h.format))
             .finish()
     }
 }
@@ -196,7 +269,7 @@ impl ScanTask {
     /// Reject tickets whose version this worker does not understand.
     pub fn validate_version(&self) -> Result<(), String> {
         match self.version {
-            SCAN_TASK_VERSION_V1 | SCAN_TASK_VERSION_V2 => Ok(()),
+            SCAN_TASK_VERSION_V1 | SCAN_TASK_VERSION_V2 | SCAN_TASK_VERSION_V3 => Ok(()),
             other => Err(format!(
                 "unsupported ScanTask version {other}; this worker supports \
                  {SCAN_TASK_VERSION_V1}..={SCAN_TASK_VERSION_CURRENT}"
@@ -241,7 +314,88 @@ mod tests {
             s3_allow_http: true,
             predicate_proto: predicate,
             limit: None,
+            hive: None,
         }
+    }
+
+    fn hive_descriptor() -> HiveScanDescriptor {
+        HiveScanDescriptor {
+            format: HiveScanFormat::Csv,
+            delimiter: b',',
+            quote: Some(b'"'),
+            escape: None,
+            has_header: true,
+            partition_values: BTreeMap::from([
+                ("dt".to_string(), "2024-01-01".to_string()),
+                ("region".to_string(), "eu".to_string()),
+            ]),
+            // Deliberately NOT alphabetical: this is the order the projection
+            // indexes by, and a BTreeMap would sort it to dt,region.
+            partition_columns: vec!["region".to_string(), "dt".to_string()],
+            file_schema_json: "{\"fields\":[]}".to_string(),
+        }
+    }
+
+    /// The guard the whole of cycle 5 rests on. Adding an optional field to a
+    /// message every distributed Iceberg query already sends must not change
+    /// one byte of those messages.
+    #[test]
+    fn an_iceberg_task_is_byte_identical_to_its_v2_encoding() {
+        let task = task_with_predicate(None);
+        let bytes = task.to_bytes().expect("serialize");
+        let json = String::from_utf8(bytes).expect("utf8");
+        assert!(
+            !json.contains("hive"),
+            "an Iceberg ticket must not carry the hive key at all, got: {json}"
+        );
+        // And it still declares v2: the version bumps only when a descriptor
+        // is actually present, so an old worker keeps accepting these.
+        assert!(json.contains("\"version\":2"), "got: {json}");
+    }
+
+    #[test]
+    fn a_hive_descriptor_round_trips_and_keeps_the_declared_column_order() {
+        let mut task = task_with_predicate(None);
+        task.version = SCAN_TASK_VERSION_V3;
+        task.hive = Some(hive_descriptor());
+
+        let bytes = task.to_bytes().expect("serialize");
+        let back = ScanTask::from_bytes(&bytes).expect("deserialize");
+        let hive = back.hive.expect("descriptor survives the round trip");
+
+        assert_eq!(hive, hive_descriptor());
+        assert_eq!(
+            hive.partition_columns,
+            vec!["region".to_string(), "dt".to_string()],
+            "declared order is load-bearing: the projection indexes by position, \
+             so sorting it silently swaps two partition columns"
+        );
+    }
+
+    #[test]
+    fn version_three_is_accepted_and_four_is_not() {
+        let mut task = task_with_predicate(None);
+        for v in [SCAN_TASK_VERSION_V1, SCAN_TASK_VERSION_V2, SCAN_TASK_VERSION_V3] {
+            task.version = v;
+            assert!(task.validate_version().is_ok(), "v{v} must be accepted");
+        }
+        task.version = 4;
+        assert!(
+            task.validate_version().is_err(),
+            "an unknown version must be refused, not read as the newest known one"
+        );
+    }
+
+    /// A v2 ticket from an older coordinator has no `hive` key at all. It must
+    /// deserialize as a non-Hive task rather than failing.
+    #[test]
+    fn a_v2_ticket_without_the_key_deserializes_as_non_hive() {
+        let json = r#"{"version":2,"fragment_id":"f","data_file_paths":[],
+            "projected_columns":[],"s3_endpoint":"","s3_region":"",
+            "s3_access_key":"","s3_secret_key":"","s3_session_token":"",
+            "s3_path_style":false,"s3_allow_http":false}"#;
+        let task = ScanTask::from_bytes(json.as_bytes()).expect("v2 ticket still parses");
+        assert!(task.hive.is_none());
     }
 
     /// The predicate must ride as base64, not as a JSON array of decimal
@@ -325,6 +479,7 @@ mod tests {
             s3_allow_http: true,
             predicate_proto: None,
             limit: None,
+            hive: None,
         };
 
         let bytes = task.to_bytes().unwrap();
@@ -361,6 +516,7 @@ mod tests {
             s3_allow_http: true,
             predicate_proto: None,
             limit: None,
+            hive: None,
         };
 
         let bytes = task.to_bytes().unwrap();
@@ -416,6 +572,7 @@ mod tests {
             s3_allow_http: false,
             predicate_proto: None,
             limit: None,
+            hive: None,
         };
         let debug_output = format!("{task:?}");
         assert!(!debug_output.contains("AKIAIOSFODNN7EXAMPLE"));
@@ -451,6 +608,7 @@ mod tests {
             s3_allow_http: false,
             predicate_proto: Some(predicate_bytes.clone()),
             limit: Some(42),
+            hive: None,
         };
 
         let bytes = task.to_bytes().unwrap();

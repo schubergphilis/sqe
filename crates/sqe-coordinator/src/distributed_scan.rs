@@ -1521,6 +1521,7 @@ mod tests {
 
     fn make_task(id: &str) -> ScanTask {
         ScanTask {
+            hive: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,
@@ -1617,6 +1618,7 @@ mod tests {
     fn test_distributed_scan_exec_properties() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let task = ScanTask {
+            hive: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,

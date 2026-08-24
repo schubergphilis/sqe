@@ -14,7 +14,11 @@ use serde::{Deserialize, Serialize};
 /// whole-file ticket; version 2 adds optional row-group / byte ranges.
 pub const SCAN_TASK_VERSION_V1: u32 = 1;
 pub const SCAN_TASK_VERSION_V2: u32 = 2;
-pub const SCAN_TASK_VERSION_CURRENT: u32 = SCAN_TASK_VERSION_V2;
+/// `3` = optional Hive descriptor (cycle 5). A v3 ticket WITHOUT the
+/// descriptor is byte-identical to v2, so the version is bumped only when the
+/// descriptor is actually present.
+pub const SCAN_TASK_VERSION_V3: u32 = 3;
+pub const SCAN_TASK_VERSION_CURRENT: u32 = SCAN_TASK_VERSION_V3;
 
 /// Default target compressed size for a morsel (128 MiB).
 pub const DEFAULT_MORSEL_TARGET_BYTES: u64 = 128 * 1024 * 1024;

@@ -1655,6 +1655,7 @@ mod tests {
 
     fn task_with_predicate(predicate_proto: Option<Vec<u8>>, limit: Option<usize>) -> ScanTask {
         ScanTask {
+            hive: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,
@@ -2053,6 +2054,7 @@ mod tests {
         // The bucket/path machinery uses s3:// URLs; the object key resolves to
         // "data/f.parquet" matching the blob written above.
         ScanTask {
+            hive: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,

@@ -90,6 +90,7 @@ pub fn local_scan_task(object_keys: Vec<String>, file_sizes: Vec<u64>) -> ScanTa
         .map(|k| format!("s3://test-bucket/{k}"))
         .collect();
     ScanTask {
+        hive: None,
         version: 1,
         morsel_id: None,
         row_group_start: None,
