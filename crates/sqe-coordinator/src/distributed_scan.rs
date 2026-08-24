@@ -9,6 +9,8 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Ticket;
 use arrow_schema::SchemaRef;
 use chrono::{DateTime, Utc};
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_plan::apply_expression_roots;
 use datafusion::common::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -380,6 +382,17 @@ impl ExecutionPlan for DistributedScanExec {
 
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+
+    /// SQE PATCH (DataFusion 55): report the filters pushed into this scan.
+    /// This is a leaf, so no other node in the tree owns them; leaving them
+    /// unreported hides the hash-join dynamic filters from DataFusion's
+    /// expression traversal.
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        apply_expression_roots(self.pushed_down_filters.iter(), f)
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

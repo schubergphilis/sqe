@@ -1528,6 +1528,8 @@ mod tests {
     use std::fmt;
 
     use datafusion::common::Result as DFResult;
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    use datafusion::physical_expr::PhysicalExpr;
     use datafusion::execution::TaskContext;
     use datafusion::physical_expr::EquivalenceProperties;
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -1569,6 +1571,14 @@ mod tests {
     impl ExecutionPlan for MetricsStubExec {
         fn name(&self) -> &str {
             "MetricsStubExec"
+        }
+
+        /// SQE PATCH (DataFusion 55): metrics-only test stub, no expressions.
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+        ) -> DFResult<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
         }
 
         fn properties(&self) -> &Arc<PlanProperties> {
