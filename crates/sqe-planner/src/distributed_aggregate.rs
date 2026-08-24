@@ -24,6 +24,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::Result;
@@ -533,7 +534,7 @@ impl PhysicalOptimizerRule for DistributedAggregateRule {
 
 /// Estimate the total data size (bytes) from a plan's statistics.
 fn estimate_data_size(plan: &Arc<dyn ExecutionPlan>) -> usize {
-    let stats = match plan.partition_statistics(None) {
+    let stats = match StatisticsContext::new().compute(plan.as_ref(), &StatisticsArgs::new()) {
         Ok(stats) => stats,
         Err(_) => return 0,
     };
@@ -563,7 +564,7 @@ fn estimate_group_cardinality(agg: &AggregateExec) -> Option<usize> {
     let col_index = column.index();
 
     let input = &agg.children()[0];
-    let stats = input.partition_statistics(None).ok()?;
+    let stats = StatisticsContext::new().compute(input.as_ref(), &StatisticsArgs::new()).ok()?;
 
     // Index the input column statistics by the group-by column's index.
     let col_stats = stats.column_statistics.get(col_index)?;

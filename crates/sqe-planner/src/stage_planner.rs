@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use datafusion::common::ScalarValue;
 use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -491,9 +492,29 @@ mod tests {
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![]
         }
+        /// DataFusion 55 deprecated this but kept it a *required* trait method, and
+        /// its own migration example is exactly this shim. The real logic lives in
+        /// `replace_children`; this forwards with `Recompute`, which is what
+        /// `with_new_children` always meant.
+        #[allow(deprecated)]
         fn with_new_children(
             self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DFResult<Arc<dyn ExecutionPlan>> {
+            self.replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+        }
+
+        fn replace_children(
+            self: Arc<Self>,
             _children: Vec<Arc<dyn ExecutionPlan>>,
+            // DataFusion 55 replaced with_new_children. `Keep` only *permits*
+            // skipping property recomputation; these nodes rebuild and recompute
+            // unconditionally, which is valid under both modes (recomputing when
+            // Keep was allowed is redundant, never wrong), so it is not consulted.
+            _options: ReplaceChildrenOptions,
         ) -> DFResult<Arc<dyn ExecutionPlan>> {
             Ok(self)
         }

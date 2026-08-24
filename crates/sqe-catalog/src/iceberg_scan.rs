@@ -7,6 +7,8 @@ use arrow::array::BooleanArray;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
+use datafusion::physical_plan::statistics::StatisticsArgs;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::physical_plan::apply_expression_roots;
@@ -916,9 +918,27 @@ impl ExecutionPlan for IcebergScanExec {
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
+    /// DataFusion 55 deprecated this but kept it a *required* trait method, and
+    /// its own migration example is exactly this shim. The real logic lives in
+    /// `replace_children`; this forwards with `Recompute`, which is what
+    /// `with_new_children` always meant.
+    #[allow(deprecated)]
     fn with_new_children(
         self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    /// DataFusion 55 replaced with_new_children. This node is a leaf, so there
+    /// are no children to swap and neither properties mode changes anything.
+    fn replace_children(
+        self: Arc<Self>,
         _c: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
     }
@@ -937,9 +957,19 @@ impl ExecutionPlan for IcebergScanExec {
     /// When `cached_statistics` is populated (via `with_cached_statistics`), the
     /// pre-computed manifest aggregation is returned. Otherwise we fall back to
     /// the snapshot summary's row count and byte size with column stats absent.
-    fn partition_statistics(
+    /// SQE PATCH (DataFusion 55): this used to override `partition_statistics`.
+    /// DataFusion 55 deprecated that method AND stopped calling it: its default
+    /// body now returns `Statistics::new_unknown`, and the statistics walk
+    /// (`StatisticsContext::compute`) dispatches to `statistics_from_inputs`
+    /// instead. Leaving the override on the old method would have compiled
+    /// cleanly and silently reported Unknown row counts for every Iceberg scan,
+    /// which is what JoinStrategyRule and star_schema_reorder plan from.
+    ///
+    /// This node is a leaf, so `input_stats` is always empty.
+    fn statistics_from_inputs(
         &self,
-        _partition: Option<usize>,
+        _input_stats: &[Arc<datafusion::common::Statistics>],
+        _args: &StatisticsArgs,
     ) -> DFResult<Arc<datafusion::common::Statistics>> {
         use datafusion::common::{stats::Precision, ColumnStatistics, Statistics};
 

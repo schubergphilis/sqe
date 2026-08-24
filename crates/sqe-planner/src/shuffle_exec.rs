@@ -22,6 +22,7 @@ use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -215,9 +216,29 @@ impl ExecutionPlan for ShuffleWriterExec {
         vec![&self.input]
     }
 
+    /// DataFusion 55 deprecated this but kept it a *required* trait method, and
+    /// its own migration example is exactly this shim. The real logic lives in
+    /// `replace_children`; this forwards with `Recompute`, which is what
+    /// `with_new_children` always meant.
+    #[allow(deprecated)]
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        // DataFusion 55 replaced with_new_children. `Keep` only *permits*
+        // skipping property recomputation; these nodes rebuild and recompute
+        // unconditionally, which is valid under both modes (recomputing when
+        // Keep was allowed is redundant, never wrong), so it is not consulted.
+        _options: ReplaceChildrenOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::Internal(
@@ -401,9 +422,29 @@ impl ExecutionPlan for ShuffleReaderExec {
         vec![]
     }
 
+    /// DataFusion 55 deprecated this but kept it a *required* trait method, and
+    /// its own migration example is exactly this shim. The real logic lives in
+    /// `replace_children`; this forwards with `Recompute`, which is what
+    /// `with_new_children` always meant.
+    #[allow(deprecated)]
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        // DataFusion 55 replaced with_new_children. `Keep` only *permits*
+        // skipping property recomputation; these nodes rebuild and recompute
+        // unconditionally, which is valid under both modes (recomputing when
+        // Keep was allowed is redundant, never wrong), so it is not consulted.
+        _options: ReplaceChildrenOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         if !children.is_empty() {
             return Err(DataFusionError::Internal(
@@ -601,9 +642,29 @@ mod tests {
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![]
         }
+        /// DataFusion 55 deprecated this but kept it a *required* trait method, and
+        /// its own migration example is exactly this shim. The real logic lives in
+        /// `replace_children`; this forwards with `Recompute`, which is what
+        /// `with_new_children` always meant.
+        #[allow(deprecated)]
         fn with_new_children(
             self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DFResult<Arc<dyn ExecutionPlan>> {
+            self.replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+        }
+
+        fn replace_children(
+            self: Arc<Self>,
             _children: Vec<Arc<dyn ExecutionPlan>>,
+            // DataFusion 55 replaced with_new_children. `Keep` only *permits*
+            // skipping property recomputation; these nodes rebuild and recompute
+            // unconditionally, which is valid under both modes (recomputing when
+            // Keep was allowed is redundant, never wrong), so it is not consulted.
+            _options: ReplaceChildrenOptions,
         ) -> DFResult<Arc<dyn ExecutionPlan>> {
             Ok(self)
         }
@@ -708,7 +769,7 @@ mod tests {
         ));
 
         let new_input = make_memory_plan(schema);
-        let new_writer = writer.with_new_children(vec![new_input]).unwrap();
+        let new_writer = writer.replace_children(vec![new_input], ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute)).unwrap();
         assert_eq!(new_writer.name(), "ShuffleWriterExec");
         assert_eq!(new_writer.children().len(), 1);
     }
@@ -729,10 +790,10 @@ mod tests {
         ));
 
         // Too many children
-        let result = writer.with_new_children(vec![
+        let result = writer.replace_children(vec![
             make_memory_plan(schema.clone()),
             make_memory_plan(schema),
-        ]);
+        ], ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute));
         assert!(result.is_err());
     }
 
@@ -947,11 +1008,11 @@ mod tests {
         ));
 
         // Empty children is fine (returns self)
-        let result = reader.clone().with_new_children(vec![]);
+        let result = reader.clone().replace_children(vec![], ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute));
         assert!(result.is_ok());
 
         // Non-empty children is an error
-        let result = reader.with_new_children(vec![make_memory_plan(schema)]);
+        let result = reader.replace_children(vec![make_memory_plan(schema)], ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute));
         assert!(result.is_err());
     }
 

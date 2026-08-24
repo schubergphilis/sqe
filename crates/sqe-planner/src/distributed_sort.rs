@@ -26,6 +26,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::apply_expression_roots;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -494,7 +495,7 @@ impl PhysicalOptimizerRule for DistributedSortRule {
 /// Returns 0 if statistics are unavailable, which means the rule will
 /// conservatively keep the local sort.
 fn estimate_data_size(plan: &Arc<dyn ExecutionPlan>) -> usize {
-    let stats = match plan.partition_statistics(None) {
+    let stats = match StatisticsContext::new().compute(plan.as_ref(), &StatisticsArgs::new()) {
         Ok(stats) => stats,
         Err(_) => return 0,
     };
