@@ -23,7 +23,7 @@ members = [
     "xtask",
 ]
 # Exclude vendored trees. They are referenced via path / [patch], not members.
-exclude = ["vendor/iceberg-rust", "vendor/jiter"]
+exclude = ["vendor/iceberg-rust", "vendor/jiter", "vendor/datafusion-functions-json"]
 
 [workspace.package]
 version = "0.37.0"
@@ -37,18 +37,18 @@ authors = ["Schuberg Philis"]
 [workspace.dependencies]
 # Query engine — DataFusion 54 with hash join dynamic filters, LIMIT-aware pruning,
 # 40x faster planning, nested field pushdown, and 42 function improvements.
-datafusion = "54"
-datafusion-expr = "54"
-datafusion-proto = "54"
+datafusion = "55"
+datafusion-expr = "55"
+datafusion-proto = "55"
 
 # Arrow 58 / Parquet 58 — aligned with DataFusion 54
-arrow = { version = "58", features = ["prettyprint", "ipc_compression"] }
-arrow-flight = { version = "58", features = ["flight-sql-experimental"] }
-arrow-ipc = { version = "58", features = ["lz4", "zstd"] }
-arrow-schema = "58"
-arrow-array = "58"
-arrow-buffer = "58"
-parquet = { version = "58", features = ["async", "object_store"] }
+arrow = { version = "59", features = ["prettyprint", "ipc_compression"] }
+arrow-flight = { version = "59", features = ["flight-sql-experimental"] }
+arrow-ipc = { version = "59", features = ["lz4", "zstd"] }
+arrow-schema = "59"
+arrow-array = "59"
+arrow-buffer = "59"
+parquet = { version = "59", features = ["async", "object_store"] }
 object_store = { version = "0.13", features = ["aws", "http", "azure", "gcp"] }
 
 # Iceberg — RisingWave fork for rewrite_files() / overwrite_files() transaction support.
@@ -264,3 +264,7 @@ strip = false            # Keep symbols; benchmarks want readable traces.
 # python feature remains off for SQE builds; the lock still records pyo3.
 [patch.crates-io]
 jiter = { path = "vendor/jiter" }
+# Upstream has no DataFusion 55 release; 0.54.2 pins `datafusion ^54` and was the
+# only thing holding DF 54 + arrow 58 in the tree. See
+# vendor/datafusion-functions-json/Cargo.toml for the retirement condition.
+datafusion-functions-json = { path = "vendor/datafusion-functions-json" }

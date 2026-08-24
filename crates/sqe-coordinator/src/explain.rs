@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::physical_plan::metrics::MetricValue;
 use datafusion::physical_plan::{collect, displayable, ExecutionPlan};
 use datafusion::prelude::SessionContext;
@@ -630,8 +631,7 @@ fn walk_full(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<FullRow>) {
         });
     } else {
         use datafusion::common::stats::Precision;
-        let estimated_rows = node
-            .partition_statistics(None)
+        let estimated_rows = StatisticsContext::new().compute(node.as_ref(), &StatisticsArgs::new())
             .ok()
             .and_then(|s| match s.num_rows {
                 Precision::Exact(v) | Precision::Inexact(v) => Some(v as i64),

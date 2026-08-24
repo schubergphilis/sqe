@@ -45,6 +45,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::Result;
 use datafusion::config::ConfigOptions;
@@ -163,8 +164,8 @@ impl PhysicalOptimizerRule for DimBuildSwapRule {
 
             let left = hj.left();
             let right = hj.right();
-            let left_stats = left.partition_statistics(None)?;
-            let right_stats = right.partition_statistics(None)?;
+            let left_stats = StatisticsContext::new().compute(left.as_ref(), &StatisticsArgs::new())?;
+            let right_stats = StatisticsContext::new().compute(right.as_ref(), &StatisticsArgs::new())?;
             let left_tables = iceberg_table_idents(left);
             let right_tables = iceberg_table_idents(right);
 

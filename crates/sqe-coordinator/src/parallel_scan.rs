@@ -78,11 +78,11 @@
 
 use std::sync::Arc;
 
+use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
-use datafusion::physical_optimizer::enforce_distribution::EnforceDistribution;
-use datafusion::physical_optimizer::enforce_sorting::EnforceSorting;
+use datafusion::physical_optimizer::ensure_requirements::EnsureRequirements;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::joins::{
     CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode, PiecewiseMergeJoinExec,
@@ -144,15 +144,20 @@ impl PhysicalOptimizerRule for ParallelScanRule {
         // exchanges they need (Hash repartition on both sides of a Partitioned
         // join, coalesce before a final aggregate). Only non-build scans changed,
         // so no CollectLeft build side is coalesced: no q72-class regression.
-        let redistributed = EnforceDistribution::new().optimize(rewritten, config)?;
-        // Then EnforceSorting, matching DataFusion's stock pipeline order, so a
-        // sort stranded below a newly inserted repartition (its ordering redone
-        // above the exchange) is removed instead of re-sorting wide rows and
-        // risking OOM. Finally restore a single-partition root: a plan that stays
-        // multi-partition to the top (e.g. a partitioned window ending in a
-        // per-partition TopK) would otherwise over-return `N * limit` rows,
-        // because SQE's result collection concatenates root partitions.
-        let resorted = EnforceSorting::new().optimize(redistributed, config)?;
+        // DataFusion 55 merged EnforceDistribution and EnforceSorting into
+        // EnsureRequirements, which settles distribution before sorting per
+        // operator in one pass. That is the same order this code ran them in,
+        // and upstream added it specifically to remove the non-idempotent
+        // interaction between the two separate rules, so one call replaces two.
+        // Sorting still runs on the distribution-fixed plan, so a sort stranded
+        // below a newly inserted repartition is still removed rather than
+        // re-sorting wide rows and risking OOM.
+        //
+        // Then restore a single-partition root: a plan that stays multi-partition
+        // to the top (e.g. a partitioned window ending in a per-partition TopK)
+        // would otherwise over-return `N * limit` rows, because SQE's result
+        // collection concatenates root partitions.
+        let resorted = EnsureRequirements::new().optimize(rewritten, config)?;
         let single = restore_single_partition_root(resorted);
         let restored = restore_stranded_global_fetch(single);
         Ok(reapply_erased_root_fetch(restored, pre_fetch))
@@ -182,7 +187,7 @@ impl ParallelScanRule {
         if self.byte_threshold == 0 {
             return true;
         }
-        match scan.partition_statistics(None) {
+        match StatisticsContext::new().compute(scan, &StatisticsArgs::new()) {
             Ok(stats) => stats
                 .total_byte_size
                 .get_value()

@@ -7,13 +7,18 @@ use arrow::array::BooleanArray;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
+use datafusion::physical_plan::statistics::StatisticsArgs;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
+use datafusion::physical_plan::apply_expression_roots;
 use datafusion::common::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_optimizer::pruning::PruningPredicate;
+use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningPredicateBuilder};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
@@ -756,7 +761,15 @@ impl IcebergScanExec {
         let ctx = SessionContext::new();
         let state = ctx.state();
         let physical_expr =
-            match create_physical_expr(&combined, &df_schema, state.execution_props()) {
+            match create_physical_expr(
+                &combined,
+                &df_schema,
+                state.execution_props(),
+                // DataFusion 55 added a planning context for subqueries and
+                // lambda scoping. This predicate is a plain conjunction built
+                // for pruning, with neither, so the default is correct.
+                &PhysicalPlanningContext::default(),
+            ) {
                 Ok(e) => e,
                 Err(e) => {
                     warn!(error=%e, "Physical expr failed");
@@ -764,7 +777,10 @@ impl IcebergScanExec {
                 }
             };
         let pruning_pred: PruningPredicate =
-            match PruningPredicate::try_new(physical_expr, schema.clone()) {
+            match PruningPredicateBuilder::new()
+                .with_file_schema(schema.clone())
+                .try_build(physical_expr)
+            {
                 Ok(p) => p,
                 Err(e) => {
                     warn!(error=%e, "PruningPredicate failed");
@@ -825,7 +841,10 @@ impl IcebergScanExec {
                 break;
             }
             let pruning_pred =
-                match PruningPredicate::try_new(Arc::clone(filter_expr), schema.clone()) {
+                match PruningPredicateBuilder::new()
+                    .with_file_schema(schema.clone())
+                    .try_build(Arc::clone(filter_expr))
+                {
                     Ok(p) => p,
                     Err(e) => {
                         debug!(error = %e, "PruningPredicate from dynamic filter failed, skipping");
@@ -888,15 +907,44 @@ impl ExecutionPlan for IcebergScanExec {
     fn schema(&self) -> SchemaRef {
         self.projected_schema.clone()
     }
+    /// SQE PATCH (DataFusion 55): report the filters pushed into this scan.
+    /// This is a leaf node, so nothing else in the plan tree owns them; if they
+    /// are not reported here they are invisible to DataFusion's expression
+    /// traversal. `pushed_down_filters` holds the hash-join dynamic filters.
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        apply_expression_roots(self.pushed_down_filters.iter(), f)
+    }
+
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
+    /// DataFusion 55 deprecated this but kept it a *required* trait method, and
+    /// its own migration example is exactly this shim. The real logic lives in
+    /// `replace_children`; this forwards with `Recompute`, which is what
+    /// `with_new_children` always meant.
+    #[allow(deprecated)]
     fn with_new_children(
         self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    /// DataFusion 55 replaced with_new_children. This node is a leaf, so there
+    /// are no children to swap and neither properties mode changes anything.
+    fn replace_children(
+        self: Arc<Self>,
         _c: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
     }
@@ -915,9 +963,19 @@ impl ExecutionPlan for IcebergScanExec {
     /// When `cached_statistics` is populated (via `with_cached_statistics`), the
     /// pre-computed manifest aggregation is returned. Otherwise we fall back to
     /// the snapshot summary's row count and byte size with column stats absent.
-    fn partition_statistics(
+    /// SQE PATCH (DataFusion 55): this used to override `partition_statistics`.
+    /// DataFusion 55 deprecated that method AND stopped calling it: its default
+    /// body now returns `Statistics::new_unknown`, and the statistics walk
+    /// (`StatisticsContext::compute`) dispatches to `statistics_from_inputs`
+    /// instead. Leaving the override on the old method would have compiled
+    /// cleanly and silently reported Unknown row counts for every Iceberg scan,
+    /// which is what JoinStrategyRule and star_schema_reorder plan from.
+    ///
+    /// This node is a leaf, so `input_stats` is always empty.
+    fn statistics_from_inputs(
         &self,
-        _partition: Option<usize>,
+        _input_stats: &[Arc<datafusion::common::Statistics>],
+        _args: &StatisticsArgs,
     ) -> DFResult<Arc<datafusion::common::Statistics>> {
         use datafusion::common::{stats::Precision, ColumnStatistics, Statistics};
 

@@ -4,6 +4,8 @@ use std::time::Duration;
 use arrow_array::RecordBatch;
 use arrow_array::{builder::StringBuilder, ArrayRef, BooleanArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
+use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::TableReference;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -7049,7 +7051,10 @@ fn strip_self_join_dynamic_filters(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn Exec
         let Some(hj) = node.downcast_ref::<HashJoinExec>() else {
             return Ok(Transformed::no(node));
         };
-        if *hj.join_type() != JoinType::Inner || hj.dynamic_filter_expr().is_none() {
+        // DataFusion 55: dynamic_filter_expr is deprecated. This is only a
+        // presence check, and dynamic_expressions_produced() is built from the
+        // same Option, so is_empty() is exactly is_none().
+        if *hj.join_type() != JoinType::Inner || hj.dynamic_expressions_produced().is_empty() {
             return Ok(Transformed::no(node));
         }
         let mut left = std::collections::HashSet::new();
@@ -7098,7 +7103,7 @@ fn find_iceberg_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionP
         }
     }
     let size_of = |node: &Arc<dyn ExecutionPlan>| -> u64 {
-        let stats = match node.partition_statistics(None) {
+        let stats = match StatisticsContext::new().compute(node.as_ref(), &StatisticsArgs::new()) {
             Ok(s) => s,
             Err(_) => return 0,
         };
@@ -7149,8 +7154,7 @@ fn replace_scan_in_plan(
         .any(|(new, old)| !Arc::ptr_eq(new, old));
 
     if changed {
-        plan.clone()
-            .with_new_children(new_children)
+        plan.clone().replace_children(new_children, ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute))
             .unwrap_or_else(|_| Arc::clone(plan))
     } else {
         Arc::clone(plan)

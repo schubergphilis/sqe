@@ -9,6 +9,9 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Ticket;
 use arrow_schema::SchemaRef;
 use chrono::{DateTime, Utc};
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_plan::apply_expression_roots;
 use datafusion::common::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -382,6 +385,17 @@ impl ExecutionPlan for DistributedScanExec {
         self.schema.clone()
     }
 
+    /// SQE PATCH (DataFusion 55): report the filters pushed into this scan.
+    /// This is a leaf, so no other node in the tree owns them; leaving them
+    /// unreported hides the hash-join dynamic filters from DataFusion's
+    /// expression traversal.
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        apply_expression_roots(self.pushed_down_filters.iter(), f)
+    }
+
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -390,9 +404,29 @@ impl ExecutionPlan for DistributedScanExec {
         vec![]
     }
 
+    /// DataFusion 55 deprecated this but kept it a *required* trait method, and
+    /// its own migration example is exactly this shim. The real logic lives in
+    /// `replace_children`; this forwards with `Recompute`, which is what
+    /// `with_new_children` always meant.
+    #[allow(deprecated)]
     fn with_new_children(
         self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
+        // DataFusion 55 replaced with_new_children. `Keep` only *permits*
+        // skipping property recomputation; these nodes rebuild and recompute
+        // unconditionally, which is valid under both modes (recomputing when
+        // Keep was allowed is redundant, never wrong), so it is not consulted.
+        _options: ReplaceChildrenOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
     }

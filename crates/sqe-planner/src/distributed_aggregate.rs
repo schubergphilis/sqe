@@ -24,7 +24,10 @@
 use std::fmt;
 use std::sync::Arc;
 
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
+use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::Result;
 use datafusion::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -185,6 +188,18 @@ impl ExecutionPlan for PartialAggregateExec {
         self.inner.schema()
     }
 
+    /// SQE PATCH (DataFusion 55): `ExecutionPlan` now requires nodes to expose
+    /// the physical expressions they own. This wrapper's `children()` returns
+    /// `self.inner.children()`, so the inner `AggregateExec` is never visited as
+    /// a node in the plan tree and its aggregate/group expressions would be
+    /// invisible to any traversal. Delegate to it rather than reporting none.
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        self.inner.apply_expressions(f)
+    }
+
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -193,12 +208,32 @@ impl ExecutionPlan for PartialAggregateExec {
         self.inner.children()
     }
 
+    /// DataFusion 55 deprecated this but kept it a *required* trait method; this
+    /// is upstream's own migration shim. Real logic is in `replace_children`.
+    #[allow(deprecated)]
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        // DataFusion 55 replaced with_new_children. `Keep` only *permits*
+        // skipping property recomputation; this node rebuilds and recomputes
+        // unconditionally, valid under both modes.
+        _options: ReplaceChildrenOptions,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let new_inner = Arc::clone(&self.inner)
-            .with_new_children(children)?
+            .replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )?
             .downcast_ref::<AggregateExec>()
             .ok_or_else(|| {
                 DataFusionError::Internal(
@@ -312,6 +347,18 @@ impl ExecutionPlan for FinalAggregateExec {
         self.inner.schema()
     }
 
+    /// SQE PATCH (DataFusion 55): `ExecutionPlan` now requires nodes to expose
+    /// the physical expressions they own. This wrapper's `children()` returns
+    /// `self.inner.children()`, so the inner `AggregateExec` is never visited as
+    /// a node in the plan tree and its aggregate/group expressions would be
+    /// invisible to any traversal. Delegate to it rather than reporting none.
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        self.inner.apply_expressions(f)
+    }
+
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -320,12 +367,32 @@ impl ExecutionPlan for FinalAggregateExec {
         self.inner.children()
     }
 
+    /// DataFusion 55 deprecated this but kept it a *required* trait method; this
+    /// is upstream's own migration shim. Real logic is in `replace_children`.
+    #[allow(deprecated)]
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        // DataFusion 55 replaced with_new_children. `Keep` only *permits*
+        // skipping property recomputation; this node rebuilds and recomputes
+        // unconditionally, valid under both modes.
+        _options: ReplaceChildrenOptions,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let new_inner = Arc::clone(&self.inner)
-            .with_new_children(children)?
+            .replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )?
             .downcast_ref::<AggregateExec>()
             .ok_or_else(|| {
                 DataFusionError::Internal(
@@ -508,7 +575,7 @@ impl PhysicalOptimizerRule for DistributedAggregateRule {
 
 /// Estimate the total data size (bytes) from a plan's statistics.
 fn estimate_data_size(plan: &Arc<dyn ExecutionPlan>) -> usize {
-    let stats = match plan.partition_statistics(None) {
+    let stats = match StatisticsContext::new().compute(plan.as_ref(), &StatisticsArgs::new()) {
         Ok(stats) => stats,
         Err(_) => return 0,
     };
@@ -538,7 +605,7 @@ fn estimate_group_cardinality(agg: &AggregateExec) -> Option<usize> {
     let col_index = column.index();
 
     let input = &agg.children()[0];
-    let stats = input.partition_statistics(None).ok()?;
+    let stats = StatisticsContext::new().compute(input.as_ref(), &StatisticsArgs::new()).ok()?;
 
     // Index the input column statistics by the group-by column's index.
     let col_stats = stats.column_statistics.get(col_index)?;

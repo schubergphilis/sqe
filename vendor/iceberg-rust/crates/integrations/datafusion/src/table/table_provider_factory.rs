@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider, TableProviderFactory};
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::CreateExternalTable;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use iceberg::io::FileIO;
 use iceberg::table::StaticTable;
 use iceberg::{Error, ErrorKind, Result, TableIdent};
@@ -43,7 +43,7 @@ use crate::to_datafusion_error;
 ///
 /// use datafusion::execution::session_state::SessionStateBuilder;
 /// use datafusion::prelude::*;
-/// use datafusion::sql::TableReference;
+/// use datafusion::common::TableReference;
 /// use iceberg_datafusion::IcebergTableProviderFactory;
 ///
 /// #[tokio::main]
@@ -115,7 +115,22 @@ impl TableProviderFactory for IcebergTableProviderFactory {
         check_cmd(cmd).map_err(to_datafusion_error)?;
 
         let table_name = &cmd.name;
-        let metadata_file_path = &cmd.location;
+        // SQE PATCH: DataFusion 55 replaced `CreateExternalTable::location`
+        // (a single String) with `locations: Vec<String>`. An Iceberg static
+        // table is defined by exactly one metadata file, so refuse anything
+        // else rather than silently taking the first entry.
+        let metadata_file_path = match cmd.locations.as_slice() {
+            [single] => single,
+            other => {
+                return Err(to_datafusion_error(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Iceberg external table requires exactly one metadata file location, got {}",
+                        other.len()
+                    ),
+                )));
+            }
+        };
         let options = &cmd.options;
 
         let table_name_with_ns = complement_namespace_if_necessary(table_name);
@@ -201,7 +216,7 @@ mod tests {
     use datafusion::logical_expr::CreateExternalTable;
     use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use datafusion::prelude::SessionContext;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
 
     use super::*;
 
