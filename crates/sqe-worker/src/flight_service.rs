@@ -1676,6 +1676,7 @@ mod tests {
     /// wire bytes (and so decoding succeeds past the signature gate).
     fn make_scan_task_bytes() -> Vec<u8> {
         sqe_planner::ScanTask {
+            hive: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,
