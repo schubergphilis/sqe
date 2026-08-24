@@ -402,7 +402,7 @@ pub fn runtime_memory_info() -> RuntimeMemoryInfo {
 pub fn process_rss_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        return process_rss_linux();
+        process_rss_linux()
     }
     #[cfg(target_os = "macos")]
     {
@@ -891,7 +891,7 @@ fn parse_memory_limit_value(raw: &str) -> Option<u64> {
 fn host_memory_info() -> HostMemoryInfo {
     #[cfg(target_os = "linux")]
     {
-        return host_memory_linux();
+        host_memory_linux()
     }
     #[cfg(target_os = "macos")]
     {
