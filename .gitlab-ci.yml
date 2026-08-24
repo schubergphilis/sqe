@@ -31,21 +31,30 @@ default:
 # do not merge the release MR until it has.
 include:
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.10.0'
+    ref: 'v0.11.0'
     file: '/ci/templates/guardrails.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.10.0'
+    ref: 'v0.11.0'
     file: '/ci/templates/test-rust.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.10.0'
+    ref: 'v0.11.0'
     file: '/ci/templates/deploy.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.10.0'
+    ref: 'v0.11.0'
     file: '/ci/templates/release.yml'
   - template: Security/Secret-Detection.gitlab-ci.yml
 
 variables:
   AIKIDO_IMAGE_NAME: "sqlengine/sqe"
+  # Makes aikido-test-rust's cargo test phase BLOCKING. The platform default is
+  # "0" (advisory) and is frozen by a test upstream, so this line is what replaces
+  # the deleted cargo-gate job's gating — without it this repo trades a blocking
+  # gate for a warning.
+  AIKIDO_CARGO_GATE_ENFORCE: "1"
+  # Deep async state machines in the scan path overflow the default 2MB test
+  # thread stack (the write e2e tests need this too). 32 MiB; the platform default
+  # is 8 MiB, which is not enough here. Carried over from the local cargo-gate.
+  AIKIDO_RUST_MIN_STACK: "33554432"
   # Live policy/scripts until aikido-tools image is rebuilt with CDLA + r-efi
   # exception + SQE reviewed_evidence (aikido!51). After tools image digest
   # updates, this override can be removed and AIKIDO_HOME from the image used.
@@ -164,83 +173,38 @@ aikido-sbom:
         --sbom "$AIKIDO_SBOM" --root "$CI_PROJECT_DIR"
 
 # ===== blocking correctness gate (#386) =====
-# The shared `aikido-test-rust` job already runs `cargo test --all`, but it is
-# `allow_failure: true` (advisory by design, so verify never blocks the security
-# guardrails) and its rules skip it unless Rust files changed. Advisory is the
-# wrong mode for these two checks: every way `main` broke in the 2026-07-27/28
-# window went in through a pipeline where nothing blocked.
+# Moved to the platform. aikido v0.11.0's `aikido-test-rust` IS this gate: it runs
+# `cargo test --workspace --all-features` (compile, then execute, each under its
+# own GNU timeout) as a BLOCKING phase, with clippy/audit/deny advisory in the
+# same job, plus a separate always-blocking `aikido-cargo-lock` for
+# `cargo metadata --locked`. The job that used to live here duplicated the test
+# run against the advisory copy in v0.10.0's test-rust.yml — two full compiles per
+# pipeline for one commit (measured: 28m27s + 26m51s).
 #
-#   - reqwest 0.13 bumped in Cargo.toml without regenerating Cargo.lock, so the
-#     workspace did not resolve at all (`--locked` catches this in seconds).
-#   - jsonwebtoken 11 merged with no crypto provider feature selected, so every
-#     JWT verification panicked at runtime. It COMPILED cleanly -- only running
-#     the tests catches it, which is why this gate runs `test`, not `check`.
-#   - two merges duplicated unit tests, breaking only the test build.
+# The gate blocks only where AIKIDO_CARGO_GATE_ENFORCE="1", set in `variables:`
+# above. It cannot live in `.asset`: aikido reads it from `rules:`, which GitLab
+# evaluates at pipeline creation, before any before_script loads that file.
 #
-# Deliberately narrow and blocking: manifest/lock consistency, then behaviour.
-# Everything advisory (clippy, audit, deny) stays in aikido-test-rust.
-cargo-gate:
-  stage: test
-  # This is a final backstop. The compile and execution phases below have
-  # tighter independent ceilings so a wedged test never consumes this whole
-  # job timeout.
-  timeout: 90m
-  # rustup in the image honours rust-toolchain.toml, so the pinned toolchain is
-  # used rather than whatever the base image ships. Keeps the gate honest if the
-  # pin moves.
-  #
-  # Digest-pinned (#393). The floating `rust:slim` tag meant two runs a week
-  # apart could sit on different base images with no record of the change, and
-  # a compromised or retagged upstream would land silently. The digest is the
-  # multi-arch OCI index, so linux/amd64 still resolves on the shared runners.
-  # `1.97.1-slim` matches rust-toolchain.toml; `rust:slim` and `rust:1.97.1-slim`
-  # resolved to this same digest when it was pinned. Renovate's `gitlabci`
-  # manager reads `image:` here and will raise digest bumps, grouped under
-  # "aikido ci templates" by the existing packageRule. Refresh this by hand if
-  # the rust-toolchain.toml channel moves first.
-  image: rust:1.97.1-slim@sha256:8e8cf8f7fd54a2d23d5a743b3a03f56e26b6c774276c33fa0595111704ebb15c
-  variables:
-    # Deep async state machines in the scan path overflow the default 2MB test
-    # thread stack (see docs: write e2e tests need this too).
-    RUST_MIN_STACK: "33554432"
-    CARGO_TERM_COLOR: "always"
-    # libtest's RUST_TEST_TIME_* settings only report slow tests; they do not
-    # terminate one. GNU timeout provides the actual hard ceilings.
-    SQE_CARGO_COMPILE_TIMEOUT: "45m"
-    SQE_CARGO_TEST_TIMEOUT: "20m"
+# Wall clock, since this used to run CONCURRENTLY with aikido-test-rust and now
+# does not: the test stage goes from ~28 minutes (two parallel duplicates) to ~50
+# serial, for roughly the same runner-minutes and one test run instead of two.
+#
+# Coverage change worth knowing: the local job ran on EVERY default-branch commit,
+# while aikido's carries `changes: [**/*.rs, **/Cargo.toml, **/Cargo.lock,
+# rust-toolchain.toml]` there too, so a main commit touching none of those no
+# longer compiles the workspace. Nearly every commit here touches Rust; if that
+# stops being true, override `rules:` on the job below rather than upstream.
+
+# The platform job caches only `.cargo-home/registry/`; the local cargo-gate also
+# cached `target/`. Re-added here rather than upstream because it is a per-repo
+# call: an --all-features `target/` for this workspace is several GB that GitLab
+# uploads at the end of every run, and this repo has already been paying for it.
+# `.cargo/registry` is NOT the path any more — aikido redirects CARGO_HOME to
+# `.cargo-home` so the registry lands somewhere GitLab can cache.
+aikido-test-rust:
   cache:
-    key: "cargo-gate-$CI_COMMIT_REF_SLUG"
-    paths: ["target/", ".cargo/registry/"]
-  before_script:
-    - |
-      set -euo pipefail
-      apt-get update -qq
-      apt-get install -y -qq --no-install-recommends \
-        clang mold cmake coreutils protobuf-compiler libssl-dev pkg-config >/dev/null
-  script:
-    - |
-      set -euo pipefail
-      # 1. Manifest and lockfile must agree. Fails in seconds on the renovate
-      #    "bumped Cargo.toml, never regenerated Cargo.lock" pattern.
-      echo "== cargo metadata --locked =="
-      cargo metadata --locked --format-version 1 > /dev/null
-      # 2. Behaviour. `cargo check` is NOT sufficient: the jsonwebtoken crypto
-      #    provider is resolved at runtime, so a tree with panicking auth
-      #    type-checks perfectly.
-      echo "== cargo test --workspace (compile, max $SQE_CARGO_COMPILE_TIMEOUT) =="
-      timeout --foreground --signal=TERM --kill-after=30s \
-        "$SQE_CARGO_COMPILE_TIMEOUT" \
-        cargo test --workspace --all-features --no-run
-      echo "== cargo test --workspace (execute, max $SQE_CARGO_TEST_TIMEOUT) =="
-      timeout --foreground --signal=TERM --kill-after=30s \
-        "$SQE_CARGO_TEST_TIMEOUT" \
-        cargo test --workspace --all-features
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'
-      when: never
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes: ["**/*.rs", "**/Cargo.toml", "**/Cargo.lock", "rust-toolchain.toml"]
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    key: "aikido-test-rust-$CI_COMMIT_REF_SLUG"
+    paths: ["target/", ".cargo-home/registry/"]
 
 # The vendored grant profile must be the platform's current one.
 #
@@ -259,7 +223,7 @@ cargo-gate:
 # rather than gating every MR on the availability of another repository.
 vendored-profile-drift:
   stage: test
-  # Digest-pinned for the same reason as the cargo-gate rust image above: the
+  # Digest-pinned for the same reason as aikido's rust image upstream: the
   # tag is mutable, so two runs a week apart could sit on different bases with
   # no record. The digest is the multi-arch OCI index, so linux/amd64 still
   # resolves on the shared runners. Renovate's `gitlabci` manager reads
