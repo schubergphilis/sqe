@@ -424,3 +424,95 @@ async fn a_tag_row_filter_also_reaches_a_hive_scan() {
         "the tag row filter must reach the Hive scan; 3 rows means it never fired"
     );
 }
+
+#[tokio::test]
+async fn a_resource_level_mask_needs_no_tag_at_all_on_a_hive_scan() {
+    // The scoping question behind cycle 3: is tag-based masking a CAPABILITY
+    // gap on Hive, or a convenience layer over something that already works?
+    //
+    // Here the manifest carries NO tags and the store returns NO tag masks.
+    // The mask is resource-level, the kind cycle 1's grant-based policy already
+    // resolves. If this passes, Hive column masking does not depend on cycle 3
+    // at all, and cycle 3 only buys tag-DRIVEN masking.
+    let (cache, hive_catalogs) = fixture_with_cached_manifest("lake", "sales", "orders");
+    let routed = Arc::new(sqe_coordinator::hive_tag_source::CatalogRoutedTagSource::new(
+        hive_catalogs,
+        Arc::new(sqe_coordinator::hive_tag_source::HiveTagSource::new(cache)),
+        Arc::new(AlwaysUnknown),
+    ));
+
+    let mem = Arc::new(MemTable::try_new(orders_schema(), vec![vec![orders_batch()]]).unwrap());
+    let tref = datafusion::common::TableReference::full("lake", "sales", "orders");
+    let scan = LogicalPlanBuilder::scan(tref.clone(), provider_as_source(mem.clone()), None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![
+            Expr::Column(Column::new(Some(tref.clone()), "order_id")),
+            Expr::Column(Column::new(Some(tref.clone()), "ssn")),
+        ])
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let mut column_masks = HashMap::new();
+    column_masks.insert("ssn".to_string(), MaskType::Nullify);
+    let store = ResourceMaskStore {
+        policy: ResolvedPolicy {
+            row_filters: vec![],
+            column_masks,
+            restricted_columns: vec![],
+        },
+    };
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store)).with_tag_source(routed);
+    let (rewritten, _summary) = rewriter.evaluate(&test_user(), plan).await.unwrap();
+
+    let ctx = SessionContext::new();
+    let catalog = Arc::new(MemoryCatalogProvider::new());
+    catalog
+        .register_schema("sales", Arc::new(MemorySchemaProvider::new()))
+        .unwrap();
+    ctx.register_catalog("lake", catalog);
+    ctx.register_table(tref, mem).unwrap();
+    let batches = ctx
+        .execute_logical_plan(rewritten)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let ssn = batches[0].column_by_name("ssn").expect("ssn projected");
+    assert_eq!(
+        ssn.null_count(),
+        ssn.len(),
+        "an untagged Hive table must still honour a resource-level mask"
+    );
+}
+
+/// Store with a resource-level policy and no tag rules whatsoever.
+#[derive(Debug)]
+struct ResourceMaskStore {
+    policy: ResolvedPolicy,
+}
+
+#[async_trait::async_trait]
+impl PolicyStore for ResourceMaskStore {
+    async fn resolve(
+        &self,
+        _user: &SessionUser,
+        _table: &str,
+        _namespace: &str,
+    ) -> sqe_core::Result<ResolvedPolicy> {
+        Ok(self.policy.clone())
+    }
+
+    async fn resolve_tags(
+        &self,
+        _user: &SessionUser,
+        _tags: &HashSet<String>,
+    ) -> (HashMap<String, TagMaskSpec>, Vec<Expr>, HashSet<String>) {
+        (HashMap::new(), vec![], HashSet::new())
+    }
+}
