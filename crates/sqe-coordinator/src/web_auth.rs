@@ -50,6 +50,12 @@ pub enum GuardReject {
 ///
 /// The function is pure (no HTTP types) so it can be unit-tested without an
 /// axum router.
+// Rust 1.98's clippy added `result_large_err` (216-byte threshold). Boxing the
+// Err here would shrink nothing: the Ok variant is `Identity`, the same type
+// that makes the Err large, so `Result` stays ~216 bytes either way and the box
+// only adds an allocation on the rejection path. The size is inherent to
+// returning an identity, not to the error shape.
+#[allow(clippy::result_large_err)]
 pub async fn bearer_admin_identity(
     provider: &Arc<dyn AuthProvider>,
     auth_cfg: &sqe_core::config::AuthConfig,
