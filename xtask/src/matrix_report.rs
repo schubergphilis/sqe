@@ -1,6 +1,6 @@
 //! Regenerate the Iceberg compatibility matrix state.
 //!
-//! Today (Phase 1): reads the hand-maintained seed at `docs/iceberg-matrix-state.json`,
+//! Today (Phase 1): reads the hand-maintained seed at `docs/evidence/iceberg-matrix-state.json`,
 //! validates it, prints the aggregate score, and optionally checks that the score
 //! has not regressed against a reference value.
 //!
@@ -17,8 +17,8 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 pub struct Args {
-    /// Path to the matrix state file. Defaults to docs/iceberg-matrix-state.json.
-    #[arg(long, default_value = "docs/iceberg-matrix-state.json")]
+    /// Path to the matrix state file. Defaults to docs/evidence/iceberg-matrix-state.json.
+    #[arg(long, default_value = "docs/evidence/iceberg-matrix-state.json")]
     path: PathBuf,
 
     /// Fail if the computed percentage is below this value.

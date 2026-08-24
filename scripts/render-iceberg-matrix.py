@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate docs/iceberg-matrix.md from docs/iceberg-matrix-state.json.
+"""Regenerate docs/internal/design-archive/iceberg-matrix.md from docs/evidence/iceberg-matrix-state.json.
 
 Run: python3 scripts/render-iceberg-matrix.py
 
@@ -11,8 +11,8 @@ import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-STATE = ROOT / "docs" / "iceberg-matrix-state.json"
-OUT = ROOT / "docs" / "iceberg-matrix.md"
+STATE = ROOT / "docs" / "evidence" / "iceberg-matrix-state.json"
+OUT = ROOT / "docs" / "internal" / "design-archive" / "iceberg-matrix.md"
 
 SYM = {"full": "F", "partial": "P", "unknown": "?", "none": "."}
 
@@ -88,7 +88,7 @@ def main() -> None:
     add("")
     add(f"Last generated: {d.get('generatedAt', 'n/a')}  |  Source: `{d.get('generatedBy', 'manual')}`")
     add("")
-    add("Regenerate: `python3 scripts/render-iceberg-matrix.py`. Source of truth: `docs/iceberg-matrix-state.json`.")
+    add("Regenerate: `python3 scripts/render-iceberg-matrix.py`. Source of truth: `docs/evidence/iceberg-matrix-state.json`.")
     add("")
     add("> **Side-by-side with every other engine:** see "
         "[`docs/iceberg-matrix-compare.md`](./iceberg-matrix-compare.md) for the "
@@ -181,7 +181,7 @@ def main() -> None:
     add("## Caveats")
     add("")
     add("Cells marked `partial` or `unknown` have specific gaps documented in "
-        "`docs/iceberg-matrix-state.json` under `caveats`. Key ones:")
+        "`docs/evidence/iceberg-matrix-state.json` under `caveats`. Key ones:")
     add("")
     for key, v in support.items():
         if v["level"] in ("partial", "unknown") and v.get("caveats"):
@@ -216,7 +216,7 @@ def main() -> None:
     add("## Contributing")
     add("")
     add("1. Make the change in code.")
-    add("2. Update the matching entry in `docs/iceberg-matrix-state.json`.")
+    add("2. Update the matching entry in `docs/evidence/iceberg-matrix-state.json`.")
     add("3. Run `cargo xtask matrix-report` to verify the aggregate score.")
     add("4. Raise `MATRIX_MIN_PERCENT` in `.gitlab-ci.yml` if the new score clears the next "
         "1% threshold.")
