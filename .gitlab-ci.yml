@@ -113,8 +113,23 @@ aikido-image-vuln:
   stage: .post
   image: "$AIKIDO_TOOLS_IMAGE"
   needs:
+    # Whichever of the two the pipeline actually contains. aikido is splitting the
+    # image build so the MR-side validation build stops waiting on the test stage
+    # it cannot consume (aikido!139): `aikido-build` becomes default-branch-only
+    # and pushes, `aikido-build-validate` is the MR-only --no-push twin.
+    #
+    # BOTH are `optional`, and that is the load-bearing part. A `needs:` naming a
+    # job that rules itself out of the pipeline is a pipeline-CREATION error, not
+    # a skipped job -- the same failure shape as the scheduled-pipeline config
+    # errors. Without `optional` this job would break every MR the moment the
+    # aikido ref is bumped past the split. Harmless before then: an optional need
+    # for a job that does not exist yet is simply ignored.
     - job: aikido-build
       artifacts: true
+      optional: true
+    - job: aikido-build-validate
+      artifacts: true
+      optional: true
   before_script:
     - mkdir -p "$HOME/.docker"
     - |
@@ -195,26 +210,16 @@ aikido-sbom:
 # longer compiles the workspace. Nearly every commit here touches Rust; if that
 # stops being true, override `rules:` on the job below rather than upstream.
 
-# NO `cache:` override for aikido-test-rust, and specifically no `target/`.
-# The deleted cargo-gate cached `target/` + `.cargo/registry/` and that had never
-# once worked. Measured on the first run of the platform gate (job 5218015):
-#
-#   target/: found 33219 matching artifact files and directories
-#   .cargo-home/registry/: found 50578 matching artifact files and directories
-#   FATAL: 400 Bad Request. EntityTooLarge: Your proposed upload is larger than
-#          the S3 maximum allowed size of 5 GiB
-#   Failed to create cache
-#   Job succeeded
-#
-# A rejected cache does not fail the job, so every run spent ~13 minutes zipping
-# 83797 files, stored nothing, and went green. That is why every restore logged
-# "Failed to extract cache", and why the old 28m27s cargo-gate builds were always
-# cold rather than warm. The platform default (registry only) is inherited as-is.
-#
-# To make `target/` cacheable, first get it under 5 GiB: `[profile.test] debug =
-# "line-tables-only"` and `incremental = false` (debuginfo is most of the bytes,
-# incremental fragments most of the 33219 files). aikido-test-rust prints both
-# sizes in its after_script every run, so there is a number to check against.
+# The platform job caches only `.cargo-home/registry/`; the local cargo-gate also
+# cached `target/`. Re-added here rather than upstream because it is a per-repo
+# call: an --all-features `target/` for this workspace is several GB that GitLab
+# uploads at the end of every run, and this repo has already been paying for it.
+# `.cargo/registry` is NOT the path any more — aikido redirects CARGO_HOME to
+# `.cargo-home` so the registry lands somewhere GitLab can cache.
+aikido-test-rust:
+  cache:
+    key: "aikido-test-rust-$CI_COMMIT_REF_SLUG"
+    paths: ["target/", ".cargo-home/registry/"]
 
 # The vendored grant profile must be the platform's current one.
 #
@@ -406,5 +411,5 @@ scenario-test-aws:
 
 # ── Iceberg matrix score regression guard ─────────────────────
 # Runs `cargo xtask matrix-report --min-percent N` where N is the current
-# baseline. If the committed docs/evidence/iceberg-matrix-state.json drops below the
+# baseline. If the committed docs/iceberg-matrix-state.json drops below the
 # baseline, the job fails. Bump MATRIX_MIN_PERCENT when a phase lands.
