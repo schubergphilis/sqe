@@ -22,6 +22,8 @@ use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -193,6 +195,16 @@ impl ExecutionPlan for ShuffleWriterExec {
 
     fn schema(&self) -> SchemaRef {
         self.input.schema()
+    }
+
+    /// SQE PATCH (DataFusion 55): `ShufflePartitioning` carries key column
+    /// *names* (`Vec<String>`) decoded on the executor, not `PhysicalExpr`s, so
+    /// this node owns no expressions to report.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -369,6 +381,15 @@ impl ExecutionPlan for ShuffleReaderExec {
 
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+
+    /// SQE PATCH (DataFusion 55): leaf node, batches arrive over the network.
+    /// No owned expressions.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

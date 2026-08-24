@@ -24,7 +24,8 @@
 use std::fmt;
 use std::sync::Arc;
 
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::Result;
 use datafusion::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -185,6 +186,18 @@ impl ExecutionPlan for PartialAggregateExec {
         self.inner.schema()
     }
 
+    /// SQE PATCH (DataFusion 55): `ExecutionPlan` now requires nodes to expose
+    /// the physical expressions they own. This wrapper's `children()` returns
+    /// `self.inner.children()`, so the inner `AggregateExec` is never visited as
+    /// a node in the plan tree and its aggregate/group expressions would be
+    /// invisible to any traversal. Delegate to it rather than reporting none.
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        self.inner.apply_expressions(f)
+    }
+
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
@@ -310,6 +323,18 @@ impl ExecutionPlan for FinalAggregateExec {
 
     fn schema(&self) -> arrow_schema::SchemaRef {
         self.inner.schema()
+    }
+
+    /// SQE PATCH (DataFusion 55): `ExecutionPlan` now requires nodes to expose
+    /// the physical expressions they own. This wrapper's `children()` returns
+    /// `self.inner.children()`, so the inner `AggregateExec` is never visited as
+    /// a node in the plan tree and its aggregate/group expressions would be
+    /// invisible to any traversal. Delegate to it rather than reporting none.
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        self.inner.apply_expressions(f)
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
