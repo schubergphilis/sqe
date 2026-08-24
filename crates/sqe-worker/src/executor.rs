@@ -8,6 +8,7 @@ use arrow_schema::SchemaRef;
 use datafusion::common::DFSchema;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryLimit};
 use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::physical_expr::create_physical_expr;
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::SessionContext;
@@ -325,7 +326,15 @@ fn build_physical_predicate(
         }
     };
     let ctx = SessionContext::new();
-    match create_physical_expr(predicate, &df_schema, ctx.state().execution_props()) {
+    match create_physical_expr(
+        predicate,
+        &df_schema,
+        ctx.state().execution_props(),
+        // DataFusion 55 added a planning context for subqueries and lambda
+        // scoping. A worker-side scan predicate has neither, so the default is
+        // correct.
+        &PhysicalPlanningContext::default(),
+    ) {
         Ok(expr) => Some(expr),
         Err(e) => {
             warn!(fragment_id = %fragment_id, error = %e, "Physical predicate build failed");
