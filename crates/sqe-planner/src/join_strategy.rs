@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -211,7 +212,7 @@ fn estimate_build_side_size(hash_join: &HashJoinExec) -> BuildSizeEstimate {
     // In DataFusion's HashJoinExec, the left side is the build side.
     let build_side = hash_join.left();
 
-    let stats = match build_side.partition_statistics(None) {
+    let stats = match StatisticsContext::new().compute(build_side.as_ref(), &StatisticsArgs::new()) {
         Ok(stats) => stats,
         Err(_) => return BuildSizeEstimate::Unknown,
     };

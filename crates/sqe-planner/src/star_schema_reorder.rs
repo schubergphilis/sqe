@@ -23,6 +23,7 @@
 
 use std::sync::Arc;
 
+use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::Result;
 use datafusion::config::ConfigOptions;
@@ -364,7 +365,7 @@ fn flatten_join_chain(
 ///
 /// Returns 0 if statistics are unavailable.
 fn estimate_row_count(plan: &Arc<dyn ExecutionPlan>) -> usize {
-    let stats = match plan.partition_statistics(None) {
+    let stats = match StatisticsContext::new().compute(plan.as_ref(), &StatisticsArgs::new()) {
         Ok(stats) => stats,
         Err(_) => return 0,
     };

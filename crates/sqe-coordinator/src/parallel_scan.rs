@@ -78,6 +78,7 @@
 
 use std::sync::Arc;
 
+use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
@@ -186,7 +187,7 @@ impl ParallelScanRule {
         if self.byte_threshold == 0 {
             return true;
         }
-        match scan.partition_statistics(None) {
+        match StatisticsContext::new().compute(scan, &StatisticsArgs::new()) {
             Ok(stats) => stats
                 .total_byte_size
                 .get_value()

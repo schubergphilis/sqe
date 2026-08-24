@@ -9,6 +9,7 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Ticket;
 use arrow_schema::SchemaRef;
 use chrono::{DateTime, Utc};
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::physical_plan::apply_expression_roots;
 use datafusion::common::config::ConfigOptions;
@@ -403,9 +404,29 @@ impl ExecutionPlan for DistributedScanExec {
         vec![]
     }
 
+    /// DataFusion 55 deprecated this but kept it a *required* trait method, and
+    /// its own migration example is exactly this shim. The real logic lives in
+    /// `replace_children`; this forwards with `Recompute`, which is what
+    /// `with_new_children` always meant.
+    #[allow(deprecated)]
     fn with_new_children(
         self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
+        // DataFusion 55 replaced with_new_children. `Keep` only *permits*
+        // skipping property recomputation; these nodes rebuild and recompute
+        // unconditionally, which is valid under both modes (recomputing when
+        // Keep was allowed is redundant, never wrong), so it is not consulted.
+        _options: ReplaceChildrenOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
     }
