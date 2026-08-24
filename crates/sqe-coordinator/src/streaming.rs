@@ -30,7 +30,6 @@ use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use datafusion::error::DataFusionError;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SendableRecordBatchStream;
@@ -1530,6 +1529,7 @@ mod tests {
 
     use datafusion::common::Result as DFResult;
     use datafusion::common::tree_node::TreeNodeRecursion;
+    use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
     use datafusion::physical_expr::PhysicalExpr;
     use datafusion::execution::TaskContext;
     use datafusion::physical_expr::EquivalenceProperties;

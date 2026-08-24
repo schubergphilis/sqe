@@ -24,6 +24,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -207,12 +208,32 @@ impl ExecutionPlan for PartialAggregateExec {
         self.inner.children()
     }
 
+    /// DataFusion 55 deprecated this but kept it a *required* trait method; this
+    /// is upstream's own migration shim. Real logic is in `replace_children`.
+    #[allow(deprecated)]
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        // DataFusion 55 replaced with_new_children. `Keep` only *permits*
+        // skipping property recomputation; this node rebuilds and recomputes
+        // unconditionally, valid under both modes.
+        _options: ReplaceChildrenOptions,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let new_inner = Arc::clone(&self.inner)
-            .with_new_children(children)?
+            .replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )?
             .downcast_ref::<AggregateExec>()
             .ok_or_else(|| {
                 DataFusionError::Internal(
@@ -346,12 +367,32 @@ impl ExecutionPlan for FinalAggregateExec {
         self.inner.children()
     }
 
+    /// DataFusion 55 deprecated this but kept it a *required* trait method; this
+    /// is upstream's own migration shim. Real logic is in `replace_children`.
+    #[allow(deprecated)]
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        // DataFusion 55 replaced with_new_children. `Keep` only *permits*
+        // skipping property recomputation; this node rebuilds and recomputes
+        // unconditionally, valid under both modes.
+        _options: ReplaceChildrenOptions,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let new_inner = Arc::clone(&self.inner)
-            .with_new_children(children)?
+            .replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )?
             .downcast_ref::<AggregateExec>()
             .ok_or_else(|| {
                 DataFusionError::Internal(

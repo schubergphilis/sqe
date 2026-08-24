@@ -18,7 +18,7 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_optimizer::pruning::PruningPredicate;
+use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningPredicateBuilder};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
@@ -777,7 +777,10 @@ impl IcebergScanExec {
                 }
             };
         let pruning_pred: PruningPredicate =
-            match PruningPredicate::try_new(physical_expr, schema.clone()) {
+            match PruningPredicateBuilder::new()
+                .with_file_schema(schema.clone())
+                .try_build(physical_expr)
+            {
                 Ok(p) => p,
                 Err(e) => {
                     warn!(error=%e, "PruningPredicate failed");
@@ -838,7 +841,10 @@ impl IcebergScanExec {
                 break;
             }
             let pruning_pred =
-                match PruningPredicate::try_new(Arc::clone(filter_expr), schema.clone()) {
+                match PruningPredicateBuilder::new()
+                    .with_file_schema(schema.clone())
+                    .try_build(Arc::clone(filter_expr))
+                {
                     Ok(p) => p,
                     Err(e) => {
                         debug!(error = %e, "PruningPredicate from dynamic filter failed, skipping");
