@@ -464,3 +464,723 @@ async fn two_hive_tables_in_one_bucket_with_different_secrets_are_refused() {
 
     drop(dir);
 }
+
+fn count_i64(batches: &[datafusion::arrow::array::RecordBatch]) -> i64 {
+    batches
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .expect("a count(*) row")
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .expect("Int64")
+        .value(0)
+}
+
+#[tokio::test]
+async fn indexed_read_ignores_files_outside_the_index() {
+    let f = partitioned_csv_root().await;
+    hive_fixture::plant_orders_index(&f).await;
+    // A third partition on disk that the index does not mention: an
+    // indexed scan must omit it (staleness omits, never invents). A listing
+    // scan would pick it up.
+    std::fs::create_dir_all(f.dir.path().join("data/dt=2026-01-03")).unwrap();
+    std::fs::write(
+        f.dir.path().join("data/dt=2026-01-03/part-0.csv"),
+        "id,amount\n99,99.0\n",
+    )
+    .unwrap();
+
+    let ctx = SessionContext::new();
+    register_hive_root(&ctx, &f).await;
+    let n = count_i64(
+        &ctx.sql("SELECT count(*) FROM lake.sales.orders")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("collect"),
+    );
+    assert_eq!(n, 3, "the unindexed dt=2026-01-03 partition must be omitted");
+}
+
+#[tokio::test]
+async fn indexed_and_unindexed_null_sentinel_agree() {
+    let unindexed = hive_fixture::root_with_default_partition().await;
+    let indexed = hive_fixture::root_with_default_partition().await;
+    hive_fixture::plant_orders_index(&indexed).await;
+    // The planted index only covers 01-01 and 01-02; add the sentinel entry.
+    {
+        let store = {
+            use sqe_catalog::hive::store::HiveManifestStore;
+            HiveManifestStore::new(
+                datafusion::datasource::listing::ListingTableUrl::parse(&indexed.root).unwrap(),
+                Arc::new(object_store::local::LocalFileSystem::new()),
+                sqe_catalog::hive::manifest::ManifestLimits::default(),
+                TvfPolicy {
+                    allow_local_paths: true,
+                    ..TvfPolicy::default()
+                },
+                TvfCaller::trusted_local(),
+            )
+        };
+        let mut m = store.get("sales", "orders").await.unwrap();
+        let data = format!("file://{}", indexed.dir.path().join("data").display());
+        if let Some(idx) = m.sqe.partition_index.as_mut() {
+            let mut values = std::collections::BTreeMap::new();
+            values.insert(
+                "dt".into(),
+                sqe_catalog::hive::manifest::HIVE_DEFAULT_PARTITION.into(),
+            );
+            idx.entries.push(sqe_catalog::hive::manifest::PartitionIndexEntry {
+                values,
+                location: format!("{data}/dt=__HIVE_DEFAULT_PARTITION__/"),
+                file_count: 1,
+                total_bytes: 40,
+            });
+        }
+        store.put(&m, false).await.unwrap();
+    }
+
+    let ctx_u = SessionContext::new();
+    register_hive_root(&ctx_u, &unindexed).await;
+    let ctx_i = SessionContext::new();
+    register_hive_root(&ctx_i, &indexed).await;
+    for sql in [
+        "SELECT count(*) FROM lake.sales.orders WHERE dt IS NULL",
+        "SELECT count(*) FROM lake.sales.orders WHERE dt = '2026-01-01'",
+    ] {
+        let nu = count_i64(
+            &ctx_u
+                .sql(sql)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap(),
+        );
+        let ni = count_i64(
+            &ctx_i
+                .sql(sql)
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap(),
+        );
+        assert_eq!(nu, ni, "{sql}: indexed {ni} vs listing {nu}");
+    }
+}
+
+#[tokio::test]
+async fn indexed_equality_prunes_before_scan() {
+    let f = partitioned_csv_root().await;
+    hive_fixture::plant_orders_index(&f).await;
+    let ctx = SessionContext::new();
+    register_hive_root(&ctx, &f).await;
+    let n = count_i64(
+        &ctx.sql("SELECT count(*) FROM lake.sales.orders WHERE dt = '2026-01-02'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(n, 1);
+    let plan = ctx
+        .sql("EXPLAIN SELECT id FROM lake.sales.orders WHERE dt = '2026-01-02'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let text = datafusion::arrow::util::pretty::pretty_format_batches(&plan)
+        .unwrap()
+        .to_string();
+    assert!(
+        !text.contains("dt=2026-01-01"),
+        "pruned partition must not be listed: {text}"
+    );
+}
+
+#[tokio::test]
+async fn index_metadata_supplies_size_statistics() {
+    use datafusion::catalog::CatalogProvider;
+    use datafusion::common::stats::Precision;
+
+    let f = partitioned_csv_root().await;
+    hive_fixture::plant_orders_index(&f).await;
+    let ctx = SessionContext::new();
+    let provider = register_hive_root(&ctx, &f).await;
+    let table = provider
+        .schema("sales")
+        .expect("sales")
+        .table("orders")
+        .await
+        .expect("table()")
+        .expect("orders");
+    let stats = table.statistics().expect("size stats from the index");
+    assert_eq!(stats.total_byte_size, Precision::Exact(150));
+}
+
+#[tokio::test]
+async fn analyzed_row_counts_replace_size_derived_estimates() {
+    use datafusion::catalog::CatalogProvider;
+    use datafusion::common::stats::Precision;
+
+    let f = partitioned_csv_root().await;
+    hive_fixture::plant_orders_index(&f).await;
+    {
+        let store = HiveManifestStore::new(
+            datafusion::datasource::listing::ListingTableUrl::parse(&f.root).unwrap(),
+            Arc::new(object_store::local::LocalFileSystem::new()),
+            ManifestLimits::default(),
+            TvfPolicy {
+                allow_local_paths: true,
+                ..TvfPolicy::default()
+            },
+            TvfCaller::trusted_local(),
+        );
+        let mut m = store.get("sales", "orders").await.unwrap();
+        m.sqe.statistics = Some(serde_json::json!({
+            "row_count": 3,
+            "entries": []
+        }));
+        store.put(&m, false).await.unwrap();
+    }
+    let ctx = SessionContext::new();
+    let provider = register_hive_root(&ctx, &f).await;
+    let table = provider
+        .schema("sales")
+        .unwrap()
+        .table("orders")
+        .await
+        .unwrap()
+        .unwrap();
+    let stats = table.statistics().expect("analyzed stats");
+    assert_eq!(stats.num_rows, Precision::Exact(3));
+}
+
+fn fixture_store(root: &str) -> HiveManifestStore {
+    HiveManifestStore::new(
+        datafusion::datasource::listing::ListingTableUrl::parse(root).unwrap(),
+        Arc::new(object_store::local::LocalFileSystem::new()),
+        ManifestLimits::default(),
+        TvfPolicy {
+            allow_local_paths: true,
+            ..TvfPolicy::default()
+        },
+        TvfCaller::trusted_local(),
+    )
+}
+
+#[tokio::test]
+async fn out_of_prefix_index_entry_is_readable() {
+    let f = partitioned_csv_root().await;
+    let elsewhere = f.dir.path().join("elsewhere/dt=2026-09-01");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("part-0.csv"), "id,amount\n9,90.0\n").unwrap();
+    hive_fixture::plant_orders_index(&f).await;
+    {
+        let store = fixture_store(&f.root);
+        let mut m = store.get("sales", "orders").await.unwrap();
+        if let Some(idx) = m.sqe.partition_index.as_mut() {
+            let mut values = std::collections::BTreeMap::new();
+            values.insert("dt".into(), "2026-09-01".into());
+            idx.entries.push(sqe_catalog::hive::manifest::PartitionIndexEntry {
+                values,
+                location: format!("file://{}/", elsewhere.display()),
+                file_count: 1,
+                total_bytes: 20,
+            });
+        }
+        store.put(&m, false).await.unwrap();
+    }
+    let ctx = SessionContext::new();
+    register_hive_root(&ctx, &f).await;
+    let n = count_i64(
+        &ctx.sql("SELECT count(*) FROM lake.sales.orders WHERE dt = '2026-09-01'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(n, 1);
+}
+
+#[tokio::test]
+async fn empty_index_scans_nothing_even_when_files_exist() {
+    let f = partitioned_csv_root().await;
+    {
+        let store = fixture_store(&f.root);
+        let mut m = store.get("sales", "orders").await.unwrap();
+        m.sqe.partition_index = Some(sqe_catalog::hive::manifest::PartitionIndex {
+            format_version: sqe_catalog::hive::manifest::PARTITION_INDEX_FORMAT_VERSION,
+            entries: vec![],
+        });
+        store.put(&m, false).await.unwrap();
+    }
+    let ctx = SessionContext::new();
+    register_hive_root(&ctx, &f).await;
+    let n = count_i64(
+        &ctx.sql("SELECT count(*) FROM lake.sales.orders")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(n, 0, "a present-but-empty index must not fall back to listing");
+}
+
+#[tokio::test]
+async fn indexed_in_list_and_zero_match_queries() {
+    let f = partitioned_csv_root().await;
+    hive_fixture::plant_orders_index(&f).await;
+    let ctx = SessionContext::new();
+    register_hive_root(&ctx, &f).await;
+    let n = count_i64(
+        &ctx.sql("SELECT count(*) FROM lake.sales.orders WHERE dt IN ('2026-01-02', '1999-01-01')")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(n, 1);
+    let zero = count_i64(
+        &ctx.sql("SELECT count(*) FROM lake.sales.orders WHERE dt = '1999-01-01'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(zero, 0);
+}
+
+#[tokio::test]
+async fn int_partition_column_prunes_on_typed_equality() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    for (bucket, rows) in [(7, "1,1.0\n"), (42, "2,2.0\n3,3.0\n")] {
+        let p = data.join(format!("bucket={bucket}"));
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("part-0.csv"), format!("id,amount\n{rows}")).unwrap();
+    }
+    let root = format!("file://{}/wh", dir.path().display());
+    let loc = format!("file://{}", data.display());
+    let ddl = format!(
+        "CREATE EXTERNAL TABLE sales.orders (id BIGINT, amount DOUBLE) \
+         PARTITIONED BY (bucket int) \
+         ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE \
+         LOCATION '{loc}' TBLPROPERTIES ('skip.header.line.count' = '1')"
+    );
+    let stmts = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, &ddl)
+        .unwrap();
+    let spec = sqe_sql::hive_ddl::try_extract_hive_table(&stmts[0])
+        .unwrap()
+        .unwrap();
+    let mut m = HiveManifest::from_spec(&spec, "sales", "test", "t");
+    m.sqe.partition_index = Some(sqe_catalog::hive::manifest::PartitionIndex {
+        format_version: sqe_catalog::hive::manifest::PARTITION_INDEX_FORMAT_VERSION,
+        entries: [7, 42]
+            .into_iter()
+            .map(|b| {
+                let mut values = std::collections::BTreeMap::new();
+                values.insert("bucket".into(), b.to_string());
+                sqe_catalog::hive::manifest::PartitionIndexEntry {
+                    values,
+                    location: format!("{loc}/bucket={b}/"),
+                    file_count: 1,
+                    total_bytes: 10,
+                }
+            })
+            .collect(),
+    });
+    fixture_store(&root).put(&m, false).await.unwrap();
+    let f = hive_fixture::Fixture { dir, root };
+    let ctx = SessionContext::new();
+    register_hive_root(&ctx, &f).await;
+    let n = count_i64(
+        &ctx.sql("SELECT count(*) FROM lake.sales.orders WHERE bucket = 42")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(n, 2);
+}
+
+#[tokio::test]
+async fn injected_projection_is_null_without_a_predicate_and_pins_with_one() {
+    let f = partitioned_csv_root().await;
+    // Files live under dt=...; an injected column with no context is the
+    // sentinel, so point a copy of one partition there.
+    let sentinel = f
+        .dir
+        .path()
+        .join("data/tenant=__HIVE_DEFAULT_PARTITION__");
+    std::fs::create_dir_all(&sentinel).unwrap();
+    std::fs::write(sentinel.join("part-0.csv"), "id,amount\n1,1.0\n").unwrap();
+    let acme = f.dir.path().join("data/tenant=acme");
+    std::fs::create_dir_all(&acme).unwrap();
+    std::fs::write(acme.join("part-0.csv"), "id,amount\n2,2.0\n").unwrap();
+    {
+        let store = fixture_store(&f.root);
+        let mut m = store.get("sales", "orders").await.unwrap();
+        m.partition_keys = vec![sqe_catalog::hive::manifest::GlueColumn {
+            name: "tenant".into(),
+            r#type: "string".into(),
+            comment: None,
+        }];
+        m.parameters
+            .insert("projection.enabled".into(), "true".into());
+        m.parameters
+            .insert("projection.tenant.type".into(), "injected".into());
+        store.put(&m, false).await.unwrap();
+    }
+    let ctx = SessionContext::new();
+    register_hive_root(&ctx, &f).await;
+    let batches = ctx
+        .sql("SELECT tenant FROM lake.sales.orders")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let batch = batches.iter().find(|b| b.num_rows() > 0).expect("row");
+    assert!(
+        batch.column(0).is_null(0),
+        "injected without context is NULL: {:?}",
+        batch.column(0)
+    );
+    let n = count_i64(
+        &ctx.sql("SELECT count(*) FROM lake.sales.orders WHERE tenant = 'acme'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(n, 1);
+}
+
+fn cache_manifest() -> HiveManifest {
+    HiveManifest {
+        manifest_version: sqe_catalog::hive::manifest::MANIFEST_VERSION,
+        table_type: "EXTERNAL_TABLE".to_string(),
+        database_name: "sales".to_string(),
+        name: "orders".to_string(),
+        owner: None,
+        created_at: None,
+        description: None,
+        partition_keys: vec![],
+        parameters: Default::default(),
+        storage_descriptor: sqe_catalog::hive::manifest::StorageDescriptor {
+            location: "file:///tmp/x".to_string(),
+            input_format: None,
+            output_format: None,
+            compressed: false,
+            serde_info: Default::default(),
+            columns: vec![],
+            sort_columns: vec![],
+        },
+        sqe: Default::default(),
+    }
+}
+
+#[test]
+fn cache_without_etag_expires_after_ttl() {
+    // Zero TTL: a store with no ETag must not serve a cached manifest.
+    // Instant coarseness makes a 1ms-then-sleep test flake; Duration::ZERO
+    // is the documented "always miss" bound.
+    let cache = HiveMetadataCache::with_ttl(Duration::ZERO);
+    cache.insert_versioned("sales", "orders", cache_manifest(), None);
+    assert!(
+        cache.get_if_fresh("sales", "orders", None).is_none(),
+        "a zero TTL must miss immediately when the store has no ETag"
+    );
+}
+
+#[test]
+fn cache_without_etag_is_fresh_inside_a_long_ttl() {
+    let cache = HiveMetadataCache::with_ttl(Duration::from_secs(60));
+    cache.insert_versioned("sales", "orders", cache_manifest(), None);
+    assert!(
+        cache.get_if_fresh("sales", "orders", None).is_some(),
+        "a long TTL with no ETag must hit"
+    );
+}
+
+#[test]
+fn cache_with_matching_etag_does_not_consult_ttl() {
+    let cache = HiveMetadataCache::with_ttl(Duration::ZERO);
+    cache.insert_versioned("sales", "orders", cache_manifest(), Some("etag-1".into()));
+    assert!(
+        cache
+            .get_if_fresh("sales", "orders", Some("etag-1"))
+            .is_some(),
+        "ETag match is authoritative; TTL only applies when the store has no ETag"
+    );
+}
+
+#[test]
+fn cache_keys_are_database_and_table() {
+    let cache = HiveMetadataCache::new();
+    cache.insert("sales", "orders", cache_manifest());
+    assert!(cache.get("sales", "orders").is_some());
+    assert!(cache.get("sales", "other").is_none());
+    assert!(cache.get("other", "orders").is_none());
+}
+
+#[tokio::test]
+async fn out_of_band_rows_appear_after_repair() {
+    let f = partitioned_csv_root().await;
+    hive_fixture::plant_orders_index(&f).await;
+    std::fs::create_dir_all(f.dir.path().join("data/dt=2026-01-03")).unwrap();
+    std::fs::write(
+        f.dir.path().join("data/dt=2026-01-03/part-0.csv"),
+        "id,amount\n99,99.0\n",
+    )
+    .unwrap();
+    let ctx = SessionContext::new();
+    register_hive_root(&ctx, &f).await;
+    let before = count_i64(
+        &ctx.sql("SELECT count(*) FROM lake.sales.orders")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(before, 3);
+    let store = fixture_store(&f.root);
+    let mut m = store.get("sales", "orders").await.unwrap();
+    sqe_catalog::hive::partition::msck_repair(&store, &mut m, 100)
+        .await
+        .unwrap();
+    // A fresh context so we do not reuse a stale TableProvider.
+    let ctx2 = SessionContext::new();
+    register_hive_root(&ctx2, &f).await;
+    let after = count_i64(
+        &ctx2
+            .sql("SELECT count(*) FROM lake.sales.orders")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(after, 4);
+}
+
+#[test]
+fn changed_etag_reloads_the_index() {
+    let cache = HiveMetadataCache::new();
+    cache.insert_versioned("sales", "orders", cache_manifest(), Some("etag-1".into()));
+    assert!(cache.get_if_fresh("sales", "orders", Some("etag-1")).is_some());
+    assert!(
+        cache.get_if_fresh("sales", "orders", Some("etag-2")).is_none(),
+        "a changed ETag must miss so the caller reloads"
+    );
+    assert!(
+        cache.get_if_fresh("sales", "orders", None).is_some(),
+        "no-ETag caller still uses TTL (default 60s)"
+    );
+}
+
+#[tokio::test]
+async fn projected_enum_table_scans_computed_partitions() {
+    let f = partitioned_csv_root().await;
+    {
+        let store = {
+            HiveManifestStore::new(
+                datafusion::datasource::listing::ListingTableUrl::parse(&f.root).unwrap(),
+                Arc::new(object_store::local::LocalFileSystem::new()),
+                ManifestLimits::default(),
+                TvfPolicy {
+                    allow_local_paths: true,
+                    ..TvfPolicy::default()
+                },
+                TvfCaller::trusted_local(),
+            )
+        };
+        let mut m = store.get("sales", "orders").await.unwrap();
+        m.parameters
+            .insert("projection.enabled".into(), "true".into());
+        m.parameters
+            .insert("projection.dt.type".into(), "enum".into());
+        m.parameters
+            .insert("projection.dt.values".into(), "2026-01-02".into());
+        store.put(&m, false).await.unwrap();
+    }
+    let ctx = SessionContext::new();
+    register_hive_root(&ctx, &f).await;
+    let n = count_i64(
+        &ctx.sql("SELECT count(*) FROM lake.sales.orders")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(n, 1, "only the projected dt=2026-01-02 partition");
+    let zero = count_i64(
+        &ctx.sql("SELECT count(*) FROM lake.sales.orders WHERE dt = '1999-01-01'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(zero, 0, "a value outside the enum scans nothing");
+}
+
+#[tokio::test]
+async fn indexed_range_predicate_prunes() {
+    let f = partitioned_csv_root().await;
+    hive_fixture::plant_orders_index(&f).await;
+    let ctx = SessionContext::new();
+    register_hive_root(&ctx, &f).await;
+    let n = count_i64(
+        &ctx.sql("SELECT count(*) FROM lake.sales.orders WHERE dt >= '2026-01-02'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(n, 1);
+    let n = count_i64(
+        &ctx.sql("SELECT count(*) FROM lake.sales.orders WHERE dt <> '2026-01-01'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(n, 1);
+}
+
+#[tokio::test]
+async fn indexed_is_not_null_drops_the_sentinel_partition() {
+    let f = hive_fixture::root_with_default_partition().await;
+    hive_fixture::plant_orders_index(&f).await;
+    {
+        let store = fixture_store(&f.root);
+        let mut m = store.get("sales", "orders").await.unwrap();
+        let data = format!("file://{}", f.dir.path().join("data").display());
+        if let Some(idx) = m.sqe.partition_index.as_mut() {
+            let mut values = std::collections::BTreeMap::new();
+            values.insert(
+                "dt".into(),
+                sqe_catalog::hive::manifest::HIVE_DEFAULT_PARTITION.into(),
+            );
+            idx.entries.push(sqe_catalog::hive::manifest::PartitionIndexEntry {
+                values,
+                location: format!("{data}/dt=__HIVE_DEFAULT_PARTITION__/"),
+                file_count: 1,
+                total_bytes: 40,
+            });
+        }
+        store.put(&m, false).await.unwrap();
+    }
+    let ctx = SessionContext::new();
+    register_hive_root(&ctx, &f).await;
+    let not_null = count_i64(
+        &ctx.sql("SELECT count(*) FROM lake.sales.orders WHERE dt IS NOT NULL")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(not_null, 3, "two + one real partitions, not the sentinel");
+    let is_null = count_i64(
+        &ctx.sql("SELECT count(*) FROM lake.sales.orders WHERE dt IS NULL")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(is_null, 2);
+}
+
+#[tokio::test]
+async fn composite_indexed_scan_prunes_on_one_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    for (dt, region, rows) in [
+        ("2026-01-01", "eu", "1,1.0\n"),
+        ("2026-01-01", "us", "2,2.0\n"),
+        ("2026-01-02", "eu", "3,3.0\n"),
+    ] {
+        let p = data.join(format!("dt={dt}")).join(format!("region={region}"));
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("part-0.csv"), format!("id,amount\n{rows}")).unwrap();
+    }
+    let root = format!("file://{}/wh", dir.path().display());
+    let loc = format!("file://{}", data.display());
+    let ddl = format!(
+        "CREATE EXTERNAL TABLE sales.orders (id BIGINT, amount DOUBLE) \
+         PARTITIONED BY (dt string, region string) \
+         ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE \
+         LOCATION '{loc}' TBLPROPERTIES ('skip.header.line.count' = '1')"
+    );
+    let stmts = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, &ddl)
+        .unwrap();
+    let spec = sqe_sql::hive_ddl::try_extract_hive_table(&stmts[0])
+        .unwrap()
+        .unwrap();
+    let mut m = HiveManifest::from_spec(&spec, "sales", "test", "t");
+    m.sqe.partition_index = Some(sqe_catalog::hive::manifest::PartitionIndex {
+        format_version: sqe_catalog::hive::manifest::PARTITION_INDEX_FORMAT_VERSION,
+        entries: [
+            ("2026-01-01", "eu"),
+            ("2026-01-01", "us"),
+            ("2026-01-02", "eu"),
+        ]
+        .into_iter()
+        .map(|(dt, region)| {
+            let mut values = std::collections::BTreeMap::new();
+            values.insert("dt".into(), dt.to_string());
+            values.insert("region".into(), region.to_string());
+            sqe_catalog::hive::manifest::PartitionIndexEntry {
+                values,
+                location: format!("{loc}/dt={dt}/region={region}/"),
+                file_count: 1,
+                total_bytes: 10,
+            }
+        })
+        .collect(),
+    });
+    fixture_store(&root).put(&m, false).await.unwrap();
+    let f = hive_fixture::Fixture { dir, root };
+    let ctx = SessionContext::new();
+    register_hive_root(&ctx, &f).await;
+    let n = count_i64(
+        &ctx.sql("SELECT count(*) FROM lake.sales.orders WHERE region = 'eu'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(n, 2);
+    let n = count_i64(
+        &ctx.sql(
+            "SELECT count(*) FROM lake.sales.orders \
+             WHERE dt = '2026-01-01' AND region = 'us'",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap(),
+    );
+    assert_eq!(n, 1);
+}

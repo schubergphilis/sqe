@@ -161,6 +161,38 @@ pub async fn root_with_unsupported_serde() -> Fixture {
     Fixture { dir, root }
 }
 
+/// Plant a `sqe.partition_index` on `sales.orders` covering the two
+/// `dt=` directories of [`partitioned_csv_root`]. An extra file under the
+/// table prefix that is NOT in the index is how tests prove indexed scans
+/// do not LIST the table location.
+pub async fn plant_orders_index(f: &Fixture) {
+    let store = local_store(&f.root);
+    let mut m = store.get("sales", "orders").await.expect("get");
+    let data = format!("file://{}", f.dir.path().join("data").display());
+    let mut e1 = std::collections::BTreeMap::new();
+    e1.insert("dt".into(), "2026-01-01".into());
+    let mut e2 = std::collections::BTreeMap::new();
+    e2.insert("dt".into(), "2026-01-02".into());
+    m.sqe.partition_index = Some(sqe_catalog::hive::manifest::PartitionIndex {
+        format_version: sqe_catalog::hive::manifest::PARTITION_INDEX_FORMAT_VERSION,
+        entries: vec![
+            sqe_catalog::hive::manifest::PartitionIndexEntry {
+                values: e1,
+                location: format!("{data}/dt=2026-01-01/"),
+                file_count: 1,
+                total_bytes: 100,
+            },
+            sqe_catalog::hive::manifest::PartitionIndexEntry {
+                values: e2,
+                location: format!("{data}/dt=2026-01-02/"),
+                file_count: 1,
+                total_bytes: 50,
+            },
+        ],
+    });
+    store.put(&m, false).await.expect("put index");
+}
+
 /// Register the root as catalog `lake` and return the provider so a test can
 /// inspect its manifest cache.
 pub async fn register_hive_root(ctx: &SessionContext, f: &Fixture) -> Arc<HiveCatalogProvider> {

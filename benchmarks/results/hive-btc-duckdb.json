@@ -1,0 +1,206 @@
+{
+  "duckdb_version": "1.5.5",
+  "data": "/tmp/sqe-btc-hive/data/date=*/*.parquet",
+  "generated_at": "2026-08-23T10:59:08Z",
+  "note": "In-process duckdb Python; cold=1st exec after CREATE VIEW; warm=median of next 6. OS cache hot.",
+  "local": [
+    {
+      "name": "count_full",
+      "sql": "SELECT count(*) FROM t",
+      "times_ms": [
+        70.491,
+        60.485,
+        62.426,
+        61.884,
+        63.03,
+        61.567,
+        62.285
+      ],
+      "cold_ms": 70.491,
+      "warm_median_ms": 62.084,
+      "warm_min_ms": 60.485,
+      "result": [
+        [
+          45869
+        ]
+      ]
+    },
+    {
+      "name": "count_pin",
+      "sql": "SELECT count(*) FROM t WHERE date = '2024-01-01'",
+      "times_ms": [
+        44.073,
+        44.203,
+        44.115,
+        44.022,
+        43.459,
+        44.513,
+        45.606
+      ],
+      "cold_ms": 44.073,
+      "warm_median_ms": 44.159,
+      "warm_min_ms": 43.459,
+      "result": [
+        [
+          155
+        ]
+      ]
+    },
+    {
+      "name": "sum_tx_pin",
+      "sql": "SELECT sum(transaction_count) FROM t WHERE date = '2024-01-01'",
+      "times_ms": [
+        44.637,
+        42.994,
+        46.115,
+        44.286,
+        44.914,
+        44.254,
+        43.833
+      ],
+      "cold_ms": 44.637,
+      "warm_median_ms": 44.27,
+      "warm_min_ms": 42.994,
+      "result": [
+        [
+          657752
+        ]
+      ]
+    },
+    {
+      "name": "sum_tx_full",
+      "sql": "SELECT sum(transaction_count) FROM t",
+      "times_ms": [
+        61.753,
+        59.223,
+        62.87,
+        66.537,
+        64.238,
+        62.593,
+        61.094
+      ],
+      "cold_ms": 61.753,
+      "warm_median_ms": 62.732,
+      "warm_min_ms": 59.223,
+      "result": [
+        [
+          36977562
+        ]
+      ]
+    },
+    {
+      "name": "max_number_pin",
+      "sql": "SELECT max(number) FROM t WHERE date = '2024-01-01'",
+      "times_ms": [
+        44.283,
+        44.271,
+        43.923,
+        41.928,
+        54.683,
+        46.376,
+        46.468
+      ],
+      "cold_ms": 44.283,
+      "warm_median_ms": 45.324,
+      "warm_min_ms": 41.928,
+      "result": [
+        [
+          823940
+        ]
+      ]
+    },
+    {
+      "name": "max_number_full",
+      "sql": "SELECT max(number) FROM t",
+      "times_ms": [
+        64.237,
+        59.804,
+        62.242,
+        61.177,
+        61.502,
+        61.166,
+        61.944
+      ],
+      "cold_ms": 64.237,
+      "warm_median_ms": 61.339,
+      "warm_min_ms": 59.804,
+      "result": [
+        [
+          837164
+        ]
+      ]
+    }
+  ],
+  "s3": [
+    {
+      "name": "s3_pin_one_day",
+      "times_ms": [
+        1115.8,
+        378.5,
+        351.7,
+        368.6
+      ],
+      "result": [
+        [
+          155,
+          657752
+        ]
+      ]
+    },
+    {
+      "name": "s3_jan_2024",
+      "times_ms": [
+        1574.5,
+        358.7,
+        351.9
+      ],
+      "result": [
+        [
+          4522
+        ]
+      ]
+    }
+  ],
+  "sqe_dev_release": {
+    "count_full": {
+      "listing": [
+        196.4,
+        54.7
+      ],
+      "indexed": [
+        120.8,
+        23.0
+      ]
+    },
+    "count_pin": {
+      "listing": [
+        99.1,
+        47.9
+      ],
+      "indexed": [
+        1.9,
+        0.7
+      ],
+      "projection": [
+        11.2,
+        3.1
+      ]
+    },
+    "sum_tx_pin": {
+      "listing": [
+        95.9,
+        48.6
+      ],
+      "indexed": [
+        1.5,
+        0.9
+      ]
+    },
+    "sum_tx_full": {
+      "indexed": [
+        144.0,
+        26.6
+      ]
+    }
+  }
+}

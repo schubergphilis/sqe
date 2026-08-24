@@ -1,0 +1,77 @@
+{
+  "generated_at": "2026-08-23T10:52:08Z",
+  "cases": [
+    {
+      "name": "btc_blocks_prefixes",
+      "wall_ms": 4321.1,
+      "rc": 0,
+      "lines": 6437,
+      "bytes": null,
+      "cmd": "aws s3 ls --no-sign-request s3://aws-public-blockchain/v1.0/btc/blocks/"
+    },
+    {
+      "name": "btc_tx_prefixes",
+      "wall_ms": 911.1,
+      "rc": 0,
+      "lines": 2,
+      "bytes": null,
+      "cmd": "aws s3 ls --no-sign-request s3://aws-public-blockchain/v1.0/btc/"
+    },
+    {
+      "name": "btc_2024_jan_recursive",
+      "wall_ms": 918.3,
+      "rc": 0,
+      "lines": 31,
+      "bytes": 1679524,
+      "cmd": "aws s3 ls --no-sign-request --recursive s3://aws-public-blockchain/v1.0/btc/blocks/date=2024-01-"
+    },
+    {
+      "name": "btc_2026_aug_recursive",
+      "wall_ms": 1043.0,
+      "rc": 0,
+      "lines": 87,
+      "bytes": 2112945,
+      "cmd": "aws s3 ls --no-sign-request --recursive s3://aws-public-blockchain/v1.0/btc/blocks/date=2026-08-"
+    },
+    {
+      "name": "btc_2009_recursive",
+      "wall_ms": 1207.0,
+      "rc": 0,
+      "lines": 358,
+      "bytes": 9714181,
+      "cmd": "aws s3 ls --no-sign-request --recursive s3://aws-public-blockchain/v1.0/btc/blocks/date=2009-"
+    },
+    {
+      "name": "btc_blocks_recursive_all",
+      "wall_ms": 6470.0,
+      "rc": 0,
+      "lines": 6501,
+      "bytes": 343659162,
+      "cmd": "aws s3 ls --no-sign-request --recursive s3://aws-public-blockchain/v1.0/btc/blocks/"
+    },
+    {
+      "name": "btc_one_day_2024",
+      "wall_ms": 933.7,
+      "rc": 0,
+      "lines": 1,
+      "bytes": 56689,
+      "cmd": "aws s3 ls --no-sign-request --recursive s3://aws-public-blockchain/v1.0/btc/blocks/date=2024-01-01/"
+    },
+    {
+      "name": "btc_get_2009_sample",
+      "wall_ms": 1349.5,
+      "rc": 0,
+      "lines": 2,
+      "bytes": null,
+      "cmd": "aws s3 cp --no-sign-request s3://aws-public-blockchain/v1.0/btc/blocks/date=2009-01-03/ /tmp/sqe-btc-probe/2009-01-03/ --recursive"
+    },
+    {
+      "name": "btc_get_2024_01_01",
+      "wall_ms": 1565.5,
+      "rc": 0,
+      "lines": 2,
+      "bytes": null,
+      "cmd": "aws s3 cp --no-sign-request s3://aws-public-blockchain/v1.0/btc/blocks/date=2024-01-01/ /tmp/sqe-btc-probe/2024-01-01/ --recursive"
+    }
+  ]
+}

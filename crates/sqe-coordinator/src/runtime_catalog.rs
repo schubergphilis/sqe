@@ -387,6 +387,7 @@ pub async fn attach_configured_hive_roots(
         max_bytes: hive_config.manifest_max_bytes,
         max_columns: hive_config.manifest_max_columns,
         max_partition_keys: hive_config.manifest_max_partition_keys,
+        max_partition_index_entries: hive_config.manifest_max_partition_index_entries,
     };
     for root in &hive_config.roots {
         if root.name == default_catalog {

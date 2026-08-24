@@ -1,15 +1,10 @@
 //! Server-mode Hive DDL and statement dispatch (Task 10b).
 //!
-//! Two rows from the spec's statement dispatch table are deliberately
-//! absent from `unsupported_statements_are_rejected_by_name_with_their_cycle`:
-//! `MSCK REPAIR TABLE` and `SHOW PARTITIONS`. Neither can be dispatched by
-//! coordinator wiring alone: `MSCK` parses in sqlparser 0.62 but
-//! `sqe-sql`'s `classify()` has no arm for it and falls to the wildcard,
-//! and `SHOW PARTITIONS` has no dedicated AST at all and lands in
-//! `Statement::ShowVariable`. Both produce a generic not-implemented error
-//! today, accurate but not naming `hive_external` or its cycle. Cycle 2
-//! adds the classifier arms that make the wording specific, as a side
-//! effect of adding real support.
+//! Cycle-2 note: `MSCK REPAIR TABLE`, `SHOW PARTITIONS`, and
+//! `ALTER TABLE ... ADD/DROP PARTITION` used to be listed here as
+//! generic-rejection rows. Cycle 2 implements them; their dispatch tests
+//! live in `hive_partition_ddl_test.rs`. `ANALYZE TABLE` is implemented
+//! there too.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -392,12 +387,6 @@ async fn handler_with_root_and_policy(catalog: &str, store: Arc<InMemoryPolicySt
 async fn unsupported_statements_are_rejected_by_name_with_their_cycle() {
     let h = handler_with_root("lake").await;
     let cases: &[(&str, u8, &str)] = &[
-        ("ANALYZE lake.sales.orders", 2, "ANALYZE"),
-        (
-            "ALTER TABLE lake.sales.orders ADD PARTITION (dt='2026-01-01')",
-            2,
-            "ADD PARTITION",
-        ),
         (
             "ALTER TABLE lake.sales.orders SET TAGS (ssn = ('PII'))",
             3,
@@ -457,8 +446,16 @@ async fn unsupported_statements_are_rejected_by_name_with_their_cycle() {
 /// and the manifest's own `LOCATION`), so a stub that swallowed the
 /// statement into an empty-but-`Ok` answer would fail this test even though
 /// `unwrap()` alone would not have caught it.
-#[tokio::test]
-async fn supported_statements_reach_the_hive_path_not_the_iceberg_path() {
+#[test]
+fn supported_statements_reach_the_hive_path_not_the_iceberg_path() {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(1)
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::spawn(async {
     let h = handler_with_root("lake").await;
     let data_dir = h._dirs[0].path().join("data");
     write_csv_fixture(&data_dir);
@@ -511,6 +508,10 @@ async fn supported_statements_reach_the_hive_path_not_the_iceberg_path() {
     for needle in ["CREATE EXTERNAL TABLE", "LOCATION", "PARTITIONED BY"] {
         assert!(ddl.contains(needle), "missing {needle} in: {ddl}");
     }
+            })
+            .await
+            .expect("join");
+        });
 }
 
 #[tokio::test]
@@ -542,14 +543,25 @@ async fn create_external_table_emits_an_audit_event_with_the_policy_name() {
 /// The end-to-end guard for the `lit(false)` failure mode. Without the
 /// routing tag source this returns zero rows rather than erroring, which is
 /// why the assertion is on the row count.
-#[tokio::test]
-async fn a_hive_query_is_not_denied_when_a_tag_source_is_active() {
-    let h = handler_with_root_and_tag_source("lake").await;
-    let rows = h
-        .query_rows_for_test("SELECT count(*) AS n FROM lake.sales.orders")
-        .await
-        .expect("query");
-    assert_eq!(rows, 3, "a tag source must not deny an untagged Hive table");
+#[test]
+fn a_hive_query_is_not_denied_when_a_tag_source_is_active() {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(1)
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()
+        .unwrap()
+        .block_on(async {
+            let h = handler_with_root_and_tag_source("lake").await;
+            let rows = tokio::spawn(async move {
+                h.query_rows_for_test("SELECT count(*) AS n FROM lake.sales.orders")
+                    .await
+            })
+            .await
+            .expect("join")
+            .expect("query");
+            assert_eq!(rows, 3, "a tag source must not deny an untagged Hive table");
+        });
 }
 
 /// The `CREATE EXTERNAL TABLE` mirror of

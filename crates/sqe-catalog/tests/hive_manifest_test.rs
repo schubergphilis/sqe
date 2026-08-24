@@ -1,6 +1,11 @@
 #![cfg(feature = "hive-external")]
 
-use sqe_catalog::hive::manifest::{HiveManifest, ManifestLimits, MANIFEST_VERSION};
+use std::collections::BTreeMap;
+
+use sqe_catalog::hive::manifest::{
+    HiveManifest, ManifestLimits, PartitionIndex, PartitionIndexEntry,
+    PARTITION_INDEX_FORMAT_VERSION, MANIFEST_VERSION,
+};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
@@ -222,4 +227,167 @@ fn a_column_name_repeated_between_columns_and_partition_keys_is_rejected() {
         format!("{err:?}").contains("id"),
         "error should name the duplicated column: {err:?}"
     );
+}
+
+fn index_of(m: &mut HiveManifest) -> &mut PartitionIndex {
+    m.sqe.partition_index.get_or_insert_with(|| PartitionIndex {
+        format_version: PARTITION_INDEX_FORMAT_VERSION,
+        entries: Vec::new(),
+    })
+}
+
+fn entry(dt: &str) -> PartitionIndexEntry {
+    PartitionIndexEntry {
+        values: BTreeMap::from([("dt".to_string(), dt.to_string())]),
+        location: format!("s3://raw/orders/dt={dt}/"),
+        file_count: 1,
+        total_bytes: 1024,
+    }
+}
+
+#[test]
+fn partition_index_round_trips_through_json() {
+    let mut m = HiveManifest::from_spec(&spec_of(DDL), "sales", "j", "t");
+    index_of(&mut m).entries = vec![entry("2026-01-02"), entry("2026-01-03")];
+    let back = HiveManifest::parse(&m.to_bytes().expect("bytes"), &ManifestLimits::default())
+        .expect("parse");
+    let idx = back.sqe.partition_index.expect("index survives");
+    assert_eq!(idx.format_version, PARTITION_INDEX_FORMAT_VERSION);
+    assert_eq!(idx.entries.len(), 2);
+    assert_eq!(idx.entries[0].values.get("dt").map(String::as_str), Some("2026-01-02"));
+    assert_eq!(idx.entries[0].location, "s3://raw/orders/dt=2026-01-02/");
+    assert_eq!(idx.entries[0].file_count, 1);
+    assert_eq!(idx.entries[0].total_bytes, 1024);
+}
+
+#[test]
+fn a_newer_partition_index_format_version_is_rejected() {
+    let mut m = HiveManifest::from_spec(&spec_of(DDL), "sales", "j", "t");
+    index_of(&mut m).format_version = 99;
+    let err = HiveManifest::parse(&m.to_bytes().expect("bytes"), &ManifestLimits::default())
+        .expect_err("must reject");
+    assert!(
+        format!("{err:?}").contains("99"),
+        "error should name the version: {err:?}"
+    );
+}
+
+#[test]
+fn an_oversized_partition_index_is_rejected_at_load() {
+    let limits = ManifestLimits {
+        max_partition_index_entries: 2,
+        ..ManifestLimits::default()
+    };
+    let mut m = HiveManifest::from_spec(&spec_of(DDL), "sales", "j", "t");
+    index_of(&mut m).entries = vec![
+        entry("2026-01-01"),
+        entry("2026-01-02"),
+        entry("2026-01-03"),
+    ];
+    let err = HiveManifest::parse(&m.to_bytes().expect("bytes"), &limits).expect_err("must reject");
+    assert!(
+        format!("{err:?}").to_lowercase().contains("exceeding the cap"),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn an_entry_whose_value_keys_do_not_match_the_partition_keys_is_rejected() {
+    let mut m = HiveManifest::from_spec(&spec_of(DDL), "sales", "j", "t");
+    let mut e = entry("2026-01-02");
+    e.values.remove("dt");
+    index_of(&mut m).entries = vec![e];
+    let err = HiveManifest::parse(&m.to_bytes().expect("bytes"), &ManifestLimits::default())
+        .expect_err("must reject");
+    assert!(
+        format!("{err:?}").contains("dt"),
+        "error should name the key: {err:?}"
+    );
+
+    // And an extra key that is not a declared partition key at all.
+    let mut m = HiveManifest::from_spec(&spec_of(DDL), "sales", "j", "t");
+    let mut e = entry("2026-01-02");
+    e.values.insert("region".to_string(), "eu".to_string());
+    index_of(&mut m).entries = vec![e];
+    assert!(
+        HiveManifest::parse(&m.to_bytes().expect("bytes"), &ManifestLimits::default()).is_err()
+    );
+}
+
+// The DDL above declares `dt string`. A second table shape declares `dt
+// date`, which is what the typed-value tests need.
+const DDL_DATE_KEY: &str = "CREATE EXTERNAL TABLE sales.orders (id BIGINT, amount DOUBLE) \
+PARTITIONED BY (dt date) \
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde' \
+STORED AS TEXTFILE LOCATION 's3://raw/orders/'";
+
+#[test]
+fn a_partition_value_that_does_not_parse_to_the_declared_type_fails_load() {
+    let mut m = HiveManifest::from_spec(&spec_of(DDL_DATE_KEY), "sales", "j", "t");
+    index_of(&mut m).entries = vec![entry("not-a-date")];
+    let err = HiveManifest::parse(&m.to_bytes().expect("bytes"), &ManifestLimits::default())
+        .expect_err("must reject");
+    assert!(
+        format!("{err:?}").contains("not-a-date"),
+        "error should name the value: {err:?}"
+    );
+}
+
+#[test]
+fn a_date_typed_partition_value_that_parses_is_accepted() {
+    let mut m = HiveManifest::from_spec(&spec_of(DDL_DATE_KEY), "sales", "j", "t");
+    index_of(&mut m).entries = vec![entry("2026-01-02")];
+    HiveManifest::parse(&m.to_bytes().expect("bytes"), &ManifestLimits::default())
+        .expect("a valid date parses");
+}
+
+#[test]
+fn an_int_typed_partition_value_must_parse_as_a_number() {
+    const INT_KEY: &str = "CREATE EXTERNAL TABLE sales.orders (id BIGINT) \
+PARTITIONED BY (bucket int) \
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde' \
+STORED AS TEXTFILE LOCATION 's3://raw/orders/'";
+    let mut bad = HiveManifest::from_spec(&spec_of(INT_KEY), "sales", "j", "t");
+    let mut e = entry("42");
+    e.values = BTreeMap::from([("bucket".to_string(), "forty-two".to_string())]);
+    e.location = "s3://raw/orders/bucket=forty-two/".to_string();
+    index_of(&mut bad).entries = vec![e];
+    assert!(
+        HiveManifest::parse(&bad.to_bytes().expect("bytes"), &ManifestLimits::default()).is_err()
+    );
+}
+
+#[test]
+fn the_default_partition_sentinel_is_valid_for_every_declared_type() {
+    let mut m = HiveManifest::from_spec(&spec_of(DDL_DATE_KEY), "sales", "j", "t");
+    index_of(&mut m).entries = vec![entry("__HIVE_DEFAULT_PARTITION__")];
+    HiveManifest::parse(&m.to_bytes().expect("bytes"), &ManifestLimits::default())
+        .expect("the sentinel normalizes to NULL, not a typed parse failure");
+}
+
+#[test]
+fn an_entry_location_must_not_be_empty() {
+    let mut m = HiveManifest::from_spec(&spec_of(DDL), "sales", "j", "t");
+    let mut e = entry("2026-01-02");
+    e.location = String::new();
+    index_of(&mut m).entries = vec![e];
+    let err = HiveManifest::parse(&m.to_bytes().expect("bytes"), &ManifestLimits::default())
+        .expect_err("must reject");
+    assert!(
+        format!("{err:?}").to_lowercase().contains("location"),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn planted_malformed_projection_fails_closed_naming_the_property() {
+    let mut m = HiveManifest::from_spec(&spec_of(DDL), "sales", "j", "t");
+    m.parameters
+        .insert("projection.enabled".into(), "true".into());
+    m.parameters
+        .insert("projection.dt.type".into(), "banana".into());
+    let err = HiveManifest::parse(&m.to_bytes().expect("bytes"), &ManifestLimits::default())
+        .expect_err("must reject");
+    let msg = err.to_string();
+    assert!(msg.contains("projection.dt.type"), "{msg}");
 }

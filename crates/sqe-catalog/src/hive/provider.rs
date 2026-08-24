@@ -35,7 +35,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -53,16 +53,21 @@ use datafusion::logical_expr::{
 use datafusion::physical_expr::expressions::{
     binary as phys_binary, case as phys_case, col as phys_col, lit as phys_lit,
 };
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use futures::TryStreamExt;
 use moka::sync::Cache as SyncCache;
 use object_store::{ObjectMeta, ObjectStore};
 use tracing::{error, warn};
 
-use super::manifest::HiveManifest;
-use super::serde_map::{arrow_type, listing_options, resolve_format};
-use super::stats::{row_width_hint, size_only_statistics};
+use super::manifest::{HiveManifest, PartitionIndex, PartitionIndexEntry};
+use super::partition::{
+    evaluate_projection, parse_projection, prune_entries_owned, ProjectionConfig,
+};
+use super::serde_map::{arrow_type, listing_options, resolve_format, ResolvedFormat};
+use super::stats::{analyzed_statistics, row_width_hint, size_only_from_index, size_only_statistics};
 use super::store::HiveManifestStore;
 use super::HiveError;
 
@@ -132,8 +137,16 @@ struct ObjectStoreOwner {
     secret: Option<String>,
 }
 
+#[derive(Clone)]
+struct CachedManifest {
+    manifest: HiveManifest,
+    etag: Option<String>,
+    loaded_at: Instant,
+}
+
 pub struct HiveMetadataCache {
-    inner: SyncCache<String, HiveManifest>,
+    inner: SyncCache<String, CachedManifest>,
+    ttl: Duration,
     /// Guards against the collision `register_object_store` cannot see on
     /// its own: DataFusion's `ObjectStoreRegistry` keys purely on
     /// `scheme://host:port` (see `object_store_bucket_key`), discarding the
@@ -164,10 +177,15 @@ impl Default for HiveMetadataCache {
 
 impl HiveMetadataCache {
     pub fn new() -> Self {
+        Self::with_ttl(Duration::from_secs(60))
+    }
+
+    pub fn with_ttl(ttl: Duration) -> Self {
         Self {
             inner: SyncCache::builder()
                 .max_capacity(MANIFEST_CACHE_CAPACITY)
                 .build(),
+            ttl,
             object_store_owners: Mutex::new(HashMap::new()),
         }
     }
@@ -177,11 +195,62 @@ impl HiveMetadataCache {
     }
 
     pub fn get(&self, database: &str, table: &str) -> Option<HiveManifest> {
-        self.inner.get(&Self::key(database, table))
+        self.inner
+            .get(&Self::key(database, table))
+            .map(|c| c.manifest)
     }
 
     pub fn insert(&self, database: &str, table: &str, m: HiveManifest) {
-        self.inner.insert(Self::key(database, table), m);
+        self.insert_versioned(database, table, m, None);
+    }
+
+    pub fn insert_versioned(
+        &self,
+        database: &str,
+        table: &str,
+        m: HiveManifest,
+        etag: Option<String>,
+    ) {
+        self.inner.insert(
+            Self::key(database, table),
+            CachedManifest {
+                manifest: m,
+                etag,
+                loaded_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Use the cached manifest when the store's current ETag matches, or
+    /// when the store has no ETag and the TTL has not elapsed. A changed
+    /// ETag returns `None` so the caller reloads.
+    pub fn get_if_fresh(
+        &self,
+        database: &str,
+        table: &str,
+        etag: Option<&str>,
+    ) -> Option<HiveManifest> {
+        let cached = self.inner.get(&Self::key(database, table))?;
+        match etag {
+            Some(now) => {
+                if cached.etag.as_deref() == Some(now) {
+                    Some(cached.manifest)
+                } else {
+                    None
+                }
+            }
+            None => {
+                if cached.loaded_at.elapsed() < self.ttl {
+                    Some(cached.manifest)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    pub fn invalidate(&self, database: &str, table: &str) {
+        self.inner.invalidate(&Self::key(database, table));
     }
 
     /// Claim `bucket_key` for `table_ref` reading under `secret`, or refuse
@@ -476,24 +545,240 @@ fn nullify_default_partition_columns(
 /// [`nullify_default_partition_columns`] for the other half, which turns the
 /// literal sentinel into a real NULL in `scan()`'s physical output so
 /// `SELECT dt` and `WHERE dt IS NULL` agree on what the value is.
-#[derive(Debug)]
 struct HiveTableProvider {
     inner: Arc<ListingTable>,
     schema: SchemaRef,
     statistics: Statistics,
     partition_columns: Vec<String>,
+    partition_types: Vec<(String, String)>,
+    index: Option<PartitionIndex>,
+    projection: Option<ProjectionConfig>,
+    resolved: ResolvedFormat,
+    file_schema: SchemaRef,
+    data_store_factory: Arc<dyn HiveDataStoreFactory>,
+    secret: Option<String>,
+    runtime: Arc<RuntimeEnv>,
+    max_index_entries: usize,
+    table_location: String,
+}
+
+impl fmt::Debug for HiveTableProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HiveTableProvider")
+            .field("partition_columns", &self.partition_columns)
+            .field("has_index", &self.index.is_some())
+            .finish()
+    }
 }
 
 impl HiveTableProvider {
-    fn new(inner: ListingTable, statistics: Statistics, partition_columns: Vec<String>) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        inner: ListingTable,
+        statistics: Statistics,
+        partition_columns: Vec<String>,
+        partition_types: Vec<(String, String)>,
+        index: Option<PartitionIndex>,
+        projection: Option<ProjectionConfig>,
+        resolved: ResolvedFormat,
+        file_schema: SchemaRef,
+        data_store_factory: Arc<dyn HiveDataStoreFactory>,
+        secret: Option<String>,
+        runtime: Arc<RuntimeEnv>,
+        max_index_entries: usize,
+        table_location: String,
+    ) -> Self {
         let schema = nullable_partition_schema(&inner.schema(), &partition_columns);
         Self {
             inner: Arc::new(inner),
             schema,
             statistics,
             partition_columns,
+            partition_types,
+            index,
+            projection,
+            resolved,
+            file_schema,
+            data_store_factory,
+            secret,
+            runtime,
+            max_index_entries,
+            table_location,
         }
     }
+
+    fn uses_index_scan(&self) -> bool {
+        self.projection
+            .as_ref()
+            .map(|p| p.enabled)
+            .unwrap_or(false)
+            || self.index.is_some()
+    }
+
+    fn planned_entries(&self, filters: &[Expr]) -> Result<Vec<PartitionIndexEntry>, HiveError> {
+        if let Some(proj) = self.projection.as_ref().filter(|p| p.enabled) {
+            let virtuals = evaluate_projection(
+                proj,
+                &self.table_location,
+                filters,
+                self.max_index_entries,
+            )?;
+            return Ok(prune_entries_owned(
+                &virtuals,
+                filters,
+                &self.partition_types,
+            ));
+        }
+        if let Some(index) = &self.index {
+            return Ok(prune_entries_owned(
+                &index.entries,
+                filters,
+                &self.partition_types,
+            ));
+        }
+        Ok(Vec::new())
+    }
+
+    async fn scan_from_entries(
+        &self,
+        state: &dyn Session,
+        projection: Option<&[usize]>,
+        filters: Vec<Expr>,
+        limit: Option<usize>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let entries = self.planned_entries(&filters).map_err(to_df)?;
+        let out_schema = projected_schema(&self.schema, projection);
+        if entries.is_empty() {
+            return Ok(Arc::new(EmptyExec::new(out_schema)));
+        }
+
+        let n_file = self.file_schema.fields().len();
+        let file_proj = file_column_projection(projection, n_file);
+        let data_filters: Vec<Expr> = filters
+            .iter()
+            .filter(|f| !references_only_partition_cols(f, &self.partition_columns))
+            .cloned()
+            .collect();
+
+        let mut plans = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            let url = table_location_url(&entry.location).map_err(to_df)?;
+            let store = self
+                .data_store_factory
+                .store_for(&entry.location, self.secret.as_deref())
+                .map_err(to_df)?;
+            self.runtime
+                .register_object_store(url.as_ref(), store);
+
+            let options = listing_options(&self.resolved, Vec::new()).map_err(to_df)?;
+            let config = ListingTableConfig::new(url)
+                .with_listing_options(options)
+                .with_schema(Arc::clone(&self.file_schema));
+            let listing = ListingTable::try_new(config)?;
+            let plan = listing
+                .scan(state, file_proj.as_ref(), &data_filters, limit)
+                .await?;
+            let plan = attach_partition_values(
+                plan,
+                &self.file_schema,
+                &self.partition_columns,
+                &entry.values,
+                projection,
+                &self.schema,
+            )?;
+            let plan = nullify_default_partition_columns(plan, &self.partition_columns)?;
+            plans.push(plan);
+        }
+
+        if plans.len() == 1 {
+            Ok(plans.pop().unwrap())
+        } else {
+            Ok(UnionExec::try_new(plans)?)
+        }
+    }
+}
+
+fn projected_schema(schema: &Schema, projection: Option<&[usize]>) -> SchemaRef {
+    match projection {
+        Some(idx) => {
+            let fields: Vec<Field> = idx.iter().map(|&i| schema.field(i).clone()).collect();
+            Arc::new(Schema::new(fields).with_metadata(schema.metadata().clone()))
+        }
+        None => Arc::new(schema.clone()),
+    }
+}
+
+fn file_column_projection(projection: Option<&[usize]>, n_file: usize) -> Option<Vec<usize>> {
+    let sel = projection?;
+    let file_idx: Vec<usize> = sel.iter().copied().filter(|&i| i < n_file).collect();
+    if file_idx.is_empty() {
+        None
+    } else {
+        Some(file_idx)
+    }
+}
+
+fn references_only_partition_cols(expr: &Expr, partition_cols: &[String]) -> bool {
+    let mut only = true;
+    let mut any = false;
+    let _ = expr.apply(|node| {
+        if let Expr::Column(c) = node {
+            any = true;
+            if !partition_cols.iter().any(|p| p == &c.name) {
+                only = false;
+            }
+        }
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    });
+    any && only
+}
+
+fn attach_partition_values(
+    plan: Arc<dyn ExecutionPlan>,
+    file_schema: &Schema,
+    partition_columns: &[String],
+    values: &std::collections::BTreeMap<String, String>,
+    projection: Option<&[usize]>,
+    full_schema: &Schema,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    let selected: Vec<usize> = match projection {
+        Some(p) => p.to_vec(),
+        None => (0..full_schema.fields().len()).collect(),
+    };
+    let inner_schema = plan.schema();
+    let n_file = file_schema.fields().len();
+    let exprs = selected
+        .iter()
+        .map(|&i| {
+            let field = full_schema.field(i);
+            let name = field.name().clone();
+            let expr: Arc<dyn PhysicalExpr> = if i < n_file {
+                phys_col(&name, inner_schema.as_ref())?
+            } else {
+                let key = &partition_columns[i - n_file];
+                let raw = values
+                    .get(key)
+                    .map(String::as_str)
+                    .unwrap_or(HIVE_DEFAULT_PARTITION);
+                phys_lit(partition_scalar(raw, field.data_type()))
+            };
+            Ok((expr, name))
+        })
+        .collect::<DFResult<Vec<(Arc<dyn PhysicalExpr>, String)>>>()?;
+    Ok(Arc::new(ProjectionExec::try_new(exprs, plan)?))
+}
+
+fn partition_scalar(raw: &str, dt: &DataType) -> ScalarValue {
+    if raw == HIVE_DEFAULT_PARTITION {
+        return match dt {
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+                ScalarValue::Utf8(Some(HIVE_DEFAULT_PARTITION.to_string()))
+            }
+            other => ScalarValue::try_from(other).unwrap_or(ScalarValue::Null),
+        };
+    }
+    ScalarValue::try_from_string(raw.to_string(), dt)
+        .unwrap_or_else(|_| ScalarValue::Utf8(Some(raw.to_string())))
 }
 
 /// `schema` with every field named in `partition_columns` remarked nullable.
@@ -548,6 +833,20 @@ impl TableProvider for HiveTableProvider {
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let rewritten = normalize_default_partition_filters(filters, &self.partition_columns)?;
+        if self.uses_index_scan() {
+            // Heap-allocate the indexed path: its future (per-partition
+            // ListingTable scans) is large enough that constructing it in
+            // this already-boxed async_trait method overflowed a 2 MB
+            // tokio worker during SELECT.
+            let proj = projection.cloned();
+            return Box::pin(self.scan_from_entries(
+                state,
+                proj.as_deref(),
+                rewritten,
+                limit,
+            ))
+            .await;
+        }
         let plan = self
             .inner
             .scan(state, projection, &rewritten, limit)
@@ -567,6 +866,18 @@ impl TableProvider for HiveTableProvider {
             )?),
             None => None,
         };
+        if self.uses_index_scan() {
+            let filters = rewritten.unwrap_or_default();
+            let proj = args.projection().map(|s| s.to_vec());
+            let plan = Box::pin(self.scan_from_entries(
+                state,
+                proj.as_deref(),
+                filters,
+                args.limit(),
+            ))
+            .await?;
+            return Ok(ScanResult::new(plan));
+        }
         let mut new_args = ScanArgs::default()
             .with_projection(args.projection())
             .with_limit(args.limit());
@@ -800,10 +1111,22 @@ impl SchemaProvider for HiveSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        let manifest = match self.store.get(&self.database, name).await {
-            Ok(m) => m,
+        let etag = match self.store.manifest_etag(&self.database, name).await {
+            Ok(e) => e,
             Err(HiveError::NotFound(_)) => return Ok(None),
             Err(e) => return Err(to_df(e)),
+        };
+        let manifest = if let Some(cached) =
+            self.cache
+                .get_if_fresh(&self.database, name, etag.as_deref())
+        {
+            cached
+        } else {
+            match self.store.get(&self.database, name).await {
+                Ok(m) => m,
+                Err(HiveError::NotFound(_)) => return Ok(None),
+                Err(e) => return Err(to_df(e)),
+            }
         };
 
         // Cache BEFORE building the table. The policy layer's `TagSource` is
@@ -820,7 +1143,8 @@ impl SchemaProvider for HiveSchemaProvider {
         // `loading_a_table_populates_the_metadata_cache_before_returning`)
         // green, which is exactly why the happy-path test alone was not
         // enough.
-        self.cache.insert(&self.database, name, manifest.clone());
+        self.cache
+            .insert_versioned(&self.database, name, manifest.clone(), etag);
 
         let resolved = resolve_format(&manifest).map_err(to_df)?;
         let file_schema = file_schema_of(&manifest).map_err(to_df)?;
@@ -857,26 +1181,48 @@ impl SchemaProvider for HiveSchemaProvider {
         self.runtime
             .register_object_store(url.as_ref(), Arc::clone(&data_store));
 
-        let width_hint = row_width_hint(&file_schema);
+        let file_schema_ref = Arc::new(file_schema);
+        let width_hint = row_width_hint(&file_schema_ref);
         let config = ListingTableConfig::new(url.clone())
             .with_listing_options(options)
-            .with_schema(Arc::new(file_schema));
+            .with_schema(Arc::clone(&file_schema_ref));
         let listing_table = ListingTable::try_new(config)?;
         let full_schema = listing_table.schema();
 
-        let statistics = match data_store
-            .list(Some(url.prefix()))
-            .try_collect::<Vec<ObjectMeta>>()
-            .await
-        {
-            Ok(files) => size_only_statistics(&files, width_hint, &full_schema),
-            Err(e) => {
-                warn!(
-                    database = %self.database, table = %name, error = %e,
-                    "hive_external: could not list files for size-only statistics; \
-                     table remains queryable with unknown statistics"
-                );
-                Statistics::new_unknown(&full_schema)
+        let projection_cfg =
+            parse_projection(&manifest.parameters, &manifest.partition_keys).map_err(to_df)?;
+        let index = manifest.sqe.partition_index.clone();
+        let partition_types: Vec<(String, String)> = manifest
+            .partition_keys
+            .iter()
+            .map(|k| (k.name.clone(), k.r#type.clone()))
+            .collect();
+
+        let statistics = if let Some(hs) = manifest.hive_statistics() {
+            let bytes = index
+                .as_ref()
+                .map(|i| i.entries.iter().map(|e| e.total_bytes).sum());
+            analyzed_statistics(hs.row_count, bytes, &full_schema)
+        } else if let Some(idx) = &index {
+            let bytes: u64 = idx.entries.iter().map(|e| e.total_bytes).sum();
+            size_only_from_index(bytes, width_hint, &full_schema)
+        } else if projection_cfg.as_ref().map(|p| p.enabled).unwrap_or(false) {
+            Statistics::new_unknown(&full_schema)
+        } else {
+            match data_store
+                .list(Some(url.prefix()))
+                .try_collect::<Vec<ObjectMeta>>()
+                .await
+            {
+                Ok(files) => size_only_statistics(&files, width_hint, &full_schema),
+                Err(e) => {
+                    warn!(
+                        database = %self.database, table = %name, error = %e,
+                        "hive_external: could not list files for size-only statistics; \
+                         table remains queryable with unknown statistics"
+                    );
+                    Statistics::new_unknown(&full_schema)
+                }
             }
         };
 
@@ -884,6 +1230,16 @@ impl SchemaProvider for HiveSchemaProvider {
             listing_table,
             statistics,
             partition_names,
+            partition_types,
+            index,
+            projection_cfg,
+            resolved,
+            file_schema_ref,
+            Arc::clone(&self.data_store_factory),
+            manifest.secret().map(str::to_string),
+            Arc::clone(&self.runtime),
+            self.store.limits().max_partition_index_entries,
+            manifest.storage_descriptor.location.clone(),
         ))))
     }
 }
