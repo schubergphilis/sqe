@@ -587,6 +587,14 @@ mod tests {
         fn schema(&self) -> SchemaRef {
             self.schema.clone()
         }
+        /// SQE PATCH (DataFusion 55): test mock, owns no expressions.
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+        ) -> DFResult<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
         fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }

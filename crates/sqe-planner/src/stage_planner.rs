@@ -428,7 +428,8 @@ mod tests {
 
     use datafusion::error::Result as DFResult;
     use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-    use datafusion::physical_expr::EquivalenceProperties;
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion::physical_plan::{DisplayAs, DisplayFormatType, Partitioning, PlanProperties};
 
@@ -476,6 +477,14 @@ mod tests {
         fn schema(&self) -> SchemaRef {
             self.schema.clone()
         }
+        /// SQE PATCH (DataFusion 55): test mock, owns no expressions.
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+        ) -> DFResult<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
         fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
