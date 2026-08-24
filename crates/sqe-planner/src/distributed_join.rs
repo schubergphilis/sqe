@@ -20,8 +20,9 @@
 
 use std::sync::Arc;
 
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::arrow::compute::SortOptions;
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::Result;
 use datafusion::config::ConfigOptions;
 use datafusion::logical_expr::JoinType;
@@ -281,6 +282,17 @@ impl ExecutionPlan for BroadcastJoinPlan {
         self.inner_join.schema()
     }
 
+    /// SQE PATCH (DataFusion 55): this node owns no physical expressions of its
+    /// own. `inner_as_plan` is `inner_join` upcast and is returned from
+    /// `children()`, so the `HashJoinExec`'s expressions are visited when the
+    /// traversal descends into that child.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
         self.inner_join.properties()
     }
@@ -525,6 +537,16 @@ impl ExecutionPlan for ShuffleHashJoinPlan {
 
     fn schema(&self) -> arrow_schema::SchemaRef {
         self.properties.eq_properties.schema().clone()
+    }
+
+    /// SQE PATCH (DataFusion 55): the join keys here are column *names*
+    /// (`Vec<String>`), resolved on the worker, not `PhysicalExpr`s, so this
+    /// node owns no expressions to report.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {

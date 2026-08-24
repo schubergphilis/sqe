@@ -26,7 +26,9 @@
 use std::fmt;
 use std::sync::Arc;
 
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::apply_expression_roots;
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Result, ScalarValue};
 use datafusion::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -314,6 +316,16 @@ impl ExecutionPlan for DistributedSortExec {
 
     fn schema(&self) -> arrow_schema::SchemaRef {
         self.input.schema()
+    }
+
+    /// SQE PATCH (DataFusion 55): report the sort key expressions. These are
+    /// real `PhysicalExpr` roots owned by this node, so hiding them would make
+    /// them invisible to expression rewriting and display.
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        apply_expression_roots(self.sort_exprs.iter().map(|s| &s.expr), f)
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
