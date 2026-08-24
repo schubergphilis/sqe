@@ -8,4 +8,4 @@
 # This pins the toolchain used for development and CI. The crates' declared
 # minimum supported Rust version stays `rust-version = "1.85"` in Cargo.toml;
 # this bump does not raise what downstream consumers need.
-channel = "1.97.1"
+channel = "1.98.0"
