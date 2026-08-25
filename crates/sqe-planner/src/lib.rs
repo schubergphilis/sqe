@@ -48,7 +48,7 @@ pub use scan_morsel::{
     ScanMorsel, DEFAULT_MORSEL_MAX_BYTES, DEFAULT_MORSEL_TARGET_BYTES, SCAN_TASK_VERSION_CURRENT,
     SCAN_TASK_VERSION_V1, SCAN_TASK_VERSION_V2,
 };
-pub use scan_task::ScanTask;
+pub use scan_task::{HiveScanDescriptor, HiveScanFormat, ScanTask};
 pub use shuffle_exec::{ShufflePartitioning, ShuffleReaderExec, ShuffleWriterExec};
 pub use single_distinct_count::SingleDistinctCountCompanionRule;
 pub use sort_memory::{

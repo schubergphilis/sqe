@@ -127,6 +127,7 @@ mod tests {
 
     fn make_task(id: &str) -> ScanTask {
         ScanTask {
+            hive: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,

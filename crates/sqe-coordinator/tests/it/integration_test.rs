@@ -340,6 +340,7 @@ async fn test_local_fallback_without_workers() {
 #[test]
 fn test_scan_task_roundtrip() {
     let task = sqe_planner::ScanTask {
+        hive: None,
         version: 1,
         morsel_id: None,
         row_group_start: None,

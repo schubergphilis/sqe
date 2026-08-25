@@ -3839,6 +3839,7 @@ impl QueryHandler {
                     let file_sizes_bytes: Vec<u64> =
                         group_morsels.iter().map(|m| m.file_size_bytes).collect();
                     vec![sqe_planner::ScanTask {
+                        hive: None,
                         version: sqe_planner::SCAN_TASK_VERSION_V1,
                         morsel_id: None,
                         row_group_start: None,
@@ -3866,6 +3867,7 @@ impl QueryHandler {
                     group_morsels
                         .into_iter()
                         .map(|m| sqe_planner::ScanTask {
+                            hive: None,
                             version: sqe_planner::SCAN_TASK_VERSION_V2,
                             morsel_id: Some(m.morsel_id.clone()),
                             row_group_start: None,
