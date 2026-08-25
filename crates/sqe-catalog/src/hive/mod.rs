@@ -15,6 +15,7 @@ pub mod provider;
 pub mod serde_map;
 pub mod stats;
 pub mod store;
+pub mod worker_scan;
 
 pub use ddl_render::{hive_spec_from_manifest, render_hive_create_table_ddl};
 
