@@ -22,14 +22,14 @@
 
 ## 3b. Worker-side execution of a Hive task
 
-- [ ] 3b.1 Read `task.hive` in the worker scan path and report the FULL schema.
-- [ ] 3b.2 Call `append_partition_columns` BEFORE the batch's `BytePermit` is
+- [x] 3b.1 Read `task.hive` in the worker scan path and report the FULL schema.
+- [x] 3b.2 Call `append_partition_columns` BEFORE the batch's `BytePermit` is
       acquired. See design.md: doing it as a stream transform afterwards
       under-accounts memory, because the permit was sized to the pre-partition
       batch and `Accounted::get_mut` will not complain.
-- [ ] 3b.3 Test: the permit's logical size covers the materialized batch, not
+- [x] 3b.3 Test: the permit's logical size covers the materialized batch, not
       the file-columns-only batch.
-- [ ] 3b.4 Refuse a v3 Hive task whose format the worker cannot read, with the
+- [x] 3b.4 Refuse a v3 Hive task whose format the worker cannot read, with the
       reason, rather than failing inside a parquet footer read.
 
 ## 4. Differential correctness
