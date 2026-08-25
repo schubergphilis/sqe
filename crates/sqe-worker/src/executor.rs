@@ -437,6 +437,27 @@ pub async fn execute_scan_streaming_with_store(
         anyhow::bail!("ScanTask has no data files");
     }
 
+    // A Hive task whose format this worker cannot read must be refused HERE,
+    // naming the format. Letting it through means failing several layers down
+    // inside a parquet footer read, with an error that describes a corrupt
+    // file rather than an unsupported format. The coordinator is supposed to
+    // have made this decision already (`hive::worker_scan::servability`), so
+    // reaching this is a coordinator bug, and it should say so plainly.
+    let hive_ctx: Option<Arc<(sqe_planner::HiveScanDescriptor, SchemaRef)>> = match &task.hive {
+        None => None,
+        Some(d) => {
+            if !matches!(d.format, sqe_planner::HiveScanFormat::Parquet) {
+                anyhow::bail!(
+                    "worker cannot execute a hive scan of format {:?}; this release reads \
+                     parquet only, and the coordinator should not have dispatched it",
+                    d.format
+                );
+            }
+            let full = crate::hive_partition::full_schema_of(d).map_err(|e| anyhow::anyhow!(e))?;
+            Some(Arc::new((d.clone(), full)))
+        }
+    };
+
     let start = std::time::Instant::now();
     let scan_budget = scan_budget.unwrap_or_else(|| default_scan_budget(&session_ctx));
 
@@ -456,6 +477,14 @@ pub async fn execute_scan_streaming_with_store(
         coordinator_metrics.as_deref(),
     )
     .await?;
+
+    // A Hive scan's output carries the partition columns too, so the schema
+    // reported to the caller is the full one, not the data file's. Taken here,
+    // before `hive_ctx` moves into the producer task.
+    let out_schema: SchemaRef = match &hive_ctx {
+        Some(ctx) => Arc::clone(&ctx.1),
+        None => Arc::clone(&first_schema),
+    };
 
     // Fetch-resident: charge a capped estimate of the open file's compressed
     // size against the scan budget while the file streams. Dropped when the
@@ -551,7 +580,25 @@ pub async fn execute_scan_streaming_with_store(
             queue_space: &Notify,
             metrics: &Option<Arc<WorkerMetricsRegistry>>,
             batch: RecordBatch,
+            hive: Option<&Arc<(sqe_planner::HiveScanDescriptor, SchemaRef)>>,
         ) -> bool {
+            // Materialize Hive partition columns BEFORE sizing. Doing it after
+            // the permit is acquired would leave the worker holding more memory
+            // than it reserved: a partition column allocates one value per row,
+            // and `Accounted::get_mut` would not complain. See design.md.
+            let batch = match hive {
+                None => batch,
+                Some(ctx) => {
+                    let (desc, full) = ctx.as_ref();
+                    match crate::hive_partition::append_partition_columns(&batch, desc, full) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let _ = tx.send(Err(anyhow::anyhow!(e))).await;
+                            return false;
+                        }
+                    }
+                }
+            };
             let batch_bytes = batch.get_array_memory_size();
             let permit = match scan_budget.acquire(batch_bytes).await {
                 Ok(p) => p,
@@ -596,7 +643,7 @@ pub async fn execute_scan_streaming_with_store(
                 Ok(batch) => {
                     total_rows += batch.num_rows();
                     first_file_bytes += batch.get_array_memory_size();
-                    if !emit_batch(&tx, &scan_budget, &queue_bytes, &queue_space, &metrics, batch)
+                    if !emit_batch(&tx, &scan_budget, &queue_bytes, &queue_space, &metrics, batch, hive_ctx.as_ref())
                         .await
                     {
                         return;
@@ -708,7 +755,7 @@ pub async fn execute_scan_streaming_with_store(
                 match batch_res {
                     Ok(batch) => {
                         total_rows += batch.num_rows();
-                        if !emit_batch(&tx, &scan_budget, &queue_bytes, &queue_space, &metrics, batch)
+                        if !emit_batch(&tx, &scan_budget, &queue_bytes, &queue_space, &metrics, batch, hive_ctx.as_ref())
                         .await
                     {
                             return;
@@ -801,7 +848,7 @@ pub async fn execute_scan_streaming_with_store(
         metrics,
         scan_budget,
     });
-    Ok((first_schema, out_stream))
+    Ok((out_schema, out_stream))
 }
 
 /// Open a single Parquet file and return its batch stream plus its byte size.

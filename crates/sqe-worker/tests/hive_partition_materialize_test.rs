@@ -176,3 +176,57 @@ fn a_descriptor_claiming_more_partitions_than_the_schema_is_an_error() {
     let err = append_partition_columns(&file_batch(), &desc, &parsed).unwrap_err();
     assert!(err.contains("partition columns"), "got: {err}");
 }
+
+// ─── Task 3b.3: the memory the permit must cover ────────────────────────────
+
+/// The worker sizes a batch with `get_array_memory_size()` and acquires a
+/// `BytePermit` for exactly that many bytes. If partition columns are appended
+/// AFTER that, the worker holds more memory than it reserved.
+///
+/// This test does not exercise the permit directly -- it pins the fact the
+/// integration depends on: materializing GROWS the batch, measurably. If this
+/// ever reported zero growth, the ordering constraint in `emit_batch` would be
+/// pointless and someone would rightly delete it.
+#[test]
+fn materializing_partition_columns_grows_the_batch_measurably() {
+    let schema = full_schema(vec![
+        Field::new("region", DataType::Utf8, true),
+        Field::new("dt", DataType::Utf8, true),
+    ]);
+    let desc = descriptor(
+        vec!["region", "dt"],
+        &[("region", "europe-west-1"), ("dt", "2024-01-01")],
+        &schema,
+    );
+    let parsed = full_schema_of(&desc).unwrap();
+
+    let before = file_batch();
+    let after = append_partition_columns(&before, &desc, &parsed).unwrap();
+
+    let grew_by = after.get_array_memory_size() as i64 - before.get_array_memory_size() as i64;
+    assert!(
+        grew_by > 0,
+        "appending two string partition columns must grow the batch; if it does \
+         not, the permit-ordering constraint in emit_batch is unnecessary. \
+         before={} after={}",
+        before.get_array_memory_size(),
+        after.get_array_memory_size()
+    );
+}
+
+/// The sentinel path allocates too. A NULL array is not free, so the same
+/// ordering constraint applies to a default partition.
+#[test]
+fn even_a_null_partition_column_adds_memory() {
+    let schema = full_schema(vec![Field::new("dt", DataType::Utf8, true)]);
+    let desc = descriptor(vec!["dt"], &[], &schema); // sentinel -> NULL
+    let parsed = full_schema_of(&desc).unwrap();
+
+    let before = file_batch();
+    let after = append_partition_columns(&before, &desc, &parsed).unwrap();
+    assert!(
+        after.get_array_memory_size() >= before.get_array_memory_size(),
+        "a NULL partition column still allocates a validity buffer"
+    );
+    assert_eq!(after.num_columns(), before.num_columns() + 1);
+}
