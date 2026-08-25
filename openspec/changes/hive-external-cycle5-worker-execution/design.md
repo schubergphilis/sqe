@@ -83,3 +83,38 @@ So the acceptance test is differential rather than golden: run the same query bo
 ## Sequencing
 
 Parquet first: it is the format the worker already reads, so it isolates the partition-materialization problem from the reader problem. CSV and JSON follow, and they are where the SerDe parameters start to matter.
+
+## Where partition materialization must happen on the worker, and why not later
+
+The worker's scan returns `(SchemaRef, ScanBatchStream)`, and
+`ScanBatchStream` yields `AccountedBatch = Accounted<RecordBatch>`: a batch
+paired with a `BytePermit` sized to that batch.
+
+The obvious integration is to leave the Parquet reader alone and map each batch
+through `append_partition_columns` on the way out. It is wrong. Appending
+partition columns allocates a full constant array per column per batch, so the
+batch grows AFTER its permit was acquired, and the worker then holds more memory
+than it reserved. `Accounted::get_mut` makes that easy to do by accident: the
+permit stays at the old size and nothing complains.
+
+The size is not marginal either. A Utf8 partition column materializes one string
+per row, matching what coordinator-local execution does (`ProjectionExec` over a
+literal also produces a full array), so the growth is real on both paths -- but
+only the worker path has a permit that would be wrong about it.
+
+So materialization must happen **before the permit is acquired**, inside batch
+production, not as a stream transform afterwards. That is a deeper integration
+point than task 2 assumed, and it is the reason task 2's function takes a
+`RecordBatch` and returns one rather than operating on the stream: the pure
+function is correct and reusable, and only its CALL SITE is constrained.
+
+Alternatives considered:
+
+- Grow the permit after the fact. Possible, but it moves an acquire into the
+  hot per-batch path and can fail mid-stream, which turns a memory question into
+  an error-handling question.
+- Materialize partition columns as dictionary or run-end arrays so the growth is
+  negligible. Attractive, and it is what several engines do, but the output would
+  then differ in ARRAY TYPE from coordinator-local execution, which is exactly
+  the equivalence the differential tests exist to protect. It would need the
+  coordinator path changed in the same way, in the same change.
