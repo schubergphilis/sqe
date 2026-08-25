@@ -14,7 +14,24 @@ use datafusion::physical_plan::{displayable, ExecutionPlan};
 use datafusion::prelude::SessionContext;
 use sqe_catalog::hive::manifest::PartitionIndexEntry;
 use sqe_catalog::hive::scan_exec::{HiveScanExec, HiveScanSpec};
+use sqe_catalog::hive::provider::HiveDataStoreFactory;
 use sqe_catalog::hive::serde_map::{HiveFileFormat, ResolvedFormat};
+
+/// The listing path is exercised by the integration suite against a real store;
+/// these tests are about findability and row-equivalence, so the factory is a
+/// stub that is never called.
+#[derive(Debug)]
+struct UnusedStoreFactory;
+
+impl HiveDataStoreFactory for UnusedStoreFactory {
+    fn store_for(
+        &self,
+        _location: &str,
+        _secret: Option<&str>,
+    ) -> Result<Arc<dyn object_store::ObjectStore>, sqe_catalog::hive::HiveError> {
+        unreachable!("these tests never list")
+    }
+}
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -60,6 +77,7 @@ fn spec(n_partitions: usize) -> HiveScanSpec {
         partition_columns: vec!["dt".to_string()],
         full_schema: schema(),
         secret: None,
+        data_store_factory: Arc::new(UnusedStoreFactory),
     }
 }
 

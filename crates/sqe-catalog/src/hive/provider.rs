@@ -350,7 +350,7 @@ fn to_df(e: HiveError) -> DataFusionError {
 /// Hive DDL requires a trailing slash on `LOCATION`, so a table declared
 /// without one would otherwise make every file below it invisible to the
 /// scan. This is the layer that owns normalizing that gap.
-fn table_location_url(location: &str) -> Result<ListingTableUrl, HiveError> {
+pub(crate) fn table_location_url(location: &str) -> Result<ListingTableUrl, HiveError> {
     let normalized = if location.ends_with('/') {
         location.to_string()
     } else {
@@ -710,6 +710,7 @@ impl HiveTableProvider {
                 partition_columns: self.partition_columns.clone(),
                 full_schema: Arc::clone(&self.schema),
                 secret: self.secret.clone(),
+                data_store_factory: Arc::clone(&self.data_store_factory),
             },
         )))
     }

@@ -27,8 +27,13 @@
 //! inner plan costs nothing meaningful even when it is later discarded --
 //! `ListingTable` lists lazily at execute time, so an unused plan does no I/O.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
+
+use futures::TryStreamExt;
+use object_store::ObjectMeta;
+use url::Url;
 
 use arrow_schema::SchemaRef;
 use datafusion::common::tree_node::TreeNodeRecursion;
@@ -41,6 +46,8 @@ use datafusion::physical_plan::{
 };
 
 use super::manifest::PartitionIndexEntry;
+use super::provider::{table_location_url, HiveDataStoreFactory};
+use crate::hive::HiveError;
 use super::serde_map::ResolvedFormat;
 
 /// What the coordinator needs to turn this scan into worker tasks, without
@@ -58,6 +65,11 @@ pub struct HiveScanSpec {
     pub full_schema: SchemaRef,
     /// Named secret for the data store, if the manifest declared one.
     pub secret: Option<String>,
+    /// Builds an object store for a partition's location. Carried on the spec
+    /// so the node can list its own files, the way `IcebergScanExec` answers
+    /// `data_file_info()` for itself, rather than making the coordinator
+    /// reconstruct storage access from the plan.
+    pub data_store_factory: Arc<dyn HiveDataStoreFactory>,
 }
 
 /// A Hive external table scan, wrapping the plan that executes it.
@@ -79,6 +91,67 @@ impl HiveScanExec {
     /// The plan that executes this scan coordinator-local.
     pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
         &self.input
+    }
+
+    /// List the data files of each surviving partition, as
+    /// `(partition values, [(url, size_bytes)])`.
+    ///
+    /// The Hive analogue of `IcebergScanExec::data_file_info()`, and the input
+    /// `build_hive_scan_tasks` needs. Sizes are collected because placement
+    /// without them is blind: that is the whole reason the coordinator lists
+    /// rather than shipping a prefix for the worker to expand.
+    ///
+    /// Only partitions that survived pruning are listed. That bound is what the
+    /// cycle-2 partition index bought, and this spends it deliberately rather
+    /// than walking the table.
+    ///
+    /// A partition whose listing fails is an error rather than an empty
+    /// partition: silently returning no files would turn an unreachable
+    /// location into a query that succeeds with missing rows.
+    pub async fn partition_files(
+        &self,
+    ) -> Result<Vec<(BTreeMap<String, String>, Vec<(String, u64)>)>, HiveError> {
+        let ext = self.spec.resolved.file_extension.clone();
+        let mut out = Vec::with_capacity(self.spec.entries.len());
+
+        for entry in &self.spec.entries {
+            let url = table_location_url(&entry.location)?;
+            let store = self
+                .spec
+                .data_store_factory
+                .store_for(&entry.location, self.spec.secret.as_deref())?;
+
+            let metas: Vec<ObjectMeta> = store
+                .list(Some(url.prefix()))
+                .try_collect()
+                .await
+                .map_err(|e| {
+                    HiveError::Validation(format!(
+                        "listing partition `{}`: {e}",
+                        entry.location
+                    ))
+                })?;
+
+            let base = Url::parse(&entry.location).map_err(|e| {
+                HiveError::Validation(format!("partition location `{}`: {e}", entry.location))
+            })?;
+
+            let mut files = Vec::new();
+            for m in metas {
+                let key = m.location.as_ref();
+                // Skip directory markers and anything the table's format would
+                // not read. An empty declared extension means "no filter",
+                // which is how Hive's extensionless part files are handled.
+                if key.ends_with('/') || (!ext.is_empty() && !key.ends_with(&ext)) {
+                    continue;
+                }
+                let mut full = base.clone();
+                full.set_path(key);
+                files.push((full.to_string(), m.size));
+            }
+            out.push((entry.values.clone(), files));
+        }
+        Ok(out)
     }
 }
 
