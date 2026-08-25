@@ -118,3 +118,65 @@ Alternatives considered:
   then differ in ARRAY TYPE from coordinator-local execution, which is exactly
   the equivalence the differential tests exist to protect. It would need the
   coordinator path changed in the same way, in the same change.
+
+## The real obstacle is the plan shape, not the ticket
+
+This design opened by saying `ScanTask` cannot carry a Hive scan, following the
+reference page's framing that cycle 5 is blocked "because `ScanTask` today is
+shaped for Parquet and Iceberg field IDs". That is true, and it is now fixed,
+and it was not the hard part.
+
+The coordinator decides what to distribute by finding ONE node:
+
+```rust
+let scan_node = find_iceberg_scan(&plan);
+let iceberg_scan = scan_node.downcast_ref::<IcebergScanExec>();
+```
+
+`IcebergScanExec` is a single, SQE-owned plan node that knows its table, its
+projection and its files. Everything downstream -- `dim_build_swap`,
+`explain.rs`, `parallel_probe_scan` -- finds it the same way.
+
+A Hive scan has no such node. `scan_from_entries` emits, per surviving
+partition, a `ListingTable` scan wrapped in `attach_partition_values`'
+`ProjectionExec` and then `nullify_default_partition_columns`' second
+`ProjectionExec`, and unions them:
+
+```
+UnionExec
+├── ProjectionExec(nullify) -> ProjectionExec(partition values) -> ListingTable scan
+└── ProjectionExec(nullify) -> ProjectionExec(partition values) -> ListingTable scan
+```
+
+There is nothing to downcast to and nothing carrying the table's identity. So
+the remaining work is not "call `build_hive_scan_tasks` from the provider"; it
+is giving Hive a scan node.
+
+### Two ways, and only one of them is safe
+
+**Recognize the shape.** Walk the plan for a `UnionExec` whose children all
+match projection-over-projection-over-`ListingTable`. Cheap to write and a trap:
+it is pattern-matching on the output of two other functions plus whatever
+DataFusion's optimizer did to them. Any rule that collapses a single-partition
+union, reorders a projection, or fuses the two projections silently stops the
+match, and the symptom is not an error -- it is the scan quietly failing to
+distribute, which is the exact invisibility `HiveLocalScanExec` was built to
+prevent.
+
+**Give Hive its own node.** `HiveScanExec`, emitted by `HiveTableProvider`,
+carrying the planned partition entries, the resolved format, the partition
+columns and the full schema -- the Hive analogue of `IcebergScanExec`. The
+coordinator finds it by downcast, exactly as it finds the Iceberg one, and
+replaces it with a `DistributedScanExec` built from `build_hive_scan_tasks`.
+
+The second is the real work of cycle 5 and it is a provider refactor, not a
+wiring task: `scan_from_entries` currently BUILDS the execution plan, and it
+would instead have to describe the scan and let one node own execution. The
+partition materialization and sentinel-nullification logic moves inside that
+node, which has the side benefit of putting it next to the worker-side copy that
+must agree with it.
+
+Nothing already built is wasted: the ticket, the worker-side materialization,
+the task builder and the servability decision are all needed either way. But
+the sequencing changes -- `HiveScanExec` comes before the differential harness,
+because until it exists there is nothing to dispatch.

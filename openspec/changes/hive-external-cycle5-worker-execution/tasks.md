@@ -32,6 +32,26 @@
 - [x] 3b.4 Refuse a v3 Hive task whose format the worker cannot read, with the
       reason, rather than failing inside a parquet footer read.
 
+## 3c. Give Hive a scan node (prerequisite for everything below)
+
+Discovered while wiring 3.1: the coordinator finds what to distribute by
+`downcast_ref::<IcebergScanExec>()`, and a Hive scan is a UnionExec of
+projections over ListingTable scans with no SQE-owned node in it. See design.md.
+
+- [ ] 3c.1 `HiveScanExec`: one node owning the planned entries, resolved format,
+      partition columns and full schema.
+- [ ] 3c.2 `HiveTableProvider::scan` emits it instead of building the union.
+      Partition materialization and sentinel nullification move inside it,
+      next to the worker-side copy they must agree with.
+- [ ] 3c.3 Coordinator finds it by downcast and replaces it with a
+      `DistributedScanExec` built from `build_hive_scan_tasks`.
+- [ ] 3c.4 Do NOT pattern-match the union shape as a shortcut. It matches on the
+      output of two other functions plus the optimizer, and when a rule reshapes
+      the plan the scan silently stops distributing -- no error, just an idle
+      cluster.
+- [ ] 3c.5 Regression: the rows an unpartitioned and a multi-partition Hive
+      table return are unchanged by the refactor, BEFORE any dispatch is added.
+
 ## 4. Differential correctness
 
 - [ ] 4.1 Harness: run a query coordinator-local and worker-distributed, compare rows.
