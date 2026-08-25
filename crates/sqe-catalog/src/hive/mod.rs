@@ -15,6 +15,7 @@ pub mod provider;
 pub mod serde_map;
 pub mod stats;
 pub mod store;
+pub mod scan_exec;
 pub mod scan_mode;
 pub mod worker_scan;
 
