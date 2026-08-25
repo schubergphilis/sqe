@@ -230,6 +230,7 @@ mod tests {
 
     fn make_task(id: &str, file_count: usize, file_size_mb: u64) -> ScanTask {
         ScanTask {
+            hive: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,
@@ -257,6 +258,7 @@ mod tests {
 
     fn make_task_with_sizes(id: &str, sizes: &[u64]) -> ScanTask {
         ScanTask {
+            hive: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,
@@ -738,6 +740,7 @@ mod tests {
         let file_path = "s3://bucket/dashboard/metrics.parquet".to_string();
 
         let task1 = ScanTask {
+            hive: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,
@@ -760,6 +763,7 @@ mod tests {
             limit: None,
         };
         let task2 = ScanTask {
+            hive: None,
             version: 1,
             morsel_id: None,
             row_group_start: None,

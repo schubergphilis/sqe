@@ -45,7 +45,11 @@ datafusion-proto = "55"
 arrow = { version = "59", features = ["prettyprint", "ipc_compression"] }
 arrow-flight = { version = "59", features = ["flight-sql-experimental"] }
 arrow-ipc = { version = "59", features = ["lz4", "zstd"] }
-arrow-schema = "59"
+# `serde` is enabled for cycle 5: a Hive ScanTask carries the table's full
+# Arrow schema so a worker can type directory-encoded partition literals the
+# same way the coordinator does. The feature only adds Serialize/Deserialize
+# impls; it changes no behaviour for anything already using arrow-schema.
+arrow-schema = { version = "59", features = ["serde"] }
 arrow-array = "59"
 arrow-buffer = "59"
 parquet = { version = "59", features = ["async", "object_store"] }
