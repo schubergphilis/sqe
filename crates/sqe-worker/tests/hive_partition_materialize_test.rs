@@ -83,17 +83,43 @@ fn a_typed_partition_key_keeps_its_declared_type() {
 }
 
 #[test]
-fn a_missing_value_becomes_the_hive_default_partition() {
-    // `attach_partition_values` uses `unwrap_or(HIVE_DEFAULT_PARTITION)`, and
-    // for a Utf8 column that surfaces as the literal string, not NULL.
+fn the_default_partition_sentinel_becomes_null_not_the_literal_string() {
+    // The first version of this test asserted the literal string, which is
+    // what `attach_partition_values` produces -- but that is an INTERMEDIATE.
+    // The coordinator then runs `nullify_default_partition_columns`, which
+    // rewrites a Utf8 partition column equal to the sentinel to NULL. Asserting
+    // the intermediate would have locked in a worker that returns
+    // "__HIVE_DEFAULT_PARTITION__" where the coordinator returns NULL: same
+    // type, same row count, different values.
     let schema = full_schema(vec![Field::new("dt", DataType::Utf8, true)]);
     let desc = descriptor(vec!["dt"], &[], &schema); // no value for dt
     let parsed = full_schema_of(&desc).unwrap();
 
     let out = append_partition_columns(&file_batch(), &desc, &parsed).expect("materialize");
     let dt = out.column_by_name("dt").unwrap();
-    let vals = dt.as_any().downcast_ref::<StringArray>().expect("Utf8");
-    assert_eq!(vals.value(0), "__HIVE_DEFAULT_PARTITION__");
+    assert_eq!(
+        dt.null_count(),
+        dt.len(),
+        "the sentinel must resolve to NULL, matching what coordinator-local \
+         execution returns after nullify_default_partition_columns"
+    );
+}
+
+#[test]
+fn an_explicit_value_is_not_nullified() {
+    // The control for the test above: only the sentinel nullifies. If the
+    // worker nullified every partition value the test above would still pass.
+    let schema = full_schema(vec![Field::new("dt", DataType::Utf8, true)]);
+    let desc = descriptor(vec!["dt"], &[("dt", "2024-01-01")], &schema);
+    let parsed = full_schema_of(&desc).unwrap();
+
+    let out = append_partition_columns(&file_batch(), &desc, &parsed).unwrap();
+    let dt = out.column_by_name("dt").unwrap();
+    assert_eq!(dt.null_count(), 0, "an explicit value must survive");
+    assert_eq!(
+        dt.as_any().downcast_ref::<StringArray>().unwrap().value(0),
+        "2024-01-01"
+    );
 }
 
 #[test]

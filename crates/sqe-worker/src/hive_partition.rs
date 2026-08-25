@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
+use datafusion::common::ScalarValue;
 use sqe_catalog::hive::manifest::HIVE_DEFAULT_PARTITION;
 use sqe_catalog::hive::provider::partition_scalar;
 use sqe_planner::HiveScanDescriptor;
@@ -75,7 +76,25 @@ pub fn append_partition_columns(
             .get(key)
             .map(String::as_str)
             .unwrap_or(HIVE_DEFAULT_PARTITION);
-        let scalar = partition_scalar(raw, field.data_type());
+        // The sentinel resolves to NULL, not to the literal string.
+        //
+        // Coordinator-local execution reaches that in TWO steps:
+        // `partition_scalar` yields the literal `__HIVE_DEFAULT_PARTITION__`
+        // for a Utf8 column (and a typed NULL for anything else), and then
+        // `nullify_default_partition_columns` rewrites the Utf8 case to NULL
+        // with a CASE over the column. A worker knows the partition value
+        // statically, and a partition column is constant across the whole
+        // partition, so the runtime CASE and this static decision agree.
+        //
+        // Doing only the first step would produce the literal string where the
+        // coordinator produces NULL: same type, same row count, different
+        // values -- which no schema check would catch.
+        let scalar = if raw == HIVE_DEFAULT_PARTITION {
+            ScalarValue::try_from(field.data_type())
+                .map_err(|e| format!("partition column `{key}`: null of declared type: {e}"))?
+        } else {
+            partition_scalar(raw, field.data_type())
+        };
         let array = scalar
             .to_array_of_size(rows)
             .map_err(|e| format!("partition column `{key}`: {e}"))?;
