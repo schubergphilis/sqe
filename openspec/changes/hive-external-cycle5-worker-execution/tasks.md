@@ -17,8 +17,8 @@
 
 - [x] 3.1 Split a Hive scan into per-partition tasks from the cycle-2 partition index. (pure builder + tests; the listing that feeds it is still to wire)
 - [x] 3.2 Decide worker-servability per table; record the decision. (decision function + reasons; recording into EXPLAIN is 3.3)
-- [ ] 3.3 Fall back to coordinator-local when not servable, and surface it in `EXPLAIN`.
-- [ ] 3.4 Test: an unservable table runs coordinator-local AND is observably marked as such. A test that only checks the rows would pass on a silent fallback.
+- [x] 3.3 Fall back to coordinator-local when not servable, and surface it in `EXPLAIN`. (marker node + reason; provider wiring pending the dispatch path)
+- [x] 3.4 Test: an unservable table runs coordinator-local AND is observably marked as such. A test that only checks the rows would pass on a silent fallback.
 
 ## 4. Differential correctness
 
