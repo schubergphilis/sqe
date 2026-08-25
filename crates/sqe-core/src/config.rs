@@ -230,6 +230,18 @@ pub struct QueryConfig {
     /// Target size per scan task for bin-packing. Default: "256MB".
     #[serde(default = "default_target_task_size")]
     pub target_task_size: String,
+    /// Dispatch Hive external table scans to workers (cycle 5).
+    ///
+    /// Defaults to FALSE. Hive scans have run coordinator-local since cycle 1,
+    /// and turning distribution on changes which process reads the data, so it
+    /// is opt-in until it has been measured on a real multi-worker rig. Turning
+    /// it off is the rollback: no ticket changes, no plan changes, the scan
+    /// simply runs where it always did.
+    ///
+    /// With it on, a table the worker path cannot serve still runs
+    /// coordinator-local and says so in EXPLAIN, rather than failing.
+    #[serde(default)]
+    pub distributed_hive_scans: bool,
     /// Controls when ORDER BY clauses are preserved vs stripped to save memory.
     ///
     /// - `"strict"`: Always sort. Spill to disk if needed.
@@ -421,6 +433,7 @@ impl Default for QueryConfig {
             distribution_threshold: default_distribution_threshold(),
             distribution_file_threshold: default_distribution_file_threshold(),
             target_task_size: default_target_task_size(),
+            distributed_hive_scans: false,
             sort_mode: default_sort_mode(),
             late_materialization_min_projection_cols: default_late_mat_min_projection_cols(),
             star_schema_reorder: default_true(),

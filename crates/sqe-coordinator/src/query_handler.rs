@@ -3595,7 +3595,16 @@ impl QueryHandler {
             return plan;
         }
 
-        // 3. Find IcebergScanExec node in the plan tree
+        // 3. A Hive external table scan is a different node; try it first.
+        //    A plan carries one or the other, and the Iceberg path below would
+        //    return `plan` untouched for a Hive query anyway.
+        if let Some(hive_node) = find_hive_scan(&plan) {
+            return self
+                .try_distribute_hive(plan, hive_node, &healthy, registry, session, query_id)
+                .await;
+        }
+
+        // 4. Find IcebergScanExec node in the plan tree
         let scan_node = match find_iceberg_scan(&plan) {
             Some(node) => node,
             None => {
@@ -4060,6 +4069,155 @@ impl QueryHandler {
         // Replace the IcebergScanExec leaf within the plan tree, keeping
         // all parent nodes (filter, aggregate, sort, projection) intact.
         replace_scan_in_plan(&plan, &scan_node, dist_scan)
+    }
+
+    /// Distribute a Hive external table scan, or say why it did not.
+    ///
+    /// Never fails a query: every negative path returns a runnable plan. When
+    /// the scan cannot distribute the plan is wrapped in `HiveLocalScanExec` so
+    /// EXPLAIN carries the reason -- a silent fallback is indistinguishable
+    /// from success, and the only symptom would be an idle cluster.
+    async fn try_distribute_hive(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        hive_node: Arc<dyn ExecutionPlan>,
+        healthy: &[String],
+        registry: &Arc<crate::worker_registry::WorkerRegistry>,
+        session: &Session,
+        query_id: &uuid::Uuid,
+    ) -> Arc<dyn ExecutionPlan> {
+        use sqe_catalog::hive::scan_exec::HiveScanExec;
+        use sqe_catalog::hive::scan_mode::HiveLocalScanExec;
+        use sqe_catalog::hive::worker_scan::{servability, Unservable};
+
+        let local = |p: &Arc<dyn ExecutionPlan>, node: &Arc<dyn ExecutionPlan>, reason: String| {
+            let marked: Arc<dyn ExecutionPlan> =
+                Arc::new(HiveLocalScanExec::new(Arc::clone(node), reason));
+            replace_scan_in_plan(p, node, marked)
+        };
+
+        let scan = match hive_node.downcast_ref::<HiveScanExec>() {
+            Some(s) => s,
+            None => return plan,
+        };
+        let spec = scan.spec();
+
+        if let Err(reason) = servability(
+            self.config.query.distributed_hive_scans,
+            spec.resolved.kind,
+            spec.entries.len(),
+        ) {
+            // `Disabled` is the default state, and marking every Hive scan in a
+            // non-distributed deployment would be noise rather than signal.
+            if matches!(reason, Unservable::Disabled) {
+                return plan;
+            }
+            debug!(reason = %reason.reason(), "hive scan not distributable");
+            return local(&plan, &hive_node, reason.reason());
+        }
+
+        let partitions = match scan.partition_files().await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "listing hive partitions failed; executing locally");
+                return local(
+                    &plan,
+                    &hive_node,
+                    format!("listing partitions failed: {e}"),
+                );
+            }
+        };
+
+        let files: Vec<crate::hive_scan_tasks::HivePartitionFiles> = partitions
+            .into_iter()
+            .map(|(values, files)| crate::hive_scan_tasks::HivePartitionFiles { values, files })
+            .collect();
+
+        let storage = &self.config.storage;
+        let read = crate::hive_scan_tasks::HiveReadFormat {
+            format: match spec.resolved.kind {
+                sqe_catalog::hive::serde_map::HiveFileFormat::Parquet => {
+                    sqe_planner::HiveScanFormat::Parquet
+                }
+                sqe_catalog::hive::serde_map::HiveFileFormat::Csv => {
+                    sqe_planner::HiveScanFormat::Csv
+                }
+                sqe_catalog::hive::serde_map::HiveFileFormat::Json => {
+                    sqe_planner::HiveScanFormat::Json
+                }
+            },
+            delimiter: spec.resolved.delimiter,
+            quote: spec.resolved.quote,
+            escape: spec.resolved.escape,
+            has_header: spec.resolved.has_header,
+        };
+        let s3 = crate::hive_scan_tasks::HiveS3Access {
+            endpoint: storage.s3_endpoint.clone(),
+            region: storage.s3_region.clone(),
+            access_key: storage.s3_access_key.clone(),
+            secret_key: storage.s3_secret_key.expose().to_string(),
+            session_token: String::new(),
+            path_style: storage.s3_path_style,
+            allow_http: storage.s3_endpoint.starts_with("http://"),
+        };
+        let projected: Vec<String> = spec
+            .full_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+
+        let tasks = match crate::hive_scan_tasks::build_hive_scan_tasks(
+            &files,
+            &crate::hive_scan_tasks::HiveScanTable {
+                read: &read,
+                partition_columns: &spec.partition_columns,
+                full_schema: spec.full_schema.as_ref(),
+                s3: &s3,
+            },
+            &crate::hive_scan_tasks::HiveScanQuery {
+                projected_columns: &projected,
+                predicate_proto: None,
+                limit: None,
+                fragment_prefix: &query_id.to_string(),
+            },
+        ) {
+            Ok(t) if !t.is_empty() => t,
+            Ok(_) => {
+                return local(
+                    &plan,
+                    &hive_node,
+                    "no partition listed any files".to_string(),
+                )
+            }
+            Err(e) => {
+                warn!(error = %e, "building hive scan tasks failed; executing locally");
+                return local(&plan, &hive_node, format!("building tasks failed: {e}"));
+            }
+        };
+
+        let worker_urls: Vec<String> = healthy.to_vec();
+        let mut exec = crate::distributed_scan::DistributedScanExec::new(
+            tasks,
+            worker_urls,
+            Arc::clone(&spec.full_schema),
+        )
+        .with_worker_secret(self.config.coordinator.worker_secret.expose().to_string())
+        .with_timeouts(
+            std::time::Duration::from_secs(self.config.coordinator.worker_connect_timeout_secs),
+            std::time::Duration::from_secs(self.config.coordinator.worker_rpc_timeout_secs),
+        );
+        exec = exec.with_worker_registry(Arc::clone(registry));
+
+        info!(
+            username = %session.user.username,
+            query_id = %query_id,
+            partitions = exec.scan_tasks().len(),
+            "Distributed hive scan plan created"
+        );
+
+        let dist: Arc<dyn ExecutionPlan> = Arc::new(exec);
+        replace_scan_in_plan(&plan, &hive_node, dist)
     }
 
     /// Create a DataFusion SessionContext with the user's Polaris catalog registered.
@@ -7090,6 +7248,34 @@ fn strip_self_join_dynamic_filters(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn Exec
             original
         }
     }
+}
+
+/// Find the `HiveScanExec` in a plan, if there is one.
+///
+/// Deliberately returns the FIRST match and does not try to pick between
+/// several: a multi-scan Hive plan (a join of two Hive tables) is not something
+/// this release distributes, and quietly choosing one of them would distribute
+/// half a query. The Iceberg finder has the same restriction for the same
+/// reason.
+fn find_hive_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+    let mut found: Option<Arc<dyn ExecutionPlan>> = None;
+    let mut stack: Vec<Arc<dyn ExecutionPlan>> = vec![Arc::clone(plan)];
+    while let Some(node) = stack.pop() {
+        if node
+            .downcast_ref::<sqe_catalog::hive::scan_exec::HiveScanExec>()
+            .is_some()
+        {
+            if found.is_some() {
+                return None; // more than one: not distributed by this release
+            }
+            found = Some(node);
+            continue;
+        }
+        for child in node.children() {
+            stack.push(Arc::clone(child));
+        }
+    }
+    found
 }
 
 fn find_iceberg_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
