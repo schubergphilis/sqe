@@ -20,6 +20,18 @@
 - [x] 3.3 Fall back to coordinator-local when not servable, and surface it in `EXPLAIN`. (marker node + reason; provider wiring pending the dispatch path)
 - [x] 3.4 Test: an unservable table runs coordinator-local AND is observably marked as such. A test that only checks the rows would pass on a silent fallback.
 
+## 3b. Worker-side execution of a Hive task
+
+- [ ] 3b.1 Read `task.hive` in the worker scan path and report the FULL schema.
+- [ ] 3b.2 Call `append_partition_columns` BEFORE the batch's `BytePermit` is
+      acquired. See design.md: doing it as a stream transform afterwards
+      under-accounts memory, because the permit was sized to the pre-partition
+      batch and `Accounted::get_mut` will not complain.
+- [ ] 3b.3 Test: the permit's logical size covers the materialized batch, not
+      the file-columns-only batch.
+- [ ] 3b.4 Refuse a v3 Hive task whose format the worker cannot read, with the
+      reason, rather than failing inside a parquet footer read.
+
 ## 4. Differential correctness
 
 - [ ] 4.1 Harness: run a query coordinator-local and worker-distributed, compare rows.
