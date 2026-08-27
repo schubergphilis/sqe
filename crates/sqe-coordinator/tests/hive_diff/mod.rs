@@ -557,3 +557,17 @@ pub async fn quoted_csv() -> Fixture {
     plant_index(&f).await;
     f
 }
+
+/// Run the partition-index discovery the coordinator runs after a write.
+///
+/// `HiveDdlHandler::refresh_index_after_write` delegates to exactly this
+/// function, so a test calling it exercises the same rebuild rather than a
+/// re-implementation of it.
+pub async fn refresh_partition_index(f: &Fixture) {
+    let store = local_store(&f.root);
+    let mut m = store.get("sales", "orders").await.expect("get manifest");
+    let max = store.limits().max_partition_index_entries;
+    sqe_catalog::hive::partition::msck_repair(&store, &mut m, max)
+        .await
+        .expect("refresh the partition index");
+}

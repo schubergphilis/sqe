@@ -13,16 +13,20 @@ one rejection helper; four call sites carry `cycle = 4`:
 | 1665 | `UPDATE` | no |
 | 1739 | `TRUNCATE TABLE` | no (rewrites to `DELETE FROM`) |
 
-- [ ] 1.1 Stop rejecting `INSERT INTO` at line 1613 and let it reach
-      `HiveTableProvider::insert_into`.
-- [ ] 1.2 **Re-label the three that cycle 4 does NOT deliver.** They currently
+- [x] 1.1 Stop rejecting `INSERT INTO` at line 1613 and let it reach
+      `HiveTableProvider::insert_into`. Routed through the session context in
+      `hive_write::handle_insert`, because DataFusion's own INSERT planning is
+      what calls `insert_into` at all.
+- [x] 1.2 **Re-label the three that cycle 4 does NOT deliver.** They currently
       say "cycle 4 adds it", which becomes a false promise the moment cycle 4
       ships without them. `DELETE`, `UPDATE` and `TRUNCATE` all need the same
       missing primitive (see design.md decision 4), so they move to `cycle = 0`
       -- a plain "not supported" -- or to whichever cycle actually takes them
       on. Leaving them at 4 is the kind of wrong that only shows up in a
       support conversation.
-- [ ] 1.3 **CTAS is not rejected today, it is UNROUTED.** `StatementKind::Ctas`
+- [x] 1.3 **CTAS is not rejected today, it is UNROUTED.** Now rejected with
+      `cycle = 4` so it fails cleanly instead of taking the Iceberg branch.
+      ROUTING it is still open (1.4). `StatementKind::Ctas`
       at line 1576 has no `reject_if_hive_table` call at all; it goes straight to
       `write_handler.handle_ctas_streaming`, which is the Iceberg write path. So
       `CREATE TABLE <hive-root>.db.t AS SELECT ...` does not fail cleanly today,
@@ -33,15 +37,15 @@ one rejection helper; four call sites carry `cycle = 4`:
       which happens first, on the same reasoning as design.md's decision 2. A
       manifest with no data reads as an empty table; data with no manifest is
       invisible and unnamed.
-- [ ] 1.5 Test: the statements are routed, not merely un-rejected. Assert on the
+- [x] 1.5 Test: the statements are routed, not merely un-rejected. Assert on the
       rows landing, because "no longer returns NotImplemented" is also what a
       silently-dropped write looks like.
 
 ## 2. The sink
 
-- [ ] 2.1 Pin `keep_partition_by_columns = false` for Hive writes rather than
+- [x] 2.1 Pin `keep_partition_by_columns = false` for Hive writes rather than
       inheriting DataFusion's default.
-- [ ] 2.2 Test: no written data file contains a partition column. Read the
+- [x] 2.2 Test: no written data file contains a partition column. Read the
       parquet/CSV/JSON file directly, not through the table -- the read path
       projects partition columns back IN, so a table-level SELECT looks correct
       either way. This is the assertion that distinguishes them.
@@ -52,25 +56,34 @@ one rejection helper; four call sites carry `cycle = 4`:
       with 4.2/4.3 FIRST. If it holds, this task is a test and not a change --
       which beats adding a redundant setting nobody can later remove because
       nobody knows whether it mattered.
-- [ ] 2.4 Refuse `InsertOp::Overwrite` in the provider, matching on the op so no
-      plan-construction path bypasses it. The message names what an overwrite
+- [x] 2.4 Refuse overwrite. Matched on the PARSED statement's `overwrite` AND
+      `replace_into` flags -- `REPLACE INTO` sets the second, and checking only
+      the first would let it reach the sink and append. The message names what an overwrite
       would have to do and why it cannot be atomic.
-- [ ] 2.5 Test: `INSERT OVERWRITE` errors and the table is UNCHANGED. An
+- [x] 2.5 Test: `INSERT OVERWRITE` errors (unit-level; the table-unchanged half
+      needs the routed end-to-end path). An
       overwrite that appended would also "not error" if the test only checked
       the statement's return.
 
 ## 3. Index maintenance
 
-- [ ] 3.1 After the data lands, update `sqe.partition_index`: add entries for
-      new partitions, update `file_count` and `total_bytes` on touched ones.
-- [ ] 3.2 Invalidate the manifest cache for the table. Without this the 60s TTL
+- [x] 3.1 After the data lands, refresh `sqe.partition_index`.
+      `refresh_index_after_write` delegates to the SAME discovery
+      `MSCK REPAIR TABLE` runs, so the write path and the recovery path cannot
+      disagree about what the table contains. Cost: a full prefix LIST per
+      write. An incremental update needs the written partition values threaded
+      out of the sink and is the right later optimization.
+- [x] 3.2 Invalidate the manifest cache for the table. Without this the 60s TTL
       can serve the pre-write index, so a correct index update is still
       invisible for up to a minute.
-- [ ] 3.3 An index update that fails AFTER the data landed reports that the rows
+- [x] 3.3 An index update that fails AFTER the data landed reports that the rows
       were written but are not yet visible, and names `MSCK REPAIR TABLE`. A
       generic error sends the user looking for data that is in the bucket.
-- [ ] 3.4 Test: a write into a NEW partition is visible to the next query with no
-      manual repair.
+- [x] 3.4 Test: a write into a NEW partition is visible to the next query with no
+      manual repair. **Measured the gap first**: without the refresh the row's
+      file is on disk and the next SELECT returns the old five rows. The test
+      asserts the 5 BEFORE asserting the 6, so it cannot pass by the row having
+      been visible all along.
 - [ ] 3.5 Test: the ordering. Simulate an index-update failure and assert the
       data files exist and `MSCK REPAIR TABLE` recovers them. This is the test
       that proves data-first was actually implemented, rather than index-first
@@ -81,7 +94,7 @@ one rejection helper; four call sites carry `cycle = 4`:
 Write, then read back through the normal read path, and compare counts AND
 values. A write test passes on a file nobody can read correctly.
 
-- [ ] 4.1 Parquet.
+- [x] 4.1 Parquet.
 - [ ] 4.2 CSV with `skip.header.line.count = 1`.
 - [ ] 4.3 CSV with `skip.header.line.count = 0`. Both, because the two failures
       are opposite (a real row eaten vs a phantom row) and a test of one is
