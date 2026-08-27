@@ -647,3 +647,29 @@ pub async fn refresh_named_index(f: &Fixture, table: &str) {
         .await
         .expect("refresh the partition index");
 }
+
+/// A typed (Int64) partition key with NO default-partition directory.
+///
+/// Separate from [`typed_key_with_default_partition`] because the two exercise
+/// different things on the WRITE side: a typed key alone works, while a table
+/// that already holds a `__HIVE_DEFAULT_PARTITION__` directory under a typed
+/// key cannot be inserted into at all. See
+/// `a_typed_partition_key_round_trips_through_a_write` and its sibling.
+pub async fn typed_key_only() -> Fixture {
+    let dir = tempfile::tempdir().expect("tmp");
+    let data_path = dir.path().join("data");
+    std::fs::create_dir_all(&data_path).expect("mkdir data");
+    write_parquet_partition(&data_path, "year=2024", &[1, 2], &[10.5, 20.0]);
+    write_parquet_partition(&data_path, "year=2025", &[3], &[30.5]);
+
+    let f = Fixture {
+        root: format!("file://{}/wh", dir.path().display()),
+        data: format!("file://{}", data_path.display()),
+        partitions: vec!["year=2024".into(), "year=2025".into()],
+        key: ("year".into(), "int".into()),
+        dir,
+    };
+    put_manifest(&f.root, &f.data, &f.key, "parquet").await;
+    plant_index(&f).await;
+    f
+}

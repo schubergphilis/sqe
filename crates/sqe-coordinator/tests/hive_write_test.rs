@@ -562,3 +562,113 @@ async fn a_write_leaves_no_partial_or_staging_files_behind() {
     let rows = read_back(&f).await;
     assert_eq!(rows.len(), 6, "{rows:?}");
 }
+
+/// 4.5: a typed (non-string) partition key round-trips through a write.
+///
+/// Cycle 5's differential suite pinned typed keys on the READ side, from
+/// directories the fixture wrote. This is the other half: a write has to
+/// produce a directory name the read side parses back into the declared type,
+/// and the two halves are different code.
+#[tokio::test]
+async fn a_typed_partition_key_round_trips_through_a_write() {
+    let f = hive_diff::typed_key_only().await;
+
+    let ctx = session(&f).await;
+    ctx.sql("INSERT INTO lake.sales.orders VALUES (20, 200.5, 2027)")
+        .await
+        .expect("plan insert")
+        .collect()
+        .await
+        .expect("execute insert");
+
+    // The directory name is the contract between writer and reader, so it is
+    // asserted directly rather than inferred from a successful read.
+    let dirs: Vec<String> = std::fs::read_dir(f.dir.path().join("data"))
+        .expect("read data dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        dirs.iter().any(|d| d == "year=2027"),
+        "a typed partition value must produce `year=2027`, got: {dirs:?}"
+    );
+
+    hive_diff::refresh_partition_index(&f).await;
+    let rows = hive_diff::sorted_rows(
+        &session(&f)
+            .await
+            .sql("SELECT id, amount, year FROM lake.sales.orders")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("collect"),
+    );
+    assert_eq!(rows.len(), 4, "three existing plus one written: {rows:?}");
+    assert!(
+        rows.contains(&"20|200.5|2027".to_string()),
+        "the typed key must read back as the integer it was written as, not as \
+         a string: {rows:?}"
+    );
+}
+
+/// 4.5, the half that does NOT work, pinned so it is a known limitation rather
+/// than a surprise.
+///
+/// **A table that already holds a `__HIVE_DEFAULT_PARTITION__` directory under
+/// a typed (non-string) partition key cannot be written to.** The insert fails
+/// with `Cannot cast string '__HIVE_DEFAULT_PARTITION__' to value of Int32
+/// type`.
+///
+/// The cause is a genuine asymmetry between the two paths, not an oversight
+/// here. The READ path knows about the sentinel deliberately: `partition_scalar`
+/// types it and `nullify_default_partition_columns` resolves it to NULL, which
+/// cycle 5's differential suite pins. The WRITE path goes through DataFusion's
+/// `ListingTable::insert_into`, which lists the table's EXISTING partitions to
+/// build its `file_group` and casts each directory value to the partition
+/// column's declared type. Hive's sentinel is a string, so an Int32 key cannot
+/// take it.
+///
+/// Asserted as a failure with its current message rather than left to be
+/// rediscovered. If a later change makes this work, this test fails and points
+/// at the reference page's limitation note, which then needs removing.
+#[tokio::test]
+async fn a_default_partition_under_a_typed_key_blocks_writes() {
+    let f = hive_diff::typed_key_with_default_partition().await;
+    let ctx = session(&f).await;
+
+    let err = ctx
+        .sql("INSERT INTO lake.sales.orders VALUES (20, 200.5, 2027)")
+        .await
+        .expect("the statement plans")
+        .collect()
+        .await
+        .expect_err(
+            "writing into a table with a default-partition directory under a \
+             typed key does not work; if it does now, remove the limitation \
+             note from the reference page",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("__HIVE_DEFAULT_PARTITION__"),
+        "the failure must at least name the sentinel: {msg}"
+    );
+
+    // And the READ path is unaffected, which is what makes this an asymmetry
+    // rather than a broken table.
+    let rows = hive_diff::sorted_rows(
+        &session(&f)
+            .await
+            .sql("SELECT id, amount, year FROM lake.sales.orders")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("collect"),
+    );
+    assert_eq!(rows.len(), 5, "reads still work: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r.ends_with("|NULL")),
+        "and the sentinel still resolves to NULL on read: {rows:?}"
+    );
+}
