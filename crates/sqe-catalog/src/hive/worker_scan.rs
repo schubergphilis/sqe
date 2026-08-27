@@ -17,7 +17,12 @@ use super::serde_map::HiveFileFormat;
 /// Why a table cannot be scanned on workers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unservable {
-    /// The worker has no reader for this format yet (cycle 5, task 5).
+    /// The worker has no reader for this format.
+    ///
+    /// No format answers this today: parquet, CSV and line-delimited JSON all
+    /// have worker-side readers as of cycle 5, task 5. The variant stays as the
+    /// answer for a format added to `HiveFileFormat` later, which
+    /// [`servability`]'s exhaustive match forces someone to give.
     Format(HiveFileFormat),
     /// Nothing to split: no partition entries were planned, so there is no
     /// per-partition unit of work to distribute.
@@ -31,7 +36,7 @@ impl Unservable {
     pub fn reason(&self) -> String {
         match self {
             Unservable::Format(f) => format!(
-                "worker execution supports parquet only in this release; this table is {}",
+                "worker execution has no reader for this table's format, which is {}",
                 match f {
                     HiveFileFormat::Csv => "csv",
                     HiveFileFormat::Json => "json",
@@ -60,12 +65,18 @@ pub fn servability(
     if !enabled {
         return Err(Unservable::Disabled);
     }
-    // Parquet only for now: the worker builds every reader through
-    // ParquetRecordBatchStreamBuilder. CSV and JSON readers are task 5, and
-    // until they exist a CSV table dispatched to a worker would not fail
-    // cleanly, it would fail obscurely inside a parquet footer read.
-    if !matches!(format, HiveFileFormat::Parquet) {
-        return Err(Unservable::Format(format));
+    // Every declared format now has a worker-side reader: parquet through
+    // ParquetRecordBatchStreamBuilder, CSV and line-delimited JSON through
+    // `sqe_worker::hive_reader` (cycle 5, task 5).
+    //
+    // Written as an exhaustive match rather than a passing `if`, on purpose. A
+    // new variant on `HiveFileFormat` must not become silently servable: the
+    // worker would then be dispatched a format it has no reader for and would
+    // fail inside a parquet footer read, reporting a corrupt file. This makes
+    // that a compile error instead, and `Unservable::Format` is the answer to
+    // give when it happens.
+    match format {
+        HiveFileFormat::Parquet | HiveFileFormat::Csv | HiveFileFormat::Json => {}
     }
     if planned_entry_count == 0 {
         return Err(Unservable::NoPartitionEntries);
@@ -83,11 +94,29 @@ mod tests {
     }
 
     #[test]
-    fn csv_and_json_are_refused_with_a_reason_naming_the_format() {
+    fn every_declared_format_is_servable_now_that_the_readers_exist() {
+        // Cycle 5 task 5 added the CSV and JSON readers. Leaving this refusal
+        // in place would have made those readers unreachable while every CSV
+        // table kept falling back -- which looks exactly like success.
+        for fmt in [
+            HiveFileFormat::Parquet,
+            HiveFileFormat::Csv,
+            HiveFileFormat::Json,
+        ] {
+            assert!(
+                servability(true, fmt, 4).is_ok(),
+                "{fmt:?} has a worker-side reader and must be servable"
+            );
+        }
+    }
+
+    #[test]
+    fn the_format_reason_still_names_the_format() {
+        // `Unservable::Format` is the answer for a format added later with no
+        // worker reader. Its reason has to name the format, or EXPLAIN says a
+        // table is unservable without saying why.
         for (fmt, want) in [(HiveFileFormat::Csv, "csv"), (HiveFileFormat::Json, "json")] {
-            let err = servability(true, fmt, 4).expect_err("not servable yet");
-            assert_eq!(err, Unservable::Format(fmt));
-            let reason = err.reason();
+            let reason = Unservable::Format(fmt).reason();
             assert!(
                 reason.contains(want),
                 "the reason must name the format so EXPLAIN says WHY, got: {reason}"

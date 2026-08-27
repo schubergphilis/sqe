@@ -4128,59 +4128,12 @@ impl QueryHandler {
             }
         };
 
-        let files: Vec<crate::hive_scan_tasks::HivePartitionFiles> = partitions
-            .into_iter()
-            .map(|(values, files)| crate::hive_scan_tasks::HivePartitionFiles { values, files })
-            .collect();
-
-        let storage = &self.config.storage;
-        let read = crate::hive_scan_tasks::HiveReadFormat {
-            format: match spec.resolved.kind {
-                sqe_catalog::hive::serde_map::HiveFileFormat::Parquet => {
-                    sqe_planner::HiveScanFormat::Parquet
-                }
-                sqe_catalog::hive::serde_map::HiveFileFormat::Csv => {
-                    sqe_planner::HiveScanFormat::Csv
-                }
-                sqe_catalog::hive::serde_map::HiveFileFormat::Json => {
-                    sqe_planner::HiveScanFormat::Json
-                }
-            },
-            delimiter: spec.resolved.delimiter,
-            quote: spec.resolved.quote,
-            escape: spec.resolved.escape,
-            has_header: spec.resolved.has_header,
-        };
-        let s3 = crate::hive_scan_tasks::HiveS3Access {
-            endpoint: storage.s3_endpoint.clone(),
-            region: storage.s3_region.clone(),
-            access_key: storage.s3_access_key.clone(),
-            secret_key: storage.s3_secret_key.expose().to_string(),
-            session_token: String::new(),
-            path_style: storage.s3_path_style,
-            allow_http: storage.s3_endpoint.starts_with("http://"),
-        };
-        let projected: Vec<String> = spec
-            .full_schema
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
-
-        let tasks = match crate::hive_scan_tasks::build_hive_scan_tasks(
-            &files,
-            &crate::hive_scan_tasks::HiveScanTable {
-                read: &read,
-                partition_columns: &spec.partition_columns,
-                full_schema: spec.full_schema.as_ref(),
-                s3: &s3,
-            },
-            &crate::hive_scan_tasks::HiveScanQuery {
-                projected_columns: &projected,
-                predicate_proto: None,
-                limit: None,
-                fragment_prefix: &query_id.to_string(),
-            },
+        let s3 = crate::hive_scan_tasks::hive_s3_access(&self.config.storage);
+        let tasks = match crate::hive_scan_tasks::tasks_for_hive_scan(
+            spec,
+            partitions,
+            &s3,
+            &query_id.to_string(),
         ) {
             Ok(t) if !t.is_empty() => t,
             Ok(_) => {
@@ -4216,7 +4169,18 @@ impl QueryHandler {
             "Distributed hive scan plan created"
         );
 
+        // The tasks carry the FULL schema; the node being replaced carries the
+        // query's projection. Reconcile the width before substituting, or every
+        // parent -- which indexes its child by position -- reads a different
+        // column and the query silently answers something else.
         let dist: Arc<dyn ExecutionPlan> = Arc::new(exec);
+        let dist = match crate::hive_scan_tasks::align_to_scan_schema(dist, &hive_node.schema()) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(error = %e, "narrowing the distributed hive scan failed; executing locally");
+                return local(&plan, &hive_node, format!("schema alignment failed: {e}"));
+            }
+        };
         replace_scan_in_plan(&plan, &hive_node, dist)
     }
 
@@ -7313,7 +7277,12 @@ fn find_iceberg_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionP
 /// Walks the tree recursively. When the target node is found (by Arc pointer
 /// equality), it's replaced with the replacement. All ancestor nodes are
 /// rebuilt via `with_new_children()` to incorporate the change.
-fn replace_scan_in_plan(
+///
+/// Public so the Hive differential tests can run the real substitution rather
+/// than a re-implementation of it. The parents are the reason: they index their
+/// child by POSITION, so a replacement of a different width returns the wrong
+/// column instead of an error, and only the real rebuild shows that.
+pub fn replace_scan_in_plan(
     plan: &Arc<dyn ExecutionPlan>,
     target: &Arc<dyn ExecutionPlan>,
     replacement: Arc<dyn ExecutionPlan>,

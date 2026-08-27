@@ -180,3 +180,49 @@ Nothing already built is wasted: the ticket, the worker-side materialization,
 the task builder and the servability decision are all needed either way. But
 the sequencing changes -- `HiveScanExec` comes before the differential harness,
 because until it exists there is nothing to dispatch.
+
+## Why CSV and JSON are one task per file (task 5.4)
+
+**Decision: a Hive CSV or line-delimited JSON task covers exactly one file, and
+that file is read whole. There is no byte-range splitting.**
+
+Cycle 1 already noted that compressed CSV/JSON is one file per thread. That note
+is not the reason, and inheriting it silently would hide a decision behind an
+observation. The reasons are:
+
+- **No row groups.** A parquet task can be split at a row-group boundary
+  because the footer says where the boundaries are. CSV and JSON have no
+  footer and no index. `row_group_start`/`row_group_end` on `ScanTask` mean
+  nothing for them.
+- **A byte range is not a record range.** Splitting at byte N lands mid-record.
+  Recovering the boundary means scanning forward for the next unquoted newline,
+  which for CSV requires tracking quote state from an unknown starting state:
+  a newline inside a quoted field is data, not a boundary. The coordinator
+  cannot do that from a listing, and a worker doing it would have to read
+  backwards past the start of its own range.
+- **A header belongs to the file, not the range.** With
+  `skip.header.line.count = 1`, only the range containing byte 0 must skip a
+  line. Every other range must not. That is an extra piece of per-range state
+  whose only purpose is to be got wrong.
+- **Compression removes the option entirely.** A gzip member has to be read
+  from its start, so a compressed file is one unit regardless of what the
+  splitter would prefer.
+
+The parallelism that cycle 5 is actually after comes from partitions and files,
+not from within a file. A Hive table with one 4 GB CSV file gets no benefit; a
+table with 200 files across 12 partitions parallelizes fully. That is the shape
+Hive tables come in, and the same shape cycle 2's partition index assumes.
+
+### The cost this accepts, stated plainly
+
+Both readers fetch the object whole before decoding, so a CSV task's peak
+residency includes the entire encoded file. A parquet task's includes only the
+byte ranges it fetched. The size is charged against the scan budget through the
+same fetch-permit path parquet uses (`open_csv_stream` returns the object's real
+length), so the memory is accounted rather than hidden -- but it is charged
+where a parquet task of the same logical size would charge less.
+
+A streaming decode would fix that. `arrow`'s CSV and JSON readers both expose an
+incremental `Decoder`, so the work is bounded and known; it is left out of cycle
+5 because it changes the memory profile of the scan path and belongs with a
+measurement, not with the reader that first made CSV distribute at all.

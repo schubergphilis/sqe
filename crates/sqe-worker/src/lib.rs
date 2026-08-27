@@ -7,6 +7,7 @@ pub mod executor;
 pub mod flight_service;
 pub mod heartbeat;
 pub mod hive_partition;
+pub mod hive_reader;
 pub mod operator_memory;
 pub mod runtime;
 pub mod shuffle;

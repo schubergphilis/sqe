@@ -53,15 +53,18 @@ pub type ScanBatchStream =
 /// scheduling guard so a burst of tiny batches cannot monopolise the runtime.
 pub const SCAN_CHANNEL_ITEM_CAPACITY: usize = 16;
 
-/// Per-file Parquet batch stream returned by [`open_parquet_stream`].
-type ParquetBatchStream =
-    Pin<Box<dyn Stream<Item = Result<RecordBatch, parquet::errors::ParquetError>> + Send>>;
+/// Per-file batch stream returned by [`open_task_stream`].
+///
+/// The item error is `anyhow` rather than `ParquetError` because a Hive task
+/// may be CSV or line-delimited JSON, whose readers fail with an `ArrowError`.
+/// Unifying at the boundary keeps one producer loop instead of one per format.
+type FileBatchStream = Pin<Box<dyn Stream<Item = anyhow::Result<RecordBatch>> + Send>>;
 
-/// Result of opening one Parquet file: its batch stream, schema, and byte size.
-type OpenedParquet = anyhow::Result<(ParquetBatchStream, SchemaRef, u64)>;
+/// Result of opening one data file: its batch stream, schema, and byte size.
+type OpenedFile = anyhow::Result<(FileBatchStream, SchemaRef, u64)>;
 
-/// A boxed, in-flight open of one Parquet file (#234 depth-1 prefetch).
-type PendingOpen = Pin<Box<dyn std::future::Future<Output = OpenedParquet> + Send>>;
+/// A boxed, in-flight open of one data file (#234 depth-1 prefetch).
+type PendingOpen = Pin<Box<dyn std::future::Future<Output = OpenedFile> + Send>>;
 
 /// Wraps the scan mpsc receiver so queue-resident gauges track accounted
 /// batches. The permit travels with the batch; this wrapper only adjusts the
@@ -437,21 +440,23 @@ pub async fn execute_scan_streaming_with_store(
         anyhow::bail!("ScanTask has no data files");
     }
 
-    // A Hive task whose format this worker cannot read must be refused HERE,
-    // naming the format. Letting it through means failing several layers down
-    // inside a parquet footer read, with an error that describes a corrupt
-    // file rather than an unsupported format. The coordinator is supposed to
-    // have made this decision already (`hive::worker_scan::servability`), so
-    // reaching this is a coordinator bug, and it should say so plainly.
+    // A Hive task's format decides which reader opens its files. All three
+    // declared formats have one as of cycle 5 task 5, so this no longer refuses
+    // anything -- but the match is exhaustive on purpose: a format added to
+    // `HiveScanFormat` with no reader must be a compile error here rather than
+    // a corrupt-footer error several layers down inside a parquet read.
+    //
+    // The refusal that used to live here also gated `servability`'s parquet-only
+    // rule. Both had to be lifted together: leaving either in place makes the
+    // new readers unreachable while every CSV table keeps falling back, which
+    // looks exactly like success.
     let hive_ctx: Option<Arc<(sqe_planner::HiveScanDescriptor, SchemaRef)>> = match &task.hive {
         None => None,
         Some(d) => {
-            if !matches!(d.format, sqe_planner::HiveScanFormat::Parquet) {
-                anyhow::bail!(
-                    "worker cannot execute a hive scan of format {:?}; this release reads \
-                     parquet only, and the coordinator should not have dispatched it",
-                    d.format
-                );
+            match d.format {
+                sqe_planner::HiveScanFormat::Parquet
+                | sqe_planner::HiveScanFormat::Csv
+                | sqe_planner::HiveScanFormat::Json => {}
             }
             let full = crate::hive_partition::full_schema_of(d).map_err(|e| anyhow::anyhow!(e))?;
             Some(Arc::new((d.clone(), full)))
@@ -467,7 +472,7 @@ pub async fn execute_scan_streaming_with_store(
 
     let first_path = task.data_file_paths[0].clone();
 
-    let (mut first_stream, first_schema, first_bytes) = open_parquet_stream(
+    let (mut first_stream, first_schema, first_bytes) = open_task_stream(
         &task,
         &first_path,
         initial_store.clone(),
@@ -475,6 +480,7 @@ pub async fn execute_scan_streaming_with_store(
         predicate.as_ref(),
         task.file_sizes_bytes.first().copied(),
         coordinator_metrics.as_deref(),
+        hive_ctx.as_ref(),
     )
     .await?;
 
@@ -650,7 +656,7 @@ pub async fn execute_scan_streaming_with_store(
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(anyhow::Error::new(e))).await;
+                    let _ = tx.send(Err(e)).await;
                     return;
                 }
             }
@@ -681,15 +687,23 @@ pub async fn execute_scan_streaming_with_store(
         };
         let mut idx = 1usize;
 
+        // Kept alongside `hive_ctx` (which the batch loop still needs) so the
+        // prefetch closure has its own handle to clone per open.
+        let hive_for_prefetch = hive_ctx.clone();
+
         let start_next_open = |idx: usize, store: Arc<dyn ObjectStore>| -> PendingOpen {
             let task = task.clone();
             let footer_cache = footer_cache.clone();
             let predicate = predicate.clone();
             let coordinator_metrics = coordinator_metrics.clone();
+            // Cloned into the prefetch, not read from the outer binding: the
+            // prefetch must dispatch on the SAME format as the first open, or a
+            // multi-file CSV task reads file 1 as CSV and file 2 as parquet.
+            let hive_for_open = hive_for_prefetch.clone();
             Box::pin(async move {
                 let path = task.data_file_paths[idx].clone();
                 let size = task.file_sizes_bytes.get(idx).copied();
-                open_parquet_stream(
+                open_task_stream(
                     &task,
                     &path,
                     store,
@@ -697,6 +711,7 @@ pub async fn execute_scan_streaming_with_store(
                     predicate.as_ref(),
                     size,
                     coordinator_metrics.as_deref(),
+                    hive_for_open.as_ref(),
                 )
                 .await
             })
@@ -762,7 +777,7 @@ pub async fn execute_scan_streaming_with_store(
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(anyhow::Error::new(e))).await;
+                        let _ = tx.send(Err(e)).await;
                         return;
                     }
                 }
@@ -858,6 +873,92 @@ pub async fn execute_scan_streaming_with_store(
 /// entirely: the size is fed straight to `ParquetObjectReader::with_file_size`.
 /// When it is `None` (size missing for this file), the function falls back to a
 /// single `head()` to learn the size.
+/// Open one data file for a scan task, dispatching on the task's format.
+///
+/// An Iceberg task, and a Hive task whose format is parquet, go through
+/// [`open_parquet_stream`] exactly as before. A CSV or line-delimited JSON Hive
+/// task goes through [`crate::hive_reader`].
+///
+/// ## Why the dispatch is here and not at the call sites
+///
+/// There are two production opens -- the first file, and the depth-1 prefetch
+/// of the next one -- and they must agree. A dispatch duplicated at both is a
+/// scan that reads file 1 as CSV and file 2 as parquet, which fails on file 2
+/// with a corrupt-footer error that says nothing about formats.
+///
+/// The projection is deliberately NOT applied for CSV and JSON. A Hive task's
+/// `projected_columns` is the FULL schema including partition columns, and
+/// `resolve_scan_projection` narrows it against the parquet file's own schema.
+/// The CSV and JSON readers bind by ordinal against the declared file schema
+/// instead, so they read every file column and let the plan above the scan
+/// discard what it does not need. Narrowing here would shift ordinals and bind
+/// the wrong column.
+async fn open_task_stream(
+    task: &ScanTask,
+    file_path: &str,
+    store: Arc<dyn ObjectStore>,
+    footer_cache: Option<&FooterCache>,
+    predicate: Option<&Expr>,
+    known_size: Option<u64>,
+    coordinator_metrics: Option<&MetricsRegistry>,
+    hive: Option<&Arc<(sqe_planner::HiveScanDescriptor, SchemaRef)>>,
+) -> OpenedFile {
+    let hive = match hive {
+        None => {
+            return open_parquet_stream(
+                task,
+                file_path,
+                store,
+                footer_cache,
+                predicate,
+                known_size,
+                coordinator_metrics,
+            )
+            .await
+        }
+        Some(h) => h,
+    };
+    let (desc, full_schema) = hive.as_ref();
+    if matches!(desc.format, sqe_planner::HiveScanFormat::Parquet) {
+        return open_parquet_stream(
+            task,
+            file_path,
+            store,
+            footer_cache,
+            predicate,
+            known_size,
+            coordinator_metrics,
+        )
+        .await;
+    }
+
+    let object_key = s3_url_to_key(file_path)?;
+    let path = ObjectPath::from(object_key.as_str());
+    let file_schema = crate::hive_partition::file_schema_of(desc, full_schema)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    match desc.format {
+        sqe_planner::HiveScanFormat::Csv => {
+            debug!(file = %file_path, "Reading Hive CSV file");
+            crate::hive_reader::open_csv_stream(
+                &store,
+                &path,
+                file_schema,
+                desc.delimiter,
+                desc.quote,
+                desc.escape,
+                desc.has_header,
+            )
+            .await
+        }
+        sqe_planner::HiveScanFormat::Json => {
+            debug!(file = %file_path, "Reading Hive JSON file");
+            crate::hive_reader::open_json_stream(&store, &path, file_schema).await
+        }
+        sqe_planner::HiveScanFormat::Parquet => unreachable!("handled above"),
+    }
+}
+
 #[allow(deprecated)] // parquet 59.2.0 deprecated ParquetObjectReader in favour of a
 // hand-written AsyncFileReader / SpawnedReader. Unlike the DataFusion 55
 // statistics deprecation, this one is behaviour-identical if left alone: the
@@ -873,7 +974,7 @@ async fn open_parquet_stream(
     predicate: Option<&Expr>,
     known_size: Option<u64>,
     coordinator_metrics: Option<&MetricsRegistry>,
-) -> OpenedParquet {
+) -> OpenedFile {
     debug!(file = %file_path, "Reading Parquet file");
     let object_key = s3_url_to_key(file_path)?;
     let path = ObjectPath::from(object_key.as_str());
@@ -1149,7 +1250,13 @@ async fn open_parquet_stream(
             .observe(s3_elapsed.as_secs_f64());
     }
 
-    Ok((Box::pin(stream), schema, bytes_total))
+    // Lift ParquetError into anyhow here rather than in the producer loop, so
+    // every format's stream is the same type by the time it is consumed.
+    Ok((
+        Box::pin(stream.map_err(anyhow::Error::new)),
+        schema,
+        bytes_total,
+    ))
 }
 
 #[tracing::instrument(skip(task, metrics, session_ctx, credential_rx, footer_cache, filter_expr, coordinator_metrics), fields(fragment_id = %task.fragment_id, file_count = task.data_file_paths.len()))]

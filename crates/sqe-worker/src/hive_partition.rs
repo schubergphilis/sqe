@@ -41,6 +41,27 @@ fn file_column_count(full_schema: &Schema, desc: &HiveScanDescriptor) -> Result<
         })
 }
 
+/// The schema of the columns actually stored in a data file: the full schema
+/// minus the trailing partition columns.
+///
+/// Derived through [`file_column_count`], the same split
+/// [`append_partition_columns`] uses, so a reader and the appender cannot
+/// disagree about where the file ends and the partition begins.
+///
+/// Required by the CSV and JSON readers, which bind fields by POSITION against
+/// a declared schema. Letting either infer its own schema is how two files in
+/// one table end up with different types, and how a header row gets counted as
+/// data -- the failure design.md names.
+pub fn file_schema_of(
+    desc: &HiveScanDescriptor,
+    full_schema: &SchemaRef,
+) -> Result<SchemaRef, String> {
+    let n_file = file_column_count(full_schema, desc)?;
+    Ok(Arc::new(Schema::new(
+        full_schema.fields()[..n_file].to_vec(),
+    )))
+}
+
 /// Parse the descriptor's full schema.
 pub fn full_schema_of(desc: &HiveScanDescriptor) -> Result<SchemaRef, String> {
     serde_json::from_str::<Schema>(&desc.full_schema_json)
