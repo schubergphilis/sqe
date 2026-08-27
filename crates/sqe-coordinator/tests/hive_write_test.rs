@@ -492,3 +492,73 @@ async fn ctas_creates_a_partitioned_table_and_loads_it() {
         "CTAS must fan out into k=v directories under its LOCATION"
     );
 }
+
+/// 5.2: a reader must never see a torn or leftover file in a partition.
+///
+/// **This needs no engine change, and that is the finding.** `object_store`'s
+/// `LocalFileSystem` already writes to a staging path and then renames:
+/// `put` does `new_staged_upload(...)` followed by `std::fs::rename`, and a
+/// multipart upload's `complete` renames too. `rename(2)` within one filesystem
+/// is atomic, so a partial write is never visible at the final path. On an
+/// object store the equivalent guarantee is the store's own: a `PUT` becomes
+/// visible whole or not at all.
+///
+/// So this verifies the property rather than implementing it. Writing a second
+/// rename in SQE would be redundant, and redundant safety code nobody can later
+/// remove because nobody knows whether it mattered is its own cost.
+///
+/// A true torn-file test would have to observe the filesystem mid-write, which
+/// is racy and would either flake or pass vacuously. What is checkable without
+/// a race: after the write, every file under the partition is a COMPLETE,
+/// readable data file and no staging leftover remains. A reader listing that
+/// directory is exactly what would trip over either failure.
+#[tokio::test]
+async fn a_write_leaves_no_partial_or_staging_files_behind() {
+    let f = multi_partition("parquet").await;
+    let ctx = session(&f).await;
+
+    ctx.sql("INSERT INTO lake.sales.orders VALUES (12, 120.5, '2026-01-02')")
+        .await
+        .expect("plan insert")
+        .collect()
+        .await
+        .expect("execute insert");
+
+    let dir = f.dir.path().join("data").join("dt=2026-01-02");
+    let entries: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read partition dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+
+    // Two files: the fixture's and the written one. A staging leftover would
+    // make this three, and it would be a file the read path then tries to open
+    // as parquet.
+    assert_eq!(
+        entries.len(),
+        2,
+        "the partition must hold exactly the fixture's file and the written \
+         one; anything extra is a staging leftover a reader would try to parse: \
+         {entries:?}"
+    );
+
+    // Every file must be a COMPLETE parquet file. A torn write would leave one
+    // whose footer does not parse, which is precisely how a reader experiences
+    // a non-atomic write.
+    for path in &entries {
+        let file = std::fs::File::open(path).expect("open");
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap_or_else(|e| {
+                panic!("{path:?} is not a complete parquet file, so the write was not atomic: {e}")
+            });
+        assert!(
+            reader.metadata().file_metadata().num_rows() > 0,
+            "{path:?} parsed but holds no rows, which is a truncated write"
+        );
+    }
+
+    // And the table still reads correctly, which is the property all of the
+    // above exists to protect.
+    let rows = read_back(&f).await;
+    assert_eq!(rows.len(), 6, "{rows:?}");
+}

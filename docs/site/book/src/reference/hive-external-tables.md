@@ -248,7 +248,9 @@ The partition column goes last, matching the table's column order as `SHOW CREAT
 
 **A single file appears atomically. A multi-file write does not.**
 
-An object store makes a `PUT` visible whole or not at all, so no reader ever sees a half-written file. But a write that produces several files has no commit that makes them appear together, and there is nothing SQE can do about that: a Hive external table has no metadata pointer to swap. Its content is whatever is in the directory, which is exactly the property that lets other engines read it.
+An object store makes a `PUT` visible whole or not at all, so no reader ever sees a half-written file. On a local filesystem the same holds for a different reason: the object-store layer writes to a staging path and then renames, and `rename(2)` within one filesystem is atomic. Neither guarantee is SQE's own, and SQE does not add a second one on top.
+
+But a write that produces several files has no commit that makes them appear together, and there is nothing SQE can do about that: a Hive external table has no metadata pointer to swap. Its content is whatever is in the directory, which is exactly the property that lets other engines read it.
 
 So a concurrent reader may see a subset of an in-progress write, and an interrupted write leaves the files it had already landed. Those files hold real rows, not corruption. **If you need snapshot isolation on write, use an Iceberg table.**
 

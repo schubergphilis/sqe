@@ -149,9 +149,24 @@ values. A write test passes on a file nobody can read correctly.
       problem. Static file names have already cost this repo
       an INSERT failure at scale in the Iceberg path; the symptom under
       concurrency is a lost file, not an error.
-- [ ] 5.2 Local-filesystem writes go to a temporary name and rename within the
-      directory, so a reader never sees a torn file. Object-store `PUT` is
-      already whole-or-nothing and needs nothing.
+- [x] 5.2 **No engine change needed, and that is the finding.**
+      `object_store`'s `LocalFileSystem` already stages and renames: `put` calls
+      `new_staged_upload(...)` then `std::fs::rename`, and a multipart upload's
+      `complete` renames as well. `rename(2)` within one filesystem is atomic,
+      so a partial write is never visible at the final path. Object-store `PUT`
+      carries the same guarantee natively.
+
+      Verified rather than assumed, and verified without a race: a true
+      torn-file test would have to observe the filesystem mid-write, which
+      flakes or passes vacuously. `a_write_leaves_no_partial_or_staging_files_behind`
+      instead asserts what a reader would actually trip over -- no staging
+      leftover in the partition, and every file present parses as a complete
+      parquet file with rows.
+
+      Second time this cycle that reading the dependency first turned an
+      implementation task into a test (see 2.3, the CSV header). Adding a
+      redundant rename would have been safety code nobody could later remove,
+      because nobody would know whether it mattered.
 - [x] 5.3 Folded into 3.5 rather than left as a separate box. "An interrupted
       write" is not testable in-process without killing a process mid-sink, and
       the honest version of the property -- the data survives and is

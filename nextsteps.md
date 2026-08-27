@@ -12,7 +12,9 @@
 >
 > Two sqlparser traps worth knowing: Hive's `PARTITIONED BY` lands in `hive_distribution`, not `partition_by`; and `LOCATION` lands in `hive_formats.location`, not `ct.location`. Reading the wrong field in either case yields a silently wrong table.
 >
-> **NEXT in cycle 4:** the local-filesystem write-then-rename (5.2) and the quickstart write-restart-read (7.1), which is the one that genuinely proves index persistence across a restart.
+> **5.2 needed no code.** `object_store`'s LocalFileSystem already stages and renames (`put` -> `new_staged_upload` then `std::fs::rename`; multipart `complete` renames too), so per-file atomicity is the dependency's guarantee, not SQE's. Verified without a race by asserting no staging leftover survives and every file present parses as complete parquet. That is twice this cycle that reading the dependency first turned an implementation task into a test (the CSV header was the other).
+>
+> **NEXT in cycle 4:** the quickstart write-restart-read (7.1), which is the only remaining item and the one that genuinely proves index persistence across an engine restart. It needs the quickstart stack rather than the test harness.
 >
 > ---
 >
