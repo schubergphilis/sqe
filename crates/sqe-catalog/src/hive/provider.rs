@@ -66,6 +66,7 @@ use super::manifest::{HiveManifest, PartitionIndex, PartitionIndexEntry};
 use super::partition::{
     evaluate_projection, parse_projection, prune_entries_owned, ProjectionConfig,
 };
+use super::scan_exec::{HiveScanExec, HiveScanSpec};
 use super::serde_map::{arrow_type, listing_options, resolve_format, ResolvedFormat};
 use super::stats::{analyzed_statistics, row_width_hint, size_only_from_index, size_only_statistics};
 use super::store::HiveManifestStore;
@@ -349,7 +350,7 @@ fn to_df(e: HiveError) -> DataFusionError {
 /// Hive DDL requires a trailing slash on `LOCATION`, so a table declared
 /// without one would otherwise make every file below it invisible to the
 /// scan. This is the layer that owns normalizing that gap.
-fn table_location_url(location: &str) -> Result<ListingTableUrl, HiveError> {
+pub(crate) fn table_location_url(location: &str) -> Result<ListingTableUrl, HiveError> {
     let normalized = if location.ends_with('/') {
         location.to_string()
     } else {
@@ -690,11 +691,28 @@ impl HiveTableProvider {
             plans.push(plan);
         }
 
-        if plans.len() == 1 {
-            Ok(plans.pop().unwrap())
+        let inner: Arc<dyn ExecutionPlan> = if plans.len() == 1 {
+            plans.pop().unwrap()
         } else {
-            Ok(UnionExec::try_new(plans)?)
-        }
+            UnionExec::try_new(plans)?
+        };
+
+        // Wrap in the one node a Hive scan can be recognized by. The coordinator
+        // finds what to distribute with `downcast_ref::<IcebergScanExec>()`, and
+        // until this existed a Hive scan was a UnionExec of projections over
+        // ListingTable scans with nothing in it naming the table. `execute`
+        // delegates, so this changes nothing about what a query returns.
+        Ok(Arc::new(HiveScanExec::new(
+            inner,
+            HiveScanSpec {
+                entries,
+                resolved: self.resolved.clone(),
+                partition_columns: self.partition_columns.clone(),
+                full_schema: Arc::clone(&self.schema),
+                secret: self.secret.clone(),
+                data_store_factory: Arc::clone(&self.data_store_factory),
+            },
+        )))
     }
 }
 

@@ -332,7 +332,12 @@ sqe --stop-on-error --file create-tables.sql >/dev/null || die "DDL failed; re-r
 {
   echo '## The data in the bucket'
   echo '```'
-  s3 s3 ls --recursive "$DATA" | head -12
+  # NOT `s3 ls | head -12`: head closes the pipe after 12 lines, the aws CLI
+  # takes EPIPE, and under `set -o pipefail` that kills the whole run several
+  # steps before the assertions -- with a "Broken pipe" that looks nothing like
+  # its cause. Capture first, then trim from a herestring, so nothing upstream
+  # is still writing when the reader stops.
+  head -12 <<<"$(s3 s3 ls --recursive "$DATA")"
   echo '```'
   echo
   echo '## Process 1: create the tables, then query them'
