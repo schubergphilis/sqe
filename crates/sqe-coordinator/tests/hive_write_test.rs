@@ -293,3 +293,202 @@ async fn a_csv_table_declaring_no_header_round_trips_without_gaining_one() {
          count-only check would catch: {rows:?}"
     );
 }
+
+/// 5.1: two concurrent inserts into the SAME partition must both land.
+///
+/// Static file names have already cost this repo an INSERT failure at scale in
+/// the Iceberg path, found through a dbt load. The symptom under concurrency is
+/// not an error -- it is one writer's file silently replacing another's, so the
+/// row count is what catches it.
+///
+/// Each writer gets its own session context, because that is what two
+/// concurrent clients have. Sharing one would test a single writer twice.
+#[tokio::test]
+async fn two_concurrent_inserts_into_one_partition_both_land() {
+    let f = multi_partition("parquet").await;
+
+    let (a, b) = tokio::join!(
+        async {
+            let ctx = session(&f).await;
+            ctx.sql("INSERT INTO lake.sales.orders VALUES (100, 100.5, '2026-01-02')")
+                .await
+                .expect("plan insert A")
+                .collect()
+                .await
+                .expect("execute insert A")
+        },
+        async {
+            let ctx = session(&f).await;
+            ctx.sql("INSERT INTO lake.sales.orders VALUES (200, 200.5, '2026-01-02')")
+                .await
+                .expect("plan insert B")
+                .collect()
+                .await
+                .expect("execute insert B")
+        }
+    );
+    let _ = (a, b);
+
+    // Two NEW files beside the fixture's own, not one. Asserted on the
+    // directory rather than only on rows: a collision that overwrote one
+    // writer's file would leave a single new file, and the row count alone
+    // could be explained away as a visibility problem.
+    let dir = f.dir.path().join("data").join("dt=2026-01-02");
+    let written: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read partition dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()) != Some("part-0.parquet"))
+        .collect();
+    assert_eq!(
+        written.len(),
+        2,
+        "each concurrent writer must have produced its own file; one file means \
+         a name collision silently discarded a write. Found: {written:?}"
+    );
+
+    let rows = read_back(&f).await;
+    assert_eq!(rows.len(), 7, "five existing plus both writes: {rows:?}");
+    for want in ["100|100.5|2026-01-02", "200|200.5|2026-01-02"] {
+        assert!(
+            rows.contains(&want.to_string()),
+            "both writes must be readable, missing {want}: {rows:?}"
+        );
+    }
+}
+
+/// 3.5: the write ordering, proven rather than assumed.
+///
+/// Data lands BEFORE the index is refreshed. This simulates the refresh
+/// failing -- by simply not calling it -- and asserts the two properties that
+/// make the ordering safe: the data files exist, and `MSCK REPAIR TABLE`'s own
+/// discovery recovers them exactly.
+///
+/// Index-first would fail the other way, promising a partition whose files do
+/// not exist. A test that only checked the happy path would pass for either
+/// ordering.
+#[tokio::test]
+async fn data_lands_before_the_index_so_a_failed_refresh_is_recoverable() {
+    let f = multi_partition("parquet").await;
+    let ctx = session(&f).await;
+
+    ctx.sql("INSERT INTO lake.sales.orders VALUES (11, 110.5, '2026-10-01')")
+        .await
+        .expect("plan insert")
+        .collect()
+        .await
+        .expect("execute insert");
+
+    // No refresh call: this is the state a failed refresh leaves behind.
+    let new_dir = f.dir.path().join("data").join("dt=2026-10-01");
+    assert!(
+        new_dir.is_dir(),
+        "the data must have landed first, so a refresh failure cannot lose it"
+    );
+    assert_eq!(
+        read_back(&f).await.len(),
+        5,
+        "and it must be invisible until the index knows, or this proves nothing"
+    );
+
+    // The documented recovery, run as documented.
+    hive_diff::refresh_partition_index(&f).await;
+
+    let rows = read_back(&f).await;
+    assert_eq!(rows.len(), 6, "MSCK REPAIR must recover the rows: {rows:?}");
+    assert!(rows.contains(&"11|110.5|2026-10-01".to_string()), "{rows:?}");
+}
+
+/// 1.4: CTAS creates the manifest AND lands the data, and the result reads back.
+///
+/// Exercised through the DDL + write mechanics rather than the coordinator's
+/// dispatch (which needs a live `QueryHandler`): build the spec the way the
+/// router does, write the manifest, then load through the same INSERT path.
+/// That is the same sequence in the same order, so a divergence in either half
+/// shows up here.
+#[tokio::test]
+async fn ctas_creates_a_partitioned_table_and_loads_it() {
+    let f = multi_partition("parquet").await;
+    let ctx = session(&f).await;
+
+    // The target table's data lives beside the source's, under its own prefix.
+    let target_loc = format!("file://{}/ctas_out", f.dir.path().display());
+    let sql = format!(
+        "CREATE TABLE lake.sales.copy PARTITIONED BY (dt string) STORED AS PARQUET \
+         LOCATION '{target_loc}' AS SELECT id, amount, dt FROM lake.sales.orders"
+    );
+    let stmt = sqlparser::parser::Parser::parse_sql(
+        &sqlparser::dialect::DuckDbDialect {},
+        &sql,
+    )
+    .expect("parse ctas")
+    .remove(0);
+    let ct = match &stmt {
+        sqlparser::ast::Statement::CreateTable(ct) => ct,
+        other => panic!("not a CREATE TABLE: {other:?}"),
+    };
+
+    let select_sql = sqe_coordinator::hive_write::ctas_select_sql(ct).expect("select");
+    let schema = ctx
+        .sql(&select_sql)
+        .await
+        .expect("plan ctas query")
+        .schema()
+        .as_arrow()
+        .clone();
+    let spec = sqe_coordinator::hive_write::ctas_spec(ct, &schema).expect("ctas spec");
+
+    // The spec must split file columns from partition keys, or the table it
+    // creates is unreadable in a way no row count would reveal.
+    assert_eq!(
+        spec.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        vec!["id", "amount"]
+    );
+    assert_eq!(
+        spec.partition_keys.iter().map(|k| k.name.as_str()).collect::<Vec<_>>(),
+        vec!["dt"]
+    );
+
+    // Manifest first, then data -- the CTAS ordering, inverted from INSERT's.
+    hive_diff::put_spec_manifest(&f, &spec).await;
+
+    let ctx2 = session(&f).await;
+    let load = format!("INSERT INTO lake.sales.copy {select_sql}");
+    ctx2.sql(&load)
+        .await
+        .expect("plan ctas load")
+        .collect()
+        .await
+        .expect("execute ctas load");
+    hive_diff::refresh_named_index(&f, "copy").await;
+
+    let ctx3 = session(&f).await;
+    let rows = hive_diff::sorted_rows(
+        &ctx3
+            .sql("SELECT id, amount, dt FROM lake.sales.copy")
+            .await
+            .expect("plan read of the new table")
+            .collect()
+            .await
+            .expect("collect"),
+    );
+    assert_eq!(
+        rows,
+        vec![
+            "1|10.5|2026-01-01",
+            "2|20.0|2026-01-01",
+            "3|30.5|2026-01-02",
+            "4|40.5|2026-01-03",
+            "5|45.0|2026-01-03",
+        ],
+        "the CTAS table must hold exactly the source's rows, partition values included"
+    );
+
+    // And the partition columns must be directory-encoded in the NEW table too,
+    // not written into its files.
+    let out = f.dir.path().join("ctas_out");
+    assert!(
+        out.join("dt=2026-01-01").is_dir(),
+        "CTAS must fan out into k=v directories under its LOCATION"
+    );
+}

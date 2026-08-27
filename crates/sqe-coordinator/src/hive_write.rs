@@ -22,6 +22,7 @@
 //! other engine reading the directory decides the table's content the same way.
 //! A caller who needs snapshot isolation on write needs an Iceberg table.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
@@ -157,5 +158,393 @@ mod tests {
         // reach the sink and append.
         let err = reject_overwrite(&parse("REPLACE INTO t SELECT 1"));
         assert!(err.is_err(), "REPLACE INTO must not fall through to an append");
+    }
+}
+
+/// Map an Arrow type back to the Hive type name a manifest records.
+///
+/// The inverse of `serde_map::arrow_type_of`, and deliberately narrower than
+/// it: only the types that round-trip. A CTAS whose query produces something
+/// unmappable fails at CREATE, naming the column, rather than writing a
+/// manifest the read path cannot parse. That is the difference between an error
+/// and a table nobody can select from.
+fn hive_type_of(dt: &DataType) -> Option<&'static str> {
+    Some(match dt {
+        DataType::Int8 => "tinyint",
+        DataType::Int16 => "smallint",
+        DataType::Int32 => "int",
+        DataType::Int64 => "bigint",
+        DataType::Float32 => "float",
+        DataType::Float64 => "double",
+        DataType::Boolean => "boolean",
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "string",
+        DataType::Binary | DataType::LargeBinary => "binary",
+        DataType::Date32 => "date",
+        DataType::Timestamp(_, None) => "timestamp",
+        _ => return None,
+    })
+}
+
+/// The partition key names a `PARTITIONED BY` clause declares, with the type
+/// each one was declared as when it was given one.
+///
+/// sqlparser puts Hive's `PARTITIONED BY` in `hive_distribution`, NOT in
+/// `partition_by` (which is the BigQuery/ClickHouse expression form and stays
+/// `None` here). Reading the wrong field yields an unpartitioned table from a
+/// statement that asked for partitions, silently.
+///
+/// Both spellings are accepted because both are in the wild:
+/// `PARTITIONED BY (dt string)` declares the type (Hive/Athena), and
+/// `PARTITIONED BY (dt)` refers to a column the query already produces
+/// (Spark/Trino), leaving the type to be taken from the query schema.
+fn declared_partition_keys(ct: &sqlparser::ast::CreateTable) -> Vec<(String, Option<String>)> {
+    use sqlparser::ast::HiveDistributionStyle;
+    match &ct.hive_distribution {
+        HiveDistributionStyle::PARTITIONED { columns } => columns
+            .iter()
+            .map(|c| {
+                let declared = match &c.data_type {
+                    sqlparser::ast::DataType::Unspecified => None,
+                    other => Some(other.to_string()),
+                };
+                (c.name.value.clone(), declared)
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Build the manifest spec for `CREATE TABLE <hive> ... AS SELECT`.
+///
+/// `query_schema` is the SELECT's output schema, which is where the column list
+/// comes from: a CTAS need not declare one, and when it does the query is still
+/// the authority on types.
+///
+/// ## Partition columns must be the trailing ones
+///
+/// Hive's own convention, and load-bearing rather than stylistic. The read path
+/// derives its file schema as "the full schema minus the trailing
+/// `partition_keys.len()` fields", and the worker's
+/// `append_partition_columns` splits at the same index. A partition column in
+/// the middle of the query's output would put a file column where a partition
+/// column is expected, with no error and the wrong values.
+///
+/// So this VALIDATES the order rather than reordering to fix it. Reordering
+/// would silently change which column the user's data lands in.
+pub fn ctas_spec(
+    ct: &sqlparser::ast::CreateTable,
+    query_schema: &Schema,
+) -> Result<sqe_sql::hive_ddl::HiveTableSpec, SqeError> {
+    use sqe_sql::hive_ddl::{HiveColumn, HiveTableSpec};
+
+    if ct.or_replace {
+        // `DROP TABLE` on a Hive external table deletes the MANIFEST and never
+        // the data, which is the documented cycle-1 contract. So
+        // `CREATE OR REPLACE ... AS SELECT` would write new files into a
+        // directory that still holds the old ones, and the table would read
+        // back as the union of both. Refused rather than shipped.
+        return Err(SqeError::NotImplemented(
+            "hive_external: CREATE OR REPLACE TABLE ... AS SELECT is not supported for Hive \
+             external tables. DROP TABLE removes the manifest but never the data, so the \
+             replacement would read back as the union of the old and new rows. Drop the table \
+             and delete its data directory, then create it again."
+                .to_string(),
+        ));
+    }
+
+    let location = ct
+        .hive_formats
+        .as_ref()
+        .and_then(|f| f.location.clone())
+        .ok_or_else(|| {
+            // Required, not defaulted. SQE never invents a data path for an
+            // external table -- cycle 1 made LOCATION mandatory on
+            // CREATE EXTERNAL TABLE for the same reason, and guessing one here
+            // would write a user's data somewhere they did not name.
+            SqeError::Execution(
+                "hive_external: CREATE TABLE ... AS SELECT against a Hive root requires an \
+                 explicit LOCATION, because SQE does not choose data paths for external \
+                 tables. Add LOCATION 's3://bucket/prefix/' before AS SELECT."
+                    .to_string(),
+            )
+        })?;
+
+    let parts: Vec<String> = ct
+        .name
+        .0
+        .iter()
+        .filter_map(|p| p.as_ident().map(|i| i.value.clone()))
+        .collect();
+    let (catalog, database, name) = match parts.as_slice() {
+        [t] => (None, None, t.clone()),
+        [d, t] => (None, Some(d.clone()), t.clone()),
+        [c, d, t] => (Some(c.clone()), Some(d.clone()), t.clone()),
+        _ => {
+            return Err(SqeError::Execution(format!(
+                "hive_external: `{}` is not a one, two, or three part table name",
+                ct.name
+            )))
+        }
+    };
+
+    let declared = declared_partition_keys(ct);
+    let n_fields = query_schema.fields().len();
+    if declared.len() >= n_fields {
+        return Err(SqeError::Execution(format!(
+            "hive_external: the query produces {n_fields} column(s) and {} of them were \
+             declared as partition keys, leaving nothing to store in the data files",
+            declared.len()
+        )));
+    }
+    let split = n_fields - declared.len();
+
+    // Validate the trailing-column convention rather than silently reordering.
+    for (i, (key, _)) in declared.iter().enumerate() {
+        let field = query_schema.field(split + i);
+        if !field.name().eq_ignore_ascii_case(key) {
+            return Err(SqeError::Execution(format!(
+                "hive_external: partition column `{key}` must be column {} of the SELECT, but \
+                 that column is `{}`. Hive stores partition columns in the directory name and \
+                 the read path expects them last, so the SELECT must end with them in the \
+                 declared order.",
+                split + i + 1,
+                field.name()
+            )));
+        }
+    }
+
+    let to_column = |field: &arrow_schema::Field,
+                     declared_type: Option<&String>|
+     -> Result<HiveColumn, SqeError> {
+        let sql_type = match declared_type {
+            Some(t) => t.to_ascii_lowercase(),
+            None => hive_type_of(field.data_type())
+                .ok_or_else(|| {
+                    SqeError::Execution(format!(
+                        "hive_external: column `{}` has type {} which has no Hive equivalent \
+                         this release records. Cast it in the SELECT, or declare the column \
+                         type explicitly.",
+                        field.name(),
+                        field.data_type()
+                    ))
+                })?
+                .to_string(),
+        };
+        Ok(HiveColumn {
+            name: field.name().clone(),
+            sql_type,
+            comment: None,
+        })
+    };
+
+    let mut columns = Vec::with_capacity(split);
+    for field in query_schema.fields().iter().take(split) {
+        columns.push(to_column(field, None)?);
+    }
+    let mut partition_keys = Vec::with_capacity(declared.len());
+    for (i, (_, declared_type)) in declared.iter().enumerate() {
+        partition_keys.push(to_column(query_schema.field(split + i), declared_type.as_ref())?);
+    }
+
+    let stored_as = match ct.hive_formats.as_ref().and_then(|f| f.storage.as_ref()) {
+        // Matched on the variant, not formatted from it. `HiveIOFormat` has no
+        // `Display`, and munging its `Debug` output would break the moment
+        // sqlparser renamed a field.
+        Some(sqlparser::ast::HiveIOFormat::FileFormat { format }) => format!("{format}"),
+        // Both remaining variants enumerated rather than caught by a wildcard.
+        // A variant added to `HiveIOFormat` later must be a compile error here,
+        // not silently treated as parquet -- that would write parquet files
+        // into a table whose manifest claims a different format, and the
+        // failure would surface on the next SELECT.
+        Some(sqlparser::ast::HiveIOFormat::IOF { .. })
+        | Some(sqlparser::ast::HiveIOFormat::Using { .. }) => {
+            return Err(SqeError::NotImplemented(
+                "hive_external: CREATE TABLE ... AS SELECT with an explicit INPUTFORMAT / \
+                 OUTPUTFORMAT or USING clause is not supported. Use STORED AS PARQUET, or \
+                 omit the clause."
+                    .to_string(),
+            ))
+        }
+        // Parquet rather than Hive's own TEXTFILE default, on purpose: a CTAS
+        // is SQE writing the files, and writing text would discard the types
+        // the query schema just established.
+        None => "PARQUET".to_string(),
+    };
+
+    Ok(HiveTableSpec {
+        catalog,
+        database,
+        name,
+        if_not_exists: ct.if_not_exists,
+        comment: None,
+        columns,
+        partition_keys,
+        location,
+        serde_class: None,
+        serde_properties: BTreeMap::new(),
+        stored_as: Some(stored_as),
+        input_format: None,
+        output_format: None,
+        table_properties: BTreeMap::new(),
+    })
+}
+
+/// The SELECT text of a CTAS, ready to plan.
+///
+/// Rendered back from the AST rather than sliced out of the original SQL,
+/// because the original may carry the `PARTITIONED BY` and `LOCATION` clauses
+/// interleaved and a textual split would take them along.
+pub fn ctas_select_sql(ct: &sqlparser::ast::CreateTable) -> Option<String> {
+    ct.query
+        .as_ref()
+        .map(|q| sqe_sql::rewrite_named_tvf_args(&format!("{q}")))
+}
+
+/// The `INSERT INTO` that loads a freshly created CTAS table.
+///
+/// Reuses the INSERT path deliberately: it already carries the fan-out, the
+/// partition-index refresh, the ordering guarantee, and the session-cache
+/// invalidation, all of which a second loader would have to reimplement and
+/// could get subtly different.
+pub fn ctas_load_sql(table: &sqlparser::ast::ObjectName, select_sql: &str) -> String {
+    format!("INSERT INTO {table} {select_sql}")
+}
+
+#[cfg(test)]
+mod ctas_tests {
+    use super::*;
+    use arrow_schema::Field;
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    fn ct(sql: &str) -> sqlparser::ast::CreateTable {
+        match Parser::parse_sql(&GenericDialect {}, sql).expect("parse").remove(0) {
+            Statement::CreateTable(ct) => ct,
+            other => panic!("not a CREATE TABLE: {other:?}"),
+        }
+    }
+
+    fn schema(fields: &[(&str, DataType)]) -> Schema {
+        Schema::new(
+            fields
+                .iter()
+                .map(|(n, t)| Field::new(*n, t.clone(), true))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn partition_keys_come_from_hive_distribution_not_partition_by() {
+        // sqlparser puts Hive's PARTITIONED BY in `hive_distribution` and leaves
+        // `partition_by` as None. Reading the wrong field yields an
+        // UNPARTITIONED table from a statement that asked for partitions, with
+        // no error -- so this asserts the keys actually arrive.
+        let c = ct(
+            "CREATE TABLE lake.sales.o (id BIGINT) PARTITIONED BY (dt string) \
+             LOCATION 's3://b/p/' AS SELECT 1 AS id, 'x' AS dt",
+        );
+        assert!(c.partition_by.is_none(), "the field a naive reading would use");
+        let spec = ctas_spec(
+            &c,
+            &schema(&[("id", DataType::Int64), ("dt", DataType::Utf8)]),
+        )
+        .expect("spec");
+        assert_eq!(
+            spec.partition_keys.iter().map(|k| k.name.as_str()).collect::<Vec<_>>(),
+            vec!["dt"]
+        );
+        assert_eq!(
+            spec.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["id"],
+            "the partition column must NOT also be a stored column"
+        );
+        assert_eq!(spec.stored_as.as_deref(), Some("PARQUET"));
+    }
+
+    #[test]
+    fn an_untyped_partition_key_takes_its_type_from_the_query() {
+        // Spark/Trino spelling: `PARTITIONED BY (dt)` with no type.
+        let c = ct(
+            "CREATE TABLE lake.sales.o PARTITIONED BY (dt) LOCATION 's3://b/p/' \
+             AS SELECT 1 AS id, 'x' AS dt",
+        );
+        let spec = ctas_spec(
+            &c,
+            &schema(&[("id", DataType::Int64), ("dt", DataType::Utf8)]),
+        )
+        .expect("spec");
+        assert_eq!(spec.partition_keys[0].sql_type, "string");
+        assert_eq!(spec.columns[0].sql_type, "bigint");
+    }
+
+    #[test]
+    fn a_partition_column_that_is_not_last_is_an_error_not_a_reorder() {
+        // The read path splits the schema at `len() - partition_keys.len()`, so
+        // a partition column in the middle puts a file column where a partition
+        // column is expected. Reordering to "fix" it would silently move the
+        // user's data into a different column, so it errors instead.
+        let c = ct(
+            "CREATE TABLE lake.sales.o PARTITIONED BY (dt) LOCATION 's3://b/p/' \
+             AS SELECT 'x' AS dt, 1 AS id",
+        );
+        let err = ctas_spec(
+            &c,
+            &schema(&[("dt", DataType::Utf8), ("id", DataType::Int64)]),
+        )
+        .expect_err("dt is first, not last");
+        let msg = err.to_string();
+        assert!(msg.contains("must be column 2"), "{msg}");
+        assert!(msg.contains("`id`"), "the message must name what is there: {msg}");
+    }
+
+    #[test]
+    fn a_missing_location_is_refused_rather_than_invented() {
+        let c = ct("CREATE TABLE lake.sales.o AS SELECT 1 AS id");
+        let err = ctas_spec(&c, &schema(&[("id", DataType::Int64)]))
+            .expect_err("no LOCATION");
+        let msg = err.to_string();
+        assert!(msg.contains("LOCATION"), "{msg}");
+        assert!(
+            msg.contains("does not choose data paths"),
+            "the message must say WHY it is required: {msg}"
+        );
+    }
+
+    #[test]
+    fn or_replace_is_refused_because_drop_leaves_the_data() {
+        let c = ct(
+            "CREATE OR REPLACE TABLE lake.sales.o LOCATION 's3://b/p/' AS SELECT 1 AS id",
+        );
+        let err = ctas_spec(&c, &schema(&[("id", DataType::Int64)]))
+            .expect_err("or_replace");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("union"),
+            "the message must explain that the result would mix old and new rows: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_type_with_no_hive_equivalent_fails_at_create_not_at_read() {
+        // A manifest the read path cannot parse is worse than a rejected CREATE:
+        // the table would exist and nobody could select from it.
+        let c = ct("CREATE TABLE lake.sales.o LOCATION 's3://b/p/' AS SELECT 1 AS id");
+        let err = ctas_spec(
+            &c,
+            &schema(&[("id", DataType::Duration(arrow_schema::TimeUnit::Second))]),
+        )
+        .expect_err("duration has no hive type");
+        assert!(err.to_string().contains("no Hive equivalent"), "{err}");
+    }
+
+    #[test]
+    fn declaring_every_column_a_partition_key_leaves_nothing_to_store() {
+        let c = ct(
+            "CREATE TABLE lake.sales.o PARTITIONED BY (dt) LOCATION 's3://b/p/' \
+             AS SELECT 'x' AS dt",
+        );
+        let err = ctas_spec(&c, &schema(&[("dt", DataType::Utf8)]))
+            .expect_err("no file columns left");
+        assert!(err.to_string().contains("nothing to store"), "{err}");
     }
 }

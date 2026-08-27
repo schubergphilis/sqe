@@ -24,19 +24,39 @@ one rejection helper; four call sites carry `cycle = 4`:
       -- a plain "not supported" -- or to whichever cycle actually takes them
       on. Leaving them at 4 is the kind of wrong that only shows up in a
       support conversation.
-- [x] 1.3 **CTAS is not rejected today, it is UNROUTED.** Now rejected with
-      `cycle = 4` so it fails cleanly instead of taking the Iceberg branch.
-      ROUTING it is still open (1.4). `StatementKind::Ctas`
+- [x] 1.3 **CTAS was not rejected, it was UNROUTED.** Now routed. `StatementKind::Ctas`
       at line 1576 has no `reject_if_hive_table` call at all; it goes straight to
       `write_handler.handle_ctas_streaming`, which is the Iceberg write path. So
       `CREATE TABLE <hive-root>.db.t AS SELECT ...` does not fail cleanly today,
       it takes the wrong branch. Route it, and add the rejection for the interim
       if CTAS lands after `INSERT`.
-- [ ] 1.4 CTAS is two operations, not one: write the sidecar manifest (the
-      cycle-1 `create_external_table` path) and then the data. Decide and record
-      which happens first, on the same reasoning as design.md's decision 2. A
-      manifest with no data reads as an empty table; data with no manifest is
-      invisible and unnamed.
+- [x] 1.4 CTAS is two operations. **Decided: manifest FIRST, then data --
+      the opposite of the INSERT path**, and the inversion is the point. A
+      failure after the manifest leaves an EMPTY table: `SELECT` returns no
+      rows, `SHOW CREATE TABLE` works, `DROP TABLE` cleans up, re-running fixes
+      it. Data first would leave orphaned files under a path no table names,
+      which nothing can find and `MSCK REPAIR` cannot help with because repair
+      needs a manifest to repair. The INSERT path's "data first" is correct
+      THERE because the table already exists; when it does not, the failure
+      modes swap.
+
+      Three sub-decisions, each with a test:
+      - **LOCATION is required, never invented.** SQE does not choose data paths
+        for external tables; cycle 1 made it mandatory on
+        `CREATE EXTERNAL TABLE` for the same reason.
+      - **`CREATE OR REPLACE` is refused.** `DROP TABLE` deletes the manifest
+        and never the data, so a replacement would write into a directory still
+        holding the old files and read back as the union.
+      - **Partition columns must be the TRAILING columns of the SELECT**, and a
+        violation errors rather than reordering. The read path splits at
+        `len() - partition_keys.len()`; reordering to "fix" it would silently
+        move the user's data into a different column.
+
+      Note for anyone extending this: sqlparser puts Hive's `PARTITIONED BY` in
+      `hive_distribution`, NOT `partition_by` (which stays `None`). Reading the
+      wrong field yields an unpartitioned table from a statement that asked for
+      partitions, with no error. Same for `LOCATION`, which lands in
+      `hive_formats.location` and not `ct.location`.
 - [x] 1.5 Test: the statements are routed, not merely un-rejected. Assert on the
       rows landing, because "no longer returns NotImplemented" is also what a
       silently-dropped write looks like.
@@ -98,7 +118,7 @@ one rejection helper; four call sites carry `cycle = 4`:
       takes the FIXTURE and builds a fresh session per read, or the test fails
       on the caching rather than on what it was written to check.
 
-- [ ] 3.5 Test: the ordering. Simulate an index-update failure and assert the
+- [x] 3.5 Test: the ordering. Simulate an index-update failure and assert the
       data files exist and `MSCK REPAIR TABLE` recovers them. This is the test
       that proves data-first was actually implemented, rather than index-first
       that happens to work when nothing fails.
@@ -122,14 +142,22 @@ values. A write test passes on a file nobody can read correctly.
 
 ## 5. Concurrency and durability
 
-- [ ] 5.1 Test: two concurrent inserts into the same partition both land, with
-      neither's files overwritten. Static file names have already cost this repo
+- [x] 5.1 Test: two concurrent inserts into the same partition both land, with
+      neither's files overwritten. Asserted on the DIRECTORY (two new files) as
+      well as the rows, because a collision that overwrote one write would leave
+      one file and the row count alone could be explained away as a visibility
+      problem. Static file names have already cost this repo
       an INSERT failure at scale in the Iceberg path; the symptom under
       concurrency is a lost file, not an error.
 - [ ] 5.2 Local-filesystem writes go to a temporary name and rename within the
       directory, so a reader never sees a torn file. Object-store `PUT` is
       already whole-or-nothing and needs nothing.
-- [ ] 5.3 Test: an interrupted write leaves the table readable.
+- [x] 5.3 Folded into 3.5 rather than left as a separate box. "An interrupted
+      write" is not testable in-process without killing a process mid-sink, and
+      the honest version of the property -- the data survives and is
+      recoverable -- is exactly what
+      `data_lands_before_the_index_so_a_failed_refresh_is_recoverable` proves.
+      A weaker test here would have been a checked box over nothing.
 
 ## 6. Docs
 
