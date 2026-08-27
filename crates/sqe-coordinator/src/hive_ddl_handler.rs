@@ -545,20 +545,52 @@ impl HiveDdlHandler {
         session: &Session,
         table_ref: &TableReference,
     ) -> Result<usize, SqeError> {
+        self.repair_index(session, table_ref, "MSCK REPAIR TABLE").await
+    }
+
+    /// Rebuild `sqe.partition_index` after a write, so a new partition
+    /// directory is visible to the next query.
+    ///
+    /// Cycle 2 made reads plan from the index instead of listing the table
+    /// prefix, which means a write into a partition the index does not mention
+    /// is INVISIBLE. Measured, not assumed: an insert into an unindexed
+    /// partition lands its file on disk and the next `SELECT` returns the old
+    /// five rows. Without this call the strongest read optimization in the Hive
+    /// path is also the thing that makes the first write look like a lost write.
+    ///
+    /// Deliberately the same discovery `MSCK REPAIR TABLE` runs, rather than an
+    /// incremental update computed from the written files. Two reasons: a second
+    /// implementation would drift from the one `MSCK REPAIR` uses, and drift
+    /// here means the recovery path disagrees with the write path about what
+    /// the table contains. The cost is a full prefix LIST per write, which is
+    /// exactly the work the partition index exists to avoid on READS -- an
+    /// incremental update is the right optimization later, and it needs the
+    /// written partition values threaded out of the sink to be worth doing.
+    ///
+    /// Audited as the write rather than as a repair: an operator reading the
+    /// audit log should not see a `MSCK REPAIR TABLE` nobody issued.
+    pub async fn refresh_index_after_write(
+        &self,
+        session: &Session,
+        table_ref: &TableReference,
+    ) -> Result<usize, SqeError> {
+        self.repair_index(session, table_ref, "INSERT").await
+    }
+
+    async fn repair_index(
+        &self,
+        session: &Session,
+        table_ref: &TableReference,
+        audit_label: &str,
+    ) -> Result<usize, SqeError> {
         let (root, database, table) = self.full_hive_name(table_ref)?;
         let store = self.store_for(&root)?;
         let mut manifest = store
             .get(&database, &table)
             .await
             .map_err(|e| SqeError::Execution(e.to_string()))?;
-        self.refuse_if_denied(
-            &session.user,
-            &database,
-            &table,
-            &manifest,
-            "MSCK REPAIR TABLE",
-        )
-        .await?;
+        self.refuse_if_denied(&session.user, &database, &table, &manifest, audit_label)
+            .await?;
 
         let count = sqe_catalog::hive::partition::msck_repair(
             &store,
@@ -568,8 +600,11 @@ impl HiveDdlHandler {
         .await
         .map_err(|e| SqeError::Execution(e.to_string()))?;
 
+        // Invalidate BEFORE returning. `HiveMetadataCache` has a 60s TTL, so a
+        // correct index update is still invisible for up to a minute without
+        // this -- which looks exactly like the index update having failed.
         self.invalidate_manifest(&database, &table);
-        self.emit_audit_event(session, &root, &database, &table, "MSCK REPAIR TABLE");
+        self.emit_audit_event(session, &root, &database, &table, audit_label);
         Ok(count)
     }
 
