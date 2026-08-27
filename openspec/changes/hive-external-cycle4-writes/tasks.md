@@ -49,7 +49,7 @@ one rejection helper; four call sites carry `cycle = 4`:
       parquet/CSV/JSON file directly, not through the table -- the read path
       projects partition columns back IN, so a table-level SELECT looks correct
       either way. This is the assertion that distinguishes them.
-- [ ] 2.3 CSV header. Likely ALREADY correct: `serde_map::listing_options`
+- [x] 2.3 CSV header. CONFIRMED already correct by construction: `serde_map::listing_options`
       builds one `CsvFormat` with `with_has_header(r.has_header)`, and
       DataFusion's `CsvFormat` uses that flag for both the reader's skip and the
       writer's emit, so read and write cannot disagree by construction. Verify
@@ -84,6 +84,20 @@ one rejection helper; four call sites carry `cycle = 4`:
       file is on disk and the next SELECT returns the old five rows. The test
       asserts the 5 BEFORE asserting the 6, so it cannot pass by the row having
       been visible all along.
+- [x] 3.6 **Invalidate the cached session context after a write.** Found by
+      4.3, not predicted by the design. A `SELECT` before the write caches the
+      table provider in that `SessionContext`; the next `SELECT` on the same
+      context returns the PRE-write rows while a fresh context returns the
+      correct ones. So refreshing the index without also dropping the cached
+      context makes a correct refresh invisible -- indistinguishable from the
+      refresh failing. The Iceberg CTAS and INSERT arms already called
+      `invalidate_session_cache`; the Hive arm did not.
+
+      The testing half matters as much: a test reusing one context does not
+      match production, which builds one per statement. `read_back` therefore
+      takes the FIXTURE and builds a fresh session per read, or the test fails
+      on the caching rather than on what it was written to check.
+
 - [ ] 3.5 Test: the ordering. Simulate an index-update failure and assert the
       data files exist and `MSCK REPAIR TABLE` recovers them. This is the test
       that proves data-first was actually implemented, rather than index-first
@@ -95,11 +109,13 @@ Write, then read back through the normal read path, and compare counts AND
 values. A write test passes on a file nobody can read correctly.
 
 - [x] 4.1 Parquet.
-- [ ] 4.2 CSV with `skip.header.line.count = 1`.
-- [ ] 4.3 CSV with `skip.header.line.count = 0`. Both, because the two failures
+- [x] 4.2 CSV with `skip.header.line.count = 1`.
+- [x] 4.3 CSV with `skip.header.line.count = 0`. Both, because the two failures
       are opposite (a real row eaten vs a phantom row) and a test of one is
-      passed by a writer that gets the other wrong.
-- [ ] 4.4 Line-delimited JSON.
+      passed by a writer that gets the other wrong. **Writing this one found a
+      different bug**: it failed with the written row MISSING, not duplicated,
+      and the cause was neither the writer nor the header. See 3.6.
+- [x] 4.4 Line-delimited JSON.
 - [ ] 4.5 A typed non-string partition key and `__HIVE_DEFAULT_PARTITION__`,
       round-tripped. Cycle 5's differential suite pinned these on the READ side;
       a write has to produce directory names the read side then parses back.
