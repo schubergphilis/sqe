@@ -34,9 +34,12 @@
 //! regardless.
 //!
 //! The consequence is real and is not hidden: a Hive CSV task's peak residency
-//! includes the whole encoded object, where a parquet task's includes only the
-//! ranges it fetched. The caller charges the object's size against the scan
-//! budget for exactly that reason.
+//! includes the whole ENCODED object, where a parquet task's includes only the
+//! ranges it fetched. The caller charges that size against the scan budget
+//! through the same fetch-permit path parquet uses, so it is visible in
+//! `scan_fetch_resident_bytes` -- but the charge is capped at an eighth of the
+//! budget's capacity, so a text file larger than that is under-charged. Decoded
+//! batches are charged in full, one at a time, which is why the decode is lazy.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -116,19 +119,23 @@ pub async fn open_csv_stream(
         .build(Cursor::new(bytes))
         .map_err(|e| anyhow::anyhow!("hive csv reader for `{path}`: {e}"))?;
 
-    // The reader is a blocking `Iterator`. Collected eagerly rather than
-    // wrapped in `spawn_blocking` per batch: the whole object is already in
-    // memory, so decoding does no I/O and cannot block on the network, and the
-    // per-batch spawn would cost more than the decode.
+    // Decoded LAZILY. `stream::iter` over the reader itself, never over a
+    // collected Vec: collecting would allocate every batch of the file before
+    // the caller has admitted any of them against the scan budget, so peak
+    // residency would be the encoded object PLUS the whole decoded file with
+    // nothing charged for either. `emit_batch` charges one batch at a time, and
+    // that only bounds anything if one batch at a time is what exists.
     //
-    // The batches are still yielded one at a time downstream, which is what the
-    // scan budget admits against.
-    let batches: Vec<anyhow::Result<RecordBatch>> = reader
-        .map(|r| r.map_err(|e| anyhow::anyhow!("hive csv `{path}`: {e}")))
-        .collect();
-
+    // No `spawn_blocking`: the object is already in memory, so decoding does no
+    // I/O and cannot block on the network. Lazy decode is the same total work as
+    // eager, spread across polls.
+    let owned_path = path.to_string();
     Ok((
-        Box::pin(stream::iter(batches).boxed()),
+        Box::pin(
+            stream::iter(reader)
+                .map(move |r| r.map_err(|e| anyhow::anyhow!("hive csv `{owned_path}`: {e}")))
+                .boxed(),
+        ),
         file_schema,
         len,
     ))
@@ -161,12 +168,14 @@ pub async fn open_json_stream(
         .build(std::io::BufReader::new(Cursor::new(bytes)))
         .map_err(|e| anyhow::anyhow!("hive json reader for `{path}`: {e}"))?;
 
-    let batches: Vec<anyhow::Result<RecordBatch>> = reader
-        .map(|r| r.map_err(|e| anyhow::anyhow!("hive json `{path}`: {e}")))
-        .collect();
-
+    // Lazy, for the same reason as the CSV reader above.
+    let owned_path = path.to_string();
     Ok((
-        Box::pin(stream::iter(batches).boxed()),
+        Box::pin(
+            stream::iter(reader)
+                .map(move |r| r.map_err(|e| anyhow::anyhow!("hive json `{owned_path}`: {e}")))
+                .boxed(),
+        ),
         file_schema,
         len,
     ))

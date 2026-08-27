@@ -32,6 +32,14 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::ExecutionPlan;
 use sqe_planner::{HiveScanDescriptor, HiveScanFormat, ScanTask};
 
+/// A listing of one partition: its directory-encoded values, and each data
+/// file's `(url, size_bytes)`.
+///
+/// The shape `HiveScanExec::partition_files` returns and `tasks_for_hive_scan`
+/// takes. Named so the two agree by type rather than by having the same nested
+/// tuple typed out twice.
+pub type HivePartitionListing = (BTreeMap<String, String>, Vec<(String, u64)>);
+
 /// One partition's worth of already-listed data files.
 pub struct HivePartitionFiles {
     /// Directory-encoded partition values, as recorded in the index.
@@ -182,7 +190,7 @@ pub fn build_hive_scan_tasks(
 ///   pushdown INSIDE the distributed Hive scan. Absent, not broken.
 pub fn tasks_for_hive_scan(
     spec: &sqe_catalog::hive::scan_exec::HiveScanSpec,
-    partitions: Vec<(BTreeMap<String, String>, Vec<(String, u64)>)>,
+    partitions: Vec<HivePartitionListing>,
     s3: &HiveS3Access,
     fragment_prefix: &str,
 ) -> Result<Vec<ScanTask>, String> {

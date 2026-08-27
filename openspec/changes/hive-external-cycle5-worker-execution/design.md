@@ -216,11 +216,24 @@ Hive tables come in, and the same shape cycle 2's partition index assumes.
 ### The cost this accepts, stated plainly
 
 Both readers fetch the object whole before decoding, so a CSV task's peak
-residency includes the entire encoded file. A parquet task's includes only the
-byte ranges it fetched. The size is charged against the scan budget through the
-same fetch-permit path parquet uses (`open_csv_stream` returns the object's real
-length), so the memory is accounted rather than hidden -- but it is charged
-where a parquet task of the same logical size would charge less.
+residency includes the entire ENCODED file. A parquet task's includes only the
+byte ranges it fetched.
+
+That size reaches the scan budget through the same fetch-permit path parquet
+uses -- `open_csv_stream` returns the object's real length, so it shows up in
+`scan_fetch_resident_bytes` -- but the charge is not the whole story, and it
+would be wrong to claim the memory is fully accounted. The fetch charge is
+capped at an eighth of the budget's capacity, so a text file larger than that
+is under-charged, exactly as an unusually large parquet file is.
+
+Decoded batches are a separate matter and are charged in full, one at a time, by
+`emit_batch`. That is only true because the decode is LAZY. A first draft of
+both readers collected the whole file's batches before returning, which made
+peak residency the encoded object plus the entire decoded file with nothing
+charged for the decoded half -- a new way for a worker to OOM instead of
+returning `ResourceExhausted`, on a path that had previously refused CSV
+outright. `stream::iter` over the arrow reader itself, never over a collected
+`Vec`, is what keeps the per-batch charge meaningful.
 
 A streaming decode would fix that. `arrow`'s CSV and JSON readers both expose an
 incremental `Decoder`, so the work is bounded and known; it is left out of cycle
