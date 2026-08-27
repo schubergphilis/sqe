@@ -24,12 +24,11 @@ one rejection helper; four call sites carry `cycle = 4`:
       -- a plain "not supported" -- or to whichever cycle actually takes them
       on. Leaving them at 4 is the kind of wrong that only shows up in a
       support conversation.
-- [x] 1.3 **CTAS was not rejected, it was UNROUTED.** Now routed. `StatementKind::Ctas`
-      at line 1576 has no `reject_if_hive_table` call at all; it goes straight to
-      `write_handler.handle_ctas_streaming`, which is the Iceberg write path. So
-      `CREATE TABLE <hive-root>.db.t AS SELECT ...` does not fail cleanly today,
-      it takes the wrong branch. Route it, and add the rejection for the interim
-      if CTAS lands after `INSERT`.
+- [x] 1.3 **CTAS was not rejected, it was UNROUTED.** `StatementKind::Ctas` at
+      line 1576 had no `reject_if_hive_table` call at all and went straight to
+      `write_handler.handle_ctas_streaming`, the Iceberg write path, so
+      `CREATE TABLE <hive-root>.db.t AS SELECT ...` took the wrong branch rather
+      than failing cleanly. Routed now; see 1.4 for the ordering decision.
 - [x] 1.4 CTAS is two operations. **Decided: manifest FIRST, then data --
       the opposite of the INSERT path**, and the inversion is the point. A
       failure after the manifest leaves an EMPTY table: `SELECT` returns no
@@ -136,9 +135,29 @@ values. A write test passes on a file nobody can read correctly.
       different bug**: it failed with the written row MISSING, not duplicated,
       and the cause was neither the writer nor the header. See 3.6.
 - [x] 4.4 Line-delimited JSON.
-- [ ] 4.5 A typed non-string partition key and `__HIVE_DEFAULT_PARTITION__`,
+- [x] 4.5 A typed non-string partition key and `__HIVE_DEFAULT_PARTITION__`,
       round-tripped. Cycle 5's differential suite pinned these on the READ side;
       a write has to produce directory names the read side then parses back.
+
+      **The typed key round-trips. The sentinel does not, and writing this task
+      is what found it.** A table that ALREADY holds a
+      `__HIVE_DEFAULT_PARTITION__` directory under a non-string partition key
+      cannot be inserted into at all:
+      `Cannot cast string '__HIVE_DEFAULT_PARTITION__' to value of Int32 type`.
+
+      A real asymmetry, not an oversight. The READ path knows the sentinel
+      deliberately -- `partition_scalar` types it, then
+      `nullify_default_partition_columns` resolves it to NULL. The WRITE path
+      goes through DataFusion's `ListingTable::insert_into`, which lists the
+      table's EXISTING partitions to build its `file_group` and casts each
+      directory value to the declared type. Hive's sentinel is a string.
+
+      Pinned by `a_default_partition_under_a_typed_key_blocks_writes`, which
+      asserts the failure AND that reads still work, so the limitation cannot
+      quietly become a broken table. If a later change fixes it, that test
+      fails and points at the reference-page note to remove. Documented as a
+      known limitation with the workaround (declare the key `string`, or move
+      the sentinel partition aside).
 
 ## 5. Concurrency and durability
 
