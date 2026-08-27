@@ -222,11 +222,53 @@ Hive DDL, `MSCK REPAIR`, `SHOW PARTITIONS`, `ANALYZE`, and manifest access all s
 | `MSCK REPAIR TABLE` | Supported. Relists the table location and rewrites the index. The remedy for a stale index. Junk paths (non-`k=v` dirs, untypeable values, files at the table root) are skipped, matching Hive and Athena. No-op on projection-enabled tables |
 | `SHOW PARTITIONS` | Supported. Reads the index when present, lists when absent |
 | `ALTER TABLE ... SET TAGS`, masking policy statements | Rejected, naming cycle 3 |
-| `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE` | Rejected, naming cycle 4 |
+| `INSERT INTO` | **Supported.** Appends into `k=v/` partition directories, refreshes the partition index, and drops the cached session context so the next query sees the rows. See [Writes](#writes) |
+| `INSERT OVERWRITE`, `REPLACE INTO` | Rejected, naming why it cannot be made atomic |
+| `CREATE TABLE ... AS SELECT` | Rejected, naming cycle 4. Previously this reached the Iceberg dispatch with no Hive-aware check at all |
+| `UPDATE`, `DELETE`, `TRUNCATE` | Rejected outright. All three need the same primitive `INSERT OVERWRITE` needs, and a Hive external table does not have it |
 | `ALTER TABLE` rename, column add/drop/rename, `COMMENT ON` | Rejected outright. Schema evolution on an external table is a manifest edit, not scheduled work |
 | Partition evolution, branches, tags, time travel | Rejected outright. These are Iceberg snapshot features with no Hive equivalent |
 
-Every rejection names `hive_external` and, where one is planned, the cycle that adds support, so the error tells you what to do rather than only what failed. Two statements are absent from this table on purpose. `CREATE EXTERNAL TABLE ... AS SELECT` cannot reach any handler at all, Hive-aware or not: sqlparser's own grammar for `external: true` has no `AS SELECT` path in any dialect, so there is nothing to name. A plain `CREATE TABLE lake.x.y AS SELECT` (no `EXTERNAL`) against a Hive name does parse and does reach the ordinary Iceberg `CreateTable` dispatch, which carries no Hive-aware check, so it does not fail with a `hive_external` message; and `MERGE` against a Hive target is not yet gated by a Hive-aware check either. Neither path has been run to confirm what error surfaces instead. Both are writes, so both land in cycle 4 regardless of which error they produce today.
+Every rejection names `hive_external` and, where one is planned, the cycle that adds support, so the error tells you what to do rather than only what failed.
+
+One correction to an earlier version of this page. It said a plain `CREATE TABLE lake.x.y AS SELECT` "does reach the ordinary Iceberg `CreateTable` dispatch, which carries no Hive-aware check". That was accurate and it was a bug, not a documentation gap: the statement took the Iceberg write path against a Hive name. It now fails with a `hive_external` message naming cycle 4. `CREATE EXTERNAL TABLE ... AS SELECT` still cannot reach any handler, because sqlparser's grammar for `external: true` has no `AS SELECT` path in any dialect, so there is nothing to name. `MERGE` against a Hive target is still not gated by a Hive-aware check.
+
+## Writes
+
+`INSERT INTO` lands rows in the table's `k=v/` partition directories, one directory per distinct partition value in the inserted data. Partition columns are written into the directory NAME and never into the data file, which is what keeps the files readable by Athena, Spark, and Trino.
+
+```sql
+INSERT INTO lake.sales.orders VALUES (6, 60.5, '2026-01-02');
+INSERT INTO lake.sales.orders SELECT id, amount, dt FROM staging.orders;
+```
+
+The partition column goes last, matching the table's column order as `SHOW CREATE TABLE` renders it.
+
+### The visibility contract
+
+**A single file appears atomically. A multi-file write does not.**
+
+An object store makes a `PUT` visible whole or not at all, so no reader ever sees a half-written file. But a write that produces several files has no commit that makes them appear together, and there is nothing SQE can do about that: a Hive external table has no metadata pointer to swap. Its content is whatever is in the directory, which is exactly the property that lets other engines read it.
+
+So a concurrent reader may see a subset of an in-progress write, and an interrupted write leaves the files it had already landed. Those files hold real rows, not corruption. **If you need snapshot isolation on write, use an Iceberg table.**
+
+### The partition index is refreshed for you
+
+Reads plan from `sqe.partition_index` rather than listing the table prefix, so a write into a partition the index does not mention would otherwise be invisible. Every `INSERT` refreshes the index after the data lands, using the same discovery `MSCK REPAIR TABLE` runs, and then drops the cached session context so the next query sees the rows.
+
+The ordering is deliberate: data first, then the index. The reverse would make the index promise files that do not exist. This way the only possible in-between state is data that is intact and not yet visible, and the error says so:
+
+```
+hive_external: the rows were WRITTEN but are not yet visible: refreshing the
+partition index failed (...). The data files are on storage and intact. Run
+`MSCK REPAIR TABLE lake.sales.orders` to make them visible.
+```
+
+The cost is one prefix listing per write, which is the work the index exists to avoid on reads. An incremental update is the right optimization later.
+
+### Why INSERT OVERWRITE is refused
+
+An overwrite would have to delete the partition's objects and then write new ones. No object store can make those two steps atomic, so an interruption between them loses the partition. That is real data loss from a statement that reads as routine, so it is refused rather than approximated. `REPLACE INTO` is refused for the same reason and through the same check, because it sets a different parser flag and would otherwise execute as a plain append.
 
 ## Known limitations, and what to do about them
 
@@ -248,6 +290,8 @@ Every rejection names `hive_external` and, where one is planned, the cycle that 
 
 ## What is next
 
-Cycle 3 adds tag-based row filters and column masks on Hive scans. Cycle 4 adds writes (`INSERT INTO`, CTAS) into partition directories.
+Cycle 3 adds tag-based row filters and column masks on Hive scans.
+
+Cycle 4 is partly in: `INSERT INTO` works (see [Writes](#writes)). CTAS is still open, because it is two operations -- write the sidecar manifest, then the data -- and the ordering is its own decision.
 
 Cycle 5, worker execution, has shipped and is described under [Worker execution](#worker-execution). Two pieces of it are still open: predicate and projection pushdown into a distributed Hive task, and a streaming CSV/JSON decode so a large text file does not have to be resident whole.

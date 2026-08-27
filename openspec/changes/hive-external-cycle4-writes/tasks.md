@@ -133,14 +133,14 @@ values. A write test passes on a file nobody can read correctly.
 
 ## 6. Docs
 
-- [ ] 6.1 Reference page: the visibility contract, in the words of design.md's
+- [x] 6.1 Reference page: the visibility contract, in the words of design.md's
       decision 1. Per-object atomicity, no multi-file atomicity, what a
       concurrent reader can see, and "if you need snapshot isolation on write,
       use an Iceberg table".
-- [ ] 6.2 The statement-support table gains `INSERT INTO` and CTAS, and records
+- [x] 6.2 The statement-support table gains `INSERT INTO` and CTAS, and records
       `INSERT OVERWRITE` / `DELETE` / `UPDATE` / `MERGE` as refused with the
       reason.
-- [ ] 6.3 `nextsteps.md` and README roadmap.
+- [x] 6.3 `nextsteps.md` and README roadmap.
 
 ## 7. Quickstart
 
