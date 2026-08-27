@@ -1,3 +1,10 @@
+// Shared by two test binaries (`hive_differential_test` and
+// `hive_write_test`), and each compiles the whole module while using only the
+// part it needs. So every helper the OTHER binary uses reads as dead code here.
+// Splitting the module to satisfy the lint would mean two fixtures for one
+// warehouse shape, which is how a passing test starts asserting the wrong thing.
+#![allow(dead_code)]
+
 //! Cycle 5, task 4.1: the differential harness.
 //!
 //! Two execution paths must return the same rows for the same Hive scan:
@@ -570,4 +577,48 @@ pub async fn refresh_partition_index(f: &Fixture) {
     sqe_catalog::hive::partition::msck_repair(&store, &mut m, max)
         .await
         .expect("refresh the partition index");
+}
+
+/// A CSV table that declares NO header, with headerless data on disk.
+///
+/// The opposite half of the silent pair. With `skip.header.line.count` absent,
+/// a writer that emits a header adds a phantom row on read-back whose columns
+/// are the literal column names. Testing only the declared-1 case is passed by
+/// a writer that gets this one wrong, which is why both exist.
+pub async fn headerless_csv() -> Fixture {
+    let dir = tempfile::tempdir().expect("tmp");
+    let data_path = dir.path().join("data");
+    let part = data_path.join("dt=2026-01-01");
+    std::fs::create_dir_all(&part).expect("mkdir partition");
+    // No header line, matching the absent declaration.
+    std::fs::write(part.join("part-0.csv"), "1,10.5\n2,20.0\n").expect("write csv");
+
+    let f = Fixture {
+        root: format!("file://{}/wh", dir.path().display()),
+        data: format!("file://{}", data_path.display()),
+        partitions: vec!["dt=2026-01-01".into()],
+        key: ("dt".into(), "string".into()),
+        dir,
+    };
+    let ddl = format!(
+        "CREATE EXTERNAL TABLE sales.orders (id BIGINT, amount DOUBLE) \
+         PARTITIONED BY (dt string) \
+         ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' \
+         STORED AS TEXTFILE LOCATION '{}'",
+        f.data
+    );
+    let stmts = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, &ddl)
+        .expect("parse headerless-csv ddl");
+    let spec = sqe_sql::hive_ddl::try_extract_hive_table(&stmts[0])
+        .expect("extract")
+        .expect("external table");
+    let m = HiveManifest::from_spec(&spec, "sales", "test", "2026-08-27T00:00:00Z");
+    local_store(&f.root).put(&m, false).await.expect("put manifest");
+    plant_index(&f).await;
+    f
+}
+
+/// The fixture's manifest store, for tests that need to inspect the manifest.
+pub fn manifest_store(f: &Fixture) -> HiveManifestStore {
+    local_store(&f.root)
 }

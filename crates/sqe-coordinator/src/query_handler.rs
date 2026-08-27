@@ -1656,6 +1656,19 @@ impl QueryHandler {
                                         "hive_external: the rows were WRITTEN but are not yet                                          visible: refreshing the partition index failed ({e}).                                          The data files are on storage and intact. Run                                          `MSCK REPAIR TABLE {hive_ref}` to make them visible."
                                     )));
                                 }
+                                // Drop the cached session context, the way
+                                // the Iceberg CTAS and INSERT arms do. Measured:
+                                // a SELECT before the write caches the table
+                                // provider, and the next SELECT on that same
+                                // context returns the PRE-write rows while a
+                                // fresh context returns the correct ones. The
+                                // index was already refreshed above; without
+                                // this the refresh is invisible, which is
+                                // indistinguishable from the refresh failing.
+                                crate::session_context::invalidate_session_cache(
+                                    &session.user.username,
+                                )
+                                .await;
                                 return Ok(written);
                             }
                         }
