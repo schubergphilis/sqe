@@ -356,6 +356,45 @@ sqe --stop-on-error --file create-tables.sql >/dev/null || die "DDL failed; re-r
 } >> "$OUT"
 ok "tables created and queried"
 
+# --- process 1b: write into a NEW partition -------------------------------
+# The point of this step is not that INSERT returns success. It is that the
+# rows are still there in process 2, from a different engine that read nothing
+# but the bucket.
+#
+# A NEW partition specifically. Reads plan from `sqe.partition_index` in the
+# sidecar rather than by listing the table prefix, so a write into a partition
+# the index does not mention is invisible until the index is refreshed AND that
+# refresh is persisted. An insert into an existing partition would pass even if
+# the refresh only ever lived in the writing engine's memory.
+step "process 1b: INSERT INTO a new partition"
+insert_before=$(sqe -e "SELECT COUNT(*) AS n FROM lake.demo.events_parquet" 2>&1 \
+  | grep -Eo '^\| [0-9]+' | tr -d '| ' | head -1)
+sqe --stop-on-error -e "INSERT INTO lake.demo.events_parquet VALUES \
+  (999999, 4242, 'quickstart-write', 42.5, '2026-12-31', 'eu')" >/dev/null \
+  || die "INSERT failed; re-run without >/dev/null to see it"
+insert_after=$(sqe -e "SELECT COUNT(*) AS n FROM lake.demo.events_parquet" 2>&1 \
+  | grep -Eo '^\| [0-9]+' | tr -d '| ' | head -1)
+{
+  echo
+  echo '## Process 1b: write into a partition that did not exist'
+  echo
+  echo 'Reads plan from the partition index in the sidecar, so a write into a new'
+  echo 'partition has to refresh that index and persist it. Otherwise the rows are'
+  echo 'on storage and invisible.'
+  echo
+  echo '```sql'
+  echo "INSERT INTO lake.demo.events_parquet VALUES"
+  echo "  (999999, 4242, 'quickstart-write', 42.5, '2026-12-31', 'eu');"
+  echo '```'
+  echo
+  echo '```'
+  echo "rows before: ${insert_before}"
+  echo "rows after:  ${insert_after}"
+  sqe -e "SHOW PARTITIONS lake.demo.events_parquet" 2>&1 | tail -6
+  echo '```'
+} >> "$OUT"
+ok "wrote one row into dt=2026-12-31/region=eu (${insert_before} -> ${insert_after})"
+
 # --- the manifest ----------------------------------------------------------
 step "the sidecar manifest, straight out of the bucket"
 MANIFEST_KEY="s3://${BUCKET}/wh/demo/events_parquet/_sqe/table.json"
@@ -398,6 +437,13 @@ step "process 2: a fresh engine re-attaches the same root"
   sqe -e "SELECT COUNT(*) AS parquet_rows FROM lake.demo.events_parquet" 2>&1
   sqe -e "SHOW CREATE TABLE lake.demo.events_parquet" 2>&1
   echo '```'
+  echo
+  echo 'And the row process 1b wrote, read back by an engine that never saw the'
+  echo 'INSERT. The partition index it plans from came out of the bucket.'
+  echo
+  echo '```'
+  sqe -e "SELECT event_id, kind FROM lake.demo.events_parquet WHERE dt = '2026-12-31'" 2>&1
+  echo '```'
 } >> "$OUT"
 ok "captured to $OUT"
 
@@ -425,10 +471,29 @@ assert_not_empty "csv table returns a count"     "$p1_csv"
 assert_not_empty "json table returns a count"    "$p1_json"
 assert_not_empty "ndjson table returns a count"  "$p1_ndjson"
 
+# The write survived a process boundary. Three separate claims, because each
+# one fails differently:
+#   - the INSERT added exactly one row (not zero, not a duplicated batch);
+#   - process 2 sees it, which is the only thing that distinguishes a persisted
+#     partition-index refresh from one that lived in the writing engine's
+#     memory;
+#   - the row's own values come back, so a count that happened to match cannot
+#     stand in for the data.
+assert_eq "INSERT added exactly one row" "$insert_after" "$((insert_before + 1))"
+assert_eq "process 2 still sees the written row" "$p1_parquet" "$insert_after"
+written_row=$(sqe -e "SELECT event_id, kind, dt, region FROM lake.demo.events_parquet WHERE dt = '2026-12-31'" 2>&1)
+assert_contains "the written row reads back with its values" "$written_row" "quickstart-write"
+assert_contains "the written row keeps its partition values"  "$written_row" "2026-12-31"
+assert_contains "the written row keeps its second partition key" "$written_row" "| eu "
+
 # The generator recorded what it wrote, so the engine's counts are checked
 # against an independent source rather than against themselves.
 gen_rows() { python3 -c "import json;print(json.load(open('$MARKER'))['row_counts']['$1'])"; }
-assert_eq "parquet row count matches the generator" "$p1_parquet" "$(gen_rows events_parquet)"
+# +1 for the row process 1b inserted. Written as an expression rather than a
+# new constant so the generator stays the independent source of truth and the
+# write's contribution is visible.
+assert_eq "parquet row count matches the generator plus the written row" \
+  "$p1_parquet" "$(( $(gen_rows events_parquet) + 1 ))"
 assert_eq "csv row count matches the generator"     "$p1_csv"     "$(gen_rows events_csv)"
 assert_eq "json row count matches the generator"    "$p1_json"    "$(gen_rows events_json)"
 assert_eq "ndjson row count matches the generator"  "$p1_ndjson"  "$(gen_rows events_ndjson)"
