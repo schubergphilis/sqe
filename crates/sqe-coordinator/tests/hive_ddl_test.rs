@@ -392,20 +392,32 @@ async fn unsupported_statements_are_rejected_by_name_with_their_cycle() {
             3,
             "SET TAGS",
         ),
+        // No plain-INSERT row: cycle 4 SUPPORTS it. See
+        // `a_plain_insert_is_no_longer_rejected_by_the_hive_gate`.
         (
-            "INSERT INTO lake.sales.orders VALUES (1, 2.0, '2026-01-01')",
-            4,
-            "INSERT",
+            "INSERT OVERWRITE lake.sales.orders VALUES (1, 2.0, '2026-01-01')",
+            0,
+            "INSERT OVERWRITE",
         ),
-        // No CTAS row: `CREATE EXTERNAL TABLE ... AS SELECT` does not parse,
-        // so it never reaches dispatch. Task 9 pins that boundary instead.
-        ("DELETE FROM lake.sales.orders WHERE id = 1", 4, "DELETE"),
+        // A plain `CREATE TABLE <hive> AS SELECT` DOES parse and used to reach
+        // the Iceberg write path with no Hive-aware check at all. It is gated
+        // now. `CREATE EXTERNAL TABLE ... AS SELECT` still does not parse, so it
+        // never reaches dispatch; task 9 pins that boundary instead.
+        (
+            "CREATE TABLE lake.sales.o2 AS SELECT 1 AS id",
+            4,
+            "CREATE TABLE AS SELECT",
+        ),
+        // Cycle 0, not 4: all three need the same primitive INSERT OVERWRITE
+        // needs, and cycle 4 does not deliver them. Saying "cycle 4 adds it"
+        // would be a promise the release does not keep.
+        ("DELETE FROM lake.sales.orders WHERE id = 1", 0, "DELETE"),
         (
             "UPDATE lake.sales.orders SET amount = 1 WHERE id = 1",
-            4,
+            0,
             "UPDATE",
         ),
-        ("TRUNCATE TABLE lake.sales.orders", 4, "TRUNCATE"),
+        ("TRUNCATE TABLE lake.sales.orders", 0, "TRUNCATE"),
         (
             "ALTER TABLE lake.sales.orders RENAME TO lake.sales.o2",
             0,
@@ -894,7 +906,7 @@ async fn a_column_restricted_hive_table_hides_only_that_column_in_show_create_ta
 /// Mutation-checked: reverting `reject_if_hive_table` to call
 /// `resolve_table_kind` directly (skipping the session-default-catalog
 /// promotion) made this test fail -- the statement no longer errored with
-/// `hive_external`/`cycle 4`, confirming it would otherwise have proceeded
+/// `hive_external` at all, confirming it would otherwise have proceeded
 /// into the Iceberg write path instead of being rejected.
 #[tokio::test]
 async fn an_unqualified_reference_under_a_hive_default_catalog_is_still_rejected() {
@@ -911,9 +923,16 @@ async fn an_unqualified_reference_under_a_hive_default_catalog_is_still_rejected
          not silently proceed",
     );
     let msg = err.to_string();
+    // `hive_external` plus the statement name is what discriminates here: it
+    // proves the reference resolved to the HIVE branch. The `cycle 4` assertion
+    // this test used to carry is gone because DELETE no longer names a cycle --
+    // it needs the same primitive INSERT OVERWRITE needs, so it is refused
+    // outright rather than scheduled. The mutation the doc comment describes
+    // (skipping the session-default-catalog promotion) still fails this test,
+    // because without the promotion the statement never produces a
+    // `hive_external` error at all.
     assert!(msg.contains("hive_external"), "{msg}");
     assert!(msg.contains("DELETE"), "{msg}");
-    assert!(msg.contains("cycle 4"), "{msg}");
 }
 
 /// The `resolve_table_kind_for_session` promotion itself, isolated from
@@ -1005,4 +1024,52 @@ async fn attach_refuses_a_name_matching_the_session_default_catalog() {
     );
 
     drop((audit_dir, mock));
+}
+
+/// Cycle 4: a plain `INSERT` must no longer be turned away by the Hive gate.
+///
+/// The point is the ABSENCE of a `hive_external` rejection, not success. This
+/// harness registers the manifest but not a queryable warehouse, so planning
+/// fails on the table lookup -- and that failure is the evidence: it can only
+/// be reached AFTER `reject_if_hive_table` would have fired. An assertion of
+/// `is_ok()` would be untestable here, and an assertion of `is_err()` alone
+/// would pass just as well if the statement were still rejected.
+///
+/// The end-to-end write is covered by `hive_write_test`, which builds a real
+/// warehouse on disk and reads the rows back.
+#[tokio::test]
+async fn a_plain_insert_is_no_longer_rejected_by_the_hive_gate() {
+    let h = handler_with_root("lake").await;
+    let err = h
+        .execute_for_test("INSERT INTO lake.sales.orders VALUES (1, 2.0, '2026-01-01')")
+        .await
+        .expect_err("this harness cannot plan the table, so the statement still errors");
+    let msg = format!("{err}");
+    assert!(
+        !msg.contains("is not supported for Hive external tables"),
+        "INSERT must reach the write path, not the rejection: {msg}"
+    );
+    assert!(
+        msg.contains("hive insert"),
+        "and it must have reached the HIVE insert path specifically, rather than \
+         the Iceberg one: {msg}"
+    );
+}
+
+/// The same statement with `OVERWRITE` must still be refused, and must say why.
+#[tokio::test]
+async fn insert_overwrite_is_refused_before_any_table_lookup() {
+    let h = handler_with_root("lake").await;
+    let err = h
+        .execute_for_test("INSERT OVERWRITE lake.sales.orders VALUES (1, 2.0, '2026-01-01')")
+        .await
+        .expect_err("overwrite must be refused");
+    let msg = format!("{err}");
+    // Refused BEFORE the table lookup the plain insert trips over, which is how
+    // this test tells "refused" apart from "failed for an unrelated reason".
+    assert!(
+        !msg.contains("not found"),
+        "the refusal must precede planning: {msg}"
+    );
+    assert!(msg.contains("atomic"), "the reason must be stated: {msg}");
 }
