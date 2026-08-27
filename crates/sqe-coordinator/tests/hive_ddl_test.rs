@@ -399,15 +399,13 @@ async fn unsupported_statements_are_rejected_by_name_with_their_cycle() {
             0,
             "INSERT OVERWRITE",
         ),
-        // A plain `CREATE TABLE <hive> AS SELECT` DOES parse and used to reach
-        // the Iceberg write path with no Hive-aware check at all. It is gated
-        // now. `CREATE EXTERNAL TABLE ... AS SELECT` still does not parse, so it
+        // No CTAS row either: cycle 4 SUPPORTS it. A plain
+        // `CREATE TABLE <hive> AS SELECT` used to reach the Iceberg write path
+        // with no Hive-aware check at all; it is routed now, and the cases that
+        // still fail do so for their own reasons rather than by cycle. See
+        // `ctas_without_a_location_names_the_missing_clause`.
+        // `CREATE EXTERNAL TABLE ... AS SELECT` still does not parse, so it
         // never reaches dispatch; task 9 pins that boundary instead.
-        (
-            "CREATE TABLE lake.sales.o2 AS SELECT 1 AS id",
-            4,
-            "CREATE TABLE AS SELECT",
-        ),
         // Cycle 0, not 4: all three need the same primitive INSERT OVERWRITE
         // needs, and cycle 4 does not deliver them. Saying "cycle 4 adds it"
         // would be a promise the release does not keep.
@@ -1072,4 +1070,33 @@ async fn insert_overwrite_is_refused_before_any_table_lookup() {
         "the refusal must precede planning: {msg}"
     );
     assert!(msg.contains("atomic"), "the reason must be stated: {msg}");
+}
+
+/// Cycle 4: CTAS is routed, so a CTAS that fails must fail for its OWN reason.
+///
+/// The rejection-by-cycle table used to carry this statement. It cannot any
+/// more: the statement reaches the Hive CTAS path and stops there because no
+/// `LOCATION` was given, which is a different and more useful error than "not
+/// supported". Asserted on the clause name and on the reason, because
+/// "requires LOCATION" without the why sends someone looking for a config knob.
+#[tokio::test]
+async fn ctas_without_a_location_names_the_missing_clause() {
+    let h = handler_with_root("lake").await;
+    let err = h
+        .execute_for_test("CREATE TABLE lake.sales.o2 AS SELECT 1 AS id")
+        .await
+        .expect_err("no LOCATION");
+    let msg = format!("{err}");
+    assert!(msg.contains("hive_external"), "{msg}");
+    assert!(msg.contains("LOCATION"), "{msg}");
+    assert!(
+        msg.contains("does not choose data paths"),
+        "the message must say WHY it is required: {msg}"
+    );
+    // And it must NOT read as a scheduling problem. This is the assertion that
+    // catches a regression to `reject_if_hive_table(.., "CTAS", 4)`.
+    assert!(
+        !msg.contains("cycle 4"),
+        "CTAS is supported; the error must not blame a future cycle: {msg}"
+    );
 }
