@@ -1,3 +1,10 @@
+// Shared by two test binaries (`hive_differential_test` and
+// `hive_write_test`), and each compiles the whole module while using only the
+// part it needs. So every helper the OTHER binary uses reads as dead code here.
+// Splitting the module to satisfy the lint would mean two fixtures for one
+// warehouse shape, which is how a passing test starts asserting the wrong thing.
+#![allow(dead_code)]
+
 //! Cycle 5, task 4.1: the differential harness.
 //!
 //! Two execution paths must return the same rows for the same Hive scan:
@@ -554,6 +561,115 @@ pub async fn quoted_csv() -> Fixture {
         .expect("external table");
     let m = HiveManifest::from_spec(&spec, "sales", "test", "2026-08-27T00:00:00Z");
     local_store(&f.root).put(&m, false).await.expect("put manifest");
+    plant_index(&f).await;
+    f
+}
+
+/// Run the partition-index discovery the coordinator runs after a write.
+///
+/// `HiveDdlHandler::refresh_index_after_write` delegates to exactly this
+/// function, so a test calling it exercises the same rebuild rather than a
+/// re-implementation of it.
+pub async fn refresh_partition_index(f: &Fixture) {
+    let store = local_store(&f.root);
+    let mut m = store.get("sales", "orders").await.expect("get manifest");
+    let max = store.limits().max_partition_index_entries;
+    sqe_catalog::hive::partition::msck_repair(&store, &mut m, max)
+        .await
+        .expect("refresh the partition index");
+}
+
+/// A CSV table that declares NO header, with headerless data on disk.
+///
+/// The opposite half of the silent pair. With `skip.header.line.count` absent,
+/// a writer that emits a header adds a phantom row on read-back whose columns
+/// are the literal column names. Testing only the declared-1 case is passed by
+/// a writer that gets this one wrong, which is why both exist.
+pub async fn headerless_csv() -> Fixture {
+    let dir = tempfile::tempdir().expect("tmp");
+    let data_path = dir.path().join("data");
+    let part = data_path.join("dt=2026-01-01");
+    std::fs::create_dir_all(&part).expect("mkdir partition");
+    // No header line, matching the absent declaration.
+    std::fs::write(part.join("part-0.csv"), "1,10.5\n2,20.0\n").expect("write csv");
+
+    let f = Fixture {
+        root: format!("file://{}/wh", dir.path().display()),
+        data: format!("file://{}", data_path.display()),
+        partitions: vec!["dt=2026-01-01".into()],
+        key: ("dt".into(), "string".into()),
+        dir,
+    };
+    let ddl = format!(
+        "CREATE EXTERNAL TABLE sales.orders (id BIGINT, amount DOUBLE) \
+         PARTITIONED BY (dt string) \
+         ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' \
+         STORED AS TEXTFILE LOCATION '{}'",
+        f.data
+    );
+    let stmts = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, &ddl)
+        .expect("parse headerless-csv ddl");
+    let spec = sqe_sql::hive_ddl::try_extract_hive_table(&stmts[0])
+        .expect("extract")
+        .expect("external table");
+    let m = HiveManifest::from_spec(&spec, "sales", "test", "2026-08-27T00:00:00Z");
+    local_store(&f.root).put(&m, false).await.expect("put manifest");
+    plant_index(&f).await;
+    f
+}
+
+/// The fixture's manifest store, for tests that need to inspect the manifest.
+pub fn manifest_store(f: &Fixture) -> HiveManifestStore {
+    local_store(&f.root)
+}
+
+/// Write the manifest for an arbitrary spec, the way `create_external_table`
+/// does, so a CTAS test can perform step 1 of the two-step sequence.
+pub async fn put_spec_manifest(f: &Fixture, spec: &sqe_sql::hive_ddl::HiveTableSpec) {
+    let m = HiveManifest::from_spec(
+        spec,
+        spec.database.as_deref().unwrap_or("sales"),
+        "test",
+        "2026-08-27T00:00:00Z",
+    );
+    local_store(&f.root)
+        .put(&m, false)
+        .await
+        .expect("put the CTAS manifest");
+}
+
+/// The index refresh, for a table other than the fixture's `orders`.
+pub async fn refresh_named_index(f: &Fixture, table: &str) {
+    let store = local_store(&f.root);
+    let mut m = store.get("sales", table).await.expect("get manifest");
+    let max = store.limits().max_partition_index_entries;
+    sqe_catalog::hive::partition::msck_repair(&store, &mut m, max)
+        .await
+        .expect("refresh the partition index");
+}
+
+/// A typed (Int64) partition key with NO default-partition directory.
+///
+/// Separate from [`typed_key_with_default_partition`] because the two exercise
+/// different things on the WRITE side: a typed key alone works, while a table
+/// that already holds a `__HIVE_DEFAULT_PARTITION__` directory under a typed
+/// key cannot be inserted into at all. See
+/// `a_typed_partition_key_round_trips_through_a_write` and its sibling.
+pub async fn typed_key_only() -> Fixture {
+    let dir = tempfile::tempdir().expect("tmp");
+    let data_path = dir.path().join("data");
+    std::fs::create_dir_all(&data_path).expect("mkdir data");
+    write_parquet_partition(&data_path, "year=2024", &[1, 2], &[10.5, 20.0]);
+    write_parquet_partition(&data_path, "year=2025", &[3], &[30.5]);
+
+    let f = Fixture {
+        root: format!("file://{}/wh", dir.path().display()),
+        data: format!("file://{}", data_path.display()),
+        partitions: vec!["year=2024".into(), "year=2025".into()],
+        key: ("year".into(), "int".into()),
+        dir,
+    };
+    put_manifest(&f.root, &f.data, &f.key, "parquet").await;
     plant_index(&f).await;
     f
 }

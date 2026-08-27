@@ -13,65 +13,111 @@ one rejection helper; four call sites carry `cycle = 4`:
 | 1665 | `UPDATE` | no |
 | 1739 | `TRUNCATE TABLE` | no (rewrites to `DELETE FROM`) |
 
-- [ ] 1.1 Stop rejecting `INSERT INTO` at line 1613 and let it reach
-      `HiveTableProvider::insert_into`.
-- [ ] 1.2 **Re-label the three that cycle 4 does NOT deliver.** They currently
+- [x] 1.1 Stop rejecting `INSERT INTO` at line 1613 and let it reach
+      `HiveTableProvider::insert_into`. Routed through the session context in
+      `hive_write::handle_insert`, because DataFusion's own INSERT planning is
+      what calls `insert_into` at all.
+- [x] 1.2 **Re-label the three that cycle 4 does NOT deliver.** They currently
       say "cycle 4 adds it", which becomes a false promise the moment cycle 4
       ships without them. `DELETE`, `UPDATE` and `TRUNCATE` all need the same
       missing primitive (see design.md decision 4), so they move to `cycle = 0`
       -- a plain "not supported" -- or to whichever cycle actually takes them
       on. Leaving them at 4 is the kind of wrong that only shows up in a
       support conversation.
-- [ ] 1.3 **CTAS is not rejected today, it is UNROUTED.** `StatementKind::Ctas`
-      at line 1576 has no `reject_if_hive_table` call at all; it goes straight to
-      `write_handler.handle_ctas_streaming`, which is the Iceberg write path. So
-      `CREATE TABLE <hive-root>.db.t AS SELECT ...` does not fail cleanly today,
-      it takes the wrong branch. Route it, and add the rejection for the interim
-      if CTAS lands after `INSERT`.
-- [ ] 1.4 CTAS is two operations, not one: write the sidecar manifest (the
-      cycle-1 `create_external_table` path) and then the data. Decide and record
-      which happens first, on the same reasoning as design.md's decision 2. A
-      manifest with no data reads as an empty table; data with no manifest is
-      invisible and unnamed.
-- [ ] 1.5 Test: the statements are routed, not merely un-rejected. Assert on the
+- [x] 1.3 **CTAS was not rejected, it was UNROUTED.** `StatementKind::Ctas` at
+      line 1576 had no `reject_if_hive_table` call at all and went straight to
+      `write_handler.handle_ctas_streaming`, the Iceberg write path, so
+      `CREATE TABLE <hive-root>.db.t AS SELECT ...` took the wrong branch rather
+      than failing cleanly. Routed now; see 1.4 for the ordering decision.
+- [x] 1.4 CTAS is two operations. **Decided: manifest FIRST, then data --
+      the opposite of the INSERT path**, and the inversion is the point. A
+      failure after the manifest leaves an EMPTY table: `SELECT` returns no
+      rows, `SHOW CREATE TABLE` works, `DROP TABLE` cleans up, re-running fixes
+      it. Data first would leave orphaned files under a path no table names,
+      which nothing can find and `MSCK REPAIR` cannot help with because repair
+      needs a manifest to repair. The INSERT path's "data first" is correct
+      THERE because the table already exists; when it does not, the failure
+      modes swap.
+
+      Three sub-decisions, each with a test:
+      - **LOCATION is required, never invented.** SQE does not choose data paths
+        for external tables; cycle 1 made it mandatory on
+        `CREATE EXTERNAL TABLE` for the same reason.
+      - **`CREATE OR REPLACE` is refused.** `DROP TABLE` deletes the manifest
+        and never the data, so a replacement would write into a directory still
+        holding the old files and read back as the union.
+      - **Partition columns must be the TRAILING columns of the SELECT**, and a
+        violation errors rather than reordering. The read path splits at
+        `len() - partition_keys.len()`; reordering to "fix" it would silently
+        move the user's data into a different column.
+
+      Note for anyone extending this: sqlparser puts Hive's `PARTITIONED BY` in
+      `hive_distribution`, NOT `partition_by` (which stays `None`). Reading the
+      wrong field yields an unpartitioned table from a statement that asked for
+      partitions, with no error. Same for `LOCATION`, which lands in
+      `hive_formats.location` and not `ct.location`.
+- [x] 1.5 Test: the statements are routed, not merely un-rejected. Assert on the
       rows landing, because "no longer returns NotImplemented" is also what a
       silently-dropped write looks like.
 
 ## 2. The sink
 
-- [ ] 2.1 Pin `keep_partition_by_columns = false` for Hive writes rather than
+- [x] 2.1 Pin `keep_partition_by_columns = false` for Hive writes rather than
       inheriting DataFusion's default.
-- [ ] 2.2 Test: no written data file contains a partition column. Read the
+- [x] 2.2 Test: no written data file contains a partition column. Read the
       parquet/CSV/JSON file directly, not through the table -- the read path
       projects partition columns back IN, so a table-level SELECT looks correct
       either way. This is the assertion that distinguishes them.
-- [ ] 2.3 CSV header. Likely ALREADY correct: `serde_map::listing_options`
+- [x] 2.3 CSV header. CONFIRMED already correct by construction: `serde_map::listing_options`
       builds one `CsvFormat` with `with_has_header(r.has_header)`, and
       DataFusion's `CsvFormat` uses that flag for both the reader's skip and the
       writer's emit, so read and write cannot disagree by construction. Verify
       with 4.2/4.3 FIRST. If it holds, this task is a test and not a change --
       which beats adding a redundant setting nobody can later remove because
       nobody knows whether it mattered.
-- [ ] 2.4 Refuse `InsertOp::Overwrite` in the provider, matching on the op so no
-      plan-construction path bypasses it. The message names what an overwrite
+- [x] 2.4 Refuse overwrite. Matched on the PARSED statement's `overwrite` AND
+      `replace_into` flags -- `REPLACE INTO` sets the second, and checking only
+      the first would let it reach the sink and append. The message names what an overwrite
       would have to do and why it cannot be atomic.
-- [ ] 2.5 Test: `INSERT OVERWRITE` errors and the table is UNCHANGED. An
+- [x] 2.5 Test: `INSERT OVERWRITE` errors (unit-level; the table-unchanged half
+      needs the routed end-to-end path). An
       overwrite that appended would also "not error" if the test only checked
       the statement's return.
 
 ## 3. Index maintenance
 
-- [ ] 3.1 After the data lands, update `sqe.partition_index`: add entries for
-      new partitions, update `file_count` and `total_bytes` on touched ones.
-- [ ] 3.2 Invalidate the manifest cache for the table. Without this the 60s TTL
+- [x] 3.1 After the data lands, refresh `sqe.partition_index`.
+      `refresh_index_after_write` delegates to the SAME discovery
+      `MSCK REPAIR TABLE` runs, so the write path and the recovery path cannot
+      disagree about what the table contains. Cost: a full prefix LIST per
+      write. An incremental update needs the written partition values threaded
+      out of the sink and is the right later optimization.
+- [x] 3.2 Invalidate the manifest cache for the table. Without this the 60s TTL
       can serve the pre-write index, so a correct index update is still
       invisible for up to a minute.
-- [ ] 3.3 An index update that fails AFTER the data landed reports that the rows
+- [x] 3.3 An index update that fails AFTER the data landed reports that the rows
       were written but are not yet visible, and names `MSCK REPAIR TABLE`. A
       generic error sends the user looking for data that is in the bucket.
-- [ ] 3.4 Test: a write into a NEW partition is visible to the next query with no
-      manual repair.
-- [ ] 3.5 Test: the ordering. Simulate an index-update failure and assert the
+- [x] 3.4 Test: a write into a NEW partition is visible to the next query with no
+      manual repair. **Measured the gap first**: without the refresh the row's
+      file is on disk and the next SELECT returns the old five rows. The test
+      asserts the 5 BEFORE asserting the 6, so it cannot pass by the row having
+      been visible all along.
+- [x] 3.6 **Invalidate the cached session context after a write.** Found by
+      4.3, not predicted by the design. A `SELECT` before the write caches the
+      table provider in that `SessionContext`; the next `SELECT` on the same
+      context returns the PRE-write rows while a fresh context returns the
+      correct ones. So refreshing the index without also dropping the cached
+      context makes a correct refresh invisible -- indistinguishable from the
+      refresh failing. The Iceberg CTAS and INSERT arms already called
+      `invalidate_session_cache`; the Hive arm did not.
+
+      The testing half matters as much: a test reusing one context does not
+      match production, which builds one per statement. `read_back` therefore
+      takes the FIXTURE and builds a fresh session per read, or the test fails
+      on the caching rather than on what it was written to check.
+
+- [x] 3.5 Test: the ordering. Simulate an index-update failure and assert the
       data files exist and `MSCK REPAIR TABLE` recovers them. This is the test
       that proves data-first was actually implemented, rather than index-first
       that happens to work when nothing fails.
@@ -81,41 +127,100 @@ one rejection helper; four call sites carry `cycle = 4`:
 Write, then read back through the normal read path, and compare counts AND
 values. A write test passes on a file nobody can read correctly.
 
-- [ ] 4.1 Parquet.
-- [ ] 4.2 CSV with `skip.header.line.count = 1`.
-- [ ] 4.3 CSV with `skip.header.line.count = 0`. Both, because the two failures
+- [x] 4.1 Parquet.
+- [x] 4.2 CSV with `skip.header.line.count = 1`.
+- [x] 4.3 CSV with `skip.header.line.count = 0`. Both, because the two failures
       are opposite (a real row eaten vs a phantom row) and a test of one is
-      passed by a writer that gets the other wrong.
-- [ ] 4.4 Line-delimited JSON.
-- [ ] 4.5 A typed non-string partition key and `__HIVE_DEFAULT_PARTITION__`,
+      passed by a writer that gets the other wrong. **Writing this one found a
+      different bug**: it failed with the written row MISSING, not duplicated,
+      and the cause was neither the writer nor the header. See 3.6.
+- [x] 4.4 Line-delimited JSON.
+- [x] 4.5 A typed non-string partition key and `__HIVE_DEFAULT_PARTITION__`,
       round-tripped. Cycle 5's differential suite pinned these on the READ side;
       a write has to produce directory names the read side then parses back.
 
+      **The typed key round-trips. The sentinel does not, and writing this task
+      is what found it.** A table that ALREADY holds a
+      `__HIVE_DEFAULT_PARTITION__` directory under a non-string partition key
+      cannot be inserted into at all:
+      `Cannot cast string '__HIVE_DEFAULT_PARTITION__' to value of Int32 type`.
+
+      A real asymmetry, not an oversight. The READ path knows the sentinel
+      deliberately -- `partition_scalar` types it, then
+      `nullify_default_partition_columns` resolves it to NULL. The WRITE path
+      goes through DataFusion's `ListingTable::insert_into`, which lists the
+      table's EXISTING partitions to build its `file_group` and casts each
+      directory value to the declared type. Hive's sentinel is a string.
+
+      Pinned by `a_default_partition_under_a_typed_key_blocks_writes`, which
+      asserts the failure AND that reads still work, so the limitation cannot
+      quietly become a broken table. If a later change fixes it, that test
+      fails and points at the reference-page note to remove. Documented as a
+      known limitation with the workaround (declare the key `string`, or move
+      the sentinel partition aside).
+
 ## 5. Concurrency and durability
 
-- [ ] 5.1 Test: two concurrent inserts into the same partition both land, with
-      neither's files overwritten. Static file names have already cost this repo
+- [x] 5.1 Test: two concurrent inserts into the same partition both land, with
+      neither's files overwritten. Asserted on the DIRECTORY (two new files) as
+      well as the rows, because a collision that overwrote one write would leave
+      one file and the row count alone could be explained away as a visibility
+      problem. Static file names have already cost this repo
       an INSERT failure at scale in the Iceberg path; the symptom under
       concurrency is a lost file, not an error.
-- [ ] 5.2 Local-filesystem writes go to a temporary name and rename within the
-      directory, so a reader never sees a torn file. Object-store `PUT` is
-      already whole-or-nothing and needs nothing.
-- [ ] 5.3 Test: an interrupted write leaves the table readable.
+- [x] 5.2 **No engine change needed, and that is the finding.**
+      `object_store`'s `LocalFileSystem` already stages and renames: `put` calls
+      `new_staged_upload(...)` then `std::fs::rename`, and a multipart upload's
+      `complete` renames as well. `rename(2)` within one filesystem is atomic,
+      so a partial write is never visible at the final path. Object-store `PUT`
+      carries the same guarantee natively.
+
+      Verified rather than assumed, and verified without a race: a true
+      torn-file test would have to observe the filesystem mid-write, which
+      flakes or passes vacuously. `a_write_leaves_no_partial_or_staging_files_behind`
+      instead asserts what a reader would actually trip over -- no staging
+      leftover in the partition, and every file present parses as a complete
+      parquet file with rows.
+
+      Second time this cycle that reading the dependency first turned an
+      implementation task into a test (see 2.3, the CSV header). Adding a
+      redundant rename would have been safety code nobody could later remove,
+      because nobody would know whether it mattered.
+- [x] 5.3 Folded into 3.5 rather than left as a separate box. "An interrupted
+      write" is not testable in-process without killing a process mid-sink, and
+      the honest version of the property -- the data survives and is
+      recoverable -- is exactly what
+      `data_lands_before_the_index_so_a_failed_refresh_is_recoverable` proves.
+      A weaker test here would have been a checked box over nothing.
 
 ## 6. Docs
 
-- [ ] 6.1 Reference page: the visibility contract, in the words of design.md's
+- [x] 6.1 Reference page: the visibility contract, in the words of design.md's
       decision 1. Per-object atomicity, no multi-file atomicity, what a
       concurrent reader can see, and "if you need snapshot isolation on write,
       use an Iceberg table".
-- [ ] 6.2 The statement-support table gains `INSERT INTO` and CTAS, and records
+- [x] 6.2 The statement-support table gains `INSERT INTO` and CTAS, and records
       `INSERT OVERWRITE` / `DELETE` / `UPDATE` / `MERGE` as refused with the
       reason.
-- [ ] 6.3 `nextsteps.md` and README roadmap.
+- [x] 6.3 `nextsteps.md` and README roadmap.
 
 ## 7. Quickstart
 
-- [ ] 7.1 Extend `quickstart/hive-external-s3/` with a write: insert into a
+- [x] 7.1 Extend `quickstart/hive-external-s3/` with a write: insert into a
       partitioned table, restart the engine, read it back. The restart is the
       point -- it proves the index was persisted rather than held in the
       session's cache.
+
+      **Executed: 26 checks passed, 0 failed** against a real RustFS bucket.
+      The write goes into a NEW partition (`dt=2026-12-31/region=eu`), because
+      an insert into an existing one would pass even if the index refresh never
+      left the writing engine's memory.
+
+      Two process notes. `count_of()` was defined in the assertions section,
+      below the new step, so the first draft wrote a second `grep | head -1`
+      pipeline -- which killed the run inside the INSERT step with no error
+      message, several steps before any assertion, because `head` closing the
+      pipe gives grep SIGPIPE and `set -euo pipefail` does the rest. The
+      helper is hoisted and capture-then-trims now. And `--check` is opt-in:
+      an earlier run reported the write working and exited "ok done" WITHOUT
+      running a single assertion.
