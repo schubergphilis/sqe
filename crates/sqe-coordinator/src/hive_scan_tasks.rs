@@ -23,9 +23,22 @@
 //! this stays testable without an object store.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use arrow_schema::Schema;
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::ExecutionPlan;
 use sqe_planner::{HiveScanDescriptor, HiveScanFormat, ScanTask};
+
+/// A listing of one partition: its directory-encoded values, and each data
+/// file's `(url, size_bytes)`.
+///
+/// The shape `HiveScanExec::partition_files` returns and `tasks_for_hive_scan`
+/// takes. Named so the two agree by type rather than by having the same nested
+/// tuple typed out twice.
+pub type HivePartitionListing = (BTreeMap<String, String>, Vec<(String, u64)>);
 
 /// One partition's worth of already-listed data files.
 pub struct HivePartitionFiles {
@@ -148,4 +161,151 @@ pub fn build_hive_scan_tasks(
         });
     }
     Ok(tasks)
+}
+
+/// Turn a planned Hive scan plus its listing into worker tasks.
+///
+/// This is the whole task-building half of `try_distribute_hive`, lifted out so
+/// something other than a live coordinator can call it. `try_distribute_hive`
+/// needs a `Session`, a worker registry and a set of healthy URLs, so it cannot
+/// run in a unit test -- and the differential tests would otherwise have to
+/// hand-build a `HiveScanQuery`, which is how a test ends up green against a
+/// configuration production never produces.
+///
+/// Two of those production choices are deliberate and load-bearing for the
+/// differential tests, so they are stated here rather than left to be
+/// rediscovered:
+///
+/// - `projected_columns` is the FULL schema, every time, including the
+///   partition columns that are not in any data file.
+///   `resolve_scan_projection` drops the absent names, so the worker projects
+///   exactly the file columns IN FULL-SCHEMA ORDER, and
+///   `append_partition_columns` then appends the partition columns at the tail.
+///   That order is what the `len() - partition_columns.len()` split assumes.
+///   Narrowing this to the query's projection would break that split.
+/// - `predicate_proto` and `limit` are `None`. Partition pruning already
+///   happened on the coordinator (cycle 2 gave `spec.entries` only the
+///   survivors), and the `FilterExec` above the scan still applies the
+///   predicate, so rows are correct. What is absent is file and row-group
+///   pushdown INSIDE the distributed Hive scan. Absent, not broken.
+pub fn tasks_for_hive_scan(
+    spec: &sqe_catalog::hive::scan_exec::HiveScanSpec,
+    partitions: Vec<HivePartitionListing>,
+    s3: &HiveS3Access,
+    fragment_prefix: &str,
+) -> Result<Vec<ScanTask>, String> {
+    use sqe_catalog::hive::serde_map::HiveFileFormat;
+
+    let files: Vec<HivePartitionFiles> = partitions
+        .into_iter()
+        .map(|(values, files)| HivePartitionFiles { values, files })
+        .collect();
+
+    let read = HiveReadFormat {
+        format: match spec.resolved.kind {
+            HiveFileFormat::Parquet => HiveScanFormat::Parquet,
+            HiveFileFormat::Csv => HiveScanFormat::Csv,
+            HiveFileFormat::Json => HiveScanFormat::Json,
+        },
+        delimiter: spec.resolved.delimiter,
+        quote: spec.resolved.quote,
+        escape: spec.resolved.escape,
+        has_header: spec.resolved.has_header,
+    };
+
+    let projected: Vec<String> = spec
+        .full_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+
+    build_hive_scan_tasks(
+        &files,
+        &HiveScanTable {
+            read: &read,
+            partition_columns: &spec.partition_columns,
+            full_schema: spec.full_schema.as_ref(),
+            s3,
+        },
+        &HiveScanQuery {
+            projected_columns: &projected,
+            predicate_proto: None,
+            limit: None,
+            fragment_prefix,
+        },
+    )
+}
+
+/// Read S3 access for Hive tasks out of the engine's storage config.
+pub fn hive_s3_access(storage: &sqe_core::config::StorageConfig) -> HiveS3Access {
+    HiveS3Access {
+        endpoint: storage.s3_endpoint.clone(),
+        region: storage.s3_region.clone(),
+        access_key: storage.s3_access_key.clone(),
+        secret_key: storage.s3_secret_key.expose().to_string(),
+        session_token: String::new(),
+        path_style: storage.s3_path_style,
+        allow_http: storage.s3_endpoint.starts_with("http://"),
+    }
+}
+
+/// Narrow a full-schema distributed Hive scan back to the schema of the node it
+/// replaces.
+///
+/// ## Why this is required rather than tidy
+///
+/// A Hive task always projects the FULL schema: `resolve_scan_projection` drops
+/// the partition names that no data file contains, and
+/// `append_partition_columns` appends them at the tail, so the split point
+/// `len() - partition_columns.len()` holds. Narrowing the task's projection
+/// would break that split.
+///
+/// But the node being replaced is `HiveScanExec`, whose schema is the QUERY's
+/// projection -- `scan_from_entries` applies it. For `SELECT dt FROM t` that is
+/// one column while the distributed scan produces three.
+///
+/// Every parent in the plan indexes its child by POSITION. A `ProjectionExec`
+/// holding `Column("dt", 0)` against a replacement whose column 0 is `id` does
+/// not fail: it returns `id`'s values under the name `dt`. So the width has to
+/// be reconciled at the substitution, or distributed execution silently answers
+/// a different query.
+///
+/// Returns the input untouched when the schemas already agree, which is the
+/// `SELECT *` case and the common one.
+pub fn align_to_scan_schema(
+    wide: Arc<dyn ExecutionPlan>,
+    target: &Schema,
+) -> Result<Arc<dyn ExecutionPlan>, String> {
+    let wide_schema = wide.schema();
+    if wide_schema.fields() == target.fields() {
+        return Ok(wide);
+    }
+
+    let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = Vec::with_capacity(target.fields().len());
+    for field in target.fields() {
+        // By name, not by position: the target is a subset in the full schema's
+        // order, and a positional guess is the exact bug this function exists
+        // to prevent.
+        let idx = wide_schema.index_of(field.name()).map_err(|_| {
+            format!(
+                "distributed hive scan cannot supply column `{}`; it produces [{}]",
+                field.name(),
+                wide_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+        exprs.push((
+            Arc::new(Column::new(field.name(), idx)) as Arc<dyn PhysicalExpr>,
+            field.name().clone(),
+        ));
+    }
+
+    ProjectionExec::try_new(exprs, wide)
+        .map(|p| Arc::new(p) as Arc<dyn ExecutionPlan>)
+        .map_err(|e| format!("narrowing the distributed hive scan: {e}"))
 }
