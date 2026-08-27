@@ -14,7 +14,9 @@
 >
 > **5.2 needed no code.** `object_store`'s LocalFileSystem already stages and renames (`put` -> `new_staged_upload` then `std::fs::rename`; multipart `complete` renames too), so per-file atomicity is the dependency's guarantee, not SQE's. Verified without a race by asserting no staging leftover survives and every file present parses as complete parquet. That is twice this cycle that reading the dependency first turned an implementation task into a test (the CSV header was the other).
 >
-> **NEXT in cycle 4:** the quickstart write-restart-read (7.1), which is the only remaining item and the one that genuinely proves index persistence across an engine restart. It needs the quickstart stack rather than the test harness.
+> **Cycle 4 is complete.** The quickstart (7.1) now writes into a new partition and a second engine reads it back: 26 checks passed, 0 failed against a real RustFS bucket. `process 2 still sees the written row` is the load-bearing one -- process 2 attached the same root and read nothing but the bucket, so it can only see the row if the partition-index refresh was persisted rather than kept in memory.
+>
+> **NEXT: cycle 3**, the last unstarted cycle: tag-based row filters and column masks on Hive scans, plus Ranger resource registration. Two tests already on main (`4f769d7`, `68228b6`) suggest masking may already reach a Hive scan by construction, so scope it by checking that first -- the same approach that turned two cycle-4 tasks into tests instead of code.
 >
 > ---
 >

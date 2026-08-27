@@ -187,7 +187,21 @@ values. A write test passes on a file nobody can read correctly.
 
 ## 7. Quickstart
 
-- [ ] 7.1 Extend `quickstart/hive-external-s3/` with a write: insert into a
+- [x] 7.1 Extend `quickstart/hive-external-s3/` with a write: insert into a
       partitioned table, restart the engine, read it back. The restart is the
       point -- it proves the index was persisted rather than held in the
       session's cache.
+
+      **Executed: 26 checks passed, 0 failed** against a real RustFS bucket.
+      The write goes into a NEW partition (`dt=2026-12-31/region=eu`), because
+      an insert into an existing one would pass even if the index refresh never
+      left the writing engine's memory.
+
+      Two process notes. `count_of()` was defined in the assertions section,
+      below the new step, so the first draft wrote a second `grep | head -1`
+      pipeline -- which killed the run inside the INSERT step with no error
+      message, several steps before any assertion, because `head` closing the
+      pipe gives grep SIGPIPE and `set -euo pipefail` does the rest. The
+      helper is hoisted and capture-then-trims now. And `--check` is opt-in:
+      an earlier run reported the write working and exited "ok done" WITHOUT
+      running a single assertion.
