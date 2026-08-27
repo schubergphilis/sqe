@@ -55,25 +55,74 @@ projections over ListingTable scans with no SQE-owned node in it. See design.md.
 
 ## 4. Differential correctness
 
-- [ ] 4.1 Harness: run a query coordinator-local and worker-distributed, compare rows.
-- [ ] 4.2 Parquet, partitioned, multi-partition.
-- [ ] 4.3 Predicate pushdown active (partition pruning must agree on both paths).
-- [ ] 4.4 Projection subset, including a partition column only, and a file column only.
+- [x] 4.1 Harness: run a query coordinator-local and worker-distributed, compare rows.
+      `crates/sqe-coordinator/tests/hive_diff/mod.rs`. In-process against a
+      `LocalFileSystem` store, calling the same task builder and the same worker
+      scan entry point production calls -- not a Flight cluster, which would add
+      transport rather than correctness coverage.
+- [x] 4.2 Parquet, partitioned, multi-partition. Plus a typed (Int64) partition
+      key and `__HIVE_DEFAULT_PARTITION__`, both of which return rows either way
+      when they are wrong.
+- [x] 4.3 Predicate pushdown active (partition pruning must agree on both paths).
+      Pruning happens once, on the coordinator, before either path exists, so
+      both inherit the same survivors -- asserted, along with the surviving
+      partition being the REQUESTED one. File and row-group pushdown INSIDE a
+      distributed Hive task is absent, not broken: `predicate_proto` is `None`
+      and the `FilterExec` above the scan still applies. Recorded in the
+      reference page rather than left for a green check to imply.
+- [x] 4.4 Projection subset, including a partition column only, and a file column
+      only. **This found a real bug.** `try_distribute_hive` replaced a
+      `HiveScanExec` carrying the QUERY's projection with a `DistributedScanExec`
+      carrying the FULL schema. Every parent indexes its child by position, so
+      `SELECT dt FROM t` returned `id`'s values under the name `dt` -- no error,
+      wrong column. Fixed by `align_to_scan_schema`, and the test runs the real
+      `replace_scan_in_plan` against the real parent plan so a re-introduction
+      cannot pass.
 
 ## 5. CSV and JSON readers
 
-- [ ] 5.1 CSV reader on the worker honoring delimiter, quote, escape, header.
-- [ ] 5.2 Line-delimited JSON reader.
-- [ ] 5.3 Differential tests per format.
-- [ ] 5.4 Decide and document byte-range splitting for CSV/JSON, or state that they stay one task per file. Cycle 1 already notes compressed CSV/JSON is one file per thread; do not silently inherit that as if it were designed here.
+- [x] 5.1 CSV reader on the worker honoring delimiter, quote, escape, header.
+      `crates/sqe-worker/src/hive_reader.rs`. Schema is DECLARED, never inferred:
+      inference is how two files in one table disagree on a type and how a header
+      row becomes the type sample and then a data row.
+- [x] 5.2 Line-delimited JSON reader.
+- [x] 5.3 Differential tests per format. Same data in all three formats, so the
+      expected row count is known rather than being whatever that format's
+      reader produced. Plus a quoted-delimiter CSV case, which separates "read
+      the delimiter" from "read the quoteChar".
+- [x] 5.4 Decided: one task per file, read whole, no byte-range splitting.
+      Reasoning in design.md under "Why CSV and JSON are one task per file",
+      written as a decision rather than inherited from cycle 1's compressed-file
+      note. The memory cost it accepts is stated there and in the reference page.
+- [x] 5.5 Lift BOTH refusals together. `servability`'s parquet-only rule and the
+      executor's matching `bail!` each independently made the new readers
+      unreachable; leaving either would have kept every CSV table falling back,
+      which looks exactly like success. Both are now exhaustive matches, so a
+      format added later is a compile error rather than a corrupt-footer error.
 
 ## 6. Measurement
 
+**Both open, deliberately.** The correctness work above is complete and lands
+without them. A number from an uncounterbalanced run on a shared box is worse
+than no number: this repo has already produced a 22% within-arm swing on
+identical code, and a checked box with a weak number behind it reads as
+"measured" forever.
+
 - [ ] 6.1 Multi-worker rig, partitioned Hive table, against the cycle-2 coordinator-local baseline.
+      Needs the native two-worker rig (workers must ACCEPT before the
+      coordinator starts, or every query silently runs local) and a Hive dataset
+      big enough for the partition count to matter.
 - [ ] 6.2 Record in `docs/evidence/perf/`. Counterbalance the runs: a plain new-first/old-second comparison on a shared box has already proven worthless once (a 22% within-arm swing on identical code).
 
 ## 7. Docs
 
-- [ ] 7.1 Reference page: worker execution, the fallback contract, and what remains coordinator-local.
-- [ ] 7.2 Remove the cycle-5 limitation note once it is no longer true.
-- [ ] 7.3 `nextsteps.md` and README roadmap.
+- [x] 7.1 Reference page: worker execution, the fallback contract, and what
+      remains coordinator-local. New "Worker execution" section in
+      `docs/site/book/src/reference/hive-external-tables.md`, with the fallback
+      table and the marker's EXPLAIN output.
+- [x] 7.2 Remove the cycle-5 limitation note once it is no longer true. The
+      "Server mode runs Hive scans on the coordinator" limitation is replaced by
+      the flag's default-off state, which is the accurate version. The
+      compressed-CSV limitation is widened to all text files, because the reason
+      turned out to be the absence of row groups, not compression.
+- [x] 7.3 `nextsteps.md` and README roadmap.

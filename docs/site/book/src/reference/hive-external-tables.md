@@ -165,7 +165,47 @@ Two things a server-mode deployment needs that embedded mode does not. `[storage
 
 The exception is metadata statements that enumerate catalogs. `information_schema.tables` and `DESCRIBE` walk **every** registered catalog before any `WHERE` clause narrows them, so an unreachable Iceberg catalog fails those statements even for a query that only named a Hive root. `SHOW TABLES FROM <root>.<database>` does not, and is the reliable listing in server mode. In embedded mode it is the reverse: `SHOW TABLES` is not parsed and `information_schema` is what works.
 
-In server mode, Hive scans execute coordinator-local, the same way the file table-valued functions do today. Coordinator-local execution is not distributed scan parity. Worker execution of Hive scans is cycle 5, because `ScanTask` today is shaped for Parquet and Iceberg field IDs, and giving it a Hive-shaped alternative is its own protocol change.
+## Worker execution
+
+Hive scans can run on workers. It is opt-in:
+
+```toml
+[query]
+distributed_hive_scans = true
+```
+
+Default off. With the flag off, every Hive scan runs coordinator-local, exactly as before.
+
+One `ScanTask` per surviving partition. The coordinator lists the partitions that survived pruning and ships their file paths and sizes, rather than shipping a prefix for the worker to expand: placement without sizes is blind, and one partition holding a thousand files would otherwise land wholesale on one worker. The listing is bounded by the partition index, so only survivors are listed, never the whole table.
+
+All three formats run on workers: Parquet, CSV, and line-delimited JSON. A CSV or JSON task covers exactly one file and reads it whole. There is no byte-range splitting, because neither format has row groups and a byte offset is not a record boundary. A table with one very large CSV file gets no intra-file parallelism; a table with many files across many partitions parallelizes fully.
+
+Partition columns are directory-encoded and absent from every data file, so the worker materializes them as constant arrays, typed from the table's declared schema. The typing rule is imported from the coordinator's own `partition_scalar` rather than reimplemented, and `__HIVE_DEFAULT_PARTITION__` resolves to NULL on both paths. A differential test suite runs the same query coordinator-local and worker-side and compares rows and schemas, per format, because the failure to design against here is not a crash: it is a partition column silently typed `varchar` on one path, or a header row counted as data.
+
+### The fallback contract
+
+Not every scan distributes, and a scan that does not is never a query failure. It runs coordinator-local and says why.
+
+| Situation | What happens |
+|---|---|
+| `distributed_hive_scans = false` | Coordinator-local, unmarked. This is the default state; marking every scan in a non-distributed deployment would be noise. |
+| No partition entries planned | Coordinator-local, marked. A table with no partition index has no per-partition unit of work to distribute. |
+| Partition listing failed | Coordinator-local, marked with the listing error. |
+| No worker reader for the format | Coordinator-local, marked with the format. No format answers this today. |
+
+"Marked" means the plan carries a `HiveLocalScanExec` node and plain `EXPLAIN` prints the reason:
+
+```
+HiveLocalScanExec: coordinator-local, no partition entries to distribute; scan runs coordinator-local
+```
+
+The marker exists because a silent fallback is the worst outcome available. The query still returns correct rows, so nothing looks wrong, and the only symptom is a cluster that never gets any work. Run `EXPLAIN` if you expected a Hive scan to distribute and it did not.
+
+### What stays coordinator-local regardless
+
+Predicate and projection pushdown are not pushed into a distributed Hive scan. A task carries no pushed-down predicate and always projects the full schema; the `Filter` and `Projection` above the scan still apply, so results are correct, but a worker reads more of each file than a coordinator-local scan would. Partition pruning is unaffected: it happens on the coordinator before either path exists, so both inherit the same surviving partitions.
+
+Hive DDL, `MSCK REPAIR`, `SHOW PARTITIONS`, `ANALYZE`, and manifest access all stay on the coordinator.
 
 ## Statement support today
 
@@ -192,7 +232,7 @@ Every rejection names `hive_external` and, where one is planned, the cycle that 
 
 **A stale index omits partitions, never invents them.** Files that landed out of band after the last `MSCK REPAIR` or `ADD PARTITION` are invisible until you repair. SQE does not list the table prefix at plan time to double-check the index, because that listing is the cost the index exists to remove. `MSCK REPAIR TABLE` is the named recovery path. Deleting the `sqe.partition_index` slot from the manifest restores cycle-1 discovery.
 
-**A compressed CSV or JSON file is one thread, however many cores you have.** Split large compressed files at write time rather than relying on in-engine parallelism to compensate.
+**A CSV or JSON file is one task, however many cores you have.** Not only compressed files: neither format has row groups, so there is no boundary to split on, and a worker reads each text file whole. Split large text files at write time rather than relying on in-engine parallelism to compensate. Parquet splits within a file.
 
 **Reads use engine credentials or a named secret, never the caller's own.** Do not point a Hive root at a bucket your users should not uniformly be able to read through the engine's identity. Use the `[storage.tvf]` allowlist and grants to bound exposure per user; do not rely on the credential itself to do that job.
 
@@ -202,10 +242,12 @@ Every rejection names `hive_external` and, where one is planned, the cycle that 
 
 **`SHOW SCHEMAS` does not list a Hive root's databases.** This is not a Hive-specific gap: `SHOW SCHEMAS` is not parsed in embedded mode at all, against any catalog kind, and in server mode it has no dedicated Hive path yet, so it fails with a generic catalog error against a Hive root. `SELECT catalog_name, schema_name FROM information_schema.schemata WHERE catalog_name = '<root>'` works in both modes and is the reliable way to list a root's databases; `SHOW TABLES FROM <root>.<database>` works too once you know the database name.
 
-**Server mode runs Hive scans on the coordinator, not on workers.** A distributed deployment gets no scan parallelism across workers for a Hive table today. Size the coordinator accordingly, or wait for cycle 5.
+**Distributed Hive scans are off by default.** Set `query.distributed_hive_scans = true` to turn them on. With the flag off, or for a table that cannot distribute, scans run coordinator-local and `EXPLAIN` says so; see [Worker execution](#worker-execution) for the fallback contract.
 
 **A grant against an Iceberg namespace never governs a same-named Hive database, and vice versa.** A prior draft of this page understated the actual exposure here: the policy engine and the tag route both key off the table reference's catalog component, and a two-part reference (`sales.orders`, no catalog) carries no catalog component at all. Attaching a Hive root under the SAME name as the session's default catalog would have let an unqualified reference reach that root while policy resolution still took the Iceberg branch. SQE now refuses to attach a Hive root under that name, at both `[[hive.roots]]` startup and `ATTACH`, so the collision cannot occur. One narrower corner case remains open: an Iceberg namespace whose dotted name literally equals `<root>.<database>` still produces the same policy key as a Hive table in that root's database. Name your Hive roots to avoid that collision until a later cycle closes it structurally.
 
 ## What is next
 
-Cycle 3 adds tag-based row filters and column masks on Hive scans. Cycle 4 adds writes (`INSERT INTO`, CTAS) into partition directories. Cycle 5 moves Hive scan execution onto workers.
+Cycle 3 adds tag-based row filters and column masks on Hive scans. Cycle 4 adds writes (`INSERT INTO`, CTAS) into partition directories.
+
+Cycle 5, worker execution, has shipped and is described under [Worker execution](#worker-execution). Two pieces of it are still open: predicate and projection pushdown into a distributed Hive task, and a streaming CSV/JSON decode so a large text file does not have to be resident whole.
