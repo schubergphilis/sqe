@@ -1,5 +1,17 @@
 # SQE — Next Steps
 
+> **STATUS 2026-08-27 (b): Hive external tables, cycle 4 writes started, `INSERT INTO` works, on `feat/hive-cycle4-writes`.**
+>
+> `INSERT INTO` a Hive external table appends into `k=v/` partition directories, refreshes `sqe.partition_index`, and drops the cached session context. The writer was not the work: `HiveTableProvider::insert_into` already delegated to its inner `ListingTable`, and DataFusion 55 already carried `table_partition_cols` into `FileSinkConfig`, so cycle 4 is routing plus bookkeeping.
+>
+> Two bugs found by tests rather than by reasoning. The partition index goes stale on write, so an insert into a new partition landed its file and stayed invisible -- the strongest read optimization in the Hive path was also what made the first write look like a lost write. And a `SELECT` before a write caches the table provider in that session context, so the next `SELECT` on it returned pre-write rows; the Iceberg arms already called `invalidate_session_cache` and the Hive arm did not.
+>
+> Also fixed: CTAS had NO Hive check and fell into the Iceberg write path. `DELETE`/`UPDATE`/`TRUNCATE` said "cycle 4 adds it" and now say plainly unsupported, since all three need the primitive `INSERT OVERWRITE` needs.
+>
+> **NEXT in cycle 4:** CTAS routing (two operations, needs its own ordering decision), the concurrency test (two writers into one partition), the local-filesystem write-then-rename, and the quickstart write-restart-read.
+>
+> ---
+>
 > **STATUS 2026-08-27: Hive external tables, cycle 5 (worker execution) complete except measurement, on `feat/hive-cycle5-finish`.**
 >
 > Hive scans run on workers behind `query.distributed_hive_scans` (default false). One `ScanTask` per surviving partition, built from the cycle-2 partition index; the coordinator lists the survivors so placement has sizes. All three formats now have worker-side readers: parquet as before, CSV and line-delimited JSON new in `sqe-worker/src/hive_reader.rs`, both bound to the DECLARED file schema rather than an inferred one. A scan that cannot distribute runs coordinator-local and plain `EXPLAIN` prints why, because a silent fallback returns correct rows and leaves the cluster idle.
