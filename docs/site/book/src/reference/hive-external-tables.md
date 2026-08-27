@@ -224,7 +224,7 @@ Hive DDL, `MSCK REPAIR`, `SHOW PARTITIONS`, `ANALYZE`, and manifest access all s
 | `ALTER TABLE ... SET TAGS`, masking policy statements | Rejected, naming cycle 3 |
 | `INSERT INTO` | **Supported.** Appends into `k=v/` partition directories, refreshes the partition index, and drops the cached session context so the next query sees the rows. See [Writes](#writes) |
 | `INSERT OVERWRITE`, `REPLACE INTO` | Rejected, naming why it cannot be made atomic |
-| `CREATE TABLE ... AS SELECT` | Rejected, naming cycle 4. Previously this reached the Iceberg dispatch with no Hive-aware check at all |
+| `CREATE TABLE ... AS SELECT` | **Supported**, with a required `LOCATION`. See [CTAS](#ctas). `CREATE OR REPLACE` is refused. Previously this reached the Iceberg dispatch with no Hive-aware check at all |
 | `UPDATE`, `DELETE`, `TRUNCATE` | Rejected outright. All three need the same primitive `INSERT OVERWRITE` needs, and a Hive external table does not have it |
 | `ALTER TABLE` rename, column add/drop/rename, `COMMENT ON` | Rejected outright. Schema evolution on an external table is a manifest edit, not scheduled work |
 | Partition evolution, branches, tags, time travel | Rejected outright. These are Iceberg snapshot features with no Hive equivalent |
@@ -266,6 +266,30 @@ partition index failed (...). The data files are on storage and intact. Run
 
 The cost is one prefix listing per write, which is the work the index exists to avoid on reads. An incremental update is the right optimization later.
 
+### CTAS
+
+```sql
+CREATE TABLE lake.sales.daily
+  PARTITIONED BY (dt string)
+  STORED AS PARQUET
+  LOCATION 's3://bucket/warehouse/sales/daily/'
+AS SELECT id, amount, dt FROM lake.sales.orders;
+```
+
+Three rules, each of which fails loudly rather than guessing.
+
+**`LOCATION` is required.** SQE does not choose data paths for external tables, the same way `CREATE EXTERNAL TABLE` requires one. A CTAS without it errors instead of writing your data somewhere you did not name.
+
+**Partition columns come last in the SELECT.** Hive stores them in the directory name and the read path expects them at the end of the schema. A partition column elsewhere in the projection is an error naming the column that is actually in that position, not a silent reorder: reordering would move your data into a different column.
+
+Both `PARTITIONED BY (dt string)` and `PARTITIONED BY (dt)` work. The first declares the type, the second takes it from the query. Column types for the stored columns always come from the query, so a type with no Hive equivalent fails at `CREATE` rather than producing a table nobody can read.
+
+**Format defaults to Parquet**, not Hive's `TEXTFILE`. A CTAS is SQE writing the files, and writing text would discard the types the query just established. `STORED AS` overrides it.
+
+**`CREATE OR REPLACE` is refused.** `DROP TABLE` on a Hive external table removes the manifest and never the data, so a replacement would write new files into a directory that still holds the old ones and the table would read back as the union of both. Drop the table, delete its data directory, then create it again.
+
+CTAS runs in two steps, manifest then data, which is the opposite order from `INSERT`. A failure between them leaves an empty table: `SELECT` returns nothing, `SHOW CREATE TABLE` works, `DROP TABLE` cleans up, and re-running fixes it. Writing the data first would leave files under a path no table names, and `MSCK REPAIR TABLE` could not help because repair needs a manifest to repair.
+
 ### Why INSERT OVERWRITE is refused
 
 An overwrite would have to delete the partition's objects and then write new ones. No object store can make those two steps atomic, so an interruption between them loses the partition. That is real data loss from a statement that reads as routine, so it is refused rather than approximated. `REPLACE INTO` is refused for the same reason and through the same check, because it sets a different parser flag and would otherwise execute as a plain append.
@@ -292,6 +316,6 @@ An overwrite would have to delete the partition's objects and then write new one
 
 Cycle 3 adds tag-based row filters and column masks on Hive scans.
 
-Cycle 4 is partly in: `INSERT INTO` works (see [Writes](#writes)). CTAS is still open, because it is two operations -- write the sidecar manifest, then the data -- and the ordering is its own decision.
+Cycle 4 is in for reads-into-writes: `INSERT INTO` and CTAS both work (see [Writes](#writes)). `INSERT OVERWRITE`, `DELETE`, `UPDATE` and `MERGE` remain refused, all for the same reason: a Hive external table has no atomic multi-file commit to build them on.
 
 Cycle 5, worker execution, has shipped and is described under [Worker execution](#worker-execution). Two pieces of it are still open: predicate and projection pushdown into a distributed Hive task, and a streaming CSV/JSON decode so a large text file does not have to be resident whole.

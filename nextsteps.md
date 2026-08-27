@@ -8,7 +8,11 @@
 >
 > Also fixed: CTAS had NO Hive check and fell into the Iceberg write path. `DELETE`/`UPDATE`/`TRUNCATE` said "cycle 4 adds it" and now say plainly unsupported, since all three need the primitive `INSERT OVERWRITE` needs.
 >
-> **NEXT in cycle 4:** CTAS routing (two operations, needs its own ordering decision), the concurrency test (two writers into one partition), the local-filesystem write-then-rename, and the quickstart write-restart-read.
+> **CTAS landed too.** Manifest first, then data -- the opposite order from INSERT, and the inversion is the point: a failure after the manifest leaves an empty table that DROP cleans up, while data-first would leave orphaned files under a path no table names, which `MSCK REPAIR` cannot recover because repair needs a manifest to repair. `LOCATION` is required (SQE does not invent data paths for external tables), partition columns must be the trailing SELECT columns (a violation errors rather than reordering), and `CREATE OR REPLACE` is refused because DROP leaves the data and the result would be the union.
+>
+> Two sqlparser traps worth knowing: Hive's `PARTITIONED BY` lands in `hive_distribution`, not `partition_by`; and `LOCATION` lands in `hive_formats.location`, not `ct.location`. Reading the wrong field in either case yields a silently wrong table.
+>
+> **NEXT in cycle 4:** the local-filesystem write-then-rename (5.2) and the quickstart write-restart-read (7.1), which is the one that genuinely proves index persistence across a restart.
 >
 > ---
 >

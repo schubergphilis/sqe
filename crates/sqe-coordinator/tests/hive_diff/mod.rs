@@ -622,3 +622,28 @@ pub async fn headerless_csv() -> Fixture {
 pub fn manifest_store(f: &Fixture) -> HiveManifestStore {
     local_store(&f.root)
 }
+
+/// Write the manifest for an arbitrary spec, the way `create_external_table`
+/// does, so a CTAS test can perform step 1 of the two-step sequence.
+pub async fn put_spec_manifest(f: &Fixture, spec: &sqe_sql::hive_ddl::HiveTableSpec) {
+    let m = HiveManifest::from_spec(
+        spec,
+        spec.database.as_deref().unwrap_or("sales"),
+        "test",
+        "2026-08-27T00:00:00Z",
+    );
+    local_store(&f.root)
+        .put(&m, false)
+        .await
+        .expect("put the CTAS manifest");
+}
+
+/// The index refresh, for a table other than the fixture's `orders`.
+pub async fn refresh_named_index(f: &Fixture, table: &str) {
+    let store = local_store(&f.root);
+    let mut m = store.get("sales", table).await.expect("get manifest");
+    let max = store.limits().max_partition_index_entries;
+    sqe_catalog::hive::partition::msck_repair(&store, &mut m, max)
+        .await
+        .expect("refresh the partition index");
+}
