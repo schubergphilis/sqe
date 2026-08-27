@@ -50,6 +50,15 @@ use super::provider::{table_location_url, HiveDataStoreFactory};
 use crate::hive::HiveError;
 use super::serde_map::ResolvedFormat;
 
+/// A listing of one partition: its directory-encoded values, and each data
+/// file's `(url, size_bytes)`.
+///
+/// `sqe_coordinator::hive_scan_tasks::HivePartitionListing` is the same type on
+/// the consuming side. Two aliases rather than one because the catalog crate
+/// cannot depend on the coordinator; they are named identically so a change to
+/// one is visibly a change to the other.
+pub type PartitionListing = (BTreeMap<String, String>, Vec<(String, u64)>);
+
 /// What the coordinator needs to turn this scan into worker tasks, without
 /// having to re-derive any of it from the plan tree.
 #[derive(Debug, Clone)]
@@ -108,9 +117,7 @@ impl HiveScanExec {
     /// A partition whose listing fails is an error rather than an empty
     /// partition: silently returning no files would turn an unreachable
     /// location into a query that succeeds with missing rows.
-    pub async fn partition_files(
-        &self,
-    ) -> Result<Vec<(BTreeMap<String, String>, Vec<(String, u64)>)>, HiveError> {
+    pub async fn partition_files(&self) -> Result<Vec<PartitionListing>, HiveError> {
         let ext = self.spec.resolved.file_extension.clone();
         let mut out = Vec::with_capacity(self.spec.entries.len());
 

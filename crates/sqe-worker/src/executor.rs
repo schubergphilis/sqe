@@ -893,6 +893,11 @@ pub async fn execute_scan_streaming_with_store(
 /// instead, so they read every file column and let the plan above the scan
 /// discard what it does not need. Narrowing here would shift ordinals and bind
 /// the wrong column.
+// Eight arguments: the seven `open_parquet_stream` already takes, plus the Hive
+// descriptor that decides which reader opens the file. Grouping them into a
+// struct would only move the same list somewhere else, and the same `#[allow]`
+// is what `execute_scan_streaming_with_store` uses one layer up.
+#[allow(clippy::too_many_arguments)]
 async fn open_task_stream(
     task: &ScanTask,
     file_path: &str,
@@ -1276,6 +1281,23 @@ pub async fn execute_scan(
     filter_expr: Option<Arc<dyn PhysicalExpr>>,
     coordinator_metrics: Option<&Arc<MetricsRegistry>>,
 ) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
+    // Refused rather than read. `open_task_stream`'s format dispatch lives in
+    // the STREAMING path, which is the one Flight `DoGet` uses; nothing in the
+    // engine calls this function today, so it never grew the dispatch. Letting
+    // a Hive task through would read a CSV file with a parquet reader and
+    // report a corrupt footer.
+    //
+    // The alternative -- adding the dispatch here too -- means a second copy of
+    // the reader selection that has no caller to keep it honest, and the two
+    // would drift. A caller that needs Hive support should use
+    // `execute_scan_streaming_with_store`.
+    if task.hive.is_some() {
+        anyhow::bail!(
+            "execute_scan does not support hive tasks; use \
+             execute_scan_streaming_with_store, which carries the format dispatch"
+        );
+    }
+
     let start = std::time::Instant::now();
 
     info!(

@@ -17,9 +17,17 @@
 //! is not the part that can silently return different rows: it is
 //! format-blind and schema-driven. What CAN differ is what a task contains and
 //! how a worker opens it, and both of those are reachable in-process. So the
-//! harness calls the same task builder production calls and the same worker
-//! scan entry point a Flight `DoGet` would, against a `LocalFileSystem` store.
-//! A cluster adds transport, not correctness coverage.
+//! harness calls the same task builder production calls, and
+//! `execute_scan_streaming_with_store` -- the function a Flight `DoGet`
+//! eventually reaches.
+//!
+//! Not full parity, and the gap is worth naming. `DoGet` goes through
+//! `execute_scan_streaming`, which BUILDS its object store from the task's S3
+//! fields; this harness passes `HiveS3Access::default()` and injects a
+//! `LocalFileSystem` instead. So store construction and credential refresh are
+//! not covered here. What is covered is task content, reader selection,
+//! partition materialization and schema -- the parts that can return wrong rows
+//! rather than an error.
 //!
 //! ## Why the task builder is called, not hand-built
 //!
