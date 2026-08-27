@@ -104,6 +104,23 @@ sqe() {
   fi
 }
 
+# count_of(): one row count out of a rendered result table.
+#
+# `set -euo pipefail` is on, so `grep ... | head -1` is a trap rather than a
+# convenience: head closes the pipe, grep takes SIGPIPE, the pipeline reports
+# failure and `set -e` kills the run. This script already carries a comment
+# about that exact hazard for `s3 ls | head -12`, and it bit this helper's
+# first draft too -- the run died inside the INSERT step with no error message
+# at all, several steps before any assertion.
+#
+# So: capture first, then trim from a herestring, and nothing upstream is still
+# writing when the reader stops.
+count_of() {
+  local rendered
+  rendered=$(sqe -e "SELECT COUNT(*) AS n FROM $1" 2>&1)
+  grep -Eo '^\| [0-9]+' <<<"$rendered" | tr -d '| ' | sed -n '1p'
+}
+
 # list_tables(): the statement that lists a Hive root's tables is NOT the same
 # in both modes, and neither mode can use the other's.
 #   embedded: `SHOW TABLES FROM <root>.<db>` is not parsed at all (a
@@ -367,13 +384,11 @@ ok "tables created and queried"
 # refresh is persisted. An insert into an existing partition would pass even if
 # the refresh only ever lived in the writing engine's memory.
 step "process 1b: INSERT INTO a new partition"
-insert_before=$(sqe -e "SELECT COUNT(*) AS n FROM lake.demo.events_parquet" 2>&1 \
-  | grep -Eo '^\| [0-9]+' | tr -d '| ' | head -1)
+insert_before=$(count_of lake.demo.events_parquet)
 sqe --stop-on-error -e "INSERT INTO lake.demo.events_parquet VALUES \
   (999999, 4242, 'quickstart-write', 42.5, '2026-12-31', 'eu')" >/dev/null \
   || die "INSERT failed; re-run without >/dev/null to see it"
-insert_after=$(sqe -e "SELECT COUNT(*) AS n FROM lake.demo.events_parquet" 2>&1 \
-  | grep -Eo '^\| [0-9]+' | tr -d '| ' | head -1)
+insert_after=$(count_of lake.demo.events_parquet)
 {
   echo
   echo '## Process 1b: write into a partition that did not exist'
@@ -390,7 +405,8 @@ insert_after=$(sqe -e "SELECT COUNT(*) AS n FROM lake.demo.events_parquet" 2>&1 
   echo '```'
   echo "rows before: ${insert_before}"
   echo "rows after:  ${insert_after}"
-  sqe -e "SHOW PARTITIONS lake.demo.events_parquet" 2>&1 | tail -6
+  # Captured then trimmed, for the same SIGPIPE reason as count_of.
+  tail -6 <<<"$(sqe -e "SHOW PARTITIONS lake.demo.events_parquet" 2>&1)"
   echo '```'
 } >> "$OUT"
 ok "wrote one row into dt=2026-12-31/region=eu (${insert_before} -> ${insert_after})"
@@ -458,8 +474,6 @@ fi
 # agrees with process 1", which is the only thing that distinguishes reading
 # the manifest from having recreated the table.
 step "checking invariants"
-
-count_of() { sqe -e "SELECT COUNT(*) AS n FROM $1" 2>&1 | grep -Eo '^\| [0-9]+' | tr -d '| ' | head -1; }
 
 p1_parquet=$(count_of lake.demo.events_parquet)
 p1_csv=$(count_of lake.demo.events_csv)
