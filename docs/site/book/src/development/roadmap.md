@@ -329,9 +329,10 @@ An MCP Streamable HTTP endpoint (protocol revision 2025-11-25) served from the c
 - Nine read tools behind `read_scope`; `execute_sql_readonly` gated by SQE's SQL parser and statement classifier as an allow-list (one statement; query and `SHOW` kinds only, everything else refused by default)
 - `execute_sql_change` hidden unless `allow_writes = true`, then gated on the write scope, an SQE role in `write_roles`, and source authorization
 - Runnable end-to-end stack with Codex and Claude Code templates: `quickstart/mcp/` (14/14 checks, 2026-08-28)
+- `[mcp.auth] mode`: `oauth` (default), `static` principals with env/base64 bearer tokens, `anonymous` for a no-IdP deployment; anonymous refused when an IdP is configured, under `production_mode`, or with writes on
 - Documented at [Model Context Protocol](../deployment/mcp.md) and [MCP with Codex and Claude](../quickstart/mcp.md)
 
-Open: no dynamic client registration on SQE's side (the authorization server owns registration), no MCP resources or prompts (tools only), no streamed partial results.
+Open: no dynamic client registration on SQE's side (the authorization server owns registration), no MCP resources or prompts (tools only), no streamed partial results, and no mode-2 arm in the quickstart (that stack is Keycloak-based).
 
 ---
 

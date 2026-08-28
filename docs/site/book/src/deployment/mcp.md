@@ -81,6 +81,109 @@ A dedicated MCP listener uses `[coordinator.tls]`. The shared internal web
 listener is plaintext, as before, so terminate TLS at the ingress/reverse proxy.
 In either mode, the public `resource_uri` must use HTTPS in production.
 
+## Deployments with no identity provider
+
+The section above assumes every caller carries a user token. A catalog reached
+with engine credentials (AWS Glue, S3 Tables, an attached warehouse, an
+auth-less Nessie) has no such tokens: SQE runs those queries under one identity
+and the source authorizes the engine, not the person. `[mcp.auth] mode` covers
+that shape.
+
+```toml
+[mcp]
+enabled      = true
+resource_uri = "http://sqe.internal:9091/mcp"
+allow_writes = true
+
+[mcp.auth]
+mode = "static"                       # "oauth" (default) | "static" | "anonymous"
+
+[[mcp.auth.principals]]
+user      = "mcp-reader"
+roles     = ["reader"]
+token_env = "SQE_MCP_READ_TOKEN"      # preferred
+
+[[mcp.auth.principals]]
+user      = "mcp-writer"
+roles     = ["data_writer"]
+token_b64 = "c3FlLXdyaXRlci10b2tlbi0x"
+```
+
+A caller presents `Authorization: Bearer <token>`; SQE matches it against the
+configured principals in constant time and adopts that principal's user name
+and roles. `token_env` wins over `token_b64` when both are set. Base64 is
+encoding, not protection: anyone who can read the config can read the token, so
+use `token_env` outside development. Tokens resolve once at startup, and a
+token under 16 characters, an unset `token_env`, malformed base64, or two
+principals sharing a token all fail the config check rather than the first
+request.
+
+Static mode carries no OAuth scopes, because SQE is both the issuer and the
+verifier of these tokens. The three write gates become two: the principal's
+roles must intersect `write_roles`, and the source must authorize the
+statement. `enabled = true` with `allow_writes = true` and no principal holding
+a writer role is a startup error, since the write tool would be advertised and
+unusable.
+
+`mode = "anonymous"` accepts every caller as one fixed identity:
+
+```toml
+[mcp.auth]
+mode = "anonymous"
+
+[mcp.auth.anonymous]
+user  = "mcp-anonymous"
+roles = ["reader"]
+```
+
+Three conditions refuse it at startup:
+
+- any `auth.providers` entry that authenticates against an identity provider
+  (`oidc_password`, `client_credentials`, `client_credentials_passthrough`,
+  `token_exchange`, `bearer_token`, `bearer_passthrough`). A deployment that
+  can authenticate real callers has no reason to skip it. `api_key`, `mtls` and
+  `aws_iam` are local credential checks and do not block anonymous mode.
+- `production_mode`, matching the existing rule that refuses the `anonymous`
+  auth provider there.
+- `allow_writes = true`. An anonymous caller is nobody to attribute a write to.
+
+`[mcp.auth] mode` governs `/mcp` only. The SQL path keeps whatever
+`auth.providers` does, so the natural mode-2 configuration pairs an
+`anonymous` provider (every Flight SQL and Trino caller is one identity, as the
+`aws-glue` and `aws-s3-tables` quickstarts already do) with
+`mcp.auth.mode = "static"` (an MCP caller must present a configured token).
+The two lines look contradictory and are not: the anonymous provider describes
+the SQL door, the MCP mode describes the MCP door.
+
+The reverse pairing is refused. `mcp.auth.mode = "oauth"` with an `anonymous`
+auth provider fails at startup, because OAuth mode reads scopes out of the
+bearer's payload and leaves signature verification to the chain: a provider
+that verifies nothing would accept an unsigned token carrying the read scope,
+and in a deployment reached with engine credentials that token would read real
+data. `bearer_passthrough` is a weaker case (the source still validates the
+token it receives) and is refused only under `production_mode`, but do not use
+it for an internet-facing MCP endpoint.
+
+In both modes the OAuth machinery stands down: the two
+`/.well-known/oauth-protected-resource` routes are not mounted, and a `401`
+carries a bare `WWW-Authenticate: Bearer` with no `resource_metadata`.
+`authorization_servers` is required only in `oauth` mode. `resource_uri` stays
+required in all three.
+
+The MCP bearer is a credential for SQE, never forwarded upstream: the session
+built for a static or anonymous caller carries an empty catalog token, the same
+as the anonymous SQL path, and the source is reached with the engine's
+configured credentials.
+
+One consequence worth stating plainly. In `oauth` mode the source is the last
+line of defense, and a caller holding every scope SQE advertises still reads
+only what the catalog grants that user. In these two modes **there is no such
+last line**: the source serves whatever the engine's credentials can reach. The
+gates that were defense in depth become load-bearing, so keep `allow_writes`
+off unless a specific principal needs it, issue one token per caller so the
+audit log names something useful, and put the endpoint on a network only its
+callers can reach.
+
 ## Tools
 
 Read tools are always available after the `sqe:mcp:read` scope is validated:

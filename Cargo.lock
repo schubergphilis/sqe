@@ -6657,6 +6657,7 @@ name = "sqe-core"
 version = "0.37.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "chrono",
  "futures",
  "hex",
@@ -6715,6 +6716,7 @@ dependencies = [
  "sqe-sql",
  "sqe-trino-compat",
  "sqlparser",
+ "subtle",
  "tokio",
  "tower",
  "tracing",
