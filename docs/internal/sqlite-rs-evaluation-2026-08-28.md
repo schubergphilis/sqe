@@ -192,6 +192,44 @@ cargo test -p sqe-cli                       # embedded warehouse + ATTACH suites
 That is the strongest reason to treat this as evaluable rather than speculative:
 the oracle is not hypothetical, it is a green suite today.
 
+## Measured, later the same day
+
+The evaluation above left the composite-key question open. It was run, with
+sqlite-rs 0.18.5's CLI and stock `sqlite3` 3.51.0, and the answer reshapes the
+plan.
+
+**sqlite-rs maintains a named index and ignores the implicit
+`sqlite_autoindex_*`.**
+
+| Schema shape | Rust engine write | Stock `sqlite3` afterwards |
+|---|---|---|
+| Declared composite `PRIMARY KEY`, stock-created | row accepted, autoindex untouched | `integrity_check`: "row 2 missing from index"; `count(*)` answers from the stale index and undercounts |
+| Declared composite `PRIMARY KEY`, sqlite-rs-created | duplicates accepted | any write or `integrity_check`: "database disk image is malformed (11)" |
+| No declared PK, named `CREATE UNIQUE INDEX` | duplicate refused (code 2067) | `integrity_check` ok, index complete, both directions clean |
+
+A control with no primary key at all writes and verifies fine, which places the
+fault precisely: not the file format, not page 1, not the schema table, but
+index maintenance for the implicit autoindex.
+
+Three consequences for SQE:
+
+1. The catalog schema must drop the declared composite primary key and use a
+   named unique index instead. An earlier draft proposed keeping the constraint
+   *and* adding an index; that is the malformed case.
+2. The Rust engine must treat any catalog carrying an `sqlite_autoindex_*` as
+   read-only. Writing to it corrupts it silently, and silent is the operative
+   word: the write returns success.
+3. Adoption of an existing warehouse is a migration, not a config flip, because
+   the unmaintained autoindex cannot be repaired by adding an index.
+
+For Lab271 this is worth more than the API gaps: it is a silent-corruption bug
+against a valid SQLite file in a project whose headline claim is byte
+compatibility. It should be filed as a bug with the reproduction above, ahead of
+everything in spec 012.
+
+Scope 3 (attaching an arbitrary SQLite database read-only) is untouched, since
+it never writes. It is now the safest part of the work.
+
 ## What would change the verdict
 
 1. A `sqlx` driver, or a public `Connection`-shaped API with bound parameters.

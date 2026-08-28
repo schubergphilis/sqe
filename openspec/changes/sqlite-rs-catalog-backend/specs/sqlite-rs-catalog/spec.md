@@ -170,6 +170,36 @@ the schema and overridable with an explicit option.
 - **THEN** the query fails with an error naming the ceiling and how to raise it,
   rather than materializing the whole table
 
+### Requirement: A foreign catalog is refused for writes, never corrupted
+A catalog whose tables carry an index the Rust engine does not maintain
+(`sqlite_autoindex_*`, created by any engine that declares a composite
+`PRIMARY KEY`) SHALL be readable and SHALL refuse writes with an actionable
+error. SQE's own schema SHALL use a named unique index and no declared composite
+primary key, so that both engines maintain and enforce it.
+
+Measured on 2026-08-28: writing into such a catalog with the Rust engine leaves
+rows out of the index, after which stock SQLite undercounts and
+`PRAGMA integrity_check` reports rows missing. The corruption is silent at write
+time, which is why this requirement is fail-closed rather than best-effort.
+
+#### Scenario: a foreign catalog is read but not written
+- **GIVEN** a warehouse created through the C engine, sqlx, Spark or pyiceberg
+- **WHEN** it is opened with the Rust engine
+- **THEN** listing and loading tables succeed
+- **AND** any write is refused with an error naming the reason and
+  `sqlite_engine = "c"` as the remedy
+
+#### Scenario: integrity is checked after every write, not once
+- **GIVEN** any write through the Rust engine to a SQE-created warehouse
+- **WHEN** stock `sqlite3` runs `PRAGMA integrity_check` on the file
+- **THEN** it reports ok
+
+#### Scenario: no silent migration
+- **GIVEN** a foreign catalog
+- **WHEN** the Rust engine is selected for it
+- **THEN** SQE does not rewrite its schema, and the refusal explains that
+  adopting it requires recreating the catalog tables
+
 ### Requirement: Behavior parity with the C engine is asserted, not assumed
 The existing catalog test suites SHALL run against both engines, and a failure under one and not the other SHALL be treated as a defect in the new engine rather than a difference to document.
 
