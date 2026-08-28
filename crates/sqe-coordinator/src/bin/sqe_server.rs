@@ -521,7 +521,14 @@ fn build_health_router(state: Arc<HealthState>) -> Router {
 }
 
 fn start_health_server(port: u16, state: Arc<HealthState>) {
-    let app = build_health_router(state);
+    start_health_server_with_extra(port, state, None);
+}
+
+fn start_health_server_with_extra(port: u16, state: Arc<HealthState>, extra: Option<Router>) {
+    let mut app = build_health_router(state);
+    if let Some(extra) = extra {
+        app = app.merge(extra);
+    }
 
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
@@ -1264,8 +1271,6 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             }
         },
     });
-    start_health_server(health_port, health_state);
-
     // Spawn the OTLP audit shipper when export is enabled.
     let shipper_shutdown_tx = if let Some(ref spool_path) = shipper_spool_path {
         let ae = &config.metrics.audit_export;
@@ -1471,6 +1476,34 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     let metadata_rate_limiter = Arc::new(sqe_coordinator::rate_limiter::MetadataRateLimiter::new(
         &config.rate_limit,
     ));
+
+    // MCP can share the existing health/web listener or use a dedicated port.
+    // Both modes reuse the same live auth chain and QueryHandler.
+    let mcp_web_router = if config.mcp.is_enabled() && config.mcp.port == 0 {
+        tracing::info!(port = health_port, resource = %config.mcp.resource_uri, "MCP endpoint mounted on web listener at /mcp");
+        Some(sqe_coordinator::mcp_server::mcp_router(
+            Arc::clone(&auth_chain),
+            Arc::clone(&query_handler),
+            Arc::clone(&rate_limiter),
+            Arc::clone(&auth_rate_limiter),
+            config.mcp.clone(),
+        ))
+    } else {
+        if config.mcp.port > 0 {
+            sqe_coordinator::mcp_server::start_mcp_server(
+                Arc::clone(&auth_chain),
+                Arc::clone(&query_handler),
+                Arc::clone(&rate_limiter),
+                Arc::clone(&auth_rate_limiter),
+                config.mcp.clone(),
+                &config.coordinator.tls,
+            )
+            .await?;
+            tracing::info!(port = config.mcp.port, resource = %config.mcp.resource_uri, "MCP endpoint enabled at /mcp");
+        }
+        None
+    };
+    start_health_server_with_extra(health_port, health_state, mcp_web_router);
 
     // Trino compat
     if config.coordinator.trino_http_port > 0 {

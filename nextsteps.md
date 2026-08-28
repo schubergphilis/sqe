@@ -1,5 +1,21 @@
 # SQE — Next Steps
 
+> **STATUS 2026-08-28: MCP endpoint over Streamable HTTP, OAuth resource-server model, uncommitted on `main`.**
+>
+> SQE serves `/mcp` (protocol revision 2025-11-25) from the coordinator binary, off by default behind a new `[mcp]` block. New crate `sqe-mcp`, wired by `crates/sqe-coordinator/src/mcp_server.rs` either onto the existing web listener (`enabled = true, port = 0`) or onto a dedicated port with its own TLS.
+>
+> The design decision worth writing down is what SQE refuses to be. It is a resource server only: it validates the caller's bearer through the existing auth chain, reuses the same per-user `Session` as Flight SQL and Trino HTTP, and forwards that bearer to the source, so `user bearer -> MCP -> Session -> catalog/storage` holds with no MCP service account and no token exchange. Discovery and registration stay with the authorization server; SQE publishes RFC 9728 protected-resource metadata at both well-known paths and answers a missing or wrong token with a `WWW-Authenticate` challenge naming the scope.
+>
+> Two gates carry the security story. `execute_sql_readonly` is enforced by `sqe-sql`'s classifier as an ALLOW-list (query and `SHOW` kinds, one statement per call), so a statement kind added later is refused by default rather than accidentally permitted. `execute_sql_change` is absent from `tools/list` unless `allow_writes = true`, and then needs the write scope, an SQE role in `write_roles`, and source authorization independently -- the quickstart proves the third one is not redundant by giving a reader the OAuth write scope and watching Polaris deny it anyway.
+>
+> `quickstart/mcp/` layers onto the `polaris-keycloak-user-token` stack rather than cloning it: 14 checks passed, 0 failed on 2026-08-28 against live Keycloak, Polaris and RustFS, plus secret-free Codex and Claude Code templates. Responses are bounded (1000 rows / 2 MiB, explicit `truncated`), browser callers need an exact `Origin` allow-list entry, and bearer validation and query execution ride the coordinator's existing rate limiters.
+>
+> One real gap found while writing the docs: the Helm coordinator Service publishes Flight SQL, Trino HTTP and metrics, and NOT `healthPort`, so a shared-listener `/mcp` (and the web UI on the same port) is unreachable through the shipped chart. Written down in [Kubernetes & Helm](docs/site/book/src/deployment/kubernetes.md) rather than silently fixed, since it is a chart change with its own ingress question.
+>
+> **NEXT: commit this on a feature branch and open an MR** (nothing here is committed yet), then decide whether MCP resources/prompts and an SSE streaming response are worth having. Docs and CHANGELOG are updated; the marketing site sync (`/update-sqeweb`) has not been run.
+>
+> ---
+>
 > **STATUS 2026-08-27 (b): Hive external tables, cycle 4 writes started, `INSERT INTO` works, on `feat/hive-cycle4-writes`.**
 >
 > `INSERT INTO` a Hive external table appends into `k=v/` partition directories, refreshes `sqe.partition_index`, and drops the cached session context. The writer was not the work: `HiveTableProvider::insert_into` already delegated to its inner `ListingTable`, and DataFusion 55 already carried `table_partition_cols` into `FileSinkConfig`, so cycle 4 is routing plus bookkeeping.

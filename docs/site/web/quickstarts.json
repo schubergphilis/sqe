@@ -15,6 +15,11 @@
           "blurb": "Clients bring a pre-minted Keycloak token; SQE validates it and passes it through."
         },
         {
+          "name": "mcp",
+          "title": "MCP with Codex and Claude",
+          "blurb": "Authenticated SQE MCP with read/write gates, protocol tests, and reusable AI client setup."
+        },
+        {
           "name": "nessie",
           "title": "Project Nessie",
           "blurb": "Nessie as the Iceberg REST catalog, auth-less, anonymous SQE."

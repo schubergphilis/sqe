@@ -14,6 +14,8 @@ SQE_CONFIG=/etc/sqe/sqe.toml sqe-server
 
 ## Full Reference
 
+The MCP block has its own page with the authorization model and tool reference: [Model Context Protocol](./mcp.md).
+
 ```toml
 [coordinator]
 flight_sql_port = 50051         # Flight SQL gRPC port
@@ -35,6 +37,19 @@ session_context_cache_ttl_secs = 60  # Per-user SessionContext cache TTL. Also t
 cert_file = ""                  # PEM certificate (TLS enabled when both cert + key are set)
 key_file = ""                   # PEM private key
 ca_file = ""                    # Optional PEM CA for mTLS client certificate verification
+
+[mcp]                           # Model Context Protocol endpoint. Off by default.
+enabled = false                 # true mounts /mcp; a nonzero port also enables it
+port = 0                        # 0 = share the health/web listener; nonzero = own listener + TLS
+resource_uri = ""               # Public MCP URL; the RFC 8707 resource / token audience
+authorization_servers = []      # Issuers advertised in RFC 9728 metadata
+allowed_origins = []            # Exact browser origins; native clients send no Origin
+read_scope = "sqe:mcp:read"     # Scope required for discovery and all read tools
+write_scope = "sqe:mcp:write"   # Additional scope required by execute_sql_change
+allow_writes = false            # false hides execute_sql_change from tools/list
+write_roles = ["data_writer"]   # SQE roles allowed to call execute_sql_change
+max_result_rows = 1000          # Row cap per tool response
+max_response_bytes = 2097152    # Byte cap per tool response (2 MiB)
 
 [worker]
 coordinator_url = "http://coordinator:50051"

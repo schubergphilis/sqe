@@ -1,0 +1,15 @@
+# MCP-only overlay. The base stack, bootstrap, data and images come from
+# ../polaris-keycloak-user-token/docker-compose.yml.
+services:
+  sqe:
+    environment:
+      RUST_LOG: "info,sqe_mcp=debug,sqe_auth=debug"
+      SQE_MCP__ALLOW_WRITES: ${MCP_ALLOW_WRITES:-false}
+      SQE_MCP__RESOURCE_URI: http://localhost:${SQE_MCP_PORT:-19091}/mcp
+    volumes:
+      # Compose resolves overlay paths relative to the first compose file.
+      - ../mcp/sqe.toml:/etc/sqe/sqe.toml:ro
+      - ./queries.sql:/queries.sql:ro
+    ports:
+      # MCP uses the already-existing health/web port (prometheus_port + 1).
+      - "${SQE_MCP_PORT:-19091}:9091"

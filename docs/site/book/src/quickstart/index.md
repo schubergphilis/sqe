@@ -20,6 +20,7 @@ how to use it.
 |---|---|---|
 | [Polaris + Keycloak (client credentials)](./polaris-keycloak-client-id.md) | Polaris + Keycloak; SQE mints user tokens via the OIDC password grant | validated |
 | [Polaris + Keycloak (user token)](./polaris-keycloak-user-token.md) | Same stack; clients bring a pre-minted Keycloak token, SQE validates + passes it through | validated |
+| [MCP with Codex and Claude](./mcp.md) | Reuses the user-token stack; MCP read/write gates, tests and client configuration | runnable harness |
 | [Project Nessie](./nessie.md) | Nessie as the Iceberg REST catalog (auth-less, anonymous SQE) | validated |
 | [Unity Catalog OSS](./unity-oss.md) | Unity Catalog OSS over Iceberg REST (read-only; catalog-browse demo) | validated |
 

@@ -30,6 +30,7 @@ gantt
     Phase 10 - Benchmarks vs Trino :done, p10, 2026-06, 2026-07
     Phase 8a - Trino Wire Compat :done, p8a, 2026-06, 2026-07
     Write-Path Memory Safety     :done, wms, 2026-07, 2026-07
+    MCP Endpoint (OAuth)         :done, mcp, 2026-08, 2026-08
 
     section Next
     SF100 Scaling                :sf100, 2026-07, 2026-09
@@ -316,6 +317,21 @@ Deferrals (documented): mTLS, per-event user-OIDC bearer forwarding, MERGE per-b
 ## Web UI (Done)
 
 A read-only ops dashboard ships in the coordinator binary, on the health port (`metrics_port + 1`). Queries with per-fragment timing, cluster nodes, live engine metrics with 12h history, and the audit operator log. No login (network-gated), no build step, no external assets. Toggle with `[metrics] web_ui`. Reference: [Web UI](../operations/web-ui.md).
+
+---
+
+## MCP Endpoint (Done)
+
+An MCP Streamable HTTP endpoint (protocol revision 2025-11-25) served from the coordinator binary, off by default behind `[mcp]`. It is an OAuth resource server: it validates the caller's bearer with the existing auth chain, reuses the same per-user `Session` as Flight SQL and Trino HTTP, and forwards that bearer to the source. No MCP service account.
+
+- `sqe-mcp` crate: Streamable HTTP transport, RFC 9728 protected-resource metadata, bearer challenges, tool dispatch, response bounding
+- `McpConfig` in `sqe-core` with startup validation; mounts on the existing web listener or a dedicated port
+- Nine read tools behind `read_scope`; `execute_sql_readonly` gated by SQE's SQL parser and statement classifier as an allow-list (one statement; query and `SHOW` kinds only, everything else refused by default)
+- `execute_sql_change` hidden unless `allow_writes = true`, then gated on the write scope, an SQE role in `write_roles`, and source authorization
+- Runnable end-to-end stack with Codex and Claude Code templates: `quickstart/mcp/` (14/14 checks, 2026-08-28)
+- Documented at [Model Context Protocol](../deployment/mcp.md) and [MCP with Codex and Claude](../quickstart/mcp.md)
+
+Open: no dynamic client registration on SQE's side (the authorization server owns registration), no MCP resources or prompts (tools only), no streamed partial results.
 
 ---
 

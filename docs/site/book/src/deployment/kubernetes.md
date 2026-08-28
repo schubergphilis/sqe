@@ -147,6 +147,8 @@ service:
   metricsPort: 9090
 ```
 
+The Service publishes three ports: Flight SQL, Trino HTTP, and metrics. `healthPort` (9091) is a container port used by the probes and is NOT in the Service, so anything served there reaches no cluster client through it: the web UI and, when `[mcp] enabled = true` with `port = 0`, the `/mcp` endpoint. To expose MCP on Kubernetes today, either give it a dedicated `[mcp] port` and add a Service port plus ingress route for it, or add a port for `healthPort` yourself. Neither is in the chart yet. Put MCP behind the same TLS-terminating ingress as the rest of the public surface; `resource_uri` must be the HTTPS URL clients actually call, because it is the token audience.
+
 ### Health Probes
 
 ```yaml
