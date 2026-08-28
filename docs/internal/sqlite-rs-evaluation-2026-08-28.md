@@ -5,11 +5,22 @@ Question asked: can we swap the SQLite library SQE uses for this pure-Rust reimp
 
 ## Verdict
 
-Not today, and the blocker is not SQL feature coverage. It is the integration
-surface: SQE never calls SQLite directly, it calls `sqlx`, and sqlite-rs exposes
-no `sqlx` driver, no rusqlite-compatible API, and no C ABI. The two projects are
-one adapter layer apart, and that adapter needs two things sqlite-rs does not
-have yet (bound parameters, a `Send` pager).
+**Superseded twice in one day; read "Measured, later the same day" below for the
+current answer.** The two revisions are kept rather than edited away, because
+each was wrong in a way worth remembering.
+
+The original verdict, written from the README and the GitHub API: not today,
+because SQE never calls SQLite directly, it calls `sqlx`, and sqlite-rs exposes
+no `sqlx` driver, no rusqlite-compatible API and no C ABI.
+
+Revision 1, after reading `examples/`: the API is sufficient today. Bound
+parameters are public (`execute_with_db_and_params`, over their `Variable`
+opcode), database creation is public (`DatabaseHeader::new_empty_page1`), and
+gap 2 below is wrong on both counts. SQE can write the adapter with no upstream
+work.
+
+Revision 2, after actually running it: the adapter is viable, and the blocker is
+not an API at all. It is index maintenance. See the measured section.
 
 The direction is right and worth investing in. SQE argues sovereignty for a
 living, and its own dependency tree currently statically links a C library for
@@ -105,7 +116,15 @@ in SQE that bypasses `iceberg-catalog-sql`, owns its own schema and SQL, and
 talks to sqlite-rs directly. Only viable for the embedded warehouse (see
 staging), and it is new code SQE maintains, not a swap.
 
-### 2. Bound parameters / prepared statements (blocking, partly unconfirmed)
+### 2. Bound parameters / prepared statements (WRONG, see revision 1)
+
+**This section is incorrect and kept for the record.** Bound parameters are
+public and reachable: `execute_with_db_and_params(&program, source, header,
+vec![Value::Integer(id)])` is what `examples/query.rs` calls, over the `Variable`
+opcode their ADR-0015 landed. Positional `?` and `?NNN` work, which is exactly
+what the catalog uses. What is missing is a statement facade, not the capability.
+The lesson: a README plus a file listing is not a substitute for the examples
+directory.
 
 `sqlx`'s entire surface is `query(...).bind(...)`, and the vendored catalog uses
 it throughout. Nothing in the paths read (`lib.rs` module list, `exec.rs`,
