@@ -5,7 +5,7 @@
 - [ ] 0.1 Point `sqlite-rs query` and `sqlite-rs dump` at a warehouse `sqe-cli --embedded` created, and diff against `sqlite3`. Zero SQE code. If the file does not round-trip, nothing below matters.
 - [ ] 0.2 Wire the actor plus three operations (`create_namespace`, `create_table`, `load_table`) against that file in a throwaway binary. The question this answers is not "does it work" but "how much does their internals-shaped API cost to call", which decides whether tasks 1 to 6 are two weeks or six.
 - [ ] 0.3 Confirm the rows-affected gap is real by asking upstream, not by grepping. If `changes()` exists or lands, task 3.4 simplifies to a single conditional `UPDATE`.
-- [ ] 0.4 **Settle the autoindex question before anything else.** Create the catalog schema with sqlite-rs, then have stock `sqlite3` insert into it and run `integrity_check`. A table whose declared composite primary key has no `sqlite_autoindex_*` is a schema stock SQLite never writes, and its behavior there is not something to guess. A bad answer here does not kill the change, it demotes it to open-only on C-created catalogs, and that is a decision to take up front.
+- [x] 0.4 **Settled 2026-08-28** (sqlite-rs 0.18.5, stock `sqlite3` 3.51.0). sqlite-rs maintains a NAMED index and ignores the implicit `sqlite_autoindex_*`. Writing into a stock-created table with a declared composite `PRIMARY KEY` corrupts it silently: `integrity_check` reports "row N missing from index" and `count(*)` answers from the stale index. Creating that same DDL with sqlite-rs produces a file stock `sqlite3` calls "malformed (11)" on any write. A table with NO declared PK and an explicit `CREATE UNIQUE INDEX` round-trips perfectly in both directions, with uniqueness enforced by both engines. Consequences are in the design; tasks 3.1, 3.1b and 4d below carry them.
 
 ## 1. Engine adapter (one file, one blast radius)
 
@@ -26,8 +26,8 @@
 
 ## 3. `Catalog` implementation, read path first
 
-- [ ] 3.1 Schema bootstrap: read the schema first and create only what is absent, because `IF NOT EXISTS` parses and is then ignored. Columns identical to `iceberg-catalog-sql`'s, composite `PRIMARY KEY` declared for DDL compatibility.
-- [ ] 3.1b Add an explicit `CREATE UNIQUE INDEX` on the primary-key columns, because the implicit `sqlite_autoindex_*` is not created and an unbacked constraint is not enforced. A real index is enforced (`Opcode::NoConflict`), so this restores the duplicate-rejection SQE relies on.
+- [ ] 3.1 Schema bootstrap: read the schema first and create only what is absent, because `IF NOT EXISTS` parses and is then ignored. Columns identical to `iceberg-catalog-sql`'s, and **no declared composite `PRIMARY KEY`**. Per task 0.4 the declared constraint is what makes the file malformed to stock SQLite, so declaring it "for DDL compatibility" is the one thing not to do.
+- [ ] 3.1b Create a named `CREATE UNIQUE INDEX` on those columns instead, for both engines, so one schema serves both. Measured: a named index is maintained and enforced by sqlite-rs (code 2067) and by stock `sqlite3` (code 19), and `integrity_check` stays clean after either writes.
 - [ ] 3.1c Test: a second `create_table` for the same identifier is rejected. Without 3.1b this test passes silently against the C backend and fails only against `sqlite_rs`, which is the whole reason it runs against both.
 - [ ] 3.2 Read methods: `list_namespaces`, `get_namespace`, `namespace_exists`, `list_tables`, `table_exists`, `load_table`. The `UNION` in the namespace listing and the `LIMIT 1` probes are the shapes to port exactly.
 - [ ] 3.3 Write methods: `create_namespace`, `update_namespace`, `drop_namespace`, `create_table`, `drop_table`, `rename_table`, `register_table`, `update_table`.
@@ -66,6 +66,14 @@
 - [ ] 4c.8 Test: a join between a scope-3 table and an Iceberg table returns correct rows.
 - [ ] 4c.9 Test: a column holding mixed storage classes produces the documented error rather than wrong values, and a pushed-down filter returns exactly what DataFusion's own filter would.
 
+## 4d. Fail closed on a foreign catalog
+
+- [ ] 4d.1 At open, read `sqlite_master` and detect `sqlite_autoindex_*` (or any declared composite `PRIMARY KEY`) on the catalog tables. Its presence means the file was created by an engine whose index this one will not maintain.
+- [ ] 4d.2 With the Rust engine, a foreign catalog is READ-ONLY: reads are safe and stay allowed, writes are refused with an error that names the reason and points at `sqlite_engine = "c"`. Measured: writing anyway corrupts the file quietly, so this guard is the difference between a feature and an incident.
+- [ ] 4d.3 No silent migration. Adding a named index to a foreign catalog does not repair it, because the unmaintained autoindex remains; switching an existing warehouse means recreating the two catalog tables, and SQE will not do that behind the user's back.
+- [ ] 4d.4 Test: open a warehouse created through the C engine with the Rust engine, assert reads work and a write is refused with that error rather than succeeding.
+- [ ] 4d.5 Test: after any Rust-engine write to a SQE-created warehouse, stock `sqlite3` reports `integrity_check` ok. This is the assertion that would have caught the corruption; run it in every write test, not once.
+
 ## 5. Interop and parity, which is where this change is won or lost
 
 - [ ] 5.1 Test: C-engine create and populate, Rust-engine load and commit, C-engine read back. All three steps, in that order, in one test.
@@ -84,7 +92,8 @@
 ## 7. Upstream, and the part that helps regardless
 
 - [ ] 7.1 Contribute SQE's catalog statement corpus to sqlite-rs as a fixture family, so their pinned-oracle harness covers this workload. Highest value per hour in this whole change, and it pays off even if SQE never ships the backend.
-- [ ] 7.2 File the five gaps found: no incremental row API (the whole result set materializes as `Vec<Vec<Value>>`, which is what caps scope 3), no rows-affected count, no library API to create a database (their `examples/README.md` documents this one), `IF NOT EXISTS` ignored after parsing, and composite-key constraints neither enforced nor backed by an auto-created index (their `insert.rs` documents this one). The last two are SQL-semantics gaps owned by V3/V7 rather than by the embedding-API spec.
+- [ ] 7.2 **File the autoindex corruption first, as a bug rather than a gap.** With the reproduction from task 0.4: sqlite-rs writing into a valid stock-created table with a declared composite `PRIMARY KEY` leaves rows out of `sqlite_autoindex_*`, so stock SQLite then undercounts and `integrity_check` fails. It is a silent-corruption bug in a project whose headline claim is byte compatibility, and it is worth more to them than everything else on this list.
+- [ ] 7.2b File the five gaps found: no incremental row API (the whole result set materializes as `Vec<Vec<Value>>`, which is what caps scope 3), no rows-affected count, no library API to create a database (their `examples/README.md` documents this one), `IF NOT EXISTS` ignored after parsing, and composite-key constraints neither enforced nor backed by an auto-created index (their `insert.rs` documents this one). The last two are SQL-semantics gaps owned by V3/V7 rather than by the embedding-API spec.
 - [ ] 7.3 Offer `.openspec/specs/012-embedding-api/` (six requirements) and ADR-0033 as a PR against their repo. Two edits are needed for their tooling to see it, and they are theirs to make, not ours to assume: a row in `.openspec/README.md`'s Specs table and a value-block entry in `plan.md`. `tools/assurance.py` reads both.
 - [ ] 7.4 Ask which of Tier 1 they intend to take, in order: composite-key enforcement (also fixes their own byte-compatibility claim), then the rows-affected count, then `IF NOT EXISTS`. SQE ships without all three; the answer decides which workarounds are permanent.
 

@@ -85,32 +85,44 @@ doesn't auto-create `sqlite_autoindex_*` entries yet) has no real index to seek
 against, so it still isn't enforced."
 
 SQE's catalog key is exactly that shape, `(catalog_name, table_namespace,
-table_name)`, and it relies on the constraint for two things: rejecting a
-duplicate `create_table`, and the lookup path. The same doc says a *real* index
-is enforced, via `Opcode::NoConflict` seeking it, so the workaround is to stop
-relying on the implicit one:
+table_name)`. **This was measured on 2026-08-28** with sqlite-rs 0.18.5 and
+stock `sqlite3` 3.51.0, and the result decides the change:
 
-```sql
-CREATE TABLE iceberg_tables (... , PRIMARY KEY (catalog_name, table_namespace, table_name));
-CREATE UNIQUE INDEX iceberg_tables_pk ON iceberg_tables (catalog_name, table_namespace, table_name);
-```
+| Schema shape | Rust engine write | Stock `sqlite3` afterwards |
+|---|---|---|
+| Declared composite `PRIMARY KEY`, created by stock (what sqlx, Spark's `JdbcCatalog` and pyiceberg's `SqlCatalog` all write) | accepts the row, does not maintain `sqlite_autoindex_*` | **corrupt**: `integrity_check` reports "row 2 missing from index", `count(*)` answers from the index and undercounts |
+| Declared composite `PRIMARY KEY`, created by sqlite-rs | accepts duplicates | **malformed**: `INSERT` and `integrity_check` fail with "database disk image is malformed (11)" |
+| No declared PK, explicit named `CREATE UNIQUE INDEX` | enforced, SQLite code 2067 on a duplicate | **ok**: `integrity_check` clean, index complete, both engines agree |
 
-The declared constraint keeps the DDL identical to what `iceberg-catalog-sql`
-writes, and the explicit index restores enforcement. An extra named index is
-invisible to readers that query rows rather than inspect indexes, which is
-every Iceberg client.
+The distinction is exact: **sqlite-rs maintains a named index and ignores the
+implicit `sqlite_autoindex_*`.** A table with no PK and a real index round-trips
+perfectly between the two engines, in both creation directions. A table with a
+declared composite PK does not, and the failure is silent on the write side.
 
-**The open interop question, and it is the one that decides this change.** Stock
-`sqlite3` materializes `sqlite_autoindex_iceberg_tables_1` for that DDL, and
-sqlite-rs does not. So a catalog *created* by sqlite-rs has a schema stock
-SQLite did not write, and what stock SQLite does when it later inserts into a
-table whose declared primary key has no backing index is not something to
-guess. Three outcomes are possible: it works, `integrity_check` complains, or a
-write fails. Task 0.4 settles it with no SQE code at all, and it runs before
-tasks 1 to 4 rather than alongside them, because the answer decides whether SQE
-may create catalogs with this backend or only open ones the C backend created.
-Task 5.2 then asserts the answer as a standing test. Downgrading to open-only
-is a viable, honest fallback; discovering it after shipping is not.
+Three consequences, and none of them is a detail:
+
+**The schema must not declare the composite primary key.** An earlier draft of
+this design proposed declaring it for DDL compatibility *and* adding an explicit
+index. That combination is the malformed case: the declared PK is the poison, not
+the missing index. SQE creates `iceberg_tables` and
+`iceberg_namespace_properties` without the constraint and with a named
+`CREATE UNIQUE INDEX` on the same columns, for both engines, so one schema serves
+both. Iceberg clients query rows rather than inspect constraints, so their DML is
+unaffected.
+
+**The Rust engine must refuse to write a foreign catalog.** A warehouse created
+by sqlx, Spark or pyiceberg carries a declared PK and an `sqlite_autoindex_*`
+that this engine will not maintain. Writing to it corrupts it quietly. So the
+engine adapter detects `sqlite_autoindex_*` in `sqlite_master` at open and, if
+present, either refuses writes or refuses the mount, per task 4d. Reads are safe
+and stay allowed. Failing closed here is the difference between a feature and an
+incident.
+
+**Adoption is not migration.** You cannot repair a foreign catalog by adding a
+named index: the unmaintained autoindex is still there. Switching an existing
+warehouse to the Rust engine means recreating the two catalog tables, which is a
+migration SQE is not going to perform silently. New warehouses get the Rust
+engine; existing ones keep the C engine until upstream maintains autoindexes.
 
 ## The actor boundary
 
