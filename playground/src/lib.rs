@@ -11,6 +11,8 @@
 //! Everything the browser can reach must serve CORS headers, and parquet
 //! additionally needs HTTP Range support (206 + `Accept-Ranges: bytes`).
 
+mod iceberg;
+
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -19,7 +21,7 @@ use arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::file_format::FileFormat;
-use datafusion::datasource::listing::ListingOptions;
+use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::prelude::*;
 use object_store::aws::AmazonS3Builder;
 use object_store::http::HttpBuilder;
@@ -62,6 +64,16 @@ struct QueryResult {
     rows: Vec<Vec<Option<String>>>,
     row_count: u32,
     truncated: bool,
+}
+
+#[derive(Serialize)]
+struct IcebergInfo {
+    name: String,
+    columns: Vec<Column>,
+    snapshot_id: String,
+    data_files: u32,
+    location: String,
+    schema_mismatch: bool,
 }
 
 #[derive(Serialize)]
@@ -214,6 +226,73 @@ pub async fn register(name: String, url: String) -> Result<JsValue, JsValue> {
     }
 
     Ok(info)
+}
+
+/// Register the Iceberg table whose `metadata.json` lives at `url`.
+///
+/// Resolves the current snapshot to an explicit list of parquet files and
+/// registers exactly those. Registering the data DIRECTORY instead would
+/// appear to work and be wrong: it picks up files from every snapshot,
+/// including ones the current snapshot has replaced.
+#[wasm_bindgen]
+pub async fn register_iceberg(name: String, url: String) -> Result<JsValue, JsValue> {
+    let ctx = with_ctx()?;
+    let parsed = url::Url::parse(&url).map_err(|e| err("url", e))?;
+    register_store(&ctx, &parsed)?;
+
+    let table = iceberg::load(&ctx, &parsed)
+        .await
+        .map_err(|e| JsValue::from_str(&format!("iceberg: {e}")))?;
+
+    let paths = table
+        .data_files
+        .iter()
+        .map(ListingTableUrl::parse)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| err("data file path", e))?;
+
+    let opts = ListingOptions::new(Arc::new(ParquetFormat::default()));
+    let config = ListingTableConfig::new_with_multi_paths(paths)
+        .with_listing_options(opts)
+        .infer_schema(&ctx.state())
+        .await
+        .map_err(|e| err("infer schema", e))?;
+    let provider = ListingTable::try_new(config).map_err(|e| err("listing table", e))?;
+
+    ctx.register_table(&name, Arc::new(provider))
+        .map_err(|e| err("register", e))?;
+
+    // Surface what the CATALOG says the schema is next to what the files say.
+    // They should agree; when they do not, the parquet was written under an
+    // older schema and column names are the thing most likely to be stale.
+    let info = ctx.table(&name).await.map_err(|e| err("table", e))?;
+    let file_names = info
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect::<Vec<_>>();
+    let catalog_names = table.fields.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+    let schema_mismatch = file_names != catalog_names;
+
+    let out = IcebergInfo {
+        name: name.clone(),
+        columns: info
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| Column {
+                name: f.name().clone(),
+                data_type: f.data_type().to_string(),
+                numeric: f.data_type().is_numeric(),
+            })
+            .collect(),
+        snapshot_id: table.snapshot_id.to_string(),
+        data_files: table.data_files.len() as u32,
+        location: table.location,
+        schema_mismatch,
+    };
+    serde_wasm_bindgen::to_value(&out).map_err(|e| err("serialize", e))
 }
 
 /// Schema of an already-registered table, for the sidebar.

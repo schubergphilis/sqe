@@ -456,11 +456,12 @@
         <h2>Add source</h2>
         <label class="f" for="src-name">Table name</label>
         <input class="f" id="src-name" value="events" spellcheck="false">
-        <label class="f" for="src-url">Parquet or CSV URL</label>
+        <label class="f" for="src-url">Parquet, CSV or Iceberg metadata.json</label>
         <input class="f" id="src-url" value="/events.parquet" spellcheck="false"
                placeholder="https://host/data.parquet">
         <button id="btn-add" style="width:100%">Register</button>
-        <button class="ghost" id="btn-sample" style="width:100%;margin-top:6px">Load sample data</button>
+        <button class="ghost" id="btn-sample" style="width:100%;margin-top:6px">Load sample parquet</button>
+        <button class="ghost" id="btn-ice" style="width:100%">Load sample Iceberg table</button>
 
         <details class="s3">
           <summary>S3-compatible bucket</summary>
@@ -861,21 +862,41 @@ async function addSource(name, url, starterSql) {
     // non-special scheme like s3:// would normalise it into something the
     // object-store registry no longer matches.
     const abs = /^[a-z0-9+.-]+:\/\//i.test(url) ? url : new URL(url, location.href).href;
-    const info = await engine.register(name, abs);
+    // A metadata.json is an Iceberg table, not a file to scan. Reading it as
+    // parquet would fail confusingly, and reading its data DIRECTORY would
+    // silently ignore the snapshot.
+    const isIceberg = /\.metadata\.json$/i.test(abs);
+    const info = isIceberg
+      ? await engine.register_iceberg(name, abs)
+      : await engine.register(name, abs);
     registered.set(name, info);
     renderTables();
     if (pristine || !ta.value.trim()) {
       ta.value = starterSql || `select *\nfrom ${name}\nlimit 100`;
       sync();
     }
+    const extra = info.snapshot_id
+      ? ` &middot; snapshot ${esc(info.snapshot_id)} &middot; ${info.data_files} data file${info.data_files === 1 ? '' : 's'}`
+      : '';
     out.innerHTML = '<div class="placeholder"><div class="big">' + esc(name) +
       '</div><div class="sm">registered &middot; ' + info.columns.length +
-      ' columns &middot; \u2318\u21a9 to query</div></div>';
+      ' columns' + extra + ' &middot; \u2318\u21a9 to query</div></div>';
+    if (info.schema_mismatch) {
+      out.querySelector('.sm').innerHTML +=
+        '<br><span style="color:var(--amber)">catalog schema and file schema disagree</span>';
+    }
   } catch (e) {
     renderError(typeof e === 'string' ? e : (e && e.message) || String(e));
   } finally {
     setBusy(false);
   }
+}
+
+function loadIceberg() {
+  const u = '/iceberg/demo/events/metadata/00002-21180f54-b81a-47f8-9a6e-68a68eb85977.metadata.json';
+  $('src-name').value = 'ice';
+  $('src-url').value = u;
+  addSource('ice', u);
 }
 
 function loadSample() {
@@ -940,6 +961,7 @@ $('btn-add').onclick = () => {
   if (n && u) addSource(n, u);
 };
 $('btn-sample').onclick = loadSample;
+$('btn-ice').onclick = loadIceberg;
 $('btn-s3').onclick = () => {
   const bucket = $('s3-bucket').value.trim();
   const st = $('s3-status');

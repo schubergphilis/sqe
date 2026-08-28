@@ -11,23 +11,49 @@ cargo install wasm-bindgen-cli --version 0.2.127
 python3 www/serve.py          # http://127.0.0.1:8799
 ```
 
-## What this is not
+## Reading Iceberg without iceberg-rust
 
-It is not the SQE engine. There is no Iceberg, no catalog, no policy
-enforcement, no distributed execution. What runs here is DataFusion 55 reading
-parquet and CSV over `object_store`, which is a slice of the engine's read path
-and nothing more.
+Point it at a table's `metadata.json` and it reads the table:
 
-The reason is specific. `iceberg-rust` does FileIO through opendal, and
-opendal's `Access` trait uses boxed futures declared without a `Send` bound.
-On `wasm32-unknown-unknown` reqwest's futures are `!Send`, so the crate fails to
-compile with 39 variants of "future cannot be sent between threads safely". No
-feature flag fixes it; it needs an object_store FileIO backend upstream, or a
-metadata reader written against the Iceberg spec directly.
+    /iceberg/demo/events/metadata/00002-....metadata.json
 
-`object_store` escapes the same trap only because wasm-bindgen carries
-`unsafe impl Send for JsValue` on non-atomics wasm, which satisfies its
-`#[async_trait]` bounds. That difference is the whole reason this exists at all.
+`iceberg-rust` cannot compile for `wasm32-unknown-unknown`. Its FileIO goes
+through opendal, whose `Access` trait uses boxed futures declared without a
+`Send` bound, and reqwest's futures are `!Send` on browser wasm: 39 variants of
+"future cannot be sent between threads safely", and no feature flag fixes it.
+(`object_store` escapes the identical trap only because wasm-bindgen carries
+`unsafe impl Send for JsValue` on non-atomics wasm.)
+
+So `src/iceberg.rs` implements the read path against the spec instead, which is
+smaller than it sounds because Iceberg's on-disk formats are ordinary: JSON and
+Avro, both reachable over fetch.
+
+    metadata.json  ->  current-snapshot-id  ->  manifest list (Avro)
+                   ->  manifests (Avro)     ->  parquet data files
+
+Three things it gets right, each of which is silently wrong if you skip it:
+
+- **The snapshot governs.** Every path is driven from `current-snapshot-id`.
+  Registering the data *directory* would appear to work on any test table and be
+  wrong in general, because the directory holds files from every snapshot
+  including replaced ones. Point the reader at an older `metadata.json` and you
+  get that version of the table, which is time travel for free.
+- **Paths are rebased.** Iceberg records absolute locations, and they are almost
+  never the URL you fetched from. The bundled fixture records `file:///...`
+  because SQE wrote it locally, while the browser reads it over HTTP; an S3
+  table records `s3://`. Each path is re-rooted by stripping the table's own
+  `location` prefix.
+- **Delete files are refused, not ignored.** A merge-on-read table with position
+  or equality deletes returns an error. Skipping them silently would return rows
+  the table says are deleted, which looks exactly like success.
+
+Verified against a table written by `sqe-cli` itself: two appends, two
+snapshots, two data files. `count(*)` returns 6 and the aggregate matches what
+the CLI prints. The v1 metadata returns 3 rows from one file; the v0 metadata
+errors as empty.
+
+Still not the SQE engine: read-only, copy-on-write only, no catalog
+integration yet, no policy layer, no distributed execution.
 
 ## Constraints worth knowing before you debug something
 
@@ -129,7 +155,9 @@ Both already work natively: `sqe-cli --embedded --catalog-backend glue|s3tables`
 
 | Path | Purpose |
 |---|---|
-| `src/lib.rs` | `#[wasm_bindgen]` surface: `start`, `register`, `run_sql`, `explain`, `configure_s3` |
+| `src/lib.rs` | `#[wasm_bindgen]` surface: `start`, `register`, `register_iceberg`, `run_sql`, `explain`, `configure_s3` |
+| `src/iceberg.rs` | Iceberg read path: metadata.json, manifest list and manifests |
+| `www/iceberg/` | A real Iceberg table written by `sqe-cli`, used as the fixture |
 | `www/index.html` | The whole UI. Hand-written SQL tokenizer, no framework, no CDN |
 | `www/serve.py` | Static server with Range, CORS and WebDAV PROPFIND |
 | `build.sh` | cargo build, wasm-bindgen, optional wasm-opt |
@@ -182,13 +210,25 @@ lets `build.sh` run `wasm-opt -Oz` for another 15 to 25 percent. Boot to ready i
 
 ## Where this could go
 
-Reading Iceberg without iceberg-rust is the obvious next step: `metadata.json`
-is JSON, manifest lists and manifests are Avro, and `apache-avro` is pure Rust.
-Snapshot to manifest list to manifests to data file paths, then hand the paths to
-DataFusion. Read-only, no position deletes. That would make it Iceberg in a
-browser tab.
+An Iceberg REST catalog client, so you point at a catalog rather than at a
+`metadata.json`. It is plain HTTPS and JSON over fetch and needs none of
+`iceberg-catalog-rest` (whose non-optional `gcp_auth` drags in hyper and mio and
+will not build for wasm). `loadTable` returns the table metadata inline, so it
+feeds straight into the reader that already works.
 
-After that, browsing an Iceberg REST catalog is plain HTTPS and JSON over fetch,
-with no need for `iceberg-catalog-rest` (whose non-optional `gcp_auth` dependency
-drags in hyper and mio and will not build for wasm either). Gated entirely on
-whether the catalog sends CORS headers.
+Measured 2026-08-28: **AWS's service endpoints support CORS**.
+`s3tables.us-east-1.amazonaws.com` and `glue.us-east-1.amazonaws.com` both answer
+the preflight with `Access-Control-Allow-Origin: *`, reflect back the signed
+headers (`authorization`, `x-amz-date`, `x-amz-content-sha256`,
+`x-amz-security-token`) and cache it for 48 hours. So no proxy is needed to
+reach the catalog; SigV4 is HMAC-SHA256 and does not need the AWS SDK.
+
+What is still unverified for S3 Tables is the data files: they live in an
+AWS-managed table bucket, which must also expose `content-range`. That needs an
+account to settle. Snowflake Open Catalog is managed Polaris, so it is the same
+REST client with a bearer token instead of SigV4, and testable with no AWS at
+all.
+
+Beyond that: merge-on-read (applying position deletes), and partition pruning
+from the manifest statistics that are already being parsed and currently
+discarded.
