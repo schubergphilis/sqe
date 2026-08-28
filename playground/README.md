@@ -46,8 +46,8 @@ the file it received, and you get:
 
 This was measured, not guessed. RustFS allows the origin and sends
 `Content-Range`, but its expose list is `x-request-id, content-type,
-content-length, etag`, so a browser read fails until something widens it. On AWS
-S3 the fix is `ExposeHeaders` in the bucket CORS rule:
+content-length, etag`, so a browser read fails until something widens it. MinIO gets it right by default. On AWS S3 you set `ExposeHeaders` in the bucket
+CORS rule:
 
 ```json
 [{
@@ -84,14 +84,42 @@ feedback.
 which needs COOP/COEP headers and a rebuild with atomics. Expect single-core
 query performance.
 
-**What has actually been tested.** HTTP and HTTPS sources: parquet and CSV,
-file and directory form, verified in Chrome. S3: verified against RustFS through
-a header-widening proxy, since RustFS's own expose list makes a direct browser
-read impossible. The directory form passed 10 of 10 runs, the single-file form 9
-of 10, with the tenth returning a truncated read. That was only ever observed
-through the throwaway proxy, so it is not attributed to the engine, but
-`register` now refuses a zero-column table outright rather than registering an
-empty one that fails later as "No field named x".
+## Public data, and which hosts actually work
+
+Being public is not the requirement. Exposing `content-range` is. Measured
+2026-08-28, all through a real browser:
+
+| Host | Origin allowed | content-range exposed | Works |
+|---|---|---|---|
+| HuggingFace CDN | `*` | `*` | **yes** |
+| `shell.duckdb.org` | `*` | nothing | no |
+| `raw.githubusercontent.com` | `*` | nothing | no |
+| NYC TLC CloudFront | none | nothing | no |
+| MinIO (default) | configurable | `Content-Range, ... , *` | **yes** |
+| RustFS | yes | `x-request-id, content-type, content-length, etag` | no |
+
+The three failures are instructive. Two of them serve a perfectly good `206`
+with a `Content-Range` header, and curl sees it; the browser hides it from the
+page because it is not on the CORS safelist and was not exposed, and the parquet
+reader cannot tell how much of the file it received.
+
+So the built-in "Public data" list points at HuggingFace, which hosts a large
+amount of open parquet and gets the headers right. The 2 GB fineweb shard is the
+one worth clicking: a filtered `LIMIT` returns in about 670 ms because only the
+footer and a couple of row groups cross the network. Drop the `LIMIT` and the
+same query has to pull all 2 GB through one wasm thread, which takes minutes.
+Same engine, same file; the difference is whether parquet gets to skip.
+
+**What has actually been tested.** HTTP and HTTPS: parquet and CSV, file and
+directory form, local and remote, verified in Chrome. Remote parquet at 0.2 MB,
+2 MB, 20 MB and 2 GB. S3: verified against MinIO with no proxy in the path, 30
+of 30 runs clean across both the file and directory forms.
+
+An earlier round measured 9 of 10 on the S3 single-file form, but that ran
+through a throwaway CORS-widening proxy needed to work around RustFS. Against
+MinIO directly the flake does not reproduce, so it was the proxy. `register`
+refuses a zero-column table regardless, rather than registering an empty one
+that fails later as "No field named x".
 
 **AWS Glue and S3 Tables do not work here**, and cannot without a proxy. The AWS
 SDK does not target browser wasm, and AWS API endpoints serve no CORS headers.

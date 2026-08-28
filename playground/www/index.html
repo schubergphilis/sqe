@@ -200,6 +200,16 @@
   .col .cn { color: var(--dim); }
   .col .ct { margin-left: auto; color: var(--faint); font-size: 10px; }
 
+  .ds { display: block; width: 100%; text-align: left; border: 0; padding: 8px 0;
+        border-bottom: 1px solid var(--line); background: none;
+        font-family: var(--mono); font-size: 12px; color: var(--ink);
+        letter-spacing: 0; text-transform: none; cursor: pointer;
+        display: flex; align-items: baseline; gap: 8px; }
+  .ds:last-of-type { border-bottom: none; }
+  .ds::before { content: "\25B8"; color: var(--amber); font-size: 10px; }
+  .ds:hover:not(:disabled) { color: var(--amber); border-color: var(--line); }
+  .ds .sz { margin-left: auto; color: var(--faint); font-size: 10px; }
+
   details.s3 { margin-top: 4px; }
   details.s3 > summary {
     list-style: none; cursor: pointer;
@@ -487,6 +497,14 @@
       </div>
 
       <div class="sect">
+        <h2>Public data</h2>
+        <p class="note">Remote parquet, read straight from the page. Only hosts
+        that expose content-range to the browser can work at all; these do.
+        Each loads a starter query sized to the file.</p>
+        <div id="datasets"></div>
+      </div>
+
+      <div class="sect">
         <h2>Tables <span class="count" id="tbl-count"></span></h2>
         <div id="tables">
           <div class="empty">Nothing registered yet.<br><a id="lnk-sample">Load the sample</a> to start.</div>
@@ -661,6 +679,7 @@ function setBusy(b, label) {
   $('btn-run').disabled = b;
   $('btn-explain').disabled = b;
   $('btn-add').disabled = b;
+  document.querySelectorAll('.ds').forEach(el => { el.disabled = b; });
 }
 
 /* ---------------------------------------------------------------- results */
@@ -834,7 +853,7 @@ function renderTables() {
   }
 }
 
-async function addSource(name, url) {
+async function addSource(name, url, starterSql) {
   if (busy) return;
   setBusy(true, 'registering');
   try {
@@ -846,7 +865,7 @@ async function addSource(name, url) {
     registered.set(name, info);
     renderTables();
     if (pristine || !ta.value.trim()) {
-      ta.value = `select *\nfrom ${name}\nlimit 100`;
+      ta.value = starterSql || `select *\nfrom ${name}\nlimit 100`;
       sync();
     }
     out.innerHTML = '<div class="placeholder"><div class="big">' + esc(name) +
@@ -864,6 +883,55 @@ function loadSample() {
   $('src-url').value = '/events.parquet';
   addSource('events', '/events.parquet');
 }
+
+// Public parquet that a browser can actually read. The gate is not whether a
+// bucket is public, it is whether the host lists content-range in
+// Access-Control-Expose-Headers. Measured 2026-08-28: HuggingFace's CDN sends
+// `expose-headers: *` and works; shell.duckdb.org and raw.githubusercontent.com
+// allow the origin but expose nothing, so the parquet reader cannot tell how
+// much of the file it got; the NYC TLC CloudFront distribution sends no CORS
+// at all.
+const HF = 'https://huggingface.co/datasets';
+// Each carries a starter query sized to the file. This matters most for
+// fineweb: a filtered LIMIT touches the footer and a row group or two and
+// returns in under a second, while an unbounded GROUP BY has to scan all 2 GB
+// through one wasm thread and takes minutes. Same engine, same file; the
+// difference is whether parquet gets to skip.
+const DATASETS = [
+  { name: 'cola', size: '0.2 MB',
+    url: `${HF}/nyu-mll/glue/resolve/main/cola/train-00000-of-00001.parquet`,
+    sql: 'select label, count(*) as n\nfrom cola\ngroup by label' },
+  { name: 'gsm8k', size: '2 MB',
+    url: `${HF}/openai/gsm8k/resolve/main/main/train-00000-of-00001.parquet`,
+    sql: 'select question, answer\nfrom gsm8k\nlimit 20' },
+  { name: 'imdb', size: '20 MB',
+    url: `${HF}/stanfordnlp/imdb/resolve/main/plain_text/train-00000-of-00001.parquet`,
+    sql: 'select label, count(*) as reviews\nfrom imdb\ngroup by label\norder by label' },
+  { name: 'fineweb', size: '2 GB',
+    url: `${HF}/HuggingFaceFW/fineweb/resolve/main/sample/10BT/000_00000.parquet`,
+    sql: "-- 2 GB on HuggingFace. Only the footer and the row groups this\n"
+       + "-- filter needs ever cross the network, so it returns in under a\n"
+       + "-- second. Drop the LIMIT and it must scan all 2 GB: minutes.\n"
+       + "select url, language, token_count\nfrom fineweb\nwhere token_count > 1000\nlimit 100" },
+];
+
+(() => {
+  const host = $('datasets');
+  for (const d of DATASETS) {
+    const b = document.createElement('button');
+    b.className = 'ds';
+    b.append(d.name);
+    const sz = document.createElement('span');
+    sz.className = 'sz'; sz.textContent = d.size;
+    b.appendChild(sz);
+    b.onclick = () => {
+      $('src-name').value = d.name;
+      $('src-url').value = d.url;
+      addSource(d.name, d.url, d.sql);
+    };
+    host.appendChild(b);
+  }
+})();
 
 $('btn-run').onclick = () => run(false);
 $('btn-explain').onclick = () => run(true);
