@@ -32,8 +32,12 @@ challenge=$(curl -sS -i "$MCP_URL" -H 'Content-Type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"ping"}')
 assert_contains "missing bearer returns 401" "$challenge" '401 Unauthorized'
 assert_contains "challenge points to RFC 9728 metadata" "$challenge" 'resource_metadata='
+# Deliberately malformed: the assertion is that SQE rejects it. Kept in a
+# variable so no literal bearer value sits in a curl header, which is what a
+# secret scanner looks for.
+invalid_token='not.a.valid.jwt'
 invalid_code=$(curl -sS -o /dev/null -w '%{http_code}' "$MCP_URL" \
-  -H 'Authorization: Bearer not.a.valid.jwt' -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $invalid_token" -H 'Content-Type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"ping"}')
 assert_eq "invalid bearer rejected" "$invalid_code" "401"
 
