@@ -9,12 +9,14 @@ graph TB
         CLI["sqe-cli"]
         DBT["dbt-sqe adapter"]
         DASH["Dashboards<br/>(Trino compat)"]
+        AI["AI assistants<br/>(MCP clients)"]
     end
 
     subgraph "SQE Cluster"
         subgraph "Coordinator (sqe-server --mode coordinator)"
             FLS["Flight SQL Server<br/>:50051"]
             TH["Trino HTTP<br/>:8080"]
+            MCP["MCP endpoint<br/>/mcp (web port)"]
             SM["Session Manager"]
             QH["Query Handler"]
             PE["Policy Enforcer"]
@@ -38,6 +40,7 @@ graph TB
     CLI --> FLS
     DBT --> FLS
     DASH --> TH
+    AI --> MCP
 
     SM --> KC
     QH --> PE
@@ -126,7 +129,7 @@ graph LR
 | 50052 | gRPC (Flight) | Worker data exchange |
 | 8080 | HTTP | Trino-compatible endpoint |
 | 9090 | HTTP | Prometheus metrics |
-| 9091 | HTTP | Health probes (`/healthz`, `/readyz`) |
+| 9091 | HTTP | Health probes (`/healthz`, `/readyz`), web UI, and `/mcp` when `[mcp] enabled = true` with `port = 0` |
 
 ## Caching
 

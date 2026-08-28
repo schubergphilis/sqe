@@ -32,6 +32,7 @@ Client (JDBC/Flight SQL) -> Coordinator -> Workers (DataFusion) -> Iceberg (Pola
 | `sqe-coordinator` | Scheduler, Flight SQL server, session management, statement routing |
 | `sqe-worker` | Executor, DataFusion runtime, Flight client |
 | `sqe-trino-compat` | Optional Trino wire protocol adapter |
+| `sqe-mcp` | MCP Streamable HTTP endpoint; OAuth resource server, tool surface, read-only SQL gate |
 | `sqe-metrics` | Prometheus exporter, OTel integration |
 
 ## Key Design Decisions

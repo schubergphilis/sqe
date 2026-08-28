@@ -1,0 +1,8 @@
+[mcp_servers.sqe]
+url = "http://localhost:19091/mcp"
+bearer_token_env_var = "SQE_MCP_TOKEN"
+default_tools_approval_mode = "writes"
+required = true
+startup_timeout_sec = 20
+tool_timeout_sec = 60
+

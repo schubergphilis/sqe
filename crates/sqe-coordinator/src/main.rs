@@ -505,6 +505,25 @@ async fn async_main() -> anyhow::Result<()> {
         &config.rate_limit,
     ));
 
+    // Embedded Streamable HTTP MCP resource server. It uses the same bearer
+    // validator and QueryHandler, so no service identity is introduced.
+    if config.mcp.port > 0 {
+        sqe_coordinator::mcp_server::start_mcp_server(
+            Arc::clone(&auth_chain),
+            Arc::clone(&query_handler),
+            Arc::clone(&rate_limiter),
+            Arc::clone(&auth_rate_limiter),
+            config.mcp.clone(),
+            &config.coordinator.tls,
+        )
+        .await?;
+        tracing::info!(port = config.mcp.port, resource = %config.mcp.resource_uri, "MCP endpoint enabled at /mcp");
+    } else if config.mcp.is_enabled() {
+        tracing::warn!(
+            "mcp.enabled=true with mcp.port=0 requires the main sqe-server binary's shared web listener; this legacy sqe-coordinator binary will not expose MCP"
+        );
+    }
+
     // Start Trino-compat HTTP server
     if config.coordinator.trino_http_port > 0 {
         let auth_adapter = Arc::new(AuthenticatorAdapter {

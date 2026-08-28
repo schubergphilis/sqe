@@ -77,6 +77,21 @@ The first response carries a `nextUri`; a client follows it until results are ex
 
 The Trino JDBC driver and the Trino CLI refuse to send a username and password over plain HTTP. The endpoint serves plain HTTP, so for password auth put a TLS-terminating reverse proxy in front and connect over `https://`. Bearer-token auth works over plain HTTP if you cannot terminate TLS. See [Connect BI tools](../quickstart/bi-tools.md) for Metabase, Superset, DBeaver, and CLI recipes, and [Trino HTTP connectivity](../features/trino-http.md) for the endpoint reference. Flight SQL is the recommended protocol for SQE-native clients; reach for Trino HTTP when a tool only speaks Trino.
 
+## MCP (AI assistants)
+
+SQE speaks Model Context Protocol over Streamable HTTP, so Claude Code, Codex and other MCP clients can query the lakehouse as the signed-in user. It is off by default; enable it with `[mcp] enabled = true` and point `resource_uri` at the public URL.
+
+```bash
+curl -s -H "Authorization: Bearer $SQE_MCP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+  http://localhost:9091/mcp
+```
+
+The endpoint is an OAuth protected resource. It validates the caller's token, never mints one, and forwards that same bearer to the catalog and storage, so the assistant sees exactly what its human can see, masks and row filters included. Read tools unlock on `read_scope`; the write tool is hidden unless `allow_writes = true` and still needs a write scope, an SQE writer role, and source authorization.
+
+Client configuration for Codex and Claude Code, plus a runnable Keycloak + Polaris stack, is in [MCP with Codex and Claude](../quickstart/mcp.md). Endpoint reference: [Model Context Protocol](../deployment/mcp.md).
+
 ## Which protocol
 
 | You are | Use |
@@ -85,3 +100,4 @@ The Trino JDBC driver and the Trino CLI refuse to send a username and password o
 | Connecting a JDBC tool that supports the Flight SQL driver | Flight SQL via JDBC |
 | Pointing an existing Trino client or a Trino-only BI tool | Trino HTTP |
 | Running ad-hoc SQL from a terminal | `sqe-cli` (Flight SQL); see [Using the CLI](cli.md) |
+| Wiring an AI assistant or agent (Claude Code, Codex) | MCP over Streamable HTTP |

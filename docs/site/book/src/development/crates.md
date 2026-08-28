@@ -1,6 +1,6 @@
 # Rust Crate Structure
 
-SQE is organized as a Cargo workspace with 11 crates. Each crate has a focused responsibility.
+SQE is organized as a Cargo workspace of focused crates. The tables below cover the core engine crates; the workspace also carries the Quack (DuckDB wire) crates, `sqe-compaction`, `sqe-spill`, `sqe-lineage`, `sqe-trino-functions` and `sqe-bench`.
 
 ## Dependency Graph
 
@@ -19,6 +19,7 @@ graph TB
     COORD --> PLANNER["sqe-planner"]
     COORD --> METRICS["sqe-metrics"]
     COORD --> TRINO["sqe-trino-compat"]
+    COORD --> MCP["sqe-mcp"]
     COORD --> CORE["sqe-core"]
 
     WORKER --> PLANNER
@@ -32,6 +33,9 @@ graph TB
     PLANNER --> CORE
     METRICS --> CORE
     TRINO --> CORE
+    MCP --> CORE
+    MCP --> AUTH
+    MCP --> SQL
 
     CLI --> CORE
 
@@ -115,6 +119,7 @@ The coordinator: SQL routing, session management, write handling.
 | `write_handler.rs` | CTAS and INSERT INTO handling |
 | `writer.rs` | Parquet file writing to S3 |
 | `distributed_scan.rs` | Distributed scan coordination |
+| `mcp_server.rs` | MCP wiring: router mount, dedicated-listener mode, and the executor that runs tool SQL through `QueryHandler` under the existing auth and query rate limiters |
 | `mode.rs` | `Mode` enum, `resolve_mode()` for sqe-server |
 | `bin/sqe_server.rs` | Unified server binary entry point |
 
@@ -159,6 +164,20 @@ Trino wire protocol compatibility layer.
 | `server.rs` | Trino HTTP server (`/v1/statement` endpoint) |
 | `protocol.rs` | RecordBatch to Trino JSON response serialization |
 | `types.rs` | Arrow to Trino type mapping |
+
+### sqe-mcp
+
+Model Context Protocol endpoint. An OAuth resource server, not an authorization server: it validates the caller's bearer through `sqe-auth` and hands the identity to the coordinator's session layer.
+
+| Concern | Contents |
+|---|---|
+| Transport | Streamable HTTP `/mcp` route (axum), JSON-RPC dispatch, `initialize` / `tools/list` / `tools/call` |
+| OAuth | RFC 9728 protected-resource metadata routes, `WWW-Authenticate` challenges, scope checks, `Origin` allow-list |
+| Tools | Nine read tools plus the optional `execute_sql_change`; annotations mark read-only versus write |
+| SQL gating | `sqe-sql` pre-parse plus `parse_and_classify_typed`, allow-listing query and `SHOW` kinds only |
+| Bounding | `max_result_rows` / `max_response_bytes` with an explicit `truncated` flag |
+
+Reference: [Model Context Protocol](../deployment/mcp.md).
 
 ## Key External Dependencies
 

@@ -10,7 +10,8 @@
     "profile",
     "roles",
     "web-origins",
-    "catalog"
+    "catalog",
+    "sqe:mcp:read"
   ],
   "clientScopes": [
     {
@@ -20,6 +21,24 @@
       "attributes": {
         "include.in.token.scope": "true",
         "display.on.consent.screen": "false"
+      }
+    },
+    {
+      "name": "sqe:mcp:read",
+      "description": "Read-only SQE MCP tools",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true"
+      }
+    },
+    {
+      "name": "sqe:mcp:write",
+      "description": "SQE MCP change/write tool (also requires an SQE writer role)",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true"
       }
     }
   ],
@@ -89,6 +108,19 @@
       "publicClient": true,
       "directAccessGrantsEnabled": true,
       "standardFlowEnabled": true,
+      "defaultClientScopes": [
+        "acr",
+        "basic",
+        "email",
+        "profile",
+        "roles",
+        "web-origins",
+        "catalog",
+        "sqe:mcp:read"
+      ],
+      "optionalClientScopes": [
+        "sqe:mcp:write"
+      ],
       "redirectUris": [
         "http://localhost/*",
         "http://localhost:*/*"

@@ -30,6 +30,7 @@ pub mod parallel_probe_scan;
 pub mod parallel_scan;
 pub mod policy_wiring;
 pub mod quack_executor;
+pub mod mcp_server;
 pub mod query_cache;
 pub mod query_handler;
 pub mod query_tracker;

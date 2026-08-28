@@ -1,0 +1,73 @@
+# Reuses the Polaris + Keycloak user-token quickstart, adding MCP on SQE's
+# existing web listener. All bearer tokens remain per-user end to end.
+
+[coordinator]
+flight_sql_port = 50051
+trino_http_port = 8080
+mode = "hybrid"
+flight_compression = "none"
+
+[mcp]
+enabled = true
+port = 0 # share metrics.prometheus_port + 1 (9091 inside the container)
+resource_uri = "http://localhost:19091/mcp"
+authorization_servers = ["http://keycloak:8080/realms/iceberg"]
+allowed_origins = []
+read_scope = "sqe:mcp:read"
+write_scope = "sqe:mcp:write"
+allow_writes = false # run.sh --writes overrides this through the environment
+write_roles = ["data_writer"]
+max_result_rows = 100
+max_response_bytes = 262144
+
+[worker]
+memory_limit = "4GB"
+spill_dir = "/tmp/sqe-spill"
+
+[auth]
+keycloak_url = "http://keycloak:8080"
+realm = "iceberg"
+client_id = "sqe-client"
+client_secret = ""
+ssl_verification = false
+
+[[auth.providers]]
+type = "bearer_token"
+jwks_url = "http://keycloak:8080/realms/iceberg/protocol/openid-connect/certs"
+issuer = "http://keycloak:8080/realms/iceberg"
+user_claim = "preferred_username"
+roles_claim = "realm_access.roles"
+allow_unbounded_audience = true
+allow_insecure_jwks = true
+
+[catalogs.quickstart]
+polaris_url = "http://polaris:8181/api/catalog"
+warehouse = "quickstart"
+metadata_cache_ttl_secs = 30
+default_table_format_version = 2
+
+[catalog]
+polaris_url = "http://polaris:8181/api/catalog"
+warehouse = "quickstart"
+
+[storage]
+s3_endpoint = "http://rustfs:9000"
+s3_region = "us-east-1"
+s3_access_key = "s3admin"
+s3_secret_key = "s3adminpw"
+s3_path_style = true
+s3_allow_http = true
+
+[policy]
+engine = "passthrough"
+
+[rate_limit]
+enabled = true
+per_user_queries_per_minute = 120
+global_queries_per_minute = 5000
+
+[session]
+idle_timeout_secs = 900
+
+[metrics]
+prometheus_port = 9090

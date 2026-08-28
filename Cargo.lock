@@ -6625,6 +6625,7 @@ dependencies = [
  "sqe-compaction",
  "sqe-core",
  "sqe-lineage",
+ "sqe-mcp",
  "sqe-metrics",
  "sqe-planner",
  "sqe-policy",
@@ -6695,6 +6696,28 @@ dependencies = [
  "tracing",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "sqe-mcp"
+version = "0.37.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sqe-auth",
+ "sqe-core",
+ "sqe-sql",
+ "sqe-trino-compat",
+ "sqlparser",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]
