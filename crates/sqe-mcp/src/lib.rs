@@ -20,7 +20,10 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sqe_auth::{AuthProvider, FlightCredentials};
-use sqe_core::{config::McpConfig, SecretString, Session, SqeError};
+use sqe_core::{
+    config::{McpAuthMode, McpConfig, McpPrincipalConfig},
+    SecretString, Session, SqeError,
+};
 use sqe_sql::StatementKind;
 
 pub const PROTOCOL_VERSION: &str = "2025-11-25";
@@ -40,6 +43,38 @@ pub struct McpServerState {
     executor: Arc<dyn QueryExecutor>,
     auth_rate_limiter: Option<Arc<dyn AuthRateLimiter>>,
     config: McpConfig,
+    /// Static-mode principals with their tokens already resolved from
+    /// `token_env` / `token_b64`. Resolution happens once, here, rather than
+    /// per request. A principal whose token cannot be resolved is DROPPED
+    /// (fail closed) and logged; config validation refuses that case at
+    /// startup, so the server path never sees it.
+    principals: Arc<Vec<StaticPrincipal>>,
+}
+
+/// One static-mode principal: an opaque bearer plus the identity it grants.
+struct StaticPrincipal {
+    token: SecretString,
+    user: String,
+    roles: Vec<String>,
+}
+
+impl StaticPrincipal {
+    fn resolve(config: &McpPrincipalConfig) -> Option<Self> {
+        match config.resolve_token() {
+            Ok(token) => Some(Self {
+                token,
+                user: config.user.clone(),
+                roles: config.roles.clone(),
+            }),
+            Err(message) => {
+                tracing::error!(
+                    "MCP static principal disabled: {message} (config validation should have \
+                     refused this at startup)"
+                );
+                None
+            }
+        }
+    }
 }
 
 impl McpServerState {
@@ -48,11 +83,22 @@ impl McpServerState {
         executor: Arc<dyn QueryExecutor>,
         config: McpConfig,
     ) -> Self {
+        let principals: Arc<Vec<StaticPrincipal>> = Arc::new(if config.auth.mode == McpAuthMode::Static {
+            config
+                .auth
+                .principals
+                .iter()
+                .filter_map(StaticPrincipal::resolve)
+                .collect()
+        } else {
+            Vec::new()
+        });
         Self {
             auth,
             executor,
             auth_rate_limiter: None,
             config,
+            principals,
         }
     }
 
@@ -63,16 +109,22 @@ impl McpServerState {
 }
 
 pub fn router(state: McpServerState) -> Router {
-    Router::new()
-        .route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_delete))
-        .route(
-            "/.well-known/oauth-protected-resource",
-            get(resource_metadata),
-        )
-        .route(
-            "/.well-known/oauth-protected-resource/mcp",
-            get(resource_metadata),
-        )
+    let mut router = Router::new().route("/mcp", post(mcp_post).get(mcp_get).delete(mcp_delete));
+    // Protected-resource metadata describes an authorization server. Static and
+    // anonymous modes have none, and metadata pointing at a server that does
+    // not exist sends clients chasing it.
+    if state.config.auth.mode == McpAuthMode::Oauth {
+        router = router
+            .route(
+                "/.well-known/oauth-protected-resource",
+                get(resource_metadata),
+            )
+            .route(
+                "/.well-known/oauth-protected-resource/mcp",
+                get(resource_metadata),
+            );
+    }
+    router
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .with_state(state)
 }
@@ -142,7 +194,10 @@ struct JsonRpcRequest {
 #[derive(Clone)]
 struct AuthContext {
     session: Session,
-    scopes: BTreeSet<String>,
+    /// OAuth scopes from the caller's token, or `None` in the modes that have
+    /// no external issuer. `None` means "gate on roles alone", never
+    /// "everything is permitted".
+    scopes: Option<BTreeSet<String>>,
 }
 
 async fn mcp_post(
@@ -165,7 +220,10 @@ async fn mcp_post(
     };
     if request.method == "tools/call"
         && request.params.get("name").and_then(Value::as_str) == Some("execute_sql_change")
-        && !auth.scopes.contains(&state.config.write_scope)
+        && auth
+            .scopes
+            .as_ref()
+            .is_some_and(|scopes| !scopes.contains(&state.config.write_scope))
     {
         return auth_error_for_scope(
             &state.config,
@@ -207,6 +265,9 @@ fn origin_allowed(config: &McpConfig, headers: &HeaderMap) -> bool {
         .any(|allowed| allowed == origin)
 }
 
+// The Err variant is a ready-to-send axum Response, which is large by
+// construction; boxing it here would only move the allocation.
+#[allow(clippy::result_large_err)]
 async fn authenticate(
     state: &McpServerState,
     headers: &HeaderMap,
@@ -223,6 +284,81 @@ async fn authenticate(
         )
             .into_response());
     }
+    match state.config.auth.mode {
+        McpAuthMode::Oauth => authenticate_oauth(state, headers).await,
+        McpAuthMode::Static => authenticate_static(state, headers),
+        McpAuthMode::Anonymous => Ok(authenticate_anonymous(state)),
+    }
+}
+
+/// Match the caller's bearer against the configured static principals.
+///
+/// The comparison lives here rather than in the auth chain on purpose: a
+/// deployment with no IdP typically ends its chain in the `anonymous`
+/// provider, which accepts any credential, so delegating a static token to the
+/// chain would let a WRONG token authenticate.
+// The Err variant is a ready-to-send axum Response, which is large by
+// construction; boxing it here would only move the allocation.
+#[allow(clippy::result_large_err)]
+fn authenticate_static(
+    state: &McpServerState,
+    headers: &HeaderMap,
+) -> Result<AuthContext, Response> {
+    let Some(token) = bearer(headers) else {
+        return Err(auth_error(&state.config, StatusCode::UNAUTHORIZED, None));
+    };
+    let matched = state.principals.iter().find(|principal| {
+        let expected = principal.token.expose().as_bytes();
+        let presented = token.as_bytes();
+        expected.len() == presented.len()
+            && bool::from(subtle::ConstantTimeEq::ct_eq(expected, presented))
+    });
+    let Some(principal) = matched else {
+        tracing::warn!("MCP static bearer did not match any configured principal");
+        return Err(auth_error(
+            &state.config,
+            StatusCode::UNAUTHORIZED,
+            Some("invalid_token"),
+        ));
+    };
+    Ok(AuthContext {
+        session: local_session(principal.user.clone(), principal.roles.clone()),
+        scopes: None,
+    })
+}
+
+/// Accept every caller as the one configured identity.
+fn authenticate_anonymous(state: &McpServerState) -> AuthContext {
+    let anonymous = &state.config.auth.anonymous;
+    AuthContext {
+        session: local_session(anonymous.user.clone(), anonymous.roles.clone()),
+        scopes: None,
+    }
+}
+
+/// A session for an identity SQE itself resolved, with no upstream token.
+///
+/// The catalog token is deliberately empty: these modes exist because the
+/// source is reached with engine credentials, and the MCP bearer is a
+/// credential for SQE, not something to forward upstream. Matches what the
+/// coordinator already builds for the anonymous SQL path.
+fn local_session(user: String, roles: Vec<String>) -> Session {
+    Session::new(
+        user,
+        SecretString::new(String::new()),
+        None,
+        chrono::Utc::now() + chrono::Duration::hours(1),
+        roles,
+    )
+}
+
+// The Err variant is a ready-to-send axum Response, which is large by
+// construction; boxing it here would only move the allocation.
+#[allow(clippy::result_large_err)]
+async fn authenticate_oauth(
+    state: &McpServerState,
+    headers: &HeaderMap,
+) -> Result<AuthContext, Response> {
     let Some(token) = bearer(headers) else {
         return Err(auth_error(&state.config, StatusCode::UNAUTHORIZED, None));
     };
@@ -272,7 +408,10 @@ async fn authenticate(
         identity.roles,
     )
     .with_identity(identity.subject, identity.email, identity.groups);
-    Ok(AuthContext { session, scopes })
+    Ok(AuthContext {
+        session,
+        scopes: Some(scopes),
+    })
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -313,17 +452,20 @@ fn auth_error_for_scope(
     error: Option<&str>,
     scope: &str,
 ) -> Response {
-    let metadata = format!(
-        "{}/.well-known/oauth-protected-resource/mcp",
-        config
-            .resource_uri
-            .trim_end_matches("/mcp")
-            .trim_end_matches('/')
-    );
-    let mut challenge = format!(
-        "Bearer resource_metadata=\"{metadata}\", scope=\"{}\"",
-        scope
-    );
+    let mut challenge = if config.auth.mode == McpAuthMode::Oauth {
+        let metadata = format!(
+            "{}/.well-known/oauth-protected-resource/mcp",
+            config
+                .resource_uri
+                .trim_end_matches("/mcp")
+                .trim_end_matches('/')
+        );
+        format!("Bearer resource_metadata=\"{metadata}\", scope=\"{scope}\"")
+    } else {
+        // No authorization server to discover, and no OAuth scope to ask for:
+        // the caller either holds a configured token or does not.
+        "Bearer".to_string()
+    };
     if let Some(error) = error {
         challenge.push_str(&format!(", error=\"{error}\""));
     }
@@ -539,11 +681,13 @@ fn authorize_write(state: &McpServerState, auth: &AuthContext) -> Result<(), (i3
     if !state.config.allow_writes {
         return Err((-32602, "MCP writes are disabled".into()));
     }
-    if !auth.scopes.contains(&state.config.write_scope) {
-        return Err((
-            -32003,
-            format!("OAuth scope '{}' is required", state.config.write_scope),
-        ));
+    if let Some(scopes) = &auth.scopes {
+        if !scopes.contains(&state.config.write_scope) {
+            return Err((
+                -32003,
+                format!("OAuth scope '{}' is required", state.config.write_scope),
+            ));
+        }
     }
     if !auth
         .session
@@ -658,7 +802,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct RecordingExecutor(Mutex<Option<String>>);
+    struct RecordingExecutor(Mutex<Option<String>>, Mutex<Option<(String, Vec<String>)>>);
 
     #[async_trait]
     impl QueryExecutor for RecordingExecutor {
@@ -668,6 +812,10 @@ mod tests {
             _sql: &str,
         ) -> Result<Vec<RecordBatch>, SqeError> {
             *self.0.lock().unwrap() = Some(session.access_token().expose().to_string());
+            *self.1.lock().unwrap() = Some((
+                session.user.username.clone(),
+                session.user.roles.clone(),
+            ));
             Ok(vec![])
         }
     }
@@ -838,5 +986,236 @@ mod tests {
             test_config(),
         ));
         let _combined = existing.merge(mcp);
+    }
+    // -----------------------------------------------------------------------
+    // [mcp.auth] mode = "static" / "anonymous": deployments with no IdP
+    // -----------------------------------------------------------------------
+
+    use sqe_core::config::{McpAnonymousConfig, McpAuthConfig};
+
+    const READ_TOKEN: &str = "reader-token-long-enough";
+    const WRITE_TOKEN: &str = "writer-token-long-enough";
+
+    fn b64(value: &str) -> String {
+        base64::engine::general_purpose::STANDARD.encode(value)
+    }
+
+    fn static_config(allow_writes: bool) -> McpConfig {
+        McpConfig {
+            resource_uri: "http://localhost:9091/mcp".to_string(),
+            allow_writes,
+            auth: McpAuthConfig {
+                mode: McpAuthMode::Static,
+                principals: vec![
+                    McpPrincipalConfig {
+                        user: "mcp-reader".to_string(),
+                        roles: vec!["reader".to_string()],
+                        token_env: String::new(),
+                        token_b64: b64(READ_TOKEN),
+                    },
+                    McpPrincipalConfig {
+                        user: "mcp-writer".to_string(),
+                        roles: vec!["data_writer".to_string()],
+                        token_env: String::new(),
+                        token_b64: b64(WRITE_TOKEN),
+                    },
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn anonymous_config() -> McpConfig {
+        McpConfig {
+            resource_uri: "http://localhost:9091/mcp".to_string(),
+            auth: McpAuthConfig {
+                mode: McpAuthMode::Anonymous,
+                anonymous: McpAnonymousConfig {
+                    user: "kiosk".to_string(),
+                    roles: vec!["reader".to_string()],
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn tool_call(name: &str) -> String {
+        json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"tools/call",
+            "params":{"name":name,"arguments":{"sql":"SELECT 1"}}
+        })
+        .to_string()
+    }
+
+    async fn post(
+        config: McpConfig,
+        executor: Arc<RecordingExecutor>,
+        bearer: Option<&str>,
+        body: String,
+    ) -> Response<Body> {
+        let app = router(McpServerState::new(Arc::new(MockAuth), executor, config));
+        let mut request = Request::post("/mcp")
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = bearer {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        app.oneshot(request.body(Body::from(body)).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn static_mode_runs_the_query_as_the_matching_principal() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let response = post(
+            static_config(false),
+            executor.clone(),
+            Some(READ_TOKEN),
+            tool_call("execute_sql_readonly"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let identity = executor.1.lock().unwrap().clone().expect("query ran");
+        assert_eq!(identity.0, "mcp-reader");
+        assert_eq!(identity.1, vec!["reader".to_string()]);
+    }
+
+    /// The load-bearing test for mode 2: the auth chain here accepts ANY
+    /// credential (as the `anonymous` provider does in a Glue deployment), so
+    /// delegating the static token to it would let a wrong token through.
+    #[tokio::test]
+    async fn static_mode_rejects_an_unknown_token_despite_a_permissive_auth_chain() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let response = post(
+            static_config(false),
+            executor.clone(),
+            Some("not-the-configured-token"),
+            tool_call("execute_sql_readonly"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(executor.1.lock().unwrap().is_none(), "no query may run");
+    }
+
+    #[tokio::test]
+    async fn static_mode_never_forwards_the_mcp_token_to_the_catalog() {
+        let executor = Arc::new(RecordingExecutor::default());
+        post(
+            static_config(false),
+            executor.clone(),
+            Some(READ_TOKEN),
+            tool_call("execute_sql_readonly"),
+        )
+        .await;
+        let catalog_token = executor.0.lock().unwrap().clone().expect("query ran");
+        assert!(
+            catalog_token.is_empty(),
+            "static MCP token must not become the catalog bearer, got: {catalog_token}"
+        );
+    }
+
+    #[tokio::test]
+    async fn static_mode_denies_the_change_tool_to_a_reader_principal() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let response = post(
+            static_config(true),
+            executor.clone(),
+            Some(READ_TOKEN),
+            json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"execute_sql_change",
+                          "arguments":{"sql":"INSERT INTO t VALUES (1)"}}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert!(value["error"].is_object(), "expected a JSON-RPC error: {value}");
+        assert!(executor.1.lock().unwrap().is_none(), "no write may run");
+    }
+
+    #[tokio::test]
+    async fn static_mode_allows_the_change_tool_for_a_writer_principal() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let response = post(
+            static_config(true),
+            executor.clone(),
+            Some(WRITE_TOKEN),
+            json!({
+                "jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"execute_sql_change",
+                          "arguments":{"sql":"INSERT INTO t VALUES (1)"}}
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let identity = executor.1.lock().unwrap().clone().expect("write ran");
+        assert_eq!(identity.0, "mcp-writer");
+    }
+
+    #[tokio::test]
+    async fn anonymous_mode_serves_reads_with_no_bearer_at_all() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let response = post(
+            anonymous_config(),
+            executor.clone(),
+            None,
+            tool_call("execute_sql_readonly"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let identity = executor.1.lock().unwrap().clone().expect("query ran");
+        assert_eq!(identity.0, "kiosk");
+        assert_eq!(identity.1, vec!["reader".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn oauth_discovery_is_not_advertised_without_an_authorization_server() {
+        for config in [static_config(false), anonymous_config()] {
+            let app = router(McpServerState::new(
+                Arc::new(MockAuth),
+                Arc::new(RecordingExecutor::default()),
+                config,
+            ));
+            let response = app
+                .oneshot(
+                    Request::get("/.well-known/oauth-protected-resource")
+                        .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn static_mode_challenge_points_at_no_metadata() {
+        let response = post(
+            static_config(false),
+            Arc::new(RecordingExecutor::default()),
+            None,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let challenge = response.headers()[header::WWW_AUTHENTICATE]
+            .to_str()
+            .unwrap();
+        assert!(
+            !challenge.contains("resource_metadata"),
+            "no authorization server exists to discover, got: {challenge}"
+        );
     }
 }

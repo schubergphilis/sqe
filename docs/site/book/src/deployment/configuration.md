@@ -51,6 +51,26 @@ write_roles = ["data_writer"]   # SQE roles allowed to call execute_sql_change
 max_result_rows = 1000          # Row cap per tool response
 max_response_bytes = 2097152    # Byte cap per tool response (2 MiB)
 
+[mcp.auth]                      # How callers authenticate to /mcp
+mode = "oauth"                  # "oauth" (default) | "static" | "anonymous"
+
+# mode = "static": SQE issues and verifies the tokens; roles come from the
+# matched principal and there are no OAuth scopes.
+# [[mcp.auth.principals]]
+# user      = "mcp-reader"
+# roles     = ["reader"]
+# token_env = "SQE_MCP_READ_TOKEN"   # preferred; wins over token_b64
+# [[mcp.auth.principals]]
+# user      = "mcp-writer"
+# roles     = ["data_writer"]
+# token_b64 = "..."                  # base64 is encoding, not protection
+
+# mode = "anonymous": every caller becomes one identity. Refused when an IdP
+# provider is configured, under production_mode, and with allow_writes = true.
+# [mcp.auth.anonymous]
+# user  = "mcp-anonymous"
+# roles = ["reader"]
+
 [worker]
 coordinator_url = "http://coordinator:50051"
 flight_port = 50052             # Worker Flight port
