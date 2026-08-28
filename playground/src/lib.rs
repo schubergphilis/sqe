@@ -23,6 +23,7 @@ use datafusion::datasource::listing::ListingOptions;
 use datafusion::prelude::*;
 use object_store::aws::AmazonS3Builder;
 use object_store::http::HttpBuilder;
+use object_store::RetryConfig;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
@@ -30,6 +31,18 @@ use wasm_bindgen::prelude::*;
 /// stops being readable long before DataFusion stops being able to produce
 /// rows, and serialising a million of them just wedges the tab.
 const MAX_ROWS: usize = 2_000;
+
+/// object_store defaults to retrying for three minutes. In a CLI that is
+/// reasonable; in a UI a mistyped URL locks the page for three minutes behind
+/// a spinner with nothing to read. Fail fast enough that the error is the
+/// feedback.
+fn retry() -> RetryConfig {
+    RetryConfig {
+        max_retries: 2,
+        retry_timeout: std::time::Duration::from_secs(12),
+        ..Default::default()
+    }
+}
 
 thread_local! {
     static CTX: RefCell<Option<SessionContext>> = const { RefCell::new(None) };
@@ -97,6 +110,7 @@ fn register_store(ctx: &SessionContext, url: &url::Url) -> Result<(), JsValue> {
             };
             let store = HttpBuilder::new()
                 .with_url(&origin)
+                .with_retry(retry())
                 .build()
                 .map_err(|e| err("http store", e))?;
             ctx.register_object_store(url, Arc::new(store));
@@ -133,7 +147,8 @@ pub fn configure_s3(
         } else {
             region
         })
-        .with_allow_http(allow_http);
+        .with_allow_http(allow_http)
+        .with_retry(retry());
 
     if !endpoint.is_empty() {
         b = b.with_endpoint(&endpoint).with_virtual_hosted_style_request(false);
@@ -180,7 +195,25 @@ pub async fn register(name: String, url: String) -> Result<JsValue, JsValue> {
         .await
         .map_err(|e| err("register", e))?;
 
-    describe(name).await
+    // Schema inference over a file list that came back empty yields a table
+    // with no columns and no error, which then fails much later as "No field
+    // named x" and points at the query instead of the source. Refuse it here.
+    // Observed intermittently against an S3 endpoint when a range read is
+    // truncated, so this is a real state to guard, not a theoretical one.
+    let info = describe(name.clone()).await?;
+    let empty = ctx
+        .table(&name)
+        .await
+        .map(|df| df.schema().fields().is_empty())
+        .unwrap_or(true);
+    if empty {
+        let _ = ctx.deregister_table(&name);
+        return Err(JsValue::from_str(&format!(
+            "register: '{url}' resolved to a table with no columns.              Either nothing matched the path, or the reads that infer the              schema came back truncated. For an S3 host, check that its CORS              policy exposes content-range."
+        )));
+    }
+
+    Ok(info)
 }
 
 /// Schema of an already-registered table, for the sidebar.
