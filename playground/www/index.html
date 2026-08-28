@@ -1,0 +1,830 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQE Playground</title>
+<!--
+  No external requests. No CDN, no webfont host, no build step. The SQL
+  highlighter below is ~90 lines of regex rather than an editor framework,
+  because a tool whose whole argument is that you can run your own query
+  engine should not need someone else's infrastructure to render a textarea.
+-->
+<style>
+  :root {
+    --bg:      #0b0d0c;
+    --bg-2:    #0f1211;
+    --panel:   #121615;
+    --raised:  #171c1a;
+    --line:    #232b28;
+    --line-hi: #35403c;
+    --ink:     #ded8cc;
+    --dim:     #79837e;
+    --faint:   #4d5854;
+
+    --amber:   #f0a04b;
+    --mint:    #7fd4a8;
+    --sage:    #a8c98f;
+    --steel:   #8ab6d6;
+    --rose:    #e8695e;
+
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "IBM Plex Mono", Menlo, monospace;
+    --sans: ui-sans-serif, -apple-system, "Helvetica Neue", sans-serif;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+
+    --rail: 288px;
+    --editor-h: 240px;
+    --ease: cubic-bezier(.22,.61,.36,1);
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    height: 100%; margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 14px;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Grain. Keeps the flat charcoal from reading as a dead void. */
+  body::after {
+    content: ""; position: fixed; inset: 0; z-index: 999; pointer-events: none;
+    opacity: .028; mix-blend-mode: overlay;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='4'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+
+  /* Signal line. Idle it is a hairline; during execution it sweeps. */
+  #signal {
+    position: fixed; top: 0; left: 0; right: 0; height: 2px; z-index: 1000;
+    background: var(--line); overflow: hidden;
+  }
+  #signal::after {
+    content: ""; position: absolute; inset: 0;
+    background: linear-gradient(90deg, transparent, var(--amber), transparent);
+    transform: translateX(-100%); opacity: 0;
+  }
+  #signal.busy::after { opacity: 1; animation: sweep 1.1s var(--ease) infinite; }
+  @keyframes sweep { to { transform: translateX(100%); } }
+
+  .app {
+    display: grid;
+    grid-template-columns: var(--rail) 1fr;
+    grid-template-rows: 1fr 26px;
+    height: 100%;
+  }
+
+  /* ---------------------------------------------------------------- rail */
+
+  .rail {
+    grid-row: 1 / 2;
+    background: var(--bg-2);
+    border-right: 1px solid var(--line);
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+
+  .brand {
+    padding: 26px 22px 20px;
+    border-bottom: 1px solid var(--line);
+  }
+  .brand h1 {
+    margin: 0;
+    font-family: var(--serif);
+    font-style: italic;
+    font-weight: 400;
+    font-size: 40px;
+    letter-spacing: -.02em;
+    line-height: .9;
+    color: var(--ink);
+  }
+  .brand h1 em { font-style: italic; color: var(--amber); }
+  .brand p {
+    margin: 9px 0 0;
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: .13em;
+    text-transform: uppercase;
+    color: var(--faint);
+    line-height: 1.6;
+  }
+
+  .rail-scroll { flex: 1; overflow-y: auto; }
+
+  .sect { border-bottom: 1px solid var(--line); padding: 18px 22px 20px; }
+  .sect > h2 {
+    margin: 0 0 14px;
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: .18em;
+    text-transform: uppercase;
+    color: var(--dim);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .sect > h2 .count { color: var(--faint); }
+
+  label.f {
+    display: block;
+    font-family: var(--mono);
+    font-size: 9.5px; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--faint);
+    margin: 0 0 5px;
+  }
+  input.f {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 7px 9px;
+    margin-bottom: 11px;
+    outline: none;
+    transition: border-color .16s var(--ease);
+  }
+  input.f:focus { border-color: var(--line-hi); }
+  input.f::placeholder { color: var(--faint); }
+
+  button {
+    font-family: var(--mono);
+    font-size: 10px; letter-spacing: .14em; text-transform: uppercase;
+    background: transparent;
+    color: var(--ink);
+    border: 1px solid var(--line-hi);
+    padding: 8px 14px;
+    cursor: pointer;
+    transition: all .16s var(--ease);
+  }
+  button:hover:not(:disabled) { border-color: var(--amber); color: var(--amber); }
+  button:disabled { opacity: .35; cursor: not-allowed; }
+  button.primary { border-color: var(--amber); color: var(--amber); }
+  button.primary:hover:not(:disabled) { background: var(--amber); color: var(--bg); }
+  button.primary:hover:not(:disabled) kbd { color: var(--bg); border-color: rgba(11,13,12,.35); }
+  button.ghost { border-color: transparent; color: var(--dim); padding: 8px 0; }
+  button.ghost:hover:not(:disabled) { color: var(--amber); border-color: transparent; }
+
+  /* tables list */
+  .tbl { border-bottom: 1px solid var(--line); }
+  .tbl:last-child { border-bottom: none; }
+  .tbl > summary {
+    list-style: none; cursor: pointer;
+    padding: 9px 0;
+    font-family: var(--mono); font-size: 12px;
+    color: var(--ink);
+    display: flex; align-items: baseline; gap: 8px;
+  }
+  .tbl > summary::-webkit-details-marker { display: none; }
+  .tbl > summary::before {
+    content: "+"; color: var(--amber); font-size: 11px; width: 9px;
+  }
+  .tbl[open] > summary::before { content: "\2212"; }
+  .tbl > summary:hover { color: var(--amber); }
+  .tbl > summary .n { margin-left: auto; color: var(--faint); font-size: 10px; }
+  .cols { padding: 0 0 10px 17px; }
+  .col {
+    display: flex; gap: 10px; align-items: baseline;
+    font-family: var(--mono); font-size: 11px;
+    padding: 2.5px 0;
+  }
+  .col .cn { color: var(--dim); }
+  .col .ct { margin-left: auto; color: var(--faint); font-size: 10px; }
+
+  .empty {
+    font-family: var(--mono); font-size: 11px; color: var(--faint);
+    line-height: 1.7;
+  }
+  .empty a { color: var(--amber); text-decoration: none; border-bottom: 1px solid var(--line-hi); cursor: pointer; }
+
+  /* ---------------------------------------------------------------- main */
+
+  .main {
+    grid-row: 1 / 2;
+    display: grid;
+    grid-template-rows: auto 1fr;
+    overflow: hidden;
+  }
+
+  .editor-wrap { border-bottom: 1px solid var(--line); background: var(--panel); }
+
+  .toolbar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 18px;
+    border-bottom: 1px solid var(--line);
+  }
+  .toolbar .lbl {
+    font-family: var(--mono); font-size: 10px; letter-spacing: .18em;
+    text-transform: uppercase; color: var(--dim);
+    margin-right: auto;
+  }
+  .toolbar kbd {
+    font-family: var(--mono); font-size: 10px; color: var(--faint);
+    border: 1px solid var(--line); padding: 2px 5px; margin-left: 4px;
+  }
+
+  .editor {
+    position: relative;
+    font-family: var(--mono);
+    font-size: 13.5px;
+    line-height: 1.65;
+    height: var(--editor-h);
+  }
+  .editor > pre, .editor > textarea {
+    margin: 0; border: 0; outline: none;
+    position: absolute; inset: 0;
+    padding: 16px 20px;
+    font: inherit;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow: auto;
+    tab-size: 2;
+  }
+  .editor > pre {
+    pointer-events: none;
+    color: var(--ink);
+    background: transparent;
+  }
+  .editor > textarea {
+    background: transparent;
+    color: transparent;
+    caret-color: var(--amber);
+    resize: none;
+  }
+  .editor > textarea::selection { background: #2c4a3f; }
+
+  .tok-kw  { color: var(--amber); }
+  .tok-fn  { color: var(--steel); }
+  .tok-str { color: var(--sage); }
+  .tok-num { color: var(--mint); }
+  .tok-com { color: var(--faint); font-style: italic; }
+  .tok-op  { color: var(--dim); }
+  .tok-pun { color: var(--faint); }
+
+  .resizer {
+    height: 6px; cursor: row-resize; background: var(--panel);
+    border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .resizer::after {
+    content: ""; width: 34px; height: 1px; background: var(--line-hi);
+    transition: background .16s var(--ease), width .16s var(--ease);
+  }
+  .resizer:hover::after, .resizer.drag::after { background: var(--amber); width: 60px; }
+  body.resizing { cursor: row-resize; user-select: none; }
+
+  /* -------------------------------------------------------------- output */
+
+  .out { overflow: auto; position: relative; }
+
+  table.grid {
+    border-collapse: separate; border-spacing: 0;
+    width: 100%;
+    font-family: var(--mono);
+    font-size: 12.5px;
+  }
+  table.grid thead th {
+    position: sticky; top: 0; z-index: 2;
+    background: var(--raised);
+    border-bottom: 1px solid var(--line-hi);
+    text-align: left;
+    padding: 9px 16px;
+    white-space: nowrap;
+    font-weight: 400;
+  }
+  table.grid thead th .h {
+    display: block; color: var(--ink); font-size: 12px;
+  }
+  table.grid thead th .t {
+    display: block; color: var(--faint); font-size: 9.5px;
+    letter-spacing: .1em; text-transform: uppercase; margin-top: 2px;
+  }
+  table.grid thead th.num, table.grid td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  table.grid tbody td {
+    padding: 6px 16px;
+    border-bottom: 1px solid var(--line);
+    color: var(--ink);
+    white-space: pre;
+    max-width: 460px; overflow: hidden; text-overflow: ellipsis;
+  }
+  table.grid tbody td.num { color: var(--mint); }
+  table.grid tbody tr:hover td { background: var(--bg-2); }
+  table.grid td .null { color: var(--faint); font-style: italic; }
+  table.grid tbody td.rn {
+    color: var(--faint); text-align: right; font-size: 11px;
+    background: var(--bg-2); border-right: 1px solid var(--line);
+    position: sticky; left: 0;
+  }
+  table.grid thead th.rn {
+    background: var(--raised); border-right: 1px solid var(--line);
+    position: sticky; left: 0; z-index: 3;
+  }
+
+  .placeholder {
+    display: grid; place-content: center; height: 100%;
+    text-align: center; gap: 14px; padding: 40px;
+  }
+  .placeholder .big {
+    font-family: var(--serif); font-style: italic; font-size: 34px;
+    color: var(--faint); letter-spacing: -.01em;
+  }
+  .placeholder .sm {
+    font-family: var(--mono); font-size: 11px; color: var(--faint);
+    letter-spacing: .1em; text-transform: uppercase; line-height: 2;
+  }
+
+  .plan { padding: 4px 0 28px; }
+  .plan section { border-bottom: 1px solid var(--line); }
+  .plan h3 {
+    margin: 0; padding: 11px 20px 9px;
+    font-family: var(--mono); font-size: 10px; letter-spacing: .18em;
+    text-transform: uppercase; color: var(--amber); font-weight: 400;
+    background: var(--bg-2);
+    border-bottom: 1px solid var(--line);
+  }
+  .plan pre {
+    margin: 0; padding: 14px 20px 18px;
+    font-family: var(--mono); font-size: 12px; line-height: 1.7;
+    color: var(--ink);
+    white-space: pre; overflow-x: auto;
+  }
+  /* Indentation is the whole point of a plan; dim it so the operators pop. */
+  .plan pre .op { color: var(--steel); }
+
+  .err {
+    margin: 20px;
+    border: 1px solid #4a2723;
+    border-left: 2px solid var(--rose);
+    background: #17100f;
+    padding: 14px 18px;
+    font-family: var(--mono); font-size: 12px;
+    color: #f0b3ad;
+    white-space: pre-wrap;
+    line-height: 1.65;
+  }
+  .err b {
+    display: block; color: var(--rose); font-weight: 400;
+    font-size: 10px; letter-spacing: .18em; text-transform: uppercase;
+    margin-bottom: 7px;
+  }
+  .err .hint { display: block; margin-top: 10px; color: var(--dim); font-style: italic; }
+
+  /* -------------------------------------------------------------- status */
+
+  .status {
+    grid-column: 1 / -1;
+    display: flex; align-items: center; gap: 0;
+    background: var(--bg-2);
+    border-top: 1px solid var(--line);
+    font-family: var(--mono); font-size: 10px;
+    letter-spacing: .1em;
+    color: var(--faint);
+  }
+  .status .cell {
+    padding: 0 14px; height: 25px; display: flex; align-items: center; gap: 7px;
+    border-right: 1px solid var(--line);
+  }
+  .status .cell:last-child { border-right: none; margin-left: auto; border-left: 1px solid var(--line); }
+  .status .k { text-transform: uppercase; color: var(--faint); }
+  .status .v { color: var(--dim); }
+  .status .v.on { color: var(--mint); }
+  .status .v.warn { color: var(--amber); }
+  .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--faint); }
+  .dot.on { background: var(--mint); box-shadow: 0 0 6px var(--mint); }
+  .dot.busy { background: var(--amber); box-shadow: 0 0 6px var(--amber); animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: .25; } }
+
+  ::-webkit-scrollbar { width: 11px; height: 11px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--line); border: 3px solid var(--bg); }
+  ::-webkit-scrollbar-thumb:hover { background: var(--line-hi); }
+</style>
+</head>
+<body>
+
+<div id="signal"></div>
+
+<div class="app">
+
+  <aside class="rail">
+    <div class="brand">
+      <h1>sqe<em>.</em></h1>
+      <p>Query&nbsp;engine<br>compiled&nbsp;to&nbsp;wasm</p>
+    </div>
+
+    <div class="rail-scroll">
+      <div class="sect">
+        <h2>Add source</h2>
+        <label class="f" for="src-name">Table name</label>
+        <input class="f" id="src-name" value="events" spellcheck="false">
+        <label class="f" for="src-url">Parquet or CSV URL</label>
+        <input class="f" id="src-url" value="/events.parquet" spellcheck="false"
+               placeholder="https://host/data.parquet">
+        <button id="btn-add" style="width:100%">Register</button>
+        <button class="ghost" id="btn-sample" style="width:100%;margin-top:6px">Load sample data</button>
+      </div>
+
+      <div class="sect">
+        <h2>Tables <span class="count" id="tbl-count"></span></h2>
+        <div id="tables">
+          <div class="empty">Nothing registered yet.<br><a id="lnk-sample">Load the sample</a> to start.</div>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="editor-wrap">
+      <div class="toolbar">
+        <span class="lbl">Query</span>
+        <button class="ghost" id="btn-explain">Explain</button>
+        <button class="primary" id="btn-run">Run<kbd>&#8984;&#8629;</kbd></button>
+      </div>
+      <div class="editor">
+        <pre aria-hidden="true"><code id="hl"></code></pre>
+        <textarea id="sql" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
+      </div>
+      <div class="resizer" id="resizer" title="Drag to resize"></div>
+    </div>
+
+    <div class="out" id="out">
+      <div class="placeholder">
+        <div class="big">no results yet</div>
+        <div class="sm">register a source &middot; write sql &middot; &#8984;&#8629;</div>
+      </div>
+    </div>
+  </main>
+
+  <div class="status">
+    <div class="cell"><span class="dot" id="st-dot"></span><span class="v" id="st-state">booting</span></div>
+    <div class="cell"><span class="k">engine</span><span class="v">datafusion 55</span></div>
+    <div class="cell"><span class="k">boot</span><span class="v" id="st-boot">&mdash;</span></div>
+    <div class="cell"><span class="k">rows</span><span class="v" id="st-rows">&mdash;</span></div>
+    <div class="cell"><span class="k">elapsed</span><span class="v" id="st-ms">&mdash;</span></div>
+    <div class="cell"><span class="k">wasm</span><span class="v" id="st-size">&mdash;</span></div>
+  </div>
+
+</div>
+
+<script type="module">
+import init, * as engine from './pkg/sqe_playground.js';
+
+const $ = id => document.getElementById(id);
+const ta = $('sql'), hl = $('hl'), out = $('out');
+
+/* ------------------------------------------------------------ highlighter */
+
+const KW = new Set(`select from where group by having order limit offset as on join inner
+left right full outer cross union all except intersect distinct case when then else end
+and or not in exists between like ilike is null asc desc with recursive insert into values
+update set delete create table view schema drop alter add column if primary key foreign
+references default cast over partition rows range unbounded preceding following current
+row explain analyze describe show tables using natural qualify lateral fetch first only
+int integer bigint smallint float double decimal numeric varchar char text boolean date
+timestamp time interval array struct map true false`.split(/\s+/));
+
+const esc = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+// One pass, alternation ordered so comments and strings win over everything.
+const RE = new RegExp([
+  /(--[^\n]*|\/\*[\s\S]*?\*\/)/,          // 1 comment
+  /('(?:''|\\.|[^'\\])*'?)/,              // 2 single-quoted string
+  /("(?:""|[^"])*"?)/,                    // 3 quoted identifier
+  /(\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b)/, // 4 number
+  /([A-Za-z_][A-Za-z0-9_]*)/,             // 5 word
+  /([(),;.\[\]])/,                        // 6 punctuation
+  /([+\-*/%<>=!|&~^:]+)/,                 // 7 operator
+].map(r => r.source).join('|'), 'g');
+
+function highlight(src) {
+  let outHtml = '', last = 0, m;
+  RE.lastIndex = 0;
+  while ((m = RE.exec(src)) !== null) {
+    if (m.index > last) outHtml += esc(src.slice(last, m.index));
+    const [full, com, str, qid, num, word, pun, op] = m;
+    if (com)       outHtml += `<span class="tok-com">${esc(com)}</span>`;
+    else if (str)  outHtml += `<span class="tok-str">${esc(str)}</span>`;
+    else if (qid)  outHtml += `<span class="tok-str">${esc(qid)}</span>`;
+    else if (num)  outHtml += `<span class="tok-num">${esc(num)}</span>`;
+    else if (word) {
+      const isKw = KW.has(word.toLowerCase());
+      // A word immediately followed by "(" reads as a call, not a keyword.
+      const call = src[RE.lastIndex] === '(';
+      const cls = isKw && !call ? 'tok-kw' : (call ? 'tok-fn' : '');
+      outHtml += cls ? `<span class="${cls}">${esc(word)}</span>` : esc(word);
+    }
+    else if (pun)  outHtml += `<span class="tok-pun">${esc(pun)}</span>`;
+    else if (op)   outHtml += `<span class="tok-op">${esc(op)}</span>`;
+    last = m.index + full.length;
+  }
+  outHtml += esc(src.slice(last));
+  // Trailing newline keeps the overlay's last line from collapsing.
+  return outHtml + '\n';
+}
+
+// Once the handle has been dragged the height is the user's, not ours.
+let manualResize = false;
+
+function autosize() {
+  if (manualResize) return;
+  // scrollHeight only shrinks if the box is allowed to collapse first.
+  const prev = ta.style.height;
+  ta.style.height = 'auto';
+  const need = ta.scrollHeight;
+  ta.style.height = prev;
+  const h = Math.min(Math.max(need, 140), Math.round(window.innerHeight * 0.45));
+  document.documentElement.style.setProperty('--editor-h', h + 'px');
+}
+
+function sync() {
+  hl.innerHTML = highlight(ta.value);
+  autosize();
+  hl.parentElement.scrollTop = ta.scrollTop;
+  hl.parentElement.scrollLeft = ta.scrollLeft;
+}
+// The boot text is a hint, not the user's work: registering a source may
+// overwrite it, but never anything typed.
+let pristine = true;
+ta.addEventListener('input', () => { pristine = false; sync(); });
+ta.addEventListener('scroll', sync);
+ta.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); run(false); }
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    const s = ta.selectionStart;
+    ta.value = ta.value.slice(0, s) + '  ' + ta.value.slice(ta.selectionEnd);
+    ta.selectionStart = ta.selectionEnd = s + 2;
+    sync();
+  }
+});
+
+/* --------------------------------------------------------------- resizer */
+
+(() => {
+  const bar = $('resizer'), ed = document.querySelector('.editor');
+  let y0 = 0, h0 = 0;
+  const move = e => {
+    const h = Math.min(Math.max(h0 + (e.clientY - y0), 96), window.innerHeight - 220);
+    document.documentElement.style.setProperty('--editor-h', h + 'px');
+  };
+  const up = () => {
+    bar.classList.remove('drag');
+    document.body.classList.remove('resizing');
+    removeEventListener('pointermove', move);
+    removeEventListener('pointerup', up);
+  };
+  bar.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    y0 = e.clientY; h0 = ed.getBoundingClientRect().height;
+    manualResize = true;
+    bar.classList.add('drag');
+    document.body.classList.add('resizing');
+    addEventListener('pointermove', move);
+    addEventListener('pointerup', up);
+  });
+})();
+
+/* ----------------------------------------------------------------- status */
+
+let busy = false;
+function setBusy(b, label) {
+  busy = b;
+  $('signal').classList.toggle('busy', b);
+  $('st-dot').className = 'dot ' + (b ? 'busy' : 'on');
+  $('st-state').textContent = label || (b ? 'running' : 'ready');
+  $('st-state').className = 'v ' + (b ? 'warn' : 'on');
+  $('btn-run').disabled = b;
+  $('btn-explain').disabled = b;
+  $('btn-add').disabled = b;
+}
+
+/* ---------------------------------------------------------------- results */
+
+function renderError(msg) {
+  // Order matters: the specific patterns have to win over the generic
+  // "not found", which otherwise swallows "table ... not found".
+  const hints = [
+    [/table '.*' not found|no table named/i,
+     'No such table in this session. Register the source in the left rail first, and check the name matches.'],
+    [/range request not supported/i,
+     'Parquet needs HTTP Range. The host answered a range request with a full 200 instead of a 206. serve.py in this directory does it correctly; python3 -m http.server does not.'],
+    [/cors|failed to fetch|networkerror|load failed|error sending request|http error/i,
+     'The browser could not reach that host, or it refused the read. Two usual causes: the host is down, or it sends no CORS headers, in which case the request dies before the engine ever sees it.'],
+    [/parsererror|sql error/i,
+     'The statement did not parse. DataFusion 55 SQL, which is close to but not identical to the dialect the SQE coordinator accepts.'],
+    [/no such file|404|not found/i,
+     'Check the URL. A path ending in "/" is read as a directory of files rather than one file.'],
+  ];
+  const hit = hints.find(([re]) => re.test(msg));
+  out.innerHTML = '';
+  const d = document.createElement('div');
+  d.className = 'err';
+  d.innerHTML = '<b>Error</b>' + esc(msg) +
+    (hit ? `<span class="hint">${esc(hit[1])}</span>` : '');
+  out.appendChild(d);
+}
+
+// EXPLAIN comes back as (plan_type, plan) where `plan` is multi-line tree
+// text. Squeezing that into a grid cell makes it unreadable, so it gets its
+// own view.
+function isExplain(res) {
+  return res.columns.length === 2 &&
+         res.columns[0].name === 'plan_type' &&
+         res.columns[1].name === 'plan';
+}
+
+function renderPlan(res) {
+  const wrap = document.createElement('div');
+  wrap.className = 'plan';
+  for (const [type, body] of res.rows) {
+    const sec = document.createElement('section');
+    const h = document.createElement('h3');
+    h.textContent = (type || '').replace(/_/g, ' ');
+    const pre = document.createElement('pre');
+    pre.innerHTML = esc(body || '').replace(
+      /^(\s*)([A-Za-z]+(?:Exec|Sink|Stream)?)\b/gm,
+      (_, ind, op) => `${ind}<span class="op">${op}</span>`);
+    sec.append(h, pre);
+    wrap.appendChild(sec);
+  }
+  out.innerHTML = '';
+  out.appendChild(wrap);
+}
+
+function renderTable(res) {
+  if (isExplain(res)) return renderPlan(res);
+  if (!res.columns.length) {
+    out.innerHTML = '<div class="placeholder"><div class="big">no rows</div>' +
+      '<div class="sm">the statement returned an empty result</div></div>';
+    return;
+  }
+  const t = document.createElement('table');
+  t.className = 'grid';
+
+  const thead = document.createElement('thead');
+  const hr = document.createElement('tr');
+  hr.appendChild(Object.assign(document.createElement('th'), { className: 'rn' }));
+  for (const c of res.columns) {
+    const th = document.createElement('th');
+    if (c.numeric) th.className = 'num';
+    const h = document.createElement('span'); h.className = 'h'; h.textContent = c.name;
+    const ty = document.createElement('span'); ty.className = 't'; ty.textContent = c.data_type;
+    th.append(h, ty);
+    hr.appendChild(th);
+  }
+  thead.appendChild(hr);
+
+  const tbody = document.createElement('tbody');
+  res.rows.forEach((row, i) => {
+    const tr = document.createElement('tr');
+    const rn = document.createElement('td');
+    rn.className = 'rn'; rn.textContent = i + 1;
+    tr.appendChild(rn);
+    row.forEach((cell, ci) => {
+      const td = document.createElement('td');
+      if (res.columns[ci].numeric) td.className = 'num';
+      if (cell === null || cell === undefined) {
+        const n = document.createElement('span');
+        n.className = 'null'; n.textContent = 'NULL';
+        td.appendChild(n);
+      } else {
+        td.textContent = cell;
+      }
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+
+  t.append(thead, tbody);
+  out.innerHTML = '';
+  out.appendChild(t);
+}
+
+/* ------------------------------------------------------------------- runs */
+
+async function run(isExplain) {
+  const sql = ta.value.trim().replace(/;\s*$/, '');
+  if (!sql || busy) return;
+  setBusy(true);
+  const t0 = performance.now();
+  try {
+    const res = await (isExplain ? engine.explain(sql) : engine.run_sql(sql));
+    const ms = performance.now() - t0;
+    renderTable(res);
+    $('st-rows').textContent = res.truncated
+      ? `${res.rows.length} of ${res.row_count}`
+      : String(res.row_count);
+    $('st-rows').className = 'v' + (res.truncated ? ' warn' : '');
+    $('st-ms').textContent = ms < 1000 ? `${ms.toFixed(0)} ms` : `${(ms / 1000).toFixed(2)} s`;
+  } catch (e) {
+    renderError(typeof e === 'string' ? e : (e && e.message) || String(e));
+    $('st-rows').textContent = '\u2014';
+    $('st-ms').textContent = '\u2014';
+  } finally {
+    setBusy(false);
+  }
+}
+
+/* --------------------------------------------------------------- registry */
+
+const registered = new Map();
+
+function renderTables() {
+  const host = $('tables');
+  $('tbl-count').textContent = registered.size ? `[${registered.size}]` : '';
+  if (!registered.size) {
+    host.innerHTML = '<div class="empty">Nothing registered yet.<br>' +
+      '<a id="lnk-sample">Load the sample</a> to start.</div>';
+    $('lnk-sample').onclick = loadSample;
+    return;
+  }
+  host.innerHTML = '';
+  for (const [name, info] of registered) {
+    const d = document.createElement('details');
+    d.className = 'tbl';
+    const s = document.createElement('summary');
+    s.append(name);
+    const n = document.createElement('span');
+    n.className = 'n'; n.textContent = `${info.columns.length} col`;
+    s.appendChild(n);
+    // Clicking the name drops a starter query in the editor.
+    s.addEventListener('dblclick', () => {
+      ta.value = `select *\nfrom ${name}\nlimit 100`;
+      pristine = false; sync(); ta.focus();
+    });
+    const box = document.createElement('div');
+    box.className = 'cols';
+    for (const c of info.columns) {
+      const r = document.createElement('div');
+      r.className = 'col';
+      const cn = document.createElement('span'); cn.className = 'cn'; cn.textContent = c.name;
+      const ct = document.createElement('span'); ct.className = 'ct'; ct.textContent = c.data_type;
+      r.append(cn, ct);
+      box.appendChild(r);
+    }
+    d.append(s, box);
+    host.appendChild(d);
+  }
+}
+
+async function addSource(name, url) {
+  if (busy) return;
+  setBusy(true, 'registering');
+  try {
+    const info = await engine.register(name, new URL(url, location.href).href);
+    registered.set(name, info);
+    renderTables();
+    if (pristine || !ta.value.trim()) {
+      ta.value = `select *\nfrom ${name}\nlimit 100`;
+      sync();
+    }
+    out.innerHTML = '<div class="placeholder"><div class="big">' + esc(name) +
+      '</div><div class="sm">registered &middot; ' + info.columns.length +
+      ' columns &middot; \u2318\u21a9 to query</div></div>';
+  } catch (e) {
+    renderError(typeof e === 'string' ? e : (e && e.message) || String(e));
+  } finally {
+    setBusy(false);
+  }
+}
+
+function loadSample() {
+  $('src-name').value = 'events';
+  $('src-url').value = '/events.parquet';
+  addSource('events', '/events.parquet');
+}
+
+$('btn-run').onclick = () => run(false);
+$('btn-explain').onclick = () => run(true);
+$('btn-add').onclick = () => {
+  const n = $('src-name').value.trim(), u = $('src-url').value.trim();
+  if (n && u) addSource(n, u);
+};
+$('btn-sample').onclick = loadSample;
+$('lnk-sample').onclick = loadSample;
+
+/* ------------------------------------------------------------------- boot */
+
+ta.value = '-- SQE playground. DataFusion 55, compiled to WebAssembly.\n' +
+           '-- Register a parquet or CSV source on the left, then run.\n\n' +
+           'select 1 as hello';
+sync();
+
+const t0 = performance.now();
+await init();
+engine.start();
+$('st-boot').textContent = `${Math.round(performance.now() - t0)} ms`;
+setBusy(false, 'ready');
+
+// Report the real bundle size rather than a number baked into the page.
+fetch('./pkg/sqe_playground_bg.wasm', { method: 'HEAD' })
+  .then(r => {
+    const enc = r.headers.get('content-encoding');
+    const n = Number(r.headers.get('content-length'));
+    if (n) $('st-size').textContent = `${(n / 1048576).toFixed(1)} MB${enc ? ' ' + enc : ''}`;
+  })
+  .catch(() => {});
+
+ta.focus();
+</script>
+</body>
+</html>
