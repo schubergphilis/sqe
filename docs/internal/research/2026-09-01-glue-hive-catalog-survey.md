@@ -1,23 +1,31 @@
 # Querying an AWS Glue Hive catalog from SQE
 
-Survey of a live Glue Data Catalog (account 088044431914, eu-central-1, 618
-tables) against what SQE can read today, plus what the gap costs to close.
+Survey of a live Glue Data Catalog (account 088044431914, eu-central-1)
+against what SQE can read today, plus what the gap costs to close.
+
+Two passes, hours apart. The first read a field subset and saw 618 tables;
+the second pulled full definitions and saw 692. The catalog is not static,
+so treat every count here as a snapshot, not a constant.
 
 ## What the catalog actually holds
 
-All 618 tables are Hive `EXTERNAL_TABLE`. **Zero Iceberg tables.** No table
-carries the `table_type=ICEBERG` parameter.
+692 tables: 636 `EXTERNAL_TABLE` and 56 `VIRTUAL_VIEW`. **Zero Iceberg
+tables.** No table carries the `table_type=ICEBERG` parameter.
 
 | SerDe | Tables |
 |---|---|
-| `org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe` | 433 |
+| `org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe` | 451 |
 | `org.openx.data.jsonserde.JsonSerDe` | 181 |
 | `org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe` | 3 |
 | `org.apache.hadoop.hive.serde2.OpenCSVSerde` | 1 |
 
-224 of 618 tables are partitioned. Data spans six buckets (`-raw-`,
+224 external tables are partitioned. Data spans six buckets (`-raw-`,
 `-refined-`, `-refined-sensitive-`, `-transient-`, `-ingestion-`,
 `-staging-datazone`).
+
+The file-extension and empty-location breakdowns further down were measured
+against the first pass's 618 and have not been re-measured against 692. The
+proportions hold; the absolute numbers have drifted upward.
 
 All four SerDe classes are already in `serde_map.rs`'s supported set, and the
 three text SerDes are all comma-delimited. SerDe coverage is 100% today.
@@ -27,9 +35,9 @@ three text SerDes are all comma-delimited. SerDe coverage is 100% today.
 That flag builds `iceberg_catalog_glue` and wraps it in
 `IcebergCatalogProvider`. It resolves a Glue table by reading
 `Parameters.metadata_location` and loading Iceberg metadata from it. A Hive
-external table has no such pointer, so every one of the 618 tables fails to
-load. The flag is correct for what it does; it just addresses a catalog shape
-this account does not have.
+external table has no such pointer, so every one of the 636 external tables
+fails to load. The flag is correct for what it does; it just addresses a
+catalog shape this account does not have.
 
 Extending that backend is not the move either. `iceberg::Catalog::load_table`
 returns an Iceberg `Table` built from a metadata file. Making it return
@@ -52,7 +60,7 @@ Scope the trait to reads only: `get(db, table) -> HiveManifest`,
 `list_databases`, `list_tables`. Leave `put`/`delete` off it, matching the
 read-only posture `--catalog-backend` already has.
 
-## Two findings that decide whether any of this reads a byte
+## Findings that decide whether any of this reads a byte
 
 Sampled the first objects under all 618 table locations, then re-listed in
 full every location the sample called empty:
@@ -178,13 +186,108 @@ source closes.
 token field. Spilling to S3 under SSO remains broken, deliberately left out
 of this change.
 
+## Partition projection is not optional
+
+A second pass pulled the full table definitions rather than a field subset,
+and the catalog is bigger and stranger than the first count said: 692 tables,
+636 `EXTERNAL_TABLE` plus 56 `VIRTUAL_VIEW`.
+
+**199 of the 636 external tables set `projection.enabled = true`**, and
+**192 of those have zero partitions registered in Glue.** Their partitions do
+not exist as metadata at all; Athena computes them from a formula. A backend
+that resolves partitions through `GetPartitions` returns an empty list for
+those tables, and an empty partition list means zero rows. No error, no
+warning, just a third of the catalog quietly answering nothing.
+
+That makes projection a correctness requirement, not a feature to defer.
+
+The shape is mercifully narrow. Three projection types appear (`date` 189,
+`integer` 187, `enum` 27) and **no table sets
+`storage.location.template`**, so every one uses the default Hive layout of
+`<Location>/<key>=<value>/`. Verified on S3:
+
+```
+Location:  s3://<bucket>/claude/projects/
+partitions: claude/projects/airflow_execution_date=2026-01-16/<uuid>.json.gz
+config:    projection.airflow_execution_date.type  = date
+           projection.airflow_execution_date.range = 2026-03-12,NOW
+           projection.airflow_execution_date.format = yyyy-MM-dd
+```
+
+One parity trap worth naming. That table's projection range starts
+2026-03-12, but S3 holds partition directories back to 2026-01-16. Projection
+*restricts* what is visible, so Athena cannot see the earlier data. An
+implementation that discovers partitions by listing directories would return
+more rows than Athena for the same query, and "more rows" is still a parity
+failure. Honor the declared range rather than what the bucket happens to
+hold.
+
+Partition keys never appear in `StorageDescriptor.Columns`. Checked across
+all 224 partitioned tables: zero name overlap between `Columns` and
+`PartitionKeys`. The query schema is `Columns` followed by `PartitionKeys`,
+which is the order `append_partition_columns` already produces.
+
+## Following Glue's columns, and where they need repairing
+
+Glue should be the source of truth for the schema. It is the only source for
+the 27 tables whose data directory is gone, and it is what makes the 356
+extensionless tables readable at all. But its column list does not match the
+files exactly, and the two ways it drifts are both silent.
+
+Comparing Glue's declared columns against real Parquet footers:
+
+- **Case.** Glue stores column names lowercased (Hive convention). The files
+  preserve the writer's case. Four of nine readable samples had Glue `op`
+  against Parquet `Op`. A case-sensitive match yields an all-NULL column.
+- **Order.** Glue's column order differs from the file's on two of nine
+  samples. Matching by position rather than by name would return the wrong
+  column's data under the right column's name, which is the failure shape
+  already recorded for plan-node width substitution and field-id projection.
+
+So the rule is: take names and types from Glue, resolve them against the file
+schema **by case-insensitive name, never by position**, fill a column absent
+from the file with NULLs, and ignore a file column Glue does not declare.
+That is Hive and Athena semantics, and it is what makes "follow Glue, fix
+where needed" concrete.
+
+The sample is small because of a separate gap: `read_parquet` hardcodes
+`.with_file_extension(".parquet")` with no override, so it cannot read an
+extensionless object even when handed its exact key. `read_json` and
+`read_csv` both expose a `file_extension` argument. Adding the same argument
+to `read_parquet` is a small change that would make 356 tables reachable
+ad-hoc before the Glue backend lands.
+
+## The other Glue parameters, and whether we need them
+
+| Parameter | Tables | Use it? |
+|---|---|---|
+| `projection.*` | 199 | **Required.** 192 have no registered partitions. |
+| `presto_view` / `VIRTUAL_VIEW` | 56 | Separate decision. Base64 Trino view SQL. |
+| `classification` (`json`, `parquet`) | 286 | Cheap cross-check on the SerDe mapping. |
+| `numFiles`, `totalSize` | 333 | Free statistics, no footer reads. |
+| `recordCount`, `averageRecordSize` | 25 | Better statistics where the crawler ran. |
+| `skip.header.line.count` | few | Already handled in `resolve_format`. |
+| `compressionType` | 25 | **Not trustworthy.** Every value is `none`, yet 127 tables are `.json.gz`. Infer compression from the key suffix instead. |
+| `has_encrypted_data`, `EXTERNAL`, `auto.purge`, `transactional`, `trino_*` | many | Ignore. |
+
+The 56 views are the one open question rather than a gap. They are Trino view
+definitions stored base64-encoded in `presto_view`, so serving them means
+parsing Trino SQL and resolving it against the same catalog. Skipping them
+means `bi_views` looks empty. Worth deciding deliberately rather than by
+omission.
+
 ## Sequencing
 
 1. S3 session token. Done, prerequisite for reading anything with SSO.
 2. Gzip detection in `serde_map::listing_options`, keyed on the object
    suffix. `read_json` already does this; the Hive provider does not, and
    131 tables need it.
-3. The Glue metadata source behind the read-only trait.
+3. The Glue metadata source behind the read-only trait. Schema is
+   `Columns ++ PartitionKeys`, resolved against files by case-insensitive
+   name and never by position.
+3a. Partition projection, in the same change rather than after it. Without
+   it 192 tables return zero rows instead of an error, and a silent wrong
+   answer is worse than an unsupported-table message.
 4. Partition-level `StorageDescriptor` divergence. Glue allows a partition's
    SerDe to differ from its table's; a table migrated JSON to Parquet
    mid-life has both under one definition. That produces wrong columns rather
