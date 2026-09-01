@@ -74,12 +74,24 @@ like a permissions problem and is not one. The Hive provider is already
 correct here: `resolve_format` returns `file_extension: String::new()`, so
 `ListingOptions` matches every object under the prefix.
 
-**Gzipped JSON (131 tables).** `serde_map::listing_options` builds
-`JsonFormat::default()`, which is `FileCompressionType::UNCOMPRESSED`.
-Pointed at `.json.gz` it feeds gzip bytes to the JSON parser. This is the one
-format gap the Glue backend has to close itself, since Glue's
-`StorageDescriptor` does not record compression; it has to be inferred from
-the object key suffix. 72% of the JSON tables here are affected.
+**Gzipped JSON (131 tables).** The two read paths disagree here, and the
+difference matters because the Glue backend inherits the weaker one.
+
+`read_json` handles it: the TVF has its own `compression` argument defaulting
+to `auto`, detected from the path extension. Confirmed by reading a
+`.json.gz` object directly, which returned rows.
+
+`serde_map::listing_options` does not: it builds `JsonFormat::default()`,
+which is `FileCompressionType::UNCOMPRESSED`, and never calls
+`with_file_compression_type`. A Hive table whose data is gzipped feeds gzip
+bytes to the JSON parser. Glue's `StorageDescriptor` does not record
+compression at all, so the Glue backend has to infer it from the object key
+suffix the same way the TVF already does. 72% of the JSON tables here are
+gzipped.
+
+One table (`JsonSerDe` over `.xml.gz`) is XML that Glue has recorded as JSON.
+No amount of compression handling makes that readable, and it should be
+reported as an unsupported table rather than a parse failure.
 
 40 table locations hold no data objects at all. Those should report an empty
 table, not an error.
@@ -99,8 +111,24 @@ attach it alongside an explicit key pair, `hive_s3_access` forwards it, and
 `EmbeddedS3Options` reads `SQE_STORAGE__S3_SESSION_TOKEN` then
 `AWS_SESSION_TOKEN`.
 
-Verified against the live account: before the fix, listing returned 403
-`InvalidAccessKeyId`; after, the same query lists successfully.
+Verified against the live account. Before the fix, listing returned 403
+`InvalidAccessKeyId`. After, a full query runs:
+
+```
+$ eval "$(aws configure export-credentials --format env)"
+$ sqe-cli --embedded --memory -e "SELECT count(*) AS n FROM read_parquet(
+    's3://<bucket>/snapshots/dotcomregistration/latest/public/customer/')"
++----+
+| n  |
++----+
+| 14 |
++----+
+```
+
+Reading a Glue table through a TVF today means naming its S3 location by
+hand and picking the matching TVF, and it only works for the 56 tables whose
+files carry a recognizable extension. That is the gap the Glue metadata
+source closes.
 
 `sqe-spill`'s `S3SpillConfig` has its own credential struct and still has no
 token field. Spilling to S3 under SSO remains broken, deliberately left out
@@ -109,7 +137,9 @@ of this change.
 ## Sequencing
 
 1. S3 session token. Done, prerequisite for reading anything with SSO.
-2. Gzip detection for JSON, keyed on the object suffix. Unblocks 131 tables.
+2. Gzip detection in `serde_map::listing_options`, keyed on the object
+   suffix. `read_json` already does this; the Hive provider does not, and
+   131 tables need it.
 3. The Glue metadata source behind the read-only trait.
 4. Partition-level `StorageDescriptor` divergence. Glue allows a partition's
    SerDe to differ from its table's; a table migrated JSON to Parquet
