@@ -608,6 +608,12 @@ pub fn build_s3_store(
     if !secret_key.is_empty() {
         builder = builder.with_secret_access_key(secret_key);
     }
+    // Only meaningful alongside an explicit key pair. Attaching it to the
+    // no-credential path would override the provider chain's own token.
+    let session_token = storage.s3_session_token.expose();
+    if !access_key.is_empty() && !session_token.is_empty() {
+        builder = builder.with_token(session_token);
+    }
     if !endpoint.is_empty() {
         builder = builder.with_endpoint(endpoint);
     }
@@ -651,6 +657,10 @@ pub fn build_s3_store_for_bucket(
     let secret = storage.s3_secret_key.expose();
     if !secret.is_empty() {
         builder = builder.with_secret_access_key(secret);
+    }
+    let session_token = storage.s3_session_token.expose();
+    if !storage.s3_access_key.is_empty() && !session_token.is_empty() {
+        builder = builder.with_token(session_token);
     }
     if !storage.s3_endpoint.is_empty() {
         builder = builder.with_endpoint(storage.s3_endpoint.as_str());

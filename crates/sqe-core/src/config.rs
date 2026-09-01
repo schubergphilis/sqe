@@ -2313,6 +2313,12 @@ pub struct StorageConfig {
     pub s3_access_key: String,
     #[serde(default)]
     pub s3_secret_key: SecretString,
+    /// STS session token, required whenever `s3_access_key` holds temporary
+    /// credentials (SSO, assumed role, IMDS). Signing without it against
+    /// temporary keys fails as `InvalidAccessKeyId`, which reads like a
+    /// wrong key rather than a missing token.
+    #[serde(default)]
+    pub s3_session_token: SecretString,
     #[serde(default)]
     pub s3_path_style: bool,
     /// Allow plaintext HTTP for S3 endpoints. Only enable for dev/test (e.g., MinIO).
@@ -2917,6 +2923,7 @@ impl Default for StorageConfig {
             s3_region: String::new(),
             s3_access_key: String::new(),
             s3_secret_key: SecretString::default(),
+            s3_session_token: SecretString::default(),
             s3_path_style: false,
             s3_allow_http: false,
             coalesce_threshold: default_coalesce_threshold(),
