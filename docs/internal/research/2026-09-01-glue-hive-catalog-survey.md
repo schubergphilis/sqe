@@ -54,20 +54,26 @@ read-only posture `--catalog-backend` already has.
 
 ## Two findings that decide whether any of this reads a byte
 
-Sampled the first objects under all 618 table locations:
+Sampled the first objects under all 618 table locations, then re-listed in
+full every location the sample called empty:
 
 | SerDe | File extension | Tables |
 |---|---|---|
-| ParquetHiveSerDe | *(none)* | 343 |
+| ParquetHiveSerDe | *(none)* | 356 |
 | ParquetHiveSerDe | `.parquet` | 52 |
-| ParquetHiveSerDe | *(empty prefix)* | 38 |
+| ParquetHiveSerDe | *(location absent)* | 25 |
 | JsonSerDe | `.json.gz` | 127 |
 | JsonSerDe | `.json` | 48 |
 | JsonSerDe | other `.gz` | 4 |
-| JsonSerDe | *(empty prefix)* | 2 |
+| JsonSerDe | *(location absent)* | 2 |
 | LazySimpleSerDe / OpenCSVSerde | `.csv` | 4 |
 
-**Extensionless Parquet (343 tables).** Athena CTAS writes
+The 13 tables the first pass could not classify were transient-zone tables
+mid-rewrite; on re-listing they held extensionless Athena output, so they
+fold into the 356. Nothing in this catalog uses ORC, Avro, or a SerDe outside
+the four listed.
+
+**Extensionless Parquet (356 tables).** Athena CTAS writes
 `20260901_064011_00178_rk5z8_<uuid>` with no suffix. The file TVFs
 (`read_parquet`) filter on extension and report "No files found," which reads
 like a permissions problem and is not one. The Hive provider is already
@@ -93,8 +99,43 @@ One table (`JsonSerDe` over `.xml.gz`) is XML that Glue has recorded as JSON.
 No amount of compression handling makes that readable, and it should be
 reported as an unsupported table rather than a parse failure.
 
-40 table locations hold no data objects at all. Those should report an empty
-table, not an error.
+**Locations that hold nothing (27 tables).** A first pass counted 40, from a
+three-object sample per table. Re-listing them in full split that number in
+two, and both halves say something.
+
+13 were a sampling race. They live in `-transient-datazone` (`afas_tmp`,
+`afas_sensitive_tmp`) and were genuinely empty at 14:05, then held a fresh
+Athena CTAS file 40 minutes later. The transient zone is rewritten on every
+ETL pass, so "this table is empty" is a statement with a shelf life of
+minutes. Any cache over Glue metadata or file listings needs a TTL short
+enough to survive that, and a survey that samples once will disagree with
+itself.
+
+The other 27 are not empty. **The directory Glue points at does not exist.**
+Listing the exact `StorageDescriptor.Location` returns nothing, and the
+prefix is absent from its parent's `CommonPrefixes` entirely. Meanwhile the
+parent holds up to 79 sibling snapshot directories that do have data:
+
+```
+glue Location:  s3://<bucket>/thecore/user/20260901-fd1c98f9-.../   (absent)
+actually there: s3://<bucket>/thecore/user/20260710-dce562be-.../   (+16 more)
+```
+
+Nine `datadog_tmp` tables are the degenerate case, where the parent is gone
+too. The rest are snapshot tables whose Glue pointer was advanced to a
+directory that was never written, or whose target has since been
+lifecycle-deleted while older snapshots survive.
+
+This is the strongest argument for reading Glue metadata rather than
+sniffing files, and it is worth stating plainly. **All 27 still carry full
+column metadata in Glue**, 2 to 28 columns each, with no table missing its
+schema. A metadata-driven catalog answers them correctly: right column names
+and types, zero rows, which is what Athena does. A TVF cannot answer them at
+all, because it has nothing to infer a schema from and fails with "Cannot
+infer schema from an empty location."
+
+So the 27 are not an edge case to tolerate. They are 4.4% of the catalog that
+only a metadata-driven path can serve.
 
 ## Prerequisite, now fixed: S3 session tokens
 
@@ -127,7 +168,10 @@ $ sqe-cli --embedded --memory -e "SELECT count(*) AS n FROM read_parquet(
 
 Reading a Glue table through a TVF today means naming its S3 location by
 hand and picking the matching TVF, and it only works for the 56 tables whose
-files carry a recognizable extension. That is the gap the Glue metadata
+files carry a recognizable extension (52 `.parquet` plus 4 `.csv`). The 179
+JSON tables need the TVF's own compression handling, the 356 extensionless
+Parquet tables need the Hive provider's empty-extension listing, and the 27
+with absent locations need Glue's schema. That is the gap the Glue metadata
 source closes.
 
 `sqe-spill`'s `S3SpillConfig` has its own credential struct and still has no
@@ -149,3 +193,11 @@ of this change.
 5. The TVF path allowlist (`[storage.tvf]`) has to cover all six buckets, or
    the Glue source hands back locations that get rejected downstream and the
    mapping looks broken when it is not.
+6. A missing location is a valid empty table, not an error. Build the schema
+   from `StorageDescriptor.Columns` and return zero rows when the prefix does
+   not exist, matching Athena. Inferring schema from files would fail 27
+   tables outright, and the failure would arrive as "cannot infer schema,"
+   which points at the engine rather than at a dangling Glue pointer.
+7. Cache with a short TTL. Transient-zone tables are rewritten on every ETL
+   pass, so both the file listing and any "this table is empty" conclusion go
+   stale within minutes.
