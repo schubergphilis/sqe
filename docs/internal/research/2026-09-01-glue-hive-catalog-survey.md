@@ -35,9 +35,23 @@ three text SerDes are all comma-delimited. SerDe coverage is 100% today.
 That flag builds `iceberg_catalog_glue` and wraps it in
 `IcebergCatalogProvider`. It resolves a Glue table by reading
 `Parameters.metadata_location` and loading Iceberg metadata from it. A Hive
-external table has no such pointer, so every one of the 636 external tables
-fails to load. The flag is correct for what it does; it just addresses a
-catalog shape this account does not have.
+external table has no such pointer.
+
+The failure is harsher than "no tables show up". `IcebergCatalogProvider::
+try_new` lists every namespace, then `IcebergSchemaProvider::try_new` eagerly
+loads every table in each one through `try_join_all`, which fails on the
+first error. One non-Iceberg table therefore takes down the whole attach.
+Measured against this account (`sqe-cli --features aws`):
+
+```
+$ sqe-cli --embedded --catalog-backend glue \
+    --catalog-warehouse s3://<bucket>/ --region eu-central-1 -e "SHOW DATABASES"
+Error: failed to attach `glue` catalog: DataInvalid => No 'metadata_location' set on table
+```
+
+Not one database is reachable, and the error arrives before any query runs.
+The flag is correct for what it does; it just addresses a catalog shape this
+account does not have.
 
 Extending that backend is not the move either. `iceberg::Catalog::load_table`
 returns an Iceberg `Table` built from a metadata file. Making it return
@@ -275,6 +289,50 @@ definitions stored base64-encoded in `presto_view`, so serving them means
 parsing Trino SQL and resolving it against the same catalog. Skipping them
 means `bi_views` looks empty. Worth deciding deliberately rather than by
 omission.
+
+## Server mode, and what auto-attaches
+
+**The server gets everything the embedded engine gets, because none of it is
+embedded-specific.** The Hive provider, the SerDe mapping and partition
+projection all live in `sqe-catalog` and are shared. `sqe_server` attaches
+`[[hive.roots]]` at startup through
+`runtime_catalog::attach_configured_hive_roots`, and `ATTACH <location> AS
+<name> (TYPE hive_external)` works per session through `query_handler`. The
+S3 session-token fix reaches the server the same way, via
+`hive_scan_tasks::hive_s3_access`.
+
+Distributed execution honors projection without doing anything special.
+Partitions are computed once on the coordinator in `planned_entries`, pruned
+there, and only the survivors travel to workers as `ScanTask`s. Workers never
+re-evaluate a projection or re-read a manifest.
+
+**Nothing auto-attaches Glue databases, in either mode.** Two mechanisms
+exist and neither does what the question wants:
+
+- The Iceberg path (`--catalog-backend glue`, or `[catalog] backend = Glue`
+  on the server) *would* enumerate every Glue database automatically:
+  `IcebergCatalogProvider::try_new` calls `list_namespaces(None)` and builds
+  a schema provider per namespace. But as above, it cannot get past the first
+  Hive table, so in this account it attaches nothing at all. It also
+  enumerates once at construction and never refreshes, which upstream flags
+  in its own TODO, so a database created later stays invisible until restart.
+- The Hive path discovers databases automatically too, but from **object
+  storage, not Glue**. `HiveCatalogProvider::schema_names` calls
+  `HiveManifestStore::list_databases`, which lists prefixes under the
+  warehouse root looking for `_sqe/table.json` sidecars. Glue is never
+  consulted, so a Glue-defined table is invisible no matter where it points.
+
+So "point SQE at Glue and query every database it can reach" is exactly the
+capability the Glue metadata source adds, and it does not exist yet. When it
+lands it should enumerate through `GetDatabases`/`GetTables` behind the same
+TTL cache, and it must resolve tables lazily: eager loading is what makes the
+Iceberg path fail whole-catalog on a single bad table, and a catalog of 692
+tables will always contain one SQE cannot read.
+
+Minor, found while checking: the `--catalog-backend` help text says the `aws`
+cargo feature is "default-on", but `sqe-cli`'s `Cargo.toml` sets
+`default = []`. Without `--features aws` the flag fails with "requires the
+`glue` cargo feature".
 
 ## Sequencing
 
