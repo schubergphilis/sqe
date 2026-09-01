@@ -25,7 +25,7 @@ RUN cargo build --release --locked --no-default-features --bin sqe-bench \
     && mkdir -p /build/out \
     && cp target/release/sqe-bench /build/out/
 
-FROM cgr.dev/chainguard/glibc-dynamic@sha256:df4e22a4b5dcd8e15a51fe9b04e16717d411dd9f4fe4b3844c1bf425b14be303
+FROM cgr.dev/chainguard/glibc-dynamic@sha256:993affbc31d155dfdd4c86c4415e87557df5695a0c84bce924992c8e93724168
 
 USER 65532
 
