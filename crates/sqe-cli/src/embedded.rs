@@ -139,6 +139,9 @@ pub struct EmbeddedS3Options {
     pub endpoint: Option<String>,
     pub access_key: Option<String>,
     pub secret_key: Option<String>,
+    /// STS session token. Never a CLI flag: the only credentials that need
+    /// one are temporary, and they arrive through the environment.
+    pub session_token: Option<String>,
     pub region: Option<String>,
     /// Force virtual-hosted addressing (`bucket.host`) even when an
     /// endpoint override is set. See [`Self::to_storage_config`] for why
@@ -185,6 +188,10 @@ impl EmbeddedS3Options {
                 &flags.secret_key,
                 &["SQE_STORAGE__S3_SECRET_KEY", "AWS_SECRET_ACCESS_KEY"],
             ),
+            session_token: pick(
+                &flags.session_token,
+                &["SQE_STORAGE__S3_SESSION_TOKEN", "AWS_SESSION_TOKEN"],
+            ),
             region: pick(
                 &flags.region,
                 &["SQE_STORAGE__S3_REGION", "AWS_REGION", "AWS_DEFAULT_REGION"],
@@ -226,6 +233,9 @@ impl EmbeddedS3Options {
         }
         if let Some(key) = &self.secret_key {
             storage.s3_secret_key = sqe_core::SecretString::new(key.clone());
+        }
+        if let Some(token) = &self.session_token {
+            storage.s3_session_token = sqe_core::SecretString::new(token.clone());
         }
         if let Some(region) = &self.region {
             storage.s3_region = region.clone();
@@ -1209,6 +1219,49 @@ mod tests {
         // `AWS_*` still fills what neither a flag nor `SQE_STORAGE__*` set.
         assert_eq!(resolved.secret_key.as_deref(), Some("aws-secret"));
         assert_eq!(resolved.region.as_deref(), Some("eu-west-1"));
+    }
+
+    #[test]
+    fn a_session_token_reaches_the_storage_config() {
+        // Temporary credentials (SSO, assumed role) are useless without the
+        // token: S3 rejects the request as `InvalidAccessKeyId`, which reads
+        // like a wrong key rather than a missing token. There is no flag for
+        // it on purpose, so the environment is the only path in.
+        let resolved = EmbeddedS3Options::resolve(
+            &EmbeddedS3Options::default(),
+            env_of(&[
+                ("AWS_ACCESS_KEY_ID", "ASIAEXAMPLE"),
+                ("AWS_SECRET_ACCESS_KEY", "secret"),
+                ("AWS_SESSION_TOKEN", "the-token"),
+            ]),
+        );
+        assert_eq!(resolved.session_token.as_deref(), Some("the-token"));
+        assert_eq!(
+            resolved.to_storage_config().s3_session_token.expose(),
+            "the-token"
+        );
+    }
+
+    #[test]
+    fn the_sqe_session_token_spelling_wins_over_the_aws_one() {
+        let resolved = EmbeddedS3Options::resolve(
+            &EmbeddedS3Options::default(),
+            env_of(&[
+                ("SQE_STORAGE__S3_SESSION_TOKEN", "sqe-token"),
+                ("AWS_SESSION_TOKEN", "aws-token"),
+            ]),
+        );
+        assert_eq!(resolved.session_token.as_deref(), Some("sqe-token"));
+    }
+
+    #[test]
+    fn no_session_token_leaves_the_storage_config_empty() {
+        // The provider chain supplies its own token when the engine has no
+        // static key pair. Defaulting to a non-empty value here would sign
+        // anonymous reads with a token that does not match the keys.
+        let resolved = EmbeddedS3Options::resolve(&EmbeddedS3Options::default(), env_of(&[]));
+        assert_eq!(resolved.session_token, None);
+        assert!(resolved.to_storage_config().s3_session_token.expose().is_empty());
     }
 
     #[test]

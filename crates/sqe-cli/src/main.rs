@@ -249,6 +249,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         endpoint: cli.s3_endpoint.clone(),
         access_key: cli.s3_access_key.clone(),
         secret_key: cli.s3_secret_key.clone(),
+        session_token: None,
         region: cli.s3_region.clone(),
         virtual_hosted: cli.s3_virtual_hosted,
     });
