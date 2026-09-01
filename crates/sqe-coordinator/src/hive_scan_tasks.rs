@@ -244,7 +244,7 @@ pub fn hive_s3_access(storage: &sqe_core::config::StorageConfig) -> HiveS3Access
         region: storage.s3_region.clone(),
         access_key: storage.s3_access_key.clone(),
         secret_key: storage.s3_secret_key.expose().to_string(),
-        session_token: String::new(),
+        session_token: storage.s3_session_token.expose().to_string(),
         path_style: storage.s3_path_style,
         allow_http: storage.s3_endpoint.starts_with("http://"),
     }

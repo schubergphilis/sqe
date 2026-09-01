@@ -138,8 +138,14 @@ struct Cli {
     /// the embedded engine attaches that AWS catalog read-only instead
     /// of a local filesystem catalog. Credentials come from the AWS
     /// provider chain (`AWS_PROFILE`, SSO, instance profile). Requires
-    /// the `aws` cargo feature (default-on). Mutually exclusive with
+    /// the `aws` cargo feature, which is default-OFF: build with
+    /// `cargo build -p sqe-cli --features aws`. Mutually exclusive with
     /// `--memory`, `--warehouse`, and `--catalog`.
+    ///
+    /// Only reads Iceberg tables. A Glue catalog of Hive external tables
+    /// fails the attach outright, because the upstream provider eagerly
+    /// loads every table and the first one without a `metadata_location`
+    /// aborts the whole catalog.
     #[arg(long, value_enum, conflicts_with_all = ["memory", "warehouse", "catalog"])]
     catalog_backend: Option<CloudBackend>,
 
@@ -249,6 +255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         endpoint: cli.s3_endpoint.clone(),
         access_key: cli.s3_access_key.clone(),
         secret_key: cli.s3_secret_key.clone(),
+        session_token: None,
         region: cli.s3_region.clone(),
         virtual_hosted: cli.s3_virtual_hosted,
     });
