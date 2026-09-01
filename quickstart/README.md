@@ -74,6 +74,7 @@ validated from a clean state.
 |---|---|---|
 | [`polaris-keycloak-client-id`](./polaris-keycloak-client-id/) | Polaris + Keycloak; SQE mints user tokens via the OIDC password grant (client credentials) | **validated 2026-06-06** |
 | [`polaris-keycloak-user-token`](./polaris-keycloak-user-token/) | Same stack; clients bring a pre-minted Keycloak token (`--token`), SQE validates + passes it through | **validated 2026-06-06** |
+| [`mcp`](./mcp/) | Reuses the user-token stack; authenticated SQE MCP, read/write gates, protocol tests, Codex + Claude setup | runnable harness |
 | [`polaris-ranger-keycloak`](./polaris-ranger-keycloak/) | Polaris + Apache Ranger access control: SQE writes GRANT/REVOKE to Ranger, Polaris enforces, column masks match Spark + Kyuubi byte-for-byte | test harness (`test.sh` + `parity-test.sh`) |
 | [`nessie`](./nessie/) | Project Nessie as the Iceberg REST catalog (auth-less, anonymous SQE) | **validated 2026-06-06** |
 | [`unity-oss`](./unity-oss/) | Unity Catalog OSS over Iceberg REST (read-only upstream; catalog-browse demo) | **validated 2026-06-06** |

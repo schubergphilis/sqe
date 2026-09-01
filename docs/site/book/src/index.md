@@ -21,6 +21,7 @@ graph LR
 - **Arrow-native** — columnar data flows from Parquet files through the entire query pipeline to the client. No row-based serialization anywhere.
 - **Iceberg-native** — built on iceberg-rust, not a connector bolted onto a generic engine. Partition pruning, metadata caching, and Iceberg v3 support are first-class.
 - **Fine-grained security** — row filters and column masks enforced at the logical plan level, before the optimizer runs. Invisible columns, transparent row filtering, no information leakage.
+- **MCP for AI clients.** A Model Context Protocol endpoint ships in the coordinator binary, off by default. It acts as an OAuth resource server rather than a credential proxy: the assistant's user token becomes the same per-user session Flight SQL uses, so a model reads exactly what its human can read. See [Model Context Protocol](./deployment/mcp.md).
 - **Rust performance** — single binary, no JVM, no GC pauses, predictable memory usage, fast startup.
 
 ## Quick Start (embedded, no server)

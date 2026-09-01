@@ -1,0 +1,28 @@
+[package]
+name = "sqe-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sqe-core = { path = "../sqe-core" }
+sqe-auth = { path = "../sqe-auth" }
+sqe-sql = { path = "../sqe-sql" }
+sqe-trino-compat = { path = "../sqe-trino-compat" }
+arrow-array = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlparser = { workspace = true }
+subtle = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+arrow-schema = { workspace = true }
+tower = { version = "0.5", features = ["util"] }

@@ -6,6 +6,76 @@ All notable changes to SQE are documented in this file.
 
 ### Added
 
+- MCP auth modes for deployments with no identity provider
+
+    `[mcp.auth] mode` selects how callers authenticate to `/mcp`: `oauth`
+    (default, unchanged), `static`, or `anonymous`. A catalog reached with
+    engine credentials (AWS Glue, S3 Tables, an attached warehouse, an
+    auth-less Nessie) has no user tokens to validate, and MCP previously had
+    no way to serve it: the scope check reads OAuth claims from a JWT, and the
+    validator demanded an authorization server. `static` matches the caller's
+    bearer against `[[mcp.auth.principals]]` in constant time and adopts that
+    principal's user and roles; the token comes from `token_env` (preferred)
+    or `token_b64`, resolved once at startup. `anonymous` accepts every caller
+    as one configured identity. The static comparison lives in `sqe-mcp`
+    rather than the auth chain on purpose: a no-IdP chain typically ends in
+    the `anonymous` provider, which accepts any credential, so delegating
+    would let a WRONG token authenticate. Neither mode forwards the MCP bearer
+    upstream; the session carries an empty catalog token, as the anonymous SQL
+    path already does. In both modes the OAuth surface stands down: no
+    `/.well-known/oauth-protected-resource` routes, a bare
+    `WWW-Authenticate: Bearer` challenge, and `authorization_servers` required
+    only in `oauth` mode. Anonymous mode is refused at startup when any
+    identity-provider entry is present in `auth.providers`, under
+    `production_mode`, or with `allow_writes = true`; static mode is refused
+    with no principals, a token under 16 characters, an unset `token_env`,
+    malformed `token_b64`, two principals sharing a token, or writes enabled
+    with no principal holding a `write_roles` role. Static mode carries no
+    OAuth scopes, so the write gate is roles plus source authorization, and
+    the docs say plainly that these modes have no last line of defense at the
+    source. The same audit closed a hole in the mode left alone:
+    `mcp.auth.mode = "oauth"` combined with the `anonymous` auth provider is
+    now a startup error, because OAuth mode reads scopes from the bearer's
+    payload and delegates signature verification to the chain, so a provider
+    that verifies nothing would have accepted an unsigned token carrying the
+    read scope.
+
+- Model Context Protocol endpoint (OAuth resource server)
+
+    The coordinator can expose an MCP Streamable HTTP endpoint (protocol
+    revision 2025-11-25) from the main `sqe-server` binary, off by default
+    behind a new `[mcp]` config block. The endpoint is a protected OAuth
+    resource, not an authorization server and not a credential proxy: the
+    caller's `Authorization: Bearer` goes through SQE's existing auth chain,
+    the validated identity becomes the same per-user `Session` Flight SQL and
+    Trino HTTP use, and that same bearer is forwarded to the source catalog
+    and storage. There is no MCP service account and no shared root
+    credential, so the invariant is `user bearer -> MCP -> Session ->
+    catalog/storage`. SQE publishes RFC 9728 protected-resource metadata at
+    `/.well-known/oauth-protected-resource` and
+    `/.well-known/oauth-protected-resource/mcp`, and answers unauthorized
+    calls with a `WWW-Authenticate: Bearer` challenge carrying
+    `resource_metadata` and the missing scope; clients run Authorization Code
+    with PKCE and the RFC 8707 `resource` parameter against their own
+    authorization server. Nine read tools (`execute_sql_readonly`,
+    `list_catalogs`, `list_schemas`, `list_tables`, `describe_table`,
+    `get_table_ddl`, `get_table_stats`, `explain_query`, `whoami`) unlock on
+    the `read_scope`. `execute_sql_readonly` accepts exactly one statement and
+    is gated by SQE's SQL parser and statement classifier rather than a
+    keyword regular expression. `execute_sql_change` is absent from
+    `tools/list` unless `allow_writes = true`, and a call then needs three
+    independent authorizations: the OAuth write scope, an SQE role in
+    `write_roles` (default `data_writer`), and source authorization for that
+    user and statement. OAuth scopes bound the MCP surface only; they grant no
+    catalog, table, row, column or storage access. Responses are bounded by
+    `max_result_rows` (1000) and `max_response_bytes` (2 MiB) with an explicit
+    `truncated` flag, and requests carrying an `Origin` header are rejected
+    unless the exact origin is allow-listed (DNS-rebinding defense; native
+    clients send no `Origin`). New `sqe-mcp` crate; reference page in
+    `docs/site/book/src/deployment/mcp.md`; runnable end-to-end stack with
+    Codex and Claude Code client templates in `quickstart/mcp/` (14/14 checks
+    against live Keycloak + Polaris + RustFS on 2026-08-28).
+
 - Per-caller namespace visibility in metadata listings
 
     `SHOW SCHEMAS`, `information_schema.schemata`, and Flight SQL
