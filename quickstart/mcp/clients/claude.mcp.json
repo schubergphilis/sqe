@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "sqe": {
+      "type": "http",
+      "url": "${SQE_MCP_URL:-http://localhost:19091/mcp}",
+      "headers": {
+        "Authorization": "Bearer ${SQE_MCP_TOKEN}"
+      }
+    }
+  }
+}

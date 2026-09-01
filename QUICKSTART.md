@@ -273,6 +273,12 @@ SQE speaks Arrow Flight SQL, so any Flight SQL client works:
 - **Trino-compat HTTP**: SQE also exposes a Trino HTTP endpoint on
   `trino_http_port` (default 18080). Useful for clients that don't
   speak Flight SQL but do speak Trino REST.
+- **AI assistants (Claude Code, Codex)**: enable `[mcp]` and point
+  an MCP client at `/mcp` on the health/web port. The endpoint is an
+  OAuth resource server, so the assistant queries as the token's
+  user. See the book's
+  [Model Context Protocol](docs/site/book/src/deployment/mcp.md) page
+  and the runnable `quickstart/mcp/` stack.
 
 ## Troubleshooting
 

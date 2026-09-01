@@ -19,6 +19,11 @@
   ],
   "milestones": [
     {
+      "date": "Aug 2026",
+      "title": "MCP, governed by the caller's own token",
+      "body": "SQE speaks Model Context Protocol over Streamable HTTP from the same coordinator binary, off by default. It is an OAuth resource server rather than a credential proxy: the caller's bearer becomes the same per-user session Flight SQL uses and travels to the catalog and storage unchanged, so an assistant reads exactly what its human can read. The read-only SQL tool is gated by SQE's own parser as an allow-list, and the write tool needs an OAuth scope, an engine role, and source authorization independently."
+    },
+    {
       "date": "Jun 2026",
       "title": "Read-only ops web UI",
       "body": "A network-gated dashboard ships inside the coordinator binary, live queries with per-fragment timing, cluster workers, and engine metrics with 12h history (sparklines, gauges, a query-activity histogram). No login, no build step, no external assets."

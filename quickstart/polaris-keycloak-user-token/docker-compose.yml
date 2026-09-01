@@ -113,12 +113,21 @@ services:
       quarkus.oidc.token.issuer: http://keycloak:8080/realms/iceberg
       quarkus.oidc.client-id: polaris-frontend-client
       quarkus.oidc.token.audience: account
-      quarkus.oidc.roles.role-claim-path: groups
+      # Realm roles, not groups: this realm assigns realm roles to users and
+      # has no groups, so a "groups" claim path activates no principal roles.
+      quarkus.oidc.roles.role-claim-path: "realm_access/roles"
       quarkus.oidc.tls.verification: none
       polaris.oidc.principal-mapper.name-claim-path: preferred_username
-      polaris.oidc.principal-roles-mapper.filter: ".*"
+      # Allow-list the realm roles that exist as Polaris principal-roles, then
+      # prefix them: Polaris activates a role only when the mapped value reads
+      # PRINCIPAL_ROLE:<name>, and it rejects the whole request with 401 if any
+      # mapped role is not granted to the principal. So Keycloak's own
+      # offline_access/uma_authorization/default-roles-* must be filtered out,
+      # and this list has to stay in sync with the roles created in
+      # ../_shared/polaris/bootstrap.sh.
+      polaris.oidc.principal-roles-mapper.filter: "(service_admin|catalog_admin|data_writer|table_reader)"
       polaris.oidc.principal-roles-mapper.mappings[0].regex: (.+)
-      polaris.oidc.principal-roles-mapper.mappings[0].replacement: $1
+      polaris.oidc.principal-roles-mapper.mappings[0].replacement: PRINCIPAL_ROLE:$1
       polaris.features."SUPPORTED_CATALOG_STORAGE_TYPES": "[\"S3\"]"
       # Keep false so Polaris injects s3.endpoint + path-style into the Iceberg
       # FileIO (works with the custom RustFS endpoint + per-catalog stsUnavailable).

@@ -30,8 +30,8 @@
       "pillar": "iceberg"
     },
     {
-      "title": "Two wire protocols",
-      "body": "Arrow Flight SQL and Trino HTTP from the same coordinator. Connect existing Trino clients unchanged.",
+      "title": "Three wire protocols",
+      "body": "Arrow Flight SQL, Trino HTTP and MCP from the same coordinator. Trino clients connect unchanged; AI clients connect as the token's user, with no service account.",
       "pillar": "open"
     },
     {
@@ -152,7 +152,7 @@
       "label": "Wire protocols",
       "cells": [
         {
-          "t": "Flight SQL + Trino"
+          "t": "Flight SQL + Trino + MCP"
         },
         {
           "t": "Trino HTTP"

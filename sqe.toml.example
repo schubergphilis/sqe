@@ -8,6 +8,40 @@ mode = "hybrid"   # "local", "distributed", or "hybrid"
 # security.allow_insecure_transport, unauthenticated workers). Env:
 # SQE_PRODUCTION_MODE or SQE_COORDINATOR__PRODUCTION_MODE.
 
+# Remote Model Context Protocol endpoint (disabled by default). The MCP bearer
+# is validated by the same auth chain as Flight/Trino and forwarded unchanged
+# through SQE to Polaris/source storage. The public URL is the OAuth resource
+# indicator/audience; configure the bearer-token provider with the same audience.
+# [mcp]
+# enabled = true  # with port omitted/0, mount on health/web (prometheus_port + 1)
+# port = 8081     # optional: isolated listener instead
+# resource_uri = "https://sqe.example.com/mcp"
+# authorization_servers = ["https://idp.example.com/realms/data"]
+# allowed_origins = [] # exact browser origins; native clients send no Origin
+# read_scope = "sqe:mcp:read"
+# write_scope = "sqe:mcp:write"
+# allow_writes = false
+# write_roles = ["data_writer"]
+# max_result_rows = 1000
+# max_response_bytes = 2097152
+#
+# Deployments with NO identity provider (Glue / S3 Tables / attached warehouse
+# reached with engine credentials) have no user tokens to validate. Two modes
+# cover that: `static` matches the caller's bearer against configured
+# principals, `anonymous` accepts everyone as one identity. Anonymous is
+# refused when an IdP provider is configured, under production_mode, and with
+# allow_writes = true. See docs deployment/mcp.md.
+# [mcp.auth]
+# mode = "static"
+# [[mcp.auth.principals]]
+# user      = "mcp-reader"
+# roles     = ["reader"]
+# token_env = "SQE_MCP_READ_TOKEN"   # preferred; wins over token_b64
+# [[mcp.auth.principals]]
+# user      = "mcp-writer"
+# roles     = ["data_writer"]
+# token_b64 = "..."                  # base64 obfuscates, it does not protect
+
 # Rate limiting (P0 for production). Disabled by default for dev ergonomics.
 # Set enabled = true (or SQE_RATE_LIMIT__ENABLED=true) in prod; the
 # production_mode validator will refuse startup if disabled.

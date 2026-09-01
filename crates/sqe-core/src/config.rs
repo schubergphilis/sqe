@@ -7,6 +7,9 @@ use crate::SecretString;
 #[derive(Debug, Deserialize, Clone)]
 pub struct SqeConfig {
     pub coordinator: CoordinatorConfig,
+    /// Model Context Protocol endpoint. Disabled by default (`port = 0`).
+    #[serde(default)]
+    pub mcp: McpConfig,
     #[serde(default)]
     pub worker: WorkerConfig,
     pub auth: AuthConfig,
@@ -685,6 +688,245 @@ pub struct CoordinatorConfig {
     /// concurrency. Default: 60 s. Env `SQE_COORDINATOR__SESSION_CONTEXT_CACHE_TTL_SECS`.
     #[serde(default = "default_session_context_cache_ttl_secs")]
     pub session_context_cache_ttl_secs: u64,
+}
+
+/// Streamable HTTP MCP resource-server configuration.
+///
+/// MCP never mints or exchanges tokens. It validates the caller's bearer with
+/// SQE's existing auth chain and forwards that same user token through the SQE
+/// session to the source catalog/storage layer.
+#[derive(Debug, Deserialize, Clone)]
+pub struct McpConfig {
+    /// Enable MCP. A non-zero `port` also enables it for backwards-compatible
+    /// convenience; `enabled = true, port = 0` mounts it on the web port.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Dedicated TCP port for `/mcp`; zero mounts on the existing web listener.
+    #[serde(default)]
+    pub port: u16,
+    /// Canonical RFC 8707 resource identifier (normally the public MCP URL).
+    #[serde(default)]
+    pub resource_uri: String,
+    /// OAuth/OIDC issuers advertised through RFC 9728 protected-resource metadata.
+    #[serde(default)]
+    pub authorization_servers: Vec<String>,
+    /// Browser origins allowed to call `/mcp`. Requests without `Origin`
+    /// (normal native MCP clients) are unaffected. Empty rejects all browser origins.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    /// Scope required for all MCP discovery and read operations.
+    #[serde(default = "default_mcp_read_scope")]
+    pub read_scope: String,
+    /// Additional scope required by the change/write tool.
+    #[serde(default = "default_mcp_write_scope")]
+    pub write_scope: String,
+    /// Enables the change/write tool. It is absent from tools/list when false.
+    #[serde(default)]
+    pub allow_writes: bool,
+    /// At least one of these SQE roles is also required for change/write calls.
+    #[serde(default = "default_mcp_write_roles")]
+    pub write_roles: Vec<String>,
+    /// Maximum rows serialized into one MCP tool response.
+    #[serde(default = "default_mcp_max_result_rows")]
+    pub max_result_rows: usize,
+    /// Maximum JSON bytes returned in one MCP tool response.
+    #[serde(default = "default_mcp_max_response_bytes")]
+    pub max_response_bytes: usize,
+    /// How callers authenticate to `/mcp`. Defaults to OAuth.
+    #[serde(default)]
+    pub auth: McpAuthConfig,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 0,
+            resource_uri: String::new(),
+            authorization_servers: Vec::new(),
+            allowed_origins: Vec::new(),
+            read_scope: default_mcp_read_scope(),
+            write_scope: default_mcp_write_scope(),
+            allow_writes: false,
+            write_roles: default_mcp_write_roles(),
+            max_result_rows: default_mcp_max_result_rows(),
+            max_response_bytes: default_mcp_max_response_bytes(),
+            auth: McpAuthConfig::default(),
+        }
+    }
+}
+
+/// How callers authenticate to `/mcp`.
+///
+/// `Oauth` is the only mode that reaches an external identity provider. The
+/// other two exist for deployments that have none: a catalog configured with
+/// engine credentials (AWS Glue, S3 Tables, an attached warehouse) has no user
+/// tokens to validate, so the MCP surface is gated on configured principals or
+/// on nothing at all.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum McpAuthMode {
+    /// Validate the caller's bearer through the auth chain and read OAuth
+    /// scopes from its claims. Requires `authorization_servers`.
+    #[default]
+    Oauth,
+    /// Match the caller's bearer against `[[mcp.auth.principals]]`. Roles come
+    /// from the matched principal; there are no OAuth scopes.
+    Static,
+    /// Accept every caller as one fixed identity. Refused when an identity
+    /// provider is configured, under `production_mode`, and with writes on.
+    Anonymous,
+}
+
+impl McpAuthMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Oauth => "oauth",
+            Self::Static => "static",
+            Self::Anonymous => "anonymous",
+        }
+    }
+}
+
+/// MCP authentication settings.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct McpAuthConfig {
+    #[serde(default)]
+    pub mode: McpAuthMode,
+    /// Static bearer principals, used when `mode = "static"`.
+    #[serde(default)]
+    pub principals: Vec<McpPrincipalConfig>,
+    /// Identity assigned to every caller when `mode = "anonymous"`.
+    #[serde(default)]
+    pub anonymous: McpAnonymousConfig,
+}
+
+impl McpAuthConfig {
+    /// Roles a principal must hold for the change/write tool, given the
+    /// endpoint's `write_roles`.
+    pub fn has_writer(&self, write_roles: &[String]) -> bool {
+        self.principals
+            .iter()
+            .any(|p| p.roles.iter().any(|role| write_roles.contains(role)))
+    }
+}
+
+/// One static MCP principal: a bearer token, a user name, and roles.
+///
+/// The token comes from `token_env` (preferred) or `token_b64`. Base64 is
+/// encoding, not protection: anyone who can read the config can read the
+/// token, so prefer the environment variable outside development.
+#[derive(Debug, Deserialize, Clone)]
+pub struct McpPrincipalConfig {
+    /// Identity assigned to callers presenting this token.
+    pub user: String,
+    /// SQE roles for this principal. The write gate checks these against
+    /// `mcp.write_roles`.
+    #[serde(default)]
+    pub roles: Vec<String>,
+    /// Environment variable holding the bearer token. Wins over `token_b64`.
+    #[serde(default)]
+    pub token_env: String,
+    /// Base64-encoded bearer token. Obfuscation only.
+    #[serde(default)]
+    pub token_b64: String,
+}
+
+/// Minimum token length. Short tokens are guessable, and a static token is the
+/// only thing standing between a caller and the engine's own credentials.
+const MCP_MIN_TOKEN_LEN: usize = 16;
+
+impl McpPrincipalConfig {
+    /// Resolve this principal's bearer token, preferring `token_env`.
+    ///
+    /// Returns the message to surface at startup on failure, so validation and
+    /// the serving path agree on what a usable token is.
+    pub fn resolve_token(&self) -> Result<SecretString, String> {
+        let user = &self.user;
+        let token = if !self.token_env.trim().is_empty() {
+            let var = self.token_env.trim();
+            match std::env::var(var) {
+                Ok(value) if !value.trim().is_empty() => value,
+                _ => {
+                    return Err(format!(
+                        "mcp.auth.principals[{user}] token_env '{var}' is unset or empty"
+                    ))
+                }
+            }
+        } else if !self.token_b64.trim().is_empty() {
+            let decoded = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                self.token_b64.trim(),
+            )
+            .map_err(|_| {
+                format!("mcp.auth.principals[{user}] token_b64 is not valid base64")
+            })?;
+            String::from_utf8(decoded).map_err(|_| {
+                format!("mcp.auth.principals[{user}] token_b64 must decode to UTF-8")
+            })?
+        } else {
+            return Err(format!(
+                "mcp.auth.principals[{user}] needs either token_env or token_b64"
+            ));
+        };
+        if token.len() < MCP_MIN_TOKEN_LEN {
+            return Err(format!(
+                "mcp.auth.principals[{user}] token must be at least {MCP_MIN_TOKEN_LEN} characters"
+            ));
+        }
+        Ok(SecretString::new(token))
+    }
+}
+
+/// Identity handed to every caller in anonymous mode.
+#[derive(Debug, Deserialize, Clone)]
+pub struct McpAnonymousConfig {
+    #[serde(default = "default_mcp_anonymous_user")]
+    pub user: String,
+    #[serde(default)]
+    pub roles: Vec<String>,
+}
+
+impl Default for McpAnonymousConfig {
+    fn default() -> Self {
+        Self {
+            user: default_mcp_anonymous_user(),
+            roles: Vec::new(),
+        }
+    }
+}
+
+fn default_mcp_anonymous_user() -> String {
+    "mcp-anonymous".to_string()
+}
+
+impl McpConfig {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled || self.port > 0
+    }
+}
+
+fn default_mcp_read_scope() -> String {
+    "sqe:mcp:read".to_string()
+}
+fn default_mcp_write_scope() -> String {
+    "sqe:mcp:write".to_string()
+}
+fn default_mcp_write_roles() -> Vec<String> {
+    vec!["data_writer".to_string()]
+}
+fn default_mcp_max_result_rows() -> usize {
+    1_000
+}
+fn default_mcp_max_response_bytes() -> usize {
+    2 * 1024 * 1024
+}
+
+fn valid_oauth_scope(scope: &str) -> bool {
+    !scope.is_empty()
+        && scope
+            .bytes()
+            .all(|byte| matches!(byte, 0x21 | 0x23..=0x5b | 0x5d..=0x7e))
 }
 
 /// HTTP/2 + TCP knobs applied to every tonic Server / Client this
@@ -1508,6 +1750,26 @@ pub enum AuthProviderConfig {
 // (the catch-all also guards against a future variant leaking a secret without
 // a matching arm). Note `AuthConfig`'s own Debug already summarizes the
 // provider list as a count; this protects a stray `{:?}` of a single provider.
+impl AuthProviderConfig {
+    /// The provider's TOML `type` when it authenticates against an external
+    /// identity provider, `None` for the credential-local providers.
+    ///
+    /// Used to refuse `mcp.auth.mode = "anonymous"` on a deployment that can
+    /// authenticate real callers. `api_key`, `mtls` and `aws_iam` are local
+    /// credential checks rather than an IdP, so they do not block it.
+    pub fn identity_provider_kind(&self) -> Option<&'static str> {
+        match self {
+            Self::OidcPassword { .. } => Some("oidc_password"),
+            Self::ClientCredentials { .. } => Some("client_credentials"),
+            Self::ClientCredentialsPassthrough { .. } => Some("client_credentials_passthrough"),
+            Self::TokenExchange { .. } => Some("token_exchange"),
+            Self::BearerToken { .. } => Some("bearer_token"),
+            Self::BearerPassthrough { .. } => Some("bearer_passthrough"),
+            Self::AwsIam { .. } | Self::ApiKey { .. } | Self::Mtls { .. } | Self::Anonymous { .. } => None,
+        }
+    }
+}
+
 impl std::fmt::Debug for AuthProviderConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -4378,6 +4640,192 @@ impl SqeConfig {
                 ));
             }
         }
+        if self.mcp.is_enabled() {
+            let mp = self.mcp.port;
+            if mp > 0 {
+                for (name, port) in [
+                    (
+                        "coordinator.flight_sql_port",
+                        self.coordinator.flight_sql_port,
+                    ),
+                    (
+                        "coordinator.trino_http_port",
+                        self.coordinator.trino_http_port,
+                    ),
+                    ("coordinator.quack_port", self.coordinator.quack_port),
+                    ("metrics.prometheus_port", self.metrics.prometheus_port),
+                    (
+                        "health/web port",
+                        self.metrics.prometheus_port.saturating_add(1),
+                    ),
+                ] {
+                    if port > 0 && port == mp {
+                        errors.push(format!("port conflict: mcp.port and {name} are both {mp}"));
+                    }
+                }
+            }
+            if self.mcp.resource_uri.trim().is_empty() {
+                errors.push("mcp.resource_uri is required when mcp.port is enabled".to_string());
+            } else {
+                match url::Url::parse(&self.mcp.resource_uri) {
+                    Ok(url)
+                        if url.has_host()
+                            && url.path() == "/mcp"
+                            && url.query().is_none()
+                            && url.fragment().is_none() =>
+                    {
+                        if self.coordinator.production_mode && url.scheme() != "https" {
+                            errors.push(
+                                "mcp.resource_uri must use https in production_mode".to_string(),
+                            );
+                        }
+                    }
+                    _ => errors.push(
+                        "mcp.resource_uri must be an absolute URL with path /mcp and no query or fragment"
+                            .to_string(),
+                    ),
+                }
+            }
+            if self.mcp.auth.mode == McpAuthMode::Oauth && self.mcp.authorization_servers.is_empty()
+            {
+                errors.push(
+                    "mcp.authorization_servers requires at least one OAuth/OIDC issuer when mcp.port is enabled"
+                        .to_string(),
+                );
+            } else {
+                for issuer in &self.mcp.authorization_servers {
+                    match url::Url::parse(issuer) {
+                        Ok(url) if url.has_host() && url.fragment().is_none() => {
+                            if self.coordinator.production_mode && url.scheme() != "https" {
+                                errors.push(format!(
+                                    "mcp authorization server must use https in production_mode: {issuer}"
+                                ));
+                            }
+                        }
+                        _ => errors.push(format!(
+                            "mcp authorization server must be an absolute URL without a fragment: {issuer}"
+                        )),
+                    }
+                }
+            }
+            match self.mcp.auth.mode {
+                McpAuthMode::Oauth => {
+                    // OAuth mode reads scopes from the bearer's payload and
+                    // leaves signature verification to the auth chain. A
+                    // provider that verifies nothing turns that into a hole: an
+                    // unsigned JWT carrying the read scope would authenticate,
+                    // and in a deployment reached with engine credentials it
+                    // would read real data. Such a deployment wants static or
+                    // anonymous mode, where the gate is a token SQE issued.
+                    if self
+                        .auth
+                        .providers
+                        .iter()
+                        .any(|provider| matches!(provider, AuthProviderConfig::Anonymous { .. }))
+                    {
+                        errors.push(
+                            "mcp.auth.mode = \"oauth\" cannot be combined with the anonymous \
+                             auth provider: the provider validates no token, so any bearer \
+                             carrying the read scope would be accepted. Use mcp.auth.mode = \
+                             \"static\" or \"anonymous\" instead"
+                                .to_string(),
+                        );
+                    }
+                    if !valid_oauth_scope(&self.mcp.read_scope) {
+                        errors.push(
+                            "mcp.read_scope must be one non-empty OAuth scope token".to_string(),
+                        );
+                    }
+                    if self.mcp.allow_writes
+                        && (!valid_oauth_scope(&self.mcp.write_scope)
+                            || self.mcp.write_roles.is_empty())
+                    {
+                        errors.push(
+                            "write-capable MCP requires both mcp.write_scope and mcp.write_roles"
+                                .to_string(),
+                        );
+                    }
+                }
+                // Static mode carries no OAuth scopes: the caller's token is
+                // issued here, so the principal's roles are the only gate.
+                McpAuthMode::Static => {
+                    if self.mcp.auth.principals.is_empty() {
+                        errors.push(
+                            "mcp.auth.principals requires at least one principal when \
+                             mcp.auth.mode = \"static\""
+                                .to_string(),
+                        );
+                    }
+                    let mut tokens: Vec<String> = Vec::new();
+                    for principal in &self.mcp.auth.principals {
+                        if principal.user.trim().is_empty() {
+                            errors.push("every mcp.auth.principals entry needs a user".to_string());
+                        }
+                        match principal.resolve_token() {
+                            Ok(token) => {
+                                let token = token.expose().to_string();
+                                if tokens.contains(&token) {
+                                    errors.push(
+                                        "two mcp.auth.principals share the same token".to_string(),
+                                    );
+                                } else {
+                                    tokens.push(token);
+                                }
+                            }
+                            Err(message) => errors.push(message),
+                        }
+                    }
+                    if self.mcp.allow_writes
+                        && !self.mcp.auth.has_writer(&self.mcp.write_roles)
+                    {
+                        errors.push(
+                            "write-capable MCP in static mode needs a principal holding a role \
+                             in mcp.write_roles"
+                                .to_string(),
+                        );
+                    }
+                }
+                // Anonymous mode authenticates nobody. It is a development and
+                // trusted-network shape only, and it must never coexist with an
+                // identity provider: a deployment that can authenticate users
+                // has no reason to hand the engine's credentials to whoever
+                // reaches the port.
+                McpAuthMode::Anonymous => {
+                    if let Some(kind) = self
+                        .auth
+                        .providers
+                        .iter()
+                        .find_map(|provider| provider.identity_provider_kind())
+                    {
+                        errors.push(format!(
+                            "mcp.auth.mode = \"anonymous\" is refused because an identity \
+                             provider is configured (auth.providers contains {kind}); use \
+                             mcp.auth.mode = \"oauth\" or \"static\""
+                        ));
+                    }
+                    if self.coordinator.production_mode {
+                        errors.push(
+                            "mcp.auth.mode = \"anonymous\" is not allowed under production_mode"
+                                .to_string(),
+                        );
+                    }
+                    if self.mcp.allow_writes {
+                        errors.push(
+                            "mcp.auth.mode = \"anonymous\" cannot be combined with \
+                             mcp.allow_writes: an anonymous caller is nobody to attribute a \
+                             write to"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            if self.mcp.max_result_rows == 0 || self.mcp.max_response_bytes == 0 {
+                errors.push(
+                    "mcp.max_result_rows and mcp.max_response_bytes must be greater than zero"
+                        .to_string(),
+                );
+            }
+        }
 
         // TLS validation: if one of cert/key is set, both must be set
         let tls = &self.coordinator.tls;
@@ -4899,6 +5347,21 @@ impl SqeConfig {
         env_override_str_logged("SQE_MEMORY_LIMIT", &mut self.coordinator.memory_limit);
         // `SQE_MEMORY_POOL` overrides `coordinator.memory_pool` ("greedy" | "fair").
         env_override_str_logged("SQE_MEMORY_POOL", &mut self.coordinator.memory_pool);
+
+        // MCP resource server. Collection fields stay in TOML so scopes,
+        // issuers, origins, and roles remain reviewable as one policy block.
+        env_override_bool("SQE_MCP__ENABLED", &mut self.mcp.enabled);
+        env_override_u16("SQE_MCP__PORT", &mut self.mcp.port);
+        env_override_str("SQE_MCP__RESOURCE_URI", &mut self.mcp.resource_uri);
+        env_override_bool("SQE_MCP__ALLOW_WRITES", &mut self.mcp.allow_writes);
+        env_override_usize(
+            "SQE_MCP__MAX_RESULT_ROWS",
+            &mut self.mcp.max_result_rows,
+        );
+        env_override_usize(
+            "SQE_MCP__MAX_RESPONSE_BYTES",
+            &mut self.mcp.max_response_bytes,
+        );
 
         // Worker
         env_override_str(
@@ -6054,6 +6517,7 @@ partial_progress_batch = 5
     /// Helper to build a valid config for validation tests.
     fn valid_config() -> SqeConfig {
         SqeConfig {
+            mcp: Default::default(),
             coordinator: CoordinatorConfig {
                 flight_sql_port: 50051,
                 trino_http_port: 8080,
@@ -6437,6 +6901,307 @@ partial_progress_batch = 5
             err.contains("flight_sql_port") && err.contains("prometheus_port"),
             "Expected port conflict error, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_validate_mcp_requires_oauth_resource_metadata() {
+        let mut config = valid_config();
+        config.mcp.port = 8081;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("mcp.resource_uri"), "got: {err}");
+        assert!(err.contains("mcp.authorization_servers"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_mcp_accepts_secure_read_only_config() {
+        let mut config = valid_config();
+        config.mcp.port = 8081;
+        config.mcp.resource_uri = "https://sqe.example.com/mcp".to_string();
+        config.mcp.authorization_servers = vec!["https://idp.example.com/realm".to_string()];
+        config.validate().expect("valid MCP config");
+    }
+
+    #[test]
+    fn test_validate_mcp_write_mode_requires_scope_and_role() {
+        let mut config = valid_config();
+        config.mcp.port = 8081;
+        config.mcp.resource_uri = "https://sqe.example.com/mcp".to_string();
+        config.mcp.authorization_servers = vec!["https://idp.example.com/realm".to_string()];
+        config.mcp.allow_writes = true;
+        config.mcp.write_scope.clear();
+        config.mcp.write_roles.clear();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("write-capable MCP"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // [mcp.auth] modes: oauth (default), static principals, anonymous
+    // -----------------------------------------------------------------------
+
+    fn mcp_enabled_config() -> SqeConfig {
+        let mut config = valid_config();
+        config.mcp.port = 8081;
+        config.mcp.resource_uri = "https://sqe.example.com/mcp".to_string();
+        config
+    }
+
+    fn b64(value: &str) -> String {
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, value)
+    }
+
+    fn provider_from_toml(toml: &str) -> AuthProviderConfig {
+        toml::from_str(toml).expect("auth provider TOML parses")
+    }
+
+    fn static_principal(user: &str, roles: &[&str], token: &str) -> McpPrincipalConfig {
+        McpPrincipalConfig {
+            user: user.to_string(),
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+            token_env: String::new(),
+            token_b64: b64(token),
+        }
+    }
+
+    #[test]
+    fn mcp_auth_mode_defaults_to_oauth() {
+        assert_eq!(McpAuthConfig::default().mode, McpAuthMode::Oauth);
+    }
+
+    #[test]
+    fn mcp_anonymous_mode_is_refused_when_an_idp_is_configured() {
+        let mut config = mcp_enabled_config();
+        config.mcp.auth.mode = McpAuthMode::Anonymous;
+        config.auth.providers = vec![provider_from_toml(
+            r#"
+            type = "bearer_token"
+            jwks_url = "https://idp.example.com/certs"
+            issuer = "https://idp.example.com"
+            audience = "https://sqe.example.com/mcp"
+        "#,
+        )];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("mcp.auth.mode = \"anonymous\"") && err.contains("bearer_token"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn mcp_anonymous_mode_is_allowed_alongside_non_idp_providers() {
+        let mut config = mcp_enabled_config();
+        config.mcp.auth.mode = McpAuthMode::Anonymous;
+        config.auth.providers = vec![provider_from_toml(r#"type = "mtls""#)];
+        config.validate().expect("mtls is not an IdP");
+    }
+
+    #[test]
+    fn mcp_anonymous_mode_needs_no_authorization_servers() {
+        let mut config = mcp_enabled_config();
+        config.mcp.auth.mode = McpAuthMode::Anonymous;
+        config.validate().expect("anonymous MCP has no authorization server");
+    }
+
+    #[test]
+    fn mcp_anonymous_mode_refuses_writes() {
+        let mut config = mcp_enabled_config();
+        config.mcp.auth.mode = McpAuthMode::Anonymous;
+        config.mcp.allow_writes = true;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("anonymous") && err.contains("allow_writes"), "got: {err}");
+    }
+
+    #[test]
+    fn mcp_anonymous_mode_is_refused_in_production() {
+        let mut config = mcp_enabled_config();
+        config.coordinator.production_mode = true;
+        config.mcp.resource_uri = "https://sqe.example.com/mcp".to_string();
+        config.mcp.auth.mode = McpAuthMode::Anonymous;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("anonymous") && err.contains("production_mode"),
+            "got: {err}"
+        );
+    }
+
+    /// `oauth` mode reads scopes out of the bearer's payload and leaves
+    /// signature checking to the auth chain. An `anonymous` provider checks
+    /// nothing, so an unsigned JWT carrying `{"scope":"sqe:mcp:read"}` would
+    /// pass both gates and reach data the engine's own credentials can read.
+    #[test]
+    fn mcp_oauth_mode_is_refused_with_an_anonymous_provider() {
+        let mut config = mcp_enabled_config();
+        config.mcp.authorization_servers = vec!["https://idp.example.com/realm".to_string()];
+        config.auth.providers = vec![provider_from_toml(
+            r#"
+            type = "anonymous"
+            user = "anonymous"
+        "#,
+        )];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("anonymous") && err.contains("mcp.auth.mode"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn mcp_static_mode_is_allowed_with_an_anonymous_provider() {
+        let mut config = mcp_enabled_config();
+        config.mcp.auth.mode = McpAuthMode::Static;
+        config.mcp.auth.principals =
+            vec![static_principal("mcp-reader", &["reader"], "a-sufficiently-long-token")];
+        config.auth.providers = vec![provider_from_toml(
+            r#"
+            type = "anonymous"
+            user = "anonymous"
+        "#,
+        )];
+        config
+            .validate()
+            .expect("an anonymous SQL path with token-gated MCP is the mode-2 shape");
+    }
+
+    #[test]
+    fn mcp_static_mode_requires_at_least_one_principal() {
+        let mut config = mcp_enabled_config();
+        config.mcp.auth.mode = McpAuthMode::Static;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("mcp.auth.principals"), "got: {err}");
+    }
+
+    #[test]
+    fn mcp_static_mode_needs_no_authorization_servers() {
+        let mut config = mcp_enabled_config();
+        config.mcp.auth.mode = McpAuthMode::Static;
+        config.mcp.auth.principals =
+            vec![static_principal("mcp-reader", &["reader"], "a-sufficiently-long-token")];
+        config.validate().expect("static MCP has no authorization server");
+    }
+
+    #[test]
+    fn mcp_static_mode_refuses_two_principals_sharing_a_token() {
+        let mut config = mcp_enabled_config();
+        config.mcp.auth.mode = McpAuthMode::Static;
+        config.mcp.auth.principals = vec![
+            static_principal("mcp-reader", &["reader"], "a-sufficiently-long-token"),
+            static_principal("mcp-writer", &["data_writer"], "a-sufficiently-long-token"),
+        ];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("same token"), "got: {err}");
+    }
+
+    #[test]
+    fn mcp_static_mode_refuses_a_short_token() {
+        let mut config = mcp_enabled_config();
+        config.mcp.auth.mode = McpAuthMode::Static;
+        config.mcp.auth.principals = vec![static_principal("mcp-reader", &["reader"], "short")];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("16"), "got: {err}");
+    }
+
+    #[test]
+    fn mcp_static_mode_refuses_invalid_base64() {
+        let mut config = mcp_enabled_config();
+        config.mcp.auth.mode = McpAuthMode::Static;
+        config.mcp.auth.principals = vec![McpPrincipalConfig {
+            user: "mcp-reader".to_string(),
+            roles: vec!["reader".to_string()],
+            token_env: String::new(),
+            token_b64: "not valid base64!!".to_string(),
+        }];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("token_b64"), "got: {err}");
+    }
+
+    #[test]
+    fn mcp_static_mode_refuses_a_principal_with_no_credential() {
+        let mut config = mcp_enabled_config();
+        config.mcp.auth.mode = McpAuthMode::Static;
+        config.mcp.auth.principals = vec![McpPrincipalConfig {
+            user: "mcp-reader".to_string(),
+            roles: vec!["reader".to_string()],
+            token_env: String::new(),
+            token_b64: String::new(),
+        }];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("token_env") && err.contains("token_b64"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn mcp_static_mode_refuses_an_unset_token_env() {
+        let mut config = mcp_enabled_config();
+        config.mcp.auth.mode = McpAuthMode::Static;
+        config.mcp.auth.principals = vec![McpPrincipalConfig {
+            user: "mcp-reader".to_string(),
+            roles: vec!["reader".to_string()],
+            token_env: "SQE_MCP_TOKEN_THAT_IS_NOT_SET".to_string(),
+            token_b64: String::new(),
+        }];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("SQE_MCP_TOKEN_THAT_IS_NOT_SET"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn mcp_static_token_env_wins_over_base64() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("SQE_MCP_TEST_READ_TOKEN", "env-token-is-long-enough");
+        let principal = McpPrincipalConfig {
+            user: "mcp-reader".to_string(),
+            roles: vec!["reader".to_string()],
+            token_env: "SQE_MCP_TEST_READ_TOKEN".to_string(),
+            token_b64: b64("base64-token-is-long-too"),
+        };
+        let token = principal.resolve_token().expect("resolves");
+        std::env::remove_var("SQE_MCP_TEST_READ_TOKEN");
+        assert_eq!(token.expose(), "env-token-is-long-enough");
+    }
+
+    #[test]
+    fn mcp_static_mode_refuses_writes_without_a_writer_principal() {
+        let mut config = mcp_enabled_config();
+        config.mcp.auth.mode = McpAuthMode::Static;
+        config.mcp.allow_writes = true;
+        config.mcp.auth.principals =
+            vec![static_principal("mcp-reader", &["reader"], "a-sufficiently-long-token")];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("write_roles"), "got: {err}");
+    }
+
+    #[test]
+    fn mcp_static_mode_accepts_a_reader_and_a_writer() {
+        let mut config = mcp_enabled_config();
+        config.mcp.auth.mode = McpAuthMode::Static;
+        config.mcp.allow_writes = true;
+        config.mcp.auth.principals = vec![
+            static_principal("mcp-reader", &["reader"], "read-token-long-enough"),
+            static_principal("mcp-writer", &["data_writer"], "write-token-long-enough"),
+        ];
+        config.validate().expect("a reader and a writer");
+    }
+
+    #[test]
+    fn test_mcp_environment_overrides() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("SQE_MCP__ALLOW_WRITES", "true");
+        std::env::set_var(
+            "SQE_MCP__RESOURCE_URI",
+            "http://localhost:19091/mcp",
+        );
+
+        let mut config = valid_config();
+        config.apply_env_overrides();
+
+        assert!(config.mcp.allow_writes);
+        assert_eq!(config.mcp.resource_uri, "http://localhost:19091/mcp");
+
+        std::env::remove_var("SQE_MCP__ALLOW_WRITES");
+        std::env::remove_var("SQE_MCP__RESOURCE_URI");
     }
 
     #[test]

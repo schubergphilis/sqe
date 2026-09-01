@@ -18,6 +18,7 @@ members = [
     "crates/sqe-quack-wire",
     "crates/sqe-quack-server",
     "crates/sqe-quack-client",
+    "crates/sqe-mcp",
     "crates/sqe-cli",
     "crates/sqe-bench",
     "xtask",
