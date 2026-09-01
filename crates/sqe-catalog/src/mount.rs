@@ -365,7 +365,7 @@ fn store_for_secret(
     let sqe_core::Secret::Aws {
         access_key,
         secret_key,
-        session_token: _,
+        session_token,
         region,
         profile: _,
     } = secret
@@ -396,6 +396,15 @@ fn store_for_secret(
         .unwrap_or(storage.s3_secret_key.expose());
     if !secret_val.is_empty() {
         builder = builder.with_secret_access_key(secret_val);
+    }
+    // The secret's own token wins; a secret naming temporary credentials
+    // must not be signed with the engine-wide token from another identity.
+    let token = session_token
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(storage.s3_session_token.expose());
+    if !access.is_empty() && !token.is_empty() {
+        builder = builder.with_token(token);
     }
     let reg = region
         .as_deref()
