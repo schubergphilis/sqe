@@ -622,6 +622,7 @@ impl HiveTableProvider {
                 proj,
                 &self.table_location,
                 filters,
+                &self.partition_types,
                 self.max_index_entries,
             )?;
             return Ok(prune_entries_owned(
