@@ -574,6 +574,7 @@ pub async fn analyze_table(
                 &cfg,
                 &manifest.storage_descriptor.location,
                 &[],
+                &[],
                 store.limits().max_partition_index_entries,
             )?
             .into_iter()
