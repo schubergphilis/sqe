@@ -69,6 +69,7 @@ use super::partition::{
 use super::scan_exec::{HiveScanExec, HiveScanSpec};
 use super::serde_map::{arrow_type, listing_options, resolve_format, ResolvedFormat};
 use super::stats::{analyzed_statistics, row_width_hint, size_only_from_index, size_only_statistics};
+use super::source::HiveMetadataSource;
 use super::store::HiveManifestStore;
 use super::HiveError;
 
@@ -959,7 +960,13 @@ impl TableProvider for HiveTableProvider {
 /// SESSION; see the module doc comment for why.
 pub struct HiveCatalogProvider {
     name: String,
-    store: Arc<HiveManifestStore>,
+    /// Where table metadata is read from. A sidecar warehouse and a
+    /// metastore that already exists (Glue, HMS) differ only here.
+    source: Arc<dyn HiveMetadataSource>,
+    /// The same object as `source` when this catalog is backed by a sidecar
+    /// warehouse SQE owns, and `None` when it reads a metastore it does not.
+    /// Only DDL needs it; reads go through `source`.
+    sidecar: Option<Arc<HiveManifestStore>>,
     data_store_factory: Arc<dyn HiveDataStoreFactory>,
     runtime: Arc<RuntimeEnv>,
     manifest_cache: Arc<HiveMetadataCache>,
@@ -1006,7 +1013,33 @@ impl HiveCatalogProvider {
             .build();
         Self {
             name,
-            store,
+            source: Arc::clone(&store) as Arc<dyn HiveMetadataSource>,
+            sidecar: Some(store),
+            data_store_factory,
+            runtime,
+            manifest_cache,
+            table_names_cache,
+        }
+    }
+
+    /// Same catalog over a metastore SQE does not own, so there is no
+    /// sidecar to write and DDL is refused rather than silently dropped.
+    pub fn with_source(
+        name: String,
+        source: Arc<dyn HiveMetadataSource>,
+        data_store_factory: Arc<dyn HiveDataStoreFactory>,
+        runtime: Arc<RuntimeEnv>,
+        manifest_cache: Arc<HiveMetadataCache>,
+        cache_ttl: Duration,
+    ) -> Self {
+        let table_names_cache = SyncCache::builder()
+            .max_capacity(TABLE_NAMES_CACHE_CAPACITY)
+            .time_to_live(cache_ttl)
+            .build();
+        Self {
+            name,
+            source,
+            sidecar: None,
             data_store_factory,
             runtime,
             manifest_cache,
@@ -1024,8 +1057,11 @@ impl HiveCatalogProvider {
     /// through a DataFusion `SchemaProvider` method, since none of those
     /// three statements has a DataFusion-native path that reaches a Hive
     /// manifest.
-    pub fn store(&self) -> Arc<HiveManifestStore> {
-        Arc::clone(&self.store)
+    /// `None` when this catalog reads a metastore SQE does not own, where
+    /// there is nothing to write a manifest to. Callers turn that into a
+    /// refusal naming the catalog rather than a silent no-op.
+    pub fn store(&self) -> Option<Arc<HiveManifestStore>> {
+        self.sidecar.clone()
     }
 
     /// Drop any cached `table_names()` result for `database`. Call after DDL
@@ -1046,7 +1082,7 @@ impl HiveCatalogProvider {
 
 impl CatalogProvider for HiveCatalogProvider {
     fn schema_names(&self) -> Vec<String> {
-        let store = Arc::clone(&self.store);
+        let store = Arc::clone(&self.source);
         match crate::runtime_bridge::block_on_compat(async move { store.list_databases().await }) {
             Ok(Ok(names)) => names,
             Ok(Err(e)) => {
@@ -1070,7 +1106,7 @@ impl CatalogProvider for HiveCatalogProvider {
         // directory-based emptiness.
         Some(Arc::new(HiveSchemaProvider {
             database: name.to_string(),
-            store: Arc::clone(&self.store),
+            source: Arc::clone(&self.source),
             data_store_factory: Arc::clone(&self.data_store_factory),
             runtime: Arc::clone(&self.runtime),
             cache: Arc::clone(&self.manifest_cache),
@@ -1083,7 +1119,7 @@ impl CatalogProvider for HiveCatalogProvider {
 /// manifest store.
 pub struct HiveSchemaProvider {
     database: String,
-    store: Arc<HiveManifestStore>,
+    source: Arc<dyn HiveMetadataSource>,
     data_store_factory: Arc<dyn HiveDataStoreFactory>,
     runtime: Arc<RuntimeEnv>,
     cache: Arc<HiveMetadataCache>,
@@ -1111,7 +1147,7 @@ impl SchemaProvider for HiveSchemaProvider {
             return (*cached).clone();
         }
 
-        let store = Arc::clone(&self.store);
+        let store = Arc::clone(&self.source);
         let database = self.database.clone();
         let names = match crate::runtime_bridge::block_on_compat(async move {
             store.list_tables(&database).await
@@ -1137,7 +1173,7 @@ impl SchemaProvider for HiveSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        let etag = match self.store.manifest_etag(&self.database, name).await {
+        let etag = match self.source.etag(&self.database, name).await {
             Ok(e) => e,
             Err(HiveError::NotFound(_)) => return Ok(None),
             Err(e) => return Err(to_df(e)),
@@ -1148,7 +1184,7 @@ impl SchemaProvider for HiveSchemaProvider {
         {
             cached
         } else {
-            match self.store.get(&self.database, name).await {
+            match self.source.get(&self.database, name).await {
                 Ok(m) => m,
                 Err(HiveError::NotFound(_)) => return Ok(None),
                 Err(e) => return Err(to_df(e)),
@@ -1264,7 +1300,7 @@ impl SchemaProvider for HiveSchemaProvider {
             Arc::clone(&self.data_store_factory),
             manifest.secret().map(str::to_string),
             Arc::clone(&self.runtime),
-            self.store.limits().max_partition_index_entries,
+            self.source.limits().max_partition_index_entries,
             manifest.storage_descriptor.location.clone(),
         ))))
     }
