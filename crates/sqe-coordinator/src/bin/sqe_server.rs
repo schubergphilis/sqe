@@ -1768,8 +1768,8 @@ async fn run_worker(config: SqeConfig, config_path: String) -> anyhow::Result<()
         // alone does not break a scan. Gating worker readiness on catalog
         // reachability is a deliberately conservative cluster-health signal: if
         // the catalog is down the coordinator cannot plan or dispatch anyway.
-        // config.validate() already requires catalog.catalog_url non-empty for
-        // both roles, so this always probes.
+        // Glue/Hive-only deployments leave this empty and skip the catalog
+        // probe. Workers serving Iceberg keep the conservative readiness gate.
         catalog_url: config.catalog.catalog_url.clone(),
         node_info: None,
         metrics_history: None,

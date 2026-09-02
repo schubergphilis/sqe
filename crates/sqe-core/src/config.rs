@@ -2113,7 +2113,7 @@ pub struct CatalogConfig {
     ///
     /// Old configs that used `polaris_url` continue to deserialize
     /// thanks to the serde alias.
-    #[serde(alias = "polaris_url")]
+    #[serde(default, alias = "polaris_url")]
     pub catalog_url: String,
     #[serde(default)]
     pub warehouse: String,
@@ -4545,7 +4545,9 @@ impl SqeConfig {
     ///
     /// Practical outcomes:
     /// - Legacy single-catalog config: returns one entry,
-    ///   `("iceberg", &self.catalog)`.
+    ///   `("iceberg", &self.catalog)`. An empty REST `catalog_url` means the
+    ///   legacy Iceberg catalog is not configured and returns no entry; this is
+    ///   the normal shape of a Glue/Hive-only deployment.
     /// - Pure new-style config (only `[catalogs.*]` set, no
     ///   `default_catalog`): returns the named catalogs sorted by
     ///   name. The legacy `[catalog]` block exists in the struct but
@@ -4559,7 +4561,9 @@ impl SqeConfig {
     /// so the caller doesn't pay clone cost during dispatch.
     pub fn flattened_catalogs(&self) -> Vec<(String, &CatalogConfig)> {
         if self.catalogs.is_empty() {
-            return vec![(Self::LEGACY_CATALOG_NAME.to_string(), &self.catalog)];
+            return catalog_is_configured(&self.catalog)
+                .then(|| vec![(Self::LEGACY_CATALOG_NAME.to_string(), &self.catalog)])
+                .unwrap_or_default();
         }
         let mut out: Vec<(String, &CatalogConfig)> =
             self.catalogs.iter().map(|(k, v)| (k.clone(), v)).collect();
@@ -4580,7 +4584,9 @@ impl SqeConfig {
             // legacy block wins (operator set it explicitly; that's
             // an opt-in to use the legacy block as that name).
             out.retain(|(n, _)| n != name);
-            out.push((name.to_string(), &self.catalog));
+            if catalog_is_configured(&self.catalog) {
+                out.push((name.to_string(), &self.catalog));
+            }
             out.sort_by(|a, b| a.0.cmp(&b.0));
         }
         out
@@ -4591,8 +4597,9 @@ impl SqeConfig {
     /// 1. `query.default_catalog` if set and non-empty.
     /// 2. The first entry from `flattened_catalogs()`.
     /// 3. `Self::LEGACY_CATALOG_NAME` as a last resort (no
-    ///    catalogs flattened, which is a config error caught
-    ///    elsewhere).
+    ///    Iceberg catalogs flattened). Session construction uses
+    ///    DataFusion's neutral catalog instead in that case unless
+    ///    `query.default_catalog` was set explicitly.
     pub fn resolve_default_catalog(&self) -> String {
         if let Some(name) = self
             .query
@@ -4609,6 +4616,10 @@ impl SqeConfig {
     }
 }
 
+fn catalog_is_configured(config: &CatalogConfig) -> bool {
+    !matches!(config.backend, CatalogBackend::Rest) || !config.catalog_url.trim().is_empty()
+}
+
 impl SqeConfig {
     /// Validate configuration: required fields and port conflicts.
     pub fn validate(&self) -> crate::error::Result<()> {
@@ -4622,14 +4633,6 @@ impl SqeConfig {
 
         if !has_providers && self.auth.client_id.trim().is_empty() {
             errors.push("auth.client_id is required".to_string());
-        }
-        if self.catalog.catalog_url.trim().is_empty() {
-            errors.push(
-                "catalog.catalog_url is required (TOML field; or env \
-                 SQE_CATALOG__CATALOG_URL). Legacy names `polaris_url` / \
-                 SQE_CATALOG__POLARIS_URL also work via serde alias."
-                    .to_string(),
-            );
         }
         if !has_providers
             && self.auth.keycloak_url.trim().is_empty()
@@ -6716,14 +6719,22 @@ partial_progress_batch = 5
     }
 
     #[test]
-    fn test_validate_missing_catalog_url() {
+    fn test_validate_accepts_missing_legacy_catalog_url() {
         let mut config = valid_config();
         config.catalog.catalog_url = String::new();
-        let err = config.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("catalog.catalog_url is required"),
-            "Expected catalog_url error, got: {err}"
-        );
+        assert!(config.validate().is_ok());
+        assert!(config.flattened_catalogs().is_empty());
+    }
+
+    #[test]
+    fn legacy_catalog_url_defaults_to_absent() {
+        #[derive(serde::Deserialize)]
+        struct Wrap {
+            catalog: CatalogConfig,
+        }
+
+        let parsed: Wrap = toml::from_str("[catalog]\n").expect("catalog URL is optional");
+        assert!(parsed.catalog.catalog_url.is_empty());
     }
 
     #[test]
