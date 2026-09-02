@@ -43,6 +43,24 @@ python3 scripts/glue-to-sidecar.py --root ~/.sqe/gluemirror
 SQE_CONFIG=quickstart/glue-readonly/sqe.toml sqe-server
 ```
 
+Or skip the `[mcp]` block entirely and use the flags, which set the same
+thing and force read-only:
+
+```bash
+sqe-server --config your.toml --mcp-anonymous --mcp-port 8098
+```
+
+`--mcp-anonymous` is refused when `[[auth.providers]]` configures an
+identity provider, and under `production_mode`. Those checks run on the
+resulting config, so a flag cannot get you past one the TOML equivalent
+would have failed.
+
+If a query comes back with `Error performing PUT
+http://169.254.169.254/latest/api/token`, the engine has no S3 credentials
+and is falling through to instance metadata. On a laptop that almost always
+means the SSO token expired: re-run `aws sso login`, then re-export the
+`SQE_STORAGE__*` variables from step 1.
+
 Tables resolve as `glue.<database>.<table>`.
 
 ```bash
