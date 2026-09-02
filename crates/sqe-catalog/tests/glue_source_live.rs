@@ -26,7 +26,7 @@ fn region() -> Option<String> {
 #[tokio::test]
 #[ignore = "needs live AWS credentials and a populated Glue catalog"]
 async fn lists_every_database_in_the_region() {
-    let src = GlueMetadataSource::from_env(region().as_deref(), None).await;
+    let src = GlueMetadataSource::from_env(region().as_deref(), None, Default::default()).await;
     let dbs = src.list_databases().await.expect("get_databases");
     assert!(
         dbs.len() > 1,
@@ -42,7 +42,7 @@ async fn a_table_maps_onto_a_manifest_the_provider_can_read() {
     let db = std::env::var("SQE_TEST_GLUE_DATABASE").unwrap_or_else(|_| "claude".to_string());
     let table = std::env::var("SQE_TEST_GLUE_TABLE").unwrap_or_else(|_| "user_usage".to_string());
 
-    let src = GlueMetadataSource::from_env(region().as_deref(), None).await;
+    let src = GlueMetadataSource::from_env(region().as_deref(), None, Default::default()).await;
 
     let tables = src.list_tables(&db).await.expect("get_tables");
     assert!(tables.contains(&table), "{db} has no {table}: {tables:?}");
@@ -108,7 +108,7 @@ async fn a_table_maps_onto_a_manifest_the_provider_can_read() {
 #[tokio::test]
 #[ignore = "needs live AWS credentials and a populated Glue catalog"]
 async fn projection_properties_survive_the_mapping() {
-    let src = GlueMetadataSource::from_env(region().as_deref(), None).await;
+    let src = GlueMetadataSource::from_env(region().as_deref(), None, Default::default()).await;
     let m = src
         .get("usage_data_raw", "sbp_cloud")
         .await
@@ -129,7 +129,7 @@ async fn projection_properties_survive_the_mapping() {
 #[tokio::test]
 #[ignore = "needs live AWS credentials and a populated Glue catalog"]
 async fn an_absent_table_is_not_found_rather_than_a_transport_error() {
-    let src = GlueMetadataSource::from_env(region().as_deref(), None).await;
+    let src = GlueMetadataSource::from_env(region().as_deref(), None, Default::default()).await;
     let err = src
         .get("claude", "no_such_table_ee7f21")
         .await

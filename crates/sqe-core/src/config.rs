@@ -2385,14 +2385,41 @@ pub struct StorageConfig {
 pub struct HiveRootConfig {
     /// SQL identifier the root is exposed as (`<name>.<database>.<table>`).
     pub name: String,
+    /// Where this root's table metadata comes from. `sidecar` (the default)
+    /// reads `_sqe/table.json` under `location`; `glue` reads the AWS Glue
+    /// Data Catalog and ignores `location` entirely.
+    #[serde(default)]
+    pub kind: HiveRootKind,
     /// Warehouse root location (`s3://bucket/prefix/`, a local path, ...).
+    /// Required for `sidecar`, unused for `glue`.
+    #[serde(default)]
     pub location: String,
+    /// `glue` only: the AWS region holding the catalog. Falls back to the
+    /// ambient AWS configuration when unset.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// `glue` only: another account's Glue `CatalogId`. `None` is the
+    /// caller's own account, which is what almost every deployment wants.
+    #[serde(default)]
+    pub catalog_id: Option<String>,
     /// Optional named secret (see `CREATE SECRET`) used when a manifest
     /// under this root does not name its own `sqe.secret`. Currently
     /// unused by `build_hive_root`/`session_hive_catalog`, which resolve a
     /// secret from the manifest itself; reserved for a root-level default.
     #[serde(default)]
     pub secret: Option<String>,
+}
+
+/// Where a `[[hive.roots]]` entry reads its table metadata.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HiveRootKind {
+    /// `_sqe/table.json` sidecars under the root location, written by SQE.
+    #[default]
+    Sidecar,
+    /// The AWS Glue Data Catalog, read live. SQE does not own it, so DDL
+    /// against this root is refused rather than silently dropped.
+    Glue,
 }
 
 fn default_hive_manifest_max_bytes() -> usize {

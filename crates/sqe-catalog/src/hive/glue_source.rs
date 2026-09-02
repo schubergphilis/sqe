@@ -62,17 +62,17 @@ impl GlueMetadataSource {
     /// chain the AWS CLI uses, so `AWS_PROFILE`, SSO, an instance profile and
     /// a task role all work, and credentials refresh rather than being
     /// captured once.
-    pub async fn from_env(region: Option<&str>, catalog_id: Option<String>) -> Self {
+    pub async fn from_env(
+        region: Option<&str>,
+        catalog_id: Option<String>,
+        limits: ManifestLimits,
+    ) -> Self {
         let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
         if let Some(region) = region.filter(|r| !r.is_empty()) {
             loader = loader.region(aws_config::Region::new(region.to_string()));
         }
         let conf = loader.load().await;
-        Self::new(
-            aws_sdk_glue::Client::new(&conf),
-            catalog_id,
-            ManifestLimits::default(),
-        )
+        Self::new(aws_sdk_glue::Client::new(&conf), catalog_id, limits)
     }
 }
 

@@ -43,6 +43,24 @@ struct Cli {
     /// Overrides `[mcp] port`.
     #[arg(long)]
     mcp_port: Option<u16>,
+
+    /// Attach the AWS Glue Data Catalog as a read-only Hive catalog under
+    /// this SQL name, so every Glue database in the region resolves as
+    /// `<name>.<database>.<table>`. Equivalent to a `[[hive.roots]]` entry
+    /// with `kind = "glue"`.
+    ///
+    /// Tables are resolved lazily on first reference, never enumerated up
+    /// front, so one unreadable table does not take the catalog down.
+    /// Credentials come from the AWS provider chain, and each table's
+    /// location is still gated by `[storage.tvf]`, which must name the
+    /// buckets the data lives in.
+    #[arg(long, value_name = "NAME")]
+    glue_catalog: Option<String>,
+
+    /// AWS region for `--glue-catalog`. Falls back to the ambient AWS
+    /// configuration when omitted.
+    #[arg(long, requires = "glue_catalog")]
+    glue_region: Option<String>,
 }
 
 #[derive(Clone, clap::ValueEnum)]
@@ -796,6 +814,19 @@ async fn async_main() -> anyhow::Result<()> {
              endpoint reads as one anonymous identity using the engine's storage credentials. \
              Use [mcp.auth] mode = \"static\" or \"oauth\" outside a trusted network."
         );
+    }
+
+    if let Some(name) = cli.glue_catalog.as_deref() {
+        // Appended rather than replacing, so the flag composes with any
+        // sidecar roots the config already declares.
+        config.hive.roots.push(sqe_core::config::HiveRootConfig {
+            name: name.to_string(),
+            kind: sqe_core::config::HiveRootKind::Glue,
+            location: String::new(),
+            region: cli.glue_region.clone(),
+            catalog_id: None,
+            secret: None,
+        });
     }
 
     let config = config;

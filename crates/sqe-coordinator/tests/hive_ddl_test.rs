@@ -600,7 +600,7 @@ async fn create_external_table_refused_when_hive_registries_are_not_wired() {
     .await
     .expect("build_hive_root");
     registry
-        .attach_hive_root("lake", store)
+        .attach_hive_root("lake", sqe_catalog::hive::source::HiveRoot::from_store(store))
         .expect("attach_hive_root");
 
     let mut config = minimal_config("http://localhost:59996");
