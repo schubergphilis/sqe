@@ -5527,6 +5527,12 @@ impl SqeConfig {
             "SQE_STORAGE__S3_SECRET_KEY",
             &mut self.storage.s3_secret_key,
         );
+        // Temporary credentials rotate, so the token belongs in the
+        // environment rather than in a config file that outlives it.
+        env_override_secret(
+            "SQE_STORAGE__S3_SESSION_TOKEN",
+            &mut self.storage.s3_session_token,
+        );
         env_override_bool(
             "SQE_STORAGE__S3_PATH_STYLE",
             &mut self.storage.s3_path_style,
