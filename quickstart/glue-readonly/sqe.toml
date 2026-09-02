@@ -30,6 +30,13 @@ catalog_url = "http://127.0.0.1:1/unused"
 client_id = "unused-no-idp"
 token_endpoint = "http://127.0.0.1:1/token"
 
+[metrics]
+# Who read which table. One JSON line per query, carrying the actor, the
+# fully-qualified resources the plan touched, the operation, timing and row
+# counts. Empty (the default) makes the audit logger a silent no-op, which
+# is easy to mistake for "SQE does not log table access".
+audit_log_path = "/tmp/sqe-audit.log"
+
 [storage]
 s3_region = "eu-central-1"
 
