@@ -13,6 +13,7 @@ pub mod projection;
 pub mod prune;
 pub mod provider;
 pub mod serde_map;
+pub mod source;
 pub mod stats;
 pub mod store;
 pub mod scan_exec;
