@@ -109,6 +109,43 @@ const MANIFEST_CACHE_CAPACITY: u64 = 16_384;
 /// rewrite has to happen before the file listing, not after.
 pub use super::manifest::HIVE_DEFAULT_PARTITION;
 
+/// The codec the table's data files are wrapped in, read off the first
+/// object under `prefix`.
+///
+/// Glue has no trustworthy field for this: `compressionType` is absent on
+/// most tables and reads "none" on every table that carries it, gzipped
+/// ones included. So the key suffix is the only signal, and one listing per
+/// manifest-cache miss is what it costs.
+///
+/// Falls back to `current` when the prefix is empty, unreachable, or the
+/// first object names no codec. A listing failure is not fatal here: the
+/// scan itself will surface it with a better message than this would.
+async fn detect_compression(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &object_store::path::Path,
+    current: datafusion::datasource::file_format::file_compression_type::FileCompressionType,
+) -> datafusion::datasource::file_format::file_compression_type::FileCompressionType {
+    let mut stream = store.list(Some(prefix));
+    loop {
+        match stream.try_next().await {
+            Ok(Some(meta)) => {
+                // Directory markers and the manifest sidecar say nothing
+                // about how the data is encoded.
+                let key = meta.location.as_ref();
+                if meta.size == 0 || key.ends_with('/') || key.contains("/_sqe/") {
+                    continue;
+                }
+                return super::serde_map::compression_from_key(key).unwrap_or(current);
+            }
+            Ok(None) => return current,
+            Err(e) => {
+                warn!(prefix = %prefix, error = %e, "hive_external: could not list files to detect compression; assuming uncompressed");
+                return current;
+            }
+        }
+    }
+}
+
 /// Builds an object store for a table's data location. The implementation
 /// holds the session's credentials; `secret` is a name resolved against the
 /// SecretStore, never material carried in a manifest.
@@ -1208,11 +1245,46 @@ impl SchemaProvider for HiveSchemaProvider {
         self.cache
             .insert_versioned(&self.database, name, manifest.clone(), etag);
 
-        let resolved = resolve_format(&manifest).map_err(to_df)?;
-        let file_schema = file_schema_of(&manifest).map_err(to_df)?;
-        let partition_cols = partition_columns_of(&manifest).map_err(to_df)?;
+        // A table this release cannot read is invisible, not fatal. Glue
+        // holds formats SQE has no reader for (ORC, Avro) and types it
+        // cannot map, and `information_schema.tables` calls this for every
+        // table in the catalog: erroring here means one unreadable table
+        // out of 692 takes down the whole listing, which is the same
+        // enumerate-and-fail shape that makes the Iceberg Glue provider
+        // useless against a Hive catalog. The reason is logged rather than
+        // discarded, and a direct `SELECT` on such a table reports it as
+        // not found, matching how a denied column is absent rather than an
+        // error.
+        let unreadable = |what: &str, e: HiveError| {
+            warn!(
+                database = %self.database, table = %name,
+                error = %e,
+                "hive_external: table hidden from this catalog: its {what} is not readable by \
+                 this release"
+            );
+        };
+        let mut resolved = match resolve_format(&manifest) {
+            Ok(r) => r,
+            Err(e) => {
+                unreadable("storage format", e);
+                return Ok(None);
+            }
+        };
+        let file_schema = match file_schema_of(&manifest) {
+            Ok(s) => s,
+            Err(e) => {
+                unreadable("column schema", e);
+                return Ok(None);
+            }
+        };
+        let partition_cols = match partition_columns_of(&manifest) {
+            Ok(p) => p,
+            Err(e) => {
+                unreadable("partition schema", e);
+                return Ok(None);
+            }
+        };
         let partition_names: Vec<String> = partition_cols.iter().map(|(n, _)| n.clone()).collect();
-        let options = listing_options(&resolved, partition_cols).map_err(to_df)?;
 
         let url = table_location_url(&manifest.storage_descriptor.location).map_err(to_df)?;
 
@@ -1240,8 +1312,21 @@ impl SchemaProvider for HiveSchemaProvider {
         // The session's own runtime, not a fresh one: `ListingTable`
         // resolves its object store from the session's registry at scan
         // time, so the store has to live where the query will look for it.
-        self.runtime
-            .register_object_store(url.as_ref(), Arc::clone(&data_store));
+        // Compression has to come from a real object key: Glue records
+        // nothing usable (`compressionType` is absent on most tables and
+        // says "none" on every table carrying it, gzipped ones included).
+        // One listing per manifest-cache miss, and only for the text
+        // formats, where guessing wrong feeds gzip bytes to a parser and
+        // fails as `Encountered unexpected ''` rather than as a codec
+        // problem.
+        if matches!(
+            resolved.kind,
+            super::serde_map::HiveFileFormat::Json | super::serde_map::HiveFileFormat::Csv
+        ) {
+            resolved.compression =
+                detect_compression(&data_store, url.prefix(), resolved.compression).await;
+        }
+        let options = listing_options(&resolved, partition_cols).map_err(to_df)?;
 
         let file_schema_ref = Arc::new(file_schema);
         let width_hint = row_width_hint(&file_schema_ref);
