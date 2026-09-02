@@ -1,40 +1,23 @@
-//! Placeholder for the Puffin-backed `StatisticsSource` consumer.
+//! Placeholder for a Puffin-backed DataFusion statistics consumer.
 //!
 //! Tasks 7.12-7.14 of the iceberg-matrix-parity Phase F deliver the CBO
 //! wiring that reads theta-sketch NDV estimates from the Puffin sidecar
 //! written by `crates/sqe-catalog/src/puffin_stats.rs`. The consumer side
-//! waits for DataFusion 54 where the `StatisticsSource` trait lands:
+//! DataFusion 55 now exposes two relevant building blocks, but neither is a
+//! drop-in consumer for Iceberg Puffin files:
 //!
-//! - Tracking issue: <https://github.com/apache/datafusion/issues/21157>
-//! - SQE constraint: the RisingWave iceberg-rust fork still pins DataFusion
-//!   52.1; SQE's DF 53 upgrade unblocks this once the fork rebases onto
-//!   `main`. See `docs/matrix-parity-tracking-issue.md` for the schedule.
+//! - `StatisticsRequest` is threaded through logical `TableScan` / `ScanArgs`,
+//!   but SQE still needs an optimizer rule that requests the statistics and an
+//!   Iceberg provider that reads the requested Puffin blobs.
+//! - `StatisticsRegistry` / `StatisticsProvider` propagate statistics through
+//!   physical operators. The registry is opt-in and affects join selection, so
+//!   it must be enabled only after plan and benchmark validation.
 //!
-//! ## Planned shape
-//!
-//! ```ignore
-//! pub struct PuffinStatisticsSource {
-//!     table: iceberg::table::Table,
-//!     cache: moka::sync::Cache<i64, Arc<FileMetadata>>,
-//! }
-//!
-//! #[async_trait]
-//! impl StatisticsSource for PuffinStatisticsSource {
-//!     async fn statistics(
-//!         &self,
-//!         snapshot_id: i64,
-//!     ) -> Result<Statistics, DataFusionError> {
-//!         // 1. Load the StatisticsFile entry for snapshot_id from
-//!         //    table.metadata().statistics()
-//!         // 2. Open the Puffin sidecar via table.file_io()
-//!         // 3. For each blob, read the `ndv` property
-//!         // 4. Build Statistics { num_rows, column_statistics: ColumnStatistics[] }
-//!     }
-//! }
-//! ```
-//!
-//! See also `crates/sqe-catalog/src/puffin_stats.rs` for the writer side of
-//! this round-trip.
+//! The implementation should load the snapshot's `StatisticsFile`, map blob
+//! field IDs to columns, expose NDV/min/max through an Iceberg statistics
+//! provider, add the matching request rule, and then validate join plans and
+//! benchmark suites before enabling the physical registry. See
+//! `crates/sqe-catalog/src/puffin_stats.rs` for the writer side.
 //
-// TODO(matrix-f): Phase F tasks 7.12-7.14 — implement PuffinStatisticsSource
-// once DataFusion 54 (apache/datafusion#21157) lands in the SQE toolchain.
+// TODO(matrix-f): Phase F tasks 7.12-7.14 — implement the StatisticsRequest
+// producer and Iceberg/Puffin provider, then benchmark StatisticsRegistry.
