@@ -713,14 +713,14 @@ pub async fn create_session_context(
             // expected, correct behaviour, not a bug, but it is easy to
             // misread this loop as re-registering every session's provider
             // on every DDL statement, which it does not.
-            for (name, store) in &hive_roots {
+            for (name, root) in &hive_roots {
                 let hive_caller = sqe_core::config::TvfCaller::for_user(
                     session.user.username.clone(),
                     session.user.roles.clone(),
                 );
-                let hive_provider = sqe_catalog::mount::session_hive_catalog(
+                let hive_provider = sqe_catalog::mount::session_hive_catalog_from_source(
                     name,
-                    Arc::clone(store),
+                    root.source(),
                     &global_storage,
                     secrets,
                     hive_caller,

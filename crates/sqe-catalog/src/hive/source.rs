@@ -28,6 +28,8 @@
 //! 692-table catalog cannot be loaded. A real catalog always contains a
 //! table this engine cannot read; the rest must stay queryable.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use super::manifest::{HiveManifest, ManifestLimits};
@@ -82,5 +84,47 @@ impl HiveMetadataSource for HiveManifestStore {
 
     fn limits(&self) -> &ManifestLimits {
         HiveManifestStore::limits(self)
+    }
+}
+
+/// One attached Hive root: where its table metadata comes from, plus the
+/// sidecar store behind it when SQE owns one.
+///
+/// The pair exists because reads and DDL want different things. Reads only
+/// ever need [`HiveMetadataSource`]. `CREATE EXTERNAL TABLE` and `DROP
+/// TABLE` need a store they can write, which a root over someone else's
+/// metastore does not have, so `sidecar` is `None` there and the DDL path
+/// refuses by name rather than appearing to succeed.
+#[derive(Clone)]
+pub struct HiveRoot {
+    source: Arc<dyn HiveMetadataSource>,
+    sidecar: Option<Arc<HiveManifestStore>>,
+}
+
+impl HiveRoot {
+    /// A root over a sidecar warehouse SQE owns: readable and writable.
+    pub fn from_store(store: Arc<HiveManifestStore>) -> Self {
+        Self {
+            source: Arc::clone(&store) as Arc<dyn HiveMetadataSource>,
+            sidecar: Some(store),
+        }
+    }
+
+    /// A root over a metastore SQE does not own: readable only.
+    pub fn from_source(source: Arc<dyn HiveMetadataSource>) -> Self {
+        Self {
+            source,
+            sidecar: None,
+        }
+    }
+
+    pub fn source(&self) -> Arc<dyn HiveMetadataSource> {
+        Arc::clone(&self.source)
+    }
+
+    /// The writable sidecar store, or `None` when this root reads an
+    /// external metastore.
+    pub fn sidecar(&self) -> Option<Arc<HiveManifestStore>> {
+        self.sidecar.clone()
     }
 }
