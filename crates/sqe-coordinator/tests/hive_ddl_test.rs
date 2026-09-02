@@ -375,6 +375,83 @@ async fn handler_with_root_and_policy(catalog: &str, store: Arc<InMemoryPolicySt
 // Tests
 // ---------------------------------------------------------------------------
 
+/// A Hive/Glue-only deployment must not need a fake REST catalog merely to
+/// build DataFusion's information schema. This is the regression the optional
+/// legacy `catalog_url` is for: the query below used to probe `/v1/config` on
+/// an operator-supplied dead anchor before it could enumerate `lake`.
+#[test]
+fn information_schema_tables_works_without_an_iceberg_anchor() {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(1)
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()
+        .expect("test runtime")
+        .block_on(async {
+            tokio::spawn(information_schema_tables_without_anchor_inner())
+                .await
+                .expect("test task")
+        });
+}
+
+async fn information_schema_tables_without_anchor_inner() {
+    let root_dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = root_dir.path().join("data");
+    write_csv_fixture(&data_dir);
+
+    let config = minimal_config("");
+    assert!(config.flattened_catalogs().is_empty());
+    let tracker = Arc::new(QueryTracker::new(&config.query_history));
+    let handler = QueryHandler::new(
+        Arc::new(PassthroughEnforcer),
+        None,
+        config,
+        None,
+        None,
+        None,
+        None,
+        tracker,
+        None,
+        None,
+        None,
+        RuntimeCatalogRegistry::new(),
+        SecretStore::new(),
+    )
+    .expect("QueryHandler::new")
+    .with_hive_registries(Arc::new(HiveCatalogs::new()), Arc::new(HiveMetadataCache::new()));
+    let session = dummy_session();
+
+    handler
+        .execute(
+            &session,
+            &format!(
+                "ATTACH 'file://{}/wh' AS lake (TYPE hive_external)",
+                root_dir.path().display()
+            ),
+            None,
+        )
+        .await
+        .expect("attach Hive root");
+    handler
+        .execute(&session, &create_orders_ddl(&data_dir, "lake"), None)
+        .await
+        .expect("create fixture table");
+
+    let batches = handler
+        .execute(
+            &session,
+            "SELECT table_catalog, table_schema, table_name \
+             FROM information_schema.tables \
+             WHERE table_catalog = 'lake' AND table_schema = 'sales' \
+             AND table_name = 'orders'",
+            None,
+        )
+        .await
+        .expect("information_schema must not need an Iceberg anchor");
+    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(rows, 1);
+}
+
 /// One case per row of the spec's statement dispatch table (minus MSCK/SHOW
 /// PARTITIONS, see the module doc). Every rejection must name `hive_external`
 /// and, when a cycle is planned, that exact cycle -- checked as `"cycle {n}"`,
