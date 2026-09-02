@@ -100,12 +100,13 @@ Apache cut **v0.10.1** on 2026-08-01. It does not replace this fork and is not
 a de-vendoring path: the release has no rewrite/overwrite transaction actions,
 `PositionDeleteFileWriter`, `DeletionVectorWriter`, or `expr::dynamic`, while
 its DataFusion dependency is older than SQE's DataFusion 55. Apache `main` now
-has position- and equality-delete writers, but still lacks the transaction
-actions, deletion-vector writer, dynamic predicate API, and SQE's decode,
-fetch-ahead, and SBBF scan patches. PRs #2185 and #2203 remain open and
-conflicted. Its MSRV also exceeds SQE's current workspace MSRV. Use v0.10.1 as
-the released audit baseline and evaluate focused fixes rather than merging
-Apache `main` wholesale.
+has an equality-delete writer, but still lacks `PositionDeleteFileWriter`, the
+transaction actions, deletion-vector writer, dynamic predicate API, and SQE's
+decode, fetch-ahead, and SBBF scan patches. (Its writer module documentation
+mentions `PositionDeleteFileWriter`, but no implementation exists.) PRs #2185
+and #2203 remain open and conflicted. Its MSRV also exceeds SQE's current
+workspace MSRV. Use v0.10.1 as the released audit baseline and evaluate focused
+fixes rather than merging Apache `main` wholesale.
 
 ## DataFusion 55 / Arrow 59 readiness (probed 2026-08-24)
 
