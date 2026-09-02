@@ -27,6 +27,22 @@ struct Cli {
     /// Server mode (overrides SQE_MODE env var and config file)
     #[arg(short, long, value_enum, default_value = "coordinator")]
     mode: CliMode,
+
+    /// Serve `/mcp` with NO authentication: every caller is one anonymous
+    /// identity reading with the engine's own storage credentials. For a
+    /// laptop or a trusted network, never a shared environment.
+    ///
+    /// Equivalent to `[mcp] enabled = true` plus `[mcp.auth] mode =
+    /// "anonymous"`, and forces `allow_writes = false`. The usual refusals
+    /// still apply: anonymous is rejected when `[[auth.providers]]`
+    /// configures an identity provider, and under `production_mode`.
+    #[arg(long)]
+    mcp_anonymous: bool,
+
+    /// Port for `/mcp`. Zero mounts it on the existing web listener.
+    /// Overrides `[mcp] port`.
+    #[arg(long)]
+    mcp_port: Option<u16>,
 }
 
 #[derive(Clone, clap::ValueEnum)]
@@ -745,8 +761,36 @@ async fn async_main() -> anyhow::Result<()> {
         .or_else(|| std::env::var("SQE_CONFIG").ok())
         .unwrap_or_else(|| "sqe.toml".to_string());
 
-    let config = SqeConfig::load(&config_path)
+    let mut config = SqeConfig::load(&config_path)
         .map_err(|e| anyhow::anyhow!("Failed to load config from {config_path}: {e}"))?;
+
+    // CLI overrides land before `validate`, so a flag cannot talk the
+    // engine past a check the TOML equivalent would have failed.
+    if let Some(port) = cli.mcp_port {
+        config.mcp.port = port;
+        config.mcp.enabled = true;
+    }
+    if cli.mcp_anonymous {
+        config.mcp.enabled = true;
+        config.mcp.auth.mode = sqe_core::config::McpAuthMode::Anonymous;
+        // Anonymous plus writes is refused by `validate` anyway; clearing it
+        // here means `--mcp-anonymous` against a config that enabled writes
+        // starts read-only rather than failing to start.
+        config.mcp.allow_writes = false;
+        // `resource_uri` is required whenever MCP listens on its own port.
+        // A flag-only invocation has no config to carry one, so derive the
+        // loopback URL the caller will actually use.
+        if config.mcp.resource_uri.trim().is_empty() && config.mcp.port != 0 {
+            config.mcp.resource_uri = format!("http://127.0.0.1:{}/mcp", config.mcp.port);
+        }
+        tracing::warn!(
+            "WARNING: MCP is UNAUTHENTICATED (--mcp-anonymous). Every caller reaching the \
+             endpoint reads as one anonymous identity using the engine's storage credentials. \
+             Use [mcp.auth] mode = \"static\" or \"oauth\" outside a trusted network."
+        );
+    }
+
+    let config = config;
     config.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Security warnings for production readiness
