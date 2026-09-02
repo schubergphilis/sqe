@@ -7,6 +7,8 @@
 //! mapping rather than a redesign.
 
 pub mod ddl_render;
+#[cfg(feature = "glue")]
+pub mod glue_source;
 pub mod manifest;
 pub mod partition;
 pub mod projection;
