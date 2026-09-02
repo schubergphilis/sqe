@@ -86,7 +86,9 @@ AWS_REGION=eu-central-1 sqe-cli --embedded --memory \
 
 ## What works, and what does not
 
-Verified against a live catalog of 692 Glue tables:
+Verified against a live catalog of 692 Glue tables, through an
+unauthenticated MCP endpoint (`--mcp-anonymous`) and through the embedded
+engine:
 
 - Plain Parquet and CSV tables.
 - **Extensionless Parquet** (Athena CTAS output, 356 tables here). The file
