@@ -84,6 +84,38 @@ AWS_REGION=eu-central-1 sqe-cli --embedded --memory \
   -e "SELECT count(*) FROM glue.app_db_dotcomregistration.customer"
 ```
 
+## Who read what
+
+`[metrics] audit_log_path` writes one JSON line per query naming the actor,
+the fully-qualified tables the plan touched, the operation, timing and row
+counts. It is empty by default, which makes the audit logger a silent
+no-op and is easy to mistake for "SQE does not log table access".
+
+```json
+{"time":"2026-09-02T07:45:06Z","kind":"query","actor":{"username":"mcp-anonymous"},
+ "status":"success",
+ "resources":[{"catalog":"glue","namespace":["claude"],"name":"user_usage",
+               "object_type":"table"}],
+ "policy":{"row_filters_applied":0,"denied":false},
+ "timing":{"duration_ms":844},
+ "query":{"text":"SELECT count(*) ...","statement_type":"query"},
+ "integrity":{"seq":0,"prev_hash":"000...","hash":"4fbf..."}}
+```
+
+`kind` separates `query` from `grant`, `admin_ddl`, `auth`, `session` and
+`policy_decision`; `query.statement_type` distinguishes read from write
+within a query. `resources` is resolved from the logical plan, so it lists
+the base tables actually scanned, including through a view. The `integrity`
+chain hashes each line against its predecessor, so a deleted line is
+detectable.
+
+Under `--mcp-anonymous` every caller logs as `mcp-anonymous`, which is the
+honest consequence of anonymous mode: the trail shows what was read but not
+by whom. Static or OAuth mode puts a real principal in `actor`.
+
+Set `[metrics.audit] format = "ocsf"` for OCSF instead of the native shape,
+and `[metrics.audit_export]` to ship to an OTLP collector.
+
 ## What works, and what does not
 
 Verified against a live catalog of 692 Glue tables, through an
@@ -111,5 +143,16 @@ Known gaps, in the order they will bite:
   `presto_view`.
 - `list_schemas` over MCP does not see Hive roots. Query through
   `execute_sql_readonly` instead.
+- **`describe_table` and `information_schema.tables` fail**, because they
+  enumerate every catalog including the deliberately-unreachable Iceberg
+  anchor at `catalog_url`. Repeated attempts trip a 30-second circuit
+  breaker that then blocks working queries too. Use `list_tables`, or
+  `SELECT * ... LIMIT 1`, for column discovery.
+- **The mirror goes stale.** Snapshot-style tables rotate their directory
+  daily: a table reading 72,946 rows one day returns 0 the next, because
+  Glue now points at `20260902-<uuid>/` while the mirror still names
+  `20260901-<uuid>/` and that prefix has been deleted. Zero rows is also
+  what a genuinely-missing prefix looks like, so re-run the mirror before
+  concluding a table is empty. Cron it.
 - ORC, Avro, SequenceFile and RCFile are rejected by name. None appear in
   this catalog; Avro is the cheapest to add.
