@@ -769,6 +769,14 @@ async fn async_main() -> anyhow::Result<()> {
     if let Some(port) = cli.mcp_port {
         config.mcp.port = port;
         config.mcp.enabled = true;
+        // A loopback `resource_uri` from the config names the port the config
+        // chose, so overriding the port leaves it pointing at a listener that
+        // no longer exists. Public URLs are left alone: behind a proxy the
+        // resource identifier is deliberately not the local port.
+        let uri = config.mcp.resource_uri.trim().to_string();
+        if uri.contains("127.0.0.1") || uri.contains("localhost") || uri.contains("[::1]") {
+            config.mcp.resource_uri = format!("http://127.0.0.1:{port}/mcp");
+        }
     }
     if cli.mcp_anonymous {
         config.mcp.enabled = true;
