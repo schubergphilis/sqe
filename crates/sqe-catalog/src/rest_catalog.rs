@@ -34,17 +34,30 @@ static SHARED_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
 static USER_CIRCUIT_BREAKERS: std::sync::LazyLock<DashMap<String, Arc<CircuitBreaker>>> =
     std::sync::LazyLock::new(DashMap::new);
 
-fn user_circuit_breaker(token_fingerprint: &str) -> Arc<CircuitBreaker> {
-    if let Some(existing) = USER_CIRCUIT_BREAKERS.get(token_fingerprint) {
+/// One breaker per (user, catalog), never per user alone.
+///
+/// Keying on the token by itself let one unreachable catalog take out every
+/// other catalog the same user could reach: five failed calls to a dead
+/// endpoint opened the circuit, and the next 30 seconds of calls to healthy
+/// catalogs were refused with `CircuitBreakerOpen` before leaving the
+/// process. `information_schema.tables` and `describe_table` walk every
+/// attached catalog, so they tripped it on their own and then blocked the
+/// queries that had been working a second earlier.
+///
+/// A breaker exists to stop hammering an upstream that is down. That
+/// argument is per upstream, so the key is too.
+fn user_circuit_breaker(token_fingerprint: &str, catalog: &str) -> Arc<CircuitBreaker> {
+    let key = format!("{token_fingerprint}|{catalog}");
+    if let Some(existing) = USER_CIRCUIT_BREAKERS.get(&key) {
         return Arc::clone(existing.value());
     }
     let cb = Arc::new(CircuitBreaker::new(
-        format!("polaris-user-{token_fingerprint}"),
+        format!("polaris-user-{token_fingerprint}-{catalog}"),
         5,
         std::time::Duration::from_secs(30),
     ));
     USER_CIRCUIT_BREAKERS
-        .entry(token_fingerprint.to_string())
+        .entry(key)
         .or_insert_with(|| Arc::clone(&cb))
         .clone()
 }
@@ -847,7 +860,7 @@ impl SessionCatalog {
         // per process, mirroring the ClientCredentials warning in sqe-auth.
         warn_shared_backend_identity_once(backend);
 
-        let circuit_breaker = user_circuit_breaker(&token_fingerprint);
+        let circuit_breaker = user_circuit_breaker(&token_fingerprint, &catalog.warehouse);
         Ok(Self {
             inner: CatalogHandle::Other(inner),
             catalog_url: String::new(),
@@ -1105,7 +1118,7 @@ impl SessionCatalog {
 
         let http_client = http_client.unwrap_or_else(|| SHARED_HTTP_CLIENT.clone());
         let circuit_breaker =
-            circuit_breaker.unwrap_or_else(|| user_circuit_breaker(&token_fingerprint));
+            circuit_breaker.unwrap_or_else(|| user_circuit_breaker(&token_fingerprint, catalog_url));
 
         // Use the shared global cache when provided; fall back to a private
         // per-session cache (disabled — max_capacity 0) so that call sites that
