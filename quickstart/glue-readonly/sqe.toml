@@ -38,6 +38,12 @@ token_endpoint = "http://127.0.0.1:1/token"
 audit_log_path = "/tmp/sqe-audit.log"
 
 [storage]
+# Credentials are left unset on purpose. Precedence is `[storage]` here,
+# then SQE_STORAGE__S3_*, then the standard AWS_ACCESS_KEY_ID /
+# AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN, and finally object_store's own
+# chain (EC2 instance profile, ECS task role, EKS web identity). AWS_PROFILE
+# and the SSO cache are not resolved directly: export them first with
+# `aws configure export-credentials --format env`.
 s3_region = "eu-central-1"
 
 [storage.tvf]

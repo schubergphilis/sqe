@@ -5287,6 +5287,63 @@ impl SqeConfig {
 
     /// Apply environment variable overrides. Convention: `SQE_<SECTION>__<FIELD>`.
     /// E.g. `SQE_AUTH__KEYCLOAK_URL=https://...` overrides `auth.keycloak_url`.
+    /// Fill S3 settings the operator did not set from the AWS-standard
+    /// variables, so `eval "$(aws configure export-credentials --format env)"`
+    /// works against the server the same way it already works against
+    /// `sqe-cli --embedded`.
+    ///
+    /// Consulted only where the SQE-specific setting is still empty, so
+    /// `[storage]` in TOML and `SQE_STORAGE__*` both keep winning. Anything
+    /// left empty after this still falls through to `object_store`'s own
+    /// chain, which covers an EC2 instance profile, an ECS task role, and
+    /// EKS web identity. `AWS_PROFILE` and the SSO cache are NOT covered:
+    /// resolving those needs the AWS SDK's credential provider, which also
+    /// brings refresh, and temporary credentials taken as static strings
+    /// here expire without renewing. Export them first, or feed the server
+    /// a role it can assume.
+    fn apply_aws_env_fallbacks(&mut self) {
+        let non_empty = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+
+        // Credentials move as a set. Pairing a configured access key with an
+        // ambient session token from some other identity produces a signature
+        // failure that names neither, so only adopt the environment's
+        // credentials when none are configured at all.
+        if self.storage.s3_access_key.is_empty() && self.storage.s3_secret_key.expose().is_empty() {
+            if let (Some(access), Some(secret)) = (
+                non_empty("AWS_ACCESS_KEY_ID"),
+                non_empty("AWS_SECRET_ACCESS_KEY"),
+            ) {
+                self.storage.s3_access_key = access;
+                self.storage.s3_secret_key = SecretString::new(secret);
+                if let Some(token) = non_empty("AWS_SESSION_TOKEN") {
+                    self.storage.s3_session_token = SecretString::new(token);
+                }
+            }
+        }
+
+        if self.storage.s3_region.is_empty() {
+            if let Some(region) = non_empty("AWS_REGION").or_else(|| non_empty("AWS_DEFAULT_REGION"))
+            {
+                self.storage.s3_region = region;
+            }
+        }
+
+        // `AWS_ENDPOINT_URL_S3` is the service-specific spelling and wins over
+        // the all-services one, matching the AWS SDKs and `sqe-cli`.
+        if self.storage.s3_endpoint.is_empty() {
+            if let Some(endpoint) =
+                non_empty("AWS_ENDPOINT_URL_S3").or_else(|| non_empty("AWS_ENDPOINT_URL"))
+            {
+                self.storage.s3_endpoint = endpoint;
+            }
+        }
+    }
+
     fn apply_env_overrides(&mut self) {
         // Coordinator
         env_override_u16(
@@ -5533,6 +5590,7 @@ impl SqeConfig {
             "SQE_STORAGE__S3_SESSION_TOKEN",
             &mut self.storage.s3_session_token,
         );
+        self.apply_aws_env_fallbacks();
         env_override_bool(
             "SQE_STORAGE__S3_PATH_STYLE",
             &mut self.storage.s3_path_style,
@@ -7215,6 +7273,117 @@ partial_progress_batch = 5
 
         std::env::remove_var("SQE_MCP__ALLOW_WRITES");
         std::env::remove_var("SQE_MCP__RESOURCE_URI");
+    }
+
+    /// Clear every variable these tests read, so one leaking from the
+    /// surrounding process cannot decide the result.
+    fn clear_aws_env() {
+        for k in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+            "AWS_ENDPOINT_URL",
+            "AWS_ENDPOINT_URL_S3",
+            "SQE_STORAGE__S3_ACCESS_KEY",
+            "SQE_STORAGE__S3_SECRET_KEY",
+            "SQE_STORAGE__S3_SESSION_TOKEN",
+            "SQE_STORAGE__S3_REGION",
+            "SQE_STORAGE__S3_ENDPOINT",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    fn aws_env_credentials_are_adopted_when_nothing_else_is_set() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_aws_env();
+        std::env::set_var("AWS_ACCESS_KEY_ID", "ASIAFROMENV");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-from-env");
+        std::env::set_var("AWS_SESSION_TOKEN", "token-from-env");
+        std::env::set_var("AWS_REGION", "eu-central-1");
+
+        let mut config = valid_config();
+        config.apply_env_overrides();
+
+        assert_eq!(config.storage.s3_access_key, "ASIAFROMENV");
+        assert_eq!(config.storage.s3_secret_key.expose(), "secret-from-env");
+        assert_eq!(config.storage.s3_session_token.expose(), "token-from-env");
+        assert_eq!(config.storage.s3_region, "eu-central-1");
+        clear_aws_env();
+    }
+
+    #[test]
+    fn sqe_storage_settings_win_over_the_aws_ones() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_aws_env();
+        std::env::set_var("SQE_STORAGE__S3_ACCESS_KEY", "from-sqe");
+        std::env::set_var("SQE_STORAGE__S3_SECRET_KEY", "sqe-secret");
+        std::env::set_var("SQE_STORAGE__S3_REGION", "us-east-1");
+        std::env::set_var("AWS_ACCESS_KEY_ID", "from-aws");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "aws-secret");
+        std::env::set_var("AWS_REGION", "eu-central-1");
+
+        let mut config = valid_config();
+        config.apply_env_overrides();
+
+        assert_eq!(config.storage.s3_access_key, "from-sqe");
+        assert_eq!(config.storage.s3_secret_key.expose(), "sqe-secret");
+        assert_eq!(config.storage.s3_region, "us-east-1");
+        clear_aws_env();
+    }
+
+    /// Adopting the environment's token alongside a configured key would sign
+    /// with two halves of different identities and fail naming neither.
+    #[test]
+    fn a_configured_key_is_never_paired_with_an_ambient_token() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_aws_env();
+        std::env::set_var("AWS_ACCESS_KEY_ID", "from-aws");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "aws-secret");
+        std::env::set_var("AWS_SESSION_TOKEN", "aws-token");
+
+        let mut config = valid_config();
+        config.storage.s3_access_key = "configured".to_string();
+        config.storage.s3_secret_key = SecretString::new("configured-secret".to_string());
+        config.apply_env_overrides();
+
+        assert_eq!(config.storage.s3_access_key, "configured");
+        assert!(
+            config.storage.s3_session_token.expose().is_empty(),
+            "an ambient token must not attach to a configured key"
+        );
+        clear_aws_env();
+    }
+
+    #[test]
+    fn no_aws_env_leaves_credentials_empty_for_the_provider_chain() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_aws_env();
+
+        let mut config = valid_config();
+        config.apply_env_overrides();
+
+        // Empty is meaningful: object_store then uses its own chain, which
+        // is how an EC2 instance profile or ECS task role reaches the engine.
+        assert!(config.storage.s3_access_key.is_empty());
+        assert!(config.storage.s3_secret_key.expose().is_empty());
+    }
+
+    #[test]
+    fn the_s3_specific_endpoint_variable_wins() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_aws_env();
+        std::env::set_var("AWS_ENDPOINT_URL", "http://generic:9000");
+        std::env::set_var("AWS_ENDPOINT_URL_S3", "http://s3-specific:9000");
+
+        let mut config = valid_config();
+        config.apply_env_overrides();
+
+        assert_eq!(config.storage.s3_endpoint, "http://s3-specific:9000");
+        clear_aws_env();
     }
 
     #[test]

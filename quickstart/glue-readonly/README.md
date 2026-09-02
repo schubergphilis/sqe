@@ -26,12 +26,9 @@ The mirror is a snapshot. Re-run the script to pick up Glue changes.
 ## Run it
 
 ```bash
-# 1. Credentials. The server reads SQE_STORAGE__* , not AWS_* .
+# 1. Credentials. The standard AWS variables are enough.
 eval "$(aws configure export-credentials --format env)"
 export AWS_REGION=eu-central-1
-export SQE_STORAGE__S3_ACCESS_KEY="$AWS_ACCESS_KEY_ID"
-export SQE_STORAGE__S3_SECRET_KEY="$AWS_SECRET_ACCESS_KEY"
-export SQE_STORAGE__S3_SESSION_TOKEN="$AWS_SESSION_TOKEN"
 
 # 2. Mirror the catalog (~610 tables, a couple of minutes).
 python3 scripts/glue-to-sidecar.py --root ~/.sqe/gluemirror
@@ -59,7 +56,8 @@ If a query comes back with `Error performing PUT
 http://169.254.169.254/latest/api/token`, the engine has no S3 credentials
 and is falling through to instance metadata. On a laptop that almost always
 means the SSO token expired: re-run `aws sso login`, then re-export the
-`SQE_STORAGE__*` variables from step 1.
+credentials from step 1. Temporary credentials are read once at startup and
+never refreshed, so a long-running server needs a restart after renewal.
 
 Tables resolve as `glue.<database>.<table>`.
 
