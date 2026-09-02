@@ -12,11 +12,12 @@ fork retirement, and feature adoption rather than another dependency bump.
 
 The RisingWave iceberg-rust fork cannot be retired. Apache v0.10.1 lacks SQE's
 required rewrite/overwrite transaction actions, position-delete writer,
-deletion-vector writer, and dynamic predicates. Apache `main` has since gained
-position- and equality-delete writers, but still lacks the transaction actions,
-deletion-vector writer, dynamic predicates, and SQE scan extensions. It also
-targets an older DataFusion release. Upstream OverwriteAction PR #2185 and
-RowDelta PR #2203 remain open and conflicted.
+deletion-vector writer, and dynamic predicates. Apache `main` has an equality-
+delete writer, but still lacks `PositionDeleteFileWriter`, the transaction
+actions, deletion-vector writer, dynamic predicates, and SQE scan extensions.
+(A module-level comment mentions `PositionDeleteFileWriter`, but there is no
+implementation.) It also targets an older DataFusion release. Upstream
+OverwriteAction PR #2185 and RowDelta PR #2203 remain open and conflicted.
 
 ## Existing workarounds
 
@@ -71,3 +72,27 @@ Ranked follow-ups:
 5. Revisit native `MERGE INTO` hooks only as a longer-term simplification.
    They do not replace Iceberg transactions, authorization, or SQE write
    routing today.
+
+## Apache `main` follow-up (2026-09-02)
+
+Apache `main` was refreshed at `a18a0b2`, 162 commits after v0.10.1. None of
+SQE's runtime patches can be deleted while the vendor tree remains based on
+the RisingWave branch. A future Apache-main rebase would absorb the six
+recorded Apache cherry-picks, the `CatalogBuilder::with_storage_factory` shim,
+and the REST header-precedence fix (the new REST auth path posts OAuth forms
+without merging catalog headers and forces form content type). It would not
+absorb SQE's loader feature gates/`Sync` bound, current-schema projection,
+SigV4 support, strict-metrics residual elimination, dynamic predicates,
+decode gate, SBBF probing, or fetch-ahead pipeline.
+
+High-priority Apache-main fixes missing from the vendor snapshot are:
+
+- #2781: preserve null data rows for non-null equality-delete values;
+- #2797: reject a missing required field with no initial default;
+- #2859: avoid a lost-wakeup hang in positional-delete loading;
+- #2509: de-duplicate file paths inside one FastAppend batch;
+- #3062: propagate SQL-catalog transaction commit failures.
+
+These are focused backport candidates. They improve correctness but do not
+remove any SQE integration layer. Performance candidates after those include
+#3015 (buffer positional-delete runs) and #3080 (constant column construction).
