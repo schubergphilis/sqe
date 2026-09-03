@@ -248,7 +248,20 @@ pub async fn create_session_context(
                 .into_iter()
                 .map(|(n, c)| (n, c.clone()))
                 .collect();
-            let catalog_name = config.resolve_default_catalog();
+            // Do not implicitly promote a Hive root here. Policy routing sees
+            // the catalog only on fully-qualified references, so making Hive
+            // the default would let two-part references take the Iceberg
+            // policy branch (see `attach_configured_hive_roots`).
+            let catalog_name = if flattened.is_empty() {
+                config
+                    .query
+                    .default_catalog
+                    .clone()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| "datafusion".to_string())
+            } else {
+                config.resolve_default_catalog()
+            };
 
             // --- Session catalog/schema resolution (Trino X-Trino-Catalog /
             //     X-Trino-Schema) ---
@@ -554,11 +567,12 @@ pub async fn create_session_context(
             // for queries flows through DataFusion's CatalogProvider
             // registration above; this is purely the legacy
             // bookkeeping handle.
-            let session_catalog = primary_session_catalog.ok_or_else(|| {
-                Arc::new(SqeError::Config(
-                    "no catalogs configured; populate `[catalog]` or `[catalogs.*]`".into(),
+            let session_catalog = primary_session_catalog.unwrap_or_else(|| {
+                Arc::new(SessionCatalog::unconfigured(
+                    &global_storage,
+                    table_cache.cloned(),
                 ))
-            })?;
+            });
             let session_catalog_for_return = session_catalog.clone();
 
             // The SessionCatalog bound to the session's *effective* default
@@ -713,14 +727,14 @@ pub async fn create_session_context(
             // expected, correct behaviour, not a bug, but it is easy to
             // misread this loop as re-registering every session's provider
             // on every DDL statement, which it does not.
-            for (name, store) in &hive_roots {
+            for (name, root) in &hive_roots {
                 let hive_caller = sqe_core::config::TvfCaller::for_user(
                     session.user.username.clone(),
                     session.user.roles.clone(),
                 );
-                let hive_provider = sqe_catalog::mount::session_hive_catalog(
+                let hive_provider = sqe_catalog::mount::session_hive_catalog_from_source(
                     name,
-                    Arc::clone(store),
+                    root.source(),
                     &global_storage,
                     secrets,
                     hive_caller,

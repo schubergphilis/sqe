@@ -2113,7 +2113,7 @@ pub struct CatalogConfig {
     ///
     /// Old configs that used `polaris_url` continue to deserialize
     /// thanks to the serde alias.
-    #[serde(alias = "polaris_url")]
+    #[serde(default, alias = "polaris_url")]
     pub catalog_url: String,
     #[serde(default)]
     pub warehouse: String,
@@ -2385,14 +2385,41 @@ pub struct StorageConfig {
 pub struct HiveRootConfig {
     /// SQL identifier the root is exposed as (`<name>.<database>.<table>`).
     pub name: String,
+    /// Where this root's table metadata comes from. `sidecar` (the default)
+    /// reads `_sqe/table.json` under `location`; `glue` reads the AWS Glue
+    /// Data Catalog and ignores `location` entirely.
+    #[serde(default)]
+    pub kind: HiveRootKind,
     /// Warehouse root location (`s3://bucket/prefix/`, a local path, ...).
+    /// Required for `sidecar`, unused for `glue`.
+    #[serde(default)]
     pub location: String,
+    /// `glue` only: the AWS region holding the catalog. Falls back to the
+    /// ambient AWS configuration when unset.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// `glue` only: another account's Glue `CatalogId`. `None` is the
+    /// caller's own account, which is what almost every deployment wants.
+    #[serde(default)]
+    pub catalog_id: Option<String>,
     /// Optional named secret (see `CREATE SECRET`) used when a manifest
     /// under this root does not name its own `sqe.secret`. Currently
     /// unused by `build_hive_root`/`session_hive_catalog`, which resolve a
     /// secret from the manifest itself; reserved for a root-level default.
     #[serde(default)]
     pub secret: Option<String>,
+}
+
+/// Where a `[[hive.roots]]` entry reads its table metadata.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HiveRootKind {
+    /// `_sqe/table.json` sidecars under the root location, written by SQE.
+    #[default]
+    Sidecar,
+    /// The AWS Glue Data Catalog, read live. SQE does not own it, so DDL
+    /// against this root is refused rather than silently dropped.
+    Glue,
 }
 
 fn default_hive_manifest_max_bytes() -> usize {
@@ -4518,7 +4545,9 @@ impl SqeConfig {
     ///
     /// Practical outcomes:
     /// - Legacy single-catalog config: returns one entry,
-    ///   `("iceberg", &self.catalog)`.
+    ///   `("iceberg", &self.catalog)`. An empty REST `catalog_url` means the
+    ///   legacy Iceberg catalog is not configured and returns no entry; this is
+    ///   the normal shape of a Glue/Hive-only deployment.
     /// - Pure new-style config (only `[catalogs.*]` set, no
     ///   `default_catalog`): returns the named catalogs sorted by
     ///   name. The legacy `[catalog]` block exists in the struct but
@@ -4532,7 +4561,9 @@ impl SqeConfig {
     /// so the caller doesn't pay clone cost during dispatch.
     pub fn flattened_catalogs(&self) -> Vec<(String, &CatalogConfig)> {
         if self.catalogs.is_empty() {
-            return vec![(Self::LEGACY_CATALOG_NAME.to_string(), &self.catalog)];
+            return catalog_is_configured(&self.catalog)
+                .then(|| vec![(Self::LEGACY_CATALOG_NAME.to_string(), &self.catalog)])
+                .unwrap_or_default();
         }
         let mut out: Vec<(String, &CatalogConfig)> =
             self.catalogs.iter().map(|(k, v)| (k.clone(), v)).collect();
@@ -4553,7 +4584,9 @@ impl SqeConfig {
             // legacy block wins (operator set it explicitly; that's
             // an opt-in to use the legacy block as that name).
             out.retain(|(n, _)| n != name);
-            out.push((name.to_string(), &self.catalog));
+            if catalog_is_configured(&self.catalog) {
+                out.push((name.to_string(), &self.catalog));
+            }
             out.sort_by(|a, b| a.0.cmp(&b.0));
         }
         out
@@ -4564,8 +4597,9 @@ impl SqeConfig {
     /// 1. `query.default_catalog` if set and non-empty.
     /// 2. The first entry from `flattened_catalogs()`.
     /// 3. `Self::LEGACY_CATALOG_NAME` as a last resort (no
-    ///    catalogs flattened, which is a config error caught
-    ///    elsewhere).
+    ///    Iceberg catalogs flattened). Session construction uses
+    ///    DataFusion's neutral catalog instead in that case unless
+    ///    `query.default_catalog` was set explicitly.
     pub fn resolve_default_catalog(&self) -> String {
         if let Some(name) = self
             .query
@@ -4582,6 +4616,10 @@ impl SqeConfig {
     }
 }
 
+fn catalog_is_configured(config: &CatalogConfig) -> bool {
+    !matches!(config.backend, CatalogBackend::Rest) || !config.catalog_url.trim().is_empty()
+}
+
 impl SqeConfig {
     /// Validate configuration: required fields and port conflicts.
     pub fn validate(&self) -> crate::error::Result<()> {
@@ -4595,14 +4633,6 @@ impl SqeConfig {
 
         if !has_providers && self.auth.client_id.trim().is_empty() {
             errors.push("auth.client_id is required".to_string());
-        }
-        if self.catalog.catalog_url.trim().is_empty() {
-            errors.push(
-                "catalog.catalog_url is required (TOML field; or env \
-                 SQE_CATALOG__CATALOG_URL). Legacy names `polaris_url` / \
-                 SQE_CATALOG__POLARIS_URL also work via serde alias."
-                    .to_string(),
-            );
         }
         if !has_providers
             && self.auth.keycloak_url.trim().is_empty()
@@ -5287,6 +5317,63 @@ impl SqeConfig {
 
     /// Apply environment variable overrides. Convention: `SQE_<SECTION>__<FIELD>`.
     /// E.g. `SQE_AUTH__KEYCLOAK_URL=https://...` overrides `auth.keycloak_url`.
+    /// Fill S3 settings the operator did not set from the AWS-standard
+    /// variables, so `eval "$(aws configure export-credentials --format env)"`
+    /// works against the server the same way it already works against
+    /// `sqe-cli --embedded`.
+    ///
+    /// Consulted only where the SQE-specific setting is still empty, so
+    /// `[storage]` in TOML and `SQE_STORAGE__*` both keep winning. Anything
+    /// left empty after this still falls through to `object_store`'s own
+    /// chain, which covers an EC2 instance profile, an ECS task role, and
+    /// EKS web identity. `AWS_PROFILE` and the SSO cache are NOT covered:
+    /// resolving those needs the AWS SDK's credential provider, which also
+    /// brings refresh, and temporary credentials taken as static strings
+    /// here expire without renewing. Export them first, or feed the server
+    /// a role it can assume.
+    fn apply_aws_env_fallbacks(&mut self) {
+        let non_empty = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+
+        // Credentials move as a set. Pairing a configured access key with an
+        // ambient session token from some other identity produces a signature
+        // failure that names neither, so only adopt the environment's
+        // credentials when none are configured at all.
+        if self.storage.s3_access_key.is_empty() && self.storage.s3_secret_key.expose().is_empty() {
+            if let (Some(access), Some(secret)) = (
+                non_empty("AWS_ACCESS_KEY_ID"),
+                non_empty("AWS_SECRET_ACCESS_KEY"),
+            ) {
+                self.storage.s3_access_key = access;
+                self.storage.s3_secret_key = SecretString::new(secret);
+                if let Some(token) = non_empty("AWS_SESSION_TOKEN") {
+                    self.storage.s3_session_token = SecretString::new(token);
+                }
+            }
+        }
+
+        if self.storage.s3_region.is_empty() {
+            if let Some(region) = non_empty("AWS_REGION").or_else(|| non_empty("AWS_DEFAULT_REGION"))
+            {
+                self.storage.s3_region = region;
+            }
+        }
+
+        // `AWS_ENDPOINT_URL_S3` is the service-specific spelling and wins over
+        // the all-services one, matching the AWS SDKs and `sqe-cli`.
+        if self.storage.s3_endpoint.is_empty() {
+            if let Some(endpoint) =
+                non_empty("AWS_ENDPOINT_URL_S3").or_else(|| non_empty("AWS_ENDPOINT_URL"))
+            {
+                self.storage.s3_endpoint = endpoint;
+            }
+        }
+    }
+
     fn apply_env_overrides(&mut self) {
         // Coordinator
         env_override_u16(
@@ -5527,6 +5614,13 @@ impl SqeConfig {
             "SQE_STORAGE__S3_SECRET_KEY",
             &mut self.storage.s3_secret_key,
         );
+        // Temporary credentials rotate, so the token belongs in the
+        // environment rather than in a config file that outlives it.
+        env_override_secret(
+            "SQE_STORAGE__S3_SESSION_TOKEN",
+            &mut self.storage.s3_session_token,
+        );
+        self.apply_aws_env_fallbacks();
         env_override_bool(
             "SQE_STORAGE__S3_PATH_STYLE",
             &mut self.storage.s3_path_style,
@@ -6625,14 +6719,22 @@ partial_progress_batch = 5
     }
 
     #[test]
-    fn test_validate_missing_catalog_url() {
+    fn test_validate_accepts_missing_legacy_catalog_url() {
         let mut config = valid_config();
         config.catalog.catalog_url = String::new();
-        let err = config.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("catalog.catalog_url is required"),
-            "Expected catalog_url error, got: {err}"
-        );
+        assert!(config.validate().is_ok());
+        assert!(config.flattened_catalogs().is_empty());
+    }
+
+    #[test]
+    fn legacy_catalog_url_defaults_to_absent() {
+        #[derive(serde::Deserialize)]
+        struct Wrap {
+            catalog: CatalogConfig,
+        }
+
+        let parsed: Wrap = toml::from_str("[catalog]\n").expect("catalog URL is optional");
+        assert!(parsed.catalog.catalog_url.is_empty());
     }
 
     #[test]
@@ -7209,6 +7311,117 @@ partial_progress_batch = 5
 
         std::env::remove_var("SQE_MCP__ALLOW_WRITES");
         std::env::remove_var("SQE_MCP__RESOURCE_URI");
+    }
+
+    /// Clear every variable these tests read, so one leaking from the
+    /// surrounding process cannot decide the result.
+    fn clear_aws_env() {
+        for k in [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+            "AWS_ENDPOINT_URL",
+            "AWS_ENDPOINT_URL_S3",
+            "SQE_STORAGE__S3_ACCESS_KEY",
+            "SQE_STORAGE__S3_SECRET_KEY",
+            "SQE_STORAGE__S3_SESSION_TOKEN",
+            "SQE_STORAGE__S3_REGION",
+            "SQE_STORAGE__S3_ENDPOINT",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    fn aws_env_credentials_are_adopted_when_nothing_else_is_set() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_aws_env();
+        std::env::set_var("AWS_ACCESS_KEY_ID", "ASIAFROMENV");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-from-env");
+        std::env::set_var("AWS_SESSION_TOKEN", "token-from-env");
+        std::env::set_var("AWS_REGION", "eu-central-1");
+
+        let mut config = valid_config();
+        config.apply_env_overrides();
+
+        assert_eq!(config.storage.s3_access_key, "ASIAFROMENV");
+        assert_eq!(config.storage.s3_secret_key.expose(), "secret-from-env");
+        assert_eq!(config.storage.s3_session_token.expose(), "token-from-env");
+        assert_eq!(config.storage.s3_region, "eu-central-1");
+        clear_aws_env();
+    }
+
+    #[test]
+    fn sqe_storage_settings_win_over_the_aws_ones() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_aws_env();
+        std::env::set_var("SQE_STORAGE__S3_ACCESS_KEY", "from-sqe");
+        std::env::set_var("SQE_STORAGE__S3_SECRET_KEY", "sqe-secret");
+        std::env::set_var("SQE_STORAGE__S3_REGION", "us-east-1");
+        std::env::set_var("AWS_ACCESS_KEY_ID", "from-aws");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "aws-secret");
+        std::env::set_var("AWS_REGION", "eu-central-1");
+
+        let mut config = valid_config();
+        config.apply_env_overrides();
+
+        assert_eq!(config.storage.s3_access_key, "from-sqe");
+        assert_eq!(config.storage.s3_secret_key.expose(), "sqe-secret");
+        assert_eq!(config.storage.s3_region, "us-east-1");
+        clear_aws_env();
+    }
+
+    /// Adopting the environment's token alongside a configured key would sign
+    /// with two halves of different identities and fail naming neither.
+    #[test]
+    fn a_configured_key_is_never_paired_with_an_ambient_token() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_aws_env();
+        std::env::set_var("AWS_ACCESS_KEY_ID", "from-aws");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "aws-secret");
+        std::env::set_var("AWS_SESSION_TOKEN", "aws-token");
+
+        let mut config = valid_config();
+        config.storage.s3_access_key = "configured".to_string();
+        config.storage.s3_secret_key = SecretString::new("configured-secret".to_string());
+        config.apply_env_overrides();
+
+        assert_eq!(config.storage.s3_access_key, "configured");
+        assert!(
+            config.storage.s3_session_token.expose().is_empty(),
+            "an ambient token must not attach to a configured key"
+        );
+        clear_aws_env();
+    }
+
+    #[test]
+    fn no_aws_env_leaves_credentials_empty_for_the_provider_chain() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_aws_env();
+
+        let mut config = valid_config();
+        config.apply_env_overrides();
+
+        // Empty is meaningful: object_store then uses its own chain, which
+        // is how an EC2 instance profile or ECS task role reaches the engine.
+        assert!(config.storage.s3_access_key.is_empty());
+        assert!(config.storage.s3_secret_key.expose().is_empty());
+    }
+
+    #[test]
+    fn the_s3_specific_endpoint_variable_wins() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_aws_env();
+        std::env::set_var("AWS_ENDPOINT_URL", "http://generic:9000");
+        std::env::set_var("AWS_ENDPOINT_URL_S3", "http://s3-specific:9000");
+
+        let mut config = valid_config();
+        config.apply_env_overrides();
+
+        assert_eq!(config.storage.s3_endpoint, "http://s3-specific:9000");
+        clear_aws_env();
     }
 
     #[test]
