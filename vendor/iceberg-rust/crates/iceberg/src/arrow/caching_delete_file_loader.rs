@@ -16,7 +16,6 @@
 // under the License.
 
 use std::collections::HashSet;
-use std::ops::Not;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, Int64Array, StringArray, StructArray};
@@ -536,21 +535,29 @@ impl CachingDeleteFileLoader {
                 continue;
             }
 
-            // Process the collected columns in lockstep
+            // Iceberg equality-delete semantics distinguish NULL from every
+            // non-NULL value. Build the predicate that keeps rows directly:
+            // `col IS NULL OR col != value` for a non-NULL delete value, and
+            // `col IS NOT NULL` for a NULL delete value. Negating `col = value`
+            // would yield NULL for a NULL data value and incorrectly filter it.
             #[allow(clippy::len_zero)]
             while datum_columns_with_names[0].0.len() > 0 {
-                let mut row_predicate = AlwaysTrue;
+                let mut row_keep_predicate = Predicate::AlwaysFalse;
                 for &mut (ref mut column, ref field_name) in &mut datum_columns_with_names {
                     if let Some(item) = column.next() {
-                        let cell_predicate = if let Some(datum) = item? {
-                            Reference::new(field_name.clone()).equal_to(datum.clone())
+                        let reference = Reference::new(field_name.clone());
+                        let cell_keep_predicate = if let Some(datum) = item? {
+                            reference
+                                .clone()
+                                .is_null()
+                                .or(reference.not_equal_to(datum.clone()))
                         } else {
-                            Reference::new(field_name.clone()).is_null()
+                            reference.is_not_null()
                         };
-                        row_predicate = row_predicate.and(cell_predicate)
+                        row_keep_predicate = row_keep_predicate.or(cell_keep_predicate);
                     }
                 }
-                row_predicates.push(row_predicate.not().rewrite_not());
+                row_predicates.push(row_keep_predicate);
             }
         }
 
@@ -782,11 +789,119 @@ mod tests {
         )
         .await
         .expect("error parsing batch stream");
-        println!("{parsed_eq_delete}");
-
-        let expected = "(((((y != 1) OR (z != 100)) OR (a != \"HELP\")) OR (sa != 4)) OR (b != 62696E6172795F64617461)) AND (((((y != 2) OR (z IS NOT NULL)) OR (a IS NOT NULL)) OR (sa != 5)) OR (b IS NOT NULL))".to_string();
+        let expected = "((((((y IS NULL) OR (y != 1)) OR ((z IS NULL) OR (z != 100))) OR ((a IS NULL) OR (a != \"HELP\"))) OR ((sa IS NULL) OR (sa != 4))) OR ((b IS NULL) OR (b != 62696E6172795F64617461))) AND ((((((y IS NULL) OR (y != 2)) OR (z IS NOT NULL)) OR (a IS NOT NULL)) OR ((sa IS NULL) OR (sa != 5))) OR (b IS NOT NULL))".to_string();
 
         assert_eq!(parsed_eq_delete.to_string(), expected);
+    }
+
+    #[tokio::test]
+    async fn test_equality_delete_predicate_preserves_null_rows() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![simple_field(
+            "status",
+            DataType::Utf8,
+            true,
+            "3",
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![Some("INACTIVE")])) as ArrayRef],
+        )
+        .unwrap();
+        let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
+
+        let predicate = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+            stream,
+            HashSet::from_iter([3]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            predicate.to_string(),
+            "(status IS NULL) OR (status != \"INACTIVE\")"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_equality_delete_predicate_matches_null_delete_value() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![simple_field(
+            "status",
+            DataType::Utf8,
+            true,
+            "3",
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef],
+        )
+        .unwrap();
+        let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
+
+        let predicate = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+            stream,
+            HashSet::from_iter([3]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(predicate.to_string(), "status IS NOT NULL");
+    }
+
+    #[tokio::test]
+    async fn test_equality_delete_predicate_multiple_columns() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            simple_field("id", DataType::Int64, true, "1"),
+            simple_field("status", DataType::Utf8, true, "3"),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("X")])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
+
+        let predicate = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+            stream,
+            HashSet::from_iter([1, 3]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            predicate.to_string(),
+            "((id IS NULL) OR (id != 1)) OR ((status IS NULL) OR (status != \"X\"))"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_equality_delete_predicate_multiple_delete_rows() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![simple_field(
+            "status",
+            DataType::Utf8,
+            true,
+            "3",
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![Some("A"), Some("B")])) as ArrayRef],
+        )
+        .unwrap();
+        let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
+
+        let predicate = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+            stream,
+            HashSet::from_iter([3]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            predicate.to_string(),
+            "((status IS NULL) OR (status != \"A\")) AND ((status IS NULL) OR (status != \"B\"))"
+        );
     }
 
     /// Create a simple field with metadata.
