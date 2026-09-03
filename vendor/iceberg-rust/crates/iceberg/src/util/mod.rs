@@ -211,31 +211,6 @@ use crate::spec::{Manifest, ManifestFile, ManifestList, ManifestStatus, Snapshot
 pub(crate) const DEFAULT_DELETE_CONCURRENCY_LIMIT: usize = 10;
 pub(crate) const DEFAULT_LOAD_CONCURRENCY_LIMIT: usize = 16;
 
-/// Concurrently loads manifest lists for the given snapshots.
-pub(crate) async fn load_manifest_lists(
-    file_io: &FileIO,
-    table_metadata: &TableMetadataRef,
-    snapshots: Vec<SnapshotRef>,
-    concurrency: usize,
-) -> Result<Vec<(SnapshotRef, ManifestList)>> {
-    let concurrency = concurrency.max(1);
-
-    stream::iter(snapshots)
-        .map(|snapshot| {
-            let file_io = file_io.clone();
-            let table_metadata = table_metadata.clone();
-            async move {
-                let manifest_list = snapshot
-                    .load_manifest_list(&file_io, &table_metadata)
-                    .await?;
-                Ok((snapshot, manifest_list))
-            }
-        })
-        .buffer_unordered(concurrency)
-        .try_collect()
-        .await
-}
-
 /// Streams the manifest lists for `snapshots`, invoking `f` on each loaded
 /// [`ManifestList`] and dropping it immediately afterwards.
 ///
@@ -294,46 +269,6 @@ pub(crate) async fn load_manifests(
         .buffer_unordered(concurrency)
         .try_collect()
         .await
-}
-
-/// Streams the manifests for `manifest_files`, invoking the fallible closure `f`
-/// on each loaded [`Manifest`] (with its [`ManifestFile`]) and dropping it
-/// immediately afterwards.
-///
-/// Unlike [`load_manifests`], this never holds more than `concurrency` manifests
-/// in memory at once. Use it when you only need to fold entries out of
-/// (potentially very many / very large) manifests — e.g. routing entries into
-/// manifest writers during a rewrite — instead of retaining every loaded
-/// manifest at once.
-pub(crate) async fn try_for_each_manifest<F>(
-    file_io: &FileIO,
-    manifest_files: Vec<ManifestFile>,
-    concurrency: usize,
-    mut f: F,
-) -> Result<()>
-where
-    F: FnMut(&ManifestFile, &Manifest) -> Result<()>,
-{
-    let concurrency = concurrency.max(1);
-
-    let mut stream = stream::iter(manifest_files)
-        .map(|manifest_file| {
-            let file_io = file_io.clone();
-            async move {
-                let manifest = manifest_file.load_manifest(&file_io).await?;
-                Ok::<_, crate::Error>((manifest_file, manifest))
-            }
-        })
-        .buffer_unordered(concurrency);
-
-    while let Some(loaded) = stream.next().await {
-        let (manifest_file, manifest) = loaded?;
-        f(&manifest_file, &manifest)?;
-        // `manifest_file`/`manifest` are dropped here, bounding peak memory to at
-        // most `concurrency` manifests in flight (rather than all of them).
-    }
-
-    Ok(())
 }
 
 /// Streams the manifests for `manifest_files`, invoking `f` on each loaded
