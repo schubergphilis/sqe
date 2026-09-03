@@ -286,12 +286,12 @@ them quickly.
    the same bug (the override and its explanatory comment are upstream code);
    worth reporting so this patch can eventually be dropped.
 
-## Cherry-picks from apache/iceberg-rust main
+## Apache iceberg-rust backports
 
-Seven fixes from apache main applied on top of the RW base. RisingWave
-has not backported these yet; they apply on the SQE vendor because
-the touched files diverge minimally from apache. The original PR
-authorship and commit messages are preserved.
+Eight fixes from Apache main and one reviewed Apache PR are applied on top of
+the RW base. RisingWave has not backported these yet; they apply on the SQE
+vendor because the touched files diverge minimally from Apache. The original
+PR authorship and commit messages are preserved.
 
 - **#2118** Make `convert_filters_to_predicate` public — visibility
   change on the DataFusion integration so SQE can reuse the filter
@@ -326,6 +326,11 @@ authorship and commit messages are preserved.
   `IS NOT NULL` for a NULL delete value) instead of negating equality under SQL
   three-valued logic. Includes single-column, composite-key, multiple-row, and
   existing file-backed predicate tests.
+- **#3062** SQL catalog commit error propagation — exact behavioral backport of
+  Apache PR head `d8e7ed0642c6` (originally audited as `6678583`). The internal
+  transaction path now returns commit failures instead of returning a successful
+  statement result. A deferred SQLite foreign-key constraint exercises the
+  failure through the public catalog API and confirms the write is rolled back.
 
 Three apache fixes were considered but skipped:
 
