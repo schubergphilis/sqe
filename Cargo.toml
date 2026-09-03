@@ -63,8 +63,8 @@ object_store = { version = "0.13", features = ["aws", "http", "azure", "gcp"] }
 # ported to DataFusion 55 / Arrow 59 / Parquet 59. Retains RW fork features:
 # RewriteFilesAction, OverwriteFilesAction, PositionDeleteFileWriter,
 # DeletionVectorWriter, MergeAppend, parallel manifest loading.
-# Eight apache main fixes cherry-picked on top: #2118, #2348, #2307, #2351,
-# #2360, #2616, #2781, #2859.
+# Nine apache fixes cherry-picked on top: #2118, #2348, #2307, #2351, #2360,
+# #2616, #2781, #2797, #2509.
 # Vendored in vendor/iceberg-rust/ — see vendor/iceberg-rust/README.md
 iceberg = { path = "vendor/iceberg-rust/crates/iceberg" }
 # No default `aws-sigv4` on this path dep: sqe-catalog's `rest-sigv4`
