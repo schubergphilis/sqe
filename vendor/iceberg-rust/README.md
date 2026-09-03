@@ -343,18 +343,21 @@ authorship and commit messages are preserved.
   `IS NOT NULL` for a NULL delete value) instead of negating equality under SQL
   three-valued logic. Includes single-column, composite-key, multiple-row, and
   existing file-backed predicate tests.
-<<<<<<< vendor/iceberg-rust/README.md
 - **#2859** positional-delete lost-wakeup fix — exact behavioral backport of
   Apache commit `dbbefa41e8a`. Waiters now create an `OwnedNotified` while the
   positional-delete state lock is held, ensuring a load completion cannot be
   signalled between observing `Loading` and registering the waiter. Includes a
   bounded regression test for completion-before-await plus multi-waiter and
   cancelled-waiter coverage.
+- **#3080** repeated constant-column construction — adapted backport of Apache
+  commit `a5f162fed26d`. String and binary partition columns now stream one
+  borrowed literal into Arrow's buffers instead of allocating an intermediate
+  vector (and cloning every string once per output row). Large binary and fixed
+  binary were already using the optimized construction in this vendor tree.
 - **#3022** temporal partition path formatting — adapted behavioral backport of
   Apache commit `107f449d1984`. Year, month, day, and hour transform ordinals
   now render as Iceberg's Java/Spark-compatible date strings, including
   pre-epoch values, instead of raw integer ordinals.
-=======
 - **#3062** SQL catalog commit error propagation — exact behavioral backport of
   Apache PR head `d8e7ed0642c6` (originally audited as `6678583`). The internal
   transaction path now returns commit failures instead of returning a successful
@@ -365,7 +368,6 @@ authorship and commit messages are preserved.
   Files with the same path in one batch are collapsed to their first occurrence
   before manifests and snapshot totals are produced. SQE applies one shared
   path set across its separate data-file and delete-file collections.
->>>>>>> vendor/iceberg-rust/README.md
 
 Three apache fixes were considered but skipped:
 

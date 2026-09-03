@@ -1006,16 +1006,16 @@ pub(crate) fn create_primitive_array_repeated(
             let vals: Vec<Option<f64>> = vec![None; num_rows];
             Arc::new(Float64Array::from(vals))
         }
-        (DataType::Utf8, Some(PrimitiveLiteral::String(value))) => {
-            Arc::new(StringArray::from(vec![value.clone(); num_rows]))
-        }
+        (DataType::Utf8, Some(PrimitiveLiteral::String(value))) => Arc::new(
+            StringArray::from_iter_values(std::iter::repeat_n(value.as_str(), num_rows)),
+        ),
         (DataType::Utf8, None) => {
             let vals: Vec<Option<String>> = vec![None; num_rows];
             Arc::new(StringArray::from(vals))
         }
-        (DataType::Binary, Some(PrimitiveLiteral::Binary(value))) => {
-            Arc::new(BinaryArray::from_vec(vec![value; num_rows]))
-        }
+        (DataType::Binary, Some(PrimitiveLiteral::Binary(value))) => Arc::new(
+            BinaryArray::from_iter_values(std::iter::repeat_n(value.as_slice(), num_rows)),
+        ),
         (DataType::Binary, None) => {
             let vals: Vec<Option<&[u8]>> = vec![None; num_rows];
             Arc::new(BinaryArray::from_opt_vec(vals))
@@ -2105,6 +2105,44 @@ mod test {
 
         assert_eq!(array.data_type(), &target_type);
         assert_eq!(array.len(), num_rows);
+    }
+
+    #[test]
+    fn test_create_primitive_array_repeated_string_and_binary() {
+        let text = "partition-value-2026";
+        let bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let num_rows = 4;
+
+        let utf8 = create_primitive_array_repeated(
+            &DataType::Utf8,
+            &Some(PrimitiveLiteral::String(text.to_string())),
+            num_rows,
+        )
+        .unwrap();
+        let utf8 = utf8.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(utf8.len(), num_rows);
+        assert!((0..num_rows).all(|i| utf8.value(i) == text));
+
+        let binary = create_primitive_array_repeated(
+            &DataType::Binary,
+            &Some(PrimitiveLiteral::Binary(bytes.clone())),
+            num_rows,
+        )
+        .unwrap();
+        let binary = binary.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(binary.len(), num_rows);
+        assert!((0..num_rows).all(|i| binary.value(i) == bytes.as_slice()));
+    }
+
+    #[test]
+    fn test_create_primitive_array_repeated_string_empty() {
+        let array = create_primitive_array_repeated(
+            &DataType::Utf8,
+            &Some(PrimitiveLiteral::String("x".to_string())),
+            0,
+        )
+        .unwrap();
+        assert!(array.is_empty());
     }
 
     #[test]
