@@ -3,7 +3,8 @@
 This is a vendored copy of the [RisingWave Labs iceberg-rust fork](https://github.com/risingwavelabs/iceberg-rust),
 branch `dev_rebase_main_20260303` at commit `813e54419b43`. The branch carries
 Arrow 58 / Parquet 58 (RW PR #148, 2026-04-15) plus writer and transaction
-fixes on top. SQE resolves the vendored crates in its DataFusion 54 workspace.
+fixes on top. SQE has ported the vendored crates to DataFusion 55 / Arrow 59 /
+Parquet 59.
 
 ## Vendored crates
 
@@ -28,7 +29,7 @@ contexts.
 
 ## Why a fork?
 
-Apache upstream iceberg-rust (v0.9.0) lacks:
+Apache's latest release, iceberg-rust v0.10.1, lacks:
 - `RewriteFilesAction` / `OverwriteFilesAction` (Copy-on-Write DELETE/UPDATE)
 - `PositionDeleteFileWriter` (Merge-on-Read position deletes)
 - `DeletionVectorWriter` (Iceberg V3)
@@ -42,7 +43,13 @@ The RisingWave fork provides all of these.
 - When upstream merges these, SQE will migrate to official apache/iceberg-rust
 
 Last audited on 2026-07-30. The RisingWave branch had advanced to
-`ac90a10d`, 11 commits past the vendored baseline. Four of them are
+`ac90a10d`, 11 commits past the vendored baseline. Four fixes are
+- RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus four focused backports (see below); branch tip at last audit `1657c184`
+- Apache upstream: tracking PRs #2185 (OverwriteAction) and #2203 (RowDeltaAction)
+- When upstream merges these, SQE will migrate to official apache/iceberg-rust
+
+Last audited on 2026-09-02. The RisingWave branch had advanced to
+`1657c184`, 14 commits past the vendored baseline. Four of them are
 backported as focused commits on top of this snapshot:
 
 - `f31001cd` (RW #187) lenient decode of truncated string metric bounds.
@@ -53,10 +60,12 @@ backported as focused commits on top of this snapshot:
 - `edf72a59` (RW #190) resolve predicate field IDs via the Arrow schema when
   Parquet leaves lack them. Lands in `reader.rs` alongside three SQE patch
   families and still applied cleanly.
-- `550393d0` (RW #186) return a typed `DataInvalid` error when a Parquet data
-  file is shorter than its manifest-recorded size, preventing an out-of-bounds
-  object-store slice panic. Adapted to SQE's refactored
-  `open_parquet_and_load_metadata` path.
+- `6bd8e98f` (RW #196) propagate and cache equality-delete load failures.
+  Retryable and cancelled loads can be reclaimed; non-retryable failures are
+  retained for late consumers. The backport is stacked after Apache #2859 so
+  both delete-loader notification fixes are reviewed as one state machine.
+- `1657c184` (RW #205) map Iceberg `Timestamptz` / `TimestamptzNs` to Glue's
+  equivalent non-timezone timestamp types, matching Spark's Glue integration.
 
 That `ee489f56` applies cleanly is itself useful: it means the dangling-DV fix
 does *not* depend on `c3ac742` below.
@@ -79,20 +88,31 @@ Still not backported:
   taking together with `61a8941` as one validated piece.
 - `08a18f41` / `ac90a10d` add trait impls and exports for `DeleteVector`.
   API surface only; take when something needs them.
+- `6bd8e98` propagates and caches equality-delete load failures. This is a
+  valuable correctness fix, but it replaces the loader/filter concurrency
+  state machine across three files (over 500 changed lines) that also carry
+  SQE scan patches. Port it in a dedicated MR with cancellation, retry, and
+  equality-delete regression coverage rather than folding it into this audit.
+- `deb4a3c8` caches OpenDAL S3/GCS operators by bucket. It is useful for
+  credential/token reuse but changes shared storage state and serialization;
+  take it separately with multi-bucket and credential-refresh validation.
 
 Apache `main` is audited selectively rather than merged wholesale: it has
 different transaction APIs, dependency versions, and MSRV requirements. Every
 accepted fix is listed below with its upstream PR and retained as a focused
 backport.
 
-Apache cut **v0.10.0** on 2026-07-21. It does not replace this fork and is not
-a de-vendoring path: it has no rewrite/overwrite transaction actions, no
-`PositionDeleteFileWriter` or `DeletionVectorWriter`, and no `expr::dynamic`,
-while its `iceberg-datafusion` targets DataFusion 53 (SQE is on 54, so that
-would be a downgrade). Its MSRV is `rust-version = "1.94"`, which is the floor
-for taking apache cherry-picks. Use 0.10.0 as the audit baseline for the next
-apache sweep instead: apache `main` is roughly four months past this fork's
-`dev_rebase_main_20260303` base.
+Apache cut **v0.10.1** on 2026-08-01. It does not replace this fork and is not
+a de-vendoring path: the release has no rewrite/overwrite transaction actions,
+`PositionDeleteFileWriter`, `DeletionVectorWriter`, or `expr::dynamic`, while
+its DataFusion dependency is older than SQE's DataFusion 55. Apache `main` now
+has an equality-delete writer, but still lacks `PositionDeleteFileWriter`, the
+transaction actions, deletion-vector writer, dynamic predicate API, and SQE's
+decode, fetch-ahead, and SBBF scan patches. (Its writer module documentation
+mentions `PositionDeleteFileWriter`, but no implementation exists.) PRs #2185
+and #2203 remain open and conflicted. Its MSRV also exceeds SQE's current
+workspace MSRV. Use v0.10.1 as the released audit baseline and evaluate focused
+fixes rather than merging Apache `main` wholesale.
 
 ## DataFusion 55 / Arrow 59 readiness (probed 2026-08-24)
 
@@ -274,7 +294,7 @@ them quickly.
 
 ## Cherry-picks from apache/iceberg-rust main
 
-Seven fixes from apache main applied on top of the RW base. RisingWave
+Eight fixes from apache main applied on top of the RW base. RisingWave
 has not backported these yet; they apply on the SQE vendor because
 the touched files diverge minimally from apache. The original PR
 authorship and commit messages are preserved.
@@ -299,10 +319,25 @@ authorship and commit messages are preserved.
   The upstream change intentionally does not alter strict expression visitors;
   SQE's production use of `StrictMetricsEvaluator` is documented separately as
   SQE-only patch family 9.
-- **#2867** malformed Puffin footer length validation — exact behavioral
-  backport of Apache commit `c0db7707951`. Files shorter than the minimum
-  Puffin envelope and footer lengths larger than the file now return
-  `DataInvalid` instead of underflowing or issuing an invalid range read.
+- **#2797** required missing-field validation — exact behavioral backport of
+  Apache commit `78df272cb1a`. When a required projected field is absent from
+  an older data file and has no `initial-default`, the record-batch transformer
+  now returns a clear `DataInvalid` error instead of synthesizing a null column.
+  Optional missing fields and required fields with an initial default retain
+  their existing behavior.
+- **#2781** equality-delete NULL correctness — exact behavioral backport of
+  Apache commit `22c256e985a6`. A nullable data value must survive a non-NULL
+  equality-delete value; a NULL delete value matches only NULL data. The reader
+  now constructs the keep predicate directly (`IS NULL OR != value`, or
+  `IS NOT NULL` for a NULL delete value) instead of negating equality under SQL
+  three-valued logic. Includes single-column, composite-key, multiple-row, and
+  existing file-backed predicate tests.
+- **#2859** positional-delete lost-wakeup fix — exact behavioral backport of
+  Apache commit `dbbefa41e8a`. Waiters now create an `OwnedNotified` while the
+  positional-delete state lock is held, ensuring a load completion cannot be
+  signalled between observing `Loading` and registering the waiter. Includes a
+  bounded regression test for completion-before-await plus multi-waiter and
+  cancelled-waiter coverage.
 
 Three apache fixes were considered but skipped:
 

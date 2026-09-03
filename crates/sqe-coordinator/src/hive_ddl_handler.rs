@@ -388,7 +388,7 @@ impl HiveDdlHandler {
                     .to_string(),
             ));
         };
-        let store = self.store_for(catalog)?;
+        let store = self.source_for(catalog)?;
         let manifest = store
             .get(schema, table)
             .await
@@ -438,7 +438,7 @@ impl HiveDdlHandler {
         root: &str,
         database: &str,
     ) -> Result<Vec<String>, SqeError> {
-        let store = self.store_for(root)?;
+        let store = self.source_for(root)?;
         let names = store
             .list_tables(database)
             .await
@@ -746,6 +746,29 @@ impl HiveDdlHandler {
         Ok(())
     }
 
+    /// The metadata source for a root, whatever backs it. Everything that
+    /// only reads should use this: a Glue-backed root answers reads fine and
+    /// has no sidecar at all.
+    fn source_for(
+        &self,
+        catalog_name: &str,
+    ) -> Result<Arc<dyn sqe_catalog::hive::source::HiveMetadataSource>, SqeError> {
+        let roots = self
+            .runtime_catalogs
+            .hive_roots()
+            .map_err(SqeError::Catalog)?;
+        roots
+            .into_iter()
+            .find(|(name, _)| name == catalog_name)
+            .map(|(_, root)| root.source())
+            .ok_or_else(|| {
+                SqeError::Execution(format!(
+                    "hive root '{catalog_name}' is not attached; attach it with ATTACH \
+                     ... TYPE hive_external (or configure it under [[hive.roots]])"
+                ))
+            })
+    }
+
     fn store_for(
         &self,
         catalog_name: &str,
@@ -754,17 +777,27 @@ impl HiveDdlHandler {
             .runtime_catalogs
             .hive_roots()
             .map_err(SqeError::Catalog)?;
-        roots
+        let root = roots
             .into_iter()
             .find(|(name, _)| name == catalog_name)
-            .map(|(_, store)| store)
+            .map(|(_, root)| root)
             .ok_or_else(|| {
                 SqeError::Execution(format!(
                     "hive root '{catalog_name}' is not attached; attach it with ATTACH \
                      ... TYPE hive_external (or configure it under [[hive.roots]]) before \
                      creating tables in it"
                 ))
-            })
+            })?;
+        // A root over a metastore SQE does not own has nothing to write a
+        // manifest to. Say so rather than failing further in on a
+        // half-applied change.
+        root.sidecar().ok_or_else(|| {
+            SqeError::Execution(format!(
+                "catalog '{catalog_name}' reads an external metastore that SQE does not own, so \
+                 this statement is not available on it; make the change where the metastore owns \
+                 the definition"
+            ))
+        })
     }
 
     /// Emit the handler's own audit event. `audit_resources` (in
