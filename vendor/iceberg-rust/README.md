@@ -38,12 +38,12 @@ The RisingWave fork provides all of these.
 
 ## Upstream tracking
 
-- RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus six focused backports (see below); branch tip at last audit `1657c184`
+- RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus seven focused backports (see below); branch tip at last audit `1657c184`
 - Apache upstream: tracking PRs #2185 (OverwriteAction) and #2203 (RowDeltaAction)
 - When upstream merges these, SQE will migrate to official apache/iceberg-rust
 
 Last audited on 2026-09-02. The RisingWave branch had advanced to
-`1657c184`, 14 commits past the vendored baseline. Six of them are
+`1657c184`, 14 commits past the vendored baseline. Seven of them are
 backported as focused commits on top of this snapshot:
 
 - `f31001cd` (RW #187) lenient decode of truncated string metric bounds.
@@ -64,6 +64,10 @@ backported as focused commits on top of this snapshot:
   peak rewrite memory, and calibrate entry-size estimates against actual
   uncompressed Avro output. Applied together with #181. The obsolete
   `try_for_each_manifest` helper was removed from SQE's renamed `util/mod.rs`.
+- `0d9e873c` (RW #177) stream manifest lists and manifests while collecting
+  referenced files for orphan cleanup. Peak memory is bounded by configured
+  load concurrency rather than all snapshots and manifests; the now-unused
+  collecting `load_manifest_lists` helper was removed from `util/mod.rs`.
 
 That `ee489f56` applies cleanly is itself useful: it means the dangling-DV fix
 does *not* depend on `c3ac742` below.
@@ -73,8 +77,6 @@ Still not backported:
 - `c3ac742` unifies the overwrite/rewrite transaction implementations. Its
   public transaction entry points remain source-compatible, but it overlaps
   SQE's CoW transaction path and requires the write regression suite.
-- `0d9e873` streams manifest loading during orphan-file removal. This is
-  API-compatible; it remains pending maintenance-path validation.
 - `550393d0` (RW #186) fails cleanly instead of panicking on truncated data
   files. Needs a hand port: the `reader.rs` hunk only lands with fuzz against
   SQE's drifted copy, and its one `spec/manifest/writer.rs` hunk (+5/-3 in
