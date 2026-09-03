@@ -25,8 +25,8 @@ pub(crate) const ICEBERG_FIELD_CURRENT: &str = "iceberg.field.current";
 use std::collections::HashMap;
 
 use aws_sdk_glue::types::Column;
+use iceberg::Result;
 use iceberg::spec::{PrimitiveType, SchemaVisitor, TableMetadata, VariantType, visit_schema};
-use iceberg::{Error, ErrorKind, Result};
 
 use crate::error::from_aws_build_error;
 
@@ -165,12 +165,10 @@ impl SchemaVisitor for GlueSchemaBuilder {
             PrimitiveType::Date => "date".to_string(),
             PrimitiveType::Timestamp => "timestamp".to_string(),
             PrimitiveType::TimestampNs => "timestamp_ns".to_string(),
-            PrimitiveType::Timestamptz | PrimitiveType::TimestamptzNs => {
-                return Err(Error::new(
-                    ErrorKind::FeatureUnsupported,
-                    format!("Conversion from {p:?} is not supported"),
-                ));
-            }
+            // Glue has no timezone-aware timestamp type. Match Spark's Glue
+            // integration by storing the equivalent non-timezone type.
+            PrimitiveType::Timestamptz => "timestamp".to_string(),
+            PrimitiveType::TimestamptzNs => "timestamp_ns".to_string(),
             PrimitiveType::Time | PrimitiveType::String | PrimitiveType::Uuid => {
                 "string".to_string()
             }
@@ -320,12 +318,24 @@ mod tests {
                     "name": "c13",
                     "required": true,
                     "type": "binary"
+                },
+                {
+                    "id": 14,
+                    "name": "c14",
+                    "required": true,
+                    "type": "timestamptz"
+                },
+                {
+                    "id": 15,
+                    "name": "c15",
+                    "required": true,
+                    "type": "timestamptz_ns"
                 }
             ]
         }"#;
 
         let schema = serde_json::from_str::<Schema>(record)?;
-        let metadata = create_metadata(schema)?;
+        let metadata = create_metadata_with_format_version(schema, FormatVersion::V3)?;
 
         let result = GlueSchemaBuilder::from_iceberg(&metadata)?.build();
 
@@ -343,6 +353,8 @@ mod tests {
             create_column("c11", "string", "11", false)?,
             create_column("c12", "binary", "12", false)?,
             create_column("c13", "binary", "13", false)?,
+            create_column("c14", "timestamp", "14", false)?,
+            create_column("c15", "timestamp_ns", "15", false)?,
         ];
 
         assert_eq!(result, expected);
