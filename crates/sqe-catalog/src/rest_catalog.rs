@@ -34,17 +34,30 @@ static SHARED_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
 static USER_CIRCUIT_BREAKERS: std::sync::LazyLock<DashMap<String, Arc<CircuitBreaker>>> =
     std::sync::LazyLock::new(DashMap::new);
 
-fn user_circuit_breaker(token_fingerprint: &str) -> Arc<CircuitBreaker> {
-    if let Some(existing) = USER_CIRCUIT_BREAKERS.get(token_fingerprint) {
+/// One breaker per (user, catalog), never per user alone.
+///
+/// Keying on the token by itself let one unreachable catalog take out every
+/// other catalog the same user could reach: five failed calls to a dead
+/// endpoint opened the circuit, and the next 30 seconds of calls to healthy
+/// catalogs were refused with `CircuitBreakerOpen` before leaving the
+/// process. `information_schema.tables` and `describe_table` walk every
+/// attached catalog, so they tripped it on their own and then blocked the
+/// queries that had been working a second earlier.
+///
+/// A breaker exists to stop hammering an upstream that is down. That
+/// argument is per upstream, so the key is too.
+fn user_circuit_breaker(token_fingerprint: &str, catalog: &str) -> Arc<CircuitBreaker> {
+    let key = format!("{token_fingerprint}|{catalog}");
+    if let Some(existing) = USER_CIRCUIT_BREAKERS.get(&key) {
         return Arc::clone(existing.value());
     }
     let cb = Arc::new(CircuitBreaker::new(
-        format!("polaris-user-{token_fingerprint}"),
+        format!("polaris-user-{token_fingerprint}-{catalog}"),
         5,
         std::time::Duration::from_secs(30),
     ));
     USER_CIRCUIT_BREAKERS
-        .entry(token_fingerprint.to_string())
+        .entry(key)
         .or_insert_with(|| Arc::clone(&cb))
         .clone()
 }
@@ -592,6 +605,123 @@ pub struct SessionCatalog {
     table_cache: TableMetadataCache,
 }
 
+/// Local placeholder used when a deployment has no Iceberg catalog.
+///
+/// The coordinator still carries a `SessionCatalog` through a handful of
+/// legacy write and metadata-TVF APIs. Making all of those APIs optional would
+/// spread the absence check across the whole query layer. This catalog keeps
+/// that compatibility handle local and fail-fast without constructing a REST
+/// client or touching `/v1/config`.
+#[derive(Debug)]
+struct UnconfiguredCatalog;
+
+fn unconfigured_catalog_error() -> iceberg::Error {
+    iceberg::Error::new(
+        iceberg::ErrorKind::Unexpected,
+        "no Iceberg catalog is configured; configure catalog.catalog_url or a named Iceberg catalog",
+    )
+}
+
+#[async_trait::async_trait]
+impl iceberg::Catalog for UnconfiguredCatalog {
+    async fn list_namespaces(
+        &self,
+        _parent: Option<&iceberg::NamespaceIdent>,
+    ) -> iceberg::Result<Vec<iceberg::NamespaceIdent>> {
+        Err(unconfigured_catalog_error())
+    }
+
+    async fn create_namespace(
+        &self,
+        _namespace: &iceberg::NamespaceIdent,
+        _properties: HashMap<String, String>,
+    ) -> iceberg::Result<iceberg::Namespace> {
+        Err(unconfigured_catalog_error())
+    }
+
+    async fn get_namespace(
+        &self,
+        _namespace: &iceberg::NamespaceIdent,
+    ) -> iceberg::Result<iceberg::Namespace> {
+        Err(unconfigured_catalog_error())
+    }
+
+    async fn namespace_exists(
+        &self,
+        _namespace: &iceberg::NamespaceIdent,
+    ) -> iceberg::Result<bool> {
+        Err(unconfigured_catalog_error())
+    }
+
+    async fn update_namespace(
+        &self,
+        _namespace: &iceberg::NamespaceIdent,
+        _properties: HashMap<String, String>,
+    ) -> iceberg::Result<()> {
+        Err(unconfigured_catalog_error())
+    }
+
+    async fn drop_namespace(
+        &self,
+        _namespace: &iceberg::NamespaceIdent,
+    ) -> iceberg::Result<()> {
+        Err(unconfigured_catalog_error())
+    }
+
+    async fn list_tables(
+        &self,
+        _namespace: &iceberg::NamespaceIdent,
+    ) -> iceberg::Result<Vec<iceberg::TableIdent>> {
+        Err(unconfigured_catalog_error())
+    }
+
+    async fn create_table(
+        &self,
+        _namespace: &iceberg::NamespaceIdent,
+        _creation: iceberg::TableCreation,
+    ) -> iceberg::Result<iceberg::table::Table> {
+        Err(unconfigured_catalog_error())
+    }
+
+    async fn load_table(
+        &self,
+        _table: &iceberg::TableIdent,
+    ) -> iceberg::Result<iceberg::table::Table> {
+        Err(unconfigured_catalog_error())
+    }
+
+    async fn drop_table(&self, _table: &iceberg::TableIdent) -> iceberg::Result<()> {
+        Err(unconfigured_catalog_error())
+    }
+
+    async fn table_exists(&self, _table: &iceberg::TableIdent) -> iceberg::Result<bool> {
+        Err(unconfigured_catalog_error())
+    }
+
+    async fn rename_table(
+        &self,
+        _src: &iceberg::TableIdent,
+        _dest: &iceberg::TableIdent,
+    ) -> iceberg::Result<()> {
+        Err(unconfigured_catalog_error())
+    }
+
+    async fn register_table(
+        &self,
+        _table: &iceberg::TableIdent,
+        _metadata_location: String,
+    ) -> iceberg::Result<iceberg::table::Table> {
+        Err(unconfigured_catalog_error())
+    }
+
+    async fn update_table(
+        &self,
+        _commit: iceberg::TableCommit,
+    ) -> iceberg::Result<iceberg::table::Table> {
+        Err(unconfigured_catalog_error())
+    }
+}
+
 impl std::fmt::Debug for SessionCatalog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionCatalog")
@@ -726,6 +856,26 @@ pub(crate) fn namespace_visible_from_probe<T>(
 }
 
 impl SessionCatalog {
+    /// Construct the compatibility handle for a deployment with no Iceberg
+    /// catalog. No network client or backend catalog is created.
+    pub fn unconfigured(
+        storage_config: &StorageConfig,
+        table_cache: Option<TableMetadataCache>,
+    ) -> Self {
+        Self {
+            inner: CatalogHandle::Other(Arc::new(UnconfiguredCatalog)),
+            catalog_url: String::new(),
+            warehouse: String::new(),
+            bearer_token: String::new(),
+            token_fingerprint: "unconfigured".to_string(),
+            storage_config: storage_config.clone(),
+            http_client: SHARED_HTTP_CLIENT.clone(),
+            circuit_breaker: user_circuit_breaker("unconfigured", "unconfigured"),
+            require_vended_credentials: false,
+            table_cache: table_cache.unwrap_or_else(|| TableMetadataCache::new(0)),
+        }
+    }
+
     /// Create a new per-session catalog configured with the user's bearer token.
     ///
     /// The `bearer_token` is set as the `token` property in the REST catalog config,
@@ -847,7 +997,7 @@ impl SessionCatalog {
         // per process, mirroring the ClientCredentials warning in sqe-auth.
         warn_shared_backend_identity_once(backend);
 
-        let circuit_breaker = user_circuit_breaker(&token_fingerprint);
+        let circuit_breaker = user_circuit_breaker(&token_fingerprint, &catalog.warehouse);
         Ok(Self {
             inner: CatalogHandle::Other(inner),
             catalog_url: String::new(),
@@ -1105,7 +1255,7 @@ impl SessionCatalog {
 
         let http_client = http_client.unwrap_or_else(|| SHARED_HTTP_CLIENT.clone());
         let circuit_breaker =
-            circuit_breaker.unwrap_or_else(|| user_circuit_breaker(&token_fingerprint));
+            circuit_breaker.unwrap_or_else(|| user_circuit_breaker(&token_fingerprint, catalog_url));
 
         // Use the shared global cache when provided; fall back to a private
         // per-session cache (disabled — max_capacity 0) so that call sites that
@@ -2127,7 +2277,7 @@ mod cache_capacity_tests {
     use super::{
         iceberg_error_is_forbidden, insert_s3_credential_props, insert_s3_location_props,
         insert_s3_vended_isolation_props, record_catalog_breaker_outcome, select_keys_for_suffix,
-        REST_CATALOG_CACHE_MAX_CAPACITY,
+        SessionCatalog, REST_CATALOG_CACHE_MAX_CAPACITY,
     };
     use sqe_core::config::StorageConfig;
     use std::collections::HashMap;
@@ -2141,6 +2291,16 @@ mod cache_capacity_tests {
             s3_path_style: true,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn unconfigured_catalog_fails_fast_without_a_rest_backend() {
+        let catalog = SessionCatalog::unconfigured(&StorageConfig::default(), None);
+        let err = catalog
+            .list_namespaces()
+            .await
+            .expect_err("an Iceberg operation needs a configured catalog");
+        assert!(err.to_string().contains("no Iceberg catalog is configured"));
     }
 
     #[test]

@@ -6473,6 +6473,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-credential-types",
+ "aws-sdk-glue",
  "bytes",
  "chrono",
  "dashmap",
