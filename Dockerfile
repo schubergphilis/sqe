@@ -94,7 +94,7 @@ RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},sharing=locked,target
     && sccache --show-stats
 
 # Digest-pinned; Renovate bumps the runtime independently of builder tooling.
-FROM cgr.dev/chainguard/glibc-dynamic@sha256:df4e22a4b5dcd8e15a51fe9b04e16717d411dd9f4fe4b3844c1bf425b14be303 AS runtime-base
+FROM cgr.dev/chainguard/glibc-dynamic@sha256:993affbc31d155dfdd4c86c4415e87557df5695a0c84bce924992c8e93724168 AS runtime-base
 
 USER 65532
 

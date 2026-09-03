@@ -45,7 +45,7 @@ use url::Url;
 ///
 /// The file-reader TVFs (`read_parquet` / `read_csv`) read raw buckets that
 /// external writers (a dbt run landing files, another engine) mutate while
-/// SQE is live. DataFusion 54 enables `list_files_cache` by default with an
+/// SQE is live. DataFusion 55 enables `list_files_cache` by default with an
 /// **infinite TTL** (`CacheManagerConfig::default`), so a directory listed
 /// once is frozen for the life of the process: a file that grows after that
 /// first LIST keeps its stale `ObjectMeta.size`, and the next directory read
