@@ -38,6 +38,9 @@ The RisingWave fork provides all of these.
 
 ## Upstream tracking
 
+<<<<<<< vendor/iceberg-rust/README.md
+- RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus six focused backports (see below); branch tip at last audit `1657c184`
+=======
 - RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus four backports (see below); branch tip at last audit `ac90a10d`
 - Apache upstream: tracking PRs #2185 (OverwriteAction) and #2203 (RowDeltaAction)
 - When upstream merges these, SQE will migrate to official apache/iceberg-rust
@@ -45,11 +48,12 @@ The RisingWave fork provides all of these.
 Last audited on 2026-07-30. The RisingWave branch had advanced to
 `ac90a10d`, 11 commits past the vendored baseline. Four fixes are
 - RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus four focused backports (see below); branch tip at last audit `1657c184`
+>>>>>>> vendor/iceberg-rust/README.md
 - Apache upstream: tracking PRs #2185 (OverwriteAction) and #2203 (RowDeltaAction)
 - When upstream merges these, SQE will migrate to official apache/iceberg-rust
 
 Last audited on 2026-09-02. The RisingWave branch had advanced to
-`1657c184`, 14 commits past the vendored baseline. Four of them are
+`1657c184`, 14 commits past the vendored baseline. Six of them are
 backported as focused commits on top of this snapshot:
 
 - `f31001cd` (RW #187) lenient decode of truncated string metric bounds.
@@ -66,6 +70,14 @@ backported as focused commits on top of this snapshot:
   both delete-loader notification fixes are reviewed as one state machine.
 - `1657c184` (RW #205) map Iceberg `Timestamptz` / `TimestamptzNs` to Glue's
   equivalent non-timezone timestamp types, matching Spark's Glue integration.
+- `61a89414` (RW #181) cache rewritten input/output manifests and the proposed
+  snapshot identity across optimistic commit retries. Concurrent append-only
+  retries reuse the already-written manifests; concurrent rewrites invalidate
+  the cache and rerun clustering.
+- `0b65d716` (RW #185) write full clustered manifests incrementally to bound
+  peak rewrite memory, and calibrate entry-size estimates against actual
+  uncompressed Avro output. Applied together with #181. The obsolete
+  `try_for_each_manifest` helper was removed from SQE's renamed `util/mod.rs`.
 
 That `ee489f56` applies cleanly is itself useful: it means the dangling-DV fix
 does *not* depend on `c3ac742` below.
@@ -75,11 +87,12 @@ Still not backported:
 - `c3ac742` unifies the overwrite/rewrite transaction implementations. Its
   public transaction entry points remain source-compatible, but it overlaps
   SQE's CoW transaction path and requires the write regression suite.
-- `61a8941` reuses rewritten manifests during commit-conflict retries. This is
-  API-compatible but substantially rewrites `rewrite_manifests.rs` and needs
-  conflict/retry validation before adoption.
 - `0d9e873` streams manifest loading during orphan-file removal. This is
   API-compatible; it remains pending maintenance-path validation.
+- `550393d0` (RW #186) fails cleanly instead of panicking on truncated data
+  files. Needs a hand port: the `reader.rs` hunk only lands with fuzz against
+  SQE's drifted copy, and its one `spec/manifest/writer.rs` hunk (+5/-3 in
+  `datum_serialized_len`) does not apply. Small, but not mechanical.
 - `0b65d716` (RW #185) bounds rewrite-manifests memory and calibrates the
   manifest size estimate. **Blocked on `61a8941`**: 4 of its 5
   `rewrite_manifests.rs` hunks do not apply without it, and it also deletes
