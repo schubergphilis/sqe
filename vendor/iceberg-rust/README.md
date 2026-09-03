@@ -38,21 +38,12 @@ The RisingWave fork provides all of these.
 
 ## Upstream tracking
 
-<<<<<<< vendor/iceberg-rust/README.md
-- RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus five focused backports (see below); branch tip at last audit `1657c184`
-=======
-- RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus seven focused backports (see below); branch tip at last audit `1657c184`
-- Apache upstream: tracking PRs #2185 (OverwriteAction) and #2203 (RowDeltaAction)
-- When upstream merges these, SQE will migrate to official apache/iceberg-rust
-
-Last audited on 2026-07-30. The RisingWave branch had advanced to
-`ac90a10d`, 11 commits past the vendored baseline. Four fixes are
-- RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus four focused backports (see below); branch tip at last audit `1657c184`
+- RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus ten focused backports (see below); branch tip at last audit `1657c184`
 - Apache upstream: tracking PRs #2185 (OverwriteAction) and #2203 (RowDeltaAction)
 - When upstream merges these, SQE will migrate to official apache/iceberg-rust
 
 Last audited on 2026-09-02. The RisingWave branch had advanced to
-`1657c184`, 14 commits past the vendored baseline. Seven of them are
+`1657c184`, 14 commits past the vendored baseline. Ten of them are
 backported as focused commits on top of this snapshot:
 
 - `f31001cd` (RW #187) lenient decode of truncated string metric bounds.
@@ -63,6 +54,9 @@ backported as focused commits on top of this snapshot:
 - `edf72a59` (RW #190) resolve predicate field IDs via the Arrow schema when
   Parquet leaves lack them. Lands in `reader.rs` alongside three SQE patch
   families and still applied cleanly.
+- `550393d0` (RW #186) return a typed `DataInvalid` error when a Parquet data
+  file is shorter than its manifest-recorded size, preventing an out-of-bounds
+  object-store slice panic. Adapted to SQE's refactored reader path.
 - `6bd8e98f` (RW #196) propagate and cache equality-delete load failures.
   Retryable and cancelled loads can be reclaimed; non-retryable failures are
   retained for late consumers. The backport is stacked after Apache #2859 so
@@ -95,23 +89,8 @@ Still not backported:
 - `c3ac742` unifies the overwrite/rewrite transaction implementations. Its
   public transaction entry points remain source-compatible, but it overlaps
   SQE's CoW transaction path and requires the write regression suite.
-- `550393d0` (RW #186) fails cleanly instead of panicking on truncated data
-  files. Needs a hand port: the `reader.rs` hunk only lands with fuzz against
-  SQE's drifted copy, and its one `spec/manifest/writer.rs` hunk (+5/-3 in
-  `datum_serialized_len`) does not apply. Small, but not mechanical.
-- `0b65d716` (RW #185) bounds rewrite-manifests memory and calibrates the
-  manifest size estimate. **Blocked on `61a8941`**: 4 of its 5
-  `rewrite_manifests.rs` hunks do not apply without it, and it also deletes
-  `crates/iceberg/src/utils.rs`, which this tree no longer has (apache renamed
-  it to `util/mod.rs`). Wanted for the OOM-safety program, so it is worth
-  taking together with `61a8941` as one validated piece.
 - `08a18f41` / `ac90a10d` add trait impls and exports for `DeleteVector`.
   API surface only; take when something needs them.
-- `6bd8e98` propagates and caches equality-delete load failures. This is a
-  valuable correctness fix, but it replaces the loader/filter concurrency
-  state machine across three files (over 500 changed lines) that also carry
-  SQE scan patches. Port it in a dedicated MR with cancellation, retry, and
-  equality-delete regression coverage rather than folding it into this audit.
 
 Apache `main` is audited selectively rather than merged wholesale: it has
 different transaction APIs, dependency versions, and MSRV requirements. Every
@@ -310,7 +289,7 @@ them quickly.
 
 ## Apache iceberg-rust backports
 
-Ten fixes from apache main applied on top of the RW base. RisingWave
+Fifteen fixes from apache main applied on top of the RW base. RisingWave
 has not backported these yet; they apply on the SQE vendor because
 the touched files diverge minimally from apache. The original PR
 authorship and commit messages are preserved.
@@ -335,6 +314,10 @@ authorship and commit messages are preserved.
   The upstream change intentionally does not alter strict expression visitors;
   SQE's production use of `StrictMetricsEvaluator` is documented separately as
   SQE-only patch family 9.
+- **#2867** malformed Puffin footer length validation — exact behavioral
+  backport of Apache commit `c0db7707951`. Truncated envelopes and impossible
+  footer lengths now return `DataInvalid` instead of underflowing or issuing an
+  invalid range read.
 - **#2797** required missing-field validation — exact behavioral backport of
   Apache commit `78df272cb1a`. When a required projected field is absent from
   an older data file and has no `initial-default`, the record-batch transformer
@@ -373,6 +356,11 @@ authorship and commit messages are preserved.
   Files with the same path in one batch are collapsed to their first occurrence
   before manifests and snapshot totals are produced. SQE applies one shared
   path set across its separate data-file and delete-file collections.
+- **#3015** positional-delete run buffering — adapted backport of Apache commit
+  `7b33321f34d9`. Contiguous positions for one data-file path are bulk-appended
+  with one hash lookup per run. This fork already used borrowed `entry_ref`
+  lookups, so the retained benefit is reduced hashing and bulk Roaring inserts
+  rather than Apache's additional removal of per-row path allocations.
 
 Three apache fixes were considered but skipped:
 
