@@ -332,6 +332,11 @@ PR authorship and commit messages are preserved.
   `IS NOT NULL` for a NULL delete value) instead of negating equality under SQL
   three-valued logic. Includes single-column, composite-key, multiple-row, and
   existing file-backed predicate tests.
+- **#3062** SQL catalog commit error propagation — exact behavioral backport of
+  Apache PR head `d8e7ed0642c6` (originally audited as `6678583`). The internal
+  transaction path now returns commit failures instead of returning a successful
+  statement result. A deferred SQLite foreign-key constraint exercises the
+  failure through the public catalog API and confirms the write is rolled back.
 - **#2509** FastAppend intra-batch path de-duplication — adapted from the
   unmerged Apache PR head `1254b05c00fe` (originally audited as `252bb60`).
   Files with the same path in one batch are collapsed to their first occurrence

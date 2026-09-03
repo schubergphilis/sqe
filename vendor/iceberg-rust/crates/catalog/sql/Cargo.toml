@@ -39,3 +39,15 @@ iceberg = { workspace = true }
 sqlx = { version = "0.9.0", features = ["any"], default-features = false }
 strum = { workspace = true }
 
+[dev-dependencies]
+itertools = { workspace = true }
+regex = { workspace = true }
+sqlx = { version = "0.9.0", features = [
+  "tls-rustls",
+  "runtime-tokio",
+  "any",
+  "sqlite",
+  "migrate",
+], default-features = false }
+tempfile = { workspace = true }
+tokio = { workspace = true }
