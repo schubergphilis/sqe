@@ -86,10 +86,6 @@ Still not backported:
   `crates/iceberg/src/utils.rs`, which this tree no longer has (apache renamed
   it to `util/mod.rs`). Wanted for the OOM-safety program, so it is worth
   taking together with `61a8941` as one validated piece.
-- `550393d0` (RW #186) fails cleanly instead of panicking on truncated data
-  files. Needs a hand port: the `reader.rs` hunk only lands with fuzz against
-  SQE's drifted copy, and its one `spec/manifest/writer.rs` hunk (+5/-3 in
-  `datum_serialized_len`) does not apply. Small, but not mechanical.
 - `08a18f41` / `ac90a10d` add trait impls and exports for `DeleteVector`.
   API surface only; take when something needs them.
 - `6bd8e98` propagates and caches equality-delete load failures. This is a

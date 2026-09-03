@@ -1054,6 +1054,23 @@ impl ArrowReader {
         bytes_read_counter: Option<Arc<AtomicU64>>,
     ) -> Result<(ArrowFileReader, ArrowReaderMetadata)> {
         let parquet_file = file_io.new_input(data_file_path)?;
+
+        // Guard against truncated or partially-written data files. The Parquet
+        // metadata reader trusts the manifest size when locating the footer;
+        // allowing that size beyond the real object can panic in range slicing.
+        let actual_size = parquet_file.metadata().await?.size;
+        if actual_size < file_size_in_bytes {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Parquet data file is truncated: manifest recorded \
+                     file_size_in_bytes={file_size_in_bytes} but object store \
+                     reports {actual_size} bytes"
+                ),
+            )
+            .with_context("path", data_file_path.to_string()));
+        }
+
         let parquet_reader = parquet_file.reader().await?;
         // Wrap with CountingFileRead when a counter is supplied so total
         // scan I/O can be reported via `ScanMetrics::bytes_read()`
@@ -2844,6 +2861,37 @@ mod tests {
         DataContentType, DataFileFormat, Datum, MapType, NestedField, PrimitiveType, Schema,
         SchemaRef, Type, VariantType,
     };
+
+    #[tokio::test]
+    async fn test_truncated_data_file_errors_instead_of_panicking() {
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+        let file_io = FileIO::from_path(&table_location).unwrap().build().unwrap();
+
+        let data_file_path = format!("{table_location}/truncated.parquet");
+        std::fs::write(&data_file_path, vec![0u8; 41_470]).unwrap();
+        let manifest_recorded_size = 4_686_247u64;
+
+        let result = ArrowReader::open_parquet_and_load_metadata(
+            &data_file_path,
+            file_io,
+            false,
+            None,
+            manifest_recorded_size,
+            None,
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("expected truncated data file to error, not succeed"),
+            Err(error) => error,
+        };
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.message().contains("truncated"),
+            "unexpected error message: {err}"
+        );
+    }
 
     /// The IN-predicate hash-set fast path must match the or(eq) fallback's
     /// semantics exactly: member rows true, non-member rows false, null rows
