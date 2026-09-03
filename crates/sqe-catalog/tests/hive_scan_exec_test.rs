@@ -67,6 +67,7 @@ fn spec(n_partitions: usize) -> HiveScanSpec {
             })
             .collect(),
         resolved: ResolvedFormat {
+            compression: datafusion::datasource::file_format::file_compression_type::FileCompressionType::UNCOMPRESSED,
             kind: HiveFileFormat::Parquet,
             delimiter: b',',
             quote: None,

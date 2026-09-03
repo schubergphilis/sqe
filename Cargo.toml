@@ -36,13 +36,14 @@ homepage = "https://gitlab.schubergphilis.com/data-ai/chameleon/sqlengine"
 authors = ["Schuberg Philis"]
 
 [workspace.dependencies]
-# Query engine — DataFusion 54 with hash join dynamic filters, LIMIT-aware pruning,
-# 40x faster planning, nested field pushdown, and 42 function improvements.
+# Query engine — DataFusion 55. See docs/evidence/perf/df55-arrow59-ab.md for
+# the validated upgrade results and docs/internal/research/2026-09-02-datafusion-55-followups.md
+# for the post-upgrade workaround and feature audit.
 datafusion = "55"
 datafusion-expr = "55"
 datafusion-proto = "55"
 
-# Arrow 58 / Parquet 58 — aligned with DataFusion 54
+# Arrow 59 / Parquet 59 — aligned with DataFusion 55
 arrow = { version = "59", features = ["prettyprint", "ipc_compression"] }
 arrow-flight = { version = "59", features = ["flight-sql-experimental"] }
 arrow-ipc = { version = "59", features = ["lz4", "zstd"] }
@@ -58,8 +59,8 @@ object_store = { version = "0.13", features = ["aws", "http", "azure", "gcp"] }
 
 # Iceberg — RisingWave fork for rewrite_files() / overwrite_files() transaction support.
 # Pinned to risingwavelabs/iceberg-rust dev_rebase_main_20260303 @ 813e54419b43.
-# Arrow 58 / Parquet 58 first landed via RW PR #148; the SQE workspace is now
-# aligned on DataFusion 54. Retains RW fork features:
+# Arrow 58 / Parquet 58 first landed via RW PR #148; the SQE vendor copy is now
+# ported to DataFusion 55 / Arrow 59 / Parquet 59. Retains RW fork features:
 # RewriteFilesAction, OverwriteFilesAction, PositionDeleteFileWriter,
 # DeletionVectorWriter, MergeAppend, parallel manifest loading.
 # Seven apache main fixes cherry-picked on top: #2118, #2348, #2307, #2351,

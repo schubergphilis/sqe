@@ -69,7 +69,7 @@ pub struct RuntimeCatalogRegistry {
     inner: Arc<RwLock<HashMap<String, AttachedCatalog>>>,
     /// The Hive lane. See the "Hive lane" section below for why this is a
     /// second map rather than a second field on `AttachedCatalog`.
-    hive_roots: Arc<RwLock<HashMap<String, Arc<sqe_catalog::hive::store::HiveManifestStore>>>>,
+    hive_roots: Arc<RwLock<HashMap<String, sqe_catalog::hive::source::HiveRoot>>>,
 }
 
 impl RuntimeCatalogRegistry {
@@ -261,7 +261,7 @@ impl RuntimeCatalogRegistry {
     pub fn attach_hive_root(
         &self,
         name: &str,
-        store: Arc<sqe_catalog::hive::store::HiveManifestStore>,
+        root: sqe_catalog::hive::source::HiveRoot,
     ) -> Result<(), String> {
         {
             let iceberg = self
@@ -283,7 +283,7 @@ impl RuntimeCatalogRegistry {
                 "catalog '{name}' is already attached; DETACH it first"
             ));
         }
-        hive.insert(name.to_string(), store);
+        hive.insert(name.to_string(), root);
         info!(catalog = %name, kind = "hive_external", "Catalog attached at runtime");
         Ok(())
     }
@@ -325,14 +325,14 @@ impl RuntimeCatalogRegistry {
     /// as-is instead of rebuilding them.
     pub fn hive_roots(
         &self,
-    ) -> Result<Vec<(String, Arc<sqe_catalog::hive::store::HiveManifestStore>)>, String> {
+    ) -> Result<Vec<(String, sqe_catalog::hive::source::HiveRoot)>, String> {
         let hive = self
             .hive_roots
             .read()
             .map_err(|_| "hive registry poisoned".to_string())?;
         let mut pairs: Vec<_> = hive
             .iter()
-            .map(|(name, store)| (name.clone(), Arc::clone(store)))
+            .map(|(name, root)| (name.clone(), root.clone()))
             .collect();
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(pairs)
@@ -400,19 +400,55 @@ pub async fn attach_configured_hive_roots(
                 root.name
             ));
         }
-        let store = sqe_catalog::mount::build_hive_root(
-            &root.location,
-            &std::collections::BTreeMap::new(),
-            storage,
-            limits,
-            sqe_core::config::TvfCaller::trusted_startup_config(),
-        )
-        .await
-        .map_err(|e| format!("[[hive.roots]] {}={}: {e}", root.name, root.location))?;
-        registry.attach_hive_root(&root.name, store)?;
+        let attached = match root.kind {
+            sqe_core::config::HiveRootKind::Sidecar => {
+                let store = sqe_catalog::mount::build_hive_root(
+                    &root.location,
+                    &std::collections::BTreeMap::new(),
+                    storage,
+                    limits,
+                    sqe_core::config::TvfCaller::trusted_startup_config(),
+                )
+                .await
+                .map_err(|e| format!("[[hive.roots]] {}={}: {e}", root.name, root.location))?;
+                sqe_catalog::hive::source::HiveRoot::from_store(store)
+            }
+            sqe_core::config::HiveRootKind::Glue => build_glue_hive_root(root, limits).await?,
+        };
+        registry.attach_hive_root(&root.name, attached)?;
         hive_catalogs.insert(&root.name);
     }
     Ok(())
+}
+
+/// A `kind = "glue"` root. Feature-gated because the Glue client is a large
+/// dependency the slim build deliberately omits; without it the operator
+/// gets a message naming the feature rather than a root that silently
+/// resolves nothing.
+#[cfg(feature = "glue")]
+async fn build_glue_hive_root(
+    root: &sqe_core::config::HiveRootConfig,
+    limits: sqe_catalog::hive::manifest::ManifestLimits,
+) -> Result<sqe_catalog::hive::source::HiveRoot, String> {
+    let source = sqe_catalog::mount::build_glue_root(
+        root.region.as_deref(),
+        root.catalog_id.clone(),
+        limits,
+    )
+    .await;
+    Ok(sqe_catalog::hive::source::HiveRoot::from_source(source))
+}
+
+#[cfg(not(feature = "glue"))]
+async fn build_glue_hive_root(
+    root: &sqe_core::config::HiveRootConfig,
+    _limits: sqe_catalog::hive::manifest::ManifestLimits,
+) -> Result<sqe_catalog::hive::source::HiveRoot, String> {
+    Err(format!(
+        "[[hive.roots]] '{}' sets kind = \"glue\", which needs the `glue` cargo feature on \
+         sqe-catalog (build with --features glue)",
+        root.name
+    ))
 }
 
 #[cfg(test)]
@@ -441,7 +477,7 @@ mod hive_lane_tests {
         let registry = RuntimeCatalogRegistry::new();
         let store = local_hive_store(dir.path()).await;
 
-        registry.attach_hive_root("lake", store).expect("attach");
+        registry.attach_hive_root("lake", sqe_catalog::hive::source::HiveRoot::from_store(store)).expect("attach");
 
         assert!(registry.is_hive_root("lake").expect("is_hive_root"));
         let roots = registry.hive_roots().expect("hive_roots");
@@ -455,11 +491,11 @@ mod hive_lane_tests {
         let registry = RuntimeCatalogRegistry::new();
         let store = local_hive_store(dir.path()).await;
         registry
-            .attach_hive_root("lake", Arc::clone(&store))
+            .attach_hive_root("lake", sqe_catalog::hive::source::HiveRoot::from_store(Arc::clone(&store)))
             .expect("first attach");
 
         let err = registry
-            .attach_hive_root("lake", store)
+            .attach_hive_root("lake", sqe_catalog::hive::source::HiveRoot::from_store(store))
             .expect_err("duplicate attach must fail");
         assert!(err.contains("already attached"), "{err}");
     }
@@ -567,7 +603,7 @@ mod hive_lane_tests {
         let registry = RuntimeCatalogRegistry::new();
         let store = local_hive_store(dir.path()).await;
         registry
-            .attach_hive_root("lake", store)
+            .attach_hive_root("lake", sqe_catalog::hive::source::HiveRoot::from_store(store))
             .expect("hive attach");
 
         let secrets = sqe_core::SecretStore::new();
@@ -615,7 +651,7 @@ mod hive_lane_tests {
 
         let store = local_hive_store(dir.path()).await;
         let err = registry
-            .attach_hive_root("lake", store)
+            .attach_hive_root("lake", sqe_catalog::hive::source::HiveRoot::from_store(store))
             .expect_err("must not shadow an attached iceberg catalog");
         assert!(err.contains("already attached"), "{err}");
     }
@@ -625,7 +661,7 @@ mod hive_lane_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let registry = RuntimeCatalogRegistry::new();
         let store = local_hive_store(dir.path()).await;
-        registry.attach_hive_root("lake", store).expect("attach");
+        registry.attach_hive_root("lake", sqe_catalog::hive::source::HiveRoot::from_store(store)).expect("attach");
 
         registry.detach_hive_root("lake").expect("detach");
 
@@ -652,6 +688,9 @@ mod hive_lane_tests {
         storage.tvf.allow_local_paths = true;
         let hive_config = sqe_core::config::HiveConfig {
             roots: vec![sqe_core::config::HiveRootConfig {
+                kind: Default::default(),
+                region: None,
+                catalog_id: None,
                 name: "lake".to_string(),
                 location: format!("file://{}", dir.path().display()),
                 secret: None,
@@ -681,6 +720,9 @@ mod hive_lane_tests {
         storage.tvf.allow_local_paths = true;
         let hive_config = sqe_core::config::HiveConfig {
             roots: vec![sqe_core::config::HiveRootConfig {
+                kind: Default::default(),
+                region: None,
+                catalog_id: None,
                 name: "lake".to_string(),
                 location: format!("file://{}", dir.path().display()),
                 secret: None,
@@ -705,6 +747,9 @@ mod hive_lane_tests {
     async fn attach_configured_hive_roots_fails_closed_on_a_bad_root() {
         let hive_config = sqe_core::config::HiveConfig {
             roots: vec![sqe_core::config::HiveRootConfig {
+                kind: Default::default(),
+                region: None,
+                catalog_id: None,
                 name: "lake".to_string(),
                 location: "/no/such/warehouse".to_string(),
                 secret: None,

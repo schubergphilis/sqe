@@ -333,7 +333,21 @@ impl InformationSchemaProvider {
                 debug!(error = %e, "information_schema: skipping catalog the principal is not authorized to list");
                 Ok(Vec::new())
             }
-            Err(e) => Err(DataFusionError::External(Box::new(e))),
+            // An unreachable catalog contributes nothing, the same as one the
+            // caller cannot see. information_schema spans every attached
+            // catalog, so propagating here lets a single dead endpoint blind
+            // the caller to every healthy one: a deployment that keeps an
+            // Iceberg anchor configured but unreachable, and reads its real
+            // tables from elsewhere, could not run `information_schema.tables`
+            // at all. Warn rather than debug, because unreachable is worth
+            // noticing even though it is survivable.
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "information_schema: catalog could not be listed and contributes no rows"
+                );
+                Ok(Vec::new())
+            }
         }
     }
 }
