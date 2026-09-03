@@ -38,6 +38,12 @@ The RisingWave fork provides all of these.
 
 ## Upstream tracking
 
+- RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus four backports (see below); branch tip at last audit `ac90a10d`
+- Apache upstream: tracking PRs #2185 (OverwriteAction) and #2203 (RowDeltaAction)
+- When upstream merges these, SQE will migrate to official apache/iceberg-rust
+
+Last audited on 2026-07-30. The RisingWave branch had advanced to
+`ac90a10d`, 11 commits past the vendored baseline. Four fixes are
 - RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus four focused backports (see below); branch tip at last audit `1657c184`
 - Apache upstream: tracking PRs #2185 (OverwriteAction) and #2203 (RowDeltaAction)
 - When upstream merges these, SQE will migrate to official apache/iceberg-rust
@@ -54,6 +60,10 @@ backported as focused commits on top of this snapshot:
 - `edf72a59` (RW #190) resolve predicate field IDs via the Arrow schema when
   Parquet leaves lack them. Lands in `reader.rs` alongside three SQE patch
   families and still applied cleanly.
+- `6bd8e98f` (RW #196) propagate and cache equality-delete load failures.
+  Retryable and cancelled loads can be reclaimed; non-retryable failures are
+  retained for late consumers. The backport is stacked after Apache #2859 so
+  both delete-loader notification fixes are reviewed as one state machine.
 - `1657c184` (RW #205) map Iceberg `Timestamptz` / `TimestamptzNs` to Glue's
   equivalent non-timezone timestamp types, matching Spark's Glue integration.
 
@@ -76,10 +86,6 @@ Still not backported:
   `crates/iceberg/src/utils.rs`, which this tree no longer has (apache renamed
   it to `util/mod.rs`). Wanted for the OOM-safety program, so it is worth
   taking together with `61a8941` as one validated piece.
-- `550393d0` (RW #186) fails cleanly instead of panicking on truncated data
-  files. Needs a hand port: the `reader.rs` hunk only lands with fuzz against
-  SQE's drifted copy, and its one `spec/manifest/writer.rs` hunk (+5/-3 in
-  `datum_serialized_len`) does not apply. Small, but not mechanical.
 - `08a18f41` / `ac90a10d` add trait impls and exports for `DeleteVector`.
   API surface only; take when something needs them.
 - `6bd8e98` propagates and caches equality-delete load failures. This is a
