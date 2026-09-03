@@ -274,7 +274,7 @@ them quickly.
 
 ## Cherry-picks from apache/iceberg-rust main
 
-Seven fixes from apache main applied on top of the RW base. RisingWave
+Eight fixes from apache main applied on top of the RW base. RisingWave
 has not backported these yet; they apply on the SQE vendor because
 the touched files diverge minimally from apache. The original PR
 authorship and commit messages are preserved.
@@ -306,6 +306,12 @@ authorship and commit messages are preserved.
   `IS NOT NULL` for a NULL delete value) instead of negating equality under SQL
   three-valued logic. Includes single-column, composite-key, multiple-row, and
   existing file-backed predicate tests.
+- **#2859** positional-delete lost-wakeup fix — exact behavioral backport of
+  Apache commit `dbbefa41e8a`. Waiters now create an `OwnedNotified` while the
+  positional-delete state lock is held, ensuring a load completion cannot be
+  signalled between observing `Loading` and registering the waiter. Includes a
+  bounded regression test for completion-before-await plus multi-waiter and
+  cancelled-waiter coverage.
 
 Three apache fixes were considered but skipped:
 
