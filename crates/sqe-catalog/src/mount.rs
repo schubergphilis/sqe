@@ -205,6 +205,63 @@ pub async fn build_hive_root(
     )))
 }
 
+/// A Hive root backed by the AWS Glue Data Catalog rather than by sidecar
+/// manifests: SQE reads the metastore that already exists instead of keeping
+/// a copy of it.
+///
+/// `region` falls back to the ambient AWS configuration when `None`, and
+/// `catalog_id` names another account's catalog (Glue's cross-account
+/// `CatalogId`); `None` is the caller's own account.
+///
+/// Credentials come from the AWS provider chain, so `AWS_PROFILE`, SSO, an
+/// instance profile and a task role all work here and, unlike the static
+/// `[storage]` credentials used for the data reads, they refresh.
+///
+/// No location check: a Glue root names no path of its own. Each table's
+/// `StorageDescriptor.location` is still checked against `[storage.tvf]` on
+/// every load, which is where the allowlist belongs for this shape.
+#[cfg(all(feature = "hive-external", feature = "glue"))]
+pub async fn build_glue_root(
+    region: Option<&str>,
+    catalog_id: Option<String>,
+    limits: crate::hive::manifest::ManifestLimits,
+) -> Arc<dyn crate::hive::source::HiveMetadataSource> {
+    Arc::new(
+        crate::hive::glue_source::GlueMetadataSource::from_env(region, catalog_id, limits).await,
+    )
+}
+
+/// Build the per-session Hive catalog provider over a metadata source that
+/// is not a sidecar warehouse. DDL against the result is refused, because
+/// SQE does not own the metastore it is reading.
+#[cfg(feature = "hive-external")]
+#[allow(clippy::too_many_arguments)]
+pub fn session_hive_catalog_from_source(
+    name: &str,
+    source: Arc<dyn crate::hive::source::HiveMetadataSource>,
+    storage: &StorageConfig,
+    secrets: &SecretStore,
+    caller: TvfCaller,
+    runtime: Arc<RuntimeEnv>,
+    manifest_cache: Arc<crate::hive::provider::HiveMetadataCache>,
+    cache_ttl: std::time::Duration,
+) -> Arc<crate::hive::provider::HiveCatalogProvider> {
+    let factory: Arc<dyn crate::hive::provider::HiveDataStoreFactory> =
+        Arc::new(EngineHiveDataStoreFactory {
+            storage: storage.clone(),
+            secrets: secrets.clone(),
+            caller,
+        });
+    Arc::new(crate::hive::provider::HiveCatalogProvider::with_source(
+        name.to_string(),
+        source,
+        factory,
+        runtime,
+        manifest_cache,
+        cache_ttl,
+    ))
+}
+
 /// Build the per-session Hive catalog provider over a shared root.
 ///
 /// `caller` is this session's identity for the `[storage.tvf]` allowlist
