@@ -376,9 +376,12 @@ impl SqlCatalog {
             Some(t) => sqlx_query.execute(&mut **t).await.map_err(from_sqlx_error),
             None => {
                 let mut tx = self.connection.begin().await.map_err(from_sqlx_error)?;
-                let result = sqlx_query.execute(&mut *tx).await.map_err(from_sqlx_error);
-                let _ = tx.commit().await.map_err(from_sqlx_error);
-                result
+                let result = sqlx_query
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(from_sqlx_error)?;
+                tx.commit().await.map_err(from_sqlx_error)?;
+                Ok(result)
             }
         }
     }
@@ -1022,14 +1025,16 @@ mod tests {
     use iceberg::{Catalog, CatalogBuilder, Namespace, NamespaceIdent, TableCreation, TableIdent};
     use itertools::Itertools;
     use regex::Regex;
+    use sqlx::AssertSqlSafe;
+    use sqlx::Executor;
     use sqlx::migrate::MigrateDatabase;
     use tempfile::TempDir;
 
     use crate::catalog::{
-        NAMESPACE_LOCATION_PROPERTY_KEY, SQL_CATALOG_PROP_BIND_STYLE, SQL_CATALOG_PROP_URI,
-        SQL_CATALOG_PROP_WAREHOUSE,
+        NAMESPACE_LOCATION_PROPERTY_KEY, NAMESPACE_TABLE_NAME, SQL_CATALOG_PROP_BIND_STYLE,
+        SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE,
     };
-    use crate::{SqlBindStyle, SqlCatalogBuilder};
+    use crate::{SqlBindStyle, SqlCatalog, SqlCatalogBuilder};
 
     const UUID_REGEX_STR: &str = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 
@@ -1372,6 +1377,88 @@ mod tests {
             .await;
 
         assert!(catalog.is_err());
+    }
+
+    async fn new_commit_error_catalog() -> SqlCatalog {
+        let sql_lite_uri = format!("sqlite:{}", temp_path());
+        sqlx::Sqlite::create_database(&sql_lite_uri).await.unwrap();
+        let catalog = SqlCatalogBuilder::default()
+            .with_storage_factory(Arc::new(LocalFsStorageFactory))
+            .prop("pool.max-connections", "1")
+            .load(
+                "iceberg",
+                HashMap::from_iter([
+                    (SQL_CATALOG_PROP_URI.to_string(), sql_lite_uri),
+                    (SQL_CATALOG_PROP_WAREHOUSE.to_string(), temp_path()),
+                ]),
+            )
+            .await
+            .unwrap();
+
+        catalog
+            .connection
+            .execute("PRAGMA foreign_keys = ON")
+            .await
+            .unwrap();
+        // This deferred constraint lets an INSERT succeed while COMMIT fails.
+        catalog
+            .connection
+            .execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        catalog
+            .connection
+            .execute(
+                "CREATE TABLE child(parent_id INTEGER REFERENCES parent(id) \
+                 DEFERRABLE INITIALLY DEFERRED)",
+            )
+            .await
+            .unwrap();
+
+        catalog
+    }
+
+    #[tokio::test]
+    async fn test_execute_returns_commit_error() {
+        let catalog = new_commit_error_catalog().await;
+
+        // Make the public namespace operation insert a child row whose deferred
+        // foreign-key constraint succeeds during execution but fails at commit.
+        let trigger = format!(
+            "CREATE TRIGGER fail_namespace_commit
+             AFTER INSERT ON {NAMESPACE_TABLE_NAME}
+             BEGIN INSERT INTO child VALUES (1); END"
+        );
+        sqlx::query(AssertSqlSafe(trigger))
+            .execute(&catalog.connection)
+            .await
+            .unwrap();
+
+        let failed_namespace = NamespaceIdent::new("failed".into());
+        let error = catalog
+            .create_namespace(&failed_namespace, HashMap::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), iceberg::ErrorKind::Unexpected);
+        assert!(!catalog.namespace_exists(&failed_namespace).await.unwrap());
+
+        // A valid relationship confirms that successful transactions still commit.
+        catalog
+            .connection
+            .execute("INSERT INTO parent VALUES (1)")
+            .await
+            .unwrap();
+        let committed_namespace = NamespaceIdent::new("committed".into());
+        catalog
+            .create_namespace(&committed_namespace, HashMap::new())
+            .await
+            .unwrap();
+        assert!(
+            catalog
+                .namespace_exists(&committed_namespace)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
