@@ -37,12 +37,12 @@ The RisingWave fork provides all of these.
 
 ## Upstream tracking
 
-- RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus three backports (see below); branch tip at last audit `ac90a10d`
+- RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus four backports (see below); branch tip at last audit `ac90a10d`
 - Apache upstream: tracking PRs #2185 (OverwriteAction) and #2203 (RowDeltaAction)
 - When upstream merges these, SQE will migrate to official apache/iceberg-rust
 
 Last audited on 2026-07-30. The RisingWave branch had advanced to
-`ac90a10d`, 11 commits past the vendored baseline. Three of them are
+`ac90a10d`, 11 commits past the vendored baseline. Four of them are
 backported as focused commits on top of this snapshot:
 
 - `f31001cd` (RW #187) lenient decode of truncated string metric bounds.
@@ -53,6 +53,10 @@ backported as focused commits on top of this snapshot:
 - `edf72a59` (RW #190) resolve predicate field IDs via the Arrow schema when
   Parquet leaves lack them. Lands in `reader.rs` alongside three SQE patch
   families and still applied cleanly.
+- `550393d0` (RW #186) return a typed `DataInvalid` error when a Parquet data
+  file is shorter than its manifest-recorded size, preventing an out-of-bounds
+  object-store slice panic. Adapted to SQE's refactored
+  `open_parquet_and_load_metadata` path.
 
 That `ee489f56` applies cleanly is itself useful: it means the dangling-DV fix
 does *not* depend on `c3ac742` below.
@@ -73,10 +77,6 @@ Still not backported:
   `crates/iceberg/src/utils.rs`, which this tree no longer has (apache renamed
   it to `util/mod.rs`). Wanted for the OOM-safety program, so it is worth
   taking together with `61a8941` as one validated piece.
-- `550393d0` (RW #186) fails cleanly instead of panicking on truncated data
-  files. Needs a hand port: the `reader.rs` hunk only lands with fuzz against
-  SQE's drifted copy, and its one `spec/manifest/writer.rs` hunk (+5/-3 in
-  `datum_serialized_len`) does not apply. Small, but not mechanical.
 - `08a18f41` / `ac90a10d` add trait impls and exports for `DeleteVector`.
   API surface only; take when something needs them.
 
@@ -274,7 +274,7 @@ them quickly.
 
 ## Cherry-picks from apache/iceberg-rust main
 
-Six fixes from apache main applied on top of the RW base. RisingWave
+Seven fixes from apache main applied on top of the RW base. RisingWave
 has not backported these yet; they apply on the SQE vendor because
 the touched files diverge minimally from apache. The original PR
 authorship and commit messages are preserved.
@@ -299,6 +299,10 @@ authorship and commit messages are preserved.
   The upstream change intentionally does not alter strict expression visitors;
   SQE's production use of `StrictMetricsEvaluator` is documented separately as
   SQE-only patch family 9.
+- **#2867** malformed Puffin footer length validation — exact behavioral
+  backport of Apache commit `c0db7707951`. Files shorter than the minimum
+  Puffin envelope and footer lengths larger than the file now return
+  `DataInvalid` instead of underflowing or issuing an invalid range read.
 
 Three apache fixes were considered but skipped:
 
