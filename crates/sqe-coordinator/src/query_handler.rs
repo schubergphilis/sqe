@@ -6577,7 +6577,7 @@ impl QueryHandler {
             .await
             .map_err(SqeError::Execution)?;
             self.runtime_catalogs
-                .attach_hive_root(&stmt.name, store)
+                .attach_hive_root(&stmt.name, sqe_catalog::hive::source::HiveRoot::from_store(store))
                 .map_err(SqeError::Execution)?;
             hive_catalogs.insert(&stmt.name);
             crate::session_context::invalidate_all_session_caches().await;

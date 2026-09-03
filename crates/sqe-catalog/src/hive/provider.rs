@@ -69,6 +69,7 @@ use super::partition::{
 use super::scan_exec::{HiveScanExec, HiveScanSpec};
 use super::serde_map::{arrow_type, listing_options, resolve_format, ResolvedFormat};
 use super::stats::{analyzed_statistics, row_width_hint, size_only_from_index, size_only_statistics};
+use super::source::HiveMetadataSource;
 use super::store::HiveManifestStore;
 use super::HiveError;
 
@@ -107,6 +108,43 @@ const MANIFEST_CACHE_CAPACITY: u64 = 16_384;
 /// re-checks with a `Filter` node above it. That is exactly why the
 /// rewrite has to happen before the file listing, not after.
 pub use super::manifest::HIVE_DEFAULT_PARTITION;
+
+/// The codec the table's data files are wrapped in, read off the first
+/// object under `prefix`.
+///
+/// Glue has no trustworthy field for this: `compressionType` is absent on
+/// most tables and reads "none" on every table that carries it, gzipped
+/// ones included. So the key suffix is the only signal, and one listing per
+/// manifest-cache miss is what it costs.
+///
+/// Falls back to `current` when the prefix is empty, unreachable, or the
+/// first object names no codec. A listing failure is not fatal here: the
+/// scan itself will surface it with a better message than this would.
+async fn detect_compression(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &object_store::path::Path,
+    current: datafusion::datasource::file_format::file_compression_type::FileCompressionType,
+) -> datafusion::datasource::file_format::file_compression_type::FileCompressionType {
+    let mut stream = store.list(Some(prefix));
+    loop {
+        match stream.try_next().await {
+            Ok(Some(meta)) => {
+                // Directory markers and the manifest sidecar say nothing
+                // about how the data is encoded.
+                let key = meta.location.as_ref();
+                if meta.size == 0 || key.ends_with('/') || key.contains("/_sqe/") {
+                    continue;
+                }
+                return super::serde_map::compression_from_key(key).unwrap_or(current);
+            }
+            Ok(None) => return current,
+            Err(e) => {
+                warn!(prefix = %prefix, error = %e, "hive_external: could not list files to detect compression; assuming uncompressed");
+                return current;
+            }
+        }
+    }
+}
 
 /// Builds an object store for a table's data location. The implementation
 /// holds the session's credentials; `secret` is a name resolved against the
@@ -959,7 +997,13 @@ impl TableProvider for HiveTableProvider {
 /// SESSION; see the module doc comment for why.
 pub struct HiveCatalogProvider {
     name: String,
-    store: Arc<HiveManifestStore>,
+    /// Where table metadata is read from. A sidecar warehouse and a
+    /// metastore that already exists (Glue, HMS) differ only here.
+    source: Arc<dyn HiveMetadataSource>,
+    /// The same object as `source` when this catalog is backed by a sidecar
+    /// warehouse SQE owns, and `None` when it reads a metastore it does not.
+    /// Only DDL needs it; reads go through `source`.
+    sidecar: Option<Arc<HiveManifestStore>>,
     data_store_factory: Arc<dyn HiveDataStoreFactory>,
     runtime: Arc<RuntimeEnv>,
     manifest_cache: Arc<HiveMetadataCache>,
@@ -1006,7 +1050,33 @@ impl HiveCatalogProvider {
             .build();
         Self {
             name,
-            store,
+            source: Arc::clone(&store) as Arc<dyn HiveMetadataSource>,
+            sidecar: Some(store),
+            data_store_factory,
+            runtime,
+            manifest_cache,
+            table_names_cache,
+        }
+    }
+
+    /// Same catalog over a metastore SQE does not own, so there is no
+    /// sidecar to write and DDL is refused rather than silently dropped.
+    pub fn with_source(
+        name: String,
+        source: Arc<dyn HiveMetadataSource>,
+        data_store_factory: Arc<dyn HiveDataStoreFactory>,
+        runtime: Arc<RuntimeEnv>,
+        manifest_cache: Arc<HiveMetadataCache>,
+        cache_ttl: Duration,
+    ) -> Self {
+        let table_names_cache = SyncCache::builder()
+            .max_capacity(TABLE_NAMES_CACHE_CAPACITY)
+            .time_to_live(cache_ttl)
+            .build();
+        Self {
+            name,
+            source,
+            sidecar: None,
             data_store_factory,
             runtime,
             manifest_cache,
@@ -1024,8 +1094,11 @@ impl HiveCatalogProvider {
     /// through a DataFusion `SchemaProvider` method, since none of those
     /// three statements has a DataFusion-native path that reaches a Hive
     /// manifest.
-    pub fn store(&self) -> Arc<HiveManifestStore> {
-        Arc::clone(&self.store)
+    /// `None` when this catalog reads a metastore SQE does not own, where
+    /// there is nothing to write a manifest to. Callers turn that into a
+    /// refusal naming the catalog rather than a silent no-op.
+    pub fn store(&self) -> Option<Arc<HiveManifestStore>> {
+        self.sidecar.clone()
     }
 
     /// Drop any cached `table_names()` result for `database`. Call after DDL
@@ -1046,7 +1119,7 @@ impl HiveCatalogProvider {
 
 impl CatalogProvider for HiveCatalogProvider {
     fn schema_names(&self) -> Vec<String> {
-        let store = Arc::clone(&self.store);
+        let store = Arc::clone(&self.source);
         match crate::runtime_bridge::block_on_compat(async move { store.list_databases().await }) {
             Ok(Ok(names)) => names,
             Ok(Err(e)) => {
@@ -1070,7 +1143,7 @@ impl CatalogProvider for HiveCatalogProvider {
         // directory-based emptiness.
         Some(Arc::new(HiveSchemaProvider {
             database: name.to_string(),
-            store: Arc::clone(&self.store),
+            source: Arc::clone(&self.source),
             data_store_factory: Arc::clone(&self.data_store_factory),
             runtime: Arc::clone(&self.runtime),
             cache: Arc::clone(&self.manifest_cache),
@@ -1083,7 +1156,7 @@ impl CatalogProvider for HiveCatalogProvider {
 /// manifest store.
 pub struct HiveSchemaProvider {
     database: String,
-    store: Arc<HiveManifestStore>,
+    source: Arc<dyn HiveMetadataSource>,
     data_store_factory: Arc<dyn HiveDataStoreFactory>,
     runtime: Arc<RuntimeEnv>,
     cache: Arc<HiveMetadataCache>,
@@ -1111,7 +1184,7 @@ impl SchemaProvider for HiveSchemaProvider {
             return (*cached).clone();
         }
 
-        let store = Arc::clone(&self.store);
+        let store = Arc::clone(&self.source);
         let database = self.database.clone();
         let names = match crate::runtime_bridge::block_on_compat(async move {
             store.list_tables(&database).await
@@ -1137,7 +1210,7 @@ impl SchemaProvider for HiveSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        let etag = match self.store.manifest_etag(&self.database, name).await {
+        let etag = match self.source.etag(&self.database, name).await {
             Ok(e) => e,
             Err(HiveError::NotFound(_)) => return Ok(None),
             Err(e) => return Err(to_df(e)),
@@ -1148,7 +1221,7 @@ impl SchemaProvider for HiveSchemaProvider {
         {
             cached
         } else {
-            match self.store.get(&self.database, name).await {
+            match self.source.get(&self.database, name).await {
                 Ok(m) => m,
                 Err(HiveError::NotFound(_)) => return Ok(None),
                 Err(e) => return Err(to_df(e)),
@@ -1172,11 +1245,46 @@ impl SchemaProvider for HiveSchemaProvider {
         self.cache
             .insert_versioned(&self.database, name, manifest.clone(), etag);
 
-        let resolved = resolve_format(&manifest).map_err(to_df)?;
-        let file_schema = file_schema_of(&manifest).map_err(to_df)?;
-        let partition_cols = partition_columns_of(&manifest).map_err(to_df)?;
+        // A table this release cannot read is invisible, not fatal. Glue
+        // holds formats SQE has no reader for (ORC, Avro) and types it
+        // cannot map, and `information_schema.tables` calls this for every
+        // table in the catalog: erroring here means one unreadable table
+        // out of 692 takes down the whole listing, which is the same
+        // enumerate-and-fail shape that makes the Iceberg Glue provider
+        // useless against a Hive catalog. The reason is logged rather than
+        // discarded, and a direct `SELECT` on such a table reports it as
+        // not found, matching how a denied column is absent rather than an
+        // error.
+        let unreadable = |what: &str, e: HiveError| {
+            warn!(
+                database = %self.database, table = %name,
+                error = %e,
+                "hive_external: table hidden from this catalog: its {what} is not readable by \
+                 this release"
+            );
+        };
+        let mut resolved = match resolve_format(&manifest) {
+            Ok(r) => r,
+            Err(e) => {
+                unreadable("storage format", e);
+                return Ok(None);
+            }
+        };
+        let file_schema = match file_schema_of(&manifest) {
+            Ok(s) => s,
+            Err(e) => {
+                unreadable("column schema", e);
+                return Ok(None);
+            }
+        };
+        let partition_cols = match partition_columns_of(&manifest) {
+            Ok(p) => p,
+            Err(e) => {
+                unreadable("partition schema", e);
+                return Ok(None);
+            }
+        };
         let partition_names: Vec<String> = partition_cols.iter().map(|(n, _)| n.clone()).collect();
-        let options = listing_options(&resolved, partition_cols).map_err(to_df)?;
 
         let url = table_location_url(&manifest.storage_descriptor.location).map_err(to_df)?;
 
@@ -1204,8 +1312,21 @@ impl SchemaProvider for HiveSchemaProvider {
         // The session's own runtime, not a fresh one: `ListingTable`
         // resolves its object store from the session's registry at scan
         // time, so the store has to live where the query will look for it.
-        self.runtime
-            .register_object_store(url.as_ref(), Arc::clone(&data_store));
+        // Compression has to come from a real object key: Glue records
+        // nothing usable (`compressionType` is absent on most tables and
+        // says "none" on every table carrying it, gzipped ones included).
+        // One listing per manifest-cache miss, and only for the text
+        // formats, where guessing wrong feeds gzip bytes to a parser and
+        // fails as `Encountered unexpected ''` rather than as a codec
+        // problem.
+        if matches!(
+            resolved.kind,
+            super::serde_map::HiveFileFormat::Json | super::serde_map::HiveFileFormat::Csv
+        ) {
+            resolved.compression =
+                detect_compression(&data_store, url.prefix(), resolved.compression).await;
+        }
+        let options = listing_options(&resolved, partition_cols).map_err(to_df)?;
 
         let file_schema_ref = Arc::new(file_schema);
         let width_hint = row_width_hint(&file_schema_ref);
@@ -1264,7 +1385,7 @@ impl SchemaProvider for HiveSchemaProvider {
             Arc::clone(&self.data_store_factory),
             manifest.secret().map(str::to_string),
             Arc::clone(&self.runtime),
-            self.store.limits().max_partition_index_entries,
+            self.source.limits().max_partition_index_entries,
             manifest.storage_descriptor.location.clone(),
         ))))
     }
