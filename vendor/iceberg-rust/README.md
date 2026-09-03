@@ -38,7 +38,17 @@ The RisingWave fork provides all of these.
 
 ## Upstream tracking
 
+<<<<<<< vendor/iceberg-rust/README.md
 - RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus six focused backports (see below); branch tip at last audit `1657c184`
+=======
+- RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus four backports (see below); branch tip at last audit `ac90a10d`
+- Apache upstream: tracking PRs #2185 (OverwriteAction) and #2203 (RowDeltaAction)
+- When upstream merges these, SQE will migrate to official apache/iceberg-rust
+
+Last audited on 2026-07-30. The RisingWave branch had advanced to
+`ac90a10d`, 11 commits past the vendored baseline. Four fixes are
+- RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus four focused backports (see below); branch tip at last audit `1657c184`
+>>>>>>> vendor/iceberg-rust/README.md
 - Apache upstream: tracking PRs #2185 (OverwriteAction) and #2203 (RowDeltaAction)
 - When upstream merges these, SQE will migrate to official apache/iceberg-rust
 
@@ -54,6 +64,10 @@ backported as focused commits on top of this snapshot:
 - `edf72a59` (RW #190) resolve predicate field IDs via the Arrow schema when
   Parquet leaves lack them. Lands in `reader.rs` alongside three SQE patch
   families and still applied cleanly.
+- `6bd8e98f` (RW #196) propagate and cache equality-delete load failures.
+  Retryable and cancelled loads can be reclaimed; non-retryable failures are
+  retained for late consumers. The backport is stacked after Apache #2859 so
+  both delete-loader notification fixes are reviewed as one state machine.
 - `1657c184` (RW #205) map Iceberg `Timestamptz` / `TimestamptzNs` to Glue's
   equivalent non-timezone timestamp types, matching Spark's Glue integration.
 - `61a89414` (RW #181) cache rewritten input/output manifests and the proposed
@@ -79,6 +93,12 @@ Still not backported:
   files. Needs a hand port: the `reader.rs` hunk only lands with fuzz against
   SQE's drifted copy, and its one `spec/manifest/writer.rs` hunk (+5/-3 in
   `datum_serialized_len`) does not apply. Small, but not mechanical.
+- `0b65d716` (RW #185) bounds rewrite-manifests memory and calibrates the
+  manifest size estimate. **Blocked on `61a8941`**: 4 of its 5
+  `rewrite_manifests.rs` hunks do not apply without it, and it also deletes
+  `crates/iceberg/src/utils.rs`, which this tree no longer has (apache renamed
+  it to `util/mod.rs`). Wanted for the OOM-safety program, so it is worth
+  taking together with `61a8941` as one validated piece.
 - `08a18f41` / `ac90a10d` add trait impls and exports for `DeleteVector`.
   API surface only; take when something needs them.
 - `6bd8e98` propagates and caches equality-delete load failures. This is a
@@ -285,12 +305,12 @@ them quickly.
    the same bug (the override and its explanatory comment are upstream code);
    worth reporting so this patch can eventually be dropped.
 
-## Cherry-picks from apache/iceberg-rust main
+## Apache iceberg-rust backports
 
-Eight fixes from apache main applied on top of the RW base. RisingWave
-has not backported these yet; they apply on the SQE vendor because
-the touched files diverge minimally from apache. The original PR
-authorship and commit messages are preserved.
+Eight fixes from Apache main and one reviewed Apache PR are applied on top of
+the RW base. RisingWave has not backported these yet; they apply on the SQE
+vendor because the touched files diverge minimally from Apache. The original
+PR authorship and commit messages are preserved.
 
 - **#2118** Make `convert_filters_to_predicate` public — visibility
   change on the DataFusion integration so SQE can reuse the filter
@@ -325,12 +345,16 @@ authorship and commit messages are preserved.
   `IS NOT NULL` for a NULL delete value) instead of negating equality under SQL
   three-valued logic. Includes single-column, composite-key, multiple-row, and
   existing file-backed predicate tests.
-- **#2859** positional-delete lost-wakeup fix — exact behavioral backport of
-  Apache commit `dbbefa41e8a`. Waiters now create an `OwnedNotified` while the
-  positional-delete state lock is held, ensuring a load completion cannot be
-  signalled between observing `Loading` and registering the waiter. Includes a
-  bounded regression test for completion-before-await plus multi-waiter and
-  cancelled-waiter coverage.
+- **#3062** SQL catalog commit error propagation — exact behavioral backport of
+  Apache PR head `d8e7ed0642c6` (originally audited as `6678583`). The internal
+  transaction path now returns commit failures instead of returning a successful
+  statement result. A deferred SQLite foreign-key constraint exercises the
+  failure through the public catalog API and confirms the write is rolled back.
+- **#2509** FastAppend intra-batch path de-duplication — adapted from the
+  unmerged Apache PR head `1254b05c00fe` (originally audited as `252bb60`).
+  Files with the same path in one batch are collapsed to their first occurrence
+  before manifests and snapshot totals are produced. SQE applies one shared
+  path set across its separate data-file and delete-file collections.
 
 Three apache fixes were considered but skipped:
 
