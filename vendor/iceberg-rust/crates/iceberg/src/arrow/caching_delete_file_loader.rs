@@ -255,11 +255,11 @@ impl CachingDeleteFileLoader {
                 let pos_del_load_key = Self::pos_delete_load_key(task);
                 match del_filter.try_start_pos_del_load(&pos_del_load_key) {
                     PosDelLoadAction::AlreadyLoaded => Ok(DeleteFileContext::ExistingPosDel),
-                    PosDelLoadAction::WaitFor(notify) => {
+                    PosDelLoadAction::WaitFor(notified) => {
                         // Positional deletes are accessed synchronously by ArrowReader.
                         // We must wait here to ensure the data is ready before returning,
                         // otherwise ArrowReader might get an empty/partial result.
-                        notify.notified().await;
+                        notified.await;
                         Ok(DeleteFileContext::ExistingPosDel)
                     }
                     PosDelLoadAction::Load => {
