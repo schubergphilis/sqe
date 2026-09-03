@@ -7,8 +7,11 @@
 
 use std::collections::BTreeMap;
 
-use datafusion::arrow::datatypes::DataType;
+use std::sync::Arc;
+
+use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion::datasource::file_format::csv::CsvFormat;
+use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
 use datafusion::datasource::file_format::json::JsonFormat;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::file_format::FileFormat;
@@ -45,11 +48,72 @@ pub enum HiveFileFormat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedFormat {
     pub kind: HiveFileFormat,
+    /// Codec the data files are wrapped in. Glue records nothing reliable
+    /// here (`compressionType` is absent on most tables and reads "none" on
+    /// every table that has it, including gzipped ones), so this is filled
+    /// in from an actual object key by [`compression_from_key`] rather than
+    /// from metadata. `UNCOMPRESSED` until someone does that.
+    pub compression: FileCompressionType,
     pub delimiter: u8,
     pub quote: Option<u8>,
     pub escape: Option<u8>,
     pub has_header: bool,
     pub file_extension: String,
+}
+
+/// `array<int>` -> `Some("int")`, for the named constructor only. Tolerates
+/// whitespace between the name and the bracket, as Hive DDL allows.
+fn strip_generic<'a>(t: &'a str, name: &str) -> Option<&'a str> {
+    let rest = t.strip_prefix(name)?.trim_start();
+    let rest = rest.strip_prefix('<')?;
+    let inner = rest.strip_suffix('>')?;
+    Some(inner)
+}
+
+/// Split on commas that sit outside any `<>`, so
+/// `map<string,int>,bigint` yields two parts rather than three.
+fn split_top_level(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(s[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = s[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail.to_string());
+    }
+    out
+}
+
+/// `name:type` split on the first colon outside any `<>`, so a struct member
+/// whose type is itself a map keeps its own colons out of the decision.
+fn split_field_decl(s: &str) -> Option<(String, String)> {
+    let mut depth = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            ':' if depth == 0 => {
+                let name = s[..i].trim();
+                let ty = s[i + 1..].trim();
+                if name.is_empty() || ty.is_empty() {
+                    return None;
+                }
+                return Some((name.to_string(), ty.to_string()));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Resolve a manifest's format, SerDe class taking precedence over
@@ -106,7 +170,29 @@ pub fn resolve_format(m: &HiveManifest) -> Result<ResolvedFormat, HiveError> {
         escape: single_byte(props, &["escapeChar", "escape.delim"])?,
         has_header,
         file_extension: String::new(),
+        compression: FileCompressionType::UNCOMPRESSED,
     })
+}
+
+/// The codec an object key's suffix implies. Hive and Athena decide
+/// compression per file this way; there is no metadata to consult.
+///
+/// Returns `None` for a key that names no codec, which lets a caller tell
+/// "definitely uncompressed" apart from "nothing to go on".
+pub fn compression_from_key(key: &str) -> Option<FileCompressionType> {
+    let lower = key.to_ascii_lowercase();
+    let c = if lower.ends_with(".gz") || lower.ends_with(".gzip") {
+        FileCompressionType::GZIP
+    } else if lower.ends_with(".bz2") || lower.ends_with(".bzip2") {
+        FileCompressionType::BZIP2
+    } else if lower.ends_with(".xz") {
+        FileCompressionType::XZ
+    } else if lower.ends_with(".zst") || lower.ends_with(".zstd") {
+        FileCompressionType::ZSTD
+    } else {
+        return None;
+    };
+    Some(c)
 }
 
 /// A human-readable keyword for a Hadoop input format class this release
@@ -231,9 +317,65 @@ pub fn arrow_type(sql_type: &str) -> Result<DataType, HiveError> {
         return Ok(DataType::Decimal128(precision, scale));
     }
 
+    if let Some(inner) = strip_generic(&t, "array") {
+        // Arrow names a list's child field, Hive does not. `element` is what
+        // the Parquet LIST spec uses and what arrow-rs produces reading one,
+        // so a declared schema built here lines up with the file's.
+        let child = arrow_type(inner)?;
+        return Ok(DataType::List(Arc::new(Field::new(
+            "element", child, true,
+        ))));
+    }
+
+    if let Some(inner) = strip_generic(&t, "map") {
+        let (k, v) = split_top_level(inner)
+            .into_iter()
+            .collect::<Vec<_>>()
+            .split_first()
+            .and_then(|(k, rest)| rest.first().map(|v| ((*k).to_string(), v.to_string())))
+            .ok_or_else(|| {
+                HiveError::Validation(format!("type `{sql_type}` needs a key and a value type"))
+            })?;
+        let key = arrow_type(&k)?;
+        let value = arrow_type(&v)?;
+        // Parquet spells a map as a repeated `key_value` group; the key is
+        // non-nullable there by definition.
+        let entries = Field::new(
+            "key_value",
+            DataType::Struct(
+                vec![
+                    Field::new("key", key, false),
+                    Field::new("value", value, true),
+                ]
+                .into(),
+            ),
+            false,
+        );
+        return Ok(DataType::Map(Arc::new(entries), false));
+    }
+
+    if let Some(inner) = strip_generic(&t, "struct") {
+        let mut fields = Vec::new();
+        for part in split_top_level(inner) {
+            let (name, ty) = split_field_decl(&part).ok_or_else(|| {
+                HiveError::Validation(format!(
+                    "struct member `{part}` in `{sql_type}` is not `name:type`"
+                ))
+            })?;
+            fields.push(Field::new(name, arrow_type(&ty)?, true));
+        }
+        if fields.is_empty() {
+            return Err(HiveError::Validation(format!(
+                "type `{sql_type}` declares no members"
+            )));
+        }
+        return Ok(DataType::Struct(fields.into()));
+    }
+
     if t.contains('<') {
         return Err(HiveError::Validation(format!(
-            "type `{sql_type}` is a nested type, which is not supported in this release"
+            "type `{sql_type}` is a nested type this release does not read; array, map and \
+             struct are supported"
         )));
     }
 
@@ -280,9 +422,13 @@ pub fn listing_options(
             if let Some(q) = r.quote {
                 csv = csv.with_quote(q);
             }
-            std::sync::Arc::new(csv)
+            std::sync::Arc::new(csv.with_file_compression_type(r.compression))
         }
-        HiveFileFormat::Json => std::sync::Arc::new(JsonFormat::default()),
+        HiveFileFormat::Json => std::sync::Arc::new(
+            JsonFormat::default().with_file_compression_type(r.compression),
+        ),
+        // Parquet carries its codec per column chunk in the footer, so an
+        // outer wrapper is neither expected nor applicable.
         HiveFileFormat::Parquet => std::sync::Arc::new(ParquetFormat::default()),
     };
 

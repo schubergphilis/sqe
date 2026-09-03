@@ -7,12 +7,15 @@
 //! mapping rather than a redesign.
 
 pub mod ddl_render;
+#[cfg(feature = "glue")]
+pub mod glue_source;
 pub mod manifest;
 pub mod partition;
 pub mod projection;
 pub mod prune;
 pub mod provider;
 pub mod serde_map;
+pub mod source;
 pub mod stats;
 pub mod store;
 pub mod scan_exec;
