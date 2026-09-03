@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -113,6 +113,27 @@ impl FastAppendAction {
         self
     }
 
+    /// Collapse files sharing a path to their first occurrence, so a single
+    /// manifest never references the same file twice. Always runs (unlike the
+    /// `check_duplicate`-gated cross-snapshot check) since it is in-memory only.
+    fn dedupe_added_files(&self) -> (Vec<DataFile>, Vec<DataFile>) {
+        let mut seen =
+            HashSet::with_capacity(self.added_data_files.len() + self.added_delete_files.len());
+        let added_data_files = self
+            .added_data_files
+            .iter()
+            .filter(|data_file| seen.insert(data_file.file_path.as_str()))
+            .cloned()
+            .collect();
+        let added_delete_files = self
+            .added_delete_files
+            .iter()
+            .filter(|data_file| seen.insert(data_file.file_path.as_str()))
+            .cloned()
+            .collect();
+        (added_data_files, added_delete_files)
+    }
+
     /// Generate snapshot id ahead which is used by exactly once delivery.
     pub fn generate_snapshot_id(table: &Table) -> i64 {
         SnapshotProducer::generate_unique_snapshot_id(table)
@@ -134,14 +155,15 @@ impl TransactionAction for FastAppendAction {
             ));
         }
 
+        let (added_data_files, added_delete_files) = self.dedupe_added_files();
         let mut snapshot_producer = SnapshotProducer::new(
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
             self.key_metadata.clone(),
             self.snapshot_id,
             self.snapshot_properties.clone(),
-            self.added_data_files.clone(),
-            self.added_delete_files.clone(),
+            added_data_files,
+            added_delete_files,
             vec![],
             vec![],
         );
@@ -338,8 +360,9 @@ mod tests {
     use std::sync::Arc;
 
     use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH, Struct,
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH, Struct,
     };
+    use crate::table::Table;
     use crate::transaction::tests::make_v2_minimal_table;
     use crate::transaction::{Transaction, TransactionAction};
     use crate::{TableRequirement, TableUpdate};
@@ -446,6 +469,118 @@ mod tests {
         let action = action.add_data_files(vec![data_file.clone()]);
 
         assert!(Arc::new(action).commit(&table).await.is_err());
+    }
+
+    async fn committed_data_files(table: &Table, updates: &[TableUpdate]) -> Vec<DataFile> {
+        let TableUpdate::AddSnapshot { snapshot } = &updates[0] else {
+            unreachable!("first update is always AddSnapshot")
+        };
+        let manifest_list = snapshot
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await
+            .unwrap();
+        assert_eq!(1, manifest_list.entries().len());
+        manifest_list.entries()[0]
+            .load_manifest(table.file_io())
+            .await
+            .unwrap()
+            .entries()
+            .iter()
+            .map(|entry| entry.data_file().clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_fast_append_dedupes_intra_batch_duplicate_paths() {
+        let table = make_v2_minimal_table();
+        let tx = Transaction::new(&table);
+
+        let make_file = |size: u64, records: u64| {
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path("test/dup.parquet".to_string())
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(size)
+                .record_count(records)
+                .partition_spec_id(table.metadata().default_partition_spec_id())
+                .partition(Struct::from_iter([Some(Literal::long(1))]))
+                .build()
+                .unwrap()
+        };
+
+        let action = tx.fast_append().add_data_files(vec![
+            make_file(100, 10),
+            make_file(200, 20),
+            make_file(300, 30),
+        ]);
+        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let updates = action_commit.take_updates();
+        let files = committed_data_files(&table, &updates).await;
+
+        assert_eq!(1, files.len());
+        assert_eq!(100, files[0].file_size_in_bytes());
+        let TableUpdate::AddSnapshot { snapshot } = &updates[0] else {
+            unreachable!("first update is always AddSnapshot")
+        };
+        assert_eq!(
+            Some("1"),
+            snapshot
+                .summary()
+                .additional_properties
+                .get("added-data-files")
+                .map(String::as_str)
+        );
+        assert_eq!(
+            Some("10"),
+            snapshot
+                .summary()
+                .additional_properties
+                .get("added-records")
+                .map(String::as_str)
+        );
+        assert_eq!(
+            Some("1"),
+            snapshot
+                .summary()
+                .additional_properties
+                .get("total-data-files")
+                .map(String::as_str)
+        );
+        assert_eq!(
+            Some("10"),
+            snapshot
+                .summary()
+                .additional_properties
+                .get("total-records")
+                .map(String::as_str)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fast_append_dedupes_when_cross_snapshot_check_is_disabled() {
+        let table = make_v2_minimal_table();
+        let tx = Transaction::new(&table);
+
+        let make_file = || {
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path("test/dup.parquet".to_string())
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(100)
+                .record_count(10)
+                .partition_spec_id(table.metadata().default_partition_spec_id())
+                .partition(Struct::from_iter([Some(Literal::long(1))]))
+                .build()
+                .unwrap()
+        };
+
+        let action = tx
+            .fast_append()
+            .set_check_duplicate(false)
+            .add_data_files(vec![make_file(), make_file()]);
+        let mut action_commit = Arc::new(action).commit(&table).await.unwrap();
+        let files = committed_data_files(&table, &action_commit.take_updates()).await;
+        assert_eq!(1, files.len());
     }
 
     #[tokio::test]

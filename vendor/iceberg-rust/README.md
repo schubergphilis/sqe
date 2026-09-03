@@ -286,12 +286,12 @@ them quickly.
    the same bug (the override and its explanatory comment are upstream code);
    worth reporting so this patch can eventually be dropped.
 
-## Cherry-picks from apache/iceberg-rust main
+## Apache iceberg-rust backports
 
-Seven fixes from apache main applied on top of the RW base. RisingWave
-has not backported these yet; they apply on the SQE vendor because
-the touched files diverge minimally from apache. The original PR
-authorship and commit messages are preserved.
+Eight fixes from Apache main and one reviewed Apache PR are applied on top of
+the RW base. RisingWave has not backported these yet; they apply on the SQE
+vendor because the touched files diverge minimally from Apache. The original
+PR authorship and commit messages are preserved.
 
 - **#2118** Make `convert_filters_to_predicate` public — visibility
   change on the DataFusion integration so SQE can reuse the filter
@@ -326,6 +326,11 @@ authorship and commit messages are preserved.
   `IS NOT NULL` for a NULL delete value) instead of negating equality under SQL
   three-valued logic. Includes single-column, composite-key, multiple-row, and
   existing file-backed predicate tests.
+- **#2509** FastAppend intra-batch path de-duplication — adapted from the
+  unmerged Apache PR head `1254b05c00fe` (originally audited as `252bb60`).
+  Files with the same path in one batch are collapsed to their first occurrence
+  before manifests and snapshot totals are produced. SQE applies one shared
+  path set across its separate data-file and delete-file collections.
 
 Three apache fixes were considered but skipped:
 
