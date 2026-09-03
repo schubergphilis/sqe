@@ -38,17 +38,13 @@ The RisingWave fork provides all of these.
 
 ## Upstream tracking
 
-<<<<<<< vendor/iceberg-rust/README.md
 - RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus six focused backports (see below); branch tip at last audit `1657c184`
-=======
-- RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus four backports (see below); branch tip at last audit `ac90a10d`
 - Apache upstream: tracking PRs #2185 (OverwriteAction) and #2203 (RowDeltaAction)
 - When upstream merges these, SQE will migrate to official apache/iceberg-rust
 
 Last audited on 2026-07-30. The RisingWave branch had advanced to
 `ac90a10d`, 11 commits past the vendored baseline. Four fixes are
 - RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus four focused backports (see below); branch tip at last audit `1657c184`
->>>>>>> vendor/iceberg-rust/README.md
 - Apache upstream: tracking PRs #2185 (OverwriteAction) and #2203 (RowDeltaAction)
 - When upstream merges these, SQE will migrate to official apache/iceberg-rust
 
@@ -307,10 +303,10 @@ them quickly.
 
 ## Apache iceberg-rust backports
 
-Eight fixes from Apache main and one reviewed Apache PR are applied on top of
-the RW base. RisingWave has not backported these yet; they apply on the SQE
-vendor because the touched files diverge minimally from Apache. The original
-PR authorship and commit messages are preserved.
+Ten fixes from apache main applied on top of the RW base. RisingWave
+has not backported these yet; they apply on the SQE vendor because
+the touched files diverge minimally from apache. The original PR
+authorship and commit messages are preserved.
 
 - **#2118** Make `convert_filters_to_predicate` public — visibility
   change on the DataFusion integration so SQE can reuse the filter
@@ -345,6 +341,18 @@ PR authorship and commit messages are preserved.
   `IS NOT NULL` for a NULL delete value) instead of negating equality under SQL
   three-valued logic. Includes single-column, composite-key, multiple-row, and
   existing file-backed predicate tests.
+<<<<<<< vendor/iceberg-rust/README.md
+- **#2859** positional-delete lost-wakeup fix — exact behavioral backport of
+  Apache commit `dbbefa41e8a`. Waiters now create an `OwnedNotified` while the
+  positional-delete state lock is held, ensuring a load completion cannot be
+  signalled between observing `Loading` and registering the waiter. Includes a
+  bounded regression test for completion-before-await plus multi-waiter and
+  cancelled-waiter coverage.
+- **#3022** temporal partition path formatting — adapted behavioral backport of
+  Apache commit `107f449d1984`. Year, month, day, and hour transform ordinals
+  now render as Iceberg's Java/Spark-compatible date strings, including
+  pre-epoch values, instead of raw integer ordinals.
+=======
 - **#3062** SQL catalog commit error propagation — exact behavioral backport of
   Apache PR head `d8e7ed0642c6` (originally audited as `6678583`). The internal
   transaction path now returns commit failures instead of returning a successful
@@ -355,6 +363,7 @@ PR authorship and commit messages are preserved.
   Files with the same path in one batch are collapsed to their first occurrence
   before manifests and snapshot totals are produced. SQE applies one shared
   path set across its separate data-file and delete-file collections.
+>>>>>>> vendor/iceberg-rust/README.md
 
 Three apache fixes were considered but skipped:
 

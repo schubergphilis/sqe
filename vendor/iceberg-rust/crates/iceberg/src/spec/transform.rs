@@ -21,10 +21,12 @@ use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
+use chrono::Datelike;
 use fnv::FnvHashSet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::values::decimal_utils::decimal_from_i128_with_scale;
+use super::values::temporal::date;
 use super::{Datum, PrimitiveLiteral};
 use crate::ErrorKind;
 use crate::error::{Error, Result};
@@ -35,6 +37,8 @@ use crate::expr::{
 use crate::spec::Literal;
 use crate::spec::datatypes::{PrimitiveType, Type};
 use crate::transform::{BoxedTransformFunction, create_transform_function};
+
+const UNIX_EPOCH_YEAR: i32 = 1970;
 
 /// Transform is used to transform predicates to partition predicates,
 /// in addition to transforming data values.
@@ -138,20 +142,38 @@ pub enum Transform {
 impl Transform {
     /// Returns a human-readable String representation of a transformed value.
     pub fn to_human_string(&self, field_type: &Type, value: Option<&Literal>) -> String {
-        let Some(value) = value else {
+        let Some(value) = value.and_then(Literal::as_primitive_literal) else {
             return "null".to_string();
         };
 
-        if let Some(value) = value.as_primitive_literal() {
-            let field_type = field_type.as_primitive_type().unwrap();
-            let datum = Datum::new(field_type.clone(), value);
-
-            match self {
-                Self::Void => "null".to_string(),
-                _ => datum.to_human_string(),
+        match (*self, value) {
+            (Self::Void, _) => "null".to_string(),
+            (Self::Year, PrimitiveLiteral::Int(ordinal)) => {
+                format!("{:04}", UNIX_EPOCH_YEAR + ordinal)
             }
-        } else {
-            "null".to_string()
+            (Self::Month, PrimitiveLiteral::Int(ordinal)) => format!(
+                "{:04}-{:02}",
+                UNIX_EPOCH_YEAR + ordinal.div_euclid(12),
+                1 + ordinal.rem_euclid(12)
+            ),
+            (Self::Day, PrimitiveLiteral::Int(ordinal)) => {
+                let date = date::days_to_date(ordinal);
+                format!("{:04}-{:02}-{:02}", date.year(), date.month(), date.day())
+            }
+            (Self::Hour, PrimitiveLiteral::Int(ordinal)) => {
+                let day = date::days_to_date(ordinal.div_euclid(24));
+                format!(
+                    "{:04}-{:02}-{:02}-{:02}",
+                    day.year(),
+                    day.month(),
+                    day.day(),
+                    ordinal.rem_euclid(24)
+                )
+            }
+            (_, value) => {
+                let field_type = field_type.as_primitive_type().unwrap();
+                Datum::new(field_type.clone(), value).to_human_string()
+            }
         }
     }
 
@@ -1061,4 +1083,28 @@ impl<'de> Deserialize<'de> for Transform {
 enum AdjustedProjection {
     Single(Datum),
     Set(FnvHashSet<Datum>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn human(transform: Transform, ordinal: i32) -> String {
+        transform.to_human_string(
+            &Type::Primitive(PrimitiveType::Int),
+            Some(&Literal::int(ordinal)),
+        )
+    }
+
+    #[test]
+    fn test_temporal_transform_human_strings() {
+        assert_eq!(human(Transform::Year, -1), "1969");
+        assert_eq!(human(Transform::Year, 47), "2017");
+        assert_eq!(human(Transform::Month, -1), "1969-12");
+        assert_eq!(human(Transform::Month, 569), "2017-06");
+        assert_eq!(human(Transform::Day, -1), "1969-12-31");
+        assert_eq!(human(Transform::Day, 17332), "2017-06-15");
+        assert_eq!(human(Transform::Hour, -1), "1969-12-31-23");
+        assert_eq!(human(Transform::Hour, 415984), "2017-06-15-16");
+    }
 }
