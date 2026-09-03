@@ -288,7 +288,7 @@ them quickly.
 
 ## Cherry-picks from apache/iceberg-rust main
 
-Eight fixes from apache main applied on top of the RW base. RisingWave
+Ten fixes from apache main applied on top of the RW base. RisingWave
 has not backported these yet; they apply on the SQE vendor because
 the touched files diverge minimally from apache. The original PR
 authorship and commit messages are preserved.
@@ -332,6 +332,11 @@ authorship and commit messages are preserved.
   signalled between observing `Loading` and registering the waiter. Includes a
   bounded regression test for completion-before-await plus multi-waiter and
   cancelled-waiter coverage.
+- **#3080** repeated constant-column construction — adapted backport of Apache
+  commit `a5f162fed26d`. String and binary partition columns now stream one
+  borrowed literal into Arrow's buffers instead of allocating an intermediate
+  vector (and cloning every string once per output row). Large binary and fixed
+  binary were already using the optimized construction in this vendor tree.
 
 Three apache fixes were considered but skipped:
 
