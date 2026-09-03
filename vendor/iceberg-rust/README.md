@@ -274,7 +274,7 @@ them quickly.
 
 ## Cherry-picks from apache/iceberg-rust main
 
-Six fixes from apache main applied on top of the RW base. RisingWave
+Seven fixes from apache main applied on top of the RW base. RisingWave
 has not backported these yet; they apply on the SQE vendor because
 the touched files diverge minimally from apache. The original PR
 authorship and commit messages are preserved.
@@ -299,6 +299,12 @@ authorship and commit messages are preserved.
   The upstream change intentionally does not alter strict expression visitors;
   SQE's production use of `StrictMetricsEvaluator` is documented separately as
   SQE-only patch family 9.
+- **#2797** required missing-field validation — exact behavioral backport of
+  Apache commit `78df272cb1a`. When a required projected field is absent from
+  an older data file and has no `initial-default`, the record-batch transformer
+  now returns a clear `DataInvalid` error instead of synthesizing a null column.
+  Optional missing fields and required fields with an initial default retain
+  their existing behavior.
 
 Three apache fixes were considered but skipped:
 
