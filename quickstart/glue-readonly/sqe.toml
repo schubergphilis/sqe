@@ -1,0 +1,101 @@
+# SQE against an AWS Glue Hive catalog, read-only, no identity provider.
+#
+# DEVELOPMENT SHAPE. Every caller is anonymous and reads with the engine's
+# own AWS credentials. Put this behind a trusted network boundary, or move
+# to `[mcp.auth] mode = "static"` (shared tokens) or "oauth" (a real IdP)
+# before anyone but you can reach the port. See the hardening notes at the
+# bottom.
+#
+# Prerequisites:
+#   1. python3 scripts/glue-to-sidecar.py --root ~/.sqe/gluemirror
+#   2. eval "$(aws configure export-credentials --format env)"
+#   3. SQE_CONFIG=quickstart/glue-readonly/sqe.toml sqe-server
+
+[coordinator]
+flight_port = 50051
+prometheus_port = 9464
+
+# Required by config validation even though no Iceberg catalog is used here:
+# the Glue tables are read through the Hive root below, not through a REST
+# catalog. Point it at an unreachable address rather than a real one.
+[catalog]
+catalog_url = "http://127.0.0.1:1/unused"
+
+# No `[[auth.providers]]` on purpose. MCP refuses `mode = "anonymous"` when
+# any provider is configured, on the grounds that a deployment able to
+# authenticate users has no reason to hand out the engine's credentials.
+# These two legacy fields satisfy the validator without registering an
+# identity provider.
+[auth]
+client_id = "unused-no-idp"
+token_endpoint = "http://127.0.0.1:1/token"
+
+[metrics]
+# Who read which table. One JSON line per query, carrying the actor, the
+# fully-qualified resources the plan touched, the operation, timing and row
+# counts. Empty (the default) makes the audit logger a silent no-op, which
+# is easy to mistake for "SQE does not log table access".
+audit_log_path = "/tmp/sqe-audit.log"
+
+[storage]
+# Credentials are left unset on purpose. Precedence is `[storage]` here,
+# then SQE_STORAGE__S3_*, then the standard AWS_ACCESS_KEY_ID /
+# AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN, and finally object_store's own
+# chain (EC2 instance profile, ECS task role, EKS web identity). AWS_PROFILE
+# and the SSO cache are not resolved directly: export them first with
+# `aws configure export-credentials --format env`.
+s3_region = "eu-central-1"
+
+[storage.tvf]
+# The sidecar manifests live on the local filesystem. The server fails
+# closed on local paths by default because its callers are remote
+# identities; this opens that gate. Staging the mirror in S3 instead lets
+# you drop this line.
+allow_local_paths = true
+# Every bucket a Glue table's StorageDescriptor.Location can name. Reads
+# use the engine's AWS credentials, so this list is the real access
+# boundary: anything not named here is refused, and anything named here is
+# readable by any caller. Keep it to the buckets you mean.
+allowed_object_store_prefixes = [
+  "s3://sbp-a-088044431914-datalake-raw-datazone/",
+  "s3://sbp-a-088044431914-datalake-refined-datazone/",
+  "s3://sbp-a-088044431914-datalake-refined-sensitive-datazone/",
+  "s3://sbp-a-088044431914-datalake-transient-datazone/",
+  "s3://sbp-a-088044431914-datalake-ingestion-datazone/",
+  "s3://sbp-a-088044431914-datalake-staging-datazone/",
+]
+
+[hive]
+# 199 of the Glue tables project their partitions, and the widest declares
+# snapshot_date x snapshot_hour x snapshot_minute. Predicates prune each
+# axis before the product, so this cap is only reached by a query with no
+# partition predicate at all.
+manifest_max_partition_index_entries = 100000
+
+# The Glue mirror. `name` is the SQL catalog: `glue.<database>.<table>`.
+# Regenerate the mirror to pick up Glue changes; it is a snapshot, not a
+# live view.
+[[hive.roots]]
+name = "glue"
+location = "file:///Users/jjverhoeks/.sqe/gluemirror/"
+
+[mcp]
+enabled = true
+port = 8098
+resource_uri = "http://127.0.0.1:8098/mcp"
+# Reads only. Anonymous plus writes is refused anyway: an anonymous caller
+# is nobody to attribute a write to.
+allow_writes = false
+max_result_rows = 1000
+
+[mcp.auth]
+mode = "anonymous"
+
+# ── Hardening, when this stops being a laptop ─────────────────────────
+# 1. `[mcp.auth] mode = "static"` with per-consumer tokens from token_env,
+#    or "oauth" against the real IdP. Anonymous is refused under
+#    coordinator.production_mode.
+# 2. Stage the mirror in S3 and drop `allow_local_paths`.
+# 3. Narrow `allowed_object_store_prefixes` to the prefixes each consumer
+#    should see, rather than whole buckets.
+# 4. Turn on `[rate_limit]`; production_mode refuses startup without it.

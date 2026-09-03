@@ -9,9 +9,10 @@
 //! ## Scope
 //!
 //! Phase F of the iceberg-matrix-parity change covers the writer side only.
-//! DataFusion 53 has no `StatisticsSource` hook; the consumer side waits for
-//! DataFusion 54 + apache/datafusion#21157. See the TODO in
-//! `crates/sqe-planner/src/stats.rs` for the future wiring point.
+//! DataFusion 55 has `StatisticsRequest` and the opt-in physical
+//! `StatisticsRegistry`, but it does not automatically request or consume
+//! Iceberg Puffin statistics. See `crates/sqe-planner/src/stats.rs` for the
+//! remaining provider, optimizer-rule, and benchmark work.
 //!
 //! ## Sketch format
 //!
@@ -33,11 +34,10 @@
 //!
 //! ## Consumer side (deferred)
 //!
-//! TODO(matrix-f): tasks 7.12-7.14 wire these blobs into DataFusion's
-//! `StatisticsSource` once it lands in DataFusion 54. See
-//! `crates/sqe-planner/src/stats.rs` for the planned module and
-//! <https://github.com/apache/datafusion/issues/21157> for the upstream
-//! tracking issue.
+//! TODO(matrix-f): tasks 7.12-7.14 wire these blobs into an Iceberg statistics
+//! provider and add a `StatisticsRequest` producer. Evaluate DataFusion's
+//! `StatisticsRegistry` against join-plan and benchmark evidence before
+//! enabling it; see `crates/sqe-planner/src/stats.rs`.
 
 use std::collections::HashMap;
 

@@ -1010,7 +1010,9 @@ impl EmbeddedClient {
             &created_at,
         );
 
-        provider.store().put(&manifest, spec.if_not_exists).await?;
+        writable_store(&provider, catalog_name)?
+            .put(&manifest, spec.if_not_exists)
+            .await?;
         // So a `SHOW TABLES` (or a plan that calls `table_exist`) issued
         // right after sees the new table instead of a stale listing cached
         // for up to `cache_ttl` (60s in `attach_hive_root`).
@@ -1073,7 +1075,7 @@ impl EmbeddedClient {
             .into());
         }
 
-        match provider.store().delete(database, table).await {
+        match writable_store(&provider, catalog)?.delete(database, table).await {
             Ok(()) => {}
             Err(sqe_catalog::hive::HiveError::NotFound(_)) if *if_exists => {}
             Err(e) => return Err(e.into()),
@@ -1106,7 +1108,7 @@ impl EmbeddedClient {
             return Ok(None);
         };
 
-        let manifest = provider.store().get(database, table).await?;
+        let manifest = writable_store(&provider, catalog)?.get(database, table).await?;
         let spec = sqe_catalog::hive::hive_spec_from_manifest(catalog, &manifest);
         let ddl = sqe_catalog::hive::render_hive_create_table_ddl(&spec);
 
@@ -1178,6 +1180,22 @@ fn object_name_parts(name: &sqlparser::ast::ObjectName) -> Vec<String> {
         .iter()
         .filter_map(|p| p.as_ident().map(ident_text))
         .collect()
+}
+
+/// The writable sidecar store behind a Hive root, or an error naming the
+/// catalog. A root reading a metastore SQE does not own (Glue, HMS) has no
+/// manifest to write, and DDL against it must say so rather than appear to
+/// succeed.
+fn writable_store(
+    provider: &sqe_catalog::hive::provider::HiveCatalogProvider,
+    catalog: &str,
+) -> anyhow::Result<std::sync::Arc<sqe_catalog::hive::store::HiveManifestStore>> {
+    provider.store().ok_or_else(|| {
+        anyhow::anyhow!(
+            "catalog `{catalog}` reads an external metastore, so SQE cannot write its table \
+             definitions; change the table where the metastore owns it"
+        )
+    })
 }
 
 #[cfg(test)]
