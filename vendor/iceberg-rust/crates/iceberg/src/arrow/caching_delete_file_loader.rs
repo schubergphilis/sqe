@@ -414,10 +414,12 @@ impl CachingDeleteFileLoader {
         mut stream: ArrowRecordBatchStream,
     ) -> Result<HashMap<String, DeleteVector>> {
         let mut result: HashMap<String, DeleteVector> = HashMap::default();
+        let mut run_positions: Vec<u64> = Vec::new();
 
         while let Some(batch) = stream.next().await {
+            debug_assert!(run_positions.is_empty());
+
             let batch = batch?;
-            let schema = batch.schema();
             let columns = batch.columns();
 
             let Some(file_paths) = columns[0].as_any().downcast_ref::<StringArray>() else {
@@ -433,6 +435,7 @@ impl CachingDeleteFileLoader {
                 ));
             };
 
+            let mut run_path: Option<&str> = None;
             for (file_path, pos) in file_paths.iter().zip(positions.iter()) {
                 let (Some(file_path), Some(pos)) = (file_path, pos) else {
                     return Err(Error::new(
@@ -441,11 +444,48 @@ impl CachingDeleteFileLoader {
                     ));
                 };
 
-                result.entry_ref(file_path).or_default().insert(pos as u64);
+                if run_path != Some(file_path) {
+                    if let Some(previous_path) = run_path {
+                        Self::merge_delete_positions(
+                            &mut result,
+                            previous_path,
+                            &run_positions,
+                        );
+                        run_positions.clear();
+                    }
+                    run_path = Some(file_path);
+                }
+                run_positions.push(pos as u64);
+            }
+
+            if let Some(previous_path) = run_path {
+                Self::merge_delete_positions(&mut result, previous_path, &run_positions);
+                run_positions.clear();
             }
         }
 
         Ok(result)
+    }
+
+    fn merge_delete_positions(
+        result: &mut HashMap<String, DeleteVector>,
+        file_path: &str,
+        positions: &[u64],
+    ) {
+        debug_assert!(!positions.is_empty());
+
+        let delete_vector = result.entry_ref(file_path).or_default();
+        if let Err(error) = delete_vector.insert_positions(positions) {
+            tracing::debug!(
+                file_path,
+                run_len = positions.len(),
+                error = %error,
+                "positional delete run fell back to per-position insert"
+            );
+            for &position in positions {
+                delete_vector.insert(position);
+            }
+        }
     }
 
     async fn parse_delete_vector_puffin(
@@ -1221,6 +1261,36 @@ mod tests {
 
         let result = delete_filter.get_delete_vector(&file_scan_tasks[1]);
         assert!(result.is_none()); // no pos dels for file 3
+    }
+
+    #[tokio::test]
+    async fn test_parse_positional_deletes_merges_runs_and_fallbacks() {
+        let schema = crate::arrow::delete_filter::tests::create_pos_del_schema();
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(["a", "a", "b", "a"])),
+                Arc::new(Int64Array::from_iter_values([5_i64, 10, 2, 3])),
+            ],
+        )
+        .unwrap();
+        let batch2 = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from_iter_values(["a", "a", "c"])),
+                Arc::new(Int64Array::from_iter_values([7_i64, 7, 0])),
+            ],
+        )
+        .unwrap();
+        let stream = futures::stream::iter(vec![Ok(batch1), Ok(batch2)]).boxed();
+
+        let result = CachingDeleteFileLoader::parse_positional_deletes_record_batch_stream(stream)
+            .await
+            .unwrap();
+
+        assert_eq!(result["a"].iter().collect::<Vec<_>>(), vec![3, 5, 7, 10]);
+        assert_eq!(result["b"].iter().collect::<Vec<_>>(), vec![2]);
+        assert_eq!(result["c"].iter().collect::<Vec<_>>(), vec![0]);
     }
 
     /// Verifies that evolve_schema on partial-schema equality deletes works correctly
