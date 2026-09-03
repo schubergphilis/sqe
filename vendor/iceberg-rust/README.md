@@ -274,7 +274,7 @@ them quickly.
 
 ## Cherry-picks from apache/iceberg-rust main
 
-Six fixes from apache main applied on top of the RW base. RisingWave
+Seven fixes from apache main applied on top of the RW base. RisingWave
 has not backported these yet; they apply on the SQE vendor because
 the touched files diverge minimally from apache. The original PR
 authorship and commit messages are preserved.
@@ -299,6 +299,13 @@ authorship and commit messages are preserved.
   The upstream change intentionally does not alter strict expression visitors;
   SQE's production use of `StrictMetricsEvaluator` is documented separately as
   SQE-only patch family 9.
+- **#2781** equality-delete NULL correctness — exact behavioral backport of
+  Apache commit `22c256e985a6`. A nullable data value must survive a non-NULL
+  equality-delete value; a NULL delete value matches only NULL data. The reader
+  now constructs the keep predicate directly (`IS NULL OR != value`, or
+  `IS NOT NULL` for a NULL delete value) instead of negating equality under SQL
+  three-valued logic. Includes single-column, composite-key, multiple-row, and
+  existing file-backed predicate tests.
 
 Three apache fixes were considered but skipped:
 
