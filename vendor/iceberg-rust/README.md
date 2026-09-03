@@ -38,6 +38,9 @@ The RisingWave fork provides all of these.
 
 ## Upstream tracking
 
+<<<<<<< vendor/iceberg-rust/README.md
+- RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus five focused backports (see below); branch tip at last audit `1657c184`
+=======
 - RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus seven focused backports (see below); branch tip at last audit `1657c184`
 - Apache upstream: tracking PRs #2185 (OverwriteAction) and #2203 (RowDeltaAction)
 - When upstream merges these, SQE will migrate to official apache/iceberg-rust
@@ -66,6 +69,11 @@ backported as focused commits on top of this snapshot:
   both delete-loader notification fixes are reviewed as one state machine.
 - `1657c184` (RW #205) map Iceberg `Timestamptz` / `TimestamptzNs` to Glue's
   equivalent non-timezone timestamp types, matching Spark's Glue integration.
+- `deb4a3c8` (RW #208) cache OpenDAL S3/GCS operators by bucket. Each cache is
+  owned by one immutable storage configuration, so bucket is the complete
+  variable part of the operator identity; clones share it, while deserialization
+  deliberately starts with an empty cache. Dynamic credential loaders remain
+  inside the reused operator and continue to refresh credentials.
 - `61a89414` (RW #181) cache rewritten input/output manifests and the proposed
   snapshot identity across optimistic commit retries. Concurrent append-only
   retries reuse the already-written manifests; concurrent rewrites invalidate
@@ -104,9 +112,6 @@ Still not backported:
   state machine across three files (over 500 changed lines) that also carry
   SQE scan patches. Port it in a dedicated MR with cancellation, retry, and
   equality-delete regression coverage rather than folding it into this audit.
-- `deb4a3c8` caches OpenDAL S3/GCS operators by bucket. It is useful for
-  credential/token reuse but changes shared storage state and serialization;
-  take it separately with multi-bucket and credential-refresh validation.
 
 Apache `main` is audited selectively rather than merged wholesale: it has
 different transaction APIs, dependency versions, and MSRV requirements. Every
