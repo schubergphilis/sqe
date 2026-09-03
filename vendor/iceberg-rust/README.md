@@ -313,6 +313,12 @@ authorship and commit messages are preserved.
   The upstream change intentionally does not alter strict expression visitors;
   SQE's production use of `StrictMetricsEvaluator` is documented separately as
   SQE-only patch family 9.
+- **#2797** required missing-field validation — exact behavioral backport of
+  Apache commit `78df272cb1a`. When a required projected field is absent from
+  an older data file and has no `initial-default`, the record-batch transformer
+  now returns a clear `DataInvalid` error instead of synthesizing a null column.
+  Optional missing fields and required fields with an initial default retain
+  their existing behavior.
 - **#2781** equality-delete NULL correctness — exact behavioral backport of
   Apache commit `22c256e985a6`. A nullable data value must survive a non-NULL
   equality-delete value; a NULL delete value matches only NULL data. The reader
