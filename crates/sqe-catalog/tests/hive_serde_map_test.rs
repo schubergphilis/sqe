@@ -128,10 +128,9 @@ fn hive_scalar_types_map_to_arrow() {
         arrow_type("decimal(18,2)").expect("decimal"),
         DataType::Decimal128(18, 2)
     );
-    assert!(
-        arrow_type("array<string>").is_err(),
-        "nested types are cycle-2 work"
-    );
+    // Nested types used to be rejected here. They map now; the cases that
+    // matter live in the dedicated tests further down.
+    assert!(arrow_type("array<string>").is_ok());
 }
 
 // Team-lead ruling: erroring on a bare `decimal` (no precision or scale) is
@@ -247,4 +246,82 @@ fn an_explicit_row_format_serde_beats_the_stored_as_default_serde() {
         resolve_format(&m).expect("resolve").kind,
         HiveFileFormat::Json
     ));
+}
+
+// ── Nested types ─────────────────────────────────────────────────────
+// 85 tables in the surveyed Glue catalog carry at least one array, struct
+// or map column, and every one of them used to fail at planning.
+
+#[test]
+fn array_maps_to_a_list_of_its_element() {
+    let DataType::List(f) = arrow_type("array<string>").unwrap() else {
+        panic!("expected a list");
+    };
+    assert_eq!(
+        f.name(),
+        "element",
+        "arrow-rs reads Parquet LIST children under this name; a mismatch here reads as a \
+         missing column rather than an error"
+    );
+    assert_eq!(f.data_type(), &DataType::Utf8);
+}
+
+#[test]
+fn struct_members_keep_their_names_and_order() {
+    let DataType::Struct(fs) =
+        arrow_type("struct<type:string,user_id:bigint,deleted:boolean>").unwrap()
+    else {
+        panic!("expected a struct");
+    };
+    let names: Vec<&str> = fs.iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(names, vec!["type", "user_id", "deleted"]);
+    assert_eq!(fs[1].data_type(), &DataType::Int64);
+}
+
+#[test]
+fn map_key_is_not_nullable() {
+    let DataType::Map(entries, sorted) = arrow_type("map<string,int>").unwrap() else {
+        panic!("expected a map");
+    };
+    assert!(!sorted);
+    let DataType::Struct(kv) = entries.data_type() else {
+        panic!("map entries must be a struct");
+    };
+    assert_eq!(kv[0].name(), "key");
+    assert!(
+        !kv[0].is_nullable(),
+        "a Parquet map key is non-null by definition"
+    );
+    assert!(kv[1].is_nullable());
+}
+
+/// Why the split tracks bracket depth: the inner map's comma and colon must
+/// not terminate the outer struct's member.
+#[test]
+fn nesting_inside_a_struct_member_is_not_split_on() {
+    let DataType::Struct(fs) =
+        arrow_type("struct<a:map<string,int>,b:array<struct<c:double>>>").unwrap()
+    else {
+        panic!("expected a struct");
+    };
+    assert_eq!(fs.len(), 2, "got {fs:?}");
+    assert_eq!(fs[0].name(), "a");
+    assert!(matches!(fs[0].data_type(), DataType::Map(_, _)));
+    let DataType::List(inner) = fs[1].data_type() else {
+        panic!("b should be a list");
+    };
+    assert!(matches!(inner.data_type(), DataType::Struct(_)));
+}
+
+#[test]
+fn a_malformed_struct_member_is_named_in_the_error() {
+    let err = arrow_type("struct<justaname>").unwrap_err().to_string();
+    assert!(err.contains("justaname"), "{err}");
+    assert!(err.contains("name:type"), "{err}");
+}
+
+#[test]
+fn an_unknown_generic_still_reports_what_is_supported() {
+    let err = arrow_type("uniontype<int,string>").unwrap_err().to_string();
+    assert!(err.contains("array, map and struct"), "{err}");
 }

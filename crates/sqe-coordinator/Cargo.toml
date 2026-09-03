@@ -12,6 +12,10 @@ repository.workspace = true
 # into every workspace consumer via Cargo's feature unification. Tests
 # now run via `cargo test -p sqe-coordinator --features test-sqlite`.
 test-sqlite = ["sqe-catalog/sql-sqlite"]
+# `[[hive.roots]] kind = "glue"`: read table metadata from the AWS Glue Data
+# Catalog. Off by default because the Glue client is the heavyweight AWS SDK
+# dependency the slim build exists to avoid.
+glue = ["sqe-catalog/glue"]
 
 [lib]
 name = "sqe_coordinator"
