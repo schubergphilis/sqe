@@ -288,7 +288,7 @@ them quickly.
 
 ## Cherry-picks from apache/iceberg-rust main
 
-Eight fixes from apache main applied on top of the RW base. RisingWave
+Ten fixes from apache main applied on top of the RW base. RisingWave
 has not backported these yet; they apply on the SQE vendor because
 the touched files diverge minimally from apache. The original PR
 authorship and commit messages are preserved.
@@ -332,6 +332,10 @@ authorship and commit messages are preserved.
   signalled between observing `Loading` and registering the waiter. Includes a
   bounded regression test for completion-before-await plus multi-waiter and
   cancelled-waiter coverage.
+- **#3022** temporal partition path formatting — adapted behavioral backport of
+  Apache commit `107f449d1984`. Year, month, day, and hour transform ordinals
+  now render as Iceberg's Java/Spark-compatible date strings, including
+  pre-epoch values, instead of raw integer ordinals.
 
 Three apache fixes were considered but skipped:
 
