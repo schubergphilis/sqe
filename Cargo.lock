@@ -6428,6 +6428,7 @@ dependencies = [
  "toml",
  "tracing",
  "url",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6460,6 +6461,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6520,6 +6522,7 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
+ "workspace-hack",
  "zip",
 ]
 
@@ -6563,6 +6566,7 @@ dependencies = [
  "tokio",
  "tonic",
  "url",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6588,6 +6592,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6660,6 +6665,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wiremock",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6681,6 +6687,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "workspace-hack",
  "zeroize",
 ]
 
@@ -6707,6 +6714,7 @@ dependencies = [
  "tracing",
  "uuid",
  "wiremock",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6730,6 +6738,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6755,6 +6764,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6774,6 +6784,7 @@ dependencies = [
  "sqe-spill",
  "tokio",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6799,6 +6810,7 @@ dependencies = [
  "tokio",
  "tracing",
  "wiremock",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6816,6 +6828,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "url",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6839,6 +6852,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6851,6 +6865,7 @@ dependencies = [
  "arrow-schema",
  "reqwest 0.13.4",
  "thiserror 2.0.20",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6872,6 +6887,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6883,6 +6899,7 @@ dependencies = [
  "sqe-core",
  "sqlparser",
  "tracing",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6914,6 +6931,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6935,6 +6953,7 @@ dependencies = [
  "tokio",
  "unicode-normalization",
  "url",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6979,6 +6998,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -8386,6 +8406,133 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
+name = "workspace-hack"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "aws-config",
+ "aws-smithy-http-client",
+ "aws-smithy-types",
+ "axum",
+ "axum-core",
+ "bigdecimal",
+ "bytes",
+ "cc",
+ "chrono",
+ "clap",
+ "clap_builder",
+ "crc32fast",
+ "datafusion-common",
+ "datafusion-datasource",
+ "datafusion-datasource-arrow",
+ "datafusion-datasource-csv",
+ "datafusion-datasource-json",
+ "datafusion-datasource-parquet",
+ "datafusion-expr",
+ "datafusion-functions",
+ "datafusion-physical-expr",
+ "datafusion-physical-expr-common",
+ "datafusion-physical-plan",
+ "digest 0.10.7",
+ "digest 0.11.3",
+ "either",
+ "event-listener-strategy",
+ "fastrand",
+ "foldhash 0.2.0",
+ "form_urlencoded",
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-io",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
+ "hashbrown 0.17.1",
+ "httparse",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "iceberg-catalog-loader",
+ "iceberg-catalog-rest",
+ "indexmap 2.14.0",
+ "lexical-parse-float",
+ "lexical-parse-integer",
+ "lexical-util",
+ "libc",
+ "libsqlite3-sys",
+ "log",
+ "md-5 0.10.6",
+ "md-5 0.11.0",
+ "memchr",
+ "moka",
+ "num-bigint 0.4.8",
+ "num-integer",
+ "num-traits",
+ "object_store",
+ "once_cell",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "ordered-float",
+ "parquet",
+ "percent-encoding",
+ "portable-atomic",
+ "ppv-lite86",
+ "proc-macro2",
+ "quote",
+ "rand 0.10.2",
+ "rand 0.9.5",
+ "rand_chacha 0.9.0",
+ "regex",
+ "regex-automata",
+ "regex-lite",
+ "regex-syntax",
+ "reqwest 0.12.28",
+ "reqwest 0.13.4",
+ "ring",
+ "rustls",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "scopeguard",
+ "serde",
+ "serde_core",
+ "serde_json",
+ "simd-adler32",
+ "simdutf8",
+ "slab",
+ "smallvec",
+ "sqlparser",
+ "sqlx",
+ "subtle",
+ "syn 2.0.119",
+ "syn 3.0.3",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "toml_datetime",
+ "toml_parser",
+ "tonic",
+ "tower",
+ "tracing",
+ "tracing-core",
+ "tracing-futures",
+ "tracing-log",
+ "tracing-subscriber",
+ "twox-hash",
+ "uuid",
+ "winnow",
+ "zerocopy",
+ "zstd",
+ "zstd-safe",
+ "zstd-sys",
+]
+
+[[package]]
 name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8414,6 +8561,7 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "workspace-hack",
 ]
 
 [[package]]

@@ -21,6 +21,7 @@ members = [
     "crates/sqe-mcp",
     "crates/sqe-cli",
     "crates/sqe-bench",
+    "crates/workspace-hack",
     "xtask",
 ]
 # Exclude vendored trees. They are referenced via path / [patch], not members.
