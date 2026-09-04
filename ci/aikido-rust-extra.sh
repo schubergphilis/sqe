@@ -8,3 +8,13 @@ cargo check -p sqe-catalog --no-default-features --features rest,sql-postgres
 cargo check -p sqe-catalog --no-default-features --features rest,sql-sqlite
 cargo check -p sqe-catalog --no-default-features
 cargo xtask matrix-report --min-percent 50
+
+# The workspace-hack crate must match the dependency graph, or per-crate builds
+# silently fall back to their own feature resolution and the 38-copies problem
+# returns without anyone noticing. `generate --diff` exits non-zero on drift.
+# cargo-hakari is not in the rust image; a from-source install is a few minutes
+# and runs in parallel with the gate, so it is acceptable here for now.
+if ! command -v cargo-hakari >/dev/null 2>&1; then
+  cargo install cargo-hakari --locked --version 0.9.38 >/dev/null 2>&1
+fi
+cargo hakari generate --diff

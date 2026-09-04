@@ -4,6 +4,26 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Build: one dependency build for every cargo selection (cargo-hakari)
+
+    `crates/workspace-hack` is a cargo-hakari managed crate that every member
+    depends on. It pins the union of third-party features the workspace
+    build resolves, so `cargo test -p sqe-coordinator`, `cargo build -p
+    sqe-bench -p sqe-coordinator` (the bench scripts), `make test` and CI now
+    share one compiled copy of the DataFusion and iceberg stack instead of
+    one per selection (38 copies were found in `target/debug/deps`). The
+    optional catalog backends stay out of it through `final-excludes`;
+    `sqe-catalog` gains `hadoop` and `sql-sqlite` in its default set because
+    sqe-cli always required them and every workspace build already carried
+    them. Measured on a one-line coordinator change: `cargo test -p
+    sqe-coordinator --no-run` 5m50s to 35 s, `cargo build -p sqe-bench -p
+    sqe-coordinator` from a full dependency rebuild to 30 s; cold workspace
+    build unchanged (8m25s vs 8m14s). Regenerate with `cargo hakari generate`
+    after dependency changes; `ci/aikido-rust-extra.sh` fails when the crate
+    is stale.
+
 ### Added
 
 - MCP auth modes for deployments with no identity provider

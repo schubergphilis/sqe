@@ -54,6 +54,7 @@ prometheus = { workspace = true }
 # Used only at worker startup to pick the first non-loopback, non-link-local
 # address when POD_IP / HOSTNAME are not set. Cross-platform (posix + windows).
 if-addrs = "0.15"
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 tokio = { workspace = true }
