@@ -8,9 +8,11 @@ repository.workspace = true
 
 [features]
 # Opt-in for integration tests that spin up a SQLite-backed Iceberg
-# catalog. Activating this through a dev-dep used to leak `sql-sqlite`
-# into every workspace consumer via Cargo's feature unification. Tests
-# now run via `cargo test -p sqe-coordinator --features test-sqlite`.
+# catalog: `cargo test -p sqe-coordinator --features test-sqlite`. Since
+# 2026-09-04 `sql-sqlite` is in sqe-catalog's default set (sqe-cli always
+# required it, so every workspace build carried it anyway), which makes the
+# backend part of this feature a no-op; it stays as the switch that compiles
+# the `#[cfg(feature = "test-sqlite")]` tests in.
 test-sqlite = ["sqe-catalog/sql-sqlite"]
 # `[[hive.roots]] kind = "glue"`: read table metadata from the AWS Glue Data
 # Catalog. Off by default because the Glue client is the heavyweight AWS SDK
@@ -92,6 +94,7 @@ sqe-worker = { path = "../sqe-worker" }
 opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 opentelemetry_sdk = { workspace = true }
@@ -105,10 +108,9 @@ sqe-core = { path = "../sqe-core" }
 sqe-auth = { path = "../sqe-auth" }
 sqe-quack-server = { path = "../sqe-quack-server" }
 sqe-quack-wire = { path = "../sqe-quack-wire" }
-# Tests for the runtime catalog registry need the `sql-sqlite` backend
-# on `sqe-catalog`. Enable through the `test-sqlite` feature instead of
-# a dev-dep override so feature unification does not leak the SQLite
-# driver into every workspace build.
+# Tests for the runtime catalog registry are gated behind the `test-sqlite`
+# feature above rather than a dev-dep feature override, so that a per-crate
+# build resolves sqe-catalog exactly as the workspace build does.
 sqe-catalog = { path = "../sqe-catalog" }
 sqe-sql = { path = "../sqe-sql" }
 sqe-policy = { path = "../sqe-policy" }

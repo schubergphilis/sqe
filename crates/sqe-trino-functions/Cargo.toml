@@ -31,6 +31,7 @@ regex = { workspace = true }
 unicode-normalization = { workspace = true }
 rust-stemmers = { workspace = true }
 chrono-tz = { workspace = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 tokio = { workspace = true }
