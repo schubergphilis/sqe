@@ -66,9 +66,79 @@ variables:
   # builder stage if stage order in Dockerfile drifts.
   AIKIDO_DOCKER_TARGET: "runtime"
 
-# Cold Rust image build. The Dockerfile is a plain multi-stage (rust bookworm
-# builder -> distroless runtime) with no chef/sccache; a full release link of
-# the engine can still exceed GitLab's 1h default. This is a CEILING only.
+# ── Binaries for the image, compiled by cargo in the test stage ──────
+# The image used to be compiled inside kaniko in .post, after the tests: a
+# `cargo chef cook` (9m20s) plus a release build with thin LTO (28m25s) plus
+# about four minutes of filesystem snapshots, 38 to 67 minutes measured, with
+# every RUN --mount cache ignored. This job does the compile with cargo, in the
+# test stage with `needs: []`, so it overlaps the test gate; the .post image job
+# then only COPYs (Dockerfile.ci).
+#
+# Profile: `release` (thin LTO, stripped) on the default branch, where the image
+# is published. `dev-release` on merge requests, where the image is a discarded
+# validation artifact: same opt-level, no LTO, so the link is minutes not tens
+# of minutes. `strip` keeps the MR artifact small.
+#
+# Same native deps as the platform test job: .cargo/config.toml pins clang +
+# mold for x86_64 Linux, protobuf-compiler is needed by datafusion-substrait's
+# build script. `--locked` and `--no-default-features` match ./Dockerfile.
+# The rust image tag follows rust-toolchain.toml (1.98.0); ./Dockerfile still
+# says 1.97.1, tracked as item A7 of the build-time plan.
+release-binaries:
+  stage: test
+  needs: []
+  image: rust:1.98.0-slim-bookworm
+  timeout: 90m
+  variables:
+    CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
+    CARGO_INCREMENTAL: "0"
+    CARGO_TERM_COLOR: "always"
+  cache:
+    key: "release-binaries-registry"
+    paths:
+      - .cargo-home/registry/
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends clang mold cmake curl protobuf-compiler libprotobuf-dev libssl-dev pkg-config binutils >/dev/null
+  script:
+    - |
+      set -euo pipefail
+      echo "profile: $CARGO_PROFILE"
+      cargo build --locked --profile "$CARGO_PROFILE" --no-default-features \
+        --bin sqe-server --bin sqe-worker --bin sqe-cli --bin sqe-bench
+      mkdir -p out
+      for b in sqe-server sqe-worker sqe-cli sqe-bench; do
+        cp "target/$CARGO_PROFILE/$b" out/
+        strip "out/$b"
+      done
+      ls -la out/
+  artifacts:
+    paths:
+      - out/
+    expire_in: 1 day
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - Dockerfile
+        - Dockerfile.ci
+        - Cargo.toml
+        - Cargo.lock
+        - rust-toolchain.toml
+        - .cargo/config.toml
+        - .gitlab-ci.yml
+        - "crates/*/Cargo.toml"
+        - "vendor/**/*"
+        - "xtask/**/*"
+      variables:
+        CARGO_PROFILE: "dev-release"
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      variables:
+        CARGO_PROFILE: "release"
+
+# Image assembly from the release-binaries artifact (Dockerfile.ci, COPY only).
+# The 3h timeout is a leftover ceiling from when this job compiled the engine
+# inside kaniko; the job now takes minutes.
 #
 # Script is re-stated from aikido deploy.yml (v0.9.4) so we can pass
 # --target=$AIKIDO_DOCKER_TARGET. When bumping the aikido `ref:`, re-diff this
@@ -84,6 +154,11 @@ aikido-build:
   # Stage order keeps this push behind the test gate; a `needs:` here would let
   # an untested image reach the registry. The MR-side speedup is the template's
   # aikido-build-validate (--no-push, `needs: []`), narrowed below.
+  #
+  # `dependencies:` fetches release-binaries' out/ artifact WITHOUT changing
+  # ordering (unlike `needs:`), so the push still waits for the whole test stage.
+  dependencies:
+    - release-binaries
   script:
     - |
       set -euo pipefail
@@ -94,7 +169,7 @@ aikido-build:
       # kaniko doesn't auto-populate BuildKit's TARGETARCH/TARGETOS; default amd64.
       BA="$BA --build-arg TARGETARCH=${AIKIDO_TARGETARCH:-amd64} --build-arg TARGETOS=linux"
       for kv in ${AIKIDO_BUILD_ARGS:-}; do BA="$BA --build-arg $kv"; done
-      # Distroless final stage (Dockerfile `AS runtime`).
+      # Distroless final stage (Dockerfile.ci `AS runtime`, same as ./Dockerfile).
       TARGET="--target ${AIKIDO_DOCKER_TARGET:-runtime}"
       if [ "$CI_COMMIT_REF_NAME" = "$CI_DEFAULT_BRANCH" ]; then
         DEST="--destination $AIKIDO_IMAGE --digest-file image-digest.txt"
@@ -104,7 +179,7 @@ aikido-build:
       echo "kaniko: target=${AIKIDO_DOCKER_TARGET:-runtime} dest_mode=$( [ "$CI_COMMIT_REF_NAME" = "$CI_DEFAULT_BRANCH" ] && echo push || echo no-push )"
       /kaniko/executor \
         --context "$CI_PROJECT_DIR" \
-        --dockerfile "$CI_PROJECT_DIR/Dockerfile" \
+        --dockerfile "$CI_PROJECT_DIR/Dockerfile.ci" \
         $TARGET \
         $BA \
         $DEST
@@ -117,10 +192,16 @@ aikido-build:
 # --no-default-features graph the image uses), and before the split existed
 # this build was 38 to 67 serial minutes per MR for a discarded artifact.
 aikido-build-validate:
+  # `needs: []` in the template; here it needs the MR-profile binaries. Nothing
+  # is pushed on an MR, so ordering against the test gate does not matter.
+  needs:
+    - job: release-binaries
+      artifacts: true
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:
         - Dockerfile
+        - Dockerfile.ci
         - Cargo.toml
         - Cargo.lock
         - rust-toolchain.toml

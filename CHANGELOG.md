@@ -24,6 +24,17 @@ All notable changes to SQE are documented in this file.
     after dependency changes; `ci/aikido-rust-extra.sh` fails when the crate
     is stale.
 
+- CI: the image job only packages binaries compiled by cargo in the test stage
+
+    `release-binaries` (test stage, `needs: []`) runs `cargo build` for the
+    four binaries in parallel with the test gate and publishes them as an
+    artifact; `Dockerfile.ci` is a COPY-only twin of the runtime stages, and
+    the kaniko job consumes the artifact through `dependencies:` so the
+    default-branch push still waits for the whole test stage. Compiling
+    inside kaniko took 38 to 67 minutes after the tests and ignored every
+    cache mount. Merge requests build with `dev-release` (no LTO) since that
+    image is never published; main keeps `release`.
+
 - CI: image build runs in parallel with the test gate on merge requests
 
     `aikido-build-validate` (MR only, `--no-push`, `needs: []`) starts at
