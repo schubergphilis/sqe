@@ -28,6 +28,13 @@ BENCH_PORT_TRINO="18080"
 # Bloom-filter A/B lever: any truthy value passes `--bloom-filter` to the
 # load, writing Parquet blooms on TPC-H/SSB join-key columns. Off by default.
 BENCH_BLOOM_FILTER="${BENCH_BLOOM_FILTER:-}"
+# Puffin NDV A/B lever (see benchmark-test.sh): truthy loads with
+# `--puffin-stats` and starts the coordinator with query.puffin_statistics.
+BENCH_PUFFIN_STATS="${BENCH_PUFFIN_STATS:-}"
+case "$(printf '%s' "$BENCH_PUFFIN_STATS" | tr '[:upper:]' '[:lower:]')" in
+    ""|0|false|no|off) BENCH_PUFFIN_STATS="" ;;
+    *) BENCH_PUFFIN_STATS=1; export SQE_QUERY__PUFFIN_STATISTICS=true ;;
+esac
 
 # Credentials (match test stack — same as integration-test.sh)
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-s3admin}"
@@ -286,6 +293,11 @@ for BENCH in "${BENCHMARKS[@]}"; do
         ""|0|false|no|off) ;;
         *) BLOOM_ARGS=(--bloom-filter); echo "  (bloom filters ON for join-key columns)" ;;
     esac
+    PUFFIN_ARGS=()
+    if [ -n "$BENCH_PUFFIN_STATS" ]; then
+        PUFFIN_ARGS=(--puffin-stats)
+        echo "  (Puffin NDV sidecars ON; coordinator query.puffin_statistics=true)"
+    fi
     LOAD_START=$(date +%s)
     if ! AWS_SECRET_ACCESS_KEY="$DATA_S3_SECRET_KEY" "$BENCH_BIN" load "$BENCH" \
         --scale "$BENCH_SCALE" \
@@ -299,6 +311,7 @@ for BENCH in "${BENCHMARKS[@]}"; do
         --s3-endpoint "$DATA_S3_ENDPOINT" \
         --s3-region "$DATA_S3_REGION" \
         ${BLOOM_ARGS[@]+"${BLOOM_ARGS[@]}"} \
+        ${PUFFIN_ARGS[@]+"${PUFFIN_ARGS[@]}"} \
         --clean 2>&1; then
         echo "  ✗ Load FAILED"
         FAIL=$((FAIL + 1))

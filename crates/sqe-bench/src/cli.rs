@@ -240,6 +240,14 @@ pub enum Command {
         /// `BENCH_BLOOM_FILTER=1` into this flag.)
         #[arg(long, default_value_t = false)]
         bloom_filter: bool,
+
+        /// Write Puffin NDV sidecars (`write.puffin.stats = 'true'`) for the
+        /// loaded tables so the coordinator's `query.puffin_statistics`
+        /// experiment has distinct-count estimates to plan from. Off by
+        /// default so baselines stay comparable. (The benchmark scripts
+        /// translate `BENCH_PUFFIN_STATS=1` into this flag.)
+        #[arg(long, default_value_t = false)]
+        puffin_stats: bool,
     },
 
     /// Run benchmark queries and report timing

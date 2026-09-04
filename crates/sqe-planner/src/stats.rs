@@ -16,7 +16,7 @@ use std::sync::Arc;
 use datafusion::common::tree_node::Transformed;
 use datafusion::common::{Column, DataFusionError, Result};
 use datafusion::logical_expr::logical_plan::{LogicalPlan, TableScanBuilder};
-use datafusion::logical_expr::StatisticsRequest;
+use datafusion::logical_expr::statistics::StatisticsRequest;
 use datafusion::optimizer::optimizer::ApplyOrder;
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 
@@ -84,7 +84,7 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
             Field::new("unused", DataType::Int32, true),
         ]));
-        let table = Arc::new(MemTable::try_new(schema, vec![]).unwrap());
+        let table = Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap());
         LogicalPlan::TableScan(
             TableScanBuilder::new("t", provider_as_source(table))
                 .with_projection(projection)

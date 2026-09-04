@@ -6,6 +6,22 @@ All notable changes to SQE are documented in this file.
 
 ### Added
 
+- Experimental Puffin NDV statistics consumer (`query.puffin_statistics`)
+
+    Tables that opted in to `write.puffin.stats = 'true'` already carried a
+    theta-sketch sidecar per column with an `ndv` estimate duplicated into the
+    Iceberg `StatisticsFile` blob metadata. Nothing read it. With
+    `query.puffin_statistics = true` (env `SQE_QUERY__PUFFIN_STATISTICS`,
+    default false) the coordinator registers an optimizer rule that attaches
+    DataFusion 55 `StatisticsRequest::DistinctCount` requests to every
+    projected scan column, the Iceberg table provider answers them from the
+    current snapshot's statistics metadata as `Precision::Inexact` without
+    fetching the Puffin body, and `datafusion.optimizer.use_statistics_registry`
+    is switched on so join selection sees the distinct counts. Off by default
+    until the plan and benchmark gates pass; `BENCH_PUFFIN_STATS=1` on the
+    benchmark scripts loads with sidecars and starts the coordinator with the
+    flag on for an A/B against an identical baseline load.
+
 - MCP auth modes for deployments with no identity provider
 
     `[mcp.auth] mode` selects how callers authenticate to `/mcp`: `oauth`

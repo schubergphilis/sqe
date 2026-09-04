@@ -5816,6 +5816,10 @@ impl SqeConfig {
         // Query
         env_override_u64("SQE_QUERY__TIMEOUT_SECS", &mut self.query.timeout_secs);
         env_override_usize("SQE_QUERY__MAX_SQL_BYTES", &mut self.query.max_sql_bytes);
+        env_override_bool(
+            "SQE_QUERY__PUFFIN_STATISTICS",
+            &mut self.query.puffin_statistics,
+        );
     }
 }
 
