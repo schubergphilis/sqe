@@ -21,6 +21,10 @@ pub struct LoadArgs<'a> {
     /// CTAS). Off by default so baselines stay comparable; see
     /// [`bloom_columns`].
     pub bloom_filter: bool,
+    /// Emit Puffin NDV sidecars after each load commit (via the
+    /// `write.puffin.stats` table property on the CTAS). Off by default; the
+    /// coordinator only consumes them when `query.puffin_statistics` is on.
+    pub puffin_stats: bool,
 }
 
 /// Sort-on-write clustering key for a fact table.
@@ -215,14 +219,23 @@ pub async fn load_benchmark(client: &dyn BenchClient, args: &LoadArgs<'_>) -> an
         // Bloom filters on join-key columns, when requested. The property
         // must be set at table-creation time -- it drives the CTAS data
         // write through SQE's Iceberg writer.
+        // Both levers share one TBLPROPERTIES clause; sqlparser accepts a
+        // single options list per CTAS.
+        let mut tbl_props: Vec<String> = Vec::new();
         if args.bloom_filter {
             let cols = bloom_columns(benchmark, &table_def.name);
             if !cols.is_empty() {
-                base_sql.push_str(&format!(
-                    " TBLPROPERTIES ('write.parquet.bloom-filter-columns' = '{}')",
+                tbl_props.push(format!(
+                    "'write.parquet.bloom-filter-columns' = '{}'",
                     cols.join(",")
                 ));
             }
+        }
+        if args.puffin_stats {
+            tbl_props.push("'write.puffin.stats' = 'true'".to_string());
+        }
+        if !tbl_props.is_empty() {
+            base_sql.push_str(&format!(" TBLPROPERTIES ({})", tbl_props.join(", ")));
         }
         if let Some(spec) = partition_spec(benchmark, &table_def.name) {
             base_sql.push_str(&format!(" PARTITIONED BY ({spec})"));

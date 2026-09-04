@@ -372,6 +372,15 @@ pub async fn create_session_context(
                         max_size,
                     );
                 }
+                // Registry and NDV requests are separate experiments: the
+                // registry changes how every join is costed, NDV requests
+                // only add distinct counts to Iceberg scan statistics.
+                if config.query.statistics_registry {
+                    sc = sc.set_bool(
+                        "datafusion.optimizer.use_statistics_registry",
+                        true,
+                    );
+                }
                 sc
             };
 
@@ -467,6 +476,11 @@ pub async fn create_session_context(
             ctx.add_optimizer_rule(Arc::new(
                 sqe_planner::SingleDistinctCountCompanionRule::new(),
             ));
+            if config.query.puffin_statistics {
+                ctx.add_optimizer_rule(Arc::new(
+                    sqe_planner::PuffinStatisticsRequestRule::new(),
+                ));
+            }
 
             // Register DataFusion's built-in in-memory catalog so DML helpers can register
             // temporary MemTables under `datafusion.public.<name>` without hitting the

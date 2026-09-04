@@ -8,11 +8,11 @@
 //!
 //! ## Scope
 //!
-//! Phase F of the iceberg-matrix-parity change covers the writer side only.
-//! DataFusion 55 has `StatisticsRequest` and the opt-in physical
-//! `StatisticsRegistry`, but it does not automatically request or consume
-//! Iceberg Puffin statistics. See `crates/sqe-planner/src/stats.rs` for the
-//! remaining provider, optimizer-rule, and benchmark work.
+//! Phase F of the iceberg-matrix-parity change: this module is the writer
+//! plus the metadata-only reader. DataFusion 55 has `StatisticsRequest` and
+//! the opt-in physical `StatisticsRegistry`, but it does not request or
+//! consume Iceberg Puffin statistics on its own; the SQE request rule lives in
+//! `crates/sqe-planner/src/stats.rs`.
 //!
 //! ## Sketch format
 //!
@@ -29,21 +29,26 @@
 //! ## Opt-in
 //!
 //! Emission is gated by the table property `write.puffin.stats = 'true'`.
-//! The default is off while the deferred consumer side lands; flipping the
-//! default to true is a follow-up once tasks 7.12-7.14 close.
+//! The default stays off until the consumer below clears its benchmark gate
+//! (task 7.14); flipping it is a follow-up.
 //!
-//! ## Consumer side (deferred)
+//! ## Consumer side
 //!
-//! TODO(matrix-f): tasks 7.12-7.14 wire these blobs into an Iceberg statistics
-//! provider and add a `StatisticsRequest` producer. Evaluate DataFusion's
-//! `StatisticsRegistry` against join-plan and benchmark evidence before
-//! enabling it; see `crates/sqe-planner/src/stats.rs`.
+//! [`PuffinNdvCache`] and [`parse_ndv_properties`] read the `ndv` property
+//! back from the snapshot's `StatisticsFile` blob metadata, so answering a
+//! DataFusion `StatisticsRequest::DistinctCount` never fetches the Puffin
+//! body. `SqeTableProvider::scan_with_args` applies them as
+//! `Precision::Inexact` distinct counts; the request producer is
+//! `PuffinStatisticsRequestRule` in `crates/sqe-planner/src/stats.rs`. Both
+//! sit behind `query.puffin_statistics` (default false), which also enables
+//! `datafusion.optimizer.use_statistics_registry`.
 
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, RecordBatch};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, TimeUnit};
 use datasketches::theta::ThetaSketch;
 
 use iceberg::io::FileIO;
@@ -85,6 +90,70 @@ pub const PROP_NDV: &str = "ndv";
 /// `fields`).
 pub const PROP_FIELD_ID: &str = "field_id";
 
+/// Snapshot-keyed cache of NDV estimates advertised in Iceberg statistics
+/// metadata.
+///
+/// The `ndv` property is duplicated into the Iceberg `StatisticsFile` entry,
+/// so answering a DataFusion statistics request does not need to fetch the
+/// Puffin body. Keeping the parsed map on the snapshot-bound table provider
+/// also avoids reparsing metadata when a prepared statement is planned more
+/// than once.
+#[derive(Debug, Default)]
+pub struct PuffinNdvCache {
+    by_snapshot: RwLock<HashMap<i64, Arc<HashMap<i32, usize>>>>,
+}
+
+impl PuffinNdvCache {
+    /// Return parsed field-id to NDV estimates for `snapshot_id`.
+    pub fn for_snapshot(
+        &self,
+        snapshot_id: i64,
+        statistics_file: Option<&StatisticsFile>,
+    ) -> Arc<HashMap<i32, usize>> {
+        if let Ok(cache) = self.by_snapshot.read() {
+            if let Some(ndv) = cache.get(&snapshot_id) {
+                return Arc::clone(ndv);
+            }
+        }
+
+        let parsed = Arc::new(
+            statistics_file
+                .map(parse_ndv_properties)
+                .unwrap_or_default(),
+        );
+        if let Ok(mut cache) = self.by_snapshot.write() {
+            return Arc::clone(
+                cache
+                    .entry(snapshot_id)
+                    .or_insert_with(|| Arc::clone(&parsed)),
+            );
+        }
+        parsed
+    }
+}
+
+/// Parse standard theta-sketch NDV properties from an Iceberg statistics file.
+///
+/// Malformed, multi-column, stale-snapshot, and unrelated blobs are ignored.
+/// A sketch estimate is inherently approximate, so callers must expose these
+/// values to DataFusion as `Precision::Inexact`.
+pub fn parse_ndv_properties(statistics_file: &StatisticsFile) -> HashMap<i32, usize> {
+    statistics_file
+        .blob_metadata
+        .iter()
+        .filter(|blob| {
+            blob.r#type == APACHE_DATASKETCHES_THETA_V1
+                && blob.snapshot_id == statistics_file.snapshot_id
+                && blob.fields.len() == 1
+        })
+        .filter_map(|blob| {
+            let field_id = *blob.fields.first()?;
+            let ndv = blob.properties.get(PROP_NDV)?.parse::<usize>().ok()?;
+            Some((field_id, ndv))
+        })
+        .collect()
+}
+
 /// Return true when the table property opts in to Puffin emission.
 pub fn puffin_stats_enabled(table_properties: &HashMap<String, String>) -> bool {
     table_properties
@@ -111,49 +180,111 @@ pub fn puffin_sidecar_path(metadata_location: &str, snapshot_id: i64) -> String 
 
 /// Build one theta sketch per top-level column in the schema.
 ///
+/// Per-column theta sketches keyed by Iceberg field id, in schema order:
+/// `(field_id, column_name, sketch, ndv_estimate)`.
+pub type ColumnSketches = Vec<(i32, String, ThetaSketch, u64)>;
+
+/// Incremental theta-sketch builder for a write that streams its batches.
+///
+/// The buffered CTAS/INSERT paths hold every batch in memory and can call
+/// [`build_theta_sketches`] after the fact. The streaming paths cannot: they
+/// hand each batch to the Parquet writer and drop it. This accumulator sits
+/// on the batch stream instead, so NDV statistics cost one bounded sketch per
+/// column (k = 4096 retained hashes) rather than a second copy of the data.
+///
+/// Sketchable columns are decided from the first batch seen, matching the
+/// batch-slice builder. Nulls are ignored.
+pub struct ThetaSketchAccumulator {
+    fields: Vec<(i32, String)>,
+    /// `(schema column index, field id, name, sketch)`; populated lazily on
+    /// the first batch so the Arrow types are known.
+    sketches: Option<Vec<(usize, i32, String, ThetaSketch)>>,
+}
+
+impl std::fmt::Debug for ThetaSketchAccumulator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThetaSketchAccumulator")
+            .field("columns", &self.fields.len())
+            .field("initialised", &self.sketches.is_some())
+            .finish()
+    }
+}
+
+impl ThetaSketchAccumulator {
+    /// Prepare an accumulator for the table's current schema. Batches are
+    /// expected in schema column order, which is what both the CTAS SELECT
+    /// and a column-reordered INSERT SELECT deliver.
+    pub fn new(schema: &IcebergSchema) -> Self {
+        Self {
+            fields: schema
+                .as_struct()
+                .fields()
+                .iter()
+                .map(|f| (f.id, f.name.clone()))
+                .collect(),
+            sketches: None,
+        }
+    }
+
+    /// Feed one batch. The first batch fixes which columns are sketched.
+    pub fn update(&mut self, batch: &RecordBatch) {
+        let sketches = self.sketches.get_or_insert_with(|| {
+            self.fields
+                .iter()
+                .enumerate()
+                .filter_map(|(col_idx, (field_id, name))| {
+                    if batch.num_columns() <= col_idx {
+                        return None;
+                    }
+                    let arrow_type = batch.column(col_idx).data_type();
+                    if !is_sketchable_type(arrow_type) {
+                        debug!(
+                            field = %name,
+                            data_type = ?arrow_type,
+                            "skipping non-primitive column for theta sketch"
+                        );
+                        return None;
+                    }
+                    Some((col_idx, *field_id, name.clone(), ThetaSketch::builder().build()))
+                })
+                .collect()
+        });
+        for (col_idx, _, _, sketch) in sketches.iter_mut() {
+            if *col_idx < batch.num_columns() {
+                feed_column_into_sketch(sketch, batch.column(*col_idx).as_ref());
+            }
+        }
+    }
+
+    /// True when no batch has been fed yet; there is nothing to write.
+    pub fn is_empty(&self) -> bool {
+        self.sketches.is_none()
+    }
+
+    /// Finish and return the per-column sketches with their NDV estimates.
+    pub fn finish(self) -> ColumnSketches {
+        self.sketches
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, field_id, name, sketch)| {
+                // estimate() returns f64; use rounded value for the `ndv` property.
+                let ndv = sketch.estimate().round().max(0.0) as u64;
+                (field_id, name, sketch, ndv)
+            })
+            .collect()
+    }
+}
+
 /// Returns `(field_id, name, sketch, ndv_estimate)` tuples in schema order.
 /// Columns whose Arrow type is not hashable in a meaningful way (structs,
 /// lists, maps) are skipped with a warning, which matches the Java writer's
 /// behaviour of only sketching primitives.
-pub fn build_theta_sketches(
-    schema: &IcebergSchema,
-    batches: &[RecordBatch],
-) -> Vec<(i32, String, ThetaSketch, u64)> {
-    let fields = schema.as_struct().fields();
-    let mut out = Vec::with_capacity(fields.len());
-
-    for (col_idx, iceberg_field) in fields.iter().enumerate() {
-        let Some(first_batch) = batches.first() else {
-            continue;
-        };
-        if first_batch.num_columns() <= col_idx {
-            continue;
-        }
-
-        let arrow_type = first_batch.column(col_idx).data_type().clone();
-        if !is_sketchable_type(&arrow_type) {
-            debug!(
-                field = %iceberg_field.name,
-                data_type = ?arrow_type,
-                "skipping non-primitive column for theta sketch"
-            );
-            continue;
-        }
-
-        let mut sketch = ThetaSketch::builder().build();
-        for batch in batches {
-            if col_idx >= batch.num_columns() {
-                continue;
-            }
-            feed_column_into_sketch(&mut sketch, batch.column(col_idx).as_ref());
-        }
-
-        // estimate() returns f64; use rounded value for the `ndv` property.
-        let ndv = sketch.estimate().round().max(0.0) as u64;
-        out.push((iceberg_field.id, iceberg_field.name.clone(), sketch, ndv));
+pub fn build_theta_sketches(schema: &IcebergSchema, batches: &[RecordBatch]) -> ColumnSketches {
+    let mut acc = ThetaSketchAccumulator::new(schema);
+    for batch in batches {
+        acc.update(batch);
     }
-
-    out
+    acc.finish()
 }
 
 /// Decide whether an Arrow type can be fed into a theta sketch.
@@ -183,6 +314,7 @@ fn is_sketchable_type(dt: &DataType) -> bool {
             | DataType::Timestamp(_, _)
             | DataType::Utf8
             | DataType::LargeUtf8
+            | DataType::Utf8View
             | DataType::Decimal128(_, _)
             | DataType::Decimal256(_, _)
     )
@@ -258,6 +390,50 @@ fn feed_column_into_sketch(sketch: &mut ThetaSketch, column: &dyn Array) {
                 }
             }
         }
+        // DataFusion 55 reads Parquet strings as Utf8View by default
+        // (`schema_force_view_types`), so CTAS/INSERT SELECT batches carry
+        // this type, not Utf8. Same bytes, same hash.
+        DataType::Utf8View => {
+            let arr = column.as_string_view();
+            for i in 0..arr.len() {
+                if arr.is_valid(i) {
+                    sketch.update(arr.value(i));
+                }
+            }
+        }
+        DataType::Int8 => feed_primitive::<arrow_array::types::Int8Type>(sketch, column),
+        DataType::Int16 => feed_primitive::<arrow_array::types::Int16Type>(sketch, column),
+        DataType::UInt8 => feed_primitive::<arrow_array::types::UInt8Type>(sketch, column),
+        DataType::UInt16 => feed_primitive::<arrow_array::types::UInt16Type>(sketch, column),
+        DataType::UInt32 => feed_primitive::<arrow_array::types::UInt32Type>(sketch, column),
+        DataType::Date32 => feed_primitive::<arrow_array::types::Date32Type>(sketch, column),
+        DataType::Date64 => feed_primitive::<arrow_array::types::Date64Type>(sketch, column),
+        DataType::Time32(TimeUnit::Second) => {
+            feed_primitive::<arrow_array::types::Time32SecondType>(sketch, column)
+        }
+        DataType::Time32(TimeUnit::Millisecond) => {
+            feed_primitive::<arrow_array::types::Time32MillisecondType>(sketch, column)
+        }
+        DataType::Time64(TimeUnit::Microsecond) => {
+            feed_primitive::<arrow_array::types::Time64MicrosecondType>(sketch, column)
+        }
+        DataType::Time64(TimeUnit::Nanosecond) => {
+            feed_primitive::<arrow_array::types::Time64NanosecondType>(sketch, column)
+        }
+        // Decimals hash their unscaled integer representation. TPC-H/TPC-DS
+        // money columns are Decimal128 and used to fall through to the
+        // "missing handler" warning on every batch.
+        DataType::Decimal128(_, _) => {
+            feed_primitive::<arrow_array::types::Decimal128Type>(sketch, column)
+        }
+        DataType::Decimal256(_, _) => {
+            let arr = column.as_primitive::<arrow_array::types::Decimal256Type>();
+            for i in 0..arr.len() {
+                if arr.is_valid(i) {
+                    sketch.update(arr.value(i).to_le_bytes());
+                }
+            }
+        }
         DataType::Timestamp(_, _) => {
             // All timestamp variants store an i64 internally. Cast via the
             // downcast helpers for the microsecond unit since Iceberg stores
@@ -290,6 +466,15 @@ fn feed_column_into_sketch(sketch: &mut ThetaSketch, column: &dyn Array) {
                         sketch.update(arr.value(i));
                     }
                 }
+            } else if let Some(arr) = column
+                .as_any()
+                .downcast_ref::<arrow_array::TimestampSecondArray>()
+            {
+                for i in 0..arr.len() {
+                    if arr.is_valid(i) {
+                        sketch.update(arr.value(i));
+                    }
+                }
             }
         }
         other => {
@@ -298,6 +483,21 @@ fn feed_column_into_sketch(sketch: &mut ThetaSketch, column: &dyn Array) {
             // is the single source of truth. Warn so a gap surfaces during
             // testing rather than silently ignoring data.
             warn!(data_type = ?other, "theta sketch missing type handler; column skipped");
+        }
+    }
+}
+
+/// Feed every non-null value of a primitive column whose native type hashes
+/// directly (integers, dates, times, `i128` decimals).
+fn feed_primitive<T>(sketch: &mut ThetaSketch, column: &dyn Array)
+where
+    T: arrow_array::ArrowPrimitiveType,
+    T::Native: std::hash::Hash,
+{
+    let arr = column.as_primitive::<T>();
+    for i in 0..arr.len() {
+        if arr.is_valid(i) {
+            sketch.update(arr.value(i));
         }
     }
 }
@@ -331,17 +531,30 @@ pub async fn write_puffin_sidecar(
     snapshot_id: i64,
     sequence_number: i64,
 ) -> iceberg::Result<StatisticsFile> {
+    let sketches = build_theta_sketches(schema, batches);
+    write_puffin_sidecar_from_sketches(file_io, base_dir, &sketches, snapshot_id, sequence_number)
+        .await
+}
+
+/// Write a Puffin sidecar from already-built sketches (the streaming write
+/// paths accumulate them with [`ThetaSketchAccumulator`] while batches flow
+/// to the Parquet writer). See [`write_puffin_sidecar`] for the layout.
+pub async fn write_puffin_sidecar_from_sketches(
+    file_io: &FileIO,
+    base_dir: &str,
+    sketches: &ColumnSketches,
+    snapshot_id: i64,
+    sequence_number: i64,
+) -> iceberg::Result<StatisticsFile> {
     let uuid = uuid::Uuid::new_v4();
     let sidecar_path = format!("{base_dir}/{snapshot_id}-{uuid}.stats");
-
-    let sketches = build_theta_sketches(schema, batches);
 
     let output_file = file_io.new_output(&sidecar_path)?;
     let mut writer = PuffinWriter::new(&output_file, HashMap::new(), false).await?;
 
     let mut blob_metadata_specs: Vec<SpecBlobMetadata> = Vec::with_capacity(sketches.len());
 
-    for (field_id, name, sketch, ndv) in &sketches {
+    for (field_id, name, sketch, ndv) in sketches {
         let mut props = HashMap::new();
         props.insert(PROP_NDV.to_string(), ndv.to_string());
         props.insert(PROP_FIELD_ID.to_string(), field_id.to_string());
@@ -428,13 +641,61 @@ mod tests {
         );
     }
 
-    use arrow_array::{Int64Array, StringArray};
+    use arrow_array::{ArrayRef, Int64Array, StringArray};
     use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
     use iceberg::io::FileIOBuilder;
     use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
     use tempfile::TempDir;
 
     use super::*;
+
+    fn statistics_file_with_blobs(blob_metadata: Vec<SpecBlobMetadata>) -> StatisticsFile {
+        StatisticsFile {
+            snapshot_id: 42,
+            statistics_path: "memory://table/metadata/42.stats".to_string(),
+            file_size_in_bytes: 100,
+            file_footer_size_in_bytes: 50,
+            key_metadata: None,
+            blob_metadata,
+        }
+    }
+
+    #[test]
+    fn parses_only_valid_single_field_theta_ndv_properties() {
+        let blob = |kind: &str, snapshot_id: i64, fields: Vec<i32>, ndv: &str| SpecBlobMetadata {
+            r#type: kind.to_string(),
+            snapshot_id,
+            sequence_number: 1,
+            fields,
+            properties: HashMap::from([(PROP_NDV.to_string(), ndv.to_string())]),
+        };
+        let file = statistics_file_with_blobs(vec![
+            blob(APACHE_DATASKETCHES_THETA_V1, 42, vec![7], "123"),
+            blob(APACHE_DATASKETCHES_THETA_V1, 41, vec![8], "456"),
+            blob(APACHE_DATASKETCHES_THETA_V1, 42, vec![9, 10], "2"),
+            blob("other-sketch", 42, vec![11], "3"),
+            blob(APACHE_DATASKETCHES_THETA_V1, 42, vec![12], "invalid"),
+        ]);
+
+        assert_eq!(parse_ndv_properties(&file), HashMap::from([(7, 123)]));
+    }
+
+    #[test]
+    fn caches_parsed_ndv_by_snapshot() {
+        let cache = PuffinNdvCache::default();
+        let first = statistics_file_with_blobs(vec![SpecBlobMetadata {
+            r#type: APACHE_DATASKETCHES_THETA_V1.to_string(),
+            snapshot_id: 42,
+            sequence_number: 1,
+            fields: vec![7],
+            properties: HashMap::from([(PROP_NDV.to_string(), "123".to_string())]),
+        }]);
+        let changed = statistics_file_with_blobs(vec![]);
+
+        assert_eq!(cache.for_snapshot(42, Some(&first)).get(&7), Some(&123));
+        assert_eq!(cache.for_snapshot(42, Some(&changed)).get(&7), Some(&123));
+        assert!(cache.for_snapshot(43, None).is_empty());
+    }
 
     fn schema_id_name() -> IcebergSchema {
         IcebergSchema::builder()
@@ -468,6 +729,95 @@ mod tests {
 
         let empty = HashMap::new();
         assert!(!puffin_stats_enabled(&empty));
+    }
+
+    /// The streaming write paths feed batches one at a time; the estimate must
+    /// not depend on how the rows were chunked.
+    #[test]
+    fn accumulator_over_split_batches_matches_single_batch() {
+        let schema = schema_id_name();
+        let whole = sample_batch(vec![1, 2, 3, 1, 2, 4], vec!["a", "b", "c", "a", "b", "d"]);
+        let expected = build_theta_sketches(&schema, &[whole]);
+
+        let mut acc = ThetaSketchAccumulator::new(&schema);
+        assert!(acc.is_empty());
+        acc.update(&sample_batch(vec![1, 2], vec!["a", "b"]));
+        acc.update(&sample_batch(vec![3, 1], vec!["c", "a"]));
+        acc.update(&sample_batch(vec![2, 4], vec!["b", "d"]));
+        assert!(!acc.is_empty());
+        let got = acc.finish();
+
+        assert_eq!(got.len(), expected.len());
+        for (g, e) in got.iter().zip(expected.iter()) {
+            assert_eq!(g.0, e.0, "field id");
+            assert_eq!(g.1, e.1, "name");
+            assert_eq!(g.3, e.3, "ndv for {}", g.1);
+            assert_eq!(g.3, 4);
+        }
+    }
+
+    /// Every type `is_sketchable_type` admits must have a feeding handler.
+    /// Before this test, Decimal128 and Date32 were admitted but unhandled,
+    /// so TPC-H money and date columns shipped `ndv = 0` and a WARN per batch;
+    /// Utf8View (what DataFusion 55 reads Parquet strings as) was not admitted
+    /// at all, so string columns had no blob.
+    #[test]
+    fn every_sketchable_type_yields_an_estimate() {
+        use arrow_array::{
+            Date32Array, Decimal128Array, Int16Array, StringViewArray, Time64MicrosecondArray,
+            TimestampSecondArray, UInt32Array,
+        };
+        let columns: Vec<(&str, ArrayRef)> = vec![
+            ("i16", Arc::new(Int16Array::from(vec![1, 2, 1]))),
+            ("u32", Arc::new(UInt32Array::from(vec![7, 8, 7]))),
+            ("d32", Arc::new(Date32Array::from(vec![10, 11, 10]))),
+            (
+                "dec",
+                Arc::new(
+                    Decimal128Array::from(vec![100, 200, 100])
+                        .with_precision_and_scale(15, 2)
+                        .unwrap(),
+                ),
+            ),
+            ("sv", Arc::new(StringViewArray::from(vec!["a", "b", "a"]))),
+            ("t64", Arc::new(Time64MicrosecondArray::from(vec![1, 2, 1]))),
+            ("ts", Arc::new(TimestampSecondArray::from(vec![5, 6, 5]))),
+        ];
+        let fields: Vec<Field> = columns
+            .iter()
+            .map(|(name, arr)| Field::new(*name, arr.data_type().clone(), false))
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(fields)),
+            columns.iter().map(|(_, a)| Arc::clone(a)).collect(),
+        )
+        .unwrap();
+        let iceberg_fields: Vec<_> = columns
+            .iter()
+            .enumerate()
+            .map(|(i, (name, _))| {
+                NestedField::required(i as i32 + 1, *name, Type::Primitive(PrimitiveType::Long))
+                    .into()
+            })
+            .collect();
+        let schema = IcebergSchema::builder()
+            .with_fields(iceberg_fields)
+            .build()
+            .unwrap();
+
+        let sketches = build_theta_sketches(&schema, &[batch]);
+        assert_eq!(sketches.len(), columns.len(), "every column sketched");
+        for (_, name, _, ndv) in &sketches {
+            assert_eq!(*ndv, 2, "ndv for {name}");
+        }
+    }
+
+    /// An accumulator that never saw a batch yields nothing to write.
+    #[test]
+    fn accumulator_without_batches_finishes_empty() {
+        let acc = ThetaSketchAccumulator::new(&schema_id_name());
+        assert!(acc.is_empty());
+        assert!(acc.finish().is_empty());
     }
 
     #[test]

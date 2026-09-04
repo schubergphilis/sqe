@@ -21,7 +21,10 @@ use sqlparser::ast::{ObjectName, Statement};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use sqe_catalog::puffin_stats::{puffin_stats_enabled, write_puffin_sidecar};
+use sqe_catalog::puffin_stats::{
+    build_theta_sketches, puffin_stats_enabled, write_puffin_sidecar_from_sketches,
+    ColumnSketches, ThetaSketchAccumulator,
+};
 use sqe_catalog::{SessionCatalog, TableMetadataCache};
 use sqe_core::table_properties::{
     resolve_delete_mode, resolve_merge_mode, resolve_update_mode, WriteMode,
@@ -124,6 +127,52 @@ fn reorder_insert_select(
 
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Shared handle to the streaming-path sketch accumulator.
+type SharedSketchAccumulator = Arc<std::sync::Mutex<ThetaSketchAccumulator>>;
+
+/// Wrap a write stream so every batch also feeds the Puffin NDV sketches,
+/// when `table` opted in via `write.puffin.stats`. Returns the stream
+/// unchanged and `None` otherwise, so opted-out tables pay nothing.
+fn tap_stream_for_puffin_sketches(
+    table: &IcebergTable,
+    stream: datafusion::execution::SendableRecordBatchStream,
+) -> (
+    datafusion::execution::SendableRecordBatchStream,
+    Option<SharedSketchAccumulator>,
+) {
+    if !puffin_stats_enabled(table.metadata().properties()) {
+        return (stream, None);
+    }
+    let acc: SharedSketchAccumulator = Arc::new(std::sync::Mutex::new(
+        ThetaSketchAccumulator::new(table.metadata().current_schema()),
+    ));
+    let tap = Arc::clone(&acc);
+    let schema = stream.schema();
+    let tapped = stream.inspect(move |item| {
+        if let Ok(batch) = item {
+            // A poisoned lock means an earlier panic in this task; skipping
+            // the sketch update loses statistics, never data.
+            if let Ok(mut guard) = tap.lock() {
+                guard.update(batch);
+            }
+        }
+    });
+    let stream: datafusion::execution::SendableRecordBatchStream =
+        Box::pin(RecordBatchStreamAdapter::new(schema, Box::pin(tapped)));
+    (stream, Some(acc))
+}
+
+/// Take the accumulated sketches once the writer has drained the stream.
+/// `None` when the table did not opt in or no batch was ever seen.
+fn finish_puffin_sketches(acc: Option<SharedSketchAccumulator>) -> Option<ColumnSketches> {
+    let acc = acc?;
+    let acc = Arc::try_unwrap(acc).ok()?.into_inner().ok()?;
+    if acc.is_empty() {
+        return None;
+    }
+    Some(acc.finish())
 }
 
 /// Build a single-row RecordBatch reporting affected row count.
@@ -850,6 +899,35 @@ impl WriteHandler {
         table_ident: &TableIdent,
         batches_for_stats: &[RecordBatch],
     ) {
+        // Sketch against the committed schema so field ids match the blobs.
+        let table = match catalog.load_table(table_ident).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "puffin: could not reload table for sidecar");
+                return;
+            }
+        };
+        if !puffin_stats_enabled(table.metadata().properties()) {
+            return;
+        }
+        let sketches = build_theta_sketches(table.metadata().current_schema(), batches_for_stats);
+        self.maybe_emit_puffin_sidecar_from_sketches(catalog, table_ident, &sketches)
+            .await;
+    }
+
+    /// Streaming-path twin of [`Self::maybe_emit_puffin_sidecar`]: the
+    /// sketches were accumulated while batches flowed to the Parquet writer,
+    /// so no batch copy exists. Same failure policy: log and move on, the data
+    /// commit already succeeded.
+    async fn maybe_emit_puffin_sidecar_from_sketches(
+        &self,
+        catalog: &Arc<dyn Catalog>,
+        table_ident: &TableIdent,
+        sketches: &ColumnSketches,
+    ) {
+        if sketches.is_empty() {
+            return;
+        }
         // Reload the table post-commit so we see the new snapshot id and
         // sequence number.
         let table = match catalog.load_table(table_ident).await {
@@ -881,11 +959,10 @@ impl WriteHandler {
             .unwrap_or(metadata_location)
             .to_string();
 
-        let stats_file = match write_puffin_sidecar(
+        let stats_file = match write_puffin_sidecar_from_sketches(
             table.file_io(),
             &base_dir,
-            table.metadata().current_schema(),
-            batches_for_stats,
+            sketches,
             snapshot_id,
             sequence_number,
         )
@@ -1264,6 +1341,10 @@ impl WriteHandler {
             let stream = df.execute_stream().await.map_err(|e| {
                 SqeError::Execution(format!("Failed to start execution stream: {e}"))
             })?;
+            // Puffin NDV sketches ride along on the stream when the table
+            // opted in; the buffered path clones batches instead, which the
+            // streaming path exists to avoid.
+            let (stream, sketch_acc) = tap_stream_for_puffin_sketches(&table, stream);
 
             let (data_files, total_rows) = write_data_files_streaming_with_metrics(
                 &table,
@@ -1304,6 +1385,10 @@ impl WriteHandler {
                     total_rows,
                     "CTAS committed successfully (streaming)"
                 );
+                if let Some(sketches) = finish_puffin_sketches(sketch_acc) {
+                    self.maybe_emit_puffin_sidecar_from_sketches(&catalog, &table_ident, &sketches)
+                        .await;
+                }
             } else {
                 cleanup_guard.mark_committed();
                 info!(
@@ -1434,6 +1519,8 @@ impl WriteHandler {
             .await
             .map_err(|e| SqeError::Execution(format!("Failed to start execution stream: {e}")))?;
 
+        let (stream, sketch_acc) = tap_stream_for_puffin_sketches(&table, stream);
+
         let tracker = new_upload_tracker();
         let cleanup_guard =
             WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "insert-streaming")
@@ -1458,6 +1545,11 @@ impl WriteHandler {
         self.commit_written_files(catalog.as_ref(), table, &table_ident, data_files, overwrite)
             .await?;
         cleanup_guard.mark_committed();
+
+        if let Some(sketches) = finish_puffin_sketches(sketch_acc) {
+            self.maybe_emit_puffin_sidecar_from_sketches(&catalog, &table_ident, &sketches)
+                .await;
+        }
 
         info!(
             table = %table_ident,

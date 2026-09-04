@@ -1,0 +1,40 @@
+plan_type,plan
+logical_plan,"Sort: profit.nation ASC NULLS LAST, profit.o_year DESC NULLS FIRST
+  Projection: profit.nation, profit.o_year, sum(profit.amount) AS sum_profit
+    Aggregate: groupBy=[[profit.nation, profit.o_year]], aggr=[[sum(profit.amount)]]
+      SubqueryAlias: profit
+        Projection: tpch_sf1.nation.n_name AS nation, date_part(Utf8(""YEAR""), tpch_sf1.orders.o_orderdate) AS o_year, tpch_sf1.lineitem.l_extendedprice * (Int64(1) - tpch_sf1.lineitem.l_discount) - tpch_sf1.partsupp.ps_supplycost * tpch_sf1.lineitem.l_quantity AS amount
+          Filter: tpch_sf1.supplier.s_suppkey = tpch_sf1.lineitem.l_suppkey AND tpch_sf1.partsupp.ps_suppkey = tpch_sf1.lineitem.l_suppkey AND tpch_sf1.partsupp.ps_partkey = tpch_sf1.lineitem.l_partkey AND tpch_sf1.part.p_partkey = tpch_sf1.lineitem.l_partkey AND tpch_sf1.orders.o_orderkey = tpch_sf1.lineitem.l_orderkey AND tpch_sf1.supplier.s_nationkey = tpch_sf1.nation.n_nationkey AND tpch_sf1.part.p_name LIKE Utf8(""%green%"")
+            Cross Join:
+              Cross Join:
+                Cross Join:
+                  Cross Join:
+                    Cross Join:
+                      TableScan: tpch_sf1.part
+                      TableScan: tpch_sf1.supplier
+                    TableScan: tpch_sf1.lineitem
+                  TableScan: tpch_sf1.partsupp
+                TableScan: tpch_sf1.orders
+              TableScan: tpch_sf1.nation"
+physical_plan,"SortPreservingMergeExec: [nation@0 ASC NULLS LAST, o_year@1 DESC]
+  ProjectionExec: expr=[nation@0 as nation, o_year@1 as o_year, sum(profit.amount)@2 as sum_profit]
+    SortExec: expr=[nation@0 ASC NULLS LAST, o_year@1 DESC], preserve_partitioning=[true]
+      AggregateExec: mode=FinalPartitioned, gby=[nation@0 as nation, o_year@1 as o_year], aggr=[sum(profit.amount)]
+        RepartitionExec: partitioning=Hash([nation@0, o_year@1], 11), input_partitions=11
+          AggregateExec: mode=Partial, gby=[nation@0 as nation, o_year@1 as o_year], aggr=[sum(profit.amount)]
+            ProjectionExec: expr=[n_name@0 as nation, date_part(YEAR, o_orderdate@1) as o_year, l_extendedprice@2 * (1 - l_discount@3) - ps_supplycost@4 * l_quantity@5 as amount]
+              HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(n_nationkey@0, s_nationkey@3)], projection=[n_name@1, o_orderdate@7, l_extendedprice@3, l_discount@4, ps_supplycost@6, l_quantity@2]
+                IcebergScanExec: table=tpch_sf1.nation, projection=Some([""n_nationkey"", ""n_name""]), predicate=[], df_filters=0, pushed_down_filters=0, snapshot_id=None
+                HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(o_orderkey@0, l_orderkey@0)], projection=[l_quantity@3, l_extendedprice@4, l_discount@5, s_nationkey@6, ps_supplycost@7, o_orderdate@1]
+                  IcebergScanExec: table=tpch_sf1.orders, projection=Some([""o_orderkey"", ""o_orderdate""]), predicate=[], df_filters=0, pushed_down_filters=0, snapshot_id=None
+                  HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(ps_suppkey@1, l_suppkey@2), (ps_partkey@0, l_partkey@1)], projection=[l_orderkey@3, l_quantity@6, l_extendedprice@7, l_discount@8, s_nationkey@9, ps_supplycost@2]
+                    IcebergScanExec: table=tpch_sf1.partsupp, projection=Some([""ps_partkey"", ""ps_suppkey"", ""ps_supplycost""]), predicate=[], df_filters=0, pushed_down_filters=0, snapshot_id=None
+                    HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(s_suppkey@0, l_suppkey@2)], projection=[l_orderkey@2, l_partkey@3, l_suppkey@4, l_quantity@5, l_extendedprice@6, l_discount@7, s_nationkey@1]
+                      IcebergScanExec: table=tpch_sf1.supplier, projection=Some([""s_suppkey"", ""s_nationkey""]), predicate=[], df_filters=0, pushed_down_filters=1, snapshot_id=None
+                      HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(p_partkey@0, l_partkey@1)], projection=[l_orderkey@1, l_partkey@2, l_suppkey@3, l_quantity@4, l_extendedprice@5, l_discount@6]
+                        CoalescePartitionsExec
+                          FilterExec: p_name@1 LIKE %green%, projection=[p_partkey@0]
+                            RepartitionExec: partitioning=RoundRobinBatch(11), input_partitions=1
+                              IcebergScanExec: table=tpch_sf1.part, projection=Some([""p_partkey"", ""p_name""]), predicate=[], df_filters=0, pushed_down_filters=0, snapshot_id=None
+                        IcebergScanExec: table=tpch_sf1.lineitem, projection=Some([""l_orderkey"", ""l_partkey"", ""l_suppkey"", ""l_quantity"", ""l_extendedprice"", ""l_discount""]), predicate=[], df_filters=0, pushed_down_filters=4, snapshot_id=None
+"
