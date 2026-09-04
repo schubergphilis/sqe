@@ -59,3 +59,4 @@ pub use splitter::bin_pack_files;
 pub use splitter::split_files;
 pub use stage_planner::{compute_waves, decompose_plan, QueryStage, ShuffleType};
 pub use star_schema_reorder::{StarSchemaReorderRule, DEFAULT_MIN_RATIO};
+pub use stats::PuffinStatisticsRequestRule;
