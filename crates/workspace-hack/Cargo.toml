@@ -7,6 +7,10 @@ name = "workspace-hack"
 version = "0.1.0"
 edition = "2021"
 description = "workspace-hack package, managed by hakari"
+# The SBOM license gate (ci/sbom-license-from-cargo.py) reads this for every
+# workspace member; without it the crate lands in REVIEW as "license evidence
+# missing" and blocks the pipeline.
+license.workspace = true
 # You can choose to publish this crate: see https://docs.rs/cargo-hakari/latest/cargo_hakari/publishing.
 publish = false
 
