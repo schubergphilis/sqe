@@ -73,6 +73,41 @@ variables:
 # script against ci/templates/deploy.yml and keep the --target line.
 aikido-build:
   timeout: 3h
+  # Start at pipeline creation instead of after the test stage. Measured on
+  # 2026-09-04 (pipelines 1600968, 1600377, 1601474): this job took 38 to 67
+  # minutes and only began once aikido-test-rust (20 to 38 minutes) had
+  # finished, so the two largest jobs ran back to back and a 72-minute MR
+  # pipeline was two serial compiles. Nothing here consumes the test job's
+  # output; the image is built from the same commit either way. With
+  # `needs: []` the wall clock is max(test, build), not the sum.
+  #
+  # A job with `needs:` ignores stage order and starts the moment its needs
+  # finish. So the .post jobs that need THIS job (image-vuln, publish-image,
+  # image-sbom, mbom) would otherwise publish an image before the test gate
+  # has run. Each of them is overridden below to also need aikido-test-rust
+  # and aikido-cargo-lock (optional, because both are skipped on a main commit
+  # with no Rust change). Untested code still cannot reach the registry.
+  needs: []
+  # On merge requests the build is a --no-push validation of the Dockerfile.
+  # A Rust-only change cannot break it in a way the test stage does not
+  # already catch (ci/aikido-rust-extra.sh compiles the --no-default-features
+  # variant the image uses), so run it only when an image input moves. Main
+  # keeps building and pushing on every commit.
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - Dockerfile
+        - Cargo.toml
+        - Cargo.lock
+        - rust-toolchain.toml
+        - .cargo/config.toml
+        - .gitlab-ci.yml
+        - "crates/*/Cargo.toml"
+        - "vendor/**/*"
+        - "xtask/**/*"
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      exists:
+        - Dockerfile
   # Never cancel a push mid-layer. On main this kaniko run pushes $AIKIDO_IMAGE,
   # and a half-written manifest is worse than a wasted run, so this job opts out
   # of the `default: interruptible: true` above. Same reasoning for the publish,
@@ -130,6 +165,12 @@ aikido-image-vuln:
     - job: aikido-build-validate
       artifacts: true
       optional: true
+    # Test-stage gates, so this .post job does not run ahead of them now that
+    # aikido-build itself starts at pipeline creation (see its needs: []).
+    - job: aikido-test-rust
+      optional: true
+    - job: aikido-cargo-lock
+      optional: true
   before_script:
     - mkdir -p "$HOME/.docker"
     - |
@@ -138,8 +179,11 @@ aikido-image-vuln:
   script:
     - |
       set -euo pipefail
-      if grep -q 'validation-only' image-digest.txt 2>/dev/null; then
-        echo "MR validation build (no image pushed); container CVE gate runs on merge to $CI_DEFAULT_BRANCH"
+      # No digest file at all means aikido-build did not run in this pipeline
+      # (MR without an image-input change, see its rules:). Nothing was built,
+      # so there is nothing to scan; the gate enforces on merge to main.
+      if [ ! -f image-digest.txt ] || grep -q 'validation-only' image-digest.txt 2>/dev/null; then
+        echo "MR validation build (no image pushed or no image built); container CVE gate runs on merge to $CI_DEFAULT_BRANCH"
         exit 0
       fi
       echo "grype container gate: registry:$AIKIDO_IMAGE (fail-on high)"
@@ -210,16 +254,21 @@ aikido-sbom:
 # longer compiles the workspace. Nearly every commit here touches Rust; if that
 # stops being true, override `rules:` on the job below rather than upstream.
 
-# The platform job caches only `.cargo-home/registry/`; the local cargo-gate also
-# cached `target/`. Re-added here rather than upstream because it is a per-repo
-# call: an --all-features `target/` for this workspace is several GB that GitLab
-# uploads at the end of every run, and this repo has already been paying for it.
-# `.cargo/registry` is NOT the path any more — aikido redirects CARGO_HOME to
-# `.cargo-home` so the registry lands somewhere GitLab can cache.
-aikido-test-rust:
-  cache:
-    key: "aikido-test-rust-$CI_COMMIT_REF_SLUG"
-    paths: ["target/", ".cargo-home/registry/"]
+# `target/` is deliberately NOT cached here; the platform default (registry
+# only) stands. This repo used to add `target/` to the cache, and every run
+# then spent 10 minutes (job 5284525: 14:20:48 to 14:31:07) zipping a
+# several-GB tree only for the upload to fail with `EntityTooLarge` (the cache
+# store caps objects at 5 GiB). No cache ever landed, MR branch keys never
+# existed, and the compile phase measured the same with the stale restore
+# (12m45s) as fully cold on a quiet runner (11m27s, job 5286725). Ten minutes
+# of pure overhead per job, zero hits. Dependency reuse across jobs has to
+# come from a compiler cache that stores per-crate objects (sccache to an S3
+# bucket), tracked as item A2 in
+# docs/internal/plans/2026-09-04-build-test-time-program.md.
+#
+# The feature-matrix checks that used to run at the tail of this job now run
+# in `rust-feature-matrix` below, in parallel; ci/aikido-rust-extra.sh exits
+# early when it finds itself inside aikido-test-rust.
 
 # The vendored grant profile must be the platform's current one.
 #
@@ -276,6 +325,52 @@ vendored-profile-drift:
       changes:
         - "crates/sqe-policy/assets/*.json"
 
+# ── Feature-matrix checks, parallel to the test gate ─────────────
+# ci/aikido-rust-extra.sh (six `cargo check -p sqe-catalog` feature variants
+# plus `cargo xtask matrix-report`) took 7m49s at the tail of aikido-test-rust
+# (job 5284525, 14:12:58 to 14:20:47), serial behind the tests, and advisory
+# (`|| echo`) so a failure never showed. Here it is its own job that starts at
+# pipeline creation and blocks: the variants it checks are exactly the
+# --no-default-features graph the container image compiles, and the matrix
+# score floor is a real regression guard. All four traces inspected on
+# 2026-09-04 passed it, so making it blocking changes no outcome today.
+#
+# Same image and native deps as the platform test job: .cargo/config.toml pins
+# clang + mold as the x86_64 linker, so both must be present or nothing links.
+rust-feature-matrix:
+  stage: test
+  needs: []
+  image: rust:1.97.1-slim@sha256:8e8cf8f7fd54a2d23d5a743b3a03f56e26b6c774276c33fa0595111704ebb15c
+  timeout: 40m
+  variables:
+    CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
+    CARGO_INCREMENTAL: "0"
+  cache:
+    key: "rust-feature-matrix-registry"
+    paths:
+      - .cargo-home/registry/
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends clang mold cmake curl protobuf-compiler libssl-dev pkg-config >/dev/null
+  script:
+    - ./ci/aikido-rust-extra.sh
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - "**/*.rs"
+        - "**/Cargo.toml"
+        - "**/Cargo.lock"
+        - rust-toolchain.toml
+        - ci/aikido-rust-extra.sh
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - "**/*.rs"
+        - "**/Cargo.toml"
+        - "**/Cargo.lock"
+        - rust-toolchain.toml
+        - ci/aikido-rust-extra.sh
+
 # ── Publish / release jobs opt out of auto-cancel ──────────────
 # These come from the aikido deploy.yml and release.yml includes, so the
 # `default: interruptible: true` at the top of this file would otherwise make
@@ -287,10 +382,43 @@ vendored-profile-drift:
 # aikido-build carries its own `interruptible: false` at its override above.
 aikido-publish-image:
   interruptible: false
+  # Restated from the aikido template (`needs: [aikido-build]`) plus the two
+  # test-stage gates. Without this, `needs: []` on aikido-build above would let
+  # this job start before the tests finished. Re-diff against the template on
+  # every aikido `ref:` bump.
+  needs:
+    - job: aikido-build
+      artifacts: true
+    - job: aikido-test-rust
+      optional: true
+    - job: aikido-cargo-lock
+      optional: true
 aikido-image-sbom:
   interruptible: false
+  # Restated from the aikido template (`needs: [aikido-build]`) plus the two
+  # test-stage gates. Without this, `needs: []` on aikido-build above would let
+  # this job start before the tests finished. Re-diff against the template on
+  # every aikido `ref:` bump.
+  needs:
+    - job: aikido-build
+      artifacts: true
+    - job: aikido-test-rust
+      optional: true
+    - job: aikido-cargo-lock
+      optional: true
 aikido-mbom:
   interruptible: false
+  # Restated from the aikido template (`needs: [aikido-build]`) plus the two
+  # test-stage gates. Without this, `needs: []` on aikido-build above would let
+  # this job start before the tests finished. Re-diff against the template on
+  # every aikido `ref:` bump.
+  needs:
+    - job: aikido-build
+      artifacts: true
+    - job: aikido-test-rust
+      optional: true
+    - job: aikido-cargo-lock
+      optional: true
 aikido-release:
   interruptible: false
 aikido-release-image:
