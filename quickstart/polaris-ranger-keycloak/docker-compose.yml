@@ -84,7 +84,7 @@ services:
       start_period: 20s
 
   bucket-init:
-    image: amazon/aws-cli:2.36.34
+    image: amazon/aws-cli:2.36.36
     entrypoint: ["sh", "-c"]
     command:
       - |
