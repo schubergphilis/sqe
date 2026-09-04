@@ -70,6 +70,7 @@ sqlparser = { workspace = true }
 # `HiveManifest::from_spec`'s `created_at` and this crate's own manifest
 # `owner`/timestamp stamping for CREATE EXTERNAL TABLE.
 chrono = { workspace = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 tempfile = "3"

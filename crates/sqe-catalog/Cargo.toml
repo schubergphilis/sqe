@@ -19,7 +19,18 @@ repository.workspace = true
 # Tables SDK); hadoop adds ~0 (no new deps); sql-postgres ~5-10 MB; hms
 # ~10-15 MB; glue ~50-80 MB (aws-sdk-glue is the heavyweight); s3tables
 # adds ~5-10 MB on top of glue's AWS SDK runtime.
-default = ["rest", "rest-sigv4", "hive-external"]
+#
+# `hadoop` and `sql-sqlite` are in the default set for one reason: sqe-cli
+# requires them, and under resolver 2 every `cargo test --workspace` therefore
+# already builds this crate with them on. A `cargo test -p sqe-coordinator`
+# did not, so the same crate came out with a different feature set and
+# catalog, compaction, worker, coordinator and its test binaries were
+# compiled twice (measured 2026-09-04: 4m50s versus about 35 s for a one-line
+# coordinator change). The container image is unchanged by this: it builds
+# sqe-cli in the same cargo invocation, so it carried both already. Keep this
+# list equal to what sqe-cli asks for; the workspace-hack crate pins the
+# third-party side of the same problem.
+default = ["rest", "rest-sigv4", "hive-external", "hadoop", "sql-sqlite"]
 # Umbrella for the legacy default: every supported backend compiled in.
 # Use when packaging an image that needs to dispatch to Polaris, Glue,
 # S3 Tables, Hive Metastore, Hadoop warehouses, and Postgres-backed SQL
@@ -186,6 +197,7 @@ aws-config = { version = "1.10", optional = true }
 # no binary weight.
 aws-sdk-glue = { version = "1.159", default-features = false, features = ["rt-tokio"], optional = true }
 aws-credential-types = { version = "1.3", optional = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 opentelemetry = { workspace = true }
