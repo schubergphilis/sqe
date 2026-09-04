@@ -40,7 +40,10 @@ All notable changes to SQE are documented in this file.
     sqe-catalog feature matrix and `cargo xtask matrix-report` moved from the
     test job's tail into a parallel, blocking `rust-feature-matrix` job. The
     never-run `scenario-test-aws` skeleton and the duplicate GitLab
-    Secret-Detection include are removed. Baseline and the rest of the plan:
+    Secret-Detection include are removed. The aikido include moves to v0.12.0,
+    which carries the same gate changes upstream (aikido !155), so the local
+    `rust-feature-matrix` job and the `needs: []` overrides are gone again.
+    Baseline and the rest of the plan:
     `docs/internal/plans/2026-09-04-build-test-time-program.md`.
 
 ### Added
