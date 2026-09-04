@@ -23,8 +23,46 @@ All notable changes to SQE are documented in this file.
     build unchanged (8m25s vs 8m14s). Regenerate with `cargo hakari generate`
     after dependency changes; `ci/aikido-rust-extra.sh` fails when the crate
     is stale.
+- CI: image build runs in parallel with the test gate
+
+    `aikido-build` now carries `needs: []`, so the kaniko image build (38 to
+    67 minutes measured) starts at pipeline creation instead of after
+    `aikido-test-rust` (20 to 38 minutes). Wall clock becomes the longer of
+    the two rather than their sum. On merge requests the validation build
+    runs only when an image input changes (Dockerfile, manifests, lockfile,
+    toolchain, vendor tree); main still builds and pushes every commit. The
+    `target/` directory is no longer added to the GitLab cache: the archive
+    exceeded the 5 GiB object limit on every run, so each job spent ten
+    minutes zipping a tree that never uploaded. The sqe-catalog feature
+    matrix and `cargo xtask matrix-report` moved out of the test job's tail
+    into a parallel, blocking `rust-feature-matrix` job. Baseline and the
+    rest of the plan: `docs/internal/plans/2026-09-04-build-test-time-program.md`.
 
 ### Added
+
+- Experimental Puffin NDV statistics consumer (`query.puffin_statistics`)
+
+    Tables that opted in to `write.puffin.stats = 'true'` already carried a
+    theta-sketch sidecar per column with an `ndv` estimate duplicated into the
+    Iceberg `StatisticsFile` blob metadata. Nothing read it. With
+    `query.puffin_statistics = true` (env `SQE_QUERY__PUFFIN_STATISTICS`,
+    default false) the coordinator registers an optimizer rule that attaches
+    DataFusion 55 `StatisticsRequest::DistinctCount` requests to every
+    projected scan column, the Iceberg table provider answers them from the
+    current snapshot's statistics metadata as `Precision::Inexact` without
+    fetching the Puffin body. A second, independent flag
+    `query.statistics_registry` switches on
+    `datafusion.optimizer.use_statistics_registry`; the two are separate
+    because the first SF1 A/B showed the registry, not the NDV values, moving
+    TPC-H hash-join build sides onto the fact table (q17 +40%). Both default
+    off. `BENCH_PUFFIN_STATS=1` / `BENCH_STATS_REGISTRY=1` on the benchmark
+    scripts drive the arms against an identical baseline load.
+
+    The sidecar writer itself never ran on the default path before this
+    change: CTAS and INSERT are routed through the streaming handlers, which
+    did not call it. A `ThetaSketchAccumulator` now taps the batch stream, and
+    Decimal, Date, Time and `Utf8View` columns (the type DataFusion 55 reads
+    Parquet strings as) get estimates instead of `ndv = 0` or no blob.
 
 - MCP auth modes for deployments with no identity provider
 
