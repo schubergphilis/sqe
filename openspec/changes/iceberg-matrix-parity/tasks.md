@@ -131,9 +131,9 @@
 - [x] 7.9 Verify Puffin emission test passes and sketch NDV within 5% of true (`ndv_estimate_within_five_percent_of_one_million` passes)
 - [x] 7.10 Implement `CALL system.suggest_bloom_filter_columns` using query history (`crates/sqe-coordinator/src/suggest_bloom.rs`)
 - [x] 7.11 Test suggestion output against a seeded query log (9 unit tests in `suggest_bloom`)
-- [ ] 7.12 (Deferred, waits for DF 54 and apache/datafusion#21157) Implement `PuffinStatisticsSource` -- see TODOs in `crates/sqe-planner/src/stats.rs` and `crates/sqe-catalog/src/puffin_stats.rs`
-- [ ] 7.13 (Deferred) Wire StatisticsSource into sqe-planner CBO
-- [ ] 7.14 (Deferred) Benchmark join reorder accuracy with Puffin vs Parquet stats
+- [x] 7.12 Implement the Puffin statistics consumer on DataFusion 55's `StatisticsRequest` API (the anticipated `StatisticsSource` never shipped): `PuffinNdvCache` / `parse_ndv_properties` in `crates/sqe-catalog/src/puffin_stats.rs` read the `ndv` blob property from the snapshot's `StatisticsFile` metadata (no Puffin body fetch), and `SqeTableProvider::scan_with_args` answers `DistinctCount` requests as `Precision::Inexact`
+- [x] 7.13 Wire into the CBO: `PuffinStatisticsRequestRule` (`crates/sqe-planner/src/stats.rs`) requests NDV on projected scan columns; `query.puffin_statistics` (default false, env `SQE_QUERY__PUFFIN_STATISTICS`) registers the rule and enables `datafusion.optimizer.use_statistics_registry`
+- [x] 7.14 Benchmark join plans and runtime with the flags on vs off (`BENCH_PUFFIN_STATS=1` / `BENCH_STATS_REGISTRY=1` levers; `docs/evidence/perf/puffin-ndv-ab-2026-09-04.md`): NDV-only arm plan-neutral except q17 and runtime-neutral; registry arm flips TPC-H build sides onto the fact table (q17 +40%). Both flags stay off; peak memory not captured (harness has no memory column). Clean-rig repeat and an SQE-side consumer are the follow-ups
 - [x] 7.15 Update `docs/iceberg-matrix-state.json`: bloom-filters v2 -> F, v3 -> P (+5 points, 87 -> 92 / 189, 46.0% -> 48.7%)
 - [x] 7.16 Commit Phase F and tag v0.21.0-puffin (tag not pushed, per instructions)
 

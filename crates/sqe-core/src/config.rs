@@ -375,6 +375,23 @@ pub struct QueryConfig {
     /// type fit. Default: "4MB". Set to "0" to keep DataFusion's default.
     #[serde(default = "default_runtime_filter_inlist_max_size")]
     pub runtime_filter_inlist_max_size: String,
+    /// Experimental use of snapshot-scoped Puffin NDV statistics during
+    /// planning. When enabled, SQE requests distinct counts from Iceberg table
+    /// providers (`PuffinStatisticsRequestRule`) and the scan reports them as
+    /// inexact column statistics. Default false until plan and benchmark
+    /// gates pass. Pair with `statistics_registry` to also route them through
+    /// DataFusion's pluggable statistics registry.
+    #[serde(default)]
+    pub puffin_statistics: bool,
+    /// Experimental: enable DataFusion's `StatisticsRegistry`
+    /// (`datafusion.optimizer.use_statistics_registry`) so join selection
+    /// estimates cardinalities through the built-in provider chain instead of
+    /// each operator's `partition_statistics`. Kept separate from
+    /// `puffin_statistics` because the 2026-09-04 SF1 A/B showed the registry,
+    /// not the NDV values, flipping TPC-H build sides onto the fact table
+    /// (q17 +40%). Default false.
+    #[serde(default)]
+    pub statistics_registry: bool,
     /// Cap on concurrently open partition writers per partitioned write (the
     /// bounded fanout writer). When a batch arrives for a new partition and
     /// the map is full, the least-recently-written writer is closed and
@@ -448,6 +465,8 @@ impl Default for QueryConfig {
             distributed_scan_pushdown: default_true(),
             runtime_filter_inlist_max_values: default_runtime_filter_inlist_max_values(),
             runtime_filter_inlist_max_size: default_runtime_filter_inlist_max_size(),
+            puffin_statistics: false,
+            statistics_registry: false,
             fanout_max_open_writers: 0,
             fanout_buffer_budget: default_fanout_buffer_budget(),
             write_buffer_tracking: default_true(),
@@ -5809,6 +5828,14 @@ impl SqeConfig {
         // Query
         env_override_u64("SQE_QUERY__TIMEOUT_SECS", &mut self.query.timeout_secs);
         env_override_usize("SQE_QUERY__MAX_SQL_BYTES", &mut self.query.max_sql_bytes);
+        env_override_bool(
+            "SQE_QUERY__PUFFIN_STATISTICS",
+            &mut self.query.puffin_statistics,
+        );
+        env_override_bool(
+            "SQE_QUERY__STATISTICS_REGISTRY",
+            &mut self.query.statistics_registry,
+        );
     }
 }
 
@@ -8585,6 +8612,19 @@ type = "aws"
         assert_eq!(q.runtime_filter_inlist_max_size, "256KB");
         let rf: RuntimeFiltersConfig = toml::from_str("wait_ms = 0").unwrap();
         assert_eq!(rf.wait_ms, 0);
+    }
+
+    #[test]
+    fn puffin_statistics_is_explicitly_opt_in() {
+        let defaults: QueryConfig = toml::from_str("").unwrap();
+        assert!(!defaults.puffin_statistics);
+
+        let enabled: QueryConfig = toml::from_str("puffin_statistics = true").unwrap();
+        assert!(enabled.puffin_statistics);
+        assert!(!enabled.statistics_registry, "registry is a separate opt-in");
+
+        let registry: QueryConfig = toml::from_str("statistics_registry = true").unwrap();
+        assert!(registry.statistics_registry);
     }
 
     #[test]

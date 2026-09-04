@@ -1,0 +1,31 @@
+plan_type,plan
+logical_plan,"Projection: sum(tpch_sf1.lineitem.l_extendedprice) / Decimal128(7.0,2,1) AS avg_yearly
+  Aggregate: groupBy=[[]], aggr=[[sum(tpch_sf1.lineitem.l_extendedprice)]]
+    Filter: tpch_sf1.part.p_partkey = tpch_sf1.lineitem.l_partkey AND tpch_sf1.part.p_brand = Utf8(""Brand#23"") AND tpch_sf1.part.p_container = Utf8(""MED BOX"") AND tpch_sf1.lineitem.l_quantity < (<subquery>)
+      Subquery:
+        Projection: Decimal128(0.2,1,1) * avg(tpch_sf1.lineitem.l_quantity)
+          Aggregate: groupBy=[[]], aggr=[[avg(tpch_sf1.lineitem.l_quantity)]]
+            Filter: tpch_sf1.lineitem.l_partkey = outer_ref(tpch_sf1.part.p_partkey)
+              TableScan: tpch_sf1.lineitem
+      Cross Join:
+        TableScan: tpch_sf1.lineitem
+        TableScan: tpch_sf1.part"
+physical_plan,"ProjectionExec: expr=[sum(tpch_sf1.lineitem.l_extendedprice)@0 / 7.0 as avg_yearly]
+  AggregateExec: mode=Final, gby=[], aggr=[sum(tpch_sf1.lineitem.l_extendedprice)]
+    CoalescePartitionsExec
+      AggregateExec: mode=Partial, gby=[], aggr=[sum(tpch_sf1.lineitem.l_extendedprice)]
+        HashJoinExec: mode=CollectLeft, join_type=LeftSemi, on=[(p_partkey@2, l_partkey@1)], filter=CAST(l_quantity@0 AS Decimal128(21, 7)) < Decimal128(0.2,1,1) * avg(tpch_sf1.lineitem.l_quantity)@1, projection=[l_extendedprice@1]
+          CoalescePartitionsExec
+            HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(p_partkey@0, l_partkey@0)], projection=[l_quantity@2, l_extendedprice@3, p_partkey@0]
+              CoalescePartitionsExec
+                FilterExec: p_brand@1 = Brand#23 AND p_container@2 = MED BOX, projection=[p_partkey@0]
+                  RepartitionExec: partitioning=RoundRobinBatch(11), input_partitions=1
+                    IcebergScanExec: table=tpch_sf1.part, projection=Some([""p_partkey"", ""p_brand"", ""p_container""]), predicate=[(p_brand = ""Brand#23"") AND (p_container = ""MED BOX"")], df_filters=2, pushed_down_filters=0, snapshot_id=None
+              RepartitionExec: partitioning=RoundRobinBatch(11), input_partitions=1
+                IcebergScanExec: table=tpch_sf1.lineitem, projection=Some([""l_partkey"", ""l_quantity"", ""l_extendedprice""]), predicate=[], df_filters=0, pushed_down_filters=1, snapshot_id=None
+          ProjectionExec: expr=[0.2 * avg(tpch_sf1.lineitem.l_quantity)@1 as Decimal128(0.2,1,1) * avg(tpch_sf1.lineitem.l_quantity), l_partkey@0 as l_partkey]
+            AggregateExec: mode=FinalPartitioned, gby=[l_partkey@0 as l_partkey], aggr=[avg(tpch_sf1.lineitem.l_quantity)]
+              RepartitionExec: partitioning=Hash([l_partkey@0], 11), input_partitions=11
+                AggregateExec: mode=Partial, gby=[l_partkey@0 as l_partkey], aggr=[avg(tpch_sf1.lineitem.l_quantity)]
+                  IcebergScanExec: table=tpch_sf1.lineitem, projection=Some([""l_partkey"", ""l_quantity""]), predicate=[], df_filters=0, pushed_down_filters=1, snapshot_id=None
+"

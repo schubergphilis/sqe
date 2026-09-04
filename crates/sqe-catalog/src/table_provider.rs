@@ -2,9 +2,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
-use datafusion::catalog::Session;
+use datafusion::catalog::{ScanArgs, ScanResult, Session};
+use datafusion::common::stats::Precision;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result as DFResult;
+use datafusion::logical_expr::statistics::StatisticsRequest;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use iceberg::arrow::schema_to_arrow_schema;
@@ -60,6 +62,8 @@ pub struct SqeTableProvider {
     /// scan_fetch_ahead`. `None` = scan default (3x cores); `Some(0)` =
     /// staging disabled; `Some(n)` = absolute depth.
     scan_fetch_ahead: Option<usize>,
+    /// Parsed Puffin NDV metadata, shared by clones and keyed by snapshot.
+    puffin_ndv_cache: Arc<crate::puffin_stats::PuffinNdvCache>,
 }
 
 impl SqeTableProvider {
@@ -93,6 +97,7 @@ impl SqeTableProvider {
             runtime_filter_bloom_probe: true,
             runtime_filter_bloom_max_values: 65536,
             scan_fetch_ahead: None,
+            puffin_ndv_cache: Arc::new(crate::puffin_stats::PuffinNdvCache::default()),
         })
     }
 
@@ -186,17 +191,16 @@ impl SqeTableProvider {
     }
 }
 
-#[async_trait]
-impl TableProvider for SqeTableProvider {
-    fn schema(&self) -> ArrowSchemaRef {
+impl SqeTableProvider {
+    fn schema_impl(&self) -> ArrowSchemaRef {
         self.schema.clone()
     }
 
-    fn table_type(&self) -> TableType {
+    fn table_type_impl(&self) -> TableType {
         TableType::Base
     }
 
-    fn supports_filters_pushdown(
+    fn supports_filters_pushdown_impl(
         &self,
         filters: &[&Expr],
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
@@ -216,12 +220,13 @@ impl TableProvider for SqeTableProvider {
             .collect())
     }
 
-    async fn scan(
+    async fn scan_impl(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         _limit: Option<usize>,
+        statistics_requests: &[StatisticsRequest],
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Convert projection indices to column names for iceberg-rust's scan API
         let projected_columns = projection.map(|indices| {
@@ -321,7 +326,12 @@ impl TableProvider for SqeTableProvider {
         )
         .await
         {
-            Ok(stats) => {
+            Ok(mut stats) => {
+                self.apply_requested_puffin_ndv(
+                    &mut stats,
+                    projected_schema.as_ref(),
+                    statistics_requests,
+                );
                 exec = exec.with_cached_statistics(stats);
             }
             Err(e) => {
@@ -334,5 +344,104 @@ impl TableProvider for SqeTableProvider {
         }
 
         Ok(Arc::new(exec))
+    }
+
+    fn apply_requested_puffin_ndv(
+        &self,
+        stats: &mut datafusion::common::Statistics,
+        projected_schema: &arrow::datatypes::Schema,
+        requests: &[StatisticsRequest],
+    ) {
+        let requested: std::collections::HashSet<&str> = requests
+            .iter()
+            .filter_map(|request| match request {
+                StatisticsRequest::DistinctCount(column) => Some(column.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        if requested.is_empty() {
+            return;
+        }
+
+        let metadata = self.table.metadata();
+        let snapshot = self
+            .snapshot_id
+            .and_then(|id| metadata.snapshot_by_id(id))
+            .or_else(|| metadata.current_snapshot());
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        let snapshot_id = snapshot.snapshot_id();
+        let ndv_by_field_id = self
+            .puffin_ndv_cache
+            .for_snapshot(snapshot_id, metadata.statistics_for_snapshot(snapshot_id));
+        let Ok(iceberg_schema) = snapshot.schema(metadata) else {
+            return;
+        };
+
+        for (index, field) in projected_schema.fields().iter().enumerate() {
+            if !requested.contains(field.name().as_str()) {
+                continue;
+            }
+            let Some(iceberg_field) = iceberg_schema.field_by_name(field.name()) else {
+                continue;
+            };
+            let Some(&ndv) = ndv_by_field_id.get(&iceberg_field.id) else {
+                continue;
+            };
+            let ndv = stats
+                .num_rows
+                .get_value()
+                .map_or(ndv, |row_count| ndv.min(*row_count));
+            if let Some(column_stats) = stats.column_statistics.get_mut(index) {
+                column_stats.distinct_count = Precision::Inexact(ndv);
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl TableProvider for SqeTableProvider {
+    fn schema(&self) -> ArrowSchemaRef {
+        self.schema_impl()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.table_type_impl()
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
+        self.supports_filters_pushdown_impl(filters)
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.scan_impl(state, projection, filters, limit, &[]).await
+    }
+
+    async fn scan_with_args<'a>(
+        &self,
+        state: &dyn Session,
+        args: ScanArgs<'a>,
+    ) -> DFResult<ScanResult> {
+        let projection = args.projection().map(<[_]>::to_vec);
+        let plan = self
+            .scan_impl(
+                state,
+                projection.as_ref(),
+                args.filters().unwrap_or(&[]),
+                args.limit(),
+                args.statistics_requests(),
+            )
+            .await?;
+        Ok(ScanResult::new(plan))
     }
 }
