@@ -71,11 +71,20 @@ BENCH_BLOOM_FILTER="${BENCH_BLOOM_FILTER:-}"
 # (tables get `write.puffin.stats = 'true'`, so every load commit also writes
 # a Puffin theta-sketch sidecar) AND the coordinator is started with
 # `SQE_QUERY__PUFFIN_STATISTICS=true`, which registers the distinct-count
-# request rule and DataFusion's statistics registry. Off by default.
+# request rule. Off by default. See BENCH_STATS_REGISTRY below.
 BENCH_PUFFIN_STATS="${BENCH_PUFFIN_STATS:-}"
 case "$(printf '%s' "$BENCH_PUFFIN_STATS" | tr '[:upper:]' '[:lower:]')" in
     ""|0|false|no|off) BENCH_PUFFIN_STATS="" ;;
     *) BENCH_PUFFIN_STATS=1; export SQE_QUERY__PUFFIN_STATISTICS=true ;;
+esac
+# Second, independent arm: DataFusion's statistics registry
+# (`query.statistics_registry`). Truthy starts the coordinator with
+# `SQE_QUERY__STATISTICS_REGISTRY=true`; combine with BENCH_PUFFIN_STATS=1
+# for the "NDV through the registry" arm.
+BENCH_STATS_REGISTRY="${BENCH_STATS_REGISTRY:-}"
+case "$(printf '%s' "$BENCH_STATS_REGISTRY" | tr '[:upper:]' '[:lower:]')" in
+    ""|0|false|no|off) BENCH_STATS_REGISTRY="" ;;
+    *) BENCH_STATS_REGISTRY=1; export SQE_QUERY__STATISTICS_REGISTRY=true ;;
 esac
 
 # Trino comparison mode: start a Trino container and validate results against it
@@ -804,6 +813,9 @@ for BENCH in "${BENCHMARKS[@]}"; do
     if [ -n "$BENCH_PUFFIN_STATS" ]; then
         PUFFIN_ARGS=(--puffin-stats)
         echo "  (Puffin NDV sidecars ON; coordinator query.puffin_statistics=true)"
+    fi
+    if [ -n "$BENCH_STATS_REGISTRY" ]; then
+        echo "  (DataFusion statistics registry ON; coordinator query.statistics_registry=true)"
     fi
     LOAD_START=$(date +%s)
     LOAD_ATTEMPTS=2
