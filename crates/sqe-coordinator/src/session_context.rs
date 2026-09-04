@@ -372,6 +372,12 @@ pub async fn create_session_context(
                         max_size,
                     );
                 }
+                if config.query.puffin_statistics {
+                    sc = sc.set_bool(
+                        "datafusion.optimizer.use_statistics_registry",
+                        true,
+                    );
+                }
                 sc
             };
 
@@ -467,6 +473,11 @@ pub async fn create_session_context(
             ctx.add_optimizer_rule(Arc::new(
                 sqe_planner::SingleDistinctCountCompanionRule::new(),
             ));
+            if config.query.puffin_statistics {
+                ctx.add_optimizer_rule(Arc::new(
+                    sqe_planner::PuffinStatisticsRequestRule::new(),
+                ));
+            }
 
             // Register DataFusion's built-in in-memory catalog so DML helpers can register
             // temporary MemTables under `datafusion.public.<name>` without hitting the

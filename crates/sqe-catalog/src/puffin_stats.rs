@@ -40,6 +40,7 @@
 //! enabling it; see `crates/sqe-planner/src/stats.rs`.
 
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, RecordBatch};
@@ -84,6 +85,70 @@ pub const PROP_NDV: &str = "ndv";
 /// Blob property key for the field id (for readers that do not index on
 /// `fields`).
 pub const PROP_FIELD_ID: &str = "field_id";
+
+/// Snapshot-keyed cache of NDV estimates advertised in Iceberg statistics
+/// metadata.
+///
+/// The `ndv` property is duplicated into the Iceberg `StatisticsFile` entry,
+/// so answering a DataFusion statistics request does not need to fetch the
+/// Puffin body. Keeping the parsed map on the snapshot-bound table provider
+/// also avoids reparsing metadata when a prepared statement is planned more
+/// than once.
+#[derive(Debug, Default)]
+pub struct PuffinNdvCache {
+    by_snapshot: RwLock<HashMap<i64, Arc<HashMap<i32, usize>>>>,
+}
+
+impl PuffinNdvCache {
+    /// Return parsed field-id to NDV estimates for `snapshot_id`.
+    pub fn for_snapshot(
+        &self,
+        snapshot_id: i64,
+        statistics_file: Option<&StatisticsFile>,
+    ) -> Arc<HashMap<i32, usize>> {
+        if let Ok(cache) = self.by_snapshot.read() {
+            if let Some(ndv) = cache.get(&snapshot_id) {
+                return Arc::clone(ndv);
+            }
+        }
+
+        let parsed = Arc::new(
+            statistics_file
+                .map(parse_ndv_properties)
+                .unwrap_or_default(),
+        );
+        if let Ok(mut cache) = self.by_snapshot.write() {
+            return Arc::clone(
+                cache
+                    .entry(snapshot_id)
+                    .or_insert_with(|| Arc::clone(&parsed)),
+            );
+        }
+        parsed
+    }
+}
+
+/// Parse standard theta-sketch NDV properties from an Iceberg statistics file.
+///
+/// Malformed, multi-column, stale-snapshot, and unrelated blobs are ignored.
+/// A sketch estimate is inherently approximate, so callers must expose these
+/// values to DataFusion as `Precision::Inexact`.
+pub fn parse_ndv_properties(statistics_file: &StatisticsFile) -> HashMap<i32, usize> {
+    statistics_file
+        .blob_metadata
+        .iter()
+        .filter(|blob| {
+            blob.r#type == APACHE_DATASKETCHES_THETA_V1
+                && blob.snapshot_id == statistics_file.snapshot_id
+                && blob.fields.len() == 1
+        })
+        .filter_map(|blob| {
+            let field_id = *blob.fields.first()?;
+            let ndv = blob.properties.get(PROP_NDV)?.parse::<usize>().ok()?;
+            Some((field_id, ndv))
+        })
+        .collect()
+}
 
 /// Return true when the table property opts in to Puffin emission.
 pub fn puffin_stats_enabled(table_properties: &HashMap<String, String>) -> bool {
@@ -435,6 +500,54 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    fn statistics_file_with_blobs(blob_metadata: Vec<SpecBlobMetadata>) -> StatisticsFile {
+        StatisticsFile {
+            snapshot_id: 42,
+            statistics_path: "memory://table/metadata/42.stats".to_string(),
+            file_size_in_bytes: 100,
+            file_footer_size_in_bytes: 50,
+            key_metadata: None,
+            blob_metadata,
+        }
+    }
+
+    #[test]
+    fn parses_only_valid_single_field_theta_ndv_properties() {
+        let blob = |kind: &str, snapshot_id: i64, fields: Vec<i32>, ndv: &str| SpecBlobMetadata {
+            r#type: kind.to_string(),
+            snapshot_id,
+            sequence_number: 1,
+            fields,
+            properties: HashMap::from([(PROP_NDV.to_string(), ndv.to_string())]),
+        };
+        let file = statistics_file_with_blobs(vec![
+            blob(APACHE_DATASKETCHES_THETA_V1, 42, vec![7], "123"),
+            blob(APACHE_DATASKETCHES_THETA_V1, 41, vec![8], "456"),
+            blob(APACHE_DATASKETCHES_THETA_V1, 42, vec![9, 10], "2"),
+            blob("other-sketch", 42, vec![11], "3"),
+            blob(APACHE_DATASKETCHES_THETA_V1, 42, vec![12], "invalid"),
+        ]);
+
+        assert_eq!(parse_ndv_properties(&file), HashMap::from([(7, 123)]));
+    }
+
+    #[test]
+    fn caches_parsed_ndv_by_snapshot() {
+        let cache = PuffinNdvCache::default();
+        let first = statistics_file_with_blobs(vec![SpecBlobMetadata {
+            r#type: APACHE_DATASKETCHES_THETA_V1.to_string(),
+            snapshot_id: 42,
+            sequence_number: 1,
+            fields: vec![7],
+            properties: HashMap::from([(PROP_NDV.to_string(), "123".to_string())]),
+        }]);
+        let changed = statistics_file_with_blobs(vec![]);
+
+        assert_eq!(cache.for_snapshot(42, Some(&first)).get(&7), Some(&123));
+        assert_eq!(cache.for_snapshot(42, Some(&changed)).get(&7), Some(&123));
+        assert!(cache.for_snapshot(43, None).is_empty());
+    }
 
     fn schema_id_name() -> IcebergSchema {
         IcebergSchema::builder()
