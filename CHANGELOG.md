@@ -6,6 +6,30 @@ All notable changes to SQE are documented in this file.
 
 ### Added
 
+- Experimental Puffin NDV statistics consumer (`query.puffin_statistics`)
+
+    Tables that opted in to `write.puffin.stats = 'true'` already carried a
+    theta-sketch sidecar per column with an `ndv` estimate duplicated into the
+    Iceberg `StatisticsFile` blob metadata. Nothing read it. With
+    `query.puffin_statistics = true` (env `SQE_QUERY__PUFFIN_STATISTICS`,
+    default false) the coordinator registers an optimizer rule that attaches
+    DataFusion 55 `StatisticsRequest::DistinctCount` requests to every
+    projected scan column, the Iceberg table provider answers them from the
+    current snapshot's statistics metadata as `Precision::Inexact` without
+    fetching the Puffin body. A second, independent flag
+    `query.statistics_registry` switches on
+    `datafusion.optimizer.use_statistics_registry`; the two are separate
+    because the first SF1 A/B showed the registry, not the NDV values, moving
+    TPC-H hash-join build sides onto the fact table (q17 +40%). Both default
+    off. `BENCH_PUFFIN_STATS=1` / `BENCH_STATS_REGISTRY=1` on the benchmark
+    scripts drive the arms against an identical baseline load.
+
+    The sidecar writer itself never ran on the default path before this
+    change: CTAS and INSERT are routed through the streaming handlers, which
+    did not call it. A `ThetaSketchAccumulator` now taps the batch stream, and
+    Decimal, Date, Time and `Utf8View` columns (the type DataFusion 55 reads
+    Parquet strings as) get estimates instead of `ndv = 0` or no blob.
+
 - MCP auth modes for deployments with no identity provider
 
     `[mcp.auth] mode` selects how callers authenticate to `/mcp`: `oauth`
