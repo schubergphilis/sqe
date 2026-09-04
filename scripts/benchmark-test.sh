@@ -67,6 +67,16 @@ BENCH_PORT_TRINO="18080"
 # equality predicates; TPC-H/SSB join keys are hash-join runtime filters, so
 # a null/negative delta at SF1 is an expected finding, not a failure.
 BENCH_BLOOM_FILTER="${BENCH_BLOOM_FILTER:-}"
+# Puffin NDV A/B lever. When truthy, the load step passes `--puffin-stats`
+# (tables get `write.puffin.stats = 'true'`, so every load commit also writes
+# a Puffin theta-sketch sidecar) AND the coordinator is started with
+# `SQE_QUERY__PUFFIN_STATISTICS=true`, which registers the distinct-count
+# request rule and DataFusion's statistics registry. Off by default.
+BENCH_PUFFIN_STATS="${BENCH_PUFFIN_STATS:-}"
+case "$(printf '%s' "$BENCH_PUFFIN_STATS" | tr '[:upper:]' '[:lower:]')" in
+    ""|0|false|no|off) BENCH_PUFFIN_STATS="" ;;
+    *) BENCH_PUFFIN_STATS=1; export SQE_QUERY__PUFFIN_STATISTICS=true ;;
+esac
 
 # Trino comparison mode: start a Trino container and validate results against it
 COMPARE_TRINO="${COMPARE_TRINO:-}"
@@ -790,6 +800,11 @@ for BENCH in "${BENCHMARKS[@]}"; do
         ""|0|false|no|off) ;;
         *) BLOOM_ARGS=(--bloom-filter); echo "  (bloom filters ON for join-key columns)" ;;
     esac
+    PUFFIN_ARGS=()
+    if [ -n "$BENCH_PUFFIN_STATS" ]; then
+        PUFFIN_ARGS=(--puffin-stats)
+        echo "  (Puffin NDV sidecars ON; coordinator query.puffin_statistics=true)"
+    fi
     LOAD_START=$(date +%s)
     LOAD_ATTEMPTS=2
     LOAD_OK=0
@@ -806,6 +821,7 @@ for BENCH in "${BENCHMARKS[@]}"; do
             --s3-endpoint "$DATA_S3_ENDPOINT" \
             --s3-region "$DATA_S3_REGION" \
             ${BLOOM_ARGS[@]+"${BLOOM_ARGS[@]}"} \
+            ${PUFFIN_ARGS[@]+"${PUFFIN_ARGS[@]}"} \
             --clean 2>&1; then
             LOAD_OK=1
             break
