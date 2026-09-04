@@ -31,16 +31,16 @@ default:
 # do not merge the release MR until it has.
 include:
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.11.0'
+    ref: 'v0.12.0'
     file: '/ci/templates/guardrails.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.11.0'
+    ref: 'v0.12.0'
     file: '/ci/templates/test-rust.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.11.0'
+    ref: 'v0.12.0'
     file: '/ci/templates/deploy.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.11.0'
+    ref: 'v0.12.0'
     file: '/ci/templates/release.yml'
   # GitLab's own Security/Secret-Detection template was included here too. It
   # duplicated aikido-secret-scan (same gitleaks-class scan, a second image
@@ -80,17 +80,10 @@ aikido-build:
   # of the `default: interruptible: true` above. Same reasoning for the publish,
   # SBOM-of-image and release/signing jobs overridden below.
   interruptible: false
-  # DEFAULT BRANCH ONLY, in .post, with no `needs:`. Stage order is what keeps
-  # this push behind the test gate, and a job with `needs:` ignores stage order,
-  # so speeding it up that way would publish an untested image to the registry.
-  # The MR-side speedup is aikido-build-validate below, where nothing is pushed.
-  # This mirrors the shape aikido main already has (deploy.yml after aikido!139,
-  # unreleased as of 2026-09-04); once a release carries it, drop both the
-  # rules here and the twin below.
-  rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      exists:
-        - Dockerfile
+  # Default-branch-only, in .post, no `needs:` (all from the v0.12.0 template).
+  # Stage order keeps this push behind the test gate; a `needs:` here would let
+  # an untested image reach the registry. The MR-side speedup is the template's
+  # aikido-build-validate (--no-push, `needs: []`), narrowed below.
   script:
     - |
       set -euo pipefail
@@ -117,17 +110,13 @@ aikido-build:
         $DEST
       [ -f image-digest.txt ] || echo "validation-only build (--no-push); no image pushed" > image-digest.txt
 
-# MR-side validation build: same job, `--no-push`, starts at pipeline creation.
-# Measured before this existed (pipelines 1600968, 1600377, 1601474): the build
-# began only after aikido-test-rust finished, so the two largest jobs ran back
-# to back and a 72-minute MR pipeline was two serial compiles for an artifact
-# that is discarded. A Rust-only change cannot break this build in a way the
-# test stage misses (rust-feature-matrix compiles the --no-default-features
-# graph the image uses), so it runs only when an image input changes.
+# The template's MR validation build (`extends: aikido-build`, `needs: []`,
+# `--no-push`) runs on every MR that has a Dockerfile. Narrowed here to MRs
+# that change an image input: a Rust-only change cannot break this build in a
+# way the test stage misses (aikido-rust-extra compiles the
+# --no-default-features graph the image uses), and before the split existed
+# this build was 38 to 67 serial minutes per MR for a discarded artifact.
 aikido-build-validate:
-  extends: aikido-build
-  needs: []
-  interruptible: true
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:
@@ -250,21 +239,11 @@ aikido-sbom:
 # longer compiles the workspace. Nearly every commit here touches Rust; if that
 # stops being true, override `rules:` on the job below rather than upstream.
 
-# The two gate jobs start at pipeline creation instead of after `.pre`. The
-# guardrails there are advisory scans that never feed the gate, but they gate
-# its start through stage order: aikido-sast has taken 11m21s (pipeline
-# 1597344) and 14m54s (an MR the same week) when the shared runner was
-# saturated, and a 20-minute compile waited for it. `needs: []` only moves the
-# start; both jobs stay in `test`, so every .post job that relies on stage
-# order (the pushing aikido-build, release, signing) still waits for them.
-# aikido !155 (merged 2026-09-04) makes this the platform default; the override
-# goes away with the ref bump to the release that carries it.
-aikido-cargo-lock:
-  needs: []
-
-aikido-test-rust:
-  needs: []
-
+# aikido v0.12.0 (aikido !155) gives aikido-test-rust and aikido-cargo-lock
+# `needs: []`, sets CARGO_INCREMENTAL=0 in the gate, and runs
+# ci/aikido-rust-extra.sh in its own parallel `aikido-rust-extra` job. The
+# local overrides that did the same on v0.11.0 were removed with the ref bump.
+#
 # `target/` is deliberately NOT cached here; the platform default (registry
 # only) stands. This repo used to add `target/` to the cache, and every run
 # then spent 10 minutes (job 5284525: 14:20:48 to 14:31:07) zipping a
@@ -277,9 +256,9 @@ aikido-test-rust:
 # bucket), tracked as item A2 in
 # docs/internal/plans/2026-09-04-build-test-time-program.md.
 #
-# The feature-matrix checks that used to run at the tail of this job now run
-# in `rust-feature-matrix` below, in parallel; ci/aikido-rust-extra.sh exits
-# early when it finds itself inside aikido-test-rust.
+# The feature-matrix checks in ci/aikido-rust-extra.sh run in the platform's
+# `aikido-rust-extra` job (test stage, `needs: []`, blocking under
+# AIKIDO_CARGO_GATE_ENFORCE like the gate).
 
 # The vendored grant profile must be the platform's current one.
 #
@@ -335,52 +314,6 @@ vendored-profile-drift:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       changes:
         - "crates/sqe-policy/assets/*.json"
-
-# ── Feature-matrix checks, parallel to the test gate ─────────────
-# ci/aikido-rust-extra.sh (six `cargo check -p sqe-catalog` feature variants
-# plus `cargo xtask matrix-report`) took 7m49s at the tail of aikido-test-rust
-# (job 5284525, 14:12:58 to 14:20:47), serial behind the tests, and advisory
-# (`|| echo`) so a failure never showed. Here it is its own job that starts at
-# pipeline creation and blocks: the variants it checks are exactly the
-# --no-default-features graph the container image compiles, and the matrix
-# score floor is a real regression guard. All four traces inspected on
-# 2026-09-04 passed it, so making it blocking changes no outcome today.
-#
-# Same image and native deps as the platform test job: .cargo/config.toml pins
-# clang + mold as the x86_64 linker, so both must be present or nothing links.
-rust-feature-matrix:
-  stage: test
-  needs: []
-  image: rust:1.97.1-slim@sha256:8e8cf8f7fd54a2d23d5a743b3a03f56e26b6c774276c33fa0595111704ebb15c
-  timeout: 40m
-  variables:
-    CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
-    CARGO_INCREMENTAL: "0"
-  cache:
-    key: "rust-feature-matrix-registry"
-    paths:
-      - .cargo-home/registry/
-  before_script:
-    - apt-get update -qq && apt-get install -y -qq --no-install-recommends clang mold cmake curl protobuf-compiler libssl-dev pkg-config >/dev/null
-  script:
-    - ./ci/aikido-rust-extra.sh
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'
-      when: never
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes:
-        - "**/*.rs"
-        - "**/Cargo.toml"
-        - "**/Cargo.lock"
-        - rust-toolchain.toml
-        - ci/aikido-rust-extra.sh
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      changes:
-        - "**/*.rs"
-        - "**/Cargo.toml"
-        - "**/Cargo.lock"
-        - rust-toolchain.toml
-        - ci/aikido-rust-extra.sh
 
 # ── Publish / release jobs opt out of auto-cancel ──────────────
 # These come from the aikido deploy.yml and release.yml includes, so the
