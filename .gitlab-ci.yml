@@ -42,7 +42,9 @@ include:
   - project: 'vpf-data-ai/aikido'
     ref: 'v0.11.0'
     file: '/ci/templates/release.yml'
-  - template: Security/Secret-Detection.gitlab-ci.yml
+  # GitLab's own Security/Secret-Detection template was included here too. It
+  # duplicated aikido-secret-scan (same gitleaks-class scan, a second image
+  # pull, a second job in the test stage) and was dropped on 2026-09-04.
 
 variables:
   AIKIDO_IMAGE_NAME: "sqlengine/sqe"
@@ -73,46 +75,22 @@ variables:
 # script against ci/templates/deploy.yml and keep the --target line.
 aikido-build:
   timeout: 3h
-  # Start at pipeline creation instead of after the test stage. Measured on
-  # 2026-09-04 (pipelines 1600968, 1600377, 1601474): this job took 38 to 67
-  # minutes and only began once aikido-test-rust (20 to 38 minutes) had
-  # finished, so the two largest jobs ran back to back and a 72-minute MR
-  # pipeline was two serial compiles. Nothing here consumes the test job's
-  # output; the image is built from the same commit either way. With
-  # `needs: []` the wall clock is max(test, build), not the sum.
-  #
-  # A job with `needs:` ignores stage order and starts the moment its needs
-  # finish. So the .post jobs that need THIS job (image-vuln, publish-image,
-  # image-sbom, mbom) would otherwise publish an image before the test gate
-  # has run. Each of them is overridden below to also need aikido-test-rust
-  # and aikido-cargo-lock (optional, because both are skipped on a main commit
-  # with no Rust change). Untested code still cannot reach the registry.
-  needs: []
-  # On merge requests the build is a --no-push validation of the Dockerfile.
-  # A Rust-only change cannot break it in a way the test stage does not
-  # already catch (ci/aikido-rust-extra.sh compiles the --no-default-features
-  # variant the image uses), so run it only when an image input moves. Main
-  # keeps building and pushing on every commit.
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes:
-        - Dockerfile
-        - Cargo.toml
-        - Cargo.lock
-        - rust-toolchain.toml
-        - .cargo/config.toml
-        - .gitlab-ci.yml
-        - "crates/*/Cargo.toml"
-        - "vendor/**/*"
-        - "xtask/**/*"
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      exists:
-        - Dockerfile
   # Never cancel a push mid-layer. On main this kaniko run pushes $AIKIDO_IMAGE,
   # and a half-written manifest is worse than a wasted run, so this job opts out
   # of the `default: interruptible: true` above. Same reasoning for the publish,
   # SBOM-of-image and release/signing jobs overridden below.
   interruptible: false
+  # DEFAULT BRANCH ONLY, in .post, with no `needs:`. Stage order is what keeps
+  # this push behind the test gate, and a job with `needs:` ignores stage order,
+  # so speeding it up that way would publish an untested image to the registry.
+  # The MR-side speedup is aikido-build-validate below, where nothing is pushed.
+  # This mirrors the shape aikido main already has (deploy.yml after aikido!139,
+  # unreleased as of 2026-09-04); once a release carries it, drop both the
+  # rules here and the twin below.
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      exists:
+        - Dockerfile
   script:
     - |
       set -euo pipefail
@@ -139,6 +117,30 @@ aikido-build:
         $DEST
       [ -f image-digest.txt ] || echo "validation-only build (--no-push); no image pushed" > image-digest.txt
 
+# MR-side validation build: same job, `--no-push`, starts at pipeline creation.
+# Measured before this existed (pipelines 1600968, 1600377, 1601474): the build
+# began only after aikido-test-rust finished, so the two largest jobs ran back
+# to back and a 72-minute MR pipeline was two serial compiles for an artifact
+# that is discarded. A Rust-only change cannot break this build in a way the
+# test stage misses (rust-feature-matrix compiles the --no-default-features
+# graph the image uses), so it runs only when an image input changes.
+aikido-build-validate:
+  extends: aikido-build
+  needs: []
+  interruptible: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - Dockerfile
+        - Cargo.toml
+        - Cargo.lock
+        - rust-toolchain.toml
+        - .cargo/config.toml
+        - .gitlab-ci.yml
+        - "crates/*/Cargo.toml"
+        - "vendor/**/*"
+        - "xtask/**/*"
+
 # Container CVE gate on the image kaniko just built. Source-tree grype (aikido-scan)
 # never sees the distroless base or the static healthcheck wget; this job does.
 # Distroless/cc is expected to keep HIGH/CRITICAL at zero (measured ~0 high when
@@ -164,12 +166,6 @@ aikido-image-vuln:
       optional: true
     - job: aikido-build-validate
       artifacts: true
-      optional: true
-    # Test-stage gates, so this .post job does not run ahead of them now that
-    # aikido-build itself starts at pipeline creation (see its needs: []).
-    - job: aikido-test-rust
-      optional: true
-    - job: aikido-cargo-lock
       optional: true
   before_script:
     - mkdir -p "$HOME/.docker"
@@ -253,6 +249,21 @@ aikido-sbom:
 # rust-toolchain.toml]` there too, so a main commit touching none of those no
 # longer compiles the workspace. Nearly every commit here touches Rust; if that
 # stops being true, override `rules:` on the job below rather than upstream.
+
+# The two gate jobs start at pipeline creation instead of after `.pre`. The
+# guardrails there are advisory scans that never feed the gate, but they gate
+# its start through stage order: aikido-sast has taken 11m21s (pipeline
+# 1597344) and 14m54s (an MR the same week) when the shared runner was
+# saturated, and a 20-minute compile waited for it. `needs: []` only moves the
+# start; both jobs stay in `test`, so every .post job that relies on stage
+# order (the pushing aikido-build, release, signing) still waits for them.
+# aikido !155 (merged 2026-09-04) makes this the platform default; the override
+# goes away with the ref bump to the release that carries it.
+aikido-cargo-lock:
+  needs: []
+
+aikido-test-rust:
+  needs: []
 
 # `target/` is deliberately NOT cached here; the platform default (registry
 # only) stands. This repo used to add `target/` to the cache, and every run
@@ -382,43 +393,10 @@ rust-feature-matrix:
 # aikido-build carries its own `interruptible: false` at its override above.
 aikido-publish-image:
   interruptible: false
-  # Restated from the aikido template (`needs: [aikido-build]`) plus the two
-  # test-stage gates. Without this, `needs: []` on aikido-build above would let
-  # this job start before the tests finished. Re-diff against the template on
-  # every aikido `ref:` bump.
-  needs:
-    - job: aikido-build
-      artifacts: true
-    - job: aikido-test-rust
-      optional: true
-    - job: aikido-cargo-lock
-      optional: true
 aikido-image-sbom:
   interruptible: false
-  # Restated from the aikido template (`needs: [aikido-build]`) plus the two
-  # test-stage gates. Without this, `needs: []` on aikido-build above would let
-  # this job start before the tests finished. Re-diff against the template on
-  # every aikido `ref:` bump.
-  needs:
-    - job: aikido-build
-      artifacts: true
-    - job: aikido-test-rust
-      optional: true
-    - job: aikido-cargo-lock
-      optional: true
 aikido-mbom:
   interruptible: false
-  # Restated from the aikido template (`needs: [aikido-build]`) plus the two
-  # test-stage gates. Without this, `needs: []` on aikido-build above would let
-  # this job start before the tests finished. Re-diff against the template on
-  # every aikido `ref:` bump.
-  needs:
-    - job: aikido-build
-      artifacts: true
-    - job: aikido-test-rust
-      optional: true
-    - job: aikido-cargo-lock
-      optional: true
 aikido-release:
   interruptible: false
 aikido-release-image:
@@ -483,59 +461,12 @@ aikido-sign-image:
 # Re-adding either requires a runner with a working dind sidecar (or a
 # socket-mounted shell runner). Do not reintroduce an allow_failure-only variant.
 
-# ── AWS cloud-backed scenario tests (opt-in, needs AWS creds) ──
-# Runs the AWS quickstarts (aws-glue, aws-s3-tables, glue-lake-formation) end to
-# end: each run.sh CDK-deploys throwaway Glue / S3 Tables / Lake Formation
-# resources, drives a create/write/read round-trip through SQE, then tears the
-# resources back down. These cost real money and touch a real AWS account, so
-# the job is `when: manual` only and never runs automatically.
-#
-# Prerequisites (set as protected/masked CI/CD variables before triggering):
-#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION (and AWS_SESSION_TOKEN
-#   for assumed-role creds). The target account must be `cdk bootstrap`-ed once.
-# RUN_AWS_SCENARIOS gates the body so an accidental trigger without creds is a
-# clear no-op rather than a half-deployed stack.
-#
-# The AWS run.sh scripts support `--check`: each runs its deploy -> round-trip
-# flow, asserts the OUTPUT-derived invariants, and tears the resources back down
-# (the assertions run before teardown, so a failed assertion still cleans up the
-# stack). This job invokes them with `--check` so the gated run actually asserts.
-scenario-test-aws:
-  stage: test
-  image: docker:29@sha256:3ef33f2e220b79ed3ef3b99d81746f06f306cd6340e2cb7331d17ae996e74cb6
-  services:
-    - name: docker:29-dind
-      alias: docker
-      command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
-  variables:
-    DOCKER_HOST: tcp://docker:2375
-    DOCKER_TLS_CERTDIR: ""
-    DOCKER_DRIVER: overlay2
-    # Opt-in switch. The job is manual; this guards the body too.
-    RUN_AWS_SCENARIOS: "1"
-  before_script:
-    # AWS scenarios need the AWS CLI, Node/npx (CDK), and Docker, plus bash.
-    # NOTE: run.sh uses `aws configure export-credentials` (AWS CLI v2 only).
-    # Alpine's `aws-cli` apk package is v1 and lacks that subcommand, so a real
-    # runner for this job must provide AWS CLI v2 (custom image or v2 install
-    # step). Wiring AWS CLI v2 into a real runner image is the remaining piece;
-    # this is a skeleton.
-    - apk add --no-cache bash curl docker-compose aws-cli nodejs npm python3
-  script:
-    - |
-      if [ "${RUN_AWS_SCENARIOS:-0}" != "1" ]; then
-        echo "RUN_AWS_SCENARIOS != 1; skipping AWS scenarios (set the variable to opt in)."
-        exit 0
-      fi
-    # Fail fast with a clear message if the AWS credentials are not wired.
-    - 'test -n "${AWS_ACCESS_KEY_ID:-}" || { echo "ERROR: AWS_ACCESS_KEY_ID not set. Configure AWS_* CI/CD variables before triggering this job."; exit 1; }'
-    - ( cd quickstart/aws-glue && ./run.sh --check )
-    - ( cd quickstart/aws-s3-tables && ./run.sh --check )
-    - ( cd quickstart/glue-lake-formation && ./run.sh --check )
-  rules:
-    - when: manual
-      allow_failure: true
-  timeout: 2h
+# ── AWS cloud-backed scenario tests: REMOVED 2026-09-04 ────────
+# `scenario-test-aws` was a manual, never-run skeleton (needed a dind sidecar
+# the runners do not have and AWS CLI v2 the image did not ship). The three
+# AWS quickstarts still run locally: `quickstart/aws-glue/run.sh --check`,
+# `quickstart/aws-s3-tables/run.sh --check`,
+# `quickstart/glue-lake-formation/run.sh --check`.
 
 # ── Iceberg matrix score regression guard ─────────────────────
 # Runs `cargo xtask matrix-report --min-percent N` where N is the current
