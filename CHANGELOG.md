@@ -4,6 +4,23 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- CI: image build runs in parallel with the test gate
+
+    `aikido-build` now carries `needs: []`, so the kaniko image build (38 to
+    67 minutes measured) starts at pipeline creation instead of after
+    `aikido-test-rust` (20 to 38 minutes). Wall clock becomes the longer of
+    the two rather than their sum. On merge requests the validation build
+    runs only when an image input changes (Dockerfile, manifests, lockfile,
+    toolchain, vendor tree); main still builds and pushes every commit. The
+    `target/` directory is no longer added to the GitLab cache: the archive
+    exceeded the 5 GiB object limit on every run, so each job spent ten
+    minutes zipping a tree that never uploaded. The sqe-catalog feature
+    matrix and `cargo xtask matrix-report` moved out of the test job's tail
+    into a parallel, blocking `rust-feature-matrix` job. Baseline and the
+    rest of the plan: `docs/internal/plans/2026-09-04-build-test-time-program.md`.
+
 ### Added
 
 - Experimental Puffin NDV statistics consumer (`query.puffin_statistics`)
