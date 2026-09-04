@@ -210,6 +210,26 @@ and are to be re-measured, not assumed.
 | C2 | Split `sqe-coordinator` (64K lines, 67 s lib + 43 s bin + 16 test binaries). The write path extraction plan already exists (`2026-07-13-sqe-write-crate-extraction.md`); hive and maintenance are the next candidates. | Coordinator lib compile roughly halves; touches to write code stop rebuilding the whole coordinator. | Large refactor; do after B1 and B2 so the gain is measurable. |
 | C3 | Runner capacity: a dedicated runner with a persistent `target/` on local disk, or a larger shared class. Runner 2433 (`docker_socket`) already exists and would also let `make test-integration` return to CI. | The GitLab-based precedent for this shape went from 20 min to under 5. | Platform team ownership; not in this repo. |
 
+### Progress log
+
+- 2026-09-04, A1 (MR !928, `ci/parallel-image-build`): image build in
+  parallel with the test gate on MRs, `target/` removed from the CI cache,
+  feature-matrix checks in their own job. Platform side: aikido !155
+  (merged) gives the gate `needs: []`, `CARGO_INCREMENTAL=0` and an
+  `aikido-rust-extra` job; consumable once a v0.12.0 tag is cut through the
+  manual `create-pipeline-release` job.
+- 2026-09-04, B1 (MR !929, `build/workspace-hack`): cargo-hakari crate plus
+  `sqe-catalog` default features aligned with the workspace union. After a
+  one-line coordinator change: `cargo test -p sqe-coordinator --no-run`
+  5m50s to 35 s; `cargo test -p sqe-catalog --no-run` 24 s; the bench
+  scripts' `cargo build -p sqe-bench -p sqe-coordinator` 30 s; cold
+  workspace build 8m25s (was 8m14s, noise). Two things learned: hakari
+  unifies the none, default and all feature sets of every member, so the
+  optional backends have to be kept out with `final-excludes` and three
+  lines pinned by hand; and first-party crates are outside hakari's reach,
+  so a member that another member enables extra features on (sqe-cli on
+  sqe-catalog) has to carry those features in its default set.
+
 ## 4. Expected end state
 
 | Loop | Today | After A | After B | After C |
