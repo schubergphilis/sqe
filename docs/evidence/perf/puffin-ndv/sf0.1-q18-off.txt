@@ -1,0 +1,35 @@
+plan_type,plan
+logical_plan,"Limit: skip=0, fetch=100
+  Sort: tpch_sf0_1.orders.o_totalprice DESC NULLS FIRST, tpch_sf0_1.orders.o_orderdate ASC NULLS LAST
+    Projection: tpch_sf0_1.customer.c_name, tpch_sf0_1.customer.c_custkey, tpch_sf0_1.orders.o_orderkey, tpch_sf0_1.orders.o_orderdate, tpch_sf0_1.orders.o_totalprice, sum(tpch_sf0_1.lineitem.l_quantity)
+      Aggregate: groupBy=[[tpch_sf0_1.customer.c_name, tpch_sf0_1.customer.c_custkey, tpch_sf0_1.orders.o_orderkey, tpch_sf0_1.orders.o_orderdate, tpch_sf0_1.orders.o_totalprice]], aggr=[[sum(tpch_sf0_1.lineitem.l_quantity)]]
+        Filter: tpch_sf0_1.orders.o_orderkey IN (<subquery>) AND tpch_sf0_1.customer.c_custkey = tpch_sf0_1.orders.o_custkey AND tpch_sf0_1.orders.o_orderkey = tpch_sf0_1.lineitem.l_orderkey
+          Subquery:
+            Projection: tpch_sf0_1.lineitem.l_orderkey
+              Filter: sum(tpch_sf0_1.lineitem.l_quantity) > Int64(300)
+                Aggregate: groupBy=[[tpch_sf0_1.lineitem.l_orderkey]], aggr=[[sum(tpch_sf0_1.lineitem.l_quantity)]]
+                  TableScan: tpch_sf0_1.lineitem
+          Cross Join:
+            Cross Join:
+              TableScan: tpch_sf0_1.customer
+              TableScan: tpch_sf0_1.orders
+            TableScan: tpch_sf0_1.lineitem"
+physical_plan,"SortPreservingMergeExec: [o_totalprice@4 DESC, o_orderdate@3 ASC NULLS LAST], fetch=100
+  SortExec: TopK(fetch=100), expr=[o_totalprice@4 DESC, o_orderdate@3 ASC NULLS LAST], preserve_partitioning=[true]
+    AggregateExec: mode=FinalPartitioned, gby=[c_name@0 as c_name, c_custkey@1 as c_custkey, o_orderkey@2 as o_orderkey, o_orderdate@3 as o_orderdate, o_totalprice@4 as o_totalprice], aggr=[sum(tpch_sf0_1.lineitem.l_quantity)]
+      RepartitionExec: partitioning=Hash([c_name@0, c_custkey@1, o_orderkey@2, o_orderdate@3, o_totalprice@4], 11), input_partitions=11
+        AggregateExec: mode=Partial, gby=[c_name@1 as c_name, c_custkey@0 as c_custkey, o_orderkey@2 as o_orderkey, o_orderdate@4 as o_orderdate, o_totalprice@3 as o_totalprice], aggr=[sum(tpch_sf0_1.lineitem.l_quantity)]
+          HashJoinExec: mode=CollectLeft, join_type=RightSemi, on=[(l_orderkey@0, o_orderkey@2)]
+            CoalescePartitionsExec
+              FilterExec: sum(tpch_sf0_1.lineitem.l_quantity)@1 > 300.00, projection=[l_orderkey@0]
+                AggregateExec: mode=FinalPartitioned, gby=[l_orderkey@0 as l_orderkey], aggr=[sum(tpch_sf0_1.lineitem.l_quantity)]
+                  RepartitionExec: partitioning=Hash([l_orderkey@0], 11), input_partitions=11
+                    AggregateExec: mode=Partial, gby=[l_orderkey@0 as l_orderkey], aggr=[sum(tpch_sf0_1.lineitem.l_quantity)]
+                      RepartitionExec: partitioning=RoundRobinBatch(11), input_partitions=1
+                        IcebergScanExec: table=tpch_sf0_1.lineitem, projection=Some([""l_orderkey"", ""l_quantity""]), predicate=[], df_filters=0, pushed_down_filters=0, snapshot_id=None
+            HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(l_orderkey@0, o_orderkey@2)], projection=[c_custkey@2, c_name@3, o_orderkey@4, o_totalprice@5, o_orderdate@6, l_quantity@1]
+              IcebergScanExec: table=tpch_sf0_1.lineitem, projection=Some([""l_orderkey"", ""l_quantity""]), predicate=[], df_filters=0, pushed_down_filters=0, snapshot_id=None
+              HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(c_custkey@0, o_custkey@1)], projection=[c_custkey@0, c_name@1, o_orderkey@2, o_totalprice@4, o_orderdate@5]
+                IcebergScanExec: table=tpch_sf0_1.customer, projection=Some([""c_custkey"", ""c_name""]), predicate=[], df_filters=0, pushed_down_filters=0, snapshot_id=None
+                IcebergScanExec: table=tpch_sf0_1.orders, projection=Some([""o_orderkey"", ""o_custkey"", ""o_totalprice"", ""o_orderdate""]), predicate=[], df_filters=0, pushed_down_filters=4, snapshot_id=None
+"

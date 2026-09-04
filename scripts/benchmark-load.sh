@@ -35,6 +35,15 @@ case "$(printf '%s' "$BENCH_PUFFIN_STATS" | tr '[:upper:]' '[:lower:]')" in
     ""|0|false|no|off) BENCH_PUFFIN_STATS="" ;;
     *) BENCH_PUFFIN_STATS=1; export SQE_QUERY__PUFFIN_STATISTICS=true ;;
 esac
+# Second, independent arm: DataFusion's statistics registry
+# (`query.statistics_registry`). Truthy starts the coordinator with
+# `SQE_QUERY__STATISTICS_REGISTRY=true`; combine with BENCH_PUFFIN_STATS=1
+# for the "NDV through the registry" arm.
+BENCH_STATS_REGISTRY="${BENCH_STATS_REGISTRY:-}"
+case "$(printf '%s' "$BENCH_STATS_REGISTRY" | tr '[:upper:]' '[:lower:]')" in
+    ""|0|false|no|off) BENCH_STATS_REGISTRY="" ;;
+    *) BENCH_STATS_REGISTRY=1; export SQE_QUERY__STATISTICS_REGISTRY=true ;;
+esac
 
 # Credentials (match test stack — same as integration-test.sh)
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-s3admin}"
@@ -297,6 +306,9 @@ for BENCH in "${BENCHMARKS[@]}"; do
     if [ -n "$BENCH_PUFFIN_STATS" ]; then
         PUFFIN_ARGS=(--puffin-stats)
         echo "  (Puffin NDV sidecars ON; coordinator query.puffin_statistics=true)"
+    fi
+    if [ -n "$BENCH_STATS_REGISTRY" ]; then
+        echo "  (DataFusion statistics registry ON; coordinator query.statistics_registry=true)"
     fi
     LOAD_START=$(date +%s)
     if ! AWS_SECRET_ACCESS_KEY="$DATA_S3_SECRET_KEY" "$BENCH_BIN" load "$BENCH" \

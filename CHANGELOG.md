@@ -16,11 +16,19 @@ All notable changes to SQE are documented in this file.
     DataFusion 55 `StatisticsRequest::DistinctCount` requests to every
     projected scan column, the Iceberg table provider answers them from the
     current snapshot's statistics metadata as `Precision::Inexact` without
-    fetching the Puffin body, and `datafusion.optimizer.use_statistics_registry`
-    is switched on so join selection sees the distinct counts. Off by default
-    until the plan and benchmark gates pass; `BENCH_PUFFIN_STATS=1` on the
-    benchmark scripts loads with sidecars and starts the coordinator with the
-    flag on for an A/B against an identical baseline load.
+    fetching the Puffin body. A second, independent flag
+    `query.statistics_registry` switches on
+    `datafusion.optimizer.use_statistics_registry`; the two are separate
+    because the first SF1 A/B showed the registry, not the NDV values, moving
+    TPC-H hash-join build sides onto the fact table (q17 +40%). Both default
+    off. `BENCH_PUFFIN_STATS=1` / `BENCH_STATS_REGISTRY=1` on the benchmark
+    scripts drive the arms against an identical baseline load.
+
+    The sidecar writer itself never ran on the default path before this
+    change: CTAS and INSERT are routed through the streaming handlers, which
+    did not call it. A `ThetaSketchAccumulator` now taps the batch stream, and
+    Decimal, Date, Time and `Utf8View` columns (the type DataFusion 55 reads
+    Parquet strings as) get estimates instead of `ndv = 0` or no blob.
 
 - MCP auth modes for deployments with no identity provider
 

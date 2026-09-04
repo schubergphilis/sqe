@@ -372,7 +372,10 @@ pub async fn create_session_context(
                         max_size,
                     );
                 }
-                if config.query.puffin_statistics {
+                // Registry and NDV requests are separate experiments: the
+                // registry changes how every join is costed, NDV requests
+                // only add distinct counts to Iceberg scan statistics.
+                if config.query.statistics_registry {
                     sc = sc.set_bool(
                         "datafusion.optimizer.use_statistics_registry",
                         true,
