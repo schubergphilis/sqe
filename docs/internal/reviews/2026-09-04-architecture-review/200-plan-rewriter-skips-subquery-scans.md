@@ -4,7 +4,7 @@
 - Severity: high
 - Category: security
 - Effort: S (hours)
-- Status: open
+- Status: fixed (branch `fix/security-scale-review-2026-09-05`, 2026-09-05)
 
 ## Problem
 
@@ -102,3 +102,7 @@ In `crates/sqe-policy/src/plan_rewriter.rs`:
 - docs/internal/reviews/2026-07-25-production-readiness-review.md, section
   "Security" test matrix lists "view/subquery/DML paths" as untested; still
   true.
+
+## Resolution (2026-09-05)
+
+`PolicyPlanRewriter` (`crates/sqe-policy/src/plan_rewriter.rs`) uses `apply_with_subqueries` for the view-scan pre-pass and `transform_down_with_subqueries` for the rewrite, so `TableScan`s inside scalar subqueries, `EXISTS` and `IN (SELECT ...)` receive the same row filters, masks and denials as top-level scans. Integration test `subqueries_enforce_row_filters_and_masks` runs all three shapes against a `false` row filter and requires zero rows.

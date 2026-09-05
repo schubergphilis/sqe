@@ -121,6 +121,17 @@ pub trait AuthProvider: Send + Sync {
     /// - `Err(AuthError::Internal)` on unexpected errors
     async fn authenticate(&self, credentials: &FlightCredentials) -> Result<Identity, AuthError>;
 
+    /// Authenticate a bearer whose payload claims may authorize OAuth actions.
+    /// Only providers that validate the supplied token's signature, lifetime
+    /// and intended audience may opt in. Generic authentication (including
+    /// passthrough, anonymous and service credentials) cannot establish this.
+    async fn authenticate_oauth(
+        &self,
+        _credentials: &FlightCredentials,
+    ) -> Result<Identity, AuthError> {
+        Err(AuthError::NotMyCredentials)
+    }
+
     /// Optionally return a fresh catalog token for an existing identity.
     ///
     /// Called by `SessionManager` before catalog requests to ensure the token

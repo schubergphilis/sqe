@@ -4,7 +4,7 @@
 - Severity: high
 - Category: security
 - Effort: S (hours)
-- Status: open
+- Status: fixed (branch `fix/security-scale-review-2026-09-05`, 2026-09-05)
 
 ## Problem
 
@@ -83,3 +83,7 @@ shows up. Outside `production_mode`, nothing blocks this combination.
 - 206 (identity-to-session duplication is where `token_verified` must be
   carried through).
 - memory note "MCP server + auth modes" (!902).
+
+## Resolution (2026-09-05)
+
+`AuthProvider::authenticate_oauth` (`crates/sqe-auth/src/provider.rs`) defaults to `NotMyCredentials`; only `BearerTokenProvider` opts in, and it additionally refuses OAuth when no audience is configured under `allow_unbounded_audience`. `AuthChain::authenticate_oauth` never falls back to generic `authenticate`, and the MCP OAuth handler (`crates/sqe-mcp/src/lib.rs`) calls `authenticate_oauth`, so passthrough, anonymous and service-credential providers can no longer establish OAuth scopes from an unverified payload. Test `oauth_never_falls_back_to_generic_authentication`.
