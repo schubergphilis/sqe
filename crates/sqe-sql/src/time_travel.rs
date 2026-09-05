@@ -82,7 +82,7 @@ const TIME_TRAVEL_NEEDLES: &[(&str, bool)] = &[
 /// OF` table-version spelling in SQE's dialect (it expects `FOR UPDATE` /
 /// `FOR SHARE`), so the clause must be gone before the query is parsed.
 pub fn extract_time_travel_spec(sql: &str) -> Result<(String, Vec<TimeTravelSpec>)> {
-    let upper = sql.to_uppercase();
+    let upper = sql.to_ascii_uppercase();
     let upper_bytes = upper.as_bytes();
 
     // Fast path: no time-travel clause present.
@@ -259,7 +259,7 @@ fn parse_timestamp_token(input: &str) -> Result<(VersionRef, usize)> {
     }
 
     // Optional `TIMESTAMP` keyword prefix (Trino: `TIMESTAMP '...'`).
-    let upper = trimmed.to_uppercase();
+    let upper = trimmed.to_ascii_uppercase();
     let body_off = if upper.starts_with("TIMESTAMP") && trimmed[9..].starts_with([' ', '\'']) {
         let mut k = 9;
         while trimmed[k..].starts_with(' ') {
@@ -316,7 +316,7 @@ fn parse_timestamp_token(input: &str) -> Result<(VersionRef, usize)> {
 /// SNAPSHOT <id2>` (case insensitive). Descending ranges (start greater than
 /// end) or non-integer arguments are rejected here with a clear error.
 pub fn extract_incremental_spec(sql: &str) -> Result<(String, Vec<IncrementalSpec>)> {
-    let upper = sql.to_uppercase();
+    let upper = sql.to_ascii_uppercase();
     let needle = " FOR INCREMENTAL BETWEEN SNAPSHOT ";
     if !upper.contains(needle.trim()) {
         return Ok((sql.to_string(), vec![]));
@@ -352,7 +352,7 @@ pub fn extract_incremental_spec(sql: &str) -> Result<(String, Vec<IncrementalSpe
 
                 // Expect `AND SNAPSHOT` (with leading + trailing whitespace).
                 let rest = &sql[after_start..];
-                let rest_upper = rest.to_uppercase();
+                let rest_upper = rest.to_ascii_uppercase();
                 let and_marker = "AND SNAPSHOT";
                 let rest_trimmed = rest_upper.trim_start();
                 let leading_ws = rest_upper.len() - rest_trimmed.len();

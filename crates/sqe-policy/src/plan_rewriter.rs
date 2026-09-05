@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion::common::tree_node::{Transformed, TreeNodeRecursion};
 use datafusion::logical_expr::{col, lit, Cast, Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion::scalar::ScalarValue;
 use tracing::{debug, warn};
@@ -126,7 +126,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
         // usually empty, leaking the base table raw. Mark such scans for a
         // fail-closed deny rather than trusting the view-name policy.
         let mut view_scans: HashSet<String> = HashSet::new();
-        plan.apply(|node| {
+        plan.apply_with_subqueries(|node| {
             if let LogicalPlan::TableScan(scan) = node {
                 let table_name = scan.table_name.to_string();
                 if let Ok(provider) = datafusion::datasource::source_as_provider(&scan.source) {
@@ -331,7 +331,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
 
         // Rewrite the plan
         let rewritten = plan
-            .transform_down(|node| {
+            .transform_down_with_subqueries(|node| {
                 if let LogicalPlan::TableScan(ref scan) = node {
                     let table_name = scan.table_name.to_string();
                     if let Some(policy) = table_policies.get(&table_name) {
