@@ -4,16 +4,21 @@
 - Severity: low
 - Category: maintainability
 - Effort: S (hours)
-- Status: partial (branch `fix/config-startup-code-structure`, 2026-09-05)
+- Status: fixed (branch `fix/config-startup-code-structure`, 2026-09-05)
 
 ## Resolution (2026-09-05)
 
-Partial on `fix/config-startup-code-structure`. Coordinator and CLI embedded
+Fixed on `fix/config-startup-code-structure`. Coordinator and CLI embedded
 mode share `sqe_catalog::engine_session_config()`. `std::env::set_var` after
 runtime start is gone; `--token` works on the HTTP protocol; missing TTY
-credentials exit with a one-line error. Mask-key still reads
-`SQE_POLICY__MASK_KEY` in embedded mode (follow-up: load `[policy]` from
-`--config`).
+credentials exit with a one-line error. `--config` loads `[policy] mask_key`
+and `[storage]` through the same overlay as the server.
+
+
+## Resolution (2026-09-05, continued)
+
+`--config` on sqe-cli loads `[policy] mask_key` and `[storage]` through the
+same overlay as the server, so HMAC-SHA256 matches.
 
 
 ## Problem
