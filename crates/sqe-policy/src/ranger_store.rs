@@ -897,13 +897,12 @@ pub(crate) fn resolve_tag_policies(
 fn cache_key(user: &SessionUser, table: &str, namespace: &str) -> String {
     let mut roles = user.roles.clone();
     roles.sort();
-    format!(
-        "{}:{}:{}:{}",
-        user.username,
-        namespace,
-        table,
-        roles.join(",")
-    )
+    roles.dedup();
+    let mut groups = user.groups.clone();
+    groups.sort();
+    groups.dedup();
+    // Debug tuple encoding preserves field/list boundaries, unlike comma joins.
+    format!("{:?}", (&user.username, namespace, table, roles, groups))
 }
 
 #[derive(Debug)]
@@ -1483,6 +1482,21 @@ mod tests {
             observed >= 1,
             "fetch failure must record a resolve-duration sample"
         );
+    }
+
+    #[test]
+    fn policy_cache_distinguishes_groups_and_list_boundaries() {
+        let mut alice = user("alice", &["analyst"]);
+        let original = cache_key(&alice, "orders", "sales");
+        alice.groups = vec!["restricted".into()];
+        assert_ne!(original, cache_key(&alice, "orders", "sales"));
+        alice.groups = vec!["a,b".into()];
+        let combined = cache_key(&alice, "orders", "sales");
+        alice.groups = vec!["a".into(), "b".into()];
+        assert_ne!(combined, cache_key(&alice, "orders", "sales"));
+        let ordered = cache_key(&alice, "orders", "sales");
+        alice.groups.reverse();
+        assert_eq!(ordered, cache_key(&alice, "orders", "sales"));
     }
 
     /// Fix 1: per-user cache hit/miss counters increment via `resolve`. We seed

@@ -65,7 +65,7 @@ pub struct BranchRetention {
 /// through to the default sqlparser path.
 pub fn try_parse_ref_ddl(sql: &str) -> Result<Option<RefDdl>> {
     let trimmed = sql.trim().trim_end_matches(';');
-    let upper = trimmed.to_uppercase();
+    let upper = trimmed.to_ascii_uppercase();
 
     // Must start with ALTER TABLE to be any of our statements.
     if !upper.starts_with("ALTER TABLE ") {
@@ -75,14 +75,14 @@ pub fn try_parse_ref_ddl(sql: &str) -> Result<Option<RefDdl>> {
     // Skip "ALTER TABLE "
     let rest = trimmed[12..].trim_start();
     let (table, rest_after_table) = split_identifier(rest)?;
-    let rest_upper = rest_after_table.to_uppercase();
+    let rest_upper = rest_after_table.to_ascii_uppercase();
     let rest_upper_trimmed = rest_upper.trim_start();
     let rest_trimmed = rest_after_table.trim_start();
 
     if rest_upper_trimmed.starts_with("CREATE ") {
         // CREATE [OR REPLACE] (BRANCH|TAG) name ...
         let after_create = rest_trimmed[6..].trim_start();
-        let after_create_upper = after_create.to_uppercase();
+        let after_create_upper = after_create.to_ascii_uppercase();
 
         let (create_or_replace, after_maybe_replace) =
             if after_create_upper.starts_with("OR REPLACE ") {
@@ -91,7 +91,7 @@ pub fn try_parse_ref_ddl(sql: &str) -> Result<Option<RefDdl>> {
                 (false, after_create)
             };
 
-        let after_upper = after_maybe_replace.to_uppercase();
+        let after_upper = after_maybe_replace.to_ascii_uppercase();
         if after_upper.starts_with("BRANCH ") {
             if create_or_replace {
                 return Err(SqeError::Execution(
@@ -126,7 +126,7 @@ pub fn try_parse_ref_ddl(sql: &str) -> Result<Option<RefDdl>> {
 
     if rest_upper_trimmed.starts_with("DROP ") {
         let after_drop = rest_trimmed[5..].trim_start();
-        let after_drop_upper = after_drop.to_uppercase();
+        let after_drop_upper = after_drop.to_ascii_uppercase();
         if after_drop_upper.starts_with("BRANCH ") {
             let after_kw = after_drop[7..].trim_start();
             let (name, tail) = split_identifier(after_kw)?;
@@ -157,7 +157,7 @@ fn parse_if_exists(tail: &str) -> Result<bool> {
     if tail_trim.is_empty() {
         return Ok(false);
     }
-    if tail_trim.to_uppercase() == "IF EXISTS" {
+    if tail_trim.to_ascii_uppercase() == "IF EXISTS" {
         return Ok(true);
     }
     Err(SqeError::Execution(format!(
@@ -190,7 +190,7 @@ fn parse_tag_tail(tail: &str) -> Result<(Option<i64>, Option<i64>)> {
 /// Parse the optional `AS OF VERSION <n>` clause. Returns `(snapshot_id, remainder)`.
 fn parse_as_of_version(input: &str) -> Result<(Option<i64>, &str)> {
     let trimmed = input.trim_start();
-    let upper = trimmed.to_uppercase();
+    let upper = trimmed.to_ascii_uppercase();
     if !upper.starts_with("AS OF VERSION ") {
         return Ok((None, trimmed));
     }
@@ -270,7 +270,7 @@ fn parse_tag_retention(input: &str) -> Result<Option<i64>> {
 /// Parse `WITH RETENTION (k => v, ...)` into a list of (key, value) strings.
 fn parse_retention_args(input: &str) -> Result<Vec<(String, String)>> {
     let trimmed = input.trim();
-    let upper = trimmed.to_uppercase();
+    let upper = trimmed.to_ascii_uppercase();
     if !upper.starts_with("WITH RETENTION") {
         return Err(SqeError::Execution(format!(
             "expected WITH RETENTION clause, got: '{trimmed}'"
