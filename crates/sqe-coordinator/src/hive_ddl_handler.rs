@@ -611,10 +611,16 @@ impl HiveDdlHandler {
     ) -> Result<(), SqeError> {
         let (root, database, table) = self.full_hive_name(table_ref)?;
         let store = self.store_for(&root)?;
-        let manifest = store
-            .get(&database, &table)
-            .await
-            .map_err(|e| SqeError::Execution(e.to_string()))?;
+        let manifest = match store.get(&database, &table).await {
+            Ok(m) => m,
+            // No manifest means no table and therefore nothing to authorize:
+            // the write path resolves its provider from this same manifest,
+            // so without one no object can land. Let it report the lookup
+            // failure itself, so the error names the path the statement
+            // actually took rather than the gate in front of it.
+            Err(sqe_catalog::hive::HiveError::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(SqeError::Execution(e.to_string())),
+        };
         self.refuse_if_denied(&session.user, &database, &table, &manifest, statement)
             .await
     }
