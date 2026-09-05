@@ -6,6 +6,7 @@ This is the combined prioritization of **all 109 reported findings**: 102 from t
 
 ## Progress
 
+- **2026-09-05** (branch `fix/errors-audit-observability`): fixed 607, 800, 104, 305, 709, 306, 812, 410, 612 from area 10 (610 partial). See each finding file's Resolution section.
 - **2026-09-05** (branch `fix/security-scale-review-2026-09-05`): fixed 900, 901, 902, 903, 904, 905, 906 (all seven security/scale findings) and 105, 200, 203, 206 from the September 4 review. Each finding file carries a "Resolution" section with the code location and the tests that cover it. The cache remediation for 902 disables the materialized result cache for every governing policy engine; re-enabling it behind a policy fingerprint is follow-up work.
 
 ## Priority definitions and ordering

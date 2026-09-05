@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
-use sqe_core::{Session, SqeError};
+use sqe_core::{Session, SqeError, SqeErrorCode};
 use sqe_quack_server::{QueryError, QueryExecutor};
 
 use crate::QueryHandler;
@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn plain_execution_maps_to_execution() {
         let mapped =
-            sqe_error_to_query_error(SqeError::Execution("table 'foo' not found".to_string()));
+            sqe_error_to_query_error(SqeError::with_code(SqeErrorCode::ExecutionFailed, "table 'foo' not found".to_string()));
         match mapped {
             QueryError::Execution(msg) => assert!(msg.contains("table 'foo' not found")),
             other => panic!("expected Execution, got {other:?}"),

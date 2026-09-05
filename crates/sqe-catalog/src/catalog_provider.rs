@@ -57,15 +57,11 @@ fn should_degrade_to_empty_namespaces(
     if !degrade_unresolvable {
         return false;
     }
-    // Static-anchor resilience: degrade on an unresolvable/absent warehouse, but
-    // never on a transient fault the caller should retry.
-    !matches!(
+    // Allow-list: only a missing warehouse/namespace may look empty. TLS
+    // misconfig, deserialization bugs, and unknown codes propagate.
+    matches!(
         code,
-        SqeErrorCode::CatalogUnavailable
-            | SqeErrorCode::CircuitBreakerOpen
-            | SqeErrorCode::QueryTimeout
-            | SqeErrorCode::ResourceExhausted
-            | SqeErrorCode::AuthenticationFailed
+        SqeErrorCode::SchemaNotFound | SqeErrorCode::CatalogNotFound | SqeErrorCode::TableNotFound
     )
 }
 
@@ -819,7 +815,10 @@ mod tests {
             "Failed to list namespaces: Unable to find warehouse main_warehouse".to_string(),
         );
         assert_eq!(generic.error_code(), sqe_core::SqeErrorCode::CatalogError);
-        assert!(should_degrade_to_empty_namespaces(&generic, true));
+        assert!(
+            !should_degrade_to_empty_namespaces(&generic, true),
+            "unexpected codes must propagate, not degrade to empty"
+        );
         assert!(!should_degrade_to_empty_namespaces(&generic, false));
     }
 

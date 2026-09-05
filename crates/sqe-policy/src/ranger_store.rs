@@ -281,7 +281,7 @@ impl RangerStore {
         // resolve-duration histogram on every query during an outage, skewing
         // p50/p99 toward zero exactly when the metric is being read.
         self.breaker.check().map_err(|e| {
-            sqe_core::error::SqeError::Execution(format!("Ranger unavailable: {e}"))
+            sqe_core::error::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Ranger unavailable: {e}"))
         })?;
 
         let started = Instant::now();
@@ -294,13 +294,13 @@ impl RangerStore {
             .map_err(|e| {
                 self.breaker.record_failure();
                 self.record_metric(started, "err");
-                sqe_core::error::SqeError::Execution(format!("Ranger download failed: {e}"))
+                sqe_core::error::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Ranger download failed: {e}"))
             })?;
 
         if !resp.status().is_success() {
             self.breaker.record_failure();
             self.record_metric(started, "err");
-            return Err(sqe_core::error::SqeError::Execution(format!(
+            return Err(sqe_core::error::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
                 "Ranger download returned status {}",
                 resp.status()
             )));
@@ -309,7 +309,7 @@ impl RangerStore {
         let bundle: ServicePolicies = resp.json().await.map_err(|e| {
             self.breaker.record_failure();
             self.record_metric(started, "err");
-            sqe_core::error::SqeError::Execution(format!("Failed to parse Ranger bundle: {e}"))
+            sqe_core::error::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Failed to parse Ranger bundle: {e}"))
         })?;
         // Once per download, not per query: group-only items are invisible
         // unless `groups_claim` is set, which is a config gap not a per-row miss.
@@ -924,23 +924,23 @@ impl RangerStore {
             .send()
             .await
             .map_err(|e| {
-                sqe_core::SqeError::Execution(format!("Ranger service lookup failed: {e}"))
+                sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Ranger service lookup failed: {e}"))
             })?;
         if !response.status().is_success() {
-            return Err(sqe_core::SqeError::Execution(format!(
+            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
                 "Ranger service lookup failed (HTTP {})",
                 response.status()
             )));
         }
         let body: serde_json::Value = response.json().await.map_err(|e| {
-            sqe_core::SqeError::Execution(format!("Ranger service lookup parse failed: {e}"))
+            sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Ranger service lookup parse failed: {e}"))
         })?;
         let component_type = body
             .get("type")
             .and_then(serde_json::Value::as_str)
             .filter(|v| !v.is_empty())
             .ok_or_else(|| {
-                sqe_core::SqeError::Execution(
+                sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
                     "Ranger component service response omitted its type".to_string(),
                 )
             })?
@@ -969,16 +969,16 @@ impl RangerStore {
             .send()
             .await
             .map_err(|e| {
-                sqe_core::SqeError::Execution(format!("Ranger policy list failed: {e}"))
+                sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Ranger policy list failed: {e}"))
             })?;
         if !response.status().is_success() {
-            return Err(sqe_core::SqeError::Execution(format!(
+            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
                 "Ranger policy list failed (HTTP {})",
                 response.status()
             )));
         }
         response.json().await.map_err(|e| {
-            sqe_core::SqeError::Execution(format!("Ranger policy list parse failed: {e}"))
+            sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Ranger policy list parse failed: {e}"))
         })
     }
 
@@ -998,12 +998,12 @@ impl RangerStore {
             request = request.json(body);
         }
         let response = request.send().await.map_err(|e| {
-            sqe_core::SqeError::Execution(format!("Ranger policy mutation failed: {e}"))
+            sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Ranger policy mutation failed: {e}"))
         })?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(sqe_core::SqeError::Execution(format!(
+            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
                 "Ranger policy mutation failed (HTTP {status}){}",
                 if body.trim().is_empty() {
                     String::new()
@@ -1023,7 +1023,7 @@ impl RangerStore {
         let service = match &stmt.target {
             sqe_sql::policy_ddl::PolicyTarget::Table(_) => self.service_name.clone(),
             sqe_sql::policy_ddl::PolicyTarget::Tag(_) => link.tag_service.clone().ok_or_else(|| {
-                sqe_core::SqeError::Execution(format!(
+                sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
                     "CREATE POLICY ON TAG requires Ranger service '{}' to have a linked tag service",
                     self.service_name
                 ))
@@ -1036,7 +1036,7 @@ impl RangerStore {
             .into_iter()
             .find(|p| p.get("name").and_then(serde_json::Value::as_str) == Some(&stmt.name));
         match existing {
-            Some(_) if !stmt.or_replace => Err(sqe_core::SqeError::Execution(format!(
+            Some(_) if !stmt.or_replace => Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
                 "Policy '{}' is present; use CREATE OR REPLACE POLICY",
                 stmt.name
             ))),
@@ -1045,7 +1045,7 @@ impl RangerStore {
                     .get("id")
                     .and_then(serde_json::Value::as_i64)
                     .ok_or_else(|| {
-                        sqe_core::SqeError::Execution(format!(
+                        sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
                             "Ranger policy '{}' has no numeric id",
                             stmt.name
                         ))
@@ -1090,7 +1090,7 @@ impl RangerStore {
             );
         }
         if ids.is_empty() && !stmt.if_exists {
-            return Err(sqe_core::SqeError::Execution(format!(
+            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
                 "Policy '{}' not found",
                 stmt.name
             )));
@@ -1136,7 +1136,7 @@ fn ranger_policy_body(
         PolicyTarget::Table(table) => {
             let parts: Vec<&str> = table.split('.').map(|v| v.trim_matches('"')).collect();
             if parts.len() < 2 {
-                return Err(sqe_core::SqeError::Execution(
+                return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
                     "CREATE POLICY ON TABLE requires at least <schema>.<table>".to_string(),
                 ));
             }

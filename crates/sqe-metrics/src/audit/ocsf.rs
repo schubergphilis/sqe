@@ -93,13 +93,14 @@ pub fn to_ocsf(event: &AuditEvent) -> Value {
 
 fn class_for(kind: &AuditKind) -> (u32, u32) {
     match kind {
-        AuditKind::Query | AuditKind::PolicyDecision => (6005, 6),
+        AuditKind::Query | AuditKind::PolicyDecision | AuditKind::Scan => (6005, 6),
         AuditKind::Auth => (3002, 3),
         AuditKind::Session => (3003, 3),
         AuditKind::Grant => (3001, 3),
         // Maintenance shares AdminDdl's class: both are system/operational
         // change activity rather than a user query or interactive session.
-        AuditKind::AdminDdl | AuditKind::Maintenance => (3004, 3),
+        // AuditResume is a writer-integrity marker, not a user action.
+        AuditKind::AdminDdl | AuditKind::Maintenance | AuditKind::AuditResume => (3004, 3),
     }
 }
 

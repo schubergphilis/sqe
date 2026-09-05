@@ -29,7 +29,7 @@ use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion::sql::unparser::expr_to_sql;
 
-use sqe_core::error::SqeError;
+use sqe_core::error::{SqeError, SqeErrorCode};
 use sqe_core::SessionUser;
 
 use crate::PolicyEnforcer;
@@ -72,11 +72,11 @@ pub async fn extract_write_predicates(
     let empty_batches: Vec<Vec<arrow_array::RecordBatch>> = vec![vec![]];
     let mem = Arc::new(
         MemTable::try_new(schema, empty_batches)
-            .map_err(|e| SqeError::Execution(format!("policy probe MemTable: {e}")))?,
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("policy probe MemTable: {e}")))?,
     );
     let plan = LogicalPlanBuilder::scan(table_ref, provider_as_source(mem), None)
         .and_then(|b| b.build())
-        .map_err(|e| SqeError::Execution(format!("policy probe scan: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("policy probe scan: {e}")))?;
 
     let (rewritten, summary) = enforcer.evaluate(user, plan).await?;
     Ok((unparse_predicates(&rewritten), summary))

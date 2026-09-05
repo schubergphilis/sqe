@@ -20,7 +20,7 @@ pub use config::{
     FlightCompression, ProfileMode, QueryCacheConfig, QueryConfig, QueryHistoryConfig,
     ResolvedWorkerMemory, SortMode, SqeConfig, WorkerMemoryConfig, WorkerSpillConfig,
 };
-pub use error::{CatalogOp, Result, SqeError, SqeErrorCode};
+pub use error::{classified_by_text_total, CatalogOp, Result, SqeError, SqeErrorCode};
 pub use secret::{Secret, SecretStore, SecretStoreError};
 pub use secret_string::SecretString;
 pub use session::{Credentials, Session, SessionUser};

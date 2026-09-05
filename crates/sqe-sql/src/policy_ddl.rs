@@ -3,7 +3,7 @@
 //! Ranger remains the shared policy store used by SQE and Spark/Kyuubi. These
 //! statements replace hand-written Ranger JSON with a SQL management surface.
 
-use sqe_core::{Result, SqeError};
+use sqe_core::{Result, SqeError, SqeErrorCode};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyTarget {
@@ -248,7 +248,7 @@ fn expect_kw<'a>(s: &'a str, keyword: &str) -> Result<&'a str> {
             rest.is_empty() || rest.starts_with(char::is_whitespace) || rest.starts_with('(')
         })
         .map(str::trim_start)
-        .ok_or_else(|| SqeError::Execution(format!("CREATE POLICY: expected {keyword}")))
+        .ok_or_else(|| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("CREATE POLICY: expected {keyword}")))
 }
 
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
@@ -266,7 +266,7 @@ fn require_empty(rest: &str) -> Result<()> {
 }
 
 fn syntax<T>(message: &str) -> Result<T> {
-    Err(SqeError::Execution(format!("CREATE POLICY: {message}")))
+    Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("CREATE POLICY: {message}")))
 }
 
 #[cfg(test)]
@@ -287,7 +287,7 @@ mod tests {
         assert!(stmt.or_replace);
         assert_eq!(
             stmt.target,
-            PolicyTarget::Table("sales_wh.ac.orders".into())
+            PolicyTarget::Table("sales_wh.ac.orders".to_string())
         );
         assert_eq!(stmt.principal.kind, PolicyPrincipalKind::Role);
         assert!(
@@ -320,7 +320,7 @@ mod tests {
         assert_eq!(
             try_parse_policy_ddl("DROP POLICY IF EXISTS p;").unwrap(),
             Some(PolicyDdlStatement::Drop(DropPolicyStatement {
-                name: "p".into(),
+                name: "p".to_string(),
                 if_exists: true
             }))
         );

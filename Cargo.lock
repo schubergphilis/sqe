@@ -6675,6 +6675,7 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "chrono",
+ "datafusion",
  "futures",
  "hex",
  "serde",

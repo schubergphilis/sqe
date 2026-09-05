@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use sqe_core::QueryHistoryConfig;
+use sqe_core::SqeErrorCode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryState {
@@ -403,7 +404,7 @@ mod tests {
         let id = Uuid::now_v7();
         tracker.start(id, "carol", None, "BAD SQL", "s3", None, vec![], None);
         tracker.running(&id, 0);
-        let err = sqe_core::SqeError::Execution("syntax error near BAD".to_string());
+        let err = sqe_core::SqeError::with_code(SqeErrorCode::ExecutionFailed, "syntax error near BAD".to_string());
         tracker.failed(&id, &err);
         let rec = tracker.history.get(&id).unwrap();
         assert_eq!(rec.state, QueryState::Failed);

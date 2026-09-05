@@ -29,7 +29,7 @@ use sqe_catalog::{SessionCatalog, TableMetadataCache};
 use sqe_core::table_properties::{
     resolve_delete_mode, resolve_merge_mode, resolve_update_mode, WriteMode,
 };
-use sqe_core::{Session, SqeConfig, SqeError};
+use sqe_core::{Session, SqeConfig, SqeError, SqeErrorCode};
 use tracing::instrument;
 
 use crate::catalog_ops::{catalog_qualifier, fold_unquoted_ident, parse_table_ref};
@@ -70,7 +70,7 @@ fn reorder_insert_select(
     let target_names: Vec<&str> = target_fields.iter().map(|f| f.name.as_str()).collect();
 
     if columns.len() > target_names.len() {
-        return Err(SqeError::Execution(format!(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "INSERT column list has {} entries but target table has {} columns",
             columns.len(),
             target_names.len(),
@@ -84,12 +84,12 @@ fn reorder_insert_select(
         .collect();
     for name in &provided_lower {
         if !seen.insert(name.clone()) {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "INSERT column list contains duplicate column '{name}'"
             )));
         }
         if !target_names.iter().any(|t| t.eq_ignore_ascii_case(name)) {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "INSERT column '{name}' does not exist in target table"
             )));
         }
@@ -177,18 +177,29 @@ fn finish_puffin_sketches(acc: Option<SharedSketchAccumulator>) -> Option<Column
 
 /// Build a single-row RecordBatch reporting affected row count.
 /// Matches Trino's DML response which returns the update count.
-pub(crate) fn affected_rows_batch(count: usize) -> Vec<RecordBatch> {
+pub(crate) fn affected_rows_batch(count: u64) -> sqe_core::Result<Vec<RecordBatch>> {
     use arrow_array::Int64Array;
     use arrow_schema::{DataType, Field};
+    let n = i64::try_from(count).map_err(|_| {
+        SqeError::with_code(
+            SqeErrorCode::InternalError,
+            format!("rows_affected {count} does not fit in i64"),
+        )
+    })?;
     let schema = Arc::new(ArrowSchema::new(vec![Field::new(
         "rows_affected",
         DataType::Int64,
         false,
     )]));
-    match RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![count as i64]))]) {
-        Ok(batch) => vec![batch],
-        Err(_) => vec![],
-    }
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![n]))]).map_err(
+        |e| {
+            SqeError::with_code(
+                SqeErrorCode::InternalError,
+                format!("failed to build rows_affected batch: {e}"),
+            )
+        },
+    )?;
+    Ok(vec![batch])
 }
 
 /// Run the MERGE cardinality check against the registered target/source
@@ -208,11 +219,11 @@ async fn check_merge_cardinality(
             .sql(sql)
             .await
             .map_err(|e| {
-                SqeError::Execution(format!("MERGE cardinality check failed to plan: {e}"))
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("MERGE cardinality check failed to plan: {e}"))
             })?
             .collect()
             .await
-            .map_err(|e| SqeError::Execution(format!("MERGE cardinality check failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("MERGE cardinality check failed: {e}")))?;
         Ok(batches
             .first()
             .and_then(|b| {
@@ -262,7 +273,7 @@ fn build_lineage_insert_plan(
 ) -> sqe_core::Result<LogicalPlan> {
     let arrow_schema: ArrowSchema = source.schema().as_arrow().clone();
     let target_mem = MemTable::try_new(Arc::new(arrow_schema), vec![vec![]])
-        .map_err(|e| SqeError::Execution(format!("Failed to build lineage target stub: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build lineage target stub: {e}")))?;
     let target_provider: Arc<dyn datafusion::catalog::TableProvider> = Arc::new(target_mem);
     let target_ref = TableReference::full(
         catalog.to_string(),
@@ -275,9 +286,9 @@ fn build_lineage_insert_plan(
         provider_as_source(target_provider),
         InsertOp::Append,
     )
-    .map_err(|e| SqeError::Execution(format!("Failed to build lineage INSERT wrapper: {e}")))?
+    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build lineage INSERT wrapper: {e}")))?
     .build()
-    .map_err(|e| SqeError::Execution(format!("Failed to build lineage plan: {e}")))
+    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build lineage plan: {e}")))
 }
 
 /// Extract the target table `ObjectName` from a `Statement::Delete`. Centralises
@@ -287,7 +298,7 @@ pub(crate) fn delete_target_object_name(stmt: &Statement) -> sqe_core::Result<&O
     let delete = match stmt {
         Statement::Delete(d) => d,
         other => {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "Expected DELETE statement, got: {other}"
             )));
         }
@@ -301,7 +312,7 @@ pub(crate) fn delete_target_object_name(stmt: &Statement) -> sqe_core::Result<&O
         .ok_or_else(|| SqeError::Execution("DELETE statement has no target table".to_string()))?;
     match &first.relation {
         sqlparser::ast::TableFactor::Table { name, .. } => Ok(name),
-        other => Err(SqeError::Execution(format!(
+        other => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "Expected table name in DELETE, got: {other}"
         ))),
     }
@@ -331,14 +342,14 @@ pub(crate) fn update_target_object_name(stmt: &Statement) -> sqe_core::Result<&O
     let table_factor = match stmt {
         Statement::Update(update) => &update.table,
         other => {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "Expected UPDATE statement, got: {other}"
             )));
         }
     };
     match &table_factor.relation {
         sqlparser::ast::TableFactor::Table { name, .. } => Ok(name),
-        other => Err(SqeError::Execution(format!(
+        other => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "Expected table name in UPDATE, got: {other}"
         ))),
     }
@@ -381,7 +392,7 @@ fn lineage_target_parts(config: &SqeConfig, table_ident: &TableIdent) -> (String
 fn build_arrow_schema_for_table(table: &IcebergTable) -> sqe_core::Result<Arc<ArrowSchema>> {
     let iceberg_schema = table.metadata().current_schema();
     let arrow_schema = iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
-        .map_err(|e| SqeError::Execution(format!("Iceberg -> Arrow schema: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Iceberg -> Arrow schema: {e}")))?;
     Ok(Arc::new(arrow_schema))
 }
 
@@ -1027,8 +1038,7 @@ impl WriteHandler {
         let (table_name, _or_replace, arrow_schema, partition_by, user_options) = match stmt {
             Statement::CreateTable(ct) => {
                 if ct.query.is_none() {
-                    return Err(SqeError::Execution(
-                        "CTAS statement has no SELECT query".into(),
+                    return Err(SqeError::Execution("CTAS statement has no SELECT query".to_string(),
                     ));
                 }
 
@@ -1037,8 +1047,7 @@ impl WriteHandler {
                 let schema = if let Some(batch) = batches.first() {
                     batch.schema()
                 } else {
-                    return Err(SqeError::Execution(
-                        "CTAS query returned no batches — cannot infer schema".into(),
+                    return Err(SqeError::Execution("CTAS query returned no batches — cannot infer schema".to_string(),
                     ));
                 };
 
@@ -1051,7 +1060,7 @@ impl WriteHandler {
                 )
             }
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Expected CreateTable statement, got: {other}"
                 )));
             }
@@ -1155,7 +1164,7 @@ impl WriteHandler {
                     })
                     .await
                     .map_err(|e| {
-                        SqeError::Execution(format!("Failed to commit CTAS transaction: {e}"))
+                        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to commit CTAS transaction: {e}"))
                     })?;
                     cleanup_guard.mark_committed();
 
@@ -1220,8 +1229,7 @@ impl WriteHandler {
         let (table_name, _or_replace, partition_by, user_options) = match stmt {
             Statement::CreateTable(ct) => {
                 if ct.query.is_none() {
-                    return Err(SqeError::Execution(
-                        "CTAS statement has no SELECT query".into(),
+                    return Err(SqeError::Execution("CTAS statement has no SELECT query".to_string(),
                     ));
                 }
                 (
@@ -1232,7 +1240,7 @@ impl WriteHandler {
                 )
             }
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Expected CreateTable statement, got: {other}"
                 )));
             }
@@ -1246,7 +1254,7 @@ impl WriteHandler {
         let df = ctx
             .sql(select_sql)
             .await
-            .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
 
         // Enforce policy on the source SELECT so masks and restrictions
         // shape the target table. Without this, CTAS over a masked table
@@ -1258,7 +1266,7 @@ impl WriteHandler {
         let df = ctx
             .execute_logical_plan(enforced_source)
             .await
-            .map_err(|e| SqeError::Execution(format!("Plan execution failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Plan execution failed: {e}")))?;
 
         let arrow_schema = Arc::new(df.schema().as_arrow().clone());
         let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema)?;
@@ -1334,7 +1342,7 @@ impl WriteHandler {
                 .with_metrics(self.metrics.clone());
         let post_create: sqe_core::Result<usize> = async {
             let stream = df.execute_stream().await.map_err(|e| {
-                SqeError::Execution(format!("Failed to start execution stream: {e}"))
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to start execution stream: {e}"))
             })?;
             // Puffin NDV sketches ride along on the stream when the table
             // opted in; the buffered path clones batches instead, which the
@@ -1372,7 +1380,7 @@ impl WriteHandler {
                 )
                 .await
                 .map_err(|e| {
-                    SqeError::Execution(format!("Failed to commit CTAS transaction: {e}"))
+                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to commit CTAS transaction: {e}"))
                 })?;
                 cleanup_guard.mark_committed();
                 info!(
@@ -1408,7 +1416,7 @@ impl WriteHandler {
         // Report the written-row count as a 1-row `rows_affected` batch,
         // consistent with the buffered INSERT path and the DELETE/UPDATE/MERGE
         // handlers. The coordinator recovers it (O2) into query history + audit.
-        Ok(affected_rows_batch(total_rows))
+        affected_rows_batch(total_rows as u64)
     }
 
     /// Handle INSERT INTO ns.table SELECT ... — streaming variant.
@@ -1439,14 +1447,14 @@ impl WriteHandler {
                         (name, &ins.columns, ins.overwrite)
                     }
                     other => {
-                        return Err(SqeError::Execution(format!(
+                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                             "INSERT INTO table functions not supported: {other}"
                         )));
                     }
                 }
             }
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Expected Insert statement, got: {other}"
                 )));
             }
@@ -1483,7 +1491,7 @@ impl WriteHandler {
         let df = ctx
             .sql(&effective_sql)
             .await
-            .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
 
         // Enforce row filters, column masks, and restricted columns on the
         // source SELECT. Without this, INSERT INTO sink SELECT FROM masked
@@ -1507,12 +1515,12 @@ impl WriteHandler {
         let df = ctx
             .execute_logical_plan(enforced_plan)
             .await
-            .map_err(|e| SqeError::Execution(format!("Plan execution failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Plan execution failed: {e}")))?;
 
         let stream = df
             .execute_stream()
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to start execution stream: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to start execution stream: {e}")))?;
 
         let (stream, sketch_acc) = tap_stream_for_puffin_sketches(&table, stream);
 
@@ -1534,7 +1542,7 @@ impl WriteHandler {
         if total_rows == 0 && !overwrite {
             info!(table = %table_ident, "INSERT SELECT returned no rows — nothing to write");
             cleanup_guard.mark_committed();
-            return Ok(affected_rows_batch(0));
+            return affected_rows_batch(0);
         }
 
         self.commit_written_files(catalog.as_ref(), table, &table_ident, data_files, overwrite)
@@ -1556,7 +1564,7 @@ impl WriteHandler {
         // Report the written-row count as a 1-row `rows_affected` batch,
         // consistent with the buffered INSERT path and the DELETE/UPDATE/MERGE
         // handlers. The coordinator recovers it (O2) into query history + audit.
-        Ok(affected_rows_batch(total_rows))
+        affected_rows_batch(total_rows as u64)
     }
 
     /// Handle CREATE TABLE [IF NOT EXISTS] ns.table (column definitions)
@@ -1573,7 +1581,7 @@ impl WriteHandler {
         let ct = match stmt {
             Statement::CreateTable(ct) => ct,
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Expected CreateTable statement, got: {other}"
                 )));
             }
@@ -1592,8 +1600,7 @@ impl WriteHandler {
         let name = table_ident.name().to_string();
 
         if ct.columns.is_empty() {
-            return Err(SqeError::Execution(
-                "CREATE TABLE requires at least one column definition".into(),
+            return Err(SqeError::Execution("CREATE TABLE requires at least one column definition".to_string(),
             ));
         }
 
@@ -1724,7 +1731,7 @@ impl WriteHandler {
             src_table.metadata().current_schema(),
         )
         .map_err(|e| {
-            SqeError::Execution(format!("CREATE TABLE LIKE: source schema conversion: {e}"))
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("CREATE TABLE LIKE: source schema conversion: {e}"))
         })?;
         let iceberg_schema = arrow_schema_to_iceberg(&src_arrow)?;
 
@@ -1796,14 +1803,14 @@ impl WriteHandler {
                 match &ins.table {
                     sqlparser::ast::TableObject::TableName(name) => (name, ins.overwrite),
                     other => {
-                        return Err(SqeError::Execution(format!(
+                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                             "INSERT INTO table functions not supported: {other}"
                         )));
                     }
                 }
             }
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Expected Insert statement, got: {other}"
                 )));
             }
@@ -1873,7 +1880,7 @@ impl WriteHandler {
             "INSERT INTO committed successfully"
         );
 
-        Ok(affected_rows_batch(total_rows)) // DML success with affected row count
+        affected_rows_batch(total_rows as u64) // DML success with affected row count
     }
 
     /// Handle a Flight SQL DoPut ingest — write streamed Arrow batches to an Iceberg table.
@@ -1895,7 +1902,7 @@ impl WriteHandler {
             [ns, tbl] => (None, *ns, (*tbl).to_string()),
             [cat, ns, tbl] => (Some(*cat), *ns, (*tbl).to_string()),
             _ => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Invalid table name for ingest: {table_name}"
                 )));
             }
@@ -1952,7 +1959,7 @@ impl WriteHandler {
             )
             .await
             .map_err(|e| {
-                SqeError::Execution(format!("Failed to commit ingest transaction: {e}"))
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to commit ingest transaction: {e}"))
             })?;
             cleanup_guard.mark_committed();
 
@@ -1996,7 +2003,7 @@ impl WriteHandler {
             [ns, tbl] => (None, *ns, (*tbl).to_string()),
             [cat, ns, tbl] => (Some(*cat), *ns, (*tbl).to_string()),
             _ => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Invalid table name for ingest: {table_name}"
                 )));
             }
@@ -2023,7 +2030,7 @@ impl WriteHandler {
         // schema. Derive it from the table's current Iceberg schema.
         let arrow_schema = Arc::new(
             iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).map_err(
-                |e| SqeError::Execution(format!("Failed to derive ingest Arrow schema: {e}")),
+                |e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to derive ingest Arrow schema: {e}")),
             )?,
         );
 
@@ -2070,7 +2077,7 @@ impl WriteHandler {
             )
             .await
             .map_err(|e| {
-                SqeError::Execution(format!("Failed to commit ingest transaction: {e}"))
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to commit ingest transaction: {e}"))
             })?;
             cleanup_guard.mark_committed();
 
@@ -2108,7 +2115,7 @@ impl WriteHandler {
             Statement::Delete(d) => d,
             // unreachable: resolve_delete_target_ident above already filtered.
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Expected DELETE statement, got: {other}"
                 )))
             }
@@ -2163,7 +2170,7 @@ impl WriteHandler {
                         attempt += 1;
                     }
                     Err(e) => {
-                        return Err(SqeError::Execution(format!(
+                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                             "Failed to commit truncate: {e}"
                         )));
                     }
@@ -2196,7 +2203,7 @@ impl WriteHandler {
                 partition_prune_cow_files(old_data_files, &table, where_clause.as_ref());
             if to_rewrite.is_empty() {
                 info!(table = %table_ident, "DELETE: no partitions match the WHERE clause; nothing to rewrite");
-                return Ok(affected_rows_batch(0));
+                return affected_rows_batch(0);
             }
             if pruned_files > 0 {
                 info!(table = %table_ident, pruned_files, rewrite_files = to_rewrite.len(), "DELETE: partition-pruned CoW rewrite");
@@ -2312,13 +2319,13 @@ impl WriteHandler {
                     continue;
                 }
                 Err(e) => {
-                    return Err(SqeError::Execution(format!("Failed to commit DELETE: {e}")));
+                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to commit DELETE: {e}")));
                 }
             }
         };
 
         info!(table = %table_ident, deleted_rows = total_deleted, "DELETE committed successfully");
-        Ok(affected_rows_batch(total_deleted))
+        affected_rows_batch(total_deleted as u64)
     }
 
     /// Handle DELETE FROM using Merge-on-Read (position deletes).
@@ -2347,7 +2354,7 @@ impl WriteHandler {
         let delete = match stmt {
             Statement::Delete(d) => d,
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Expected DELETE statement, got: {other}"
                 )))
             }
@@ -2385,11 +2392,11 @@ impl WriteHandler {
             let tx = Transaction::new(&table);
             let action = tx.rewrite_files().delete_files(files_to_remove);
             let tx = action.apply(tx).map_err(|e| {
-                SqeError::Execution(format!("Failed to apply truncate transaction: {e}"))
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to apply truncate transaction: {e}"))
             })?;
             tx.commit(catalog.as_catalog().as_ref())
                 .await
-                .map_err(|e| SqeError::Execution(format!("Failed to commit truncate: {e}")))?;
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to commit truncate: {e}")))?;
             info!(table = %table_ident, "MoR DELETE: table truncated successfully");
             return Ok(vec![]);
         }
@@ -2490,10 +2497,10 @@ impl WriteHandler {
             },
         )
         .await
-        .map_err(|e| SqeError::Execution(format!("Failed to commit MoR DELETE: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to commit MoR DELETE: {e}")))?;
 
         info!(table = %table_ident, deleted_rows = deleted_count, "MoR DELETE committed successfully");
-        Ok(affected_rows_batch(deleted_count))
+        affected_rows_batch(deleted_count as u64)
     }
 
     /// Handle DELETE FROM using Merge-on-Read with equality deletes.
@@ -2525,7 +2532,7 @@ impl WriteHandler {
         let delete = match stmt {
             Statement::Delete(d) => d,
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Expected DELETE statement, got: {other}"
                 )))
             }
@@ -2539,7 +2546,7 @@ impl WriteHandler {
             .identifier_field_ids()
             .collect();
         if identifier_field_ids.is_empty() {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "table {table_ident} has no identifier-field-ids; equality-delete path requires a primary key"
             )));
         }
@@ -2572,11 +2579,11 @@ impl WriteHandler {
             let tx = Transaction::new(&table);
             let action = tx.rewrite_files().delete_files(files_to_remove);
             let tx = action.apply(tx).map_err(|e| {
-                SqeError::Execution(format!("Failed to apply truncate transaction: {e}"))
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to apply truncate transaction: {e}"))
             })?;
             tx.commit(catalog.as_catalog().as_ref())
                 .await
-                .map_err(|e| SqeError::Execution(format!("Failed to commit truncate: {e}")))?;
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to commit truncate: {e}")))?;
             return Ok(vec![]);
         }
 
@@ -2625,7 +2632,7 @@ impl WriteHandler {
                     )
                     .await?;
                 let filtered = filter_record_batch(&batch, &match_mask).map_err(|e| {
-                    SqeError::Execution(format!("failed to filter match rows: {e}"))
+                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("failed to filter match rows: {e}"))
                 })?;
                 if filtered.num_rows() == 0 {
                     continue;
@@ -2678,7 +2685,7 @@ impl WriteHandler {
             if msg.contains("stale snapshot") || msg.contains("rowdelta conflict") {
                 SqeError::Catalog(format!("commit conflict: {e}"))
             } else {
-                SqeError::Execution(format!("Failed to commit equality DELETE: {e}"))
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to commit equality DELETE: {e}"))
             }
         })?;
 
@@ -2687,7 +2694,7 @@ impl WriteHandler {
             deleted_rows = total_matched,
             "equality DELETE committed successfully"
         );
-        Ok(affected_rows_batch(total_matched))
+        affected_rows_batch(total_matched as u64)
     }
 
     /// Dispatch a DELETE statement to CoW, MoR position deletes, or MoR
@@ -2802,7 +2809,7 @@ impl WriteHandler {
         let (assignments, selection) = match stmt {
             Statement::Update(update) => (&update.assignments, &update.selection),
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Expected UPDATE statement, got: {other}"
                 )))
             }
@@ -2846,7 +2853,7 @@ impl WriteHandler {
                 partition_prune_cow_files(old_data_files, &table, selection.as_ref());
             if to_rewrite.is_empty() {
                 info!(table = %table_ident, "UPDATE: no partitions match the WHERE clause; nothing to rewrite");
-                return Ok(affected_rows_batch(0));
+                return affected_rows_batch(0);
             }
             if pruned_files > 0 {
                 info!(table = %table_ident, pruned_files, rewrite_files = to_rewrite.len(), "UPDATE: partition-pruned CoW rewrite");
@@ -2973,13 +2980,13 @@ impl WriteHandler {
                     continue;
                 }
                 Err(e) => {
-                    return Err(SqeError::Execution(format!("Failed to commit UPDATE: {e}")));
+                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to commit UPDATE: {e}")));
                 }
             }
         };
 
         info!(table = %table_ident, updated_rows = total_updated, "UPDATE committed successfully");
-        Ok(affected_rows_batch(total_updated))
+        affected_rows_batch(total_updated as u64)
     }
 
     /// Dispatch an UPDATE statement to CoW or MoR based on
@@ -3094,7 +3101,7 @@ impl WriteHandler {
         let (assignments, selection) = match stmt {
             Statement::Update(update) => (&update.assignments, &update.selection),
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Expected UPDATE statement, got: {other}"
                 )))
             }
@@ -3111,7 +3118,7 @@ impl WriteHandler {
             .identifier_field_ids()
             .collect();
         if identifier_field_ids.is_empty() {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "MoR UPDATE on {table_ident} requires identifier-field-ids (primary key)"
             )));
         }
@@ -3191,7 +3198,7 @@ impl WriteHandler {
                 // batch by the match mask; the equality-delete writer
                 // projects identifier columns from the Iceberg schema.
                 let old_keys = filter_record_batch(&batch, &match_mask).map_err(|e| {
-                    SqeError::Execution(format!("failed to filter match rows: {e}"))
+                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("failed to filter match rows: {e}"))
                 })?;
                 if old_keys.num_rows() > 0 {
                     key_batches.push(old_keys);
@@ -3213,7 +3220,7 @@ impl WriteHandler {
                     )
                     .await?;
                 let new_rows = filter_record_batch(&full_rewrite, &match_mask).map_err(|e| {
-                    SqeError::Execution(format!("failed to filter updated rows: {e}"))
+                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("failed to filter updated rows: {e}"))
                 })?;
                 if new_rows.num_rows() > 0 {
                     new_row_batches.push(new_rows);
@@ -3286,7 +3293,7 @@ impl WriteHandler {
             if msg.contains("stale snapshot") || msg.contains("rowdelta conflict") {
                 SqeError::Catalog(format!("commit conflict: {e}"))
             } else {
-                SqeError::Execution(format!("Failed to commit MoR UPDATE: {e}"))
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to commit MoR UPDATE: {e}"))
             }
         })?;
         cleanup_guard.mark_committed();
@@ -3296,7 +3303,7 @@ impl WriteHandler {
             updated_rows = total_updated,
             "MoR UPDATE committed successfully"
         );
-        Ok(affected_rows_batch(total_updated))
+        affected_rows_batch(total_updated as u64)
     }
 
     /// Handle MERGE INTO target USING source ON condition WHEN ...
@@ -3324,7 +3331,7 @@ impl WriteHandler {
         let (table_factor, source_factor, on_expr, clauses) = match stmt {
             Statement::Merge(merge) => (&merge.table, &merge.source, &merge.on, &merge.clauses),
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Expected MERGE statement, got: {other}"
                 )));
             }
@@ -3337,7 +3344,7 @@ impl WriteHandler {
                 (name, alias_str)
             }
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Expected table name in MERGE target, got: {other}"
                 )));
             }
@@ -3406,7 +3413,7 @@ impl WriteHandler {
             let schema = Arc::new(
                 iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).map_err(
                     |e| {
-                        SqeError::Execution(format!(
+                        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                             "Failed to convert Iceberg schema to Arrow: {e}"
                         ))
                     },
@@ -3450,7 +3457,7 @@ impl WriteHandler {
                 let iceberg_schema = table.metadata().current_schema();
                 Arc::new(
                     iceberg::arrow::schema_to_arrow_schema(iceberg_schema).map_err(|e| {
-                        SqeError::Execution(format!(
+                        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                             "Failed to convert Iceberg schema to Arrow: {e}"
                         ))
                     })?,
@@ -3465,7 +3472,7 @@ impl WriteHandler {
                     vec![target_buf.as_slice().to_vec()],
                 )
             }
-            .map_err(|e| SqeError::Execution(format!("Failed to create target MemTable: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to create target MemTable: {e}")))?;
             _target_buf_hold = Some(target_buf);
             (target_schema, Arc::new(target_mem))
         };
@@ -3477,7 +3484,7 @@ impl WriteHandler {
             .collect();
 
         if target_columns.is_empty() {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "MERGE target table {table_ident} has no columns for match detection"
             )));
         }
@@ -3501,7 +3508,7 @@ impl WriteHandler {
         // Register the target relation in the full session context (which has
         // all catalog tables registered for cross-table subqueries).
         ctx.register_table(&qualified_target_ref, target_provider)
-            .map_err(|e| SqeError::Execution(format!("Failed to register target provider: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to register target provider: {e}")))?;
 
         // Use the pre-executed source batches (caller handles source query execution)
         if source_batches.is_empty() {
@@ -3515,10 +3522,10 @@ impl WriteHandler {
         let source_mem =
             datafusion::datasource::MemTable::try_new(source_schema.clone(), vec![source_batches])
                 .map_err(|e| {
-                    SqeError::Execution(format!("Failed to create source MemTable: {e}"))
+                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to create source MemTable: {e}"))
                 })?;
         ctx.register_table(&qualified_source_ref, Arc::new(source_mem))
-            .map_err(|e| SqeError::Execution(format!("Failed to register source MemTable: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to register source MemTable: {e}")))?;
 
         // Rewrite the ON condition to use our MemTable names instead of
         // aliases, using the same identifier-aware rewriter as the clause
@@ -3593,7 +3600,7 @@ impl WriteHandler {
         let df = ctx
             .sql(&select_sql)
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to plan MERGE query: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to plan MERGE query: {e}")))?;
 
         // Layer B (output side): stream the merged output straight into the
         // streaming sink instead of `df.collect()`-ing the whole merged result
@@ -3613,7 +3620,7 @@ impl WriteHandler {
         let stream = df
             .execute_stream()
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to execute MERGE query: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to execute MERGE query: {e}")))?;
 
         // Write new data files from the merged results (streaming).
         let tracker = new_upload_tracker();
@@ -3658,15 +3665,15 @@ impl WriteHandler {
         }
         let tx = action
             .apply(tx)
-            .map_err(|e| SqeError::Execution(format!("Failed to apply MERGE rewrite: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to apply MERGE rewrite: {e}")))?;
         tx.commit(catalog.as_catalog().as_ref())
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to commit MERGE: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to commit MERGE: {e}")))?;
         cleanup_guard.mark_committed();
         catalog.invalidate_table_all_tokens(&table_ident).await;
 
         info!(table = %table_ident, total_rows, "MERGE committed successfully");
-        Ok(affected_rows_batch(total_rows))
+        affected_rows_batch(total_rows as u64)
     }
 
     /// Plan + collect one MoR MERGE sub-query, mapping errors to a labelled
@@ -3681,10 +3688,10 @@ impl WriteHandler {
         let df = ctx
             .sql(sql)
             .await
-            .map_err(|e| SqeError::Execution(format!("MoR MERGE {label} plan failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("MoR MERGE {label} plan failed: {e}")))?;
         df.collect()
             .await
-            .map_err(|e| SqeError::Execution(format!("MoR MERGE {label} execution failed: {e}")))
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("MoR MERGE {label} execution failed: {e}")))
     }
 
     /// Dispatch MERGE to CoW or MoR based on `write.merge.mode`
@@ -3847,7 +3854,7 @@ impl WriteHandler {
         let (table_factor, source_factor, on_expr, clauses) = match stmt {
             Statement::Merge(merge) => (&merge.table, &merge.source, &merge.on, &merge.clauses),
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Expected MERGE statement, got: {other}"
                 )));
             }
@@ -3859,7 +3866,7 @@ impl WriteHandler {
                 (name, alias_str)
             }
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Expected table name in MERGE target, got: {other}"
                 )));
             }
@@ -3880,7 +3887,7 @@ impl WriteHandler {
             .identifier_field_ids()
             .collect();
         if identifier_field_ids.is_empty() {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "MoR MERGE on {table_ident} requires identifier-field-ids (primary key)"
             )));
         }
@@ -3917,7 +3924,7 @@ impl WriteHandler {
             let iceberg_schema = table.metadata().current_schema();
             let arrow_schema =
                 iceberg::arrow::schema_to_arrow_schema(iceberg_schema).map_err(|e| {
-                    SqeError::Execution(format!("Failed to convert Iceberg schema to Arrow: {e}"))
+                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to convert Iceberg schema to Arrow: {e}"))
                 })?;
             Arc::new(arrow_schema)
         };
@@ -3945,9 +3952,9 @@ impl WriteHandler {
                 vec![target_buf.as_slice().to_vec()],
             )
         }
-        .map_err(|e| SqeError::Execution(format!("Failed to create target MemTable: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to create target MemTable: {e}")))?;
         ctx.register_table(&q_target, Arc::new(target_mem))
-            .map_err(|e| SqeError::Execution(format!("Failed to register target MemTable: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to register target MemTable: {e}")))?;
 
         if source_batches.is_empty() {
             info!(table = %table_ident, "MoR MERGE: source returned no data, nothing to merge");
@@ -3957,10 +3964,10 @@ impl WriteHandler {
         let source_mem =
             datafusion::datasource::MemTable::try_new(source_schema.clone(), vec![source_batches])
                 .map_err(|e| {
-                    SqeError::Execution(format!("Failed to create source MemTable: {e}"))
+                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to create source MemTable: {e}"))
                 })?;
         ctx.register_table(&q_source, Arc::new(source_mem))
-            .map_err(|e| SqeError::Execution(format!("Failed to register source MemTable: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to register source MemTable: {e}")))?;
 
         let source_columns: Vec<String> = source_schema
             .fields()
@@ -4283,7 +4290,7 @@ impl WriteHandler {
             if msg.contains("stale snapshot") || msg.contains("rowdelta conflict") {
                 SqeError::Catalog(format!("commit conflict: {e}"))
             } else {
-                SqeError::Execution(format!("Failed to commit MoR MERGE: {e}"))
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to commit MoR MERGE: {e}"))
             }
         })?;
         cleanup_guard.mark_committed();
@@ -4296,7 +4303,7 @@ impl WriteHandler {
             inserted_rows,
             "MoR MERGE committed successfully"
         );
-        Ok(affected_rows_batch(total_touched))
+        affected_rows_batch(total_touched as u64)
     }
 
     // -------------------------------------------------------------------------
@@ -4352,7 +4359,7 @@ impl WriteHandler {
                 }
             })
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to commit INSERT: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to commit INSERT: {e}")))?;
             return Ok(());
         }
 
@@ -4442,7 +4449,7 @@ impl WriteHandler {
                     attempt += 1;
                 }
                 Err(e) => {
-                    return Err(SqeError::Execution(format!(
+                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "Failed to commit INSERT OVERWRITE: {e}"
                     )));
                 }
@@ -4494,7 +4501,7 @@ impl WriteHandler {
         let manifest_list = cache
             .get_manifest_list(snapshot, &metadata_ref)
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to load manifest list: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to load manifest list: {e}")))?;
 
         let concurrency = self.config.catalog.manifest_concurrency.max(1);
         let manifests: Vec<Arc<iceberg::spec::Manifest>> =
@@ -4506,7 +4513,7 @@ impl WriteHandler {
                 .buffer_unordered(concurrency)
                 .try_collect()
                 .await
-                .map_err(|e| SqeError::Execution(format!("Failed to load manifest: {e}")))?;
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to load manifest: {e}")))?;
 
         let data_files = manifests
             .into_iter()
@@ -4561,12 +4568,12 @@ impl WriteHandler {
         let file_io = table.file_io();
         let input = file_io
             .new_input(file_path)
-            .map_err(|e| SqeError::Execution(format!("Failed to open file '{file_path}': {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to open file '{file_path}': {e}")))?;
 
         let input_file = input
             .read()
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to read file '{file_path}': {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to read file '{file_path}': {e}")))?;
 
         // Reserve the compressed bytes for the lifetime of the decode below.
         // Dropped when this function returns (on success or via `?`).
@@ -4580,13 +4587,13 @@ impl WriteHandler {
 
         let reader = parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new(input_file)
             .map_err(|e| {
-                SqeError::Execution(format!(
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Failed to create Parquet reader for '{file_path}': {e}"
                 ))
             })?;
 
         let reader = reader.build().map_err(|e| {
-            SqeError::Execution(format!(
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "Failed to build Parquet reader for '{file_path}': {e}"
             ))
         })?;
@@ -4597,7 +4604,7 @@ impl WriteHandler {
             let mut buf = TrackedBatchBuffer::new(p, "cow-decode-buffer");
             for item in reader {
                 let batch = item.map_err(|e| {
-                    SqeError::Execution(format!("Failed to read Parquet file '{file_path}': {e}"))
+                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to read Parquet file '{file_path}': {e}"))
                 })?;
                 buf.push(batch)?;
             }
@@ -4607,7 +4614,7 @@ impl WriteHandler {
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| {
-                    SqeError::Execution(format!("Failed to read Parquet file '{file_path}': {e}"))
+                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to read Parquet file '{file_path}': {e}"))
                 })?
         };
 
@@ -4632,15 +4639,15 @@ impl WriteHandler {
     ) -> sqe_core::Result<DeleteAwareReadPlan> {
         let scan =
             table.scan().select_all().build().map_err(|e| {
-                SqeError::Execution(format!("Failed to build rewrite read scan: {e}"))
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build rewrite read scan: {e}"))
             })?;
         let tasks: Vec<iceberg::scan::FileScanTask> = scan
             .plan_files()
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to plan rewrite read: {e}")))?
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to plan rewrite read: {e}")))?
             .try_collect()
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to plan rewrite read: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to plan rewrite read: {e}")))?;
         let mut tasks_by_path: std::collections::HashMap<String, Vec<iceberg::scan::FileScanTask>> =
             std::collections::HashMap::new();
         for task in tasks {
@@ -4674,7 +4681,7 @@ impl WriteHandler {
             // entry and the scan task, silently raw-reading here would drop the
             // file's delete files and resurrect deleted rows. Fail loud instead
             // (see !576 review): a wrong DML result is worse than an error.
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "delete-aware read: data file '{file_path}' is missing from the \
                  scan plan; refusing to read it without its delete files (this \
                  indicates a data-file path mismatch between the manifest and \
@@ -4687,7 +4694,7 @@ impl WriteHandler {
             .scan
             .read_tasks_to_arrow_with_metrics(stream)
             .map_err(|e| {
-                SqeError::Execution(format!("Failed to read data file '{file_path}': {e}"))
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to read data file '{file_path}': {e}"))
             })?;
         let mut batch_stream = result.stream();
 
@@ -4702,7 +4709,7 @@ impl WriteHandler {
             .map(|p| TrackedBatchBuffer::new(p, "cow-decode-buffer"));
         while let Some(item) = batch_stream.next().await {
             let batch = item.map_err(|e| {
-                SqeError::Execution(format!("Failed to read data file '{file_path}': {e}"))
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to read data file '{file_path}': {e}"))
             })?;
             if batch.num_rows() == 0 {
                 continue;
@@ -4749,12 +4756,12 @@ impl WriteHandler {
         let orig_name = table_ident.name();
         let mem_table =
             datafusion::datasource::MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
-                .map_err(|e| SqeError::Execution(format!("Failed to create MemTable: {e}")))?;
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to create MemTable: {e}")))?;
         ctx.register_table(
             format!("datafusion.public.{table_name}"),
             Arc::new(mem_table),
         )
-        .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to register temp table: {e}")))?;
 
         let augmented_where = augment_where_with_row_filter(where_sql, predicates);
         let from_clause = build_policy_from_clause(
@@ -4776,14 +4783,16 @@ impl WriteHandler {
         let df = ctx
             .sql(&eval_sql)
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to evaluate WHERE clause: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to evaluate WHERE clause: {e}")))?;
         let result_batches: Vec<RecordBatch> = df
             .collect()
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to collect WHERE evaluation: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to collect WHERE evaluation: {e}")))?;
 
         // Deregister temp table
-        let _ = ctx.deregister_table(format!("datafusion.public.{table_name}"));
+        if let Err(e) = ctx.deregister_table(format!("datafusion.public.{table_name}")) {
+            tracing::debug!(table = %table_name, error = %e, "failed to deregister scratch table");
+        }
 
         if result_batches.is_empty() || result_batches[0].num_rows() == 0 {
             return Ok(batch.clone());
@@ -4796,14 +4805,14 @@ impl WriteHandler {
             .as_any()
             .downcast_ref::<BooleanArray>()
             .ok_or_else(|| {
-                SqeError::Execution("WHERE evaluation did not produce a boolean column".into())
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, "WHERE evaluation did not produce a boolean column")
             })?;
         let negated = not(match_col)
-            .map_err(|e| SqeError::Execution(format!("Failed to negate WHERE mask: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to negate WHERE mask: {e}")))?;
 
         // Apply the mask to the original batch
         filter_record_batch(batch, &negated)
-            .map_err(|e| SqeError::Execution(format!("Failed to filter batch: {e}")))
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to filter batch: {e}")))
     }
 
     /// Evaluate a WHERE clause against a RecordBatch and return a BooleanArray indicating
@@ -4833,12 +4842,12 @@ impl WriteHandler {
         let orig_name = table_ident.name();
         let mem_table =
             datafusion::datasource::MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
-                .map_err(|e| SqeError::Execution(format!("Failed to create MemTable: {e}")))?;
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to create MemTable: {e}")))?;
         ctx.register_table(
             format!("datafusion.public.{table_name}"),
             Arc::new(mem_table),
         )
-        .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to register temp table: {e}")))?;
 
         let augmented_where = augment_where_with_row_filter(where_sql, predicates);
         let from_clause = build_policy_from_clause(
@@ -4858,13 +4867,15 @@ impl WriteHandler {
         let df = ctx
             .sql(&eval_sql)
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to evaluate WHERE clause: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to evaluate WHERE clause: {e}")))?;
         let result_batches: Vec<RecordBatch> = df
             .collect()
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to collect WHERE evaluation: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to collect WHERE evaluation: {e}")))?;
 
-        let _ = ctx.deregister_table(format!("datafusion.public.{table_name}"));
+        if let Err(e) = ctx.deregister_table(format!("datafusion.public.{table_name}")) {
+            tracing::debug!(table = %table_name, error = %e, "failed to deregister scratch table");
+        }
 
         if result_batches.is_empty() || result_batches[0].num_rows() == 0 {
             // No rows matched
@@ -4877,7 +4888,7 @@ impl WriteHandler {
             .as_any()
             .downcast_ref::<BooleanArray>()
             .ok_or_else(|| {
-                SqeError::Execution("WHERE evaluation did not produce a boolean column".into())
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, "WHERE evaluation did not produce a boolean column")
             })?
             .clone();
 
@@ -4908,12 +4919,12 @@ impl WriteHandler {
         let orig_name = table_ident.name();
         let mem_table =
             datafusion::datasource::MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
-                .map_err(|e| SqeError::Execution(format!("Failed to create MemTable: {e}")))?;
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to create MemTable: {e}")))?;
         ctx.register_table(
             format!("datafusion.public.{table_name}"),
             Arc::new(mem_table),
         )
-        .map_err(|e| SqeError::Execution(format!("Failed to register temp table: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to register temp table: {e}")))?;
 
         // Best-effort decorrelation of any `ScalarSubquery` nodes in the SET
         // expressions. DataFusion's physical planner cannot compile scalar
@@ -4993,13 +5004,15 @@ impl WriteHandler {
         let df = ctx
             .sql(&select_sql)
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to evaluate UPDATE: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to evaluate UPDATE: {e}")))?;
         let result_batches: Vec<RecordBatch> = df
             .collect()
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to collect UPDATE results: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to collect UPDATE results: {e}")))?;
 
-        let _ = ctx.deregister_table(format!("datafusion.public.{table_name}"));
+        if let Err(e) = ctx.deregister_table(format!("datafusion.public.{table_name}")) {
+            tracing::debug!(table = %table_name, error = %e, "failed to deregister scratch table");
+        }
 
         // Return the first (and only) result batch
         result_batches
@@ -5029,12 +5042,12 @@ impl WriteHandler {
         let orig_name = table_ident.name();
         let mem_table =
             datafusion::datasource::MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
-                .map_err(|e| SqeError::Execution(format!("MemTable error: {e}")))?;
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("MemTable error: {e}")))?;
         ctx.register_table(
             format!("datafusion.public.{table_name}"),
             Arc::new(mem_table),
         )
-        .map_err(|e| SqeError::Execution(format!("Register error: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Register error: {e}")))?;
 
         let augmented_where = augment_where_with_row_filter(where_sql, predicates);
         let from_clause = build_policy_from_clause(
@@ -5056,13 +5069,15 @@ impl WriteHandler {
         let df = ctx
             .sql(&sql)
             .await
-            .map_err(|e| SqeError::Execution(format!("Count query failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Count query failed: {e}")))?;
         let batches: Vec<RecordBatch> = df
             .collect()
             .await
-            .map_err(|e| SqeError::Execution(format!("Count collect failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Count collect failed: {e}")))?;
 
-        let _ = ctx.deregister_table(format!("datafusion.public.{table_name}"));
+        if let Err(e) = ctx.deregister_table(format!("datafusion.public.{table_name}")) {
+            tracing::debug!(table = %table_name, error = %e, "failed to deregister scratch table");
+        }
 
         let count = batches
             .first()
@@ -5153,7 +5168,7 @@ pub async fn lift_in_subqueries(
     // Parse the WHERE expression by wrapping it in a dummy SELECT.
     let dummy_sql = format!("SELECT * FROM __dummy WHERE {where_sql}");
     let mut stmts = Parser::parse_sql(&GenericDialect {}, &dummy_sql)
-        .map_err(|e| SqeError::Execution(format!("IN-subquery lift parse error: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("IN-subquery lift parse error: {e}")))?;
 
     let where_expr_opt = match stmts.first_mut() {
         Some(Statement::Query(q)) => match q.body.as_mut() {
@@ -5222,7 +5237,7 @@ pub async fn lift_in_subqueries(
         // not depend on them beyond this preflight.
         let preflight_sql = format!("SELECT * FROM ({subquery_text}) AS __sq");
         let pre_df = ctx.sql(&preflight_sql).await.map_err(|e| {
-            SqeError::Execution(format!(
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "IN-subquery preflight failed for `{preflight_sql}`: {e}"
             ))
         })?;
@@ -5235,7 +5250,7 @@ pub async fn lift_in_subqueries(
         drop(pre_df);
 
         if subq_cols.len() != num_cols {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "IN-subquery arity mismatch: LHS has {num_cols} column(s), \
                      subquery returns {} column(s)",
                 subq_cols.len()
@@ -5282,15 +5297,15 @@ pub async fn lift_in_subqueries(
         // evaluates to FALSE — i.e. `IN (empty)` is FALSE and `NOT IN
         // (empty)` is TRUE, matching the old rewriter's behaviour).
         let mat_df = ctx.sql(&materialiser_sql).await.map_err(|e| {
-            SqeError::Execution(format!("IN-subquery materialiser plan failed: {e}"))
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("IN-subquery materialiser plan failed: {e}"))
         })?;
         let schema: Arc<ArrowSchema> = Arc::new(mat_df.schema().as_arrow().clone());
         let batches = mat_df.collect().await.map_err(|e| {
-            SqeError::Execution(format!("IN-subquery materialiser execution failed: {e}"))
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("IN-subquery materialiser execution failed: {e}"))
         })?;
 
         let mem = MemTable::try_new(schema, vec![batches]).map_err(|e| {
-            SqeError::Execution(format!(
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "Failed to build MemTable for IN-subquery keyset: {e}"
             ))
         })?;
@@ -5312,7 +5327,7 @@ pub async fn lift_in_subqueries(
         let qualified_scratch = format!("datafusion.public.{scratch_name}");
         ctx.register_table(qualified_scratch.as_str(), Arc::new(mem))
             .map_err(|e| {
-                SqeError::Execution(format!(
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Failed to register IN-subquery scratch MemTable: {e}"
                 ))
             })?;
@@ -6306,7 +6321,7 @@ fn partition_prune_cow_files(
 /// in metadata", which is the ROW/struct write failure in #321.
 fn arrow_schema_to_iceberg(arrow_schema: &ArrowSchema) -> sqe_core::Result<IcebergSchema> {
     arrow_schema_to_schema_auto_assign_ids(arrow_schema)
-        .map_err(|e| SqeError::Execution(format!("Failed to build Iceberg schema: {e}")))
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build Iceberg schema: {e}")))
 }
 
 /// Build an Iceberg schema from an Arrow schema, applying column DEFAULTs.
@@ -6345,7 +6360,7 @@ pub(crate) fn arrow_schema_to_iceberg_with_defaults(
     use sqe_sql::{extract_default_literal, DefaultLiteral};
 
     if arrow_schema.fields().len() != column_defs.len() {
-        return Err(SqeError::Execution(format!(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "Schema field count ({}) does not match column definition count ({})",
             arrow_schema.fields().len(),
             column_defs.len()
@@ -6358,7 +6373,7 @@ pub(crate) fn arrow_schema_to_iceberg_with_defaults(
     // top-level columns, so the nested IDs from the auto-assignment are
     // preserved unchanged.
     let base = arrow_schema_to_schema_auto_assign_ids(arrow_schema)
-        .map_err(|e| SqeError::Execution(format!("Failed to build Iceberg schema: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build Iceberg schema: {e}")))?;
 
     let mut fields = Vec::with_capacity(column_defs.len());
 
@@ -6375,7 +6390,7 @@ pub(crate) fn arrow_schema_to_iceberg_with_defaults(
 
         if let Some(expr) = default_expr {
             let sql_literal = extract_default_literal(expr).map_err(|e| {
-                SqeError::Execution(format!(
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Invalid DEFAULT for column '{}': {e}",
                     col_def.name.value
                 ))
@@ -6391,13 +6406,13 @@ pub(crate) fn arrow_schema_to_iceberg_with_defaults(
                     // DefaultLiteral::Null is a no-op: NULL is already the absent default.
                 }
                 Ok(None) => {
-                    return Err(SqeError::Execution(format!(
+                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "DEFAULT literal for column '{}' is not compatible with type {:?}",
                         col_def.name.value, iceberg_type
                     )));
                 }
                 Err(msg) => {
-                    return Err(SqeError::Execution(format!(
+                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "DEFAULT literal for column '{}': {msg}",
                         col_def.name.value
                     )));
@@ -6411,7 +6426,7 @@ pub(crate) fn arrow_schema_to_iceberg_with_defaults(
     IcebergSchema::builder()
         .with_fields(fields)
         .build()
-        .map_err(|e| SqeError::Execution(format!("Failed to build Iceberg schema: {e}")))
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build Iceberg schema: {e}")))
 }
 
 /// Convert a SQL-surface default literal into an Iceberg `Literal`.
@@ -6697,7 +6712,7 @@ pub(crate) fn build_partition_spec(
             .find(|f| f.name == source_name)
             .map(|f| f.id)
             .ok_or_else(|| {
-                SqeError::Execution(format!(
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "PARTITIONED BY references unknown column '{source_name}'"
                 ))
             })?;
@@ -6712,7 +6727,7 @@ pub(crate) fn build_partition_spec(
     let spec = UnboundPartitionSpec::builder()
         .with_spec_id(0)
         .add_partition_fields(fields)
-        .map_err(|e| SqeError::Execution(format!("Invalid PARTITIONED BY clause: {e}")))?
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Invalid PARTITIONED BY clause: {e}")))?
         .build();
 
     Ok(Some(spec))
@@ -6735,12 +6750,12 @@ pub(crate) fn parse_partition_transform_sql(
     let mut parser = Parser::new(&dialect)
         .try_with_sql(transform_sql)
         .map_err(|e| {
-            SqeError::Execution(format!(
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "Failed to lex partition transform '{transform_sql}': {e}"
             ))
         })?;
     let expr = parser.parse_expr().map_err(|e| {
-        SqeError::Execution(format!(
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "Failed to parse partition transform '{transform_sql}': {e}"
         ))
     })?;
@@ -6764,7 +6779,7 @@ fn parse_partition_transform(
         // Compound identifier (e.g. `t.col`) — take the last segment.
         Expr::CompoundIdentifier(parts) => {
             let name = parts.last().map(|p| p.value.clone()).ok_or_else(|| {
-                SqeError::Execution("PARTITIONED BY: empty compound identifier".to_string())
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, "PARTITIONED BY: empty compound identifier".to_string())
             })?;
             Ok((name.clone(), name, Transform::Identity))
         }
@@ -6777,12 +6792,12 @@ fn parse_partition_transform(
                 .and_then(|p| p.as_ident())
                 .map(|id| id.value.to_ascii_lowercase())
                 .ok_or_else(|| {
-                    SqeError::Execution("PARTITIONED BY: function call without a name".to_string())
+                    SqeError::with_code(SqeErrorCode::ExecutionFailed, "PARTITIONED BY: function call without a name".to_string())
                 })?;
             let args = match &func.args {
                 FunctionArguments::List(list) => &list.args,
                 _ => {
-                    return Err(SqeError::Execution(format!(
+                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "PARTITIONED BY: unsupported argument form for {fn_name}()"
                     )));
                 }
@@ -6805,12 +6820,12 @@ fn parse_partition_transform(
                     Expr::Identifier(id) => Ok(fold_unquoted_ident(id)),
                     Expr::CompoundIdentifier(parts) => {
                         parts.last().map(fold_unquoted_ident).ok_or_else(|| {
-                            SqeError::Execution(format!(
+                            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                                 "PARTITIONED BY {fn_name}(): empty compound identifier"
                             ))
                         })
                     }
-                    other => Err(SqeError::Execution(format!(
+                    other => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "PARTITIONED BY {fn_name}(): expected column name, got {other}"
                     ))),
                 }
@@ -6819,15 +6834,15 @@ fn parse_partition_transform(
                 match arg {
                     Expr::Value(v) => match &v.value {
                         Value::Number(n, _) => n.parse::<u32>().map_err(|e| {
-                            SqeError::Execution(format!(
+                            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                                 "PARTITIONED BY {fn_name}(): integer parameter '{n}': {e}"
                             ))
                         }),
-                        other => Err(SqeError::Execution(format!(
+                        other => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                             "PARTITIONED BY {fn_name}(): expected integer, got {other}"
                         ))),
                     },
-                    other => Err(SqeError::Execution(format!(
+                    other => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "PARTITIONED BY {fn_name}(): expected integer literal, got {other}"
                     ))),
                 }
@@ -6836,8 +6851,7 @@ fn parse_partition_transform(
             match fn_name.as_str() {
                 "year" | "years" => {
                     if bare_args.len() != 1 {
-                        return Err(SqeError::Execution(
-                            "PARTITIONED BY year(): expected exactly one column".into(),
+                        return Err(SqeError::Execution("PARTITIONED BY year(): expected exactly one column".to_string(),
                         ));
                     }
                     let col = column_name(bare_args[0])?;
@@ -6845,8 +6859,7 @@ fn parse_partition_transform(
                 }
                 "month" | "months" => {
                     if bare_args.len() != 1 {
-                        return Err(SqeError::Execution(
-                            "PARTITIONED BY month(): expected exactly one column".into(),
+                        return Err(SqeError::Execution("PARTITIONED BY month(): expected exactly one column".to_string(),
                         ));
                     }
                     let col = column_name(bare_args[0])?;
@@ -6854,8 +6867,7 @@ fn parse_partition_transform(
                 }
                 "day" | "days" => {
                     if bare_args.len() != 1 {
-                        return Err(SqeError::Execution(
-                            "PARTITIONED BY day(): expected exactly one column".into(),
+                        return Err(SqeError::Execution("PARTITIONED BY day(): expected exactly one column".to_string(),
                         ));
                     }
                     let col = column_name(bare_args[0])?;
@@ -6863,8 +6875,7 @@ fn parse_partition_transform(
                 }
                 "hour" | "hours" => {
                     if bare_args.len() != 1 {
-                        return Err(SqeError::Execution(
-                            "PARTITIONED BY hour(): expected exactly one column".into(),
+                        return Err(SqeError::Execution("PARTITIONED BY hour(): expected exactly one column".to_string(),
                         ));
                     }
                     let col = column_name(bare_args[0])?;
@@ -6872,8 +6883,7 @@ fn parse_partition_transform(
                 }
                 "bucket" => {
                     if bare_args.len() != 2 {
-                        return Err(SqeError::Execution(
-                            "PARTITIONED BY bucket(N, col): expected exactly two arguments".into(),
+                        return Err(SqeError::Execution("PARTITIONED BY bucket(N, col): expected exactly two arguments".to_string(),
                         ));
                     }
                     let n = int_arg(bare_args[0])?;
@@ -6901,21 +6911,20 @@ fn parse_partition_transform(
                 }
                 "void" => {
                     if bare_args.len() != 1 {
-                        return Err(SqeError::Execution(
-                            "PARTITIONED BY void(col): expected exactly one column".into(),
+                        return Err(SqeError::Execution("PARTITIONED BY void(col): expected exactly one column".to_string(),
                         ));
                     }
                     let col = column_name(bare_args[0])?;
                     Ok((col.clone(), format!("{col}_null"), Transform::Void))
                 }
-                other => Err(SqeError::Execution(format!(
+                other => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "PARTITIONED BY: unsupported transform '{other}'. \
                      Supported: identity (bare column), year, month, day, hour, \
                      bucket(N, col), truncate(L, col), void."
                 ))),
             }
         }
-        other => Err(SqeError::Execution(format!(
+        other => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "PARTITIONED BY: unsupported expression form: {other}"
         ))),
     }
@@ -6926,6 +6935,13 @@ mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, TimeUnit};
     use sqlparser::ast::{DataType as SqlType, ExactNumberInfo, TimezoneInfo};
+
+    #[test]
+    fn affected_rows_batch_rejects_i64_overflow() {
+        let err = affected_rows_batch(u64::MAX).expect_err("u64::MAX must not truncate");
+        assert_eq!(err.error_code(), SqeErrorCode::InternalError);
+        assert_eq!(affected_rows_batch(0).unwrap().len(), 1);
+    }
 
     /// 905: partitioned writes are bounded by default and charge the pool.
     #[test]
@@ -8032,7 +8048,7 @@ mod tests {
         match parts.as_slice() {
             [ns, tbl] => Ok(((*ns).to_string(), (*tbl).to_string())),
             [_cat, ns, tbl] => Ok(((*ns).to_string(), (*tbl).to_string())),
-            _ => Err(sqe_core::SqeError::Execution(format!(
+            _ => Err(sqe_core::SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "Invalid table name for ingest: {table_name}"
             ))),
         }

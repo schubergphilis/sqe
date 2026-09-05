@@ -107,7 +107,7 @@ fn deepest_policy(
 ) -> sqe_core::Result<PlannedPolicy> {
     let mut plan = plan_for(object, privilege, realm, catalog, namespace, table)?;
     plan.pop().ok_or_else(|| {
-        sqe_core::SqeError::Execution(format!("Privilege '{privilege}' plans no policies"))
+        sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Privilege '{privilege}' plans no policies"))
     })
 }
 
@@ -250,7 +250,7 @@ fn is_all_privileges(privilege: &str) -> bool {
 /// resource-map injection, matching the Polaris backend's `validate_url_identifier`.
 fn validate_identifier(value: &str, what: &str) -> sqe_core::Result<()> {
     if value.is_empty() {
-        return Err(sqe_core::SqeError::Execution(format!(
+        return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
             "{what} must not be empty"
         )));
     }
@@ -258,7 +258,7 @@ fn validate_identifier(value: &str, what: &str) -> sqe_core::Result<()> {
         .chars()
         .find(|c| matches!(c, '/' | '?' | '#' | '%' | '\\') || c.is_whitespace() || c.is_control())
     {
-        return Err(sqe_core::SqeError::Execution(format!(
+        return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
             "{what} '{value}' contains invalid character {bad:?}"
         )));
     }
@@ -290,7 +290,7 @@ fn level_name(resource: &BTreeMap<String, String>) -> &'static str {
 /// both be true on any code path.
 fn required_grantor<'a>(grantor: Option<&'a str>, op: &str) -> sqe_core::Result<&'a str> {
     let g = grantor.ok_or_else(|| {
-        sqe_core::SqeError::Execution(format!(
+        sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
             "internal error: Ranger {op} reached the backend with no grantor. Ranger \
              authorizes against the grantor, so performing this as SQE's admin user \
              would skip the per-resource authority check entirely."
@@ -457,8 +457,8 @@ impl RangerGrantBackend {
         grantee: &Grantee,
     ) -> sqe_core::Result<&'a str> {
         let catalog = catalog.ok_or_else(|| {
-            sqe_core::SqeError::Execution(
-                "Ranger GRANT requires a catalog (use catalog.namespace.table)".into(),
+            sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
+                "Ranger GRANT requires a catalog (use catalog.namespace.table)",
             )
         })?;
         validate_identifier(catalog, "catalog")?;
@@ -532,7 +532,7 @@ impl RangerGrantBackend {
         let id = policy
             .get("id")
             .and_then(serde_json::Value::as_i64)
-            .ok_or_else(|| sqe_core::SqeError::Execution("Ranger policy has no id".into()))?;
+            .ok_or_else(|| sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, "Ranger policy has no id"))?;
         self.put_policy(id, &policy).await
     }
 
@@ -622,16 +622,16 @@ impl RangerGrantBackend {
             .send()
             .await
             .map_err(|e| {
-                sqe_core::SqeError::Execution(format!("Ranger policy list failed: {e}"))
+                sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Ranger policy list failed: {e}"))
             })?;
         if !resp.status().is_success() {
-            return Err(sqe_core::SqeError::Execution(format!(
+            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
                 "Ranger policy list failed (HTTP {})",
                 resp.status()
             )));
         }
         let policies: Vec<serde_json::Value> = resp.json().await.map_err(|e| {
-            sqe_core::SqeError::Execution(format!("Ranger policy list parse failed: {e}"))
+            sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Ranger policy list parse failed: {e}"))
         })?;
         Ok(policies.into_iter().find(|p| {
             let Some(res) = p.get("resources").and_then(serde_json::Value::as_object) else {
@@ -675,13 +675,13 @@ impl RangerGrantBackend {
             .send()
             .await
             .map_err(|e| {
-                sqe_core::SqeError::Execution(format!("Ranger policy {what} failed: {e}"))
+                sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Ranger policy {what} failed: {e}"))
             })?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             warn!(http_status = %status, ranger_body = %text, "Ranger policy {what} failed");
-            return Err(sqe_core::SqeError::Execution(format!(
+            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
                 "Ranger policy {what} failed (HTTP {status}){}",
                 if text.trim().is_empty() {
                     String::new()
@@ -828,11 +828,11 @@ impl RangerGrantBackend {
                     .get("id")
                     .and_then(serde_json::Value::as_i64)
                     .ok_or_else(|| {
-                        sqe_core::SqeError::Execution("Ranger policy has no id".into())
+                        sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, "Ranger policy has no id")
                     })?;
                 self.put_policy(id, &policy).await
             }
-            (other, _) => Err(sqe_core::SqeError::Execution(format!(
+            (other, _) => Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
                 "unsupported Ranger policy operation '{other}'"
             ))),
         }
@@ -895,12 +895,12 @@ impl RangerGrantBackend {
             .send()
             .await
             .map_err(|e| {
-                sqe_core::SqeError::Execution(format!("Ranger {op} request failed: {e}"))
+                sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Ranger {op} request failed: {e}"))
             })?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(sqe_core::SqeError::Execution(format!(
+            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
                 "HTTP {status}{}",
                 if text.trim().is_empty() {
                     String::new()
@@ -965,7 +965,7 @@ impl RangerGrantBackend {
                     ),
                     _ => String::new(),
                 };
-                Err(sqe_core::SqeError::Execution(format!(
+                Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
                     "Ranger {op} failed: {text}{hint}"
                 )))
             }
@@ -1379,17 +1379,17 @@ impl RangerGrantBackend {
             .basic_auth(&self.admin_user, Some(&self.admin_password))
             .send()
             .await
-            .map_err(|e| sqe_core::SqeError::Execution(format!("Ranger role fetch failed: {e}")))?;
+            .map_err(|e| sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Ranger role fetch failed: {e}")))?;
         if !resp.status().is_success() {
             let status = resp.status();
             warn!(http_status = %status, "Ranger role fetch failed");
-            return Err(sqe_core::SqeError::Execution(format!(
+            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
                 "Ranger role fetch failed (HTTP {status})"
             )));
         }
         resp.json()
             .await
-            .map_err(|e| sqe_core::SqeError::Execution(format!("Ranger role parse failed: {e}")))
+            .map_err(|e| sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Ranger role parse failed: {e}")))
     }
 
     /// Record on the policy covering `resource` that this grant happened.
@@ -1871,20 +1871,20 @@ impl RangerGrantBackend {
             .send()
             .await
             .map_err(|e| {
-                sqe_core::SqeError::Execution(format!("Ranger policy fetch failed: {e}"))
+                sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Ranger policy fetch failed: {e}"))
             })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             warn!(http_status = %status, ranger_body = %text, "Ranger policy fetch failed");
-            return Err(sqe_core::SqeError::Execution(format!(
+            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
                 "Ranger policy fetch failed (HTTP {status})"
             )));
         }
         resp.json()
             .await
-            .map_err(|e| sqe_core::SqeError::Execution(format!("Ranger policy parse failed: {e}")))
+            .map_err(|e| sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Ranger policy parse failed: {e}")))
     }
 }
 
@@ -2033,11 +2033,8 @@ impl GrantBackend for RangerGrantBackend {
                 // Reuse the inner message rather than its Display: both are
                 // `SqeError::Execution`, so `{e}` here would print "Query execution
                 // error:" twice in the one message operators are asked to read.
-                let base = match &e {
-                    sqe_core::SqeError::Execution(msg) => msg.clone(),
-                    other => other.to_string(),
-                };
-                return Err(sqe_core::SqeError::Execution(format!(
+                let base = e.to_string();
+                return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
                     "{base}{level_hint}{}",
                     match (written.is_empty(), rolled_back) {
                         (true, _) => String::new(),
@@ -2166,8 +2163,8 @@ impl GrantBackend for RangerGrantBackend {
     /// only check. Ranger offers no grantor-scoped deny.
     async fn deny(&self, _token: &str, stmt: &GrantStatement) -> sqe_core::Result<()> {
         let catalog = stmt.catalog.as_deref().ok_or_else(|| {
-            sqe_core::SqeError::Execution(
-                "Ranger DENY requires a catalog (use catalog.namespace.table)".into(),
+            sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
+                "Ranger DENY requires a catalog (use catalog.namespace.table)",
             )
         })?;
         validate_identifier(catalog, "catalog")?;
@@ -2232,7 +2229,7 @@ impl GrantBackend for RangerGrantBackend {
                     .get("id")
                     .and_then(serde_json::Value::as_i64)
                     .ok_or_else(|| {
-                        sqe_core::SqeError::Execution("Ranger policy has no id".into())
+                        sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, "Ranger policy has no id")
                     })?;
                 self.put_policy(id, &policy).await
             }
@@ -2339,8 +2336,8 @@ impl GrantBackend for RangerGrantBackend {
         check: &AccessCheck,
     ) -> sqe_core::Result<AccessCheckResult> {
         let catalog = check.catalog.as_deref().ok_or_else(|| {
-            sqe_core::SqeError::Execution(
-                "Ranger check_access requires a catalog; use catalog.namespace.table".into(),
+            sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
+                "Ranger check_access requires a catalog; use catalog.namespace.table",
             )
         })?;
         validate_identifier(catalog, "catalog")?;
@@ -3068,7 +3065,7 @@ mod tests {
         let err = b
             .build_grant_revoke("SELECT", None, None, None, &Grantee::User("a".into()))
             .unwrap_err();
-        assert!(matches!(err, sqe_core::SqeError::Execution(_)));
+        assert!(err.error_code() == sqe_core::SqeErrorCode::ExecutionFailed);
     }
 
     #[test]
@@ -3083,7 +3080,7 @@ mod tests {
                 &Grantee::User("a".into()),
             )
             .unwrap_err();
-        assert!(matches!(err, sqe_core::SqeError::Execution(_)));
+        assert!(err.error_code() == sqe_core::SqeErrorCode::ExecutionFailed);
     }
 
     // ── Task 5: policy parsing ────────────────────────────────────────
