@@ -10,9 +10,10 @@ workflow:
     - if: '$CI_COMMIT_TAG'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
-# Without at least one local job that has no `changes:` filter, GitLab
-# reports "the resulting pipeline would have been empty" for MRs that only
-# touch images/compose and never starts CI (see !936).
+# Config-only MRs (renovate.json, workflow comments) otherwise create an empty
+# pipeline: every other job here or in aikido includes carries a `changes:`
+# filter. GitLab then reports "the resulting pipeline would have been empty"
+# and never starts CI. Keep this job free of `changes:` and `extends:`.
 ci-config-sanity:
   stage: test
   image: python:3.12-alpine
@@ -215,7 +216,6 @@ aikido-build-validate:
         - Dockerfile
         - Dockerfile.bench
         - Dockerfile.full
-        - "quickstart/**/docker-compose.yml"
         - Cargo.toml
         - Cargo.lock
         - rust-toolchain.toml
