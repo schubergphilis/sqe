@@ -10,6 +10,19 @@ workflow:
     - if: '$CI_COMMIT_TAG'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
+# Config-only MRs (renovate.json, workflow comments) otherwise create an empty
+# pipeline: every other job here or in aikido includes carries a `changes:`
+# filter. GitLab then reports "the resulting pipeline would have been empty"
+# and never starts CI. Keep this job free of `changes:` and `extends:`.
+ci-config-sanity:
+  stage: test
+  image: python:3.12-alpine
+  script:
+    - python -m json.tool renovate.json >/dev/null
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
 # Auto-cancel superseded pipelines. The project setting
 # (Settings > CI/CD > auto_cancel_pending_pipelines) is already `enabled`, but it
 # only cancels jobs marked `interruptible`, and nothing here was. Measured
