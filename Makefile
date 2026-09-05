@@ -161,7 +161,7 @@ help:
 	@echo ""
 	@echo "  Combined:"
 	@echo "    make all          audit + test + image build + benchmark_all (hours, not minutes:"
-	@echo "                      full Dockerfile.full compile then SF0.1+SF1+SF10 over all suites)"
+	@echo "                      full image compile then SF0.1+SF1+SF10 over all suites)"
 	@echo "    make all_trino    Same, with the SQE-vs-Trino comparison on"
 	@echo "    make docs-and-image  dev build + rustbook + ebook + image build + sbom"
 	@echo ""
@@ -183,7 +183,7 @@ help:
 # The previous meaning of `all` (docs + image) lives on as `docs-and-image`.
 # Steps are recipe lines, not prerequisites, so they stay ordered under `-j`:
 # the benchmark stack owns fixed ports and must not overlap with anything.
-# This is a long gate, not a quick check: `build` compiles Dockerfile.full and
+# This is a long gate, not a quick check: `build` compiles the server image and
 # the benchmark step cargo-builds sqe-bench/sqe-coordinator separately, then
 # sweeps three scale factors. For a fast pre-push loop use `make audit test`.
 all:
