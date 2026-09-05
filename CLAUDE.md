@@ -4,36 +4,50 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**SQE (Sovereign Query Engine)** -- A Rust-based distributed SQL query engine for Apache Iceberg tables. Built on DataFusion + iceberg-rust for querying via Polaris REST Catalog, with OIDC auth passthrough and OPA/Cedar-based fine-grained security.
+**SQE (Sovereign Query Engine)** -- A Rust-based distributed SQL query engine for Apache Iceberg tables. Built on DataFusion + iceberg-rust for querying via Polaris REST Catalog, with OIDC auth passthrough and Ranger / Polaris-grants / in-memory / passthrough policy enforcement.
 
-This repository contains the full engine implementation across 10 crates. Licensed under Apache 2.0.
+This repository contains the full engine implementation. Licensed under Apache 2.0.
+
+The shipped long-running binary is `sqe-server` (`--mode coordinator` or `--mode worker`). `sqe-worker` is the standalone worker with the same bootstrap. OPA and Cedar were the original design and were not built.
 
 ## Architecture
 
 ```
-Client (JDBC/Flight SQL) -> Coordinator -> Workers (DataFusion) -> Iceberg (Polaris + S3)
+Client (Flight SQL, Trino HTTP, MCP, Quack/DuckDB RPC, web UI)
+  -> sqe-server (coordinator)
+  -> Workers (DataFusion)
+  -> Iceberg (Polaris + S3)
 ```
 
-- **Coordinator**: SQL parsing, auth, policy enforcement (plan rewriting), optimization, distributed scheduling
+- **Coordinator**: SQL parsing, auth, policy enforcement (plan rewriting), optimization, distributed scheduling. Run as `sqe-server --mode coordinator`.
 - **Workers**: Stateless DataFusion executors receiving secured plan fragments + user bearer tokens
 - **Auth model**: No service account -- every query runs as the authenticated user via OIDC password grant -> bearer token passthrough to Polaris/S3
-- **Security**: Policy enforcement via LogicalPlan rewriting *before* DataFusion optimization (row filters, column masks, column restriction). Pluggable backend: OPA, Cedar, or passthrough
+- **Security**: Policy enforcement via LogicalPlan rewriting *before* DataFusion optimization (row filters, column masks, column restriction). Pluggable backend: Ranger, Polaris grants, in-memory, or passthrough
 
 ## Crate Structure
 
 | Crate | Purpose |
 |---|---|
 | `sqe-core` | Shared types, config, errors |
-| `sqe-sql` | Extended SQL parser (sqlparser-rs), custom AST for GRANT/REVOKE/SHOW GRANTS/SHOW EFFECTIVE POLICY |
-| `sqe-auth` | OIDC password grant, session manager, JWT validation |
-| `sqe-policy` | PolicyEnforcer trait, PolicyStore trait (OPA/Cedar/InMemory), PlanRewriter, policy cache (moka) |
-| `sqe-catalog` | Iceberg REST catalog client (wraps iceberg-rust), information_schema virtual providers |
-| `sqe-planner` | LogicalPlan -> PhysicalPlan, partition-aware splitting |
-| `sqe-coordinator` | Scheduler, Flight SQL server, session management, statement routing |
-| `sqe-worker` | Executor, DataFusion runtime, Flight client |
-| `sqe-trino-compat` | Optional Trino wire protocol adapter |
-| `sqe-mcp` | MCP Streamable HTTP endpoint; OAuth resource server, tool surface, read-only SQL gate |
-| `sqe-metrics` | Prometheus exporter, OTel integration |
+| `sqe-sql` | SQL parser, statement classifier, GRANT/REVOKE |
+| `sqe-auth` | Pluggable auth chain (10 providers), token cache |
+| `sqe-catalog` | Iceberg REST client, caching, scan execution |
+| `sqe-policy` | Policy enforcement (passthrough, in-memory, Apache Ranger) |
+| `sqe-planner` | Plan splitting, star-schema reorder, join strategy |
+| `sqe-coordinator` | Flight SQL server, query handler, Trino HTTP (`sqe-server` binary) |
+| `sqe-worker` | Stateless DataFusion executor |
+| `sqe-cli` | Interactive SQL client (cluster + embedded modes) |
+| `sqe-metrics` | Prometheus, OpenTelemetry, audit logger |
+| `sqe-lineage` | OpenLineage 2-0-2 emitter; column-level lineage |
+| `sqe-trino-compat` | Trino wire protocol |
+| `sqe-trino-functions` | Trino-compatible scalar UDFs for DataFusion |
+| `sqe-mcp` | Model Context Protocol endpoint (OAuth resource server, tools) |
+| `sqe-compaction` | Compaction / rewrite-data-files |
+| `sqe-spill` | Spill substrate |
+| `sqe-quack-wire` | Pure-Rust port of DuckDB's BinarySerializer (Quack RPC) |
+| `sqe-quack-server` | Quack RPC server; accepts DuckDB clients over HTTP |
+| `sqe-quack-client` | Client side of the DuckDB Quack RPC |
+| `sqe-bench` | Benchmark suite |
 
 ## Key Design Decisions
 
@@ -72,7 +86,7 @@ Invariant: `docs/site/` must be publish-clean (no secrets). A later task adds a 
 3. **Phase 2c** -- dbt compatibility: write path (CTAS, MERGE, DELETE), information_schema, dbt-sqe adapter
 4. **Phase 3** -- Distributed execution: bespoke scheduler + stateless DataFusion workers (Ballista was evaluated and wound down; see `docs/site/book/src/design-notes/ballista-evaluation-learnings.md`)
 5. **Phase 4** -- Production hardening: metrics, benchmarks, Helm, Trino compat
-6. **Phase 5** -- Security: OPA/Cedar policy engine, GRANT/REVOKE SQL, column masks, row filters
+6. **Phase 5** -- Security: Ranger / Polaris grants / in-memory policy engine, GRANT/REVOKE SQL, column masks, row filters
 
 ## Tech Stack
 
@@ -82,8 +96,8 @@ Invariant: `docs/site/` must be publish-clean (no secrets). A later task adds a 
 - **Table format**: Apache Iceberg v3 via iceberg-rust 0.8.0+
 - **Catalog**: Apache Polaris (Iceberg REST)
 - **Auth**: OIDC (any provider: Keycloak, Auth0, Okta, etc.)
-- **Policy**: OPA (Rego) or Cedar (pluggable)
-- **Wire protocol**: Arrow Flight SQL (primary), Trino HTTP (optional compat)
+- **Policy**: Apache Ranger, Polaris grants, in-memory, or passthrough (OPA/Cedar were designed, not built)
+- **Wire protocol**: Arrow Flight SQL (primary), Trino HTTP, MCP, Quack/DuckDB RPC, web UI
 - **Storage**: S3-compatible (AWS S3, Ceph, Garage, R2, etc.)
 - **Policy cache**: moka (async TTL cache)
 - **Deployment**: Kubernetes (Helm)
