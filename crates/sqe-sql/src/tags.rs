@@ -32,14 +32,14 @@ pub struct SetTagsStatement {
 /// statement but malformed.
 pub fn try_parse_set_tags(sql: &str) -> Result<Option<SetTagsStatement>> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
-    let upper = trimmed.to_uppercase();
+    let upper = trimmed.to_ascii_uppercase();
     if !upper.starts_with("ALTER TABLE ") {
         return Ok(None);
     }
     let after_at = trimmed["ALTER TABLE ".len()..].trim_start();
     let (table, rest) = split_identifier(after_at)?;
     let rest = rest.trim_start();
-    let rest_upper = rest.to_uppercase();
+    let rest_upper = rest.to_ascii_uppercase();
 
     if rest_upper.starts_with("SET TAGS") {
         let body = rest["SET TAGS".len()..].trim_start();
@@ -62,7 +62,7 @@ pub fn try_parse_set_tags(sql: &str) -> Result<Option<SetTagsStatement>> {
     if let Some(after) = after_col {
         let (column, rest2) = split_identifier(after)?;
         let rest2 = rest2.trim_start();
-        let rest2_upper = rest2.to_uppercase();
+        let rest2_upper = rest2.to_ascii_uppercase();
         // SET TAG (singular) but not SET TAGS (plural, native form).
         if rest2_upper.starts_with("SET TAG") && !rest2_upper.starts_with("SET TAGS") {
             let body = rest2["SET TAG".len()..].trim_start();
@@ -115,14 +115,14 @@ pub struct MaskingPolicyOp {
 /// store, so it hands the name onward.
 pub fn try_parse_masking_policy(sql: &str) -> Result<Option<MaskingPolicyOp>> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
-    let upper = trimmed.to_uppercase();
+    let upper = trimmed.to_ascii_uppercase();
     if !upper.starts_with("ALTER TABLE ") {
         return Ok(None);
     }
     let after_at = trimmed["ALTER TABLE ".len()..].trim_start();
     let (table, rest) = split_identifier(after_at)?;
     let rest = rest.trim_start();
-    let rest_upper = rest.to_uppercase();
+    let rest_upper = rest.to_ascii_uppercase();
 
     let after_col = if rest_upper.starts_with("MODIFY COLUMN ") {
         &rest["MODIFY COLUMN ".len()..]
@@ -133,7 +133,7 @@ pub fn try_parse_masking_policy(sql: &str) -> Result<Option<MaskingPolicyOp>> {
     };
     let (column, rest2) = split_identifier(after_col)?;
     let rest2 = rest2.trim_start();
-    let rest2_upper = rest2.to_uppercase();
+    let rest2_upper = rest2.to_ascii_uppercase();
 
     // UNSET is checked FIRST. "SET MASKING POLICY" is a SUFFIX of
     // "UNSET MASKING POLICY", so testing SET first matches the UNSET form and turns

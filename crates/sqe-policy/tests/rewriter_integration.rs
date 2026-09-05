@@ -1497,3 +1497,53 @@ async fn effective_policy_reports_the_precedence_the_rewriter_applies() {
         }
     }
 }
+
+/// Policy traversal must cover expression-owned plans before decorrelation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subqueries_enforce_row_filters_and_masks() {
+    let (mem, _) = build_scan("employees");
+    let ctx = SessionContext::new();
+    ctx.register_table("employees", mem).unwrap();
+    let store = InMemoryPolicyStore::new();
+    let mut policy = ResolvedPolicy::default();
+    policy.row_filters.push(lit(false));
+    store
+        .add_table_policy("public", "employees", policy.clone())
+        .await;
+    store.add_table_policy("default", "employees", policy).await;
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store));
+    assert!(!rewriter.permits_result_cache());
+    for sql in [
+        "SELECT (SELECT count(*) FROM employees) AS n",
+        "SELECT 1 AS n WHERE EXISTS (SELECT 1 FROM employees)",
+        "SELECT 1 AS n WHERE 1 IN (SELECT customer_id FROM employees)",
+    ] {
+        let plan = ctx.state().create_logical_plan(sql).await.unwrap();
+        let (plan, summary) = rewriter.evaluate(&user("alice", &[]), plan).await.unwrap();
+        assert!(
+            summary.denied,
+            "subquery must participate in policy evaluation: {sql}"
+        );
+        let batches = ctx
+            .execute_logical_plan(plan)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        if sql.starts_with("SELECT (SELECT") {
+            let values = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(values.value(0), 0);
+        } else {
+            assert_eq!(
+                batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+                0,
+                "{sql}"
+            );
+        }
+    }
+}
