@@ -4,7 +4,16 @@
 - Severity: medium
 - Category: reliability
 - Effort: M
-- Status: open
+- Status: partial (branch `fix/config-startup-code-structure`, 2026-09-05)
+
+## Resolution (2026-09-05)
+
+Partial on `fix/config-startup-code-structure`. One runtime builder
+(`sqe_core::build_server_runtime`) with `coordinator.runtime_stack_mib`
+(default 8) is used by `sqe-server` and `sqe-worker`. Debug integration
+tests still set `RUST_MIN_STACK` (32 MiB); dropping it needs
+`stacker`/`spawn_blocking` on the recursive rewrite path (follow-up).
+
 
 ## Problem
 

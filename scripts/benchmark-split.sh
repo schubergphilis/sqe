@@ -46,7 +46,7 @@ case "$PROFILE" in
     *) echo "ERROR: PROFILE must be 'release', 'dev-release' or 'debug', got: '$PROFILE'" >&2; exit 1 ;;
 esac
 BENCH_BIN="$ROOT_DIR/target/$PROFILE/sqe-bench"
-SQE_BIN="$ROOT_DIR/target/$PROFILE/sqe-coordinator"
+SQE_BIN="$ROOT_DIR/target/$PROFILE/sqe-server"
 
 # S3 + auth (match docker-compose.test.yml)
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-s3admin}"
@@ -89,11 +89,11 @@ echo ""
 if [ ! -x "$BENCH_BIN" ] || [ ! -x "$SQE_BIN" ]; then
     echo "Building sqe-bench + sqe-coordinator (profile: $PROFILE)..."
     if [ "$PROFILE" = "release" ]; then
-        cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-coordinator --release
+        cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-server --release
     elif [ "$PROFILE" = "dev-release" ]; then
-        cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-coordinator --profile dev-release
+        cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-server --profile dev-release
     else
-        cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-coordinator
+        cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-server
     fi
 fi
 
@@ -106,7 +106,7 @@ docker compose -f "$COMPOSE_FILE" up -d >/dev/null
 #
 # Previous implementation used `pkill -f "$SQE_BIN"` where $SQE_BIN is
 # the absolute path. That misses coords started with a relative path
-# (e.g. `./target/release/sqe-coordinator` from an earlier shell). We
+# (e.g. `./target/release/sqe-server` from an earlier shell). We
 # saw this bite: the script spawned a "new" coord that tried to bind
 # already-held ports (:18080, :19090) and partially failed, then
 # queries landed inconsistently on the old vs new coord.
@@ -114,14 +114,14 @@ docker compose -f "$COMPOSE_FILE" up -d >/dev/null
 # Match by the binary name only, which catches both relative and
 # absolute invocations. Escalate to SIGKILL if the first SIGTERM
 # doesn't take effect within 3 s.
-pkill -f 'sqe-coordinator($| )' 2>/dev/null || true
+pkill -f 'sqe-server($| )' 2>/dev/null || true
 for _ in 1 2 3; do
-    pgrep -f 'sqe-coordinator($| )' >/dev/null 2>&1 || break
+    pgrep -f 'sqe-server($| )' >/dev/null 2>&1 || break
     sleep 1
 done
-if pgrep -f 'sqe-coordinator($| )' >/dev/null 2>&1; then
+if pgrep -f 'sqe-server($| )' >/dev/null 2>&1; then
     echo "WARN: sqe-coordinator did not exit on SIGTERM, sending SIGKILL" >&2
-    pkill -9 -f 'sqe-coordinator($| )' 2>/dev/null || true
+    pkill -9 -f 'sqe-server($| )' 2>/dev/null || true
     sleep 2
 fi
 
