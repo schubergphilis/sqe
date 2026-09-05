@@ -132,6 +132,8 @@ aikido-build-validate:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:
         - Dockerfile
+        - Dockerfile.bench
+        - Dockerfile.full
         - Cargo.toml
         - Cargo.lock
         - rust-toolchain.toml
