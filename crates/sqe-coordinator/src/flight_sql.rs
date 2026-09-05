@@ -824,8 +824,7 @@ impl SqeFlightSqlService {
     /// Parse the `[coordinator] flight_compression` config into IPC write options.
     fn flight_ipc_options(&self) -> Result<IpcWriteOptions, Status> {
         let compression =
-            sqe_core::FlightCompression::from_config(&self.config.coordinator.flight_compression)
-                .map_err(|e| Status::internal(format!("Invalid flight_compression config: {e}")))?;
+            self.config.coordinator.flight_compression;
         ipc_options_for(compression)
     }
 

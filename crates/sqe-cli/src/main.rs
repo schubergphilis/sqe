@@ -268,9 +268,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Cloud catalog (Glue / S3 Tables), read-only. Region goes
             // into the AWS SDK env so both the catalog builder and the
             // credential chain see it.
-            if let Some(r) = &cli.region {
-                std::env::set_var("AWS_REGION", r);
-            }
+            // Region is passed into CatalogBackend::Glue explicitly; do not
+            // mutate process environment after the runtime has started.
             let warehouse = cli
                 .catalog_warehouse
                 .clone()
@@ -341,7 +340,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Box::new(flight::FlightClient::connect_with_token(&url, token).await?)
             }
             Protocol::Http => {
-                return Err("--token is only supported with Flight protocol".into());
+                let url = format!("{scheme}://{}:{}", cli.host, cli.port);
+                Box::new(http::HttpClient::with_bearer(&url, token, cli.insecure))
             }
         }
     } else {
@@ -350,14 +350,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::env::var("SQE_USER").unwrap_or_else(|_| {
                 eprint!("Username: ");
                 let mut buf = String::new();
-                std::io::stdin().read_line(&mut buf).unwrap();
+                if std::io::stdin().read_line(&mut buf).is_err() || buf.trim().is_empty() {
+                    eprintln!("error: stdin is not a terminal; pass --user or set SQE_USER");
+                    std::process::exit(1);
+                }
                 buf.trim().to_string()
             })
         });
 
         let password = std::env::var("SQE_PASSWORD").unwrap_or_else(|_| {
-            rpassword::prompt_password("Password: ")
-                .expect("Failed to read password (not a terminal?)")
+            match rpassword::prompt_password("Password: ") {
+                Ok(p) => p,
+                Err(_) => {
+                    eprintln!(
+                        "error: stdin is not a terminal; pass --password or set SQE_PASSWORD"
+                    );
+                    std::process::exit(1);
+                }
+            }
         });
 
         match cli.protocol {

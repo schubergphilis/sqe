@@ -106,7 +106,7 @@ if [ -n "${BENCH_MEMORY_LIMIT:-}" ]; then
 fi
 COORD_LOG="/tmp/sqe-bench-coord-$$.log"
 RUST_LOG="${RUST_LOG:-sqe=info,warn}" \
-    target/release/sqe-coordinator \
+    target/release/sqe-server \
     "$COORD_CFG" \
     > "$COORD_LOG" 2>&1 &
 COORD_PID=$!

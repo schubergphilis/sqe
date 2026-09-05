@@ -1,10 +1,14 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
 use crate::SecretString;
 
+mod env_overlay;
+
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SqeConfig {
     pub coordinator: CoordinatorConfig,
     /// Model Context Protocol endpoint. Disabled by default (`port = 0`).
@@ -63,30 +67,31 @@ pub struct SqeConfig {
 }
 
 /// Controls adaptive sort stripping behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SortMode {
     /// Always sort. Spill to disk if needed.
     Strict,
     /// Only sort when keys match Iceberg partition columns.
+    #[serde(alias = "partition-only")]
     PartitionOnly,
     /// Sort when memory allows; strip non-partition sorts under pressure.
+    /// Default: tries to sort in memory, falls back to partition-only under
+    /// pressure. Never crashes from unbounded sorts.
+    #[default]
     Adaptive,
 }
 
-impl SortMode {
-    /// Parse from config string. Returns `Adaptive` for unknown values.
-    pub fn parse(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "strict" => Self::Strict,
-            "partition_only" | "partition-only" => Self::PartitionOnly,
-            "adaptive" => Self::Adaptive,
-            _ => {
-                tracing::warn!(
-                    sort_mode = s,
-                    "Unknown sort_mode, defaulting to partition_only"
-                );
-                Self::PartitionOnly
-            }
+impl FromStr for SortMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "strict" => Ok(Self::Strict),
+            "partition_only" | "partition-only" => Ok(Self::PartitionOnly),
+            "adaptive" => Ok(Self::Adaptive),
+            other => Err(format!(
+                "unknown sort_mode {other:?}; expected strict | partition_only | adaptive"
+            )),
         }
     }
 }
@@ -95,9 +100,11 @@ impl SortMode {
 /// (or fails), the coordinator renders the executed physical plan with the
 /// per-operator metrics DataFusion populated during normal execution. No
 /// re-run under EXPLAIN ANALYZE is needed to see where the time went.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProfileMode {
     /// No profiles are captured.
+    #[default]
     Off,
     /// Profile queries that cross `slow_query_threshold_secs`, and every
     /// failed query (failures are exactly when evidence is wanted).
@@ -106,21 +113,16 @@ pub enum ProfileMode {
     All,
 }
 
-impl ProfileMode {
-    /// Parse from config string. Unknown values fall back to `Off` with a
-    /// WARN (profiling is opt-in; lenient like `SortMode::parse`).
-    pub fn parse(s: &str) -> Self {
+impl FromStr for ProfileMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "off" => Self::Off,
-            "slow" => Self::Slow,
-            "all" => Self::All,
-            _ => {
-                tracing::warn!(
-                    query_profile = s,
-                    "Unknown query_profile, defaulting to off"
-                );
-                Self::Off
-            }
+            "off" => Ok(Self::Off),
+            "slow" => Ok(Self::Slow),
+            "all" => Ok(Self::All),
+            other => Err(format!(
+                "unknown query_profile {other:?}; expected off | slow | all"
+            )),
         }
     }
 }
@@ -137,18 +139,21 @@ pub enum CatalogDiscovery {
     PolarisAuto,
 }
 
-impl CatalogDiscovery {
-    /// Parse from a config string; unknown values fall back to `Static`
-    /// (fail-closed — discovery is opt-in).
-    pub fn parse(s: &str) -> Self {
+impl FromStr for CatalogDiscovery {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "polaris-auto" => Self::PolarisAuto,
-            _ => Self::Static,
+            "static" => Ok(Self::Static),
+            "polaris-auto" | "polaris_auto" => Ok(Self::PolarisAuto),
+            other => Err(format!(
+                "unknown catalog_discovery {other:?}; expected static | polaris-auto"
+            )),
         }
     }
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct QueryConfig {
     /// Default catalog for unqualified SQL identifiers. When unset
     /// (the common case), SQE picks `iceberg` if the legacy
@@ -216,9 +221,8 @@ pub struct QueryConfig {
     ///   and for every failed query.
     /// - `"all"`: log every query's profile.
     ///
-    /// Unknown values are treated as `"off"` with a WARN at startup.
-    #[serde(default = "default_query_profile")]
-    pub query_profile: String,
+    #[serde(default)]
+    pub query_profile: ProfileMode,
     /// Maximum memory per query. Default: "256MB". Supports: B, KB, MB, GB. Set to "0" for unlimited.
     #[serde(default = "default_max_query_memory")]
     pub max_query_memory: String,
@@ -254,10 +258,8 @@ pub struct QueryConfig {
     ///   sorts under memory pressure. Best default: correct for small data,
     ///   safe for large data.
     ///
-    /// Default: `"adaptive"` — tries to sort in memory, falls back to
-    /// partition-only under pressure. Never crashes from unbounded sorts.
-    #[serde(default = "default_sort_mode")]
-    pub sort_mode: String,
+    #[serde(default)]
+    pub sort_mode: SortMode,
     /// Minimum number of projection-only columns required for late materialization
     /// to be applied. Late materialization uses a two-phase Parquet scan: Phase 1
     /// reads only predicate columns, Phase 2 reads remaining columns for surviving
@@ -448,13 +450,13 @@ impl Default for QueryConfig {
             max_concurrent_sorted_writes: default_max_concurrent_sorted_writes(),
             per_user_memory_budget: default_per_user_memory_budget(),
             slow_query_threshold_secs: default_slow_query_threshold(),
-            query_profile: default_query_profile(),
+            query_profile: ProfileMode::Off,
             max_query_memory: default_max_query_memory(),
             distribution_threshold: default_distribution_threshold(),
             distribution_file_threshold: default_distribution_file_threshold(),
             target_task_size: default_target_task_size(),
             distributed_hive_scans: false,
-            sort_mode: default_sort_mode(),
+            sort_mode: SortMode::Adaptive,
             late_materialization_min_projection_cols: default_late_mat_min_projection_cols(),
             star_schema_reorder: default_true(),
             star_schema_min_ratio: default_star_schema_min_ratio(),
@@ -562,6 +564,7 @@ fn default_history_ttl_secs() -> u64 {
 }
 
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct CoordinatorConfig {
     #[serde(default = "default_flight_port")]
     pub flight_sql_port: u16,
@@ -574,7 +577,7 @@ pub struct CoordinatorConfig {
     #[serde(default)]
     pub quack_port: u16,
     #[serde(default = "default_mode")]
-    pub mode: String,
+    pub mode: ServerMode,
     /// List of worker Flight server URLs for distributed execution.
     /// Empty = single-node mode (all queries execute locally).
     #[serde(default)]
@@ -622,8 +625,8 @@ pub struct CoordinatorConfig {
     ///   ResourcesExhausted error surfaces instead of spilling.
     ///   Cross-query fairness is enforced separately by
     ///   `query.per_user_memory_budget`.
-    #[serde(default = "default_memory_pool")]
-    pub memory_pool: String,
+    #[serde(default)]
+    pub memory_pool: MemoryPoolKind,
     /// Enable spill-to-disk when memory limit is reached. Default: true.
     #[serde(default = "default_true")]
     pub spill_to_disk: bool,
@@ -631,17 +634,21 @@ pub struct CoordinatorConfig {
     /// Default: "/tmp/sqe-coordinator-spill".
     #[serde(default = "default_coordinator_spill_dir")]
     pub spill_dir: String,
-    /// Compression for spill files. "none", "lz4" (default), or "zstd".
+    /// Compression for spill files. Default: lz4.
     #[serde(default = "default_spill_compression")]
-    pub spill_compression: String,
+    pub spill_compression: FlightCompression,
     /// Arrow Flight IPC compression for client-facing DoGet responses.
-    /// Supported values: `"lz4"` (default), `"zstd"`, `"none"`.
+    /// Default: lz4.
     #[serde(default = "default_flight_compression")]
-    pub flight_compression: String,
+    pub flight_compression: FlightCompression,
     /// Arrow Flight IPC compression for internal shuffle (DoExchange) transfers.
-    /// Supported values: `"zstd"` (default), `"lz4"`, `"none"`.
+    /// Default: zstd.
     #[serde(default = "default_shuffle_compression")]
-    pub shuffle_compression: String,
+    pub shuffle_compression: FlightCompression,
+    /// Tokio worker-thread stack size in MiB for sqe-server and sqe-worker.
+    /// Default: 8. Shared so the three entry points cannot drift.
+    #[serde(default = "default_runtime_stack_mib")]
+    pub runtime_stack_mib: usize,
     /// Maximum number of workers the registry will track. Heartbeats from
     /// previously-unknown URLs are rejected once this cap is reached. Bounds
     /// the memory footprint of the registry when workers cycle through pod
@@ -1085,7 +1092,8 @@ impl std::fmt::Debug for CoordinatorConfig {
 /// IPC body compression codec for Arrow Flight transfers.
 ///
 /// Maps directly to `arrow_ipc::CompressionType` values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FlightCompression {
     /// No compression.
     None,
@@ -1100,14 +1108,116 @@ impl FlightCompression {
     ///
     /// Accepted values (case-insensitive): `"lz4"`, `"zstd"`, `"none"`.
     pub fn from_config(s: &str) -> crate::error::Result<Self> {
-        match s.trim().to_lowercase().as_str() {
+        s.parse().map_err(crate::error::SqeError::Config)
+    }
+}
+
+impl FromStr for FlightCompression {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
             "lz4" | "lz4_frame" => Ok(Self::Lz4),
             "zstd" | "zstandard" => Ok(Self::Zstd),
             "none" | "" => Ok(Self::None),
-            other => Err(crate::error::SqeError::Config(format!(
-                "Unknown Flight compression codec '{other}'. Expected: lz4, zstd, or none"
-            ))),
+            other => Err(format!(
+                "unknown Flight compression codec {other:?}; expected lz4, zstd, or none"
+            )),
         }
+    }
+}
+
+impl std::fmt::Display for FlightCompression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::None => "none",
+            Self::Lz4 => "lz4",
+            Self::Zstd => "zstd",
+        })
+    }
+}
+
+/// Memory pool strategy for the shared DataFusion runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryPoolKind {
+    /// First-come first-served up to `memory_limit`.
+    #[default]
+    Greedy,
+    /// Divide the pool evenly across registered spillable consumers.
+    Fair,
+}
+
+impl FromStr for MemoryPoolKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "greedy" => Ok(Self::Greedy),
+            "fair" => Ok(Self::Fair),
+            other => Err(format!(
+                "unknown memory_pool {other:?}; expected greedy | fair"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for MemoryPoolKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Greedy => "greedy",
+            Self::Fair => "fair",
+        })
+    }
+}
+
+/// Process role selected by `coordinator.mode` / `SQE_MODE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerMode {
+    #[default]
+    Coordinator,
+    Worker,
+    /// Legacy alias: treated as coordinator.
+    Hybrid,
+    /// Legacy alias: treated as coordinator.
+    Local,
+    /// Legacy alias: treated as coordinator.
+    Distributed,
+}
+
+impl ServerMode {
+    pub fn as_role(self) -> Self {
+        match self {
+            Self::Worker => Self::Worker,
+            Self::Coordinator | Self::Hybrid | Self::Local | Self::Distributed => Self::Coordinator,
+        }
+    }
+}
+
+impl FromStr for ServerMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "coordinator" => Ok(Self::Coordinator),
+            "worker" => Ok(Self::Worker),
+            "hybrid" => Ok(Self::Hybrid),
+            "local" => Ok(Self::Local),
+            "distributed" => Ok(Self::Distributed),
+            other => Err(format!(
+                "unknown coordinator.mode {other:?}; expected coordinator | worker"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for ServerMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Coordinator => "coordinator",
+            Self::Worker => "worker",
+            Self::Hybrid => "hybrid",
+            Self::Local => "local",
+            Self::Distributed => "distributed",
+        })
     }
 }
 
@@ -1343,6 +1453,7 @@ impl WorkerSpillConfig {
 }
 
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerConfig {
     #[serde(default)]
     pub coordinator_url: String,
@@ -1395,6 +1506,11 @@ pub struct WorkerConfig {
     /// client may push scan tasks or swap S3 credentials.
     #[serde(default)]
     pub allow_unauthenticated: bool,
+    /// Kill switch for worker row-group statistics pruning. Default true.
+    /// `SQE_WORKER__ROW_GROUP_PRUNING=0` (or the legacy un-namespaced
+    /// `SQE_WORKER_ROW_GROUP_PRUNING`) turns it off.
+    #[serde(default = "default_true")]
+    pub row_group_pruning: bool,
 }
 
 impl Default for WorkerConfig {
@@ -1412,6 +1528,7 @@ impl Default for WorkerConfig {
             scan_timeout_secs: default_scan_timeout(),
             worker_secret: String::new(),
             allow_unauthenticated: false,
+            row_group_pruning: true,
         }
     }
 }
@@ -2124,6 +2241,7 @@ pub enum CatalogAuthConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct CatalogConfig {
     /// REST catalog endpoint URL. Used by `CatalogBackend::Rest`
     /// (the default) for Polaris, Nessie, Unity OSS, AWS Glue REST,
@@ -4411,9 +4529,6 @@ fn default_per_user_memory_budget() -> String {
 fn default_slow_query_threshold() -> u64 {
     30
 }
-fn default_query_profile() -> String {
-    "off".to_string()
-}
 fn default_runtime_filter_inlist_max_values() -> usize {
     65536
 }
@@ -4438,9 +4553,6 @@ fn default_target_task_size() -> String {
 fn default_fanout_buffer_budget() -> String {
     "0".to_string()
 }
-fn default_sort_mode() -> String {
-    "adaptive".to_string()
-}
 fn default_late_mat_min_projection_cols() -> usize {
     1
 }
@@ -4451,21 +4563,22 @@ fn default_star_schema_min_ratio() -> usize {
 fn default_coordinator_memory() -> String {
     "8GB".to_string()
 }
-fn default_memory_pool() -> String {
-    "greedy".to_string()
+fn default_spill_compression() -> FlightCompression {
+    FlightCompression::Lz4
+}
+fn default_flight_compression() -> FlightCompression {
+    FlightCompression::Lz4
+}
+fn default_shuffle_compression() -> FlightCompression {
+    FlightCompression::Zstd
+}
+fn default_runtime_stack_mib() -> usize {
+    8
 }
 fn default_coordinator_spill_dir() -> String {
     "/tmp/sqe-coordinator-spill".to_string()
 }
-fn default_spill_compression() -> String {
-    "lz4".to_string()
-}
-fn default_flight_compression() -> String {
-    "lz4".to_string()
-}
-fn default_shuffle_compression() -> String {
-    "zstd".to_string()
-}
+
 fn default_max_workers() -> usize {
     1024
 }
@@ -4482,8 +4595,8 @@ fn default_flight_port() -> u16 {
 fn default_trino_port() -> u16 {
     8080
 }
-fn default_mode() -> String {
-    "hybrid".to_string()
+fn default_mode() -> ServerMode {
+    ServerMode::Hybrid
 }
 fn default_worker_flight_port() -> u16 {
     50052
@@ -5283,11 +5396,28 @@ impl SqeConfig {
     pub fn load(path: &str) -> crate::error::Result<Self> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| crate::error::SqeError::Config(format!("Failed to read {path}: {e}")))?;
-        let mut config: Self = toml::from_str(&content)
-            .map_err(|e| crate::error::SqeError::Config(format!("Failed to parse config: {e}")))?;
-        config.apply_env_overrides();
+        Self::load_from_str(&content)
+    }
+
+    /// Parse TOML, apply `SQE_*` environment overlays (fail-closed), inherit
+    /// shared OIDC secrets, and adopt AWS env fallbacks. Does not run
+    /// [`Self::validate`] so CLI flags can still patch the struct.
+    pub fn load_from_str(content: &str) -> crate::error::Result<Self> {
+        let config = env_overlay::load_from_str(content)?;
         config.log_deprecation_warnings();
+        let mut errors = Vec::new();
+        validate_byte_sizes(&config, &mut errors);
+        if !errors.is_empty() {
+            return Err(crate::error::SqeError::Config(errors.join("; ")));
+        }
         Ok(config)
+    }
+
+    /// Merged, redacted TOML for `sqe-server --print-config`.
+    pub fn load_redacted_toml(path: &str) -> crate::error::Result<String> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| crate::error::SqeError::Config(format!("Failed to read {path}: {e}")))?;
+        env_overlay::load_redacted_toml(&content)
     }
 
     /// Log warnings for deprecated config keys that still work but will be removed.
@@ -5323,507 +5453,6 @@ impl SqeConfig {
         }
     }
 
-    /// Apply environment variable overrides. Convention: `SQE_<SECTION>__<FIELD>`.
-    /// E.g. `SQE_AUTH__KEYCLOAK_URL=https://...` overrides `auth.keycloak_url`.
-    /// Fill S3 settings the operator did not set from the AWS-standard
-    /// variables, so `eval "$(aws configure export-credentials --format env)"`
-    /// works against the server the same way it already works against
-    /// `sqe-cli --embedded`.
-    ///
-    /// Consulted only where the SQE-specific setting is still empty, so
-    /// `[storage]` in TOML and `SQE_STORAGE__*` both keep winning. Anything
-    /// left empty after this still falls through to `object_store`'s own
-    /// chain, which covers an EC2 instance profile, an ECS task role, and
-    /// EKS web identity. `AWS_PROFILE` and the SSO cache are NOT covered:
-    /// resolving those needs the AWS SDK's credential provider, which also
-    /// brings refresh, and temporary credentials taken as static strings
-    /// here expire without renewing. Export them first, or feed the server
-    /// a role it can assume.
-    fn apply_aws_env_fallbacks(&mut self) {
-        let non_empty = |name: &str| {
-            std::env::var(name)
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-        };
-
-        // Credentials move as a set. Pairing a configured access key with an
-        // ambient session token from some other identity produces a signature
-        // failure that names neither, so only adopt the environment's
-        // credentials when none are configured at all.
-        if self.storage.s3_access_key.is_empty() && self.storage.s3_secret_key.expose().is_empty() {
-            if let (Some(access), Some(secret)) = (
-                non_empty("AWS_ACCESS_KEY_ID"),
-                non_empty("AWS_SECRET_ACCESS_KEY"),
-            ) {
-                self.storage.s3_access_key = access;
-                self.storage.s3_secret_key = SecretString::new(secret);
-                if let Some(token) = non_empty("AWS_SESSION_TOKEN") {
-                    self.storage.s3_session_token = SecretString::new(token);
-                }
-            }
-        }
-
-        if self.storage.s3_region.is_empty() {
-            if let Some(region) =
-                non_empty("AWS_REGION").or_else(|| non_empty("AWS_DEFAULT_REGION"))
-            {
-                self.storage.s3_region = region;
-            }
-        }
-
-        // `AWS_ENDPOINT_URL_S3` is the service-specific spelling and wins over
-        // the all-services one, matching the AWS SDKs and `sqe-cli`.
-        if self.storage.s3_endpoint.is_empty() {
-            if let Some(endpoint) =
-                non_empty("AWS_ENDPOINT_URL_S3").or_else(|| non_empty("AWS_ENDPOINT_URL"))
-            {
-                self.storage.s3_endpoint = endpoint;
-            }
-        }
-    }
-
-    fn apply_env_overrides(&mut self) {
-        // Coordinator
-        env_override_u16(
-            "SQE_COORDINATOR__FLIGHT_SQL_PORT",
-            &mut self.coordinator.flight_sql_port,
-        );
-        env_override_u16(
-            "SQE_COORDINATOR__TRINO_HTTP_PORT",
-            &mut self.coordinator.trino_http_port,
-        );
-        env_override_str("SQE_COORDINATOR__MODE", &mut self.coordinator.mode);
-        env_override_bool("SQE_COORDINATOR__DEBUG", &mut self.coordinator.debug);
-        // Short `SQE_PRODUCTION_MODE` for operators; namespaced form wins when both set.
-        env_override_bool("SQE_PRODUCTION_MODE", &mut self.coordinator.production_mode);
-        env_override_bool(
-            "SQE_COORDINATOR__PRODUCTION_MODE",
-            &mut self.coordinator.production_mode,
-        );
-        env_override_secret(
-            "SQE_COORDINATOR__WORKER_SECRET",
-            &mut self.coordinator.worker_secret,
-        );
-        env_override_bool(
-            "SQE_COORDINATOR__ALLOW_UNAUTHENTICATED_WORKERS",
-            &mut self.coordinator.allow_unauthenticated_workers,
-        );
-        env_override_str("SQE_TLS__CERT_FILE", &mut self.coordinator.tls.cert_file);
-        env_override_str("SQE_TLS__KEY_FILE", &mut self.coordinator.tls.key_file);
-        env_override_str("SQE_TLS__CA_FILE", &mut self.coordinator.tls.ca_file);
-        env_override_u64(
-            "SQE_COORDINATOR__AUTH_HANDSHAKE_TIMEOUT_SECS",
-            &mut self.coordinator.auth_handshake_timeout_secs,
-        );
-        env_override_u64(
-            "SQE_COORDINATOR__HEALTH_CHECK_INTERVAL_SECS",
-            &mut self.coordinator.health_check_interval_secs,
-        );
-        env_override_u32(
-            "SQE_COORDINATOR__HEALTH_CHECK_MAX_FAILURES",
-            &mut self.coordinator.health_check_max_failures,
-        );
-        env_override_u64(
-            "SQE_COORDINATOR__CREDENTIAL_REFRESH_INTERVAL_SECS",
-            &mut self.coordinator.credential_refresh_interval_secs,
-        );
-        env_override_u64(
-            "SQE_COORDINATOR__CREDENTIAL_PUSH_CONNECT_TIMEOUT_SECS",
-            &mut self.coordinator.credential_push_connect_timeout_secs,
-        );
-        env_override_u64(
-            "SQE_COORDINATOR__CREDENTIAL_PUSH_REQUEST_TIMEOUT_SECS",
-            &mut self.coordinator.credential_push_request_timeout_secs,
-        );
-        env_override_u64(
-            "SQE_COORDINATOR__SESSION_CONTEXT_CACHE_TTL_SECS",
-            &mut self.coordinator.session_context_cache_ttl_secs,
-        );
-        // Coordinator memory knobs use short, un-namespaced env names because
-        // operators reach for them under OOM pressure and a mistyped
-        // `SQE_COORDINATOR__MEMORY_LIMIT` silently keeps the file value (the bug
-        // this fixes: an 8GB intent ran with a 64GB file limit and OOM-killed a
-        // 31GB box). Applied overrides log at INFO with the value; neither is a
-        // secret.
-        // `SQE_MEMORY_LIMIT` overrides `coordinator.memory_limit` ("8GB", "512MB").
-        env_override_str_logged("SQE_MEMORY_LIMIT", &mut self.coordinator.memory_limit);
-        // `SQE_MEMORY_POOL` overrides `coordinator.memory_pool` ("greedy" | "fair").
-        env_override_str_logged("SQE_MEMORY_POOL", &mut self.coordinator.memory_pool);
-
-        // MCP resource server. Collection fields stay in TOML so scopes,
-        // issuers, origins, and roles remain reviewable as one policy block.
-        env_override_bool("SQE_MCP__ENABLED", &mut self.mcp.enabled);
-        env_override_u16("SQE_MCP__PORT", &mut self.mcp.port);
-        env_override_str("SQE_MCP__RESOURCE_URI", &mut self.mcp.resource_uri);
-        env_override_bool("SQE_MCP__ALLOW_WRITES", &mut self.mcp.allow_writes);
-        env_override_usize("SQE_MCP__MAX_RESULT_ROWS", &mut self.mcp.max_result_rows);
-        env_override_usize(
-            "SQE_MCP__MAX_RESPONSE_BYTES",
-            &mut self.mcp.max_response_bytes,
-        );
-
-        // Worker
-        env_override_str(
-            "SQE_WORKER__COORDINATOR_URL",
-            &mut self.worker.coordinator_url,
-        );
-        env_override_u16("SQE_WORKER__FLIGHT_PORT", &mut self.worker.flight_port);
-        env_override_str("SQE_WORKER__ADVERTISE_URL", &mut self.worker.advertise_url);
-        env_override_u64(
-            "SQE_WORKER__HEARTBEAT_INTERVAL_SECS",
-            &mut self.worker.heartbeat_interval_secs,
-        );
-        env_override_str("SQE_WORKER__MEMORY_LIMIT", &mut self.worker.memory_limit);
-        env_override_bool("SQE_WORKER__SPILL_TO_DISK", &mut self.worker.spill_to_disk);
-        env_override_str("SQE_WORKER__SPILL_DIR", &mut self.worker.spill_dir);
-        env_override_u64(
-            "SQE_WORKER__SCAN_TIMEOUT_SECS",
-            &mut self.worker.scan_timeout_secs,
-        );
-        env_override_str("SQE_WORKER__WORKER_SECRET", &mut self.worker.worker_secret);
-        env_override_bool(
-            "SQE_WORKER__ALLOW_UNAUTHENTICATED",
-            &mut self.worker.allow_unauthenticated,
-        );
-
-        // Security
-        env_override_bool(
-            "SQE_SECURITY__ALLOW_INSECURE_TRANSPORT",
-            &mut self.security.allow_insecure_transport,
-        );
-        env_override_bool(
-            "SQE_SECURITY__ALLOW_SHARED_SERVICE_IDENTITY",
-            &mut self.security.allow_shared_service_identity,
-        );
-        env_override_bool(
-            "SQE_SECURITY__ALLOW_UNKEYED_HASH_MASKS",
-            &mut self.security.allow_unkeyed_hash_masks,
-        );
-        env_override_bool(
-            "SQE_SECURITY__ALLOW_UNPROJECTED_TAGS",
-            &mut self.security.allow_unprojected_tags,
-        );
-
-        // Auth
-        env_override_str("SQE_AUTH__KEYCLOAK_URL", &mut self.auth.keycloak_url);
-        env_override_str("SQE_AUTH__REALM", &mut self.auth.realm);
-        env_override_str("SQE_AUTH__CLIENT_ID", &mut self.auth.client_id);
-        env_override_secret("SQE_AUTH__CLIENT_SECRET", &mut self.auth.client_secret);
-        env_override_str("SQE_AUTH__TOKEN_ENDPOINT", &mut self.auth.token_endpoint);
-        env_override_u64(
-            "SQE_AUTH__TOKEN_REFRESH_BUFFER_SECS",
-            &mut self.auth.token_refresh_buffer_secs,
-        );
-        env_override_bool(
-            "SQE_AUTH__SSL_VERIFICATION",
-            &mut self.auth.ssl_verification,
-        );
-        env_override_str("SQE_AUTH__ROLES_CLAIM", &mut self.auth.roles_claim);
-
-        // Auth providers: secrets must be injectable via env so Kubernetes
-        // Secret mounts, Vault Agent, and External Secrets Operator can rotate
-        // without rewriting TOML. Convention: `SQE_AUTH__PROVIDERS__<N>__<FIELD>`
-        // where `<N>` is the zero-based index in the `[[auth.providers]]`
-        // array. Today only `client_secret` is wired through, matching the
-        // fields where the bug bit (issue #14). Token endpoints and
-        // discovery URLs stay in TOML.
-        for (idx, provider) in self.auth.providers.iter_mut().enumerate() {
-            let env_name = format!("SQE_AUTH__PROVIDERS__{idx}__CLIENT_SECRET");
-            match provider {
-                AuthProviderConfig::OidcPassword { client_secret, .. } => {
-                    env_override_str(&env_name, client_secret);
-                }
-                AuthProviderConfig::ClientCredentials { client_secret, .. } => {
-                    env_override_str(&env_name, client_secret);
-                }
-                AuthProviderConfig::TokenExchange { client_secret, .. } => {
-                    if let Some(secret) = client_secret.as_mut() {
-                        env_override_str(&env_name, secret);
-                    } else if let Ok(v) = std::env::var(&env_name) {
-                        if !v.is_empty() {
-                            *client_secret = Some(v);
-                        }
-                    }
-                }
-                // Variants without a client_secret field: nothing to override.
-                AuthProviderConfig::BearerToken { .. }
-                | AuthProviderConfig::AwsIam { .. }
-                | AuthProviderConfig::ApiKey { .. }
-                | AuthProviderConfig::Mtls { .. }
-                | AuthProviderConfig::Anonymous { .. }
-                | AuthProviderConfig::ClientCredentialsPassthrough { .. }
-                | AuthProviderConfig::BearerPassthrough { .. } => {}
-            }
-        }
-
-        // [auth].client_secret -> oidc_password provider inheritance. The
-        // shared `[auth]` client_id/client_secret is SQE's own OIDC client, the
-        // same one the `oidc_password` (ROPC) provider uses. A provider with an
-        // empty client_secret inherits `[auth].client_secret` (which
-        // `SQE_AUTH__CLIENT_SECRET` fills), so the common "one shared secret via
-        // env" setup keeps working after migrating to `[[auth.providers]]`.
-        // Only empty fields are filled, so an explicit per-provider secret
-        // (TOML or `SQE_AUTH__PROVIDERS__<N>__CLIENT_SECRET`) still wins. Scoped
-        // to `oidc_password` on purpose: `client_credentials` / `token_exchange`
-        // are distinct external clients with their own secrets.
-        let shared_secret = self.auth.client_secret.expose().to_string();
-        if !shared_secret.is_empty() {
-            for provider in self.auth.providers.iter_mut() {
-                if let AuthProviderConfig::OidcPassword { client_secret, .. } = provider {
-                    if client_secret.is_empty() {
-                        *client_secret = shared_secret.clone();
-                    }
-                }
-            }
-        }
-
-        // Catalog
-        // SQE_CATALOG__CATALOG_URL is the canonical env var; the legacy
-        // SQE_CATALOG__POLARIS_URL is honoured first for backwards-compat
-        // and overridden by the new name when both are set.
-        env_override_str("SQE_CATALOG__POLARIS_URL", &mut self.catalog.catalog_url);
-        env_override_str("SQE_CATALOG__CATALOG_URL", &mut self.catalog.catalog_url);
-        env_override_str("SQE_CATALOG__WAREHOUSE", &mut self.catalog.warehouse);
-        env_override_bool(
-            "SQE_CATALOG__REQUIRE_VENDED_CREDENTIALS",
-            &mut self.catalog.require_vended_credentials,
-        );
-        env_override_u64(
-            "SQE_CATALOG__METADATA_CACHE_TTL_SECS",
-            &mut self.catalog.metadata_cache_ttl_secs,
-        );
-        env_override_u8(
-            "SQE_CATALOG__DEFAULT_TABLE_FORMAT_VERSION",
-            &mut self.catalog.default_table_format_version,
-        );
-        env_override_usize(
-            "SQE_CATALOG__MANIFEST_CONCURRENCY",
-            &mut self.catalog.manifest_concurrency,
-        );
-        // sqe#scan-fetch-pipeline: A/B the fetch/decode pipelining depth without a config
-        // edit. `0` disables staging; unset keeps the config/default.
-        if let Ok(v) = std::env::var("SQE_CATALOG__SCAN_FETCH_AHEAD") {
-            if let Ok(n) = v.parse::<usize>() {
-                self.catalog.scan_fetch_ahead = Some(n);
-            }
-        }
-
-        // Storage
-        env_override_str("SQE_STORAGE__S3_ENDPOINT", &mut self.storage.s3_endpoint);
-        env_override_str("SQE_STORAGE__S3_REGION", &mut self.storage.s3_region);
-        env_override_str(
-            "SQE_STORAGE__S3_ACCESS_KEY",
-            &mut self.storage.s3_access_key,
-        );
-        env_override_secret(
-            "SQE_STORAGE__S3_SECRET_KEY",
-            &mut self.storage.s3_secret_key,
-        );
-        // Temporary credentials rotate, so the token belongs in the
-        // environment rather than in a config file that outlives it.
-        env_override_secret(
-            "SQE_STORAGE__S3_SESSION_TOKEN",
-            &mut self.storage.s3_session_token,
-        );
-        self.apply_aws_env_fallbacks();
-        env_override_bool(
-            "SQE_STORAGE__S3_PATH_STYLE",
-            &mut self.storage.s3_path_style,
-        );
-        env_override_bool(
-            "SQE_STORAGE__S3_ALLOW_HTTP",
-            &mut self.storage.s3_allow_http,
-        );
-        env_override_usize(
-            "SQE_STORAGE__PREFETCH_CONCURRENCY",
-            &mut self.storage.prefetch_concurrency,
-        );
-        env_override_str(
-            "SQE_STORAGE__AZURE_ACCOUNT",
-            &mut self.storage.azure_account,
-        );
-        env_override_str(
-            "SQE_STORAGE__AZURE_ACCESS_KEY",
-            &mut self.storage.azure_access_key,
-        );
-        env_override_str(
-            "SQE_STORAGE__AZURE_SAS_TOKEN",
-            &mut self.storage.azure_sas_token,
-        );
-        env_override_bool(
-            "SQE_STORAGE__AZURE_USE_EMULATOR",
-            &mut self.storage.azure_use_emulator,
-        );
-        env_override_str(
-            "SQE_STORAGE__GCS_SERVICE_ACCOUNT_PATH",
-            &mut self.storage.gcs_service_account_path,
-        );
-        env_override_str(
-            "SQE_STORAGE__GCS_SERVICE_ACCOUNT_KEY",
-            &mut self.storage.gcs_service_account_key,
-        );
-
-        // Policy
-        env_override_parse("SQE_POLICY__ENGINE", &mut self.policy.engine);
-        env_override_str("SQE_POLICY__MASK_KEY", &mut self.policy.mask_key);
-        env_override_secret(
-            "SQE_POLICY__RANGER__ADMIN_PASSWORD",
-            &mut self.policy.ranger.admin_password,
-        );
-
-        // Access control
-        env_override_parse(
-            "SQE_ACCESS_CONTROL__BACKEND",
-            &mut self.access_control.backend,
-        );
-        env_override_str("SQE_ACCESS_CONTROL__URL", &mut self.access_control.url);
-        env_override_secret(
-            "SQE_ACCESS_CONTROL__RANGER__ADMIN_PASSWORD",
-            &mut self.access_control.ranger.admin_password,
-        );
-
-        // Metrics
-        env_override_u16(
-            "SQE_METRICS__PROMETHEUS_PORT",
-            &mut self.metrics.prometheus_port,
-        );
-        env_override_str(
-            "SQE_METRICS__OTLP_ENDPOINT",
-            &mut self.metrics.otlp_endpoint,
-        );
-        env_override_str(
-            "SQE_METRICS__TRACES_OTLP_ENDPOINT",
-            &mut self.metrics.traces_otlp_endpoint,
-        );
-        env_override_f64(
-            "SQE_METRICS__TRACE_SAMPLE_RATE",
-            &mut self.metrics.trace_sample_rate,
-        );
-        env_override_str(
-            "SQE_METRICS__AUDIT_LOG_PATH",
-            &mut self.metrics.audit_log_path,
-        );
-        env_override_str("SQE_METRICS__AUDIT__FORMAT", &mut self.metrics.audit.format);
-        env_override_bool(
-            "SQE_METRICS__AUDIT__SUPERDEBUG_LOG_RESULTS",
-            &mut self.metrics.audit.superdebug_log_results,
-        );
-        env_override_u64(
-            "SQE_METRICS__AUDIT__DASHBOARD_ACCESS_AUDIT_WINDOW_SECS",
-            &mut self.metrics.audit.dashboard_access_audit_window_secs,
-        );
-
-        // Metrics: AuditExport
-        env_override_bool(
-            "SQE_METRICS__AUDIT_EXPORT__ENABLED",
-            &mut self.metrics.audit_export.enabled,
-        );
-        env_override_str(
-            "SQE_METRICS__AUDIT_EXPORT__OTLP_ENDPOINT",
-            &mut self.metrics.audit_export.otlp_endpoint,
-        );
-        env_override_str(
-            "SQE_METRICS__AUDIT_EXPORT__SPOOL_PATH",
-            &mut self.metrics.audit_export.spool_path,
-        );
-
-        // Metrics: OpenLineage
-        env_override_bool(
-            "SQE_METRICS__OPENLINEAGE__ENABLED",
-            &mut self.metrics.openlineage.enabled,
-        );
-        env_override_str(
-            "SQE_METRICS__OPENLINEAGE__JOB_NAMESPACE",
-            &mut self.metrics.openlineage.job_namespace,
-        );
-        env_override_str(
-            "SQE_METRICS__OPENLINEAGE__PRODUCER",
-            &mut self.metrics.openlineage.producer,
-        );
-        env_override_bool(
-            "SQE_METRICS__OPENLINEAGE__EMIT_SELECTS",
-            &mut self.metrics.openlineage.emit_selects,
-        );
-        env_override_str(
-            "SQE_METRICS__OPENLINEAGE__FILE_PATH",
-            &mut self.metrics.openlineage.file_path,
-        );
-        env_override_str(
-            "SQE_METRICS__OPENLINEAGE__HTTP_ENDPOINT",
-            &mut self.metrics.openlineage.http_endpoint,
-        );
-        env_override_str(
-            "SQE_METRICS__OPENLINEAGE__AUTH_MODE",
-            &mut self.metrics.openlineage.auth_mode,
-        );
-        env_override_str(
-            "SQE_METRICS__OPENLINEAGE__API_KEY",
-            &mut self.metrics.openlineage.api_key,
-        );
-        env_override_u64(
-            "SQE_METRICS__OPENLINEAGE__HTTP_TIMEOUT_MS",
-            &mut self.metrics.openlineage.http_timeout_ms,
-        );
-        env_override_u32(
-            "SQE_METRICS__OPENLINEAGE__HTTP_RETRY_ATTEMPTS",
-            &mut self.metrics.openlineage.http_retry_attempts,
-        );
-        env_override_str(
-            "SQE_METRICS__OPENLINEAGE__SPOOL_PATH",
-            &mut self.metrics.openlineage.spool_path,
-        );
-        env_override_u64(
-            "SQE_METRICS__OPENLINEAGE__SPOOL_MAX_BYTES",
-            &mut self.metrics.openlineage.spool_max_bytes,
-        );
-        env_override_u64(
-            "SQE_METRICS__OPENLINEAGE__REPLAY_INTERVAL_SECS",
-            &mut self.metrics.openlineage.replay_interval_secs,
-        );
-        env_override_usize(
-            "SQE_METRICS__OPENLINEAGE__CHANNEL_CAPACITY",
-            &mut self.metrics.openlineage.channel_capacity,
-        );
-
-        // Rate limit
-        env_override_bool("SQE_RATE_LIMIT__ENABLED", &mut self.rate_limit.enabled);
-        env_override_u32(
-            "SQE_RATE_LIMIT__PER_USER_QUERIES_PER_MINUTE",
-            &mut self.rate_limit.per_user_queries_per_minute,
-        );
-        env_override_u32(
-            "SQE_RATE_LIMIT__GLOBAL_QUERIES_PER_MINUTE",
-            &mut self.rate_limit.global_queries_per_minute,
-        );
-
-        // Session
-        env_override_u64(
-            "SQE_SESSION__IDLE_TIMEOUT_SECS",
-            &mut self.session.idle_timeout_secs,
-        );
-        env_override_u64(
-            "SQE_SESSION__ABSOLUTE_TIMEOUT_SECS",
-            &mut self.session.absolute_timeout_secs,
-        );
-        env_override_u64(
-            "SQE_SESSION__EXPIRY_SWEEP_INTERVAL_SECS",
-            &mut self.session.expiry_sweep_interval_secs,
-        );
-        env_override_str("SQE_SESSION__SECRETS_PATH", &mut self.session.secrets_path);
-
-        // Query
-        env_override_u64("SQE_QUERY__TIMEOUT_SECS", &mut self.query.timeout_secs);
-        env_override_usize("SQE_QUERY__MAX_SQL_BYTES", &mut self.query.max_sql_bytes);
-        env_override_bool(
-            "SQE_QUERY__PUFFIN_STATISTICS",
-            &mut self.query.puffin_statistics,
-        );
-        env_override_bool(
-            "SQE_QUERY__STATISTICS_REGISTRY",
-            &mut self.query.statistics_registry,
-        );
-    }
 }
 
 /// Validate the relationship between `query.per_user_memory_budget` and
@@ -6087,111 +5716,6 @@ fn validate_urls(config: &SqeConfig, errors: &mut Vec<String>) {
     check("policy.ranger.url", &config.policy.ranger.url);
 }
 
-fn env_override_str(key: &str, target: &mut String) {
-    if let Ok(val) = std::env::var(key) {
-        *target = val;
-    }
-}
-
-/// Like [`env_override_str`], but logs at INFO when the override fires. The
-/// value is included: these knobs (coordinator memory limit / pool) are not
-/// secrets, and an operator diagnosing an OOM needs to see the effective value
-/// rather than guess whether the env var took effect.
-fn env_override_str_logged(key: &str, target: &mut String) {
-    if let Ok(val) = std::env::var(key) {
-        tracing::info!(env = key, value = %val, "config override applied from environment");
-        *target = val;
-    }
-}
-
-fn env_override_parse<T>(key: &str, target: &mut T)
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    if let Ok(val) = std::env::var(key) {
-        match val.parse::<T>() {
-            Ok(parsed) => *target = parsed,
-            Err(e) => tracing::warn!("{key}={val:?} rejected: {e}; keeping previous value"),
-        }
-    }
-}
-
-fn env_override_secret(key: &str, target: &mut SecretString) {
-    if let Ok(val) = std::env::var(key) {
-        *target = SecretString::new(val);
-    }
-}
-
-fn env_override_u8(key: &str, target: &mut u8) {
-    if let Ok(val) = std::env::var(key) {
-        if let Ok(parsed) = val.parse() {
-            *target = parsed;
-        } else {
-            tracing::warn!("{key}={val:?} is not a valid u8, ignoring");
-        }
-    }
-}
-
-fn env_override_u32(key: &str, target: &mut u32) {
-    if let Ok(val) = std::env::var(key) {
-        if let Ok(parsed) = val.parse() {
-            *target = parsed;
-        } else {
-            tracing::warn!("{key}={val:?} is not a valid u32, ignoring");
-        }
-    }
-}
-
-fn env_override_u16(key: &str, target: &mut u16) {
-    if let Ok(val) = std::env::var(key) {
-        if let Ok(parsed) = val.parse() {
-            *target = parsed;
-        } else {
-            tracing::warn!("{key}={val:?} is not a valid u16, ignoring");
-        }
-    }
-}
-
-fn env_override_u64(key: &str, target: &mut u64) {
-    if let Ok(val) = std::env::var(key) {
-        if let Ok(parsed) = val.parse() {
-            *target = parsed;
-        } else {
-            tracing::warn!("{key}={val:?} is not a valid u64, ignoring");
-        }
-    }
-}
-
-fn env_override_f64(key: &str, target: &mut f64) {
-    if let Ok(val) = std::env::var(key) {
-        if let Ok(parsed) = val.parse() {
-            *target = parsed;
-        } else {
-            tracing::warn!("{key}={val:?} is not a valid number, ignoring");
-        }
-    }
-}
-
-fn env_override_bool(key: &str, target: &mut bool) {
-    if let Ok(val) = std::env::var(key) {
-        match val.to_lowercase().as_str() {
-            "true" | "1" | "yes" => *target = true,
-            "false" | "0" | "no" => *target = false,
-            _ => tracing::warn!("{key}={val:?} is not a valid bool, ignoring"),
-        }
-    }
-}
-
-fn env_override_usize(key: &str, target: &mut usize) {
-    if let Ok(val) = std::env::var(key) {
-        if let Ok(parsed) = val.parse() {
-            *target = parsed;
-        } else {
-            tracing::warn!("{key}={val:?} is not a valid usize, ignoring");
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -6207,18 +5731,18 @@ mod tests {
     #[test]
     fn catalog_discovery_parses_and_defaults() {
         assert_eq!(
-            CatalogDiscovery::parse("polaris-auto"),
-            CatalogDiscovery::PolarisAuto
-        );
-        assert_eq!(CatalogDiscovery::parse("static"), CatalogDiscovery::Static);
-        assert_eq!(
-            CatalogDiscovery::parse("PoLaRiS-AuTo"),
+            "polaris-auto".parse::<CatalogDiscovery>().unwrap(),
             CatalogDiscovery::PolarisAuto
         );
         assert_eq!(
-            CatalogDiscovery::parse("nonsense"),
+            "static".parse::<CatalogDiscovery>().unwrap(),
             CatalogDiscovery::Static
         );
+        assert_eq!(
+            "PoLaRiS-AuTo".parse::<CatalogDiscovery>().unwrap(),
+            CatalogDiscovery::PolarisAuto
+        );
+        assert!("nonsense".parse::<CatalogDiscovery>().is_err());
         assert_eq!(CatalogDiscovery::default(), CatalogDiscovery::Static);
     }
 
@@ -6637,19 +6161,20 @@ partial_progress_batch = 5
                 flight_sql_port: 50051,
                 trino_http_port: 8080,
                 quack_port: 0,
-                mode: "hybrid".to_string(),
+                mode: ServerMode::Hybrid,
                 worker_urls: vec![],
                 debug: false,
                 tls: TlsConfig::default(),
                 worker_secret: SecretString::default(),
                 allow_unauthenticated_workers: false,
                 memory_limit: default_coordinator_memory(),
-                memory_pool: default_memory_pool(),
+                memory_pool: MemoryPoolKind::Greedy,
                 spill_to_disk: true,
                 spill_dir: default_coordinator_spill_dir(),
                 spill_compression: default_spill_compression(),
                 flight_compression: default_flight_compression(),
                 shuffle_compression: default_shuffle_compression(),
+                runtime_stack_mib: default_runtime_stack_mib(),
                 max_workers: default_max_workers(),
                 transport: GrpcTransportConfig::default(),
                 worker_connect_timeout_secs: default_worker_connect_timeout(),
@@ -7327,8 +6852,7 @@ partial_progress_batch = 5
         std::env::set_var("SQE_MCP__ALLOW_WRITES", "true");
         std::env::set_var("SQE_MCP__RESOURCE_URI", "http://localhost:19091/mcp");
 
-        let mut config = valid_config();
-        config.apply_env_overrides();
+        let config = load_with_env();
 
         assert!(config.mcp.allow_writes);
         assert_eq!(config.mcp.resource_uri, "http://localhost:19091/mcp");
@@ -7367,8 +6891,7 @@ partial_progress_batch = 5
         std::env::set_var("AWS_SESSION_TOKEN", "token-from-env");
         std::env::set_var("AWS_REGION", "eu-central-1");
 
-        let mut config = valid_config();
-        config.apply_env_overrides();
+        let config = load_with_env();
 
         assert_eq!(config.storage.s3_access_key, "ASIAFROMENV");
         assert_eq!(config.storage.s3_secret_key.expose(), "secret-from-env");
@@ -7388,8 +6911,7 @@ partial_progress_batch = 5
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "aws-secret");
         std::env::set_var("AWS_REGION", "eu-central-1");
 
-        let mut config = valid_config();
-        config.apply_env_overrides();
+        let config = load_with_env();
 
         assert_eq!(config.storage.s3_access_key, "from-sqe");
         assert_eq!(config.storage.s3_secret_key.expose(), "sqe-secret");
@@ -7407,10 +6929,15 @@ partial_progress_batch = 5
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "aws-secret");
         std::env::set_var("AWS_SESSION_TOKEN", "aws-token");
 
-        let mut config = valid_config();
-        config.storage.s3_access_key = "configured".to_string();
-        config.storage.s3_secret_key = SecretString::new("configured-secret".to_string());
-        config.apply_env_overrides();
+        let config = SqeConfig::load_from_str(
+            &(MINIMAL_TOML.to_string()
+                + r#"
+[storage]
+s3_access_key = "configured"
+s3_secret_key = "configured-secret"
+"#),
+        )
+        .unwrap();
 
         assert_eq!(config.storage.s3_access_key, "configured");
         assert!(
@@ -7425,8 +6952,7 @@ partial_progress_batch = 5
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_aws_env();
 
-        let mut config = valid_config();
-        config.apply_env_overrides();
+        let config = load_with_env();
 
         // Empty is meaningful: object_store then uses its own chain, which
         // is how an EC2 instance profile or ECS task role reaches the engine.
@@ -7441,8 +6967,7 @@ partial_progress_batch = 5
         std::env::set_var("AWS_ENDPOINT_URL", "http://generic:9000");
         std::env::set_var("AWS_ENDPOINT_URL_S3", "http://s3-specific:9000");
 
-        let mut config = valid_config();
-        config.apply_env_overrides();
+        let config = load_with_env();
 
         assert_eq!(config.storage.s3_endpoint, "http://s3-specific:9000");
         clear_aws_env();
@@ -7718,13 +7243,11 @@ partial_progress_batch = 5
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
         std::env::set_var("SQE_PRODUCTION_MODE", "true");
-        let mut cfg = valid_config();
-        assert!(!cfg.coordinator.production_mode);
-        cfg.apply_env_overrides();
+        let cfg = load_with_env();
         assert!(cfg.coordinator.production_mode);
 
         std::env::set_var("SQE_COORDINATOR__PRODUCTION_MODE", "false");
-        cfg.apply_env_overrides();
+        let cfg = load_with_env();
         assert!(!cfg.coordinator.production_mode);
 
         std::env::remove_var("SQE_PRODUCTION_MODE");
@@ -8565,27 +8088,24 @@ type = "aws"
         assert_eq!(config.max_concurrent_sorted_writes, 2);
         assert_eq!(config.slow_query_threshold_secs, 30);
         assert_eq!(config.max_query_memory, "256MB");
-        assert_eq!(config.query_profile, "off");
+        assert_eq!(config.query_profile, ProfileMode::Off);
     }
 
     #[test]
     fn test_profile_mode_parse() {
-        assert_eq!(ProfileMode::parse("off"), ProfileMode::Off);
-        assert_eq!(ProfileMode::parse("slow"), ProfileMode::Slow);
-        assert_eq!(ProfileMode::parse("all"), ProfileMode::All);
-        // Case-insensitive and whitespace-tolerant.
-        assert_eq!(ProfileMode::parse(" ALL "), ProfileMode::All);
-        assert_eq!(ProfileMode::parse("Slow"), ProfileMode::Slow);
-        // Unknown values fall back to Off (profiling is opt-in).
-        assert_eq!(ProfileMode::parse("verbose"), ProfileMode::Off);
-        assert_eq!(ProfileMode::parse(""), ProfileMode::Off);
+        assert_eq!("off".parse::<ProfileMode>().unwrap(), ProfileMode::Off);
+        assert_eq!("slow".parse::<ProfileMode>().unwrap(), ProfileMode::Slow);
+        assert_eq!("all".parse::<ProfileMode>().unwrap(), ProfileMode::All);
+        assert_eq!(" ALL ".parse::<ProfileMode>().unwrap(), ProfileMode::All);
+        assert_eq!("Slow".parse::<ProfileMode>().unwrap(), ProfileMode::Slow);
+        assert!("verbose".parse::<ProfileMode>().is_err());
+        assert!("".parse::<ProfileMode>().is_err());
     }
 
     #[test]
     fn test_query_profile_from_toml() {
         let config: QueryConfig = toml::from_str(r#"query_profile = "slow""#).unwrap();
-        assert_eq!(config.query_profile, "slow");
-        assert_eq!(ProfileMode::parse(&config.query_profile), ProfileMode::Slow);
+        assert_eq!(config.query_profile, ProfileMode::Slow);
     }
 
     #[test]
@@ -8803,8 +8323,7 @@ otlp_endpoint = ""
         std::env::set_var("SQE_METRICS__OPENLINEAGE__SPOOL_MAX_BYTES", "999");
         std::env::set_var("SQE_METRICS__OPENLINEAGE__CHANNEL_CAPACITY", "42");
 
-        let mut cfg = valid_config();
-        cfg.apply_env_overrides();
+        let cfg = load_with_env();
 
         assert!(cfg.metrics.openlineage.enabled);
         assert_eq!(cfg.metrics.openlineage.spool_max_bytes, 999);
@@ -8825,8 +8344,7 @@ otlp_endpoint = ""
         );
         std::env::set_var("SQE_METRICS__TRACE_SAMPLE_RATE", "1.0");
 
-        let mut cfg = valid_config();
-        cfg.apply_env_overrides();
+        let cfg = load_with_env();
 
         assert_eq!(
             cfg.metrics.traces_otlp_endpoint,
@@ -8847,15 +8365,9 @@ otlp_endpoint = ""
         std::env::set_var("SQE_MEMORY_LIMIT", "12GB");
         std::env::set_var("SQE_MEMORY_POOL", "fair");
 
-        let mut cfg = valid_config();
-        // Precondition: the short env names must actually change the value, i.e.
-        // start from something other than what we set (guards the regression
-        // where nothing read SQE_MEMORY_LIMIT and the file value silently won).
-        assert_ne!(cfg.coordinator.memory_limit, "12GB");
-        cfg.apply_env_overrides();
-
+        let cfg = load_with_env();
         assert_eq!(cfg.coordinator.memory_limit, "12GB");
-        assert_eq!(cfg.coordinator.memory_pool, "fair");
+        assert_eq!(cfg.coordinator.memory_pool, MemoryPoolKind::Fair);
 
         std::env::remove_var("SQE_MEMORY_LIMIT");
         std::env::remove_var("SQE_MEMORY_POOL");
@@ -8926,33 +8438,44 @@ otlp_endpoint = ""
     /// before touching the environment.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    const MINIMAL_TOML: &str = r#"
+[coordinator]
+[auth]
+client_id = "sqe-client"
+keycloak_url = "https://keycloak.example.com"
+[catalog]
+catalog_url = "https://polaris.example.com"
+warehouse = "wh"
+"#;
+
+    fn load_with_env() -> SqeConfig {
+        SqeConfig::load_from_str(MINIMAL_TOML).expect("minimal test toml")
+    }
+
     #[test]
     fn provider_client_secret_env_override_beats_toml() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-        let mut cfg = valid_config();
-        cfg.auth.providers = vec![
-            AuthProviderConfig::OidcPassword {
-                token_url: "http://idp.example.com/token".to_string(),
-                client_id: "sqe".to_string(),
-                client_secret: "toml-secret".to_string(),
-                roles_claim: "realm_access.roles".to_string(),
-                subject_claim: "sub".to_string(),
-                email_claim: String::new(),
-                groups_claim: String::new(),
-                fallthrough_on_reject: false,
-            },
-            AuthProviderConfig::ClientCredentials {
-                token_endpoint: "http://polaris:8181/oauth/tokens".to_string(),
-                client_id: "polaris-sa".to_string(),
-                client_secret: "toml-polaris".to_string(),
-            },
-        ];
-
         std::env::set_var("SQE_AUTH__PROVIDERS__0__CLIENT_SECRET", "from-env-oidc");
         std::env::set_var("SQE_AUTH__PROVIDERS__1__CLIENT_SECRET", "from-env-ccg");
 
-        cfg.apply_env_overrides();
+        let cfg = SqeConfig::load_from_str(
+            &(MINIMAL_TOML.to_string()
+                + r#"
+[[auth.providers]]
+type = "oidc_password"
+token_url = "http://idp.example.com/token"
+client_id = "sqe"
+client_secret = "toml-secret"
+
+[[auth.providers]]
+type = "client_credentials"
+token_endpoint = "http://polaris:8181/oauth/tokens"
+client_id = "polaris-sa"
+client_secret = "toml-polaris"
+"#),
+        )
+        .unwrap();
 
         match &cfg.auth.providers[0] {
             AuthProviderConfig::OidcPassword { client_secret, .. } => {
@@ -8992,7 +8515,7 @@ otlp_endpoint = ""
             fallthrough_on_reject: false,
         }];
 
-        cfg.apply_env_overrides();
+        env_overlay::inherit_oidc_password_secret(&mut cfg);
 
         match &cfg.auth.providers[0] {
             AuthProviderConfig::OidcPassword { client_secret, .. } => {
@@ -9021,7 +8544,7 @@ otlp_endpoint = ""
             fallthrough_on_reject: false,
         }];
 
-        cfg.apply_env_overrides();
+        env_overlay::inherit_oidc_password_secret(&mut cfg);
 
         match &cfg.auth.providers[0] {
             AuthProviderConfig::OidcPassword { client_secret, .. } => {
@@ -9035,19 +8558,19 @@ otlp_endpoint = ""
     fn provider_client_secret_env_override_token_exchange_optional() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
-        let mut cfg = valid_config();
-        cfg.auth.providers = vec![AuthProviderConfig::TokenExchange {
-            token_url: "http://idp.example.com/token".to_string(),
-            client_id: "sqe".to_string(),
-            client_secret: None,
-            audience: Some("polaris".to_string()),
-            user_claim: "sub".to_string(),
-            roles_claim: "realm_access.roles".to_string(),
-        }];
-
         std::env::set_var("SQE_AUTH__PROVIDERS__0__CLIENT_SECRET", "exchange-secret");
 
-        cfg.apply_env_overrides();
+        let cfg = SqeConfig::load_from_str(
+            &(MINIMAL_TOML.to_string()
+                + r#"
+[[auth.providers]]
+type = "token_exchange"
+token_url = "http://idp.example.com/token"
+client_id = "sqe"
+audience = "polaris"
+"#),
+        )
+        .unwrap();
 
         match &cfg.auth.providers[0] {
             AuthProviderConfig::TokenExchange { client_secret, .. } => {
@@ -9593,7 +9116,7 @@ otlp_endpoint = ""
     fn coord_with_secret(secret: &str) -> CoordinatorConfig {
         let toml_src = format!(
             r#"
-            mode = "single"
+            mode = "coordinator"
             worker_secret = "{secret}"
             "#
         );
@@ -9611,9 +9134,7 @@ otlp_endpoint = ""
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var("SQE_COORDINATOR__SESSION_CONTEXT_CACHE_TTL_SECS", "5");
 
-        let mut cfg = valid_config();
-        assert_ne!(cfg.coordinator.session_context_cache_ttl_secs, 5);
-        cfg.apply_env_overrides();
+        let cfg = load_with_env();
         assert_eq!(cfg.coordinator.session_context_cache_ttl_secs, 5);
 
         std::env::remove_var("SQE_COORDINATOR__SESSION_CONTEXT_CACHE_TTL_SECS");
@@ -9783,6 +9304,136 @@ otlp_endpoint = ""
             "expected metadata-cache-ttl guard under in-memory engine, got: {err}"
         );
     }
+    #[test]
+    fn malformed_bool_override_fails_closed() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("SQE_PRODUCTION_MODE", "maybe");
+        let err = SqeConfig::load_from_str(MINIMAL_TOML)
+            .unwrap_err()
+            .to_string();
+        std::env::remove_var("SQE_PRODUCTION_MODE");
+        assert!(
+            err.contains("SQE_PRODUCTION_MODE") && err.contains("maybe"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn trimmed_bool_override_is_accepted() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("SQE_PRODUCTION_MODE", " true ");
+        let cfg = load_with_env();
+        std::env::remove_var("SQE_PRODUCTION_MODE");
+        assert!(cfg.coordinator.production_mode);
+    }
+
+    #[test]
+    fn malformed_port_override_fails_closed() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("SQE_COORDINATOR__FLIGHT_SQL_PORT", "abc");
+        let err = SqeConfig::load_from_str(MINIMAL_TOML)
+            .unwrap_err()
+            .to_string();
+        std::env::remove_var("SQE_COORDINATOR__FLIGHT_SQL_PORT");
+        assert!(
+            err.contains("SQE_COORDINATOR__FLIGHT_SQL_PORT") || err.contains("invalid"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn malformed_memory_limit_fails_closed_after_trim() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("SQE_COORDINATOR__MEMORY_LIMIT", "8GB ");
+        let cfg = load_with_env();
+        assert_eq!(cfg.coordinator.memory_limit, "8GB");
+        std::env::set_var("SQE_COORDINATOR__MEMORY_LIMIT", "8 GBs");
+        let err = SqeConfig::load_from_str(MINIMAL_TOML)
+            .unwrap_err()
+            .to_string();
+        std::env::remove_var("SQE_COORDINATOR__MEMORY_LIMIT");
+        assert!(err.contains("8 GBs") || err.contains("memory_limit"), "got: {err}");
+    }
+
+    #[test]
+    fn table_format_version_overflow_fails_closed() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("SQE_CATALOG__DEFAULT_TABLE_FORMAT_VERSION", "300");
+        let err = SqeConfig::load_from_str(MINIMAL_TOML)
+            .unwrap_err()
+            .to_string();
+        std::env::remove_var("SQE_CATALOG__DEFAULT_TABLE_FORMAT_VERSION");
+        assert!(err.contains("300") || err.contains("invalid"), "got: {err}");
+    }
+
+    #[test]
+    fn unknown_env_override_fails_closed() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("SQE_QUERY__MAX_CONCURRENT_PER_USR", "3");
+        let err = SqeConfig::load_from_str(MINIMAL_TOML)
+            .unwrap_err()
+            .to_string();
+        std::env::remove_var("SQE_QUERY__MAX_CONCURRENT_PER_USR");
+        assert!(
+            err.contains("MAX_CONCURRENT_PER_USR")
+                || err.contains("max_concurrent_per_usr")
+                || err.contains("unknown"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn layered_loader_covers_fields_the_old_allowlist_missed() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("SQE_QUERY__SORT_MODE", "strict");
+        std::env::set_var("SQE_STORAGE__S3_REGION", "eu-west-1");
+        std::env::set_var("SQE_QUERY__MAX_CONCURRENT_PER_USER", "3");
+        let cfg = load_with_env();
+        std::env::remove_var("SQE_QUERY__SORT_MODE");
+        std::env::remove_var("SQE_STORAGE__S3_REGION");
+        std::env::remove_var("SQE_QUERY__MAX_CONCURRENT_PER_USER");
+        assert_eq!(cfg.query.sort_mode, SortMode::Strict);
+        assert_eq!(cfg.storage.s3_region, "eu-west-1");
+        assert_eq!(cfg.query.max_concurrent_per_user, 3);
+    }
+
+    #[test]
+    fn unknown_toml_key_under_coordinator_fails() {
+        let err = SqeConfig::load_from_str(
+            r#"
+[coordinator]
+prodution_mode = true
+[auth]
+client_id = "sqe-client"
+keycloak_url = "https://keycloak.example.com"
+[catalog]
+catalog_url = "https://polaris.example.com"
+warehouse = "wh"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("prodution_mode") || err.contains("unknown"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_sort_mode_is_a_deserialize_error() {
+        let err = toml::from_str::<QueryConfig>(r#"sort_mode = "adaptve""#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("adaptve") || err.contains("unknown"), "got: {err}");
+    }
+
+    #[test]
+    fn unknown_memory_pool_is_a_deserialize_error() {
+        let err = toml::from_str::<CoordinatorConfig>(r#"memory_pool = "Fair""#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Fair") || err.contains("unknown"), "got: {err}");
+    }
 }
 
 #[cfg(test)]
@@ -9943,3 +9594,4 @@ write_buffer_tracking = false
         assert!(!c.write_buffer_tracking);
     }
 }
+

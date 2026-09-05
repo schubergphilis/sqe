@@ -1,5 +1,13 @@
 # SQE — Next Steps
 
+> **STATUS 2026-09-05 (later): work package #659 (configuration, startup and code structure) on `fix/config-startup-code-structure`.**
+>
+> Fail-closed `SQE_*` overlay, typed mode knobs, one tokio runtime builder,
+> `sqe-coordinator` binary removed in favour of `sqe-server`, worker
+> `--config` + `/healthz`, dead `deploy/k8s` removed. Partial: stacker for
+> debug `RUST_MIN_STACK`, Dockerfile unification, QueryHandler split.
+> **NEXT:** remaining P1s in the combined index (202, 400, 503, 601/401/603).
+>
 > **STATUS 2026-09-05: security/scale review filed (7 findings) and fixed; 11 of 109 combined findings closed.**
 >
 > `docs/internal/reviews/2026-09-05-security-scale-review/` adds seven
