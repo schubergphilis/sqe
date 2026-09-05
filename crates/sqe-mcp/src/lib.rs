@@ -368,7 +368,7 @@ async fn authenticate_oauth(
     };
     let identity = state
         .auth
-        .authenticate(&credentials)
+        .authenticate_oauth(&credentials)
         .await
         .map_err(|error| {
             tracing::warn!(error = %error, "MCP bearer authentication failed");
@@ -783,6 +783,10 @@ mod tests {
 
     #[async_trait]
     impl AuthProvider for MockAuth {
+        async fn authenticate_oauth(&self, credentials: &FlightCredentials) -> Result<Identity, AuthError> {
+            self.authenticate(credentials).await
+        }
+
         async fn authenticate(
             &self,
             _credentials: &FlightCredentials,

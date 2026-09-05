@@ -4,7 +4,7 @@
 - Severity: medium
 - Category: security
 - Effort: S (hours)
-- Status: open
+- Status: fixed (branch `fix/security-scale-review-2026-09-05`, 2026-09-05)
 
 ## Problem
 
@@ -73,3 +73,7 @@ added to the key precisely to avoid this class of bug; groups were missed.
 - docs/internal/reviews/2026-07-25-production-readiness-review.md, "P1: group
   support"; the runtime gap there is now partly closed by `item_matches`, this
   is the caching remainder.
+
+## Resolution (2026-09-05)
+
+`ranger_store::cache_key` now includes sorted, deduplicated groups alongside roles and uses a Debug tuple encoding so list boundaries cannot be forged with commas. Test `policy_cache_distinguishes_groups_and_list_boundaries`.

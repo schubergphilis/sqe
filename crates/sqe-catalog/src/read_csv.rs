@@ -49,7 +49,6 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::execution::context::SessionContext;
 use datafusion_expr::Expr;
 use tracing::debug;
 
@@ -312,8 +311,8 @@ async fn build_csv_listing_table(
 
     let listing_url = ListingTableUrl::parse(&args.path)?;
 
-    let tmp_ctx = SessionContext::new();
-    register_s3_store_if_needed(FN_NAME, &tmp_ctx, &args, storage, runtime_env)?;
+    let tmp_ctx = crate::scoped_table::inference_context(runtime_env)?;
+    register_s3_store_if_needed(FN_NAME, &tmp_ctx, &args, storage, None)?;
     register_azure_store_if_needed(FN_NAME, &tmp_ctx, &args, storage)?;
     register_gcs_store_if_needed(FN_NAME, &tmp_ctx, &args, storage)?;
     register_http_store_if_needed(FN_NAME, &tmp_ctx, &args.path)?;
@@ -377,7 +376,10 @@ async fn build_csv_listing_table(
 
     let table = ListingTable::try_new(config)?;
     debug!(path = %args.path, "read_csv: built ListingTable");
-    Ok(Arc::new(table))
+    Ok(crate::scoped_table::ScopedTable::bind(
+        Arc::new(table),
+        tmp_ctx.runtime_env(),
+    ))
 }
 
 #[cfg(test)]

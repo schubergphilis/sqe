@@ -98,14 +98,30 @@ impl ResultCache {
 
     /// Compute a user-scoped cache key.
     pub fn cache_key(user: &str, sql: &str) -> String {
-        let normalized: String = sql
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_uppercase();
-        let input = format!("{user}:{normalized}");
-        let hash = Sha256::digest(input.as_bytes());
-        hex::encode(hash)
+        let mut hash = Sha256::new();
+        hash.update((user.len() as u64).to_be_bytes());
+        hash.update(user.as_bytes());
+        hash.update(sql.as_bytes());
+        hex::encode(hash.finalize())
+    }
+
+    /// Isolate sessions and result-affecting state, including credential refresh.
+    /// Only a digest leaves this method; tokens must never be logged as keys.
+    pub fn session_scope(session: &sqe_core::Session) -> String {
+        let context = format!(
+            "{:?}",
+            (
+                &session.id,
+                &session.user.username,
+                &session.user.subject,
+                &session.user.roles,
+                &session.user.groups,
+                &session.default_catalog,
+                &session.default_schema,
+                &session.write_branch,
+            )
+        );
+        Self::cache_key(&context, session.access_token().expose())
     }
 
     /// Check if a query should bypass the cache (non-deterministic functions).
@@ -329,17 +345,51 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_normalizes_whitespace() {
+    fn cache_key_preserves_whitespace() {
         let k1 = ResultCache::cache_key("alice", "SELECT  1");
         let k2 = ResultCache::cache_key("alice", "SELECT 1");
-        assert_eq!(k1, k2);
+        assert_ne!(k1, k2);
     }
 
     #[test]
-    fn cache_key_case_insensitive() {
+    fn cache_key_preserves_case() {
         let k1 = ResultCache::cache_key("alice", "select 1");
         let k2 = ResultCache::cache_key("alice", "SELECT 1");
-        assert_eq!(k1, k2);
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn different_sql_literals_never_reuse_cached_results() {
+        let cache = ResultCache::new(&test_config(), None);
+        for (a, b) in [
+            ("SELECT 'secret'", "SELECT 'SECRET'"),
+            ("SELECT 'a  b'", "SELECT 'a b'"),
+            ("SELECT \"lower\" FROM t", "SELECT \"LOWER\" FROM t"),
+        ] {
+            cache.store("alice", a, Uuid::now_v7(), vec![make_batch(1)], vec![]);
+            assert!(cache.lookup("alice", a).is_some());
+            assert!(cache.lookup("alice", b).is_none(), "{b}");
+        }
+    }
+
+    #[test]
+    fn cache_scope_tracks_session_and_namespace() {
+        let mut session = sqe_core::Session::new(
+            "alice".into(),
+            "token".into(),
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            vec![],
+        );
+        let initial = ResultCache::session_scope(&session);
+        session.default_schema = Some("other".into());
+        let schema = ResultCache::session_scope(&session);
+        assert_ne!(initial, schema);
+        session.default_catalog = Some("other".into());
+        let catalog = ResultCache::session_scope(&session);
+        assert_ne!(schema, catalog);
+        session.id = Uuid::new_v4().to_string();
+        assert_ne!(catalog, ResultCache::session_scope(&session));
     }
 
     #[test]

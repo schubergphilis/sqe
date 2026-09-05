@@ -55,6 +55,13 @@ pub struct PolicySummary {
 /// - The optimizer CANNOT push predicates through column masks (security)
 #[async_trait]
 pub trait PolicyEnforcer: Send + Sync {
+    /// Cached batches cannot be re-filtered safely after a policy change.
+    /// Enforcers must explicitly opt in only when no local policy can change
+    /// the result. Catalog access is still revalidated by the coordinator.
+    fn permits_result_cache(&self) -> bool {
+        false
+    }
+
     async fn evaluate(
         &self,
         user: &SessionUser,
@@ -68,6 +75,10 @@ pub struct PassthroughEnforcer;
 
 #[async_trait]
 impl PolicyEnforcer for PassthroughEnforcer {
+    fn permits_result_cache(&self) -> bool {
+        true
+    }
+
     async fn evaluate(
         &self,
         _user: &SessionUser,

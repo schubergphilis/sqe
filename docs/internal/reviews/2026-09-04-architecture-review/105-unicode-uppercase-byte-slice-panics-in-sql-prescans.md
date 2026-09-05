@@ -4,7 +4,7 @@
 - Severity: high
 - Category: reliability
 - Effort: S (hours)
-- Status: open
+- Status: fixed (branch `fix/security-scale-review-2026-09-05`, 2026-09-05)
 
 ## Problem
 
@@ -97,3 +97,7 @@ move of classification onto a shared task would turn it into a process crash.
   pre-scan layer these slices live in).
 - Codebase analysis 2026-06-26 item 20 (proptest exists) explains why this was
   believed covered.
+
+## Resolution (2026-09-05)
+
+All pre-parse scans in `sqe-sql` (`classifier.rs`, `ddl.rs`, `tags.rs`, `partition_evolution.rs`, `hive_partitions.rs`, `time_travel.rs`) use `to_ascii_uppercase()`, which preserves byte offsets, so slicing the original string by the matched length is always in bounds. Test `unicode_case_expansion_never_changes_prescan_offsets` feeds `ſ`, `ß`, `ﬃ` and similar expanding code points through every pre-scan and requires no panic.
