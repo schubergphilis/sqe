@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1
+#
+# CI image assembly: COPY-only. The binaries are compiled by the
+# `release-binaries` job in .gitlab-ci.yml (cargo, in parallel with the test
+# gate) and land in out/ as job artifacts; this file only packages them. No
+# compiler runs in the image build, so the post-test kaniko job takes minutes
+# instead of the 38 to 67 measured for compiling inside kaniko, which also
+# ignored every RUN --mount cache in the full Dockerfile.
+#
+# The runtime stages below MUST stay identical to the `runtime-base`,
+# `healthcheck-bin` and `runtime` stages of ./Dockerfile (same base digests,
+# labels, ports, healthcheck, entrypoint). Renovate bumps both files' digests;
+# review them together. Local `docker build .` keeps using ./Dockerfile.
+#
+#   docker build -f Dockerfile.ci -t sqe:ci .   # after `cargo build` into out/
+
+# Digest-pinned; Renovate bumps the runtime independently of builder tooling.
+FROM cgr.dev/chainguard/glibc-dynamic@sha256:993affbc31d155dfdd4c86c4415e87557df5695a0c84bce924992c8e93724168 AS runtime-base
+
+USER 65532
+
+FROM busybox:1.38.0-uclibc@sha256:297dda192bda2157ddf40abb47a45a1090caff1864db9cfb9ce4b901ba318a3c AS healthcheck-bin
+
+FROM runtime-base AS runtime
+
+ARG VERSION=dev
+ARG BUILD_DATE
+ARG GIT_REVISION
+
+LABEL org.opencontainers.image.title="sqe" \
+      org.opencontainers.image.description="Sovereign Query Engine - distributed SQL over Apache Iceberg" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.revision="${GIT_REVISION}" \
+      org.opencontainers.image.source="https://github.com/schuberg/sqe"
+
+COPY out/sqe-server out/sqe-worker out/sqe-cli /usr/local/bin/
+COPY --from=healthcheck-bin /bin/wget /usr/local/bin/wget
+
+EXPOSE 50051 50052 8080 9090 9091
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9091/healthz"]
+
+ENTRYPOINT ["/usr/local/bin/sqe-server"]

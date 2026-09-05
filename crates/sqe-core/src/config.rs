@@ -877,9 +877,7 @@ impl McpPrincipalConfig {
                 &base64::engine::general_purpose::STANDARD,
                 self.token_b64.trim(),
             )
-            .map_err(|_| {
-                format!("mcp.auth.principals[{user}] token_b64 is not valid base64")
-            })?;
+            .map_err(|_| format!("mcp.auth.principals[{user}] token_b64 is not valid base64"))?;
             String::from_utf8(decoded).map_err(|_| {
                 format!("mcp.auth.principals[{user}] token_b64 must decode to UTF-8")
             })?
@@ -1784,7 +1782,10 @@ impl AuthProviderConfig {
             Self::TokenExchange { .. } => Some("token_exchange"),
             Self::BearerToken { .. } => Some("bearer_token"),
             Self::BearerPassthrough { .. } => Some("bearer_passthrough"),
-            Self::AwsIam { .. } | Self::ApiKey { .. } | Self::Mtls { .. } | Self::Anonymous { .. } => None,
+            Self::AwsIam { .. }
+            | Self::ApiKey { .. }
+            | Self::Mtls { .. }
+            | Self::Anonymous { .. } => None,
         }
     }
 }
@@ -2484,8 +2485,8 @@ impl Default for HiveConfig {
             manifest_max_bytes: default_hive_manifest_max_bytes(),
             manifest_max_columns: default_hive_manifest_max_columns(),
             manifest_max_partition_keys: default_hive_manifest_max_partition_keys(),
-            manifest_max_partition_index_entries:
-                default_hive_manifest_max_partition_index_entries(),
+            manifest_max_partition_index_entries: default_hive_manifest_max_partition_index_entries(
+            ),
         }
     }
 }
@@ -2805,28 +2806,7 @@ impl TvfPolicy {
         }
 
         if lower.starts_with("http://") || lower.starts_with("https://") {
-            if self.allow_http {
-                return Ok(());
-            }
-            // Parse out the host (lowercased) and check the allowlist.
-            // Keeping this local + total avoids panicking on malformed input.
-            let after_scheme = lower.split_once("://").map(|x| x.1).unwrap_or("");
-            let host_with_port = after_scheme.split('/').next().unwrap_or("");
-            let host = host_with_port.split(':').next().unwrap_or("").trim();
-            if host.is_empty() {
-                return Err(format!("TVF: malformed URL '{path}' (missing host)"));
-            }
-            if self
-                .allowed_http_hosts
-                .iter()
-                .any(|h| h.eq_ignore_ascii_case(host))
-            {
-                return Ok(());
-            }
-            return Err(format!(
-                "TVF: HTTP host '{host}' is not in `[storage.tvf] allowed_http_hosts`. \
-                 Add the host or set `allow_http = true` to permit arbitrary hosts."
-            ));
+            return self.check_http_destination(path);
         }
 
         // Everything else — bare path, `file://`, `/...` — is a local path.
@@ -2935,29 +2915,40 @@ impl TvfPolicy {
         if !lower.starts_with("http://") && !lower.starts_with("https://") {
             return Ok(());
         }
-        if self.allow_http {
-            return Ok(());
+        self.check_http_destination(endpoint)
+    }
+
+    /// Parse destinations exactly as the HTTP client does. Userinfo is never
+    /// meaningful for file readers and must not masquerade as an allowed host.
+    fn check_http_destination(&self, destination: &str) -> Result<(), String> {
+        let authority = destination
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or("");
+        if authority.is_empty() || authority.starts_with('/') || destination.contains('\\') {
+            return Err(format!("TVF: malformed URL '{destination}'"));
         }
-        let after_scheme = lower.split_once("://").map(|x| x.1).unwrap_or("");
-        let host_with_port = after_scheme.split('/').next().unwrap_or("");
-        let host = host_with_port.split(':').next().unwrap_or("").trim();
-        if host.is_empty() {
-            return Err(format!(
-                "TVF: malformed endpoint '{endpoint}' (missing host)"
-            ));
+        let parsed = url::Url::parse(destination)
+            .map_err(|_| format!("TVF: malformed URL '{destination}'"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err("TVF: HTTP destination requires http or https".to_string());
         }
-        if self
-            .allowed_http_hosts
-            .iter()
-            .any(|h| h.eq_ignore_ascii_case(host))
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err("TVF: HTTP destination must not contain userinfo".to_string());
+        }
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| "TVF: malformed URL (missing host)".to_string())?;
+        if self.allow_http
+            || self
+                .allowed_http_hosts
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(host))
         {
             return Ok(());
         }
         Err(format!(
-            "TVF: endpoint host '{host}' is not in `[storage.tvf] allowed_http_hosts`. \
-             Inline `endpoint => '{endpoint}'` was rejected to prevent SSRF \
-             to metadata services. Add the host or set `allow_http = true` \
-             to permit arbitrary hosts."
+            "TVF: HTTP host '{host}' is not in `[storage.tvf] allowed_http_hosts`"
         ))
     }
 }
@@ -4831,9 +4822,7 @@ impl SqeConfig {
                             Err(message) => errors.push(message),
                         }
                     }
-                    if self.mcp.allow_writes
-                        && !self.mcp.auth.has_writer(&self.mcp.write_roles)
-                    {
+                    if self.mcp.allow_writes && !self.mcp.auth.has_writer(&self.mcp.write_roles) {
                         errors.push(
                             "write-capable MCP in static mode needs a principal holding a role \
                              in mcp.write_roles"
@@ -5376,7 +5365,8 @@ impl SqeConfig {
         }
 
         if self.storage.s3_region.is_empty() {
-            if let Some(region) = non_empty("AWS_REGION").or_else(|| non_empty("AWS_DEFAULT_REGION"))
+            if let Some(region) =
+                non_empty("AWS_REGION").or_else(|| non_empty("AWS_DEFAULT_REGION"))
             {
                 self.storage.s3_region = region;
             }
@@ -5467,10 +5457,7 @@ impl SqeConfig {
         env_override_u16("SQE_MCP__PORT", &mut self.mcp.port);
         env_override_str("SQE_MCP__RESOURCE_URI", &mut self.mcp.resource_uri);
         env_override_bool("SQE_MCP__ALLOW_WRITES", &mut self.mcp.allow_writes);
-        env_override_usize(
-            "SQE_MCP__MAX_RESULT_ROWS",
-            &mut self.mcp.max_result_rows,
-        );
+        env_override_usize("SQE_MCP__MAX_RESULT_ROWS", &mut self.mcp.max_result_rows);
         env_override_usize(
             "SQE_MCP__MAX_RESPONSE_BYTES",
             &mut self.mcp.max_response_bytes,
@@ -7134,7 +7121,9 @@ partial_progress_batch = 5
     fn mcp_anonymous_mode_needs_no_authorization_servers() {
         let mut config = mcp_enabled_config();
         config.mcp.auth.mode = McpAuthMode::Anonymous;
-        config.validate().expect("anonymous MCP has no authorization server");
+        config
+            .validate()
+            .expect("anonymous MCP has no authorization server");
     }
 
     #[test]
@@ -7143,7 +7132,10 @@ partial_progress_batch = 5
         config.mcp.auth.mode = McpAuthMode::Anonymous;
         config.mcp.allow_writes = true;
         let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("anonymous") && err.contains("allow_writes"), "got: {err}");
+        assert!(
+            err.contains("anonymous") && err.contains("allow_writes"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -7184,8 +7176,11 @@ partial_progress_batch = 5
     fn mcp_static_mode_is_allowed_with_an_anonymous_provider() {
         let mut config = mcp_enabled_config();
         config.mcp.auth.mode = McpAuthMode::Static;
-        config.mcp.auth.principals =
-            vec![static_principal("mcp-reader", &["reader"], "a-sufficiently-long-token")];
+        config.mcp.auth.principals = vec![static_principal(
+            "mcp-reader",
+            &["reader"],
+            "a-sufficiently-long-token",
+        )];
         config.auth.providers = vec![provider_from_toml(
             r#"
             type = "anonymous"
@@ -7209,9 +7204,14 @@ partial_progress_batch = 5
     fn mcp_static_mode_needs_no_authorization_servers() {
         let mut config = mcp_enabled_config();
         config.mcp.auth.mode = McpAuthMode::Static;
-        config.mcp.auth.principals =
-            vec![static_principal("mcp-reader", &["reader"], "a-sufficiently-long-token")];
-        config.validate().expect("static MCP has no authorization server");
+        config.mcp.auth.principals = vec![static_principal(
+            "mcp-reader",
+            &["reader"],
+            "a-sufficiently-long-token",
+        )];
+        config
+            .validate()
+            .expect("static MCP has no authorization server");
     }
 
     #[test]
@@ -7277,10 +7277,7 @@ partial_progress_batch = 5
             token_b64: String::new(),
         }];
         let err = config.validate().unwrap_err().to_string();
-        assert!(
-            err.contains("SQE_MCP_TOKEN_THAT_IS_NOT_SET"),
-            "got: {err}"
-        );
+        assert!(err.contains("SQE_MCP_TOKEN_THAT_IS_NOT_SET"), "got: {err}");
     }
 
     #[test]
@@ -7303,8 +7300,11 @@ partial_progress_batch = 5
         let mut config = mcp_enabled_config();
         config.mcp.auth.mode = McpAuthMode::Static;
         config.mcp.allow_writes = true;
-        config.mcp.auth.principals =
-            vec![static_principal("mcp-reader", &["reader"], "a-sufficiently-long-token")];
+        config.mcp.auth.principals = vec![static_principal(
+            "mcp-reader",
+            &["reader"],
+            "a-sufficiently-long-token",
+        )];
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("write_roles"), "got: {err}");
     }
@@ -7325,10 +7325,7 @@ partial_progress_batch = 5
     fn test_mcp_environment_overrides() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var("SQE_MCP__ALLOW_WRITES", "true");
-        std::env::set_var(
-            "SQE_MCP__RESOURCE_URI",
-            "http://localhost:19091/mcp",
-        );
+        std::env::set_var("SQE_MCP__RESOURCE_URI", "http://localhost:19091/mcp");
 
         let mut config = valid_config();
         config.apply_env_overrides();
@@ -8621,7 +8618,10 @@ type = "aws"
 
         let enabled: QueryConfig = toml::from_str("puffin_statistics = true").unwrap();
         assert!(enabled.puffin_statistics);
-        assert!(!enabled.statistics_registry, "registry is a separate opt-in");
+        assert!(
+            !enabled.statistics_registry,
+            "registry is a separate opt-in"
+        );
 
         let registry: QueryConfig = toml::from_str("statistics_registry = true").unwrap();
         assert!(registry.statistics_registry);
@@ -9306,7 +9306,11 @@ otlp_endpoint = ""
     fn tvf_object_store_trusted_startup_config_bypass() {
         let policy = TvfPolicy::default();
         assert!(policy
-            .check_path("s3://bucket/warehouse/", &TvfCaller::trusted_startup_config(), false)
+            .check_path(
+                "s3://bucket/warehouse/",
+                &TvfCaller::trusted_startup_config(),
+                false
+            )
             .is_ok());
     }
 
@@ -9320,7 +9324,11 @@ otlp_endpoint = ""
     fn tvf_local_path_ignores_trusted_startup_config() {
         let policy = TvfPolicy::default();
         assert!(policy
-            .check_path("/warehouse/lake", &TvfCaller::trusted_startup_config(), false)
+            .check_path(
+                "/warehouse/lake",
+                &TvfCaller::trusted_startup_config(),
+                false
+            )
             .is_err());
     }
 
@@ -9451,6 +9459,39 @@ otlp_endpoint = ""
         };
         // Defense-in-depth surrenders when allow_http = true.
         assert!(policy.check_endpoint("http://169.254.169.254").is_ok());
+    }
+
+    #[test]
+    fn tvf_http_destinations_reject_userinfo_and_ambiguous_authorities() {
+        for allow_http in [false, true] {
+            let policy = TvfPolicy {
+                allow_http,
+                allowed_http_hosts: vec!["allowed.example".into()],
+                ..Default::default()
+            };
+            for destination in [
+                "https://allowed.example:password@blocked.example/",
+                "https://user@allowed.example/",
+                "https://allowed.example\\@blocked.example/",
+                "http:///allowed.example/",
+                "https://allowed.example:invalid/",
+            ] {
+                assert!(check_remote(&policy, destination).is_err(), "{destination}");
+                assert!(policy.check_endpoint(destination).is_err(), "{destination}");
+            }
+        }
+    }
+
+    #[test]
+    fn tvf_http_destinations_parse_ipv6_ports_and_host_case() {
+        let policy = TvfPolicy {
+            allowed_http_hosts: vec!["allowed.example".into(), "[::1]".into()],
+            ..Default::default()
+        };
+        for destination in ["https://ALLOWED.example:443/x", "http://[::1]:9000/x"] {
+            assert!(check_remote(&policy, destination).is_ok(), "{destination}");
+            assert!(policy.check_endpoint(destination).is_ok(), "{destination}");
+        }
     }
 
     // --- SecurityConfig::resolve_client_ip (issue #74 regression tests) ---

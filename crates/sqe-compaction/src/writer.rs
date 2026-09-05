@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use arrow::compute::cast;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
+use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
@@ -382,15 +383,19 @@ pub async fn write_data_files_streaming(
         if fanout.is_bounded() {
             // Memory-bounded path: SQE's BoundedFanoutWriter caps open writers
             // and buffered bytes, cutting over least-recently-written writers.
-            // Only reached when an operator sets `fanout_max_open_writers` or
-            // `fanout_buffer_budget`; the default leaves both 0 and takes the
-            // unbounded TaskWriter path below (byte-for-byte unchanged).
+            // This is the default for coordinator writes (caps auto-derived
+            // from the pool when unset); only `write_buffer_tracking = false`
+            // and compaction rewrites take the unbounded TaskWriter path below.
+            let reservation = fanout
+                .pool
+                .as_ref()
+                .map(|pool| WriteReservation::new(pool, "fanout-buffer"));
             let mut writer = BoundedFanoutWriter::new(
                 data_file_writer_builder,
                 splitter,
                 fanout.max_open,
                 fanout.byte_budget,
-                None,
+                reservation,
             );
             while let Some(batch_result) = stream.next().await {
                 let batch =
@@ -543,26 +548,52 @@ fn apply_stamped_schema(
 }
 
 /// Resolved fanout limits for a partitioned streaming write. Both `0` means
-/// unbounded (the default): the write takes the vendored `TaskWriter` path,
-/// byte-for-byte unchanged. A non-zero value in either field switches the write
-/// to [`BoundedFanoutWriter`]. A `0` in one field while the other is set means
+/// unbounded: the write takes the vendored `TaskWriter` path, byte-for-byte
+/// unchanged. A non-zero value in either field switches the write to
+/// [`BoundedFanoutWriter`]. A `0` in one field while the other is set means
 /// that particular limit is disabled (e.g. cap the open-writer count but impose
 /// no byte budget).
-#[derive(Debug, Clone, Copy)]
+///
+/// `pool`, when set, makes the bounded writer register a `fanout-buffer`
+/// reservation so the buffered partition state is charged to the shared
+/// memory pool alongside operator memory (security/scale review 905). A
+/// denied reservation first cuts over open writers and, if nothing is left to
+/// evict, fails the write with a typed resource error.
+#[derive(Clone)]
 pub struct FanoutLimits {
     /// Max concurrently open partition writers (`0` = no cap).
     pub max_open: usize,
     /// Total buffered-byte budget across open writers (`0` = no budget).
     pub byte_budget: usize,
+    /// Shared pool to charge buffered fanout bytes to (`None` = untracked).
+    pub pool: Option<Arc<dyn MemoryPool>>,
+}
+
+impl std::fmt::Debug for FanoutLimits {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FanoutLimits")
+            .field("max_open", &self.max_open)
+            .field("byte_budget", &self.byte_budget)
+            .field("pool", &self.pool.is_some())
+            .finish()
+    }
 }
 
 impl FanoutLimits {
-    /// The default: no limits, unbounded `TaskWriter` path.
+    /// No limits, unbounded `TaskWriter` path (compaction rewrites and the
+    /// `write_buffer_tracking = false` escape hatch).
     pub const fn unbounded() -> Self {
         Self {
             max_open: 0,
             byte_budget: 0,
+            pool: None,
         }
+    }
+
+    /// Charge buffered fanout bytes to `pool` (bounded mode only).
+    pub fn with_pool(mut self, pool: Arc<dyn MemoryPool>) -> Self {
+        self.pool = Some(pool);
+        self
     }
 
     /// True when at least one limit is active (selects [`BoundedFanoutWriter`]).
@@ -612,13 +643,14 @@ pub fn auto_fanout_caps(pool_bytes: usize) -> (usize, usize) {
 /// partition since that partition's writer was (re)opened. Arrow size exceeds
 /// encoded parquet size, so it overstates, which is the safe direction for a
 /// budget. When a `fanout-buffer` [`WriteReservation`] is supplied the estimate
-/// is mirrored onto the shared pool (best-effort) so the governor sees the
-/// fanout memory; the hard bound remains `byte_budget`.
+/// is reserved on the shared pool before each partition write: a denial cuts
+/// over other open writers first and fails the write once nothing is left to
+/// evict, so fanout memory is bounded by the pool, not only by `byte_budget`.
 ///
 /// Wired into the streaming write path ([`write_data_files_streaming`]) behind
-/// the [`FanoutLimits`] gate: reached only when an operator sets
-/// `fanout_max_open_writers` or `fanout_buffer_budget` (the default leaves both
-/// 0 and takes the unbounded `TaskWriter` path unchanged). The file-level
+/// the [`FanoutLimits`] gate: the coordinator's default for partitioned writes
+/// (caps auto-derived from the pool when the `fanout_*` knobs are 0); only
+/// `write_buffer_tracking = false` selects the unbounded path. The file-level
 /// behaviour (splitting, cutover, `DataFile` completeness) is covered by the
 /// local `fs_io` tests in this module; the end-to-end Iceberg commit of cutover
 /// output still needs a live catalog to validate.
@@ -711,6 +743,25 @@ impl<B: IcebergWriterBuilder> BoundedFanoutWriter<B> {
                 }
             }
 
+            // Shared pool: the estimate after this write must fit alongside
+            // everything else the pool governs. A denial evicts other open
+            // writers first; when only this partition remains the write fails
+            // with a typed resource error rather than growing untracked.
+            loop {
+                let attempt = self
+                    .reservation
+                    .as_mut()
+                    .map(|res| res.try_resize(self.total_bytes + bytes));
+                match attempt {
+                    None | Some(Ok(())) => break,
+                    Some(Err(denied)) => {
+                        if !self.cut_over_lrw(Some(&key)).await? {
+                            return Err(denied);
+                        }
+                    }
+                }
+            }
+
             self.get_or_open(&partition_key)
                 .await?
                 .write(part_batch)
@@ -721,11 +772,6 @@ impl<B: IcebergWriterBuilder> BoundedFanoutWriter<B> {
             *self.est_bytes.entry(key.clone()).or_insert(0) += bytes;
             self.tick += 1;
             self.last_written.insert(key, self.tick);
-
-            // Pool visibility (best-effort): the hard bound is `byte_budget`.
-            if let Some(res) = self.reservation.as_mut() {
-                let _ = res.try_resize(self.total_bytes);
-            }
         }
         Ok(())
     }
@@ -789,7 +835,9 @@ impl<B: IcebergWriterBuilder> BoundedFanoutWriter<B> {
         self.last_written.remove(&key);
         self.cutovers += 1;
         if let Some(res) = self.reservation.as_mut() {
-            let _ = res.try_resize(self.total_bytes);
+            // Shrinking never fails; keep the pool in step with the estimate.
+            let excess = res.size().saturating_sub(self.total_bytes);
+            res.shrink(excess);
         }
         Ok(true)
     }
@@ -933,13 +981,15 @@ mod tests {
         );
         assert!(!FanoutLimits {
             max_open: 0,
-            byte_budget: 0
+            byte_budget: 0,
+            pool: None,
         }
         .is_bounded());
         assert!(
             FanoutLimits {
                 max_open: 8,
-                byte_budget: 0
+                byte_budget: 0,
+                pool: None,
             }
             .is_bounded(),
             "cap only"
@@ -947,14 +997,16 @@ mod tests {
         assert!(
             FanoutLimits {
                 max_open: 0,
-                byte_budget: 1 << 20
+                byte_budget: 1 << 20,
+                pool: None,
             }
             .is_bounded(),
             "budget only"
         );
         assert!(FanoutLimits {
             max_open: 8,
-            byte_budget: 1 << 20
+            byte_budget: 1 << 20,
+            pool: None,
         }
         .is_bounded());
     }
@@ -1028,6 +1080,66 @@ mod tests {
         assert!(per.contains_key(&region_struct("US")));
         assert!(per.contains_key(&region_struct("EU")));
         assert!(per.contains_key(&region_struct("ASIA")));
+    }
+
+    #[tokio::test]
+    async fn bounded_fanout_pool_denial_cuts_over_then_fails_typed() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        let dir = TempDir::new().unwrap();
+        let schema = fanout_schema();
+        let one = region_batch(&[1], &["US"]).get_array_memory_size();
+        // Room for roughly one and a half partition batches: the second
+        // partition must evict the first instead of growing untracked.
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(one + one / 2));
+        let mut w = BoundedFanoutWriter::new(
+            fanout_builder(&dir, schema.clone()),
+            fanout_splitter(&schema),
+            0,
+            0,
+            Some(WriteReservation::new(&pool, "fanout-buffer")),
+        );
+        w.write(region_batch(&[1], &["US"])).await.unwrap();
+        assert_eq!(
+            pool.reserved(),
+            one,
+            "first partition is charged to the pool"
+        );
+        w.write(region_batch(&[2], &["EU"])).await.unwrap();
+        assert_eq!(
+            w.cutovers(),
+            1,
+            "pool denial evicts the least-recently-written writer"
+        );
+        assert_eq!(
+            pool.reserved(),
+            one,
+            "evicted bytes are returned to the pool"
+        );
+
+        // A batch that can never fit, even with every other writer evicted,
+        // fails with a typed resource error and leaves the pool consistent.
+        // Arrow rounds small buffers up to the same allocation size, so the
+        // oversized batch needs enough rows to be measurably larger.
+        let ids: Vec<i32> = (3..515).collect();
+        let regions = vec!["ASIA"; ids.len()];
+        assert!(region_batch(&ids, &regions).get_array_memory_size() > one + one / 2);
+        let err = w
+            .write(region_batch(&ids, &regions))
+            .await
+            .expect_err("oversized batch must be denied");
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::ResourceExhausted);
+        assert!(err.to_string().contains("fanout-buffer"), "{err}");
+        assert_eq!(w.cutovers(), 2, "EU was evicted while trying to make room");
+        assert_eq!(pool.reserved(), 0);
+
+        let files = w.close().await.unwrap();
+        let total: u64 = files.iter().map(|f| f.record_count()).sum();
+        assert_eq!(
+            total, 2,
+            "rows accepted before the denial are all committed"
+        );
+        drop(files);
+        drop(pool);
     }
 
     #[tokio::test]

@@ -31,6 +31,7 @@ use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::error::Result as DFResult;
+#[cfg(test)]
 use datafusion::execution::context::SessionContext;
 use datafusion_expr::Expr;
 use object_store::aws::AmazonS3Builder;
@@ -232,7 +233,7 @@ async fn build_listing_table(
 
     // Create a temporary session context so we can register an object store
     // and then use it for schema inference.
-    let tmp_ctx = SessionContext::new();
+    let tmp_ctx = crate::scoped_table::inference_context(runtime_env)?;
 
     if is_s3_path(&args.path) {
         let s3 = build_s3_store(args, storage)?;
@@ -261,9 +262,6 @@ async fn build_listing_table(
         // credentials whenever the inline `endpoint =>` differs from it.
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(s3);
         tmp_ctx.register_object_store(&store_url, Arc::clone(&store));
-        if let Some(env) = runtime_env {
-            env.register_object_store(&store_url, store);
-        }
         debug!(path = %args.path, "Registered S3 object store for read_parquet");
     } else if crate::file_tvf_common::is_azure_path(&args.path) {
         let common_args = args.as_file_tvf_args();
@@ -315,7 +313,10 @@ async fn build_listing_table(
         .with_schema(schema);
 
     let table = ListingTable::try_new(config)?;
-    Ok(Arc::new(table))
+    Ok(crate::scoped_table::ScopedTable::bind(
+        Arc::new(table),
+        tmp_ctx.runtime_env(),
+    ))
 }
 
 /// Build an [`object_store::aws::AmazonS3`] from inline TVF args with

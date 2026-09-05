@@ -85,7 +85,7 @@ services:
       start_period: 20s
 
   bucket-init:
-    image: amazon/aws-cli:2.36.36
+    image: amazon/aws-cli:2.36.37
     entrypoint: ["sh", "-c"]
     command:
       - |
@@ -173,7 +173,7 @@ services:
 
   # ── ranger-setup — register service-def + service, seed admin grant ───
   ranger-setup:
-    image: curlimages/curl:8.21.0
+    image: curlimages/curl:8.22.0
     entrypoint: ["sh", "/bootstrap-ranger.sh"]
     environment:
       RANGER_URL: http://ranger-admin:6080
@@ -254,7 +254,7 @@ services:
 
   # ── polaris-setup — catalogs, namespaces, principals, principal-roles ─
   polaris-setup:
-    image: curlimages/curl:8.21.0
+    image: curlimages/curl:8.22.0
     entrypoint: ["sh", "/bootstrap-data.sh"]
     environment:
       POLARIS_URL: http://polaris:8181
