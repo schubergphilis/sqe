@@ -1741,6 +1741,11 @@ impl QueryHandler {
                         if let sqlparser::ast::TableObject::TableName(ref name) = ins.table {
                             let hive_ref = table_reference_of(name);
                             if self.is_hive_table(session, &hive_ref) {
+                                // Syntax first: an OVERWRITE is refused on the
+                                // statement alone, before any table lookup, so
+                                // the refusal cannot be masked by a lookup
+                                // error on a table that does not exist.
+                                crate::hive_write::reject_overwrite(stmt)?;
                                 // Gate the target before any object lands (503):
                                 // the post-write index refresh repeats the check,
                                 // but by then the files are in the bucket.
