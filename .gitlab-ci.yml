@@ -10,6 +10,18 @@ workflow:
     - if: '$CI_COMMIT_TAG'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
+# Without at least one local job that has no `changes:` filter, GitLab
+# reports "the resulting pipeline would have been empty" for MRs that only
+# touch images/compose and never starts CI (see !936).
+ci-config-sanity:
+  stage: test
+  image: python:3.12-alpine
+  script:
+    - python -m json.tool renovate.json >/dev/null
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
 # Auto-cancel superseded pipelines. The project setting
 # (Settings > CI/CD > auto_cancel_pending_pipelines) is already `enabled`, but it
 # only cancels jobs marked `interruptible`, and nothing here was. Measured
