@@ -5,6 +5,7 @@
 - Category: testing
 - Effort: S (hours)
 - Status: open
+- Issue: #627
 
 ## Problem
 

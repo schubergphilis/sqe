@@ -4,7 +4,8 @@
 - Severity: high
 - Category: security
 - Effort: S (hours)
-- Status: open
+- Status: fixed (branch `fix/authz-policy-enforcement-p1`, 2026-09-05)
+- Issue: #595
 
 ## Problem
 
@@ -79,3 +80,7 @@ exist and a later `MSCK REPAIR TABLE` by anyone makes them visible.
   ("policy rewriter is deliberately fail-closed") assumed a single enforcement
   point; this path predates it.
 - Memory note "Hive external tables: cycle 3 (tag masks) unstarted".
+
+## Resolution (2026-09-05)
+
+Hive INSERT (`crates/sqe-coordinator/src/hive_write.rs`) now runs its source SELECT through the policy enforcer via `enforce_insert_source`, which rebuilds the `DmlStatement` around the rewritten input and returns the policy summary for the audit record, and the target is authorized before any file is written through `HiveDdlHandler::refuse_write_if_denied`. CTAS into a Hive table takes the same pre-write check. The query handler's Hive INSERT and CTAS arms pass the enforcer, user and summary through.

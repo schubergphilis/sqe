@@ -5,6 +5,7 @@
 - Category: security
 - Effort: S (hours)
 - Status: fixed (branch `fix/security-scale-review-2026-09-05`, 2026-09-05)
+- Issue: #556
 
 ## Problem
 

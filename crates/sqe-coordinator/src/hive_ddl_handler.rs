@@ -18,7 +18,9 @@ use sqe_catalog::hive::manifest::HiveManifest;
 use sqe_catalog::hive::partition::parse_projection;
 use sqe_catalog::hive::provider::HiveMetadataCache;
 use sqe_core::{SecretStore, Session, SessionUser, SqeError};
-use sqe_metrics::audit::{Actor, AuditEvent, AuditKind, AuditLogger, ObjectType, Outcome, Resource};
+use sqe_metrics::audit::{
+    Actor, AuditEvent, AuditKind, AuditLogger, ObjectType, Outcome, Resource,
+};
 use sqe_policy::plan_rewriter::{policy_denies_all, resolve_effective_policy, HiveCatalogs};
 use sqe_policy::PolicyStore;
 use sqe_sql::hive_ddl::HiveTableSpec;
@@ -304,7 +306,13 @@ impl HiveDdlHandler {
             .map_err(|e| SqeError::Execution(e.to_string()))?;
 
         self.invalidate_manifest(&database, &spec.name);
-        self.emit_audit_event(session, catalog_name, &database, &spec.name, "CREATE EXTERNAL TABLE");
+        self.emit_audit_event(
+            session,
+            catalog_name,
+            &database,
+            &spec.name,
+            "CREATE EXTERNAL TABLE",
+        );
         Ok(())
     }
 
@@ -490,7 +498,13 @@ impl HiveDdlHandler {
             .map_err(|e| SqeError::Execution(e.to_string()))?;
 
         self.invalidate_manifest(&database, &table);
-        self.emit_audit_event(session, &root, &database, &table, "ALTER TABLE ADD PARTITION");
+        self.emit_audit_event(
+            session,
+            &root,
+            &database,
+            &table,
+            "ALTER TABLE ADD PARTITION",
+        );
         Ok(())
     }
 
@@ -532,7 +546,13 @@ impl HiveDdlHandler {
             .map_err(|e| SqeError::Execution(e.to_string()))?;
 
         self.invalidate_manifest(&database, &table);
-        self.emit_audit_event(session, &root, &database, &table, "ALTER TABLE DROP PARTITION");
+        self.emit_audit_event(
+            session,
+            &root,
+            &database,
+            &table,
+            "ALTER TABLE DROP PARTITION",
+        );
         Ok(())
     }
 
@@ -545,7 +565,8 @@ impl HiveDdlHandler {
         session: &Session,
         table_ref: &TableReference,
     ) -> Result<usize, SqeError> {
-        self.repair_index(session, table_ref, "MSCK REPAIR TABLE").await
+        self.repair_index(session, table_ref, "MSCK REPAIR TABLE")
+            .await
     }
 
     /// Rebuild `sqe.partition_index` after a write, so a new partition
@@ -575,6 +596,27 @@ impl HiveDdlHandler {
         table_ref: &TableReference,
     ) -> Result<usize, SqeError> {
         self.repair_index(session, table_ref, "INSERT").await
+    }
+
+    /// Refuse a write BEFORE any data file lands. The post-write index
+    /// refresh runs the same check, but by then the objects exist in the
+    /// bucket and a later `MSCK REPAIR TABLE` by anyone makes them visible
+    /// (architecture review 503). Both checks stay: this one is the gate,
+    /// the later one is belt and braces.
+    pub async fn refuse_write_if_denied(
+        &self,
+        session: &Session,
+        table_ref: &TableReference,
+        statement: &str,
+    ) -> Result<(), SqeError> {
+        let (root, database, table) = self.full_hive_name(table_ref)?;
+        let store = self.store_for(&root)?;
+        let manifest = store
+            .get(&database, &table)
+            .await
+            .map_err(|e| SqeError::Execution(e.to_string()))?;
+        self.refuse_if_denied(&session.user, &database, &table, &manifest, statement)
+            .await
     }
 
     async fn repair_index(
@@ -624,22 +666,23 @@ impl HiveDdlHandler {
             .await
             .map_err(|e| SqeError::Execution(e.to_string()))?;
 
-        let policy = self.resolve_policy(user, &database, &table, &manifest).await;
+        let policy = self
+            .resolve_policy(user, &database, &table, &manifest)
+            .await;
         if policy_denies_all(&policy) {
             return Err(SqeError::Execution(format!(
                 "hive_external: table not found: {database}.{table}"
             )));
         }
 
-        Ok(sqe_catalog::hive::partition::list_partitions(
-            &store,
-            &manifest,
+        Ok(
+            sqe_catalog::hive::partition::list_partitions(&store, &manifest)
+                .await
+                .map_err(|e| SqeError::Execution(e.to_string()))?
+                .into_iter()
+                .map(|p| p.spec)
+                .collect(),
         )
-        .await
-        .map_err(|e| SqeError::Execution(e.to_string()))?
-        .into_iter()
-        .map(|p| p.spec)
-        .collect())
     }
 
     /// `ANALYZE TABLE` against a Hive root: persist row counts into
@@ -725,8 +768,15 @@ impl HiveDdlHandler {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        resolve_effective_policy(store, user, table, database, &col_tags, self.mask_precedence)
-            .await
+        resolve_effective_policy(
+            store,
+            user,
+            table,
+            database,
+            &col_tags,
+            self.mask_precedence,
+        )
+        .await
     }
 
     async fn refuse_if_denied(

@@ -8,6 +8,7 @@
 - Category: performance
 - Effort: M
 - Status: fixed (branch `fix/security-scale-review-2026-09-05`, 2026-09-05)
+- Issue: #650
 - Confidence: high in source-level defect; deployment impact depends on stated prerequisites
 
 ## Problem

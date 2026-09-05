@@ -4,7 +4,8 @@
 - Severity: medium
 - Category: testing
 - Effort: M (days)
-- Status: open
+- Status: fixed (branch `fix/authz-policy-enforcement-p1`, 2026-09-05)
+- Issue: #564
 
 ## Problem
 
@@ -69,3 +70,7 @@ Add a coordinator integration test `policy_dml_parity` (see 201 and 202).
 - 200, 201, 202, 203.
 - docs/internal/reviews/2026-07-25-production-readiness-review.md, Security
   row of the qualification matrix.
+
+## Resolution (2026-09-05)
+
+New integration suite `crates/sqe-policy/tests/rewriter_shapes.rs` (12 tests) drives the rewriter through the shapes the review listed as untested and compares governed output against an ungoverned baseline: IN and EXISTS subqueries (correlated and uncorrelated), scalar subqueries under masks, joins with the governed table on either side, UNION, CTEs, DISTINCT/GROUP BY over masked columns, and denied columns referenced indirectly. Negative-case coverage for the write paths ships with the fixes for 202 (MERGE target), 503 (Hive INSERT source and target) and 510 (maintenance tiers) in this same branch.

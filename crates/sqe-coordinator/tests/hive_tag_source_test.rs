@@ -166,13 +166,13 @@ fn a_root_attached_after_the_rewriter_was_built_still_gets_the_hive_key() {
     let cats = Arc::new(HiveCatalogs::default());
     let r = datafusion::common::TableReference::full("lake", "sales", "orders");
     assert_eq!(
-        sqe_policy::plan_rewriter::resolve_policy_key_for_test(&r, &cats),
+        sqe_policy::plan_rewriter::resolve_policy_key(&r, &cats),
         Some(("sales".to_string(), "orders".to_string())),
         "before ATTACH the root is unknown, so the Iceberg branch is correct"
     );
     cats.insert("lake");
     assert_eq!(
-        sqe_policy::plan_rewriter::resolve_policy_key_for_test(&r, &cats),
+        sqe_policy::plan_rewriter::resolve_policy_key(&r, &cats),
         Some(("lake.sales".to_string(), "orders".to_string())),
         "after ATTACH the same reference must key under the root"
     );
@@ -315,13 +315,15 @@ async fn a_tag_in_the_hive_manifest_masks_the_column_in_an_executed_plan() {
     let (cache, hive_catalogs) =
         fixture_with_tagged_manifest("lake", "sales", "orders", "ssn", "PII");
 
-    let routed = Arc::new(sqe_coordinator::hive_tag_source::CatalogRoutedTagSource::new(
-        hive_catalogs,
-        Arc::new(sqe_coordinator::hive_tag_source::HiveTagSource::new(cache)),
-        // The Iceberg side stays fail-closed, so a mask that appears can only
-        // have come from the Hive branch.
-        Arc::new(AlwaysUnknown),
-    ));
+    let routed = Arc::new(
+        sqe_coordinator::hive_tag_source::CatalogRoutedTagSource::new(
+            hive_catalogs,
+            Arc::new(sqe_coordinator::hive_tag_source::HiveTagSource::new(cache)),
+            // The Iceberg side stays fail-closed, so a mask that appears can only
+            // have come from the Hive branch.
+            Arc::new(AlwaysUnknown),
+        ),
+    );
 
     let mem = Arc::new(MemTable::try_new(orders_schema(), vec![vec![orders_batch()]]).unwrap());
     let tref = datafusion::common::TableReference::full("lake", "sales", "orders");
@@ -380,11 +382,13 @@ async fn a_tag_row_filter_also_reaches_a_hive_scan() {
     // "masks work" is not evidence that filters do.
     let (cache, hive_catalogs) =
         fixture_with_tagged_manifest("lake", "sales", "orders", "ssn", "PII");
-    let routed = Arc::new(sqe_coordinator::hive_tag_source::CatalogRoutedTagSource::new(
-        hive_catalogs,
-        Arc::new(sqe_coordinator::hive_tag_source::HiveTagSource::new(cache)),
-        Arc::new(AlwaysUnknown),
-    ));
+    let routed = Arc::new(
+        sqe_coordinator::hive_tag_source::CatalogRoutedTagSource::new(
+            hive_catalogs,
+            Arc::new(sqe_coordinator::hive_tag_source::HiveTagSource::new(cache)),
+            Arc::new(AlwaysUnknown),
+        ),
+    );
 
     let mem = Arc::new(MemTable::try_new(orders_schema(), vec![vec![orders_batch()]]).unwrap());
     let tref = datafusion::common::TableReference::full("lake", "sales", "orders");
@@ -397,8 +401,9 @@ async fn a_tag_row_filter_also_reaches_a_hive_scan() {
     let store = OneTagMaskStore {
         tag: "PII".to_string(),
         mask: MaskType::Nullify,
-        tag_filters: vec![datafusion::logical_expr::col("order_id")
-            .eq(datafusion::logical_expr::lit(2_i64))],
+        tag_filters: vec![
+            datafusion::logical_expr::col("order_id").eq(datafusion::logical_expr::lit(2_i64))
+        ],
     };
     let rewriter = PolicyPlanRewriter::new(Arc::new(store)).with_tag_source(routed);
     let (rewritten, _summary) = rewriter.evaluate(&test_user(), plan).await.unwrap();
@@ -435,11 +440,13 @@ async fn a_resource_level_mask_needs_no_tag_at_all_on_a_hive_scan() {
     // resolves. If this passes, Hive column masking does not depend on cycle 3
     // at all, and cycle 3 only buys tag-DRIVEN masking.
     let (cache, hive_catalogs) = fixture_with_cached_manifest("lake", "sales", "orders");
-    let routed = Arc::new(sqe_coordinator::hive_tag_source::CatalogRoutedTagSource::new(
-        hive_catalogs,
-        Arc::new(sqe_coordinator::hive_tag_source::HiveTagSource::new(cache)),
-        Arc::new(AlwaysUnknown),
-    ));
+    let routed = Arc::new(
+        sqe_coordinator::hive_tag_source::CatalogRoutedTagSource::new(
+            hive_catalogs,
+            Arc::new(sqe_coordinator::hive_tag_source::HiveTagSource::new(cache)),
+            Arc::new(AlwaysUnknown),
+        ),
+    );
 
     let mem = Arc::new(MemTable::try_new(orders_schema(), vec![vec![orders_batch()]]).unwrap());
     let tref = datafusion::common::TableReference::full("lake", "sales", "orders");

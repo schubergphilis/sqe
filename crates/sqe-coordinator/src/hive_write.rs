@@ -35,7 +35,11 @@ use sqe_core::SqeError;
 /// One-row `count` result, matching what the Iceberg insert path returns so a
 /// client cannot tell which engine path served the statement.
 fn rows_written(n: u64) -> Result<Vec<RecordBatch>, SqeError> {
-    let schema = Arc::new(Schema::new(vec![Field::new("count", DataType::UInt64, false)]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "count",
+        DataType::UInt64,
+        false,
+    )]));
     let col: ArrayRef = Arc::new(UInt64Array::from(vec![n]));
     RecordBatch::try_new(schema, vec![col])
         .map(|b| vec![b])
@@ -78,10 +82,19 @@ pub fn reject_overwrite(stmt: &Statement) -> Result<(), SqeError> {
 /// context on purpose: DataFusion's own INSERT planning is what calls
 /// `TableProvider::insert_into`, and reimplementing the fan-out here would mean
 /// a second writer that has to agree with the read path's file schema.
+///
+/// The source SELECT runs through `enforcer` exactly as the Iceberg INSERT path
+/// does (`WriteHandler::enforce_source_plan`): without it, `INSERT INTO
+/// lake.dump.t SELECT * FROM masked_table` copied unmasked, unfiltered rows
+/// into a Hive directory the caller can read with any tool (architecture
+/// review 503). The policy summary is returned for the audit entry.
 pub async fn handle_insert(
     ctx: &SessionContext,
     stmt: &Statement,
     sql: &str,
+    enforcer: &dyn sqe_policy::PolicyEnforcer,
+    user: &sqe_core::SessionUser,
+    policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
 ) -> Result<Vec<RecordBatch>, SqeError> {
     reject_overwrite(stmt)?;
 
@@ -99,10 +112,13 @@ pub async fn handle_insert(
         .execution
         .keep_partition_by_columns = false;
 
-    let df = ctx
-        .sql(sql)
+    let state = ctx.state();
+    let plan = state
+        .create_logical_plan(sql)
         .await
         .map_err(|e| SqeError::Execution(format!("hive insert: planning failed: {e}")))?;
+    let plan = enforce_insert_source(plan, enforcer, user, policy_summary_out).await?;
+    let df = datafusion::dataframe::DataFrame::new(state, plan);
     let batches = df
         .collect()
         .await
@@ -118,6 +134,33 @@ pub async fn handle_insert(
         .unwrap_or(0);
 
     rows_written(written)
+}
+
+/// Run the INSERT's source plan through the policy enforcer and rebuild the
+/// DML node around the enforced input. Anything that is not an INSERT (the
+/// planner should never hand us one here) is refused rather than executed
+/// unenforced.
+async fn enforce_insert_source(
+    plan: datafusion::logical_expr::LogicalPlan,
+    enforcer: &dyn sqe_policy::PolicyEnforcer,
+    user: &sqe_core::SessionUser,
+    policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
+) -> Result<datafusion::logical_expr::LogicalPlan, SqeError> {
+    use datafusion::logical_expr::{DmlStatement, LogicalPlan};
+    let LogicalPlan::Dml(dml) = plan else {
+        return Err(SqeError::Execution(
+            "hive insert: statement did not plan to an INSERT".to_string(),
+        ));
+    };
+    let source = Arc::unwrap_or_clone(dml.input);
+    let (enforced, summary) = enforcer.evaluate(user, source).await?;
+    *policy_summary_out = Some(summary);
+    Ok(LogicalPlan::Dml(DmlStatement::new(
+        dml.table_name,
+        dml.target,
+        dml.op,
+        Arc::new(enforced),
+    )))
 }
 
 #[cfg(test)]
@@ -157,7 +200,10 @@ mod tests {
         // rather than `overwrite`. Checking only `overwrite` would let this
         // reach the sink and append.
         let err = reject_overwrite(&parse("REPLACE INTO t SELECT 1"));
-        assert!(err.is_err(), "REPLACE INTO must not fall through to an append");
+        assert!(
+            err.is_err(),
+            "REPLACE INTO must not fall through to an append"
+        );
     }
 }
 
@@ -343,7 +389,10 @@ pub fn ctas_spec(
     }
     let mut partition_keys = Vec::with_capacity(declared.len());
     for (i, (_, declared_type)) in declared.iter().enumerate() {
-        partition_keys.push(to_column(query_schema.field(split + i), declared_type.as_ref())?);
+        partition_keys.push(to_column(
+            query_schema.field(split + i),
+            declared_type.as_ref(),
+        )?);
     }
 
     let stored_as = match ct.hive_formats.as_ref().and_then(|f| f.storage.as_ref()) {
@@ -418,7 +467,10 @@ mod ctas_tests {
     use sqlparser::parser::Parser;
 
     fn ct(sql: &str) -> sqlparser::ast::CreateTable {
-        match Parser::parse_sql(&GenericDialect {}, sql).expect("parse").remove(0) {
+        match Parser::parse_sql(&GenericDialect {}, sql)
+            .expect("parse")
+            .remove(0)
+        {
             Statement::CreateTable(ct) => ct,
             other => panic!("not a CREATE TABLE: {other:?}"),
         }
@@ -443,18 +495,27 @@ mod ctas_tests {
             "CREATE TABLE lake.sales.o (id BIGINT) PARTITIONED BY (dt string) \
              LOCATION 's3://b/p/' AS SELECT 1 AS id, 'x' AS dt",
         );
-        assert!(c.partition_by.is_none(), "the field a naive reading would use");
+        assert!(
+            c.partition_by.is_none(),
+            "the field a naive reading would use"
+        );
         let spec = ctas_spec(
             &c,
             &schema(&[("id", DataType::Int64), ("dt", DataType::Utf8)]),
         )
         .expect("spec");
         assert_eq!(
-            spec.partition_keys.iter().map(|k| k.name.as_str()).collect::<Vec<_>>(),
+            spec.partition_keys
+                .iter()
+                .map(|k| k.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["dt"]
         );
         assert_eq!(
-            spec.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            spec.columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["id"],
             "the partition column must NOT also be a stored column"
         );
@@ -494,14 +555,16 @@ mod ctas_tests {
         .expect_err("dt is first, not last");
         let msg = err.to_string();
         assert!(msg.contains("must be column 2"), "{msg}");
-        assert!(msg.contains("`id`"), "the message must name what is there: {msg}");
+        assert!(
+            msg.contains("`id`"),
+            "the message must name what is there: {msg}"
+        );
     }
 
     #[test]
     fn a_missing_location_is_refused_rather_than_invented() {
         let c = ct("CREATE TABLE lake.sales.o AS SELECT 1 AS id");
-        let err = ctas_spec(&c, &schema(&[("id", DataType::Int64)]))
-            .expect_err("no LOCATION");
+        let err = ctas_spec(&c, &schema(&[("id", DataType::Int64)])).expect_err("no LOCATION");
         let msg = err.to_string();
         assert!(msg.contains("LOCATION"), "{msg}");
         assert!(
@@ -512,11 +575,8 @@ mod ctas_tests {
 
     #[test]
     fn or_replace_is_refused_because_drop_leaves_the_data() {
-        let c = ct(
-            "CREATE OR REPLACE TABLE lake.sales.o LOCATION 's3://b/p/' AS SELECT 1 AS id",
-        );
-        let err = ctas_spec(&c, &schema(&[("id", DataType::Int64)]))
-            .expect_err("or_replace");
+        let c = ct("CREATE OR REPLACE TABLE lake.sales.o LOCATION 's3://b/p/' AS SELECT 1 AS id");
+        let err = ctas_spec(&c, &schema(&[("id", DataType::Int64)])).expect_err("or_replace");
         let msg = err.to_string();
         assert!(
             msg.contains("union"),
@@ -543,8 +603,8 @@ mod ctas_tests {
             "CREATE TABLE lake.sales.o PARTITIONED BY (dt) LOCATION 's3://b/p/' \
              AS SELECT 'x' AS dt",
         );
-        let err = ctas_spec(&c, &schema(&[("dt", DataType::Utf8)]))
-            .expect_err("no file columns left");
+        let err =
+            ctas_spec(&c, &schema(&[("dt", DataType::Utf8)])).expect_err("no file columns left");
         assert!(err.to_string().contains("nothing to store"), "{err}");
     }
 }
