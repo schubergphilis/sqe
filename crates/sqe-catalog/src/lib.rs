@@ -70,3 +70,5 @@ pub use rest_catalog::{
 };
 #[cfg(feature = "rest")]
 pub use system_catalog::{SystemCatalogEntry, SystemCatalogProvider};
+
+mod scoped_table;

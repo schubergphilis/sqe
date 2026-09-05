@@ -788,20 +788,19 @@ impl WriteHandler {
 
     /// Resolve fanout limits for a partitioned streaming write from config.
     ///
-    /// Both knobs default to 0 → [`FanoutLimits::unbounded`], the vendored
-    /// `TaskWriter` path (byte-for-byte unchanged). Setting
-    /// `fanout_max_open_writers` or `fanout_buffer_budget` opts into the bounded
-    /// writer; once bounded mode is active, a knob left at 0 is auto-derived
-    /// from the coordinator memory pool ([`auto_fanout_caps`]) so the operator
-    /// need only set one. `write_buffer_tracking = false` forces unbounded. A
-    /// malformed `fanout_buffer_budget` string warns and disables just the
-    /// byte budget rather than failing the write.
-    ///
-    /// Note: both-0 stays unbounded on purpose. Making auto-derivation apply
-    /// with no knob set (spec open decision #4 "both-0 = bounded") would route
-    /// every partitioned write through the bounded writer; that default flip is
-    /// held for a stack-validated follow-up.
-    fn fanout_limits(&self) -> FanoutLimits {
+    /// Bounded fanout is the default (spec open decision #4, closed by
+    /// security/scale review 905): a knob left at 0 is auto-derived from the
+    /// coordinator memory pool ([`auto_fanout_caps`]) so an unsorted write over
+    /// many partitions never holds an unbounded set of open Parquet writers.
+    /// `pool`, when supplied, charges the buffered fanout estimate to the
+    /// shared pool so it competes with operator memory instead of growing
+    /// beside it. `write_buffer_tracking = false` is the escape hatch back to
+    /// the vendored unbounded `TaskWriter` path. A malformed
+    /// `fanout_buffer_budget` string warns and falls back to the auto budget.
+    fn fanout_limits(
+        &self,
+        pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
+    ) -> FanoutLimits {
         if !self.config.query.write_buffer_tracking {
             return FanoutLimits::unbounded();
         }
@@ -813,19 +812,14 @@ impl WriteHandler {
                     warn!(
                         error = %e,
                         value = %self.config.query.fanout_buffer_budget,
-                        "invalid fanout_buffer_budget; disabling fanout byte budget"
+                        "invalid fanout_buffer_budget; using the auto-derived budget"
                     );
                     0
                 }
             };
 
-        // Both unset → unbounded, unchanged default path.
-        if cfg_max == 0 && cfg_budget == 0 {
-            return FanoutLimits::unbounded();
-        }
-
-        // Bounded mode is active; auto-derive whichever knob is still 0 from the
-        // coordinator pool size so the operator only has to set one.
+        // Auto-derive whichever knob is 0 from the coordinator pool size so
+        // the operator never has to set either for a bounded write.
         let pool_bytes =
             sqe_core::config::parse_memory_limit(&self.config.coordinator.memory_limit)
                 .unwrap_or(8 * 1024 * 1024 * 1024);
@@ -837,6 +831,7 @@ impl WriteHandler {
             } else {
                 auto_budget
             },
+            pool,
         }
     }
 
@@ -1353,7 +1348,7 @@ impl WriteHandler {
                 self.metrics.as_ref(),
                 self.compression(session),
                 tracker,
-                self.fanout_limits(),
+                self.fanout_limits(Some(ctx.runtime_env().memory_pool.clone())),
             )
             .await?;
 
@@ -1532,7 +1527,7 @@ impl WriteHandler {
             self.metrics.as_ref(),
             self.compression(session),
             tracker,
-            self.fanout_limits(),
+            self.fanout_limits(Some(ctx.runtime_env().memory_pool.clone())),
         )
         .await?;
 
@@ -2049,7 +2044,9 @@ impl WriteHandler {
             self.metrics.as_ref(),
             self.compression(session),
             tracker,
-            self.fanout_limits(),
+            // Flight DoPut has no session context; the auto-derived caps still bound
+            // the writer set, only the pool charge is unavailable here.
+            self.fanout_limits(None),
         )
         .await?;
 
@@ -3629,7 +3626,7 @@ impl WriteHandler {
             self.metrics.as_ref(),
             self.compression(session),
             tracker,
-            self.fanout_limits(),
+            self.fanout_limits(Some(ctx.runtime_env().memory_pool.clone())),
         )
         .await?;
 
@@ -6929,6 +6926,34 @@ mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, TimeUnit};
     use sqlparser::ast::{DataType as SqlType, ExactNumberInfo, TimezoneInfo};
+
+    /// 905: partitioned writes are bounded by default and charge the pool.
+    #[test]
+    fn fanout_limits_default_to_bounded_with_pool() {
+        use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+        let handler = WriteHandler::new(write_test_config());
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+
+        let limits = handler.fanout_limits(Some(pool));
+        assert!(limits.is_bounded(), "both knobs at 0 must auto-derive caps");
+        assert!(limits.max_open >= 8 && limits.max_open <= 64, "{}", limits.max_open);
+        assert!(limits.byte_budget > 0);
+        assert!(limits.pool.is_some(), "pool is forwarded for shared accounting");
+
+        let mut config = write_test_config();
+        config.query.fanout_max_open_writers = 3;
+        let limits = WriteHandler::new(config).fanout_limits(None);
+        assert_eq!(limits.max_open, 3, "explicit cap wins over auto");
+        assert!(limits.byte_budget > 0, "budget still auto-derived");
+        assert!(limits.pool.is_none());
+
+        let mut config = write_test_config();
+        config.query.write_buffer_tracking = false;
+        assert!(
+            !WriteHandler::new(config).fanout_limits(None).is_bounded(),
+            "write_buffer_tracking = false is the escape hatch"
+        );
+    }
 
     // -------------------------------------------------------------------------
     // target-catalog resolution: explicit qualifier -> session catalog -> default

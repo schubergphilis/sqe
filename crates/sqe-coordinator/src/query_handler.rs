@@ -313,6 +313,11 @@ impl QueryHandler {
         }
         let explain_handler =
             crate::explain::ExplainHandler::new(Arc::clone(&policy_enforcer), &config.query);
+        // A table HEAD cannot validate a cached row filter, mask or local deny.
+        // Default every policy implementation to no result reuse unless it
+        // explicitly declares that it is a passthrough enforcer.
+        let query_cache = query_cache.filter(|_| policy_enforcer.permits_result_cache());
+
         let query_semaphore = if config.query.max_concurrent_queries > 0 {
             Some(Arc::new(tokio::sync::Semaphore::new(
                 config.query.max_concurrent_queries,
@@ -1084,7 +1089,7 @@ impl QueryHandler {
         if let StatementKind::Query(_) = &kind {
             if let Some(ref cache) = self.query_cache {
                 let authorized = cache
-                    .lookup_authorized(&session.user.username, sql, |cached| async move {
+                    .lookup_authorized(&ResultCache::session_scope(session), sql, |cached| async move {
                         self.authorize_cached_tables(session, &cached.tables_touched)
                             .await
                     })
@@ -2272,7 +2277,7 @@ impl QueryHandler {
                 if matches!(&kind, StatementKind::Query(_)) {
                     if let Ok(ref batches) = result {
                         cache.store(
-                            &session.user.username,
+                            &ResultCache::session_scope(session),
                             sql,
                             query_id,
                             batches.clone(),

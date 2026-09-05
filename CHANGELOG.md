@@ -24,6 +24,17 @@ All notable changes to SQE are documented in this file.
     after dependency changes; `ci/aikido-rust-extra.sh` fails when the crate
     is stale.
 
+- CI: the image job only packages binaries compiled by cargo in the test stage
+
+    `release-binaries` (test stage, `needs: []`) runs `cargo build` for the
+    four binaries in parallel with the test gate and publishes them as an
+    artifact; `Dockerfile.ci` is a COPY-only twin of the runtime stages, and
+    the kaniko job consumes the artifact through `dependencies:` so the
+    default-branch push still waits for the whole test stage. Compiling
+    inside kaniko took 38 to 67 minutes after the tests and ignored every
+    cache mount. Merge requests build with `dev-release` (no LTO) since that
+    image is never published; main keeps `release`.
+
 - CI: image build runs in parallel with the test gate on merge requests
 
     `aikido-build-validate` (MR only, `--no-push`, `needs: []`) starts at
@@ -40,7 +51,10 @@ All notable changes to SQE are documented in this file.
     sqe-catalog feature matrix and `cargo xtask matrix-report` moved from the
     test job's tail into a parallel, blocking `rust-feature-matrix` job. The
     never-run `scenario-test-aws` skeleton and the duplicate GitLab
-    Secret-Detection include are removed. Baseline and the rest of the plan:
+    Secret-Detection include are removed. The aikido include moves to v0.12.0,
+    which carries the same gate changes upstream (aikido !155), so the local
+    `rust-feature-matrix` job and the `needs: []` overrides are gone again.
+    Baseline and the rest of the plan:
     `docs/internal/plans/2026-09-04-build-test-time-program.md`.
 
 ### Added

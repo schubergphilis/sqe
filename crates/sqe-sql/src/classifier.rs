@@ -310,7 +310,7 @@ pub fn parse_and_classify_typed(
 
 /// Strip a case-insensitive ASCII `prefix` from `s`, returning the remainder.
 ///
-/// The previous pre-scan tested `prefix` against `s.to_uppercase()` but sliced
+/// The previous pre-scan tested `prefix` against `s.to_ascii_uppercase()` but sliced
 /// the ORIGINAL string by the prefix's byte length. `to_uppercase()` can change
 /// a string's byte length for some Unicode code points, so the matched-prefix
 /// length on the uppercased copy could differ from the byte span in the
@@ -342,7 +342,7 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 /// `path_components` are the dot-split, unquoted field names. Returns `None`
 /// for a non-dotted DROP COLUMN (which sqlparser handles normally). (#336)
 fn detect_nested_drop_column(trimmed: &str) -> Option<(String, Vec<String>, bool)> {
-    let upper = trimmed.to_uppercase();
+    let upper = trimmed.to_ascii_uppercase();
     let idx = upper.find("DROP COLUMN")?;
     // The table reference sits between `ALTER TABLE [IF EXISTS]` and `DROP COLUMN`.
     let prefix = trimmed[..idx].trim_end();
@@ -384,7 +384,7 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
     // Before parsing with sqlparser, check for SHOW CATALOGS which sqlparser
     // may not natively support.
     let trimmed = sql.trim();
-    let upper = trimmed.to_uppercase();
+    let upper = trimmed.to_ascii_uppercase();
 
     if let Some(policy) = try_parse_policy_ddl(trimmed)? {
         return Ok(StatementKind::PolicyDdl(Box::new(policy)));
@@ -482,7 +482,7 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
         let rest = rest.trim().trim_end_matches(';');
         let parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
         if parts.len() == 2 {
-            let grantee_type = parts[0].to_uppercase();
+            let grantee_type = parts[0].to_ascii_uppercase();
             let grantee_name = parts[1]
                 .trim()
                 .trim_matches('"')
@@ -670,7 +670,7 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
         // Accept: SET WRITE_BRANCH = 'name', SET WRITE_BRANCH 'name',
         //         SET WRITE_BRANCH = DEFAULT, SET WRITE_BRANCH = NULL
         let stripped = rest.strip_prefix('=').unwrap_or(rest).trim();
-        let upper_val = stripped.to_uppercase();
+        let upper_val = stripped.to_ascii_uppercase();
         if upper_val == "DEFAULT" || upper_val == "NULL" || stripped.is_empty() {
             return Ok(StatementKind::SetWriteBranch(None));
         }
@@ -851,7 +851,7 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
         Statement::ShowVariable { ref variable } => {
             let var_str: String = variable
                 .iter()
-                .map(|i| i.value.to_uppercase())
+                .map(|i| i.value.to_ascii_uppercase())
                 .collect::<Vec<_>>()
                 .join(" ");
             if var_str == "CATALOGS" {
@@ -1110,7 +1110,7 @@ fn parse_resource_reference(
 
 /// Parse `CHECK ACCESS privilege ON resource FOR USER "name"`.
 fn parse_check_access(rest: &str) -> sqe_core::Result<StatementKind> {
-    let upper = rest.to_uppercase();
+    let upper = rest.to_ascii_uppercase();
     // Find " ON " to split privilege from the rest
     let on_pos = upper.find(" ON ").ok_or_else(|| {
         sqe_core::SqeError::Execution(
@@ -1122,7 +1122,7 @@ fn parse_check_access(rest: &str) -> sqe_core::Result<StatementKind> {
     let after_on = rest[on_pos + 4..].trim();
 
     // Find " FOR USER " to split resource from user
-    let after_on_upper = after_on.to_uppercase();
+    let after_on_upper = after_on.to_ascii_uppercase();
     let for_user_pos = after_on_upper.find(" FOR USER ").ok_or_else(|| {
         sqe_core::SqeError::Execution(
             "CHECK ACCESS requires: CHECK ACCESS <privilege> ON <resource> FOR USER \"<name>\""
@@ -1161,7 +1161,7 @@ fn parse_show_effective_policy(rest: &str, has_user: bool) -> sqe_core::Result<S
 
     let (user, table) = if has_user {
         // Input is `<name> ON <table>` (the `FOR USER ` prefix was stripped).
-        let upper = rest.to_uppercase();
+        let upper = rest.to_ascii_uppercase();
         let on_pos = upper.find(" ON ").ok_or_else(bad_syntax)?;
         let user = rest[..on_pos]
             .trim()
@@ -1194,6 +1194,27 @@ fn parse_show_effective_policy(rest: &str, has_user: bool) -> sqe_core::Result<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_case_expansion_never_changes_prescan_offsets() {
+        for sql in [
+            "ſHOW TAGS FROM t",
+            "SELECT 'ß' FROM t FOR VERSION AS OF 1",
+            "ALTER TABLE café CREATE TAG v1",
+            "ALTER TABLE ß ADD PARTITION FIELD x",
+            "ALTER TABLE t SET TAGS ('ß' = 'ſ')",
+            "SELECT 'ıſßﬃ'",
+        ] {
+            // The parser may reject unsupported syntax; none may panic.
+            let _ = parse_and_classify(sql);
+            let _ = crate::time_travel::extract_time_travel_spec(sql);
+            let _ = crate::time_travel::extract_incremental_spec(sql);
+            let _ = crate::ddl::try_parse_ref_ddl(sql);
+            let _ = crate::tags::try_parse_set_tags(sql);
+            let _ = crate::partition_evolution::try_parse_partition_evolution(sql);
+            let _ = crate::hive_partitions::try_parse_hive_partition_ddl(sql);
+        }
+    }
 
     #[test]
     fn test_select_is_query() {
