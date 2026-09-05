@@ -21,6 +21,13 @@ services:
       - "29090:9090"    # Prometheus metrics
     environment:
       RUST_LOG: sqe=info,warn
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9091/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+    mem_limit: 8g
     depends_on:
       polaris:
         condition: service_healthy
@@ -30,7 +37,7 @@ services:
   # ── SQE Worker 1 ───────────────────────────────────────────
   worker-1:
     build: .
-    entrypoint: ["sqe-worker", "/config/worker.toml"]
+    entrypoint: ["sqe-worker", "--config", "/config/worker.toml"]
     volumes:
       - ./tests/distributed/worker.toml:/config/worker.toml:ro
     ports:
@@ -38,13 +45,20 @@ services:
       - "29091:9091"
     environment:
       RUST_LOG: sqe=info,warn
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9092/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+    mem_limit: 4g
     depends_on:
       - coordinator
 
   # ── SQE Worker 2 ───────────────────────────────────────────
   worker-2:
     build: .
-    entrypoint: ["sqe-worker", "/config/worker.toml"]
+    entrypoint: ["sqe-worker", "--config", "/config/worker.toml"]
     volumes:
       - ./tests/distributed/worker.toml:/config/worker.toml:ro
     ports:
@@ -52,5 +66,12 @@ services:
       - "29092:9091"
     environment:
       RUST_LOG: sqe=info,warn
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9092/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+    mem_limit: 4g
     depends_on:
       - coordinator

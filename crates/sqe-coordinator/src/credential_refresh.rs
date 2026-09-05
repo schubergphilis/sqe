@@ -12,7 +12,8 @@
 //!    Arrow Flight `do_action("refresh_credentials")`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Action;
@@ -27,20 +28,22 @@ use crate::channel_pool::ChannelPool;
 /// credential refresh push (issue #35). Matches the heartbeat path.
 const WORKER_SECRET_HEADER: &str = "x-sqe-worker-secret";
 
-fn push_connect_timeout() -> std::time::Duration {
-    std::env::var("SQE_COORDINATOR__CREDENTIAL_PUSH_CONNECT_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(std::time::Duration::from_secs)
-        .unwrap_or_else(|| std::time::Duration::from_secs(5))
+static PUSH_CONNECT_TIMEOUT: OnceLock<Duration> = OnceLock::new();
+static PUSH_REQUEST_TIMEOUT: OnceLock<Duration> = OnceLock::new();
+
+/// Wire credential-push timeouts from `SqeConfig`. Called once at coordinator
+/// startup so this module does not read `SQE_*` around the config loader.
+pub fn configure_push_timeouts(connect_secs: u64, request_secs: u64) {
+    let _ = PUSH_CONNECT_TIMEOUT.set(Duration::from_secs(connect_secs));
+    let _ = PUSH_REQUEST_TIMEOUT.set(Duration::from_secs(request_secs));
 }
 
-fn push_request_timeout() -> std::time::Duration {
-    std::env::var("SQE_COORDINATOR__CREDENTIAL_PUSH_REQUEST_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(std::time::Duration::from_secs)
-        .unwrap_or_else(|| std::time::Duration::from_secs(10))
+fn push_connect_timeout() -> Duration {
+    *PUSH_CONNECT_TIMEOUT.get_or_init(|| Duration::from_secs(5))
+}
+
+fn push_request_timeout() -> Duration {
+    *PUSH_REQUEST_TIMEOUT.get_or_init(|| Duration::from_secs(10))
 }
 
 /// Refreshed S3 credential payload pushed from coordinator to worker.

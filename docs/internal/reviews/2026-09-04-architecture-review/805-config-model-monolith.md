@@ -4,7 +4,14 @@
 - Severity: medium
 - Category: maintainability
 - Effort: M
-- Status: open
+- Status: partial (branch `fix/config-startup-code-structure`, 2026-09-05)
+
+## Resolution (2026-09-05)
+
+Partial with 103 on `fix/config-startup-code-structure`. Overlay, aliases and
+typed knobs extracted from the monolith; the remaining structs stay in
+`config/mod.rs` for a later decomposition.
+
 
 ## Problem
 

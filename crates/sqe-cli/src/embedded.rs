@@ -43,7 +43,7 @@ use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::prelude::SessionContext;
 use iceberg::CatalogBuilder;
 use iceberg_catalog_sql::{SqlCatalogBuilder, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE};
 use sqe_core::config::StorageConfig;
@@ -262,24 +262,9 @@ pub fn build_embedded_context(
     memory_limit_bytes: usize,
     storage: &StorageConfig,
 ) -> anyhow::Result<SessionContext> {
-    let session_config = SessionConfig::new()
+    let session_config = sqe_catalog::engine_session_config()
         .with_information_schema(true)
-        .with_default_catalog_and_schema("default", "default")
-        // Same DataFusion tuning the cluster coordinator applies. See
-        // the comments in `sqe-coordinator/src/session_context.rs` for
-        // the rationale on each flag.
-        .set_bool("datafusion.sql_parser.parse_float_as_decimal", true)
-        // DuckDB dialect: adds `x -> expr` lambda syntax for the Trino
-        // higher-order array functions without changing identifier/quoting
-        // behavior. See sqe-coordinator/src/session_context.rs and #354.
-        .set_str("datafusion.sql_parser.dialect", "DuckDB")
-        .set_usize(
-            "datafusion.optimizer.hash_join_single_partition_threshold",
-            64 * 1024 * 1024,
-        )
-        .set_bool("datafusion.optimizer.enable_dynamic_filter_pushdown", true)
-        .set_bool("datafusion.execution.parquet.pushdown_filters", true)
-        .set_bool("datafusion.execution.parquet.reorder_filters", true);
+        .with_default_catalog_and_schema("default", "default");
 
     let pool_size = memory_limit_bytes.max(64 * 1024 * 1024);
     let pool = Arc::new(FairSpillPool::new(pool_size));

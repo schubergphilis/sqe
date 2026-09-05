@@ -4,7 +4,15 @@
 - Severity: low
 - Category: maintainability
 - Effort: S
-- Status: open
+- Status: fixed (branch `fix/config-startup-code-structure`, 2026-09-05)
+
+## Resolution (2026-09-05)
+
+Fixed on `fix/config-startup-code-structure`. CLAUDE.md crate table matches
+the workspace members (minus workspace-hack/xtask), names `sqe-server`, lists
+the five client surfaces, and mentions OPA/Cedar only as historical. README
+quick start runs `sqe-server --config`.
+
 
 ## Problem
 

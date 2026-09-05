@@ -14,7 +14,7 @@ use datafusion::execution::memory_pool::{
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use tracing::info;
 
-use sqe_core::config::{CoordinatorConfig, StorageConfig};
+use sqe_core::config::{CoordinatorConfig, MemoryPoolKind, StorageConfig};
 use sqe_core::parse_memory_limit;
 
 /// Build a DataFusion [`RuntimeEnv`] for the coordinator with memory limits
@@ -43,7 +43,7 @@ use sqe_core::parse_memory_limit;
 /// every consumer at ~95 MB of an 8 GB pool and failing a partial aggregate
 /// that DataFusion 53 cannot emit early under a constant GROUP BY ordering
 /// key. Unknown values warn and fall back to greedy.
-fn build_memory_pool(kind: &str, memory_bytes: usize) -> Arc<dyn MemoryPool> {
+fn build_memory_pool(kind: MemoryPoolKind, memory_bytes: usize) -> Arc<dyn MemoryPool> {
     const TOP_CONSUMERS_IN_ERROR: usize = 5;
     let tracked_greedy = || {
         let pool = Arc::new(TrackConsumersPool::new(
@@ -55,16 +55,9 @@ fn build_memory_pool(kind: &str, memory_bytes: usize) -> Arc<dyn MemoryPool> {
         crate::memory::set_tracked_pool(Arc::clone(&pool));
         pool as Arc<dyn MemoryPool>
     };
-    match kind.trim().to_ascii_lowercase().as_str() {
-        "fair" => Arc::new(FairSpillPool::new(memory_bytes)),
-        "greedy" => tracked_greedy(),
-        other => {
-            tracing::warn!(
-                memory_pool = other,
-                "Unknown coordinator.memory_pool, defaulting to greedy"
-            );
-            tracked_greedy()
-        }
+    match kind {
+        MemoryPoolKind::Fair => Arc::new(FairSpillPool::new(memory_bytes)),
+        MemoryPoolKind::Greedy => tracked_greedy(),
     }
 }
 
@@ -89,7 +82,7 @@ pub fn build_coordinator_runtime(
         "Configuring coordinator DataFusion runtime"
     );
 
-    let memory_pool = build_memory_pool(&config.memory_pool, memory_bytes);
+    let memory_pool = build_memory_pool(config.memory_pool, memory_bytes);
 
     // V10 httpfs: wrap the default ObjectStoreRegistry so http(s) URLs in
     // file-format TVFs (read_csv / read_json / read_parquet) get a backing
@@ -179,10 +172,9 @@ mod tests {
     fn test_memory_pool_knob() {
         // Default is greedy: a single consumer may take the whole pool.
         let config = config_no_spill("1GB");
-        assert_eq!(config.memory_pool, "greedy");
+        assert_eq!(config.memory_pool, MemoryPoolKind::Greedy);
 
-        // "fair" restores FairSpillPool; both report a finite limit.
-        for kind in ["greedy", "fair", "GREEDY", " Fair ", "bogus"] {
+        for kind in [MemoryPoolKind::Greedy, MemoryPoolKind::Fair] {
             let pool = build_memory_pool(kind, 1024 * 1024 * 1024);
             match pool.memory_limit() {
                 MemoryLimit::Finite(limit) => assert_eq!(limit, 1024 * 1024 * 1024),

@@ -21,7 +21,7 @@ SQE_BUILD_SECS=$((SQE_BUILD_END - SQE_BUILD_START))
 echo "  Build time: ${SQE_BUILD_SECS}s"
 
 # Binary size
-SQE_COORDINATOR_SIZE=$(stat -f%z target/release/sqe-coordinator 2>/dev/null || stat -c%s target/release/sqe-coordinator)
+SQE_COORDINATOR_SIZE=$(stat -f%z target/release/sqe-server 2>/dev/null || stat -c%s target/release/sqe-server)
 SQE_CLI_SIZE=$(stat -f%z target/release/sqe-cli 2>/dev/null || stat -c%s target/release/sqe-cli)
 echo "  Coordinator binary: $((SQE_COORDINATOR_SIZE / 1048576))MB"
 echo "  CLI binary: $((SQE_CLI_SIZE / 1048576))MB"
