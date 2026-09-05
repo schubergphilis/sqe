@@ -6,6 +6,14 @@ rust-version.workspace = true
 license = "Apache-2.0"
 repository.workspace = true
 
+[features]
+default = []
+# Stage-based shuffle planning nodes (`shuffle_exec.rs`, `distributed_join.rs`).
+# No coordinator module builds these plans today -- the executed topology is a
+# distributed scan with coordinator-side joins -- so they are compiled out by
+# default and kept for the stage-execution roadmap (review finding 600).
+shuffle-planning = []
+
 [dependencies]
 sqe-core = { path = "../sqe-core" }
 sqe-spill = { path = "../sqe-spill" }

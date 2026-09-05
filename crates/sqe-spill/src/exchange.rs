@@ -300,6 +300,41 @@ impl ExchangeAttemptStore {
             .get(&(key.clone(), attempt_id))
             .cloned()
     }
+
+    /// Drop every manifest and winner belonging to `query_id`.
+    ///
+    /// Both maps are keyed by a network-supplied `query_id`/`stage_id` pair, so
+    /// without this the store grows for the lifetime of the process: one entry
+    /// per task attempt ever admitted (review finding 600). Callers invoke this
+    /// from the "query finished" path. Returns the number of entries removed
+    /// across both maps.
+    pub fn forget_query(&self, query_id: &str) -> usize {
+        let mut removed = 0usize;
+        let mut manifests = self.manifests.lock().unwrap_or_else(|p| p.into_inner());
+        let before = manifests.len();
+        manifests.retain(|(key, _), _| key.query_id != query_id);
+        removed += before - manifests.len();
+        drop(manifests);
+
+        let mut winners = self.winners.lock().unwrap_or_else(|p| p.into_inner());
+        let before = winners.len();
+        winners.retain(|key, _| key.query_id != query_id);
+        removed += before - winners.len();
+        removed
+    }
+
+    /// Number of published/committed manifests currently retained.
+    pub fn tracked_manifests(&self) -> usize {
+        self.manifests
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
+    }
+
+    /// Number of committed winners currently retained.
+    pub fn tracked_winners(&self) -> usize {
+        self.winners.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
 }
 
 pub type SharedExchangeAttemptStore = Arc<ExchangeAttemptStore>;

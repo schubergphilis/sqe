@@ -20,8 +20,10 @@
 
 mod client;
 mod tableprovider;
+mod policy;
 mod tvf;
 
 pub use client::{ClientError, ExecuteResult, QuackClient};
+pub use policy::{QuackTargetPolicy, DEFAULT_MAX_RESULT_BYTES};
 pub use tableprovider::QuackTableProvider;
 pub use tvf::QuackQueryTvf;

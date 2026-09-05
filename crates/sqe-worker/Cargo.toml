@@ -14,6 +14,15 @@ path = "src/lib.rs"
 name = "sqe-worker"
 path = "src/main.rs"
 
+[features]
+default = []
+# DoExchange shuffle intake: `shuffle.rs`, `spill_buffer.rs` and the spillable
+# `do_exchange_spill` half of `flight_service.rs`. OFF by default -- no query
+# plan produces shuffle traffic today, so with the feature off `do_exchange`
+# returns Unimplemented and nothing keyed by a network-supplied
+# query_id/stage_id exists in the process (review finding 600).
+worker-shuffle = ["sqe-spill/exchange"]
+
 [dependencies]
 sqe-core = { path = "../sqe-core" }
 sqe-catalog = { path = "../sqe-catalog" }

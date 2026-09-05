@@ -4,7 +4,7 @@
 - Severity: high
 - Category: security
 - Effort: S (hours)
-- Status: open
+- Status: fixed (branch `fix/identity-transport-trust-p1`, 2026-09-05)
 - Issue: #557
 
 ## Problem
@@ -70,3 +70,7 @@ the canonical mapping.
 - 203 (the `token_verified` flag proposed there rides on this function).
 - docs/internal/reviews/2026-07-25-production-readiness-review.md P1
   "Groups" section describes the group-matching contract this breaks.
+
+## Resolution (2026-09-05)
+
+The identity-to-session mapping lives once, in `crates/sqe-auth/src/identity_session.rs` (`Identity::into_session` / `to_session` with the expiry fallback `DEFAULT_SESSION_LIFETIME` and the catalog-token fallback). All five call sites use it: `SessionManager::identity_to_session`, `auth_session::identity_to_session` (Trino), MCP `authenticate_oauth`, `MaintenancePrincipal::session_from_identity` (which only adds the maintenance marker on top) and the Quack server, whose private copy `identity_to_core_session` is deleted. Quack sessions therefore carry subject, email and groups, so group-only Ranger items apply over Quack exactly as over Flight SQL. Tests: `all_identity_fields_survive`, `fallback_token_used_only_when_provider_supplied_none`, `missing_expiry_falls_back_to_default_lifetime`.

@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 
+use arrow_array::RecordBatch;
 use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
@@ -16,23 +17,31 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
+use futures::stream::{BoxStream, StreamExt};
 use sqe_auth::{AuthError, AuthProvider, FlightCredentials};
 use sqe_core::config::{strip_port, SecurityConfig};
 use sqe_core::SecretString;
-use sqe_quack_wire::arrow_bridge::record_batch_to_data_chunk;
+use sqe_quack_wire::arrow_bridge::{arrow_schema_to_logical, record_batch_to_data_chunk};
 use sqe_quack_wire::codec::BinaryDeserializer;
-use sqe_quack_wire::data_chunk::DataChunk;
+use sqe_quack_wire::data_chunk::{DataChunk, LogicalType};
 use sqe_quack_wire::message::{
-    decode_message, encode_message, ConnectionResponse, ErrorResponse, MessageHeader, MessageType,
-    PrepareResponse, QuackMessage,
+    decode_message, encode_message, ConnectionResponse, ErrorResponse, FetchResponse,
+    MessageHeader, MessageType, PrepareResponse, QuackMessage,
 };
 use uuid::Uuid;
 
-use crate::query_executor::{QueryError, QueryExecutor};
-use crate::session::{identity_to_core_session, Session, SessionStore};
+use crate::pending::{PendingResult, PendingResults, PENDING_RESULT_IDLE};
+use crate::query_executor::{QueryError, QueryExecutor, QueryStream};
+use crate::session::{
+    Session, SessionRejection, SessionStore, DEFAULT_SESSION_IDLE, DEFAULT_SESSION_MAX_LIFETIME,
+};
 
 const QUACK_VERSION: u64 = 1;
 const APPLICATION_VND_DUCKDB: &str = "application/vnd.duckdb";
+
+/// What every handler returns: status, the single content-type header, and the
+/// encoded Quack message body.
+type QuackResponse = (StatusCode, [(&'static str, &'static str); 1], Vec<u8>);
 
 /// QUACK-08: ceiling on `ConnectionRequest` auth attempts per second, per
 /// client IP. Each request triggers an IdP round-trip, so an un-throttled path
@@ -62,9 +71,43 @@ const QUACK_GC_EVERY_N_CHECKS: u64 = 256;
 /// no room for a multi-MB recursion / allocation-count payload.
 const QUACK_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 
+/// Per-response ceiling on encoded result bytes (finding 606). The server
+/// stops filling a `PrepareResponse`/`FetchResponse` once the Arrow batches it
+/// has pulled reach this size and parks the rest of the stream for the next
+/// `FetchRequest`. 8 MiB keeps one response comfortably inside a normal HTTP
+/// body while still amortising the round trip.
+const QUACK_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Ceiling on the *total* Arrow bytes one query may return across its
+/// `PrepareResponse` and every subsequent `FetchResponse`. Paging alone bounds
+/// peak memory but not total work, so an unqualified `SELECT *` over a large
+/// table would still stream forever; past this point the query is refused and
+/// the parked stream dropped.
+const QUACK_MAX_RESULT_BYTES: usize = 256 * 1024 * 1024;
+
+/// The two result-size bounds, together so they travel as one unit.
+#[derive(Debug, Clone, Copy)]
+pub struct ResultLimits {
+    pub max_response_bytes: usize,
+    pub max_result_bytes: usize,
+}
+
+impl Default for ResultLimits {
+    fn default() -> Self {
+        Self {
+            max_response_bytes: QUACK_MAX_RESPONSE_BYTES,
+            max_result_bytes: QUACK_MAX_RESULT_BYTES,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct QuackServerState {
     pub sessions: SessionStore,
+    /// Half-drained result streams awaiting a `FetchRequest`.
+    pub pending: PendingResults,
+    /// Per-response and per-result byte ceilings.
+    pub limits: ResultLimits,
     pub server_duckdb_version: String,
     pub server_platform: String,
     pub auth_provider: Arc<dyn AuthProvider>,
@@ -92,7 +135,9 @@ impl QuackServerState {
         query_executor: Arc<dyn QueryExecutor>,
     ) -> Self {
         Self {
-            sessions: SessionStore::new(Duration::from_secs(600)),
+            sessions: SessionStore::new(DEFAULT_SESSION_IDLE, DEFAULT_SESSION_MAX_LIFETIME),
+            pending: PendingResults::new(PENDING_RESULT_IDLE),
+            limits: ResultLimits::default(),
             server_duckdb_version: format!("sqe-{}", env!("CARGO_PKG_VERSION")),
             server_platform: std::env::consts::OS.to_string(),
             auth_provider,
@@ -111,6 +156,28 @@ impl QuackServerState {
     /// behind a load balancer (every request would share the proxy's IP).
     pub fn with_security(mut self, security: SecurityConfig) -> Self {
         self.security = security;
+        self
+    }
+
+    /// Override the session idle window and absolute lifetime. Defaults are
+    /// 600 s idle / 8 h maximum; the token's own `exp` is checked per request
+    /// regardless and is usually the tighter bound.
+    pub fn with_session_limits(mut self, idle: Duration, max_lifetime: Duration) -> Self {
+        self.sessions = SessionStore::new(idle, max_lifetime);
+        self
+    }
+
+    /// Override the per-response and per-result byte ceilings (defaults 8 MiB
+    /// and 256 MiB).
+    pub fn with_result_limits(
+        mut self,
+        max_response_bytes: usize,
+        max_result_bytes: usize,
+    ) -> Self {
+        self.limits = ResultLimits {
+            max_response_bytes,
+            max_result_bytes,
+        };
         self
     }
 
@@ -207,21 +274,25 @@ async fn handle_quack(
         Err(e) => return error_response("", None, format!("SQE-PARSE: {e}")),
     };
 
+    // Resolve the client key once, for every message type. The auth limiter
+    // needs it on the ConnectionRequest path; every *post*-connect path needs
+    // it to check the session's client binding (finding 606), so it can no
+    // longer live inside the ConnectionRequest arm.
+    let forwarded_for = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+    let client_ip = client_key(peer, forwarded_for, &state.security);
+
     match (request_header.r#type, request_body) {
         (MessageType::ConnectionRequest, QuackMessage::ConnectionRequest(req)) => {
-            // Resolve the per-IP key only on the auth path; the limiter gates
-            // ConnectionRequest specifically, since that is the IdP-amplifying
-            // path. The header is read here (not in the dispatcher) so the
-            // other message types pay no resolution cost.
-            let forwarded_for = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
-            let client_ip = client_key(peer, forwarded_for, &state.security);
             handle_connection_request(&state, &request_header, &client_ip, req).await
         }
         (MessageType::DisconnectMessage, QuackMessage::DisconnectMessage) => {
-            handle_disconnect_message(&state, &request_header)
+            handle_disconnect_message(&state, &request_header, &client_ip)
         }
         (MessageType::PrepareRequest, QuackMessage::PrepareRequest(req)) => {
-            handle_prepare_request(&state, &request_header, req).await
+            handle_prepare_request(&state, &request_header, &client_ip, req).await
+        }
+        (MessageType::FetchRequest, QuackMessage::FetchRequest(req)) => {
+            handle_fetch_request(&state, &request_header, &client_ip, req).await
         }
         (msg_type, _) => error_response(
             &request_header.connection_id,
@@ -231,108 +302,193 @@ async fn handle_quack(
     }
 }
 
+/// Wire message for a refused session. `Unknown` and `ClientMismatch` share one
+/// string on purpose: a caller replaying a stolen `connection_id` from the
+/// wrong source must not learn that the id itself was valid.
+fn session_rejection_message(rejection: SessionRejection) -> &'static str {
+    match rejection {
+        SessionRejection::Expired => "SQE-AUTH: session expired",
+        SessionRejection::Unknown | SessionRejection::ClientMismatch => {
+            "SQE-AUTH: unknown connection_id"
+        }
+    }
+}
+
+/// Resolve the session for a post-connect request, dropping any parked results
+/// belonging to a session that has just been invalidated.
+fn authorize(
+    state: &QuackServerState,
+    request_header: &MessageHeader,
+    client_ip: &str,
+) -> Result<Session, QuackResponse> {
+    match state
+        .sessions
+        .get_authorized(&request_header.connection_id, client_ip)
+    {
+        Ok(session) => Ok(session),
+        Err(rejection) => {
+            if rejection == SessionRejection::Expired {
+                // The session is gone; its parked streams must go with it,
+                // otherwise an expired connection keeps DataFusion streams
+                // (and their memory reservations) alive until the idle sweep.
+                state
+                    .pending
+                    .remove_for_connection(&request_header.connection_id);
+            }
+            Err(error_response(
+                &request_header.connection_id,
+                request_header.client_query_id,
+                session_rejection_message(rejection).to_string(),
+            ))
+        }
+    }
+}
+
+/// One page of results: batches pulled from `stream` until either the stream
+/// ended or the accumulated Arrow size reached `max_response_bytes`.
+struct Page {
+    batches: Vec<RecordBatch>,
+    bytes: usize,
+    /// True when the stream reported EOF while filling this page.
+    exhausted: bool,
+}
+
+async fn pull_page(
+    stream: &mut BoxStream<'static, Result<RecordBatch, QueryError>>,
+    max_response_bytes: usize,
+) -> Result<Page, QueryError> {
+    let mut batches = Vec::new();
+    let mut bytes = 0usize;
+    let mut exhausted = true;
+    while let Some(item) = stream.next().await {
+        let batch = item?;
+        bytes = bytes.saturating_add(batch.get_array_memory_size());
+        batches.push(batch);
+        if bytes >= max_response_bytes {
+            exhausted = false;
+            break;
+        }
+    }
+    Ok(Page {
+        batches,
+        bytes,
+        exhausted,
+    })
+}
+
+fn encode_page(batches: &[RecordBatch]) -> Result<Vec<DataChunk>, sqe_quack_wire::WireError> {
+    batches.iter().map(record_batch_to_data_chunk).collect()
+}
+
+/// Map a `QueryError` onto the wire, applying the masking rules: policy
+/// denials and internal errors never carry their detail to the client.
+fn query_error_response(request_header: &MessageHeader, err: QueryError) -> QuackResponse {
+    let message = match err {
+        QueryError::Parse(msg) => format!("SQE-PARSE: {msg}"),
+        QueryError::Policy(msg) => {
+            // Don't echo the policy decision detail — that's the row-filter
+            // / column-mask payload, and leaking it defeats the policy.
+            tracing::info!(reason = %msg, "policy denied query");
+            "SQE-POLICY: access denied".to_string()
+        }
+        QueryError::Execution(msg) => format!("SQE-EXEC: {msg}"),
+        QueryError::Internal(msg) => {
+            tracing::warn!(error = %msg, "query executor internal error");
+            "SQE-EXEC: internal execution error".to_string()
+        }
+    };
+    error_response(
+        &request_header.connection_id,
+        request_header.client_query_id,
+        message,
+    )
+}
+
+fn result_too_large_response(
+    request_header: &MessageHeader,
+    max_result_bytes: usize,
+) -> QuackResponse {
+    error_response(
+        &request_header.connection_id,
+        request_header.client_query_id,
+        format!("SQE-EXEC: result exceeds {max_result_bytes} bytes; narrow the query"),
+    )
+}
+
 async fn handle_prepare_request(
     state: &QuackServerState,
     request_header: &MessageHeader,
+    client_ip: &str,
     req: sqe_quack_wire::message::PrepareRequest,
-) -> (StatusCode, [(&'static str, &'static str); 1], Vec<u8>) {
-    let session = match state.sessions.get(&request_header.connection_id) {
-        Some(s) => s,
-        None => {
-            return error_response(
-                &request_header.connection_id,
-                request_header.client_query_id,
-                "SQE-AUTH: unknown connection_id".to_string(),
-            );
-        }
+) -> QuackResponse {
+    let session = match authorize(state, request_header, client_ip) {
+        Ok(s) => s,
+        Err(resp) => return resp,
     };
 
-    let batches = match state
+    let QueryStream {
+        schema,
+        mut batches,
+    } = match state
         .query_executor
         .execute(&session.core_session, &req.sql_query)
         .await
     {
-        Ok(b) => b,
-        Err(QueryError::Parse(msg)) => {
-            return error_response(
-                &request_header.connection_id,
-                request_header.client_query_id,
-                format!("SQE-PARSE: {msg}"),
-            );
-        }
-        Err(QueryError::Policy(msg)) => {
-            // Don't echo the policy decision detail — that's the row-filter
-            // / column-mask payload, and leaking it defeats the policy.
-            tracing::info!(reason = %msg, "policy denied query");
-            return error_response(
-                &request_header.connection_id,
-                request_header.client_query_id,
-                "SQE-POLICY: access denied".to_string(),
-            );
-        }
-        Err(QueryError::Execution(msg)) => {
-            return error_response(
-                &request_header.connection_id,
-                request_header.client_query_id,
-                format!("SQE-EXEC: {msg}"),
-            );
-        }
-        Err(QueryError::Internal(msg)) => {
-            tracing::warn!(error = %msg, "query executor internal error");
-            return error_response(
-                &request_header.connection_id,
-                request_header.client_query_id,
-                "SQE-EXEC: internal execution error".to_string(),
-            );
-        }
+        Ok(s) => s,
+        Err(e) => return query_error_response(request_header, e),
     };
 
-    // Drain the batches into our DataChunk representation. Type/name schema
-    // is captured from the first batch; later batches must match (DataFusion
-    // guarantees this within a single result stream).
-    let (result_types, result_names) = match batches.first() {
-        Some(first) => {
-            let names: Vec<String> = first
-                .schema()
-                .fields()
-                .iter()
-                .map(|f| f.name().clone())
-                .collect();
-            // We materialise the first batch to read its column types into
-            // LogicalType; conversion happens once we collect all chunks.
-            let first_chunk = match record_batch_to_data_chunk(first) {
-                Ok(c) => c,
-                Err(e) => {
-                    return error_response(
-                        &request_header.connection_id,
-                        request_header.client_query_id,
-                        format!("SQE-EXEC: {e}"),
-                    );
-                }
-            };
-            let types: Vec<_> = first_chunk
-                .columns
-                .iter()
-                .map(|v| v.logical_type.clone())
-                .collect();
-            (types, names)
-        }
-        None => (Vec::new(), Vec::new()),
-    };
+    // Column names and types come from the *schema*, not from the first batch:
+    // a query returning zero rows still has to name and type its columns.
+    let result_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
 
-    let mut chunks: Vec<DataChunk> = Vec::with_capacity(batches.len());
-    for batch in &batches {
-        match record_batch_to_data_chunk(batch) {
-            Ok(c) => chunks.push(c),
-            Err(e) => {
-                return error_response(
-                    &request_header.connection_id,
-                    request_header.client_query_id,
-                    format!("SQE-EXEC: {e}"),
-                );
-            }
-        }
+    let page = match pull_page(&mut batches, state.limits.max_response_bytes).await {
+        Ok(p) => p,
+        Err(e) => return query_error_response(request_header, e),
+    };
+    if page.bytes > state.limits.max_result_bytes {
+        return result_too_large_response(request_header, state.limits.max_result_bytes);
     }
+
+    let chunks = match encode_page(&page.batches) {
+        Ok(c) => c,
+        Err(e) => {
+            return error_response(
+                &request_header.connection_id,
+                request_header.client_query_id,
+                format!("SQE-EXEC: {e}"),
+            );
+        }
+    };
+    let result_types = match result_types_for(&schema, &chunks) {
+        Ok(t) => t,
+        Err(e) => {
+            return error_response(
+                &request_header.connection_id,
+                request_header.client_query_id,
+                format!("SQE-EXEC: {e}"),
+            );
+        }
+    };
+
+    let (needs_more_fetch, result_uuid) = if page.exhausted {
+        (false, 0i128)
+    } else {
+        // Park the rest of the stream. The uuid is random (not a counter) so a
+        // client cannot walk another session's result ids; the connection_id
+        // stored alongside is what actually authorises the fetch.
+        let uuid = Uuid::new_v4().as_u128() as i128;
+        state.pending.insert(
+            uuid,
+            Arc::new(PendingResult::new(
+                request_header.connection_id.clone(),
+                result_names.clone(),
+                batches,
+                page.bytes as u64,
+            )),
+        );
+        (true, uuid)
+    };
 
     let response_header = MessageHeader {
         r#type: MessageType::PrepareResponse,
@@ -342,10 +498,137 @@ async fn handle_prepare_request(
     let body = QuackMessage::PrepareResponse(PrepareResponse {
         result_types,
         result_names,
-        // All batches inlined; FETCH loop lands once result streaming is needed.
-        needs_more_fetch: false,
+        needs_more_fetch,
         results: chunks,
-        result_uuid: 0,
+        result_uuid,
+    });
+    let bytes = encode_message(&response_header, &body);
+    (
+        StatusCode::OK,
+        [("content-type", APPLICATION_VND_DUCKDB)],
+        bytes,
+    )
+}
+
+/// Column types for the response. The schema is the source of truth (it exists
+/// even for a zero-row result); the encoded chunks are the fallback for the one
+/// case the type alone cannot express — DuckDB `ENUM`, whose dictionary values
+/// live in the array rather than in the Arrow `DataType`.
+fn result_types_for(
+    schema: &arrow_schema::SchemaRef,
+    chunks: &[DataChunk],
+) -> Result<Vec<LogicalType>, sqe_quack_wire::WireError> {
+    match arrow_schema_to_logical(schema.as_ref()) {
+        Ok(types) => Ok(types),
+        Err(e) => match chunks.first() {
+            Some(first) => Ok(first
+                .columns
+                .iter()
+                .map(|v| v.logical_type.clone())
+                .collect()),
+            None => Err(e),
+        },
+    }
+}
+
+async fn handle_fetch_request(
+    state: &QuackServerState,
+    request_header: &MessageHeader,
+    client_ip: &str,
+    req: sqe_quack_wire::message::FetchRequest,
+) -> QuackResponse {
+    if let Err(resp) = authorize(state, request_header, client_ip) {
+        return resp;
+    }
+
+    // Unknown uuid and wrong-owner uuid share one message: a fetch is not a
+    // probe for which result ids exist on other connections.
+    let unknown = || {
+        error_response(
+            &request_header.connection_id,
+            request_header.client_query_id,
+            "SQE-EXEC: unknown or expired result_uuid".to_string(),
+        )
+    };
+    let pending = match state.pending.get(req.uuid) {
+        Some(p) if p.connection_id == request_header.connection_id => p,
+        Some(_) => {
+            tracing::warn!(
+                connection_id = %request_header.connection_id,
+                "Quack FetchRequest for a result_uuid owned by another connection"
+            );
+            return unknown();
+        }
+        None => return unknown(),
+    };
+
+    let mut guard = pending.stream.lock().await;
+    let page = match guard.as_mut() {
+        Some(stream) => match pull_page(stream, state.limits.max_response_bytes).await {
+            Ok(p) => p,
+            Err(e) => {
+                drop(guard);
+                state.pending.remove(req.uuid);
+                return query_error_response(request_header, e);
+            }
+        },
+        // Stream already reported EOF on an earlier fetch; this call is the
+        // empty terminator the client's loop is waiting for.
+        None => Page {
+            batches: Vec::new(),
+            bytes: 0,
+            exhausted: true,
+        },
+    };
+    if page.exhausted {
+        // Release the DataFusion stream as soon as it is done, even though the
+        // entry survives one more call to answer with an empty page.
+        *guard = None;
+    }
+
+    let total = pending.charge(page.bytes as u64);
+    if total > state.limits.max_result_bytes as u64 {
+        drop(guard);
+        state.pending.remove(req.uuid);
+        return result_too_large_response(request_header, state.limits.max_result_bytes);
+    }
+
+    if page.batches.is_empty() {
+        drop(guard);
+        state.pending.remove(req.uuid);
+        return fetch_response(request_header, Vec::new(), pending.next_page());
+    }
+
+    let chunks = match encode_page(&page.batches) {
+        Ok(c) => c,
+        Err(e) => {
+            drop(guard);
+            state.pending.remove(req.uuid);
+            return error_response(
+                &request_header.connection_id,
+                request_header.client_query_id,
+                format!("SQE-EXEC: {e}"),
+            );
+        }
+    };
+    let page_no = pending.next_page();
+    drop(guard);
+    fetch_response(request_header, chunks, page_no)
+}
+
+fn fetch_response(
+    request_header: &MessageHeader,
+    results: Vec<DataChunk>,
+    page_no: u64,
+) -> QuackResponse {
+    let response_header = MessageHeader {
+        r#type: MessageType::FetchResponse,
+        connection_id: request_header.connection_id.clone(),
+        client_query_id: request_header.client_query_id,
+    };
+    let body = QuackMessage::FetchResponse(FetchResponse {
+        results,
+        batch_index: Some(page_no),
     });
     let bytes = encode_message(&response_header, &body);
     (
@@ -358,15 +641,17 @@ async fn handle_prepare_request(
 fn handle_disconnect_message(
     state: &QuackServerState,
     request_header: &MessageHeader,
-) -> (StatusCode, [(&'static str, &'static str); 1], Vec<u8>) {
-    if state.sessions.get(&request_header.connection_id).is_none() {
-        return error_response(
-            &request_header.connection_id,
-            request_header.client_query_id,
-            "SQE-AUTH: unknown connection_id".to_string(),
-        );
+    client_ip: &str,
+) -> QuackResponse {
+    if let Err(resp) = authorize(state, request_header, client_ip) {
+        return resp;
     }
     state.sessions.remove(&request_header.connection_id);
+    // Parked results belong to the session, not to the client's goodwill:
+    // dropping them here releases their DataFusion streams immediately.
+    state
+        .pending
+        .remove_for_connection(&request_header.connection_id);
 
     let response_header = MessageHeader {
         r#type: MessageType::SuccessResponse,
@@ -386,7 +671,7 @@ async fn handle_connection_request(
     request_header: &MessageHeader,
     client_ip: &str,
     req: sqe_quack_wire::message::ConnectionRequest,
-) -> (StatusCode, [(&'static str, &'static str); 1], Vec<u8>) {
+) -> QuackResponse {
     // QUACK-08: throttle before touching the IdP, keyed by client IP. Rejected
     // attempts never reach authenticate(), so a credential-stuffing loop cannot
     // amplify into the IdP, and one abusive source cannot exhaust the budget
@@ -441,12 +726,18 @@ async fn handle_connection_request(
     };
 
     let connection_id = Uuid::new_v4().to_string();
-    let core_session = identity_to_core_session(&identity);
+    // Shared mapping (finding 204): carries subject, email and groups so
+    // group-scoped policies apply over Quack exactly as over Flight SQL.
+    let core_session = identity.to_session(None);
     state.sessions.insert(Session {
         connection_id: connection_id.clone(),
         bearer_token: SecretString::new(req.auth_string),
         identity,
         core_session,
+        // 606: bind the connection to the client that opened it. The
+        // connection_id is otherwise a replayable bearer credential travelling
+        // in every request body.
+        client_key: client_ip.to_string(),
     });
 
     let response_header = MessageHeader {
@@ -471,7 +762,7 @@ fn error_response(
     connection_id: &str,
     client_query_id: Option<u64>,
     message: String,
-) -> (StatusCode, [(&'static str, &'static str); 1], Vec<u8>) {
+) -> QuackResponse {
     let header = MessageHeader {
         r#type: MessageType::ErrorResponse,
         connection_id: connection_id.to_string(),

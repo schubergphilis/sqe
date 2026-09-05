@@ -75,11 +75,146 @@ pub struct HiveScanDescriptor {
     pub full_schema_json: String,
 }
 
+/// A secret carried inside a scan ticket. The ticket is the transport, so it
+/// serializes as the plain value; `Debug` never prints it (finding 401).
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct TicketSecret(String);
+
+impl TicketSecret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for TicketSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_empty() {
+            "[empty]"
+        } else {
+            "[REDACTED]"
+        })
+    }
+}
+
+/// Where a scan ticket's storage credentials come from (finding 401).
+///
+/// `WorkerDefault` is the serde default so a ticket with no credential block
+/// never implies the engine's static key pair.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScanCredentials {
+    /// No credentials shipped; the worker resolves its own chain (IRSA,
+    /// instance profile, environment). Single-tenant deployments only.
+    #[default]
+    WorkerDefault,
+    /// Short-lived credentials the catalog vended for this table and this
+    /// user. `expires_at` is unix seconds when known.
+    Vended {
+        access_key: TicketSecret,
+        secret_key: TicketSecret,
+        #[serde(default)]
+        session_token: TicketSecret,
+        #[serde(default)]
+        expires_at: Option<i64>,
+    },
+    /// The engine's static `[storage]` key pair. Requires the coordinator to
+    /// opt in via `coordinator.distributed_credentials`.
+    Static {
+        access_key: TicketSecret,
+        secret_key: TicketSecret,
+        #[serde(default)]
+        session_token: TicketSecret,
+    },
+}
+
+impl ScanCredentials {
+    pub fn static_keys(
+        access_key: impl Into<String>,
+        secret_key: impl Into<String>,
+        session_token: impl Into<String>,
+    ) -> Self {
+        Self::Static {
+            access_key: TicketSecret::new(access_key),
+            secret_key: TicketSecret::new(secret_key),
+            session_token: TicketSecret::new(session_token),
+        }
+    }
+
+    pub fn vended(
+        access_key: impl Into<String>,
+        secret_key: impl Into<String>,
+        session_token: impl Into<String>,
+        expires_at: Option<i64>,
+    ) -> Self {
+        Self::Vended {
+            access_key: TicketSecret::new(access_key),
+            secret_key: TicketSecret::new(secret_key),
+            session_token: TicketSecret::new(session_token),
+            expires_at,
+        }
+    }
+
+    /// Label for logs, metrics and audit (`worker_default`, `vended`, `static`).
+    pub fn source(&self) -> &'static str {
+        match self {
+            Self::WorkerDefault => "worker_default",
+            Self::Vended { .. } => "vended",
+            Self::Static { .. } => "static",
+        }
+    }
+
+    pub fn access_key(&self) -> &str {
+        match self {
+            Self::WorkerDefault => "",
+            Self::Vended { access_key, .. } | Self::Static { access_key, .. } => access_key.expose(),
+        }
+    }
+
+    pub fn secret_key(&self) -> &str {
+        match self {
+            Self::WorkerDefault => "",
+            Self::Vended { secret_key, .. } | Self::Static { secret_key, .. } => secret_key.expose(),
+        }
+    }
+
+    pub fn session_token(&self) -> &str {
+        match self {
+            Self::WorkerDefault => "",
+            Self::Vended { session_token, .. } | Self::Static { session_token, .. } => {
+                session_token.expose()
+            }
+        }
+    }
+
+    /// Unix-seconds expiry of vended credentials, if the catalog told us.
+    pub fn expires_at(&self) -> Option<i64> {
+        match self {
+            Self::Vended { expires_at, .. } => *expires_at,
+            _ => None,
+        }
+    }
+
+    /// True when the ticket carries key material of any kind.
+    pub fn carries_keys(&self) -> bool {
+        !matches!(self, Self::WorkerDefault)
+    }
+}
+
 /// Lightweight message sent from coordinator to worker describing
 /// which Parquet files to scan and how to access them.
 ///
-/// Workers receive this as a JSON-encoded Flight Ticket body.
-/// S3 credentials are included so workers don't need Polaris access.
+/// Workers receive this as a JSON-encoded Flight Ticket body. Storage
+/// credentials ride inside `credentials` so workers need no catalog access;
+/// the ticket is signed (finding 601) and should travel over TLS.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ScanTask {
     /// Ticket encoding version. `1` = whole-file (pre-morsel); `2` = optional
@@ -130,12 +265,20 @@ pub struct ScanTask {
     pub s3_endpoint: String,
     /// S3 region.
     pub s3_region: String,
-    /// S3 access key (vended or static).
-    pub s3_access_key: String,
-    /// S3 secret key.
-    pub s3_secret_key: String,
-    /// S3 session token (from credential vending, empty if static).
-    pub s3_session_token: String,
+    /// Storage credentials for this scan (finding 401). Typed so the ticket
+    /// records where they came from, `Debug` never prints them, and a
+    /// worker can be told to resolve its own instead.
+    #[serde(default)]
+    pub credentials: ScanCredentials,
+    /// Worker URL this ticket was issued to (finding 601). Part of the signed
+    /// bytes, so a ticket captured from one worker cannot be replayed to
+    /// another. Empty only on legacy tickets.
+    #[serde(default)]
+    pub audience: String,
+    /// Unix seconds after which the worker refuses the ticket (finding 601).
+    /// `0` only on legacy tickets.
+    #[serde(default)]
+    pub expires_at: i64,
     /// Whether to use path-style S3 access (required for most S3-compatible endpoints).
     pub s3_path_style: bool,
     /// Allow plaintext HTTP for S3 endpoints. Only enable for dev/test (e.g., MinIO).
@@ -235,11 +378,6 @@ fn default_scan_task_version() -> u32 {
 
 impl std::fmt::Debug for ScanTask {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let session_token_display = if self.s3_session_token.is_empty() {
-            "[empty]"
-        } else {
-            "[REDACTED]"
-        };
         let total_bytes: u64 = self.file_sizes_bytes.iter().sum();
         f.debug_struct("ScanTask")
             .field("version", &self.version)
@@ -252,9 +390,9 @@ impl std::fmt::Debug for ScanTask {
             .field("projected_columns", &self.projected_columns)
             .field("s3_endpoint", &self.s3_endpoint)
             .field("s3_region", &self.s3_region)
-            .field("s3_access_key", &"[REDACTED]")
-            .field("s3_secret_key", &"[REDACTED]")
-            .field("s3_session_token", &session_token_display)
+            .field("credentials", &self.credentials)
+            .field("audience", &self.audience)
+            .field("expires_at", &self.expires_at)
             .field("s3_path_style", &self.s3_path_style)
             .field("s3_allow_http", &self.s3_allow_http)
             .field("has_predicate", &self.predicate_proto.is_some())
@@ -316,9 +454,9 @@ mod tests {
             projected_field_ids: vec![1],
             s3_endpoint: "http://localhost:9000".to_string(),
             s3_region: "us-east-1".to_string(),
-            s3_access_key: "key".to_string(),
-            s3_secret_key: "secret".to_string(),
-            s3_session_token: String::new(),
+            credentials: ScanCredentials::static_keys("key".to_string(), "secret".to_string(), String::new()),
+            audience: String::new(),
+            expires_at: 0,
             s3_path_style: true,
             s3_allow_http: true,
             predicate_proto: predicate,
@@ -481,9 +619,9 @@ mod tests {
             projected_field_ids: vec![1, 2],
             s3_endpoint: "http://localhost:9000".to_string(),
             s3_region: "us-east-1".to_string(),
-            s3_access_key: "testadmin".to_string(),
-            s3_secret_key: "testadmin".to_string(),
-            s3_session_token: String::new(),
+            credentials: ScanCredentials::static_keys("testadmin".to_string(), "testadmin".to_string(), String::new()),
+            audience: String::new(),
+            expires_at: 0,
             s3_path_style: true,
             s3_allow_http: true,
             predicate_proto: None,
@@ -518,9 +656,9 @@ mod tests {
             projected_field_ids: vec![],
             s3_endpoint: String::new(),
             s3_region: String::new(),
-            s3_access_key: String::new(),
-            s3_secret_key: String::new(),
-            s3_session_token: String::new(),
+            credentials: ScanCredentials::default(),
+            audience: String::new(),
+            expires_at: 0,
             s3_path_style: false,
             s3_allow_http: true,
             predicate_proto: None,
@@ -574,9 +712,9 @@ mod tests {
             projected_field_ids: vec![],
             s3_endpoint: "http://localhost:9000".to_string(),
             s3_region: "us-east-1".to_string(),
-            s3_access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
-            s3_secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
-            s3_session_token: "session-token-value".to_string(),
+            credentials: ScanCredentials::static_keys("AKIAIOSFODNN7EXAMPLE".to_string(), "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(), "session-token-value".to_string()),
+            audience: String::new(),
+            expires_at: 0,
             s3_path_style: true,
             s3_allow_http: false,
             predicate_proto: None,
@@ -610,9 +748,9 @@ mod tests {
             projected_field_ids: vec![1, 2],
             s3_endpoint: String::new(),
             s3_region: String::new(),
-            s3_access_key: String::new(),
-            s3_secret_key: String::new(),
-            s3_session_token: String::new(),
+            credentials: ScanCredentials::default(),
+            audience: String::new(),
+            expires_at: 0,
             s3_path_style: false,
             s3_allow_http: false,
             predicate_proto: Some(predicate_bytes.clone()),

@@ -974,11 +974,14 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     let worker_registry = Arc::new(
         sqe_coordinator::worker_registry::WorkerRegistry::with_options_and_failures(
             config.coordinator.worker_urls.clone(),
-            sqe_coordinator::channel_pool::ChannelPool::shared_with_timeouts(
+            // `_and_tls`: an https worker URL needs a ClientTlsConfig or
+            // tonic refuses the URI outright (finding 603).
+            sqe_coordinator::channel_pool::ChannelPool::shared_with_timeouts_and_tls(
                 std::time::Duration::from_secs(config.coordinator.worker_connect_timeout_secs),
                 std::time::Duration::from_secs(config.coordinator.worker_rpc_timeout_secs),
                 &config.coordinator.transport,
-            ),
+                &config.coordinator.tls,
+            )?,
             config.coordinator.max_workers,
             config.coordinator.health_check_max_failures,
         ),
@@ -1681,20 +1684,23 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             let quack_addr: std::net::SocketAddr = bind
                 .parse()
                 .map_err(|e| anyhow::anyhow!("Quack server addr {bind}: {e}"))?;
-            // Install the ring crypto provider so rustls' default ServerConfig
-            // builder (used by RustlsConfig::from_pem_file) has a backend. This
-            // matches the tonic Flight path's `tls-ring`. Idempotent: a second
-            // install returns Err, which we ignore.
-            let _ = rustls::crypto::ring::default_provider().install_default();
-            if !config.coordinator.tls.ca_file.is_empty() {
-                tracing::warn!("Quack TLS is server-side only: client-CA (mTLS) from [coordinator.tls].ca_file is enforced on the Flight path but not on the Quack path");
-            }
-            let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-                &config.coordinator.tls.cert_file,
-                &config.coordinator.tls.key_file,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Quack TLS config: {e}"))?;
+            // Checked install, not a discarded one: a silent no-op here used
+            // to mean the Quack port could run on a different crypto backend
+            // than the Flight port with nothing in the log (finding 210).
+            sqe_coordinator::tls::ensure_crypto_provider();
+            // One builder for every listener, so `ca_file` now applies here
+            // too. The Quack path used to warn that mTLS was Flight-only.
+            let material = sqe_core::ServerTlsMaterial::load(&config.coordinator.tls)
+                .map_err(|e| anyhow::anyhow!("Quack TLS config: {e}"))?;
+            let quack_mtls = material.requires_client_cert();
+            let tls =
+                axum_server::tls_rustls::RustlsConfig::from_config(material.rustls_server_config());
+            // Rotation without a restart, same as the MCP listener.
+            let _quack_reload = sqe_coordinator::tls::spawn_cert_reload_watch(
+                config.coordinator.tls.clone(),
+                tls.clone(),
+                sqe_coordinator::tls::DEFAULT_CERT_RELOAD_INTERVAL,
+            );
             tokio::spawn(async move {
                 if let Err(e) = axum_server::bind_rustls(quack_addr, tls)
                     .serve(quack_app.into_make_service_with_connect_info::<std::net::SocketAddr>())
@@ -1703,7 +1709,10 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
                     tracing::error!(error = %e, "Quack RPC server (TLS) terminated unexpectedly");
                 }
             });
-            tracing::info!("DuckDB Quack RPC on port {quack_port} (TLS)");
+            tracing::info!(
+                mtls = quack_mtls,
+                "DuckDB Quack RPC on port {quack_port} (TLS)"
+            );
         } else {
             tracing::warn!("WARNING: the Quack endpoint is PLAINTEXT (no TLS) and binds 0.0.0.0 -- user OIDC bearer tokens travel in cleartext and can be captured and replayed. Set [coordinator.tls] cert_file/key_file to enable TLS, or do not expose the Quack port on untrusted networks.");
             let listener = tokio::net::TcpListener::bind(&bind)
@@ -1742,17 +1751,25 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     }
     let addr = format!("0.0.0.0:{}", config.coordinator.flight_sql_port).parse()?;
 
-    // Optional TLS
-    let tls_config = sqe_coordinator::tls::build_server_tls_config(&config.coordinator.tls)
+    // Optional TLS, from the one shared builder in `sqe_core::tls`.
+    let tls_material = sqe_core::ServerTlsMaterial::load_optional(&config.coordinator.tls)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let mut server_builder = sqe_coordinator::transport::apply_grpc_transport(
         tonic::transport::Server::builder(),
         &config.coordinator.transport,
     );
-    if let Some(tls) = tls_config {
-        server_builder = server_builder.tls_config(tls)?;
-        tracing::info!("SQE coordinator listening on {addr} (TLS)");
+    if let Some(material) = tls_material.as_ref() {
+        server_builder = server_builder.tls_config(material.tonic_server())?;
+        tracing::info!(
+            mtls = material.requires_client_cert(),
+            cert_fingerprint = material.cert_fingerprint(),
+            // tonic gives no way to swap a live acceptor, so this port keeps
+            // the certificate it started with until restart. See
+            // `sqe_coordinator::tls`.
+            hot_reload = false,
+            "SQE coordinator listening on {addr} (TLS)"
+        );
     } else {
         tracing::info!("SQE coordinator listening on {addr} (plaintext)");
     }
@@ -1847,17 +1864,25 @@ async fn run_worker(config: SqeConfig, config_path: String) -> anyhow::Result<()
     // Mark ready
     ready.store(true, Ordering::Relaxed);
 
-    // Optional TLS (reuse coordinator TLS config for workers)
-    let tls_config = sqe_coordinator::tls::build_server_tls_config(&config.coordinator.tls)
+    // Optional TLS. `[worker.tls]` when the worker has its own certificate,
+    // otherwise the inherited `[coordinator.tls]` (finding 603: one cert
+    // carrying the coordinator's SAN cannot validate for a worker URL).
+    let worker_tls = config.worker.effective_tls(&config.coordinator.tls).clone();
+    let tls_material = sqe_core::ServerTlsMaterial::load_optional(&worker_tls)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let mut server_builder = sqe_coordinator::transport::apply_grpc_transport(
         tonic::transport::Server::builder(),
         &config.coordinator.transport,
     );
-    if let Some(tls) = tls_config {
-        server_builder = server_builder.tls_config(tls)?;
-        tracing::info!("SQE worker listening on {addr} (TLS)");
+    if let Some(material) = tls_material.as_ref() {
+        server_builder = server_builder.tls_config(material.tonic_server())?;
+        tracing::info!(
+            mtls = material.requires_client_cert(),
+            cert_fingerprint = material.cert_fingerprint(),
+            hot_reload = false,
+            "SQE worker listening on {addr} (TLS)"
+        );
     } else {
         tracing::info!("SQE worker listening on {addr} (plaintext)");
     }

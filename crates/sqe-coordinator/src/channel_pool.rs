@@ -8,17 +8,27 @@
 //! to the same URL race through a per-URL `tokio::sync::Mutex` so only one
 //! handshake runs. Callers can `invalidate(url)` on connection-level errors;
 //! the next call rebuilds the entry.
+//!
+//! Finding 603: this pool used to build every channel with
+//! `Endpoint::new(url)` and never call `tls_config`, so an `https://` worker
+//! URL was rejected by tonic before a single byte left the coordinator
+//! ("Connecting to HTTPS without TLS enabled"). Turning `[coordinator.tls]` on
+//! therefore made distributed execution impossible, and leaving it off sent
+//! every user's S3 credentials over the wire in cleartext. The pool now
+//! carries a client TLS config built once from the deployment's `TlsConfig`
+//! and attaches it to any `https://` target, with the URL host as the SNI
+//! domain.
 use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use sqe_core::config::GrpcTransportConfig;
+use sqe_core::config::{GrpcTransportConfig, TlsConfig};
 use tokio::sync::Mutex;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 use crate::transport::apply_grpc_transport_endpoint;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ChannelPoolConfig {
     pub connect_timeout: Duration,
     pub request_timeout: Duration,
@@ -27,6 +37,12 @@ pub struct ChannelPoolConfig {
     /// h2's 65,535-byte default, which caps each worker's scan stream at
     /// `window / RTT`. See `transport::apply_grpc_transport_endpoint`.
     pub transport: GrpcTransportConfig,
+    /// Client TLS for `https://` targets, built once from `[coordinator.tls]`
+    /// (trust root from `ca_file`, else the platform store; our own cert
+    /// attached so an mTLS worker accepts us). Built at pool construction
+    /// rather than per connect so `get()` never does file I/O and stays
+    /// infallible with respect to a missing CA.
+    pub client_tls: Option<ClientTlsConfig>,
 }
 
 impl Default for ChannelPoolConfig {
@@ -36,6 +52,9 @@ impl Default for ChannelPoolConfig {
             request_timeout: Duration::from_secs(30),
             keep_alive: Some(Duration::from_secs(30)),
             transport: GrpcTransportConfig::default(),
+            // No configured TLS block: an https target still gets a client
+            // config (platform trust store) rather than tonic's hard refusal.
+            client_tls: sqe_core::tls::tonic_client(&TlsConfig::default(), None).ok(),
         }
     }
 }
@@ -85,6 +104,32 @@ impl ChannelPool {
         }))
     }
 
+    /// [`Self::shared_with_timeouts`] plus the deployment's TLS block, which
+    /// becomes the client config for every `https://` worker URL.
+    ///
+    /// This is the constructor the coordinator binaries use. Without it the
+    /// pool falls back to the platform trust store, which will not contain a
+    /// private cluster CA.
+    ///
+    /// # Errors
+    /// Returns [`sqe_core::SqeError::Config`] when `ca_file`, `cert_file` or
+    /// `key_file` cannot be read, so a bad TLS block fails at coordinator boot
+    /// rather than at the first dispatch.
+    pub fn shared_with_timeouts_and_tls(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+        transport: &GrpcTransportConfig,
+        tls: &TlsConfig,
+    ) -> sqe_core::Result<Arc<Self>> {
+        Ok(Arc::new(Self::new(ChannelPoolConfig {
+            connect_timeout,
+            request_timeout,
+            transport: *transport,
+            client_tls: Some(sqe_core::tls::tonic_client(tls, None)?),
+            ..ChannelPoolConfig::default()
+        })))
+    }
+
     /// Return a clone of the cached channel for `url`, connecting on miss.
     pub async fn get(&self, url: &str) -> Result<Channel, tonic::transport::Error> {
         let entry = self
@@ -102,16 +147,23 @@ impl ChannelPool {
             return Ok(ch.clone());
         }
 
-        let mut endpoint = apply_grpc_transport_endpoint(
-            Endpoint::new(url.to_string())?,
-            &self.config.transport,
-        )
-        .connect_timeout(self.config.connect_timeout)
-        .timeout(self.config.request_timeout);
+        let mut endpoint =
+            apply_grpc_transport_endpoint(Endpoint::new(url.to_string())?, &self.config.transport)
+                .connect_timeout(self.config.connect_timeout)
+                .timeout(self.config.request_timeout);
         if let Some(ka) = self.config.keep_alive {
             endpoint = endpoint
                 .keep_alive_timeout(ka)
                 .http2_keep_alive_interval(ka);
+        }
+        // An https target without a ClientTlsConfig is refused by tonic before
+        // the connect even starts, which is finding 603 in one line.
+        if sqe_core::tls::is_https_url(url) {
+            let mut client_tls = self.config.client_tls.clone().unwrap_or_default();
+            if let Some(domain) = sqe_core::tls::sni_domain(url) {
+                client_tls = client_tls.domain_name(domain);
+            }
+            endpoint = endpoint.tls_config(client_tls)?;
         }
         let channel = endpoint.connect().await?;
         *guard = Some(channel.clone());
@@ -179,7 +231,10 @@ mod tests {
             Duration::from_secs(630),
             &configured,
         );
-        assert_eq!(pool.config.transport.initial_stream_window_size, 4 * 1024 * 1024);
+        assert_eq!(
+            pool.config.transport.initial_stream_window_size,
+            4 * 1024 * 1024
+        );
         assert_eq!(
             pool.config.transport.initial_connection_window_size,
             12 * 1024 * 1024
@@ -202,6 +257,79 @@ mod tests {
             ChannelPoolConfig::default().request_timeout,
             "configured rpc timeout must override the hardcoded pool default"
         );
+    }
+
+    #[test]
+    fn channel_pool_carries_client_tls_from_the_config_block() {
+        let tls = TlsConfig {
+            ca_file: format!(
+                "{}/../sqe-core/tests/fixtures/tls/ca.crt",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            ..TlsConfig::default()
+        };
+        let pool = ChannelPool::shared_with_timeouts_and_tls(
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            &GrpcTransportConfig::default(),
+            &tls,
+        )
+        .unwrap();
+        let rendered = format!("{:?}", pool.config.client_tls.as_ref().unwrap());
+        assert!(
+            rendered.contains("certs: [Certificate"),
+            "coordinator.tls.ca_file must become the pool's trust root: {rendered}"
+        );
+    }
+
+    #[test]
+    fn channel_pool_surfaces_a_bad_ca_at_construction() {
+        // Fail at coordinator boot, not at the first dispatch.
+        let tls = TlsConfig {
+            ca_file: "/nonexistent/ca.pem".to_string(),
+            ..TlsConfig::default()
+        };
+        let err = ChannelPool::shared_with_timeouts_and_tls(
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            &GrpcTransportConfig::default(),
+            &tls,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("Failed to read TLS CA"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn channel_pool_https_target_is_not_refused_for_missing_tls() {
+        // Regression for finding 603. Before the fix tonic rejected the URI
+        // outright with "Connecting to HTTPS without TLS enabled"; the connect
+        // must now fail on the network (nothing listens on port 1), which is a
+        // completely different error.
+        let pool = ChannelPool::new(ChannelPoolConfig::default());
+        let err = pool
+            .get("https://127.0.0.1:1")
+            .await
+            .expect_err("nothing listens on port 1");
+
+        let mut chain = err.to_string();
+        let mut source: Option<&(dyn std::error::Error + 'static)> =
+            std::error::Error::source(&err);
+        while let Some(cause) = source {
+            chain.push_str(&format!(" | {cause}"));
+            source = cause.source();
+        }
+        assert!(
+            !chain.to_lowercase().contains("without tls"),
+            "https target still refused for want of a ClientTlsConfig: {chain}"
+        );
+    }
+
+    #[test]
+    fn channel_pool_default_still_has_a_client_tls_for_https() {
+        // `ChannelPool::shared()` is used by tests and by the worker registry
+        // default path; an https worker must not become unreachable there.
+        assert!(ChannelPoolConfig::default().client_tls.is_some());
     }
 
     #[tokio::test]

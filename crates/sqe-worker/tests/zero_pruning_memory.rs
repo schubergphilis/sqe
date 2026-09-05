@@ -10,6 +10,7 @@ mod common;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+#[cfg(feature = "worker-shuffle")]
 use arrow_array::RecordBatch;
 use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -17,6 +18,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
 use sqe_spill::ByteBudget;
 use sqe_worker::executor::{execute_scan_streaming_with_store, SCAN_CHANNEL_ITEM_CAPACITY};
+#[cfg(feature = "worker-shuffle")]
 use sqe_worker::shuffle::{ShuffleReceiver, DEFAULT_CHANNEL_CAPACITY};
 
 use common::*;
@@ -209,6 +211,9 @@ async fn phase0_reproducer_wide_batch_queue_exceeds_narrow() {
 }
 
 /// Phase 0 gate: item-bounded shuffle can hold ≥10x a configured budget.
+///
+/// Shuffle-only, so it compiles only with `worker-shuffle` (finding 600).
+#[cfg(feature = "worker-shuffle")]
 #[tokio::test]
 async fn phase0_reproducer_shuffle_exceeds_byte_budget() {
     let metrics = worker_metrics();
@@ -279,6 +284,9 @@ async fn phase0_reproducer_shuffle_exceeds_byte_budget() {
 /// `spill_buffer::tests::do_exchange_style_ten_x_intake_stays_bounded` and
 /// `ten_x_budget_completes_via_spill`. Flight-level round-trip stays in
 /// worker unit/integration suites that spin a real Flight server.
+///
+/// Shuffle-only, so it compiles only with `worker-shuffle` (finding 600).
+#[cfg(feature = "worker-shuffle")]
 #[tokio::test]
 async fn shuffle_ten_x_budget_completes_with_spill() {
     use arrow_array::Int64Array;

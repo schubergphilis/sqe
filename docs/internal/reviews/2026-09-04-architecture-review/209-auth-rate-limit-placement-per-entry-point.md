@@ -67,6 +67,39 @@ validated" is guaranteed to pass the limiter.
 - `grep -rn "auth_rate_limiter" crates/sqe-trino-compat crates/sqe-mcp crates/sqe-quack-server`
   shows only status-code mapping, no `check` calls.
 
+## Partial resolution (2026-09-05)
+
+The Trino Bearer gap is closed on branch
+`fix/identity-transport-trust-p1`; the finding stays **open** because the
+architectural fix — one `RateLimitedAuthProvider` in the auth layer that Flight,
+Trino, MCP, Quack and the dashboard all inherit — is not done, and the
+adapter-level `check` calls this finding wants deleted are still there.
+
+What changed, in `crates/sqe-trino-compat/src/server.rs` only:
+
+- One shared `authenticate_request` ladder now serves all four Trino routes,
+  and it consults `TrinoAuthRateLimiter::check` immediately before anything
+  that would reach a provider. The Bearer branch on `POST /v1/statement` that
+  used to go straight to `authenticate_bearer` is included, as are the three
+  poll/cancel routes that previously consulted nothing (finding 702).
+- Bearers are keyed on `bearer:<truncated sha256 of the token>`, so a bearer
+  gets the same per-tuple budget a password does without the raw token
+  becoming a map key or a log field.
+- Denial is `429` with `Retry-After: 1` on every route.
+- The peer bucket comes from a rewritten `strip_port` that leaves a bare IPv6
+  address from `x-forwarded-for` intact instead of truncating it at the last
+  colon.
+
+Test: `bearer_post_past_limiter_budget_returns_429` in
+`crates/sqe-trino-compat/src/server.rs` — with a 1-attempt budget the second
+Bearer request from the same peer returns `429` with `Retry-After`, and the
+limiter key is asserted to be a digest rather than the token.
+
+Still open from the acceptance criteria: the `sqe-coordinator` wrapper test,
+the MCP constant-username key, the dashboard bearer guard, and the
+`grep -rn "auth_rate_limiter"` criterion (the Trino adapter still calls `check`
+directly rather than only mapping a status code).
+
 ## Related
 
 - 204 (same "every entry point re-implements it" shape).

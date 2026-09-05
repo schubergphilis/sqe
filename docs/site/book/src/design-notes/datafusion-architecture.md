@@ -127,12 +127,24 @@ Coordinator (Scheduler)
   └── Streams results back via Arrow Flight
 
 Worker (Executor)
-  ├── Receives PhysicalPlan fragment + session context (bearer token)
+  ├── Receives a ScanTask (file list + projection + predicate + limit) and the bearer token
   ├── Opens iceberg-rust TableProvider with user's token
-  ├── Executes scan → filter → project → aggregate
+  ├── Executes scan → filter → project
   ├── Streams Arrow RecordBatches back to coordinator
   └── Reports metrics (rows scanned, bytes read, duration)
 ```
+
+**Executed topology: distributed scan, coordinator-side everything else.**
+A worker is handed a scan, not a plan fragment. Joins, aggregates and sorts all
+run on the coordinator, and workers never exchange data with each other. There
+is no shuffle on any query path today. The `DoExchange` shuffle intake and its
+spillable partition buffers still exist in the tree, kept for the stage-based
+execution roadmap, but they are compiled out by default: they live behind the
+`worker-shuffle` cargo feature in sqe-worker, with `shuffle-planning` in
+sqe-planner and `exchange` in sqe-spill as the planner and manifest halves. In
+a default build the worker answers `DoExchange` with `Unimplemented` and holds
+no state keyed by a caller-supplied query or stage id. Read any description of
+stage-based MPP in this repository as roadmap, not as running code.
 
 **Scaling model:**
 - Workers are stateless, horizontally scalable (K8s Deployment)

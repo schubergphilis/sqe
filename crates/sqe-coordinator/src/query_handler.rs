@@ -135,6 +135,10 @@ pub struct QueryHandler {
     worker_registry: Option<Arc<crate::worker_registry::WorkerRegistry>>,
     #[allow(dead_code)] // Used when constructing DistributedScanExec for distributed queries
     credential_tracker: Option<Arc<CredentialRefreshTracker>>,
+    /// Finding 601: Ed25519 key that signs every scan ticket this coordinator
+    /// issues. Loaded from `coordinator.ticket_signing_key_file` or generated
+    /// at boot; workers pin the public half from the heartbeat response.
+    ticket_signer: Arc<sqe_core::ticket_signing::TicketSigner>,
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
     audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
     /// Optional OpenLineage observer. When set and the statement kind is
@@ -279,6 +283,11 @@ impl QueryHandler {
         runtime_catalogs: RuntimeCatalogRegistry,
         secrets: SecretStore,
     ) -> sqe_core::Result<Self> {
+        // Finding 601: one signing key per coordinator process (or the shared
+        // key file), created before `config` is moved into the handler.
+        let ticket_signer = Arc::new(crate::ticket_credentials::load_ticket_signer(
+            &config.coordinator,
+        ));
         let catalog_ops = CatalogOps::new(config.clone());
         let mut write_handler = WriteHandler::new(config.clone());
         if let Some(ref m) = metrics {
@@ -382,6 +391,7 @@ impl QueryHandler {
             explain_handler,
             worker_registry,
             credential_tracker,
+            ticket_signer,
             metrics,
             audit,
             lineage,
@@ -506,6 +516,12 @@ impl QueryHandler {
     /// Returns a reference to the query tracker.
     pub fn query_tracker(&self) -> &Arc<QueryTracker> {
         &self.query_tracker
+    }
+
+    /// Finding 601: the scan-ticket signer; its public key is handed to
+    /// workers in the heartbeat response.
+    pub fn ticket_signer(&self) -> &Arc<sqe_core::ticket_signing::TicketSigner> {
+        &self.ticket_signer
     }
 
     /// Returns a reference to the shared DataFusion runtime.
@@ -4046,6 +4062,27 @@ impl QueryHandler {
         // (each morsel is already sized); when packing grouped multiple small
         // whole-file morsels, emit multi-file tasks without ranges.
         let storage = &self.config.storage;
+        // Finding 401: pick the credential source once per query; `None` means
+        // the configured mode cannot be satisfied and the scan runs locally.
+        let credentials = match crate::ticket_credentials::select_scan_credentials(
+            self.config.coordinator.distributed_credentials,
+            storage,
+            iceberg_scan.table(),
+        ) {
+            Some(c) => c,
+            None => {
+                warn!(
+                    query_id = %query_id,
+                    mode = ?self.config.coordinator.distributed_credentials,
+                    "distributed_credentials mode cannot be satisfied for this table; executing locally"
+                );
+                return plan;
+            }
+        };
+        let credential_source = credentials.source();
+        let credential_expiry = credentials
+            .expires_at()
+            .and_then(|s| chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0));
         let scan_tasks: Vec<sqe_planner::ScanTask> = morsel_groups
             .into_iter()
             .filter(|group| !group.is_empty())
@@ -4084,9 +4121,11 @@ impl QueryHandler {
                         projected_field_ids: projected_field_ids.clone(),
                         s3_endpoint: storage.s3_endpoint.clone(),
                         s3_region: storage.s3_region.clone(),
-                        s3_access_key: storage.s3_access_key.clone(),
-                        s3_secret_key: storage.s3_secret_key.expose().to_string(),
-                        s3_session_token: String::new(),
+                        credentials: credentials.clone(),
+
+                        audience: String::new(),
+
+                        expires_at: 0,
                         s3_path_style: storage.s3_path_style,
                         s3_allow_http: storage.s3_endpoint.starts_with("http://"),
                         predicate_proto: predicate_proto.clone(),
@@ -4112,9 +4151,11 @@ impl QueryHandler {
                             projected_field_ids: projected_field_ids.clone(),
                             s3_endpoint: storage.s3_endpoint.clone(),
                             s3_region: storage.s3_region.clone(),
-                            s3_access_key: storage.s3_access_key.clone(),
-                            s3_secret_key: storage.s3_secret_key.expose().to_string(),
-                            s3_session_token: String::new(),
+                            credentials: credentials.clone(),
+
+                            audience: String::new(),
+
+                            expires_at: 0,
                             s3_path_style: storage.s3_path_style,
                             s3_allow_http: storage.s3_endpoint.starts_with("http://"),
                             predicate_proto: predicate_proto.clone(),
@@ -4263,6 +4304,10 @@ impl QueryHandler {
                 .with_fragment_callback(callback)
                 .with_pushed_down_filters(iceberg_scan.pushed_down_filters().to_vec())
                 .with_worker_secret(self.config.coordinator.worker_secret.expose().to_string())
+                .with_ticket_signer(
+                    Arc::clone(&self.ticket_signer),
+                    std::time::Duration::from_secs(self.config.coordinator.ticket_ttl_secs),
+                )
                 .with_timeouts(
                     std::time::Duration::from_secs(
                         self.config.coordinator.worker_connect_timeout_secs,
@@ -4273,6 +4318,16 @@ impl QueryHandler {
 
         // Attach worker registry for health tracking / failover
         exec = exec.with_worker_registry(Arc::clone(registry));
+        if let Some(expiry) = credential_expiry {
+            // Finding 401: vended credentials expire; let the refresh tracker
+            // push renewed ones before the worker hits the wall.
+            exec = exec.with_credential_expiry(expiry);
+        }
+        info!(
+            query_id = %query_id,
+            sqe.credential_source = credential_source,
+            "Distributed scan credentials selected"
+        );
 
         info!(
             username = %session.user.username,
@@ -4369,6 +4424,10 @@ impl QueryHandler {
             Arc::clone(&spec.full_schema),
         )
         .with_worker_secret(self.config.coordinator.worker_secret.expose().to_string())
+        .with_ticket_signer(
+            Arc::clone(&self.ticket_signer),
+            std::time::Duration::from_secs(self.config.coordinator.ticket_ttl_secs),
+        )
         .with_timeouts(
             std::time::Duration::from_secs(self.config.coordinator.worker_connect_timeout_secs),
             std::time::Duration::from_secs(self.config.coordinator.worker_rpc_timeout_secs),

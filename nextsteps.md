@@ -1,5 +1,24 @@
 # SQE — Next Steps
 
+> **STATUS 2026-09-05 (evening): identity, credentials and transport trust batch fixed; 30 of 109 combined findings closed.**
+>
+> Branch `fix/identity-transport-trust-p1` (work package #652) closes 204,
+> 207, 208, 405, 604, 401, 601, 702, 606, 600, 603 and 210: scan tickets are
+> Ed25519-signed by a coordinator-only key with audience and expiry, workers
+> pin the public key from the heartbeat, heartbeats must come from the host
+> they advertise, ticket credentials are typed (vended / static /
+> worker_default) with `production_mode` refusing the implicit default,
+> `quack_query` is off by default and allow-listed, bearer replay reuses one
+> session, bearer validation requires an issuer and honours nbf and EC keys,
+> Trino polls carry a token and are rate-limited on every route, Quack
+> sessions expire with the token and page large results, the unreachable
+> shuffle intake is behind `worker-shuffle`, and one TLS builder serves the
+> Flight, MCP and worker listeners with client TLS on every hop. 209 is
+> partial. GitLab: issues #543-#651, work packages #652-#659.
+> **NEXT:** work package #654 (data consistency: caches, writes and
+> transactions: 302, 304, 507, 407, 500, 502, 501, 506, 505, 608, 511, 514,
+> plus the 902 fingerprint-bound result cache), then #655 memory safety.
+
 > **STATUS 2026-09-05 (later): authorization P1 batch fixed; 24 of 109 combined findings closed.**
 >
 > Branch `fix/authz-policy-enforcement-p1` closes the remaining P1s of the

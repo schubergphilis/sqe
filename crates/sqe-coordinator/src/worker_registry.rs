@@ -322,6 +322,11 @@ impl WorkerRegistry {
         Ok(())
     }
 
+    /// True when `url` is already in the registry (configured or discovered).
+    pub async fn is_known(&self, url: &str) -> bool {
+        self.inner.read().await.workers.contains_key(url)
+    }
+
     /// Immediately mark a worker as unhealthy.
     ///
     /// Unlike [`mark_failed`](Self::mark_failed), this does not use a
@@ -790,5 +795,107 @@ mod tests {
         assert!(!advertise_url_is_routable("http://0.0.0.0:50052"));
         assert!(!advertise_url_is_routable("0.0.0.0:50052"));
         assert!(!advertise_url_is_routable("http://[::]:50052"));
+    }
+}
+
+/// Finding 601: check that the host a heartbeat advertises resolves to the
+/// TCP peer that sent it. Literal IPs must equal the peer address; DNS names
+/// must resolve to it. `peer == None` (transport did not expose an address)
+/// cannot be verified and is accepted with a debug log.
+pub async fn advertise_matches_peer(
+    advertised_url: &str,
+    peer: Option<std::net::SocketAddr>,
+) -> Result<(), String> {
+    let Some(peer) = peer else {
+        debug!(
+            worker = advertised_url,
+            "heartbeat peer address unavailable; skipping advertise check"
+        );
+        return Ok(());
+    };
+    let url =
+        url::Url::parse(advertised_url).map_err(|e| format!("unparsable advertise URL: {e}"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "advertise URL has no host".to_string())?
+        .trim_matches(['[', ']'])
+        .to_string();
+    let peer_ip = canonical_ip(peer.ip());
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return if canonical_ip(ip) == peer_ip {
+            Ok(())
+        } else {
+            Err(format!(
+                "advertised {ip} but the heartbeat came from {peer_ip}"
+            ))
+        };
+    }
+    let port = url.port_or_known_default().unwrap_or(0);
+    let resolved = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| format!("cannot resolve advertised host {host}: {e}"))?;
+    let mut seen = Vec::new();
+    for addr in resolved {
+        let ip = canonical_ip(addr.ip());
+        if ip == peer_ip {
+            return Ok(());
+        }
+        seen.push(ip);
+    }
+    Err(format!(
+        "advertised host {host} resolves to {seen:?}, but the heartbeat came from {peer_ip}"
+    ))
+}
+
+fn canonical_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(std::net::IpAddr::V6(v6)),
+        v4 => v4,
+    }
+}
+
+#[cfg(test)]
+mod advertise_peer_tests {
+    use super::advertise_matches_peer;
+
+    #[tokio::test]
+    async fn literal_ip_must_equal_peer() {
+        let peer = Some("127.0.0.1:41000".parse().unwrap());
+        advertise_matches_peer("http://127.0.0.1:50052", peer)
+            .await
+            .unwrap();
+        // 601 acceptance: valid secret from 127.0.0.1 advertising 10.9.9.9 is refused.
+        let err = advertise_matches_peer("http://10.9.9.9:50052", peer)
+            .await
+            .unwrap_err();
+        assert!(err.contains("10.9.9.9"), "{err}");
+        // IPv4-mapped IPv6 peers are the same address.
+        let mapped = Some("[::ffff:127.0.0.1]:41000".parse().unwrap());
+        advertise_matches_peer("http://127.0.0.1:50052", mapped)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dns_name_must_resolve_to_peer() {
+        let peer = Some("127.0.0.1:41000".parse().unwrap());
+        advertise_matches_peer("http://localhost:50052", peer)
+            .await
+            .unwrap();
+        let other = Some("10.9.9.9:41000".parse().unwrap());
+        assert!(advertise_matches_peer("http://localhost:50052", other)
+            .await
+            .is_err());
+        assert!(advertise_matches_peer("not a url", peer).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unknown_peer_is_not_a_mismatch() {
+        advertise_matches_peer("http://10.9.9.9:50052", None)
+            .await
+            .unwrap();
     }
 }
