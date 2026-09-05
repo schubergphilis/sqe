@@ -19,6 +19,30 @@ impl HashChain {
         }
     }
 
+    /// Continue a chain from the last durable record.
+    ///
+    /// `last_seq` / `last_hash` are `integrity.seq` and `integrity.hash` of
+    /// the last parseable line in the sink file. The next stamped event is
+    /// `last_seq + 1` with `prev_hash = last_hash`, so a file that spans
+    /// process restarts remains one verifiable chain.
+    pub fn resume(last_seq: u64, last_hash: impl Into<String>) -> Self {
+        Self {
+            next_seq: last_seq.saturating_add(1),
+            prev_hash: last_hash.into(),
+        }
+    }
+
+    /// Start a new segment after an unparseable tail.
+    ///
+    /// `prev_hash` is `BROKEN:<reason>` so a verifier can distinguish a
+    /// crash/torn write from silent truncation back to a genesis boundary.
+    pub fn resume_broken(reason: &str) -> Self {
+        Self {
+            next_seq: 0,
+            prev_hash: format!("BROKEN:{reason}"),
+        }
+    }
+
     /// Return the sequence number that will be assigned to the next record.
     pub fn next_seq(&self) -> u64 {
         self.next_seq
@@ -71,13 +95,28 @@ pub enum ChainError {
     BadHash { seq: u64 },
 }
 
-/// Verify a contiguous chain of audit events starting at seq=0.
-/// Returns an error if any record has an unexpected sequence number,
-/// a broken prev_hash link, or a hash that no longer matches the event body.
+/// Verify a contiguous chain of audit events.
+///
+/// The first event may start at genesis (`seq = 0`, `prev_hash = GENESIS`)
+/// or continue a resumed segment. Subsequent events must have `seq` one
+/// greater than the previous and `prev_hash` equal to the previous hash.
+/// A `BROKEN:` prev_hash on the first event is accepted as an explicit
+/// restart marker; a `BROKEN:` link in the middle is a [`ChainError::BrokenLink`].
 pub fn verify_chain(events: &[AuditEvent]) -> Result<(), ChainError> {
-    let mut prev = GENESIS.to_string();
-    for (i, ev) in events.iter().enumerate() {
-        let expected_seq = i as u64;
+    let Some(first) = events.first() else {
+        return Ok(());
+    };
+    let mut prev = first.integrity.prev_hash.clone();
+    let mut expected_seq = first.integrity.seq;
+    // A chain that claims to start at seq 0 must be rooted at genesis or an
+    // explicit BROKEN marker. Anything else is a broken link at seq 0.
+    if expected_seq == 0
+        && prev != GENESIS
+        && !prev.starts_with("BROKEN:")
+    {
+        return Err(ChainError::BrokenLink { seq: 0 });
+    }
+    for ev in events {
         if ev.integrity.seq != expected_seq {
             return Err(ChainError::SeqGap {
                 expected: expected_seq,
@@ -95,6 +134,7 @@ pub fn verify_chain(events: &[AuditEvent]) -> Result<(), ChainError> {
             });
         }
         prev = ev.integrity.hash.clone();
+        expected_seq = expected_seq.saturating_add(1);
     }
     Ok(())
 }
@@ -180,5 +220,28 @@ mod tests {
         chain.stamp(&mut c);
         // Dropping b leaves a seq gap and a broken prev_hash link.
         assert!(verify_chain(&[a, c]).is_err());
+    }
+
+    #[test]
+    fn resume_continues_seq_and_hash() {
+        let mut chain = HashChain::new();
+        let mut a = sample_query_event();
+        chain.stamp(&mut a);
+        let mut resumed = HashChain::resume(a.integrity.seq, a.integrity.hash.clone());
+        let mut b = sample_query_event();
+        resumed.stamp(&mut b);
+        assert_eq!(b.integrity.seq, 1);
+        assert_eq!(b.integrity.prev_hash, a.integrity.hash);
+        verify_chain(&[a, b]).unwrap();
+    }
+
+    #[test]
+    fn resume_broken_is_explicit_not_genesis() {
+        let mut chain = HashChain::resume_broken("unparseable tail");
+        let mut ev = sample_query_event();
+        chain.stamp(&mut ev);
+        assert!(ev.integrity.prev_hash.starts_with("BROKEN:"));
+        assert_ne!(ev.integrity.prev_hash, GENESIS);
+        verify_chain(&[ev]).unwrap();
     }
 }

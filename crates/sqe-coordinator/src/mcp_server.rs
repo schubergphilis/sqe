@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use sqe_auth::AuthProvider;
 use sqe_core::{
     config::{McpConfig, TlsConfig},
-    Session, SqeError,
+    Session, SqeError, SqeErrorCode,
 };
 
 use crate::{
@@ -48,7 +48,7 @@ impl sqe_mcp::QueryExecutor for CoordinatorMcpExecutor {
     async fn execute(&self, session: &Session, sql: &str) -> Result<Vec<RecordBatch>, SqeError> {
         self.rate_limiter
             .check(&session.user.username)
-            .map_err(|error| SqeError::Execution(format!("rate limit: {error}")))?;
+            .map_err(|error| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("rate limit: {error}")))?;
         self.handler.execute(session, sql, None).await
     }
 }

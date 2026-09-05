@@ -729,7 +729,12 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
     ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
         self.rate_limiter
             .check(&session.user.username)
-            .map_err(|e| sqe_core::SqeError::Execution(format!("rate limit: {e}")))?;
+            .map_err(|e| {
+                sqe_core::SqeError::with_code(
+                    sqe_core::SqeErrorCode::ResourceExhausted,
+                    format!("rate limit: {e}"),
+                )
+            })?;
         self.handler.execute(session, sql, None).await
     }
 
@@ -885,7 +890,8 @@ async fn async_main() -> anyhow::Result<()> {
         &config.metrics.otlp_endpoint,
         &config.metrics.traces_otlp_endpoint,
         config.metrics.trace_sample_rate,
-    );
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
 
     tracing::info!(mode = ?mode, config = config_path, "Starting sqe-server");
 
@@ -1033,7 +1039,11 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("failed to initialize metrics registry: {e}"))?,
     );
 
-    sqe_metrics::server::start_metrics_server(metrics.clone(), config.metrics.prometheus_port);
+    let _metrics_server = sqe_metrics::server::start_metrics_server(
+        metrics.clone(),
+        config.metrics.prometheus_port,
+    )
+    .map_err(|e| anyhow::anyhow!("failed to bind metrics server: {e}"))?;
     tracing::info!(
         "Prometheus metrics on port {}",
         config.metrics.prometheus_port
@@ -1104,7 +1114,15 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         {
             let sm = session_manager.clone();
             let restore_path = config.session.persistence_path.clone();
-            let _ = tokio::task::spawn_blocking(move || sm.restore_from_file(&restore_path)).await;
+            match tokio::task::spawn_blocking(move || sm.restore_from_file(&restore_path)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "session restore from file failed");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "session restore task panicked");
+                }
+            }
         }
 
         // Spawn background task to periodically snapshot sessions to disk
@@ -1169,9 +1187,14 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     // wired via CacheTagSource. Salt is derived once at startup (stable within
     // a deployment, not across restarts/replicas, not secret-grade).
     let audit_salt = uuid::Uuid::new_v4().to_string();
-    let audit_logger = sqe_metrics::audit::AuditLogger::with_config(
+    let audit_logger = sqe_metrics::audit::AuditLogger::with_options(
         &config.metrics.audit_log_path,
         sqe_coordinator::parse_audit_format(&config.metrics.audit.format),
+        sqe_metrics::audit::AuditLoggerOptions {
+            queue_capacity: config.metrics.audit.queue_capacity,
+            fail_mode: sqe_metrics::audit::AuditFailMode::parse(&config.metrics.audit.fail_mode),
+            dropped: Some(metrics.audit_events_dropped_total.clone()),
+        },
     )
     .map_err(|e| anyhow::anyhow!(e))?;
 
@@ -1793,10 +1816,11 @@ async fn run_worker(config: SqeConfig, config_path: String) -> anyhow::Result<()
         sqe_metrics::WorkerMetricsRegistry::new()
             .map_err(|e| anyhow::anyhow!("failed to initialize worker metrics registry: {e}"))?,
     );
-    sqe_metrics::server::start_metrics_server(
+    let _metrics_server = sqe_metrics::server::start_metrics_server(
         worker_metrics.clone(),
         config.metrics.prometheus_port,
-    );
+    )
+    .map_err(|e| anyhow::anyhow!("failed to bind metrics server: {e}"))?;
 
     let (session_ctx, memory_pool) = sqe_worker::runtime::build_session_context(&config.worker)?;
 
@@ -2623,8 +2647,8 @@ mod tests {
             // "admin-tok" -> admin; "user-tok" -> non-admin; anything else -> fail
             match token.as_str() {
                 "admin-tok" => Ok(sqe_auth::Identity {
-                    user_id: "admin".into(),
-                    display_name: "Admin".into(),
+                    user_id: "admin",
+                    display_name: "Admin",
                     roles: self.admin_roles.clone(),
                     subject: None,
                     email: None,
@@ -2634,9 +2658,9 @@ mod tests {
                     expires_at: None,
                 }),
                 "user-tok" => Ok(sqe_auth::Identity {
-                    user_id: "user".into(),
-                    display_name: "User".into(),
-                    roles: vec!["analyst".into()],
+                    user_id: "user",
+                    display_name: "User",
+                    roles: vec!["analyst"],
                     subject: None,
                     email: None,
                     groups: vec![],
@@ -2644,7 +2668,7 @@ mod tests {
                     refresh_token: None,
                     expires_at: None,
                 }),
-                _ => Err(sqe_auth::AuthError::AuthFailed("bad token".into())),
+                _ => Err(sqe_auth::AuthError::AuthFailed("bad token")),
             }
         }
     }
@@ -2655,11 +2679,11 @@ mod tests {
 
     fn make_guarded_state_with_web_ui(web_ui: bool) -> Arc<HealthState> {
         let provider: Arc<dyn sqe_auth::AuthProvider> = Arc::new(StubAuthProvider {
-            admin_roles: vec!["sqe-admin".into()],
+            admin_roles: vec!["sqe-admin"],
         });
         let mut auth_cfg: sqe_core::config::AuthConfig =
             toml::from_str("").expect("empty auth config");
-        auth_cfg.admin_roles = vec!["sqe-admin".into()];
+        auth_cfg.admin_roles = vec!["sqe-admin"];
         Arc::new(HealthState {
             ready: Arc::new(AtomicBool::new(true)),
             started_at: Instant::now(),

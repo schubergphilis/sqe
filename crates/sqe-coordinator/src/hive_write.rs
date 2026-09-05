@@ -30,7 +30,7 @@ use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::SessionContext;
 use sqlparser::ast::Statement;
 
-use sqe_core::SqeError;
+use sqe_core::{SqeError, SqeErrorCode};
 
 /// One-row `count` result, matching what the Iceberg insert path returns so a
 /// client cannot tell which engine path served the statement.
@@ -39,7 +39,7 @@ fn rows_written(n: u64) -> Result<Vec<RecordBatch>, SqeError> {
     let col: ArrayRef = Arc::new(UInt64Array::from(vec![n]));
     RecordBatch::try_new(schema, vec![col])
         .map(|b| vec![b])
-        .map_err(|e| SqeError::Execution(format!("hive insert result: {e}")))
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("hive insert result: {e}")))
 }
 
 /// Reject `INSERT OVERWRITE` against a Hive external table, with the reason.
@@ -102,11 +102,11 @@ pub async fn handle_insert(
     let df = ctx
         .sql(sql)
         .await
-        .map_err(|e| SqeError::Execution(format!("hive insert: planning failed: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("hive insert: planning failed: {e}")))?;
     let batches = df
         .collect()
         .await
-        .map_err(|e| SqeError::Execution(format!("hive insert: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("hive insert: {e}")))?;
 
     // DataFusion's insert returns a one-row count. Read it rather than
     // re-deriving one, so the number reported is the number the sink wrote.
@@ -280,7 +280,7 @@ pub fn ctas_spec(
         [d, t] => (None, Some(d.clone()), t.clone()),
         [c, d, t] => (Some(c.clone()), Some(d.clone()), t.clone()),
         _ => {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "hive_external: `{}` is not a one, two, or three part table name",
                 ct.name
             )))
@@ -290,7 +290,7 @@ pub fn ctas_spec(
     let declared = declared_partition_keys(ct);
     let n_fields = query_schema.fields().len();
     if declared.len() >= n_fields {
-        return Err(SqeError::Execution(format!(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "hive_external: the query produces {n_fields} column(s) and {} of them were \
              declared as partition keys, leaving nothing to store in the data files",
             declared.len()
@@ -302,7 +302,7 @@ pub fn ctas_spec(
     for (i, (key, _)) in declared.iter().enumerate() {
         let field = query_schema.field(split + i);
         if !field.name().eq_ignore_ascii_case(key) {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "hive_external: partition column `{key}` must be column {} of the SELECT, but \
                  that column is `{}`. Hive stores partition columns in the directory name and \
                  the read path expects them last, so the SELECT must end with them in the \
@@ -320,7 +320,7 @@ pub fn ctas_spec(
             Some(t) => t.to_ascii_lowercase(),
             None => hive_type_of(field.data_type())
                 .ok_or_else(|| {
-                    SqeError::Execution(format!(
+                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "hive_external: column `{}` has type {} which has no Hive equivalent \
                          this release records. Cast it in the SELECT, or declare the column \
                          type explicitly.",

@@ -1,4 +1,25 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use datafusion::error::DataFusionError;
 use thiserror::Error;
+
+/// How many times a legacy `Catalog(String)` / `Execution(String)` error was
+/// classified by English substring. Production should drive this to zero.
+static CLASSIFIED_BY_TEXT: AtomicU64 = AtomicU64::new(0);
+
+/// Test/ops helper: count of substring classifications since process start.
+pub fn classified_by_text_total() -> u64 {
+    CLASSIFIED_BY_TEXT.load(Ordering::Relaxed)
+}
+
+fn record_text_classification(kind: &'static str, code: SqeErrorCode) {
+    CLASSIFIED_BY_TEXT.fetch_add(1, Ordering::Relaxed);
+    tracing::warn!(
+        kind,
+        code = code.name(),
+        "sqe_error_classified_by_text_total: classified a stringly-typed error by message text"
+    );
+}
 
 /// Catalog operation that failed; carried by the structured `CatalogHttp`
 /// variant so logs and metrics can attribute errors without parsing English.
@@ -109,6 +130,21 @@ fn body_for_display(body: &str) -> String {
 }
 
 impl SqeError {
+    /// Typed error without an upstream source. Prefer this over
+    /// [`SqeError::Execution`] / [`SqeError::Catalog`] so `error_code()` does
+    /// not have to sniff English.
+    pub fn with_code(code: SqeErrorCode, message: impl std::fmt::Display) -> Self {
+        #[derive(Debug)]
+        struct TypedOrigin;
+        impl std::fmt::Display for TypedOrigin {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("typed")
+            }
+        }
+        impl std::error::Error for TypedOrigin {}
+        SqeError::sourced(code, message.to_string(), TypedOrigin)
+    }
+
     /// Build a source-preserving error with an explicit [`SqeErrorCode`]. The
     /// underlying cause is kept reachable via [`std::error::Error::source`].
     pub fn sourced(
@@ -283,9 +319,45 @@ impl SqeError {
             }
             SqeError::IcebergCommitConflict(_) => SqeErrorCode::CommitConflict,
             SqeError::S3Throttled(_) => SqeErrorCode::ResourceExhausted,
-            SqeError::Catalog(msg) => classify_catalog_error(msg),
-            SqeError::Execution(msg) => classify_execution_error(msg),
+            SqeError::Catalog(msg) => {
+                let code = classify_catalog_error(msg);
+                record_text_classification("catalog", code);
+                code
+            }
+            SqeError::Execution(msg) => {
+                let code = classify_execution_error(msg);
+                record_text_classification("execution", code);
+                code
+            }
             SqeError::Sourced { code, .. } => *code,
+        }
+    }
+}
+
+impl From<DataFusionError> for SqeError {
+    fn from(e: DataFusionError) -> Self {
+        let code = datafusion_error_code(&e);
+        SqeError::sourced(code, e.to_string(), e)
+    }
+}
+
+fn datafusion_error_code(e: &DataFusionError) -> SqeErrorCode {
+    match e {
+        DataFusionError::Plan(_) => SqeErrorCode::SemanticError,
+        DataFusionError::SchemaError(_, _) => SqeErrorCode::SemanticError,
+        DataFusionError::ResourcesExhausted(_) => SqeErrorCode::ResourceExhausted,
+        DataFusionError::NotImplemented(_) => SqeErrorCode::NotSupported,
+        DataFusionError::SQL(_, _) => SqeErrorCode::ParseError,
+        DataFusionError::Internal(_) => SqeErrorCode::InternalError,
+        DataFusionError::Execution(_) => SqeErrorCode::ExecutionFailed,
+        other => {
+            // Nested External/Context wrappers: peel one layer when present.
+            if let DataFusionError::External(inner) = other {
+                if let Some(df) = inner.downcast_ref::<DataFusionError>() {
+                    return datafusion_error_code(df);
+                }
+            }
+            SqeErrorCode::ExecutionFailed
         }
     }
 }
@@ -804,7 +876,7 @@ mod tests {
     fn client_message_hides_auth_details() {
         // Auth is a user error — detail is shown, but the string still starts
         // with the auth message (no internal system paths leaked).
-        let err = SqeError::Auth("JWT expired at 2026-01-01T00:00:00Z".into());
+        let err = SqeError::Auth("JWT expired at 2026-01-01T00:00:00Z".to_string());
         // The detail IS surfaced for user errors; check it contains the reason.
         assert!(err.client_message().contains("JWT expired"));
         // Still must not expose stack traces / file paths (there are none here).
@@ -820,8 +892,7 @@ mod tests {
             "Failed to create table: status: 403 Forbidden, ... Unable to \
              create table at location 's3://iceberg-warehouse/main_warehouse/\
              dev_silver/stg_customers__dbt_tmp' because it conflicts with \
-             existing table or namespace"
-                .into(),
+             existing table or namespace",
         );
         let msg = err.client_message();
         assert!(msg.contains("conflicts with existing table"));
@@ -836,7 +907,7 @@ mod tests {
         // the variant-based routing change, the underlying message is shown
         // — that includes column / table names from the query the user
         // actually submitted.
-        let err = SqeError::Execution("Failed to bind variable: 'p_threshold' not provided".into());
+        let err = SqeError::Execution("Failed to bind variable: 'p_threshold' not provided".to_string());
         let msg = err.client_message();
         assert!(msg.contains("p_threshold"));
         assert!(msg.contains("not provided"));
@@ -851,7 +922,7 @@ mod tests {
 
     #[test]
     fn client_message_hides_config_details() {
-        let err = SqeError::Config("missing field 'client_secret'".into());
+        let err = SqeError::Config("missing field 'client_secret'".to_string());
         assert_eq!(err.client_message(), "Internal error");
         assert!(!err.client_message().contains("client_secret"));
     }
@@ -866,14 +937,14 @@ mod tests {
     #[test]
     fn to_client_error_production_hides_details() {
         // Auth is a user error so detail IS shown; test adjusted.
-        let err = SqeError::Auth("token invalid: audience mismatch".into());
+        let err = SqeError::Auth("token invalid: audience mismatch".to_string());
         let output = err.to_client_error(false);
         assert!(output.contains("audience") || output.contains("token"));
     }
 
     #[test]
     fn to_client_error_debug_exposes_details() {
-        let err = SqeError::Auth("token invalid: audience mismatch".into());
+        let err = SqeError::Auth("token invalid: audience mismatch".to_string());
         let output = err.to_client_error(true);
         assert!(output.contains("audience mismatch"));
         assert!(output.contains("Authentication failed"));
@@ -882,13 +953,13 @@ mod tests {
     #[test]
     fn is_not_found_true_for_catalog_http_404() {
         let err =
-            SqeError::Catalog("Failed to drop view (HTTP 404 Not Found): view not found".into());
+            SqeError::Catalog("Failed to drop view (HTTP 404 Not Found): view not found".to_string());
         assert!(err.is_not_found());
     }
 
     #[test]
     fn is_not_found_false_for_catalog_other_status() {
-        let err = SqeError::Catalog("Failed to drop view (HTTP 500 Internal Server Error)".into());
+        let err = SqeError::Catalog("Failed to drop view (HTTP 500 Internal Server Error)".to_string());
         assert!(!err.is_not_found());
     }
 
@@ -915,9 +986,9 @@ mod tests {
 
     #[test]
     fn is_not_found_false_for_non_catalog_variants() {
-        assert!(!SqeError::Auth("HTTP 404".into()).is_not_found());
-        assert!(!SqeError::Execution("HTTP 404".into()).is_not_found());
-        assert!(!SqeError::NotImplemented("HTTP 404".into()).is_not_found());
+        assert!(!SqeError::Auth("HTTP 404".to_string()).is_not_found());
+        assert!(!SqeError::Execution("HTTP 404".to_string()).is_not_found());
+        assert!(!SqeError::NotImplemented("HTTP 404".to_string()).is_not_found());
     }
 
     #[test]
@@ -936,7 +1007,7 @@ mod tests {
 
     #[test]
     fn error_code_auth() {
-        let err = SqeError::Auth("invalid token".into());
+        let err = SqeError::Auth("invalid token".to_string());
         let code = err.error_code();
         assert_eq!(code, SqeErrorCode::AuthenticationFailed);
         assert!(code.is_user_error());
@@ -944,7 +1015,7 @@ mod tests {
 
     #[test]
     fn error_code_table_not_found_from_execution() {
-        let err = SqeError::Execution("table 'orders' not found in catalog".into());
+        let err = SqeError::Execution("table 'orders' not found in catalog".to_string());
         let code = err.error_code();
         assert_eq!(code, SqeErrorCode::TableNotFound);
         assert!(code.is_user_error());
@@ -959,7 +1030,7 @@ mod tests {
         // SqeSchemaProvider::table(), which made every Iceberg view
         // unreadable. See scripts/access-control-parity-demo.sh section 7.
         let err = SqeError::Catalog(
-            "Failed to load table: Unexpected => Tried to load a table that does not exist".into(),
+            "Failed to load table: Unexpected => Tried to load a table that does not exist",
         );
         assert_eq!(err.error_code(), SqeErrorCode::TableNotFound);
     }
@@ -981,15 +1052,15 @@ mod tests {
     fn classify_catalog_does_not_exist_keeps_more_specific_codes() {
         // The phrasing must not outrank the view/namespace/auth branches.
         assert_eq!(
-            SqeError::Catalog("Tried to load a view that does not exist".into()).error_code(),
+            SqeError::Catalog("Tried to load a view that does not exist".to_string()).error_code(),
             SqeErrorCode::ViewNotFound
         );
         assert_eq!(
-            SqeError::Catalog("Namespace acparity does not exist".into()).error_code(),
+            SqeError::Catalog("Namespace acparity does not exist".to_string()).error_code(),
             SqeErrorCode::SchemaNotFound
         );
         assert_eq!(
-            SqeError::Catalog("Failed to load table: 403 Forbidden: table does not exist".into())
+            SqeError::Catalog("Failed to load table: 403 Forbidden: table does not exist".to_string())
                 .error_code(),
             SqeErrorCode::AccessDenied
         );
@@ -1003,8 +1074,7 @@ mod tests {
         let err = SqeError::Execution(
             "Resources exhausted: Failed to allocate additional 134217728 bytes for \
              iceberg-scan-decode:iceberg.tpch.lineitem with 0 bytes already allocated \
-             for this reservation - 1048576 bytes remain available for the total pool"
-                .into(),
+             for this reservation - 1048576 bytes remain available for the total pool",
         );
         assert_eq!(err.error_code(), SqeErrorCode::ResourceExhausted);
     }
@@ -1018,8 +1088,7 @@ mod tests {
         let err = SqeError::Execution(
             "Query execution error: Failed to commit INSERT transaction: \
              Unexpected, context: { status: 401 Unauthorized, \
-             headers: {\"www-authenticate\": \"Bearer\"} }"
-                .into(),
+             headers: {\"www-authenticate\": \"Bearer\"} }",
         );
         assert_eq!(err.error_code(), SqeErrorCode::AuthenticationFailed);
     }
@@ -1029,8 +1098,7 @@ mod tests {
         let err = SqeError::Execution(
             "Query execution error: Failed to create table: \
              Unexpected, context: { status: 403 Forbidden, \
-             headers: {\"content-type\": \"application/json\"} }"
-                .into(),
+             headers: {\"content-type\": \"application/json\"} }",
         );
         assert_eq!(err.error_code(), SqeErrorCode::AccessDenied);
     }
@@ -1043,14 +1111,14 @@ mod tests {
         // "403 forbidden") so a regular table-not-found error still routes
         // to TableNotFound, not AuthenticationFailed.
         let err = SqeError::Execution(
-            "Query execution error: table 'orders' not found in catalog".into(),
+            "Query execution error: table 'orders' not found in catalog",
         );
         assert_eq!(err.error_code(), SqeErrorCode::TableNotFound);
     }
 
     #[test]
     fn error_code_function_not_found() {
-        let err = SqeError::Execution("Invalid function 'my_udf'".into());
+        let err = SqeError::Execution("Invalid function 'my_udf'".to_string());
         let code = err.error_code();
         assert_eq!(code, SqeErrorCode::FunctionNotFound);
         assert!(code.is_user_error());
@@ -1058,7 +1126,7 @@ mod tests {
 
     #[test]
     fn error_code_type_mismatch() {
-        let err = SqeError::Execution("TypeSignatureClass(Exact([Int64])) does not match".into());
+        let err = SqeError::Execution("TypeSignatureClass(Exact([Int64])) does not match".to_string());
         let code = err.error_code();
         assert_eq!(code, SqeErrorCode::TypeMismatch);
         assert!(code.is_user_error());
@@ -1074,8 +1142,7 @@ mod tests {
         let err = SqeError::Execution(
             "Function 'lower' requires String, but received Boolean (DataType: Boolean).. \
              No function matches the given name and argument types 'lower(Boolean)'. \
-             You might need to add explicit type casts."
-                .into(),
+             You might need to add explicit type casts.",
         );
         assert_eq!(err.error_code(), SqeErrorCode::TypeMismatch);
     }
@@ -1090,7 +1157,7 @@ mod tests {
         // USER_ERROR over Trino), not fall through to ExecutionFailed
         // (INTERNAL_ERROR), which mislabels a bad predicate as a server bug.
         let err = SqeError::Execution(
-            "DataInvalid => Can't convert datum from long type to string type.".into(),
+            "DataInvalid => Can't convert datum from long type to string type.",
         );
         assert_eq!(err.error_code(), SqeErrorCode::TypeMismatch);
         assert!(err.error_code().is_user_error());
@@ -1101,7 +1168,7 @@ mod tests {
         // The raw iceberg `DataInvalid => ` wrapper should not leak to clients;
         // the readable cause survives.
         let err = SqeError::Execution(
-            "DataInvalid => Can't convert datum from long type to string type.".into(),
+            "DataInvalid => Can't convert datum from long type to string type.",
         );
         let msg = err.client_message();
         assert!(!msg.contains("DataInvalid =>"), "prefix leaked: {msg}");
@@ -1110,7 +1177,7 @@ mod tests {
 
     #[test]
     fn error_code_not_supported() {
-        let err = SqeError::NotImplemented("MERGE INTO is not yet supported".into());
+        let err = SqeError::NotImplemented("MERGE INTO is not yet supported".to_string());
         let code = err.error_code();
         assert_eq!(code, SqeErrorCode::NotSupported);
         assert!(code.is_user_error());
@@ -1118,7 +1185,7 @@ mod tests {
 
     #[test]
     fn error_code_duplicate_table() {
-        let err = SqeError::Catalog("Table 'orders' already exists".into());
+        let err = SqeError::Catalog("Table 'orders' already exists".to_string());
         let code = err.error_code();
         assert_eq!(code, SqeErrorCode::DuplicateTable);
         assert!(code.is_user_error());
@@ -1130,8 +1197,7 @@ mod tests {
         // race was active. Must NOT classify as TableNotFound.
         let err = SqeError::Catalog(
             "Failed to list namespaces: Unexpected, context: \
-             { status: 401 Unauthorized, headers: { www-authenticate: \"Bearer\" } }"
-                .into(),
+             { status: 401 Unauthorized, headers: { www-authenticate: \"Bearer\" } }",
         );
         let code = err.error_code();
         assert_eq!(code, SqeErrorCode::AuthenticationFailed);
@@ -1142,7 +1208,7 @@ mod tests {
     #[test]
     fn error_code_catalog_403_classifies_as_access_denied() {
         let err = SqeError::Catalog(
-            "Failed to load table: 403 Forbidden: principal not authorised".into(),
+            "Failed to load table: 403 Forbidden: principal not authorised",
         );
         let code = err.error_code();
         assert_eq!(code, SqeErrorCode::AccessDenied);
@@ -1154,7 +1220,7 @@ mod tests {
         // DataFusion's External wrapper is flattened by the coordinator today.
         // The catalog marker must still map it to PERMISSION_DENIED.
         let err = SqeError::Execution(
-            "SQL planning failed: External error: Access denied: Failed to load table".into(),
+            "SQL planning failed: External error: Access denied: Failed to load table",
         );
         assert_eq!(err.error_code(), SqeErrorCode::AccessDenied);
     }
@@ -1163,7 +1229,7 @@ mod tests {
     fn error_code_catalog_unauthorized_word_alone_classifies_as_auth() {
         // Some catalogs (HMS, Glue) format the error without an HTTP code
         // but still include "unauthorized" or "www-authenticate".
-        let err = SqeError::Catalog("AccessDenied: unauthorized request".into());
+        let err = SqeError::Catalog("AccessDenied: unauthorized request".to_string());
         let code = err.error_code();
         assert_eq!(code, SqeErrorCode::AuthenticationFailed);
     }
@@ -1172,14 +1238,14 @@ mod tests {
     fn error_code_catalog_table_with_404_still_classifies_as_table_not_found() {
         // Regression: the new auth-first branch must not steal genuine
         // not-found errors that don't mention auth.
-        let err = SqeError::Catalog("Failed to load table: HTTP 404 Not Found: orders".into());
+        let err = SqeError::Catalog("Failed to load table: HTTP 404 Not Found: orders".to_string());
         let code = err.error_code();
         assert_eq!(code, SqeErrorCode::TableNotFound);
     }
 
     #[test]
     fn error_code_commit_conflict() {
-        let err = SqeError::Execution("file already referenced in snapshot".into());
+        let err = SqeError::Execution("file already referenced in snapshot".to_string());
         let code = err.error_code();
         assert_eq!(code, SqeErrorCode::CommitConflict);
     }
@@ -1188,52 +1254,52 @@ mod tests {
 
     #[test]
     fn classify_catalog_503_is_unavailable_not_internal() {
-        let err = SqeError::Catalog("Polaris returned 503 Service Unavailable".into());
+        let err = SqeError::Catalog("Polaris returned 503 Service Unavailable".to_string());
         assert_eq!(err.error_code(), SqeErrorCode::CatalogUnavailable);
     }
 
     #[test]
     fn classify_catalog_502_bad_gateway_is_unavailable() {
-        let err = SqeError::Catalog("HTTP 502 Bad Gateway from upstream".into());
+        let err = SqeError::Catalog("HTTP 502 Bad Gateway from upstream".to_string());
         assert_eq!(err.error_code(), SqeErrorCode::CatalogUnavailable);
     }
 
     #[test]
     fn classify_catalog_504_gateway_timeout_is_unavailable() {
-        let err = SqeError::Catalog("HTTP 504 Gateway Timeout".into());
+        let err = SqeError::Catalog("HTTP 504 Gateway Timeout".to_string());
         assert_eq!(err.error_code(), SqeErrorCode::CatalogUnavailable);
     }
 
     #[test]
     fn classify_catalog_connection_refused_is_unavailable() {
         let err =
-            SqeError::Catalog("Failed to send request: connection refused (os error 61)".into());
+            SqeError::Catalog("Failed to send request: connection refused (os error 61)".to_string());
         assert_eq!(err.error_code(), SqeErrorCode::CatalogUnavailable);
     }
 
     #[test]
     fn classify_catalog_dns_failure_is_unavailable() {
-        let err = SqeError::Catalog("dns lookup failed: NXDOMAIN".into());
+        let err = SqeError::Catalog("dns lookup failed: NXDOMAIN".to_string());
         assert_eq!(err.error_code(), SqeErrorCode::CatalogUnavailable);
     }
 
     #[test]
     fn classify_catalog_circuit_breaker_open() {
-        let err = SqeError::Catalog("circuit breaker open for polaris-rest".into());
+        let err = SqeError::Catalog("circuit breaker open for polaris-rest".to_string());
         assert_eq!(err.error_code(), SqeErrorCode::CircuitBreakerOpen);
     }
 
     #[test]
     fn classify_catalog_genuine_404_still_not_found() {
         // The new transient checks must not steal genuine 404s.
-        let err = SqeError::Catalog("Failed to load: HTTP 404 Not Found".into());
+        let err = SqeError::Catalog("Failed to load: HTTP 404 Not Found".to_string());
         assert_eq!(err.error_code(), SqeErrorCode::TableNotFound);
     }
 
     #[test]
     fn classify_catalog_genuine_401_still_auth_failed() {
         // 401 wins over 5xx detection — auth comes first in the classifier.
-        let err = SqeError::Catalog("HTTP 401 Unauthorized: token expired".into());
+        let err = SqeError::Catalog("HTTP 401 Unauthorized: token expired".to_string());
         assert_eq!(err.error_code(), SqeErrorCode::AuthenticationFailed);
     }
 
@@ -1287,7 +1353,7 @@ mod tests {
     #[test]
     fn client_message_shows_detail_for_user_errors() {
         // NotImplemented is a user error: detail must be in client message.
-        let err = SqeError::NotImplemented("LATERAL JOIN is not yet supported".into());
+        let err = SqeError::NotImplemented("LATERAL JOIN is not yet supported".to_string());
         let msg = err.client_message();
         assert!(msg.contains("LATERAL JOIN"), "expected detail in: {msg}");
     }
@@ -1364,7 +1430,7 @@ mod tests {
     fn execution_auth_401_is_authentication_failed() {
         let err = SqeError::ExecutionAuth {
             status: 401,
-            body: "token expired".into(),
+            body: "token expired",
         };
         assert_eq!(err.error_code(), SqeErrorCode::AuthenticationFailed);
     }
@@ -1380,13 +1446,13 @@ mod tests {
 
     #[test]
     fn iceberg_commit_conflict_variant_is_commit_conflict() {
-        let err = SqeError::IcebergCommitConflict("snapshot N has already been added".into());
+        let err = SqeError::IcebergCommitConflict("snapshot N has already been added");
         assert_eq!(err.error_code(), SqeErrorCode::CommitConflict);
     }
 
     #[test]
     fn s3_throttled_variant_is_resource_exhausted() {
-        let err = SqeError::S3Throttled("SlowDown".into());
+        let err = SqeError::S3Throttled("SlowDown");
         assert_eq!(err.error_code(), SqeErrorCode::ResourceExhausted);
     }
 
@@ -1404,5 +1470,50 @@ mod tests {
             format!("{}", SqeErrorCode::InternalError),
             "GENERIC_INTERNAL_ERROR"
         );
+    }
+
+    #[test]
+    fn datafusion_resources_exhausted_maps_by_variant_not_text() {
+        let err: SqeError = DataFusionError::ResourcesExhausted(
+            "table timeout_events not found while allocating",
+        )
+        .into();
+        assert_eq!(err.error_code(), SqeErrorCode::ResourceExhausted);
+    }
+
+    #[test]
+    fn datafusion_plan_maps_to_semantic_error() {
+        let err: SqeError = DataFusionError::Plan("Error during planning").into();
+        assert_eq!(err.error_code(), SqeErrorCode::SemanticError);
+    }
+
+    #[test]
+    fn typed_code_wins_over_message_keywords() {
+        let err = SqeError::with_code(
+            SqeErrorCode::QueryTimeout,
+            "table timeout_events not found",
+        );
+        assert_eq!(err.error_code(), SqeErrorCode::QueryTimeout);
+    }
+
+    #[test]
+    fn catalog_http_500_is_unavailable_not_access_denied() {
+        let err = SqeError::CatalogHttp {
+            status: 500,
+            op: CatalogOp::LoadTable,
+            body: "forbidden by policy engine for table forbidden_words",
+        };
+        assert_eq!(err.error_code(), SqeErrorCode::CatalogUnavailable);
+        assert!(!err.error_code().is_user_error());
+    }
+
+    #[test]
+    fn iceberg_data_invalid_kind_maps_to_type_mismatch() {
+        // Mirrors `ErrorKind::DataInvalid` -> TypeMismatch at the catalog boundary.
+        let err = SqeError::with_code(
+            SqeErrorCode::TypeMismatch,
+            "DataInvalid => Can't convert datum from int to string",
+        );
+        assert_eq!(err.error_code(), SqeErrorCode::TypeMismatch);
     }
 }

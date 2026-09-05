@@ -24,7 +24,7 @@ use iceberg::table::Table as IcebergTable;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use sqe_catalog::{SessionCatalog, TableMetadataCache};
-use sqe_core::{Session, SqeConfig, SqeError};
+use sqe_core::{Session, SqeConfig, SqeError, SqeErrorCode};
 use sqe_sql::{NamespaceRef, ProcedureCall, TableRef};
 use tracing::{info, warn};
 
@@ -316,7 +316,7 @@ impl MaintenanceHandler {
                 let healthy = self.healthy_worker_count().await;
                 let outcome = match resolve_execution(mode, healthy, dist.min_workers) {
                     ExecutionPlan::SkipInsufficientWorkers => {
-                        return Err(SqeError::Execution(format!(
+                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                             "CALL system.rewrite_data_files: distribution mode 'require' \
                              needs >= {} healthy workers, only {healthy} are healthy",
                             dist.min_workers
@@ -449,7 +449,7 @@ impl MaintenanceHandler {
 
         // Target must exist in the table's snapshot history.
         if table.metadata().snapshot_by_id(snapshot_id).is_none() {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "CALL system.{op_name}: snapshot id {snapshot_id} not found in table '{ident}' history"
             )));
         }
@@ -470,7 +470,7 @@ impl MaintenanceHandler {
                     .and_then(|s| s.parent_snapshot_id());
             }
             if !is_ancestor {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "CALL system.rollback_to_snapshot: snapshot id {snapshot_id} is not an ancestor \
                      of the current snapshot of '{ident}'; use set_current_snapshot to move to an \
                      arbitrary snapshot"
@@ -487,7 +487,7 @@ impl MaintenanceHandler {
         let action = tx.create_branch(MAIN_BRANCH).with_snapshot_id(snapshot_id);
         let tx = action
             .apply(tx)
-            .map_err(|e| SqeError::Execution(format!("{op_name} apply failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("{op_name} apply failed: {e}")))?;
         let committed = tx
             .commit(catalog.as_ref())
             .await
@@ -581,7 +581,7 @@ impl MaintenanceHandler {
                 Arc::new(StringArray::from(vec!["registered"])),
             ],
         )
-        .map_err(|e| SqeError::Execution(format!("register_table summary: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("register_table summary: {e}")))?;
         Ok(vec![batch])
     }
 
@@ -639,7 +639,7 @@ impl MaintenanceHandler {
                 Arc::new(StringArray::from(vec!["dropped"])),
             ],
         )
-        .map_err(|e| SqeError::Execution(format!("drop_table summary: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("drop_table summary: {e}")))?;
         Ok(vec![batch])
     }
 
@@ -800,7 +800,7 @@ impl MaintenanceHandler {
             target = %target,
             "Maintenance procedure denied: user lacks write privilege"
         );
-        Err(SqeError::Execution(format!(
+        Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "Access denied: user '{}' does not have write privilege on '{target}' required by \
              CALL system.{}",
             session.user.username,
@@ -958,7 +958,7 @@ impl MaintenanceHandler {
         let arrow_schema: arrow_schema::SchemaRef = Arc::new(
             iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema().as_ref())
                 .map_err(|e| {
-                    SqeError::Execution(format!("compaction schema conversion failed: {e}"))
+                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("compaction schema conversion failed: {e}"))
                 })?,
         );
         let sort_spec = parse_sort_spec(strategy.as_deref(), sort_order.as_deref(), &arrow_schema)?;
@@ -1175,7 +1175,7 @@ impl MaintenanceHandler {
         let removed_rows: u64 = old_files.iter().map(|f| f.record_count()).sum();
         let added_rows: u64 = new_files.iter().map(|f| f.record_count()).sum();
         if added_rows > removed_rows {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "rewrite_data_files row-count invariant violated: added={added_rows} exceeds \
                  removed={removed_rows} (read_count={rewritten_rows}); a rewrite cannot \
                  increase row count; aborting before commit"
@@ -1270,7 +1270,7 @@ impl MaintenanceHandler {
         }
         let tx_applied = action
             .apply(tx)
-            .map_err(|e| SqeError::Execution(format!("rewrite_files apply failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("rewrite_files apply failed: {e}")))?;
 
         // TEST-ONLY (see `race_seam`'s doc comment): pauses the FIRST attempt
         // right here -- after the plan baseline was captured from a table
@@ -1479,7 +1479,7 @@ impl MaintenanceHandler {
         let metadata_location = table
             .metadata_location_result()
             .map_err(|e| {
-                SqeError::Execution(format!(
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "rewrite_data_files_distributed: table has no metadata location: {e}"
                 ))
             })?
@@ -1520,7 +1520,7 @@ impl MaintenanceHandler {
         let arrow_schema: arrow_schema::SchemaRef = Arc::new(
             iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema().as_ref())
                 .map_err(|e| {
-                    SqeError::Execution(format!("compaction schema conversion failed: {e}"))
+                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("compaction schema conversion failed: {e}"))
                 })?,
         );
         // The sort is resolved here (same parser the local path uses) but
@@ -2092,7 +2092,7 @@ impl MaintenanceHandler {
                         cur_metadata_location = reload
                             .metadata_location_result()
                             .map_err(|e| {
-                                SqeError::Execution(format!(
+                                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                                     "rewrite_data_files_distributed: reloaded table has no \
                                      metadata location: {e}"
                                 ))
@@ -2117,7 +2117,7 @@ impl MaintenanceHandler {
                     // resurrection this check exists to prevent). Fail the
                     // batch instead; the caller reports `partial` if any
                     // earlier batch already committed.
-                    return Err(SqeError::Execution(format!(
+                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "rewrite_data_files_distributed: a concurrent position delete keeps \
                          landing on this batch's own input files after {attempt} re-dispatch \
                          attempt(s); aborting this batch's commit rather than risk committing \
@@ -2180,7 +2180,7 @@ impl MaintenanceHandler {
                         cur_metadata_location = reloaded
                             .metadata_location_result()
                             .map_err(|e| {
-                                SqeError::Execution(format!(
+                                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                                     "rewrite_data_files_distributed: reloaded table has no \
                                      metadata location: {e}"
                                 ))
@@ -2277,7 +2277,7 @@ impl MaintenanceHandler {
         }
         let tx_applied = action
             .apply(tx)
-            .map_err(|e| SqeError::Execution(format!("rewrite_files apply failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("rewrite_files apply failed: {e}")))?;
 
         let committed = tx_applied
             .commit(catalog.as_ref())
@@ -2368,13 +2368,13 @@ impl MaintenanceHandler {
         if let Some(keep) = retain_last {
             action = action.retain_last(
                 i32::try_from(keep)
-                    .map_err(|_| SqeError::Execution("retain_last does not fit in i32".into()))?,
+                    .map_err(|_| SqeError::Execution("retain_last does not fit in i32".to_string()))?,
             );
         }
 
         let tx_applied = action
             .apply(tx)
-            .map_err(|e| SqeError::Execution(format!("expire_snapshots apply failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("expire_snapshots apply failed: {e}")))?;
 
         let committed = tx_applied
             .commit(catalog.as_ref())
@@ -2427,7 +2427,7 @@ impl MaintenanceHandler {
         let orphans = action
             .execute()
             .await
-            .map_err(|e| SqeError::Execution(format!("remove_orphan_files execute failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("remove_orphan_files execute failed: {e}")))?;
 
         info!(
             table = %ident,
@@ -2461,7 +2461,7 @@ impl MaintenanceHandler {
         let action = tx.rewrite_manifests();
         let tx_applied = action
             .apply(tx)
-            .map_err(|e| SqeError::Execution(format!("rewrite_manifests apply failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("rewrite_manifests apply failed: {e}")))?;
 
         let committed = tx_applied
             .commit(catalog.as_ref())
@@ -2527,7 +2527,7 @@ impl MaintenanceHandler {
         })?;
 
         if table_idents.is_empty() {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "Cannot purge orphans in empty namespace '{}': at least one registered \
                  table is required to derive the FileIO + namespace base. Add a \
                  placeholder table or clean the prefix manually.",
@@ -2557,7 +2557,7 @@ impl MaintenanceHandler {
                          refusing to proceed because an unknown registered location \
                          would be misclassified as orphan"
                     );
-                    return Err(SqeError::Execution(format!(
+                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "purge_orphan_locations: refusing to run; could not load \
                          registered table '{ident}': {e}. Fix the catalog before \
                          retrying so live tables are not deleted."
@@ -2567,7 +2567,7 @@ impl MaintenanceHandler {
         }
 
         let probe = probe_table.ok_or_else(|| {
-            SqeError::Execution(format!(
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "Cannot purge orphans in namespace '{}': failed to load any registered table",
                 namespace.as_string()
             ))
@@ -2579,7 +2579,7 @@ impl MaintenanceHandler {
             .rsplit_once('/')
             .map(|(parent, _)| parent.to_string())
             .ok_or_else(|| {
-                SqeError::Execution(format!(
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Could not derive namespace base from probe location '{probe_loc}'"
                 ))
             })?;
@@ -2598,9 +2598,9 @@ impl MaintenanceHandler {
         let listing = file_io
             .list(format!("{ns_base}/"), false)
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to list prefix '{ns_base}/': {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to list prefix '{ns_base}/': {e}")))?;
         let entries: Vec<_> = listing.try_collect().await.map_err(|e| {
-            SqeError::Execution(format!("Failed to collect listing for '{ns_base}/': {e}"))
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to collect listing for '{ns_base}/': {e}"))
         })?;
 
         let mut paths: Vec<String> = Vec::new();
@@ -2662,7 +2662,7 @@ impl MaintenanceHandler {
                 Arc::new(StringArray::from(actions)),
             ],
         )
-        .map_err(|e| SqeError::Execution(format!("Failed to build result batch: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build result batch: {e}")))?;
 
         info!(
             namespace = %namespace.as_string(),
@@ -2808,7 +2808,7 @@ fn parse_distribution_mode_override(
         "auto" => Ok(DistributionMode::Auto),
         "local" => Ok(DistributionMode::Local),
         "require" => Ok(DistributionMode::Require),
-        other => Err(SqeError::Execution(format!(
+        other => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "CALL system.rewrite_data_files: invalid 'distributed' value '{other}'; \
              expected 'auto', 'local', or 'require'"
         ))),
@@ -3002,11 +3002,11 @@ fn is_strictly_under(candidate: &str, base: &str) -> bool {
 fn classify_commit_error(err: iceberg::Error, proc: &str) -> SqeError {
     let msg = err.to_string();
     if msg.to_lowercase().contains("conflict") || msg.to_lowercase().contains("retry") {
-        SqeError::Execution(format!(
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "{proc}: concurrent writer conflict (retryable): {msg}"
         ))
     } else {
-        SqeError::Execution(format!("{proc}: commit failed: {msg}"))
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("{proc}: commit failed: {msg}"))
     }
 }
 
@@ -3097,7 +3097,7 @@ fn parse_sort_spec(
     let strat = strategy.map(|s| s.trim().to_ascii_lowercase());
     match strat.as_deref() {
         Some(s) if s != "sort" && s != "binpack" => {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "rewrite_data_files: unknown strategy '{s}'; expected 'binpack' or 'sort'"
             )));
         }
@@ -3115,9 +3115,7 @@ fn parse_sort_spec(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            SqeError::Execution(
-                "rewrite_data_files: strategy => 'sort' requires a non-empty sort_order".into(),
-            )
+            SqeError::Execution("rewrite_data_files: strategy => 'sort' requires a non-empty sort_order".to_string())
         })?;
 
     let lower = order.to_ascii_lowercase();
@@ -3129,9 +3127,7 @@ fn parse_sort_spec(
             .filter(|c| !c.is_empty())
             .collect();
         if cols.is_empty() {
-            return Err(SqeError::Execution(
-                "rewrite_data_files: zorder(...) needs at least one column".into(),
-            ));
+            return Err(SqeError::Execution("rewrite_data_files: zorder(...) needs at least one column".to_string()));
         }
         SortSpec::ZOrder(cols)
     } else {
@@ -3145,7 +3141,7 @@ fn parse_sort_spec(
                 None | Some("ASC") => true,
                 Some("DESC") => false,
                 Some(other) => {
-                    return Err(SqeError::Execution(format!(
+                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "rewrite_data_files: invalid sort direction '{other}'; expected ASC or DESC"
                     )));
                 }
@@ -3153,16 +3149,14 @@ fn parse_sort_spec(
             cols.push((toks[0].to_string(), asc));
         }
         if cols.is_empty() {
-            return Err(SqeError::Execution(
-                "rewrite_data_files: sort_order is empty".into(),
-            ));
+            return Err(SqeError::Execution("rewrite_data_files: sort_order is empty".to_string()));
         }
         SortSpec::Columns(cols)
     };
 
     for name in spec.columns() {
         if schema.field_with_name(name).is_err() {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "rewrite_data_files: sort_order column '{name}' not found in table schema"
             )));
         }
@@ -3188,7 +3182,7 @@ async fn collect_live_data_files(
     let manifest_list = cache
         .get_manifest_list(snapshot, &metadata_ref)
         .await
-        .map_err(|e| SqeError::Execution(format!("Failed to load manifest list: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to load manifest list: {e}")))?;
 
     const CONCURRENCY: usize = 8;
     let manifests: Vec<Arc<iceberg::spec::Manifest>> =
@@ -3200,7 +3194,7 @@ async fn collect_live_data_files(
             .buffer_unordered(CONCURRENCY)
             .try_collect()
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to load manifest: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to load manifest: {e}")))?;
 
     let data_files = manifests
         .into_iter()
@@ -3256,7 +3250,7 @@ fn summary_batch(
             Arc::new(StringArray::from(vec![status.as_str()])),
         ],
     )
-    .map_err(|e| SqeError::Execution(format!("Failed to build summary batch: {e}")))?;
+    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build summary batch: {e}")))?;
     Ok(batch)
 }
 
@@ -4079,7 +4073,7 @@ mod tests {
                     .flatten()
                     .any(|f| f.file_path() == self.poison_path)
                 {
-                    return Err(SqeError::Execution(format!(
+                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "synthetic dispatch failure: group containing poisoned file {}",
                         self.poison_path
                     )));

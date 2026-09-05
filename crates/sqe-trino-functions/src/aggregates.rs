@@ -228,7 +228,7 @@ impl ArgExtremumAccumulator {
 impl Accumulator for ArgExtremumAccumulator {
     fn update_batch(&mut self, args: &[ArrayRef]) -> DFResult<()> {
         if args.len() != 2 {
-            return Err(DataFusionError::Internal(format!(
+            return Err(DataFusionError::Plan(format!(
                 "ArgExtremumAccumulator::update_batch expected 2 arrays, got {}",
                 args.len()
             )));
@@ -263,7 +263,7 @@ impl Accumulator for ArgExtremumAccumulator {
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> DFResult<()> {
         if states.len() != 2 {
-            return Err(DataFusionError::Internal(format!(
+            return Err(DataFusionError::Plan(format!(
                 "ArgExtremumAccumulator::merge_batch expected 2 state arrays, got {}",
                 states.len()
             )));

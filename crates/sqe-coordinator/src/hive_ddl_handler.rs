@@ -17,7 +17,7 @@ use datafusion::common::TableReference;
 use sqe_catalog::hive::manifest::HiveManifest;
 use sqe_catalog::hive::partition::parse_projection;
 use sqe_catalog::hive::provider::HiveMetadataCache;
-use sqe_core::{SecretStore, Session, SessionUser, SqeError};
+use sqe_core::{SecretStore, Session, SessionUser, SqeError , SqeErrorCode};
 use sqe_metrics::audit::{Actor, AuditEvent, AuditKind, AuditLogger, ObjectType, Outcome, Resource};
 use sqe_policy::plan_rewriter::{policy_denies_all, resolve_effective_policy, HiveCatalogs};
 use sqe_policy::PolicyStore;
@@ -285,7 +285,7 @@ impl HiveDdlHandler {
         // failure the first time someone SELECTs from the table.
         if let Some(name) = sqe_sql::hive_ddl::secret_name(spec) {
             self.secrets.get(name).map_err(|e| {
-                SqeError::Execution(format!(
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "hive_external: TBLPROPERTIES 'sqe.secret' names '{name}', which is not a \
                      known secret: {e}"
                 ))
@@ -296,12 +296,12 @@ impl HiveDdlHandler {
         let manifest =
             HiveManifest::from_spec(spec, &database, &session.user.username, &created_at);
         parse_projection(&manifest.parameters, &manifest.partition_keys)
-            .map_err(|e| SqeError::Execution(e.to_string()))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
 
         store
             .put(&manifest, spec.if_not_exists)
             .await
-            .map_err(|e| SqeError::Execution(e.to_string()))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
 
         self.invalidate_manifest(&database, &spec.name);
         self.emit_audit_event(session, catalog_name, &database, &spec.name, "CREATE EXTERNAL TABLE");
@@ -338,7 +338,7 @@ impl HiveDdlHandler {
         };
 
         if purge {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "hive_external: DROP TABLE ... PURGE is not supported for Hive external tables \
                  ({schema}.{table}): PURGE deletes the underlying data, which an external \
                  table's DROP never does"
@@ -349,7 +349,7 @@ impl HiveDdlHandler {
         store
             .delete(schema, table)
             .await
-            .map_err(|e| SqeError::Execution(e.to_string()))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
 
         self.invalidate_manifest(schema, table);
         self.emit_audit_event(session, catalog, schema, table, "DROP TABLE");
@@ -392,7 +392,7 @@ impl HiveDdlHandler {
         let manifest = store
             .get(schema, table)
             .await
-            .map_err(|e| SqeError::Execution(e.to_string()))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
 
         let policy = self.resolve_policy(user, schema, table, &manifest).await;
         if policy_denies_all(&policy) {
@@ -400,7 +400,7 @@ impl HiveDdlHandler {
             // error (see `HiveError::NotFound`'s `Display`): a caller with
             // zero privilege must not be able to distinguish "denied" from
             // "never existed" by the error text alone.
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "hive_external: table not found: {schema}.{table}"
             )));
         }
@@ -442,7 +442,7 @@ impl HiveDdlHandler {
         let names = store
             .list_tables(database)
             .await
-            .map_err(|e| SqeError::Execution(e.to_string()))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
 
         let mut visible = Vec::with_capacity(names.len());
         for name in names {
@@ -475,7 +475,7 @@ impl HiveDdlHandler {
         let mut manifest = store
             .get(&database, &table)
             .await
-            .map_err(|e| SqeError::Execution(e.to_string()))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
         self.refuse_if_denied(
             &session.user,
             &database,
@@ -487,7 +487,7 @@ impl HiveDdlHandler {
 
         sqe_catalog::hive::partition::add_partition(&store, &mut manifest, &spec, if_not_exists)
             .await
-            .map_err(|e| SqeError::Execution(e.to_string()))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
 
         self.invalidate_manifest(&database, &table);
         self.emit_audit_event(session, &root, &database, &table, "ALTER TABLE ADD PARTITION");
@@ -507,7 +507,7 @@ impl HiveDdlHandler {
     ) -> Result<(), SqeError> {
         let (root, database, table) = self.full_hive_name(table_ref)?;
         if purge {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "hive_external: ALTER TABLE ... DROP PARTITION ... PURGE is not supported for \
                  Hive external tables ({database}.{table}): PURGE deletes the underlying data, \
                  which cycle 4 does not implement yet"
@@ -517,7 +517,7 @@ impl HiveDdlHandler {
         let mut manifest = store
             .get(&database, &table)
             .await
-            .map_err(|e| SqeError::Execution(e.to_string()))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
         self.refuse_if_denied(
             &session.user,
             &database,
@@ -529,7 +529,7 @@ impl HiveDdlHandler {
 
         sqe_catalog::hive::partition::drop_partition(&store, &mut manifest, &spec, if_exists)
             .await
-            .map_err(|e| SqeError::Execution(e.to_string()))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
 
         self.invalidate_manifest(&database, &table);
         self.emit_audit_event(session, &root, &database, &table, "ALTER TABLE DROP PARTITION");
@@ -588,7 +588,7 @@ impl HiveDdlHandler {
         let mut manifest = store
             .get(&database, &table)
             .await
-            .map_err(|e| SqeError::Execution(e.to_string()))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
         self.refuse_if_denied(&session.user, &database, &table, &manifest, audit_label)
             .await?;
 
@@ -598,7 +598,7 @@ impl HiveDdlHandler {
             store.limits().max_partition_index_entries,
         )
         .await
-        .map_err(|e| SqeError::Execution(e.to_string()))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
 
         // Invalidate BEFORE returning. `HiveMetadataCache` has a 60s TTL, so a
         // correct index update is still invisible for up to a minute without
@@ -622,11 +622,11 @@ impl HiveDdlHandler {
         let manifest = store
             .get(&database, &table)
             .await
-            .map_err(|e| SqeError::Execution(e.to_string()))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
 
         let policy = self.resolve_policy(user, &database, &table, &manifest).await;
         if policy_denies_all(&policy) {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "hive_external: table not found: {database}.{table}"
             )));
         }
@@ -636,7 +636,7 @@ impl HiveDdlHandler {
             &manifest,
         )
         .await
-        .map_err(|e| SqeError::Execution(e.to_string()))?
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?
         .into_iter()
         .map(|p| p.spec)
         .collect())
@@ -654,20 +654,20 @@ impl HiveDdlHandler {
         let mut manifest = store
             .get(&database, &table)
             .await
-            .map_err(|e| SqeError::Execution(e.to_string()))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
 
         let policy = self
             .resolve_policy(&session.user, &database, &table, &manifest)
             .await;
         if policy_denies_all(&policy) {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "hive_external: ANALYZE TABLE denied on {database}.{table}"
             )));
         }
 
         let stats = sqe_catalog::hive::partition::analyze_table(&store, &mut manifest)
             .await
-            .map_err(|e| SqeError::Execution(e.to_string()))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
         self.invalidate_manifest(&database, &table);
         self.emit_audit_event(session, &root, &database, &table, "ANALYZE TABLE");
         Ok(stats)
@@ -739,7 +739,7 @@ impl HiveDdlHandler {
     ) -> Result<(), SqeError> {
         let policy = self.resolve_policy(user, database, table, manifest).await;
         if policy_denies_all(&policy) {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "hive_external: {statement} denied on {database}.{table}"
             )));
         }
@@ -762,7 +762,7 @@ impl HiveDdlHandler {
             .find(|(name, _)| name == catalog_name)
             .map(|(_, root)| root.source())
             .ok_or_else(|| {
-                SqeError::Execution(format!(
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "hive root '{catalog_name}' is not attached; attach it with ATTACH \
                      ... TYPE hive_external (or configure it under [[hive.roots]])"
                 ))
@@ -782,7 +782,7 @@ impl HiveDdlHandler {
             .find(|(name, _)| name == catalog_name)
             .map(|(_, root)| root)
             .ok_or_else(|| {
-                SqeError::Execution(format!(
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "hive root '{catalog_name}' is not attached; attach it with ATTACH \
                      ... TYPE hive_external (or configure it under [[hive.roots]]) before \
                      creating tables in it"
@@ -792,7 +792,7 @@ impl HiveDdlHandler {
         // manifest to. Say so rather than failing further in on a
         // half-applied change.
         root.sidecar().ok_or_else(|| {
-            SqeError::Execution(format!(
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "catalog '{catalog_name}' reads an external metastore that SQE does not own, so \
                  this statement is not available on it; make the change where the metastore owns \
                  the definition"

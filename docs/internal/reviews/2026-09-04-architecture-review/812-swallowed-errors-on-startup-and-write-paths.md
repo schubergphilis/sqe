@@ -4,7 +4,7 @@
 - Severity: low
 - Category: reliability
 - Effort: S
-- Status: open
+- Status: fixed (branch `fix/errors-audit-observability`, 2026-09-05)
 
 ## Problem
 
@@ -92,3 +92,7 @@ are the current set.
 - 800 (error model) is the structural fix for the `unwrap_or_default` message-loss class.
 - June 2026 codebase analysis, Critical items 5 and 6 (fixed), Improvement 19 (partially).
 - Memory: Writes need session-cache invalidation.
+
+## Resolution (2026-09-05)
+
+Session restore logs join and restore errors. `affected_rows_batch` returns `Result` and rejects `u64::MAX`. Grant HTTP bodies use `response_body_or_unreadable`. Scratch-table deregister failures are `debug!` logged. `SQE_IT_*` remains under `#[cfg(test)]`.

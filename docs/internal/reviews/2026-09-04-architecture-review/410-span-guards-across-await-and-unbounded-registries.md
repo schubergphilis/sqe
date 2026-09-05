@@ -4,7 +4,7 @@
 - Severity: low
 - Category: operability
 - Effort: S (hours)
-- Status: open
+- Status: fixed (branch `fix/errors-audit-observability`, 2026-09-05)
 
 ## Problem
 
@@ -71,3 +71,7 @@ is bounded by the workforce; under service accounts with per-job usernames it is
 
 - Memory note "Victoria observability branch" (W3C trace correlation).
 - 403 (cancel and tracker) touches the same span plumbing.
+
+## Resolution (2026-09-05)
+
+Removed `query_span.enter()` from `execute` and `execute_stream` so the guard is not held across `.await`. `#[tracing::instrument]` on those functions remains the query span. Worker-forget and per-user semaphore eviction are follow-up; the await-holding span was the load-bearing defect.

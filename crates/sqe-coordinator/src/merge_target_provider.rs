@@ -36,6 +36,7 @@ use iceberg::io::FileIO;
 use iceberg::spec::DataFile;
 use iceberg::table::Table as IcebergTable;
 use sqe_core::SqeError;
+use sqe_core::SqeErrorCode;
 
 /// One partition streaming a pinned list of parquet data files through the
 /// target table's `FileIO`, normalising each batch to `schema`.
@@ -113,7 +114,7 @@ pub fn merge_target_table(
         .collect();
     let partition = MergeTargetPartition::new(schema.clone(), table.file_io().clone(), file_paths);
     StreamingTable::try_new(schema, vec![Arc::new(partition)])
-        .map_err(|e| SqeError::Execution(format!("Failed to build MERGE target provider: {e}")))
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build MERGE target provider: {e}")))
 }
 
 fn to_df(e: impl std::error::Error + Send + Sync + 'static) -> DataFusionError {
