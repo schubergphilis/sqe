@@ -139,6 +139,31 @@ Enable `debug = true` during development to see full error details:
 debug = true
 ```
 
+
+### Worker Trust: Signed Scan Tickets
+
+In distributed mode, the coordinator mints signed scan tickets that workers execute. SQE uses a two-key model to prevent a compromised worker from forging or replaying tickets:
+
+1. **Coordinator key:** Ed25519 private key on the coordinator only (`[coordinator] ticket_signing_key_file`). Signs every ticket. Never shipped to workers.
+2. **Worker verification key:** Ed25519 public key on every worker (`[worker] ticket_public_key`). Verifies ticket signatures. Workers also receive it via the heartbeat response from the coordinator over the authenticated channel.
+
+Each ticket carries:
+- **Audience:** the target worker's advertised URL. Workers refuse tickets for a different audience.
+- **Expiry:** absolute wall-clock time (`[coordinator] ticket_ttl_secs`, default 300 seconds). Expired tickets are rejected.
+
+Heartbeats are bound to the peer: when mTLS is off (the common case), the advertised URL's host must resolve to the TCP peer that sent the heartbeat, unless `[coordinator] allow_unverified_advertise = true` (test-only, behind a NAT/proxy). Mismatches are logged as audit events.
+
+**Migration:** If you still have coordinators running pre-Ed25519 code alongside new workers, set `[worker] accept_hmac_tickets = true` on new workers to accept the legacy HMAC-signed tickets while you roll the coordinators. The HMAC key is the shared secret every worker holds, so the HMAC proves nothing; turn this option off as soon as all coordinators are upgraded.
+
+### Distributed Scan Credentials
+
+Scan tickets carry storage credentials. The source is chosen per-query via `[coordinator] distributed_credentials`:
+
+- **`auto` (default):** Use catalog-vended credentials (from the table's FileIO properties) when present; otherwise fall back to the static `[storage]` key pair. Issues a one-time warning when falling back. Under `production_mode`, falls back only when truly unavailable (Polaris credential vending omitted).
+- **`vended`:** Strict mode. Refuse to distribute queries over tables without vended credentials. Fails the query if the table has no session token or STS credentials.
+- **`static`:** Explicit single-tenant mode. Always ship the static `[storage]` key pair, never use vended credentials.
+- **`worker_default`:** Workers resolve credentials from their own environment (IRSA, pod IAM role, `AWS_*` env vars). No credentials in the ticket. Requires every worker to have independent S3 access.
+
 ### TLS Encryption
 
 Flight SQL connections can be encrypted with TLS. Optional mTLS adds client certificate verification.

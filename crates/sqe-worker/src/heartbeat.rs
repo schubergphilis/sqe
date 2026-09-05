@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Action;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tracing::{debug, warn};
 
 /// Metadata header name shared with the coordinator's heartbeat handler.
@@ -20,6 +20,12 @@ const WORKER_SECRET_HEADER: &str = "x-sqe-worker-secret";
 /// On connection-level failure it is dropped and rebuilt on the next tick;
 /// HTTP/2 multiplexing keeps the connection alive across heartbeats.
 ///
+/// `client_tls` is applied whenever `coordinator_url` uses the `https` scheme.
+/// Without it tonic refuses the URI outright ("Connecting to HTTPS without TLS
+/// enabled") and a TLS coordinator could never be heartbeated at all, which is
+/// half of finding 603. Build it once with `sqe_core::tls::tonic_client` and
+/// hand it in; the SNI domain comes from the coordinator URL's own host.
+///
 /// On failure the error is logged and the next heartbeat is attempted after the
 /// normal interval. There is no exponential back-off because the coordinator's
 /// worker registry already tolerates a configurable number of consecutive misses
@@ -29,6 +35,8 @@ pub fn start_heartbeat_task(
     worker_url: String,
     interval: Duration,
     worker_secret: String,
+    client_tls: Option<ClientTlsConfig>,
+    ticket_pin: Option<std::sync::Arc<crate::ticket_pin::TicketKeyPin>>,
 ) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -41,7 +49,16 @@ pub fn start_heartbeat_task(
 
         loop {
             ticker.tick().await;
-            match send_heartbeat(&coordinator_url, &worker_url, &worker_secret, &mut cached).await {
+            match send_heartbeat(
+                &coordinator_url,
+                &worker_url,
+                &worker_secret,
+                client_tls.as_ref(),
+                ticket_pin.as_deref(),
+                &mut cached,
+            )
+            .await
+            {
                 Ok(()) => debug!(coordinator = %coordinator_url, "Heartbeat sent"),
                 Err(e) => {
                     cached = None;
@@ -60,16 +77,24 @@ async fn send_heartbeat(
     coordinator_url: &str,
     worker_url: &str,
     worker_secret: &str,
+    client_tls: Option<&ClientTlsConfig>,
+    ticket_pin: Option<&crate::ticket_pin::TicketKeyPin>,
     cached: &mut Option<Channel>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let channel = match cached.as_ref() {
         Some(ch) => ch.clone(),
         None => {
-            let ch = Endpoint::new(coordinator_url.to_string())?
+            let mut endpoint = Endpoint::new(coordinator_url.to_string())?
                 .connect_timeout(Duration::from_secs(5))
-                .timeout(Duration::from_secs(10))
-                .connect()
-                .await?;
+                .timeout(Duration::from_secs(10));
+            if sqe_core::tls::is_https_url(coordinator_url) {
+                let mut tls = client_tls.cloned().unwrap_or_default();
+                if let Some(domain) = sqe_core::tls::sni_domain(coordinator_url) {
+                    tls = tls.domain_name(domain);
+                }
+                endpoint = endpoint.tls_config(tls)?;
+            }
+            let ch = endpoint.connect().await?;
             *cached = Some(ch.clone());
             ch
         }
@@ -89,7 +114,21 @@ async fn send_heartbeat(
         request.metadata_mut().insert(WORKER_SECRET_HEADER, value);
     }
 
-    let _response = client.do_action(request).await?;
+    let mut response = client.do_action(request).await?.into_inner();
+    // Finding 601: the coordinator returns its scan-ticket public key in the
+    // response body over this secret-authenticated channel; pin it. Older
+    // coordinators reply with a bare "ok", which carries no key.
+    if let Some(pin) = ticket_pin {
+        if let Some(Ok(result)) = futures::StreamExt::next(&mut response).await {
+            if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&result.body) {
+                if let Some(key) = body.get("ticket_public_key").and_then(|k| k.as_str()) {
+                    if let Err(e) = pin.pin_b64(key) {
+                        warn!(error = %e, "coordinator sent an unusable ticket public key");
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -106,10 +145,70 @@ mod tests {
             "http://127.0.0.1:19999",
             "http://127.0.0.1:50052",
             "",
+            None,
+            None,
             &mut cached,
         )
         .await;
         assert!(result.is_err());
+        assert!(cached.is_none(), "failed connect should leave cache empty");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_to_https_coordinator_is_not_refused_for_missing_tls() {
+        // Regression for finding 603. Before the fix tonic rejected the URI
+        // before dialling ("Connecting to HTTPS without TLS enabled"), so a
+        // worker could never heartbeat a TLS coordinator. The failure must now
+        // be a network failure instead.
+        let mut cached: Option<Channel> = None;
+        let err = send_heartbeat(
+            "https://127.0.0.1:19999",
+            "https://worker-1.sqe.test:50052",
+            "",
+            None,
+            None,
+            &mut cached,
+        )
+        .await
+        .expect_err("nothing listens on port 19999");
+
+        let mut chain = err.to_string();
+        let mut source = err.source();
+        while let Some(cause) = source {
+            chain.push_str(&format!(" | {cause}"));
+            source = cause.source();
+        }
+        assert!(
+            !chain.to_lowercase().contains("without tls"),
+            "https coordinator still refused for want of a ClientTlsConfig: {chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_uses_the_supplied_client_tls() {
+        // Same as above but with the config the bootstrap path actually builds.
+        let tls = sqe_core::tls::tonic_client(
+            &sqe_core::config::TlsConfig {
+                ca_file: format!(
+                    "{}/../sqe-core/tests/fixtures/tls/ca.crt",
+                    env!("CARGO_MANIFEST_DIR")
+                ),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let mut cached: Option<Channel> = None;
+        let result = send_heartbeat(
+            "https://127.0.0.1:19999",
+            "https://worker-1.sqe.test:50052",
+            "",
+            Some(&tls),
+            None,
+            &mut cached,
+        )
+        .await;
+        assert!(result.is_err(), "nothing listens on port 19999");
         assert!(cached.is_none(), "failed connect should leave cache empty");
     }
 
@@ -122,6 +221,8 @@ mod tests {
             "http://127.0.0.1:50052".to_string(),
             Duration::from_millis(50),
             String::new(),
+            None,
+            None,
         );
         // Give it a moment to run a couple of iterations.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -134,6 +235,8 @@ mod tests {
             "http://127.0.0.1:50052".to_string(),
             Duration::from_millis(50),
             "shared-secret".to_string(),
+            None,
+            None,
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }

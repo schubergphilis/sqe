@@ -11,6 +11,13 @@ description = "Byte budgets, accounted buffers, and (later) spill segment storag
 name = "sqe_spill"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Durable exchange attempt manifests (`exchange.rs`). Only the feature-gated
+# worker shuffle intake consumes these; nothing on the executed query path
+# does, so the module is compiled out by default (review finding 600).
+exchange = []
+
 [dependencies]
 arrow-array = { workspace = true }
 arrow-ipc = { workspace = true }

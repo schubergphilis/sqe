@@ -41,6 +41,12 @@ pub struct SessionManager {
     /// the Session Arc so touching it on every Flight RPC is a single atomic
     /// store instead of a deep clone of the Session.
     last_activity: DashMap<String, Arc<AtomicI64>>,
+    /// Finding 405: bearer-token fingerprint -> session id, so a client that
+    /// replays the same JWT on every request (ADBC/dbt, Spark, MCP) reuses
+    /// one session instead of minting one per call. `token_of` is the
+    /// reverse map used to drop the fingerprint when the session goes.
+    by_token: DashMap<String, String>,
+    token_of: DashMap<String, String>,
     /// Optional Prometheus metrics for tracking token refreshes.
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
     /// COORD-04: hard upper bound on the number of live sessions. Each
@@ -60,6 +66,11 @@ pub struct SessionManager {
 const DEFAULT_MAX_SESSIONS: usize = 10_000;
 
 impl SessionManager {
+    /// Number of live sessions.
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
     fn update_active_sessions_metric(&self) {
         if let Some(ref metrics) = self.metrics {
             metrics.active_sessions.set(self.sessions.len() as i64);
@@ -76,6 +87,8 @@ impl SessionManager {
             legacy_authenticator: Some(authenticator),
             sessions: DashMap::new(),
             last_activity: DashMap::new(),
+            by_token: DashMap::new(),
+            token_of: DashMap::new(),
             metrics: None,
             max_sessions: DEFAULT_MAX_SESSIONS,
         }
@@ -92,6 +105,8 @@ impl SessionManager {
             legacy_authenticator: None,
             sessions: DashMap::new(),
             last_activity: DashMap::new(),
+            by_token: DashMap::new(),
+            token_of: DashMap::new(),
             metrics: None,
             max_sessions: DEFAULT_MAX_SESSIONS,
         }
@@ -123,6 +138,8 @@ impl SessionManager {
             legacy_authenticator: Some(legacy_authenticator),
             sessions: DashMap::new(),
             last_activity: DashMap::new(),
+            by_token: DashMap::new(),
+            token_of: DashMap::new(),
             metrics: None,
             max_sessions: DEFAULT_MAX_SESSIONS,
         }
@@ -175,6 +192,7 @@ impl SessionManager {
                 Some(id) => {
                     if self.sessions.remove(&id).is_some() {
                         self.last_activity.remove(&id);
+                        self.forget_token(&id);
                         self.update_active_sessions_metric();
                         warn!(
                             session_id = %id,
@@ -222,6 +240,44 @@ impl SessionManager {
         Ok(session)
     }
 
+    /// Resolve the session for a raw bearer token (a JWT the client replays
+    /// on every request), authenticating only on the first sight of it.
+    ///
+    /// Finding 405: the Flight path used to call `authenticate_credentials`
+    /// for every JWT-bearer request, minting a session, an audit event and a
+    /// JWKS validation per RPC and letting the session map grow with request
+    /// count. The token fingerprint now indexes the session: a hit returns the
+    /// existing session (still subject to `get_session`'s expiry eviction), a
+    /// miss authenticates and records the mapping. The boolean is `true` when
+    /// a session was created, so callers emit auth-success events only then.
+    pub async fn session_for_bearer(&self, token: &str) -> sqe_core::Result<(Arc<Session>, bool)> {
+        let fingerprint = bearer_fingerprint(token);
+        if let Some(id) = self.by_token.get(&fingerprint).map(|e| e.value().clone()) {
+            if let Some(session) = self.get_session(&id) {
+                return Ok((session, false));
+            }
+            // Expired or evicted underneath the mapping; fall through and
+            // re-authenticate so an expired JWT is rejected by the provider.
+            self.by_token.remove(&fingerprint);
+            self.token_of.remove(&id);
+        }
+        let credentials = FlightCredentials {
+            bearer_token: Some(sqe_core::SecretString::new(token.to_string())),
+            ..Default::default()
+        };
+        let session = self.authenticate_credentials(&credentials).await?;
+        self.by_token
+            .insert(fingerprint.clone(), session.id.clone());
+        self.token_of.insert(session.id.clone(), fingerprint);
+        Ok((session, true))
+    }
+
+    fn forget_token(&self, session_id: &str) {
+        if let Some((_, fingerprint)) = self.token_of.remove(session_id) {
+            self.by_token.remove(&fingerprint);
+        }
+    }
+
     /// Authenticate a user via username/password (legacy convenience method).
     ///
     /// Wraps the credentials into `FlightCredentials` and delegates to
@@ -247,21 +303,9 @@ impl SessionManager {
     /// only when the provider has no lifetime concept (anonymous, mTLS).
     /// Issue #26.
     fn identity_to_session(&self, identity: &Identity) -> Session {
-        let token_expiry = identity
-            .expires_at
-            .unwrap_or_else(|| Utc::now() + chrono::Duration::hours(1));
-        Session::new(
-            identity.user_id.clone(),
-            identity.catalog_token.clone().unwrap_or_default(),
-            identity.refresh_token.clone(),
-            token_expiry,
-            identity.roles.clone(),
-        )
-        .with_identity(
-            identity.subject.clone(),
-            identity.email.clone(),
-            identity.groups.clone(),
-        )
+        // Shared mapping (finding 204): every entry point builds the same
+        // session shape from `Identity::into_session`.
+        identity.to_session(None)
     }
 
     /// Look up a session by its ID (bearer token).
@@ -278,11 +322,14 @@ impl SessionManager {
 
         if let Some(ref authenticator) = self.legacy_authenticator {
             if let Some(cached) = authenticator.get_cached_token(session_id) {
-                if cached.access_token != session.access_token().expose() {
+                // Both sides are `SecretString` now (finding 208): compare the
+                // exposed bytes and move the secret through unchanged rather
+                // than re-wrapping a plain `String`.
+                if cached.access_token.expose() != session.access_token().expose() {
                     let mut updated = (*session).clone();
                     updated.rotate_credentials(sqe_core::Credentials::new(
-                        sqe_core::SecretString::new(cached.access_token),
-                        cached.refresh_token.map(sqe_core::SecretString::new),
+                        cached.access_token,
+                        cached.refresh_token,
                         cached.expiry,
                     ));
                     let updated = Arc::new(updated);
@@ -307,6 +354,7 @@ impl SessionManager {
             warn!(session_id = %session_id, "Session token expired, evicting");
             self.sessions.remove(session_id);
             self.last_activity.remove(session_id);
+            self.forget_token(session_id);
             self.update_active_sessions_metric();
             return None;
         }
@@ -416,6 +464,7 @@ impl SessionManager {
     pub fn remove_session(&self, id: &str) {
         if self.sessions.remove(id).is_some() {
             self.last_activity.remove(id);
+            self.forget_token(id);
             self.update_active_sessions_metric();
             debug!(session_id = %id, "Session removed");
         }
@@ -450,6 +499,7 @@ impl SessionManager {
         for id in expired_ids {
             if let Some((_, session)) = self.sessions.remove(&id) {
                 self.last_activity.remove(&id);
+                self.forget_token(&id);
                 let reason = if session.is_absolute_expired(absolute_timeout) {
                     "absolute timeout"
                 } else {
@@ -472,6 +522,12 @@ impl SessionManager {
 
         removed
     }
+}
+
+/// Full SHA-256 of the bearer bytes. Used only as a map key, never logged.
+fn bearer_fingerprint(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(token.as_bytes()))
 }
 
 #[cfg(test)]
@@ -992,6 +1048,94 @@ mod tests {
                 _ => Err(sqe_auth::AuthError::NotMyCredentials),
             }
         }
+    }
+
+    /// Bearer provider that counts authentications and stamps a configurable
+    /// expiry, for the finding-405 dedupe tests.
+    struct CountingBearerProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        expires_in: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl AuthProvider for CountingBearerProvider {
+        async fn authenticate(
+            &self,
+            credentials: &FlightCredentials,
+        ) -> Result<Identity, sqe_auth::AuthError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match &credentials.bearer_token {
+                Some(t) if !t.is_empty() => Ok(Identity {
+                    user_id: "alice".to_string(),
+                    display_name: "alice".to_string(),
+                    roles: vec!["analyst".to_string()],
+                    subject: Some("sub-alice".to_string()),
+                    email: None,
+                    groups: Vec::new(),
+                    catalog_token: Some(t.clone()),
+                    refresh_token: None,
+                    expires_at: Some(Utc::now() + self.expires_in),
+                }),
+                _ => Err(sqe_auth::AuthError::NotMyCredentials),
+            }
+        }
+    }
+
+    /// 405: one hundred requests replaying the same JWT produce one session
+    /// and one authentication, not one hundred of each.
+    #[tokio::test]
+    async fn same_bearer_reuses_one_session_and_authenticates_once() {
+        let provider = Arc::new(CountingBearerProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            expires_in: Duration::minutes(10),
+        });
+        let manager = SessionManager::with_provider(provider.clone());
+
+        let (first, created) = manager.session_for_bearer("eyJ.a.b").await.unwrap();
+        assert!(created);
+        for _ in 0..99 {
+            let (again, created) = manager.session_for_bearer("eyJ.a.b").await.unwrap();
+            assert!(!created);
+            assert_eq!(again.id, first.id);
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(manager.session_count(), 1);
+
+        // A different token is a different principal: new session.
+        let (other, created) = manager.session_for_bearer("eyJ.c.d").await.unwrap();
+        assert!(created);
+        assert_ne!(other.id, first.id);
+        assert_eq!(manager.session_count(), 2);
+
+        // Removing the session forgets the fingerprint, so the next replay
+        // re-authenticates instead of returning a dangling id.
+        manager.remove_session(&first.id);
+        let (_, created) = manager.session_for_bearer("eyJ.a.b").await.unwrap();
+        assert!(created);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// 405: an expired mapping is not served; the token is re-validated and
+    /// the stale session is evicted rather than accumulating.
+    #[tokio::test]
+    async fn expired_bearer_session_is_reauthenticated_not_reused() {
+        let provider = Arc::new(CountingBearerProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            expires_in: Duration::seconds(-1),
+        });
+        let manager = SessionManager::with_provider(provider.clone());
+
+        let (first, created) = manager.session_for_bearer("eyJ.a.b").await.unwrap();
+        assert!(created);
+        let (second, created) = manager.session_for_bearer("eyJ.a.b").await.unwrap();
+        assert!(created, "an expired session must not be reused");
+        assert_ne!(first.id, second.id);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            manager.session_count(),
+            1,
+            "the expired session was evicted"
+        );
     }
 
     /// Reproduce the Flight bearer-only path against a chain that mirrors

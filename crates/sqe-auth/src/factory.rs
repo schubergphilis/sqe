@@ -14,7 +14,7 @@ use crate::anonymous::{AnonymousProvider, AnonymousProviderConfig};
 use crate::api_key::{ApiKeyProvider, ApiKeyProviderConfig};
 use crate::authenticator::Authenticator;
 use crate::aws_iam::{AwsIamProvider, AwsIamProviderConfig};
-use crate::bearer_token::{BearerTokenProvider, BearerTokenProviderConfig};
+use crate::bearer_token::{BearerTokenProvider, BearerTokenProviderConfig, DEFAULT_LEEWAY_SECS};
 use crate::chain::AuthChain;
 use crate::mtls::{MtlsProvider, MtlsProviderConfig};
 use crate::oidc_client_credentials::{OidcClientCredentialsConfig, OidcClientCredentialsProvider};
@@ -143,6 +143,7 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                     groups_claim,
                     allow_unbounded_audience,
                     allow_insecure_jwks,
+                    allow_unbounded_issuer,
                 } => {
                     info!(
                         index = i,
@@ -161,6 +162,8 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                         accept_invalid_certs: config.should_skip_tls_verify(),
                         allow_unbounded_audience: *allow_unbounded_audience,
                         allow_insecure_jwks: *allow_insecure_jwks,
+                        allow_unbounded_issuer: *allow_unbounded_issuer,
+                        leeway_secs: DEFAULT_LEEWAY_SECS,
                     };
                     let provider = BearerTokenProvider::new(bt_config).map_err(|e| {
                         sqe_core::SqeError::Config(format!(

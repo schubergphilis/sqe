@@ -20,7 +20,7 @@ Client (Flight SQL, Trino HTTP, MCP, Quack/DuckDB RPC, web UI)
 ```
 
 - **Coordinator**: SQL parsing, auth, policy enforcement (plan rewriting), optimization, distributed scheduling. Run as `sqe-server --mode coordinator`.
-- **Workers**: Stateless DataFusion executors receiving secured plan fragments + user bearer tokens
+- **Workers**: Stateless DataFusion executors receiving secured `ScanTask`s (file list + projection + predicate + limit) and user bearer tokens. The executed topology is a **distributed scan**: workers scan and stream Arrow back, and every join, aggregate and sort runs on the coordinator. There is no stage-based shuffle on any query path -- the `DoExchange` shuffle intake compiles only behind the `worker-shuffle` cargo feature (off by default; `shuffle-planning` in sqe-planner and `exchange` in sqe-spill are its planner and manifest halves), and the default build answers `DoExchange` with `Unimplemented`
 - **Auth model**: No service account -- every query runs as the authenticated user via OIDC password grant -> bearer token passthrough to Polaris/S3
 - **Security**: Policy enforcement via LogicalPlan rewriting *before* DataFusion optimization (row filters, column masks, column restriction). Pluggable backend: Ranger, Polaris grants, in-memory, or passthrough
 

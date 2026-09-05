@@ -8,10 +8,16 @@ use tracing::{debug, warn};
 
 use crate::provider::truncate_for_log;
 
+/// Token response from an OIDC password-grant (ROPC) endpoint.
+///
+/// Both token fields are [`SecretString`]s, which deserialize straight from a
+/// JSON string: the bearer and refresh token never exist as plain `String`s,
+/// the derived `Debug` renders `<set>`, and the bytes are zeroized on drop.
+/// Finding 208.
 #[derive(Debug, Deserialize)]
 pub struct TokenResponse {
-    pub access_token: String,
-    pub refresh_token: Option<String>,
+    pub access_token: SecretString,
+    pub refresh_token: Option<SecretString>,
     pub expires_in: u64,
     pub token_type: String,
 }

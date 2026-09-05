@@ -149,3 +149,26 @@ SQE extracts user roles from the JWT `realm_access.roles` claim. These roles are
 Roles flow through to the Policy Enforcer, which uses them to determine row filters and column masks for each query.
 
 > **Client Credentials mode:** Role extraction only applies in OIDC (ROPC) mode, where the JWT contains user-specific claims. In client credentials mode, the token represents the service itself and typically does not carry `realm_access.roles`. The session's role list is empty, and all authorization decisions are delegated to Polaris (which enforces access based on the service principal's catalog grants).
+
+## Bearer Token Validation (finding 207)
+
+When using the `bearer_token` provider, tokens are validated with strict security checks:
+
+- **Issuer validation:** The `iss` claim is required and must match the configured `issuer` unless `allow_unbounded_issuer = true` (dev/test only). This prevents tokens minted by a sibling issuer from a multi-tenant IdP from being accepted.
+- **Not-before (`nbf`) check:** Tokens with `nbf` in the future are rejected, preventing pre-dated tokens.
+- **Clock skew:** A configurable `leeway_secs` (default 60 seconds) allows for clock drift between the IdP and the coordinator during `exp`, `nbf` and `iat` validation.
+- **EC key support:** The provider automatically loads and validates EC keys (`ES256`, `ES384`) in addition to RSA keys. Each key's algorithm is pinned from the JWK `alg` field.
+- **Key rotation:** When a signing key is removed from the JWKS, it is rejected after a 5-minute grace window, unless the fresh JWKS contains zero loadable keys (in which case the cache is cleared and a warning is logged).
+
+Configuration:
+
+```toml
+[[auth.providers]]
+type = "bearer_token"
+jwks_url = "https://idp.example.com/realms/sqe/protocol/openid-connect/certs"
+issuer = "https://idp.example.com/realms/sqe"    # Required unless allow_unbounded_issuer = true
+leeway_secs = 60                                 # Clock skew tolerance (default)
+allow_unbounded_issuer = false                   # Dev/test only: allow missing issuer
+```
+
+

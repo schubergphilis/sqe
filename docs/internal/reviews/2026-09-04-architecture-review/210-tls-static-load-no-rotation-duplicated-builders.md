@@ -4,7 +4,7 @@
 - Severity: medium
 - Category: operability
 - Effort: M (days)
-- Status: open
+- Status: fixed (branch `fix/identity-transport-trust-p1`, 2026-09-05)
 - Issue: #563
 
 ## Problem
@@ -77,3 +77,80 @@ another, and there is no test that the three agree.
 
 - docs/internal/reviews/2026-07-25-production-readiness-review.md P1 "TLS
   depends on engine or ingress configuration".
+
+## Resolution (2026-09-05)
+
+**One loader.** `crates/sqe-core/src/tls.rs` holds `ServerTlsMaterial::load`,
+which reads cert, key and optional CA once, parses them once, and derives every
+downstream shape: `tonic_server()` (Flight), `rustls_server_config()` (axum:
+MCP and Quack), and `cert_fingerprint()`. `crates/sqe-worker/src/tls.rs` is
+deleted and `crates/sqe-coordinator/src/tls.rs` is a re-export plus the
+reloader. `grep -rn "Identity::from_pem" crates/` returns one production hit,
+`sqe_core::tls::tonic_identity`, which both the server and the client path call.
+
+**Minimum version.** The rustls config is built with
+`builder_with_provider(ring).with_protocol_versions(&[TLS12, TLS13])`, so TLS
+1.1 and below are never offered on any port. The explicit provider also means
+the listeners no longer depend on whatever happened to install the process
+default first.
+
+**mTLS consistency.** `ca_file` now produces a `WebPkiClientVerifier` on the
+rustls path as well as `client_ca_root` on the tonic path, so the MCP and Quack
+listeners require a client certificate exactly when the Flight port does. The
+"Quack TLS is server-side only" warning in `bin/sqe_server.rs` is gone because
+the statement is no longer true.
+
+**Crypto provider.** `sqe_core::tls::ensure_crypto_provider()` replaces the two
+`let _ = rustls::crypto::ring::default_provider().install_default();` calls. It
+checks `CryptoProvider::get_default()` first and logs at `info` when another
+component already installed one, instead of discarding the result silently.
+
+**Reload.** `crates/sqe-coordinator/src/tls.rs::spawn_cert_reload_watch` polls
+the cert, key and CA mtimes every `DEFAULT_CERT_RELOAD_INTERVAL` (60 s), the
+same shape as `sqe-auth`'s `spawn_reload_watcher`. On change it reloads through
+`ServerTlsMaterial` (so the new pair is validated before anything is swapped)
+and then calls `RustlsConfig::reload_from_pem_file`, or `reload_from_config`
+when `ca_file` is set, because `reload_from_pem_file` would rebuild a default
+server config and silently drop the client verifier. The mtime stamp only
+advances on success, so a half-written cert-manager pair is retried on the next
+tick and the listener keeps serving the previous certificate. Both axum
+listeners (MCP in `mcp_server.rs`, Quack in `bin/sqe_server.rs`) spawn it.
+
+**Rotation documented.** The tonic Flight listener is not hot-reloadable:
+tonic 0.14 builds its acceptor inside `Server::tls_config` and exposes no way
+to replace it on a live server. That is stated in the doc comment on
+`TlsConfig::cert_file`, in the module docs of `sqe_coordinator::tls`, in the
+`hot_reload = false` field on every "listening (TLS)" log line, and in
+`docs/site/book/src/deployment/configuration.md#tls` together with the
+`reloader.stakater.com/auto` sidecar annotation that covers it in Kubernetes.
+
+Tests (all green): `sqe-core` `tls::tests::tls_server_config_floor_is_tls12`,
+`tls_ca_file_requires_a_client_certificate`,
+`tls_server_without_ca_does_not_ask_for_client_cert`,
+`tls_material_reports_a_stable_cert_fingerprint`,
+`tls_material_debug_redacts_the_private_key`,
+`tls_ensure_crypto_provider_is_idempotent`; `sqe-coordinator`
+`tls::tests::tls_mcp_listener_requires_client_cert_when_ca_set`,
+`tls_reload_picks_up_an_overwritten_cert`,
+`tls_reload_preserves_the_client_ca_requirement`,
+`tls_reload_keeps_the_old_cert_when_the_new_pair_is_broken`,
+`tls_builder_is_shared_with_sqe_core`. Fixture PEMs (a test CA certificate and two leaf
+pairs, generated once with openssl) live in
+`crates/sqe-core/tests/fixtures/tls/`, allowlisted in `.gitignore` against the
+repo-wide `*.crt` / `*.key` guard (that guard still covers every other path).
+
+Remaining items, deliberately not done here:
+
+- **No tonic hot-reload.** The acceptance criterion "overwrite `cert_file`; a
+  new HTTPS connection presents the new certificate without restart" holds for
+  the MCP and Quack ports, not for the Flight port. Doing it would mean either
+  a tonic upgrade that exposes the acceptor or serving Flight through a
+  hand-rolled `TlsAcceptor` on top of `tokio-rustls`, which is a larger change
+  than this finding warrants. The Helm reloader sidecar is the documented
+  workaround.
+- **The mTLS assertion is on the rustls config, not a live handshake.** The
+  test asserts `ServerTlsMaterial::requires_client_cert()` and that the axum
+  `RustlsConfig` is built from that material, rather than driving a real TCP
+  TLS handshake without a client certificate. A handshake-level test belongs
+  with the TLS variant of `make test-distributed`, which this branch does not
+  add.

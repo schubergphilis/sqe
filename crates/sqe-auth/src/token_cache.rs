@@ -1,11 +1,30 @@
+use std::fmt;
+
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use sqe_core::SecretString;
 
-#[derive(Debug, Clone)]
+/// A cached access/refresh token pair for one session.
+///
+/// The token material is held in [`SecretString`] so a `debug!(?cached)` or a
+/// panic message cannot print the bearer, and so the bytes are zeroized on
+/// drop. Reach for `expose()` only where the value must cross into an HTTP
+/// header. Finding 208.
+#[derive(Clone)]
 pub struct CachedToken {
-    pub access_token: String,
-    pub refresh_token: Option<String>,
+    pub access_token: SecretString,
+    pub refresh_token: Option<SecretString>,
     pub expiry: DateTime<Utc>,
+}
+
+impl fmt::Debug for CachedToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CachedToken")
+            .field("access_token", &self.access_token)
+            .field("refresh_token", &self.refresh_token)
+            .field("expiry", &self.expiry)
+            .finish()
+    }
 }
 
 pub struct TokenCache {
@@ -55,8 +74,8 @@ mod tests {
 
     fn make_token(access: &str, refresh: Option<&str>, expiry: DateTime<Utc>) -> CachedToken {
         CachedToken {
-            access_token: access.to_string(),
-            refresh_token: refresh.map(String::from),
+            access_token: SecretString::new(access.to_string()),
+            refresh_token: refresh.map(|r| SecretString::new(r.to_string())),
             expiry,
         }
     }
@@ -68,8 +87,11 @@ mod tests {
         cache.insert("s1", make_token("tok1", Some("ref1"), expiry));
 
         let cached = cache.get("s1").expect("should find cached token");
-        assert_eq!(cached.access_token, "tok1");
-        assert_eq!(cached.refresh_token.as_deref(), Some("ref1"));
+        assert_eq!(cached.access_token.expose(), "tok1");
+        assert_eq!(
+            cached.refresh_token.as_ref().map(|t| t.expose()),
+            Some("ref1")
+        );
     }
 
     #[test]
@@ -96,7 +118,37 @@ mod tests {
         cache.insert("s1", make_token("tok2", None, expiry));
 
         let cached = cache.get("s1").unwrap();
-        assert_eq!(cached.access_token, "tok2");
+        assert_eq!(cached.access_token.expose(), "tok2");
+    }
+
+    /// Finding 208: formatting a `CachedToken` must never print the bearer.
+    /// Mirrors `identity_debug_does_not_leak_token` on the provider side.
+    #[test]
+    fn debug_does_not_leak_token_material() {
+        let token = make_token(
+            "eyJhbGciOiJSUzI1NiJ9.super-secret-access",
+            Some("super-secret-refresh"),
+            Utc::now() + Duration::hours(1),
+        );
+
+        let rendered = format!("{token:?}");
+
+        assert!(
+            !rendered.contains("super-secret-access"),
+            "access token leaked into Debug output: {rendered}"
+        );
+        assert!(
+            !rendered.contains("super-secret-refresh"),
+            "refresh token leaked into Debug output: {rendered}"
+        );
+        assert!(
+            !rendered.contains("eyJ"),
+            "JWT prefix leaked into Debug output: {rendered}"
+        );
+        assert!(
+            rendered.contains("<set>"),
+            "expected the SecretString presence sentinel: {rendered}"
+        );
     }
 
     #[test]

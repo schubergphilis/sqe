@@ -1,4 +1,8 @@
 pub mod distributed_aggregate;
+/// Broadcast / shuffle-hash join planning. Gated behind `shuffle-planning`:
+/// these rules build [`shuffle_exec::ShuffleWriterExec`] trees that no
+/// coordinator module plans today (review finding 600).
+#[cfg(feature = "shuffle-planning")]
 pub mod distributed_join;
 pub mod distributed_sort;
 pub mod external_aggregate;
@@ -7,6 +11,10 @@ pub mod join_strategy;
 pub mod predicate_transfer;
 pub mod scan_morsel;
 pub mod scan_task;
+/// Shuffle writer/reader physical nodes. Gated behind `shuffle-planning`: the
+/// writer drops its input and returns an empty stream because the producer
+/// side was never written, and nothing plans it (review finding 600).
+#[cfg(feature = "shuffle-planning")]
 pub mod shuffle_exec;
 pub mod single_distinct_count;
 pub mod sort_memory;
@@ -21,6 +29,7 @@ pub use distributed_aggregate::{
     DEFAULT_DISTRIBUTED_AGGREGATE_THRESHOLD, DEFAULT_HIGH_CARDINALITY_THRESHOLD,
     MIN_EXECUTORS_FOR_DISTRIBUTED_AGGREGATE,
 };
+#[cfg(feature = "shuffle-planning")]
 pub use distributed_join::{
     BroadcastJoinPlan, BroadcastJoinRule, BroadcastSide, JoinStrategy, PreSortedJoinRule,
     ShuffleHashJoinPlan, DEFAULT_BROADCAST_THRESHOLD,
@@ -48,7 +57,8 @@ pub use scan_morsel::{
     ScanMorsel, DEFAULT_MORSEL_MAX_BYTES, DEFAULT_MORSEL_TARGET_BYTES, SCAN_TASK_VERSION_CURRENT,
     SCAN_TASK_VERSION_V1, SCAN_TASK_VERSION_V2,
 };
-pub use scan_task::{HiveScanDescriptor, HiveScanFormat, ScanTask};
+pub use scan_task::{HiveScanDescriptor, HiveScanFormat, ScanTask, ScanCredentials, TicketSecret};
+#[cfg(feature = "shuffle-planning")]
 pub use shuffle_exec::{ShufflePartitioning, ShuffleReaderExec, ShuffleWriterExec};
 pub use single_distinct_count::SingleDistinctCountCompanionRule;
 pub use sort_memory::{

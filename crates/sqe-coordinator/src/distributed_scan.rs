@@ -144,6 +144,11 @@ pub struct DistributedScanExec {
     /// can authenticate the coordinator. Empty when distributed mode is
     /// running with `allow_unauthenticated_workers = true`.
     worker_secret: String,
+    /// Finding 601: Ed25519 signer for scan tickets. `None` falls back to the
+    /// legacy HMAC over `worker_secret` (test/dev only).
+    ticket_signer: Option<Arc<sqe_core::ticket_signing::TicketSigner>>,
+    /// How long a signed ticket stays valid on the worker.
+    ticket_ttl: std::time::Duration,
     /// gRPC connect timeout for the per-call (`pool = None`) dispatch path.
     /// Issue #29.
     worker_connect_timeout: std::time::Duration,
@@ -233,6 +238,8 @@ impl DistributedScanExec {
             local_executor: None,
             fragment_callback: FragmentCallbackOpt(None),
             worker_secret: String::new(),
+            ticket_signer: None,
+            ticket_ttl: std::time::Duration::from_secs(300),
             worker_connect_timeout: std::time::Duration::from_secs(5),
             worker_rpc_timeout: std::time::Duration::from_secs(630),
             max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
@@ -256,6 +263,8 @@ impl DistributedScanExec {
             local_executor: self.local_executor.clone(),
             fragment_callback: FragmentCallbackOpt(self.fragment_callback.0.clone()),
             worker_secret: self.worker_secret.clone(),
+            ticket_signer: self.ticket_signer.clone(),
+            ticket_ttl: self.ticket_ttl,
             worker_connect_timeout: self.worker_connect_timeout,
             worker_rpc_timeout: self.worker_rpc_timeout,
             max_message_bytes: self.max_message_bytes,
@@ -285,6 +294,19 @@ impl DistributedScanExec {
     #[must_use = "with_worker_secret consumes self; bind the returned scan"]
     pub fn with_worker_secret(mut self, secret: String) -> Self {
         self.worker_secret = secret;
+        self
+    }
+
+    /// Finding 601: sign tickets with the coordinator's Ed25519 key and
+    /// stamp each with its target worker and an expiry.
+    #[must_use = "with_ticket_signer consumes self; bind the returned scan"]
+    pub fn with_ticket_signer(
+        mut self,
+        signer: Arc<sqe_core::ticket_signing::TicketSigner>,
+        ttl: std::time::Duration,
+    ) -> Self {
+        self.ticket_signer = Some(signer);
+        self.ticket_ttl = ttl;
         self
     }
 
@@ -532,6 +554,8 @@ impl ExecutionPlan for DistributedScanExec {
         let local_executor = self.local_executor.clone();
         let fragment_callback = self.fragment_callback.0.clone();
         let worker_secret = self.worker_secret.clone();
+        let ticket_signer = self.ticket_signer.clone();
+        let ticket_ttl = self.ticket_ttl;
         let dispatch_limits = DispatchLimits {
             connect_timeout: self.worker_connect_timeout,
             rpc_timeout: self.worker_rpc_timeout,
@@ -732,6 +756,8 @@ impl ExecutionPlan for DistributedScanExec {
                     channel_pool.as_deref(),
                     &parent_cx,
                     &worker_secret,
+                    ticket_signer.as_deref(),
+                    ticket_ttl,
                     &dispatch_limits,
                     &ticket_predicate_dropped,
                 )
@@ -970,15 +996,24 @@ fn encode_ticket_within_limit(
     Ok(fallback)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_to_worker(
     task: &ScanTask,
     worker_url: &str,
     pool: Option<&ChannelPool>,
     parent_cx: &opentelemetry::Context,
     worker_secret: &str,
+    ticket_signer: Option<&sqe_core::ticket_signing::TicketSigner>,
+    ticket_ttl: std::time::Duration,
     limits: &DispatchLimits,
     ticket_predicate_dropped: &datafusion::physical_plan::metrics::Count,
 ) -> Result<FlightRecordBatchStream, DataFusionError> {
+    // Finding 601: bind the ticket to this worker and to a deadline before
+    // signing, so a captured ticket cannot be replayed elsewhere or later.
+    let mut task = task.clone();
+    task.audience = worker_url.to_string();
+    task.expires_at = chrono::Utc::now().timestamp() + ticket_ttl.as_secs() as i64;
+    let task = &task;
     let ticket_bytes = encode_ticket_within_limit(
         task,
         worker_url,
@@ -1021,7 +1056,10 @@ async fn dispatch_to_worker(
     // Signing the wire bytes rather than a re-serialized struct guarantees the
     // tag covers precisely what the worker decodes: file paths, credentials,
     // and the #233 predicate and limit fields, with no canonicalization gap.
-    let scan_signature = sign_ticket(worker_secret, &ticket_bytes);
+    let scan_signature = match ticket_signer {
+        Some(signer) => Some(signer.sign(&ticket_bytes)),
+        None => sign_ticket(worker_secret, &ticket_bytes),
+    };
 
     let ticket = Ticket::new(ticket_bytes);
     let mut request = tonic::Request::new(ticket);
@@ -1535,9 +1573,9 @@ mod tests {
             projected_field_ids: vec![],
             s3_endpoint: String::new(),
             s3_region: String::new(),
-            s3_access_key: String::new(),
-            s3_secret_key: String::new(),
-            s3_session_token: String::new(),
+            credentials: sqe_planner::ScanCredentials::default(),
+            audience: String::new(),
+            expires_at: 0,
             s3_path_style: false,
             s3_allow_http: true,
             predicate_proto: None,
@@ -1632,9 +1670,9 @@ mod tests {
             projected_field_ids: vec![],
             s3_endpoint: String::new(),
             s3_region: String::new(),
-            s3_access_key: String::new(),
-            s3_secret_key: String::new(),
-            s3_session_token: String::new(),
+            credentials: sqe_planner::ScanCredentials::default(),
+            audience: String::new(),
+            expires_at: 0,
             s3_path_style: false,
             s3_allow_http: true,
             predicate_proto: None,

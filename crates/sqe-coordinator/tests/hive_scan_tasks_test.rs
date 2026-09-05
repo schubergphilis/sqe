@@ -172,6 +172,7 @@ fn s3_access_is_propagated_to_every_task() {
     for t in &tasks {
         assert_eq!(t.s3_endpoint, "http://minio:9000");
         assert_eq!(t.s3_region, "us-east-1");
-        assert_eq!(t.s3_access_key, "ak");
+        assert_eq!(t.credentials.access_key(), "ak");
+        assert_eq!(t.credentials.source(), "static");
     }
 }

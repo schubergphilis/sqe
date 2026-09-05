@@ -64,6 +64,9 @@ regexes = [
     # RSA key cannot be masked. Lives inside a string literal, so it cannot take
     # an inline gitleaks:allow comment.
     '''MIIEowIBAAKCAQEAvX0NLGQkeecTCMwoDPx6Qkutsf0PWBEjZnNm4vkmTTvHD1F0''',
+    # PKCS#8 P-256 key used only for ES256 JWT-signing tests (bearer_token.rs
+    # TEST_EC_PRIVATE_KEY_PEM), matched by its unique leading bytes.
+    '''MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcb/PT1Xj+xW0FvVc''',
     # Test fixtures in crates/sqe-core/src/secret.rs. These carry inline
     # `gitleaks:allow` comments in the working tree, but the history scan
     # (aikido-secret-scan-history) reads old blobs where the comment was not
@@ -161,4 +164,20 @@ paths = [
 regexTarget = "line"
 regexes = [
     '''curl[^\n]*-u "admin:\$\{RANGER_ADMIN_PASSWORD:-rangerR0cks!\}"''',
+]
+
+# 5. Committed TLS test fixtures. crates/sqe-core/tests/fixtures/tls/ holds a
+#    throwaway self-signed CA and two leaf key pairs (SAN worker-1.sqe.test /
+#    localhost) that exist only so the TLS builder and certificate-reload tests
+#    can run without openssl at test time. They sign nothing outside the test
+#    process. Scoped to that one directory AND to PEM private-key blocks, so a
+#    real key committed anywhere else is still flagged.
+[[allowlists]]
+description = "TLS test fixtures (path-scoped private keys)"
+condition = "AND"
+paths = [
+    '''(^|/)crates/sqe-core/tests/fixtures/tls/[^/]+\.key$''',
+]
+regexes = [
+    '''-----BEGIN (RSA |EC )?PRIVATE KEY-----''',
 ]

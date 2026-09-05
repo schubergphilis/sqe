@@ -14,7 +14,6 @@
 //! exist only for the duration of a single scheduler job and are held
 //! directly by the caller (the advisory scheduler, added in a later task).
 
-use chrono::{DateTime, Utc};
 use sqe_auth::{AuthProvider, FlightCredentials, Identity, OidcM2mConfig, OidcM2mProvider};
 use sqe_core::config::MaintenancePrincipalConfig;
 use sqe_core::{Credentials, Session, SqeError};
@@ -81,29 +80,17 @@ impl MaintenancePrincipal {
     /// carried user_id/roles) is testable without a network call: tests can
     /// hand-build an `Identity` and call this directly.
     fn session_from_identity(identity: &Identity, job_id: &str) -> Session {
-        let token_expiry: DateTime<Utc> = identity
-            .expires_at
-            .unwrap_or_else(|| Utc::now() + chrono::Duration::hours(1));
-
-        let mut session = Session::new(
-            identity.user_id.clone(),
-            identity.catalog_token.clone().unwrap_or_default(),
-            identity.refresh_token.clone(),
-            token_expiry,
-            identity.roles.clone(),
-        )
-        .with_identity(
-            identity.subject.clone(),
-            identity.email.clone(),
-            identity.groups.clone(),
-        )
-        // Explicit in-engine write-authority marker (Phase 4b). Set here,
-        // once, by the maintenance principal's own minting path only.
-        // `MaintenanceHandler::authorize_or_deny` honors this independent
-        // of the role-name heuristic so autonomous compaction is authorized
-        // by design, not by accident of "unknown role defaults to allow".
-        // Polaris still enforces authorization server-side.
-        .with_maintenance_authority(true);
+        // Shared identity-to-session mapping (finding 204), then the
+        // maintenance-only marker on top.
+        let mut session = identity
+            .to_session(None)
+            // Explicit in-engine write-authority marker (Phase 4b). Set here,
+            // once, by the maintenance principal's own minting path only.
+            // `MaintenanceHandler::authorize_or_deny` honors this independent
+            // of the role-name heuristic so autonomous compaction is authorized
+            // by design, not by accident of "unknown role defaults to allow".
+            // Polaris still enforces authorization server-side.
+            .with_maintenance_authority(true);
 
         session.id = format!("maintenance-job-{job_id}");
         session

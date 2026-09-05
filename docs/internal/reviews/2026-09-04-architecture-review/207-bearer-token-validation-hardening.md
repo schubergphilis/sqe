@@ -4,7 +4,7 @@
 - Severity: medium
 - Category: security
 - Effort: S (hours)
-- Status: open
+- Status: fixed (branch `fix/identity-transport-trust-p1`, 2026-09-05)
 - Issue: #560
 
 ## Problem
@@ -81,3 +81,49 @@ match &self.config.issuer {
 
 - docs/internal/reviews/2026-06-26-codebase-analysis.md item 8 (audience
   default) is fixed; this is the sibling set.
+
+## Resolution (2026-09-05)
+
+All four items landed in `crates/sqe-auth/src/bearer_token.rs`. `issuer` is now
+required at construction and mirrors the audience guard: an empty/missing
+`issuer` fails `BearerTokenProvider::new` unless the new
+`allow_unbounded_issuer` opt-out is set (plumbed through
+`AuthProviderConfig::BearerToken` in `crates/sqe-core/src/config.rs` as a
+`#[serde(default)]` bool and through `crates/sqe-auth/src/factory.rs`, so every
+existing config that already sets `issuer` keeps working unchanged). There is no
+discovery hook to populate it from — the provider takes `jwks_url` verbatim from
+config and never fetches `.well-known/openid-configuration` — so the field docs
+now state that the config loader/operator must set `issuer` to the discovery
+document's `issuer`. Validation additionally marks `iss` a required claim when an
+issuer is configured, because `jsonwebtoken` only compares the issuer when the
+claim is present and would otherwise wave through a token that simply omits it.
+`validate_nbf` is on and the clock-skew allowance is a config field
+(`leeway_secs`, default 60 = `DEFAULT_LEEWAY_SECS`). `refetch_jwks` replaces the
+cache on success instead of merging: a key missing from the fresh JWKS survives
+only if it was seen inside `KEY_RETIREMENT_GRACE` (5 min, injectable for tests)
+and only when the fresh JWKS still has at least one key — a successful fetch
+yielding zero loadable keys empties the cache and logs a warning rather than
+extending a retired key's life; the rotation-vs-revocation trade-off is written
+up on the constant. JWKS parsing now loads `kty == "EC"` keys via
+`DecodingKey::from_ec_components`, pins the algorithm per key from the JWK `alg`
+(falling back to `kty`/`crv`, rejecting family mismatches such as an RSA entry
+advertising `ES256`) instead of a single global RS256, and warns loudly when a
+JWKS has no loadable key. Covered by new unit tests in the same file:
+`new_rejects_missing_issuer_by_default`, `new_rejects_empty_string_issuer`,
+`new_accepts_missing_issuer_when_explicit_opt_in`,
+`new_accepts_non_empty_issuer_without_opt_in`, `issuer_match_succeeds`,
+`missing_issuer_claim_rejected_when_issuer_configured`,
+`nbf_in_the_future_returns_auth_failed`, `nbf_in_the_past_is_accepted`,
+`es256_token_validates_against_ec_jwks` (static P-256 keypair, no new
+dev-dependency), `rs256_token_rejected_against_ec_key_entry`,
+`key_algorithm_pins_alg_per_key`,
+`key_removed_from_jwks_is_rejected_after_refetch` (grace window zero),
+`key_removed_from_jwks_is_honoured_inside_grace_window`, and
+`empty_fresh_jwks_clears_the_cache`. `cargo test -p sqe-auth` is green (282
+passed, 0 failed).
+
+Follow-up worth its own finding: a *missing* `aud` claim still passes a
+configured audience for the same `jsonwebtoken` reason `iss` did — only `iss`
+was added to the required-claims set here, because forcing `aud` could break
+deployments whose IdP omits it. `leeway_secs` is also not yet exposed in
+`AuthProviderConfig::BearerToken`; it defaults to 60 from the factory.
