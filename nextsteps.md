@@ -1,5 +1,40 @@
 # SQE — Next Steps
 
+> **STATUS 2026-09-05: security/scale review filed (7 findings) and fixed; 11 of 109 combined findings closed.**
+>
+> `docs/internal/reviews/2026-09-05-security-scale-review/` adds seven
+> high-severity findings (900-906) on top of the September 4 review, and
+> `docs/internal/reviews/2026-09-05-combined-prioritized-findings.md` is the
+> combined P1/P2/P3 schedule for all 109. Branch
+> `fix/security-scale-review-2026-09-05` fixes all seven plus 105, 200, 203
+> and 206: URL-parsed HTTP destination gate, per-TVF scoped object-store
+> runtimes, result cache keyed on exact SQL bytes and full session scope and
+> disabled under any governing policy engine, bounded partitioned fanout by
+> default with pool-charged reservations, capped and pool-charged buffered
+> JSON decoding, subquery-aware policy rewriting, OAuth-only bearer
+> validation for MCP, Ranger cache key with groups, ASCII-only pre-scan
+> uppercasing. Each finding file ends with a Resolution section.
+> **NEXT:** the remaining 32 P1s in the combined index, starting with 202
+> (MERGE target row filters), 400 (time-travel aliases), 503 (Hive INSERT
+> enforcer) and 601/401/603 (worker trust); then a fingerprint-bound result
+> cache so governed deployments regain result reuse (902 follow-up).
+
+# SQE — Next Steps
+
+> **STATUS 2026-09-04 (later): architecture review filed, 102 issues, nothing fixed yet.**
+>
+> `docs/internal/reviews/2026-09-04-architecture-review/` holds one file per
+> finding in a fixed template (scope, severity, category, effort, status,
+> problem with `path:line` evidence, why it matters, proposed change,
+> acceptance criteria) so an agent can pick a file up cold. 31 high, 62
+> medium, 9 low. The five to read first: 200 (policy rewriter never enters
+> expression subqueries, so `IN (SELECT ...)` reads governed tables raw), 202
+> (MERGE handlers apply no row filters to the target), 400 (time-travel
+> aliases bypass policy), 503 (Hive INSERT plans its source without the
+> enforcer), 601 (one shared secret flattens worker trust, rogue worker
+> receives every user's S3 credentials). Index with severities in the
+> directory README.
+
 # SQE — Next Steps
 
 > **STATUS 2026-09-04: build and test time program proposed; baseline measured, nothing changed yet.**

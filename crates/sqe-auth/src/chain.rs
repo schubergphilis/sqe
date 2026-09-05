@@ -41,6 +41,21 @@ impl AuthChain {
 
 #[async_trait]
 impl AuthProvider for AuthChain {
+    async fn authenticate_oauth(
+        &self,
+        credentials: &FlightCredentials,
+    ) -> Result<Identity, AuthError> {
+        for provider in &self.providers {
+            match provider.authenticate_oauth(credentials).await {
+                Err(AuthError::NotMyCredentials) => continue,
+                result => return result,
+            }
+        }
+        Err(AuthError::AuthFailed(
+            "no provider can validate OAuth bearer claims".into(),
+        ))
+    }
+
     async fn authenticate(&self, credentials: &FlightCredentials) -> Result<Identity, AuthError> {
         if self.providers.is_empty() {
             return Err(AuthError::AuthFailed(
@@ -96,6 +111,22 @@ impl AuthProvider for AuthChain {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn oauth_never_falls_back_to_generic_authentication() {
+        let chain = AuthChain::new(vec![Arc::new(FixedProvider {
+            user_id: "alice".into(),
+        })]);
+        let credentials = FlightCredentials {
+            bearer_token: Some("forged.payload.signature".into()),
+            ..Default::default()
+        };
+        assert!(chain.authenticate(&credentials).await.is_ok());
+        assert!(matches!(
+            chain.authenticate_oauth(&credentials).await,
+            Err(AuthError::AuthFailed(_))
+        ));
+    }
 
     /// A test provider that always returns `NotMyCredentials`.
     struct SkipProvider;

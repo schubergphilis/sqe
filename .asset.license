@@ -1,0 +1,14 @@
+schema = 1
+
+# deps.dev returns 404 for this release, so the Cargo.lock-only SBOM lacks
+# license evidence. Verified the published crate against Cargo.lock on
+# 2026-09-05: Cargo.toml declares MIT OR Apache-2.0 and the archive includes
+# LICENSE-MIT and LICENSE-APACHE. Remove when deps.dev indexes this release.
+[[exception]]
+id = "OSS-FIND-MSVC-TOOLS-0-1-12-EVIDENCE-2026"
+component = "pkg:cargo/find-msvc-tools@0.1.12"
+licenses = ["MIT", "Apache-2.0"]
+scope = "evidence-vouched"
+owner = "vpf-data-ai/chameleon sqlengine maintainers"
+reason = "Published find-msvc-tools 0.1.12 declares MIT OR Apache-2.0 in Cargo.toml and includes both license texts. Source: https://static.crates.io/crates/find-msvc-tools/find-msvc-tools-0.1.12.crate ; SHA-256 3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d matches Cargo.lock. This supplies missing metadata for this exact release only; it does not waive restricted licenses."
+expires = "2026-12-04"

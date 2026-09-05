@@ -71,7 +71,7 @@ pub struct HivePartitionSpec {
 /// to the next pre-parser (`PARTITION FIELD`, tags, masking policies, ...).
 pub fn try_parse_hive_partition_ddl(sql: &str) -> Result<Option<HivePartitionDdl>> {
     let trimmed = sql.trim().trim_end_matches(';');
-    let upper = trimmed.to_uppercase();
+    let upper = trimmed.to_ascii_uppercase();
     if !upper.starts_with("ALTER TABLE ") {
         return Ok(None);
     }

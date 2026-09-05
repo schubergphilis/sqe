@@ -52,7 +52,7 @@ pub enum PartitionEvolution {
 /// so the classifier can fall through to the next pre-parser.
 pub fn try_parse_partition_evolution(sql: &str) -> Result<Option<PartitionEvolution>> {
     let trimmed = sql.trim().trim_end_matches(';');
-    let upper = trimmed.to_uppercase();
+    let upper = trimmed.to_ascii_uppercase();
 
     if !upper.starts_with("ALTER TABLE ") {
         return Ok(None);
@@ -62,7 +62,7 @@ pub fn try_parse_partition_evolution(sql: &str) -> Result<Option<PartitionEvolut
     let rest = trimmed["ALTER TABLE ".len()..].trim_start();
     let (table, rest_after_table) = split_identifier(rest)?;
     let rest_after_table = rest_after_table.trim_start();
-    let rest_upper = rest_after_table.to_uppercase();
+    let rest_upper = rest_after_table.to_ascii_uppercase();
 
     // ADD PARTITION FIELD <transform>
     if let Some(after_kw) = strip_keyword(&rest_upper, rest_after_table, "ADD PARTITION FIELD") {
@@ -182,7 +182,7 @@ fn strip_keyword<'a>(upper_rest: &str, original_rest: &'a str, kw: &str) -> Opti
 /// Split an input string on the first standalone ` WITH ` (case insensitive).
 /// Used for REPLACE PARTITION FIELD <old> WITH <new>.
 fn split_with(input: &str) -> Result<(String, String)> {
-    let upper = input.to_uppercase();
+    let upper = input.to_ascii_uppercase();
     // Find " WITH " as a whole token.
     let mut search_start = 0;
     while let Some(pos) = upper[search_start..].find("WITH") {

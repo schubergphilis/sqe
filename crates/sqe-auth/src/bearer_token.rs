@@ -517,6 +517,20 @@ impl BearerTokenProvider {
 
 #[async_trait]
 impl AuthProvider for BearerTokenProvider {
+    async fn authenticate_oauth(
+        &self,
+        credentials: &FlightCredentials,
+    ) -> Result<Identity, AuthError> {
+        if self.config.allow_unbounded_audience
+            && self.config.audience.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(AuthError::AuthFailed(
+                "OAuth requires a configured token audience".into(),
+            ));
+        }
+        self.authenticate(credentials).await
+    }
+
     async fn authenticate(&self, credentials: &FlightCredentials) -> Result<Identity, AuthError> {
         // Step 1: Detect if credentials contain a JWT.
         let token = match Self::detect_jwt(credentials) {
