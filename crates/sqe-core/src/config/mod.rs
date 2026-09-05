@@ -9434,6 +9434,24 @@ warehouse = "wh"
             .to_string();
         assert!(err.contains("Fair") || err.contains("unknown"), "got: {err}");
     }
+
+    #[test]
+    fn shipped_operator_tomls_load() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let files = [
+            "tests/sqe-test.toml",
+            "tests/distributed/coordinator.toml",
+            "tests/distributed/worker.toml",
+            "quickstart/mcp/sqe.toml",
+            "quickstart/quack/sqe.toml",
+            "tests/sqe-ranger-test.toml",
+        ];
+        for rel in files {
+            let path = root.join(rel);
+            SqeConfig::load(path.to_str().unwrap())
+                .unwrap_or_else(|e| panic!("{rel} failed to load: {e}"));
+        }
+    }
 }
 
 #[cfg(test)]

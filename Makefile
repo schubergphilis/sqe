@@ -32,11 +32,11 @@ BIN_SERVER   := sqe-server
 #   * `push` produces a multi-arch image (amd64+arm64) via `docker buildx` and
 #     pushes it straight to the registry (manifest lists can't be `--load`ed).
 #
-# The image is built from Dockerfile.full by default (all catalog backends
-# compiled in: Polaris + Nessie + Glue + HMS + Unity). Override for the slim
-# image: `make SQE_DOCKERFILE=Dockerfile build`.
+# One Dockerfile. Kitchen-sink backends are a build-arg (the previous
+# Dockerfile.full). Slim REST image: `make CATALOG_FEATURES= build`.
 DOCKER         ?= docker
-SQE_DOCKERFILE ?= Dockerfile.full
+SQE_DOCKERFILE ?= Dockerfile
+CATALOG_FEATURES ?= sqe-catalog/full-backends
 
 # Optional registry/namespace prefix for the LOCAL `build`. Empty = bare name.
 # A trailing slash is added automatically when set.
@@ -77,7 +77,8 @@ CONFIG_OUT_DIR ?= dist/sqe-config
 SQE_BUILD_ARGS := \
 	--build-arg BUILD_DATE=$(BUILD_DATE) \
 	--build-arg GIT_REVISION=$(GIT_REVISION) \
-	--build-arg VERSION=$(IMAGE_TAG)
+	--build-arg VERSION=$(IMAGE_TAG) \
+	--build-arg CATALOG_FEATURES=$(CATALOG_FEATURES)
 
 # ── Benchmarks ─────────────────────────────────────────────────────────────
 # `make benchmark_sf1` etc. wrap scripts/benchmark-make-run.sh, which wraps
