@@ -4,7 +4,8 @@
 - Severity: high
 - Category: security
 - Effort: S (hours)
-- Status: open
+- Status: fixed (branch `fix/authz-policy-enforcement-p1`, 2026-09-05)
+- Issue: #569
 
 ## Problem
 
@@ -39,3 +40,7 @@ A tag added externally to newly classify a column as PII is not enforced by SQE 
 
 - 302 (invalidation scope), 304 (stale entry resurrection).
 - Memory notes: "Tag storage decision", "RENAME/DROP carry their tags", "Spark/Ranger AC parity".
+
+## Resolution (2026-09-05)
+
+`properties_for` in `crates/sqe-catalog/src/rest_catalog.rs` only serves table properties from a cache entry whose age is inside the metadata cache TTL and skips entries invalidated for another token, so column-tag masking never reads a stale property set left by a different session. Test `table_metadata_cache_properties_ignore_stale_entries` seeds an aged entry via the `insert_aged` test hook and asserts it is not returned.

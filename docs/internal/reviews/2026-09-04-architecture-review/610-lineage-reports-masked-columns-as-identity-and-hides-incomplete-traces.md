@@ -5,6 +5,7 @@
 - Category: architecture
 - Effort: S (hours) to M (days)
 - Status: open
+- Issue: #617
 
 ## Problem
 

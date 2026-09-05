@@ -8,6 +8,7 @@
 - Category: security
 - Effort: S
 - Status: fixed (branch `fix/security-scale-review-2026-09-05`, 2026-09-05)
+- Issue: #645
 - Confidence: high in source-level defect; deployment impact depends on stated prerequisites
 
 ## Problem

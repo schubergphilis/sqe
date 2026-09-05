@@ -5,6 +5,7 @@
 - Category: maintainability
 - Effort: M (days)
 - Status: open
+- Issue: #625
 
 ## Problem
 

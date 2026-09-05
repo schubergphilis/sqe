@@ -4,7 +4,8 @@
 - Severity: high
 - Category: security
 - Effort: M (days)
-- Status: open
+- Status: fixed (branch `fix/authz-policy-enforcement-p1`, 2026-09-05)
+- Issue: #580
 
 ## Problem
 
@@ -79,3 +80,7 @@ Either way, add the real table name to `audit_resources::resources_from_plan` fo
   not cover this bypass; nothing in the 2026-06-26 review covers it.
 - Memory note "RENAME/DROP carry their tags" shows the same class of bug (identity lost on a
   rewrite) was fixed for DDL in !794.
+
+## Resolution (2026-09-05)
+
+`TimeTravelCleanup::restore_identities` (`crates/sqe-coordinator/src/query_handler.rs`) rewrites every `datafusion.public.__sqe_*` pinned scan back to the user's `TableReference` (wrapped in a `SubqueryAlias` so the plan above keeps resolving) before the plan reaches the policy rewriter and the audit. `handle_time_travel`, `handle_incremental` and `process_time_travel_table_factor` record the alias-to-identity pairs, and both planning sites (explain and execute) apply the restore. Test `restore_identities_renames_pinned_scans_and_keeps_the_plan_valid` registers a pinned provider, restores it and checks the scan carries the user's reference and the plan still executes.
