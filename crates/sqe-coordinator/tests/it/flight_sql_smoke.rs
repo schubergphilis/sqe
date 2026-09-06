@@ -36,21 +36,35 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Channel, Server};
 
-/// `catalog_url` points at a closed port on purpose. These queries never touch
-/// a catalog, and a dead URL proves it: if the statement path grew a dependency
-/// on catalog reachability, this test would fail rather than quietly pass
-/// against whatever happens to be listening on a developer's machine.
-const SMOKE_TOML: &str = r#"
-[coordinator]
+/// `catalog_url` points at an in-process Polaris mock that serves an empty
+/// catalog. The queries never touch a table, so an empty catalog keeps the
+/// transport as the only thing under test. This used to be a closed port: since
+/// finding 306 (#657) an unreachable catalog fails the session build loudly
+/// instead of degrading to an empty namespace list, so a dead URL now proves
+/// the fail-closed rule rather than the statement path.
+fn smoke_config(catalog_url: &str) -> SqeConfig {
+    let toml = format!("[coordinator]\n\n[auth]\n\n[catalog]\ncatalog_url = \"{catalog_url}\"\n");
+    toml::from_str(&toml).expect("smoke config parses")
+}
 
-[auth]
-
-[catalog]
-catalog_url = "http://127.0.0.1:59997"
-"#;
-
-fn smoke_config() -> SqeConfig {
-    toml::from_str(SMOKE_TOML).expect("smoke config parses")
+/// Polaris mock with a config endpoint and zero namespaces.
+async fn mount_empty_polaris() -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let server = wiremock::MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/config"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"overrides":{},"defaults":{}}"#),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"namespaces":[]}"#))
+        .mount(&server)
+        .await;
+    server
 }
 
 /// A running Flight SQL server. Dropping it shuts the server task down.
@@ -61,11 +75,14 @@ struct FlightServer {
     tracker: Arc<QueryTracker>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<()>>,
+    /// The Polaris mock the session build talks to; dropped with the server.
+    _polaris: wiremock::MockServer,
 }
 
 impl FlightServer {
     async fn start() -> Self {
-        let config = smoke_config();
+        let polaris = mount_empty_polaris().await;
+        let config = smoke_config(&polaris.uri());
         let tracker = Arc::new(QueryTracker::new(&config.query_history));
         let handler = QueryHandler::new(
             Arc::new(PassthroughEnforcer),
@@ -113,6 +130,7 @@ impl FlightServer {
             tracker,
             shutdown: Some(tx),
             task: Some(task),
+            _polaris: polaris,
         }
     }
 
