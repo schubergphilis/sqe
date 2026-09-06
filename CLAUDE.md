@@ -12,42 +12,10 @@ The shipped long-running binary is `sqe-server` (`--mode coordinator` or `--mode
 
 ## Architecture
 
-```
-Client (Flight SQL, Trino HTTP, MCP, Quack/DuckDB RPC, web UI)
-  -> sqe-server (coordinator)
-  -> Workers (DataFusion)
-  -> Iceberg (Polaris + S3)
-```
-
 - **Coordinator**: SQL parsing, auth, policy enforcement (plan rewriting), optimization, distributed scheduling. Run as `sqe-server --mode coordinator`.
 - **Workers**: Stateless DataFusion executors receiving secured `ScanTask`s (file list + projection + predicate + limit) and user bearer tokens. The executed topology is a **distributed scan**: workers scan and stream Arrow back, and every join, aggregate and sort runs on the coordinator. There is no stage-based shuffle on any query path -- the `DoExchange` shuffle intake compiles only behind the `worker-shuffle` cargo feature (off by default; `shuffle-planning` in sqe-planner and `exchange` in sqe-spill are its planner and manifest halves), and the default build answers `DoExchange` with `Unimplemented`
 - **Auth model**: No service account -- every query runs as the authenticated user via OIDC password grant -> bearer token passthrough to Polaris/S3
 - **Security**: Policy enforcement via LogicalPlan rewriting *before* DataFusion optimization (row filters, column masks, column restriction). Pluggable backend: Ranger, Polaris grants, in-memory, or passthrough
-
-## Crate Structure
-
-| Crate | Purpose |
-|---|---|
-| `sqe-core` | Shared types, config, errors |
-| `sqe-sql` | SQL parser, statement classifier, GRANT/REVOKE |
-| `sqe-auth` | Pluggable auth chain (10 providers), token cache |
-| `sqe-catalog` | Iceberg REST client, caching, scan execution |
-| `sqe-policy` | Policy enforcement (passthrough, in-memory, Apache Ranger) |
-| `sqe-planner` | Plan splitting, star-schema reorder, join strategy |
-| `sqe-coordinator` | Flight SQL server, query handler, Trino HTTP (`sqe-server` binary) |
-| `sqe-worker` | Stateless DataFusion executor |
-| `sqe-cli` | Interactive SQL client (cluster + embedded modes) |
-| `sqe-metrics` | Prometheus, OpenTelemetry, audit logger |
-| `sqe-lineage` | OpenLineage 2-0-2 emitter; column-level lineage |
-| `sqe-trino-compat` | Trino wire protocol |
-| `sqe-trino-functions` | Trino-compatible scalar UDFs for DataFusion |
-| `sqe-mcp` | Model Context Protocol endpoint (OAuth resource server, tools) |
-| `sqe-compaction` | Compaction / rewrite-data-files |
-| `sqe-spill` | Spill substrate |
-| `sqe-quack-wire` | Pure-Rust port of DuckDB's BinarySerializer (Quack RPC) |
-| `sqe-quack-server` | Quack RPC server; accepts DuckDB clients over HTTP |
-| `sqe-quack-client` | Client side of the DuckDB Quack RPC |
-| `sqe-bench` | Benchmark suite |
 
 ## Key Design Decisions
 
@@ -83,28 +51,6 @@ Invariant: `docs/site/` must be publish-clean (no secrets or PII). `make leak-sc
 
 The live roadmap and its status live in `README.md`; `nextsteps.md` carries the current pointer. Distribution uses a bespoke scheduler; Ballista was evaluated and rejected (see `docs/site/book/src/design-notes/ballista-evaluation-learnings.md`).
 
-1. **Phase 1** -- Single-node: DataFusion + iceberg-rust + OIDC auth + Flight SQL
-2. **Phase 2** -- Views, INSERT INTO, manifest caching, audit logging
-3. **Phase 2c** -- dbt compatibility: write path (CTAS, MERGE, DELETE), information_schema, dbt-sqe adapter
-4. **Phase 3** -- Distributed execution: bespoke scheduler + stateless DataFusion workers (Ballista was evaluated and wound down; see `docs/site/book/src/design-notes/ballista-evaluation-learnings.md`)
-5. **Phase 4** -- Production hardening: metrics, benchmarks, Helm, Trino compat
-6. **Phase 5** -- Security: Ranger / Polaris grants / in-memory policy engine, GRANT/REVOKE SQL, column masks, row filters
-
-## Tech Stack
-
-- **Language**: Rust (engine), Python (dbt adapter)
-- **Query engine**: Apache DataFusion
-- **Distribution**: bespoke scheduler + stateless DataFusion workers over Arrow Flight
-- **Table format**: Apache Iceberg v3 via iceberg-rust 0.8.0+
-- **Catalog**: Apache Polaris (Iceberg REST)
-- **Auth**: OIDC (any provider: Keycloak, Auth0, Okta, etc.)
-- **Policy**: Apache Ranger, Polaris grants, in-memory, or passthrough (OPA/Cedar were designed, not built)
-- **Wire protocol**: Arrow Flight SQL (primary), Trino HTTP, MCP, Quack/DuckDB RPC, web UI
-- **Storage**: S3-compatible (AWS S3, Ceph, Garage, R2, etc.)
-- **Policy cache**: moka (async TTL cache)
-- **Deployment**: Kubernetes (Helm)
-- **License**: Apache 2.0
-
 ## Common Commands
 
 ```bash
@@ -124,6 +70,7 @@ make test-integration-down                        # tear the stack down
 - No git worktrees -- use simple branches
 - Branch naming: `feat/`, `fix/`, `refactor/`, `docs/`, `test/` prefixes
 - Keep PRs focused -- one logical change per PR, not mega-branches
+- Edit source files with the Edit tool, not sed or Python scripts
 
 ## After Completing Work
 
@@ -135,4 +82,3 @@ When finishing a feature, bugfix, or any implementation task, **always update th
 4. **`benchmarks/results/`** -- Commit benchmark JSON reports for historical tracking (the `benchmarks` skill has the run and compare procedure)
 
 This ensures the project state is always visible to anyone reading the repo.
-
