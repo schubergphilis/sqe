@@ -15,8 +15,13 @@ pub struct WorkerInfo {
     pub url: String,
     /// Whether the worker is currently healthy.
     pub healthy: bool,
-    /// Number of fragments currently being executed on this worker.
-    pub active_fragments: u32,
+    /// Load already in flight on this worker, in the same unit
+    /// [`estimate_cost`] produces (megabytes of scan input, or file count
+    /// when sizes are unknown). Finding 408: this used to be a fragment
+    /// *count*, which the scheduler then added MB costs to, so a worker with
+    /// three in-flight fragments looked 3 MB "busier" than an idle one and
+    /// cross-query balancing was effectively off past a few MB per task.
+    pub in_flight_load: u64,
 }
 
 /// A single fragment-to-worker assignment.
@@ -73,7 +78,11 @@ impl std::error::Error for SchedulerError {}
 /// (minimum 1) so that a 10 GB file costs 1000× more than a 10 MB file.
 /// When sizes are unknown (empty vec), falls back to file count so that
 /// existing behaviour is preserved for callers that haven't populated sizes.
-fn estimate_cost(task: &ScanTask) -> u64 {
+///
+/// `pub(crate)` so the dispatcher reserves the same number on the
+/// [`crate::worker_registry::WorkerLoadTracker`] that the next scheduling
+/// round reads back as [`WorkerInfo::in_flight_load`].
+pub(crate) fn estimate_cost(task: &ScanTask) -> u64 {
     let total_bytes: u64 = task.file_sizes_bytes.iter().sum();
     if total_bytes > 0 {
         // Cost in megabytes, minimum 1
@@ -117,7 +126,8 @@ fn preferred_worker(file_paths: &[String], num_workers: usize) -> usize {
 ///
 /// Strategy:
 /// 1. Filter out unhealthy workers.
-/// 2. Initialize each worker's load from its `active_fragments` count.
+/// 2. Initialize each worker's load from its `in_flight_load` (same unit as
+///    `estimate_cost`).
 /// 3. Sort tasks by estimated cost (descending) so the heaviest tasks
 ///    are assigned first ("largest-first" bin-packing heuristic).
 /// 4. Assign each task to the worker with the currently lowest total load.
@@ -150,11 +160,13 @@ impl FragmentScheduler for WeightedScheduler {
             return Ok(vec![]);
         }
 
-        // Build a load tracker: (accumulated_load, worker_index_in_healthy)
+        // Build a load tracker: (accumulated_load, worker_index_in_healthy).
+        // `in_flight_load` is already in `estimate_cost` units, so adding task
+        // costs below compares like with like.
         let mut loads: Vec<(u64, usize)> = healthy
             .iter()
             .enumerate()
-            .map(|(i, w)| (u64::from(w.active_fragments), i))
+            .map(|(i, w)| (w.in_flight_load, i))
             .collect();
 
         // Sort tasks by estimated cost descending (largest-first bin packing).
@@ -284,12 +296,39 @@ mod tests {
         }
     }
 
-    fn make_worker(url: &str, healthy: bool, active: u32) -> WorkerInfo {
+    fn make_worker(url: &str, healthy: bool, in_flight_load: u64) -> WorkerInfo {
         WorkerInfo {
             url: url.to_string(),
             healthy,
-            active_fragments: active,
+            in_flight_load,
         }
+    }
+
+    /// Finding 408 acceptance: two workers, one already carrying one
+    /// in-flight 500 MB fragment (reserved in MB, the `estimate_cost` unit),
+    /// two new 500 MB tasks land one per worker. With the old fragment-count
+    /// initialisation the busy worker looked 1 MB loaded and, after the first
+    /// 500 MB task went to the idle one, took the second task too.
+    #[test]
+    fn test_in_flight_load_is_in_cost_units() {
+        let scheduler = WeightedScheduler::new();
+        let busy_reserved = estimate_cost(&make_task_with_sizes("inflight", &[500 * MB]));
+        assert_eq!(busy_reserved, 500);
+        let tasks = vec![
+            make_task_with_sizes("a", &[500 * MB]),
+            make_task_with_sizes("b", &[500 * MB]),
+        ];
+        let workers = vec![
+            make_worker("http://w1:50052", true, busy_reserved),
+            make_worker("http://w2:50052", true, 0),
+        ];
+
+        let assignments = scheduler.assign(&tasks, &workers).unwrap();
+        assert_eq!(assignments.len(), 2);
+        assert_ne!(
+            assignments[0].worker_url, assignments[1].worker_url,
+            "500 MB in flight must count as 500 units, not 1: got {assignments:?}"
+        );
     }
 
     #[test]

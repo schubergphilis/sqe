@@ -56,6 +56,9 @@ fn smoke_config() -> SqeConfig {
 /// A running Flight SQL server. Dropping it shuts the server task down.
 struct FlightServer {
     addr: std::net::SocketAddr,
+    /// The server's query tracker, so tests can observe query state the way
+    /// the admin API does.
+    tracker: Arc<QueryTracker>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -72,7 +75,7 @@ impl FlightServer {
             None, // credential_tracker
             None, // metrics
             None, // audit
-            tracker,
+            Arc::clone(&tracker),
             None, // query_cache
             None, // grant_backend
             None, // lineage
@@ -107,6 +110,7 @@ impl FlightServer {
 
         Self {
             addr,
+            tracker,
             shutdown: Some(tx),
             task: Some(task),
         }
@@ -184,6 +188,101 @@ async fn handshake_then_statement_returns_rows_over_grpc() {
         .downcast_ref::<arrow_array::Int64Array>()
         .expect("1 + 1 is an Int64");
     assert_eq!(values.value(0), 2);
+}
+
+/// Finding 403: the ADBC/JDBC cancel sequence over the wire. `GetFlightInfo`
+/// for a long `SELECT`, `DoGet` left streaming, then `CancelQuery` with the
+/// returned `FlightInfo`. Before the fix the ticket carried the SQL, so the
+/// server could not map it to a tracked query and answered UNSPECIFIED (0).
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_query_with_flight_info_cancels_the_running_statement() {
+    use arrow_flight::sql::{ActionCancelQueryRequest, ActionCancelQueryResult, ProstMessageExt};
+    use arrow_flight::Action;
+    use prost::Message;
+    use sqe_coordinator::query_tracker::QueryState;
+
+    let server = FlightServer::start().await;
+    let mut client = FlightSqlServiceClient::new(server.channel().await);
+    let token = client.handshake("smoke", "smoke").await.expect("handshake");
+    client.set_token(String::from_utf8(token.to_vec()).expect("token is utf-8"));
+
+    // Effectively unbounded work, catalog-free.
+    let info = client
+        .execute(
+            "SELECT count(*) FROM generate_series(1, 100000000000)".to_string(),
+            None,
+        )
+        .await
+        .expect("GetFlightInfo");
+    let ticket = info.endpoint[0].ticket.clone().expect("ticket");
+
+    // Start DoGet on a second client and leave it draining in the background.
+    let mut reader = FlightSqlServiceClient::new(server.channel().await);
+    reader.set_token(client.token().expect("token set").to_string());
+    let drain = tokio::spawn(async move {
+        let stream = reader.do_get(ticket).await.expect("DoGet opens");
+        stream.try_collect::<Vec<_>>().await
+    });
+
+    // Wait until the tracker shows the query running.
+    let tracker = Arc::clone(&server.tracker);
+    let running_id = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(r) = tracker
+                .records()
+                .into_iter()
+                .find(|r| r.state == QueryState::Running)
+            {
+                break r.query_id;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("query must reach Running");
+
+    let request = ActionCancelQueryRequest {
+        info: info.encode_to_vec().into(),
+    };
+    let action = Action {
+        r#type: "CancelQuery".to_string(),
+        body: request.as_any().encode_to_vec().into(),
+    };
+    let mut results = client
+        .do_action(action)
+        .await
+        .expect("DoAction CancelQuery");
+    let first = results
+        .try_next()
+        .await
+        .expect("action stream")
+        .expect("one result");
+    let any = arrow_flight::sql::Any::decode(&*first.body).expect("Any");
+    let result: ActionCancelQueryResult = any.unpack().expect("unpack").expect("typed result");
+    assert_eq!(result.result, 1, "CancelResult must be CANCELLED (1)");
+
+    // The tracker shows Canceled within a second.
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if tracker
+                .get(&running_id)
+                .is_some_and(|r| r.state == QueryState::Canceled)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("tracker must show Canceled within one second");
+
+    // And the DoGet stream is released rather than pinned until the idle timer.
+    // The stream may end with a Cancelled status or cleanly; only its
+    // termination is asserted here.
+    let _stream_outcome = tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+        .await
+        .expect("cancel must end the DoGet stream")
+        .expect("drain task");
 }
 
 /// A statement without a bearer token must be refused by the transport.

@@ -483,12 +483,37 @@ pub struct SqeFlightSqlService {
     /// of leaking forever, and the entry count is capped so a client looping
     /// binds it never fetches cannot exhaust coordinator memory.
     prepared_params: Arc<moka::future::Cache<Vec<u8>, Vec<String>>>,
+    /// Statements whose `FlightInfo` has been issued but whose `DoGet` has
+    /// not yet arrived, keyed by the query id carried in the ticket.
+    ///
+    /// Finding 403: the ticket used to carry the raw SQL and the query id
+    /// was minted only inside `execute_stream`, so the client never learned
+    /// an id it could cancel. The id is now minted at `GetFlightInfo`, the
+    /// ticket carries it, `DoGet` resolves the SQL here and runs under the
+    /// same id, and `CancelQuery` can reach the tracker. Same bounded TTL
+    /// shape as `prepared_params`: an abandoned `FlightInfo` expires.
+    pending_statements: Arc<moka::future::Cache<uuid::Uuid, PendingStatement>>,
+}
+
+/// A statement awaiting its `DoGet`, bound to the user who planned it.
+#[derive(Clone, Debug)]
+struct PendingStatement {
+    sql: String,
+    /// Owner: the ticket may only be redeemed by the user it was issued to.
+    username: String,
+    /// For prepared statements, the raw handle bytes so `DoGet` can pick up
+    /// the parameters bound under `(session, handle)` in `prepared_params`.
+    prepared_handle: Option<Vec<u8>>,
 }
 
 /// Maximum outstanding prepared-statement parameter binds across all sessions.
 const PREPARED_PARAMS_MAX_ENTRIES: u64 = 10_000;
 /// How long an unused parameter bind survives before eviction.
 const PREPARED_PARAMS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+/// Maximum issued-but-not-fetched statement tickets across all sessions.
+const PENDING_STATEMENTS_MAX_ENTRIES: u64 = 10_000;
+/// How long a ticket from `GetFlightInfo` stays redeemable by `DoGet`.
+const PENDING_STATEMENTS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Build the per-session prepared-statement key from the authenticated session
 /// id and the client-supplied handle bytes. Binding to `session.id` (server
@@ -529,7 +554,94 @@ impl SqeFlightSqlService {
                     .time_to_live(PREPARED_PARAMS_TTL)
                     .build(),
             ),
+            pending_statements: Arc::new(
+                moka::future::Cache::builder()
+                    .max_capacity(PENDING_STATEMENTS_MAX_ENTRIES)
+                    .time_to_live(PENDING_STATEMENTS_TTL)
+                    .build(),
+            ),
         }
+    }
+
+    /// Mint a query id for a statement, park it for `DoGet`, and return the
+    /// ticket carrying the id. Finding 403.
+    async fn issue_statement_ticket(
+        &self,
+        session: &sqe_core::Session,
+        sql: String,
+        prepared_handle: Option<Vec<u8>>,
+    ) -> (uuid::Uuid, Ticket) {
+        let query_id = uuid::Uuid::now_v7();
+        self.pending_statements
+            .insert(
+                query_id,
+                PendingStatement {
+                    sql,
+                    username: session.user.username.clone(),
+                    prepared_handle,
+                },
+            )
+            .await;
+        let fetch = FetchResults {
+            handle: query_id.to_string(),
+        };
+        let ticket = Ticket {
+            ticket: fetch.as_any().encode_to_vec().into(),
+        };
+        (query_id, ticket)
+    }
+
+    /// Resolve a ticket handle into the SQL to run and the query id to run
+    /// it under.
+    ///
+    /// New tickets carry a UUID minted by [`Self::issue_statement_ticket`];
+    /// the entry is consumed (single-use) and any parameters bound against a
+    /// prepared handle are substituted. A handle that is not a UUID is a
+    /// legacy raw-SQL ticket from an older client and runs under a fresh id.
+    async fn resolve_statement_handle(
+        &self,
+        session: &sqe_core::Session,
+        handle: &str,
+    ) -> Result<(String, Option<uuid::Uuid>), Status> {
+        let Ok(query_id) = uuid::Uuid::parse_str(handle) else {
+            return Ok((handle.to_string(), None));
+        };
+        let Some(pending) = self.pending_statements.get(&query_id).await else {
+            return Err(Status::not_found(format!(
+                "Statement handle {query_id} is unknown, expired, or already fetched; \
+                 call GetFlightInfo again"
+            )));
+        };
+        if pending.username != session.user.username {
+            warn!(
+                query_id = %query_id,
+                caller = %session.user.username,
+                owner = %pending.username,
+                "DoGet denied: ticket was issued to another user"
+            );
+            return Err(Status::permission_denied(
+                "Statement handle was issued to another user",
+            ));
+        }
+        self.pending_statements.invalidate(&query_id).await;
+
+        let sql = match pending.prepared_handle {
+            Some(ref handle_bytes) => {
+                // Same bind lookup as `do_get_prepared_statement` (WEB-03):
+                // parameters live under this session's key.
+                let key = prepared_param_key(&session.id, handle_bytes);
+                match self.prepared_params.get(&key).await {
+                    Some(params) => {
+                        self.prepared_params.invalidate(&key).await;
+                        sqe_core::substitute_placeholders(&pending.sql, &params)
+                            .map_err(Status::invalid_argument)?
+                    }
+                    None => pending.sql.clone(),
+                }
+            }
+            None => pending.sql.clone(),
+        };
+        Ok((sql, Some(query_id)))
     }
 
     #[must_use = "with_metrics consumes self; bind the returned service"]
@@ -826,8 +938,7 @@ impl SqeFlightSqlService {
 
     /// Parse the `[coordinator] flight_compression` config into IPC write options.
     fn flight_ipc_options(&self) -> Result<IpcWriteOptions, Status> {
-        let compression =
-            self.config.coordinator.flight_compression;
+        let compression = self.config.coordinator.flight_compression;
         ipc_options_for(compression)
     }
 
@@ -856,11 +967,15 @@ impl SqeFlightSqlService {
     /// statements produce small result sets (row counts, catalog metadata)
     /// where buffering is free and the existing handlers rely on owning the
     /// full `Vec<RecordBatch>`.
+    ///
+    /// `query_id` is the id minted at `GetFlightInfo` (finding 403) so the
+    /// tracker and the client's ticket agree; `None` mints a fresh one.
     async fn run_sql_into_flight_response(
         &self,
         session: &sqe_core::Session,
         sql: &str,
         client_ip: Option<String>,
+        query_id: Option<uuid::Uuid>,
     ) -> Result<Response<FlightStream>, Status> {
         // Issue #403: Flight SQL classifies (parses) before query_handler,
         // so the size cap must fire here or a huge statement still burns
@@ -883,7 +998,7 @@ impl SqeFlightSqlService {
         if matches!(kind, StatementKind::Query(_)) {
             let (schema, stream) = self
                 .query_handler
-                .execute_stream(session, sql, client_ip)
+                .execute_stream_with_id(session, sql, client_ip, query_id)
                 .await
                 .map_err(|e| sqe_error_to_status(&e, None))?;
 
@@ -1214,27 +1329,26 @@ impl FlightSqlService for SqeFlightSqlService {
             "get_flight_info_statement"
         );
 
-        // Execute the query to get the schema (and cache results)
-        // For now, we store the SQL in the ticket and re-execute on do_get
-        let fetch = FetchResults {
-            handle: sql.clone(),
-        };
-        let ticket = Ticket {
-            ticket: fetch.as_any().encode_to_vec().into(),
-        };
-        let endpoint = FlightEndpoint {
-            ticket: Some(ticket),
-            location: vec![],
-            expiration_time: None,
-            app_metadata: vec![].into(),
-        };
-
         // Plan the query to extract the schema without executing it
         let schema = self
             .query_handler
             .get_schema(&session, sql)
             .await
             .map_err(|e| sqe_error_to_status(&e, None))?;
+
+        // Finding 403: the ticket carries a query id, not the SQL. DoGet
+        // resolves the SQL by id and runs under that id, so CancelQuery
+        // with this FlightInfo reaches the tracked query.
+        let (query_id, ticket) = self
+            .issue_statement_ticket(&session, sql.clone(), None)
+            .await;
+        debug!(query_id = %query_id, "issued statement ticket");
+        let endpoint = FlightEndpoint {
+            ticket: Some(ticket),
+            location: vec![],
+            expiration_time: None,
+            app_metadata: vec![].into(),
+        };
 
         let info = FlightInfo::new()
             .try_with_schema(&schema)
@@ -1263,19 +1377,21 @@ impl FlightSqlService for SqeFlightSqlService {
                 .map_err(|e| Status::resource_exhausted(e.to_string()))?;
         }
 
-        let sql = &ticket.statement_handle;
+        let handle = &ticket.statement_handle;
 
         debug!(
             username = %session.user.username,
             "do_get_statement with handle"
         );
 
-        // The handle is the SQL query string
-        let sql_str = std::str::from_utf8(sql)
+        // The handle is a query id (finding 403) or, for legacy clients,
+        // the raw SQL string.
+        let handle_str = std::str::from_utf8(handle)
             .map_err(|e| Status::internal(format!("Invalid statement handle: {e}")))?;
+        let (sql, query_id) = self.resolve_statement_handle(&session, handle_str).await?;
 
         let client_ip = Some(self.extract_client_ip(&request));
-        self.run_sql_into_flight_response(&session, sql_str, client_ip)
+        self.run_sql_into_flight_response(&session, &sql, client_ip, query_id)
             .await
     }
 
@@ -1297,9 +1413,12 @@ impl FlightSqlService for SqeFlightSqlService {
                 "do_get_fallback executing query"
             );
 
+            let (sql, query_id) = self
+                .resolve_statement_handle(&session, &fetch.handle)
+                .await?;
             let client_ip = Some(self.extract_client_ip(&request));
             return self
-                .run_sql_into_flight_response(&session, &fetch.handle, client_ip)
+                .run_sql_into_flight_response(&session, &sql, client_ip, query_id)
                 .await;
         }
 
@@ -1595,9 +1714,18 @@ impl FlightSqlService for SqeFlightSqlService {
             .await
             .map_err(|e| sqe_error_to_status(&e, None))?;
 
-        let ticket = Ticket {
-            ticket: cmd.as_any().encode_to_vec().into(),
-        };
+        // Finding 403: each execution of a prepared statement is its own
+        // query, so mint the id here (not at CreatePreparedStatement, whose
+        // handle is reused across executions). The pending entry keeps the
+        // raw handle so DoGet finds the parameters bound against it.
+        let (query_id, ticket) = self
+            .issue_statement_ticket(
+                &session,
+                fetch.handle.clone(),
+                Some(cmd.prepared_statement_handle.to_vec()),
+            )
+            .await;
+        debug!(query_id = %query_id, "issued prepared statement ticket");
         let endpoint = FlightEndpoint {
             ticket: Some(ticket),
             location: vec![],
@@ -1762,7 +1890,7 @@ impl FlightSqlService for SqeFlightSqlService {
         );
 
         let client_ip = Some(self.extract_client_ip(&request));
-        self.run_sql_into_flight_response(&session, &sql, client_ip)
+        self.run_sql_into_flight_response(&session, &sql, client_ip, None)
             .await
     }
 
@@ -2263,10 +2391,18 @@ impl FlightSqlService for SqeFlightSqlService {
             .first()
             .and_then(|ep| ep.ticket.as_ref())
             .map(|t| {
-                if let Ok(fetch) = <FetchResults as Message>::decode(&*t.ticket) {
-                    fetch.handle
-                } else {
-                    String::from_utf8_lossy(&t.ticket).to_string()
+                // Tickets are `Any`-wrapped `FetchResults`. Decoding the raw
+                // bytes straight into `FetchResults` "succeeds" leniently with
+                // the type URL as the handle, which is why the old code never
+                // found a UUID: unwrap the `Any` first.
+                let from_any = Any::decode(&*t.ticket).ok().and_then(|any| {
+                    (any.type_url == FetchResults::type_url())
+                        .then(|| <FetchResults as Message>::decode(&*any.value).ok())
+                        .flatten()
+                });
+                match from_any {
+                    Some(fetch) => fetch.handle,
+                    None => String::from_utf8_lossy(&t.ticket).to_string(),
                 }
             })
             .ok_or_else(|| {
@@ -2275,14 +2411,30 @@ impl FlightSqlService for SqeFlightSqlService {
                 )
             })?;
 
-        // QueryTracker uses Uuid keys. Try to parse the handle as a UUID;
-        // if it's a SQL string (legacy ticket format) we cannot map it to a
-        // tracked query yet.
+        // Tickets issued by this server carry the query id (finding 403);
+        // only a legacy raw-SQL ticket from an old client fails to parse,
+        // and those never had a tracked id to cancel.
         let cancelled = if let Ok(uuid) = uuid::Uuid::parse_str(&query_id) {
             let is_admin = self.config.auth.has_admin_role(&session.user.roles);
+            // Issued but not yet fetched: drop the pending entry so a late
+            // DoGet fails with NotFound instead of starting the query.
+            let pending_dropped = match self.pending_statements.get(&uuid).await {
+                Some(p) if p.username == session.user.username || is_admin => {
+                    self.pending_statements.invalidate(&uuid).await;
+                    true
+                }
+                Some(_) => {
+                    return Err(Status::permission_denied(
+                        "Cancel denied: caller does not own this query",
+                    ));
+                }
+                None => false,
+            };
             match self.query_tracker.owner_of(&uuid) {
                 Some(owner) if owner == session.user.username || is_admin => {
-                    self.query_tracker.cancel(&uuid)
+                    // `cancel` is false once the query already reached a
+                    // terminal state; a dropped pending entry still counts.
+                    self.query_tracker.cancel(&uuid) || pending_dropped
                 }
                 Some(owner) => {
                     warn!(
@@ -2296,11 +2448,13 @@ impl FlightSqlService for SqeFlightSqlService {
                     ));
                 }
                 None => {
-                    debug!(
-                        query_id = %query_id,
-                        "CancelQuery: query not found in tracker (already completed or unknown)"
-                    );
-                    false
+                    if !pending_dropped {
+                        debug!(
+                            query_id = %query_id,
+                            "CancelQuery: query not found in tracker (already completed or unknown)"
+                        );
+                    }
+                    pending_dropped
                 }
             }
         } else {
@@ -2356,14 +2510,30 @@ impl FlightSqlService for SqeFlightSqlService {
                     }
                 }
 
-                let worker_url = std::str::from_utf8(&action.body).map_err(|e| {
-                    Status::invalid_argument(format!("Invalid heartbeat body: {e}"))
-                })?;
+                // Finding 408: the body is a JSON `HeartbeatPayload` (worker
+                // URL + sqe.proto.version + DataFusion version); a bare URL is
+                // the legacy shape and parses as version 0.
+                let heartbeat = sqe_planner::HeartbeatPayload::parse(&action.body)
+                    .map_err(Status::invalid_argument)?;
+                let worker_url = heartbeat.worker_url.as_str();
 
                 if worker_url.is_empty() {
                     return Err(Status::invalid_argument(
                         "Heartbeat body must contain the worker URL",
                     ));
+                }
+
+                // Finding 408: refuse a protocol / DataFusion skew here, with a
+                // clear Status, instead of failing at ScanTask predicate decode
+                // mid-query. A versionless heartbeat is refused only under
+                // production_mode; otherwise it is accepted with a warning.
+                if let Err(err) = crate::worker_registry::check_worker_protocol(
+                    &heartbeat,
+                    self.config.coordinator.production_mode,
+                ) {
+                    return Err(Status::failed_precondition(format!(
+                        "worker heartbeat rejected: {err}"
+                    )));
                 }
 
                 // Finding 601: a secret holder must not be able to register an
@@ -2415,6 +2585,11 @@ impl FlightSqlService for SqeFlightSqlService {
                             }
                             RegistrationError::CapacityExceeded { .. } => {
                                 Status::resource_exhausted(msg)
+                            }
+                            // Checked above via check_worker_protocol; kept
+                            // exhaustive for the enum.
+                            RegistrationError::ProtocolMismatch { .. } => {
+                                Status::failed_precondition(msg)
                             }
                         });
                     }
@@ -3211,5 +3386,181 @@ mod tests {
             creds,
             "unpadded base64 (ADBC/Go clients) must decode -- the bug"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 403: statement tickets carry the query id; CancelQuery works
+    // -----------------------------------------------------------------------
+
+    /// Catalog-free config: no REST catalog is configured at all, so the
+    /// session context builds without any network and `SELECT 1` /
+    /// `generate_series` plan locally.
+    const CANCEL_TEST_TOML: &str = r#"
+[coordinator]
+
+[auth]
+
+[catalog]
+catalog_url = ""
+"#;
+
+    /// An in-process service plus an authenticated session token. Uses the
+    /// anonymous provider so no identity backend is needed; `get_session_from_request`
+    /// resolves the session id as a bearer token.
+    async fn cancel_test_service() -> (SqeFlightSqlService, String, Arc<QueryTracker>) {
+        let config: SqeConfig = toml::from_str(CANCEL_TEST_TOML).expect("config parses");
+        let tracker = Arc::new(QueryTracker::new(&config.query_history));
+        let handler = QueryHandler::new(
+            Arc::new(sqe_policy::PassthroughEnforcer),
+            None,
+            config.clone(),
+            None,
+            None,
+            None,
+            None,
+            Arc::clone(&tracker),
+            None,
+            None,
+            None,
+            crate::RuntimeCatalogRegistry::new(),
+            sqe_core::SecretStore::new(),
+        )
+        .expect("QueryHandler::new");
+        let provider = Arc::new(sqe_auth::AnonymousProvider::new(
+            sqe_auth::AnonymousProviderConfig::default(),
+        ));
+        let session_manager = Arc::new(SessionManager::with_provider(provider));
+        let session = session_manager
+            .authenticate("alice", "pw")
+            .await
+            .expect("anonymous provider accepts any credentials");
+        let service = SqeFlightSqlService::new(session_manager, Arc::new(handler), config);
+        (service, session.id.clone(), tracker)
+    }
+
+    /// Unwrap the `Any`-wrapped `FetchResults` a statement ticket carries.
+    fn decode_ticket(ticket: &Ticket) -> FetchResults {
+        let any = Any::decode(&*ticket.ticket).expect("ticket is an Any");
+        assert_eq!(any.type_url, FetchResults::type_url());
+        <FetchResults as Message>::decode(&*any.value).expect("FetchResults")
+    }
+
+    fn authed<T>(token: &str, body: T) -> Request<T> {
+        let mut req = Request::new(body);
+        req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {token}").parse().expect("valid header"),
+        );
+        req
+    }
+
+    #[tokio::test]
+    async fn statement_ticket_is_a_uuid_and_cancel_query_returns_cancelled() {
+        let (service, token, tracker) = cancel_test_service().await;
+
+        let info = service
+            .get_flight_info_statement(
+                CommandStatementQuery {
+                    query: "SELECT 1".to_string(),
+                    transaction_id: None,
+                },
+                authed(&token, FlightDescriptor::new_cmd(vec![])),
+            )
+            .await
+            .expect("get_flight_info_statement")
+            .into_inner();
+
+        // The ticket carries a UUID, not the SQL.
+        let ticket = info.endpoint[0].ticket.as_ref().expect("ticket").clone();
+        let fetch = decode_ticket(&ticket);
+        let query_id = uuid::Uuid::parse_str(&fetch.handle)
+            .unwrap_or_else(|_| panic!("ticket handle must be a UUID, got {:?}", fetch.handle));
+        assert!(
+            service.pending_statements.get(&query_id).await.is_some(),
+            "issued ticket must be redeemable"
+        );
+
+        // CancelQuery with the FlightInfo the client holds.
+        let result = service
+            .do_action_cancel_query(
+                ActionCancelQueryRequest {
+                    info: info.encode_to_vec().into(),
+                },
+                authed(&token, Action::new("CancelQuery", vec![])),
+            )
+            .await
+            .expect("do_action_cancel_query");
+        assert_eq!(result.result, 1, "CancelResult must be CANCELLED (1)");
+
+        // The pending entry is gone, so a late DoGet cannot start the query.
+        assert!(service.pending_statements.get(&query_id).await.is_none());
+        let err = service
+            .do_get_fallback(authed(&token, ticket.clone()), fetch.as_any())
+            .await
+            .err()
+            .expect("DoGet after cancel must fail");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        assert_eq!(tracker.active_count(), 0);
+    }
+
+    /// The running-query half: DoGet runs the statement under the ticket's
+    /// id, so a cancel while it streams is found in the tracker and records
+    /// `Canceled`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn do_get_runs_under_ticket_id_and_cancel_reaches_tracker() {
+        let (service, token, tracker) = cancel_test_service().await;
+
+        // Effectively unbounded work so the stream is still open when the
+        // cancel lands.
+        let info = service
+            .get_flight_info_statement(
+                CommandStatementQuery {
+                    query: "SELECT count(*) FROM generate_series(1, 100000000000)".to_string(),
+                    transaction_id: None,
+                },
+                authed(&token, FlightDescriptor::new_cmd(vec![])),
+            )
+            .await
+            .expect("get_flight_info_statement")
+            .into_inner();
+        let ticket = info.endpoint[0].ticket.as_ref().expect("ticket").clone();
+        let fetch = decode_ticket(&ticket);
+        let query_id = uuid::Uuid::parse_str(&fetch.handle).expect("uuid ticket");
+
+        let mut stream = service
+            .do_get_fallback(authed(&token, ticket.clone()), fetch.as_any())
+            .await
+            .expect("do_get starts the query")
+            .into_inner();
+        // Pull the schema message so the stream is live, then leave it parked.
+        let first = stream.next().await;
+        assert!(first.is_some(), "schema frame expected");
+        assert!(
+            tracker.owner_of(&query_id).is_some(),
+            "tracker must know the ticket's id while the stream runs"
+        );
+
+        let result = service
+            .do_action_cancel_query(
+                ActionCancelQueryRequest {
+                    info: info.encode_to_vec().into(),
+                },
+                authed(&token, Action::new("CancelQuery", vec![])),
+            )
+            .await
+            .expect("do_action_cancel_query");
+        assert_eq!(result.result, 1, "CancelResult must be CANCELLED (1)");
+        assert_eq!(tracker.active_count(), 0);
+        assert_eq!(
+            tracker.get(&query_id).expect("record").state,
+            crate::query_tracker::QueryState::Canceled
+        );
+
+        // The parked stream is woken and ends promptly.
+        let rest = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while stream.next().await.is_some() {}
+        })
+        .await;
+        assert!(rest.is_ok(), "cancel must end the open DoGet stream");
     }
 }

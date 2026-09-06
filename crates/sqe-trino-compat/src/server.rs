@@ -1,15 +1,22 @@
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use std::net::SocketAddr;
 
+use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
+use futures::{Stream, StreamExt};
+use moka::notification::RemovalCause;
 use moka::sync::Cache as MokaCache;
+use parking_lot::Mutex;
 use tracing::{error, info, warn, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
@@ -27,14 +34,13 @@ use crate::protocol::{
 /// Default number of rows per page for result pagination.
 const DEFAULT_PAGE_SIZE: usize = 1000;
 
-/// Results older than this are evicted (5 minutes).
-const RESULT_TTL_SECS: u64 = 300;
+/// How long the id of a registry entry evicted for idleness is remembered
+/// (key only, no payload) so a late page fetch can be told "result expired"
+/// rather than "unknown query" (#621).
+const EXPIRED_ID_TTL_SECS: u64 = 3600;
 
-/// Upper bound on the bytes of cached Trino result JSON pages we keep
-/// resident at any one time. Bounding the cache by estimated payload
-/// size (not entry count) means a handful of large results cannot pin
-/// gigabytes outside DataFusion's memory pool.
-const RESULT_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+/// Cap on remembered expired ids; each is a 36-byte UUID string.
+const EXPIRED_ID_MAX_ENTRIES: u64 = 100_000;
 
 /// A query-registry entry idle (un-polled) for this long is evicted. This is
 /// `time_to_idle`, NOT `time_to_live`: every poll's `queries.get(&id)` counts
@@ -64,11 +70,13 @@ const AUTH_SESSION_CACHE_TTL_SECS: u64 = 300;
 /// population and caps what a credential-spraying peer can pin in memory.
 const AUTH_SESSION_CACHE_MAX_ENTRIES: u64 = 4096;
 
-fn build_result_cache() -> MokaCache<String, Arc<PaginatedResult>> {
+/// Tombstones for query ids the registry evicted for idleness. Consulted only
+/// on a registry miss, so a bogus id and an expired one produce different
+/// error bodies (#621).
+fn build_expired_ids() -> MokaCache<String, ()> {
     MokaCache::builder()
-        .max_capacity(RESULT_CACHE_MAX_BYTES)
-        .weigher(|_key: &String, value: &Arc<PaginatedResult>| value.estimated_bytes.max(1))
-        .time_to_live(std::time::Duration::from_secs(RESULT_TTL_SECS))
+        .max_capacity(EXPIRED_ID_MAX_ENTRIES)
+        .time_to_live(std::time::Duration::from_secs(EXPIRED_ID_TTL_SECS))
         .build()
 }
 
@@ -96,10 +104,12 @@ pub struct NodeContext {
 pub struct TrinoState<A, Q> {
     pub authenticator: Arc<A>,
     pub query_handler: Arc<Q>,
-    pub results: MokaCache<String, Arc<PaginatedResult>>,
     /// In-flight / recently-finished query lifecycle handles, keyed by
-    /// `query_id`. Distinct from `results`, which holds finished page data.
+    /// `query_id`. A finished query's open [`ResultCursor`] lives on its
+    /// handle, so one idle-evicted registry is the only result store.
     pub queries: MokaCache<String, Arc<QueryHandle>>,
+    /// Ids evicted from `queries` for idleness; see [`build_expired_ids`].
+    pub expired: MokaCache<String, ()>,
     pub node: NodeContext,
     /// Number of rows per page. Configurable for testing; defaults to [`DEFAULT_PAGE_SIZE`].
     pub page_size: usize,
@@ -206,45 +216,278 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Stores the full result set split into pages for pagination.
-#[derive(Debug)]
-pub struct PaginatedResult {
-    /// Column metadata (shared across all pages).
-    pub columns: Vec<TrinoColumn>,
-    /// Row data split into fixed-size pages.
-    pub pages: Vec<Vec<Vec<serde_json::Value>>>,
-    /// Total number of pages.
-    pub total_pages: usize,
-    /// Total rows across every page; reported as `processedRows`.
-    pub total_rows: usize,
-    /// Wall-clock time at which this result was stored; used for TTL eviction.
-    pub created_at: std::time::Instant,
-    /// Principal that created this result plus its poll token; used for
-    /// poll/cancel authorization.
-    pub owner: QueryOwner,
-    /// `INSERT`/`UPDATE`/`DELETE` for write paths; `None` for reads.
-    pub update_type: Option<String>,
-    /// Affected rows for write statements; mirrored on every page so dbt-trino
-    /// can populate `rows_affected` from any response.
-    pub update_count: Option<i64>,
-    /// Pre-computed cache weight in bytes so the result-cache weigher
-    /// does not have to walk the JSON tree on every insert.
-    pub estimated_bytes: u32,
+/// Batch stream an executor hands back: the Trino path's equivalent of
+/// DataFusion's `SendableRecordBatchStream`, but carrying `SqeError` so the
+/// Trino error mapping keeps the original variant.
+pub type TrinoBatchStream =
+    Pin<Box<dyn Stream<Item = Result<RecordBatch, sqe_core::SqeError>> + Send>>;
+
+/// A statement's result as a schema plus a lazily pulled batch stream. The
+/// server converts one page at a time; the executor never materializes the
+/// result (#621).
+pub struct TrinoResultStream {
+    pub schema: SchemaRef,
+    pub stream: TrinoBatchStream,
 }
 
-fn estimate_paginated_bytes(pages: &[Vec<Vec<serde_json::Value>>], columns: &[TrinoColumn]) -> u32 {
-    let mut total: usize = std::mem::size_of::<PaginatedResult>();
-    for col in columns {
-        total = total.saturating_add(col.name.len() + col.type_signature.raw_type.len() + 32);
+impl TrinoResultStream {
+    pub fn new(schema: SchemaRef, stream: TrinoBatchStream) -> Self {
+        Self { schema, stream }
     }
-    for page in pages {
-        for row in page {
-            for value in row {
-                total = total.saturating_add(estimate_json_bytes(value));
-            }
+
+    /// Wrap an already-materialized result. Used for the small, shape-rewritten
+    /// results (DDL/DML counts, `information_schema`, `EXPLAIN`, `DESCRIBE`)
+    /// and by test executors. The schema is taken from the first batch; an
+    /// empty result has an empty schema, which the wire layer renders as a
+    /// column-less update (data omitted), exactly as before.
+    pub fn from_batches(batches: Vec<RecordBatch>) -> Self {
+        let schema = batches
+            .first()
+            .map(|b| b.schema())
+            .unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()));
+        Self {
+            schema,
+            stream: Box::pin(futures::stream::iter(batches.into_iter().map(Ok))),
         }
     }
-    total.try_into().unwrap_or(u32::MAX)
+
+    /// Drain the stream. Only for the reshaping paths above, whose inputs
+    /// are catalog-sized.
+    pub async fn collect(mut self) -> Result<Vec<RecordBatch>, sqe_core::SqeError> {
+        let mut out = Vec::new();
+        while let Some(batch) = self.stream.next().await {
+            out.push(batch?);
+        }
+        Ok(out)
+    }
+}
+
+impl std::fmt::Debug for TrinoResultStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrinoResultStream")
+            .field("schema", &self.schema)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One converted result page, retained on the cursor so the token that
+/// produced it can be re-requested once (Trino clients retry the last
+/// `nextUri` after a transport error).
+#[derive(Debug)]
+pub struct ReadyPage {
+    /// Page token this page was served under.
+    pub token: usize,
+    pub rows: Vec<Vec<serde_json::Value>>,
+    /// Rows served up to and including this page; reported as `processedRows`.
+    pub processed_rows: usize,
+    /// True when the stream ended and no rows remain after this page.
+    pub is_last: bool,
+}
+
+/// Outcome of asking the cursor for a page token.
+#[derive(Debug)]
+pub enum PageFetch {
+    Page(Arc<ReadyPage>),
+    /// The token is neither the page just served nor the next one.
+    OutOfRange {
+        /// Token the client should have asked for (one past the last served).
+        expected: usize,
+    },
+}
+
+/// Per-query streaming result cursor. Replaces the old whole-result JSON
+/// cache: batches are pulled on demand, one page is converted per client
+/// fetch (off the runtime, under `spawn_blocking`), the buffered page is
+/// charged to the DataFusion memory pool via `reservation`, and only the most
+/// recently served page is retained for a single retry.
+pub struct ResultCursor {
+    columns: Vec<TrinoColumn>,
+    /// `None` once exhausted (or failed).
+    stream: Option<TrinoBatchStream>,
+    /// Unconsumed tail of the last batch pulled when it overran the page.
+    carry: Option<RecordBatch>,
+    page_size: usize,
+    /// Token a fresh pull will produce.
+    next_token: usize,
+    /// Most recently produced page; served again if its token is re-requested.
+    served: Option<Arc<ReadyPage>>,
+    rows_served: usize,
+    reservation: Option<MemoryReservation>,
+    update_type: Option<String>,
+    update_count: Option<i64>,
+    created_at: Instant,
+}
+
+impl std::fmt::Debug for ResultCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResultCursor")
+            .field("columns", &self.columns.len())
+            .field("open", &self.stream.is_some())
+            .field("next_token", &self.next_token)
+            .field("rows_served", &self.rows_served)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ResultCursor {
+    pub fn new(
+        result: TrinoResultStream,
+        page_size: usize,
+        reservation: Option<MemoryReservation>,
+        update_type: Option<String>,
+        update_count: Option<i64>,
+    ) -> Self {
+        Self {
+            columns: protocol::columns_for_schema(result.schema.as_ref()),
+            stream: Some(result.stream),
+            carry: None,
+            page_size: page_size.max(1),
+            next_token: 0,
+            served: None,
+            rows_served: 0,
+            reservation,
+            update_type,
+            update_count,
+            created_at: Instant::now(),
+        }
+    }
+
+    /// Cursor over an in-memory result with no pool accounting; test and
+    /// reshaped-result convenience.
+    pub fn from_batches(batches: Vec<RecordBatch>, page_size: usize) -> Self {
+        Self::new(
+            TrinoResultStream::from_batches(batches),
+            page_size,
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub fn columns(&self) -> &[TrinoColumn] {
+        &self.columns
+    }
+
+    /// Serve `token`: the page just served (retry) is returned as-is, the next
+    /// token pulls and converts a fresh page, anything else is out of range.
+    /// A stream error closes the cursor and is returned to the caller, which
+    /// marks the query failed.
+    pub async fn fetch(&mut self, token: usize) -> Result<PageFetch, sqe_core::SqeError> {
+        if let Some(page) = self.served.as_ref() {
+            if page.token == token {
+                return Ok(PageFetch::Page(Arc::clone(page)));
+            }
+            if page.is_last || token != self.next_token {
+                return Ok(PageFetch::OutOfRange {
+                    expected: self.next_token,
+                });
+            }
+        } else if token != self.next_token {
+            return Ok(PageFetch::OutOfRange {
+                expected: self.next_token,
+            });
+        }
+        let page = self.pull_page().await?;
+        self.rows_served = page.processed_rows;
+        self.next_token = token + 1;
+        self.served = Some(Arc::clone(&page));
+        Ok(PageFetch::Page(page))
+    }
+
+    /// Pull batches until a page is full or the stream ends, then convert
+    /// that page to JSON off the runtime and charge it to the pool.
+    async fn pull_page(&mut self) -> Result<Arc<ReadyPage>, sqe_core::SqeError> {
+        let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut rows = 0usize;
+        if let Some(carry) = self.carry.take() {
+            self.take_into(&mut batches, &mut rows, carry);
+        }
+        // Fill the page; once full with nothing carried, pull one batch more
+        // (into the carry) so a page that exactly drains the stream is
+        // reported as the last one instead of forcing an empty trailing page.
+        loop {
+            let full = rows >= self.page_size;
+            if full && self.carry.is_some() {
+                break;
+            }
+            let Some(stream) = self.stream.as_mut() else {
+                break;
+            };
+            match stream.next().await {
+                Some(Ok(batch)) if full => {
+                    if batch.num_rows() > 0 {
+                        self.carry = Some(batch);
+                        break;
+                    }
+                }
+                Some(Ok(batch)) => self.take_into(&mut batches, &mut rows, batch),
+                Some(Err(e)) => {
+                    self.close();
+                    return Err(e);
+                }
+                None => self.stream = None,
+            }
+        }
+        let is_last = self.stream.is_none() && self.carry.is_none();
+        // The carried slice shares its buffers with the parent batch, so the
+        // whole batch stays resident until the next page consumes it.
+        let carry_bytes = self
+            .carry
+            .as_ref()
+            .map(|b| b.get_array_memory_size())
+            .unwrap_or(0);
+
+        let (json_rows, json_bytes) = tokio::task::spawn_blocking(move || {
+            let rows = protocol::batches_to_rows(&batches);
+            let bytes: usize = rows
+                .iter()
+                .flat_map(|row| row.iter().map(estimate_json_bytes))
+                .fold(0usize, usize::saturating_add);
+            (rows, bytes)
+        })
+        .await
+        .map_err(|e| {
+            sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::InternalError,
+                format!("result page conversion task failed: {e}"),
+            )
+        })?;
+
+        if let Some(reservation) = self.reservation.as_mut() {
+            if let Err(e) = reservation.try_resize(json_bytes.saturating_add(carry_bytes)) {
+                self.close();
+                return Err(sqe_core::SqeError::from(e));
+            }
+        }
+
+        let processed_rows = self.rows_served + json_rows.len();
+        Ok(Arc::new(ReadyPage {
+            token: self.next_token,
+            rows: json_rows,
+            processed_rows,
+            is_last,
+        }))
+    }
+
+    /// Append `batch` to the page, slicing off and carrying any overrun.
+    fn take_into(&mut self, batches: &mut Vec<RecordBatch>, rows: &mut usize, batch: RecordBatch) {
+        let room = self.page_size.saturating_sub(*rows);
+        if batch.num_rows() <= room {
+            *rows += batch.num_rows();
+            batches.push(batch);
+        } else {
+            *rows += room;
+            batches.push(batch.slice(0, room));
+            self.carry = Some(batch.slice(room, batch.num_rows() - room));
+        }
+    }
+
+    /// Release the stream (cancelling upstream execution) and the carry.
+    /// The served page stays for a retry; the reservation shrinks with it.
+    fn close(&mut self) {
+        self.stream = None;
+        self.carry = None;
+    }
 }
 
 fn estimate_json_bytes(value: &serde_json::Value) -> usize {
@@ -272,8 +515,9 @@ pub enum QueryStatus {
     Queued,
     /// Background task is running `Q::execute`.
     Running,
-    /// Finished successfully; the `PaginatedResult` is in the result cache
-    /// under the same `query_id`.
+    /// The executor produced a result stream; its [`ResultCursor`] is on the
+    /// handle and pages are pulled by the results route. A stream error
+    /// during paging transitions to `Failed`.
     Finished,
     /// Execution failed; carries the mapped Trino error to replay on poll.
     /// Boxed to keep the enum small (the error struct is ~200 bytes).
@@ -295,14 +539,19 @@ impl QueryStatus {
 /// Shared handle for a statement executing in the background. Stored in the
 /// query registry under `query_id`; the background task and every poll share
 /// the same `Arc<QueryHandle>`.
+///
+/// `status` and `abort` are `parking_lot` mutexes: no poisoning, so a panic
+/// while one is held cannot turn the status endpoint into a permanent 500
+/// (#643), and every hold is a short synchronous critical section. `cursor`
+/// is a tokio mutex because pulling a page awaits the stream while holding it.
 #[derive(Debug)]
 pub struct QueryHandle {
     /// Current lifecycle state; mutated by the background task and by cancel.
-    pub status: std::sync::Mutex<QueryStatus>,
+    pub status: Mutex<QueryStatus>,
     /// Woken on every status transition so waiting polls re-check promptly.
     pub notify: tokio::sync::Notify,
     /// Abort handle for the background task; set just after spawn.
-    pub abort: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+    pub abort: Mutex<Option<tokio::task::AbortHandle>>,
     /// Principal that submitted the query plus its poll token; used for
     /// poll/cancel authorization.
     pub owner: QueryOwner,
@@ -311,20 +560,60 @@ pub struct QueryHandle {
     pub session_update: Option<protocol::UpdatedSessionState>,
     /// Registration time; used for diagnostics.
     pub created_at: std::time::Instant,
+    /// Open result once the executor returned a stream (`status == Finished`).
+    /// Cleared on failure, cancel, or when the handle is dropped, which also
+    /// drops the upstream stream and releases the pool reservation.
+    pub cursor: tokio::sync::Mutex<Option<ResultCursor>>,
+}
+
+impl QueryHandle {
+    pub fn new(
+        status: QueryStatus,
+        owner: QueryOwner,
+        session_update: Option<protocol::UpdatedSessionState>,
+    ) -> Self {
+        Self {
+            status: Mutex::new(status),
+            notify: tokio::sync::Notify::new(),
+            abort: Mutex::new(None),
+            owner,
+            session_update,
+            created_at: std::time::Instant::now(),
+            cursor: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Set a terminal status, drop any open cursor (tolerating a concurrent
+    /// page fetch, which will observe the status on its next lock) and wake
+    /// waiters.
+    fn finish_with(&self, status: QueryStatus) {
+        *self.status.lock() = status;
+        if let Ok(mut cursor) = self.cursor.try_lock() {
+            *cursor = None;
+        }
+        self.notify.notify_waiters();
+    }
 }
 
 /// Build the query-state registry. Idle-evicts abandoned entries and, on
 /// eviction of a still-running query, aborts its background task.
-fn build_query_registry() -> MokaCache<String, Arc<QueryHandle>> {
+fn build_query_registry(expired: MokaCache<String, ()>) -> MokaCache<String, Arc<QueryHandle>> {
     MokaCache::builder()
         .time_to_idle(std::time::Duration::from_secs(QUERY_REGISTRY_IDLE_SECS))
-        .eviction_listener(|_key, handle: Arc<QueryHandle>, _cause| {
-            let mut status = handle.status.lock().unwrap();
-            if !status.is_terminal() {
-                if let Some(abort) = handle.abort.lock().unwrap().as_ref() {
-                    abort.abort();
+        .eviction_listener(move |key: Arc<String>, handle: Arc<QueryHandle>, cause| {
+            {
+                let mut status = handle.status.lock();
+                if !status.is_terminal() {
+                    if let Some(abort) = handle.abort.lock().as_ref() {
+                        abort.abort();
+                    }
+                    *status = QueryStatus::Cancelled;
                 }
-                *status = QueryStatus::Cancelled;
+            }
+            // Explicit invalidation is a cancel; only idle/size eviction is
+            // "expired" from the client's point of view.
+            if matches!(cause, RemovalCause::Expired | RemovalCause::Size) {
+                expired.insert(key.as_str().to_string(), ());
             }
         })
         .build()
@@ -362,7 +651,10 @@ pub trait TrinoAuthenticator: Send + Sync + 'static {
 
 #[async_trait::async_trait]
 pub trait TrinoQueryExecutor: Send + Sync + 'static {
-    /// Execute a SQL statement and return record batches.
+    /// Plan a SQL statement and return its result as a schema plus a batch
+    /// stream. The server pulls one page at a time, so the executor must not
+    /// buffer the result (#621); small non-query results can be wrapped with
+    /// [`TrinoResultStream::from_batches`].
     ///
     /// Returns the full `SqeError` so the Trino mapping in
     /// `TrinoError::from_sqe_error` dispatches on the original variant. The
@@ -374,7 +666,15 @@ pub trait TrinoQueryExecutor: Send + Sync + 'static {
         &self,
         session: &Session,
         sql: &str,
-    ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError>;
+    ) -> Result<TrinoResultStream, sqe_core::SqeError>;
+
+    /// Memory pool the buffered result page is charged to, so Trino-path
+    /// memory is visible to the same limit as every other consumer. `None`
+    /// (the default) disables accounting; the coordinator returns its
+    /// `RuntimeEnv` pool.
+    fn memory_pool(&self) -> Option<Arc<dyn MemoryPool>> {
+        None
+    }
 
     /// Describe a prepared statement's output columns (`DESCRIBE OUTPUT`) or
     /// bind parameters (`DESCRIBE INPUT`), returning a synthetic result set.
@@ -464,11 +764,12 @@ where
     A: TrinoAuthenticator,
     Q: TrinoQueryExecutor,
 {
+    let expired = build_expired_ids();
     let state = Arc::new(TrinoState {
         authenticator,
         query_handler,
-        results: build_result_cache(),
-        queries: build_query_registry(),
+        queries: build_query_registry(expired.clone()),
+        expired,
         node,
         page_size: DEFAULT_PAGE_SIZE,
         port,
@@ -1060,29 +1361,18 @@ fn apply_trino_headers(session: Session, trino_headers: &TrinoClientHeaders) -> 
 
 // ── Pagination helpers ────────────────────────────────────────
 
-/// Split row data into fixed-size pages.
-fn paginate_rows(
-    rows: Vec<Vec<serde_json::Value>>,
-    page_size: usize,
-) -> Vec<Vec<Vec<serde_json::Value>>> {
-    if rows.is_empty() {
-        return vec![vec![]];
-    }
-    rows.chunks(page_size).map(|chunk| chunk.to_vec()).collect()
-}
-
-/// Build a `nextUri` for the given query id and page token, or `None` if this is the last page.
+/// Build a `nextUri` for the page after `token`, or `None` if `is_last`.
 fn next_uri(
     base_url: &str,
     query_id: &str,
     slug: &str,
     token: usize,
-    total_pages: usize,
+    is_last: bool,
 ) -> Option<String> {
-    if token + 1 < total_pages {
-        Some(results_uri(base_url, query_id, slug, token + 1))
-    } else {
+    if is_last {
         None
+    } else {
+        Some(results_uri(base_url, query_id, slug, token + 1))
     }
 }
 
@@ -1150,7 +1440,7 @@ async fn await_terminal_or_timeout(handle: &QueryHandle, max_wait: std::time::Du
     let deadline = tokio::time::Instant::now() + max_wait;
     loop {
         {
-            if handle.status.lock().unwrap().is_terminal() {
+            if handle.status.lock().is_terminal() {
                 return;
             }
         }
@@ -1210,16 +1500,14 @@ fn extract_base_url(headers: &HeaderMap, bound_port: u16) -> String {
     }
 }
 
-/// Build a [`TrinoResponse`] for the given page of a paginated result.
+/// Build a [`TrinoResponse`] for one page pulled from a [`ResultCursor`].
 fn build_page_response(
     base_url: &str,
     query_id: &str,
-    paginated: &PaginatedResult,
-    page_token: usize,
+    poll_token: &str,
+    cursor: &ResultCursor,
+    page: &ReadyPage,
 ) -> TrinoResponse {
-    let page_data = paginated.pages.get(page_token).cloned().unwrap_or_default();
-    let is_last = page_token + 1 >= paginated.total_pages;
-
     // DDL/update statements produce no columns. The Trino 465 JDBC client's
     // ResultRowsDecoder early-returns on `data == null` but otherwise asserts
     // `columns` is non-empty, so a non-null `data` with empty `columns` is
@@ -1227,38 +1515,157 @@ fn build_page_response(
     // `data` entirely for updates; match that by emitting None when there are
     // no columns. A SELECT returning zero rows still has columns, so its
     // (empty) data stays present. See issue #314.
-    let data = if paginated.columns.is_empty() {
+    let data = if cursor.columns.is_empty() {
         None
     } else {
-        Some(page_data)
+        Some(page.rows.clone())
     };
 
     let metrics = protocol::ExecutionMetrics {
-        elapsed_millis: paginated.created_at.elapsed().as_millis() as u64,
-        processed_rows: paginated.total_rows as u64,
+        elapsed_millis: cursor.created_at.elapsed().as_millis() as u64,
+        processed_rows: page.processed_rows as u64,
         ..protocol::ExecutionMetrics::default()
     };
-    let stats = if is_last {
+    // The total page count is unknown while streaming; report "this page done,
+    // at least one more" so the split counters keep moving.
+    let stats = if page.is_last {
         TrinoStats::finished_with_metrics(&metrics)
     } else {
-        TrinoStats::running_with_metrics(page_token + 1, paginated.total_pages, &metrics)
+        TrinoStats::running_with_metrics(page.token + 1, page.token + 2, &metrics)
     };
     TrinoResponse {
         id: query_id.to_string(),
         info_uri: Some(info_uri(base_url, query_id)),
-        next_uri: next_uri(
-            base_url,
-            query_id,
-            &paginated.owner.poll_token,
-            page_token,
-            paginated.total_pages,
-        ),
-        columns: Some(paginated.columns.clone()),
+        next_uri: next_uri(base_url, query_id, poll_token, page.token, page.is_last),
+        columns: Some(cursor.columns.clone()),
         data,
         stats,
-        update_type: paginated.update_type.clone(),
-        update_count: paginated.update_count,
+        update_type: cursor.update_type.clone(),
+        update_count: cursor.update_count,
         ..Default::default()
+    }
+}
+
+/// Error body for a results-route request whose query id is not registered.
+/// An id evicted for idleness says so; anything else is unknown (#621).
+fn not_found_response<A, Q>(state: &TrinoState<A, Q>, base_url: &str, id: &str) -> Response {
+    let message = if state.expired.contains_key(id) {
+        format!(
+            "Query result expired: no page was requested for {QUERY_REGISTRY_IDLE_SECS}s and the result was released"
+        )
+    } else {
+        "Query not found".to_string()
+    };
+    let response = TrinoResponse {
+        id: id.to_string(),
+        info_uri: Some(info_uri(base_url, id)),
+        stats: TrinoStats::failed(),
+        error: Some(TrinoError {
+            message,
+            error_code: 1,
+            error_name: "USER_ERROR".to_string(),
+            error_type: "USER_ERROR".to_string(),
+            query_id: None,
+            failure_info: None,
+            error_location: None,
+        }),
+        ..Default::default()
+    };
+    (StatusCode::NOT_FOUND, Json(response)).into_response()
+}
+
+/// Terminal-status replay shared by the poll and results routes: the mapped
+/// error for `Failed`, the cancel error for `Cancelled`, `None` otherwise.
+fn terminal_error_response(base_url: &str, id: &str, status: &QueryStatus) -> Option<Response> {
+    match status {
+        QueryStatus::Failed(trino_error) => {
+            let is_rate_limited = trino_error.error_name == "RESOURCE_EXHAUSTED";
+            let response = TrinoResponse {
+                id: id.to_string(),
+                info_uri: Some(info_uri(base_url, id)),
+                stats: TrinoStats::failed(),
+                error: Some(trino_error.as_ref().clone()),
+                ..Default::default()
+            };
+            let mut resp = (StatusCode::OK, Json(response)).into_response();
+            if is_rate_limited {
+                resp.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from_static("1"),
+                );
+            }
+            Some(resp)
+        }
+        QueryStatus::Cancelled => {
+            let response = TrinoResponse {
+                id: id.to_string(),
+                info_uri: Some(info_uri(base_url, id)),
+                stats: TrinoStats::failed(),
+                error: Some(TrinoError::user_error("Query was canceled", Some(id))),
+                ..Default::default()
+            };
+            Some((StatusCode::OK, Json(response)).into_response())
+        }
+        QueryStatus::Finished | QueryStatus::Queued | QueryStatus::Running => None,
+    }
+}
+
+/// Serve page `token` of a query whose status is `Finished`: pull it from
+/// the cursor (or replay the page just served), or, when the stream fails
+/// mid-way, mark the query failed and return the mapped error body.
+async fn serve_page(handle: &QueryHandle, base_url: &str, id: &str, token: usize) -> Response {
+    let mut cursor_guard = handle.cursor.lock().await;
+    let Some(cursor) = cursor_guard.as_mut() else {
+        // Cursor already released: a cancel or failure raced this fetch.
+        drop(cursor_guard);
+        let status = handle.status.lock();
+        return terminal_error_response(base_url, id, &status).unwrap_or_else(|| {
+            error_response(StatusCode::NOT_FOUND, "Query result is no longer available")
+        });
+    };
+    match cursor.fetch(token).await {
+        Ok(PageFetch::Page(page)) => {
+            let response =
+                build_page_response(base_url, id, &handle.owner.poll_token, cursor, &page);
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Ok(PageFetch::OutOfRange { expected }) => {
+            let response = TrinoResponse {
+                id: id.to_string(),
+                info_uri: Some(info_uri(base_url, id)),
+                stats: TrinoStats::failed(),
+                error: Some(TrinoError {
+                    message: format!(
+                        "Page token {token} out of range: pages are served in order and only the last page ({}) may be re-requested",
+                        expected.saturating_sub(1)
+                    ),
+                    error_code: 1,
+                    error_name: "USER_ERROR".to_string(),
+                    error_type: "USER_ERROR".to_string(),
+                    query_id: None,
+                    failure_info: None,
+                    error_location: None,
+                }),
+                ..Default::default()
+            };
+            (StatusCode::NOT_FOUND, Json(response)).into_response()
+        }
+        Err(sqe_err) => {
+            warn!(
+                error_code = %sqe_err.error_code(),
+                query_id = %id,
+                error = %sqe_err,
+                "Trino result stream failed while paging"
+            );
+            *cursor_guard = None;
+            drop(cursor_guard);
+            let trino_error = protocol::TrinoError::from_sqe_error(&sqe_err, Some(id));
+            let status = QueryStatus::Failed(Box::new(trino_error));
+            let resp = terminal_error_response(base_url, id, &status);
+            *handle.status.lock() = status;
+            handle.notify.notify_waiters();
+            resp.unwrap_or_else(|| error_response(StatusCode::INTERNAL_SERVER_ERROR, "unreachable"))
+        }
     }
 }
 
@@ -1273,42 +1680,61 @@ async fn run_statement<Q: TrinoQueryExecutor>(
     exec_sql: &str,
     prepared: &std::collections::HashMap<String, String>,
     show_session_props: &[(String, String)],
-) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
+) -> Result<TrinoResultStream, sqe_core::SqeError> {
     if let Some((kind, name)) = protocol::parse_describe_prepared(exec_sql) {
         match prepared.get(&name) {
-            Some(prepared_sql) => handler.describe_prepared(session, prepared_sql, kind).await,
-            None => Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
-                "Prepared statement not found: {name}"
-            ))),
+            Some(prepared_sql) => handler
+                .describe_prepared(session, prepared_sql, kind)
+                .await
+                .map(TrinoResultStream::from_batches),
+            None => Err(sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::ExecutionFailed,
+                format!("Prepared statement not found: {name}"),
+            )),
         }
     } else if let Some(like) = protocol::parse_show_session(exec_sql) {
-        Ok(build_show_session_batches(
+        Ok(TrinoResultStream::from_batches(build_show_session_batches(
             show_session_props,
             like.as_deref(),
-        ))
+        )))
     } else {
         handler.execute(session, exec_sql).await
     }
 }
 
-/// Turn a successful statement's record batches into a `PaginatedResult`:
-/// apply info-schema/EXPLAIN Trino-compat reshaping, classify the update
-/// type/count, and paginate. Pure post-processing shared by the sync and
-/// async paths.
-fn build_paginated_result(
-    batches: Vec<arrow_array::RecordBatch>,
+/// Turn a successful statement's result stream into a [`ResultCursor`].
+///
+/// Plain queries stream straight through. The shape-rewritten statement
+/// classes (DDL/DML counts, `information_schema`, `DESCRIBE`, `EXPLAIN`)
+/// need the whole result to rewrite it, so those are drained first; they are
+/// catalog-sized by construction.
+async fn open_cursor(
+    result: TrinoResultStream,
     exec_sql: &str,
     session_catalog: Option<&str>,
     page_size: usize,
-    owner: QueryOwner,
-) -> PaginatedResult {
+    reservation: Option<MemoryReservation>,
+) -> Result<ResultCursor, sqe_core::SqeError> {
     let update_type = classify_update_type(exec_sql).map(str::to_string);
+    let is_metadata = info_schema_compat::is_metadata_query(exec_sql);
+    let is_explain = explain_compat::is_explain(exec_sql);
+    if update_type.is_none() && !is_metadata && !is_explain {
+        return Ok(ResultCursor::new(
+            result,
+            page_size,
+            reservation,
+            None,
+            None,
+        ));
+    }
+
+    let batches = result.collect().await?;
     let update_count = if update_type.is_some() {
         extract_update_count(&batches).or(Some(0))
     } else {
         None
     };
-    let batches = if info_schema_compat::is_metadata_query(exec_sql) {
+    let batches = if is_metadata {
         let batches = info_schema_compat::apply_info_schema_compat(batches, session_catalog);
         if info_schema_compat::is_describe_or_show_columns(exec_sql) {
             info_schema_compat::reshape_describe_to_trino(batches)
@@ -1318,27 +1744,18 @@ fn build_paginated_result(
     } else {
         batches
     };
-    let batches = if explain_compat::is_explain(exec_sql) {
+    let batches = if is_explain {
         explain_compat::reshape_explain_to_trino(batches)
     } else {
         batches
     };
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    let (columns, data) = protocol::batches_to_trino(&batches);
-    let pages = paginate_rows(data, page_size);
-    let total_pages = pages.len();
-    let estimated_bytes = estimate_paginated_bytes(&pages, &columns);
-    PaginatedResult {
-        columns,
-        pages,
-        total_pages,
-        total_rows,
-        created_at: std::time::Instant::now(),
-        owner,
+    Ok(ResultCursor::new(
+        TrinoResultStream::from_batches(batches),
+        page_size,
+        reservation,
         update_type,
         update_count,
-        estimated_bytes,
-    }
+    ))
 }
 
 async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
@@ -1555,20 +1972,16 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         let owner = QueryOwner::new(&session);
 
         // Register the query handle before spawning so a fast poll always finds it.
-        let handle = Arc::new(QueryHandle {
-            status: std::sync::Mutex::new(QueryStatus::Queued),
-            notify: tokio::sync::Notify::new(),
-            abort: std::sync::Mutex::new(None),
-            owner: owner.clone(),
-            session_update: session_update.clone(),
-            created_at: std::time::Instant::now(),
-        });
+        let handle = Arc::new(QueryHandle::new(
+            QueryStatus::Queued,
+            owner.clone(),
+            session_update.clone(),
+        ));
         state.queries.insert(query_id.clone(), handle.clone());
 
         // Move owned state into the background task.
         let show_session_props = incoming_session_properties(&headers);
         let task_handler = state.query_handler.clone();
-        let task_results = state.results.clone();
         let task_handle = handle.clone();
         let task_query_id = query_id.clone();
         let task_session = session.clone();
@@ -1577,7 +1990,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         let task_props = show_session_props;
         let task_catalog = session.default_catalog.clone();
         let page_size = state.page_size;
-        let task_owner = owner.clone();
+        let task_pool = state.query_handler.memory_pool();
 
         let execution_span = tracing::info_span!(
             "trino.query.execution",
@@ -1597,19 +2010,21 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 struct TerminalGuard(Arc<QueryHandle>);
                 impl Drop for TerminalGuard {
                     fn drop(&mut self) {
-                        let mut s = self.0.status.lock().unwrap();
+                        let mut s = self.0.status.lock();
                         if !s.is_terminal() {
-                            *s = QueryStatus::Failed(Box::new(protocol::TrinoError::internal_error(
-                                "query task terminated unexpectedly",
-                                None,
-                            )));
+                            *s = QueryStatus::Failed(Box::new(
+                                protocol::TrinoError::internal_error(
+                                    "query task terminated unexpectedly",
+                                    None,
+                                ),
+                            ));
                             self.0.notify.notify_waiters();
                         }
                     }
                 }
                 let _guard = TerminalGuard(task_handle.clone());
 
-                *task_handle.status.lock().unwrap() = QueryStatus::Running;
+                *task_handle.status.lock() = QueryStatus::Running;
                 task_handle.notify.notify_waiters();
                 let result = run_statement(
                     task_handler.as_ref(),
@@ -1619,17 +2034,29 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                     &task_props,
                 )
                 .await;
-                match result {
-                    Ok(batches) => {
-                        let paginated = build_paginated_result(
-                            batches,
+                let cursor = match result {
+                    Ok(stream) => {
+                        let reservation = task_pool.as_ref().map(|pool| {
+                            MemoryConsumer::new(format!("TrinoResultCursor[{task_query_id}]"))
+                                .register(pool)
+                        });
+                        open_cursor(
+                            stream,
                             &task_sql,
                             task_catalog.as_deref(),
                             page_size,
-                            task_owner,
-                        );
-                        task_results.insert(task_query_id, Arc::new(paginated));
-                        *task_handle.status.lock().unwrap() = QueryStatus::Finished;
+                            reservation,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                };
+                match cursor {
+                    Ok(cursor) => {
+                        // Install the cursor before flipping the status so a poll
+                        // that sees `Finished` always finds it.
+                        *task_handle.cursor.lock().await = Some(cursor);
+                        *task_handle.status.lock() = QueryStatus::Finished;
                     }
                     Err(sqe_err) => {
                         tracing::warn!(
@@ -1640,30 +2067,26 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                         );
                         let trino_error =
                             protocol::TrinoError::from_sqe_error(&sqe_err, Some(&task_query_id));
-                        *task_handle.status.lock().unwrap() =
-                            QueryStatus::Failed(Box::new(trino_error));
+                        *task_handle.status.lock() = QueryStatus::Failed(Box::new(trino_error));
                     }
                 }
                 task_handle.notify.notify_waiters();
             }
             .instrument(execution_span),
         );
-        *handle.abort.lock().unwrap() = Some(task.abort_handle());
+        *handle.abort.lock() = Some(task.abort_handle());
 
         // Bounded wait: return the first page inline if the query finished, else a
         // started response the client polls.
         await_terminal_or_timeout(&handle, DEFAULT_MAX_WAIT).await;
 
-        let status_is_finished = matches!(*handle.status.lock().unwrap(), QueryStatus::Finished);
+        let status_is_finished = matches!(*handle.status.lock(), QueryStatus::Finished);
         if status_is_finished {
-            if let Some(paginated) = state.results.get(&query_id) {
-                let response = build_page_response(&base_url, &query_id, paginated.as_ref(), 0);
-                let mut resp = (StatusCode::OK, Json(response)).into_response();
-                if let Some(ref update) = session_update {
-                    apply_session_headers(resp.headers_mut(), update);
-                }
-                return resp;
+            let mut resp = serve_page(&handle, &base_url, &query_id, 0).await;
+            if let Some(ref update) = session_update {
+                apply_session_headers(resp.headers_mut(), update);
             }
+            return resp;
         }
 
         // Failed within the wait: replay the mapped Trino error immediately so fast
@@ -1671,24 +2094,11 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         // the `Retry-After` header the old synchronous arm added for
         // ResourceExhausted (rate-limit/OOM), detected via the stable error name.
         {
-            let status = handle.status.lock().unwrap();
-            if let QueryStatus::Failed(ref trino_error) = *status {
-                let is_rate_limited = trino_error.error_name == "RESOURCE_EXHAUSTED";
-                let response = TrinoResponse {
-                    id: query_id.clone(),
-                    info_uri: Some(info_uri(&base_url, &query_id)),
-                    stats: TrinoStats::failed(),
-                    error: Some(trino_error.as_ref().clone()),
-                    ..Default::default()
-                };
-                let mut resp = (StatusCode::OK, Json(response)).into_response();
-                if is_rate_limited {
-                    resp.headers_mut().insert(
-                        axum::http::header::RETRY_AFTER,
-                        axum::http::HeaderValue::from_static("1"),
-                    );
+            let status = handle.status.lock();
+            if let QueryStatus::Failed(_) = *status {
+                if let Some(resp) = terminal_error_response(&base_url, &query_id, &status) {
+                    return resp;
                 }
-                return resp;
             }
         }
 
@@ -1741,10 +2151,10 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         // which only the submitting client ever saw. That is proof of
         // ownership on its own, so the provider chain is never touched and
         // the pre-auth budget is never spent (issue #622).
-        let entry = state.results.get(&id);
-        let by_poll_token = entry
+        let registered = state.queries.get(&id);
+        let by_poll_token = registered
             .as_ref()
-            .is_some_and(|paginated| paginated.owner.owns_token(&slug));
+            .is_some_and(|handle| handle.owner.owns_token(&slug));
 
         // Only when the token is absent or wrong do credentials get
         // validated — and then the rate limiter runs first.
@@ -1767,68 +2177,52 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
         let base_url = extract_base_url(&headers, state.port);
 
-        match entry {
-            Some(paginated) => {
-                if let Some(ref session) = session {
-                    if !paginated.owner.is(session) {
-                        warn!(
-                            query_id = %id,
-                            caller = %session.user.username,
-                            owner = %paginated.owner.username,
-                            "get_results denied: caller does not own query"
-                        );
-                        return StatusCode::FORBIDDEN.into_response();
-                    }
-                }
-                if page_token >= paginated.total_pages {
-                    let response = TrinoResponse {
-                        id: id.clone(),
-                        info_uri: Some(info_uri(&base_url, &id)),
-                        stats: TrinoStats::failed(),
-                        error: Some(TrinoError {
-                            message: "Page token out of range".to_string(),
-                            error_code: 1,
-                            error_name: "USER_ERROR".to_string(),
-                            error_type: "USER_ERROR".to_string(),
-                            query_id: None,
-                            failure_info: None,
-                            error_location: None,
-                        }),
-                        ..Default::default()
-                    };
-                    return (StatusCode::NOT_FOUND, Json(response)).into_response();
-                }
+        let Some(handle) = registered else {
+            return not_found_response(state.as_ref(), &base_url, &id);
+        };
 
-                let response = build_page_response(&base_url, &id, paginated.as_ref(), page_token);
-                let is_last = page_token + 1 >= paginated.total_pages;
-
-                drop(paginated);
-
-                if is_last {
-                    state.results.invalidate(&id);
-                }
-
-                (StatusCode::OK, Json(response)).into_response()
-            }
-            None => {
-                let response = TrinoResponse {
-                    id: id.clone(),
-                    info_uri: Some(info_uri(&base_url, &id)),
-                    stats: TrinoStats::failed(),
-                    error: Some(TrinoError {
-                        message: "Query not found".to_string(),
-                        error_code: 1,
-                        error_name: "USER_ERROR".to_string(),
-                        error_type: "USER_ERROR".to_string(),
-                        query_id: None,
-                        failure_info: None,
-                        error_location: None,
-                    }),
-                    ..Default::default()
-                };
-                (StatusCode::NOT_FOUND, Json(response)).into_response()
+        if let Some(ref session) = session {
+            if !handle.owner.is(session) {
+                warn!(
+                    query_id = %id,
+                    caller = %session.user.username,
+                    owner = %handle.owner.username,
+                    "get_results denied: caller does not own query"
+                );
+                return StatusCode::FORBIDDEN.into_response();
             }
         }
+
+        // Snapshot the lifecycle state in a short critical section; the
+        // guard must not live across the page pull below.
+        let early = {
+            let status = handle.status.lock();
+            match &*status {
+                QueryStatus::Finished => None,
+                QueryStatus::Queued | QueryStatus::Running => {
+                    // Off-protocol: the results route before the poll route
+                    // reported completion. Send the client back to polling.
+                    Some(
+                        (
+                            StatusCode::OK,
+                            Json(build_running_response(
+                                &base_url,
+                                &id,
+                                &handle.owner.poll_token,
+                                1,
+                            )),
+                        )
+                            .into_response(),
+                    )
+                }
+                terminal => terminal_error_response(&base_url, &id, terminal),
+            }
+        };
+        if let Some(resp) = early {
+            return resp;
+        }
+
+        serve_page(&handle, &base_url, &id, page_token).await
     }
     .instrument(span)
     .await
@@ -1882,26 +2276,9 @@ async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
         let handle = match registered {
             Some(h) => h,
-            None => {
-                // Unknown/evicted id -> Trino "query not found" (same shape as
-                // get_results' None arm).
-                let response = TrinoResponse {
-                    id: id.clone(),
-                    info_uri: Some(info_uri(&base_url, &id)),
-                    stats: TrinoStats::failed(),
-                    error: Some(TrinoError {
-                        message: "Query not found".to_string(),
-                        error_code: 1,
-                        error_name: "USER_ERROR".to_string(),
-                        error_type: "USER_ERROR".to_string(),
-                        query_id: None,
-                        failure_info: None,
-                        error_location: None,
-                    }),
-                    ..Default::default()
-                };
-                return (StatusCode::NOT_FOUND, Json(response)).into_response();
-            }
+            // Unknown/evicted id -> Trino "query not found" / "result expired"
+            // (same shape as get_results' miss arm).
+            None => return not_found_response(state.as_ref(), &base_url, &id),
         };
 
         if let Some(ref session) = session {
@@ -1924,7 +2301,9 @@ async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
         await_terminal_or_timeout(&handle, max_wait).await;
 
-        let status = handle.status.lock().unwrap();
+        // No `.await` below this lock; the whole match is one synchronous
+        // critical section on a non-poisoning mutex.
+        let status = handle.status.lock();
         match &*status {
             QueryStatus::Finished => {
                 let mut resp = (
@@ -1945,34 +2324,6 @@ async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 }
                 resp
             }
-            QueryStatus::Failed(trino_error) => {
-                let is_rate_limited = trino_error.error_name == "RESOURCE_EXHAUSTED";
-                let response = TrinoResponse {
-                    id: id.clone(),
-                    info_uri: Some(info_uri(&base_url, &id)),
-                    stats: TrinoStats::failed(),
-                    error: Some(trino_error.as_ref().clone()),
-                    ..Default::default()
-                };
-                let mut resp = (StatusCode::OK, Json(response)).into_response();
-                if is_rate_limited {
-                    resp.headers_mut().insert(
-                        axum::http::header::RETRY_AFTER,
-                        axum::http::HeaderValue::from_static("1"),
-                    );
-                }
-                resp
-            }
-            QueryStatus::Cancelled => {
-                let response = TrinoResponse {
-                    id: id.clone(),
-                    info_uri: Some(info_uri(&base_url, &id)),
-                    stats: TrinoStats::failed(),
-                    error: Some(TrinoError::user_error("Query was canceled", Some(&id))),
-                    ..Default::default()
-                };
-                (StatusCode::OK, Json(response)).into_response()
-            }
             QueryStatus::Queued | QueryStatus::Running => (
                 StatusCode::OK,
                 Json(build_running_response(
@@ -1983,6 +2334,9 @@ async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 )),
             )
                 .into_response(),
+            terminal => terminal_error_response(&base_url, &id, terminal).unwrap_or_else(|| {
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "unreachable")
+            }),
         }
     }
     .instrument(span)
@@ -2042,16 +2396,12 @@ async fn cancel_query_inner<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         let client_ip = trino_client_ip(&state, &headers, peer);
         let peer_host = strip_port(&client_ip).to_string();
 
-        // A finished query lives in `results`, an in-flight one in `queries`;
-        // either copy of the owner record carries the same poll token.
-        let entry = state.results.get(&id);
+        // Running and finished queries both live in `queries`; the owner
+        // record carries the poll token.
         let registered = state.queries.get(&id);
-        let by_poll_token = entry
+        let by_poll_token = registered
             .as_ref()
-            .is_some_and(|paginated| paginated.owner.owns_token(&slug))
-            || registered
-                .as_ref()
-                .is_some_and(|handle| handle.owner.owns_token(&slug));
+            .is_some_and(|handle| handle.owner.owns_token(&slug));
 
         let session = if by_poll_token {
             None
@@ -2062,22 +2412,8 @@ async fn cancel_query_inner<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             }
         };
 
-        // Verify the caller owns the query result.
+        // Verify the caller owns the query.
         if let Some(ref session) = session {
-            if let Some(ref entry) = entry {
-                if !entry.owner.is(session) {
-                    warn!(
-                        query_id = %id,
-                        caller = %session.user.username,
-                        owner = %entry.owner.username,
-                        "Cancel denied: caller does not own query"
-                    );
-                    return StatusCode::FORBIDDEN.into_response();
-                }
-            }
-            // Results are not inserted until the task finishes, so an in-flight
-            // query has no `results` entry and its ownership is enforced here
-            // against the registry.
             if let Some(ref handle) = registered {
                 if !handle.owner.is(session) {
                     warn!(
@@ -2091,16 +2427,16 @@ async fn cancel_query_inner<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             }
         }
 
-        // Abort the background task if the query is still in flight.
+        // Abort the planning task if still in flight, and drop the cursor so
+        // the upstream stream (and its pool reservation) is released now
+        // rather than at idle eviction.
         if let Some(handle) = registered {
-            if let Some(abort) = handle.abort.lock().unwrap().as_ref() {
+            if let Some(abort) = handle.abort.lock().as_ref() {
                 abort.abort();
             }
-            *handle.status.lock().unwrap() = QueryStatus::Cancelled;
-            handle.notify.notify_waiters();
+            handle.finish_with(QueryStatus::Cancelled);
         }
 
-        state.results.invalidate(&id);
         state.queries.invalidate(&id);
         StatusCode::NO_CONTENT.into_response()
     }
@@ -2145,7 +2481,6 @@ fn extract_basic_auth(headers: &HeaderMap) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::TrinoColumn;
 
     fn test_peer() -> ConnectInfo<SocketAddr> {
         ConnectInfo("127.0.0.1:12345".parse().unwrap())
@@ -2169,8 +2504,8 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
-            results: build_result_cache(),
-            queries: build_query_registry(),
+            queries: build_query_registry(build_expired_ids()),
+            expired: build_expired_ids(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: ready.clone(),
@@ -2200,8 +2535,8 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
-            results: build_result_cache(),
-            queries: build_query_registry(),
+            queries: build_query_registry(build_expired_ids()),
+            expired: build_expired_ids(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready,
@@ -2226,8 +2561,8 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
-            results: build_result_cache(),
-            queries: build_query_registry(),
+            queries: build_query_registry(build_expired_ids()),
+            expired: build_expired_ids(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready,
@@ -2252,8 +2587,8 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
-            results: build_result_cache(),
-            queries: build_query_registry(),
+            queries: build_query_registry(build_expired_ids()),
+            expired: build_expired_ids(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready,
@@ -2322,13 +2657,16 @@ mod tests {
             &self,
             _: &Session,
             _: &str,
-        ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
-            Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, "mock".to_string()))
+        ) -> Result<TrinoResultStream, sqe_core::SqeError> {
+            Err(sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::ExecutionFailed,
+                "mock".to_string(),
+            ))
         }
     }
 
     struct TraceRecordingAuth {
-        observed: std::sync::Mutex<Vec<Option<String>>>,
+        observed: Mutex<Vec<Option<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -2336,7 +2674,6 @@ mod tests {
         async fn authenticate(&self, user: &str, _: &str) -> Result<Session, sqe_core::SqeError> {
             self.observed
                 .lock()
-                .unwrap()
                 .push(sqe_metrics::propagation::current_trace_id());
             Ok(Session::new(
                 user.to_string(),
@@ -2366,13 +2703,13 @@ mod tests {
         tracing::subscriber::set_global_default(subscriber).unwrap();
 
         let auth = Arc::new(TraceRecordingAuth {
-            observed: std::sync::Mutex::new(Vec::new()),
+            observed: Mutex::new(Vec::new()),
         });
         let state = Arc::new(TrinoState {
             authenticator: auth.clone(),
             query_handler: Arc::new(MockQuery),
-            results: build_result_cache(),
-            queries: build_query_registry(),
+            queries: build_query_registry(build_expired_ids()),
+            expired: build_expired_ids(),
             node: NodeContext {
                 version: "test".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -2427,7 +2764,7 @@ mod tests {
         )
         .await;
 
-        let observed = auth.observed.lock().unwrap().clone();
+        let observed = auth.observed.lock().clone();
         assert_eq!(observed, vec![Some(trace_id.to_string()); 3]);
         provider.shutdown().unwrap();
     }
@@ -2435,7 +2772,7 @@ mod tests {
     /// Captures the SQL strings the executor is asked to run, so a test can
     /// assert what the prepared-statement rewrite produced.
     struct RecordingQuery {
-        seen: Arc<std::sync::Mutex<Vec<String>>>,
+        seen: Arc<Mutex<Vec<String>>>,
     }
     #[async_trait::async_trait]
     impl TrinoQueryExecutor for RecordingQuery {
@@ -2443,20 +2780,20 @@ mod tests {
             &self,
             _: &Session,
             sql: &str,
-        ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
-            self.seen.lock().unwrap().push(sql.to_string());
-            Ok(vec![])
+        ) -> Result<TrinoResultStream, sqe_core::SqeError> {
+            self.seen.lock().push(sql.to_string());
+            Ok(TrinoResultStream::from_batches(vec![]))
         }
     }
 
     fn recording_state(
-        seen: Arc<std::sync::Mutex<Vec<String>>>,
+        seen: Arc<Mutex<Vec<String>>>,
     ) -> Arc<TrinoState<MockAuthOk, RecordingQuery>> {
         Arc::new(TrinoState::<MockAuthOk, RecordingQuery> {
             authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(RecordingQuery { seen }),
-            results: build_result_cache(),
-            queries: build_query_registry(),
+            queries: build_query_registry(build_expired_ids()),
+            expired: build_expired_ids(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -2487,11 +2824,11 @@ mod tests {
             &self,
             _session: &Session,
             _sql: &str,
-        ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
+        ) -> Result<TrinoResultStream, sqe_core::SqeError> {
             if !self.open.load(Ordering::SeqCst) {
                 self.gate.notified().await;
             }
-            Ok(vec![])
+            Ok(TrinoResultStream::from_batches(vec![]))
         }
     }
 
@@ -2502,8 +2839,8 @@ mod tests {
         Arc::new(TrinoState::<MockAuthOk, GatedQuery> {
             authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(GatedQuery { open, gate }),
-            results: build_result_cache(),
-            queries: build_query_registry(),
+            queries: build_query_registry(build_expired_ids()),
+            expired: build_expired_ids(),
             node: NodeContext {
                 version: "test".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -2592,14 +2929,36 @@ mod tests {
     }
 
     fn handle_with(status: QueryStatus, owner: &str) -> Arc<QueryHandle> {
-        Arc::new(QueryHandle {
-            status: std::sync::Mutex::new(status),
-            notify: tokio::sync::Notify::new(),
-            abort: std::sync::Mutex::new(None),
-            owner: test_owner(owner),
-            session_update: None,
-            created_at: std::time::Instant::now(),
-        })
+        Arc::new(QueryHandle::new(status, test_owner(owner), None))
+    }
+
+    /// A `Finished` handle whose cursor pages `batches` at `page_size` rows.
+    fn finished_handle_with(
+        owner: &str,
+        batches: Vec<RecordBatch>,
+        page_size: usize,
+    ) -> Arc<QueryHandle> {
+        let handle = handle_with(QueryStatus::Finished, owner);
+        *handle.cursor.try_lock().unwrap() = Some(ResultCursor::from_batches(batches, page_size));
+        handle
+    }
+
+    /// Single-column `bigint` batch.
+    fn int_batch(values: &[i64]) -> RecordBatch {
+        use arrow_schema::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::Int64Array::from(values.to_vec()))],
+        )
+        .unwrap()
+    }
+
+    async fn body_json(resp: Response) -> TrinoResponse {
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
     }
 
     #[tokio::test]
@@ -2751,7 +3110,7 @@ mod tests {
         let task = tokio::spawn(async move {
             gate2.notified().await; // never released in this test
         });
-        *handle.abort.lock().unwrap() = Some(task.abort_handle());
+        *handle.abort.lock() = Some(task.abort_handle());
         state.queries.insert("q1".to_string(), handle.clone());
 
         let resp = cancel_query(
@@ -2762,13 +3121,123 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-        assert!(matches!(
-            *handle.status.lock().unwrap(),
-            QueryStatus::Cancelled
-        ));
+        assert!(matches!(*handle.status.lock(), QueryStatus::Cancelled));
         // Give the runtime a tick to process the abort.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(task.is_finished());
+    }
+
+    /// Executor that panics inside `execute`.
+    struct PanickingQuery;
+
+    #[async_trait::async_trait]
+    impl TrinoQueryExecutor for PanickingQuery {
+        async fn execute(
+            &self,
+            _: &Session,
+            _: &str,
+        ) -> Result<TrinoResultStream, sqe_core::SqeError> {
+            panic!("executor blew up");
+        }
+    }
+
+    /// #643 acceptance: a panicking executor must surface as a QUERY_FAILED
+    /// style error body on the POST / next poll, never as an HTTP 500 from a
+    /// poisoned status mutex.
+    #[tokio::test]
+    async fn panicking_executor_yields_error_body_not_500() {
+        let state = state_with(Arc::new(MockAuthOk), Arc::new(PanickingQuery), None);
+        let resp = submit_query(
+            State(state.clone()),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            "SELECT 1".to_string(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let id = body.id.clone();
+        let handle = state.queries.get(&id).expect("handle registered");
+        assert!(handle.status.lock().is_terminal());
+
+        let err = match body.error {
+            Some(err) => err,
+            None => {
+                // Panic landed after the bounded wait: poll once more.
+                let poll = get_queued_results(
+                    State(state.clone()),
+                    test_peer(),
+                    basic_auth_header("alice", "pw"),
+                    Path((id.clone(), handle.owner.poll_token.clone(), "1".to_string())),
+                    axum::extract::RawQuery(None),
+                )
+                .await;
+                assert_eq!(poll.status(), StatusCode::OK);
+                body_json(poll).await.error.expect("error body")
+            }
+        };
+        assert_eq!(err.error_type, "INTERNAL_ERROR");
+        assert!(err.message.contains("terminated unexpectedly"), "{err:?}");
+
+        // The status endpoint keeps answering 200 afterwards.
+        let again = get_queued_results(
+            State(state.clone()),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            Path((id, handle.owner.poll_token.clone(), "2".to_string())),
+            axum::extract::RawQuery(None),
+        )
+        .await;
+        assert_eq!(again.status(), StatusCode::OK);
+    }
+
+    /// A stream that fails after the first page: the failing page fetch
+    /// returns the mapped error body and flips the handle to `Failed`.
+    #[tokio::test]
+    async fn stream_failure_while_paging_marks_query_failed() {
+        // Two good batches: the cursor looks one batch ahead when a page fills,
+        // so the error is first observed while producing page 1.
+        let stream = futures::stream::iter(vec![
+            Ok(int_batch(&[1])),
+            Ok(int_batch(&[2])),
+            Err(sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::ExecutionFailed,
+                "worker went away",
+            )),
+        ]);
+        let handle = handle_with(QueryStatus::Finished, "alice");
+        *handle.cursor.try_lock().unwrap() = Some(ResultCursor::new(
+            TrinoResultStream::new(int_batch(&[]).schema(), Box::pin(stream)),
+            1,
+            None,
+            None,
+            None,
+        ));
+        let state = state_with(Arc::new(MockAuthOk), Arc::new(MockQuery), None);
+        state.queries.insert("q-stream".to_string(), handle.clone());
+
+        let fetch = |token: &'static str| {
+            get_results(
+                State(state.clone()),
+                test_peer(),
+                basic_auth_header("alice", "pw"),
+                Path((
+                    "q-stream".to_string(),
+                    "poll-token-alice".to_string(),
+                    token.to_string(),
+                )),
+            )
+        };
+        let first = body_json(fetch("0").await).await;
+        assert_eq!(first.data.unwrap()[0][0], serde_json::json!(1));
+
+        let failed = fetch("1").await;
+        assert_eq!(failed.status(), StatusCode::OK);
+        let body = body_json(failed).await;
+        assert_eq!(body.stats.state, "FAILED");
+        assert!(body.error.unwrap().message.contains("worker went away"));
+        assert!(matches!(*handle.status.lock(), QueryStatus::Failed(_)));
+        assert!(handle.cursor.try_lock().unwrap().is_none());
     }
 
     #[test]
@@ -2848,7 +3317,7 @@ mod tests {
         // SET SESSION must NOT reach the executor (which rejects "SET SESSION
         // ..." as an unsupported utility statement). It returns 200 +
         // x-trino-set-session header the client replays, with updateType set.
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
         let state = recording_state(seen.clone());
 
         let resp = submit_query::<MockAuthOk, RecordingQuery>(
@@ -2862,7 +3331,7 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
-            seen.lock().unwrap().is_empty(),
+            seen.lock().is_empty(),
             "SET SESSION must not be sent to the executor"
         );
         let hdr = resp
@@ -2885,7 +3354,7 @@ mod tests {
     async fn submit_show_session_returns_current_properties() {
         // SHOW SESSION surfaces the properties the client carries in
         // X-Trino-Session, filtered by LIKE, without hitting the executor.
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
         let state = recording_state(seen.clone());
 
         let mut headers = basic_auth_header("alice", "pw");
@@ -2907,7 +3376,7 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
-            seen.lock().unwrap().is_empty(),
+            seen.lock().is_empty(),
             "SHOW SESSION must not be sent to the executor"
         );
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -2934,7 +3403,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_resolves_prepared_statement_from_header() {
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
         let state = recording_state(seen.clone());
 
         let mut headers = basic_auth_header("alice", "pw");
@@ -2955,7 +3424,7 @@ mod tests {
         .into_response();
 
         assert_eq!(resp.status(), StatusCode::OK);
-        let seen = seen.lock().unwrap();
+        let seen = seen.lock();
         assert_eq!(seen.len(), 1, "executor should run exactly once");
         assert_eq!(seen[0], "SELECT * FROM t WHERE a = 5");
     }
@@ -2965,7 +3434,7 @@ mod tests {
         // PREPARE is the JDBC/Metabase connect gate. It must NOT reach the
         // executor (the SQL parser rejects `PREPARE <name> FROM <sql>`); it
         // returns 200 + an x-trino-added-prepare header the client replays.
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
         let state = recording_state(seen.clone());
 
         let resp = submit_query::<MockAuthOk, RecordingQuery>(
@@ -2979,7 +3448,7 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
-            seen.lock().unwrap().is_empty(),
+            seen.lock().is_empty(),
             "PREPARE must not be sent to the executor"
         );
         let hdr = resp
@@ -3003,7 +3472,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_deallocate_returns_update_type_without_executing() {
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
         let state = recording_state(seen.clone());
 
         let resp = submit_query::<MockAuthOk, RecordingQuery>(
@@ -3017,7 +3486,7 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
-            seen.lock().unwrap().is_empty(),
+            seen.lock().is_empty(),
             "DEALLOCATE must not be sent to the executor"
         );
         assert!(resp.headers().get("x-trino-deallocated-prepare").is_some());
@@ -3041,7 +3510,7 @@ mod tests {
                 &self,
                 _: &Session,
                 _: &str,
-            ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
+            ) -> Result<TrinoResultStream, sqe_core::SqeError> {
                 use arrow_array::StringArray;
                 use arrow_schema::{DataType, Field, Schema};
                 let schema = Arc::new(Schema::new(vec![
@@ -3058,15 +3527,15 @@ mod tests {
                     ],
                 )
                 .unwrap();
-                Ok(vec![batch])
+                Ok(TrinoResultStream::from_batches(vec![batch]))
             }
         }
 
         let state = Arc::new(TrinoState::<MockAuthOk, InfoSchemaQuery> {
             authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(InfoSchemaQuery),
-            results: build_result_cache(),
-            queries: build_query_registry(),
+            queries: build_query_registry(build_expired_ids()),
+            expired: build_expired_ids(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -3110,7 +3579,7 @@ mod tests {
 
     #[tokio::test]
     async fn submit_unresolved_execute_never_reaches_executor() {
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
         let state = recording_state(seen.clone());
 
         // EXECUTE naming a statement the client never sent: must error out
@@ -3126,7 +3595,7 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
-            seen.lock().unwrap().is_empty(),
+            seen.lock().is_empty(),
             "unresolved EXECUTE must not reach the executor"
         );
     }
@@ -3191,46 +3660,28 @@ mod tests {
 
     // ── Pagination unit tests ─────────────────────────────────
 
-    #[test]
-    fn test_paginate_rows_empty() {
-        let pages = paginate_rows(vec![], 10);
-        assert_eq!(pages.len(), 1);
-        assert!(pages[0].is_empty());
+    #[tokio::test]
+    async fn cursor_pages_rows_in_fixed_sizes() {
+        let rows: Vec<i64> = (0..25).collect();
+        let mut cursor = ResultCursor::from_batches(vec![int_batch(&rows)], 10);
+        assert_eq!(page(&mut cursor, 0).await.rows.len(), 10);
+        assert_eq!(page(&mut cursor, 1).await.rows.len(), 10);
+        let last = page(&mut cursor, 2).await;
+        assert_eq!(last.rows.len(), 5);
+        assert!(last.is_last);
     }
 
-    #[test]
-    fn test_paginate_rows_single_page() {
-        let rows: Vec<Vec<serde_json::Value>> =
-            (0..5).map(|i| vec![serde_json::json!(i)]).collect();
-        let pages = paginate_rows(rows, 10);
-        assert_eq!(pages.len(), 1);
-        assert_eq!(pages[0].len(), 5);
-    }
-
-    #[test]
-    fn test_paginate_rows_multiple_pages() {
-        let rows: Vec<Vec<serde_json::Value>> =
-            (0..25).map(|i| vec![serde_json::json!(i)]).collect();
-        let pages = paginate_rows(rows, 10);
-        assert_eq!(pages.len(), 3);
-        assert_eq!(pages[0].len(), 10);
-        assert_eq!(pages[1].len(), 10);
-        assert_eq!(pages[2].len(), 5);
-    }
-
-    #[test]
-    fn test_paginate_rows_exact_fit() {
-        let rows: Vec<Vec<serde_json::Value>> =
-            (0..20).map(|i| vec![serde_json::json!(i)]).collect();
-        let pages = paginate_rows(rows, 10);
-        assert_eq!(pages.len(), 2);
-        assert_eq!(pages[0].len(), 10);
-        assert_eq!(pages[1].len(), 10);
+    #[tokio::test]
+    async fn cursor_empty_result_is_a_single_last_page() {
+        let mut cursor = ResultCursor::from_batches(vec![], 10);
+        let only = page(&mut cursor, 0).await;
+        assert!(only.rows.is_empty());
+        assert!(only.is_last);
     }
 
     #[test]
     fn test_next_uri_has_next() {
-        let uri = next_uri("http://localhost:8080", "q-123", "slug1", 0, 3);
+        let uri = next_uri("http://localhost:8080", "q-123", "slug1", 0, false);
         assert_eq!(
             uri,
             Some("http://localhost:8080/v1/statement/q-123/slug1/1".to_string())
@@ -3239,13 +3690,7 @@ mod tests {
 
     #[test]
     fn test_next_uri_last_page() {
-        let uri = next_uri("http://localhost:8080", "q-123", "slug1", 2, 3);
-        assert!(uri.is_none());
-    }
-
-    #[test]
-    fn test_next_uri_single_page() {
-        let uri = next_uri("http://localhost:8080", "q-123", "slug1", 0, 1);
+        let uri = next_uri("http://localhost:8080", "q-123", "slug1", 2, true);
         assert!(uri.is_none());
     }
 
@@ -3261,18 +3706,15 @@ mod tests {
 
     #[tokio::test]
     async fn await_terminal_returns_when_finished() {
-        let handle = Arc::new(QueryHandle {
-            status: std::sync::Mutex::new(QueryStatus::Running),
-            notify: tokio::sync::Notify::new(),
-            abort: std::sync::Mutex::new(None),
-            owner: test_owner("u"),
-            session_update: None,
-            created_at: std::time::Instant::now(),
-        });
+        let handle = Arc::new(QueryHandle::new(
+            QueryStatus::Running,
+            test_owner("u"),
+            None,
+        ));
         let h2 = handle.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            *h2.status.lock().unwrap() = QueryStatus::Finished;
+            *h2.status.lock() = QueryStatus::Finished;
             h2.notify.notify_waiters();
         });
         tokio::time::timeout(
@@ -3281,21 +3723,18 @@ mod tests {
         )
         .await
         .expect("returned before outer timeout");
-        assert!(handle.status.lock().unwrap().is_terminal());
+        assert!(handle.status.lock().is_terminal());
     }
 
     #[tokio::test]
     async fn await_terminal_returns_on_timeout_when_still_running() {
-        let handle = Arc::new(QueryHandle {
-            status: std::sync::Mutex::new(QueryStatus::Running),
-            notify: tokio::sync::Notify::new(),
-            abort: std::sync::Mutex::new(None),
-            owner: test_owner("u"),
-            session_update: None,
-            created_at: std::time::Instant::now(),
-        });
+        let handle = Arc::new(QueryHandle::new(
+            QueryStatus::Running,
+            test_owner("u"),
+            None,
+        ));
         await_terminal_or_timeout(&handle, std::time::Duration::from_millis(30)).await;
-        assert!(!handle.status.lock().unwrap().is_terminal());
+        assert!(!handle.status.lock().is_terminal());
     }
 
     #[test]
@@ -3332,28 +3771,25 @@ mod tests {
         assert!(resp.data.is_none());
     }
 
-    #[test]
-    fn test_build_page_response_first_page() {
-        let paginated = PaginatedResult {
-            columns: vec![TrinoColumn {
-                name: "id".to_string(),
-                r#type: "bigint".to_string(),
-                type_signature: crate::protocol::type_signature_for("bigint"),
-            }],
-            pages: vec![
-                vec![vec![serde_json::json!(1)], vec![serde_json::json!(2)]],
-                vec![vec![serde_json::json!(3)]],
-            ],
-            total_pages: 2,
-            created_at: Instant::now(),
-            owner: test_owner("test"),
-            total_rows: 0,
-            update_type: None,
-            update_count: None,
-            estimated_bytes: 0,
-        };
+    async fn page(cursor: &mut ResultCursor, token: usize) -> Arc<ReadyPage> {
+        match cursor.fetch(token).await.unwrap() {
+            PageFetch::Page(p) => p,
+            other => panic!("expected a page for token {token}, got {other:?}"),
+        }
+    }
 
-        let resp = build_page_response("http://localhost:8080", "q-abc", &paginated, 0);
+    #[tokio::test]
+    async fn test_build_page_response_first_page() {
+        let mut cursor = ResultCursor::from_batches(vec![int_batch(&[1, 2, 3])], 2);
+        let p0 = page(&mut cursor, 0).await;
+
+        let resp = build_page_response(
+            "http://localhost:8080",
+            "q-abc",
+            "poll-token-test",
+            &cursor,
+            &p0,
+        );
         assert_eq!(resp.id, "q-abc");
         assert_eq!(
             resp.info_uri,
@@ -3365,54 +3801,51 @@ mod tests {
         );
         assert_eq!(resp.data.as_ref().unwrap().len(), 2);
         assert_eq!(resp.stats.state, "RUNNING");
+        assert_eq!(resp.stats.processed_rows, 2);
     }
 
-    #[test]
-    fn test_build_page_response_last_page() {
-        let paginated = PaginatedResult {
-            columns: vec![TrinoColumn {
-                name: "id".to_string(),
-                r#type: "bigint".to_string(),
-                type_signature: crate::protocol::type_signature_for("bigint"),
-            }],
-            pages: vec![
-                vec![vec![serde_json::json!(1)], vec![serde_json::json!(2)]],
-                vec![vec![serde_json::json!(3)]],
-            ],
-            total_pages: 2,
-            created_at: Instant::now(),
-            owner: test_owner("test"),
-            total_rows: 0,
-            update_type: None,
-            update_count: None,
-            estimated_bytes: 0,
-        };
+    #[tokio::test]
+    async fn test_build_page_response_last_page() {
+        let mut cursor = ResultCursor::from_batches(vec![int_batch(&[1, 2, 3])], 2);
+        let _ = page(&mut cursor, 0).await;
+        let p1 = page(&mut cursor, 1).await;
 
-        let resp = build_page_response("http://localhost:8080", "q-abc", &paginated, 1);
+        let resp = build_page_response(
+            "http://localhost:8080",
+            "q-abc",
+            "poll-token-test",
+            &cursor,
+            &p1,
+        );
         assert!(resp.next_uri.is_none());
         assert_eq!(resp.data.as_ref().unwrap().len(), 1);
+        assert_eq!(resp.data.as_ref().unwrap()[0][0], serde_json::json!(3));
         assert_eq!(resp.stats.state, "FINISHED");
+        assert_eq!(resp.stats.processed_rows, 3);
     }
 
-    #[test]
-    fn test_build_page_response_omits_data_for_columnless_update() {
+    #[tokio::test]
+    async fn test_build_page_response_omits_data_for_columnless_update() {
         // Trino 465 JDBC client rejects a non-null `data` with empty `columns`
         // ("Columns must be set when decoding data"). Real Trino omits `data`
         // entirely for DDL/update statements. SQE must match: column-less result
         // -> data: None. See issue #314.
-        let paginated = PaginatedResult {
-            columns: vec![],
-            pages: vec![vec![]],
-            total_pages: 1,
-            created_at: Instant::now(),
-            owner: test_owner("test"),
-            total_rows: 0,
-            update_type: Some("CREATE TABLE".to_string()),
-            update_count: None,
-            estimated_bytes: 0,
-        };
+        let mut cursor = ResultCursor::new(
+            TrinoResultStream::from_batches(vec![]),
+            DEFAULT_PAGE_SIZE,
+            None,
+            Some("CREATE TABLE".to_string()),
+            None,
+        );
+        let p0 = page(&mut cursor, 0).await;
 
-        let resp = build_page_response("http://localhost:8080", "q-ddl", &paginated, 0);
+        let resp = build_page_response(
+            "http://localhost:8080",
+            "q-ddl",
+            "poll-token-test",
+            &cursor,
+            &p0,
+        );
         assert!(
             resp.data.is_none(),
             "column-less update must omit data (got {:?})",
@@ -3436,52 +3869,157 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_build_page_response_keeps_data_for_empty_select() {
+    #[tokio::test]
+    async fn test_build_page_response_keeps_data_for_empty_select() {
         // A SELECT that legitimately returns zero rows still has columns, so
         // `data` must remain present (Some) and non-null. Gating is on empty
         // columns, not empty data.
-        let paginated = PaginatedResult {
-            columns: vec![TrinoColumn {
-                name: "id".to_string(),
-                r#type: "bigint".to_string(),
-                type_signature: crate::protocol::type_signature_for("bigint"),
-            }],
-            pages: vec![vec![]],
-            total_pages: 1,
-            created_at: Instant::now(),
-            owner: test_owner("test"),
-            total_rows: 0,
-            update_type: None,
-            update_count: None,
-            estimated_bytes: 0,
-        };
+        let mut cursor = ResultCursor::from_batches(vec![int_batch(&[])], DEFAULT_PAGE_SIZE);
+        let p0 = page(&mut cursor, 0).await;
 
-        let resp = build_page_response("http://localhost:8080", "q-empty", &paginated, 0);
+        let resp = build_page_response(
+            "http://localhost:8080",
+            "q-empty",
+            "poll-token-test",
+            &cursor,
+            &p0,
+        );
         assert!(
             resp.data.is_some(),
             "SELECT with columns must keep data present even when empty"
         );
         assert!(resp.data.as_ref().unwrap().is_empty());
+        assert_eq!(resp.stats.state, "FINISHED");
     }
 
-    #[test]
-    fn test_build_page_response_single_page() {
-        let paginated = PaginatedResult {
-            columns: vec![],
-            pages: vec![vec![vec![serde_json::json!(42)]]],
-            total_pages: 1,
-            created_at: Instant::now(),
-            owner: test_owner("test"),
-            total_rows: 0,
-            update_type: None,
-            update_count: None,
-            estimated_bytes: 0,
-        };
+    #[tokio::test]
+    async fn test_build_page_response_single_page() {
+        let mut cursor = ResultCursor::from_batches(vec![int_batch(&[42])], DEFAULT_PAGE_SIZE);
+        let p0 = page(&mut cursor, 0).await;
 
-        let resp = build_page_response("http://localhost:8080", "q-single", &paginated, 0);
+        let resp = build_page_response(
+            "http://localhost:8080",
+            "q-single",
+            "poll-token-test",
+            &cursor,
+            &p0,
+        );
         assert!(resp.next_uri.is_none());
         assert_eq!(resp.stats.state, "FINISHED");
+    }
+
+    /// Trino clients retry the `nextUri` they last received after a transport
+    /// error; the page just served must come back identical, and only that one.
+    #[tokio::test]
+    async fn cursor_replays_the_last_served_page_once_and_rejects_skips() {
+        let mut cursor = ResultCursor::from_batches(vec![int_batch(&[1, 2, 3, 4])], 2);
+        assert!(matches!(
+            cursor.fetch(1).await.unwrap(),
+            PageFetch::OutOfRange { expected: 0 }
+        ));
+        let first = page(&mut cursor, 0).await;
+        let again = page(&mut cursor, 0).await;
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "retry must replay the buffered page"
+        );
+        let second = page(&mut cursor, 1).await;
+        assert_eq!(second.rows[0][0], serde_json::json!(3));
+        // Page 0 is gone once page 1 was produced.
+        assert!(matches!(
+            cursor.fetch(0).await.unwrap(),
+            PageFetch::OutOfRange { expected: 2 }
+        ));
+        // Exactly page_size rows drained the stream: the look-ahead reports
+        // this page as the last one, no empty trailing page.
+        assert!(second.is_last);
+        assert!(matches!(
+            cursor.fetch(2).await.unwrap(),
+            PageFetch::OutOfRange { .. }
+        ));
+    }
+
+    /// Batches larger than a page are sliced; the remainder carries into the
+    /// next page so rows are never dropped or duplicated across batches.
+    #[tokio::test]
+    async fn cursor_slices_across_batch_boundaries() {
+        let mut cursor = ResultCursor::from_batches(
+            vec![
+                int_batch(&[1, 2, 3]),
+                int_batch(&[4]),
+                int_batch(&[5, 6, 7]),
+            ],
+            2,
+        );
+        let mut seen = Vec::new();
+        let mut token = 0;
+        loop {
+            let p = page(&mut cursor, token).await;
+            seen.extend(p.rows.iter().map(|r| r[0].as_i64().unwrap()));
+            if p.is_last {
+                break;
+            }
+            token += 1;
+        }
+        assert_eq!(seen, vec![1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    /// A stream error mid-way surfaces from `fetch` and closes the cursor.
+    #[tokio::test]
+    async fn cursor_surfaces_stream_error_and_closes() {
+        let stream = futures::stream::iter(vec![
+            Ok(int_batch(&[1])),
+            Err(sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::ExecutionFailed,
+                "worker went away",
+            )),
+        ]);
+        let result = TrinoResultStream::new(int_batch(&[]).schema(), Box::pin(stream));
+        let mut cursor = ResultCursor::new(result, 10, None, None, None);
+        let err = cursor.fetch(0).await.unwrap_err();
+        assert!(err.to_string().contains("worker went away"));
+        assert!(
+            cursor.stream.is_none(),
+            "cursor must release the stream on error"
+        );
+    }
+
+    /// The buffered page is charged to the DataFusion pool: a pool too small
+    /// for one page rejects the fetch with ResourceExhausted instead of
+    /// growing outside the budget.
+    #[tokio::test]
+    async fn cursor_page_is_charged_to_memory_pool() {
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64));
+        let reservation = MemoryConsumer::new("test-cursor").register(&pool);
+        let rows: Vec<i64> = (0..100).collect();
+        let mut cursor = ResultCursor::new(
+            TrinoResultStream::from_batches(vec![int_batch(&rows)]),
+            DEFAULT_PAGE_SIZE,
+            Some(reservation),
+            None,
+            None,
+        );
+        let err = cursor.fetch(0).await.unwrap_err();
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::ResourceExhausted);
+
+        // A pool with room accounts for the page and releases it on drop.
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+        let reservation = MemoryConsumer::new("test-cursor").register(&pool);
+        let mut cursor = ResultCursor::new(
+            TrinoResultStream::from_batches(vec![int_batch(&rows)]),
+            DEFAULT_PAGE_SIZE,
+            Some(reservation),
+            None,
+            None,
+        );
+        let _ = page(&mut cursor, 0).await;
+        assert!(
+            pool.reserved() > 0,
+            "page bytes must be visible in the pool"
+        );
+        drop(cursor);
+        assert_eq!(pool.reserved(), 0);
     }
 
     // ── Header extraction unit tests ──────────────────────────
@@ -3580,46 +4118,77 @@ mod tests {
 
     #[test]
     fn query_registry_stores_and_reports_terminal_status() {
-        let registry = build_query_registry();
-        let handle = Arc::new(QueryHandle {
-            status: std::sync::Mutex::new(QueryStatus::Running),
-            notify: tokio::sync::Notify::new(),
-            abort: std::sync::Mutex::new(None),
-            owner: test_owner("alice"),
-            session_update: None,
-            created_at: std::time::Instant::now(),
-        });
+        let registry = build_query_registry(build_expired_ids());
+        let handle = Arc::new(QueryHandle::new(
+            QueryStatus::Running,
+            test_owner("alice"),
+            None,
+        ));
         registry.insert("q1".to_string(), handle.clone());
 
         let got = registry.get("q1").expect("handle present");
-        assert!(!got.status.lock().unwrap().is_terminal());
+        assert!(!got.status.lock().is_terminal());
 
-        *got.status.lock().unwrap() = QueryStatus::Finished;
-        assert!(got.status.lock().unwrap().is_terminal());
+        *got.status.lock() = QueryStatus::Finished;
+        assert!(got.status.lock().is_terminal());
     }
 
-    #[test]
-    fn test_paginated_result_cleanup_after_last_page() {
-        let results: MokaCache<String, Arc<PaginatedResult>> = build_result_cache();
-        results.insert(
-            "q-test".to_string(),
-            Arc::new(PaginatedResult {
-                columns: vec![],
-                pages: vec![vec![], vec![]],
-                total_pages: 2,
-                created_at: Instant::now(),
-                owner: test_owner("test"),
-                total_rows: 0,
-                update_type: None,
-                update_count: None,
-                estimated_bytes: 0,
-            }),
+    /// Idle eviction of a finished query leaves a tombstone so a late page
+    /// fetch is told the result expired, not that the id never existed (#621).
+    #[tokio::test]
+    async fn expired_query_is_reported_as_expired_not_unknown() {
+        let state = state_with(Arc::new(MockAuthOk), Arc::new(MockQuery), None);
+        state.expired.insert("q-old".to_string(), ());
+
+        let expired = get_results(
+            State(state.clone()),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            Path(("q-old".to_string(), "x".to_string(), "1".to_string())),
+        )
+        .await;
+        assert_eq!(expired.status(), StatusCode::NOT_FOUND);
+        let body = body_json(expired).await;
+        assert!(
+            body.error.as_ref().unwrap().message.contains("expired"),
+            "got {:?}",
+            body.error
         );
 
-        assert!(results.get("q-test").is_some());
+        let unknown = get_results(
+            State(state),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            Path(("q-never".to_string(), "x".to_string(), "1".to_string())),
+        )
+        .await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        let body = body_json(unknown).await;
+        assert_eq!(body.error.as_ref().unwrap().message, "Query not found");
+    }
 
-        results.invalidate("q-test");
-        assert!(results.get("q-test").is_none());
+    /// Eviction for idleness (not an explicit cancel) records the tombstone.
+    #[test]
+    fn registry_eviction_records_expired_id() {
+        let expired = build_expired_ids();
+        let registry: MokaCache<String, Arc<QueryHandle>> = MokaCache::builder()
+            .max_capacity(1)
+            .eviction_listener({
+                let expired = expired.clone();
+                move |key: Arc<String>, _handle: Arc<QueryHandle>, cause| {
+                    if matches!(cause, RemovalCause::Expired | RemovalCause::Size) {
+                        expired.insert(key.as_str().to_string(), ());
+                    }
+                }
+            })
+            .build();
+        registry.insert("q1".to_string(), handle_with(QueryStatus::Finished, "a"));
+        registry.insert("q2".to_string(), handle_with(QueryStatus::Finished, "a"));
+        registry.run_pending_tasks();
+        assert!(
+            expired.contains_key("q1") || expired.contains_key("q2"),
+            "size eviction must leave a tombstone"
+        );
     }
 
     #[tokio::test]
@@ -3627,8 +4196,8 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuthOk, MockQuery> {
             authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(MockQuery),
-            results: build_result_cache(),
-            queries: build_query_registry(),
+            queries: build_query_registry(build_expired_ids()),
+            expired: build_expired_ids(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -3664,8 +4233,8 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
-            results: build_result_cache(),
-            queries: build_query_registry(),
+            queries: build_query_registry(build_expired_ids()),
+            expired: build_expired_ids(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -3680,20 +4249,9 @@ mod tests {
             expose_version: true,
         });
 
-        state.results.insert(
-            "q-456".to_string(),
-            Arc::new(PaginatedResult {
-                columns: vec![],
-                pages: vec![vec![]],
-                total_pages: 1,
-                created_at: Instant::now(),
-                owner: test_owner("test"),
-                total_rows: 0,
-                update_type: None,
-                update_count: None,
-                estimated_bytes: 0,
-            }),
-        );
+        state
+            .queries
+            .insert("q-456".to_string(), finished_handle_with("test", vec![], 1));
 
         let response = get_results::<MockAuth, MockQuery>(
             State(state),
@@ -3717,8 +4275,8 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuthOk, MockQuery> {
             authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(MockQuery),
-            results: build_result_cache(),
-            queries: build_query_registry(),
+            queries: build_query_registry(build_expired_ids()),
+            expired: build_expired_ids(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -3733,27 +4291,27 @@ mod tests {
             expose_version: true,
         });
 
-        state.results.insert(
+        state.queries.insert(
             "q-paged".to_string(),
-            Arc::new(PaginatedResult {
-                columns: vec![TrinoColumn {
-                    name: "val".to_string(),
-                    r#type: "bigint".to_string(),
-                    type_signature: crate::protocol::type_signature_for("bigint"),
-                }],
-                pages: vec![
-                    vec![vec![serde_json::json!(10)]],
-                    vec![vec![serde_json::json!(20)]],
-                    vec![vec![serde_json::json!(30)]],
-                ],
-                total_pages: 3,
-                created_at: Instant::now(),
-                owner: test_owner("test"),
-                total_rows: 0,
-                update_type: None,
-                update_count: None,
-                estimated_bytes: 0,
-            }),
+            finished_handle_with("test", vec![int_batch(&[10, 20, 30])], 1),
+        );
+
+        // Pages are served in order: pull page 0 first.
+        let first = get_results::<MockAuthOk, MockQuery>(
+            State(state.clone()),
+            test_peer(),
+            basic_auth_header("test", "pw"),
+            Path((
+                "q-paged".to_string(),
+                "poll-token-test".to_string(),
+                "0".to_string(),
+            )),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(first).await.data.unwrap()[0][0],
+            serde_json::json!(10)
         );
 
         // Fetch page 1 (middle); authenticate as the result owner.
@@ -3790,7 +4348,7 @@ mod tests {
         assert!(trino_resp.info_uri.is_some(), "infoUri must be present");
 
         // Result should still exist (not the last page)
-        assert!(state.results.get("q-paged").is_some());
+        assert!(state.queries.get("q-paged").is_some());
     }
 
     #[tokio::test]
@@ -3798,8 +4356,8 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuthOk, MockQuery> {
             authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(MockQuery),
-            results: build_result_cache(),
-            queries: build_query_registry(),
+            queries: build_query_registry(build_expired_ids()),
+            expired: build_expired_ids(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -3814,39 +4372,43 @@ mod tests {
             expose_version: true,
         });
 
-        state.results.insert(
+        state.queries.insert(
             "q-cleanup".to_string(),
-            Arc::new(PaginatedResult {
-                columns: vec![],
-                pages: vec![
-                    vec![vec![serde_json::json!(1)]],
-                    vec![vec![serde_json::json!(2)]],
-                ],
-                total_pages: 2,
-                created_at: Instant::now(),
-                owner: test_owner("test"),
-                total_rows: 0,
-                update_type: None,
-                update_count: None,
-                estimated_bytes: 0,
-            }),
+            finished_handle_with("test", vec![int_batch(&[1, 2])], 1),
         );
 
-        // Fetch the last page (token = 1); authenticate as owner.
-        let _response = get_results::<MockAuthOk, MockQuery>(
-            State(state.clone()),
-            test_peer(),
-            basic_auth_header("test", "pw"),
-            Path((
-                "q-cleanup".to_string(),
-                "poll-token-test".to_string(),
-                "1".to_string(),
-            )),
-        )
-        .await;
+        let fetch = |token: &'static str| {
+            get_results::<MockAuthOk, MockQuery>(
+                State(state.clone()),
+                test_peer(),
+                basic_auth_header("test", "pw"),
+                Path((
+                    "q-cleanup".to_string(),
+                    "poll-token-test".to_string(),
+                    token.to_string(),
+                )),
+            )
+        };
+        let _ = fetch("0").await;
+        // Fetch the last page (token = 1) twice: the eager invalidation that
+        // used to turn a client's retry into "Query not found" is gone (#621).
+        let last = body_json(fetch("1").await).await;
+        assert_eq!(last.stats.state, "FINISHED");
+        assert!(last.next_uri.is_none());
+        let retry = body_json(fetch("1").await).await;
+        assert_eq!(retry.stats.state, "FINISHED");
+        assert_eq!(retry.data, last.data);
 
-        // Result should be cleaned up
-        assert!(state.results.get("q-cleanup").is_none());
+        // The handle stays until idle eviction; a skip past the end is rejected.
+        assert!(state.queries.get("q-cleanup").is_some());
+        let beyond = fetch("2").await;
+        assert_eq!(beyond.status(), StatusCode::NOT_FOUND);
+        assert!(body_json(beyond)
+            .await
+            .error
+            .unwrap()
+            .message
+            .contains("out of range"));
     }
 
     /// Regression for #34: an authenticated caller who is not the
@@ -3856,8 +4418,8 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuthOk, MockQuery> {
             authenticator: Arc::new(MockAuthOk),
             query_handler: Arc::new(MockQuery),
-            results: build_result_cache(),
-            queries: build_query_registry(),
+            queries: build_query_registry(build_expired_ids()),
+            expired: build_expired_ids(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -3871,19 +4433,9 @@ mod tests {
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
-        state.results.insert(
+        state.queries.insert(
             "q-secret".to_string(),
-            Arc::new(PaginatedResult {
-                columns: vec![],
-                pages: vec![vec![]],
-                total_pages: 1,
-                created_at: Instant::now(),
-                owner: test_owner("alice"),
-                total_rows: 0,
-                update_type: None,
-                update_count: None,
-                estimated_bytes: 0,
-            }),
+            finished_handle_with("alice", vec![], 1),
         );
         let response = get_results::<MockAuthOk, MockQuery>(
             State(state),
@@ -3906,8 +4458,8 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
-            results: build_result_cache(),
-            queries: build_query_registry(),
+            queries: build_query_registry(build_expired_ids()),
+            expired: build_expired_ids(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -3922,19 +4474,9 @@ mod tests {
             expose_version: true,
         });
 
-        state.results.insert(
+        state.queries.insert(
             "q-cancel".to_string(),
-            Arc::new(PaginatedResult {
-                columns: vec![],
-                pages: vec![vec![], vec![]],
-                total_pages: 2,
-                created_at: Instant::now(),
-                owner: test_owner("test-user"),
-                total_rows: 0,
-                update_type: None,
-                update_count: None,
-                estimated_bytes: 0,
-            }),
+            finished_handle_with("test-user", vec![], 1),
         );
 
         // Build Basic auth header for "test-user:pass"
@@ -3990,8 +4532,8 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
-            results: build_result_cache(),
-            queries: build_query_registry(),
+            queries: build_query_registry(build_expired_ids()),
+            expired: build_expired_ids(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -4038,8 +4580,8 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
-            results: build_result_cache(),
-            queries: build_query_registry(),
+            queries: build_query_registry(build_expired_ids()),
+            expired: build_expired_ids(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -4081,8 +4623,8 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
-            results: build_result_cache(),
-            queries: build_query_registry(),
+            queries: build_query_registry(build_expired_ids()),
+            expired: build_expired_ids(),
             node: NodeContext {
                 version: "1.2.3-4567".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -4114,8 +4656,8 @@ mod tests {
         let state = Arc::new(TrinoState::<MockAuth, MockQuery> {
             authenticator: Arc::new(MockAuth),
             query_handler: Arc::new(MockQuery),
-            results: build_result_cache(),
-            queries: build_query_registry(),
+            queries: build_query_registry(build_expired_ids()),
+            expired: build_expired_ids(),
             node: NodeContext {
                 version: "0.1.0".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),
@@ -4142,19 +4684,19 @@ mod tests {
     /// about so a test can assert *what* was keyed as well as *whether*.
     struct BudgetLimiter {
         remaining: std::sync::atomic::AtomicUsize,
-        seen: std::sync::Mutex<Vec<(String, String)>>,
+        seen: Mutex<Vec<(String, String)>>,
     }
 
     impl BudgetLimiter {
         fn new(budget: usize) -> Arc<Self> {
             Arc::new(Self {
                 remaining: std::sync::atomic::AtomicUsize::new(budget),
-                seen: std::sync::Mutex::new(Vec::new()),
+                seen: Mutex::new(Vec::new()),
             })
         }
 
         fn seen(&self) -> Vec<(String, String)> {
-            self.seen.lock().unwrap().clone()
+            self.seen.lock().clone()
         }
     }
 
@@ -4162,7 +4704,6 @@ mod tests {
         fn check(&self, peer_ip: &str, principal: &str) -> Result<(), ()> {
             self.seen
                 .lock()
-                .unwrap()
                 .push((peer_ip.to_string(), principal.to_string()));
             self.remaining
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -4201,8 +4742,8 @@ mod tests {
         Arc::new(TrinoState {
             authenticator,
             query_handler,
-            results: build_result_cache(),
-            queries: build_query_registry(),
+            queries: build_query_registry(build_expired_ids()),
+            expired: build_expired_ids(),
             node: NodeContext {
                 version: "test".to_string(),
                 ready: Arc::new(AtomicBool::new(true)),

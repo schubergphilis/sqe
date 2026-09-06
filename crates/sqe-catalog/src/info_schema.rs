@@ -5,9 +5,12 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow_array::builder::StringBuilder;
 use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
-use datafusion::catalog::SchemaProvider;
-use datafusion::datasource::{MemTable, TableProvider};
+use datafusion::catalog::{SchemaProvider, Session};
+use datafusion::common::ScalarValue;
+use datafusion::datasource::{MemTable, TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
+use datafusion::physical_plan::ExecutionPlan;
 use iceberg::NamespaceIdent;
 use tracing::{debug, warn};
 
@@ -21,6 +24,7 @@ use crate::rest_catalog::{listing_error_is_forbidden, SessionCatalog};
 /// When a `PolicyStore` and `SessionUser` are provided, restricted columns
 /// are filtered out of `information_schema.columns` so that users cannot
 /// discover column names they are not allowed to see.
+#[derive(Clone)]
 pub struct InformationSchemaProvider {
     session_catalog: Arc<SessionCatalog>,
     warehouse: String,
@@ -87,7 +91,12 @@ impl SchemaProvider for InformationSchemaProvider {
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
         match name {
             "tables" => Ok(Some(self.build_tables_table().await?)),
-            "columns" => Ok(Some(self.build_columns_table().await?)),
+            // `columns` is built lazily at scan time so a `table_schema = 'x'`
+            // predicate lists one namespace instead of the whole catalog
+            // (review 307).
+            "columns" => Ok(Some(Arc::new(InformationSchemaColumns {
+                inner: self.clone(),
+            }))),
             "schemata" => Ok(Some(self.build_schemata_table().await?)),
             _ => Ok(None),
         }
@@ -125,7 +134,7 @@ impl InformationSchemaProvider {
                     debug!(namespace = %ns, "information_schema.tables: skipping namespace the principal is not authorized to list");
                 }
                 Err(e) => {
-                    return Err(DataFusionError::External(Box::new(e)));
+                    return Err(catalog_unavailable("information_schema.tables", ns, &e));
                 }
             }
         }
@@ -143,8 +152,9 @@ impl InformationSchemaProvider {
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
     }
 
-    async fn build_columns_table(&self) -> DFResult<Arc<dyn TableProvider>> {
-        let schema = Arc::new(Schema::new(vec![
+    /// Arrow schema of `information_schema.columns`.
+    fn columns_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
             Field::new("table_catalog", DataType::Utf8, false),
             Field::new("table_schema", DataType::Utf8, false),
             Field::new("table_name", DataType::Utf8, false),
@@ -158,9 +168,27 @@ impl InformationSchemaProvider {
             Field::new("datetime_precision", DataType::Int32, true),
             Field::new("column_default", DataType::Utf8, true),
             Field::new("udt_name", DataType::Utf8, true),
-        ]));
+        ]))
+    }
 
-        let namespaces = self.list_namespaces_safe().await?;
+    /// Build the `columns` rows. With `namespace_filter` set only that
+    /// namespace is listed (one `list_tables` instead of one per namespace).
+    /// Each table is read through `SessionCatalog::load_table`, which serves
+    /// a fresh metadata-cache hit without a round trip inside the
+    /// authorization recheck window, so a warm catalog costs zero REST calls
+    /// and a cold one costs one `load_table` per miss (review 307).
+    async fn build_columns_batch(&self, namespace_filter: Option<&str>) -> DFResult<RecordBatch> {
+        let schema = Self::columns_schema();
+
+        let namespaces: Vec<String> = match namespace_filter {
+            Some(ns) => self
+                .list_namespaces_safe()
+                .await?
+                .into_iter()
+                .filter(|n| n == ns)
+                .collect(),
+            None => self.list_namespaces_safe().await?,
+        };
 
         let mut cat_b = StringBuilder::new();
         let mut sch_b = StringBuilder::new();
@@ -185,7 +213,7 @@ impl InformationSchemaProvider {
                     continue;
                 }
                 Err(e) => {
-                    return Err(DataFusionError::External(Box::new(e)));
+                    return Err(catalog_unavailable("information_schema.columns", ns, &e));
                 }
             };
 
@@ -285,7 +313,7 @@ impl InformationSchemaProvider {
             ],
         )?;
 
-        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+        Ok(batch)
     }
 
     async fn build_schemata_table(&self) -> DFResult<Arc<dyn TableProvider>> {
@@ -351,6 +379,98 @@ impl InformationSchemaProvider {
             }
         }
     }
+}
+
+/// `information_schema.columns` as a filter-aware `TableProvider`.
+///
+/// DataFusion hands `scan()` the pushed-down predicates, so a
+/// `WHERE table_schema = 'x'` (the dbt / JDBC `get_columns_in_relation`
+/// shape) builds rows for one namespace instead of every namespace in the
+/// catalog. The pushdown is `Inexact`: DataFusion still applies the filter
+/// above the scan, so a wider result is never wrong, only slower.
+#[derive(Debug)]
+struct InformationSchemaColumns {
+    inner: InformationSchemaProvider,
+}
+
+/// The namespace an `information_schema.columns` filter set pins, when a
+/// conjunct is exactly `table_schema = '<literal>'` (either operand order).
+/// Any other shape returns `None` and the full catalog is listed.
+fn namespace_filter(filters: &[Expr]) -> Option<String> {
+    fn literal_eq(col: &Expr, lit: &Expr) -> Option<String> {
+        match (col, lit) {
+            (Expr::Column(c), Expr::Literal(ScalarValue::Utf8(Some(v)), _))
+            | (Expr::Column(c), Expr::Literal(ScalarValue::LargeUtf8(Some(v)), _))
+            | (Expr::Column(c), Expr::Literal(ScalarValue::Utf8View(Some(v)), _))
+                if c.name == "table_schema" =>
+            {
+                Some(v.clone())
+            }
+            _ => None,
+        }
+    }
+    filters.iter().find_map(|f| match f {
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Eq,
+            right,
+        }) => literal_eq(left, right).or_else(|| literal_eq(right, left)),
+        _ => None,
+    })
+}
+
+#[async_trait]
+impl TableProvider for InformationSchemaColumns {
+    fn schema(&self) -> Arc<Schema> {
+        InformationSchemaProvider::columns_schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::View
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|f| {
+                if namespace_filter(&[(*f).clone()]).is_some() {
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let ns = namespace_filter(filters);
+        if let Some(ns) = &ns {
+            debug!(namespace = %ns, "information_schema.columns: namespace filter pushed down");
+        }
+        let batch = self.inner.build_columns_batch(ns.as_deref()).await?;
+        let mem = MemTable::try_new(self.schema(), vec![vec![batch]])?;
+        mem.scan(state, projection, &[], limit).await
+    }
+}
+
+/// A namespace that could not be listed for a reason other than
+/// authorization is an outage, not an empty schema: surface it as
+/// `CatalogUnavailable` so clients and the audit log can tell the two apart
+/// (review 806). Denied namespaces are skipped by the callers before this.
+fn catalog_unavailable(surface: &str, namespace: &str, e: &sqe_core::SqeError) -> DataFusionError {
+    DataFusionError::External(Box::new(sqe_core::SqeError::with_code(
+        sqe_core::SqeErrorCode::CatalogUnavailable,
+        format!("{surface}: namespace '{namespace}' could not be listed: {e}"),
+    )))
 }
 
 /// Resolved metadata for one `information_schema.columns` row.
@@ -613,6 +733,45 @@ mod tests {
         use iceberg::spec::{PrimitiveType, Type};
         let info = super::iceberg_to_sql_type_info(&Type::Primitive(PrimitiveType::String));
         assert_eq!(info.character_maximum_length, Some(i32::MAX));
+    }
+
+    /// Review 307: `WHERE table_schema = 'x'` pins one namespace in either
+    /// operand order; anything else lists the whole catalog.
+    #[test]
+    fn namespace_filter_recognises_table_schema_equality() {
+        use datafusion::logical_expr::{col, lit};
+        assert_eq!(
+            namespace_filter(&[col("table_schema").eq(lit("analytics"))]),
+            Some("analytics".to_string())
+        );
+        assert_eq!(
+            namespace_filter(&[lit("analytics").eq(col("table_schema"))]),
+            Some("analytics".to_string())
+        );
+        assert_eq!(namespace_filter(&[col("table_name").eq(lit("t"))]), None);
+        assert_eq!(
+            namespace_filter(&[col("table_schema").not_eq(lit("analytics"))]),
+            None
+        );
+        assert_eq!(namespace_filter(&[]), None);
+    }
+
+    /// Review 806: a non-auth listing failure is `CatalogUnavailable`, never
+    /// zero rows.
+    #[test]
+    fn listing_failure_maps_to_catalog_unavailable() {
+        let err = catalog_unavailable(
+            "information_schema.tables",
+            "ns",
+            &sqe_core::SqeError::Catalog("503 service unavailable".into()),
+        );
+        let DataFusionError::External(inner) = err else {
+            panic!("expected External");
+        };
+        let sqe = inner
+            .downcast_ref::<sqe_core::SqeError>()
+            .expect("SqeError");
+        assert_eq!(sqe.error_code(), sqe_core::SqeErrorCode::CatalogUnavailable);
     }
 
     #[test]

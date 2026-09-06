@@ -36,6 +36,13 @@ repository = "https://gitlab.schubergphilis.com/data-ai/chameleon/sqlengine"
 homepage = "https://gitlab.schubergphilis.com/data-ai/chameleon/sqlengine"
 authors = ["Schuberg Philis"]
 
+# Inherited by crates that declare `[lints] workspace = true`. Issue #643: a
+# `std::sync` guard held across an `.await` pins a runtime worker and, if the
+# same lock is taken on another task on that worker, deadlocks. Deny it so the
+# compiler finds the hold instead of a reviewer reasoning about temporaries.
+[workspace.lints.clippy]
+await_holding_lock = "deny"
+
 [workspace.dependencies]
 # Query engine — DataFusion 55. See docs/evidence/perf/df55-arrow59-ab.md for
 # the validated upgrade results and docs/internal/research/2026-09-02-datafusion-55-followups.md
@@ -110,6 +117,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 # HTTP
 axum = "0.8"
 reqwest = { version = "0.13", features = ["json", "rustls", "form", "query"], default-features = false }
+# The vendored iceberg-catalog-rest still builds on reqwest 0.12, so its
+# `RestCatalogBuilder::with_client` needs a 0.12 `Client`. sqe-catalog builds
+# one with the same `[catalog]` deadlines (review 300). No features: the
+# vendored crate already selects TLS; this only names the type.
+reqwest_legacy = { package = "reqwest", version = "0.12", default-features = false }
 
 # gRPC (Arrow Flight) — arrow-flight 57 requires tonic 0.14
 # `tls-native-roots` is what lets `sqe_core::tls::tonic_client` reach an
@@ -212,6 +224,8 @@ croner = "4"
 regex = "1"
 futures = "0.3"
 tokio-util = "0.7"
+# Non-poisoning mutex for lifecycle state touched from request handlers (#643).
+parking_lot = "0.12"
 
 # Puffin NDV sketches — pure-Rust Apache DataSketches theta implementation.
 # Used by `crates/sqe-catalog/src/puffin_stats.rs` to write theta sketches

@@ -94,7 +94,7 @@ pub fn try_parse_ref_ddl(sql: &str) -> Result<Option<RefDdl>> {
         let after_upper = after_maybe_replace.to_ascii_uppercase();
         if after_upper.starts_with("BRANCH ") {
             if create_or_replace {
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed,
                     "CREATE OR REPLACE BRANCH is not supported (branches are mutable; use CREATE BRANCH)"
                         .to_string(),
                 ));
@@ -157,7 +157,7 @@ fn parse_if_exists(tail: &str) -> Result<bool> {
     if tail_trim.is_empty() {
         return Ok(false);
     }
-    if tail_trim.to_ascii_uppercase() == "IF EXISTS" {
+    if tail_trim.eq_ignore_ascii_case("IF EXISTS") {
         return Ok(true);
     }
     Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
@@ -200,7 +200,7 @@ fn parse_as_of_version(input: &str) -> Result<(Option<i64>, &str)> {
         .find(|c: char| !c.is_ascii_digit() && c != '-')
         .unwrap_or(after.len());
     if end == 0 {
-        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed,
             "AS OF VERSION requires an integer snapshot id".to_string(),
         ));
     }
@@ -278,7 +278,7 @@ fn parse_retention_args(input: &str) -> Result<Vec<(String, String)>> {
     }
     let after_kw = trimmed[14..].trim_start();
     if !after_kw.starts_with('(') || !after_kw.ends_with(')') {
-        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed,
             "WITH RETENTION requires parentheses around options".to_string(),
         ));
     }
@@ -331,7 +331,7 @@ fn split_identifier(input: &str) -> Result<(String, &str)> {
             end += 1;
         }
         if end >= bytes.len() {
-            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed,
                 "unterminated quoted identifier".to_string(),
             ));
         }
