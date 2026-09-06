@@ -61,14 +61,18 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS deps
 ARG TARGETARCH
 ARG CARGO_PROFILE=release
+# Empty = slim (catalog crate defaults). Set to `sqe-catalog/full-backends`
+# for Glue/HMS/JDBC/Hadoop: `docker build --build-arg CATALOG_FEATURES=sqe-catalog/full-backends`.
+ARG CATALOG_FEATURES=
 COPY --from=planner /build/recipe.json recipe.json
 COPY vendor/ vendor/
 RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},sharing=locked,target=/usr/local/cargo/git \
     --mount=type=cache,id=sqe-sccache-${TARGETARCH},sharing=locked,target=/sccache \
     --mount=type=cache,id=sqe-target-${CARGO_PROFILE}-${TARGETARCH},sharing=locked,target=/build/target \
+    FEATURES=""; if [ -n "$CATALOG_FEATURES" ]; then FEATURES="--features ${CATALOG_FEATURES}"; fi; \
     cargo chef cook --locked --profile "${CARGO_PROFILE}" \
-      --recipe-path recipe.json --no-default-features \
+      --recipe-path recipe.json --no-default-features $FEATURES \
       --package sqe-coordinator --package sqe-worker \
       --package sqe-cli --package sqe-bench \
     && sccache --show-stats
@@ -76,6 +80,7 @@ RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},sharing=locked,target
 FROM deps AS builder
 ARG TARGETARCH
 ARG CARGO_PROFILE=release
+ARG CATALOG_FEATURES=
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY vendor/ vendor/
@@ -84,7 +89,8 @@ RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},sharing=locked,target
     --mount=type=cache,id=sqe-cargo-git-${TARGETARCH},sharing=locked,target=/usr/local/cargo/git \
     --mount=type=cache,id=sqe-sccache-${TARGETARCH},sharing=locked,target=/sccache \
     --mount=type=cache,id=sqe-target-${CARGO_PROFILE}-${TARGETARCH},sharing=locked,target=/build/target \
-    cargo build --locked --profile "${CARGO_PROFILE}" --no-default-features \
+    FEATURES=""; if [ -n "$CATALOG_FEATURES" ]; then FEATURES="--features ${CATALOG_FEATURES}"; fi; \
+    cargo build --locked --profile "${CARGO_PROFILE}" --no-default-features $FEATURES \
       --bin sqe-server --bin sqe-worker --bin sqe-cli --bin sqe-bench \
     && mkdir -p /build/out \
     && cp "target/${CARGO_PROFILE}/sqe-server" \
@@ -94,7 +100,7 @@ RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},sharing=locked,target
     && sccache --show-stats
 
 # Digest-pinned; Renovate bumps the runtime independently of builder tooling.
-# Keep this digest in lockstep with Dockerfile.bench and Dockerfile.full.
+# Keep this digest in lockstep with Dockerfile.bench.
 FROM cgr.dev/chainguard/glibc-dynamic@sha256:d49aa7837ef1ef8fae33917f94369294c6d49940d2f0b225beee65a3bb6747ed AS runtime-base
 
 USER 65532
