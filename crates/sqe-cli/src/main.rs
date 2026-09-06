@@ -56,6 +56,11 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     embedded: bool,
 
+    /// Optional `sqe.toml` for `--embedded`: `[policy]` (mask key) and
+    /// `[storage]` follow the same load/env overlay as the server.
+    #[arg(long)]
+    config: Option<String>,
+
     /// Per-process query memory limit when running embedded. Accepts
     /// suffixes (`512MB`, `2GB`, ...). Floored to 64MB. Ignored
     /// unless `--embedded` is set.
@@ -251,7 +256,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `SQE_STORAGE__S3_*`, then the standard `AWS_*` variables. Embedded
     // mode loads no `sqe.toml`, so this is the only way it learns about an
     // S3-compatible store that is not AWS.
-    let s3_options = embedded::EmbeddedS3Options::resolve_from_env(&embedded::EmbeddedS3Options {
+    let engine_cfg = match cli.config.as_deref() {
+        Some(path) => Some(sqe_core::SqeConfig::load(path)?),
+        None => None,
+    };
+    let mask_key = engine_cfg.as_ref().and_then(|c| {
+        let k = c.policy.mask_key.trim();
+        if k.is_empty() {
+            None
+        } else {
+            Some(k.to_string())
+        }
+    });
+
+    let mut s3_options = embedded::EmbeddedS3Options::resolve_from_env(&embedded::EmbeddedS3Options {
         endpoint: cli.s3_endpoint.clone(),
         access_key: cli.s3_access_key.clone(),
         secret_key: cli.s3_secret_key.clone(),
@@ -259,6 +277,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         region: cli.s3_region.clone(),
         virtual_hosted: cli.s3_virtual_hosted,
     });
+    if let Some(cfg) = engine_cfg.as_ref() {
+        if s3_options.endpoint.is_none() && !cfg.storage.s3_endpoint.is_empty() {
+            s3_options.endpoint = Some(cfg.storage.s3_endpoint.clone());
+        }
+        if s3_options.region.is_none() && !cfg.storage.s3_region.is_empty() {
+            s3_options.region = Some(cfg.storage.s3_region.clone());
+        }
+        if s3_options.access_key.is_none() && !cfg.storage.s3_access_key.is_empty() {
+            s3_options.access_key = Some(cfg.storage.s3_access_key.clone());
+        }
+        if s3_options.secret_key.is_none() && !cfg.storage.s3_secret_key.expose().is_empty() {
+            s3_options.secret_key = Some(cfg.storage.s3_secret_key.expose().to_string());
+        }
+    }
 
     let scheme = if cli.tls { "https" } else { "http" };
 
@@ -293,7 +325,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .catalog_name
                 .clone()
                 .unwrap_or_else(|| backend_label.to_string());
-            let mut client = embedded::EmbeddedClient::with_backend(limit, backend, &name, &s3_options).await?;
+            let mut client = embedded::EmbeddedClient::with_backend_and_policy(
+                limit,
+                backend,
+                &name,
+                &s3_options,
+                mask_key.as_deref(),
+            )
+            .await?;
             attach_hive_roots(&mut client, &cli.hive_root).await?;
             eprintln!(
                 "sqe-cli {} embedded engine ({} memory pool, {} catalog: {})",
@@ -322,7 +361,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 embedded::WarehouseMode::default_persistent()
             };
-            let mut client = embedded::EmbeddedClient::with_warehouse(limit, &mode, &s3_options).await?;
+            let mut client = embedded::EmbeddedClient::with_warehouse_and_policy(
+                limit,
+                &mode,
+                &s3_options,
+                mask_key.as_deref(),
+            )
+            .await?;
             attach_hive_roots(&mut client, &cli.hive_root).await?;
             eprintln!(
                 "sqe-cli {} embedded engine ({} memory pool, {})",

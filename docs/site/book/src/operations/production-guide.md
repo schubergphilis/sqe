@@ -21,7 +21,7 @@ For the full security, performance, quality, and observability audit, see `docs/
 ### Topology
 
 - One `sqe-coordinator` or `sqe-server` (all-in-one). No workers.
-- Slim Docker image (`Dockerfile`) with REST catalog + SigV4 (`rest` + `rest-sigv4`). Use `Dockerfile.full` only when runtime config must dispatch to Glue, HMS, or other SDK backends.
+- Slim Docker image (`docker build .`) with the catalog crate's default feature set. Kitchen-sink backends (Glue, HMS, JDBC, Hadoop): `docker build --build-arg CATALOG_FEATURES=sqe-catalog/full-backends -t sqe-full .`.
 
 ### Security (required even at small scale)
 
