@@ -3,7 +3,7 @@
 > For the combined backlog of all 109 findings, grouped by area and priority, use the [combined prioritized index](../2026-09-05-combined-prioritized-findings.md). It takes precedence for scheduling; this review retains its original evidence and scope.
 
 One file per issue, written so that another agent can pick a file up and act
-on it without further context. Findings only; nothing here has been fixed.
+on it without further context. Findings marked `fixed` carry a Resolution section; the rest are open.
 
 ## How to use
 

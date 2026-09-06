@@ -22,8 +22,8 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use sqe_catalog::puffin_stats::{
-    build_theta_sketches, puffin_stats_enabled, write_puffin_sidecar_from_sketches,
-    ColumnSketches, ThetaSketchAccumulator,
+    build_theta_sketches, puffin_stats_enabled, write_puffin_sidecar_from_sketches, ColumnSketches,
+    ThetaSketchAccumulator,
 };
 use sqe_catalog::{SessionCatalog, TableMetadataCache};
 use sqe_core::table_properties::{
@@ -753,14 +753,16 @@ impl WriteHandler {
         let Some(enf) = &self.policy_enforcer else {
             return Ok(sqe_policy::write_predicates::WritePolicyPredicates::default());
         };
-        // The rewriter keys policy lookups by the last namespace component
-        // and the table name. Flatten the multi-level namespace to match.
-        let namespace_key = table_ident
-            .namespace()
-            .as_ref()
-            .last()
-            .cloned()
-            .unwrap_or_else(|| "default".to_string());
+        // One key rule for reads and writes (architecture review 201): the
+        // rewriter keys policy by the FULL dotted namespace it sees in the
+        // planner's TableReference, so hand the probe the same string. The
+        // old last-component flattening made a Ranger filter on `a.b` apply
+        // to SELECT but not to DELETE/UPDATE.
+        let namespace_key = if table_ident.namespace().as_ref().is_empty() {
+            "default".to_string()
+        } else {
+            table_ident.namespace().to_string()
+        };
         let (predicates, summary) = sqe_policy::write_predicates::extract_write_predicates(
             enf.as_ref(),
             &session.user,
@@ -2922,6 +2924,7 @@ impl WriteHandler {
         source_batches: Vec<RecordBatch>,
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         use sqlparser::ast::TableFactor;
 
@@ -3086,6 +3089,22 @@ impl WriteHandler {
             )));
         }
 
+        // The caller's row filter and masks on the TARGET (architecture review
+        // 202): DELETE and UPDATE already gate their target through
+        // `compute_write_predicates`; MERGE enforced its source only, so a
+        // caller filtered to EU could delete or update US rows by matching
+        // them. The predicates are folded into the merge SQL by
+        // `merge_sql` (guarded ON, guarded BY SOURCE class, masked user
+        // references); hidden rows pass through the rewrite unchanged.
+        let target_policy = self
+            .compute_write_predicates(
+                session,
+                &table_ident,
+                target_schema.clone(),
+                policy_summary_out,
+            )
+            .await?;
+
         // Use the target alias (or a default) for the merge scratch table names.
         // The scratch table names embed a per-invocation uuid so concurrent
         // MERGEs running in the same session do not clobber each other's
@@ -3159,7 +3178,10 @@ impl WriteHandler {
             s_alias: &s_alias,
             target_columns: &target_columns,
             source_columns: &source_columns,
+            target_policy: &target_policy,
         };
+        // User references to masked target columns in ON read the mask.
+        let on_rewritten = crate::merge_sql::apply_target_masks(&on_rewritten, &merge_names);
         let classified = crate::merge_sql::classify_merge_clauses(clauses, &merge_names)?;
         let (matched_clauses, not_matched_clauses, by_source_clauses) = classified.counts();
 
@@ -3309,6 +3331,7 @@ impl WriteHandler {
         ctx: &DFSessionContext,
         source_plan: Option<LogicalPlan>,
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         // Resolve the target catalog from the table reference, mirroring INSERT,
         // so a MERGE against a discovered/non-default catalog loads and commits
@@ -3330,7 +3353,14 @@ impl WriteHandler {
             Statement::Merge(merge) => &merge.table,
             _ => {
                 return self
-                    .handle_merge(session, stmt, source_batches, catalog, ctx)
+                    .handle_merge(
+                        session,
+                        stmt,
+                        source_batches,
+                        catalog,
+                        ctx,
+                        policy_summary_out,
+                    )
                     .await;
             }
         };
@@ -3338,18 +3368,39 @@ impl WriteHandler {
             sqlparser::ast::TableFactor::Table { name, .. } => name,
             _ => {
                 return self
-                    .handle_merge(session, stmt, source_batches, catalog, ctx)
+                    .handle_merge(
+                        session,
+                        stmt,
+                        source_batches,
+                        catalog,
+                        ctx,
+                        policy_summary_out,
+                    )
                     .await;
             }
         };
         let Ok(table_ident) = resolve_table_ident(target_name, session) else {
             return self
-                .handle_merge(session, stmt, source_batches, catalog, ctx)
+                .handle_merge(
+                    session,
+                    stmt,
+                    source_batches,
+                    catalog,
+                    ctx,
+                    policy_summary_out,
+                )
                 .await;
         };
         let Ok(table) = catalog.load_table(&table_ident).await else {
             return self
-                .handle_merge(session, stmt, source_batches, catalog, ctx)
+                .handle_merge(
+                    session,
+                    stmt,
+                    source_batches,
+                    catalog,
+                    ctx,
+                    policy_summary_out,
+                )
                 .await;
         };
 
@@ -3395,21 +3446,42 @@ impl WriteHandler {
                         table = %table_ident,
                         "MERGE dispatch: MoR + equality deletes"
                     );
-                    self.handle_merge_equality(session, stmt, source_batches, catalog, ctx)
-                        .await
+                    self.handle_merge_equality(
+                        session,
+                        stmt,
+                        source_batches,
+                        catalog,
+                        ctx,
+                        policy_summary_out,
+                    )
+                    .await
                 } else {
                     info!(
                         table = %table_ident,
                         "MERGE dispatch: MoR requested but no PK; falling back to CoW"
                     );
-                    self.handle_merge(session, stmt, source_batches, catalog, ctx)
-                        .await
+                    self.handle_merge(
+                        session,
+                        stmt,
+                        source_batches,
+                        catalog,
+                        ctx,
+                        policy_summary_out,
+                    )
+                    .await
                 }
             }
             WriteMode::CopyOnWrite => {
                 info!(table = %table_ident, "MERGE dispatch: CoW");
-                self.handle_merge(session, stmt, source_batches, catalog, ctx)
-                    .await
+                self.handle_merge(
+                    session,
+                    stmt,
+                    source_batches,
+                    catalog,
+                    ctx,
+                    policy_summary_out,
+                )
+                .await
             }
         }
     }
@@ -3445,6 +3517,7 @@ impl WriteHandler {
         source_batches: Vec<RecordBatch>,
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
+        policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         use sqlparser::ast::TableFactor;
 
@@ -3582,6 +3655,15 @@ impl WriteHandler {
         // Classify clauses with the same classifier the CoW path uses: ordered
         // per row class, predicates rewritten to scratch refs, Oracle
         // sub-predicates rejected, NOT MATCHED BY SOURCE supported.
+        // Target policy (architecture review 202), see the CoW path.
+        let target_policy = self
+            .compute_write_predicates(
+                session,
+                &table_ident,
+                target_schema.clone(),
+                policy_summary_out,
+            )
+            .await?;
         let merge_names = crate::merge_sql::MergeNames {
             target_ref: &target_ref,
             source_ref: &source_ref,
@@ -3589,7 +3671,22 @@ impl WriteHandler {
             s_alias: &s_alias,
             target_columns: &target_columns,
             source_columns: &source_columns,
+            target_policy: &target_policy,
         };
+        let on_rewritten = crate::merge_sql::apply_target_masks(&on_rewritten, &merge_names);
+        // Every per-clause query below reads the target through its policy
+        // relation (admit verdict + masked aliases) and the guarded ON, so a
+        // hidden target row is never matched, deleted or updated.
+        let q_target_rel = format!(
+            "{} AS {target_ref}",
+            crate::merge_sql::target_relation(&merge_names, &q_target)
+        );
+        let on_guarded = crate::merge_sql::guarded_on(&merge_names, &on_rewritten);
+        // Target-only rows the caller cannot see are not "not matched by
+        // source" for them: they are out of scope.
+        let by_source_admit = crate::merge_sql::admit_guard(&merge_names)
+            .map(|g| format!(" AND {g}"))
+            .unwrap_or_default();
         let classified = crate::merge_sql::classify_merge_clauses(clauses, &merge_names)?;
         let (matched_count, not_matched_count, by_source_count) = classified.counts();
 
@@ -3641,19 +3738,22 @@ impl WriteHandler {
                     let update_cols: Vec<String> = target_columns
                         .iter()
                         .map(|col| {
-                            let expr = crate::merge_sql::resolve_update_expr(
-                                col,
-                                assignments,
-                                &target_ref,
-                                &source_ref,
-                                &t_alias,
-                                &s_alias,
+                            let expr = crate::merge_sql::apply_target_masks(
+                                &crate::merge_sql::resolve_update_expr(
+                                    col,
+                                    assignments,
+                                    &target_ref,
+                                    &source_ref,
+                                    &t_alias,
+                                    &s_alias,
+                                ),
+                                &merge_names,
                             );
                             format!("{expr} AS \"{col}\"")
                         })
                         .collect();
                     let new_sql = format!(
-                        "SELECT {} FROM {q_target} INNER JOIN {q_source} ON {on_rewritten} WHERE {guard}",
+                        "SELECT {} FROM {q_target_rel} INNER JOIN {q_source} ON {on_guarded} WHERE {guard}",
                         update_cols.join(", ")
                     );
                     for batch in self
@@ -3666,7 +3766,7 @@ impl WriteHandler {
                         }
                     }
                     let old_sql = format!(
-                        "SELECT {} FROM {q_target} INNER JOIN {q_source} ON {on_rewritten} WHERE {guard}",
+                        "SELECT {} FROM {q_target_rel} INNER JOIN {q_source} ON {on_guarded} WHERE {guard}",
                         old_key_cols()
                     );
                     for batch in self
@@ -3680,7 +3780,7 @@ impl WriteHandler {
                 }
                 crate::merge_sql::MergeOp::Delete => {
                     let del_sql = format!(
-                        "SELECT {} FROM {q_target} INNER JOIN {q_source} ON {on_rewritten} WHERE {guard}",
+                        "SELECT {} FROM {q_target_rel} INNER JOIN {q_source} ON {on_guarded} WHERE {guard}",
                         old_key_cols()
                     );
                     for batch in self
@@ -3723,7 +3823,7 @@ impl WriteHandler {
                     .collect();
                 let insert_sql = format!(
                     "SELECT {} FROM {q_source} WHERE NOT EXISTS \
-                     (SELECT 1 FROM {q_target} WHERE {on_rewritten}) AND ({guard})",
+                     (SELECT 1 FROM {q_target_rel} WHERE {on_guarded}) AND ({guard})",
                     insert_exprs.join(", ")
                 );
                 for batch in self
@@ -3745,8 +3845,8 @@ impl WriteHandler {
         for (i, clause) in classified.by_source.iter().enumerate() {
             let guard = crate::merge_sql::first_match_guard(&classified.by_source, i);
             let anti = format!(
-                "FROM {q_target} WHERE NOT EXISTS \
-                 (SELECT 1 FROM {q_source} WHERE {on_rewritten}) AND ({guard})"
+                "FROM {q_target_rel} WHERE NOT EXISTS \
+                 (SELECT 1 FROM {q_source} WHERE {on_guarded}) AND ({guard}){by_source_admit}"
             );
             match &clause.op {
                 crate::merge_sql::MergeOp::Delete => {
@@ -3765,13 +3865,16 @@ impl WriteHandler {
                     let new_cols: Vec<String> = target_columns
                         .iter()
                         .map(|col| {
-                            let expr = crate::merge_sql::resolve_update_expr(
-                                col,
-                                assignments,
-                                &target_ref,
-                                &source_ref,
-                                &t_alias,
-                                &s_alias,
+                            let expr = crate::merge_sql::apply_target_masks(
+                                &crate::merge_sql::resolve_update_expr(
+                                    col,
+                                    assignments,
+                                    &target_ref,
+                                    &source_ref,
+                                    &t_alias,
+                                    &s_alias,
+                                ),
+                                &merge_names,
                             );
                             format!("{expr} AS \"{col}\"")
                         })
@@ -6540,9 +6643,16 @@ mod tests {
 
         let limits = handler.fanout_limits(Some(pool));
         assert!(limits.is_bounded(), "both knobs at 0 must auto-derive caps");
-        assert!(limits.max_open >= 8 && limits.max_open <= 64, "{}", limits.max_open);
+        assert!(
+            limits.max_open >= 8 && limits.max_open <= 64,
+            "{}",
+            limits.max_open
+        );
         assert!(limits.byte_budget > 0);
-        assert!(limits.pool.is_some(), "pool is forwarded for shared accounting");
+        assert!(
+            limits.pool.is_some(),
+            "pool is forwarded for shared accounting"
+        );
 
         let mut config = write_test_config();
         config.query.fanout_max_open_writers = 3;

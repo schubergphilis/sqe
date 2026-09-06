@@ -5,6 +5,7 @@
 - Category: architecture
 - Effort: L (week+)
 - Status: open
+- Issue: #588
 
 ## Problem
 

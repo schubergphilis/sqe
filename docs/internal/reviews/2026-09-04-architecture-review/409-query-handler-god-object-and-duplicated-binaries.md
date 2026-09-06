@@ -5,6 +5,7 @@
 - Category: maintainability
 - Effort: L (week+)
 - Status: partial (branch `fix/config-startup-code-structure`, 2026-09-05)
+- Issue: #589
 
 ## Resolution (2026-09-05)
 

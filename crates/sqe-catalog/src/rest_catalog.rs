@@ -353,6 +353,22 @@ impl TableMetadataCache {
             .await;
     }
 
+    /// Insert an entry whose freshness clock is already `age` old. Test-only:
+    /// lets the soft-TTL rules be exercised without sleeping.
+    #[cfg(test)]
+    pub(crate) async fn insert_aged(&self, key: String, table: Table, age: std::time::Duration) {
+        self.inner
+            .insert(
+                key,
+                CachedTableEntry {
+                    table,
+                    etag: None,
+                    validated_at: Instant::now() - age,
+                },
+            )
+            .await;
+    }
+
     /// Attach an ETag to an existing cache entry without changing the cached
     /// table or refreshing the soft-TTL clock. Used by the background HEAD
     /// path so the ETag becomes available for future conditional revalidation
@@ -433,7 +449,8 @@ impl TableMetadataCache {
     /// returns properties only when all matching entries belong to the same
     /// warehouse. Multiple users normally create multiple token-scoped cache
     /// entries for that warehouse and are not ambiguous; matches from distinct
-    /// warehouses fail closed.
+    /// warehouses fail closed. Entries past the soft TTL are ignored, so a
+    /// stale copy held under another principal's token never decides masking.
     ///
     /// The `ends_with` scan is O(entries), but `entries` is bounded by the
     /// cache `max_capacity` (1000) and this runs once per table per query, so
@@ -448,9 +465,16 @@ impl TableMetadataCache {
     ) -> Option<std::collections::HashMap<String, String>> {
         let table_suffix = format!("|{}.{}", namespace_display, table_name);
         let exact_suffix = warehouse.map(|warehouse| format!("|{warehouse}{table_suffix}"));
+        // Only entries still inside the soft TTL may decide column masking.
+        // The data path revalidates a stale entry with an ETag before using
+        // it; the policy path has no such step, so a stale entry here would
+        // mean a tag added by another engine is ignored until the 1h hard
+        // TTL (architecture review 303). No fresh entry => `None`, which the
+        // tag source treats as UNKNOWN and the rewriter fails closed on.
+        let fresh = |entry: &CachedTableEntry| entry.validated_at.elapsed() < self.soft_ttl;
         if let Some(exact_suffix) = exact_suffix {
             for (key, entry) in self.inner.iter() {
-                if key.ends_with(&exact_suffix) {
+                if key.ends_with(&exact_suffix) && fresh(&entry) {
                     return Some(entry.table.metadata().properties().clone());
                 }
             }
@@ -460,6 +484,9 @@ impl TableMetadataCache {
         let mut fallback_warehouse = None;
         for (key, entry) in self.inner.iter() {
             if key.ends_with(&table_suffix) {
+                if !fresh(&entry) {
+                    continue;
+                }
                 let warehouse = key
                     .strip_suffix(&table_suffix)
                     .and_then(|prefix| prefix.rsplit_once('|'))
@@ -661,10 +688,7 @@ impl iceberg::Catalog for UnconfiguredCatalog {
         Err(unconfigured_catalog_error())
     }
 
-    async fn drop_namespace(
-        &self,
-        _namespace: &iceberg::NamespaceIdent,
-    ) -> iceberg::Result<()> {
+    async fn drop_namespace(&self, _namespace: &iceberg::NamespaceIdent) -> iceberg::Result<()> {
         Err(unconfigured_catalog_error())
     }
 
@@ -1254,8 +1278,8 @@ impl SessionCatalog {
         };
 
         let http_client = http_client.unwrap_or_else(|| SHARED_HTTP_CLIENT.clone());
-        let circuit_breaker =
-            circuit_breaker.unwrap_or_else(|| user_circuit_breaker(&token_fingerprint, catalog_url));
+        let circuit_breaker = circuit_breaker
+            .unwrap_or_else(|| user_circuit_breaker(&token_fingerprint, catalog_url));
 
         // Use the shared global cache when provided; fall back to a private
         // per-session cache (disabled — max_capacity 0) so that call sites that
@@ -2526,6 +2550,49 @@ mod cache_capacity_tests {
             cache.properties_for(None, "sales", "orders").is_some(),
             "multiple principals in one warehouse must share table tag metadata"
         );
+    }
+
+    /// 303: a stale entry (past the soft TTL) held under another principal's
+    /// token must never decide column masking; a fresh entry from any
+    /// principal may.
+    #[tokio::test]
+    async fn table_metadata_cache_properties_ignore_stale_entries() {
+        let ident = iceberg::TableIdent::new(
+            iceberg::NamespaceIdent::new("sales".to_string()),
+            "orders".to_string(),
+        );
+        let key_a = super::table_metadata_cache_key("tok_a", "warehouse_a", &ident);
+        let key_b = super::table_metadata_cache_key("tok_b", "warehouse_a", &ident);
+
+        let cache = super::TableMetadataCache::new(30);
+        cache
+            .insert_aged(
+                key_a.clone(),
+                test_table(),
+                std::time::Duration::from_secs(31),
+            )
+            .await;
+        assert!(
+            cache
+                .properties_for(Some("warehouse_a"), "sales", "orders")
+                .is_none(),
+            "only a stale entry exists: tag state must be UNKNOWN (fail closed)"
+        );
+        assert!(cache.properties_for(None, "sales", "orders").is_none());
+
+        cache.insert(key_b, test_table()).await;
+        assert!(
+            cache
+                .properties_for(Some("warehouse_a"), "sales", "orders")
+                .is_some(),
+            "a fresh entry under another token is authoritative"
+        );
+        assert!(cache.properties_for(None, "sales", "orders").is_some());
+
+        cache.revalidate(&key_a).await;
+        assert!(cache
+            .properties_for(Some("warehouse_a"), "sales", "orders")
+            .is_some());
     }
 
     /// Issue #240: the REST catalog cache must hold well beyond the old cap of

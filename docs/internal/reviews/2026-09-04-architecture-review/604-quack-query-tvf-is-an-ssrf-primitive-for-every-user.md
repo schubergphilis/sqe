@@ -5,6 +5,7 @@
 - Category: security
 - Effort: S (hours) for the gate, M (days) for a safe version
 - Status: open
+- Issue: #611
 
 ## Problem
 

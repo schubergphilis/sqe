@@ -537,7 +537,7 @@ impl MaintenanceScheduler {
         // sets `has_maintenance_authority(true)`, but a compaction commit
         // is exactly the kind of consequential action that must not
         // silently proceed if that ever regresses.
-        if !crate::maintenance::session_has_write_privilege(&session) {
+        if !session.has_maintenance_authority() {
             warn!(
                 table = %name,
                 "active_tick: minted maintenance session unexpectedly lacks write privilege; refusing to compact"

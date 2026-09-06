@@ -4,7 +4,8 @@
 - Severity: high
 - Category: security
 - Effort: M (days)
-- Status: open
+- Status: fixed (branch `fix/authz-policy-enforcement-p1`, 2026-09-05)
+- Issue: #555
 
 ## Problem
 
@@ -85,3 +86,7 @@ inconsistent with DELETE/UPDATE which already gate the target.
 - 201 (the key used by `compute_write_predicates` must also be fixed).
 - memory note "Write-path memory safety" tracks MERGE internals; this is the
   authorization gap, not the memory one.
+
+## Resolution (2026-09-05)
+
+MERGE now folds the target's row filter and column masks into the merge SQL (`crates/sqe-coordinator/src/merge_sql.rs`). `target_relation` wraps the target in a derived table that adds `__sqe_merge_admit` (the row filter) and `__sqe_masked_<col>` columns; `guarded_on` and `admit_guard` make hidden target rows unmatched for UPDATE/DELETE and for NOT MATCHED BY SOURCE, and `apply_target_masks` rewrites target column references in ON, WHEN conditions and SET expressions to the masked columns. Both the CoW path (`handle_merge`) and the MoR path (`handle_merge_equality`) compute the target policy and thread its summary into the audit record. Semantics follow PostgreSQL RLS: hidden rows are invisible to the statement and pass through unchanged. Tests: `target_policy_guards_on_by_source_and_masks_user_references`, `apply_target_masks_respects_boundaries_quotes_and_case` and the end-to-end `target_row_filter_protects_hidden_rows_end_to_end`.
