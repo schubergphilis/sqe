@@ -280,15 +280,21 @@ fn parse_env_value(
     Ok(infer_value(trimmed))
 }
 
-fn coerce_to(env_key: &str, trimmed: &str, existing: &toml::Value) -> Result<toml::Value, SqeError> {
+fn coerce_to(
+    env_key: &str,
+    trimmed: &str,
+    existing: &toml::Value,
+) -> Result<toml::Value, SqeError> {
     match existing {
         toml::Value::Boolean(_) => parse_bool(env_key, trimmed).map(toml::Value::Boolean),
-        toml::Value::Integer(_) => trimmed.parse::<i64>().map(toml::Value::Integer).map_err(|_| {
-            SqeError::Config(format!("{env_key}={trimmed:?} is not a valid integer"))
-        }),
-        toml::Value::Float(_) => trimmed.parse::<f64>().map(toml::Value::Float).map_err(|_| {
-            SqeError::Config(format!("{env_key}={trimmed:?} is not a valid number"))
-        }),
+        toml::Value::Integer(_) => trimmed
+            .parse::<i64>()
+            .map(toml::Value::Integer)
+            .map_err(|_| SqeError::Config(format!("{env_key}={trimmed:?} is not a valid integer"))),
+        toml::Value::Float(_) => trimmed
+            .parse::<f64>()
+            .map(toml::Value::Float)
+            .map_err(|_| SqeError::Config(format!("{env_key}={trimmed:?} is not a valid number"))),
         toml::Value::String(_) => Ok(toml::Value::String(trimmed.to_string())),
         toml::Value::Datetime(_) => Ok(toml::Value::String(trimmed.to_string())),
         other => Err(SqeError::Config(format!(
@@ -347,7 +353,11 @@ fn is_secret_path(path: &str) -> bool {
 
 fn log_override(env_key: &str, path: &str, raw: &str) {
     if is_secret_path(path) {
-        tracing::info!(env = env_key, path, "config override applied from environment");
+        tracing::info!(
+            env = env_key,
+            path,
+            "config override applied from environment"
+        );
     } else {
         tracing::info!(
             env = env_key,
@@ -408,9 +418,10 @@ mod tests {
 
     #[test]
     fn parse_bool_rejects_garbage() {
-        let err = parse_bool("SQE_PRODUCTION_MODE", "maybe").unwrap_err().to_string();
+        let err = parse_bool("SQE_PRODUCTION_MODE", "maybe")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("SQE_PRODUCTION_MODE"));
         assert!(err.contains("maybe"));
     }
-
 }

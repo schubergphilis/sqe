@@ -2318,8 +2318,11 @@ impl sqe_trino_compat::server::TrinoQueryExecutor for TestTrinoQuery {
         &self,
         session: &sqe_core::Session,
         sql: &str,
-    ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
-        self.0.execute(session, sql, None).await
+    ) -> Result<sqe_trino_compat::server::TrinoResultStream, sqe_core::SqeError> {
+        self.0
+            .execute(session, sql, None)
+            .await
+            .map(sqe_trino_compat::server::TrinoResultStream::from_batches)
     }
 }
 

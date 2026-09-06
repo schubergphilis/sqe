@@ -23,6 +23,7 @@ pub mod splitter;
 pub mod stage_planner;
 pub mod star_schema_reorder;
 pub mod stats;
+pub mod worker_protocol;
 
 pub use distributed_aggregate::{
     AggregateStrategy, DistributedAggregateRule, FinalAggregateExec, PartialAggregateExec,
@@ -68,5 +69,6 @@ pub use sort_memory_rule::SortMemoryRule;
 pub use splitter::bin_pack_files;
 pub use splitter::split_files;
 pub use stage_planner::{compute_waves, decompose_plan, QueryStage, ShuffleType};
+pub use worker_protocol::{HeartbeatPayload, PROTO_VERSION, PROTO_VERSION_UNKNOWN};
 pub use star_schema_reorder::{StarSchemaReorderRule, DEFAULT_MIN_RATIO};
 pub use stats::PuffinStatisticsRequestRule;

@@ -330,9 +330,16 @@ pub fn batches_to_trino(
         return (vec![], vec![]);
     }
 
-    let schema = batches[0].schema();
+    let columns = columns_for_schema(batches[0].schema().as_ref());
+    let rows = batches_to_rows(batches);
+    (columns, rows)
+}
 
-    let columns: Vec<TrinoColumn> = schema
+/// Trino column metadata for an Arrow schema. Split out of
+/// [`batches_to_trino`] so the streaming result cursor can emit `columns`
+/// from the schema before (or without) any batch arriving.
+pub fn columns_for_schema(schema: &arrow_schema::Schema) -> Vec<TrinoColumn> {
+    schema
         .fields()
         .iter()
         .map(|f| {
@@ -344,9 +351,14 @@ pub fn batches_to_trino(
                 type_signature,
             }
         })
-        .collect();
+        .collect()
+}
 
-    let mut rows = Vec::new();
+/// Row-major JSON conversion of a slice of batches (one page's worth). CPU
+/// bound; the server runs it under `spawn_blocking`.
+pub fn batches_to_rows(batches: &[RecordBatch]) -> Vec<Vec<serde_json::Value>> {
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let mut rows = Vec::with_capacity(total);
     for batch in batches {
         for row_idx in 0..batch.num_rows() {
             let row: Vec<serde_json::Value> = (0..batch.num_columns())
@@ -355,8 +367,7 @@ pub fn batches_to_trino(
             rows.push(row);
         }
     }
-
-    (columns, rows)
+    rows
 }
 
 /// Session-state mutations the server must echo back to the client.

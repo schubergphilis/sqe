@@ -39,7 +39,7 @@ use futures::Stream;
 use sqe_core::ProfileMode;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::Sleep;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use tracing::warn;
 
 use crate::query_handler::{
@@ -586,6 +586,11 @@ pub struct TrackedRecordBatchStream {
     /// Per-user memory reservation released when the stream drops.
     _per_user_reservation: Option<crate::memory::PerUserReservation>,
     cancel_token: Option<CancellationToken>,
+    /// `cancel_token.cancelled()` as a stored future. Polling it on every
+    /// `poll_next` registers our waker on the token, so `cancel()` wakes a
+    /// stream parked in `Pending` (slow worker, blocked gRPC send) instead
+    /// of being noticed only at the next poll or the idle timer. Finding 403.
+    cancel_wait: Option<Pin<Box<WaitForCancellationFutureOwned>>>,
     /// Set once the cancel token has fired so subsequent polls short-circuit
     /// without re-running the finalizer.
     cancelled: bool,
@@ -609,6 +614,12 @@ pub struct TrackedRecordBatchStream {
     /// idle stream aborts even when operators still advance. None leaves
     /// extensions unbounded.
     query_deadline: Option<tokio::time::Instant>,
+    /// Absolute wall-clock deadline timer (`query.timeout_secs`), polled on
+    /// every `Pending` independently of the idle timer. Before this existed
+    /// the deadline was consulted only inside the idle branch, so a stream
+    /// that produced a batch every few seconds reset the idle timer forever
+    /// and never timed out. Finding 403.
+    deadline_sleep: Option<Pin<Box<Sleep>>>,
     /// The duration behind `query_deadline`, kept for the abort message.
     query_timeout: Option<Duration>,
 }
@@ -631,11 +642,13 @@ impl TrackedRecordBatchStream {
             _teardown: None,
             _per_user_reservation: None,
             cancel_token: None,
+            cancel_wait: None,
             cancelled: false,
             idle_timeout: None,
             idle_sleep: None,
             idle_progress: None,
             query_deadline: None,
+            deadline_sleep: None,
             query_timeout: None,
         }
     }
@@ -658,12 +671,14 @@ impl TrackedRecordBatchStream {
             _permits: permit.into_iter().collect(),
             _teardown: None,
             _per_user_reservation: None,
+            cancel_wait: Some(Box::pin(cancel_token.clone().cancelled_owned())),
             cancel_token: Some(cancel_token),
             cancelled: false,
             idle_timeout: None,
             idle_sleep: None,
             idle_progress: None,
             query_deadline: None,
+            deadline_sleep: None,
             query_timeout: None,
         }
     }
@@ -685,12 +700,14 @@ impl TrackedRecordBatchStream {
             _permits: permits,
             _teardown: None,
             _per_user_reservation: None,
+            cancel_wait: Some(Box::pin(cancel_token.clone().cancelled_owned())),
             cancel_token: Some(cancel_token),
             cancelled: false,
             idle_timeout: None,
             idle_sleep: None,
             idle_progress: None,
             query_deadline: None,
+            deadline_sleep: None,
             query_timeout: None,
         }
     }
@@ -714,12 +731,14 @@ impl TrackedRecordBatchStream {
             _permits: permits,
             _teardown: None,
             _per_user_reservation: reservation,
+            cancel_wait: Some(Box::pin(cancel_token.clone().cancelled_owned())),
             cancel_token: Some(cancel_token),
             cancelled: false,
             idle_timeout: None,
             idle_sleep: None,
             idle_progress: None,
             query_deadline: None,
+            deadline_sleep: None,
             query_timeout: None,
         }
     }
@@ -753,18 +772,53 @@ impl TrackedRecordBatchStream {
         self
     }
 
-    /// Bound progress-based idle extensions to `total` from now. Without
-    /// this, a stream that keeps accruing operator work while never
-    /// emitting a batch could extend its idle deadline forever; with it,
-    /// `query.timeout_secs` bounds the streaming path the same way the
-    /// buffered path's `tokio::time::timeout` does. Skips installation
-    /// when `total` is zero. Issue #365.
+    /// Install an absolute deadline of `total` from now. The stream aborts
+    /// with a "timed out" error once it passes, whether or not batches are
+    /// still flowing, so `query.timeout_secs` bounds the streaming path the
+    /// same way the buffered path's `tokio::time::timeout` does (finding
+    /// 403). The same instant also caps progress-based idle extensions
+    /// (issue #365). Skips installation when `total` is zero.
     pub fn with_query_deadline(mut self, total: Duration) -> Self {
         if !total.is_zero() {
-            self.query_deadline = Some(tokio::time::Instant::now() + total);
+            let deadline = tokio::time::Instant::now() + total;
+            self.query_deadline = Some(deadline);
+            self.deadline_sleep = Some(Box::pin(tokio::time::sleep_until(deadline)));
             self.query_timeout = Some(total);
         }
         self
+    }
+
+    /// Abort the stream because the absolute deadline passed: finalize as a
+    /// failure and hand the client an explicit error (never a clean EOF,
+    /// which would read as an empty result).
+    fn abort_deadline(&mut self) -> Poll<Option<Result<RecordBatch, DataFusionError>>> {
+        let secs = self.query_timeout.unwrap_or_default().as_secs();
+        warn!(
+            rows_so_far = self.rows_so_far,
+            timeout_secs = secs,
+            "Stream query deadline reached, aborting query and releasing permits"
+        );
+        self.cancelled = true;
+        let msg = format!(
+            "Query timed out after {secs}s: the total query timeout elapsed \
+             while the result stream was still open."
+        );
+        if let Some(f) = self.finalizer.take() {
+            f.on_error(
+                self.rows_so_far,
+                &sqe_core::SqeError::Execution(msg.clone()),
+            );
+        }
+        Poll::Ready(Some(Err(DataFusionError::Execution(msg))))
+    }
+
+    /// Finalize as cancelled and end the stream. Idempotent via `cancelled`.
+    fn abort_cancelled(&mut self) -> Poll<Option<Result<RecordBatch, DataFusionError>>> {
+        self.cancelled = true;
+        if let Some(f) = self.finalizer.take() {
+            f.on_cancel(self.rows_so_far);
+        }
+        Poll::Ready(None)
     }
 
     fn reset_idle_timer(&mut self) {
@@ -784,25 +838,36 @@ impl Stream for TrackedRecordBatchStream {
         if self.cancelled {
             return Poll::Ready(None);
         }
-        if let Some(ref token) = self.cancel_token {
-            if token.is_cancelled() {
-                self.cancelled = true;
-                if let Some(f) = self.finalizer.take() {
-                    f.on_cancel(self.rows_so_far);
-                }
-                return Poll::Ready(None);
-            }
+        // Poll (not just inspect) the cancel future so the token holds our
+        // waker: `cancel()` then wakes this task even while the inner stream
+        // is parked in `Pending`. Finding 403.
+        let cancel_fired = match self.cancel_wait {
+            Some(ref mut wait) => wait.as_mut().poll(cx).is_ready(),
+            None => self.cancel_token.as_ref().is_some_and(|t| t.is_cancelled()),
+        };
+        if cancel_fired {
+            return self.abort_cancelled();
         }
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(batch))) => {
+                // An always-ready inner never reaches the `Pending` arm, so
+                // check the absolute deadline here too (one Instant compare).
+                if self
+                    .query_deadline
+                    .is_some_and(|d| tokio::time::Instant::now() >= d)
+                {
+                    return self.abort_deadline();
+                }
                 self.rows_so_far = self.rows_so_far.saturating_add(batch.num_rows());
                 self.reset_idle_timer();
                 Poll::Ready(Some(Ok(batch)))
             }
             Poll::Ready(Some(Err(e))) => {
                 if let Some(f) = self.finalizer.take() {
-                    let sqe_err =
-                        sqe_core::SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Query execution failed: {e}"));
+                    let sqe_err = sqe_core::SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!("Query execution failed: {e}"),
+                    );
                     f.on_error(self.rows_so_far, &sqe_err);
                 }
                 Poll::Ready(Some(Err(e)))
@@ -826,6 +891,17 @@ impl Stream for TrackedRecordBatchStream {
                 // and the diff harness scored it as a row-count mismatch
                 // instead of a failure (Trino reports the equivalent as
                 // EXCEEDED_TIME_LIMIT).
+                //
+                // Absolute deadline first (finding 403): `query.timeout_secs`
+                // is a wall-clock bound, independent of whether batches are
+                // still trickling out and resetting the idle timer.
+                let deadline_fired = match self.deadline_sleep {
+                    Some(ref mut sleep) => sleep.as_mut().poll(cx).is_ready(),
+                    None => false,
+                };
+                if deadline_fired {
+                    return self.abort_deadline();
+                }
                 let idle_fired = match self.idle_sleep {
                     Some(ref mut sleep) => sleep.as_mut().poll(cx).is_ready(),
                     None => false,
@@ -1528,16 +1604,16 @@ mod tests {
 
     use std::fmt;
 
-    use datafusion::common::Result as DFResult;
     use datafusion::common::tree_node::TreeNodeRecursion;
-    use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
-    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::common::Result as DFResult;
     use datafusion::execution::TaskContext;
     use datafusion::physical_expr::EquivalenceProperties;
+    use datafusion::physical_expr::PhysicalExpr;
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion::physical_plan::metrics::{
         Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
     };
+    use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
     use datafusion::physical_plan::{DisplayAs, DisplayFormatType, Partitioning, PlanProperties};
 
     /// ExecutionPlan stub whose metrics the test advances from outside.
@@ -1746,5 +1822,123 @@ mod tests {
 
         let record = find_record(&tracker, qid);
         assert_eq!(record.state, QueryState::Failed);
+    }
+
+    /// Finding 403 (3): a stream that keeps yielding batches resets the
+    /// idle timer every time and, before the absolute deadline existed,
+    /// never timed out. With `with_query_deadline(500ms)` it must error at
+    /// about 500ms even though a batch arrives every 100ms.
+    #[tokio::test]
+    async fn query_deadline_fires_while_batches_still_flow() {
+        let (plan, schema, runtime) = trivial_plan().await;
+        let tracker = test_tracker();
+        let finalizer = test_finalizer(tracker.clone(), plan, runtime);
+        let qid = finalizer.query_id;
+        tracker.start(
+            qid,
+            "test-user",
+            None,
+            "SELECT 1",
+            "test-session",
+            None,
+            vec![],
+            None,
+        );
+
+        let ticking = futures::stream::unfold(0u32, |i| async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Some((Ok::<RecordBatch, DataFusionError>(sample_batch(1)), i + 1))
+        });
+        let inner: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, ticking));
+
+        let mut stream = TrackedRecordBatchStream::new(inner, finalizer, None)
+            .with_idle_timeout(Duration::from_secs(60))
+            .with_query_deadline(Duration::from_millis(500));
+
+        let started = Instant::now();
+        let mut batches = 0usize;
+        let err = loop {
+            match tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("stream must terminate at the deadline, not run forever")
+            {
+                Some(Ok(_)) => batches += 1,
+                Some(Err(e)) => break e,
+                None => panic!("deadline must surface as an error, not a clean EOF"),
+            }
+        };
+        let elapsed = started.elapsed();
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            (Duration::from_millis(400)..Duration::from_millis(1200)).contains(&elapsed),
+            "deadline should fire at about 500ms, fired after {elapsed:?}"
+        );
+        assert!(
+            (3..=5).contains(&batches),
+            "roughly four 100ms batches should pass before a 500ms deadline, got {batches}"
+        );
+        assert!(stream.next().await.is_none());
+        assert_eq!(find_record(&tracker, qid).state, QueryState::Failed);
+    }
+
+    /// Finding 403 (2): `cancel()` on a stream whose inner is `Pending`
+    /// forever must wake the task and resolve the next `poll_next` at once,
+    /// not at the idle timer (60s here, so a regression fails via the 2s
+    /// outer timeout).
+    #[tokio::test]
+    async fn cancel_wakes_a_pending_stream_without_idle_timer() {
+        let (plan, schema, runtime) = trivial_plan().await;
+        let tracker = test_tracker();
+        let finalizer = test_finalizer(tracker.clone(), plan, runtime);
+        let qid = finalizer.query_id;
+        let token = tracker.start(
+            qid,
+            "test-user",
+            None,
+            "SELECT 1",
+            "test-session",
+            None,
+            vec![],
+            None,
+        );
+
+        let pending = futures::stream::pending::<Result<RecordBatch, DataFusionError>>();
+        let inner: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, pending));
+        let mut stream = TrackedRecordBatchStream::with_cancel_token(inner, finalizer, None, token)
+            .with_idle_timeout(Duration::from_secs(60))
+            .with_query_deadline(Duration::from_secs(60));
+
+        let canceller = {
+            let tracker = Arc::clone(&tracker);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert!(
+                    tracker.cancel(&qid),
+                    "query must be cancellable while in flight"
+                );
+            })
+        };
+
+        let started = Instant::now();
+        let item = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("cancel must wake the parked stream");
+        canceller.await.unwrap();
+        assert!(
+            item.is_none(),
+            "cancelled stream ends without an error item"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cancel took {:?}, should be near-immediate",
+            started.elapsed()
+        );
+        assert_eq!(find_record(&tracker, qid).state, QueryState::Canceled);
+        assert_eq!(tracker.active_count(), 0);
     }
 }

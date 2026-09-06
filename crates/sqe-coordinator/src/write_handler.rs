@@ -21,10 +21,7 @@ use sqlparser::ast::{ObjectName, Statement};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use sqe_catalog::puffin_stats::{
-    build_theta_sketches, puffin_stats_enabled, write_puffin_sidecar_from_sketches, ColumnSketches,
-    ThetaSketchAccumulator,
-};
+use sqe_catalog::puffin_stats::{puffin_stats_enabled, ColumnSketches, ThetaSketchAccumulator};
 use sqe_catalog::{SessionCatalog, TableMetadataCache};
 use sqe_core::table_properties::{
     resolve_delete_mode, resolve_merge_mode, resolve_update_mode, WriteMode,
@@ -35,9 +32,9 @@ use tracing::instrument;
 use crate::catalog_ops::{catalog_qualifier, fold_unquoted_ident, parse_table_ref};
 use crate::write_memory::{TrackedBatchBuffer, WriteReservation};
 use crate::writer::{
-    new_upload_tracker, resolve_write_compression, write_data_files_streaming_with_metrics,
-    write_data_files_with_metrics, write_equality_delete_files, write_position_delete_files,
-    FanoutLimits, WriteCleanupGuard,
+    new_upload_tracker, project_to_identifier_columns, resolve_write_compression,
+    write_data_files_streaming_with_metrics, write_data_files_with_metrics,
+    write_equality_delete_key_files, FanoutLimits, PositionDeleteWriter, WriteCleanupGuard,
 };
 
 /// Check an INSERT's projected columns against the target table's schema
@@ -1299,132 +1296,45 @@ impl WriteHandler {
         }
     }
 
-    /// Emit a Puffin NDV sidecar for the most recent snapshot, if opted in.
+    /// Register Puffin NDV statistics for the snapshot a commit just
+    /// produced, if the table opted in via `write.puffin.stats`.
     ///
-    /// Runs after a successful append-style commit. The caller reloads the
-    /// table to get the new snapshot; we then build theta sketches from the
-    /// just-written batches and register the sidecar via
-    /// [`UpdateStatisticsAction`]. A failure here is logged and swallowed:
-    /// the data commit has already succeeded, so losing statistics is not
-    /// worth rolling back for.
-    async fn maybe_emit_puffin_sidecar(
+    /// Append-shaped commits pass the sketches accumulated on the write
+    /// stream (`CarryOp::Insert` / `InsertOverwrite`); row deltas pass `None`
+    /// with `CarryOp::RowDelta` so the previous snapshot's statistics are
+    /// carried as an upper bound instead of vanishing (architecture review
+    /// 512). The statistics commit goes through `commit_with_retry`; every
+    /// failure is logged, counted in `sqe_puffin_sidecar_total`, and leaves
+    /// no staged sidecar behind. The data commit already succeeded, so
+    /// nothing here can fail the statement.
+    ///
+    /// The table is reloaded here because the rewrite helpers return the
+    /// attempt's value, not the committed table; a foreign commit landing in
+    /// that window makes the carry a no-op for our snapshot, never a wrong
+    /// annotation (the foreign snapshot's parent is ours and has none).
+    async fn carry_puffin_statistics(
         &self,
-        catalog: &Arc<dyn Catalog>,
+        catalog: &dyn Catalog,
         table_ident: &TableIdent,
-        batches_for_stats: &[RecordBatch],
+        op: crate::puffin_carry::CarryOp,
+        sketches: Option<&ColumnSketches>,
     ) {
-        // Sketch against the committed schema so field ids match the blobs.
-        let table = match catalog.load_table(table_ident).await {
+        let committed = match catalog.load_table(table_ident).await {
             Ok(t) => t,
             Err(e) => {
-                tracing::warn!(error = %e, "puffin: could not reload table for sidecar");
+                tracing::warn!(error = %e, table = %table_ident, "puffin: could not reload table for statistics");
                 return;
             }
         };
-        if !puffin_stats_enabled(table.metadata().properties()) {
-            return;
-        }
-        let sketches = build_theta_sketches(table.metadata().current_schema(), batches_for_stats);
-        self.maybe_emit_puffin_sidecar_from_sketches(catalog, table_ident, &sketches)
-            .await;
-    }
-
-    /// Streaming-path twin of [`Self::maybe_emit_puffin_sidecar`]: the
-    /// sketches were accumulated while batches flowed to the Parquet writer,
-    /// so no batch copy exists. Same failure policy: log and move on, the data
-    /// commit already succeeded.
-    async fn maybe_emit_puffin_sidecar_from_sketches(
-        &self,
-        catalog: &Arc<dyn Catalog>,
-        table_ident: &TableIdent,
-        sketches: &ColumnSketches,
-    ) {
-        if sketches.is_empty() {
-            return;
-        }
-        // Reload the table post-commit so we see the new snapshot id and
-        // sequence number.
-        let table = match catalog.load_table(table_ident).await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(error = %e, "puffin: could not reload table for sidecar");
-                return;
-            }
-        };
-        if !puffin_stats_enabled(table.metadata().properties()) {
-            return;
-        }
-        let Some(snapshot_id) = table.metadata().current_snapshot_id() else {
-            // No snapshot yet — nothing to attach the sidecar to.
-            return;
-        };
-        let sequence_number = table.metadata().last_sequence_number();
-
-        let metadata_location = match table.metadata_location() {
-            Some(p) => p,
-            None => {
-                tracing::warn!("puffin: no metadata_location on loaded table");
-                return;
-            }
-        };
-        let base_dir = metadata_location
-            .rsplit_once('/')
-            .map(|(head, _tail)| head)
-            .unwrap_or(metadata_location)
-            .to_string();
-
-        let stats_file = match write_puffin_sidecar_from_sketches(
-            table.file_io(),
-            &base_dir,
+        crate::puffin_carry::carry_forward_statistics(
+            catalog,
+            table_ident,
+            &committed,
+            op,
             sketches,
-            snapshot_id,
-            sequence_number,
+            self.metrics.as_deref(),
         )
-        .await
-        {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(error = %e, "puffin: sidecar write failed");
-                return;
-            }
-        };
-
-        let staged_path = stats_file.statistics_path.clone();
-        let file_io = table.file_io().clone();
-        let cleanup_staged = |reason: &str, err: &dyn std::fmt::Display| {
-            let path = staged_path.clone();
-            let io = file_io.clone();
-            tracing::warn!(error = %err, path = %path, reason = reason, "puffin: deleting orphan sidecar");
-            tokio::spawn(async move {
-                if let Err(del_err) = io.delete(&path).await {
-                    tracing::warn!(
-                        error = %del_err,
-                        path = %path,
-                        "puffin: orphan sidecar delete failed; will require manual cleanup"
-                    );
-                }
-            });
-        };
-
-        let table = match catalog.load_table(table_ident).await {
-            Ok(t) => t,
-            Err(e) => {
-                cleanup_staged("reload_for_stats_tx_failed", &e);
-                return;
-            }
-        };
-        let tx = Transaction::new(&table);
-        let action = tx.update_statistics().set_statistics(stats_file);
-        let tx = match action.apply(tx) {
-            Ok(t) => t,
-            Err(e) => {
-                cleanup_staged("apply_update_statistics_failed", &e);
-                return;
-            }
-        };
-        if let Err(e) = tx.commit(catalog.as_ref()).await {
-            cleanup_staged("commit_update_statistics_failed", &e);
-        }
+        .await;
     }
 
     /// Handle CREATE TABLE [OR REPLACE] ns.table AS SELECT ... — streaming variant.
@@ -1690,10 +1600,11 @@ impl WriteHandler {
                     "CTAS committed successfully (streaming)"
                 );
                 if let Some(sketches) = finish_puffin_sketches(sketch_acc) {
-                    self.maybe_emit_puffin_sidecar_from_sketches(
-                        &catalog,
+                    self.carry_puffin_statistics(
+                        catalog.as_ref(),
                         &create_ident,
-                        &sketches,
+                        crate::puffin_carry::CarryOp::Insert,
+                        Some(&sketches),
                     )
                     .await;
                 }
@@ -1856,9 +1767,16 @@ impl WriteHandler {
         cleanup_guard.mark_committed();
 
         if let Some(sketches) = finish_puffin_sketches(sketch_acc) {
-            let bridge: Arc<dyn Catalog> = catalog.as_catalog();
-            self.maybe_emit_puffin_sidecar_from_sketches(&bridge, table_ident, &sketches)
-                .await;
+            // The replaced contents are gone, so the previous snapshot's
+            // statistics do not apply: only the new sketches are registered
+            // (previous stats are still unioned as an upper bound if present).
+            self.carry_puffin_statistics(
+                catalog.as_catalog().as_ref(),
+                table_ident,
+                crate::puffin_carry::CarryOp::InsertOverwrite,
+                Some(&sketches),
+            )
+            .await;
         }
 
         self.after_commit(session, catalog.as_ref(), table_ident)
@@ -2026,7 +1944,12 @@ impl WriteHandler {
         cleanup_guard.mark_committed();
 
         if let Some(sketches) = finish_puffin_sketches(sketch_acc) {
-            self.maybe_emit_puffin_sidecar_from_sketches(&catalog, &table_ident, &sketches)
+            let op = if overwrite {
+                crate::puffin_carry::CarryOp::InsertOverwrite
+            } else {
+                crate::puffin_carry::CarryOp::Insert
+            };
+            self.carry_puffin_statistics(catalog.as_ref(), &table_ident, op, Some(&sketches))
                 .await;
             // The sidecar is a SECOND metadata commit on this table, after the
             // data commit's own `after_commit` already refreshed the caches.
@@ -2592,6 +2515,15 @@ impl WriteHandler {
         let Some(total_deleted) = total_deleted else {
             return affected_rows_batch(0);
         };
+        // Row delta: carry the previous snapshot's Puffin NDV statistics as an
+        // upper bound so the table does not lose them on its first DML (512).
+        self.carry_puffin_statistics(
+            catalog.as_catalog().as_ref(),
+            &table_ident,
+            crate::puffin_carry::CarryOp::RowDelta,
+            None,
+        )
+        .await;
         self.after_commit(session, catalog.as_ref(), &table_ident)
             .await;
         info!(table = %table_ident, deleted_rows = total_deleted, "DELETE committed successfully");
@@ -2699,11 +2631,30 @@ impl WriteHandler {
         // carry delete files and had a raw match, so an ordinary MoR DELETE on
         // a table with no deletes still reads each file once.
         let read_plan = self.plan_delete_aware_read(&table).await?;
-        let mut position_deletes: Vec<(String, i64)> = Vec::new();
         let mut deleted_count: usize = 0;
 
-        for data_file in &old_data_files {
-            let file_path = data_file.file_path().to_string();
+        // Architecture review 504: positions are flushed into the delete
+        // writer one data file at a time instead of being collected for the
+        // whole statement. The Iceberg spec wants rows inside a delete file
+        // sorted by (file_path, pos), so files are visited in path order and
+        // the writer sorts positions within each file; the accumulator then
+        // holds at most one file's positions (8 bytes each, one shared
+        // `Arc<str>` for the path) and those bytes are pool-visible through
+        // `mor-delete-position-buffer`.
+        let mut sorted_files: Vec<&iceberg::spec::DataFile> = old_data_files.iter().collect();
+        sorted_files.sort_by(|a, b| a.file_path().cmp(b.file_path()));
+        let pool = ctx.runtime_env().memory_pool.clone();
+        let mut position_res = self
+            .config
+            .query
+            .write_buffer_tracking
+            .then(|| WriteReservation::new(&pool, "mor-delete-position-buffer"));
+        let mut delete_writer =
+            PositionDeleteWriter::open(&table, self.compression(session)).await?;
+        let mut marked_positions: usize = 0;
+
+        for data_file in sorted_files {
+            let file_path: Arc<str> = Arc::from(data_file.file_path());
             let batches = self
                 .read_parquet_via_table(&table, &file_path, ctx, true)
                 .await?;
@@ -2713,7 +2664,7 @@ impl WriteHandler {
             }
 
             // Row positions are 0-based and contiguous across all batches in the file.
-            let mut raw_matches: usize = 0;
+            let mut positions: Vec<i64> = Vec::new();
             let mut row_offset: i64 = 0;
             for batch in &batches {
                 let match_mask = self
@@ -2727,18 +2678,25 @@ impl WriteHandler {
                     )
                     .await?;
 
-                for row_idx in 0..batch.num_rows() {
-                    if match_mask.value(row_idx) {
-                        raw_matches += 1;
-                        position_deletes.push((file_path.clone(), row_offset + row_idx as i64));
+                let batch_matches = match_mask.true_count();
+                if batch_matches > 0 {
+                    if let Some(r) = position_res.as_mut() {
+                        r.try_grow(batch_matches * std::mem::size_of::<i64>())?;
+                    }
+                    positions.reserve(batch_matches);
+                    for row_idx in 0..batch.num_rows() {
+                        if match_mask.value(row_idx) {
+                            positions.push(row_offset + row_idx as i64);
+                        }
                     }
                 }
                 row_offset += batch.num_rows() as i64;
             }
+            let raw_matches = positions.len();
 
             let file_has_deletes = read_plan
                 .tasks_by_path
-                .get(&file_path)
+                .get(file_path.as_ref())
                 .is_some_and(|tasks| tasks.iter().any(|t| !t.deletes.is_empty()));
             let live_matches = if raw_matches > 0 && file_has_deletes {
                 let mut live = 0usize;
@@ -2756,13 +2714,27 @@ impl WriteHandler {
                             &predicates,
                         )
                         .await?;
-                    live += (0..mask.len()).filter(|i| mask.value(*i)).count();
+                    live += mask.true_count();
                 }
                 Some(live)
             } else {
                 None
             };
-            deleted_count += newly_deleted_row_count(raw_matches, live_matches);
+            let newly_deleted = newly_deleted_row_count(raw_matches, live_matches);
+            deleted_count += newly_deleted;
+
+            // Only files that still have a visible matching row are marked:
+            // re-marking positions a live delete file already hides would
+            // upload bytes for a statement that may end up a no-op below.
+            if newly_deleted > 0 {
+                marked_positions += raw_matches;
+                delete_writer
+                    .write_file(Arc::clone(&file_path), std::mem::take(&mut positions))
+                    .await?;
+            }
+            if let Some(r) = position_res.as_mut() {
+                r.shrink(raw_matches * std::mem::size_of::<i64>());
+            }
         }
 
         // Zero live matches means either nothing matched at all or every match
@@ -2772,7 +2744,6 @@ impl WriteHandler {
         if deleted_count == 0 {
             info!(
                 table = %table_ident,
-                marked_positions = position_deletes.len(),
                 "MoR DELETE: no live matching rows, nothing to commit"
             );
             return affected_rows_batch(0);
@@ -2781,14 +2752,11 @@ impl WriteHandler {
         info!(
             table = %table_ident,
             delete_count = deleted_count,
-            marked_positions = position_deletes.len(),
-            "MoR DELETE: writing position delete files"
+            marked_positions,
+            "MoR DELETE: closing position delete files"
         );
 
-        // Write position delete files (sorted by (file_path, pos) inside the helper).
-        let delete_files =
-            write_position_delete_files(&table, position_deletes, self.compression(session))
-                .await?;
+        let delete_files = delete_writer.close().await?;
 
         // Commit: append position delete files. FastAppendAction auto-routes DataFiles
         // with content_type=PositionDeletes into the delete manifest entry.
@@ -2812,6 +2780,15 @@ impl WriteHandler {
         .await
         .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to commit MoR DELETE: {e}")))?;
 
+        // Row delta: carry the previous snapshot's Puffin NDV statistics as an
+        // upper bound so the table does not lose them on its first DML (512).
+        self.carry_puffin_statistics(
+            catalog.as_catalog().as_ref(),
+            &table_ident,
+            crate::puffin_carry::CarryOp::RowDelta,
+            None,
+        )
+        .await;
         self.after_commit(session, catalog.as_ref(), &table_ident)
             .await;
 
@@ -2913,11 +2890,18 @@ impl WriteHandler {
         );
 
         // Scan every data file and collect rows where WHERE matches. Equality
-        // deletes need only the identifier columns, so we keep the full batch
-        // for now and let the writer project downstream. Deletes are applied
+        // deletes need only the identifier columns, so each matched batch is
+        // projected to the key columns before it is buffered, and the buffer
+        // is pool-tracked (architecture review 504). Deletes are applied
         // during the read (#371) so already-deleted rows neither inflate the
         // affected-row count nor emit redundant delete keys.
-        let mut key_batches: Vec<RecordBatch> = Vec::new();
+        let pool = ctx.runtime_env().memory_pool.clone();
+        let mut key_batches = TrackedBatchBuffer::gated(
+            &pool,
+            "mor-delete-key-buffer",
+            self.config.query.write_buffer_tracking,
+        );
+        let iceberg_schema = table.metadata().current_schema().clone();
         let mut total_matched: usize = 0;
         let read_plan = self.plan_delete_aware_read(&table).await?;
 
@@ -2947,7 +2931,12 @@ impl WriteHandler {
                     continue;
                 }
                 total_matched += filtered.num_rows();
-                key_batches.push(filtered);
+                let keys = project_to_identifier_columns(
+                    &filtered,
+                    &iceberg_schema,
+                    &identifier_field_ids,
+                )?;
+                key_batches.push(keys)?;
             }
         }
 
@@ -2956,9 +2945,10 @@ impl WriteHandler {
             return affected_rows_batch(0);
         }
 
-        let delete_files = write_equality_delete_files(
+        // `key_batches` stays alive (and reserved) across the write.
+        let delete_files = write_equality_delete_key_files(
             &table,
-            key_batches,
+            key_batches.as_slice().to_vec(),
             identifier_field_ids,
             self.compression(session),
         )
@@ -2998,6 +2988,15 @@ impl WriteHandler {
             }
         })?;
 
+        // Row delta: carry the previous snapshot's Puffin NDV statistics as an
+        // upper bound so the table does not lose them on its first DML (512).
+        self.carry_puffin_statistics(
+            catalog.as_catalog().as_ref(),
+            &table_ident,
+            crate::puffin_carry::CarryOp::RowDelta,
+            None,
+        )
+        .await;
         self.after_commit(session, catalog.as_ref(), &table_ident)
             .await;
 
@@ -3228,6 +3227,27 @@ impl WriteHandler {
                                 self.config.query.write_buffer_tracking,
                             );
                             for batch in &batches {
+                                // 509: the affected-row count is the true count of
+                                // the same match mask the MoR path computes, not a
+                                // second planned-and-executed COUNT(*) per batch.
+                                let mask = self
+                                    .filter_batch_match(
+                                        ctx,
+                                        batch,
+                                        where_sql,
+                                        joins_sql,
+                                        table_ident,
+                                        predicates,
+                                    )
+                                    .await?;
+                                let matched = mask.true_count();
+                                if matched == 0 {
+                                    // Nothing to rewrite in this batch: pass it
+                                    // through untouched (no CASE evaluation).
+                                    rewritten.push(batch.clone())?;
+                                    continue;
+                                }
+                                updated_this_attempt += matched;
                                 let out = self
                                     .apply_update(
                                         ctx,
@@ -3240,19 +3260,6 @@ impl WriteHandler {
                                     )
                                     .await?;
                                 rewritten.push(out)?;
-                            }
-                            for batch in &batches {
-                                let count = self
-                                    .count_matching_rows(
-                                        ctx,
-                                        batch,
-                                        where_sql,
-                                        joins_sql,
-                                        table_ident,
-                                        predicates,
-                                    )
-                                    .await?;
-                                updated_this_attempt += count;
                             }
                             let new_files = write_data_files_with_metrics(
                                 &fresh_table,
@@ -3291,6 +3298,15 @@ impl WriteHandler {
         let Some(total_updated) = total_updated else {
             return affected_rows_batch(0);
         };
+        // Row delta: carry the previous snapshot's Puffin NDV statistics as an
+        // upper bound so the table does not lose them on its first DML (512).
+        self.carry_puffin_statistics(
+            catalog.as_catalog().as_ref(),
+            &table_ident,
+            crate::puffin_carry::CarryOp::RowDelta,
+            None,
+        )
+        .await;
         self.after_commit(session, catalog.as_ref(), &table_ident)
             .await;
         info!(table = %table_ident, updated_rows = total_updated, "UPDATE committed successfully");
@@ -3468,8 +3484,23 @@ impl WriteHandler {
         // The CoW `apply_update` helper returns a per-batch full rewrite
         // (matched rows get new values, others pass through). For MoR we
         // only want the matched rows, so we filter after apply_update.
-        let mut new_row_batches: Vec<RecordBatch> = Vec::new();
-        let mut key_batches: Vec<RecordBatch> = Vec::new();
+        //
+        // Both accumulators are pool-tracked (architecture review 504): the
+        // new-row side cannot stream because `apply_update` evaluates one
+        // batch at a time, and the key side holds only the projected
+        // identifier columns.
+        let pool = ctx.runtime_env().memory_pool.clone();
+        let mut new_row_batches = TrackedBatchBuffer::gated(
+            &pool,
+            "mor-update-row-buffer",
+            self.config.query.write_buffer_tracking,
+        );
+        let mut key_batches = TrackedBatchBuffer::gated(
+            &pool,
+            "mor-update-key-buffer",
+            self.config.query.write_buffer_tracking,
+        );
+        let iceberg_schema = table.metadata().current_schema().clone();
         let mut total_updated: usize = 0;
         // Deletes applied during the read (#371): a row already removed by a
         // delete file must not be matched and re-emitted as an updated row.
@@ -3509,7 +3540,12 @@ impl WriteHandler {
                     SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("failed to filter match rows: {e}"))
                 })?;
                 if old_keys.num_rows() > 0 {
-                    key_batches.push(old_keys);
+                    let keys = project_to_identifier_columns(
+                        &old_keys,
+                        &iceberg_schema,
+                        &identifier_field_ids,
+                    )?;
+                    key_batches.push(keys)?;
                 }
 
                 // New values for the data file. `apply_update` produces a
@@ -3531,7 +3567,7 @@ impl WriteHandler {
                     SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("failed to filter updated rows: {e}"))
                 })?;
                 if new_rows.num_rows() > 0 {
-                    new_row_batches.push(new_rows);
+                    new_row_batches.push(new_rows)?;
                 }
             }
         }
@@ -3542,13 +3578,14 @@ impl WriteHandler {
         }
 
         // Write the data file with the new values and the equality delete
-        // file with the old keys. Both go into one RowDelta commit.
+        // file with the old keys. Both go into one RowDelta commit. The
+        // tracked buffers stay alive (reserved) across both writes.
         let tracker = new_upload_tracker();
         let cleanup_guard =
             WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "update-mor");
         let new_data_files = write_data_files_with_metrics(
             &table,
-            new_row_batches,
+            new_row_batches.as_slice().to_vec(),
             "update-mor",
             self.metrics.as_ref(),
             self.compression(session),
@@ -3556,9 +3593,9 @@ impl WriteHandler {
         )
         .await?;
 
-        let delete_files = write_equality_delete_files(
+        let delete_files = write_equality_delete_key_files(
             &table,
-            key_batches,
+            key_batches.as_slice().to_vec(),
             identifier_field_ids,
             self.compression(session),
         )
@@ -3605,6 +3642,15 @@ impl WriteHandler {
             }
         })?;
         cleanup_guard.mark_committed();
+        // Row delta: carry the previous snapshot's Puffin NDV statistics as an
+        // upper bound so the table does not lose them on its first DML (512).
+        self.carry_puffin_statistics(
+            catalog.as_catalog().as_ref(),
+            &table_ident,
+            crate::puffin_carry::CarryOp::RowDelta,
+            None,
+        )
+        .await;
         self.after_commit(session, catalog.as_ref(), &table_ident)
             .await;
 
@@ -4036,6 +4082,15 @@ impl WriteHandler {
         let Some((total_rows, empty_source_affected)) = outcome else {
             return affected_rows_batch(0);
         };
+        // Row delta: carry the previous snapshot's Puffin NDV statistics as an
+        // upper bound so the table does not lose them on its first DML (512).
+        self.carry_puffin_statistics(
+            catalog.as_catalog().as_ref(),
+            &table_ident,
+            crate::puffin_carry::CarryOp::RowDelta,
+            None,
+        )
+        .await;
         self.after_commit(session, catalog.as_ref(), &table_ident)
             .await;
 
@@ -4152,22 +4207,72 @@ impl WriteHandler {
         Ok((Arc::new(target_mem), Some(target_buf)))
     }
 
-    /// Plan + collect one MoR MERGE sub-query, mapping errors to a labelled
-    /// `SqeError::Execution`. Shared by the matched / not-matched / by-source
-    /// clause loops.
-    async fn run_merge_subquery(
+    /// Plan one MoR MERGE new-row sub-query and return it as a stream whose
+    /// rows are counted into `counter` as they pass (architecture review 504).
+    /// The streams of every clause are chained into the streaming data-file
+    /// writer by the caller, so new rows never materialise in a Vec.
+    async fn merge_subquery_stream(
         &self,
         ctx: &DFSessionContext,
         sql: &str,
         label: &str,
-    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        counter: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> sqe_core::Result<datafusion::execution::SendableRecordBatchStream> {
         let df = ctx
             .sql(sql)
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("MoR MERGE {label} plan failed: {e}")))?;
-        df.collect()
+        let stream = df
+            .execute_stream()
             .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("MoR MERGE {label} execution failed: {e}")))
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("MoR MERGE {label} execution failed: {e}")))?;
+        let schema = stream.schema();
+        let label = label.to_string();
+        let counted = stream.map(move |item| match item {
+            Ok(batch) => {
+                counter.fetch_add(batch.num_rows(), std::sync::atomic::Ordering::Relaxed);
+                Ok(batch)
+            }
+            Err(e) => Err(datafusion::error::DataFusionError::Execution(format!(
+                "MoR MERGE {label} execution failed: {e}"
+            ))),
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            Box::pin(counted),
+        )))
+    }
+
+    /// Plan + drain one MoR MERGE old-key sub-query into the pool-tracked
+    /// equality-delete key buffer, returning the number of key rows. The
+    /// SELECT already projects only the identifier columns.
+    async fn collect_merge_keys(
+        &self,
+        ctx: &DFSessionContext,
+        sql: &str,
+        label: &str,
+        keys: &mut TrackedBatchBuffer,
+    ) -> sqe_core::Result<usize> {
+        let df = ctx
+            .sql(sql)
+            .await
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("MoR MERGE {label} plan failed: {e}")))?;
+        let mut stream = df
+            .execute_stream()
+            .await
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("MoR MERGE {label} execution failed: {e}")))?;
+        let mut rows = 0usize;
+        while let Some(item) = stream.next().await {
+            let batch = item.map_err(|e| {
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("MoR MERGE {label} execution failed: {e}"))
+            })?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            rows += batch.num_rows();
+            keys.push(batch)?;
+        }
+        Ok(rows)
     }
 
     /// Dispatch MERGE to CoW or MoR based on `write.merge.mode`
@@ -4618,16 +4723,43 @@ impl WriteHandler {
             "MoR MERGE: planning row delta"
         );
 
-        let mut new_data_batches: Vec<RecordBatch> = Vec::new();
-        let mut equality_delete_batches: Vec<RecordBatch> = Vec::new();
-        let mut updated_rows: usize = 0;
+        // Architecture review 504: the new-row side is no longer collected.
+        // Each per-clause SELECT is `execute_stream`ed and the streams are
+        // chained into one `select_all` stream feeding the streaming data-file
+        // writer, so new rows never sit in a Vec; the per-clause row counts
+        // come from tap counters on the streams. The old-key side is still
+        // buffered (an equality-delete file needs all keys before it closes)
+        // but only the projected identifier columns, in a pool-tracked buffer.
+        let mut new_row_streams: Vec<datafusion::execution::SendableRecordBatchStream> = Vec::new();
+        let mut equality_delete_batches = TrackedBatchBuffer::gated(
+            &pool,
+            "mor-merge-key-buffer",
+            self.config.query.write_buffer_tracking,
+        );
+        let updated_rows = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let inserted_rows = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut deleted_rows: usize = 0;
-        let mut inserted_rows: usize = 0;
 
-        // Old-key projection for an equality delete: the writer projects the
-        // identifier fields, so selecting all target columns is sufficient.
+        // Old-key projection for an equality delete: only the identifier
+        // columns, in identifier-field order, matching
+        // `write_equality_delete_key_files`.
+        let iceberg_schema = table.metadata().current_schema();
+        let key_column_names = identifier_field_ids
+            .iter()
+            .map(|id| {
+                iceberg_schema
+                    .field_by_id(*id)
+                    .map(|f| f.name.clone())
+                    .ok_or_else(|| {
+                        SqeError::with_code(
+                            SqeErrorCode::ExecutionFailed,
+                            format!("identifier field id {id} is not in the table schema"),
+                        )
+                    })
+            })
+            .collect::<sqe_core::Result<Vec<String>>>()?;
         let old_key_cols = || -> String {
-            target_columns
+            key_column_names
                 .iter()
                 .map(|col| format!("{target_ref}.\"{col}\" AS \"{col}\""))
                 .collect::<Vec<_>>()
@@ -4662,42 +4794,40 @@ impl WriteHandler {
                         "SELECT {} FROM {q_target_rel} INNER JOIN {q_source} ON {on_guarded} WHERE {guard}",
                         update_cols.join(", ")
                     );
-                    for batch in self
-                        .run_merge_subquery(ctx, &new_sql, "MATCHED UPDATE new-row")
-                        .await?
-                    {
-                        updated_rows += batch.num_rows();
-                        if batch.num_rows() > 0 {
-                            new_data_batches.push(batch);
-                        }
-                    }
+                    new_row_streams.push(
+                        self.merge_subquery_stream(
+                            ctx,
+                            &new_sql,
+                            "MATCHED UPDATE new-row",
+                            Arc::clone(&updated_rows),
+                        )
+                        .await?,
+                    );
                     let old_sql = format!(
                         "SELECT {} FROM {q_target_rel} INNER JOIN {q_source} ON {on_guarded} WHERE {guard}",
                         old_key_cols()
                     );
-                    for batch in self
-                        .run_merge_subquery(ctx, &old_sql, "MATCHED UPDATE old-key")
-                        .await?
-                    {
-                        if batch.num_rows() > 0 {
-                            equality_delete_batches.push(batch);
-                        }
-                    }
+                    self.collect_merge_keys(
+                        ctx,
+                        &old_sql,
+                        "MATCHED UPDATE old-key",
+                        &mut equality_delete_batches,
+                    )
+                    .await?;
                 }
                 crate::merge_sql::MergeOp::Delete => {
                     let del_sql = format!(
                         "SELECT {} FROM {q_target_rel} INNER JOIN {q_source} ON {on_guarded} WHERE {guard}",
                         old_key_cols()
                     );
-                    for batch in self
-                        .run_merge_subquery(ctx, &del_sql, "MATCHED DELETE")
-                        .await?
-                    {
-                        deleted_rows += batch.num_rows();
-                        if batch.num_rows() > 0 {
-                            equality_delete_batches.push(batch);
-                        }
-                    }
+                    deleted_rows += self
+                        .collect_merge_keys(
+                            ctx,
+                            &del_sql,
+                            "MATCHED DELETE",
+                            &mut equality_delete_batches,
+                        )
+                        .await?;
                 }
                 crate::merge_sql::MergeOp::Insert(..) => {
                     return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed,
@@ -4732,15 +4862,15 @@ impl WriteHandler {
                      (SELECT 1 FROM {q_target_rel} WHERE {on_guarded}) AND ({guard})",
                     insert_exprs.join(", ")
                 );
-                for batch in self
-                    .run_merge_subquery(ctx, &insert_sql, "NOT MATCHED INSERT")
-                    .await?
-                {
-                    inserted_rows += batch.num_rows();
-                    if batch.num_rows() > 0 {
-                        new_data_batches.push(batch);
-                    }
-                }
+                new_row_streams.push(
+                    self.merge_subquery_stream(
+                        ctx,
+                        &insert_sql,
+                        "NOT MATCHED INSERT",
+                        Arc::clone(&inserted_rows),
+                    )
+                    .await?,
+                );
             }
         }
 
@@ -4757,15 +4887,14 @@ impl WriteHandler {
             match &clause.op {
                 crate::merge_sql::MergeOp::Delete => {
                     let del_sql = format!("SELECT {} {anti}", old_key_cols());
-                    for batch in self
-                        .run_merge_subquery(ctx, &del_sql, "BY SOURCE DELETE")
-                        .await?
-                    {
-                        deleted_rows += batch.num_rows();
-                        if batch.num_rows() > 0 {
-                            equality_delete_batches.push(batch);
-                        }
-                    }
+                    deleted_rows += self
+                        .collect_merge_keys(
+                            ctx,
+                            &del_sql,
+                            "BY SOURCE DELETE",
+                            &mut equality_delete_batches,
+                        )
+                        .await?;
                 }
                 crate::merge_sql::MergeOp::Update(assignments) => {
                     let new_cols: Vec<String> = target_columns
@@ -4786,24 +4915,23 @@ impl WriteHandler {
                         })
                         .collect();
                     let new_sql = format!("SELECT {} {anti}", new_cols.join(", "));
-                    for batch in self
-                        .run_merge_subquery(ctx, &new_sql, "BY SOURCE UPDATE new-row")
-                        .await?
-                    {
-                        updated_rows += batch.num_rows();
-                        if batch.num_rows() > 0 {
-                            new_data_batches.push(batch);
-                        }
-                    }
+                    new_row_streams.push(
+                        self.merge_subquery_stream(
+                            ctx,
+                            &new_sql,
+                            "BY SOURCE UPDATE new-row",
+                            Arc::clone(&updated_rows),
+                        )
+                        .await?,
+                    );
                     let old_sql = format!("SELECT {} {anti}", old_key_cols());
-                    for batch in self
-                        .run_merge_subquery(ctx, &old_sql, "BY SOURCE UPDATE old-key")
-                        .await?
-                    {
-                        if batch.num_rows() > 0 {
-                            equality_delete_batches.push(batch);
-                        }
-                    }
+                    self.collect_merge_keys(
+                        ctx,
+                        &old_sql,
+                        "BY SOURCE UPDATE old-key",
+                        &mut equality_delete_batches,
+                    )
+                    .await?;
                 }
                 crate::merge_sql::MergeOp::Insert(..) => {
                     return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed,
@@ -4814,7 +4942,35 @@ impl WriteHandler {
         }
 
         // Scratch MemTables are deregistered by the `MergeScratchCleanup`
-        // drop guard declared above.
+        // drop guard declared above. The guard and `target_buf` must outlive
+        // the streaming write below: the MemTableExecs feeding the joins hold
+        // references into the tracked target batches until the streams drain.
+
+        let tracker = new_upload_tracker();
+        let cleanup_guard =
+            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "merge-mor");
+        let new_data_files = if new_row_streams.is_empty() {
+            vec![]
+        } else {
+            let chained = futures::stream::select_all(new_row_streams);
+            let stream: datafusion::execution::SendableRecordBatchStream = Box::pin(
+                RecordBatchStreamAdapter::new(target_schema.clone(), Box::pin(chained)),
+            );
+            // A zero-row stream closes the writer without producing a file.
+            let (files, _rows) = write_data_files_streaming_with_metrics(
+                &table,
+                stream,
+                "merge-mor",
+                self.metrics.as_ref(),
+                self.compression(session),
+                tracker,
+                self.fanout_limits(Some(pool.clone())),
+            )
+            .await?;
+            files
+        };
+        let updated_rows = updated_rows.load(std::sync::atomic::Ordering::Relaxed);
+        let inserted_rows = inserted_rows.load(std::sync::atomic::Ordering::Relaxed);
 
         let total_touched = updated_rows + deleted_rows + inserted_rows;
         if total_touched == 0 {
@@ -4822,27 +4978,10 @@ impl WriteHandler {
             return affected_rows_batch(0);
         }
 
-        let tracker = new_upload_tracker();
-        let cleanup_guard =
-            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "merge-mor");
-        let new_data_files = if !new_data_batches.is_empty() {
-            write_data_files_with_metrics(
-                &table,
-                new_data_batches,
-                "merge-mor",
-                self.metrics.as_ref(),
-                self.compression(session),
-                tracker,
-            )
-            .await?
-        } else {
-            vec![]
-        };
-
         let delete_files = if !equality_delete_batches.is_empty() {
-            write_equality_delete_files(
+            write_equality_delete_key_files(
                 &table,
-                equality_delete_batches,
+                equality_delete_batches.as_slice().to_vec(),
                 identifier_field_ids,
                 self.compression(session),
             )
@@ -4900,6 +5039,15 @@ impl WriteHandler {
             }
         })?;
         cleanup_guard.mark_committed();
+        // Row delta: carry the previous snapshot's Puffin NDV statistics as an
+        // upper bound so the table does not lose them on its first DML (512).
+        self.carry_puffin_statistics(
+            catalog.as_catalog().as_ref(),
+            &table_ident,
+            crate::puffin_carry::CarryOp::RowDelta,
+            None,
+        )
+        .await;
         self.after_commit(session, catalog.as_ref(), &table_ident)
             .await;
 
@@ -5377,28 +5525,21 @@ impl WriteHandler {
         use arrow::compute::not;
         use datafusion::arrow::array::BooleanArray;
 
-        // Register the batch as a temporary table so DataFusion can evaluate the predicate
-        let table_name = format!("__delete_{}", table_ident.name());
+        // Register the batch as a scratch table so DataFusion can evaluate the
+        // predicate; the guard deregisters it on every exit path (509).
+        let scratch = ScratchTable::register(ctx, batch)?;
         let orig_name = table_ident.name();
-        let mem_table =
-            datafusion::datasource::MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
-                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to create MemTable: {e}")))?;
-        ctx.register_table(
-            format!("datafusion.public.{table_name}"),
-            Arc::new(mem_table),
-        )
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to register temp table: {e}")))?;
 
         let augmented_where = augment_where_with_row_filter(where_sql, predicates);
         let from_clause = build_policy_from_clause(
-            &format!("datafusion.public.{table_name}"),
+            scratch.qualified(),
             orig_name,
             &batch.schema(),
             predicates,
             false,
         );
 
-        // Execute: SELECT <where_clause> AS __match FROM __delete_<table>
+        // Execute: SELECT <where_clause> AS __match FROM __sqe_dml_<uuid>
         // Alias the scratch table to the original target name (see apply_update
         // for rationale) so correlated subqueries inside the WHERE clause can
         // reference `tablename.col`.
@@ -5414,9 +5555,7 @@ impl WriteHandler {
             .collect()
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to collect WHERE evaluation: {e}")))?;
-
-        // Deregister temp table
-        let _ = ctx.deregister_table(format!("datafusion.public.{table_name}"));
+        drop(scratch);
 
         if result_batches.is_empty() || result_batches[0].num_rows() == 0 {
             return Ok(batch.clone());
@@ -5462,20 +5601,13 @@ impl WriteHandler {
     ) -> sqe_core::Result<arrow_array::BooleanArray> {
         use arrow_array::BooleanArray;
 
-        let table_name = format!("__mor_delete_{}", table_ident.name());
+        // Scratch table with a per-call unique name, deregistered on drop (509).
+        let scratch = ScratchTable::register(ctx, batch)?;
         let orig_name = table_ident.name();
-        let mem_table =
-            datafusion::datasource::MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
-                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to create MemTable: {e}")))?;
-        ctx.register_table(
-            format!("datafusion.public.{table_name}"),
-            Arc::new(mem_table),
-        )
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to register temp table: {e}")))?;
 
         let augmented_where = augment_where_with_row_filter(where_sql, predicates);
         let from_clause = build_policy_from_clause(
-            &format!("datafusion.public.{table_name}"),
+            scratch.qualified(),
             orig_name,
             &batch.schema(),
             predicates,
@@ -5496,8 +5628,7 @@ impl WriteHandler {
             .collect()
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to collect WHERE evaluation: {e}")))?;
-
-        let _ = ctx.deregister_table(format!("datafusion.public.{table_name}"));
+        drop(scratch);
 
         if result_batches.is_empty() || result_batches[0].num_rows() == 0 {
             // No rows matched
@@ -5537,16 +5668,9 @@ impl WriteHandler {
         table_ident: &TableIdent,
         predicates: &sqe_policy::write_predicates::WritePolicyPredicates,
     ) -> sqe_core::Result<RecordBatch> {
-        let table_name = format!("__update_{}", table_ident.name());
+        // Scratch table with a per-call unique name, deregistered on drop (509).
+        let scratch = ScratchTable::register(ctx, batch)?;
         let orig_name = table_ident.name();
-        let mem_table =
-            datafusion::datasource::MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
-                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to create MemTable: {e}")))?;
-        ctx.register_table(
-            format!("datafusion.public.{table_name}"),
-            Arc::new(mem_table),
-        )
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to register temp table: {e}")))?;
 
         // Best-effort decorrelation of any `ScalarSubquery` nodes in the SET
         // expressions. DataFusion's physical planner cannot compile scalar
@@ -5596,7 +5720,7 @@ impl WriteHandler {
         // correlated subqueries inside the SET expression can reference it.
         // e.g. `SET x = (SELECT ... WHERE ... = holding_summary.hs_ca_id)` needs
         // `holding_summary` to be in scope; without the alias DataFusion only
-        // sees `__update_holding_summary` and fails to resolve the correlation.
+        // sees `__sqe_dml_<uuid>` and fails to resolve the correlation.
         //
         // Two join sources get appended to the outer FROM clause:
         //   1. `extra_joins` from the decorrelator above: these provide the
@@ -5612,7 +5736,7 @@ impl WriteHandler {
             format!(" {}{}", extra_joins.join(" "), in_subquery_joins)
         };
         let from_clause = build_policy_from_clause(
-            &format!("datafusion.public.{table_name}"),
+            scratch.qualified(),
             orig_name,
             &batch.schema(),
             predicates,
@@ -5631,8 +5755,7 @@ impl WriteHandler {
             .collect()
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to collect UPDATE results: {e}")))?;
-
-        let _ = ctx.deregister_table(format!("datafusion.public.{table_name}"));
+        drop(scratch);
 
         // Return the first (and only) result batch
         result_batches
@@ -5641,73 +5764,6 @@ impl WriteHandler {
             .ok_or_else(|| SqeError::with_code(SqeErrorCode::ExecutionFailed, "UPDATE produced no output batches".to_string()))
     }
 
-    /// Count rows matching a WHERE clause in a batch.
-    ///
-    /// `joins_sql` carries the `LEFT JOIN ...` clauses produced by
-    /// [`Self::lift_in_subqueries`]; see `filter_batch_negate` for details.
-    /// `predicates` augments the count with the policy row filter and
-    /// column masks so the affected-row count matches what was actually
-    /// modified.
-    #[allow(clippy::too_many_arguments)]
-    async fn count_matching_rows(
-        &self,
-        ctx: &DFSessionContext,
-        batch: &RecordBatch,
-        where_sql: &str,
-        joins_sql: &str,
-        table_ident: &TableIdent,
-        predicates: &sqe_policy::write_predicates::WritePolicyPredicates,
-    ) -> sqe_core::Result<usize> {
-        let table_name = format!("__count_{}", table_ident.name());
-        let orig_name = table_ident.name();
-        let mem_table =
-            datafusion::datasource::MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])
-                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("MemTable error: {e}")))?;
-        ctx.register_table(
-            format!("datafusion.public.{table_name}"),
-            Arc::new(mem_table),
-        )
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Register error: {e}")))?;
-
-        let augmented_where = augment_where_with_row_filter(where_sql, predicates);
-        let from_clause = build_policy_from_clause(
-            &format!("datafusion.public.{table_name}"),
-            orig_name,
-            &batch.schema(),
-            predicates,
-            false,
-        );
-
-        // Alias the scratch table to the original target name (see apply_update
-        // for rationale): allows `tablename.col` references in WHERE subqueries
-        // to resolve correctly.
-        let sql = format!(
-            "SELECT COUNT(*) AS cnt \
-             FROM {from_clause}{joins_sql} \
-             WHERE {augmented_where}"
-        );
-        let df = ctx
-            .sql(&sql)
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Count query failed: {e}")))?;
-        let batches: Vec<RecordBatch> = df
-            .collect()
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Count collect failed: {e}")))?;
-
-        let _ = ctx.deregister_table(format!("datafusion.public.{table_name}"));
-
-        let count = batches
-            .first()
-            .and_then(|b| {
-                b.column(0)
-                    .as_any()
-                    .downcast_ref::<arrow_array::Int64Array>()
-            })
-            .map(|a| a.value(0) as usize)
-            .unwrap_or(0);
-        Ok(count)
-    }
 
     /// Lift every `IN (subquery)` in `where_sql` into a LEFT JOIN over a
     /// pre-materialised DISTINCT keyset.
@@ -5933,8 +5989,8 @@ pub async fn lift_in_subqueries(
         // DML handler hands us a `SessionContext` whose default catalog is the
         // Iceberg catalog, whose `SchemaProvider` rejects `register_table` with
         // "schema provider does not support registering tables". The other
-        // scratch-table call sites in this file (`filter_batch_negate`,
-        // `filter_batch_match`, `apply_update`, `count_matching_rows`) already
+        // scratch-table call sites in this file (`ScratchTable::register`, used
+        // by `filter_batch_negate`, `filter_batch_match`, `apply_update`) already
         // use this qualified path for the same reason — see commit 725a47c
         // "fix: register DML temp tables in datafusion catalog, not Iceberg
         // catalog". Keep register, JOIN reference, and deregister in lockstep
@@ -6126,9 +6182,8 @@ static IN_SUBQUERY_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// that default is the Iceberg catalog).
 ///
 /// Deregister errors are logged at `warn!` and swallowed: matches the
-/// existing scratch-table cleanup behaviour inside `filter_batch_negate`,
-/// `filter_batch_match`, `apply_update`, and `count_matching_rows` (see the
-/// `let _ = ctx.deregister_table(...)` calls in this file).
+/// scratch-table cleanup behaviour of [`ScratchTable`] and
+/// [`MergeScratchCleanup`] in this file.
 #[doc(hidden)]
 pub struct InSubqueryCleanup {
     ctx: DFSessionContext,
@@ -6196,6 +6251,60 @@ impl Drop for MergeScratchCleanup {
                 );
             }
         }
+    }
+}
+
+/// Prefix of every per-batch DML scratch MemTable (architecture review 509).
+const DML_SCRATCH_PREFIX: &str = "__sqe_dml_";
+
+/// RAII guard for one per-batch DML evaluator scratch table.
+///
+/// `filter_batch_negate`, `filter_batch_match` and `apply_update` register the
+/// batch under evaluation as a `MemTable` in the shared session context and
+/// run a generated SELECT against it. They used to register fixed names
+/// (`__delete_<table>`, `__update_<table>`, ...) and deregister only on the
+/// success path: a planning or collect error left the whole batch pinned in
+/// the per-user context until the next DML on the same table overwrote it,
+/// and two concurrent statements on one table raced on the same name.
+///
+/// `register` names the table `__sqe_dml_<uuid>` so concurrent evaluations
+/// never collide, and the guard deregisters on drop (reusing
+/// [`MergeScratchCleanup`]) so every `?` between register and result releases
+/// the batch.
+struct ScratchTable {
+    qualified: String,
+    _cleanup: MergeScratchCleanup,
+}
+
+impl ScratchTable {
+    /// Register `batch` as a single-partition MemTable under a fresh
+    /// `datafusion.public.__sqe_dml_<uuid>` name.
+    fn register(ctx: &DFSessionContext, batch: &RecordBatch) -> sqe_core::Result<Self> {
+        let qualified = format!(
+            "datafusion.public.{DML_SCRATCH_PREFIX}{}",
+            Uuid::now_v7().simple()
+        );
+        let mem_table =
+            MemTable::try_new(batch.schema(), vec![vec![batch.clone()]]).map_err(|e| {
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Failed to create MemTable: {e}"),
+                )
+            })?;
+        // Build the guard before registering so a registration error leaves
+        // nothing behind (deregistering an absent name is a logged no-op).
+        let cleanup = MergeScratchCleanup::new(ctx, vec![qualified.clone()]);
+        ctx.register_table(qualified.as_str(), Arc::new(mem_table))
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to register temp table: {e}")))?;
+        Ok(Self {
+            qualified,
+            _cleanup: cleanup,
+        })
+    }
+
+    /// Fully-qualified `datafusion.public.__sqe_dml_<uuid>` reference.
+    fn qualified(&self) -> &str {
+        &self.qualified
     }
 }
 
@@ -9428,16 +9537,215 @@ s3_path_style = true
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn update_count_with_row_filter_matches_admitted_rows() {
+        // 509: the CoW UPDATE derives its affected-row count from the match
+        // mask's true_count() instead of a second COUNT(*) plan per batch.
         use datafusion::logical_expr::{col, lit};
         let (handler, session, table_ident, ctx) =
             employees_handler_with_policy(Some(col("region").eq(lit("EU"))), vec![]).await;
         let predicates = compute_predicates_for_employees(&handler, &session, &table_ident).await;
         let batch = make_employee_batch();
-        let count = handler
-            .count_matching_rows(&ctx, &batch, "TRUE", "", &table_ident, &predicates)
+        let mask = handler
+            .filter_batch_match(&ctx, &batch, "TRUE", "", &table_ident, &predicates)
             .await
             .unwrap();
-        assert_eq!(count, 2, "row filter must shrink the affected count");
+        assert_eq!(
+            mask.true_count(),
+            2,
+            "row filter must shrink the affected count"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // 509: per-batch evaluator scratch tables
+    // -------------------------------------------------------------------------
+
+    /// Names of every table registered in the `datafusion.public` schema of
+    /// `ctx` that looks like a DML evaluator scratch table (new or legacy).
+    fn dml_scratch_tables(ctx: &DFSessionContext) -> Vec<String> {
+        ctx.catalog("datafusion")
+            .expect("datafusion catalog")
+            .schema("public")
+            .expect("public schema")
+            .table_names()
+            .into_iter()
+            .filter(|n| {
+                n.starts_with(DML_SCRATCH_PREFIX)
+                    || n.starts_with("__delete_")
+                    || n.starts_with("__mor_delete_")
+                    || n.starts_with("__update_")
+                    || n.starts_with("__count_")
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failing_predicate_leaves_no_scratch_tables_registered() {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+        let (handler, session, table_ident, ctx) =
+            employees_handler_with_policy(None, vec![]).await;
+        let predicates = compute_predicates_for_employees(&handler, &session, &table_ident).await;
+        let batch = make_employee_batch();
+
+        // A WHERE that references a column the batch does not have fails at
+        // planning, after the scratch table was registered.
+        let err = handler
+            .filter_batch_match(
+                &ctx,
+                &batch,
+                "no_such_column = 1",
+                "",
+                &table_ident,
+                &predicates,
+            )
+            .await
+            .expect_err("unknown column must fail to plan");
+        assert!(err.to_string().contains("no_such_column"), "{err}");
+        assert!(
+            dml_scratch_tables(&ctx).is_empty(),
+            "filter_batch_match leaked: {:?}",
+            dml_scratch_tables(&ctx)
+        );
+
+        handler
+            .filter_batch_negate(
+                &ctx,
+                &batch,
+                "no_such_column = 1",
+                "",
+                &table_ident,
+                &predicates,
+            )
+            .await
+            .expect_err("unknown column must fail to plan");
+        assert!(
+            dml_scratch_tables(&ctx).is_empty(),
+            "filter_batch_negate leaked: {:?}",
+            dml_scratch_tables(&ctx)
+        );
+
+        let stmt = Parser::parse_sql(
+            &GenericDialect {},
+            "UPDATE employees SET ssn = no_such_column WHERE id = 1",
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let assignments = match stmt {
+            sqlparser::ast::Statement::Update(update) => update.assignments,
+            _ => panic!("expected UPDATE"),
+        };
+        handler
+            .apply_update(
+                &ctx,
+                &batch,
+                &assignments,
+                "id = 1",
+                "",
+                &table_ident,
+                &predicates,
+            )
+            .await
+            .expect_err("unknown column must fail to plan");
+        assert!(
+            dml_scratch_tables(&ctx).is_empty(),
+            "apply_update leaked: {:?}",
+            dml_scratch_tables(&ctx)
+        );
+
+        // And the success path leaves nothing behind either.
+        handler
+            .filter_batch_match(&ctx, &batch, "id > 2", "", &table_ident, &predicates)
+            .await
+            .unwrap();
+        assert!(dml_scratch_tables(&ctx).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn interleaved_evaluations_on_same_table_are_independent() {
+        use arrow_array::{Int64Array, StringArray};
+        let (handler, session, table_ident, ctx) =
+            employees_handler_with_policy(None, vec![]).await;
+        let predicates = compute_predicates_for_employees(&handler, &session, &table_ident).await;
+
+        // Two different batches of the same table evaluated concurrently in
+        // one session context. With the old fixed `__mor_delete_employees`
+        // name the second registration replaced the first and one evaluation
+        // saw the other's rows.
+        let batch_a = make_employee_batch(); // ids 1..4 -> "id > 2" matches 2
+        let batch_b = arrow_array::RecordBatch::try_new(
+            batch_a.schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![10_i64, 20, 30, 40, 50])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+                Arc::new(StringArray::from(vec!["EU", "EU", "EU", "EU", "EU"])),
+            ],
+        )
+        .unwrap(); // "id > 2" matches all 5
+
+        let mut joined = Vec::new();
+        for _ in 0..8 {
+            let a = handler.filter_batch_match(
+                &ctx,
+                &batch_a,
+                "id > 2",
+                "",
+                &table_ident,
+                &predicates,
+            );
+            let b = handler.filter_batch_match(
+                &ctx,
+                &batch_b,
+                "id > 2",
+                "",
+                &table_ident,
+                &predicates,
+            );
+            let (ra, rb) = futures::join!(a, b);
+            joined.push((ra.unwrap(), rb.unwrap()));
+        }
+        for (ma, mb) in joined {
+            assert_eq!(ma.len(), 4, "mask A must be batch A's length");
+            assert_eq!(ma.true_count(), 2, "batch A: ids 3 and 4 match");
+            assert_eq!(mb.len(), 5, "mask B must be batch B's length");
+            assert_eq!(mb.true_count(), 5, "batch B: every id matches");
+        }
+        assert!(dml_scratch_tables(&ctx).is_empty());
+    }
+
+    // -------------------------------------------------------------------------
+    // 504: MoR key accumulation is pool-visible
+    // -------------------------------------------------------------------------
+
+    /// A MoR DELETE whose matched keys exceed the pool fails with a typed
+    /// `ResourceExhausted` naming the consumer, not an abort. Exercised at the
+    /// accumulator level: the handler pushes each projected key batch through
+    /// exactly this buffer, and a full MoR DELETE needs a live catalog + table
+    /// (integration rig), which the unit suite does not have.
+    #[test]
+    fn mor_key_buffer_denies_over_pool_naming_consumer() {
+        use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool};
+        let pool: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(4 * 1024));
+        let mut keys = TrackedBatchBuffer::gated(&pool, "mor-delete-key-buffer", true);
+        let batch = make_employee_batch();
+        let key_only = batch.project(&[0]).unwrap();
+        let mut denied = None;
+        for _ in 0..1024 {
+            if let Err(e) = keys.push(key_only.clone()) {
+                denied = Some(e);
+                break;
+            }
+        }
+        let err = denied.expect("4 KiB pool must deny the key accumulation");
+        assert_eq!(err.error_code(), SqeErrorCode::ResourceExhausted);
+        assert!(
+            err.to_string().contains("mor-delete-key-buffer"),
+            "error must name the consumer: {err}"
+        );
+        // Pool accounting is intact after the denial.
+        assert_eq!(pool.reserved(), keys.reserved_bytes());
+        drop(keys);
+        assert_eq!(pool.reserved(), 0, "reservation released on drop");
     }
 
     // -------------------------------------------------------------------------

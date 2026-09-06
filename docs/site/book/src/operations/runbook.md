@@ -116,7 +116,12 @@ circuit breaker; repeated failures trip it open.
 
 ```promql
 # 0 = closed (healthy), 1 = half_open (probing), 2 = open (failing fast).
+# One series per configured catalog (label `circuit` = endpoint); the value is
+# the worst state across that catalog's per-session breakers.
 sqe_catalog_circuit_breaker_state
+# How many per-session breakers are open on each catalog. One or two with a
+# healthy endpoint is a single bad token; all of them is the catalog.
+sqe_catalog_circuit_breakers_open
 # Catalog latency. A spike before the breaker opens is the leading signal.
 histogram_quantile(0.95, rate(sqe_catalog_request_duration_seconds_bucket[5m]))
 ```
