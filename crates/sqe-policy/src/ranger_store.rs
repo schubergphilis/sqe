@@ -939,7 +939,7 @@ impl RangerStore {
             .and_then(serde_json::Value::as_str)
             .filter(|v| !v.is_empty())
             .ok_or_else(|| {
-                sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
+                sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed,
                     "Ranger component service response omitted its type".to_string(),
                 )
             })?
@@ -1135,7 +1135,7 @@ fn ranger_policy_body(
         PolicyTarget::Table(table) => {
             let parts: Vec<&str> = table.split('.').map(|v| v.trim_matches('"')).collect();
             if parts.len() < 2 {
-                return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
+                return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed,
                     "CREATE POLICY ON TABLE requires at least <schema>.<table>".to_string(),
                 ));
             }
@@ -1198,6 +1198,17 @@ fn ranger_policy_body(
 
 #[async_trait]
 impl PolicyStore for RangerStore {
+    /// Ranger publishes a monotonically increasing `policyVersion` with every
+    /// bundle; the resolved-policy cache is already dropped when it changes,
+    /// so it is the natural fingerprint. Before the first download nothing is
+    /// known and the result cache stays off.
+    fn policy_fingerprint(&self) -> Option<String> {
+        match self.last_policy_version.load(Ordering::Acquire) {
+            0 => None,
+            v => Some(format!("ranger:{v}")),
+        }
+    }
+
     async fn create_policy(
         &self,
         stmt: &sqe_sql::policy_ddl::CreatePolicyStatement,
@@ -1731,6 +1742,16 @@ mod tests {
             !policy_matches_table(&policy, "tenant_a.other", "orders"),
             "a different last component must not match"
         );
+    }
+
+    /// 902 follow-up: no fingerprint before the first bundle, then the
+    /// Ranger policyVersion.
+    #[test]
+    fn policy_fingerprint_follows_bundle_version() {
+        let store = RangerStore::from_config(&RangerPolicyConfig::default()).unwrap();
+        assert!(store.policy_fingerprint().is_none());
+        store.last_policy_version.store(7, Ordering::Relaxed);
+        assert_eq!(store.policy_fingerprint().as_deref(), Some("ranger:7"));
     }
 
     #[tokio::test]

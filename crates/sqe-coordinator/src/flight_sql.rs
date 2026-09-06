@@ -2063,6 +2063,13 @@ impl FlightSqlService for SqeFlightSqlService {
             stream.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))),
         );
 
+        // The post-commit cache invalidation is the handler's, not this arm's
+        // (`WriteHandler::after_commit`, architecture review 507). This path
+        // never passes through `QueryHandler::execute`, which is where the
+        // invalidation used to live for every other write, so an ADBC client
+        // that bulk-loaded here and then counted rows on the same connection
+        // read the pre-ingest snapshot until the cache TTL expired. Keep the
+        // ingest going through a `WriteHandler` entry point for that reason.
         let rows = self
             .query_handler
             .write_handler()

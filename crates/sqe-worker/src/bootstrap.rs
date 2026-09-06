@@ -109,6 +109,8 @@ pub fn build_worker_service_with_hot_reload(
         .with_ticket_pin(Arc::clone(&ticket_pin))
         .with_accept_hmac_tickets(config.worker.accept_hmac_tickets)
         .with_scan_timeout(config.worker.scan_timeout_secs)
+        // Finding 608: worker-side ceiling on one compact_file_group rewrite.
+        .with_compaction_timeout(config.worker.compaction_timeout_secs)
         .with_flight_compression(shuffle_compression)
         .with_footer_cache(footer_cache)
         .with_worker_secret(config.worker.worker_secret.clone())

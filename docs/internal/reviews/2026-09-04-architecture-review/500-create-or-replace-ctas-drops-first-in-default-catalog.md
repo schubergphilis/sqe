@@ -4,7 +4,7 @@
 - Severity: high
 - Category: reliability
 - Effort: M (days)
-- Status: open
+- Status: fixed (branch `fix/data-consistency-p1`, 2026-09-05)
 - Issue: #592
 
 ## Problem
@@ -97,3 +97,75 @@ Implement replace as an Iceberg transaction on the existing table, not a drop:
 - 513 (no in-process write tests; the three scenarios above need the sqlite rig).
 - `docs/internal/plans/2026-07-13-sqe-write-crate-extraction.md` moves this
   code; land the fix before or with the move.
+
+## Resolution (2026-09-05)
+
+`CREATE OR REPLACE TABLE ... AS SELECT` is no longer a drop followed by a
+create, and the drop that resolved against the default warehouse is gone with
+it. The whole statement is handled inside `WriteHandler::handle_ctas_streaming`
+against the catalog the target name resolves to.
+
+**What changed**
+
+- `crates/sqe-coordinator/src/query_handler.rs`
+  - The `if ct.or_replace { self.drop_table_if_exists(...) }` call in the CTAS
+    arm is deleted, and so is `drop_table_if_exists` itself.
+    `grep -n drop_table_if_exists crates/sqe-coordinator/src` returns nothing.
+- `crates/sqe-coordinator/src/write_handler.rs`
+  - `handle_ctas_streaming` binds `or_replace` (it was `_or_replace`) and, when
+    it is set, asks the *resolved* `SessionCatalog` whether the target exists.
+    The SELECT is planned and policy-enforced first, as before, but nothing is
+    dropped before it runs.
+  - **In-place swap** (`ctas_replace_in_place`) when the SELECT already fits the
+    live table: the new data files are written into the live table, then ONE
+    `rewrite_files` commit removes every live data file plus the position
+    deletes those files supersede (`extend_with_superseded_deletes`) and adds
+    the new ones. It goes through `commit_rewrite_with_retry` (506) with
+    `op = "ctas-replace"`. The table keeps its UUID, its snapshot history (so
+    time travel and `rollback_to_snapshot` cross the replace), its properties
+    and its grants. `CREATE OR REPLACE TABLE t AS SELECT ... FROM t` is safe:
+    the stream is fully consumed against the pre-swap snapshot before the
+    commit. A failing SELECT, a failing write or four lost races leave the
+    original data in place and the `WriteCleanupGuard` deletes the parquet
+    files the attempt wrote.
+  - **Staged swap** otherwise: `ctas_replace_is_in_place` decides. The
+    streaming writer stamps every batch onto the live table's schema and
+    partitions with the live default spec, so a different column set, order,
+    type or nullability — or a `PARTITIONED BY` naming different source columns
+    or transforms — cannot be written into the live table at all. Those
+    statements create `<name>__sqe_replace_<uuid>` in the same namespace, write
+    and commit into it, then `drop_table` the target and `rename_table` the
+    staged table into place. Both swap calls are metadata-only. The existing
+    table still survives a failing SELECT or write; only the swap itself is two
+    catalog calls, and a failure between them names the staged table in the
+    error with the `ALTER TABLE ... RENAME TO` that finishes it by hand.
+  - When the table does not exist, `or_replace` falls through to the ordinary
+    create path (the create now uses `create_ident`, which is the target name
+    unless a staged swap is in flight).
+- Everything above runs against `resolve_target_catalog(...)`'s catalog, so
+  `CREATE OR REPLACE TABLE ws_b.ns.t` can no longer touch `ns.t` in the default
+  warehouse.
+
+**Known limitation, deliberate.** The in-place path does not re-apply the
+statement's `WITH` / `TBLPROPERTIES` clause: an in-place replace keeps the live
+table's properties (`ALTER TABLE ... SET TBLPROPERTIES` changes them). The
+staged path creates a fresh table, so it applies them and loses the history —
+the trade is documented in the code and logged at `warn` when it fires.
+
+**Tests** (`cargo test -p sqe-coordinator --lib -- write_handler merge_sql
+hive_write`, 132 passed / 0 failed)
+
+- `write_handler::tests::ctas_replace_is_in_place_for_a_matching_schema`
+- `write_handler::tests::ctas_replace_is_not_in_place_when_the_schema_differs`
+  — added column, widened type, renamed column, changed nullability.
+- `write_handler::tests::ctas_replace_in_place_requires_matching_partitioning`
+  — `PARTITIONED BY (region)` on a table whose default spec is `region` swaps
+  in place; `PARTITIONED BY (country)` does not.
+
+**Not covered by unit tests.** The three integration scenarios in the
+acceptance criteria (`CREATE OR REPLACE TABLE t AS SELECT * FROM t WHERE ...`
+keeping the pre-replace snapshot in its history, a failing SELECT leaving the
+original data intact, and a two-catalog run where `cat_b.ns.t` never touches
+`cat_a.ns.t`) need a live Polaris + object store, i.e. the docker rig
+(`make test-integration`). The unit tests cover the predicate that routes
+between the two paths, which is where the correctness decision is made.

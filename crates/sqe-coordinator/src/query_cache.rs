@@ -19,6 +19,10 @@ pub struct CachedResult {
     pub tables_touched: Vec<String>,
     pub created: DateTime<Utc>,
     pub size_bytes: usize,
+    /// Policy fingerprint current when the result was produced (finding 902
+    /// follow-up). A hit is served only while the enforcer reports the same
+    /// fingerprint; `None` entries come from a passthrough deployment.
+    pub policy_fingerprint: Option<String>,
 }
 
 pub struct ResultCache {
@@ -173,9 +177,32 @@ impl ResultCache {
         F: FnOnce(Arc<CachedResult>) -> Fut,
         Fut: Future<Output = Result<(), E>>,
     {
+        self.lookup_bound(user, sql, None, authorize).await
+    }
+
+    /// [`Self::lookup_authorized`] bound to a policy fingerprint (finding 902
+    /// follow-up): an entry produced under a different fingerprint is evicted
+    /// and reported as a miss, so a policy change is never served from
+    /// previously materialized rows.
+    pub async fn lookup_bound<E, F, Fut>(
+        &self,
+        user: &str,
+        sql: &str,
+        policy_fingerprint: Option<&str>,
+        authorize: F,
+    ) -> Result<Option<Arc<CachedResult>>, E>
+    where
+        F: FnOnce(Arc<CachedResult>) -> Fut,
+        Fut: Future<Output = Result<(), E>>,
+    {
         let Some(cached) = self.lookup(user, sql) else {
             return Ok(None);
         };
+        if cached.policy_fingerprint.as_deref() != policy_fingerprint {
+            debug!("Result cache entry produced under a different policy fingerprint; evicting");
+            self.cache.invalidate(&Self::cache_key(user, sql));
+            return Ok(None);
+        }
         if let Err(error) = authorize(Arc::clone(&cached)).await {
             self.cache.invalidate(&Self::cache_key(user, sql));
             return Err(error);
@@ -183,11 +210,25 @@ impl ResultCache {
         Ok(Some(cached))
     }
 
-    /// Store a query result in the cache.
+    /// Store a query result in the cache with no policy fingerprint.
     pub fn store(
         &self,
         user: &str,
         sql: &str,
+        query_id: Uuid,
+        batches: Vec<RecordBatch>,
+        tables_touched: Vec<String>,
+    ) {
+        self.store_bound(user, sql, None, query_id, batches, tables_touched);
+    }
+
+    /// Store a query result together with the policy fingerprint it was
+    /// produced under (finding 902 follow-up).
+    pub fn store_bound(
+        &self,
+        user: &str,
+        sql: &str,
+        policy_fingerprint: Option<String>,
         query_id: Uuid,
         batches: Vec<RecordBatch>,
         tables_touched: Vec<String>,
@@ -215,6 +256,7 @@ impl ResultCache {
             tables_touched: tables_touched.clone(),
             created: Utc::now(),
             size_bytes,
+            policy_fingerprint,
         });
 
         self.cache.insert(key.clone(), entry);
@@ -712,5 +754,78 @@ mod tests {
         assert!(cache
             .lookup("alice", "SELECT * FROM orders JOIN customers ON true")
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod policy_fingerprint_tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow_schema::{DataType, Field, Schema};
+    use sqe_core::config::QueryCacheConfig;
+
+    fn cache() -> ResultCache {
+        ResultCache::new(
+            &QueryCacheConfig {
+                enabled: true,
+                max_memory_mb: 10,
+                max_entry_mb: 1,
+                ttl_secs: 60,
+            },
+            None,
+        )
+    }
+
+    fn batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64]))]).unwrap()
+    }
+
+    async fn hit(cache: &ResultCache, fp: Option<&str>) -> bool {
+        cache
+            .lookup_bound::<(), _, _>("alice", "SELECT 1", fp, |_| async { Ok(()) })
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    /// 902 follow-up: a result produced under one policy fingerprint is served
+    /// only while the enforcer still reports that fingerprint; any other value
+    /// (or none) evicts the entry instead of serving stale rows.
+    #[tokio::test]
+    async fn hit_requires_the_same_policy_fingerprint() {
+        let cache = cache();
+        cache.store_bound(
+            "alice",
+            "SELECT 1",
+            Some("ranger:7".to_string()),
+            Uuid::now_v7(),
+            vec![batch()],
+            vec!["ns.t".to_string()],
+        );
+        assert!(hit(&cache, Some("ranger:7")).await);
+        assert!(
+            !hit(&cache, Some("ranger:8")).await,
+            "new policy version is a miss"
+        );
+        assert!(
+            !hit(&cache, Some("ranger:7")).await,
+            "the mismatched lookup evicted the stale entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn unbound_entries_only_match_unbound_lookups() {
+        let cache = cache();
+        cache.store("alice", "SELECT 1", Uuid::now_v7(), vec![batch()], vec![]);
+        assert!(!hit(&cache, Some("ranger:1")).await);
+        let cache = cache_with_plain();
+        assert!(hit(&cache, None).await);
+    }
+
+    fn cache_with_plain() -> ResultCache {
+        let c = cache();
+        c.store("alice", "SELECT 1", Uuid::now_v7(), vec![batch()], vec![]);
+        c
     }
 }

@@ -45,6 +45,10 @@ object_store = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = "0.1"
+# CancellationToken for the compact_file_group rewrite (finding 608): the
+# Flight handler cancels the rewrite when the coordinator drops the response
+# stream or the worker-side deadline fires.
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-futures = { version = "0.2", features = ["futures-03"] }
 tracing-subscriber = { workspace = true }

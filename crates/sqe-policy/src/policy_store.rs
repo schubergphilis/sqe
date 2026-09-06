@@ -20,6 +20,8 @@ pub struct InMemoryPolicyStore {
     policies: Arc<RwLock<HashMap<String, ResolvedPolicy>>>,
     /// Role-based policies keyed by role name, applied to all tables
     role_policies: Arc<RwLock<HashMap<String, ResolvedPolicy>>>,
+    /// Bumped on every mutation; feeds `policy_fingerprint` (finding 902).
+    generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl InMemoryPolicyStore {
@@ -27,6 +29,7 @@ impl InMemoryPolicyStore {
         Self {
             policies: Arc::new(RwLock::new(HashMap::new())),
             role_policies: Arc::new(RwLock::new(HashMap::new())),
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
     }
 
@@ -39,6 +42,8 @@ impl InMemoryPolicyStore {
     ) {
         let key = format!("{}.{}", namespace, table_name);
         self.policies.write().await.insert(key, policy);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Register a policy for a role (applied to all tables for users with that role).
@@ -47,6 +52,13 @@ impl InMemoryPolicyStore {
             .write()
             .await
             .insert(role.to_string(), policy);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Current mutation generation (see `policy_fingerprint`).
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -58,6 +70,10 @@ impl Default for InMemoryPolicyStore {
 
 #[async_trait]
 impl PolicyStore for InMemoryPolicyStore {
+    fn policy_fingerprint(&self) -> Option<String> {
+        Some(format!("memory:{}", self.generation()))
+    }
+
     async fn resolve(
         &self,
         user: &SessionUser,
