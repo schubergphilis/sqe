@@ -4,8 +4,15 @@
 - Severity: medium
 - Category: maintainability
 - Effort: L (week+)
-- Status: open
+- Status: partial (branch `fix/config-startup-code-structure`, 2026-09-05)
 - Issue: #589
+
+## Resolution (2026-09-05)
+
+Partial on `fix/config-startup-code-structure`. The duplicated
+`sqe-coordinator` binary is deleted (801); QueryHandler is still the god
+object. Follow-up: split `execute()` (overlaps 804).
+
 
 ## Problem
 

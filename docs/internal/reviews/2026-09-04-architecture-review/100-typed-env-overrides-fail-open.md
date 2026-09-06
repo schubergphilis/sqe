@@ -4,8 +4,16 @@
 - Severity: high
 - Category: security
 - Effort: S (hours)
-- Status: open
+- Status: fixed (branch `fix/config-startup-code-structure`, 2026-09-05)
 - Issue: #543
+
+## Resolution (2026-09-05)
+
+Fixed on `fix/config-startup-code-structure`. `SqeConfig::load` walks `SQE_*`
+into the TOML tree (trim + typed coerce) and fails closed: a malformed bool,
+port, integer or memory-limit override is `SqeError::Config` naming the
+variable. `SQE_PRODUCTION_MODE=" true "` is accepted after trim.
+
 
 ## Problem
 

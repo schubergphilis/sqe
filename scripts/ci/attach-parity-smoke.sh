@@ -53,9 +53,9 @@ STAGING_DIR="/tmp/sqe-bench-attach-smoke-data"
 
 echo "==> Building sqe-bench + sqe-coordinator + sqe-cli (profile: $PROFILE)"
 if [ "$PROFILE" = "release" ]; then
-  cargo build -p sqe-bench -p sqe-coordinator -p sqe-cli --bin sqe-bench --bin sqe-coordinator --bin sqe-cli --release 2>&1
+  cargo build -p sqe-bench -p sqe-coordinator -p sqe-cli --bin sqe-bench --bin sqe-server --bin sqe-cli --release 2>&1
 else
-  cargo build -p sqe-bench -p sqe-coordinator -p sqe-cli --bin sqe-bench --bin sqe-coordinator --bin sqe-cli --profile "$PROFILE" 2>&1
+  cargo build -p sqe-bench -p sqe-coordinator -p sqe-cli --bin sqe-bench --bin sqe-server --bin sqe-cli --profile "$PROFILE" 2>&1
 fi
 BENCH_BIN="$ROOT_DIR/target/$PROFILE/sqe-bench"
 
@@ -79,7 +79,7 @@ echo "==> Starting query coordinator (tests/benchmark-attach/coordinator-attach.
 # naming scripts/benchmark-test.sh already uses for its own coordinator log.
 COORD_LOG="/tmp/sqe-attach-smoke-coord-$$.log"
 RUST_LOG="${RUST_LOG:-sqe=info,warn}" \
-  "$ROOT_DIR/target/$PROFILE/sqe-coordinator" "$ROOT_DIR/tests/benchmark-attach/coordinator-attach.toml" \
+  "$ROOT_DIR/target/$PROFILE/sqe-server" "$ROOT_DIR/tests/benchmark-attach/coordinator-attach.toml" \
   > "$COORD_LOG" 2>&1 &
 COORD_PID=$!
 

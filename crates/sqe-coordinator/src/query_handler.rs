@@ -20,7 +20,7 @@ use tracing::Instrument;
 use tracing::{debug, info, warn, Span};
 
 use sqe_catalog::{IcebergScanExec, SessionCatalog};
-use sqe_core::{QueryConfig, SecretStore, Session, SortMode, SqeConfig, SqeError, SqeErrorCode};
+use sqe_core::{QueryConfig, SecretStore, Session, SqeConfig, SqeError, SqeErrorCode};
 use sqlparser::ast::{Statement, TableFactor};
 
 use crate::adaptive_sort;
@@ -363,7 +363,7 @@ impl QueryHandler {
             })? as usize
         };
 
-        let profile_mode = sqe_core::ProfileMode::parse(&config.query.query_profile);
+        let profile_mode = config.query.query_profile;
 
         let mut hive_ddl_handler =
             crate::hive_ddl_handler::HiveDdlHandler::new(runtime_catalogs.clone(), secrets.clone())
@@ -3305,7 +3305,7 @@ impl QueryHandler {
         };
 
         // Adaptive sort stripping
-        let sort_mode = SortMode::parse(&self.config.query.sort_mode);
+        let sort_mode = self.config.query.sort_mode;
         let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
         let (physical_plan, sort_decisions) = adaptive_sort::apply_adaptive_sort(
             physical_plan,
@@ -3640,7 +3640,7 @@ impl QueryHandler {
         };
 
         // Apply adaptive sort stripping based on sort_mode config and memory pressure.
-        let sort_mode = SortMode::parse(&self.config.query.sort_mode);
+        let sort_mode = self.config.query.sort_mode;
         let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
         let (physical_plan, sort_decisions) = adaptive_sort::apply_adaptive_sort(
             physical_plan,

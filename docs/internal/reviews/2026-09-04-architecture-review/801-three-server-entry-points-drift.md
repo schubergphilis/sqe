@@ -4,8 +4,16 @@
 - Severity: high
 - Category: architecture
 - Effort: M
-- Status: open
+- Status: fixed (branch `fix/config-startup-code-structure`, 2026-09-05)
 - Issue: #633
+
+## Resolution (2026-09-05)
+
+Fixed on `fix/config-startup-code-structure`. The `sqe-coordinator` binary is
+removed. Scripts, README and QUICKSTART launch `sqe-server`. `sqe-worker`
+uses the same `sqe_core::build_server_runtime` builder, clap-style `--config`,
+and a `/healthz`+`/readyz` listener on `prometheus_port + 1`.
+
 
 ## Problem
 
