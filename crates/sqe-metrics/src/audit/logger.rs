@@ -1,11 +1,14 @@
 //! Builds [`AuditEntry`] records from engine activity, including the
 //! `query_hash` helper used to reference a statement without storing its text.
 
-use std::sync::mpsc::{self, Sender};
+use std::io::{Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use chrono::DateTime;
+use prometheus::IntCounterVec;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -201,6 +204,67 @@ impl From<AuditEntry> for AuditEvent {
     }
 }
 
+/// What the logger does when the writer queue is full or the writer is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditFailMode {
+    /// Drop the event, increment `sqe_audit_events_dropped_total`, keep serving.
+    Open,
+    /// Surface the failure to the caller so QueryHandler can refuse the statement.
+    Closed,
+}
+
+impl AuditFailMode {
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "closed" => Self::Closed,
+            _ => Self::Open,
+        }
+    }
+}
+
+/// Construction knobs for [`AuditLogger::with_options`].
+#[derive(Clone)]
+pub struct AuditLoggerOptions {
+    pub queue_capacity: usize,
+    pub fail_mode: AuditFailMode,
+    pub dropped: Option<IntCounterVec>,
+}
+
+impl Default for AuditLoggerOptions {
+    fn default() -> Self {
+        Self {
+            queue_capacity: default_audit_queue_capacity(),
+            fail_mode: AuditFailMode::Open,
+            dropped: None,
+        }
+    }
+}
+
+/// Default bound on the writer queue. Large enough for a burst of statements
+/// but finite so a stalled disk cannot grow the process to OOM.
+pub const fn default_audit_queue_capacity() -> usize {
+    10_000
+}
+
+/// Error returned by [`AuditLogger::try_log`] / [`AuditLogger::try_log_event`]
+/// when the queue is full or the writer thread has exited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditWriteError {
+    QueueFull,
+    WriterGone,
+}
+
+impl std::fmt::Display for AuditWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuditWriteError::QueueFull => write!(f, "audit writer queue is full"),
+            AuditWriteError::WriterGone => write!(f, "audit writer thread is gone"),
+        }
+    }
+}
+
+impl std::error::Error for AuditWriteError {}
+
 /// Message type sent to the audit writer thread.
 enum AuditMsg {
     /// Legacy `AuditEntry` path from `log()`. Already PII-redacted.
@@ -209,12 +273,15 @@ enum AuditMsg {
     Legacy(Box<AuditEntry>),
     /// Canonical event from `log_event()`. Fan-out to all sinks with chain stamp.
     Event(Box<AuditEvent>),
-    Flush(Sender<()>),
+    Flush(std::sync::mpsc::Sender<()>),
 }
 
 pub struct AuditLogger {
-    tx: Option<Sender<AuditMsg>>,
+    tx: Option<SyncSender<AuditMsg>>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    fail_mode: AuditFailMode,
+    writable: Arc<AtomicBool>,
+    dropped: Option<IntCounterVec>,
     /// Shared with the worker thread. `None` until `with_gdpr` is called;
     /// the worker reads a snapshot each time it processes events.
     gdpr: Arc<Mutex<Option<GdprConfig>>>,
@@ -248,12 +315,116 @@ fn open_sink_file(path: &std::path::Path) -> Result<std::fs::File, String> {
         .map_err(|e| format!("Failed to open audit log file '{}': {e}", path.display()))
 }
 
+fn record_drop(dropped: &Option<IntCounterVec>, reason: &'static str) {
+    if let Some(c) = dropped {
+        c.with_label_values(&[reason]).inc();
+    }
+}
+
+/// Read the last non-empty line of `path` by scanning a trailing window.
+/// Returns `Ok(None)` for an empty file. A torn last line is returned as-is
+/// and classified by [`parse_integrity_from_line`].
+fn read_last_nonempty_line(path: &std::path::Path) -> Result<Option<String>, String> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    let len = file.metadata().map_err(|e| e.to_string())?.len();
+    if len == 0 {
+        return Ok(None);
+    }
+    let start = len.saturating_sub(64 * 1024);
+    file.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).map_err(|e| e.to_string())?;
+    Ok(buf
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .map(str::to_string))
+}
+
+fn parse_integrity_from_line(line: &str) -> Result<(u64, String), String> {
+    let value: serde_json::Value =
+        serde_json::from_str(line).map_err(|e| format!("unparseable json: {e}"))?;
+    let integrity = value
+        .get("integrity")
+        .ok_or_else(|| "missing integrity".to_string())?;
+    let seq = integrity
+        .get("seq")
+        .and_then(|s| s.as_u64())
+        .ok_or_else(|| "missing integrity.seq".to_string())?;
+    let hash = integrity
+        .get("hash")
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| "missing integrity.hash".to_string())?;
+    if hash.is_empty() {
+        return Err("empty integrity.hash".into());
+    }
+    Ok((seq, hash.to_string()))
+}
+
+/// Seed the in-memory chain from the last durable record, if any.
+///
+/// `Ok((chain, None))` continues from a parseable tip.
+/// `Ok((chain, Some(reason)))` starts a `BROKEN:` segment; the caller should
+/// emit an `AuditResume` event before accepting new records.
+fn resume_chain_from_path(path: &std::path::Path) -> (HashChain, Option<String>) {
+    match read_last_nonempty_line(path) {
+        Ok(None) => (HashChain::new(), None),
+        Ok(Some(line)) => match parse_integrity_from_line(&line) {
+            Ok((seq, hash)) => (HashChain::resume(seq, hash), None),
+            Err(reason) => (HashChain::resume_broken(&reason), Some(reason)),
+        },
+        Err(reason) => (HashChain::resume_broken(&reason), Some(reason)),
+    }
+}
+
+fn audit_resume_event(reason: &str) -> AuditEvent {
+    AuditEvent {
+        time: chrono::Utc::now(),
+        kind: AuditKind::AuditResume,
+        actor: Actor {
+            username: "sqe-audit-writer".into(),
+            subject: None,
+            email: None,
+            roles: Vec::new(),
+            groups: Vec::new(),
+        },
+        outcome: Outcome::Failure {
+            error_type: Some("audit_resume".into()),
+            error_code: Some("BROKEN".into()),
+            message: Some(reason.to_string()),
+        },
+        resources: Vec::new(),
+        policy: None,
+        timing: None,
+        stats: None,
+        query: None,
+        session_id: None,
+        client_ip: None,
+        trace_id: None,
+        query_id: None,
+        integrity: Integrity::default(),
+    }
+}
+
 impl AuditLogger {
     /// Create a logger writing native JSONL to `path`.
     ///
     /// An empty path disables logging (no-op logger).
     pub fn new(path: &str) -> Result<Self, String> {
         Self::with_config(path, AuditFormat::Native)
+    }
+
+    /// Create a logger with format, queue bound, fail mode and drop counter.
+    pub fn with_options(
+        path: &str,
+        format: AuditFormat,
+        options: AuditLoggerOptions,
+    ) -> Result<Self, String> {
+        Self::build(path, format, options)
     }
 
     /// Create a logger with a configurable output format.
@@ -269,10 +440,24 @@ impl AuditLogger {
     ///
     /// An empty `path` disables logging regardless of format.
     pub fn with_config(path: &str, format: AuditFormat) -> Result<Self, String> {
+        Self::build(path, format, AuditLoggerOptions::default())
+    }
+
+    fn build(
+        path: &str,
+        format: AuditFormat,
+        options: AuditLoggerOptions,
+    ) -> Result<Self, String> {
+        let fail_mode = options.fail_mode;
+        let dropped = options.dropped;
+        let queue_capacity = options.queue_capacity.max(1);
         if path.is_empty() {
             return Ok(Self {
                 tx: None,
                 worker: Mutex::new(None),
+                fail_mode,
+                writable: Arc::new(AtomicBool::new(true)),
+                dropped,
                 gdpr: Arc::new(Mutex::new(None)),
                 spool_sink: Arc::new(Mutex::new(None)),
             });
@@ -316,14 +501,37 @@ impl AuditLogger {
         let gdpr_worker = Arc::clone(&gdpr);
         let spool_sink: Arc<Mutex<Option<OcsfJsonlSink>>> = Arc::new(Mutex::new(None));
         let spool_sink_worker = Arc::clone(&spool_sink);
-        let (tx, rx) = mpsc::channel::<AuditMsg>();
+        let dropped_worker = dropped.clone();
+        let writable = Arc::new(AtomicBool::new(true));
+        let writable_worker = Arc::clone(&writable);
+        let resume_path = native_path.to_path_buf();
+        let (tx, rx) = mpsc::sync_channel::<AuditMsg>(queue_capacity);
         let worker = std::thread::Builder::new()
             .name("sqe-audit-writer".to_string())
             .spawn(move || {
                 let mut native_sink = native_sink;
                 let mut ocsf_sink = ocsf_sink;
-                let mut chain = HashChain::new();
+                let (mut chain, resume_break) = resume_chain_from_path(&resume_path);
+                if let Some(reason) = resume_break {
+                    tracing::error!(
+                        path = %resume_path.display(),
+                        reason = %reason,
+                        "AUDIT: unparseable tail; starting BROKEN chain segment"
+                    );
+                    Self::write_event(
+                        &mut native_sink,
+                        native_events,
+                        &mut ocsf_sink,
+                        &mut spool_sink_worker.lock().unwrap(),
+                        &mut chain,
+                        audit_resume_event(&reason),
+                        None,
+                        &path_owned,
+                        &dropped_worker,
+                    );
+                }
                 while let Ok(msg) = rx.recv() {
+                    writable_worker.store(true, Ordering::Relaxed);
                     // Snapshot GDPR config once per recv iteration. Config is
                     // written once at startup (with_gdpr); this lock is never
                     // contended on the hot path.
@@ -356,6 +564,7 @@ impl AuditLogger {
                                             &mut chain,
                                             &batch,
                                             &path_owned,
+                                            &dropped_worker,
                                         );
                                         batch.clear();
                                         Self::flush_sinks(
@@ -374,6 +583,7 @@ impl AuditLogger {
                                             *e,
                                             gdpr_snap.as_ref(),
                                             &path_owned,
+                                            &dropped_worker,
                                         );
                                         Self::flush_sinks(
                                             &mut native_sink,
@@ -388,6 +598,7 @@ impl AuditLogger {
                                             &mut chain,
                                             &batch,
                                             &path_owned,
+                                            &dropped_worker,
                                         );
                                         batch.clear();
                                         Self::flush_sinks(
@@ -406,6 +617,7 @@ impl AuditLogger {
                                     &mut chain,
                                     &batch,
                                     &path_owned,
+                                    &dropped_worker,
                                 );
                                 Self::flush_sinks(
                                     &mut native_sink,
@@ -430,6 +642,7 @@ impl AuditLogger {
                                             &mut batch,
                                             gdpr_snap.as_ref(),
                                             &path_owned,
+                                            &dropped_worker,
                                         );
                                         batch.clear();
                                         Self::flush_sinks(
@@ -444,6 +657,7 @@ impl AuditLogger {
                                             &mut chain,
                                             &[*e],
                                             &path_owned,
+                                            &dropped_worker,
                                         );
                                         Self::flush_sinks(
                                             &mut native_sink,
@@ -462,6 +676,7 @@ impl AuditLogger {
                                             &mut batch,
                                             gdpr_snap.as_ref(),
                                             &path_owned,
+                                            &dropped_worker,
                                         );
                                         batch.clear();
                                         Self::flush_sinks(
@@ -484,6 +699,7 @@ impl AuditLogger {
                                     &mut batch,
                                     gdpr_snap.as_ref(),
                                     &path_owned,
+                                    &dropped_worker,
                                 );
                                 Self::flush_sinks(
                                     &mut native_sink,
@@ -517,6 +733,9 @@ impl AuditLogger {
         Ok(Self {
             tx: Some(tx),
             worker: Mutex::new(Some(worker)),
+            fail_mode,
+            writable,
+            dropped,
             gdpr,
             spool_sink,
         })
@@ -531,12 +750,14 @@ impl AuditLogger {
         chain: &mut HashChain,
         batch: &[AuditEntry],
         path: &str,
+        dropped: &Option<IntCounterVec>,
     ) {
         for entry in batch {
             let body_json = match serde_json::to_string(entry) {
                 Ok(j) => j,
                 Err(e) => {
                     tracing::error!("AUDIT: serialization failed: {e}");
+                    record_drop(dropped, "io");
                     continue;
                 }
             };
@@ -554,6 +775,7 @@ impl AuditLogger {
             let line = inject_integrity(&body_json, &integrity);
             if let Err(e) = native_sink.write_raw_line(&line) {
                 tracing::error!("AUDIT: write failed for '{path}': {e}");
+                record_drop(dropped, "io");
             }
         }
     }
@@ -663,6 +885,7 @@ impl AuditLogger {
         mut event: AuditEvent,
         gdpr: Option<&GdprSnap>,
         path: &str,
+        dropped: &Option<IntCounterVec>,
     ) {
         if let Some(g) = gdpr {
             Self::apply_gdpr_masking(&mut event, g);
@@ -673,11 +896,13 @@ impl AuditLogger {
         if native_events {
             if let Err(e) = native_sink.write_line(&event) {
                 tracing::error!("AUDIT: write failed for '{path}': {e}");
+                record_drop(dropped, "io");
             }
         }
         if let Some(sink) = ocsf_sink.as_mut() {
             if let Err(e) = sink.write_line(&event) {
                 tracing::error!("AUDIT: write failed for '{path}': {e}");
+                record_drop(dropped, "io");
             }
         }
         // Export spool: written after chain.stamp so metadata.sequence is present.
@@ -685,6 +910,7 @@ impl AuditLogger {
         if let Some(sink) = spool_sink.as_mut() {
             if let Err(e) = sink.write_line(&event) {
                 tracing::error!("AUDIT: spool write failed for '{path}': {e}");
+                record_drop(dropped, "io");
             }
         }
     }
@@ -702,6 +928,7 @@ impl AuditLogger {
         batch: &mut [AuditEvent],
         gdpr: Option<&GdprSnap>,
         path: &str,
+        dropped: &Option<IntCounterVec>,
     ) {
         for event in batch.iter_mut() {
             if let Some(g) = gdpr {
@@ -713,11 +940,13 @@ impl AuditLogger {
             if native_events {
                 if let Err(e) = native_sink.write_line(event) {
                     tracing::error!("AUDIT: write failed for '{path}': {e}");
+                    record_drop(dropped, "io");
                 }
             }
             if let Some(sink) = ocsf_sink.as_mut() {
                 if let Err(e) = sink.write_line(event) {
                     tracing::error!("AUDIT: write failed for '{path}': {e}");
+                    record_drop(dropped, "io");
                 }
             }
             // Export spool: written after chain.stamp so metadata.sequence is present.
@@ -725,6 +954,7 @@ impl AuditLogger {
             if let Some(sink) = spool_sink.as_mut() {
                 if let Err(e) = sink.write_line(event) {
                     tracing::error!("AUDIT: spool write failed for '{path}': {e}");
+                    record_drop(dropped, "io");
                 }
             }
         }
@@ -806,13 +1036,29 @@ impl AuditLogger {
         Ok(self)
     }
 
-    /// Log an `AuditEntry` (legacy path). Redaction runs here before the entry
-    /// is sent to the worker. The worker writes the flat `AuditEntry` JSON format
-    /// plus an appended `integrity` block, preserving backward compatibility with
-    /// consumers that parse the flat shape.
+    /// True when new statements may run under `fail_mode = closed`.
+    ///
+    /// Open mode always returns true (drops are counted, not fatal). A disabled
+    /// logger (empty path) is writable. Closed mode returns false after a full
+    /// queue or a dead writer until the process is restarted.
+    pub fn is_writable(&self) -> bool {
+        match self.fail_mode {
+            AuditFailMode::Open => true,
+            AuditFailMode::Closed => self.tx.is_none() || self.writable.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn fail_mode(&self) -> AuditFailMode {
+        self.fail_mode
+    }
+
     pub fn log(&self, entry: &AuditEntry) {
+        let _ = self.try_log(entry);
+    }
+
+    pub fn try_log(&self, entry: &AuditEntry) -> Result<(), AuditWriteError> {
         let Some(ref tx) = self.tx else {
-            return;
+            return Ok(());
         };
 
         // Redaction runs on the caller side, before the entry is queued.
@@ -856,20 +1102,41 @@ impl AuditLogger {
             }
         };
 
-        if let Err(e) = tx.send(AuditMsg::Legacy(Box::new(redacted))) {
-            tracing::error!("AUDIT: writer dropped, entry not recorded: {e}");
-        }
+        self.enqueue(tx, AuditMsg::Legacy(Box::new(redacted)))
     }
 
     /// Log a canonical `AuditEvent` directly. The worker thread applies
     /// `redact_pii` unconditionally and GDPR masking when configured before
     /// writing to any sink. Callers do not need to pre-sanitise the event.
     pub fn log_event(&self, event: AuditEvent) {
+        let _ = self.try_log_event(event);
+    }
+
+    pub fn try_log_event(&self, event: AuditEvent) -> Result<(), AuditWriteError> {
         let Some(ref tx) = self.tx else {
-            return;
+            return Ok(());
         };
-        if let Err(e) = tx.send(AuditMsg::Event(Box::new(event))) {
-            tracing::error!("AUDIT: writer dropped, event not recorded: {e}");
+        self.enqueue(tx, AuditMsg::Event(Box::new(event)))
+    }
+
+    fn enqueue(&self, tx: &SyncSender<AuditMsg>, msg: AuditMsg) -> Result<(), AuditWriteError> {
+        match tx.try_send(msg) {
+            Ok(()) => {
+                self.writable.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(TrySendError::Full(_)) => {
+                record_drop(&self.dropped, "queue_full");
+                self.writable.store(false, Ordering::Relaxed);
+                tracing::error!("AUDIT: writer queue full, event not recorded");
+                Err(AuditWriteError::QueueFull)
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                record_drop(&self.dropped, "writer_gone");
+                self.writable.store(false, Ordering::Relaxed);
+                tracing::error!("AUDIT: writer dropped, event not recorded");
+                Err(AuditWriteError::WriterGone)
+            }
         }
     }
 
@@ -881,6 +1148,7 @@ impl AuditLogger {
         };
         let (ack_tx, ack_rx) = mpsc::channel();
         if tx.send(AuditMsg::Flush(ack_tx)).is_err() {
+            self.writable.store(false, Ordering::Relaxed);
             return;
         }
         let _ = ack_rx.recv();
@@ -1504,6 +1772,140 @@ mod tests {
         );
 
         // `logger` is still live here - the spool was made readable by flush(), not by drop.
+        drop(logger);
+    }
+
+    fn read_native_events(path: &std::path::Path) -> Vec<crate::audit::AuditEvent> {
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    #[test]
+    fn resume_across_restart_verifies_full_chain() {
+        let (_dir, path) = fresh_audit_path("sqe-audit-resume.jsonl");
+        let path_str = path.to_str().unwrap();
+
+        {
+            let logger = AuditLogger::new(path_str).unwrap();
+            for _ in 0..3 {
+                logger.log_event(crate::audit::sample_query_event());
+            }
+            logger.flush();
+        }
+
+        {
+            let logger = AuditLogger::new(path_str).unwrap();
+            for _ in 0..2 {
+                logger.log_event(crate::audit::sample_query_event());
+            }
+            logger.flush();
+        }
+
+        let events = read_native_events(&path);
+        assert_eq!(events.len(), 5, "expected 5 events, got {events:?}");
+        assert_eq!(events[0].integrity.seq, 0);
+        assert_eq!(events[4].integrity.seq, 4);
+        crate::audit::verify_chain(&events).expect("chain must verify across restart");
+    }
+
+    #[test]
+    fn truncate_tail_then_resume_reports_break() {
+        let (_dir, path) = fresh_audit_path("sqe-audit-truncate.jsonl");
+        let path_str = path.to_str().unwrap();
+
+        {
+            let logger = AuditLogger::new(path_str).unwrap();
+            for _ in 0..5 {
+                logger.log_event(crate::audit::sample_query_event());
+            }
+            logger.flush();
+        }
+
+        let original = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = original.lines().collect();
+        assert_eq!(lines.len(), 5);
+        // Keep events 0-3 and tear event 4 so the tail is unparseable.
+        let mut torn = lines[..4].join("\n");
+        torn.push_str("\n{\"kind\":\"query\",\"integrity\":");
+        std::fs::write(&path, torn).unwrap();
+
+        {
+            let logger = AuditLogger::new(path_str).unwrap();
+            logger.log_event(crate::audit::sample_query_event());
+            logger.flush();
+        }
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("BROKEN:"),
+            "resume must stamp BROKEN prev_hash, got {content}"
+        );
+        let events = read_native_events(&path);
+        let err = crate::audit::verify_chain(&events).expect_err("torn tail must break the chain");
+        match err {
+            crate::audit::ChainError::SeqGap { expected, found } => {
+                assert_eq!(
+                    expected, 4,
+                    "gap should be at seq 4 (the torn 5th event), found {found}"
+                );
+            }
+            crate::audit::ChainError::BrokenLink { seq } => {
+                assert!(seq == 0 || seq == 4 || seq == 5, "break at seq {seq}");
+            }
+            other => panic!("unexpected chain error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn full_queue_increments_dropped_metric() {
+        use prometheus::{IntCounterVec, Opts};
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let dropped = IntCounterVec::new(
+            Opts::new(
+                "sqe_audit_events_dropped_total_queue_test",
+                "audit events dropped in unit test",
+            ),
+            &["reason"],
+        )
+        .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_w = Arc::clone(&stop);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<AuditMsg>(1);
+        let worker = std::thread::spawn(move || {
+            let _first = rx.recv();
+            while !stop_w.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(rx);
+        });
+        let logger = AuditLogger {
+            tx: Some(tx),
+            worker: Mutex::new(Some(worker)),
+            fail_mode: AuditFailMode::Open,
+            writable: Arc::new(AtomicBool::new(true)),
+            dropped: Some(dropped.clone()),
+            gdpr: Arc::new(Mutex::new(None)),
+            spool_sink: Arc::new(Mutex::new(None)),
+        };
+
+        logger.log_event(crate::audit::sample_query_event());
+        std::thread::sleep(Duration::from_millis(30));
+        logger.log_event(crate::audit::sample_query_event());
+        logger.log_event(crate::audit::sample_query_event());
+
+        assert!(
+            dropped.with_label_values(&["queue_full"]).get() >= 1,
+            "expected queue_full drops, got {}",
+            dropped.with_label_values(&["queue_full"]).get()
+        );
+
+        stop.store(true, Ordering::Relaxed);
         drop(logger);
     }
 }

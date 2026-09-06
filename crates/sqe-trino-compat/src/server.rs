@@ -795,26 +795,20 @@ async fn server_state<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 }
 
 fn error_response(status: StatusCode, msg: impl Into<String>) -> Response {
+    let code = match status {
+        StatusCode::UNAUTHORIZED => sqe_core::SqeErrorCode::AuthenticationFailed,
+        StatusCode::FORBIDDEN => sqe_core::SqeErrorCode::AccessDenied,
+        StatusCode::NOT_FOUND => sqe_core::SqeErrorCode::CatalogNotFound,
+        StatusCode::TOO_MANY_REQUESTS => sqe_core::SqeErrorCode::ResourceExhausted,
+        s if s.is_server_error() => sqe_core::SqeErrorCode::InternalError,
+        _ => sqe_core::SqeErrorCode::InvalidArguments,
+    };
     let msg = msg.into();
     let body = TrinoResponse {
         id: String::new(),
         info_uri: None,
         stats: TrinoStats::failed(),
-        error: Some(TrinoError {
-            message: msg.clone(),
-            error_code: 1,
-            error_name: "USER_ERROR".to_string(),
-            error_type: "USER_ERROR".to_string(),
-            query_id: None,
-            failure_info: Some(crate::protocol::TrinoFailureInfo {
-                r#type: "io.trino.spi.USER_ERROR".to_string(),
-                message: msg,
-                suppressed: Vec::new(),
-                cause: None,
-                stack: Vec::new(),
-            }),
-            error_location: None,
-        }),
+        error: Some(TrinoError::from_code(code, msg, None)),
         ..Default::default()
     };
     (status, Json(body)).into_response()
@@ -1283,7 +1277,7 @@ async fn run_statement<Q: TrinoQueryExecutor>(
     if let Some((kind, name)) = protocol::parse_describe_prepared(exec_sql) {
         match prepared.get(&name) {
             Some(prepared_sql) => handler.describe_prepared(session, prepared_sql, kind).await,
-            None => Err(sqe_core::SqeError::Execution(format!(
+            None => Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
                 "Prepared statement not found: {name}"
             ))),
         }
@@ -1605,7 +1599,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                     fn drop(&mut self) {
                         let mut s = self.0.status.lock().unwrap();
                         if !s.is_terminal() {
-                            *s = QueryStatus::Failed(Box::new(protocol::TrinoError::user_error(
+                            *s = QueryStatus::Failed(Box::new(protocol::TrinoError::internal_error(
                                 "query task terminated unexpectedly",
                                 None,
                             )));
@@ -2329,7 +2323,7 @@ mod tests {
             _: &Session,
             _: &str,
         ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
-            Err(sqe_core::SqeError::Execution("mock".to_string()))
+            Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, "mock".to_string()))
         }
     }
 

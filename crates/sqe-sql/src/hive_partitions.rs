@@ -28,7 +28,7 @@
 use sqlparser::dialect::GenericDialect;
 use sqlparser::tokenizer::{Token, Tokenizer};
 
-use sqe_core::{Result, SqeError};
+use sqe_core::{Result, SqeError, SqeErrorCode};
 
 /// A parsed `ALTER TABLE ... ADD/DROP PARTITION` statement ready for the
 /// coordinator to translate into manifest index maintenance.
@@ -81,7 +81,7 @@ pub fn try_parse_hive_partition_ddl(sql: &str) -> Result<Option<HivePartitionDdl
     // once here instead of skipping them at every step of the walk below.
     let tokens: Vec<Token> = Tokenizer::new(&GenericDialect {}, trimmed)
         .tokenize()
-        .map_err(|e| SqeError::Execution(format!("failed to tokenize ALTER TABLE: {e}")))?
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("failed to tokenize ALTER TABLE: {e}")))?
         .into_iter()
         .filter(|t| !matches!(t, Token::Whitespace(_)))
         .collect();
@@ -139,7 +139,7 @@ pub fn try_parse_hive_partition_ddl(sql: &str) -> Result<Option<HivePartitionDdl
                             Some(s.clone())
                         }
                         other => {
-                            return Err(SqeError::Execution(format!(
+                            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                                 "ADD PARTITION LOCATION must be a single-quoted string, got {:?}",
                                 other.map(describe_token)
                             )))
@@ -237,7 +237,7 @@ fn parse_spec_values(tokens: &[Token], i: &mut usize) -> Result<Vec<(String, Str
     match tokens.get(*i) {
         Some(Token::LParen) => *i += 1,
         other => {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "expected `(` after PARTITION, got {:?}",
                 other.map(describe_token)
             )))
@@ -252,7 +252,7 @@ fn parse_spec_values(tokens: &[Token], i: &mut usize) -> Result<Vec<(String, Str
                 w.value.clone()
             }
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "expected a partition key name, got {:?}",
                     other.map(describe_token)
                 )))
@@ -261,7 +261,7 @@ fn parse_spec_values(tokens: &[Token], i: &mut usize) -> Result<Vec<(String, Str
         match tokens.get(*i) {
             Some(Token::Eq) => *i += 1,
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "expected `=` after partition key `{key}`, got {:?}",
                     other.map(describe_token)
                 )))
@@ -283,7 +283,7 @@ fn parse_spec_values(tokens: &[Token], i: &mut usize) -> Result<Vec<(String, Str
                         assemble_composite_value(tokens, i, format!("-{n}"))
                     }
                     other => {
-                        return Err(SqeError::Execution(format!(
+                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                             "expected a number after `-`, got {:?}",
                             other.map(describe_token)
                         )))
@@ -291,7 +291,7 @@ fn parse_spec_values(tokens: &[Token], i: &mut usize) -> Result<Vec<(String, Str
                 }
             }
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "expected a partition value for `{key}`, got {:?}",
                     other.map(describe_token)
                 )))
@@ -306,7 +306,7 @@ fn parse_spec_values(tokens: &[Token], i: &mut usize) -> Result<Vec<(String, Str
                 break;
             }
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "expected `,` or `)` in PARTITION spec, got {:?}",
                     other.map(describe_token)
                 )))
@@ -319,7 +319,7 @@ fn parse_spec_values(tokens: &[Token], i: &mut usize) -> Result<Vec<(String, Str
 fn expect_end(tokens: &[Token], i: usize) -> Result<()> {
     match tokens.get(i) {
         None => Ok(()),
-        Some(tok) => Err(SqeError::Execution(format!(
+        Some(tok) => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "unexpected trailing token in ALTER TABLE ... PARTITION: {}",
             describe_token(tok)
         ))),

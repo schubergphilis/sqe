@@ -38,4 +38,5 @@ futures = { workspace = true }
 # coordinator and the worker share one implementation instead of three.
 tonic = { workspace = true }
 rustls = { version = "0.23", features = ["ring"] }
+datafusion = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

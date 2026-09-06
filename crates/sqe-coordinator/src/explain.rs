@@ -13,7 +13,7 @@ use datafusion::physical_plan::{collect, displayable, ExecutionPlan};
 use datafusion::prelude::SessionContext;
 
 use sqe_catalog::IcebergScanExec;
-use sqe_core::{Session, SqeError};
+use sqe_core::{Session, SqeError, SqeErrorCode};
 use sqe_policy::PolicyEnforcer;
 
 pub struct ExplainHandler {
@@ -101,7 +101,7 @@ impl ExplainHandler {
         let df = ctx
             .sql(inner_sql)
             .await
-            .map_err(|e| SqeError::Execution(format!("EXPLAIN planning failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("EXPLAIN planning failed: {e}")))?;
 
         let logical = df.logical_plan().clone();
         let (enforced, _policy_summary) = self
@@ -115,7 +115,7 @@ impl ExplainHandler {
             .state()
             .create_physical_plan(&enforced)
             .await
-            .map_err(|e| SqeError::Execution(format!("Physical planning failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Physical planning failed: {e}")))?;
         let physical = self.apply_plan_shape_rules(ctx, physical);
 
         let physical_str = format!("{}", displayable(physical.as_ref()).indent(true));
@@ -130,7 +130,7 @@ impl ExplainHandler {
             physical_str.as_str(),
         ]));
         let batch = RecordBatch::try_new(schema, vec![types, plans])
-            .map_err(|e| SqeError::Execution(format!("Failed to build explain batch: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build explain batch: {e}")))?;
 
         Ok(vec![batch])
     }
@@ -158,7 +158,7 @@ impl ExplainHandler {
         let df = ctx
             .sql(inner_sql)
             .await
-            .map_err(|e| SqeError::Execution(format!("EXPLAIN ANALYZE planning failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("EXPLAIN ANALYZE planning failed: {e}")))?;
         let logical = df.logical_plan().clone();
         let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -174,7 +174,7 @@ impl ExplainHandler {
             .state()
             .create_physical_plan(&enforced)
             .await
-            .map_err(|e| SqeError::Execution(format!("Physical planning failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Physical planning failed: {e}")))?;
         let physical = self.apply_plan_shape_rules(ctx, physical);
         let physical_plan_ms = physical_plan_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -182,7 +182,7 @@ impl ExplainHandler {
         let execute_start = std::time::Instant::now();
         collect(physical.clone(), ctx.task_ctx())
             .await
-            .map_err(|e| SqeError::Execution(format!("EXPLAIN ANALYZE execution failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("EXPLAIN ANALYZE execution failed: {e}")))?;
         let execute_ms = execute_start.elapsed().as_secs_f64() * 1000.0;
 
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
@@ -273,7 +273,7 @@ impl ExplainHandler {
                 spilled_rows_arr,
             ],
         )
-        .map_err(|e| SqeError::Execution(format!("Failed to build analyze batch: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build analyze batch: {e}")))?;
 
         Ok(vec![batch])
     }
@@ -297,7 +297,7 @@ impl ExplainHandler {
         let df = ctx
             .sql(inner_sql)
             .await
-            .map_err(|e| SqeError::Execution(format!("EXPLAIN FULL planning failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("EXPLAIN FULL planning failed: {e}")))?;
         let logical = df.logical_plan().clone();
         let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -313,7 +313,7 @@ impl ExplainHandler {
             .state()
             .create_physical_plan(&enforced)
             .await
-            .map_err(|e| SqeError::Execution(format!("Physical planning failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Physical planning failed: {e}")))?;
         let physical = self.apply_plan_shape_rules(ctx, physical);
         let physical_plan_ms = physical_plan_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -321,7 +321,7 @@ impl ExplainHandler {
         let execute_start = std::time::Instant::now();
         collect(physical.clone(), ctx.task_ctx())
             .await
-            .map_err(|e| SqeError::Execution(format!("EXPLAIN FULL execution failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("EXPLAIN FULL execution failed: {e}")))?;
         let execute_ms = execute_start.elapsed().as_secs_f64() * 1000.0;
 
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
@@ -409,7 +409,7 @@ impl ExplainHandler {
                 spill_rows,
             ],
         )
-        .map_err(|e| SqeError::Execution(format!("Failed to build full explain batch: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build full explain batch: {e}")))?;
 
         Ok(vec![batch])
     }

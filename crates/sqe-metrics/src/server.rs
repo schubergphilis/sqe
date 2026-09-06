@@ -16,27 +16,26 @@ use crate::HasRegistry;
 pub fn start_metrics_server<R: HasRegistry + Clone>(
     metrics: Arc<R>,
     port: u16,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let app = Router::new()
-            .route("/metrics", get(metrics_handler::<R>))
-            .with_state(metrics);
-
-        let addr = format!("0.0.0.0:{port}");
-        let listener = match tokio::net::TcpListener::bind(&addr).await {
+) -> Result<tokio::task::JoinHandle<()>, std::io::Error> {
+    let addr = format!("0.0.0.0:{port}");
+    let std_listener = std::net::TcpListener::bind(&addr)?;
+    std_listener.set_nonblocking(true)?;
+    info!("Metrics server listening on {addr}");
+    Ok(tokio::spawn(async move {
+        let listener = match tokio::net::TcpListener::from_std(std_listener) {
             Ok(l) => l,
             Err(e) => {
-                error!(addr = %addr, error = %e, "Failed to bind metrics server");
+                error!(error = %e, "Failed to convert metrics listener");
                 return;
             }
         };
-
-        info!("Metrics server listening on {addr}");
-
+        let app = Router::new()
+            .route("/metrics", get(metrics_handler::<R>))
+            .with_state(metrics);
         if let Err(e) = axum::serve(listener, app).await {
             error!(error = %e, "Metrics server exited with error");
         }
-    })
+    }))
 }
 
 async fn metrics_handler<R: HasRegistry>(State(metrics): State<Arc<R>>) -> impl IntoResponse {
@@ -113,5 +112,20 @@ mod tests {
         assert!(output.contains("sqe_worker_rows_scanned_total"));
         assert!(output.contains("sqe_worker_bytes_read_total"));
         assert!(output.contains("sqe_worker_fragment_duration_seconds"));
+    }
+
+    #[test]
+    fn second_bind_on_same_port_fails() {
+        let metrics = Arc::new(MetricsRegistry::new().unwrap());
+        let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let err = start_metrics_server(metrics, port).expect_err("port is taken");
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+            ),
+            "unexpected error: {err}"
+        );
     }
 }

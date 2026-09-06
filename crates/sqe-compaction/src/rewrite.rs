@@ -26,7 +26,7 @@ use std::sync::Arc;
 use futures::{StreamExt, TryStreamExt};
 use iceberg::spec::{DataContentType, DataFile, ManifestStatus};
 use iceberg::table::Table as IcebergTable;
-use sqe_core::SqeError;
+use sqe_core::{SqeError, SqeErrorCode};
 
 use crate::writer::{write_data_files_streaming, FanoutLimits, UploadedPaths};
 
@@ -52,15 +52,15 @@ pub struct DeleteAwareReadPlan {
 pub async fn plan_delete_aware_read(table: &IcebergTable) -> sqe_core::Result<DeleteAwareReadPlan> {
     let scan =
         table.scan().select_all().build().map_err(|e| {
-            SqeError::Execution(format!("Failed to build compaction read scan: {e}"))
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build compaction read scan: {e}"))
         })?;
     let tasks: Vec<iceberg::scan::FileScanTask> = scan
         .plan_files()
         .await
-        .map_err(|e| SqeError::Execution(format!("Failed to plan compaction read: {e}")))?
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to plan compaction read: {e}")))?
         .try_collect()
         .await
-        .map_err(|e| SqeError::Execution(format!("Failed to plan compaction read: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to plan compaction read: {e}")))?;
     let mut tasks_by_path: HashMap<String, Vec<iceberg::scan::FileScanTask>> = HashMap::new();
     for task in tasks {
         tasks_by_path
@@ -104,7 +104,7 @@ pub async fn collect_live_delete_files(table: &IcebergTable) -> sqe_core::Result
     let manifest_list = cache
         .get_manifest_list(snapshot, &metadata_ref)
         .await
-        .map_err(|e| SqeError::Execution(format!("Failed to load manifest list: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to load manifest list: {e}")))?;
 
     const CONCURRENCY: usize = 8;
     let manifests: Vec<Arc<iceberg::spec::Manifest>> =
@@ -116,7 +116,7 @@ pub async fn collect_live_delete_files(table: &IcebergTable) -> sqe_core::Result
             .buffer_unordered(CONCURRENCY)
             .try_collect()
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to load manifest: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to load manifest: {e}")))?;
 
     Ok(manifests
         .into_iter()
@@ -386,7 +386,7 @@ impl datafusion::physical_plan::streaming::PartitionStream for OneShotStream {
                     self.schema.clone(),
                     futures::stream::once(async {
                         Err(datafusion::error::DataFusionError::Execution(
-                            "compaction sort source polled more than once".into(),
+                            "compaction sort source polled more than once".to_string(),
                         ))
                     }),
                 ),
@@ -417,18 +417,18 @@ pub async fn sort_group_stream(
             inner: std::sync::Mutex::new(Some(input)),
         })],
     )
-    .map_err(|e| SqeError::Execution(format!("compaction sort: build source failed: {e}")))?;
+    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("compaction sort: build source failed: {e}")))?;
 
     const SRC: &str = "__sqe_compact_src";
     session
         .register_table(SRC, Arc::new(provider))
         .map_err(|e| {
-            SqeError::Execution(format!("compaction sort: register source failed: {e}"))
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("compaction sort: register source failed: {e}"))
         })?;
     let df = session
         .table(SRC)
         .await
-        .map_err(|e| SqeError::Execution(format!("compaction sort: read source failed: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("compaction sort: read source failed: {e}")))?;
 
     let sorted = match &ctx.spec {
         SortSpec::Columns(cols) => {
@@ -437,7 +437,7 @@ pub async fn sort_group_stream(
                 .map(|(name, asc)| col(name).sort(*asc, !*asc))
                 .collect::<Vec<_>>();
             df.sort(exprs)
-                .map_err(|e| SqeError::Execution(format!("compaction sort failed: {e}")))?
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("compaction sort failed: {e}")))?
         }
         SortSpec::ZOrder(cols) => {
             // Project a Morton z-value, sort on it, then drop it so the written
@@ -457,14 +457,14 @@ pub async fn sort_group_stream(
             df.select(projected)
                 .and_then(|d| d.sort(vec![col("__sqe_zvalue").sort(true, false)]))
                 .and_then(|d| d.select(passthrough))
-                .map_err(|e| SqeError::Execution(format!("compaction z-order sort failed: {e}")))?
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("compaction z-order sort failed: {e}")))?
         }
     };
 
     sorted
         .execute_stream()
         .await
-        .map_err(|e| SqeError::Execution(format!("compaction sort execution failed: {e}")))
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("compaction sort execution failed: {e}")))
 }
 
 /// Rewrite one file group, applying its position and equality deletes, and emit
@@ -510,7 +510,7 @@ pub async fn rewrite_group(
         match plan.tasks_by_path.get(df.file_path()) {
             Some(t) => tasks.extend(t.iter().cloned()),
             None => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "delete-aware compaction: data file '{}' is missing from the scan plan; \
                      refusing to read it without its delete files (data-file path mismatch \
                      between the manifest and the scan planner)",
@@ -534,7 +534,7 @@ pub async fn rewrite_group(
     let scan_result = plan
         .scan
         .read_tasks_to_arrow_with_metrics(task_stream)
-        .map_err(|e| SqeError::Execution(format!("delete-aware compaction read failed: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("delete-aware compaction read failed: {e}")))?;
     let df_stream = scan_result
         .stream()
         .map(|item| item.map_err(|e| datafusion::error::DataFusionError::External(Box::new(e))));
@@ -576,7 +576,7 @@ pub async fn rewrite_group(
     // surviving rows (rows too low).
     match expected_rows_after_deletes(&group, live_deletes) {
         Some(expected) if rows_written != expected => {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "compaction delete-accounting mismatch: wrote {rows_written} rows, expected \
                  {expected} after applying position deletes to a group of {} files; aborting \
                  before commit",
@@ -588,7 +588,7 @@ pub async fn rewrite_group(
             // the looser bound that a rewrite can never manufacture rows.
             let base: u64 = group.iter().map(|f| f.record_count()).sum();
             if rows_written > base {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "compaction wrote {rows_written} rows from {base} input rows; deletes \
                      cannot increase the row count; aborting before commit"
                 )));
