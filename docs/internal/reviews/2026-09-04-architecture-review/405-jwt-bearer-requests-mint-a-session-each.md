@@ -5,6 +5,7 @@
 - Category: performance
 - Effort: S (hours)
 - Status: open
+- Issue: #585
 
 ## Problem
 

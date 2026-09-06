@@ -204,11 +204,12 @@ impl InformationSchemaProvider {
                 // Fail closed on policy errors: skip the table entirely rather than leak
                 // the column list when the policy backend is degraded.
                 //
-                // Match plan_rewriter's policy key: the namespace is the LAST dotted
-                // component (resolve_policy_key uses rsplit('.').next()). Passing the
-                // full dotted namespace here would miss the policy and leak restricted
-                // column names in information_schema for multi-level namespaces.
-                let policy_ns = ns.rsplit('.').next().unwrap_or(ns);
+                // Match plan_rewriter's policy key: the FULL dotted namespace, as the
+                // planner spells it in a TableScan's TableReference (architecture
+                // review 201). Reducing to the last component missed the policy for
+                // multi-level namespaces and listed restricted column names that the
+                // rewriter NULLs.
+                let policy_ns = ns.as_str();
                 let restricted_columns = match (&self.policy_store, &self.session_user) {
                     (Some(store), Some(user)) => {
                         match store.resolve(user, table_ident.name(), policy_ns).await {

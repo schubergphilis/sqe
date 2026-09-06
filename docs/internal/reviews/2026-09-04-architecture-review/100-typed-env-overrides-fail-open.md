@@ -5,6 +5,7 @@
 - Category: security
 - Effort: S (hours)
 - Status: fixed (branch `fix/config-startup-code-structure`, 2026-09-05)
+- Issue: #543
 
 ## Resolution (2026-09-05)
 
