@@ -3555,6 +3555,16 @@ pub struct AuditConfig {
     /// Default: 300 seconds.
     #[serde(default = "default_dashboard_access_audit_window_secs")]
     pub dashboard_access_audit_window_secs: u64,
+    /// Bound on the in-process audit writer queue. Default: 10_000. When the
+    /// queue is full, events are dropped and `sqe_audit_events_dropped_total`
+    /// is incremented rather than growing unbounded.
+    #[serde(default = "default_audit_queue_capacity")]
+    pub queue_capacity: usize,
+    /// `"open"` (default): drop events when the writer cannot keep up.
+    /// `"closed"`: `AuditLogger::is_writable()` becomes false and QueryHandler
+    /// refuses new statements until a subsequent enqueue succeeds.
+    #[serde(default = "default_audit_fail_mode")]
+    pub fail_mode: String,
 }
 
 fn default_audit_format() -> String {
@@ -3569,6 +3579,14 @@ fn default_dashboard_access_audit_window_secs() -> u64 {
     300
 }
 
+fn default_audit_queue_capacity() -> usize {
+    10_000
+}
+
+fn default_audit_fail_mode() -> String {
+    "open".to_string()
+}
+
 impl Default for AuditConfig {
     fn default() -> Self {
         Self {
@@ -3577,6 +3595,8 @@ impl Default for AuditConfig {
             gdpr_identifier_mode: default_gdpr_identifier_mode(),
             superdebug_log_results: false,
             dashboard_access_audit_window_secs: default_dashboard_access_audit_window_secs(),
+            queue_capacity: default_audit_queue_capacity(),
+            fail_mode: default_audit_fail_mode(),
         }
     }
 }
@@ -9565,6 +9585,8 @@ mod ranger_config_tests {
         assert!(c.gdpr_tags.is_empty());
         assert_eq!(c.gdpr_identifier_mode, "tokenize");
         assert!(!c.superdebug_log_results);
+        assert_eq!(c.queue_capacity, 10_000);
+        assert_eq!(c.fail_mode, "open");
     }
 
     #[test]

@@ -20,6 +20,7 @@ use sqe_sql::TableRef;
 use sqlparser::ast::{BinaryOperator, Expr, Query, Select, SetExpr, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use sqe_core::SqeErrorCode;
 
 /// Default number of history entries to examine.
 pub const DEFAULT_HISTORY_LIMIT: usize = 1000;
@@ -226,7 +227,7 @@ fn build_result_batch(
             Arc::new(BooleanArray::from(recommended)),
         ],
     )
-    .map_err(|e| SqeError::Execution(format!("Failed to build suggestion batch: {e}")))?;
+    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build suggestion batch: {e}")))?;
     Ok(vec![batch])
 }
 

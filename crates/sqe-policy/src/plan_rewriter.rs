@@ -146,7 +146,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
             }
             Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
         })
-        .map_err(|e| sqe_core::error::SqeError::Execution(format!("Plan traversal failed: {e}")))?;
+        .map_err(|e| sqe_core::error::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Plan traversal failed: {e}")))?;
 
         // Resolve policies for all tables
         let mut table_policies: HashMap<String, ResolvedPolicy> = HashMap::new();
@@ -455,7 +455,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                 Ok(Transformed::no(node))
             })
             .map_err(|e| {
-                sqe_core::error::SqeError::Execution(format!("Plan rewrite failed: {e}"))
+                sqe_core::error::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Plan rewrite failed: {e}"))
             })?;
 
         Ok((rewritten.data, summary))

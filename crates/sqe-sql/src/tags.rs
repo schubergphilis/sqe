@@ -4,7 +4,7 @@
 //! `sqe.column-tags` table property. They are DISTINCT from Iceberg snapshot
 //! tags (`CREATE TAG` / `DROP TAG`, see `ddl.rs`).
 
-use sqe_core::{Result, SqeError};
+use sqe_core::{Result, SqeError, SqeErrorCode};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TagAction {
@@ -160,7 +160,7 @@ pub fn try_parse_masking_policy(sql: &str) -> Result<Option<MaskingPolicyOp>> {
         // accurate for the forms it was written for, misleading here. A caller who
         // forgot the name should be told how to find one.
         if body.trim().is_empty() {
-            return Err(SqeError::Execution(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
                 "SET MASKING POLICY needs a policy name. Run SHOW MASKING POLICIES \
                  to see what is available."
                     .to_string(),
@@ -206,12 +206,12 @@ fn split_identifier(s: &str) -> Result<(String, &str)> {
         }
     }
     if in_quote {
-        return Err(SqeError::Execution(format!(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "SET TAGS: unterminated double-quote in identifier near `{s}`"
         )));
     }
     if out.is_empty() {
-        return Err(SqeError::Execution(format!(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "SET TAGS: expected an identifier near `{s}`"
         )));
     }
@@ -224,14 +224,14 @@ fn split_identifier(s: &str) -> Result<(String, &str)> {
 fn strip_parens<'a>(s: &'a str, context: &str) -> Result<&'a str> {
     let s = s.trim();
     if !s.starts_with('(') {
-        return Err(SqeError::Execution(format!(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "SET TAGS: {context}: expected a `(` to open the tag list, got `{s}`"
         )));
     }
     s.strip_prefix('(')
         .and_then(|x| x.strip_suffix(')'))
         .ok_or_else(|| {
-            SqeError::Execution(format!(
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "SET TAGS: {context}: missing closing `)` for the tag list near `{s}`"
             ))
         })
@@ -288,7 +288,7 @@ fn parse_native_set_list(body: &str) -> Result<Vec<ColumnTagOp>> {
     let mut ops = Vec::new();
     for item in split_top_level(inner) {
         let eq = item.find('=').ok_or_else(|| {
-            SqeError::Execution(format!("SET TAGS: expected `col = (...)`, got `{item}`"))
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SET TAGS: expected `col = (...)`, got `{item}`"))
         })?;
         let (col, _) = split_identifier(item[..eq].trim())?;
         let tags_part = item[eq + 1..].trim();
@@ -299,7 +299,7 @@ fn parse_native_set_list(body: &str) -> Result<Vec<ColumnTagOp>> {
             .filter(|t| !t.is_empty())
             .collect();
         if tags.is_empty() {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "SET TAGS: column `{col}` has no tags"
             )));
         }
@@ -310,7 +310,7 @@ fn parse_native_set_list(body: &str) -> Result<Vec<ColumnTagOp>> {
         });
     }
     if ops.is_empty() {
-        return Err(SqeError::Execution("SET TAGS: empty tag list".into()));
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, "SET TAGS: empty tag list"));
     }
     Ok(ops)
 }
@@ -328,7 +328,7 @@ fn parse_native_unset_list(body: &str) -> Result<Vec<ColumnTagOp>> {
         });
     }
     if ops.is_empty() {
-        return Err(SqeError::Execution("UNSET TAGS: empty column list".into()));
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, "UNSET TAGS: empty column list"));
     }
     Ok(ops)
 }
@@ -345,7 +345,7 @@ fn parse_snowflake_assignments(body: &str) -> Result<Vec<String>> {
         names.push(name);
     }
     if names.is_empty() {
-        return Err(SqeError::Execution("SET TAG: expected a tag name".into()));
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, "SET TAG: expected a tag name"));
     }
     Ok(names)
 }
@@ -358,7 +358,7 @@ fn parse_snowflake_names(body: &str) -> Result<Vec<String>> {
         names.push(name);
     }
     if names.is_empty() {
-        return Err(SqeError::Execution("UNSET TAG: expected a tag name".into()));
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, "UNSET TAG: expected a tag name"));
     }
     Ok(names)
 }

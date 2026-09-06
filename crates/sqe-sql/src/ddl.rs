@@ -17,7 +17,7 @@
 //! ALTER TABLE ns.t DROP TAG v1 [IF EXISTS]
 //! ```
 
-use sqe_core::{Result, SqeError};
+use sqe_core::{Result, SqeError, SqeErrorCode};
 
 /// A parsed branch/tag DDL statement ready for execution by the coordinator.
 #[derive(Debug, Clone, PartialEq)]
@@ -94,7 +94,7 @@ pub fn try_parse_ref_ddl(sql: &str) -> Result<Option<RefDdl>> {
         let after_upper = after_maybe_replace.to_ascii_uppercase();
         if after_upper.starts_with("BRANCH ") {
             if create_or_replace {
-                return Err(SqeError::Execution(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
                     "CREATE OR REPLACE BRANCH is not supported (branches are mutable; use CREATE BRANCH)"
                         .to_string(),
                 ));
@@ -160,7 +160,7 @@ fn parse_if_exists(tail: &str) -> Result<bool> {
     if tail_trim.to_ascii_uppercase() == "IF EXISTS" {
         return Ok(true);
     }
-    Err(SqeError::Execution(format!(
+    Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
         "unexpected tokens after branch/tag name: '{tail_trim}'"
     )))
 }
@@ -200,13 +200,13 @@ fn parse_as_of_version(input: &str) -> Result<(Option<i64>, &str)> {
         .find(|c: char| !c.is_ascii_digit() && c != '-')
         .unwrap_or(after.len());
     if end == 0 {
-        return Err(SqeError::Execution(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
             "AS OF VERSION requires an integer snapshot id".to_string(),
         ));
     }
     let num_str = &after[..end];
     let snapshot_id: i64 = num_str.parse().map_err(|_| {
-        SqeError::Execution(format!(
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "AS OF VERSION: '{num_str}' is not a valid integer snapshot id"
         ))
     })?;
@@ -220,25 +220,25 @@ fn parse_branch_retention(input: &str) -> Result<BranchRetention> {
         match k.to_lowercase().as_str() {
             "min_snapshots_to_keep" => {
                 out.min_snapshots_to_keep = Some(v.parse().map_err(|_| {
-                    SqeError::Execution(format!(
+                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "min_snapshots_to_keep requires an integer, got '{v}'"
                     ))
                 })?);
             }
             "max_snapshot_age_ms" => {
                 out.max_snapshot_age_ms = Some(v.parse().map_err(|_| {
-                    SqeError::Execution(format!(
+                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "max_snapshot_age_ms requires an integer, got '{v}'"
                     ))
                 })?);
             }
             "max_ref_age_ms" => {
                 out.max_ref_age_ms = Some(v.parse().map_err(|_| {
-                    SqeError::Execution(format!("max_ref_age_ms requires an integer, got '{v}'"))
+                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("max_ref_age_ms requires an integer, got '{v}'"))
                 })?);
             }
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "unknown retention option for branch: '{other}'"
                 )));
             }
@@ -254,11 +254,11 @@ fn parse_tag_retention(input: &str) -> Result<Option<i64>> {
         match k.to_lowercase().as_str() {
             "max_ref_age_ms" => {
                 out = Some(v.parse().map_err(|_| {
-                    SqeError::Execution(format!("max_ref_age_ms requires an integer, got '{v}'"))
+                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("max_ref_age_ms requires an integer, got '{v}'"))
                 })?);
             }
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "unknown retention option for tag: '{other}' (tags only accept max_ref_age_ms)"
                 )));
             }
@@ -272,13 +272,13 @@ fn parse_retention_args(input: &str) -> Result<Vec<(String, String)>> {
     let trimmed = input.trim();
     let upper = trimmed.to_ascii_uppercase();
     if !upper.starts_with("WITH RETENTION") {
-        return Err(SqeError::Execution(format!(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "expected WITH RETENTION clause, got: '{trimmed}'"
         )));
     }
     let after_kw = trimmed[14..].trim_start();
     if !after_kw.starts_with('(') || !after_kw.ends_with(')') {
-        return Err(SqeError::Execution(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
             "WITH RETENTION requires parentheses around options".to_string(),
         ));
     }
@@ -292,13 +292,13 @@ fn parse_retention_args(input: &str) -> Result<Vec<(String, String)>> {
         let mut it = part.splitn(2, "=>");
         let k = it
             .next()
-            .ok_or_else(|| SqeError::Execution(format!("bad retention option: '{part}'")))?
+            .ok_or_else(|| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("bad retention option: '{part}'")))?
             .trim()
             .to_string();
         let v = it
             .next()
             .ok_or_else(|| {
-                SqeError::Execution(format!(
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "retention option '{k}' missing value (use 'k => v')"
                 ))
             })?
@@ -307,7 +307,7 @@ fn parse_retention_args(input: &str) -> Result<Vec<(String, String)>> {
             .trim_matches('"')
             .to_string();
         if k.is_empty() {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "empty retention key in: '{part}'"
             )));
         }
@@ -322,7 +322,7 @@ fn parse_retention_args(input: &str) -> Result<Vec<(String, String)>> {
 fn split_identifier(input: &str) -> Result<(String, &str)> {
     let trimmed = input.trim_start();
     if trimmed.is_empty() {
-        return Err(SqeError::Execution("expected an identifier".to_string()));
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, "expected an identifier".to_string()));
     }
     let bytes = trimmed.as_bytes();
     if bytes[0] == b'"' {
@@ -331,7 +331,7 @@ fn split_identifier(input: &str) -> Result<(String, &str)> {
             end += 1;
         }
         if end >= bytes.len() {
-            return Err(SqeError::Execution(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
                 "unterminated quoted identifier".to_string(),
             ));
         }

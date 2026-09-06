@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn plain_execution_maps_to_execution() {
         let mapped =
-            sqe_error_to_query_error(SqeError::Execution("table 'foo' not found".to_string()));
+            sqe_error_to_query_error(SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, "table 'foo' not found".to_string()));
         match mapped {
             QueryError::Execution(msg) => assert!(msg.contains("table 'foo' not found")),
             other => panic!("expected Execution, got {other:?}"),

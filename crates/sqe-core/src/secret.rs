@@ -48,7 +48,7 @@ impl From<SecretStoreError> for crate::error::SqeError {
             }
             SecretStoreError::InUseBy(..)
             | SecretStoreError::NotFound(_)
-            | SecretStoreError::Io(_) => crate::error::SqeError::Execution(err.to_string()),
+            | SecretStoreError::Io(_) => crate::error::SqeError::with_code(crate::SqeErrorCode::ExecutionFailed, err.to_string()),
             SecretStoreError::Poisoned => crate::error::SqeError::Internal(anyhow::anyhow!(err)),
         }
     }

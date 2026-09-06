@@ -198,14 +198,17 @@ impl RangerTagProjector {
             .send()
             .await
             .map_err(|e| {
-                sqe_core::SqeError::Execution(format!(
+                sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
                     "Ranger tag projection request to {url} failed: {e}"
                 ))
             })?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(sqe_core::SqeError::Execution(format!(
+            let text = match resp.text().await {
+                Ok(b) => b,
+                Err(e) => format!("<body unreadable: {e}>"),
+            };
+            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
                 "Ranger tag projection returned HTTP {status}: {text}"
             )));
         }

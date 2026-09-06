@@ -4,7 +4,7 @@
 - Severity: medium
 - Category: reliability
 - Effort: M (days)
-- Status: open
+- Status: fixed (branch `fix/errors-audit-observability`, 2026-09-05)
 - Issue: #571
 
 ## Problem
@@ -41,3 +41,7 @@ Classification here is not cosmetic. `AccessDenied` on a namespace probe hides t
 - 2026-06-26 codebase analysis item on `SqeError` string variants (still open).
 - 104 and 800 file the same classifier from the sqe-core and cross-cutting side; this issue is the catalog-side evidence and the vendored-client fix. One MR can close all three.
 - 306.
+
+## Resolution (2026-09-05)
+
+`iceberg::Error::http_status()` reads the `status`/`code` context entries. `iceberg_error_is_forbidden` is `http_status() == Some(403)`. `classify_iceberg_catalog_error` builds `CatalogHttp` from the typed status, so a table named `forbidden_words` with HTTP 500 is `CatalogUnavailable`. Tests in `rest_catalog.rs`.
