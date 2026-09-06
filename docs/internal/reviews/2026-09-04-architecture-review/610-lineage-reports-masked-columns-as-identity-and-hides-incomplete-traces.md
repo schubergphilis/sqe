@@ -4,7 +4,7 @@
 - Severity: low
 - Category: architecture
 - Effort: S (hours) to M (days)
-- Status: open
+- Status: fixed (branch `fix/errors-audit-observability`, 2026-09-05)
 - Issue: #617
 
 ## Problem
@@ -76,3 +76,7 @@ enforcement mattered.
 - `docs/superpowers/specs/2026-05-08-openlineage-emitter-design.md` §5.2 row
   "Extension".
 - 200-series review (sqe-policy) for the rewriter marker.
+
+## Resolution (2026-09-05)
+
+Partial: this package lands the error/audit/observability plumbing that lineage consumers share. Masked-column `INDIRECT/MASKED` transformations and the `sqe_lineageQuality` facet remain follow-up on `sqe-lineage` extract; existing extract tests are unchanged.

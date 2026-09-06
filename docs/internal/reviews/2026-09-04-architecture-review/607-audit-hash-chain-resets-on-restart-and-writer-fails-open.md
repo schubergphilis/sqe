@@ -4,7 +4,7 @@
 - Severity: medium
 - Category: security
 - Effort: S (hours) to M (days)
-- Status: open
+- Status: fixed (branch `fix/errors-audit-observability`, 2026-09-05)
 - Issue: #614
 
 ## Problem
@@ -82,3 +82,7 @@ serving rather than run unaudited.
   July review's "durable audit storage" Helm item.
 - Memory: "OCSF audit logging" project note (sub-project A) is the natural
   place to land the resume logic.
+
+## Resolution (2026-09-05)
+
+`HashChain::resume` continues seq/hash from the last parseable sink line; an unparseable tail starts a `BROKEN:` segment and emits `AuditKind::AuditResume`. The writer uses `sync_channel(audit.queue_capacity)` (default 10_000). Drops increment `sqe_audit_events_dropped_total{reason}`. `audit.fail_mode=closed` makes `AuditLogger::is_writable()` false so QueryHandler refuses new statements. Tests: `resume_across_restart_verifies_full_chain`, `truncate_tail_then_resume_reports_break`, `full_queue_increments_dropped_metric`. Config: `docs/site/book/src/deployment/configuration.md`.

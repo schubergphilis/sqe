@@ -48,16 +48,18 @@ async fn async_main(config: SqeConfig, config_path: String) -> anyhow::Result<()
         &config.metrics.otlp_endpoint,
         &config.metrics.traces_otlp_endpoint,
         config.metrics.trace_sample_rate,
-    );
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
 
     let worker_metrics = Arc::new(
         WorkerMetricsRegistry::new()
             .map_err(|e| anyhow::anyhow!("failed to initialize worker metrics registry: {e}"))?,
     );
-    sqe_metrics::server::start_metrics_server(
+    let _metrics_server = sqe_metrics::server::start_metrics_server(
         worker_metrics.clone(),
         config.metrics.prometheus_port,
-    );
+    )
+    .map_err(|e| anyhow::anyhow!("failed to bind metrics server: {e}"))?;
 
     let ready = Arc::new(AtomicBool::new(false));
     let health_port = config.metrics.prometheus_port.saturating_add(1);

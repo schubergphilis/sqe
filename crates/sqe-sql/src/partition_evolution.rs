@@ -18,7 +18,7 @@
 //! dispatch through a dedicated handler without ever sending the SQL to
 //! sqlparser.
 
-use sqe_core::{Result, SqeError};
+use sqe_core::{Result, SqeError, SqeErrorCode};
 
 /// A parsed `ALTER TABLE ... PARTITION FIELD` statement ready for the
 /// coordinator to translate into Iceberg `TableUpdate::AddSpec` /
@@ -68,8 +68,8 @@ pub fn try_parse_partition_evolution(sql: &str) -> Result<Option<PartitionEvolut
     if let Some(after_kw) = strip_keyword(&rest_upper, rest_after_table, "ADD PARTITION FIELD") {
         let transform_sql = after_kw.trim().trim_end_matches(';').to_string();
         if transform_sql.is_empty() {
-            return Err(SqeError::Execution(
-                "ALTER TABLE ADD PARTITION FIELD: missing transform expression".into(),
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+                "ALTER TABLE ADD PARTITION FIELD: missing transform expression",
             ));
         }
         return Ok(Some(PartitionEvolution::AddField {
@@ -82,8 +82,8 @@ pub fn try_parse_partition_evolution(sql: &str) -> Result<Option<PartitionEvolut
     if let Some(after_kw) = strip_keyword(&rest_upper, rest_after_table, "DROP PARTITION FIELD") {
         let transform_sql = after_kw.trim().trim_end_matches(';').to_string();
         if transform_sql.is_empty() {
-            return Err(SqeError::Execution(
-                "ALTER TABLE DROP PARTITION FIELD: missing transform expression".into(),
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+                "ALTER TABLE DROP PARTITION FIELD: missing transform expression",
             ));
         }
         return Ok(Some(PartitionEvolution::DropField {
@@ -114,8 +114,8 @@ pub fn try_parse_partition_evolution(sql: &str) -> Result<Option<PartitionEvolut
 fn split_identifier(input: &str) -> Result<(String, &str)> {
     let trimmed = input.trim_start();
     if trimmed.is_empty() {
-        return Err(SqeError::Execution(
-            "ALTER TABLE: missing table identifier".into(),
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+            "ALTER TABLE: missing table identifier",
         ));
     }
     let bytes = trimmed.as_bytes();
@@ -136,8 +136,8 @@ fn split_identifier(input: &str) -> Result<(String, &str)> {
     let ident = trimmed[..i].to_string();
     let rest = &trimmed[i..];
     if ident.trim_matches('"').is_empty() {
-        return Err(SqeError::Execution(
-            "ALTER TABLE: empty table identifier".into(),
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+            "ALTER TABLE: empty table identifier",
         ));
     }
     Ok((ident, rest))
@@ -195,16 +195,16 @@ fn split_with(input: &str) -> Result<(String, String)> {
             let old = input[..abs].trim().to_string();
             let new = input[after_idx..].trim().trim_end_matches(';').to_string();
             if old.is_empty() || new.is_empty() {
-                return Err(SqeError::Execution(
-                    "ALTER TABLE REPLACE PARTITION FIELD: missing old or new transform".into(),
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+                    "ALTER TABLE REPLACE PARTITION FIELD: missing old or new transform",
                 ));
             }
             return Ok((old, new));
         }
         search_start = abs + 4;
     }
-    Err(SqeError::Execution(
-        "ALTER TABLE REPLACE PARTITION FIELD: expected `WITH <new_transform>`".into(),
+    Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+        "ALTER TABLE REPLACE PARTITION FIELD: expected `WITH <new_transform>`",
     ))
 }
 
@@ -231,8 +231,8 @@ mod tests {
         assert_eq!(
             pe,
             PartitionEvolution::AddField {
-                table: "default.events".into(),
-                transform_sql: "year(ts)".into(),
+                table: "default.events".to_string(),
+                transform_sql: "year(ts)".to_string(),
             }
         );
     }
@@ -270,8 +270,8 @@ mod tests {
         assert_eq!(
             pe,
             PartitionEvolution::DropField {
-                table: "default.events".into(),
-                transform_sql: "region".into(),
+                table: "default.events".to_string(),
+                transform_sql: "region".to_string(),
             }
         );
     }
@@ -286,9 +286,9 @@ mod tests {
         assert_eq!(
             pe,
             PartitionEvolution::ReplaceField {
-                table: "default.events".into(),
-                old_transform_sql: "region".into(),
-                new_transform_sql: "bucket(16, region)".into(),
+                table: "default.events".to_string(),
+                old_transform_sql: "region".to_string(),
+                new_transform_sql: "bucket(16, region)".to_string(),
             }
         );
     }

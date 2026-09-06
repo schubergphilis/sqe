@@ -253,7 +253,7 @@ fn extract_component(
                 // microseconds before delegating to the common time path.
                 build_time_int64(time_arr.iter(), 1_000, fn_name, f_time)?
             } else {
-                return Err(DataFusionError::Internal(format!(
+                return Err(DataFusionError::Plan(format!(
                     "Expected Date32, Timestamp, or Time64, got {:?}",
                     array.data_type()
                 )));
@@ -290,7 +290,7 @@ fn extract_component(
                         ))),
                     }
                 }
-                _ => return Err(DataFusionError::Internal(format!(
+                _ => return Err(DataFusionError::Plan(format!(
                     "Expected date, timestamp, or time scalar, got {scalar:?}"
                 ))),
             };
@@ -497,7 +497,7 @@ fn parse_unit(unit: &str) -> DFResult<TimeUnit> {
         "hour" | "hours" => Ok(TimeUnit::Hour),
         "minute" | "minutes" => Ok(TimeUnit::Minute),
         "second" | "seconds" => Ok(TimeUnit::Second),
-        other => Err(DataFusionError::Internal(format!(
+        other => Err(DataFusionError::Plan(format!(
             "Unsupported date unit: {other}"
         ))),
     }
@@ -526,7 +526,7 @@ fn date_add_date(d: NaiveDate, unit: TimeUnit, amount: i64) -> DFResult<NaiveDat
         TimeUnit::Minute => d.checked_add_signed(Duration::minutes(amount)),
         TimeUnit::Second => d.checked_add_signed(Duration::seconds(amount)),
     };
-    result.ok_or_else(|| DataFusionError::Internal("date_add overflow".to_string()))
+    result.ok_or_else(|| DataFusionError::Plan("date_add overflow".to_string()))
 }
 
 /// Add `amount` of `unit` to a naive datetime. Calendar units (year, month)
@@ -569,7 +569,7 @@ fn ts_add_us(us: i64, unit: TimeUnit, amount: i64) -> DFResult<i64> {
         .unwrap_or_default()
         .naive_utc();
     let new_dt = add_units_to_naive(dt, unit, amount)
-        .ok_or_else(|| DataFusionError::Internal("date_add overflow".to_string()))?;
+        .ok_or_else(|| DataFusionError::Plan("date_add overflow".to_string()))?;
     Ok(new_dt.and_utc().timestamp_micros())
 }
 
@@ -579,11 +579,11 @@ fn ts_add_us(us: i64, unit: TimeUnit, amount: i64) -> DFResult<i64> {
 fn ts_add_ns(ns: i64, unit: TimeUnit, amount: i64) -> DFResult<i64> {
     let dt = chrono::DateTime::from_timestamp_nanos(ns).naive_utc();
     let new_dt = add_units_to_naive(dt, unit, amount)
-        .ok_or_else(|| DataFusionError::Internal("date_add overflow".to_string()))?;
+        .ok_or_else(|| DataFusionError::Plan("date_add overflow".to_string()))?;
     new_dt
         .and_utc()
         .timestamp_nanos_opt()
-        .ok_or_else(|| DataFusionError::Internal("ts overflow".to_string()))
+        .ok_or_else(|| DataFusionError::Plan("ts overflow".to_string()))
 }
 
 // ─── date_add(unit, value, date_or_ts) ──────────────────────────────────────
@@ -618,7 +618,7 @@ impl ScalarUDFImpl for DateAdd {
             ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => parse_unit(s)?,
             ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => parse_unit(s)?,
             other => {
-                return Err(DataFusionError::Internal(format!(
+                return Err(DataFusionError::Plan(format!(
                     "date_add: first arg must be a string literal, got {other:?}"
                 )))
             }
@@ -634,7 +634,7 @@ impl ScalarUDFImpl for DateAdd {
             ColumnarValue::Scalar(ScalarValue::UInt64(Some(v))) => *v as i64,
             ColumnarValue::Scalar(ScalarValue::UInt32(Some(v))) => *v as i64,
             other => {
-                return Err(DataFusionError::Internal(format!(
+                return Err(DataFusionError::Plan(format!(
                     "date_add: second arg must be an integer scalar, got {other:?}"
                 )))
             }
@@ -644,7 +644,7 @@ impl ScalarUDFImpl for DateAdd {
         // guaranteed to be `Some`; treat any failure as a hard error rather
         // than panicking via .unwrap(). Issue #78.
         let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)
-            .ok_or_else(|| DataFusionError::Internal("epoch literal invalid".into()))?;
+            .ok_or_else(|| DataFusionError::Plan("epoch literal invalid".into()))?;
 
         match &args.args[2] {
             ColumnarValue::Array(array) => {
@@ -702,7 +702,7 @@ impl ScalarUDFImpl for DateAdd {
                         .with_timezone_opt(tz);
                     Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
                 } else {
-                    Err(DataFusionError::Internal(format!(
+                    Err(DataFusionError::Plan(format!(
                         "date_add: unsupported array type {:?}",
                         array.data_type()
                     )))
@@ -742,7 +742,7 @@ impl ScalarUDFImpl for DateAdd {
                 ScalarValue::TimestampNanosecond(None, tz) => Ok(ColumnarValue::Scalar(
                     ScalarValue::TimestampNanosecond(None, tz.clone()),
                 )),
-                other => Err(DataFusionError::Internal(format!(
+                other => Err(DataFusionError::Plan(format!(
                     "date_add: unsupported scalar type {other:?}"
                 ))),
             },
@@ -777,7 +777,7 @@ impl ScalarUDFImpl for DateDiff {
             ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => parse_unit(s)?,
             ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => parse_unit(s)?,
             other => {
-                return Err(DataFusionError::Internal(format!(
+                return Err(DataFusionError::Plan(format!(
                     "date_diff: first arg must be a string literal, got {other:?}"
                 )))
             }
@@ -795,7 +795,7 @@ impl ScalarUDFImpl for DateDiff {
                 ScalarValue::TimestampMicrosecond(None, _) => Ok(None),
                 ScalarValue::TimestampNanosecond(Some(ns), _) => Ok(Some(ns_to_naive(*ns).date())),
                 ScalarValue::TimestampNanosecond(None, _) => Ok(None),
-                other => Err(DataFusionError::Internal(format!(
+                other => Err(DataFusionError::Plan(format!(
                     "date_diff: unsupported scalar type {other:?}"
                 ))),
             }
@@ -860,7 +860,7 @@ impl ScalarUDFImpl for DateDiff {
                     .collect();
                 Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
             }
-            _ => Err(DataFusionError::Internal(
+            _ => Err(DataFusionError::Plan(
                 "date_diff: mixed scalar/array args not supported".to_string(),
             )),
         }
@@ -924,7 +924,7 @@ impl ScalarUDFImpl for FromUnixtime {
                     } else if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
                         arr.iter().map(|opt| opt.map(epoch_to_us)).collect()
                     } else {
-                        return Err(DataFusionError::Internal(format!(
+                        return Err(DataFusionError::Plan(format!(
                             "from_unixtime: unsupported array type {:?}",
                             array.data_type()
                         )));
@@ -1005,7 +1005,7 @@ impl ScalarUDFImpl for ToUnixtime {
                         })
                         .collect()
                 } else {
-                    return Err(DataFusionError::Internal(format!(
+                    return Err(DataFusionError::Plan(format!(
                         "to_unixtime: unsupported array type {:?}",
                         array.data_type()
                     )));
@@ -1081,7 +1081,7 @@ impl ScalarUDFImpl for TrinoDate {
                 {
                     arr.iter().map(|opt| opt.map(ns_to_days)).collect()
                 } else {
-                    return Err(DataFusionError::Internal(format!(
+                    return Err(DataFusionError::Plan(format!(
                         "date(): unsupported type {:?}",
                         array.data_type()
                     )));
@@ -1112,13 +1112,13 @@ fn invoke_if_impl(args: ScalarFunctionArgs, fn_name: &str) -> DFResult<ColumnarV
             .as_any()
             .downcast_ref::<BooleanArray>()
             .ok_or_else(|| {
-                DataFusionError::Internal(format!("{fn_name}(): condition must be boolean"))
+                DataFusionError::Plan(format!("{fn_name}(): condition must be boolean"))
             })?
             .clone(),
         ColumnarValue::Scalar(ScalarValue::Boolean(Some(b))) => BooleanArray::from(vec![*b; nrows]),
         ColumnarValue::Scalar(ScalarValue::Boolean(None)) => BooleanArray::from(vec![false; nrows]),
         other => {
-            return Err(DataFusionError::Internal(format!(
+            return Err(DataFusionError::Plan(format!(
                 "{fn_name}(): unsupported condition type {other:?}"
             )))
         }
@@ -1128,7 +1128,7 @@ fn invoke_if_impl(args: ScalarFunctionArgs, fn_name: &str) -> DFResult<ColumnarV
         match cv {
             ColumnarValue::Array(a) => Ok(Arc::clone(a)),
             ColumnarValue::Scalar(sv) => sv.to_array_of_size(n).map_err(|e| {
-                DataFusionError::Internal(format!("{fn_name}(): scalar expansion failed: {e}"))
+                DataFusionError::Plan(format!("{fn_name}(): scalar expansion failed: {e}"))
             }),
         }
     };
@@ -1137,7 +1137,7 @@ fn invoke_if_impl(args: ScalarFunctionArgs, fn_name: &str) -> DFResult<ColumnarV
     let else_arr = to_array(else_val, nrows)?;
 
     let result = zip(&mask, &then_arr, &else_arr)
-        .map_err(|e| DataFusionError::Internal(format!("{fn_name}(): zip failed: {e}")))?;
+        .map_err(|e| DataFusionError::Plan(format!("{fn_name}(): zip failed: {e}")))?;
 
     Ok(ColumnarValue::Array(result))
 }
@@ -1159,7 +1159,7 @@ impl ScalarUDFImpl for TrinoIf {
     fn return_type(&self, args: &[DataType]) -> DFResult<DataType> {
         args.get(1)
             .cloned()
-            .ok_or_else(|| DataFusionError::Internal("if() needs 3 args".to_string()))
+            .ok_or_else(|| DataFusionError::Plan("if() needs 3 args".to_string()))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -1184,7 +1184,7 @@ impl ScalarUDFImpl for TrinoIff {
     fn return_type(&self, args: &[DataType]) -> DFResult<DataType> {
         args.get(1)
             .cloned()
-            .ok_or_else(|| DataFusionError::Internal("iff() needs 3 args".to_string()))
+            .ok_or_else(|| DataFusionError::Plan("iff() needs 3 args".to_string()))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
@@ -1271,7 +1271,7 @@ impl ScalarUDFImpl for DateFormat {
             ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => s.clone(),
             ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => s.clone(),
             other => {
-                return Err(DataFusionError::Internal(format!(
+                return Err(DataFusionError::Plan(format!(
                     "date_format: second arg must be a format string, got {other:?}"
                 )))
             }
@@ -1313,7 +1313,7 @@ impl ScalarUDFImpl for DateFormat {
                         })
                         .collect()
                 } else {
-                    return Err(DataFusionError::Internal(format!(
+                    return Err(DataFusionError::Plan(format!(
                         "date_format: unsupported array type {:?}",
                         array.data_type()
                     )));
@@ -1339,7 +1339,7 @@ fn scalar_to_naive_dt(sv: &datafusion::common::ScalarValue) -> DFResult<Option<N
         ScalarValue::TimestampMicrosecond(None, _)
         | ScalarValue::TimestampNanosecond(None, _)
         | ScalarValue::Date32(None) => Ok(None),
-        other => Err(DataFusionError::Internal(format!(
+        other => Err(DataFusionError::Plan(format!(
             "Expected date/timestamp, got {other:?}"
         ))),
     }
@@ -1375,7 +1375,7 @@ impl ScalarUDFImpl for DateParse {
             ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => s.clone(),
             ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => s.clone(),
             other => {
-                return Err(DataFusionError::Internal(format!(
+                return Err(DataFusionError::Plan(format!(
                     "date_parse: second arg must be a format string, got {other:?}"
                 )))
             }
@@ -1393,7 +1393,7 @@ impl ScalarUDFImpl for DateParse {
                                     .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
                             })
                             .map_err(|e| {
-                                DataFusionError::Internal(format!(
+                                DataFusionError::Plan(format!(
                                     "date_parse: failed to parse '{s}' with format '{pattern}': {e}"
                                 ))
                             })?;
@@ -1401,7 +1401,7 @@ impl ScalarUDFImpl for DateParse {
                     }
                     ScalarValue::Utf8(None) | ScalarValue::LargeUtf8(None) => None,
                     other => {
-                        return Err(DataFusionError::Internal(format!(
+                        return Err(DataFusionError::Plan(format!(
                             "date_parse: first arg must be a string, got {other:?}"
                         )))
                     }
@@ -1415,7 +1415,7 @@ impl ScalarUDFImpl for DateParse {
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .ok_or_else(|| {
-                        DataFusionError::Internal(format!(
+                        DataFusionError::Plan(format!(
                             "date_parse: expected string array, got {:?}",
                             array.data_type()
                         ))
@@ -1499,7 +1499,7 @@ impl ScalarUDFImpl for JsonObject {
         // `is_multiple_of` would be clearer but is stable only from 1.87;
         // workspace MSRV is 1.85.
         if args.args.len() % 2 != 0 {
-            return Err(DataFusionError::Internal(
+            return Err(DataFusionError::Plan(
                 "json_object: must have an even number of arguments (key-value pairs)".to_string(),
             ));
         }
@@ -1511,7 +1511,7 @@ impl ScalarUDFImpl for JsonObject {
                 ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
                 | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => s.clone(),
                 other => {
-                    return Err(DataFusionError::Internal(format!(
+                    return Err(DataFusionError::Plan(format!(
                         "json_object: key must be a string, got {other:?}"
                     )))
                 }
@@ -1533,7 +1533,7 @@ impl ScalarUDFImpl for JsonObject {
                 ColumnarValue::Scalar(ScalarValue::Boolean(Some(v))) => serde_json::Value::Bool(*v),
                 ColumnarValue::Scalar(ScalarValue::Null) => serde_json::Value::Null,
                 other => {
-                    return Err(DataFusionError::Internal(format!(
+                    return Err(DataFusionError::Plan(format!(
                         "json_object: unsupported value type {other:?}"
                     )))
                 }
@@ -1582,13 +1582,13 @@ impl ScalarUDFImpl for JsonFormat {
                 if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
                     Ok(ColumnarValue::Array(Arc::new(arr.clone()) as ArrayRef))
                 } else {
-                    Err(DataFusionError::Internal(format!(
+                    Err(DataFusionError::Plan(format!(
                         "json_format: expected string input, got {:?}",
                         array.data_type()
                     )))
                 }
             }
-            other => Err(DataFusionError::Internal(format!(
+            other => Err(DataFusionError::Plan(format!(
                 "json_format: unsupported input {other:?}"
             ))),
         }
@@ -1706,13 +1706,13 @@ impl ScalarUDFImpl for TrinoMod {
                     .as_any()
                     .downcast_ref::<Float64Array>()
                     .ok_or_else(|| {
-                        DataFusionError::Internal("mod: lhs not Float64Array after coercion".into())
+                        DataFusionError::Plan("mod: lhs not Float64Array after coercion".into())
                     })?;
                 let b_f = b_arr
                     .as_any()
                     .downcast_ref::<Float64Array>()
                     .ok_or_else(|| {
-                        DataFusionError::Internal("mod: rhs not Float64Array after coercion".into())
+                        DataFusionError::Plan("mod: rhs not Float64Array after coercion".into())
                     })?;
                 let result: Float64Array = a_f
                     .iter()
@@ -1779,7 +1779,7 @@ fn take_function_args<const N: usize>(
     let mut out: Vec<ColumnarValue> = Vec::with_capacity(N);
     out.extend(args.iter().cloned());
     out.try_into()
-        .map_err(|_| DataFusionError::Internal(format!("{fn_name}: arity assertion failed")))
+        .map_err(|_| DataFusionError::Plan(format!("{fn_name}: arity assertion failed")))
 }
 
 // ─── truncate(x [, n]) → DataFusion `trunc(x [, n])` alias ────────────────
@@ -1837,12 +1837,12 @@ impl ScalarUDFImpl for TrinoTruncate {
             }
             ColumnarValue::Array(arr) => {
                 let f = arr.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
-                    DataFusionError::Internal("truncate: not Float64Array after coercion".into())
+                    DataFusionError::Plan("truncate: not Float64Array after coercion".into())
                 })?;
                 let result: Float64Array = f.iter().map(|v| v.map(trunc_one)).collect();
                 Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
             }
-            other => Err(DataFusionError::Internal(format!(
+            other => Err(DataFusionError::Plan(format!(
                 "truncate: unexpected scalar shape after coercion: {other:?}"
             ))),
         }
@@ -1893,12 +1893,12 @@ impl ScalarUDFImpl for TrinoSign {
             }
             ColumnarValue::Array(arr) => {
                 let f = arr.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
-                    DataFusionError::Internal("sign: not Float64Array after coercion".into())
+                    DataFusionError::Plan("sign: not Float64Array after coercion".into())
                 })?;
                 let result: Float64Array = f.iter().map(|v| v.map(trino_signum)).collect();
                 Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
             }
-            other => Err(DataFusionError::Internal(format!(
+            other => Err(DataFusionError::Plan(format!(
                 "sign: unexpected scalar shape: {other:?}"
             ))),
         }
@@ -2059,7 +2059,7 @@ fn parse_url_component(args: &[ColumnarValue], component: &str) -> DFResult<Colu
             let str_arr = arr
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| DataFusionError::Internal("Expected string array".into()))?;
+                .ok_or_else(|| DataFusionError::Plan("Expected string array".into()))?;
             let results: StringArray = str_arr
                 .iter()
                 .map(|opt| opt.and_then(|u| extract_url_component(u, component, args.get(1))))
@@ -2398,7 +2398,7 @@ impl ScalarUDFImpl for JsonArrayLength {
                 let str_arr = arr
                     .as_any()
                     .downcast_ref::<StringArray>()
-                    .ok_or_else(|| DataFusionError::Internal("Expected string array".into()))?;
+                    .ok_or_else(|| DataFusionError::Plan("Expected string array".into()))?;
                 let results: Int64Array = str_arr
                     .iter()
                     .map(|opt| {

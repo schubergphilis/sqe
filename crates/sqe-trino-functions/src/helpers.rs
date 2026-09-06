@@ -35,7 +35,7 @@ pub(crate) fn str_transform(
             let str_arr = arr
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| DataFusionError::Internal("Expected StringArray".into()))?;
+                .ok_or_else(|| DataFusionError::Plan("Expected StringArray".into()))?;
             let result: StringArray = str_arr.iter().map(|opt| opt.and_then(&f)).collect();
             Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
         }
@@ -66,7 +66,7 @@ pub(crate) fn str_transform_2(
             let str_arr = arr
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| DataFusionError::Internal("Expected StringArray".into()))?;
+                .ok_or_else(|| DataFusionError::Plan("Expected StringArray".into()))?;
             let result: StringArray = str_arr
                 .iter()
                 .map(|opt| opt.and_then(|s| f(s, s2)))

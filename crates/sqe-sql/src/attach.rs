@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use sqe_core::{Secret, SqeError};
+use sqe_core::{Secret, SqeError, SqeErrorCode};
 
 /// `ATTACH '<location>' AS <name> (TYPE <kind>, <option> = <value>, ...)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,7 +163,7 @@ pub fn build_secret_from_stmt(stmt: &CreateSecretStatement) -> Result<Secret, Sq
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .ok_or_else(|| {
-                SqeError::Execution(format!(
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "CREATE SECRET: missing required option {key} for {:?} secret",
                     stmt.kind.name()
                 ))
@@ -361,7 +361,7 @@ pub fn is_show_secrets(sql: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn err(msg: &str) -> SqeError {
-    SqeError::Execution(msg.to_string())
+    SqeError::with_code(SqeErrorCode::ExecutionFailed, msg.to_string())
 }
 
 /// Trait-like helper: case-insensitive prefix strip that requires a trailing

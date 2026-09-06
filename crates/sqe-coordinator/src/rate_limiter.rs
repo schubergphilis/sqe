@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 use sqe_core::config::RateLimitConfig;
-use sqe_core::error::SqeError;
+use sqe_core::error::{SqeError, SqeErrorCode};
 
 /// Pre-auth rate limit keyed by (peer-ip, username). The username
 /// comes from the Basic-auth header (Flight handshake) or the
@@ -55,7 +55,7 @@ impl AuthRateLimiter {
     }
 
     /// Returns `Ok(())` when the (ip, username) tuple is under budget.
-    /// Returns `SqeError::Auth("rate-limited")` otherwise, so the caller
+    /// Returns `SqeError::Auth("rate-limited".to_string())` otherwise, so the caller
     /// can map to the protocol-specific status code without leaking
     /// detail to the unauthenticated peer.
     pub fn check(&self, peer_ip: &str, username: &str) -> Result<(), SqeError> {
@@ -116,7 +116,7 @@ impl MetadataRateLimiter {
         }
         if let Some(ref l) = self.per_user {
             l.check_key(&user_id.to_string()).map_err(|_| {
-                SqeError::Execution(format!(
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Rate limit exceeded: metadata browse limit reached for user '{user_id}'"
                 ))
             })?;
@@ -179,7 +179,7 @@ impl QueryRateLimiter {
         // Per-user check
         if let Some(ref limiter) = self.per_user {
             limiter.check_key(&user_id.to_string()).map_err(|_| {
-                SqeError::Execution(format!(
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Rate limit exceeded: per-user limit reached for user '{user_id}'"
                 ))
             })?;
@@ -188,7 +188,7 @@ impl QueryRateLimiter {
         // Global check
         if let Some(ref limiter) = self.global {
             limiter.check().map_err(|_| {
-                SqeError::Execution("Rate limit exceeded: global query limit reached".to_string())
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, "Rate limit exceeded: global query limit reached".to_string())
             })?;
         }
 
@@ -389,7 +389,7 @@ mod tests {
         let err = limiter.check("frank").unwrap_err();
         // SqeError::Execution — not Auth — so the session is preserved.
         assert!(
-            matches!(err, SqeError::Execution(_)),
+            err.error_code() == SqeErrorCode::ExecutionFailed,
             "Expected Execution error variant, got: {err:?}"
         );
     }
