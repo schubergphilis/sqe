@@ -1,5 +1,19 @@
 # SQE — Next Steps
 
+> **STATUS 2026-09-05 (later): work package #657 (errors, audit, observability) fixed on `fix/errors-audit-observability`.**
+>
+> Closed findings 607, 800, 104, 305, 709, 306, 812, 410, 612 (610 partial).
+> Audit chain resumes across restarts with a bounded queue and drop counter;
+> error codes are typed (`with_code`, `From<DataFusionError>`, catalog HTTP
+> status) instead of English substring; Trino HTTP errors map by status;
+> listing outages no longer look like empty catalogs; swallowed restore and
+> rows-affected errors surface; query spans are not entered across await;
+> telemetry init and metrics bind fail closed. Each finding file has a
+> Resolution section.
+> **NEXT:** remaining P1s (202, 400, 503, worker trust) and 610 lineage mask
+> facet.
+
+
 > **STATUS 2026-09-05 (later): authorization P1 batch fixed; 24 of 109 combined findings closed.**
 >
 > Branch `fix/authz-policy-enforcement-p1` closes the remaining P1s of the

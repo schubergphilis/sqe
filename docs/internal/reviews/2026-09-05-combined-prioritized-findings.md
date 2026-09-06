@@ -6,6 +6,7 @@ This is the combined prioritization of **all 109 reported findings**: 102 from t
 
 ## Progress
 
+- **2026-09-05** (branch `fix/errors-audit-observability`): fixed 607, 800, 104, 305, 709, 306, 812, 410, 612 from area 10 (610 partial). See each finding file's Resolution section.
 - **2026-09-05** (branch `fix/security-scale-review-2026-09-05`): fixed 900, 901, 902, 903, 904, 905, 906 (all seven security/scale findings) and 105, 200, 203, 206 from the September 4 review. Each finding file carries a "Resolution" section with the code location and the tests that cover it. The cache remediation for 902 disables the materialized result cache for every governing policy engine; re-enabling it behind a policy fingerprint is follow-up work.
 - **2026-09-05** (branch `fix/authz-policy-enforcement-p1`, work package #653): fixed 201, 202, 211, 303, 400, 503, 510, the remaining P1s of area 2. Single policy-key derivation, MERGE target row filters and masks, time-travel identity restore before policy, Hive INSERT source enforcement and pre-write target check, tiered maintenance authorization, freshness-checked tag properties, and a rewriter shape suite. 18 of 109 findings closed.
 

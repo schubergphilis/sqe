@@ -226,7 +226,7 @@ impl Accumulator for CentralMomentsAccumulator {
             .as_any()
             .downcast_ref::<Float64Array>()
             .ok_or_else(|| {
-                DataFusionError::Internal(
+                DataFusionError::Plan(
                     "central-moments accumulator expected a Float64 input".to_string(),
                 )
             })?;
@@ -242,13 +242,13 @@ impl Accumulator for CentralMomentsAccumulator {
         let counts = states[0]
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| DataFusionError::Internal("count state must be UInt64".to_string()))?;
+            .ok_or_else(|| DataFusionError::Plan("count state must be UInt64".to_string()))?;
         let float_state = |idx: usize| -> DFResult<&Float64Array> {
             states[idx]
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| {
-                    DataFusionError::Internal(format!("moment state {idx} must be Float64"))
+                    DataFusionError::Plan(format!("moment state {idx} must be Float64"))
                 })
         };
         let (m1, m2, m3, m4) = (

@@ -110,11 +110,11 @@ fn eval_binary_i64(args: ScalarFunctionArgs, f: fn(i64, i64) -> i64) -> DFResult
     let a = a
         .as_any()
         .downcast_ref::<Int64Array>()
-        .ok_or_else(|| DataFusionError::Internal("bitwise: arg 0 not Int64".into()))?;
+        .ok_or_else(|| DataFusionError::Plan("bitwise: arg 0 not Int64".into()))?;
     let b = b
         .as_any()
         .downcast_ref::<Int64Array>()
-        .ok_or_else(|| DataFusionError::Internal("bitwise: arg 1 not Int64".into()))?;
+        .ok_or_else(|| DataFusionError::Plan("bitwise: arg 1 not Int64".into()))?;
     let out: Int64Array = a
         .iter()
         .zip(b.iter())
@@ -132,7 +132,7 @@ fn eval_unary_i64(args: ScalarFunctionArgs, f: fn(i64) -> i64) -> DFResult<Colum
     let a = a
         .as_any()
         .downcast_ref::<Int64Array>()
-        .ok_or_else(|| DataFusionError::Internal("bitwise: arg 0 not Int64".into()))?;
+        .ok_or_else(|| DataFusionError::Plan("bitwise: arg 0 not Int64".into()))?;
     let out: Int64Array = a.iter().map(|x| x.map(f)).collect();
     Ok(ColumnarValue::Array(Arc::new(out) as ArrayRef))
 }
@@ -245,22 +245,22 @@ impl ScalarUDFImpl for Slice {
         let list = list
             .as_any()
             .downcast_ref::<ListArray>()
-            .ok_or_else(|| DataFusionError::Internal("slice: arg 0 is not a List array".into()))?;
+            .ok_or_else(|| DataFusionError::Plan("slice: arg 0 is not a List array".into()))?;
         let starts = args.args[1].to_array(rows)?;
         let starts = starts
             .as_any()
             .downcast_ref::<Int64Array>()
-            .ok_or_else(|| DataFusionError::Internal("slice: start must be bigint".into()))?;
+            .ok_or_else(|| DataFusionError::Plan("slice: start must be bigint".into()))?;
         let lengths = args.args[2].to_array(rows)?;
         let lengths = lengths
             .as_any()
             .downcast_ref::<Int64Array>()
-            .ok_or_else(|| DataFusionError::Internal("slice: length must be bigint".into()))?;
+            .ok_or_else(|| DataFusionError::Plan("slice: length must be bigint".into()))?;
 
         let field = match list.data_type() {
             DataType::List(f) => f.clone(),
             other => {
-                return Err(DataFusionError::Internal(format!(
+                return Err(DataFusionError::Plan(format!(
                     "slice: unexpected list type {other:?}"
                 )))
             }

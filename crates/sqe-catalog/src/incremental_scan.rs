@@ -28,7 +28,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::error::ArrowError;
 use iceberg::spec::{DataContentType, ManifestStatus, SnapshotRef, TableMetadata};
 use iceberg::table::Table;
-use sqe_core::{Result, SqeError};
+use sqe_core::{Result, SqeError, SqeErrorCode};
 
 /// Meta column name for the change kind (`insert` or `delete`).
 pub const CHANGE_TYPE_COLUMN: &str = "_change_type";
@@ -158,20 +158,20 @@ pub struct IncrementalPlan {
 ///   sentinel for "from the beginning of time").
 pub fn resolve_range(metadata: &TableMetadata, start: i64, end: i64) -> Result<Vec<i64>> {
     if start > end {
-        return Err(SqeError::Execution(format!(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "FOR INCREMENTAL BETWEEN SNAPSHOT {start} AND SNAPSHOT {end}: start must be older than end"
         )));
     }
 
     if metadata.snapshot_by_id(end).is_none() {
-        return Err(SqeError::Execution(format!(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "FOR INCREMENTAL BETWEEN SNAPSHOT: end snapshot {end} not found on table"
         )));
     }
 
     // Allow start == 0 as a sentinel for "beginning of history".
     if start != 0 && metadata.snapshot_by_id(start).is_none() {
-        return Err(SqeError::Execution(format!(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "FOR INCREMENTAL BETWEEN SNAPSHOT: start snapshot {start} not found on table"
         )));
     }
@@ -187,7 +187,7 @@ pub fn resolve_range(metadata: &TableMetadata, start: i64, end: i64) -> Result<V
             break;
         }
         if !seen.insert(sid) {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "FOR INCREMENTAL BETWEEN SNAPSHOT: cycle detected at snapshot {sid}"
             )));
         }
@@ -195,7 +195,7 @@ pub fn resolve_range(metadata: &TableMetadata, start: i64, end: i64) -> Result<V
         let snap = match metadata.snapshot_by_id(sid) {
             Some(s) => s,
             None => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "FOR INCREMENTAL BETWEEN SNAPSHOT: dangling parent pointer at snapshot {sid}"
                 )));
             }
@@ -204,7 +204,7 @@ pub fn resolve_range(metadata: &TableMetadata, start: i64, end: i64) -> Result<V
         // If we ran past the start (no more parents) and start != 0, the start
         // snapshot isn't an ancestor of end — a descending or unrelated pair.
         if cursor.is_none() && start != 0 {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "FOR INCREMENTAL BETWEEN SNAPSHOT: start snapshot {start} is not an ancestor of end {end}"
             )));
         }
@@ -330,7 +330,7 @@ pub async fn plan_incremental(table: &Table, start: i64, end: i64) -> Result<Inc
         let snap = metadata
             .snapshot_by_id(*sid)
             .ok_or_else(|| {
-                SqeError::Execution(format!(
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "FOR INCREMENTAL BETWEEN SNAPSHOT: snapshot {sid} vanished during planning"
                 ))
             })?
@@ -392,7 +392,7 @@ mod tests {
     fn reconcile_keeps_in_range_position_deletes() {
         let data = make_plan_for_test(&[101, 101, 102]);
         let deletes = vec![IncrementalFile {
-            path: "d0.parquet".into(),
+            path: "d0.parquet".to_string(),
             size_bytes: 50,
             snapshot_id: 102,
             kind: ChangeKind::Delete,
@@ -409,7 +409,7 @@ mod tests {
     fn reconcile_drops_deletes_targeting_out_of_range_data() {
         let data = make_plan_for_test(&[101]);
         let deletes = vec![IncrementalFile {
-            path: "d_old.parquet".into(),
+            path: "d_old.parquet".to_string(),
             size_bytes: 50,
             snapshot_id: 102,
             kind: ChangeKind::Delete,
@@ -433,7 +433,7 @@ mod tests {
     fn reconcile_keeps_equality_deletes() {
         let data = make_plan_for_test(&[101]);
         let deletes = vec![IncrementalFile {
-            path: "eq.parquet".into(),
+            path: "eq.parquet".to_string(),
             size_bytes: 50,
             snapshot_id: 102,
             kind: ChangeKind::Delete,
@@ -618,7 +618,7 @@ mod tests {
         let id = Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![id]).unwrap();
         let file = IncrementalFile {
-            path: "f.parquet".into(),
+            path: "f.parquet".to_string(),
             size_bytes: 100,
             snapshot_id: 42,
             kind: ChangeKind::Delete,

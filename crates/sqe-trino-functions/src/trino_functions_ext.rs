@@ -207,7 +207,7 @@ impl ScalarUDFImpl for IsJsonScalar {
                 let str_arr = arr
                     .as_any()
                     .downcast_ref::<StringArray>()
-                    .ok_or_else(|| DataFusionError::Internal("Expected StringArray".into()))?;
+                    .ok_or_else(|| DataFusionError::Plan("Expected StringArray".into()))?;
                 let result: BooleanArray = str_arr
                     .iter()
                     .map(|opt| {
@@ -507,7 +507,7 @@ impl ScalarUDFImpl for FromIso8601Date {
                 let str_arr = arr
                     .as_any()
                     .downcast_ref::<StringArray>()
-                    .ok_or_else(|| DataFusionError::Internal("Expected StringArray".into()))?;
+                    .ok_or_else(|| DataFusionError::Plan("Expected StringArray".into()))?;
                 let result: Date32Array = str_arr
                     .iter()
                     .map(|opt| {
@@ -721,7 +721,7 @@ impl ScalarUDFImpl for LastDayOfMonth {
                 let date_arr = arr
                     .as_any()
                     .downcast_ref::<Date32Array>()
-                    .ok_or_else(|| DataFusionError::Internal("Expected Date32Array".into()))?;
+                    .ok_or_else(|| DataFusionError::Plan("Expected Date32Array".into()))?;
                 let result: Date32Array = date_arr
                     .iter()
                     .map(|opt| {
@@ -935,7 +935,7 @@ fn column_strings(
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .ok_or_else(|| {
-                        DataFusionError::Internal(format!(
+                        DataFusionError::Plan(format!(
                             "{fn_name}: cast to StringArray failed silently"
                         ))
                     })?
@@ -1405,7 +1405,7 @@ impl ScalarUDFImpl for Checksum {
                 let str_arr = str_arr
                     .as_any()
                     .downcast_ref::<StringArray>()
-                    .ok_or_else(|| DataFusionError::Internal("Expected StringArray".into()))?;
+                    .ok_or_else(|| DataFusionError::Plan("Expected StringArray".into()))?;
                 let result: StringArray = str_arr
                     .iter()
                     .map(|opt| {
