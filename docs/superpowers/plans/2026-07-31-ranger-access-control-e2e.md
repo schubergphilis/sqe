@@ -264,6 +264,7 @@ s3_allow_http = true
 # (issue #37) and the test can assert an exact digest.
 [policy]
 engine = "ranger"
+# nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.generic-api-key -- test-only placeholder
 mask_key = "sqe-ac-e2e-mask-key"
 
 # Difference 2: service-name is the test-owned service, not the demo's `hive`.

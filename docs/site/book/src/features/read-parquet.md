@@ -40,6 +40,7 @@ Pass credentials directly in the SQL statement. This is the primary mechanism us
 ```sql
 SELECT * FROM read_parquet(
   's3://bench-data/tpch/sf1/lineitem/*.parquet',
+  -- nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS documentation example key
   access_key => 'AKIAIOSFODNN7EXAMPLE',
   secret_key => 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
   endpoint   => 'http://localhost:9000',

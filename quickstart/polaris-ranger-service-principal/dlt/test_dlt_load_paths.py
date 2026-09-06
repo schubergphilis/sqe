@@ -103,6 +103,7 @@ def resilience_rows(start: int, stop: int, revision: str) -> list[dict[str, Any]
 
 def bearer_token() -> str:
     response = requests.post(
+        # nosemgrep: opt.aikido.semgrep-rules.python.lang.security.audit.insecure-transport.requests.request-with-http -- local docker-network token endpoint in a test stack
         TOKEN_URL,
         data={
             "grant_type": "client_credentials",
@@ -211,6 +212,7 @@ def table_exists(table: str) -> bool:
         f"{url_quote(NAMESPACE, safe='')}/tables/{url_quote(table, safe='')}"
     )
     response = requests.head(
+        # nosemgrep: opt.aikido.semgrep-rules.python.lang.security.audit.insecure-transport.requests.request-with-http -- local docker-network Polaris endpoint in a test stack
         url,
         headers={"Authorization": f"Bearer {bearer_token()}"},
         timeout=20,

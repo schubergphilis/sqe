@@ -80,6 +80,7 @@ fn parse_label(label: &str) -> Option<(String, String)> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // nosemgrep: opt.aikido.semgrep-rules.rust.lang.security.args -- operator CLI flag check; only compared against a literal, never interpreted
     let apply = std::env::args().any(|a| a == "--apply");
     let url = std::env::var("RANGER_URL").unwrap_or_else(|_| "http://localhost:26080".into());
     let url = url.trim_end_matches('/').to_string();

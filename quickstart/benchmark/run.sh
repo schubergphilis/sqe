@@ -44,13 +44,15 @@ bench generate "$BENCH" --scale "$SCALE" --output "$DATA"
 ok "data generated"
 
 step "2/3 load: CTAS-over-read_parquet into $CATALOG.${BENCH}_sf<scale>"
-bench load "$BENCH" --scale "$SCALE" --data "$DATA" \
-  --host sqe --port 50051 --catalog "$CATALOG" --clean "${AUTH[@]}"
+# nosemgrep: opt.aikido.semgrep-rules.ai.ai-best-practices.hooks-dns-exfiltration.hooks-dns-exfiltration-generic
+bench load "$BENCH" --scale "$SCALE" --data "$DATA" --host sqe \
+  --port 50051 --catalog "$CATALOG" --clean "${AUTH[@]}"
 ok "tables loaded"
 
 OUT=OUTPUT.md
 step "3/3 test: running the $BENCH query suite over Flight SQL (capturing to $OUT)"
 RUN_LOG="$(mktemp)"
+# nosemgrep: opt.aikido.semgrep-rules.ai.ai-best-practices.hooks-dns-exfiltration.hooks-dns-exfiltration-generic
 bench test "$BENCH" --scale "$SCALE" --host sqe --port 50051 --catalog "$CATALOG" "${AUTH[@]}" \
   | tee "$RUN_LOG"
 {

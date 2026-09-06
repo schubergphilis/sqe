@@ -25,6 +25,7 @@ def _request(url, headers, auth_user_pass, data=None):
     if auth_user_pass:
         token = base64.b64encode(auth_user_pass.encode()).decode()
         req.add_header("Authorization", "Basic " + token)
+    # nosemgrep: opt.aikido.semgrep-rules.python.lang.security.audit.dynamic-urllib-use-detected -- URL is the local test stack endpoint passed on the command line
     return json.load(urllib.request.urlopen(req, timeout=120))
 
 
