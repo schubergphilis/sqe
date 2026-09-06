@@ -129,13 +129,13 @@ pub async fn resolve_bearer(
                     .insert(
                         key,
                         CachedToken {
-                            access_token: resp.access_token.clone(),
+                            access_token: resp.access_token.expose().to_string(),
                             expires_at: now + cacheable,
                         },
                     )
                     .await;
             }
-            Ok(resp.access_token)
+            Ok(resp.access_token.expose().to_string())
         }
     }
 }

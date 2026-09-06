@@ -6,11 +6,20 @@ rust-version.workspace = true
 license = "Apache-2.0"
 repository.workspace = true
 
+[features]
+default = ["tls-native-roots"]
+# Lets `sqe_core::tls::tonic_client` fall back to the platform trust store for
+# an `https://` peer that has no explicit `ca_file`. Turning it off makes
+# `SqeConfig::validate` refuse `https://` worker URLs unless `ca_file` is set,
+# because there would then be no trust root at all.
+tls-native-roots = ["tonic/tls-native-roots"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 base64 = { workspace = true }
+ring = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
@@ -23,5 +32,11 @@ zeroize = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }
+# `sqe_core::tls` is the single TLS builder for every SQE listener and client
+# (findings 210 / 603). tonic and rustls are already in every workspace build
+# via `workspace-hack`, so this adds no compile weight; it only lets the
+# coordinator and the worker share one implementation instead of three.
+tonic = { workspace = true }
+rustls = { version = "0.23", features = ["ring"] }
 datafusion = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

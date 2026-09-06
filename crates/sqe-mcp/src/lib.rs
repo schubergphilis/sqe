@@ -393,21 +393,9 @@ async fn authenticate_oauth(
             Some("insufficient_scope"),
         ));
     }
-    let expiry = identity
-        .expires_at
-        .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::hours(1));
-    let catalog_token = identity
-        .catalog_token
-        .clone()
-        .unwrap_or_else(|| SecretString::new(token.to_string()));
-    let session = Session::new(
-        identity.user_id,
-        catalog_token,
-        identity.refresh_token,
-        expiry,
-        identity.roles,
-    )
-    .with_identity(identity.subject, identity.email, identity.groups);
+    // Shared identity-to-session mapping (finding 204); the raw MCP bearer
+    // is the catalog token when the provider vended none.
+    let session = identity.into_session(Some(token));
     Ok(AuthContext {
         session,
         scopes: Some(scopes),

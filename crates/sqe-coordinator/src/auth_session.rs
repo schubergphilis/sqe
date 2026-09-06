@@ -5,7 +5,7 @@
 //! `SessionManager`'s Flight SQL path).
 
 use sqe_auth::Identity;
-use sqe_core::{SecretString, Session};
+use sqe_core::Session;
 
 /// Convert an authenticated `Identity` into a `Session`.
 ///
@@ -14,26 +14,14 @@ use sqe_core::{SecretString, Session};
 /// supplied no `catalog_token`, `fallback_token` is used (e.g. the raw bearer
 /// JWT, which is forwarded to Polaris). Subject/email/groups are carried through.
 pub fn identity_to_session(identity: Identity, fallback_token: Option<&str>) -> Session {
-    let token_expiry = identity
-        .expires_at
-        .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::hours(1));
-    let catalog_token = identity
-        .catalog_token
-        .clone()
-        .unwrap_or_else(|| SecretString::new(fallback_token.unwrap_or_default().to_string()));
-    Session::new(
-        identity.user_id,
-        catalog_token,
-        identity.refresh_token,
-        token_expiry,
-        identity.roles,
-    )
-    .with_identity(identity.subject, identity.email, identity.groups)
+    // Thin alias over the shared mapping in `sqe-auth` (finding 204).
+    identity.into_session(fallback_token)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqe_core::SecretString;
 
     fn identity(token: Option<&str>, expires: Option<chrono::DateTime<chrono::Utc>>) -> Identity {
         Identity {

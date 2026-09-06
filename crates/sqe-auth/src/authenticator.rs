@@ -26,8 +26,13 @@ enum AuthBackend {
 
 /// Cached service token for client_credentials backend.
 /// Reused across all requests until near-expiry.
+///
+/// `client_credentials` mode shares one service token across every user
+/// (SEC-03), which makes it the highest-value single credential in the
+/// process — it is held in a [`SecretString`] so it cannot be formatted into
+/// a log line and is zeroized on drop. Finding 208.
 struct ServiceToken {
-    access_token: String,
+    access_token: SecretString,
     expiry: DateTime<Utc>,
 }
 
@@ -84,13 +89,13 @@ impl Authenticator {
         match &self.backend {
             AuthBackend::OidcPassword(kc) => {
                 let token_response = kc.exchange_credentials(username, password).await?;
-                let roles = kc.extract_roles(&token_response.access_token);
+                let roles = kc.extract_roles(token_response.access_token.expose());
                 let token_expiry = Utc::now() + Duration::seconds(token_response.expires_in as i64);
 
                 let session = Session::new(
                     username.to_string(),
-                    SecretString::new(token_response.access_token.clone()),
-                    token_response.refresh_token.clone().map(SecretString::new),
+                    token_response.access_token.clone(),
+                    token_response.refresh_token.clone(),
                     token_expiry,
                     roles,
                 );
@@ -121,7 +126,7 @@ impl Authenticator {
                         if st.expiry > Utc::now() + buffer {
                             let session = Session::new(
                                 username.to_string(),
-                                SecretString::new(st.access_token.clone()),
+                                st.access_token.clone(),
                                 None,
                                 st.expiry,
                                 Vec::new(),
@@ -152,7 +157,7 @@ impl Authenticator {
                 // refresh_token (we re-fetch via client_credentials when needed).
                 let session = Session::new(
                     username.to_string(),
-                    SecretString::new(token_response.access_token.clone()),
+                    token_response.access_token.clone(),
                     None,
                     token_expiry,
                     Vec::new(),
@@ -199,8 +204,8 @@ impl Authenticator {
                 let token_expiry = Utc::now() + Duration::seconds(token_response.expires_in as i64);
 
                 session.rotate_credentials(sqe_core::Credentials::new(
-                    SecretString::new(token_response.access_token.clone()),
-                    token_response.refresh_token.clone().map(SecretString::new),
+                    token_response.access_token.clone(),
+                    token_response.refresh_token.clone(),
                     token_expiry,
                 ));
 
@@ -221,7 +226,7 @@ impl Authenticator {
                 let token_expiry = Utc::now() + Duration::seconds(token_response.expires_in as i64);
 
                 session.rotate_credentials(sqe_core::Credentials::new(
-                    SecretString::new(token_response.access_token.clone()),
+                    token_response.access_token.clone(),
                     None,
                     token_expiry,
                 ));
@@ -286,8 +291,8 @@ impl Authenticator {
 
                     match &this.backend {
                         AuthBackend::OidcPassword(kc) => {
-                            let refresh_token = match cached.refresh_token.as_deref() {
-                                Some(rt) => rt,
+                            let refresh_token = match cached.refresh_token.as_ref() {
+                                Some(rt) => rt.expose(),
                                 None => {
                                     debug!(
                                         session_id = session_id,

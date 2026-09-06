@@ -7,8 +7,8 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::common::DFSchema;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryLimit};
-use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
+use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::create_physical_expr;
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::SessionContext;
@@ -408,9 +408,9 @@ pub async fn execute_scan_streaming(
     }
     let store: Arc<dyn ObjectStore> = Arc::new(build_object_store_with_creds(
         &task,
-        &task.s3_access_key,
-        &task.s3_secret_key,
-        &task.s3_session_token,
+        task.credentials.access_key(),
+        task.credentials.secret_key(),
+        task.credentials.session_token(),
     )?);
     let scan_budget = default_scan_budget(&session_ctx);
     execute_scan_streaming_with_store(
@@ -658,8 +658,16 @@ pub async fn execute_scan_streaming_with_store(
                 Ok(batch) => {
                     total_rows += batch.num_rows();
                     first_file_bytes += batch.get_array_memory_size();
-                    if !emit_batch(&tx, &scan_budget, &queue_bytes, &queue_space, &metrics, batch, hive_ctx.as_ref())
-                        .await
+                    if !emit_batch(
+                        &tx,
+                        &scan_budget,
+                        &queue_bytes,
+                        &queue_space,
+                        &metrics,
+                        batch,
+                        hive_ctx.as_ref(),
+                    )
+                    .await
                     {
                         return;
                     }
@@ -779,9 +787,17 @@ pub async fn execute_scan_streaming_with_store(
                 match batch_res {
                     Ok(batch) => {
                         total_rows += batch.num_rows();
-                        if !emit_batch(&tx, &scan_budget, &queue_bytes, &queue_space, &metrics, batch, hive_ctx.as_ref())
+                        if !emit_batch(
+                            &tx,
+                            &scan_budget,
+                            &queue_bytes,
+                            &queue_space,
+                            &metrics,
+                            batch,
+                            hive_ctx.as_ref(),
+                        )
                         .await
-                    {
+                        {
                             return;
                         }
                     }
@@ -948,8 +964,8 @@ async fn open_task_stream(
 
     let object_key = s3_url_to_key(file_path)?;
     let path = ObjectPath::from(object_key.as_str());
-    let file_schema = crate::hive_partition::file_schema_of(desc, full_schema)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let file_schema =
+        crate::hive_partition::file_schema_of(desc, full_schema).map_err(|e| anyhow::anyhow!(e))?;
 
     match desc.format {
         sqe_planner::HiveScanFormat::Csv => {
@@ -974,12 +990,12 @@ async fn open_task_stream(
 }
 
 #[allow(deprecated)] // parquet 59.2.0 deprecated ParquetObjectReader in favour of a
-// hand-written AsyncFileReader / SpawnedReader. Unlike the DataFusion 55
-// statistics deprecation, this one is behaviour-identical if left alone: the
-// struct is unchanged, only marked. The replacement moves scan-path I/O onto a
-// dedicated runtime, which is a performance change that belongs in its own
-// benchmarked MR rather than riding along with a version bump.
-// See https://github.com/apache/arrow-rs/issues/10308
+                     // hand-written AsyncFileReader / SpawnedReader. Unlike the DataFusion 55
+                     // statistics deprecation, this one is behaviour-identical if left alone: the
+                     // struct is unchanged, only marked. The replacement moves scan-path I/O onto a
+                     // dedicated runtime, which is a performance change that belongs in its own
+                     // benchmarked MR rather than riding along with a version bump.
+                     // See https://github.com/apache/arrow-rs/issues/10308
 async fn open_parquet_stream(
     task: &ScanTask,
     file_path: &str,
@@ -1275,12 +1291,12 @@ async fn open_parquet_stream(
 
 #[tracing::instrument(skip(task, metrics, session_ctx, credential_rx, footer_cache, filter_expr, coordinator_metrics), fields(fragment_id = %task.fragment_id, file_count = task.data_file_paths.len()))]
 #[allow(deprecated)] // parquet 59.2.0 deprecated ParquetObjectReader in favour of a
-// hand-written AsyncFileReader / SpawnedReader. Unlike the DataFusion 55
-// statistics deprecation, this one is behaviour-identical if left alone: the
-// struct is unchanged, only marked. The replacement moves scan-path I/O onto a
-// dedicated runtime, which is a performance change that belongs in its own
-// benchmarked MR rather than riding along with a version bump.
-// See https://github.com/apache/arrow-rs/issues/10308
+                     // hand-written AsyncFileReader / SpawnedReader. Unlike the DataFusion 55
+                     // statistics deprecation, this one is behaviour-identical if left alone: the
+                     // struct is unchanged, only marked. The replacement moves scan-path I/O onto a
+                     // dedicated runtime, which is a performance change that belongs in its own
+                     // benchmarked MR rather than riding along with a version bump.
+                     // See https://github.com/apache/arrow-rs/issues/10308
 pub async fn execute_scan(
     task: &ScanTask,
     metrics: Option<&Arc<WorkerMetricsRegistry>>,
@@ -1320,9 +1336,9 @@ pub async fn execute_scan(
     }
 
     // Mutable credential state — may be updated between files
-    let mut current_access_key = task.s3_access_key.clone();
-    let mut current_secret_key = task.s3_secret_key.clone();
-    let mut current_session_token = task.s3_session_token.clone();
+    let mut current_access_key = task.credentials.access_key().to_string();
+    let mut current_secret_key = task.credentials.secret_key().to_string();
+    let mut current_session_token = task.credentials.session_token().to_string();
     let mut credential_rx = credential_rx;
 
     let store = build_object_store_with_creds(
@@ -1597,7 +1613,14 @@ fn build_object_store_with_creds(
     secret_key: &str,
     session_token: &str,
 ) -> anyhow::Result<impl ObjectStore> {
-    let mut builder = AmazonS3Builder::new();
+    // Finding 401: a ticket without key material means "use this worker's
+    // own credential chain" (IRSA, instance profile, env), never the
+    // engine's static pair.
+    let mut builder = if task.credentials.carries_keys() || !access_key.is_empty() {
+        AmazonS3Builder::new()
+    } else {
+        AmazonS3Builder::from_env()
+    };
 
     if !task.s3_endpoint.is_empty() {
         builder = builder.with_endpoint(&task.s3_endpoint);
@@ -1854,9 +1877,9 @@ mod tests {
             projected_field_ids: vec![],
             s3_endpoint: String::new(),
             s3_region: String::new(),
-            s3_access_key: String::new(),
-            s3_secret_key: String::new(),
-            s3_session_token: String::new(),
+            credentials: sqe_planner::ScanCredentials::default(),
+            audience: String::new(),
+            expires_at: 0,
             s3_path_style: false,
             s3_allow_http: false,
             predicate_proto,
@@ -1880,11 +1903,12 @@ mod tests {
         let schema: SchemaRef =
             Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         // One row group per write: max_row_group_size 10 with 10-row batches.
-        let props = WriterProperties::builder().set_max_row_group_row_count(Some(10)).build();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(10))
+            .build();
         let mut buf = Vec::new();
         {
-            let mut writer =
-                ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
+            let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props)).unwrap();
             for base in [0i64, 100, 200] {
                 let values: Vec<i64> = (base..base + 10).collect();
                 let batch =
@@ -1897,7 +1921,11 @@ mod tests {
         }
         let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(buf)).unwrap();
         let metadata = reader.metadata().clone();
-        assert_eq!(metadata.num_row_groups(), 3, "fixture must have 3 row groups");
+        assert_eq!(
+            metadata.num_row_groups(),
+            3,
+            "fixture must have 3 row groups"
+        );
         (metadata, schema)
     }
 
@@ -2002,8 +2030,7 @@ mod tests {
     #[test]
     fn oversized_inlist_is_excluded_from_the_pruning_predicate() {
         let (metadata, schema) = three_row_group_metadata();
-        let big: Vec<datafusion::logical_expr::Expr> =
-            (0..1_000i64).map(lit).collect();
+        let big: Vec<datafusion::logical_expr::Expr> = (0..1_000i64).map(lit).collect();
         let predicate = physical(col("a").in_list(big, false), &schema);
 
         // Assert on conjunct SELECTION, not just on the outcome: DataFusion
@@ -2035,11 +2062,8 @@ mod tests {
     #[test]
     fn bounds_still_prune_when_anded_with_an_oversized_inlist() {
         let (metadata, schema) = three_row_group_metadata();
-        let big: Vec<datafusion::logical_expr::Expr> =
-            (0..1_000i64).map(|v| lit(v * 3)).collect();
-        let expr = col("a")
-            .gt(lit(150i64))
-            .and(col("a").in_list(big, false));
+        let big: Vec<datafusion::logical_expr::Expr> = (0..1_000i64).map(|v| lit(v * 3)).collect();
+        let expr = col("a").gt(lit(150i64)).and(col("a").in_list(big, false));
         let predicate = physical(expr, &schema);
         let kept = row_group_prune::prune_row_groups(
             &metadata,
@@ -2253,9 +2277,9 @@ mod tests {
             projected_field_ids: vec![],
             s3_endpoint: String::new(),
             s3_region: String::new(),
-            s3_access_key: String::new(),
-            s3_secret_key: String::new(),
-            s3_session_token: String::new(),
+            credentials: sqe_planner::ScanCredentials::default(),
+            audience: String::new(),
+            expires_at: 0,
             s3_path_style: true,
             s3_allow_http: false,
             predicate_proto: None,

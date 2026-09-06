@@ -99,13 +99,19 @@ pub fn build_worker_service_with_hot_reload(
         "Worker memory governor ready"
     );
 
+    // Finding 601: the coordinator's scan-ticket public key, pinned from
+    // config or from the heartbeat response.
+    let ticket_pin = Arc::new(
+        crate::ticket_pin::TicketKeyPin::from_config(&config.worker)
+            .map_err(|e| anyhow::anyhow!("worker.ticket_public_key: {e}"))?,
+    );
     let mut service = WorkerFlightService::new(metrics, session_ctx)
+        .with_ticket_pin(Arc::clone(&ticket_pin))
+        .with_accept_hmac_tickets(config.worker.accept_hmac_tickets)
         .with_scan_timeout(config.worker.scan_timeout_secs)
         .with_flight_compression(shuffle_compression)
-        .with_shuffle_compression(shuffle_compression)
         .with_footer_cache(footer_cache)
         .with_worker_secret(config.worker.worker_secret.clone())
-        .with_shuffle_memory_budget_atom(Arc::clone(&hot.shuffle_budget_bytes))
         .with_scan_timeout_atom(Arc::clone(&hot.scan_timeout_secs))
         .with_memory_governor(memory_governor.clone())
         // #407: encoded Flight frames are charged against their own budget.
@@ -117,6 +123,16 @@ pub fn build_worker_service_with_hot_reload(
             budgets.budget_granularity_bytes,
             None,
         ));
+    // Shuffle-only wiring: the DoExchange intake these configure only exists
+    // when `worker-shuffle` is compiled in (review finding 600). The resolved
+    // budget stays on `WorkerHotConfig` either way so config validation and
+    // hot-reload arithmetic are unchanged.
+    #[cfg(feature = "worker-shuffle")]
+    {
+        service = service
+            .with_shuffle_compression(shuffle_compression)
+            .with_shuffle_memory_budget_atom(Arc::clone(&hot.shuffle_budget_bytes));
+    }
     if let Some(sm) = spill_manager {
         service = service.with_spill_manager(sm);
     }
@@ -136,13 +152,15 @@ pub fn build_worker_service_with_hot_reload(
 
     // Plaintext warning (config validation already fail-closes on non-loopback
     // distributed setups without TLS or the opt-in; this covers the waived /
-    // loopback case so the operator still sees it).
-    if !config.coordinator.tls.is_enabled() {
+    // loopback case so the operator still sees it). The worker's own
+    // `[worker.tls]` block counts, not just the inherited `[coordinator.tls]`.
+    let worker_tls = config.worker.effective_tls(&config.coordinator.tls).clone();
+    if !worker_tls.is_enabled() {
         tracing::warn!(
             "WARNING: the worker Flight service is PLAINTEXT (no TLS). User S3 \
              credentials and the worker secret travel in cleartext. Set \
-             [coordinator.tls] cert_file/key_file to enable TLS, or do not run \
-             workers on untrusted networks."
+             [worker.tls] (or [coordinator.tls]) cert_file/key_file to enable \
+             TLS, or do not run workers on untrusted networks."
         );
     }
 
@@ -165,6 +183,7 @@ pub fn build_worker_service_with_hot_reload(
                  so the worker must advertise a routable address)"
             )
         })?;
+        service = service.with_advertise_url(advertise_url.clone());
         let interval = Duration::from_secs(config.worker.heartbeat_interval_secs);
         tracing::info!(
             coordinator = %config.worker.coordinator_url,
@@ -172,11 +191,20 @@ pub fn build_worker_service_with_hot_reload(
             interval_secs = config.worker.heartbeat_interval_secs,
             "Starting heartbeat to coordinator"
         );
+        // Client TLS for an `https://` coordinator, built once here so a bad
+        // CA path fails at worker boot rather than silently on every tick.
+        // Without this the worker could not heartbeat a TLS coordinator at all
+        // (finding 603).
+        let client_tls = sqe_core::tls::tonic_client(&worker_tls, None).map_err(|e| {
+            anyhow::anyhow!("cannot build worker client TLS for the heartbeat: {e}")
+        })?;
         heartbeat::start_heartbeat_task(
             config.worker.coordinator_url.clone(),
             advertise_url,
             interval,
             config.worker.worker_secret.clone(),
+            Some(client_tls),
+            Some(Arc::clone(&ticket_pin)),
         );
     } else {
         // A worker_secret with no coordinator_url is inert: nothing to

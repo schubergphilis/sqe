@@ -21,7 +21,7 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_expr::Expr;
 
-use crate::{ClientError, QuackClient};
+use crate::{ClientError, QuackClient, QuackTargetPolicy};
 
 /// Wraps a remote Quack query as a DataFusion table.
 ///
@@ -38,7 +38,20 @@ impl QuackTableProvider {
     /// from the first `RecordBatch`; an empty result set is reported as an
     /// error because we can't synthesize an Arrow schema with no data.
     pub fn new(uri: &str, token: Option<&str>, sql: &str) -> Result<Self, ClientError> {
-        let mut client = QuackClient::connect(uri, token)?;
+        Self::new_with_policy(uri, token, sql, QuackTargetPolicy::permissive())
+    }
+
+    /// Like [`QuackTableProvider::new`] but the destination must pass
+    /// `policy` before a socket is opened and the decoded result is capped
+    /// by `policy.max_result_bytes`. This is the constructor the SQL-facing
+    /// TVF uses (review finding 604).
+    pub fn new_with_policy(
+        uri: &str,
+        token: Option<&str>,
+        sql: &str,
+        policy: QuackTargetPolicy,
+    ) -> Result<Self, ClientError> {
+        let mut client = QuackClient::connect_with_policy(uri, token, policy)?;
         let result = client.execute(sql)?;
         let _ = client.disconnect();
         // Schema comes from `PrepareResponse.result_types`, not from the

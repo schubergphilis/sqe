@@ -16,6 +16,6 @@ datafusion = { workspace = true }
 datafusion-expr = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 url = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }

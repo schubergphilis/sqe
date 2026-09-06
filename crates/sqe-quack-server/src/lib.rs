@@ -4,12 +4,14 @@
 //! See `docs/quack-protocol.md` for the wire reference.
 
 pub mod app;
+pub mod pending;
 pub mod query_executor;
 pub mod session;
 
-pub use app::{router, QuackServerState};
-pub use query_executor::{QueryError, QueryExecutor};
-pub use session::{Session, SessionStore};
+pub use app::{router, QuackServerState, ResultLimits};
+pub use pending::{PendingResult, PendingResults};
+pub use query_executor::{QueryError, QueryExecutor, QueryStream};
+pub use session::{Session, SessionRejection, SessionStore};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {

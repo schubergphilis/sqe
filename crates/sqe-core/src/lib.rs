@@ -8,6 +8,8 @@ pub mod session;
 pub mod sql_params;
 pub mod supervised_task;
 pub mod table_properties;
+pub mod ticket_signing;
+pub mod tls;
 
 pub use process_memory::{
     enforced_memory_limit_bytes, enforced_memory_limit_source, process_rss_bytes,
@@ -33,5 +35,6 @@ pub use table_properties::{
     resolve_delete_mode, resolve_merge_mode, resolve_mode, resolve_update_mode, WriteMode,
     WRITE_DELETE_MODE, WRITE_MERGE_MODE, WRITE_UPDATE_MODE,
 };
+pub use tls::{tonic_client, ServerTlsMaterial};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

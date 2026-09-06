@@ -64,6 +64,114 @@ pub struct SqeConfig {
     /// hive_external` remains the per-session alternative once wired.
     #[serde(default)]
     pub hive: HiveConfig,
+    /// Outbound `quack_query()` table function. Off by default: it turns SQL
+    /// into HTTP POSTs from the coordinator's network position (finding 604).
+    #[serde(default)]
+    pub quack_client: QuackClientConfig,
+}
+
+/// `[quack_client]`: the outbound `quack_query(uri, sql)` table function.
+///
+/// Disabled unless `enabled = true`. When enabled, the function is registered
+/// only for sessions holding a role in `allowed_roles`, may only reach the
+/// exact `host:port` entries in `allowed_hosts` (loopback, link-local and
+/// private addresses included only when listed explicitly), never follows
+/// redirects, forwards the session's own bearer token instead of a token
+/// literal in SQL, and fails the query once the decoded result exceeds
+/// `max_result_bytes`.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub struct QuackClientConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Roles that may call `quack_query`. Empty with `enabled = true` is a
+    /// validation error: fail closed rather than open.
+    #[serde(default)]
+    pub allowed_roles: Vec<String>,
+    /// Exact `host:port` destinations. Empty with `enabled = true` is a
+    /// validation error.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    /// Cap on decoded Arrow bytes per call.
+    #[serde(default = "default_quack_client_max_result_bytes")]
+    pub max_result_bytes: usize,
+}
+
+fn default_quack_client_max_result_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
+impl Default for QuackClientConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_roles: Vec::new(),
+            allowed_hosts: Vec::new(),
+            max_result_bytes: default_quack_client_max_result_bytes(),
+        }
+    }
+}
+
+impl SqeConfig {
+    /// Finding 601: a configured ticket-signing key file (coordinator) or
+    /// pinned public key (worker) must load at boot, not at first query.
+    fn validate_ticket_keys(&self, errors: &mut Vec<String>) {
+        let path = self.coordinator.ticket_signing_key_file.trim();
+        if !path.is_empty() {
+            match std::fs::read(path) {
+                Err(e) => errors.push(format!("coordinator.ticket_signing_key_file {path}: {e}")),
+                Ok(der) => {
+                    if let Err(e) = crate::ticket_signing::TicketSigner::from_pkcs8(&der) {
+                        errors.push(format!("coordinator.ticket_signing_key_file {path}: {e}"));
+                    }
+                }
+            }
+        }
+        if self.coordinator.ticket_ttl_secs == 0 {
+            errors.push("coordinator.ticket_ttl_secs must be greater than zero".to_string());
+        }
+        let key = self.worker.ticket_public_key.trim();
+        if !key.is_empty() {
+            if let Err(e) = crate::ticket_signing::TicketVerifier::from_b64(key) {
+                errors.push(format!("worker.ticket_public_key: {e}"));
+            }
+        }
+    }
+}
+
+impl QuackClientConfig {
+    /// Whether `quack_query` should be registered for a session with `roles`.
+    pub fn permits(&self, roles: &[String]) -> bool {
+        self.enabled
+            && !self.allowed_roles.is_empty()
+            && roles
+                .iter()
+                .any(|r| self.allowed_roles.iter().any(|a| a == r))
+    }
+
+    fn validate(&self, errors: &mut Vec<String>) {
+        if !self.enabled {
+            return;
+        }
+        if self.allowed_roles.is_empty() {
+            errors.push("quack_client.allowed_roles must name at least one role when quack_client.enabled = true".to_string());
+        }
+        if self.allowed_hosts.is_empty() {
+            errors.push("quack_client.allowed_hosts must list at least one host:port when quack_client.enabled = true".to_string());
+        }
+        for host in &self.allowed_hosts {
+            let ok = host
+                .rsplit_once(':')
+                .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok());
+            if !ok {
+                errors.push(format!(
+                    "quack_client.allowed_hosts entry {host:?} must be host:port"
+                ));
+            }
+        }
+        if self.max_result_bytes == 0 {
+            errors.push("quack_client.max_result_bytes must be greater than zero".to_string());
+        }
+    }
 }
 
 /// Controls adaptive sort stripping behavior.
@@ -605,6 +713,33 @@ pub struct CoordinatorConfig {
     /// client may register as a worker.
     #[serde(default)]
     pub allow_unauthenticated_workers: bool,
+    /// PKCS#8 v2 Ed25519 private key (DER) used to sign scan tickets
+    /// (finding 601). Empty: the coordinator generates an ephemeral key at
+    /// boot and workers pin its public half from the heartbeat response.
+    /// Set it when several coordinators must sign tickets for the same
+    /// workers; generate with `sqe-server keygen ticket-signing`.
+    #[serde(default)]
+    pub ticket_signing_key_file: String,
+    /// Seconds a signed scan ticket stays valid (finding 601). Workers refuse
+    /// tickets past this age, bounding replay. Default 300.
+    #[serde(default = "default_ticket_ttl_secs")]
+    pub ticket_ttl_secs: u64,
+    /// Accept heartbeats whose advertised URL host does not resolve to the
+    /// TCP peer that sent them (finding 601). Off by default: a secret
+    /// holder can otherwise register an attacker URL and receive every
+    /// user's scan tickets. Turn on only behind a NAT/proxy where peer
+    /// addresses genuinely differ from the advertised ones.
+    #[serde(default)]
+    pub allow_unverified_advertise: bool,
+    /// Which storage credentials distributed scan tickets carry (finding
+    /// 401). `auto` (default) uses catalog-vended credentials when the table
+    /// has them and otherwise the engine's static `[storage]` key pair;
+    /// `vended` refuses to distribute without vended credentials; `static`
+    /// always ships the engine key pair (single-tenant opt-in);
+    /// `worker_default` ships none and lets each worker resolve its own
+    /// (IRSA, instance profile, env). `production_mode` rejects `auto`.
+    #[serde(default)]
+    pub distributed_credentials: DistributedCredentialMode,
     /// Memory limit for the coordinator's DataFusion runtime.
     /// Accepts human-readable sizes: "8GB", "512MB", "4096MB".
     /// Default: "8GB". Applies to all query operator memory (sorts, joins, aggregates).
@@ -1034,6 +1169,26 @@ fn default_max_decoding_message_bytes() -> usize {
     16 * 1024 * 1024
 }
 
+fn default_ticket_ttl_secs() -> u64 {
+    300
+}
+
+/// Which storage credentials a distributed scan ticket carries. See
+/// `CoordinatorConfig::distributed_credentials`.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DistributedCredentialMode {
+    /// Vended when the table has them, otherwise the engine's static pair.
+    #[default]
+    Auto,
+    /// Only catalog-vended, per-user, short-lived credentials.
+    Vended,
+    /// Always the engine's static `[storage]` key pair (single tenant).
+    Static,
+    /// No credentials in the ticket; the worker resolves its own chain.
+    WorkerDefault,
+}
+
 impl std::fmt::Debug for CoordinatorConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CoordinatorConfig")
@@ -1225,9 +1380,26 @@ impl std::fmt::Display for ServerMode {
 ///
 /// When `cert_file` and `key_file` are both set, the server enables TLS.
 /// If omitted, the server runs in plaintext (suitable for development).
+///
+/// The same block is also the *client* configuration for in-cluster hops
+/// (coordinator to worker, worker heartbeat to coordinator): `ca_file` is the
+/// trust root, and cert/key are presented as the client certificate when the
+/// peer asks for one. See [`crate::tls`].
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct TlsConfig {
     /// Path to PEM-encoded server certificate.
+    ///
+    /// **Rotation.** The axum listeners (MCP, Quack) poll this file's mtime
+    /// every 60 s and hot-swap the certificate in place, so a cert-manager
+    /// renewal is picked up without a restart. The tonic (Flight) listener
+    /// does **not**: tonic 0.14 builds its acceptor once at
+    /// `Server::tls_config` and exposes no way to swap it, so the Flight port
+    /// keeps serving the certificate it started with until the process
+    /// restarts. In Kubernetes, cover that with a reloader sidecar
+    /// (`stakater/Reloader`, annotation
+    /// `reloader.stakater.com/auto: "true"` on the Deployment) so a rotated
+    /// TLS secret triggers a rolling restart. See
+    /// `docs/site/book/src/deployment/configuration.md#tls`.
     #[serde(default)]
     pub cert_file: String,
     /// Path to PEM-encoded private key.
@@ -1235,9 +1407,22 @@ pub struct TlsConfig {
     pub key_file: String,
     /// Path to PEM-encoded CA certificate for client verification (mTLS).
     /// When set, the server requires clients to present a valid certificate
-    /// signed by this CA.
+    /// signed by this CA -- on every listener, gRPC and HTTP alike.
+    ///
+    /// On the client side of an in-cluster hop this is the trust root used to
+    /// verify the peer. A private cluster CA must be named here; the platform
+    /// trust store will not contain it.
     #[serde(default)]
     pub ca_file: String,
+    /// Allow a bare-IP `worker.advertise_url` while TLS is on.
+    ///
+    /// Off by default. A certificate issued for the coordinator cannot
+    /// validate for `https://10.1.2.3:50052` unless it carries every worker IP
+    /// in its SAN list, so a worker that derives an IP advertise URL under TLS
+    /// normally fails at boot rather than at first dispatch (finding 603). Set
+    /// this only when the certificate really does carry the IP SANs.
+    #[serde(default)]
+    pub allow_ip_advertise: bool,
 }
 
 impl TlsConfig {
@@ -1511,6 +1696,57 @@ pub struct WorkerConfig {
     /// `SQE_WORKER_ROW_GROUP_PRUNING`) turns it off.
     #[serde(default = "default_true")]
     pub row_group_pruning: bool,
+    /// Base64 Ed25519 public key of the coordinator's ticket-signing key
+    /// (finding 601). Empty (default): the worker pins the key delivered in
+    /// the secret-authenticated heartbeat response. Set it when the worker
+    /// does not heartbeat (static `coordinator.worker_urls` only) or to
+    /// forbid re-pinning.
+    #[serde(default)]
+    pub ticket_public_key: String,
+    /// Accept legacy HMAC scan-ticket tags keyed by `worker_secret`
+    /// (finding 601). Off by default: the HMAC key is the same secret every
+    /// worker holds, so it proves nothing about who authored the ticket.
+    /// Turn on only while rolling a fleet that still has pre-Ed25519
+    /// coordinators.
+    #[serde(default)]
+    pub accept_hmac_tickets: bool,
+    /// TLS identity for *this worker's* Flight listener, and the client
+    /// material it uses to reach the coordinator.
+    ///
+    /// Absent (the default) means "inherit `[coordinator.tls]`", which is the
+    /// single-cert dev setup that shipped before. Set it when the worker needs
+    /// its own certificate: one certificate carrying the coordinator's SAN
+    /// cannot validate for `https://worker-3.svc:50052` (finding 603).
+    ///
+    /// A `[worker.tls]` block with no `cert_file`/`key_file` still contributes
+    /// `allow_ip_advertise`, so the escape hatch can be set without cloning
+    /// the whole block.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
+impl WorkerConfig {
+    /// The TLS block that governs this worker's Flight listener and the
+    /// identity it presents to the coordinator: `[worker.tls]` when it carries
+    /// a cert and key, otherwise the inherited `[coordinator.tls]`.
+    pub fn effective_tls<'a>(&'a self, coordinator_tls: &'a TlsConfig) -> &'a TlsConfig {
+        match self.tls.as_ref() {
+            Some(tls) if tls.is_enabled() => tls,
+            _ => coordinator_tls,
+        }
+    }
+
+    /// Whether a bare-IP `advertise_url` is permitted while TLS is on.
+    /// `[worker.tls]` wins when present (it is the worker-scoped knob); the
+    /// inherited block is the fallback.
+    pub fn allow_ip_advertise(&self, coordinator_tls: &TlsConfig) -> bool {
+        if let Some(tls) = self.tls.as_ref() {
+            if tls.allow_ip_advertise {
+                return true;
+            }
+        }
+        self.effective_tls(coordinator_tls).allow_ip_advertise
+    }
 }
 
 impl Default for WorkerConfig {
@@ -1529,6 +1765,9 @@ impl Default for WorkerConfig {
             worker_secret: String::new(),
             allow_unauthenticated: false,
             row_group_pruning: true,
+            ticket_public_key: String::new(),
+            accept_hmac_tickets: false,
+            tls: None,
         }
     }
 }
@@ -1828,6 +2067,13 @@ pub enum AuthProviderConfig {
         /// identities. Set `true` only for local/dev setups.
         #[serde(default)]
         allow_insecure_jwks: bool,
+        /// Explicit opt-in to accept tokens from any issuer. Default
+        /// `false`: a missing/empty `issuer` then errors at startup. A
+        /// multi-tenant IdP serves one JWKS for several issuers, so audience
+        /// binding alone does not stop a token minted by a sibling issuer
+        /// for the same audience string. Finding 207.
+        #[serde(default)]
+        allow_unbounded_issuer: bool,
     },
     /// AWS IAM authentication via STS GetCallerIdentity.
     AwsIam {
@@ -4767,6 +5013,8 @@ impl SqeConfig {
     /// Validate configuration: required fields and port conflicts.
     pub fn validate(&self) -> crate::error::Result<()> {
         let mut errors = Vec::new();
+        self.quack_client.validate(&mut errors);
+        self.validate_ticket_keys(&mut errors);
 
         // Required fields
         //
@@ -5023,6 +5271,58 @@ impl SqeConfig {
             if !tls.ca_file.is_empty() && !std::path::Path::new(&tls.ca_file).exists() {
                 errors.push(format!("tls.ca_file '{}' not found", tls.ca_file));
             }
+        }
+
+        // Same shape checks for the optional per-worker TLS identity. A
+        // `[worker.tls]` block that is present but half-configured is a silent
+        // fallback to `[coordinator.tls]` otherwise, which is how a worker
+        // ends up serving the coordinator's certificate by accident.
+        if let Some(worker_tls) = self.worker.tls.as_ref() {
+            if !worker_tls.cert_file.is_empty() && worker_tls.key_file.is_empty() {
+                errors.push(
+                    "worker.tls.cert_file is set but worker.tls.key_file is missing".to_string(),
+                );
+            }
+            if worker_tls.cert_file.is_empty() && !worker_tls.key_file.is_empty() {
+                errors.push(
+                    "worker.tls.key_file is set but worker.tls.cert_file is missing".to_string(),
+                );
+            }
+            if worker_tls.is_enabled() {
+                if !std::path::Path::new(&worker_tls.cert_file).exists() {
+                    errors.push(format!(
+                        "worker.tls.cert_file '{}' not found",
+                        worker_tls.cert_file
+                    ));
+                }
+                if !std::path::Path::new(&worker_tls.key_file).exists() {
+                    errors.push(format!(
+                        "worker.tls.key_file '{}' not found",
+                        worker_tls.key_file
+                    ));
+                }
+            }
+            if !worker_tls.ca_file.is_empty() && !std::path::Path::new(&worker_tls.ca_file).exists()
+            {
+                errors.push(format!(
+                    "worker.tls.ca_file '{}' not found",
+                    worker_tls.ca_file
+                ));
+            }
+        }
+
+        // Finding 603: TLS on plus `https://` workers used to be a
+        // configuration that compiled, booted, and then failed every single
+        // dispatch because the coordinator had no client trust root. Refuse it
+        // at boot, naming the missing CA, instead of at first query with a
+        // transport error.
+        if let Some(message) = crate::tls::https_peers_need_trust_root(
+            tls.is_enabled(),
+            &self.coordinator.worker_urls,
+            &tls.ca_file,
+            crate::tls::NATIVE_ROOTS_AVAILABLE,
+        ) {
+            errors.push(message);
         }
 
         // Parquet compression validation
@@ -5361,6 +5661,18 @@ impl SqeConfig {
                  (0 disables the pre-parse statement size cap and lets a \
                  client burn coordinator memory/CPU on an arbitrarily large \
                  SQL string)"
+                    .to_string(),
+            );
+        }
+
+        if self.coordinator.distributed_credentials == DistributedCredentialMode::Auto
+            && !self.coordinator.worker_urls.is_empty()
+        {
+            errors.push(
+                "production_mode: coordinator.distributed_credentials must be set \
+                 explicitly (vended, static or worker_default); `auto` silently \
+                 ships the shared [storage] key pair to workers when a table has \
+                 no vended credentials (finding 401)"
                     .to_string(),
             );
         }
@@ -6173,10 +6485,38 @@ partial_progress_batch = 5
         assert!(config.validate().is_ok());
     }
 
+    /// 604: `quack_query` is off by default and fails closed when enabled
+    /// without roles or hosts.
+    #[test]
+    fn quack_client_is_off_by_default_and_fails_closed_when_half_configured() {
+        let mut config = valid_config();
+        assert!(!config.quack_client.permits(&["analyst".to_string()]));
+        assert!(config.validate().is_ok());
+
+        config.quack_client.enabled = true;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("quack_client.allowed_roles"), "{err}");
+        assert!(err.contains("quack_client.allowed_hosts"), "{err}");
+        // Enabled but roles empty: still nobody gets the function.
+        assert!(!config.quack_client.permits(&["analyst".to_string()]));
+
+        config.quack_client.allowed_roles = vec!["quack-users".to_string()];
+        config.quack_client.allowed_hosts = vec!["quack-peer:9495".to_string()];
+        assert!(config.validate().is_ok());
+        assert!(config.quack_client.permits(&["quack-users".to_string()]));
+        assert!(!config.quack_client.permits(&["analyst".to_string()]));
+        assert!(!config.quack_client.permits(&[]));
+
+        config.quack_client.allowed_hosts = vec!["quack-peer".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("must be host:port"), "{err}");
+    }
+
     /// Helper to build a valid config for validation tests.
     fn valid_config() -> SqeConfig {
         SqeConfig {
             mcp: Default::default(),
+            quack_client: Default::default(),
             coordinator: CoordinatorConfig {
                 flight_sql_port: 50051,
                 trino_http_port: 8080,
@@ -6187,6 +6527,10 @@ partial_progress_batch = 5
                 tls: TlsConfig::default(),
                 worker_secret: SecretString::default(),
                 allow_unauthenticated_workers: false,
+                ticket_signing_key_file: String::new(),
+                ticket_ttl_secs: default_ticket_ttl_secs(),
+                allow_unverified_advertise: false,
+                distributed_credentials: DistributedCredentialMode::Auto,
                 memory_limit: default_coordinator_memory(),
                 memory_pool: MemoryPoolKind::Greedy,
                 spill_to_disk: true,
@@ -7208,6 +7552,10 @@ s3_secret_key = "configured-secret"
         let mut config = valid_production_config();
         config.coordinator.worker_urls = vec!["http://worker-1:50051".to_string()];
         config.coordinator.worker_secret = SecretString::new("shared-secret-value".to_string());
+        // 401: `auto` is refused in production; an explicit mode passes.
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(err.contains("distributed_credentials"), "{err}");
+        config.coordinator.distributed_credentials = DistributedCredentialMode::Vended;
         assert!(config.validate_production().is_ok());
     }
 
@@ -7665,7 +8013,7 @@ type = "aws"
         let tls = TlsConfig {
             cert_file: "/tmp/cert.pem".to_string(),
             key_file: "/tmp/key.pem".to_string(),
-            ca_file: String::new(),
+            ..TlsConfig::default()
         };
         assert!(tls.is_enabled());
     }
@@ -7703,6 +8051,63 @@ type = "aws"
         assert!(
             err.contains("tls.cert_file") && err.contains("not found"),
             "Expected missing file error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_worker_tls_inherits_coordinator_block_when_absent() {
+        let mut config = valid_config();
+        config.coordinator.tls.cert_file = "/etc/sqe/coord.crt".to_string();
+        config.coordinator.tls.key_file = "/etc/sqe/coord.key".to_string();
+        assert!(config.worker.tls.is_none());
+        let effective = config.worker.effective_tls(&config.coordinator.tls);
+        assert_eq!(effective.cert_file, "/etc/sqe/coord.crt");
+        assert!(effective.is_enabled());
+    }
+
+    #[test]
+    fn test_worker_tls_overrides_coordinator_block_when_set() {
+        let mut config = valid_config();
+        config.coordinator.tls.cert_file = "/etc/sqe/coord.crt".to_string();
+        config.coordinator.tls.key_file = "/etc/sqe/coord.key".to_string();
+        config.worker.tls = Some(TlsConfig {
+            cert_file: "/etc/sqe/worker.crt".to_string(),
+            key_file: "/etc/sqe/worker.key".to_string(),
+            ..TlsConfig::default()
+        });
+        let effective = config.worker.effective_tls(&config.coordinator.tls);
+        assert_eq!(effective.cert_file, "/etc/sqe/worker.crt");
+    }
+
+    #[test]
+    fn test_worker_tls_allow_ip_advertise_reads_either_block() {
+        let mut config = valid_config();
+        assert!(!config.worker.allow_ip_advertise(&config.coordinator.tls));
+
+        // Worker-scoped knob, with no worker certificate of its own.
+        config.worker.tls = Some(TlsConfig {
+            allow_ip_advertise: true,
+            ..TlsConfig::default()
+        });
+        assert!(config.worker.allow_ip_advertise(&config.coordinator.tls));
+
+        // Or inherited from the coordinator block.
+        config.worker.tls = None;
+        config.coordinator.tls.allow_ip_advertise = true;
+        assert!(config.worker.allow_ip_advertise(&config.coordinator.tls));
+    }
+
+    #[test]
+    fn test_validate_worker_tls_cert_without_key() {
+        let mut config = valid_config();
+        config.worker.tls = Some(TlsConfig {
+            cert_file: "/tmp/worker.crt".to_string(),
+            ..TlsConfig::default()
+        });
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("worker.tls.key_file is missing"),
+            "Expected worker cert-without-key error, got: {err}"
         );
     }
 

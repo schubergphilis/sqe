@@ -14,6 +14,10 @@
 pub mod accounted;
 pub mod budget;
 pub mod error;
+/// Durable exchange attempt manifests. Gated behind the `exchange` feature:
+/// the only consumer is the worker's `worker-shuffle` DoExchange intake, which
+/// no query plan reaches (review finding 600).
+#[cfg(feature = "exchange")]
 pub mod exchange;
 pub mod fault;
 pub mod governor;
@@ -34,6 +38,7 @@ pub use budget::{
     DEFAULT_BUDGET_GRANULARITY, DEFAULT_READ_HEADROOM_DEN, DEFAULT_READ_HEADROOM_NUM,
 };
 pub use error::{BudgetError, Result};
+#[cfg(feature = "exchange")]
 pub use exchange::{
     exchange_scope, read_manifest, write_manifest_atomic, AttemptManifest, AttemptState,
     ExchangeAttemptStore, SharedExchangeAttemptStore, TaskKey, ATTEMPT_MANIFEST_VERSION,

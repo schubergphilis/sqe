@@ -25,9 +25,13 @@ async-trait = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 chrono = { workspace = true }
+# 606: result paging — QueryStream carries a BoxStream of RecordBatches so one
+# response no longer materialises the whole result.
+futures = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 reqwest = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 async-trait = { workspace = true }
+futures = { workspace = true }

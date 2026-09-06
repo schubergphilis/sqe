@@ -53,11 +53,36 @@ const DEFAULT_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 /// Hard upper bound a client-supplied `maxWait` is clamped to.
 const MAX_WAIT_CAP: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Ceiling on how long a Basic-auth session validated by the provider chain is
+/// replayed without going back to the IdP. Every read also checks the access
+/// token's own expiry, so this is only an upper bound, never an extension of
+/// the token's life. Issue #622.
+const AUTH_SESSION_CACHE_TTL_SECS: u64 = 300;
+
+/// Number of distinct Basic credentials held in the session cache. One entry
+/// per live (user, password) pair; a few thousand covers any realistic client
+/// population and caps what a credential-spraying peer can pin in memory.
+const AUTH_SESSION_CACHE_MAX_ENTRIES: u64 = 4096;
+
 fn build_result_cache() -> MokaCache<String, Arc<PaginatedResult>> {
     MokaCache::builder()
         .max_capacity(RESULT_CACHE_MAX_BYTES)
         .weigher(|_key: &String, value: &Arc<PaginatedResult>| value.estimated_bytes.max(1))
         .time_to_live(std::time::Duration::from_secs(RESULT_TTL_SECS))
+        .build()
+}
+
+/// Sessions already validated for a Basic credential, so the once-per-second
+/// poll of a long-running query does not replay the OIDC password grant
+/// against the IdP on every hop (issue #622: ten dbt threads used to generate
+/// ten grants per second, which trips Keycloak's brute-force lockout on a
+/// legitimate user).
+///
+/// The key is `sha256(user ":" pass)` — the password itself is never stored.
+pub fn build_auth_session_cache() -> MokaCache<String, Session> {
+    MokaCache::builder()
+        .max_capacity(AUTH_SESSION_CACHE_MAX_ENTRIES)
+        .time_to_live(std::time::Duration::from_secs(AUTH_SESSION_CACHE_TTL_SECS))
         .build()
 }
 
@@ -87,6 +112,9 @@ pub struct TrinoState<A, Q> {
     pub security: SecurityConfig,
     /// Optional pre-auth rate limit on credentials. Issue #57.
     pub auth_rate_limiter: Option<Arc<dyn TrinoAuthRateLimiter>>,
+    /// Basic-auth sessions already validated by the provider chain, keyed on
+    /// a digest of the credential. Issue #622.
+    pub auth_sessions: MokaCache<String, Session>,
     /// When true, /v1/info omits the build version so unauthenticated
     /// callers cannot fingerprint the engine. Issue #40.
     pub expose_version: bool,
@@ -105,6 +133,79 @@ pub trait TrinoAuthRateLimiter: Send + Sync + 'static {
     fn check(&self, peer_ip: &str, username: &str) -> Result<(), ()>;
 }
 
+/// Who submitted a query, and the secret that lets that same client keep
+/// polling it.
+///
+/// Both halves exist because neither alone is enough (issue #622):
+/// the poll token makes the common case (a client following `nextUri`) need no
+/// credentials at all, and the stable principal id makes the credential
+/// fallback compare something an attacker cannot collide with.
+#[derive(Debug, Clone)]
+pub struct QueryOwner {
+    /// Display username. Diagnostics only: a provider's `user_claim` can
+    /// remap it and it is not unique across the providers in the chain, so it
+    /// is never the value an authorization decision compares.
+    pub username: String,
+    /// Stable principal id — the IdP `sub` when the provider supplied one,
+    /// else the username. Ownership is decided on this.
+    pub id: String,
+    /// Random token minted at submit, handed to the client inside `nextUri`
+    /// and replayed verbatim on every poll. Only the submitting client ever
+    /// sees it, so presenting it proves ownership without a credential.
+    pub poll_token: String,
+}
+
+impl QueryOwner {
+    /// Mint an owner record, with a fresh poll token, for a submitting session.
+    pub fn new(session: &Session) -> Self {
+        Self {
+            username: session.user.username.clone(),
+            id: stable_principal_id(session),
+            poll_token: mint_poll_token(),
+        }
+    }
+
+    /// True when `session` is the principal that submitted the query.
+    fn is(&self, session: &Session) -> bool {
+        self.id == stable_principal_id(session)
+    }
+
+    /// True when the caller replayed the poll token minted at submit time.
+    fn owns_token(&self, presented: &str) -> bool {
+        constant_time_eq(self.poll_token.as_bytes(), presented.as_bytes())
+    }
+}
+
+/// Stable identity of an authenticated principal: the IdP subject when the
+/// provider forwarded one, else the display username. Used instead of the
+/// username so a second provider in the chain that happens to mint the same
+/// display name cannot read another session's results (issue #622).
+fn stable_principal_id(session: &Session) -> String {
+    session
+        .user
+        .subject
+        .clone()
+        .unwrap_or_else(|| session.user.username.clone())
+}
+
+/// 32 random bytes, base64url without padding: 43 URL-path-safe characters,
+/// the same construction the OAuth2 PKCE verifier uses.
+fn mint_poll_token() -> String {
+    use base64::Engine as _;
+    use rand::RngExt as _;
+    let bytes: Vec<u8> = (0..32).map(|_| rand::rng().random::<u8>()).collect();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Byte comparison that does not short-circuit, so the poll-token check cannot
+/// be turned into a byte-at-a-time timing oracle.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// Stores the full result set split into pages for pagination.
 #[derive(Debug)]
 pub struct PaginatedResult {
@@ -118,8 +219,9 @@ pub struct PaginatedResult {
     pub total_rows: usize,
     /// Wall-clock time at which this result was stored; used for TTL eviction.
     pub created_at: std::time::Instant,
-    /// Username of the session that created this result; used for cancel authorization.
-    pub owner_username: String,
+    /// Principal that created this result plus its poll token; used for
+    /// poll/cancel authorization.
+    pub owner: QueryOwner,
     /// `INSERT`/`UPDATE`/`DELETE` for write paths; `None` for reads.
     pub update_type: Option<String>,
     /// Affected rows for write statements; mirrored on every page so dbt-trino
@@ -201,8 +303,9 @@ pub struct QueryHandle {
     pub notify: tokio::sync::Notify,
     /// Abort handle for the background task; set just after spawn.
     pub abort: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
-    /// Username that submitted the query; used for poll/cancel authorization.
-    pub owner_username: String,
+    /// Principal that submitted the query plus its poll token; used for
+    /// poll/cancel authorization.
+    pub owner: QueryOwner,
     /// Session-state mutation (USE / SET CATALOG) to echo as response headers
     /// when the query finishes. `None` for ordinary statements.
     pub session_update: Option<protocol::UpdatedSessionState>,
@@ -311,10 +414,18 @@ fn build_statement_router<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         .route("/v1/info", get(server_info::<A, Q>))
         .route("/v1/info/state", get(server_state::<A, Q>))
         .route("/v1/statement", post(submit_query::<A, Q>))
-        .route("/v1/statement/{id}/{token}", get(get_results::<A, Q>))
+        // The `{slug}` segment carries the query's poll token, the way real
+        // Trino carries a slug in `/v1/statement/executing/{id}/{slug}/{token}`.
+        // Clients replay `nextUri` verbatim, so it is invisible to them; what
+        // it buys is a poll that proves ownership without re-presenting (and
+        // re-validating) a credential. Issue #622.
         .route(
-            "/v1/statement/queued/{id}/{token}",
-            get(get_queued_results::<A, Q>),
+            "/v1/statement/{id}/{slug}/{token}",
+            get(get_results::<A, Q>).delete(cancel_query_slug::<A, Q>),
+        )
+        .route(
+            "/v1/statement/queued/{id}/{slug}/{token}",
+            get(get_queued_results::<A, Q>).delete(cancel_query_slug::<A, Q>),
         )
         .route("/v1/statement/{id}", delete(cancel_query::<A, Q>))
         .with_state(state)
@@ -364,6 +475,7 @@ where
         oauth2: oauth2.clone(),
         security: options.security,
         auth_rate_limiter: options.auth_rate_limiter,
+        auth_sessions: build_auth_session_cache(),
         expose_version: options.expose_version,
     });
 
@@ -442,6 +554,179 @@ fn trino_client_ip<A, Q>(
     state
         .security
         .resolve_client_ip(Some(&peer.to_string()), xff)
+}
+
+/// Drop the `:port` suffix from a resolved client address so the rate-limiter
+/// bucket is the host, not the ephemeral source port (which would give every
+/// connection a fresh budget).
+///
+/// A resolved address arrives in three shapes: `1.2.3.4:5678` from a peer
+/// socket, `[::1]:5678` from an IPv6 peer socket, and a bare address from
+/// `x-forwarded-for`. A bare IPv6 must survive intact — naively splitting on
+/// the last colon would fold `2001:db8::1` and `2001:db8::2` into one bucket.
+fn strip_port(client_ip: &str) -> &str {
+    if let Some(rest) = client_ip.strip_prefix('[') {
+        return match rest.find(']') {
+            Some(end) => &client_ip[..end + 2],
+            None => client_ip,
+        };
+    }
+    // Exactly one colon followed by digits is a port; anything else (no
+    // colon, or several) is the address itself.
+    let mut parts = client_ip.split(':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(host), Some(port), None)
+            if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            host
+        }
+        _ => client_ip,
+    }
+}
+
+/// Why credential resolution failed, so each route maps it to the status code
+/// its protocol expects without repeating the auth ladder.
+enum AuthFailure {
+    /// No usable `Authorization` header on the request.
+    Missing,
+    /// A credential was presented and the provider chain rejected it.
+    Rejected,
+    /// The (peer, credential) tuple is over the pre-auth budget.
+    RateLimited,
+}
+
+/// Rate-limit bucket for a bearer credential: a truncated SHA-256 of the
+/// token. Bearers are attacker-supplied and unbounded in number, so the raw
+/// value must never become a map key or a log field; the digest gives the
+/// same per-credential budget passwords get without storing the secret.
+fn bearer_fingerprint(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = hex::encode(Sha256::digest(token.as_bytes()));
+    format!("bearer:{}", &digest[..16])
+}
+
+/// Session-cache key for a Basic credential. The password is hashed, never
+/// stored: a cache dump must not yield a replayable credential.
+///
+/// The username's length is mixed in first because a plain `user ":" pass`
+/// digest is ambiguous — user `a:b` with password `c` and user `a` with
+/// password `b:c` hash identically, and would then share one cached session.
+fn basic_session_key(user: &str, pass: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update((user.len() as u64).to_le_bytes());
+    hasher.update(user.as_bytes());
+    hasher.update(b":");
+    hasher.update(pass.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Consult the pre-auth rate limiter. `principal` is a Basic username or a
+/// bearer fingerprint — never a raw credential. Returns false when the tuple
+/// is over budget.
+fn check_auth_rate<A, Q>(
+    state: &Arc<TrinoState<A, Q>>,
+    peer_host: &str,
+    principal: &str,
+    client_ip: &str,
+) -> bool {
+    let Some(limiter) = state.auth_rate_limiter.as_ref() else {
+        return true;
+    };
+    if limiter.check(peer_host, principal).is_err() {
+        warn!(
+            principal = %principal,
+            client_ip = %client_ip,
+            "Trino auth rejected by rate limiter"
+        );
+        return false;
+    }
+    true
+}
+
+/// The 429 every route returns when the pre-auth limiter denies a credential.
+/// `Retry-After` is what the POST route already sent; the other routes now
+/// match it instead of silently letting the attempt through (issue #622).
+fn rate_limited_response() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(axum::http::header::RETRY_AFTER, "1")],
+        "authentication rate limit",
+    )
+        .into_response()
+}
+
+/// Resolve the caller's session from the `Authorization` header.
+///
+/// The order is the point of this function (issues #622, #562):
+///
+/// 1. A Basic credential this process already validated short-circuits on the
+///    session cache. Replaying it costs the IdP nothing, so it does not spend
+///    pre-auth budget — otherwise a legitimate client polling once a second
+///    would exhaust a 10/min budget in its first ten seconds.
+/// 2. Everything that would reach a provider — **bearer included**, which the
+///    POST route used to skip — passes the pre-auth rate limiter first, keyed
+///    on (peer ip, username or bearer fingerprint).
+/// 3. Only then is the provider chain asked to validate.
+async fn authenticate_request<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
+    state: &Arc<TrinoState<A, Q>>,
+    headers: &HeaderMap,
+    peer_host: &str,
+    client_ip: &str,
+) -> Result<Session, AuthFailure> {
+    if let Some(token) = extract_bearer_token(headers) {
+        if !check_auth_rate(state, peer_host, &bearer_fingerprint(&token), client_ip) {
+            return Err(AuthFailure::RateLimited);
+        }
+        return match state.authenticator.authenticate_bearer(&token).await {
+            Ok(session) => Ok(session),
+            Err(e) => {
+                warn!(error = %e, client_ip = %client_ip, "Trino bearer token validation failed");
+                Err(AuthFailure::Rejected)
+            }
+        };
+    }
+
+    if let Some((user, pass)) = extract_basic_auth(headers) {
+        let key = basic_session_key(&user, &pass);
+        if let Some(session) = state.auth_sessions.get(&key) {
+            // The cache TTL is a ceiling, not a lifetime grant: a session
+            // whose access token has expired is dropped and re-validated so
+            // the downstream Polaris/S3 calls never carry a dead token.
+            if session.token_expiry() > chrono::Utc::now() {
+                return Ok(session);
+            }
+            state.auth_sessions.invalidate(&key);
+        }
+        if !check_auth_rate(state, peer_host, &user, client_ip) {
+            return Err(AuthFailure::RateLimited);
+        }
+        return match state.authenticator.authenticate(&user, &pass).await {
+            Ok(session) => {
+                state.auth_sessions.insert(key, session.clone());
+                Ok(session)
+            }
+            Err(e) => {
+                warn!(error = %e, user = %user, client_ip = %client_ip, "Trino authentication failed");
+                Err(AuthFailure::Rejected)
+            }
+        };
+    }
+
+    Err(AuthFailure::Missing)
+}
+
+/// Map a credential failure on a poll/cancel route to its response: 429 for a
+/// rate-limit denial, a bare 401 for everything else.
+///
+/// `Missing` and `Rejected` collapse on purpose — the caller learns nothing
+/// about whether the query id exists or whether the credential was merely
+/// absent, so neither route can be used to enumerate query ids.
+fn poll_auth_response(failure: AuthFailure) -> Response {
+    match failure {
+        AuthFailure::RateLimited => rate_limited_response(),
+        AuthFailure::Missing | AuthFailure::Rejected => StatusCode::UNAUTHORIZED.into_response(),
+    }
 }
 
 // ── Trino /v1/info ────────────────────────────────────────────
@@ -787,9 +1072,15 @@ fn paginate_rows(
 }
 
 /// Build a `nextUri` for the given query id and page token, or `None` if this is the last page.
-fn next_uri(base_url: &str, query_id: &str, token: usize, total_pages: usize) -> Option<String> {
+fn next_uri(
+    base_url: &str,
+    query_id: &str,
+    slug: &str,
+    token: usize,
+    total_pages: usize,
+) -> Option<String> {
     if token + 1 < total_pages {
-        Some(format!("{base_url}/v1/statement/{query_id}/{}", token + 1))
+        Some(results_uri(base_url, query_id, slug, token + 1))
     } else {
         None
     }
@@ -800,18 +1091,23 @@ fn info_uri(base_url: &str, query_id: &str) -> String {
     format!("{base_url}/v1/query/{query_id}")
 }
 
+/// Build a results-paging URI. The `slug` segment is the query's poll token.
+fn results_uri(base_url: &str, query_id: &str, slug: &str, token: usize) -> String {
+    format!("{base_url}/v1/statement/{query_id}/{slug}/{token}")
+}
+
 /// Build a `queued`-route URI (the status/poll namespace).
-fn queued_uri(base_url: &str, query_id: &str, token: usize) -> String {
-    format!("{base_url}/v1/statement/queued/{query_id}/{token}")
+fn queued_uri(base_url: &str, query_id: &str, slug: &str, token: usize) -> String {
+    format!("{base_url}/v1/statement/queued/{query_id}/{slug}/{token}")
 }
 
 /// Response for a POST whose query did not finish within the bounded wait:
 /// no data, `state=QUEUED`, `nextUri` -> the queued poll route (token 1).
-fn build_started_response(base_url: &str, query_id: &str) -> TrinoResponse {
+fn build_started_response(base_url: &str, query_id: &str, slug: &str) -> TrinoResponse {
     TrinoResponse {
         id: query_id.to_string(),
         info_uri: Some(info_uri(base_url, query_id)),
-        next_uri: Some(queued_uri(base_url, query_id, 1)),
+        next_uri: Some(queued_uri(base_url, query_id, slug, 1)),
         stats: TrinoStats::queued(),
         ..Default::default()
     }
@@ -819,11 +1115,16 @@ fn build_started_response(base_url: &str, query_id: &str) -> TrinoResponse {
 
 /// Response for a poll on a query still running: no data, `state=RUNNING`,
 /// `nextUri` -> the next queued poll token.
-fn build_running_response(base_url: &str, query_id: &str, next_token: usize) -> TrinoResponse {
+fn build_running_response(
+    base_url: &str,
+    query_id: &str,
+    slug: &str,
+    next_token: usize,
+) -> TrinoResponse {
     TrinoResponse {
         id: query_id.to_string(),
         info_uri: Some(info_uri(base_url, query_id)),
-        next_uri: Some(queued_uri(base_url, query_id, next_token)),
+        next_uri: Some(queued_uri(base_url, query_id, slug, next_token)),
         stats: TrinoStats::running(0, 1),
         ..Default::default()
     }
@@ -832,11 +1133,11 @@ fn build_running_response(base_url: &str, query_id: &str, next_token: usize) -> 
 /// Response for a poll on a query that just finished: no data, `state=RUNNING`,
 /// `nextUri` -> the results-paging route at token 0. The queued route stays a
 /// status/redirect endpoint; the results route stays pure data paging.
-fn build_finished_redirect_response(base_url: &str, query_id: &str) -> TrinoResponse {
+fn build_finished_redirect_response(base_url: &str, query_id: &str, slug: &str) -> TrinoResponse {
     TrinoResponse {
         id: query_id.to_string(),
         info_uri: Some(info_uri(base_url, query_id)),
-        next_uri: Some(format!("{base_url}/v1/statement/{query_id}/0")),
+        next_uri: Some(results_uri(base_url, query_id, slug, 0)),
         stats: TrinoStats::running(0, 1),
         ..Default::default()
     }
@@ -945,7 +1246,13 @@ fn build_page_response(
     TrinoResponse {
         id: query_id.to_string(),
         info_uri: Some(info_uri(base_url, query_id)),
-        next_uri: next_uri(base_url, query_id, page_token, paginated.total_pages),
+        next_uri: next_uri(
+            base_url,
+            query_id,
+            &paginated.owner.poll_token,
+            page_token,
+            paginated.total_pages,
+        ),
         columns: Some(paginated.columns.clone()),
         data,
         stats,
@@ -993,7 +1300,7 @@ fn build_paginated_result(
     exec_sql: &str,
     session_catalog: Option<&str>,
     page_size: usize,
-    owner_username: String,
+    owner: QueryOwner,
 ) -> PaginatedResult {
     let update_type = classify_update_type(exec_sql).map(str::to_string);
     let update_count = if update_type.is_some() {
@@ -1027,7 +1334,7 @@ fn build_paginated_result(
         total_pages,
         total_rows,
         created_at: std::time::Instant::now(),
-        owner_username,
+        owner,
         update_type,
         update_count,
         estimated_bytes,
@@ -1058,363 +1365,347 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     sqe_metrics::propagation::record_trace_fields(&span);
     record_correlation_fields(&span, &correlation);
     async move {
-    let sql = body.trim();
-    if sql.is_empty() {
-        return error_response(StatusCode::BAD_REQUEST, "Empty query");
-    }
+        let sql = body.trim();
+        if sql.is_empty() {
+            return error_response(StatusCode::BAD_REQUEST, "Empty query");
+        }
 
-    let client_ip = trino_client_ip(&state, &headers, peer);
-    let peer_host = client_ip
-        .rsplit_once(':')
-        .filter(|(_, p)| p.chars().all(|c| c.is_ascii_digit()))
-        .map(|(host, _)| host)
-        .unwrap_or(&client_ip)
-        .to_string();
+        let client_ip = trino_client_ip(&state, &headers, peer);
+        let peer_host = strip_port(&client_ip).to_string();
 
-    let trino_headers = extract_trino_headers(&headers);
+        let trino_headers = extract_trino_headers(&headers);
 
-    let session = if let Some(token) = extract_bearer_token(&headers) {
-        match state.authenticator.authenticate_bearer(&token).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(error = %e, client_ip = %client_ip, "Trino bearer token validation failed");
-                return error_response(StatusCode::UNAUTHORIZED, "authentication failed");
+        let session = match authenticate_request(&state, &headers, &peer_host, &client_ip).await {
+            Ok(session) => session,
+            Err(AuthFailure::RateLimited) => return rate_limited_response(),
+            Err(AuthFailure::Rejected) => {
+                return error_response(StatusCode::UNAUTHORIZED, "authentication failed")
             }
-        }
-    } else if let Some((user, pass)) = extract_basic_auth(&headers) {
-        if let Some(ref limiter) = state.auth_rate_limiter {
-            if limiter.check(&peer_host, &user).is_err() {
-                warn!(
-                    user = %user,
-                    client_ip = %client_ip,
-                    "Trino auth rejected by rate limiter"
-                );
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    [(axum::http::header::RETRY_AFTER, "1")],
-                    "authentication rate limit",
-                )
-                    .into_response();
-            }
-        }
-        match state.authenticator.authenticate(&user, &pass).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(error = %e, user = %user, client_ip = %client_ip, "Trino authentication failed");
-                return error_response(StatusCode::UNAUTHORIZED, "authentication failed");
-            }
-        }
-    } else if let Some(ref oauth2_state) = state.oauth2 {
-        match crate::oauth2::generate_challenge(oauth2_state).await {
-            Ok((_auth_id, www_authenticate)) => {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    [(axum::http::header::WWW_AUTHENTICATE, www_authenticate)],
-                    "Authentication required",
-                )
-                    .into_response();
-            }
-            Err(status) => {
-                return error_response(status, "Failed to generate auth challenge");
-            }
-        }
-    } else {
-        return error_response(StatusCode::UNAUTHORIZED, "Missing Authorization header");
-    };
-
-    // Apply Trino client headers (catalog, schema, source) to the session.
-    let session = apply_trino_headers(session, &trino_headers);
-
-    // Record OTel semantic convention attributes on the current span.
-    {
-        let span = tracing::Span::current();
-        // Best-effort: classify the SQL to get the operation name.
-        let op = sql
-            .split_whitespace()
-            .next()
-            .unwrap_or("unknown")
-            .to_uppercase();
-        span.record("db.operation.name", op.as_str());
-        if let Some(ref schema) = session.default_schema {
-            span.record("db.namespace", schema.as_str());
-        }
-    }
-
-    let sql_hash = {
-        use sha2::{Digest, Sha256};
-        let normalised: String = sql.split_whitespace().collect::<Vec<_>>().join(" ").to_uppercase();
-        hex::encode(Sha256::digest(normalised.as_bytes()))
-    };
-    info!(
-        user = %session.user.username,
-        client_ip = %client_ip,
-        catalog = ?session.default_catalog,
-        schema = ?session.default_schema,
-        source = ?session.source,
-        sql_hash = %sql_hash,
-        sql_len = sql.len(),
-        "Trino query submitted"
-    );
-
-    let query_id = Uuid::new_v4().to_string();
-    let base_url = extract_base_url(&headers, state.port);
-
-    let session_update = protocol::parse_session_statement(sql);
-
-    // Session-control statements with no result set are driven purely by
-    // response headers and must NOT be sent to the executor (the SQL parser
-    // rejects them):
-    //   - PREPARE / DEALLOCATE PREPARE register/forget prepared SQL via
-    //     x-trino-added-prepare / x-trino-deallocated-prepare. This is the
-    //     Metabase/JDBC connect gate: the driver issues PREPARE before any
-    //     query. (#1)
-    //   - SET SESSION / RESET SESSION set/clear catalog session properties via
-    //     x-trino-set-session / x-trino-clear-session. SQE has no tunable
-    //     session-property registry, so these are accept-and-echo: the client's
-    //     value round-trips in X-Trino-Session and surfaces in SHOW SESSION,
-    //     and the executor (which would reject "SET SESSION ...") is bypassed.
-    //     (#323)
-    // USE / SET CATALOG (set_catalog / set_schema only) are left to fall
-    // through: the executor handles them and the headers are applied after.
-    if let Some(ref update) = session_update {
-        let update_type = if !update.added_prepare.is_empty() {
-            Some("PREPARE")
-        } else if !update.deallocated_prepare.is_empty() {
-            Some("DEALLOCATE")
-        } else if !update.set_session.is_empty() {
-            Some("SET SESSION")
-        } else if !update.clear_session.is_empty() {
-            Some("RESET SESSION")
-        } else {
-            None
-        };
-        if let Some(update_type) = update_type {
-            let response = TrinoResponse {
-                id: query_id.clone(),
-                info_uri: Some(info_uri(&base_url, &query_id)),
-                stats: TrinoStats::finished(),
-                // Non-null (empty) columns: the field is skip_serializing_if
-                // None, so omitting it makes the JDBC driver see `columns: null`
-                // and getColumns() throws. Real Trino returns [] for these
-                // non-query statements, so the driver builds a 0-column
-                // ResultSet and (with updateType set) treats it as a completed
-                // update rather than waiting for a result set.
-                columns: Some(vec![]),
-                update_type: Some(update_type.to_string()),
-                ..Default::default()
-            };
-            let mut resp = (StatusCode::OK, Json(response)).into_response();
-            apply_session_headers(resp.headers_mut(), update);
-            return resp;
-        }
-    }
-
-    // Trino prepared statements are stateless: the client carries the prepared
-    // SQL in X-Trino-Prepared-Statement headers and submits `EXECUTE <name>
-    // USING ...`. Resolve such a body into concrete SQL before execution.
-    let prepared = {
-        let values: Vec<String> = headers
-            .get_all("x-trino-prepared-statement")
-            .iter()
-            .filter_map(|v| v.to_str().ok().map(str::to_string))
-            .collect();
-        prepared::parse_prepared_statements(&values)
-    };
-    let effective_sql = match prepared::rewrite_execute(sql, &prepared) {
-        Ok(Some(rewritten)) => rewritten,
-        Ok(None) => sql.to_string(),
-        Err(msg) => {
-            let response = TrinoResponse {
-                id: query_id.clone(),
-                info_uri: Some(info_uri(&base_url, &query_id)),
-                stats: TrinoStats::failed(),
-                error: Some(TrinoError::user_error(msg, Some(&query_id))),
-                ..Default::default()
-            };
-            return (StatusCode::OK, Json(response)).into_response();
-        }
-    };
-    // #9: wrap parenthesis-less `VALUES` rows (`INSERT INTO t VALUES 1`,
-    // `VALUES 1, 2`) that Trino accepts but sqlparser rejects. Runs before
-    // classification and planning so both see the normalized form; a no-op for
-    // SQL that already parses (including a column named `values`). See #315.
-    let effective_sql = sqe_sql::rewrite_paren_less_values(&effective_sql);
-    // #351c: expand a leading bare `TABLE <name>` into `SELECT * FROM <name>`
-    // (Trino/SQL-standard shorthand) that sqlparser rejects. Runs before
-    // classification and planning so both see the normalized form; a no-op for
-    // SQL that already parses (CREATE/DROP/SHOW CREATE TABLE, a column named
-    // `table`). See #351c.
-    let effective_sql = sqe_sql::rewrite_bare_table(&effective_sql);
-    // #335: expand a nested / parameterized ROW-typed CAST target
-    // (`CAST(row(1, row(10)) AS row(a int, b row(x int)))`) into nested
-    // `named_struct(...)`. sqlparser rejects the nested ROW type outright, so
-    // the AST-level rewriter never sees it; this source-level rewrite runs
-    // first and yields parseable SQL. A no-op for the single-level ROW cast
-    // (which parses and is handled by the AST rewriter) and for any SQL that
-    // already parses. See #335.
-    let effective_sql = sqe_sql::rewrite_nested_row_cast(&effective_sql);
-    // #2: qualify an unqualified `information_schema` reference with the session
-    // catalog so it resolves to (and, under polaris-auto, discovers) that
-    // catalog instead of the engine default. Only metadata queries are touched.
-    let effective_sql = match session.default_catalog.as_deref() {
-        Some(cat) if info_schema_compat::is_metadata_query(&effective_sql) => {
-            info_schema_compat::qualify_information_schema(&effective_sql, cat)
-        }
-        _ => effective_sql,
-    };
-    // #8: name unaliased expression columns _col0, _col1, ... the way Trino
-    // does, instead of DataFusion's expression-text column names (e.g.
-    // `Int64(1) + Int64(1)`), which JDBC/BI clients display verbatim. Scoped
-    // to the Trino wire path: native Flight SQL clients keep DataFusion names.
-    // A no-op for non-SELECT statements (DESCRIBE, SHOW, DDL) and for
-    // projections containing a wildcard, so it is safe to run unconditionally
-    // here, before the DESCRIBE-prepared interception below.
-    let effective_sql = sqe_sql::alias_anonymous_select_columns(&effective_sql);
-    // Register the query handle before spawning so a fast poll always finds it.
-    let handle = Arc::new(QueryHandle {
-        status: std::sync::Mutex::new(QueryStatus::Queued),
-        notify: tokio::sync::Notify::new(),
-        abort: std::sync::Mutex::new(None),
-        owner_username: session.user.username.clone(),
-        session_update: session_update.clone(),
-        created_at: std::time::Instant::now(),
-    });
-    state.queries.insert(query_id.clone(), handle.clone());
-
-    // Move owned state into the background task.
-    let show_session_props = incoming_session_properties(&headers);
-    let task_handler = state.query_handler.clone();
-    let task_results = state.results.clone();
-    let task_handle = handle.clone();
-    let task_query_id = query_id.clone();
-    let task_session = session.clone();
-    let task_sql = effective_sql.clone();
-    let task_prepared = prepared.clone();
-    let task_props = show_session_props;
-    let task_catalog = session.default_catalog.clone();
-    let page_size = state.page_size;
-    let owner = session.user.username.clone();
-
-    let execution_span = tracing::info_span!(
-        "trino.query.execution",
-        sqe.query.id = %query_id,
-        trace_id = tracing::field::Empty,
-        span_id = tracing::field::Empty,
-    );
-    sqe_metrics::propagation::record_trace_fields(&execution_span);
-    let task = tokio::spawn(async move {
-        // Drop guard: if `run_statement` panics (or the task is otherwise torn
-        // down) without a terminal status set, force `Failed` on unwind so the
-        // next poll returns an error instead of the client polling a
-        // never-terminal `Running` entry forever (idle eviction would never
-        // fire because each poll resets the idle timer). Normal completion sets
-        // a terminal status first, so this no-ops.
-        struct TerminalGuard(Arc<QueryHandle>);
-        impl Drop for TerminalGuard {
-            fn drop(&mut self) {
-                let mut s = self.0.status.lock().unwrap();
-                if !s.is_terminal() {
-                    *s = QueryStatus::Failed(Box::new(protocol::TrinoError::internal_error(
-                        "query task terminated unexpectedly",
-                        None,
-                    )));
-                    self.0.notify.notify_waiters();
+            Err(AuthFailure::Missing) => {
+                if let Some(ref oauth2_state) = state.oauth2 {
+                    return match crate::oauth2::generate_challenge(oauth2_state).await {
+                        Ok((_auth_id, www_authenticate)) => (
+                            StatusCode::UNAUTHORIZED,
+                            [(axum::http::header::WWW_AUTHENTICATE, www_authenticate)],
+                            "Authentication required",
+                        )
+                            .into_response(),
+                        Err(status) => error_response(status, "Failed to generate auth challenge"),
+                    };
                 }
+                return error_response(StatusCode::UNAUTHORIZED, "Missing Authorization header");
+            }
+        };
+
+        // Apply Trino client headers (catalog, schema, source) to the session.
+        let session = apply_trino_headers(session, &trino_headers);
+
+        // Record OTel semantic convention attributes on the current span.
+        {
+            let span = tracing::Span::current();
+            // Best-effort: classify the SQL to get the operation name.
+            let op = sql
+                .split_whitespace()
+                .next()
+                .unwrap_or("unknown")
+                .to_uppercase();
+            span.record("db.operation.name", op.as_str());
+            if let Some(ref schema) = session.default_schema {
+                span.record("db.namespace", schema.as_str());
             }
         }
-        let _guard = TerminalGuard(task_handle.clone());
 
-        *task_handle.status.lock().unwrap() = QueryStatus::Running;
-        task_handle.notify.notify_waiters();
-        let result = run_statement(
-            task_handler.as_ref(),
-            &task_session,
-            &task_sql,
-            &task_prepared,
-            &task_props,
-        )
-        .await;
-        match result {
-            Ok(batches) => {
-                let paginated = build_paginated_result(
-                    batches,
-                    &task_sql,
-                    task_catalog.as_deref(),
-                    page_size,
-                    owner,
-                );
-                task_results.insert(task_query_id, Arc::new(paginated));
-                *task_handle.status.lock().unwrap() = QueryStatus::Finished;
-            }
-            Err(sqe_err) => {
-                tracing::warn!(
-                    error_code = %sqe_err.error_code(),
-                    query_id = %task_query_id,
-                    error = %sqe_err,
-                    "Trino query execution failed"
-                );
-                let trino_error =
-                    protocol::TrinoError::from_sqe_error(&sqe_err, Some(&task_query_id));
-                *task_handle.status.lock().unwrap() = QueryStatus::Failed(Box::new(trino_error));
-            }
-        }
-        task_handle.notify.notify_waiters();
-    }
-    .instrument(execution_span));
-    *handle.abort.lock().unwrap() = Some(task.abort_handle());
+        let sql_hash = {
+            use sha2::{Digest, Sha256};
+            let normalised: String = sql
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_uppercase();
+            hex::encode(Sha256::digest(normalised.as_bytes()))
+        };
+        info!(
+            user = %session.user.username,
+            client_ip = %client_ip,
+            catalog = ?session.default_catalog,
+            schema = ?session.default_schema,
+            source = ?session.source,
+            sql_hash = %sql_hash,
+            sql_len = sql.len(),
+            "Trino query submitted"
+        );
 
-    // Bounded wait: return the first page inline if the query finished, else a
-    // started response the client polls.
-    await_terminal_or_timeout(&handle, DEFAULT_MAX_WAIT).await;
+        let query_id = Uuid::new_v4().to_string();
+        let base_url = extract_base_url(&headers, state.port);
 
-    let status_is_finished = matches!(*handle.status.lock().unwrap(), QueryStatus::Finished);
-    if status_is_finished {
-        if let Some(paginated) = state.results.get(&query_id) {
-            let response = build_page_response(&base_url, &query_id, paginated.as_ref(), 0);
-            let mut resp = (StatusCode::OK, Json(response)).into_response();
-            if let Some(ref update) = session_update {
-                apply_session_headers(resp.headers_mut(), update);
-            }
-            return resp;
-        }
-    }
+        let session_update = protocol::parse_session_statement(sql);
 
-    // Failed within the wait: replay the mapped Trino error immediately so fast
-    // failures still surface on the POST rather than forcing a poll. Preserve
-    // the `Retry-After` header the old synchronous arm added for
-    // ResourceExhausted (rate-limit/OOM), detected via the stable error name.
-    {
-        let status = handle.status.lock().unwrap();
-        if let QueryStatus::Failed(ref trino_error) = *status {
-            let is_rate_limited = trino_error.error_name == "RESOURCE_EXHAUSTED";
-            let response = TrinoResponse {
-                id: query_id.clone(),
-                info_uri: Some(info_uri(&base_url, &query_id)),
-                stats: TrinoStats::failed(),
-                error: Some(trino_error.as_ref().clone()),
-                ..Default::default()
+        // Session-control statements with no result set are driven purely by
+        // response headers and must NOT be sent to the executor (the SQL parser
+        // rejects them):
+        //   - PREPARE / DEALLOCATE PREPARE register/forget prepared SQL via
+        //     x-trino-added-prepare / x-trino-deallocated-prepare. This is the
+        //     Metabase/JDBC connect gate: the driver issues PREPARE before any
+        //     query. (#1)
+        //   - SET SESSION / RESET SESSION set/clear catalog session properties via
+        //     x-trino-set-session / x-trino-clear-session. SQE has no tunable
+        //     session-property registry, so these are accept-and-echo: the client's
+        //     value round-trips in X-Trino-Session and surfaces in SHOW SESSION,
+        //     and the executor (which would reject "SET SESSION ...") is bypassed.
+        //     (#323)
+        // USE / SET CATALOG (set_catalog / set_schema only) are left to fall
+        // through: the executor handles them and the headers are applied after.
+        if let Some(ref update) = session_update {
+            let update_type = if !update.added_prepare.is_empty() {
+                Some("PREPARE")
+            } else if !update.deallocated_prepare.is_empty() {
+                Some("DEALLOCATE")
+            } else if !update.set_session.is_empty() {
+                Some("SET SESSION")
+            } else if !update.clear_session.is_empty() {
+                Some("RESET SESSION")
+            } else {
+                None
             };
-            let mut resp = (StatusCode::OK, Json(response)).into_response();
-            if is_rate_limited {
-                resp.headers_mut().insert(
-                    axum::http::header::RETRY_AFTER,
-                    axum::http::HeaderValue::from_static("1"),
-                );
+            if let Some(update_type) = update_type {
+                let response = TrinoResponse {
+                    id: query_id.clone(),
+                    info_uri: Some(info_uri(&base_url, &query_id)),
+                    stats: TrinoStats::finished(),
+                    // Non-null (empty) columns: the field is skip_serializing_if
+                    // None, so omitting it makes the JDBC driver see `columns: null`
+                    // and getColumns() throws. Real Trino returns [] for these
+                    // non-query statements, so the driver builds a 0-column
+                    // ResultSet and (with updateType set) treats it as a completed
+                    // update rather than waiting for a result set.
+                    columns: Some(vec![]),
+                    update_type: Some(update_type.to_string()),
+                    ..Default::default()
+                };
+                let mut resp = (StatusCode::OK, Json(response)).into_response();
+                apply_session_headers(resp.headers_mut(), update);
+                return resp;
             }
-            return resp;
         }
-    }
 
-    // Still running: hand the client to the queued poll route.
-    let mut resp = (
-        StatusCode::OK,
-        Json(build_started_response(&base_url, &query_id)),
-    )
-        .into_response();
-    if let Some(ref update) = session_update {
-        apply_session_headers(resp.headers_mut(), update);
-    }
-    resp
+        // Trino prepared statements are stateless: the client carries the prepared
+        // SQL in X-Trino-Prepared-Statement headers and submits `EXECUTE <name>
+        // USING ...`. Resolve such a body into concrete SQL before execution.
+        let prepared = {
+            let values: Vec<String> = headers
+                .get_all("x-trino-prepared-statement")
+                .iter()
+                .filter_map(|v| v.to_str().ok().map(str::to_string))
+                .collect();
+            prepared::parse_prepared_statements(&values)
+        };
+        let effective_sql = match prepared::rewrite_execute(sql, &prepared) {
+            Ok(Some(rewritten)) => rewritten,
+            Ok(None) => sql.to_string(),
+            Err(msg) => {
+                let response = TrinoResponse {
+                    id: query_id.clone(),
+                    info_uri: Some(info_uri(&base_url, &query_id)),
+                    stats: TrinoStats::failed(),
+                    error: Some(TrinoError::user_error(msg, Some(&query_id))),
+                    ..Default::default()
+                };
+                return (StatusCode::OK, Json(response)).into_response();
+            }
+        };
+        // #9: wrap parenthesis-less `VALUES` rows (`INSERT INTO t VALUES 1`,
+        // `VALUES 1, 2`) that Trino accepts but sqlparser rejects. Runs before
+        // classification and planning so both see the normalized form; a no-op for
+        // SQL that already parses (including a column named `values`). See #315.
+        let effective_sql = sqe_sql::rewrite_paren_less_values(&effective_sql);
+        // #351c: expand a leading bare `TABLE <name>` into `SELECT * FROM <name>`
+        // (Trino/SQL-standard shorthand) that sqlparser rejects. Runs before
+        // classification and planning so both see the normalized form; a no-op for
+        // SQL that already parses (CREATE/DROP/SHOW CREATE TABLE, a column named
+        // `table`). See #351c.
+        let effective_sql = sqe_sql::rewrite_bare_table(&effective_sql);
+        // #335: expand a nested / parameterized ROW-typed CAST target
+        // (`CAST(row(1, row(10)) AS row(a int, b row(x int)))`) into nested
+        // `named_struct(...)`. sqlparser rejects the nested ROW type outright, so
+        // the AST-level rewriter never sees it; this source-level rewrite runs
+        // first and yields parseable SQL. A no-op for the single-level ROW cast
+        // (which parses and is handled by the AST rewriter) and for any SQL that
+        // already parses. See #335.
+        let effective_sql = sqe_sql::rewrite_nested_row_cast(&effective_sql);
+        // #2: qualify an unqualified `information_schema` reference with the session
+        // catalog so it resolves to (and, under polaris-auto, discovers) that
+        // catalog instead of the engine default. Only metadata queries are touched.
+        let effective_sql = match session.default_catalog.as_deref() {
+            Some(cat) if info_schema_compat::is_metadata_query(&effective_sql) => {
+                info_schema_compat::qualify_information_schema(&effective_sql, cat)
+            }
+            _ => effective_sql,
+        };
+        // #8: name unaliased expression columns _col0, _col1, ... the way Trino
+        // does, instead of DataFusion's expression-text column names (e.g.
+        // `Int64(1) + Int64(1)`), which JDBC/BI clients display verbatim. Scoped
+        // to the Trino wire path: native Flight SQL clients keep DataFusion names.
+        // A no-op for non-SELECT statements (DESCRIBE, SHOW, DDL) and for
+        // projections containing a wildcard, so it is safe to run unconditionally
+        // here, before the DESCRIBE-prepared interception below.
+        let effective_sql = sqe_sql::alias_anonymous_select_columns(&effective_sql);
+        // Mint the poll token once, here: the same value goes on the handle, on
+        // the finished result, and into every `nextUri` this query ever emits, so
+        // a client that follows the protocol never presents a credential again.
+        let owner = QueryOwner::new(&session);
+
+        // Register the query handle before spawning so a fast poll always finds it.
+        let handle = Arc::new(QueryHandle {
+            status: std::sync::Mutex::new(QueryStatus::Queued),
+            notify: tokio::sync::Notify::new(),
+            abort: std::sync::Mutex::new(None),
+            owner: owner.clone(),
+            session_update: session_update.clone(),
+            created_at: std::time::Instant::now(),
+        });
+        state.queries.insert(query_id.clone(), handle.clone());
+
+        // Move owned state into the background task.
+        let show_session_props = incoming_session_properties(&headers);
+        let task_handler = state.query_handler.clone();
+        let task_results = state.results.clone();
+        let task_handle = handle.clone();
+        let task_query_id = query_id.clone();
+        let task_session = session.clone();
+        let task_sql = effective_sql.clone();
+        let task_prepared = prepared.clone();
+        let task_props = show_session_props;
+        let task_catalog = session.default_catalog.clone();
+        let page_size = state.page_size;
+        let task_owner = owner.clone();
+
+        let execution_span = tracing::info_span!(
+            "trino.query.execution",
+            sqe.query.id = %query_id,
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty,
+        );
+        sqe_metrics::propagation::record_trace_fields(&execution_span);
+        let task = tokio::spawn(
+            async move {
+                // Drop guard: if `run_statement` panics (or the task is otherwise torn
+                // down) without a terminal status set, force `Failed` on unwind so the
+                // next poll returns an error instead of the client polling a
+                // never-terminal `Running` entry forever (idle eviction would never
+                // fire because each poll resets the idle timer). Normal completion sets
+                // a terminal status first, so this no-ops.
+                struct TerminalGuard(Arc<QueryHandle>);
+                impl Drop for TerminalGuard {
+                    fn drop(&mut self) {
+                        let mut s = self.0.status.lock().unwrap();
+                        if !s.is_terminal() {
+                            *s = QueryStatus::Failed(Box::new(protocol::TrinoError::internal_error(
+                                "query task terminated unexpectedly",
+                                None,
+                            )));
+                            self.0.notify.notify_waiters();
+                        }
+                    }
+                }
+                let _guard = TerminalGuard(task_handle.clone());
+
+                *task_handle.status.lock().unwrap() = QueryStatus::Running;
+                task_handle.notify.notify_waiters();
+                let result = run_statement(
+                    task_handler.as_ref(),
+                    &task_session,
+                    &task_sql,
+                    &task_prepared,
+                    &task_props,
+                )
+                .await;
+                match result {
+                    Ok(batches) => {
+                        let paginated = build_paginated_result(
+                            batches,
+                            &task_sql,
+                            task_catalog.as_deref(),
+                            page_size,
+                            task_owner,
+                        );
+                        task_results.insert(task_query_id, Arc::new(paginated));
+                        *task_handle.status.lock().unwrap() = QueryStatus::Finished;
+                    }
+                    Err(sqe_err) => {
+                        tracing::warn!(
+                            error_code = %sqe_err.error_code(),
+                            query_id = %task_query_id,
+                            error = %sqe_err,
+                            "Trino query execution failed"
+                        );
+                        let trino_error =
+                            protocol::TrinoError::from_sqe_error(&sqe_err, Some(&task_query_id));
+                        *task_handle.status.lock().unwrap() =
+                            QueryStatus::Failed(Box::new(trino_error));
+                    }
+                }
+                task_handle.notify.notify_waiters();
+            }
+            .instrument(execution_span),
+        );
+        *handle.abort.lock().unwrap() = Some(task.abort_handle());
+
+        // Bounded wait: return the first page inline if the query finished, else a
+        // started response the client polls.
+        await_terminal_or_timeout(&handle, DEFAULT_MAX_WAIT).await;
+
+        let status_is_finished = matches!(*handle.status.lock().unwrap(), QueryStatus::Finished);
+        if status_is_finished {
+            if let Some(paginated) = state.results.get(&query_id) {
+                let response = build_page_response(&base_url, &query_id, paginated.as_ref(), 0);
+                let mut resp = (StatusCode::OK, Json(response)).into_response();
+                if let Some(ref update) = session_update {
+                    apply_session_headers(resp.headers_mut(), update);
+                }
+                return resp;
+            }
+        }
+
+        // Failed within the wait: replay the mapped Trino error immediately so fast
+        // failures still surface on the POST rather than forcing a poll. Preserve
+        // the `Retry-After` header the old synchronous arm added for
+        // ResourceExhausted (rate-limit/OOM), detected via the stable error name.
+        {
+            let status = handle.status.lock().unwrap();
+            if let QueryStatus::Failed(ref trino_error) = *status {
+                let is_rate_limited = trino_error.error_name == "RESOURCE_EXHAUSTED";
+                let response = TrinoResponse {
+                    id: query_id.clone(),
+                    info_uri: Some(info_uri(&base_url, &query_id)),
+                    stats: TrinoStats::failed(),
+                    error: Some(trino_error.as_ref().clone()),
+                    ..Default::default()
+                };
+                let mut resp = (StatusCode::OK, Json(response)).into_response();
+                if is_rate_limited {
+                    resp.headers_mut().insert(
+                        axum::http::header::RETRY_AFTER,
+                        axum::http::HeaderValue::from_static("1"),
+                    );
+                }
+                return resp;
+            }
+        }
+
+        // Still running: hand the client to the queued poll route.
+        let mut resp = (
+            StatusCode::OK,
+            Json(build_started_response(
+                &base_url,
+                &query_id,
+                &owner.poll_token,
+            )),
+        )
+            .into_response();
+        if let Some(ref update) = session_update {
+            apply_session_headers(resp.headers_mut(), update);
+        }
+        resp
     }
     .instrument(span)
     .await
@@ -1422,9 +1713,9 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
 async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
-    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Path((id, token)): Path<(String, String)>,
+    Path((id, slug, token)): Path<(String, String, String)>,
 ) -> Response {
     let parent = sqe_metrics::propagation::extract_trace_context_from_headers(&headers);
     let correlation = sqe_metrics::propagation::correlation_ids_from_headers(&headers);
@@ -1443,19 +1734,27 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     sqe_metrics::propagation::record_trace_fields(&span);
     record_correlation_fields(&span, &correlation);
     async move {
-        // Authenticate the caller before exposing any result data.
-        let session = if let Some(token) = extract_bearer_token(&headers) {
-            match state.authenticator.authenticate_bearer(&token).await {
-                Ok(s) => s,
-                Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
-            }
-        } else if let Some((user, pass)) = extract_basic_auth(&headers) {
-            match state.authenticator.authenticate(&user, &pass).await {
-                Ok(s) => s,
-                Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
-            }
+        let client_ip = trino_client_ip(&state, &headers, peer);
+        let peer_host = strip_port(&client_ip).to_string();
+
+        // Fast path: the client replayed the poll token minted at submit,
+        // which only the submitting client ever saw. That is proof of
+        // ownership on its own, so the provider chain is never touched and
+        // the pre-auth budget is never spent (issue #622).
+        let entry = state.results.get(&id);
+        let by_poll_token = entry
+            .as_ref()
+            .is_some_and(|paginated| paginated.owner.owns_token(&slug));
+
+        // Only when the token is absent or wrong do credentials get
+        // validated — and then the rate limiter runs first.
+        let session = if by_poll_token {
+            None
         } else {
-            return StatusCode::UNAUTHORIZED.into_response();
+            match authenticate_request(&state, &headers, &peer_host, &client_ip).await {
+                Ok(session) => Some(session),
+                Err(failure) => return poll_auth_response(failure),
+            }
         };
 
         // Parse the token as a page index.
@@ -1468,16 +1767,18 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
         let base_url = extract_base_url(&headers, state.port);
 
-        match state.results.get(&id) {
+        match entry {
             Some(paginated) => {
-                if paginated.owner_username != session.user.username {
-                    warn!(
-                        query_id = %id,
-                        caller = %session.user.username,
-                        owner = %paginated.owner_username,
-                        "get_results denied: caller does not own query"
-                    );
-                    return StatusCode::FORBIDDEN.into_response();
+                if let Some(ref session) = session {
+                    if !paginated.owner.is(session) {
+                        warn!(
+                            query_id = %id,
+                            caller = %session.user.username,
+                            owner = %paginated.owner.username,
+                            "get_results denied: caller does not own query"
+                        );
+                        return StatusCode::FORBIDDEN.into_response();
+                    }
                 }
                 if page_token >= paginated.total_pages {
                     let response = TrinoResponse {
@@ -1535,9 +1836,9 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
 async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
-    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Path((id, token)): Path<(String, String)>,
+    Path((id, slug, token)): Path<(String, String, String)>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Response {
     let parent = sqe_metrics::propagation::extract_trace_context_from_headers(&headers);
@@ -1557,24 +1858,29 @@ async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     sqe_metrics::propagation::record_trace_fields(&span);
     record_correlation_fields(&span, &correlation);
     async move {
-        let session = if let Some(bearer) = extract_bearer_token(&headers) {
-            match state.authenticator.authenticate_bearer(&bearer).await {
-                Ok(s) => s,
-                Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
-            }
-        } else if let Some((user, pass)) = extract_basic_auth(&headers) {
-            match state.authenticator.authenticate(&user, &pass).await {
-                Ok(s) => s,
-                Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
-            }
+        let client_ip = trino_client_ip(&state, &headers, peer);
+        let peer_host = strip_port(&client_ip).to_string();
+
+        // Same fast path as `get_results`: a replayed poll token is proof of
+        // ownership, so a 1/s poll of a long query costs the IdP nothing.
+        let registered = state.queries.get(&id);
+        let by_poll_token = registered
+            .as_ref()
+            .is_some_and(|handle| handle.owner.owns_token(&slug));
+
+        let session = if by_poll_token {
+            None
         } else {
-            return StatusCode::UNAUTHORIZED.into_response();
+            match authenticate_request(&state, &headers, &peer_host, &client_ip).await {
+                Ok(session) => Some(session),
+                Err(failure) => return poll_auth_response(failure),
+            }
         };
 
         let base_url = extract_base_url(&headers, state.port);
         let next_token: usize = token.parse().unwrap_or(1usize).saturating_add(1);
 
-        let handle = match state.queries.get(&id) {
+        let handle = match registered {
             Some(h) => h,
             None => {
                 // Unknown/evicted id -> Trino "query not found" (same shape as
@@ -1598,14 +1904,16 @@ async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             }
         };
 
-        if handle.owner_username != session.user.username {
-            warn!(
-                query_id = %id,
-                caller = %session.user.username,
-                owner = %handle.owner_username,
-                "get_queued_results denied: caller does not own query"
-            );
-            return StatusCode::FORBIDDEN.into_response();
+        if let Some(ref session) = session {
+            if !handle.owner.is(session) {
+                warn!(
+                    query_id = %id,
+                    caller = %session.user.username,
+                    owner = %handle.owner.username,
+                    "get_queued_results denied: caller does not own query"
+                );
+                return StatusCode::FORBIDDEN.into_response();
+            }
         }
 
         // Extract maxWait from the raw query string ("maxWait=1s").
@@ -1621,7 +1929,11 @@ async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             QueryStatus::Finished => {
                 let mut resp = (
                     StatusCode::OK,
-                    Json(build_finished_redirect_response(&base_url, &id)),
+                    Json(build_finished_redirect_response(
+                        &base_url,
+                        &id,
+                        &handle.owner.poll_token,
+                    )),
                 )
                     .into_response();
                 // Echo any session-state mutation (USE / SET CATALOG) on the
@@ -1663,7 +1975,12 @@ async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             }
             QueryStatus::Queued | QueryStatus::Running => (
                 StatusCode::OK,
-                Json(build_running_response(&base_url, &id, next_token)),
+                Json(build_running_response(
+                    &base_url,
+                    &id,
+                    &handle.owner.poll_token,
+                    next_token,
+                )),
             )
                 .into_response(),
         }
@@ -1672,11 +1989,38 @@ async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     .await
 }
 
+/// `DELETE` on the executing/queued URI the client is currently holding. The
+/// slug segment is the query's poll token, so the submitting client cancels
+/// without presenting a credential; anything else falls back to the
+/// rate-limited credential path.
+async fn cancel_query_slug<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
+    State(state): State<Arc<TrinoState<A, Q>>>,
+    connect_info: ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path((id, slug, _token)): Path<(String, String, String)>,
+) -> Response {
+    cancel_query_inner(state, connect_info, headers, id, slug).await
+}
+
+/// Legacy `DELETE /v1/statement/{id}`: no slug on the wire, so it always takes
+/// the credential path.
 async fn cancel_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
-    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    connect_info: ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<String>,
+) -> Response {
+    // An empty slug can never equal a 43-character poll token, so the
+    // constant-time comparison rejects it and the fallback runs.
+    cancel_query_inner(state, connect_info, headers, id, String::new()).await
+}
+
+async fn cancel_query_inner<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
+    state: Arc<TrinoState<A, Q>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    id: String,
+    slug: String,
 ) -> Response {
     let parent = sqe_metrics::propagation::extract_trace_context_from_headers(&headers);
     let correlation = sqe_metrics::propagation::correlation_ids_from_headers(&headers);
@@ -1695,47 +2039,60 @@ async fn cancel_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     sqe_metrics::propagation::record_trace_fields(&span);
     record_correlation_fields(&span, &correlation);
     async move {
-        // Authenticate the caller.
-        let session = if let Some(token) = extract_bearer_token(&headers) {
-            match state.authenticator.authenticate_bearer(&token).await {
-                Ok(s) => s,
-                Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
-            }
-        } else if let Some((user, pass)) = extract_basic_auth(&headers) {
-            match state.authenticator.authenticate(&user, &pass).await {
-                Ok(s) => s,
-                Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
-            }
+        let client_ip = trino_client_ip(&state, &headers, peer);
+        let peer_host = strip_port(&client_ip).to_string();
+
+        // A finished query lives in `results`, an in-flight one in `queries`;
+        // either copy of the owner record carries the same poll token.
+        let entry = state.results.get(&id);
+        let registered = state.queries.get(&id);
+        let by_poll_token = entry
+            .as_ref()
+            .is_some_and(|paginated| paginated.owner.owns_token(&slug))
+            || registered
+                .as_ref()
+                .is_some_and(|handle| handle.owner.owns_token(&slug));
+
+        let session = if by_poll_token {
+            None
         } else {
-            return StatusCode::UNAUTHORIZED.into_response();
+            match authenticate_request(&state, &headers, &peer_host, &client_ip).await {
+                Ok(session) => Some(session),
+                Err(failure) => return poll_auth_response(failure),
+            }
         };
 
         // Verify the caller owns the query result.
-        if let Some(entry) = state.results.get(&id) {
-            if entry.owner_username != session.user.username {
-                warn!(
-                    query_id = %id,
-                    caller = %session.user.username,
-                    owner = %entry.owner_username,
-                    "Cancel denied: caller does not own query"
-                );
-                return StatusCode::FORBIDDEN.into_response();
+        if let Some(ref session) = session {
+            if let Some(ref entry) = entry {
+                if !entry.owner.is(session) {
+                    warn!(
+                        query_id = %id,
+                        caller = %session.user.username,
+                        owner = %entry.owner.username,
+                        "Cancel denied: caller does not own query"
+                    );
+                    return StatusCode::FORBIDDEN.into_response();
+                }
+            }
+            // Results are not inserted until the task finishes, so an in-flight
+            // query has no `results` entry and its ownership is enforced here
+            // against the registry.
+            if let Some(ref handle) = registered {
+                if !handle.owner.is(session) {
+                    warn!(
+                        query_id = %id,
+                        caller = %session.user.username,
+                        owner = %handle.owner.username,
+                        "Cancel denied: caller does not own query"
+                    );
+                    return StatusCode::FORBIDDEN.into_response();
+                }
             }
         }
 
-        // Abort the background task if the query is still in flight. Results are
-        // not inserted until the task finishes, so an in-flight query has no
-        // `results` entry and its ownership is enforced here against the registry.
-        if let Some(handle) = state.queries.get(&id) {
-            if handle.owner_username != session.user.username {
-                warn!(
-                    query_id = %id,
-                    caller = %session.user.username,
-                    owner = %handle.owner_username,
-                    "Cancel denied: caller does not own query"
-                );
-                return StatusCode::FORBIDDEN.into_response();
-            }
+        // Abort the background task if the query is still in flight.
+        if let Some(handle) = registered {
             if let Some(abort) = handle.abort.lock().unwrap().as_ref() {
                 abort.abort();
             }
@@ -1824,6 +2181,7 @@ mod tests {
             oauth2: None,
             security: SecurityConfig::default(),
             auth_rate_limiter: None,
+            auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
 
@@ -1854,6 +2212,7 @@ mod tests {
             oauth2: None,
             security: SecurityConfig::default(),
             auth_rate_limiter: None,
+            auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
 
@@ -1879,6 +2238,7 @@ mod tests {
             oauth2: None,
             security: SecurityConfig::default(),
             auth_rate_limiter: None,
+            auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
 
@@ -1904,6 +2264,7 @@ mod tests {
             oauth2: None,
             security: SecurityConfig::default(),
             auth_rate_limiter: None,
+            auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
 
@@ -2022,11 +2383,15 @@ mod tests {
             oauth2: None,
             security: SecurityConfig::default(),
             auth_rate_limiter: None,
+            auth_sessions: build_auth_session_cache(),
             expose_version: false,
         });
         let trace_id = "0af7651916cd43dd8448eb211c80319c";
-        let headers = || {
-            let mut headers = basic_auth_header("test", "pw");
+        // A distinct credential per call: this test is about trace
+        // propagation into `authenticate`, and the Basic-auth session cache
+        // would otherwise (correctly) serve calls 2 and 3 without one.
+        let headers = |user: &str| {
+            let mut headers = basic_auth_header(user, "pw");
             headers.insert(
                 "traceparent",
                 format!("00-{trace_id}-b7ad6b7169203331-01")
@@ -2039,21 +2404,25 @@ mod tests {
         let _ = submit_query(
             State(state.clone()),
             test_peer(),
-            headers(),
+            headers("submitter"),
             "SELECT 1".to_string(),
         )
         .await;
         let _ = get_results(
             State(state.clone()),
             test_peer(),
-            headers(),
-            Path(("query-42".to_string(), "bad-page".to_string())),
+            headers("poller"),
+            Path((
+                "query-42".to_string(),
+                "no-such-slug".to_string(),
+                "bad-page".to_string(),
+            )),
         )
         .await;
         let _ = cancel_query(
             State(state),
             test_peer(),
-            headers(),
+            headers("canceller"),
             Path("query-42".to_string()),
         )
         .await;
@@ -2098,6 +2467,7 @@ mod tests {
             oauth2: None,
             security: SecurityConfig::default(),
             auth_rate_limiter: None,
+            auth_sessions: build_auth_session_cache(),
             expose_version: true,
         })
     }
@@ -2144,6 +2514,7 @@ mod tests {
             oauth2: None,
             security: SecurityConfig::default(),
             auth_rate_limiter: None,
+            auth_sessions: build_auth_session_cache(),
             expose_version: false,
         })
     }
@@ -2209,12 +2580,23 @@ mod tests {
         let _router = build_statement_router(state);
     }
 
+    /// Owner record for a fixture. The poll token is deterministic so a test
+    /// can either thread it through the URL (fast path) or deliberately send
+    /// the wrong one (credential fallback).
+    fn test_owner(username: &str) -> QueryOwner {
+        QueryOwner {
+            username: username.to_string(),
+            id: username.to_string(),
+            poll_token: format!("poll-token-{username}"),
+        }
+    }
+
     fn handle_with(status: QueryStatus, owner: &str) -> Arc<QueryHandle> {
         Arc::new(QueryHandle {
             status: std::sync::Mutex::new(status),
             notify: tokio::sync::Notify::new(),
             abort: std::sync::Mutex::new(None),
-            owner_username: owner.to_string(),
+            owner: test_owner(owner),
             session_update: None,
             created_at: std::time::Instant::now(),
         })
@@ -2232,7 +2614,11 @@ mod tests {
             State(state),
             test_peer(),
             basic_auth_header("alice", "pw"),
-            Path(("q1".to_string(), "3".to_string())),
+            Path((
+                "q1".to_string(),
+                "poll-token-alice".to_string(),
+                "3".to_string(),
+            )),
             axum::extract::RawQuery(Some("maxWait=50ms".to_string())),
         )
         .await;
@@ -2243,7 +2629,7 @@ mod tests {
         assert_eq!(json.stats.state, "RUNNING");
         assert_eq!(
             json.next_uri.as_deref(),
-            Some("http://localhost:8080/v1/statement/queued/q1/4")
+            Some("http://localhost:8080/v1/statement/queued/q1/poll-token-alice/4")
         );
         assert!(json.data.is_none());
     }
@@ -2261,7 +2647,11 @@ mod tests {
             State(state),
             test_peer(),
             basic_auth_header("alice", "pw"),
-            Path(("q1".to_string(), "1".to_string())),
+            Path((
+                "q1".to_string(),
+                "poll-token-alice".to_string(),
+                "1".to_string(),
+            )),
             axum::extract::RawQuery(None),
         )
         .await;
@@ -2271,7 +2661,7 @@ mod tests {
         let json: protocol::TrinoResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             json.next_uri.as_deref(),
-            Some("http://localhost:8080/v1/statement/q1/0")
+            Some("http://localhost:8080/v1/statement/q1/poll-token-alice/0")
         );
         assert!(json.data.is_none());
     }
@@ -2290,7 +2680,11 @@ mod tests {
             State(state),
             test_peer(),
             basic_auth_header("alice", "pw"),
-            Path(("q1".to_string(), "1".to_string())),
+            Path((
+                "q1".to_string(),
+                "poll-token-alice".to_string(),
+                "1".to_string(),
+            )),
             axum::extract::RawQuery(None),
         )
         .await;
@@ -2312,7 +2706,11 @@ mod tests {
             State(state),
             test_peer(),
             basic_auth_header("alice", "pw"),
-            Path(("missing".to_string(), "1".to_string())),
+            Path((
+                "missing".to_string(),
+                "poll-token-alice".to_string(),
+                "1".to_string(),
+            )),
             axum::extract::RawQuery(None),
         )
         .await;
@@ -2331,7 +2729,12 @@ mod tests {
             State(state),
             test_peer(),
             basic_auth_header("alice", "pw"), // MockAuthOk authenticates as "alice"
-            Path(("q1".to_string(), "1".to_string())),
+            // Wrong slug for this query, so the credential fallback decides.
+            Path((
+                "q1".to_string(),
+                "poll-token-alice".to_string(),
+                "1".to_string(),
+            )),
             axum::extract::RawQuery(Some("maxWait=10ms".to_string())),
         )
         .await;
@@ -2674,6 +3077,7 @@ mod tests {
             oauth2: None,
             security: SecurityConfig::default(),
             auth_rate_limiter: None,
+            auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
 
@@ -2826,22 +3230,22 @@ mod tests {
 
     #[test]
     fn test_next_uri_has_next() {
-        let uri = next_uri("http://localhost:8080", "q-123", 0, 3);
+        let uri = next_uri("http://localhost:8080", "q-123", "slug1", 0, 3);
         assert_eq!(
             uri,
-            Some("http://localhost:8080/v1/statement/q-123/1".to_string())
+            Some("http://localhost:8080/v1/statement/q-123/slug1/1".to_string())
         );
     }
 
     #[test]
     fn test_next_uri_last_page() {
-        let uri = next_uri("http://localhost:8080", "q-123", 2, 3);
+        let uri = next_uri("http://localhost:8080", "q-123", "slug1", 2, 3);
         assert!(uri.is_none());
     }
 
     #[test]
     fn test_next_uri_single_page() {
-        let uri = next_uri("http://localhost:8080", "q-123", 0, 1);
+        let uri = next_uri("http://localhost:8080", "q-123", "slug1", 0, 1);
         assert!(uri.is_none());
     }
 
@@ -2861,7 +3265,7 @@ mod tests {
             status: std::sync::Mutex::new(QueryStatus::Running),
             notify: tokio::sync::Notify::new(),
             abort: std::sync::Mutex::new(None),
-            owner_username: "u".to_string(),
+            owner: test_owner("u"),
             session_update: None,
             created_at: std::time::Instant::now(),
         });
@@ -2886,7 +3290,7 @@ mod tests {
             status: std::sync::Mutex::new(QueryStatus::Running),
             notify: tokio::sync::Notify::new(),
             abort: std::sync::Mutex::new(None),
-            owner_username: "u".to_string(),
+            owner: test_owner("u"),
             session_update: None,
             created_at: std::time::Instant::now(),
         });
@@ -2896,11 +3300,11 @@ mod tests {
 
     #[test]
     fn started_response_points_at_queued_route_without_data() {
-        let resp = build_started_response("http://h:8080", "q1");
+        let resp = build_started_response("http://h:8080", "q1", "slug1");
         assert_eq!(resp.stats.state, "QUEUED");
         assert_eq!(
             resp.next_uri.as_deref(),
-            Some("http://h:8080/v1/statement/queued/q1/1")
+            Some("http://h:8080/v1/statement/queued/q1/slug1/1")
         );
         assert!(resp.data.is_none());
         assert!(resp.columns.is_none());
@@ -2908,22 +3312,22 @@ mod tests {
 
     #[test]
     fn running_response_increments_queued_token() {
-        let resp = build_running_response("http://h:8080", "q1", 4);
+        let resp = build_running_response("http://h:8080", "q1", "slug1", 4);
         assert_eq!(resp.stats.state, "RUNNING");
         assert_eq!(
             resp.next_uri.as_deref(),
-            Some("http://h:8080/v1/statement/queued/q1/4")
+            Some("http://h:8080/v1/statement/queued/q1/slug1/4")
         );
         assert!(resp.data.is_none());
     }
 
     #[test]
     fn finished_redirect_response_points_at_results_route() {
-        let resp = build_finished_redirect_response("http://h:8080", "q1");
+        let resp = build_finished_redirect_response("http://h:8080", "q1", "slug1");
         assert_eq!(resp.stats.state, "RUNNING");
         assert_eq!(
             resp.next_uri.as_deref(),
-            Some("http://h:8080/v1/statement/q1/0")
+            Some("http://h:8080/v1/statement/q1/slug1/0")
         );
         assert!(resp.data.is_none());
     }
@@ -2942,7 +3346,7 @@ mod tests {
             ],
             total_pages: 2,
             created_at: Instant::now(),
-            owner_username: "test".to_string(),
+            owner: test_owner("test"),
             total_rows: 0,
             update_type: None,
             update_count: None,
@@ -2957,7 +3361,7 @@ mod tests {
         );
         assert_eq!(
             resp.next_uri,
-            Some("http://localhost:8080/v1/statement/q-abc/1".to_string())
+            Some("http://localhost:8080/v1/statement/q-abc/poll-token-test/1".to_string())
         );
         assert_eq!(resp.data.as_ref().unwrap().len(), 2);
         assert_eq!(resp.stats.state, "RUNNING");
@@ -2977,7 +3381,7 @@ mod tests {
             ],
             total_pages: 2,
             created_at: Instant::now(),
-            owner_username: "test".to_string(),
+            owner: test_owner("test"),
             total_rows: 0,
             update_type: None,
             update_count: None,
@@ -3001,7 +3405,7 @@ mod tests {
             pages: vec![vec![]],
             total_pages: 1,
             created_at: Instant::now(),
-            owner_username: "test".to_string(),
+            owner: test_owner("test"),
             total_rows: 0,
             update_type: Some("CREATE TABLE".to_string()),
             update_count: None,
@@ -3046,7 +3450,7 @@ mod tests {
             pages: vec![vec![]],
             total_pages: 1,
             created_at: Instant::now(),
-            owner_username: "test".to_string(),
+            owner: test_owner("test"),
             total_rows: 0,
             update_type: None,
             update_count: None,
@@ -3068,7 +3472,7 @@ mod tests {
             pages: vec![vec![vec![serde_json::json!(42)]]],
             total_pages: 1,
             created_at: Instant::now(),
-            owner_username: "test".to_string(),
+            owner: test_owner("test"),
             total_rows: 0,
             update_type: None,
             update_count: None,
@@ -3181,7 +3585,7 @@ mod tests {
             status: std::sync::Mutex::new(QueryStatus::Running),
             notify: tokio::sync::Notify::new(),
             abort: std::sync::Mutex::new(None),
-            owner_username: "alice".to_string(),
+            owner: test_owner("alice"),
             session_update: None,
             created_at: std::time::Instant::now(),
         });
@@ -3204,7 +3608,7 @@ mod tests {
                 pages: vec![vec![], vec![]],
                 total_pages: 2,
                 created_at: Instant::now(),
-                owner_username: "test".to_string(),
+                owner: test_owner("test"),
                 total_rows: 0,
                 update_type: None,
                 update_count: None,
@@ -3235,6 +3639,7 @@ mod tests {
             oauth2: None,
             security: SecurityConfig::default(),
             auth_rate_limiter: None,
+            auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
 
@@ -3243,7 +3648,11 @@ mod tests {
             State(state),
             test_peer(),
             basic_auth_header("test", "pw"),
-            Path(("q-123".to_string(), "not-a-number".to_string())),
+            Path((
+                "q-123".to_string(),
+                "poll-token-test".to_string(),
+                "not-a-number".to_string(),
+            )),
         )
         .await;
 
@@ -3267,6 +3676,7 @@ mod tests {
             oauth2: None,
             security: SecurityConfig::default(),
             auth_rate_limiter: None,
+            auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
 
@@ -3277,7 +3687,7 @@ mod tests {
                 pages: vec![vec![]],
                 total_pages: 1,
                 created_at: Instant::now(),
-                owner_username: "test".to_string(),
+                owner: test_owner("test"),
                 total_rows: 0,
                 update_type: None,
                 update_count: None,
@@ -3289,7 +3699,11 @@ mod tests {
             State(state),
             test_peer(),
             HeaderMap::new(),
-            Path(("q-456".to_string(), "5".to_string())),
+            Path((
+                "q-456".to_string(),
+                "wrong-slug".to_string(),
+                "5".to_string(),
+            )),
         )
         .await;
 
@@ -3315,6 +3729,7 @@ mod tests {
             oauth2: None,
             security: SecurityConfig::default(),
             auth_rate_limiter: None,
+            auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
 
@@ -3333,7 +3748,7 @@ mod tests {
                 ],
                 total_pages: 3,
                 created_at: Instant::now(),
-                owner_username: "test".to_string(),
+                owner: test_owner("test"),
                 total_rows: 0,
                 update_type: None,
                 update_count: None,
@@ -3346,7 +3761,11 @@ mod tests {
             State(state.clone()),
             test_peer(),
             basic_auth_header("test", "pw"),
-            Path(("q-paged".to_string(), "1".to_string())),
+            Path((
+                "q-paged".to_string(),
+                "poll-token-test".to_string(),
+                "1".to_string(),
+            )),
         )
         .await;
 
@@ -3365,7 +3784,7 @@ mod tests {
         );
         assert_eq!(
             trino_resp.next_uri,
-            Some("http://localhost:8080/v1/statement/q-paged/2".to_string())
+            Some("http://localhost:8080/v1/statement/q-paged/poll-token-test/2".to_string())
         );
         assert_eq!(trino_resp.stats.state, "RUNNING");
         assert!(trino_resp.info_uri.is_some(), "infoUri must be present");
@@ -3391,6 +3810,7 @@ mod tests {
             oauth2: None,
             security: SecurityConfig::default(),
             auth_rate_limiter: None,
+            auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
 
@@ -3404,7 +3824,7 @@ mod tests {
                 ],
                 total_pages: 2,
                 created_at: Instant::now(),
-                owner_username: "test".to_string(),
+                owner: test_owner("test"),
                 total_rows: 0,
                 update_type: None,
                 update_count: None,
@@ -3417,7 +3837,11 @@ mod tests {
             State(state.clone()),
             test_peer(),
             basic_auth_header("test", "pw"),
-            Path(("q-cleanup".to_string(), "1".to_string())),
+            Path((
+                "q-cleanup".to_string(),
+                "poll-token-test".to_string(),
+                "1".to_string(),
+            )),
         )
         .await;
 
@@ -3444,6 +3868,7 @@ mod tests {
             oauth2: None,
             security: SecurityConfig::default(),
             auth_rate_limiter: None,
+            auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
         state.results.insert(
@@ -3453,7 +3878,7 @@ mod tests {
                 pages: vec![vec![]],
                 total_pages: 1,
                 created_at: Instant::now(),
-                owner_username: "alice".to_string(),
+                owner: test_owner("alice"),
                 total_rows: 0,
                 update_type: None,
                 update_count: None,
@@ -3464,7 +3889,13 @@ mod tests {
             State(state),
             test_peer(),
             basic_auth_header("mallory", "pw"),
-            Path(("q-secret".to_string(), "0".to_string())),
+            // Mallory does not hold alice's poll token, so the ownership
+            // check on the credential fallback is what decides.
+            Path((
+                "q-secret".to_string(),
+                "not-alices-token".to_string(),
+                "0".to_string(),
+            )),
         )
         .await;
         assert_eq!(response.into_response().status(), StatusCode::FORBIDDEN);
@@ -3487,6 +3918,7 @@ mod tests {
             oauth2: None,
             security: SecurityConfig::default(),
             auth_rate_limiter: None,
+            auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
 
@@ -3497,7 +3929,7 @@ mod tests {
                 pages: vec![vec![], vec![]],
                 total_pages: 2,
                 created_at: Instant::now(),
-                owner_username: "test-user".to_string(),
+                owner: test_owner("test-user"),
                 total_rows: 0,
                 update_type: None,
                 update_count: None,
@@ -3570,6 +4002,7 @@ mod tests {
             oauth2: None,
             security: SecurityConfig::default(),
             auth_rate_limiter: None,
+            auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
 
@@ -3617,6 +4050,7 @@ mod tests {
             oauth2: None,
             security: SecurityConfig::default(),
             auth_rate_limiter: None,
+            auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
 
@@ -3659,6 +4093,7 @@ mod tests {
             oauth2: None,
             security: SecurityConfig::default(),
             auth_rate_limiter: None,
+            auth_sessions: build_auth_session_cache(),
             expose_version: false,
         });
         let Json(info) = server_info(State(state)).await;
@@ -3691,11 +4126,392 @@ mod tests {
             oauth2: None,
             security: SecurityConfig::default(),
             auth_rate_limiter: None,
+            auth_sessions: build_auth_session_cache(),
             expose_version: false,
         });
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
         let resolved = trino_client_ip(&state, &headers, "10.0.0.1:33333".parse().unwrap());
         assert_eq!(resolved, "10.0.0.1:33333");
+    }
+
+    // ── Poll-token binding and pre-auth rate limiting (#622, #562) ──
+
+    /// Fixed-budget stand-in for the coordinator's `AuthRateLimiter`: allows
+    /// `budget` checks, then denies, and records every tuple it was asked
+    /// about so a test can assert *what* was keyed as well as *whether*.
+    struct BudgetLimiter {
+        remaining: std::sync::atomic::AtomicUsize,
+        seen: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl BudgetLimiter {
+        fn new(budget: usize) -> Arc<Self> {
+            Arc::new(Self {
+                remaining: std::sync::atomic::AtomicUsize::new(budget),
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn seen(&self) -> Vec<(String, String)> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl TrinoAuthRateLimiter for BudgetLimiter {
+        fn check(&self, peer_ip: &str, principal: &str) -> Result<(), ()> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((peer_ip.to_string(), principal.to_string()));
+            self.remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .map(|_| ())
+                .map_err(|_| ())
+        }
+    }
+
+    /// Counts how many times the provider chain was actually asked to
+    /// validate a credential.
+    struct CountingAuth {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl TrinoAuthenticator for CountingAuth {
+        async fn authenticate(&self, user: &str, _: &str) -> Result<Session, sqe_core::SqeError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Session::new(
+                user.to_string(),
+                sqe_core::SecretString::new("mock-token".to_string()),
+                None,
+                chrono::Utc::now() + chrono::Duration::hours(1),
+                vec![],
+            ))
+        }
+    }
+
+    /// Handler-test state with the caches empty and everything but the
+    /// authenticator, executor and limiter at its default.
+    fn state_with<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
+        authenticator: Arc<A>,
+        query_handler: Arc<Q>,
+        auth_rate_limiter: Option<Arc<dyn TrinoAuthRateLimiter>>,
+    ) -> Arc<TrinoState<A, Q>> {
+        Arc::new(TrinoState {
+            authenticator,
+            query_handler,
+            results: build_result_cache(),
+            queries: build_query_registry(),
+            node: NodeContext {
+                version: "test".to_string(),
+                ready: Arc::new(AtomicBool::new(true)),
+                started_at: Instant::now(),
+            },
+            page_size: DEFAULT_PAGE_SIZE,
+            port: 8080,
+            oauth2: None,
+            security: SecurityConfig::default(),
+            auth_rate_limiter,
+            auth_sessions: build_auth_session_cache(),
+            expose_version: false,
+        })
+    }
+
+    fn retry_after(resp: &Response) -> Option<String> {
+        resp.headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    }
+
+    /// #622: the POST route's limiter used to be trivially bypassable by
+    /// guessing credentials against a GET poll instead. Every route now
+    /// consults it before the provider chain.
+    #[tokio::test]
+    async fn poll_with_wrong_credentials_is_rate_limited() {
+        let limiter = BudgetLimiter::new(2);
+        let state = state_with(
+            Arc::new(MockAuth), // rejects every credential
+            Arc::new(MockQuery),
+            Some(limiter.clone()),
+        );
+
+        let poll = |attempt: usize| {
+            let state = state.clone();
+            async move {
+                get_results(
+                    State(state),
+                    test_peer(),
+                    basic_auth_header("mallory", &format!("guess-{attempt}")),
+                    Path((
+                        "q-victim".to_string(),
+                        "no-slug".to_string(),
+                        "0".to_string(),
+                    )),
+                )
+                .await
+            }
+        };
+
+        assert_eq!(poll(1).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(poll(2).await.status(), StatusCode::UNAUTHORIZED);
+
+        let denied = poll(3).await;
+        assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(retry_after(&denied).as_deref(), Some("1"));
+
+        // Keyed on the host, not the ephemeral source port, and on the
+        // username, not the password.
+        assert_eq!(
+            limiter.seen(),
+            vec![("127.0.0.1".to_string(), "mallory".to_string()); 3]
+        );
+    }
+
+    /// #622 acceptance criterion: a submit plus N polls of the same query hit
+    /// the provider chain exactly once. The polls carry credentials, the way a
+    /// real Trino client does — they are simply never validated again.
+    #[tokio::test]
+    async fn submit_plus_polls_authenticates_exactly_once() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let limiter = BudgetLimiter::new(100);
+        let open = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let state = state_with(
+            Arc::new(CountingAuth {
+                calls: calls.clone(),
+            }),
+            Arc::new(GatedQuery {
+                open,
+                gate: gate.clone(),
+            }),
+            Some(limiter.clone()),
+        );
+
+        let submitted = submit_query(
+            State(state.clone()),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            "SELECT 1".to_string(),
+        )
+        .await;
+        let body = axum::body::to_bytes(submitted.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let started: protocol::TrinoResponse = serde_json::from_slice(&body).unwrap();
+        let (query_id, slug) = split_queued_uri(started.next_uri.as_deref().unwrap());
+
+        for token in 1..=5 {
+            let resp = get_queued_results(
+                State(state.clone()),
+                test_peer(),
+                basic_auth_header("alice", "pw"),
+                Path((query_id.clone(), slug.clone(), token.to_string())),
+                axum::extract::RawQuery(Some("maxWait=1ms".to_string())),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the five polls must not have re-run the password grant"
+        );
+        // And they did not spend pre-auth budget either: only the POST was
+        // ever put to the limiter.
+        assert_eq!(limiter.seen().len(), 1);
+
+        gate.notify_waiters();
+    }
+
+    /// Split `.../v1/statement/queued/{id}/{slug}/{token}` into (id, slug).
+    fn split_queued_uri(uri: &str) -> (String, String) {
+        let parts: Vec<&str> = uri.rsplitn(4, '/').collect();
+        // rsplitn yields [token, slug, id, prefix]
+        (parts[2].to_string(), parts[1].to_string())
+    }
+
+    /// The poll token alone is sufficient: no `Authorization` header at all,
+    /// and an authenticator that would reject one if there were.
+    #[tokio::test]
+    async fn poll_with_valid_poll_token_needs_no_credentials() {
+        let state = state_with(Arc::new(MockAuth), Arc::new(MockQuery), None);
+        state
+            .queries
+            .insert("q1".to_string(), handle_with(QueryStatus::Running, "alice"));
+
+        let resp = get_queued_results(
+            State(state),
+            test_peer(),
+            HeaderMap::new(),
+            Path((
+                "q1".to_string(),
+                "poll-token-alice".to_string(),
+                "1".to_string(),
+            )),
+            axum::extract::RawQuery(Some("maxWait=1ms".to_string())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: protocol::TrinoResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.stats.state, "RUNNING");
+    }
+
+    /// A wrong poll token with no credentials is indistinguishable from a
+    /// poll for a query id that does not exist: both are a bare 401, so the
+    /// route cannot be used to enumerate query ids.
+    #[tokio::test]
+    async fn wrong_poll_token_without_credentials_does_not_leak_existence() {
+        let state = state_with(Arc::new(MockAuth), Arc::new(MockQuery), None);
+        state
+            .queries
+            .insert("q1".to_string(), handle_with(QueryStatus::Running, "alice"));
+
+        let poll = |id: &str, slug: &str| {
+            let state = state.clone();
+            let (id, slug) = (id.to_string(), slug.to_string());
+            async move {
+                get_queued_results(
+                    State(state),
+                    test_peer(),
+                    HeaderMap::new(),
+                    Path((id, slug, "1".to_string())),
+                    axum::extract::RawQuery(Some("maxWait=1ms".to_string())),
+                )
+                .await
+            }
+        };
+
+        let existing = poll("q1", "wrong-token").await;
+        let missing = poll("q-does-not-exist", "wrong-token").await;
+
+        assert_eq!(existing.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            axum::body::to_bytes(existing.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            axum::body::to_bytes(missing.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "the two 401 bodies must be identical"
+        );
+    }
+
+    /// #562: the Bearer branch on `POST /v1/statement` used to go straight to
+    /// `authenticate_bearer`, so garbage bearers could drive JWKS refetches
+    /// and IdP round trips without limit.
+    #[tokio::test]
+    async fn bearer_post_past_limiter_budget_returns_429() {
+        let limiter = BudgetLimiter::new(1);
+        let state = state_with(
+            Arc::new(MockAuth), // no bearer provider -> rejects
+            Arc::new(MockQuery),
+            Some(limiter.clone()),
+        );
+
+        let post = || {
+            let state = state.clone();
+            async move {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    "authorization",
+                    "Bearer eyJhbGciOi.payload.signature".parse().unwrap(),
+                );
+                submit_query(State(state), test_peer(), headers, "SELECT 1".to_string()).await
+            }
+        };
+
+        assert_eq!(post().await.status(), StatusCode::UNAUTHORIZED);
+
+        let denied = post().await;
+        assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(retry_after(&denied).as_deref(), Some("1"));
+
+        // The bucket is a digest, never the token: a bearer is
+        // attacker-supplied and must not become a map key or a log field.
+        let seen = limiter.seen();
+        assert_eq!(seen.len(), 2);
+        for (peer, principal) in seen {
+            assert_eq!(peer, "127.0.0.1");
+            assert!(principal.starts_with("bearer:"), "got {principal}");
+            assert!(!principal.contains("eyJhbGciOi"), "got {principal}");
+        }
+    }
+
+    #[test]
+    fn poll_tokens_are_long_and_unique() {
+        let a = mint_poll_token();
+        let b = mint_poll_token();
+        assert_eq!(a.len(), 43, "32 bytes base64url without padding");
+        assert_ne!(a, b);
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "must be safe in a URL path segment: {a}"
+        );
+    }
+
+    #[test]
+    fn constant_time_eq_matches_ordinary_equality() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"", b"a"));
+    }
+
+    #[test]
+    fn strip_port_keeps_the_host() {
+        assert_eq!(strip_port("127.0.0.1:12345"), "127.0.0.1");
+        assert_eq!(strip_port("127.0.0.1"), "127.0.0.1");
+        assert_eq!(strip_port("[::1]:8080"), "[::1]");
+        assert_eq!(strip_port("[::1]"), "[::1]");
+        // A bare IPv6 from `x-forwarded-for` keeps every group: truncating at
+        // the last colon would fold whole /64s into one rate-limit bucket.
+        assert_eq!(strip_port("::1"), "::1");
+        assert_eq!(strip_port("2001:db8::1"), "2001:db8::1");
+        assert_eq!(strip_port("1.2.3.4:notaport"), "1.2.3.4:notaport");
+    }
+
+    /// Ownership is decided on the IdP subject, not the display name, so a
+    /// second provider that happens to mint the same username cannot read
+    /// another session's results.
+    #[test]
+    fn ownership_compares_subject_not_display_name() {
+        let mut submitter = Session::new(
+            "alice".to_string(),
+            sqe_core::SecretString::new("t".to_string()),
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            vec![],
+        );
+        submitter.user.subject = Some("idp-1|alice".to_string());
+        let owner = QueryOwner::new(&submitter);
+
+        let mut impostor = submitter.clone();
+        impostor.user.subject = Some("idp-2|alice".to_string());
+
+        assert!(owner.is(&submitter));
+        assert!(
+            !owner.is(&impostor),
+            "same display name, different subject: not the owner"
+        );
+    }
+
+    #[test]
+    fn basic_session_key_hides_the_password() {
+        let key = basic_session_key("alice", "hunter2");
+        assert_eq!(key.len(), 64, "hex sha256");
+        assert!(!key.contains("hunter2"));
+        assert!(!key.contains("alice"));
+        assert_ne!(key, basic_session_key("alice", "hunter3"));
+        // No ambiguity between ("a:b", "c") and ("a", "b:c").
+        assert_ne!(basic_session_key("a:b", "c"), basic_session_key("a", "b:c"));
     }
 }

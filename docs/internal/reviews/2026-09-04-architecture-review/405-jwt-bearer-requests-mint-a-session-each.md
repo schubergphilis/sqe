@@ -4,7 +4,7 @@
 - Severity: medium
 - Category: performance
 - Effort: S (hours)
-- Status: open
+- Status: fixed (branch `fix/identity-transport-trust-p1`, 2026-09-05)
 - Issue: #585
 
 ## Problem
@@ -68,3 +68,7 @@ in `remove_session` and the sweeper.
 - 2026-07-25 review P1-6 (auth failure invalidates the whole REST catalog cache) is the
   neighbouring identity-keying gap; the same fingerprint should key both.
 - 403 (ticket carries query id) touches the same handlers.
+
+## Resolution (2026-09-05)
+
+`SessionManager::session_for_bearer` (`crates/sqe-coordinator/src/session_manager.rs`) indexes sessions by the SHA-256 fingerprint of the bearer token: a hit returns the existing session through `get_session` (so expiry eviction still applies) and a miss authenticates once and records the mapping. Fingerprints are dropped on `remove_session`, the idle/absolute sweeper, the COORD-04 LRU eviction and the expiry path. `get_session_from_request` in `flight_sql.rs` uses it and emits the auth-success audit event only when a session was created. Tests: `same_bearer_reuses_one_session_and_authenticates_once` (100 requests, one session, one provider call) and `expired_bearer_session_is_reauthenticated_not_reused`.

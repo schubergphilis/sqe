@@ -4,7 +4,7 @@
 - Severity: high
 - Category: security
 - Effort: S (hours) for the gate, M (days) for a safe version
-- Status: open
+- Status: fixed (branch `fix/identity-transport-trust-p1`, 2026-09-05)
 - Issue: #611
 
 ## Problem
@@ -87,3 +87,7 @@ outbound HTTP from that position is a textbook SSRF, and it is on by default.
 - Issue 605 (decoder robustness), 606 (server-side Quack session model).
 - 200-series review for the MCP read-only gate: `quack_query` also bypasses
   any "read-only SQL" classification that inspects table names.
+
+## Resolution (2026-09-05)
+
+`quack_query` is registered only when `[quack_client] enabled = true` and the session holds a role in `quack_client.allowed_roles` (`QuackClientConfig::permits`, `session_context.rs`); `SqeConfig::validate` refuses `enabled` with empty roles or hosts. The TVF (`crates/sqe-quack-client/src/tvf.rs`) takes only `(uri, sql)`, forwards the session's own bearer token instead of a SQL-literal token (the three-argument form is refused), checks the destination against the exact `host:port` allow-list in `QuackTargetPolicy` before any socket is opened (loopback, link-local, private and IPv4-mapped addresses refused unless listed), never follows redirects, caps the decoded result at `max_result_bytes` while chunks land, and runs the blocking round trip inside `tokio::task::block_in_place` so it does not starve the runtime worker. Tests: `policy.rs` (metadata/loopback/private refusal, exact host:port, cap), `tvf.rs` (`rejects_token_argument_form`, `refuses_disallowed_destinations_before_connecting`), config (`quack_client_is_off_by_default_and_fails_closed_when_half_configured`).
