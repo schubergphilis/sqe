@@ -173,7 +173,7 @@ case "$PROFILE" in
 esac
 
 if [ "$NEEDS_COORDINATOR" = "1" ]; then
-  BUILD_TARGETS=(-p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-coordinator)
+  BUILD_TARGETS=(-p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-server)
 else
   BUILD_TARGETS=(-p sqe-bench --bin sqe-bench)
 fi
@@ -186,7 +186,7 @@ else
   cargo build "${BUILD_TARGETS[@]}" 2>&1
 fi
 BENCH_BIN="$ROOT_DIR/target/$PROFILE/sqe-bench"
-SQE_BIN="$ROOT_DIR/target/$PROFILE/sqe-coordinator"
+SQE_BIN="$ROOT_DIR/target/$PROFILE/sqe-server"
 echo ""
 
 # ── Throwaway coordinator against the golden Polaris (load path only) ────

@@ -21,7 +21,7 @@ use std::time::Duration;
 use datafusion::prelude::SessionContext;
 use prometheus::Counter;
 use sqe_catalog::FooterCache;
-use sqe_core::{parse_memory_limit, FlightCompression, SqeConfig};
+use sqe_core::{parse_memory_limit, SqeConfig};
 use sqe_metrics::WorkerMetricsRegistry;
 use sqe_spill::{
     ByteBudget, LocalSegmentStore, MemoryGovernor, ResizableFairSpillPool, S3SegmentStore,
@@ -67,9 +67,8 @@ pub fn build_worker_service_with_hot_reload(
     memory_pool: Option<Arc<ResizableFairSpillPool>>,
     config_path: Option<&str>,
 ) -> anyhow::Result<WorkerFlightService> {
-    let shuffle_compression =
-        FlightCompression::from_config(&config.coordinator.shuffle_compression)
-            .unwrap_or(FlightCompression::Zstd);
+    let shuffle_compression = config.coordinator.shuffle_compression;
+    crate::executor::configure_row_group_pruning(config.worker.row_group_pruning);
 
     // Parquet footer cache: avoids re-reading file metadata from S3 on every
     // scan. Sized from storage.footer_cache_size. Counters are standalone

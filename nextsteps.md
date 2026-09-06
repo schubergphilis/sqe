@@ -1,6 +1,6 @@
 # SQE — Next Steps
 
-> **STATUS 2026-09-05 (later): authorization P1 batch fixed; 18 of 109 combined findings closed.**
+> **STATUS 2026-09-05 (later): authorization P1 batch fixed; 24 of 109 combined findings closed.**
 >
 > Branch `fix/authz-policy-enforcement-p1` closes the remaining P1s of the
 > authorization area (work package #653): one policy-key derivation shared by
@@ -20,6 +20,14 @@
 > safety (701, 504, 403, 300, 301); then the fingerprint-bound result cache
 > (902 follow-up).
 
+> **STATUS 2026-09-05 (later): work package #659 (configuration, startup and code structure) on `fix/config-startup-code-structure`.**
+>
+> Fail-closed `SQE_*` overlay, typed mode knobs, one tokio runtime builder,
+> `sqe-coordinator` binary removed in favour of `sqe-server`, worker
+> `--config` + `/healthz`, dead `deploy/k8s` removed. Partial: stacker for
+> debug `RUST_MIN_STACK`, Dockerfile unification, QueryHandler split.
+> **NEXT:** remaining P1s in the combined index (202, 400, 503, 601/401/603).
+>
 > **STATUS 2026-09-05: security/scale review filed (7 findings) and fixed; 11 of 109 combined findings closed.**
 >
 > `docs/internal/reviews/2026-09-05-security-scale-review/` adds seven

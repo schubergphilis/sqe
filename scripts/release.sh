@@ -60,6 +60,12 @@ echo "==> Bumping crate versions to ${VERSION}"
 perl -i -0pe 's/(\[workspace\.package\]\n(?:[^\[]*?))version = ".*?"/${1}version = "'"$VERSION"'"/s' Cargo.toml
 echo "  Cargo.toml [workspace.package] -> $VERSION"
 
+if [[ -f deploy/helm/sqe/Chart.yaml ]]; then
+    perl -i -pe 's/^version: .*/version: '"$VERSION"'/' deploy/helm/sqe/Chart.yaml
+    perl -i -pe 's/^appVersion: .*/appVersion: "'"$VERSION"'"/' deploy/helm/sqe/Chart.yaml
+    echo "  deploy/helm/sqe/Chart.yaml version/appVersion -> $VERSION"
+fi
+
 # Belt and braces: bump any crate that still carries its own version line
 # instead of inheriting from the workspace.
 for crate_toml in crates/*/Cargo.toml; do

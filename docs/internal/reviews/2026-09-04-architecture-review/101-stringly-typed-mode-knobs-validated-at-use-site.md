@@ -4,8 +4,16 @@
 - Severity: medium
 - Category: reliability
 - Effort: M (days)
-- Status: open
+- Status: fixed (branch `fix/config-startup-code-structure`, 2026-09-05)
 - Issue: #544
+
+## Resolution (2026-09-05)
+
+Fixed on `fix/config-startup-code-structure`. `sort_mode`, `query_profile`,
+`memory_pool`, `flight_compression` / `spill_compression` / `shuffle_compression`,
+and `coordinator.mode` are enums deserialized with `snake_case`. Unknown values
+fail at load. Silent `defaulting to` fallbacks are gone.
+
 
 ## Problem
 
