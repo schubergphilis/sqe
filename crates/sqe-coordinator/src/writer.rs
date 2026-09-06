@@ -44,6 +44,7 @@ pub use sqe_compaction::writer::{
 // Internal-only helper: never referenced outside this module either before or
 // after the move, so a plain (non-`pub`) import is enough.
 use sqe_compaction::writer::unpartitioned_spec_key;
+use sqe_core::SqeErrorCode;
 
 /// Iceberg table property that lists columns to get Parquet bloom filters.
 ///
@@ -130,7 +131,7 @@ pub async fn write_data_files(
     let batches = stamp_field_ids(batches, table.metadata().current_schema())?;
 
     let inner_loc = DefaultLocationGenerator::new(table.metadata().clone())
-        .map_err(|e| SqeError::Execution(format!("Location generator error: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Location generator error: {e}")))?;
     let location_generator = TrackingLocationGenerator::new(inner_loc, tracker);
 
     // Generate a unique write ID for this operation. File names follow the
@@ -172,21 +173,21 @@ pub async fn write_data_files(
         let mut writer = data_file_writer_builder
             .build(partition_key)
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to build data file writer: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build data file writer: {e}")))?;
 
         for batch in &batches {
             if batch.num_rows() > 0 {
                 writer
                     .write(batch.clone())
                     .await
-                    .map_err(|e| SqeError::Execution(format!("Write error: {e}")))?;
+                    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Write error: {e}")))?;
             }
         }
 
         writer
             .close()
             .await
-            .map_err(|e| SqeError::Execution(format!("Close writer error: {e}")))?
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Close writer error: {e}")))?
     } else {
         // Partitioned path: TaskWriter routes per-row to per-partition
         // writers, emitting one DataFile per partition with the right
@@ -203,7 +204,7 @@ pub async fn write_data_files(
             schema.clone(),
             partition_spec.clone(),
         )
-        .map_err(|e| SqeError::Execution(format!("Failed to build partition splitter: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build partition splitter: {e}")))?;
         let mut writer = TaskWriter::new_with_partition_splitter(
             data_file_writer_builder,
             true,
@@ -216,13 +217,13 @@ pub async fn write_data_files(
                 writer
                     .write(batch.clone())
                     .await
-                    .map_err(|e| SqeError::Execution(format!("Partitioned write error: {e}")))?;
+                    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Partitioned write error: {e}")))?;
             }
         }
         writer
             .close()
             .await
-            .map_err(|e| SqeError::Execution(format!("Close partitioned writer error: {e}")))?
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Close partitioned writer error: {e}")))?
     };
 
     info!(
@@ -334,7 +335,7 @@ pub async fn write_position_delete_files(
     );
 
     let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
-        .map_err(|e| SqeError::Execution(format!("Location generator error: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Location generator error: {e}")))?;
 
     let write_id = Uuid::now_v7();
     let file_name_generator = DefaultFileNameGenerator::new(
@@ -362,7 +363,7 @@ pub async fn write_position_delete_files(
     let mut writer = pos_delete_builder
         .build(None)
         .await
-        .map_err(|e| SqeError::Execution(format!("Failed to build position delete writer: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build position delete writer: {e}")))?;
 
     // Convert to PositionDeleteInput and sort by (file_path, pos) as required by spec.
     let mut inputs: Vec<PositionDeleteInput> = deletes
@@ -374,12 +375,12 @@ pub async fn write_position_delete_files(
     writer
         .write(inputs)
         .await
-        .map_err(|e| SqeError::Execution(format!("Failed to write position deletes: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to write position deletes: {e}")))?;
 
     let delete_files = writer
         .close()
         .await
-        .map_err(|e| SqeError::Execution(format!("Failed to close position delete writer: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to close position delete writer: {e}")))?;
 
     info!(
         table = %table.identifier(),
@@ -443,7 +444,7 @@ pub async fn write_equality_delete_files(
     let stamped = stamp_field_ids(key_batches, iceberg_schema.as_ref())?;
 
     let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
-        .map_err(|e| SqeError::Execution(format!("Location generator error: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Location generator error: {e}")))?;
 
     let write_id = Uuid::now_v7();
     let file_name_generator = DefaultFileNameGenerator::new(
@@ -465,26 +466,26 @@ pub async fn write_equality_delete_files(
     );
 
     let config = EqualityDeleteWriterConfig::new(resolved_ids, iceberg_schema.clone())
-        .map_err(|e| SqeError::Execution(format!("Equality delete config error: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Equality delete config error: {e}")))?;
 
     let eq_delete_builder = EqualityDeleteFileWriterBuilder::new(rolling_writer_builder, config);
 
     let mut writer = eq_delete_builder
         .build(None)
         .await
-        .map_err(|e| SqeError::Execution(format!("Failed to build equality delete writer: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build equality delete writer: {e}")))?;
 
     for batch in stamped {
         writer
             .write(batch)
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to write equality deletes: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to write equality deletes: {e}")))?;
     }
 
     let delete_files = writer
         .close()
         .await
-        .map_err(|e| SqeError::Execution(format!("Failed to close equality delete writer: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to close equality delete writer: {e}")))?;
 
     info!(
         table = %table.identifier(),
@@ -513,7 +514,7 @@ fn stamp_field_ids(
     // Build the canonical Arrow schema from the Iceberg schema so we know the
     // expected Arrow data type for each column (e.g. Timestamp(µs) not Timestamp(ns)).
     let expected_arrow_schema = schema_to_arrow_schema(iceberg_schema)
-        .map_err(|e| SqeError::Execution(format!("Failed to derive expected Arrow schema: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to derive expected Arrow schema: {e}")))?;
 
     let iceberg_fields = iceberg_schema.as_struct().fields();
     let new_fields: Vec<Arc<arrow_schema::Field>> = first
@@ -562,7 +563,7 @@ fn stamp_field_ids(
                         Ok(col.clone())
                     } else {
                         cast(col, target).map_err(|e| {
-                            SqeError::Execution(format!(
+                            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                                 "Failed to cast column '{}' from {:?} to {:?}: {e}",
                                 new_schema.field(i).name(),
                                 col.data_type(),
@@ -573,7 +574,7 @@ fn stamp_field_ids(
                 })
                 .collect();
             RecordBatch::try_new(new_schema.clone(), new_columns?)
-                .map_err(|e| SqeError::Execution(format!("Failed to stamp field IDs: {e}")))
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to stamp field IDs: {e}")))
         })
         .collect()
 }

@@ -18,6 +18,14 @@ pub enum AuditKind {
     /// (later) a rewrite job. Never a user query or an interactive admin
     /// action; the actor is always the dedicated maintenance principal.
     Maintenance,
+    /// Worker-side scan of a distributed fragment. The ticket does not carry
+    /// a user principal, so `query_id` / `trace_id` identify the coordinator
+    /// statement that produced the ticket.
+    Scan,
+    /// Writer resumed after an unparseable tail (torn write or crash mid-line).
+    /// `integrity.prev_hash` is `BROKEN:<reason>` so verifiers can distinguish
+    /// this from silent truncation back to genesis.
+    AuditResume,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

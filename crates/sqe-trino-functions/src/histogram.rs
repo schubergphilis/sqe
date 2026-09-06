@@ -160,7 +160,7 @@ impl HistogramAccumulator {
 impl Accumulator for HistogramAccumulator {
     fn update_batch(&mut self, args: &[ArrayRef]) -> DFResult<()> {
         if args.len() != 1 {
-            return Err(DataFusionError::Internal(format!(
+            return Err(DataFusionError::Plan(format!(
                 "histogram::update_batch expected 1 array, got {}",
                 args.len()
             )));
@@ -288,7 +288,7 @@ impl Accumulator for HistogramAccumulator {
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> DFResult<()> {
         if states.len() != 1 {
-            return Err(DataFusionError::Internal(format!(
+            return Err(DataFusionError::Plan(format!(
                 "histogram::merge_batch expected 1 state array, got {}",
                 states.len()
             )));
@@ -300,7 +300,7 @@ impl Accumulator for HistogramAccumulator {
             .as_any()
             .downcast_ref::<arrow::array::ListArray>()
             .ok_or_else(|| {
-                DataFusionError::Internal(
+                DataFusionError::Plan(
                     "histogram::merge_batch state[0] is not a ListArray".into(),
                 )
             })?;
@@ -313,7 +313,7 @@ impl Accumulator for HistogramAccumulator {
                 .as_any()
                 .downcast_ref::<StructArray>()
                 .ok_or_else(|| {
-                    DataFusionError::Internal(
+                    DataFusionError::Plan(
                         "histogram::merge_batch list element is not a StructArray".into(),
                     )
                 })?;
@@ -323,7 +323,7 @@ impl Accumulator for HistogramAccumulator {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| {
-                    DataFusionError::Internal(
+                    DataFusionError::Plan(
                         "histogram::merge_batch struct value column is not Int64".into(),
                     )
                 })?;

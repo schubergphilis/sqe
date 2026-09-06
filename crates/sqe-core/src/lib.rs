@@ -23,7 +23,7 @@ pub use config::{
     WorkerMemoryConfig, WorkerSpillConfig,
 };
 pub use runtime::{build_server_runtime, DEFAULT_RUNTIME_STACK_MIB};
-pub use error::{CatalogOp, Result, SqeError, SqeErrorCode};
+pub use error::{classified_by_text_total, CatalogOp, Result, SqeError, SqeErrorCode};
 pub use secret::{Secret, SecretStore, SecretStoreError};
 pub use secret_string::SecretString;
 pub use session::{Credentials, Session, SessionUser};

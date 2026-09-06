@@ -203,6 +203,10 @@ pub struct MetricsRegistry {
     /// bundle download. These never apply unless `groups_claim` is set.
     pub ranger_group_only_items: IntCounter,
 
+    /// Audit events dropped because the writer queue was full or a sink write
+    /// failed. Label `reason` is `queue_full`, `io`, or `writer_gone`.
+    pub audit_events_dropped_total: IntCounterVec,
+
     // Audit export (OTLP shipper) metrics
     pub audit_export_records_total: IntCounterVec,
     pub audit_export_batch_failures_total: IntCounter,
@@ -642,6 +646,13 @@ impl MetricsRegistry {
             &["op", "outcome"],
         )?;
 
+        let audit_events_dropped_total = register_int_counter_vec(
+            &registry,
+            "sqe_audit_events_dropped_total",
+            "Audit events dropped because the writer queue was full, the writer died, or a sink write failed",
+            &["reason"],
+        )?;
+
         // Audit export (OTLP shipper) metrics
         let audit_export_records_total = register_int_counter_vec(
             &registry,
@@ -804,6 +815,7 @@ impl MetricsRegistry {
             policy_circuit_breaker_state,
             ranger_group_only_items,
             write_orphan_files_total,
+            audit_events_dropped_total,
             audit_export_records_total,
             audit_export_batch_failures_total,
             audit_export_spool_lag_bytes,

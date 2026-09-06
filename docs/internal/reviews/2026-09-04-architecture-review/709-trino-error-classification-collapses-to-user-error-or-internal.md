@@ -4,7 +4,7 @@
 - Severity: medium
 - Category: operability
 - Effort: S (hours)
-- Status: open
+- Status: fixed (branch `fix/errors-audit-observability`, 2026-09-05)
 - Issue: #629
 
 ## Problem
@@ -55,3 +55,7 @@ Clients branch on `errorType`: dbt-trino retries `INTERNAL_ERROR` and `INSUFFICI
 - 703 (scalar-only UDFs; same files).
 - 800-range cross-cutting error handling.
 - `docs/internal/reviews/2026-07-25-production-readiness-review.md` item 24 credits the `SqeErrorCode` mapping; this issue is about the paths that bypass it.
+
+## Resolution (2026-09-05)
+
+`error_response` maps HTTP status to `SqeErrorCode` (`TrinoError::from_code`). Panic guard emits `internal_error`. Rate-limit adapter returns `ResourceExhausted` so `Retry-After` fires. UDF `DataFusionError::Internal` for user input was replaced with `Plan` (USER_ERROR). Test: `error_from_code_maps_auth_and_internal`.

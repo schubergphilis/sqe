@@ -381,16 +381,19 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Restore sessions from a JSON snapshot file (best-effort).
+    /// Restore sessions from a JSON snapshot file.
     ///
-    /// If the file does not exist or cannot be parsed the method returns
-    /// silently — a missing snapshot is not an error condition.
+    /// A missing file is not an error: there is simply nothing to restore.
+    /// Any other read failure, or a snapshot that does not parse, is
+    /// returned to the caller so a corrupt or unreadable snapshot is visible
+    /// at startup instead of being logged once and forgotten (finding 812).
     /// Full restore (re-creating live `Session` objects) requires re-validating
     /// tokens against the OIDC provider and is deferred to a future iteration.
-    pub fn restore_from_file(&self, path: &str) {
+    pub fn restore_from_file(&self, path: &str) -> std::io::Result<()> {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
-            Err(_) => return, // No snapshot to restore
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
         };
         match serde_json::from_str::<serde_json::Value>(&content) {
             Ok(serde_json::Value::Array(entries)) => {
@@ -399,16 +402,16 @@ impl SessionManager {
                     count = entries.len(),
                     "Found session snapshot — full restore requires token re-validation (not yet implemented)"
                 );
+                Ok(())
             }
-            Ok(_) => {
-                tracing::warn!(
-                    path = path,
-                    "Session snapshot has unexpected format, skipping restore"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(path = path, error = %e, "Failed to parse session snapshot, skipping restore");
-            }
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("session snapshot {path} has unexpected format (expected a JSON array)"),
+            )),
+            Err(e) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("session snapshot {path} failed to parse: {e}"),
+            )),
         }
     }
 
@@ -833,8 +836,10 @@ mod tests {
             "Snapshot entry must include the correct username"
         );
 
-        // restore_from_file is best-effort / logs only — it must not panic
-        manager.restore_from_file(&tmp_path);
+        // A well-formed snapshot restores without error.
+        manager
+            .restore_from_file(&tmp_path)
+            .expect("restore of a valid snapshot");
 
         // Clean up
         let _ = std::fs::remove_file(&tmp_path);

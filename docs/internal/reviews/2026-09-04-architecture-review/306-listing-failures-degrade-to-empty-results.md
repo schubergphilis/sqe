@@ -4,7 +4,7 @@
 - Severity: medium
 - Category: reliability
 - Effort: M (days)
-- Status: open
+- Status: fixed (branch `fix/errors-audit-observability`, 2026-09-05)
 - Issue: #572
 
 ## Problem
@@ -41,3 +41,7 @@ For discovery clients "empty" and "unavailable" are materially different: dbt co
 
 - 2026-07-25 production readiness review P1-7 (still holds).
 - 305 (classification decides what counts as transient).
+
+## Resolution (2026-09-05)
+
+`SqeSchemaProvider` records `listing_failed` on `list_tables` errors and `table_exist` then returns true so DROP/CREATE IF EXISTS hit the catalog instead of no-op. `should_degrade_to_empty_namespaces` is an allow-list of not-found codes; unexpected `CatalogError` propagates. Test updated in `catalog_provider.rs`.
