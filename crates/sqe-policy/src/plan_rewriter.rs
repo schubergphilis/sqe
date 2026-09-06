@@ -100,6 +100,20 @@ impl PolicyPlanRewriter {
 
 #[async_trait]
 impl PolicyEnforcer for PolicyPlanRewriter {
+    fn policy_fingerprint(&self) -> Option<String> {
+        // The store fingerprint covers resource and tag policies; mask
+        // precedence and the presence of a mask key change rendered values,
+        // so they are part of the identity too. Table-level tag changes go
+        // through DDL, which evicts that table's cached results.
+        self.store.policy_fingerprint().map(|f| {
+            format!(
+                "{f}|precedence={:?}|keyed_hash={}",
+                self.mask_precedence,
+                self.mask_key.is_some()
+            )
+        })
+    }
+
     async fn evaluate(
         &self,
         user: &SessionUser,

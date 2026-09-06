@@ -297,11 +297,41 @@ ISSUE-220.
 
 ---
 
+## 6. High write conflict rate
+
+**Symptom.** INSERT, UPDATE, DELETE, MERGE statements are slower than expected. Audit log shows repeated retries or `sqe_write_commit_retries_total` is climbing.
+
+**Likely cause.** Concurrent writers on the same table are generating optimistic-concurrency conflicts. Each writer retries automatically with exponential backoff, but sustained high conflicts slow write throughput and can exhaust retry budgets under extreme load.
+
+**Diagnosis.**
+
+```promql
+# Conflicts by operation type (ctas-replace, delete-cow, merge-cow, truncate, etc.).
+sum by (op) (rate(sqe_write_commit_retries_total[5m]))
+# Which users drive the most retries.
+sum by (user) (rate(sqe_write_commit_retries_total[5m]))
+```
+
+```bash
+# Write performance in audit log. grep for "retries", "conflict", "retried" fields.
+tail -100 /var/log/sqe/audit/audit.jsonl | grep -i "insert\|merge\|delete\|update" | jq '.retries'
+```
+
+**Resolution.**
+
+- Expected under dbt incremental models or high-concurrency MERGE workloads: the engine retries transparently and returns success.
+- Sustained high conflict rates point to design: either consolidate writes into fewer, larger statements, or spread writes across non-overlapping partition ranges.
+- If one coordinator is a bottleneck under multi-coordinator HA, ensure session stickiness is wired (sessions are coordinator-local today).
+
+**Escalation.** If write throughput degraded after a code change, capture `sqe_write_commit_retries_total` over time and the failing statement, then page the engine on-call.
+
+---
+
 ## Escalation summary
 
 | Surface | First responder | Page next |
 |---|---|---|
-| Worker crashloop, coordinator OOM, registry flap | SQE on-call | Engine on-call |
+| Worker crashloop, coordinator OOM, registry flap, high write conflicts | SQE on-call | Engine on-call |
 | Catalog (Polaris) outage | SQE on-call | Catalog owner |
 | OIDC provider outage | SQE on-call | Identity team |
 

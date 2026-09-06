@@ -190,6 +190,13 @@ pub struct MetricsRegistry {
     // operators can alert on `outcome="leaked"` accumulation in S3.
     pub write_orphan_files_total: IntCounterVec,
 
+    // Write path: rewrite commits retried after losing an optimistic-concurrency
+    // race, labelled by op (truncate / delete-cow / update-cow / merge-cow /
+    // insert-overwrite / ctas-replace). A rising counter means concurrent
+    // writers — another session's DML or the compaction scheduler — are
+    // contending on the same table (architecture review 506).
+    pub write_commit_retries_total: IntCounterVec,
+
     // Catalog (Polaris) roundtrip + circuit breaker state
     pub catalog_request_duration_seconds: HistogramVec,
     pub catalog_circuit_breaker_state: GaugeVec,
@@ -642,6 +649,13 @@ impl MetricsRegistry {
             &["op", "outcome"],
         )?;
 
+        let write_commit_retries_total = register_int_counter_vec(
+            &registry,
+            "sqe_write_commit_retries_total",
+            "Rewrite commits retried after an optimistic-concurrency conflict, by op",
+            &["op"],
+        )?;
+
         // Audit export (OTLP shipper) metrics
         let audit_export_records_total = register_int_counter_vec(
             &registry,
@@ -804,6 +818,7 @@ impl MetricsRegistry {
             policy_circuit_breaker_state,
             ranger_group_only_items,
             write_orphan_files_total,
+            write_commit_retries_total,
             audit_export_records_total,
             audit_export_batch_failures_total,
             audit_export_spool_lag_bytes,
@@ -1118,6 +1133,33 @@ mod tests {
         metrics.dashboard_auth_anonymous_denied_total.inc_by(0);
         // 17 original + 14 streaming + 7 new (S3 + auth) + 1 adaptive sort + 1 dashboard = 40 minimum
         assert!(metrics.registry.gather().len() >= 40);
+    }
+
+    #[test]
+    fn test_write_commit_retries_total() {
+        let metrics = MetricsRegistry::new().unwrap();
+        metrics
+            .write_commit_retries_total
+            .with_label_values(&["merge-cow"])
+            .inc();
+        metrics
+            .write_commit_retries_total
+            .with_label_values(&["merge-cow"])
+            .inc();
+        assert_eq!(
+            metrics
+                .write_commit_retries_total
+                .with_label_values(&["merge-cow"])
+                .get(),
+            2
+        );
+        assert_eq!(
+            metrics
+                .write_commit_retries_total
+                .with_label_values(&["truncate"])
+                .get(),
+            0
+        );
     }
 
     #[test]

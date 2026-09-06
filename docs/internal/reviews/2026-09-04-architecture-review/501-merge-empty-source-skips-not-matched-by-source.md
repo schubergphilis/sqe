@@ -4,7 +4,7 @@
 - Severity: high
 - Category: reliability
 - Effort: S (hours)
-- Status: open
+- Status: fixed (branch `fix/data-consistency-p1`, 2026-09-05)
 - Issue: #593
 
 ## Problem
@@ -69,3 +69,67 @@ of the statement was already paid.
 
 - 514 (inconsistent `Ok(vec![])` vs `rows_affected` on no-op paths).
 - 513 (test rig).
+
+## Resolution (2026-09-05)
+
+Both MERGE handlers now classify the clauses first and only shortcut an empty
+source when the statement has no `WHEN NOT MATCHED BY SOURCE` clause.
+
+**What changed**
+
+- `crates/sqe-coordinator/src/merge_sql.rs`
+  - `empty_source_is_no_op(&ClassifiedMerge)` — the shortcut predicate. It
+    takes the *classification result*, so it cannot be evaluated before
+    `classify_merge_clauses` has run; the ordering the fix depends on is
+    carried by the type system rather than by a comment.
+  - `empty_source_claim_count_sql(&ClassifiedMerge, &MergeNames, &str)` —
+    `SELECT COUNT(*)` over the target relation filtered by the union of the BY
+    SOURCE clause predicates plus the caller's row filter. With an empty source
+    nothing matches and nothing is inserted, so BY SOURCE is the only class
+    that can change a row and the union is exact under first-match-wins.
+- `crates/sqe-coordinator/src/write_handler.rs`
+  - `handle_merge` (CoW) and `handle_merge_equality` (MoR) take a new
+    `source_schema_hint: Option<arrow_schema::SchemaRef>`. Zero batches carry
+    no schema, so the hint is what lets an empty source be registered as a
+    typed `MemTable` (`vec![vec![]]`) and the merge SQL be built at all. With
+    no hint both handlers fall back to the historical no-op.
+  - The `source_batches.is_empty()` early return moved below
+    `classify_merge_clauses` in both handlers and now returns
+    `affected_rows_batch(0)` (514) instead of `vec![]`.
+  - CoW reports the claimed-row count for the empty-source case instead of
+    `total_rows`: `total_rows` is the number of rows *written*, which is 0
+    after a BY SOURCE DELETE emptied the table.
+  - `scalar_count` was hoisted out of `check_merge_cardinality` to module
+    scope (with a `label` argument; the cardinality messages are unchanged) so
+    the empty-source count can reuse it.
+  - `handle_merge_dispatch` threads the hint through all seven call sites.
+- `crates/sqe-coordinator/src/query_handler.rs` — one added `let` in the
+  `StatementKind::Merge` arm derives the hint from the already-captured source
+  plan (`merge_source_logical.as_ref().map(|p| Arc::new(p.schema().as_arrow().clone()))`)
+  and passes it to `handle_merge_dispatch`.
+
+**Tests** (`cargo test -p sqe-coordinator --lib -- write_handler merge_sql`,
+112 passed / 0 failed)
+
+- `merge_sql::tests::empty_source_shortcut_requires_classification` — the
+  regression guard the acceptance criteria asked for: classification succeeds
+  with zero source columns, and the shortcut is false with a BY SOURCE clause,
+  true without one.
+- `merge_sql::tests::empty_source_by_source_delete_empties_target_end_to_end` —
+  3-row target, empty source `MemTable`, `WHEN NOT MATCHED BY SOURCE THEN
+  DELETE`: the CoW merge SELECT returns 0 rows (the table is emptied), the
+  claim-count query returns 3, and the MoR anti-join shape claims the same 3
+  rows. Both merge modes, at the SQL level.
+- `merge_sql::tests::empty_source_claim_count_honours_predicates_and_row_filter`
+  — a predicated BY SOURCE clause claims 2 of 3 rows; an EU-only caller claims
+  0 (202 interaction).
+- `merge_sql::tests::empty_source_claim_count_is_none_without_by_source_clauses`
+  — no count query when the statement is a genuine no-op.
+
+**Not covered by unit tests.** The commit-level assertion ("no new snapshot"
+for an empty source with only MATCHED / NOT MATCHED clauses) is by
+construction — both handlers return before the write and the commit — but
+asserting the snapshot count needs a live catalog, so it belongs in the docker
+e2e suite (`crates/sqe-coordinator/tests/it/`), as does an end-to-end
+`rows_affected = 3` over a real Iceberg table. The in-process harness in
+`merge_sql.rs` covers the SQL semantics only.

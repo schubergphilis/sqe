@@ -70,18 +70,29 @@
 //! than leaving zero live rows, specifically so the table never returns to
 //! the unprotected "no rows" state after its first claim.
 //!
-//! # Reader cost (accepted, documented, a later-phase concern)
+//! # Reader cost (bounded by manifest bounds since finding 511)
 //!
 //! [`try_acquire`]/[`renew`]/[`release`] each re-derive the current lease
-//! state for `job_key` by decoding every live data file in
-//! `maintenance_log` (there is no partitioning or file-level index on
-//! `table_name`/`trigger`), because the ledger's own advisory/success/
-//! failed/skipped job rows share the same table and file-per-row shape.
-//! This is O(total rows ever written to the ledger) per lease operation.
-//! Acceptable at Phase 4d's scale (a lease check per due table per
-//! scheduler tick, TTLs in minutes); if `maintenance_log` grows very large
-//! this should be revisited (e.g. partitioning by `table_name`), but that is
-//! out of scope here.
+//! state for `job_key` from the live data files of `maintenance_log`,
+//! because the ledger's own advisory/success/failed/skipped job rows share
+//! the same table and file-per-row shape. This USED to decode every one of
+//! those files -- O(total rows ever written to the ledger) per lease
+//! operation, on the critical path of every scheduled compaction.
+//!
+//! It no longer opens the job-history ones. Iceberg records per-column
+//! min/max per data file in the manifest, so `read_lease_rows` prunes on
+//! the `trigger` column's bounds and only reads files that could hold a
+//! lease row (`file_excludes_lease_rows`). That is a file-level index in
+//! all but name, and it needed no schema change. Two costs remain, both
+//! bounded: the manifest scan itself (one metadata read, O(files)), and
+//! files whose writer recorded no bounds (read, as before -- unknown bounds
+//! always mean "read it").
+//!
+//! Moving lease rows into their own partition (or their own table) would
+//! remove the manifest scan too, but both need a schema/partition-spec
+//! migration of an operator-created table, so they stay out of scope here.
+//! `crate::maintenance_log::compact_history` attacks the same cost from the
+//! other side by collapsing aged job history into one file per day.
 //!
 //! Run the integration test with
 //! `cargo test -p sqe-coordinator --features test-sqlite --test maintenance_lease_test`.
@@ -90,16 +101,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
-use iceberg::spec::{DataContentType, DataFile, ManifestStatus};
+use iceberg::spec::DataFile;
 use iceberg::table::Table as IcebergTable;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, ErrorKind};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use sqe_core::SqeError;
 
-use crate::maintenance_log::{resolve_state_table_ident, row_to_record_batch, MaintenanceLogRow};
+use crate::maintenance_log::{
+    collect_live_data_files, field_id, read_batches, resolve_state_table_ident,
+    row_to_record_batch, string_bounds, MaintenanceLogRow,
+};
 use crate::write_handler::is_conflict_message;
 use crate::writer::{
     new_upload_tracker, parse_parquet_compression, write_data_files, WriteCleanupGuard,
@@ -107,7 +121,12 @@ use crate::writer::{
 
 /// `trigger` value marking a `maintenance_log` row as lease bookkeeping
 /// rather than a job/advisory row.
-const LEASE_TRIGGER: &str = "lease";
+///
+/// `pub(crate)` so `crate::maintenance_log`'s retention pass can recognise
+/// -- and refuse to rewrite -- a file holding one. Moving a live claim into
+/// a day bundle would invalidate the exact-path delete the next
+/// `renew`/`release` CAS depends on.
+pub(crate) const LEASE_TRIGGER: &str = "lease";
 /// `status` value for a live claim.
 const LEASE_STATUS_CLAIMED: &str = "claimed";
 /// `status` value for a released tombstone (see the module docs: `release`
@@ -229,40 +248,30 @@ struct LiveLeaseRow {
     data_file: DataFile,
 }
 
-/// Collect every live (non-deleted, `DataContentType::Data`) data file in
-/// `table`'s current snapshot. Mirrors `write_handler::collect_data_files`
-/// (sequential rather than concurrency-limited: this table is small and
-/// this is a control-plane operation, not a hot write path).
-async fn collect_data_files(table: &IcebergTable) -> sqe_core::Result<Vec<DataFile>> {
-    let metadata_ref = table.metadata_ref();
-    let Some(snapshot) = metadata_ref.current_snapshot() else {
-        return Ok(vec![]);
-    };
-
-    let cache = table.object_cache();
-    let manifest_list = cache
-        .get_manifest_list(snapshot, &metadata_ref)
-        .await
-        .map_err(|e| {
-            SqeError::Execution(format!(
-                "maintenance_lease: failed to load manifest list: {e}"
-            ))
-        })?;
-
-    let mut data_files = Vec::new();
-    for mf in manifest_list.entries() {
-        let manifest = cache.get_manifest(mf).await.map_err(|e| {
-            SqeError::Execution(format!("maintenance_lease: failed to load manifest: {e}"))
-        })?;
-        for entry in manifest.entries() {
-            if entry.status() != ManifestStatus::Deleted
-                && entry.data_file().content_type() == DataContentType::Data
-            {
-                data_files.push(entry.data_file().clone());
-            }
-        }
+/// True when this file's recorded `trigger` bounds PROVE it holds no lease
+/// row, so [`read_lease_rows`] can skip opening it (review finding 511).
+///
+/// This is the file-level index the lease reads have instead of a
+/// partitioned or separate lease table: Iceberg already keeps per-column
+/// min/max per data file in the manifest, and `trigger` is exactly the
+/// column that separates lease bookkeeping from job history. A ledger file
+/// written by `append_row` holds one row, so its bounds are that row's
+/// value; a file written by the retention pass holds a day's rows, so its
+/// bounds are that day's range.
+///
+/// Conservative in the only direction that matters: `None` bounds (a writer
+/// that recorded none) means "unknown", and unknown means read the file.
+/// Truncated string bounds only ever widen the range, so a file that really
+/// does hold a lease row can never be pruned by this.
+///
+/// `pub(crate)` because `crate::maintenance_log`'s retention pass asks the
+/// same question for the opposite reason (it must never rewrite a file that
+/// might hold a lease row), and the two must not answer it differently.
+pub(crate) fn file_excludes_lease_rows(df: &DataFile, trigger_field_id: i32) -> bool {
+    match string_bounds(df, trigger_field_id) {
+        Some((lower, upper)) => lower > LEASE_TRIGGER || upper < LEASE_TRIGGER,
+        None => false,
     }
-    Ok(data_files)
 }
 
 /// Read one data file's single-row `RecordBatch` via the table's `FileIO`.
@@ -273,37 +282,8 @@ async fn read_single_row_batch(
     table: &IcebergTable,
     file_path: &str,
 ) -> sqe_core::Result<RecordBatch> {
-    let file_io = table.file_io();
-    let input = file_io.new_input(file_path).map_err(|e| {
-        SqeError::Execution(format!(
-            "maintenance_lease: failed to open '{file_path}': {e}"
-        ))
-    })?;
-    let bytes = input.read().await.map_err(|e| {
-        SqeError::Execution(format!(
-            "maintenance_lease: failed to read '{file_path}': {e}"
-        ))
-    })?;
-    let reader = parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new(bytes).map_err(|e| {
-        SqeError::Execution(format!(
-            "maintenance_lease: failed to open parquet reader for '{file_path}': {e}"
-        ))
-    })?;
-    let reader = reader.build().map_err(|e| {
-        SqeError::Execution(format!(
-            "maintenance_lease: failed to build parquet reader for '{file_path}': {e}"
-        ))
-    })?;
-    let batches: Vec<RecordBatch> =
-        reader
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                SqeError::Execution(format!(
-                    "maintenance_lease: failed to decode '{file_path}': {e}"
-                ))
-            })?;
-    batches
+    read_batches(table, file_path)
+        .await?
         .into_iter()
         .find(|b| b.num_rows() > 0)
         .ok_or_else(|| {
@@ -356,14 +336,28 @@ fn get_i64_col(batch: &RecordBatch, name: &str, file_path: &str) -> sqe_core::Re
 /// more than one defensively: the very first claim for a `job_key` is
 /// written via an unprotected `fast_append` (see the module docs' bootstrap
 /// gap), so a genuine race there can leave two.
+///
+/// Job-history files are skipped WITHOUT being opened whenever the manifest
+/// records `trigger` bounds for them (see [`file_excludes_lease_rows`]):
+/// that is what keeps a lease operation -- which runs on the critical path
+/// of every scheduled compaction -- from paying an object-store GET plus a
+/// Parquet decode per row the ledger has ever accumulated (finding 511).
+/// The manifest scan itself is still O(files), but it is one metadata read,
+/// not one read per file.
 async fn read_lease_rows(
     table: &IcebergTable,
     job_key: &str,
 ) -> sqe_core::Result<Vec<LiveLeaseRow>> {
-    let data_files = collect_data_files(table).await?;
+    let data_files = collect_live_data_files(table).await?;
+    let trigger_field_id = field_id(table, "trigger");
+    let mut pruned = 0usize;
     let mut out = Vec::new();
     for df in data_files {
         let path = df.file_path().to_string();
+        if trigger_field_id.is_some_and(|fid| file_excludes_lease_rows(&df, fid)) {
+            pruned += 1;
+            continue;
+        }
         let batch = read_single_row_batch(table, &path).await?;
         let trigger = get_str_col(&batch, "trigger", &path)?;
         if trigger != LEASE_TRIGGER {
@@ -388,6 +382,13 @@ async fn read_lease_rows(
             },
             data_file: df,
         });
+    }
+    if pruned > 0 {
+        debug!(
+            job_key = %job_key,
+            pruned_files = pruned,
+            "maintenance_lease: skipped job-history files via manifest trigger bounds"
+        );
     }
     Ok(out)
 }
@@ -924,5 +925,122 @@ mod tests {
         let b = generate_holder_id();
         assert!(!a.is_empty());
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn file_excludes_lease_rows_needs_bounds_to_prune() {
+        // The pure half of the pruning rule, stated as a table. The
+        // impure half (do real ledger files actually carry these bounds?)
+        // is what `bounds_pruning_e2e` below checks -- a rule that is
+        // right in the abstract and never fires in practice would be a
+        // fake fix.
+        for (lower, upper, expect_pruned) in [
+            ("scheduled", "scheduled", true),
+            ("advisory", "advisory", true),
+            ("lease", "lease", false),
+            ("advisory", "scheduled", false), // a mixed day bundle spans "lease"
+            ("lease", "scheduled", false),
+        ] {
+            let pruned = lower > LEASE_TRIGGER || upper < LEASE_TRIGGER;
+            assert_eq!(
+                pruned, expect_pruned,
+                "bounds ({lower}, {upper}) should prune = {expect_pruned}"
+            );
+        }
+    }
+
+    /// Does a real ledger file actually carry the `trigger` bounds
+    /// [`file_excludes_lease_rows`] prunes on? The whole "lease reads stop
+    /// scanning job history" claim of finding 511 rests on the answer, and
+    /// nothing else in the test suite would notice if the writer stopped
+    /// recording them: the pruning is a pure optimisation, so losing it is
+    /// invisible except as slowness.
+    #[cfg(feature = "test-sqlite")]
+    mod bounds_pruning_e2e {
+        use super::*;
+        use std::collections::{BTreeMap, HashMap};
+
+        use crate::maintenance_log::{
+            append_row, collect_live_data_files, field_id, maintenance_log_arrow_schema,
+            skipped_row,
+        };
+        use iceberg::{NamespaceIdent, TableCreation};
+        use sqe_core::SecretStore;
+
+        #[tokio::test]
+        async fn job_history_files_are_pruned_and_lease_files_are_not() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let catalog: Arc<dyn Catalog> = sqe_catalog::mount::build_catalog(
+                dir.path().to_str().expect("tempdir path is UTF-8"),
+                sqe_sql::CatalogKind::Sqlite,
+                &BTreeMap::new(),
+                &SecretStore::new(),
+            )
+            .await
+            .expect("sqlite catalog builds");
+
+            let ns = NamespaceIdent::new("sqe_system".to_string());
+            catalog
+                .create_namespace(&ns, HashMap::new())
+                .await
+                .expect("create namespace");
+            let schema = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(
+                &maintenance_log_arrow_schema(),
+            )
+            .expect("arrow schema converts");
+            catalog
+                .create_table(
+                    &ns,
+                    TableCreation::builder()
+                        .name("maintenance_log".to_string())
+                        .schema(schema)
+                        .build(),
+                )
+                .await
+                .expect("create maintenance_log");
+
+            // One job-history row and one lease claim.
+            let row = skipped_row("job-1", "ns.t", "svc", 1_000, "no eligible compaction debt");
+            append_row(&catalog, "sqe_system.maintenance_log", &row)
+                .await
+                .expect("append job row");
+            try_acquire(
+                &catalog,
+                "sqe_system.maintenance_log",
+                "ns.t",
+                "holder-a",
+                60,
+                2_000,
+            )
+            .await
+            .expect("acquire succeeds")
+            .expect("lease is acquirable");
+
+            let table = catalog
+                .load_table(&resolve_state_table_ident("sqe_system.maintenance_log"))
+                .await
+                .expect("load state table");
+            let fid = field_id(&table, "trigger").expect("the ledger has a `trigger` column");
+            let files = collect_live_data_files(&table)
+                .await
+                .expect("collect files");
+            assert_eq!(files.len(), 2, "one job row file, one lease claim file");
+
+            let pruned = files
+                .iter()
+                .filter(|df| file_excludes_lease_rows(df, fid))
+                .count();
+            assert_eq!(
+                pruned, 1,
+                "the job-history file must be pruned on its `trigger` bounds without being read; \
+                 if this is 0 the ledger writer stopped recording column bounds and every lease \
+                 operation is back to decoding all of job history"
+            );
+
+            // And the lease still reads correctly through the pruning.
+            let rows = read_lease_rows(&table, "ns.t").await.expect("read lease");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].state.holder_id, "holder-a");
+        }
     }
 }

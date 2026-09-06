@@ -27,6 +27,12 @@
 //! *reports*: Prometheus gauges, an `AuditKind::Maintenance` event, and a
 //! best-effort `maintenance_log` row.
 //!
+//! The daily ledger-retention pass (finding 511, below) also commits in
+//! `Advisory` mode -- but only against `sqe_system.maintenance_log`, this
+//! subsystem's own state table, which advisory mode already appends a row
+//! to on every tick. "Advisory mutates nothing" has always meant no USER
+//! table, and it still does.
+//!
 //! In `Active` mode (Phase 4b), `advisory_tick` delegates each due,
 //! opted-in table to `active_one_table` instead, which refreshes the
 //! maintenance session's token and commits a `rewrite_data_files` rewrite
@@ -45,6 +51,36 @@
 //! whose loop declines to run. That is the actual isolation guarantee;
 //! see the wiring in `sqe_server.rs`'s `run_coordinator`.
 //!
+//! # A tick discovers, decides, and hands off -- it never does the work
+//!
+//! (Review finding 511.) `advisory_tick` is a *scheduling* pass, not an
+//! execution pass. It costs one `list_namespaces` + one `list_tables` per
+//! namespace, plus a `load_table` only for tables it has never seen or
+//! whose cached properties have aged past
+//! `scheduler.discovery_cache_ticks` ticks (default 5); the listing itself
+//! is the change signal (a table that stops being listed is evicted). Every
+//! due table is then handed to a bounded [`JoinSet`] -- concurrency
+//! `scheduler.max_concurrent_jobs`, default 1, i.e. the same
+//! one-job-at-a-time behaviour as before -- and the tick returns
+//! immediately. A table whose previous job is still in flight is skipped
+//! (not queued twice) on the following tick.
+//!
+//! Three consequences worth stating out loud:
+//!
+//! - A 40-minute rewrite no longer delays health reporting for any other
+//!   table: it delays only the *permit*, and only when
+//!   `max_concurrent_jobs` is exhausted.
+//! - Both interval loops (`spawn` and `run_with_lease_renewal`) use
+//!   `MissedTickBehavior::Skip`, so a long job is followed by ONE tick, not
+//!   by a burst of every tick that was missed while it ran.
+//! - Tests (and shutdown) need an explicit join point, because "the tick
+//!   returned" no longer means "the work finished": see
+//!   [`MaintenanceScheduler::drain_inflight_jobs`].
+//!
+//! The scheduler also runs [`crate::maintenance_log::compact_history`] on a
+//! daily cadence (first tick after process start, then once per UTC day) so
+//! the one-Parquet-file-per-row ledger does not grow without bound.
+//!
 //! # `catalog_factory`: the test seam
 //!
 //! Building an `Arc<dyn Catalog>` for a minted session in production goes
@@ -60,11 +96,11 @@
 //! exercising the real `MaintenancePrincipal::mint_session` call (against a
 //! wiremock IdP) for everything upstream of catalog construction.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use croner::Cron;
 use iceberg::{Catalog, TableIdent};
@@ -73,6 +109,9 @@ use sqe_core::config::{
 };
 use sqe_core::{Session, SqeError};
 use sqe_sql::TableRef;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
 use crate::maintenance_lease::{self, LeaseHandle};
@@ -144,6 +183,187 @@ pub fn stable_holder_id() -> String {
     }
 }
 
+/// Lock a `std::sync::Mutex` guarding scheduler bookkeeping, recovering
+/// from poisoning instead of propagating a panic.
+///
+/// Every mutex this is used on guards a plain cache/bookkeeping value whose
+/// worst case after a panic is a stale entry (one extra `load_table`, one
+/// extra ledger row, one extra job). Turning that into a panic in the tick
+/// loop -- which the supervisor would then restart -- is strictly worse
+/// than carrying on with possibly-stale bookkeeping. Same pattern as
+/// `warned_invalid_schedules` below.
+fn lock_or_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// One table's cached discovery result. See
+/// [`MaintenanceScheduler::discover_tables`].
+struct CachedTable {
+    ident: TableIdent,
+    props: HashMap<String, String>,
+    loaded_at_tick: u64,
+}
+
+/// Cross-tick `(ident, properties)` cache keyed on `ident.to_string()`.
+///
+/// `tick` is a monotonically increasing counter of DISCOVERY passes, not
+/// wall-clock: the TTL the operator configures is "N ticks", so counting
+/// ticks is the honest unit, and it keeps the cache's behaviour identical
+/// whether the scheduler is running on its real cadence or being driven a
+/// tick at a time by a test.
+#[derive(Default)]
+struct DiscoveryCache {
+    tick: u64,
+    entries: HashMap<String, CachedTable>,
+}
+
+impl DiscoveryCache {
+    /// Start a new discovery pass and return its tick number. Saturating,
+    /// not wrapping: a wrapped counter would make every entry look
+    /// arbitrarily fresh or stale exactly once every 2^64 ticks, and
+    /// pinning the counter at `u64::MAX` (~584 billion years at a 1s tick)
+    /// merely degrades to "always fresh".
+    fn advance_tick(&mut self) -> u64 {
+        self.tick = self.tick.saturating_add(1);
+        self.tick
+    }
+
+    /// Evict every cached table that the catalog no longer lists. The
+    /// listing is the change signal: a dropped (or renamed) table must not
+    /// keep being scheduled off a cached property map.
+    fn retain_listed(&mut self, listed: &[TableIdent]) {
+        let live: HashSet<String> = listed.iter().map(|i| i.to_string()).collect();
+        self.entries.retain(|name, _| live.contains(name));
+    }
+
+    /// True when `name`'s cached properties are younger than `ttl_ticks`
+    /// discovery passes, i.e. may be reused without a `load_table`.
+    fn is_fresh(&self, name: &str, tick: u64, ttl_ticks: u64) -> bool {
+        self.entries
+            .get(name)
+            .is_some_and(|e| tick.saturating_sub(e.loaded_at_tick) < ttl_ticks)
+    }
+
+    fn insert(&mut self, ident: TableIdent, props: HashMap<String, String>) {
+        let tick = self.tick;
+        self.entries.insert(
+            ident.to_string(),
+            CachedTable {
+                ident,
+                props,
+                loaded_at_tick: tick,
+            },
+        );
+    }
+
+    /// The two structures a tick works from, in the shape the pre-cache
+    /// discovery loop produced them. Sorted by table name so a tick's
+    /// evaluation order is deterministic rather than `HashMap`-iteration
+    /// order (which decides who gets the first job permit).
+    #[allow(clippy::type_complexity)]
+    fn snapshot(
+        &self,
+    ) -> (
+        Vec<(String, HashMap<String, String>)>,
+        HashMap<String, TableIdent>,
+    ) {
+        let mut props_by_table: Vec<(String, HashMap<String, String>)> = self
+            .entries
+            .iter()
+            .map(|(name, e)| (name.clone(), e.props.clone()))
+            .collect();
+        props_by_table.sort_by(|a, b| a.0.cmp(&b.0));
+        let idents_by_table: HashMap<String, TableIdent> = self
+            .entries
+            .iter()
+            .map(|(name, e)| (name.clone(), e.ident.clone()))
+            .collect();
+        (props_by_table, idents_by_table)
+    }
+}
+
+/// The last `skipped` ledger row written per table, as
+/// `(schedule_window_start_ms, reason)`.
+///
+/// A table with no compaction debt is skipped on EVERY tick it is due, and
+/// each skip used to append one Parquet file to `maintenance_log` (finding
+/// 511's fourth arm). One row per table per schedule window per reason
+/// keeps the information -- "this table was considered and had nothing to
+/// do this window" -- without the file-per-tick growth.
+///
+/// Bounded by table count, not tick count: one entry per table, overwritten
+/// in place.
+#[derive(Default)]
+struct SkipLedger {
+    last: HashMap<String, (i64, String)>,
+}
+
+impl SkipLedger {
+    /// True when this skip is new information (a different table, a
+    /// different schedule window, or a different reason within the same
+    /// window) and should therefore be written to the ledger.
+    fn should_record(&mut self, table: &str, window_start_ms: i64, reason: &str) -> bool {
+        match self.last.get(table) {
+            Some((window, prev_reason))
+                if *window == window_start_ms && prev_reason.as_str() == reason =>
+            {
+                false
+            }
+            _ => {
+                self.last
+                    .insert(table.to_string(), (window_start_ms, reason.to_string()));
+                true
+            }
+        }
+    }
+}
+
+/// Identity of one scheduled per-table job, as the three recorders
+/// (`record_failed_job`, `record_skipped_job`,
+/// `record_skipped_insufficient_workers`) need it.
+///
+/// Grouped rather than passed as four loose arguments so a caller cannot
+/// hand one recorder this job's `job_id` and another its neighbour's
+/// `started_at_ms`, and so adding the schedule window (finding 511) did not
+/// push those signatures past readability.
+struct JobRecord<'a> {
+    job_id: &'a str,
+    ident: &'a TableIdent,
+    /// When the job started, for the ledger row's `started_at_ms`.
+    started_at_ms: i64,
+    /// The schedule window the job was scheduled FOR: the `skipped`-row
+    /// dedup key, never a scheduling input. See [`schedule_window_start_ms`].
+    window_start_ms: i64,
+}
+
+/// RAII claim on a job key in the scheduler's in-flight set: released on
+/// drop, which covers a normal return, a panic inside the job, and a
+/// `JoinSet::abort_all` at shutdown alike.
+struct InflightGuard {
+    set: Arc<Mutex<HashSet<String>>>,
+    key: String,
+}
+
+impl InflightGuard {
+    /// `Some(guard)` when `key` was not already in flight, `None` when it
+    /// was (the caller must then skip, not queue).
+    fn try_claim(set: &Arc<Mutex<HashSet<String>>>, key: &str) -> Option<Self> {
+        if !lock_or_recover(set).insert(key.to_string()) {
+            return None;
+        }
+        Some(Self {
+            set: Arc::clone(set),
+            key: key.to_string(),
+        })
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        lock_or_recover(&self.set).remove(&self.key);
+    }
+}
+
 /// The advisory and active auto-compaction scheduler.
 ///
 /// Holds everything one tick needs: the config gate/knobs, the dedicated
@@ -180,7 +400,42 @@ pub struct MaintenanceScheduler {
     catalog_factory: CatalogFactory,
     handler: Arc<crate::maintenance::MaintenanceHandler>,
     holder_id: String,
+    /// Cross-tick discovery cache (finding 511): `(ident, properties)` per
+    /// discovered table, refreshed at most once every
+    /// `scheduler.discovery_cache_ticks` ticks.
+    discovery: Arc<Mutex<DiscoveryCache>>,
+    /// Job keys (table idents, plus [`RETENTION_JOB_KEY`]) whose job is
+    /// spawned but not finished. A key in here is skipped, not queued
+    /// again, by the next tick.
+    inflight: Arc<Mutex<HashSet<String>>>,
+    /// Last `skipped` ledger row written per table, so a table with no debt
+    /// writes one row per schedule window instead of one per tick.
+    skip_ledger: Arc<Mutex<SkipLedger>>,
+    /// The bounded set every per-table job is spawned into. `tokio::sync::Mutex`
+    /// (not `std`) because [`Self::drain_inflight_jobs`] holds it across an
+    /// `await`.
+    jobs: Arc<tokio::sync::Mutex<JoinSet<()>>>,
+    /// `scheduler.max_concurrent_jobs` permits: what actually bounds the
+    /// `JoinSet` above (a `JoinSet` on its own bounds nothing).
+    job_permits: Arc<Semaphore>,
+    /// UTC day number of the last `maintenance_log` retention pass, so it
+    /// runs once a day rather than once a tick.
+    last_retention_day: Arc<Mutex<Option<i64>>>,
 }
+
+/// In-flight job key for the daily `maintenance_log` retention pass. Not a
+/// table ident (`ns.table`), and deliberately not parseable as one, so it
+/// can never collide with a real table's key in `inflight`.
+const RETENTION_JOB_KEY: &str = "<maintenance_log retention>";
+
+/// How much `maintenance_log` history the daily retention pass leaves
+/// alone. Rows younger than this are never rewritten (they are the rows a
+/// live lease CAS and a recent-history query care about); older rows are
+/// rewritten into one file per UTC day. Not a config knob: the procedure
+/// itself takes `retention_days` as a parameter, so an operator-driven
+/// `CALL` can pass any value; this is only the scheduler's own cadence
+/// default.
+const HISTORY_RETENTION_DAYS: i64 = 7;
 
 impl MaintenanceScheduler {
     pub fn new(
@@ -191,6 +446,7 @@ impl MaintenanceScheduler {
         catalog_factory: CatalogFactory,
         handler: Arc<crate::maintenance::MaintenanceHandler>,
     ) -> Self {
+        let max_concurrent_jobs = cfg.scheduler.max_concurrent_jobs.max(1);
         Self {
             cfg,
             principal,
@@ -199,6 +455,40 @@ impl MaintenanceScheduler {
             catalog_factory,
             handler,
             holder_id: stable_holder_id(),
+            discovery: Arc::new(Mutex::new(DiscoveryCache::default())),
+            inflight: Arc::new(Mutex::new(HashSet::new())),
+            skip_ledger: Arc::new(Mutex::new(SkipLedger::default())),
+            jobs: Arc::new(tokio::sync::Mutex::new(JoinSet::new())),
+            job_permits: Arc::new(Semaphore::new(max_concurrent_jobs)),
+            last_retention_day: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// A handle to the same scheduler for one spawned job: every field is
+    /// an `Arc` or a cheap clone, and every piece of MUTABLE state
+    /// (`discovery`, `inflight`, `skip_ledger`, `jobs`, `job_permits`,
+    /// `last_retention_day`) is shared, not copied -- a job's clone and the
+    /// tick loop's original are the same scheduler, seen from two tasks.
+    ///
+    /// Deliberately private and deliberately not a `Clone` impl: an
+    /// external caller that cloned this expecting an INDEPENDENT scheduler
+    /// would get one that silently shares the other's in-flight set and
+    /// lease identity.
+    fn clone_for_job(&self) -> Self {
+        Self {
+            cfg: self.cfg.clone(),
+            principal: Arc::clone(&self.principal),
+            metrics: Arc::clone(&self.metrics),
+            audit: self.audit.clone(),
+            catalog_factory: Arc::clone(&self.catalog_factory),
+            handler: Arc::clone(&self.handler),
+            holder_id: self.holder_id.clone(),
+            discovery: Arc::clone(&self.discovery),
+            inflight: Arc::clone(&self.inflight),
+            skip_ledger: Arc::clone(&self.skip_ledger),
+            jobs: Arc::clone(&self.jobs),
+            job_permits: Arc::clone(&self.job_permits),
+            last_retention_day: Arc::clone(&self.last_retention_day),
         }
     }
 
@@ -244,45 +534,17 @@ impl MaintenanceScheduler {
         let session = self.principal.mint_session(&job_id).await?;
         let catalog = (self.catalog_factory)(&session).await?;
 
-        let namespaces = catalog.list_namespaces(None).await.map_err(|e| {
-            SqeError::Catalog(format!("advisory_tick: failed to list namespaces: {e}"))
-        })?;
+        // Drop the bookkeeping for jobs that have already finished. Without
+        // this the `JoinSet` keeps one completed entry per job forever
+        // (nothing else ever joins them in production, where
+        // `drain_inflight_jobs` only runs at shutdown).
+        self.reap_finished_jobs().await;
 
-        let mut props_by_table: Vec<(String, HashMap<String, String>)> = Vec::new();
-        let mut idents_by_table: HashMap<String, TableIdent> = HashMap::new();
-
-        for ns in &namespaces {
-            let tables = match catalog.list_tables(ns).await {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(
-                        namespace = %ns,
-                        error = %e,
-                        "advisory_tick: failed to list tables; skipping namespace"
-                    );
-                    continue;
-                }
-            };
-            for ident in tables {
-                match crate::maintenance::load_table(&catalog, &ident).await {
-                    Ok(table) => {
-                        let name = ident.to_string();
-                        props_by_table.push((name.clone(), table.metadata().properties().clone()));
-                        idents_by_table.insert(name, ident);
-                    }
-                    Err(e) => {
-                        warn!(
-                            table = %ident,
-                            error = %e,
-                            "advisory_tick: failed to load table; skipping"
-                        );
-                    }
-                }
-            }
-        }
-
-        let enabled = select_enabled(&props_by_table);
         let now_ms = chrono::Utc::now().timestamp_millis();
+        self.maybe_spawn_history_retention(&catalog, now_ms).await;
+
+        let (props_by_table, idents_by_table) = self.discover_tables(&catalog).await?;
+        let enabled = select_enabled(&props_by_table);
         // Lookup for `resolve_schedule`'s per-table `sqe.maintenance.compaction.schedule`
         // override; built once per tick from the same discovery pass `select_enabled`
         // just filtered, so the gate and the override resolution can never see
@@ -311,32 +573,254 @@ impl MaintenanceScheduler {
             let Some(ident) = idents_by_table.get(&name) else {
                 continue;
             };
-            // Active mode compacts (Phase 4b); every other mode (today only
-            // `Advisory` reaches this loop -- `Off` never constructs a
-            // scheduler at all) keeps the pre-4b read-only report. This is
-            // the entire "advisory/off unchanged" boundary: `active_one_table`
-            // is the ONLY place in this file that ever commits to a user
-            // table.
-            match self.cfg.mode {
-                MaintenanceMode::Active => {
-                    self.active_one_table(&catalog, ident, now_ms).await;
-                }
-                _ => {
-                    if let Err(e) = self
-                        .analyze_one_table(&catalog, ident, &job_id, now_ms)
-                        .await
-                    {
-                        warn!(
-                            table = %name,
-                            error = %e,
-                            "advisory_tick: per-table analysis failed; continuing with other tables"
-                        );
+            // The schedule window this table is due FOR (the cron's fire
+            // instant, not "now"): the dedup key for `skipped` ledger rows,
+            // so a table with no debt writes one row per window instead of
+            // one per tick. `None` (invalid cron) cannot happen here --
+            // `table_due` already returned false for that -- but falling
+            // back to `now_ms` degrades to "never dedup", never to "dedup
+            // two different windows together".
+            let window_start_ms =
+                schedule_window_start_ms(&name, &schedule, self.cfg.scheduler.jitter_secs, now_ms)
+                    .unwrap_or(now_ms);
+
+            // One job per table at a time. A table whose previous job is
+            // still running is skipped, NOT queued a second time: queueing
+            // would let a table that takes longer than its schedule period
+            // build an unbounded backlog of jobs that each compact the same
+            // debt the one before it already handled.
+            let Some(inflight_guard) = InflightGuard::try_claim(&self.inflight, &name) else {
+                debug!(
+                    table = %name,
+                    "advisory_tick: previous job for this table is still in flight; skipping this tick"
+                );
+                continue;
+            };
+
+            // Hand off and move on. The tick's job is to DECIDE; the
+            // `JoinSet` (bounded by `job_permits`) does the work, so a slow
+            // rewrite delays neither this tick's remaining tables nor the
+            // next tick (finding 511).
+            let job = self.clone_for_job();
+            let job_catalog = Arc::clone(&catalog);
+            let job_ident = ident.clone();
+            let job_id = job_id.clone();
+            let job_name = name.clone();
+            let permits = Arc::clone(&self.job_permits);
+            self.jobs.lock().await.spawn(async move {
+                // Held for the whole job: dropping it (normal return, panic,
+                // or abort) is what frees the table for a later tick.
+                let _inflight_guard = inflight_guard;
+                // Acquire AFTER spawning, not before: `max_concurrent_jobs`
+                // bounds how many jobs RUN at once, and the tick must not
+                // block waiting for a permit on a table's behalf.
+                let Ok(_permit) = permits.acquire().await else {
+                    // Semaphore closed: the scheduler is shutting down.
+                    return;
+                };
+                // Active mode compacts (Phase 4b); every other mode (today
+                // only `Advisory` reaches this loop -- `Off` never
+                // constructs a scheduler at all) keeps the pre-4b read-only
+                // report. This is the entire "advisory/off unchanged"
+                // boundary: `active_one_table` is the ONLY place in this
+                // file that ever commits to a user table.
+                match job.cfg.mode {
+                    MaintenanceMode::Active => {
+                        job.active_one_table(&job_catalog, &job_ident, now_ms, window_start_ms)
+                            .await;
                     }
+                    _ => {
+                        if let Err(e) = job
+                            .analyze_one_table(&job_catalog, &job_ident, &job_id, now_ms)
+                            .await
+                        {
+                            warn!(
+                                table = %job_name,
+                                error = %e,
+                                "advisory_tick: per-table analysis failed; continuing with other tables"
+                            );
+                        }
+                    }
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Discover `(name, properties)` and `name -> ident` for every table
+    /// currently listed under the default warehouse, re-reading properties
+    /// from the catalog only when they are missing or stale.
+    ///
+    /// The listing (`list_namespaces` + `list_tables` per namespace) runs
+    /// every tick and is the change signal: a newly listed table is loaded
+    /// on the spot, a table that stops being listed is evicted from the
+    /// cache. What does NOT run every tick is `load_table`: a table whose
+    /// cached entry is younger than `scheduler.discovery_cache_ticks` ticks
+    /// reuses its cached properties. That is the difference between one
+    /// metadata.json GET per table per tick and one per table per N ticks,
+    /// per coordinator (finding 511).
+    ///
+    /// Staleness window, stated plainly: an operator who flips
+    /// `sqe.maintenance.enabled` (or a per-table `sqe.maintenance.*`
+    /// override) is picked up within `discovery_cache_ticks` ticks, not on
+    /// the next tick. Every property this cache serves only ever decides
+    /// WHETHER and WHEN to schedule a job; the job itself re-loads the
+    /// table (`analyze_one_table`/`active_one_table` both call
+    /// `load_table`) and re-resolves its overrides from that fresh copy, so
+    /// no rewrite ever runs with stale parameters.
+    ///
+    /// A `load_table` failure keeps whatever entry is already cached (the
+    /// table is still listed, so it still exists) and is otherwise the same
+    /// warn-and-skip as before: a table that has never loaded successfully
+    /// is simply absent from this tick's result.
+    async fn discover_tables(
+        &self,
+        catalog: &Arc<dyn Catalog>,
+    ) -> sqe_core::Result<(
+        Vec<(String, HashMap<String, String>)>,
+        HashMap<String, TableIdent>,
+    )> {
+        let namespaces = catalog.list_namespaces(None).await.map_err(|e| {
+            SqeError::Catalog(format!("advisory_tick: failed to list namespaces: {e}"))
+        })?;
+
+        let mut listed: Vec<TableIdent> = Vec::new();
+        for ns in &namespaces {
+            match catalog.list_tables(ns).await {
+                Ok(tables) => listed.extend(tables),
+                Err(e) => {
+                    warn!(
+                        namespace = %ns,
+                        error = %e,
+                        "advisory_tick: failed to list tables; skipping namespace"
+                    );
                 }
             }
         }
 
-        Ok(())
+        let ttl_ticks = self.cfg.scheduler.discovery_cache_ticks.max(1);
+        let stale: Vec<TableIdent> = {
+            let mut cache = lock_or_recover(&self.discovery);
+            let tick = cache.advance_tick();
+            cache.retain_listed(&listed);
+            listed
+                .iter()
+                .filter(|ident| !cache.is_fresh(&ident.to_string(), tick, ttl_ticks))
+                .cloned()
+                .collect()
+        };
+
+        let mut loaded: Vec<(TableIdent, HashMap<String, String>)> = Vec::new();
+        for ident in stale {
+            match crate::maintenance::load_table(catalog, &ident).await {
+                Ok(table) => loaded.push((ident, table.metadata().properties().clone())),
+                Err(e) => {
+                    warn!(
+                        table = %ident,
+                        error = %e,
+                        "advisory_tick: failed to load table; skipping"
+                    );
+                }
+            }
+        }
+
+        let mut cache = lock_or_recover(&self.discovery);
+        for (ident, props) in loaded {
+            cache.insert(ident, props);
+        }
+        Ok(cache.snapshot())
+    }
+
+    /// Join every job this scheduler has spawned and is still running.
+    ///
+    /// Since finding 511 a returned `advisory_tick` means "the work is
+    /// scheduled", not "the work is done". Callers that need the stronger
+    /// statement -- tests asserting on a compaction's effects, and a
+    /// graceful shutdown that would rather let a rewrite finish than abort
+    /// it mid-commit -- call this afterwards.
+    pub async fn drain_inflight_jobs(&self) {
+        let mut jobs = self.jobs.lock().await;
+        while jobs.join_next().await.is_some() {}
+    }
+
+    /// Abort every in-flight job. Used on cancellation, where the previous
+    /// (inline) implementation dropped a half-finished rewrite the same way
+    /// when the tick future itself was cancelled.
+    async fn abort_inflight_jobs(&self) {
+        self.jobs.lock().await.abort_all();
+    }
+
+    /// Reap already-finished jobs without blocking on the running ones.
+    async fn reap_finished_jobs(&self) {
+        let mut jobs = self.jobs.lock().await;
+        while jobs.try_join_next().is_some() {}
+    }
+
+    /// Spawn the `maintenance_log` retention pass at most once per UTC day
+    /// (finding 511's ledger arm).
+    ///
+    /// Deliberately does NOT take a `job_permits` permit: with the default
+    /// `max_concurrent_jobs = 1` that would make a control-plane
+    /// housekeeping pass block the very compaction work the scheduler
+    /// exists to run. It is guarded by the same in-flight set as a table
+    /// job (under [`RETENTION_JOB_KEY`]), so a slow pass is never started
+    /// twice.
+    ///
+    /// Multi-coordinator safe without a lease: the rewrite commit is a
+    /// `check_file_existence` CAS, so a second coordinator running the same
+    /// pass concurrently loses cleanly and no-ops (see
+    /// [`crate::maintenance_log::compact_history`]).
+    async fn maybe_spawn_history_retention(&self, catalog: &Arc<dyn Catalog>, now_ms: i64) {
+        let today = now_ms.div_euclid(86_400_000);
+        {
+            let mut last = lock_or_recover(&self.last_retention_day);
+            if *last == Some(today) {
+                return;
+            }
+            *last = Some(today);
+        }
+        let Some(guard) = InflightGuard::try_claim(&self.inflight, RETENTION_JOB_KEY) else {
+            return;
+        };
+
+        let catalog = Arc::clone(catalog);
+        let state_table = self.cfg.scheduler.state_table.clone();
+        self.jobs.lock().await.spawn(async move {
+            let _guard = guard;
+            match maintenance_log::compact_history(
+                &catalog,
+                &state_table,
+                HISTORY_RETENTION_DAYS,
+                now_ms,
+            )
+            .await
+            {
+                Ok(outcome) if outcome.is_noop() => {
+                    debug!(
+                        state_table = %state_table,
+                        "maintenance_log retention: nothing to compact"
+                    );
+                }
+                Ok(outcome) => {
+                    info!(
+                        state_table = %state_table,
+                        files_in = outcome.files_in,
+                        files_out = outcome.files_out,
+                        rows = outcome.rows,
+                        days = outcome.days,
+                        "maintenance_log retention: rewrote aged ledger rows into one file per day"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        state_table = %state_table,
+                        error = %e,
+                        "maintenance_log retention failed (best-effort, not fatal)"
+                    );
+                }
+            }
+        });
     }
 
     /// Analyze one table's compaction debt and report it. Read-only: the
@@ -433,7 +917,18 @@ impl MaintenanceScheduler {
     /// no log row, metric, or audit event, since there is no job to
     /// attribute one to. One table's compaction failing must never abort
     /// the tick or block any other opted-in table from being considered.
-    async fn active_one_table(&self, catalog: &Arc<dyn Catalog>, ident: &TableIdent, now_ms: i64) {
+    ///
+    /// `window_start_ms` is the schedule window this job was scheduled for
+    /// (the cron fire instant, from [`schedule_window_start_ms`]); it is
+    /// only ever used as the dedup key for `skipped` ledger rows, never to
+    /// decide whether to compact.
+    async fn active_one_table(
+        &self,
+        catalog: &Arc<dyn Catalog>,
+        ident: &TableIdent,
+        now_ms: i64,
+        window_start_ms: i64,
+    ) {
         let name = ident.to_string();
 
         let table = match crate::maintenance::load_table(catalog, ident).await {
@@ -502,6 +997,15 @@ impl MaintenanceScheduler {
 
         let job_id = uuid::Uuid::now_v7().to_string();
         let started_at_ms = now_ms;
+        // Everything the ledger/metric/audit recorders below need to
+        // identify this job, gathered once so the four of them cannot be
+        // handed inconsistent pieces of it.
+        let rec = JobRecord {
+            job_id: &job_id,
+            ident,
+            started_at_ms,
+            window_start_ms,
+        };
 
         // Eligibility: small-file debt (eligible_groups) OR ANY delete-heavy
         // file. `>= delete_file_threshold` (a per-file delete-COUNT
@@ -512,14 +1016,8 @@ impl MaintenanceScheduler {
         let has_eligible_work = health.eligible_groups > 0 || health.delete_heavy_files > 0;
         if !has_eligible_work {
             info!(table = %name, "active_tick: skipped, no eligible compaction debt");
-            self.record_skipped_job(
-                catalog,
-                &job_id,
-                ident,
-                started_at_ms,
-                "no eligible compaction debt",
-            )
-            .await;
+            self.record_skipped_job(catalog, &rec, "no eligible compaction debt")
+                .await;
             return;
         }
 
@@ -527,8 +1025,7 @@ impl MaintenanceScheduler {
             Ok(s) => s,
             Err(e) => {
                 warn!(table = %name, error = %e, "active_tick: failed to mint maintenance session");
-                self.record_failed_job(catalog, &job_id, ident, started_at_ms, &e.to_string())
-                    .await;
+                self.record_failed_job(catalog, &rec, &e.to_string()).await;
                 return;
             }
         };
@@ -544,9 +1041,7 @@ impl MaintenanceScheduler {
             );
             self.record_failed_job(
                 catalog,
-                &job_id,
-                ident,
-                started_at_ms,
+                &rec,
                 "minted maintenance session lacks write privilege",
             )
             .await;
@@ -573,8 +1068,7 @@ impl MaintenanceScheduler {
             Ok(c) => c,
             Err(e) => {
                 warn!(table = %name, error = %e, "active_tick: failed to build commit catalog");
-                self.record_failed_job(catalog, &job_id, ident, started_at_ms, &e.to_string())
-                    .await;
+                self.record_failed_job(catalog, &rec, &e.to_string()).await;
                 return;
             }
         };
@@ -583,8 +1077,7 @@ impl MaintenanceScheduler {
             Ok(t) => t,
             Err(e) => {
                 warn!(table = %name, error = %e, "active_tick: failed to build table reference");
-                self.record_failed_job(catalog, &job_id, ident, started_at_ms, &e.to_string())
-                    .await;
+                self.record_failed_job(catalog, &rec, &e.to_string()).await;
                 return;
             }
         };
@@ -640,15 +1133,8 @@ impl MaintenanceScheduler {
                 min_workers = dist.min_workers,
                 "active_tick: skipped, distribution.mode=require but the fleet is below min_workers"
             );
-            self.record_skipped_insufficient_workers(
-                catalog,
-                &job_id,
-                ident,
-                started_at_ms,
-                healthy,
-                dist.min_workers,
-            )
-            .await;
+            self.record_skipped_insufficient_workers(catalog, &rec, healthy, dist.min_workers)
+                .await;
             return;
         }
 
@@ -845,8 +1331,7 @@ impl MaintenanceScheduler {
             Ok(outcome) if outcome.skipped_reason.is_some() => {
                 let reason = outcome.skipped_reason.unwrap_or_default();
                 info!(table = %name, reason = %reason, "active_tick: rewrite_data_files skipped");
-                self.record_skipped_job(catalog, &job_id, ident, started_at_ms, &reason)
-                    .await;
+                self.record_skipped_job(catalog, &rec, &reason).await;
             }
             Ok(outcome) if outcome.partial => {
                 // Phase 4d Task 3: `distribution.partial_progress` opted in
@@ -943,8 +1428,7 @@ impl MaintenanceScheduler {
             }
             Err(e) => {
                 warn!(table = %name, error = %e, "active_tick: compaction failed");
-                self.record_failed_job(catalog, &job_id, ident, started_at_ms, &e.to_string())
-                    .await;
+                self.record_failed_job(catalog, &rec, &e.to_string()).await;
             }
         }
     }
@@ -958,17 +1442,15 @@ impl MaintenanceScheduler {
     async fn record_failed_job(
         &self,
         catalog: &Arc<dyn Catalog>,
-        job_id: &str,
-        ident: &TableIdent,
-        started_at_ms: i64,
+        rec: &JobRecord<'_>,
         error: &str,
     ) {
-        let name = ident.to_string();
+        let name = rec.ident.to_string();
         let row = maintenance_log::failed_row(
-            job_id,
+            rec.job_id,
             &name,
             &self.principal.user_id,
-            started_at_ms,
+            rec.started_at_ms,
             chrono::Utc::now().timestamp_millis(),
             error,
         );
@@ -979,9 +1461,9 @@ impl MaintenanceScheduler {
             .inc();
         if let Some(audit) = &self.audit {
             audit.log_event(build_failed_audit_event(
-                ident,
+                rec.ident,
                 &self.principal.user_id,
-                job_id,
+                rec.job_id,
                 error,
             ));
         }
@@ -993,32 +1475,64 @@ impl MaintenanceScheduler {
     /// `rewrite_data_files` itself reporting `skipped_reason`) so the
     /// job-total counter, the ledger, and the audit trail can never
     /// disagree about whether a job counted as skipped.
+    ///
+    /// # One ledger row per table per schedule window (finding 511)
+    ///
+    /// A table with no compaction debt is skipped on every tick it is due.
+    /// The ledger append is one Parquet FILE per row, so at `tick_secs = 60`
+    /// that was 1,440 files per idle table per day, forever, in the same
+    /// table the HA lease reads on the critical path of every compaction.
+    /// The row is therefore written only when this skip is new information:
+    /// a different `window_start_ms` (the schedule window the job was
+    /// scheduled for) or a different `reason` than the last row this
+    /// process wrote for this table.
+    ///
+    /// The metric and the audit event are deliberately NOT deduped. Those
+    /// two are bounded-cost, aggregate-shaped signals ("how often did we
+    /// decide to skip", "what did the maintenance principal do") that an
+    /// operator reads as rates; the ledger row is the unbounded, one-file-
+    /// per-write one. The counter therefore counts skip DECISIONS while the
+    /// ledger records skip WINDOWS -- they can differ by design, and that
+    /// difference is the fix, not a disagreement.
+    ///
+    /// The dedup state is per process: a coordinator restart re-writes one
+    /// row per table per window, which is the correct trade (bounded by
+    /// restarts, and a restart is exactly when an operator wants to see the
+    /// scheduler is alive).
     async fn record_skipped_job(
         &self,
         catalog: &Arc<dyn Catalog>,
-        job_id: &str,
-        ident: &TableIdent,
-        started_at_ms: i64,
+        rec: &JobRecord<'_>,
         reason: &str,
     ) {
-        let name = ident.to_string();
-        let row = maintenance_log::skipped_row(
-            job_id,
-            &name,
-            &self.principal.user_id,
-            started_at_ms,
-            reason,
-        );
-        self.append_job_row(catalog, &row).await;
+        let name = rec.ident.to_string();
+        let record_row =
+            lock_or_recover(&self.skip_ledger).should_record(&name, rec.window_start_ms, reason);
+        if record_row {
+            let row = maintenance_log::skipped_row(
+                rec.job_id,
+                &name,
+                &self.principal.user_id,
+                rec.started_at_ms,
+                reason,
+            );
+            self.append_job_row(catalog, &row).await;
+        } else {
+            debug!(
+                table = %name,
+                reason = %reason,
+                "active_tick: same skip already recorded for this schedule window; not appending a duplicate ledger row"
+            );
+        }
         self.metrics
             .maintenance_job_total
             .with_label_values(&["skipped"])
             .inc();
         if let Some(audit) = &self.audit {
             audit.log_event(build_skipped_audit_event(
-                ident,
+                rec.ident,
                 &self.principal.user_id,
-                job_id,
+                rec.job_id,
                 reason,
             ));
         }
@@ -1036,9 +1550,7 @@ impl MaintenanceScheduler {
     async fn record_skipped_insufficient_workers(
         &self,
         catalog: &Arc<dyn Catalog>,
-        job_id: &str,
-        ident: &TableIdent,
-        started_at_ms: i64,
+        rec: &JobRecord<'_>,
         healthy_workers: usize,
         min_workers: usize,
     ) {
@@ -1046,8 +1558,7 @@ impl MaintenanceScheduler {
             "insufficient_workers: distribution.mode=require needs >= {min_workers} \
              healthy workers, only {healthy_workers} are healthy"
         );
-        self.record_skipped_job(catalog, job_id, ident, started_at_ms, &reason)
-            .await;
+        self.record_skipped_job(catalog, rec, &reason).await;
         self.metrics
             .maintenance_skipped_total
             .with_label_values(&["insufficient_workers"])
@@ -1087,6 +1598,15 @@ impl MaintenanceScheduler {
         sqe_core::spawn_supervised("maintenance-scheduler", move |token| async move {
             let tick_secs = self.cfg.scheduler.tick_secs.max(1);
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(tick_secs));
+            // `Skip`, not the default `Burst` (finding 511): if the loop is
+            // ever held up past a tick boundary, resume on the next
+            // scheduled tick instead of firing once per missed tick back to
+            // back. A discovery pass is not free (a `list_tables` per
+            // namespace, plus a `load_table` per newly seen or aged-out
+            // table), and replaying it N times the instant a stall clears
+            // makes this loop the noisiest tenant on the catalog exactly
+            // when the catalog is recovering.
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     _ = token.cancelled() => break,
@@ -1100,6 +1620,13 @@ impl MaintenanceScheduler {
                     }
                 }
             }
+            // Jobs now outlive the tick that scheduled them, so cancelling
+            // the loop no longer cancels them implicitly. Abort explicitly,
+            // matching the pre-511 behaviour where cancelling the loop
+            // dropped the in-progress tick (and with it its rewrite) --
+            // Iceberg's optimistic commit means an aborted rewrite loses
+            // work, never corrupts a table.
+            self.abort_inflight_jobs().await;
         })
     }
 }
@@ -1459,6 +1986,12 @@ async fn run_with_lease_renewal<'a, T>(
     let mut fut = fut;
     let renew_every = std::time::Duration::from_secs((ttl_secs / 2).max(1));
     let mut ticker = tokio::time::interval(renew_every);
+    // `Skip`, not the default `Burst` (finding 511): a renewal that runs
+    // long (a slow catalog commit) must not be followed by a burst of
+    // back-to-back renewals, each of which is a real CAS commit against the
+    // shared state table. One renewal per half-TTL period is the whole
+    // point; catching up on missed ones renews nothing extra.
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     ticker.tick().await; // the first tick fires immediately; consume it so renewal starts one full half-TTL period in, not instantly.
     loop {
         tokio::select! {
@@ -1737,11 +2270,48 @@ pub fn table_due(
     tick_secs: u64,
     now_ms: i64,
 ) -> bool {
+    let Some((prev_fire_ms, adjusted_now_ms)) =
+        previous_fire_ms(ident, schedule, jitter_secs, now_ms)
+    else {
+        return false;
+    };
+    prev_fire_ms > adjusted_now_ms - (tick_secs as i64) * 1000
+}
+
+/// The schedule window `ident` is currently in: the cron's most recent fire
+/// instant at or before `now_ms` (jitter-adjusted, so two tables sharing a
+/// schedule but not a jitter offset are in different windows), in epoch ms.
+/// `None` for an invalid or unsatisfiable cron -- the same inputs for which
+/// [`table_due`] returns false.
+///
+/// Used as the dedup key for `skipped` ledger rows (finding 511): "already
+/// recorded for this window" has to mean the SCHEDULE window, not "within
+/// the last N seconds", or a table whose schedule fires more often than the
+/// dedup interval would silently stop recording skips.
+pub fn schedule_window_start_ms(
+    ident: &str,
+    schedule: &str,
+    jitter_secs: u64,
+    now_ms: i64,
+) -> Option<i64> {
+    previous_fire_ms(ident, schedule, jitter_secs, now_ms).map(|(fire_ms, _)| fire_ms)
+}
+
+/// Shared core of [`table_due`] and [`schedule_window_start_ms`]: the cron's
+/// most recent fire at or before the jitter-adjusted `now`, together with
+/// that adjusted `now`. `None` on an invalid cron (warned once per
+/// `(ident, schedule)` pair) or a `croner` search error.
+fn previous_fire_ms(
+    ident: &str,
+    schedule: &str,
+    jitter_secs: u64,
+    now_ms: i64,
+) -> Option<(i64, i64)> {
     let cron = match Cron::from_str(schedule) {
         Ok(c) => c,
         Err(e) => {
             warn_invalid_schedule_once(ident, schedule, &e);
-            return false;
+            return None;
         }
     };
 
@@ -1750,19 +2320,9 @@ pub fn table_due(
     // yields zero jitter delay rather than bypassing the schedule check.
     let offset_secs = jitter_offset_secs(ident, jitter_secs);
     let adjusted_now_ms = now_ms - (offset_secs as i64) * 1000;
-    let Some(adjusted_now) =
-        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(adjusted_now_ms)
-    else {
-        return false;
-    };
-
-    let prev_fire = match cron.find_previous_occurrence(&adjusted_now, true) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-
-    let window_start_ms = adjusted_now_ms - (tick_secs as i64) * 1000;
-    prev_fire.timestamp_millis() > window_start_ms
+    let adjusted_now = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(adjusted_now_ms)?;
+    let prev_fire = cron.find_previous_occurrence(&adjusted_now, true).ok()?;
+    Some((prev_fire.timestamp_millis(), adjusted_now_ms))
 }
 
 #[cfg(test)]
@@ -2239,5 +2799,543 @@ mod tests {
     #[test]
     fn select_enabled_empty_input_returns_empty() {
         assert!(select_enabled(&[]).is_empty());
+    }
+
+    // --- Discovery cache (finding 511, arm 1) ---
+
+    fn ident(ns: &str, name: &str) -> TableIdent {
+        TableIdent::new(
+            iceberg::NamespaceIdent::new(ns.to_string()),
+            name.to_string(),
+        )
+    }
+
+    #[test]
+    fn discovery_cache_entry_is_fresh_until_the_ttl_elapses() {
+        let mut cache = DiscoveryCache::default();
+        assert_eq!(cache.advance_tick(), 1);
+        cache.insert(ident("ns", "t"), HashMap::new());
+        // Loaded at tick 1 with a 5-tick TTL: reused on ticks 2..=5, and
+        // reloaded on tick 6 (age 5 is no longer "younger than 5").
+        for expected_tick in 2..=5 {
+            let tick = cache.advance_tick();
+            assert_eq!(tick, expected_tick);
+            assert!(
+                cache.is_fresh("ns.t", tick, 5),
+                "tick {tick}: a {}-tick-old entry must still be reused",
+                tick - 1
+            );
+        }
+        let tick = cache.advance_tick();
+        assert_eq!(tick, 6);
+        assert!(
+            !cache.is_fresh("ns.t", tick, 5),
+            "a 5-tick-old entry must be re-loaded under a 5-tick TTL"
+        );
+        assert_eq!(tick - 1, 5);
+    }
+
+    #[test]
+    fn discovery_cache_ttl_of_one_reloads_every_tick() {
+        let mut cache = DiscoveryCache::default();
+        cache.advance_tick();
+        cache.insert(ident("ns", "t"), HashMap::new());
+        let tick = cache.advance_tick();
+        assert!(
+            !cache.is_fresh("ns.t", tick, 1),
+            "ttl_ticks = 1 is the pre-cache behaviour: load on every tick"
+        );
+    }
+
+    #[test]
+    fn discovery_cache_never_serves_a_table_it_has_not_loaded() {
+        let mut cache = DiscoveryCache::default();
+        let tick = cache.advance_tick();
+        assert!(!cache.is_fresh("ns.never-seen", tick, 5));
+    }
+
+    #[test]
+    fn discovery_cache_evicts_tables_the_catalog_stopped_listing() {
+        let mut cache = DiscoveryCache::default();
+        cache.advance_tick();
+        cache.insert(ident("ns", "kept"), HashMap::new());
+        cache.insert(ident("ns", "dropped"), HashMap::new());
+
+        cache.retain_listed(&[ident("ns", "kept")]);
+
+        let (props, idents) = cache.snapshot();
+        assert_eq!(props.len(), 1);
+        assert_eq!(props[0].0, "ns.kept");
+        assert!(idents.contains_key("ns.kept"));
+        assert!(
+            !idents.contains_key("ns.dropped"),
+            "a table the catalog no longer lists must not keep being scheduled"
+        );
+    }
+
+    #[test]
+    fn discovery_cache_snapshot_is_sorted_by_table_name() {
+        let mut cache = DiscoveryCache::default();
+        cache.advance_tick();
+        for name in ["c", "a", "b"] {
+            cache.insert(ident("ns", name), HashMap::new());
+        }
+        let (props, _) = cache.snapshot();
+        let names: Vec<&str> = props.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["ns.a", "ns.b", "ns.c"]);
+    }
+
+    #[test]
+    fn discovery_cache_insert_refreshes_the_load_tick() {
+        let mut cache = DiscoveryCache::default();
+        cache.advance_tick();
+        cache.insert(ident("ns", "t"), HashMap::new());
+        let tick = cache.advance_tick();
+        assert!(!cache.is_fresh("ns.t", tick, 1));
+        // Re-loading at the current tick makes it fresh again.
+        cache.insert(ident("ns", "t"), HashMap::new());
+        assert!(cache.is_fresh("ns.t", tick, 1));
+    }
+
+    #[test]
+    fn discovery_cache_snapshot_returns_the_cached_properties() {
+        let mut cache = DiscoveryCache::default();
+        cache.advance_tick();
+        cache.insert(
+            ident("ns", "t"),
+            HashMap::from([(MAINTENANCE_ENABLED_PROPERTY.to_string(), "true".to_string())]),
+        );
+        let (props, _) = cache.snapshot();
+        assert_eq!(select_enabled(&props), vec!["ns.t".to_string()]);
+    }
+
+    // --- Skipped-row dedup (finding 511, arm 4) ---
+
+    #[test]
+    fn skip_ledger_writes_one_row_per_table_per_window() {
+        let mut ledger = SkipLedger::default();
+        let window = 1_700_000_000_000;
+        let recorded = (0..100)
+            .filter(|_| ledger.should_record("ns.idle", window, "no eligible compaction debt"))
+            .count();
+        assert_eq!(
+            recorded, 1,
+            "100 ticks with no debt must write exactly one skipped row for the table"
+        );
+    }
+
+    #[test]
+    fn skip_ledger_records_again_in_the_next_window() {
+        let mut ledger = SkipLedger::default();
+        let reason = "no eligible compaction debt";
+        assert!(ledger.should_record("ns.idle", 1_000, reason));
+        assert!(!ledger.should_record("ns.idle", 1_000, reason));
+        assert!(
+            ledger.should_record("ns.idle", 2_000, reason),
+            "a new schedule window is new information and must be recorded"
+        );
+    }
+
+    #[test]
+    fn skip_ledger_records_a_different_reason_in_the_same_window() {
+        let mut ledger = SkipLedger::default();
+        assert!(ledger.should_record("ns.idle", 1_000, "no eligible compaction debt"));
+        assert!(
+            ledger.should_record("ns.idle", 1_000, "insufficient_workers: ..."),
+            "a table that starts being skipped for a DIFFERENT reason must say so"
+        );
+        assert!(!ledger.should_record("ns.idle", 1_000, "insufficient_workers: ..."));
+    }
+
+    #[test]
+    fn skip_ledger_tracks_tables_independently() {
+        let mut ledger = SkipLedger::default();
+        let reason = "no eligible compaction debt";
+        assert!(ledger.should_record("ns.a", 1_000, reason));
+        assert!(
+            ledger.should_record("ns.b", 1_000, reason),
+            "one table's skip must never suppress another's"
+        );
+        assert!(!ledger.should_record("ns.a", 1_000, reason));
+        assert!(!ledger.should_record("ns.b", 1_000, reason));
+    }
+
+    // --- In-flight guard (finding 511, arm 2) ---
+
+    #[test]
+    fn inflight_guard_refuses_a_second_claim_and_frees_the_key_on_drop() {
+        let set = Arc::new(Mutex::new(HashSet::new()));
+        let first = InflightGuard::try_claim(&set, "ns.t").expect("first claim wins");
+        assert!(
+            InflightGuard::try_claim(&set, "ns.t").is_none(),
+            "a table whose job is still in flight must be skipped, not queued twice"
+        );
+        assert!(
+            InflightGuard::try_claim(&set, "ns.other").is_some(),
+            "a different table is unaffected"
+        );
+        drop(first);
+        assert!(
+            InflightGuard::try_claim(&set, "ns.t").is_some(),
+            "dropping the guard (return, panic, or abort) frees the table"
+        );
+    }
+
+    // --- Schedule window key ---
+
+    #[test]
+    fn schedule_window_start_ms_is_constant_across_a_window_and_moves_with_it() {
+        // Every minute, no jitter: two instants inside the same minute share
+        // a window; the next minute does not.
+        let base = utc_ms(2026, 9, 5, 12, 30, 5);
+        let same_window = utc_ms(2026, 9, 5, 12, 30, 55);
+        let next_window = utc_ms(2026, 9, 5, 12, 31, 5);
+
+        let w1 = schedule_window_start_ms("ns.t", "* * * * *", 0, base).expect("valid cron");
+        let w2 = schedule_window_start_ms("ns.t", "* * * * *", 0, same_window).expect("valid cron");
+        let w3 = schedule_window_start_ms("ns.t", "* * * * *", 0, next_window).expect("valid cron");
+
+        assert_eq!(w1, w2);
+        assert_ne!(w2, w3);
+        assert_eq!(w1, utc_ms(2026, 9, 5, 12, 30, 0));
+    }
+
+    #[test]
+    fn schedule_window_start_ms_is_none_for_an_invalid_cron() {
+        assert!(schedule_window_start_ms("ns.t", "not a cron", 0, 1_700_000_000_000).is_none());
+    }
+
+    #[test]
+    fn schedule_window_start_ms_agrees_with_table_due_on_the_daily_schedule() {
+        // 02:00:30 on the daily-02:00 schedule: due, and the window is the
+        // 02:00:00 fire it is due for.
+        let now = utc_ms(2026, 9, 5, 2, 0, 30);
+        assert!(table_due("ns.t", "0 2 * * *", 0, 60, now));
+        assert_eq!(
+            schedule_window_start_ms("ns.t", "0 2 * * *", 0, now),
+            Some(utc_ms(2026, 9, 5, 2, 0, 0))
+        );
+    }
+
+    /// End-to-end proof of the discovery cache against a REAL tick, with a
+    /// `catalog_factory` handing the scheduler a catalog that records every
+    /// `load_table` call (finding 511's first acceptance criterion).
+    ///
+    /// Uses the same SQLite-backed Iceberg harness as
+    /// `tests/maintenance_scheduler_test.rs`, but lives here rather than
+    /// there because an integration test cannot implement
+    /// `#[async_trait] iceberg::Catalog`: `async-trait` is a dependency of
+    /// this crate, not a dev-dependency, so the counting wrapper only
+    /// compiles inside the lib.
+    #[cfg(feature = "test-sqlite")]
+    mod discovery_cache_e2e {
+        use super::*;
+        use std::collections::BTreeMap;
+
+        use sqe_core::config::{
+            MaintenanceDistributionConfig, MaintenancePrincipalConfig, MaintenanceSchedulerConfig,
+        };
+        use sqe_core::{SecretStore, SecretString};
+        use tempfile::TempDir;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// Delegating `iceberg::Catalog` that counts `load_table` per table
+        /// ident. Everything else is pass-through: the point is to measure
+        /// the scheduler's catalog traffic, not to fake catalog behaviour.
+        #[derive(Debug)]
+        struct CountingCatalog {
+            inner: Arc<dyn Catalog>,
+            loads: Mutex<HashMap<String, usize>>,
+        }
+
+        impl CountingCatalog {
+            fn new(inner: Arc<dyn Catalog>) -> Self {
+                Self {
+                    inner,
+                    loads: Mutex::new(HashMap::new()),
+                }
+            }
+
+            fn loads_for(&self, table: &str) -> usize {
+                lock_or_recover(&self.loads)
+                    .get(table)
+                    .copied()
+                    .unwrap_or(0)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Catalog for CountingCatalog {
+            async fn list_namespaces(
+                &self,
+                parent: Option<&iceberg::NamespaceIdent>,
+            ) -> iceberg::Result<Vec<iceberg::NamespaceIdent>> {
+                self.inner.list_namespaces(parent).await
+            }
+            async fn create_namespace(
+                &self,
+                namespace: &iceberg::NamespaceIdent,
+                properties: HashMap<String, String>,
+            ) -> iceberg::Result<iceberg::Namespace> {
+                self.inner.create_namespace(namespace, properties).await
+            }
+            async fn get_namespace(
+                &self,
+                namespace: &iceberg::NamespaceIdent,
+            ) -> iceberg::Result<iceberg::Namespace> {
+                self.inner.get_namespace(namespace).await
+            }
+            async fn namespace_exists(
+                &self,
+                namespace: &iceberg::NamespaceIdent,
+            ) -> iceberg::Result<bool> {
+                self.inner.namespace_exists(namespace).await
+            }
+            async fn update_namespace(
+                &self,
+                namespace: &iceberg::NamespaceIdent,
+                properties: HashMap<String, String>,
+            ) -> iceberg::Result<()> {
+                self.inner.update_namespace(namespace, properties).await
+            }
+            async fn drop_namespace(
+                &self,
+                namespace: &iceberg::NamespaceIdent,
+            ) -> iceberg::Result<()> {
+                self.inner.drop_namespace(namespace).await
+            }
+            async fn list_tables(
+                &self,
+                namespace: &iceberg::NamespaceIdent,
+            ) -> iceberg::Result<Vec<TableIdent>> {
+                self.inner.list_tables(namespace).await
+            }
+            async fn create_table(
+                &self,
+                namespace: &iceberg::NamespaceIdent,
+                creation: iceberg::TableCreation,
+            ) -> iceberg::Result<iceberg::table::Table> {
+                self.inner.create_table(namespace, creation).await
+            }
+            async fn load_table(
+                &self,
+                table: &TableIdent,
+            ) -> iceberg::Result<iceberg::table::Table> {
+                *lock_or_recover(&self.loads)
+                    .entry(table.to_string())
+                    .or_insert(0) += 1;
+                self.inner.load_table(table).await
+            }
+            async fn drop_table(&self, table: &TableIdent) -> iceberg::Result<()> {
+                self.inner.drop_table(table).await
+            }
+            async fn table_exists(&self, table: &TableIdent) -> iceberg::Result<bool> {
+                self.inner.table_exists(table).await
+            }
+            async fn rename_table(
+                &self,
+                src: &TableIdent,
+                dest: &TableIdent,
+            ) -> iceberg::Result<()> {
+                self.inner.rename_table(src, dest).await
+            }
+            async fn register_table(
+                &self,
+                table: &TableIdent,
+                metadata_location: String,
+            ) -> iceberg::Result<iceberg::table::Table> {
+                self.inner.register_table(table, metadata_location).await
+            }
+            async fn update_table(
+                &self,
+                commit: iceberg::TableCommit,
+            ) -> iceberg::Result<iceberg::table::Table> {
+                self.inner.update_table(commit).await
+            }
+        }
+
+        async fn sqlite_catalog(dir: &TempDir) -> Arc<dyn Catalog> {
+            sqe_catalog::mount::build_catalog(
+                dir.path().to_str().expect("tempdir path is UTF-8"),
+                sqe_sql::CatalogKind::Sqlite,
+                &BTreeMap::new(),
+                &SecretStore::new(),
+            )
+            .await
+            .expect("sqlite catalog builds")
+        }
+
+        async fn create_table(catalog: &Arc<dyn Catalog>, ns: &str, name: &str) {
+            let ns_ident = iceberg::NamespaceIdent::new(ns.to_string());
+            if !catalog
+                .namespace_exists(&ns_ident)
+                .await
+                .expect("namespace_exists")
+            {
+                catalog
+                    .create_namespace(&ns_ident, HashMap::new())
+                    .await
+                    .expect("create namespace");
+            }
+            let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "id",
+                arrow_schema::DataType::Int64,
+                false,
+            )]));
+            let schema = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow_schema)
+                .expect("arrow schema converts");
+            let creation = iceberg::TableCreation::builder()
+                .name(name.to_string())
+                .schema(schema)
+                .properties(HashMap::new())
+                .build();
+            catalog
+                .create_table(&ns_ident, creation)
+                .await
+                .expect("create table");
+        }
+
+        async fn mock_idp() -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "fake-maintenance-catalog-token",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                })))
+                .mount(&server)
+                .await;
+            server
+        }
+
+        fn build_scheduler(
+            idp: &MockServer,
+            catalog: Arc<CountingCatalog>,
+            discovery_cache_ticks: u64,
+        ) -> MaintenanceScheduler {
+            let cfg = MaintenanceConfig {
+                mode: MaintenanceMode::Advisory,
+                principal: Some(MaintenancePrincipalConfig {
+                    token_endpoint: format!("{}/token", idp.uri()),
+                    client_id: "sqe-maintenance-test".to_string(),
+                    client_secret: SecretString::new("test-secret".to_string()),
+                    scope: None,
+                    user_id: "svc-sqe-maintenance".to_string(),
+                    roles: vec!["maintenance".to_string()],
+                    refresh_skew_secs: 60,
+                }),
+                scheduler: MaintenanceSchedulerConfig {
+                    jitter_secs: 0,
+                    schedule: "* * * * *".to_string(),
+                    discovery_cache_ticks,
+                    ..Default::default()
+                },
+                compaction: MaintenanceCompactionConfig::default(),
+                distribution: MaintenanceDistributionConfig::default(),
+            };
+            let principal = Arc::new(
+                MaintenancePrincipal::from_config(cfg.principal.as_ref().expect("principal set"))
+                    .expect("build principal"),
+            );
+            let metrics = Arc::new(sqe_metrics::MetricsRegistry::new().expect("metrics registry"));
+            let factory: CatalogFactory = {
+                Arc::new(move |_session: &Session| {
+                    let catalog: Arc<dyn Catalog> = Arc::clone(&catalog) as Arc<dyn Catalog>;
+                    Box::pin(async move { Ok(catalog) })
+                })
+            };
+            let handler = Arc::new(crate::maintenance::MaintenanceHandler::new(
+                toml::from_str(
+                    r#"
+[coordinator]
+[auth]
+[catalog]
+catalog_url = ""
+"#,
+                )
+                .expect("minimal SqeConfig parses"),
+            ));
+            MaintenanceScheduler::new(cfg, principal, metrics, None, factory, handler)
+        }
+
+        /// The acceptance criterion, literally: two consecutive ticks with
+        /// no property change call `load_table` at most once per table.
+        ///
+        /// The tables are deliberately NOT opted in, so the ONLY thing that
+        /// would load them is discovery -- an opted-in table's job loads it
+        /// again by design (the job never trusts cached properties).
+        #[tokio::test]
+        async fn two_consecutive_ticks_load_each_table_once() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let inner = sqlite_catalog(&dir).await;
+            for name in ["a", "b", "c"] {
+                create_table(&inner, "ns", name).await;
+            }
+            let counting = Arc::new(CountingCatalog::new(inner));
+            let idp = mock_idp().await;
+            let scheduler = build_scheduler(&idp, Arc::clone(&counting), 5);
+
+            scheduler.advisory_tick().await.expect("tick 1");
+            scheduler.drain_inflight_jobs().await;
+            scheduler.advisory_tick().await.expect("tick 2");
+            scheduler.drain_inflight_jobs().await;
+
+            for table in ["ns.a", "ns.b", "ns.c"] {
+                assert_eq!(
+                    counting.loads_for(table),
+                    1,
+                    "{table} must be loaded once across two ticks, not once per tick"
+                );
+            }
+        }
+
+        /// The cache is the DEFAULT, not the only behaviour:
+        /// `discovery_cache_ticks = 1` restores the pre-511
+        /// load-every-table-every-tick pass, which is what makes the knob
+        /// meaningful (and proves the two ticks above really did both run).
+        #[tokio::test]
+        async fn discovery_cache_ticks_of_one_loads_every_tick() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let inner = sqlite_catalog(&dir).await;
+            create_table(&inner, "ns", "a").await;
+            let counting = Arc::new(CountingCatalog::new(inner));
+            let idp = mock_idp().await;
+            let scheduler = build_scheduler(&idp, Arc::clone(&counting), 1);
+
+            scheduler.advisory_tick().await.expect("tick 1");
+            scheduler.drain_inflight_jobs().await;
+            scheduler.advisory_tick().await.expect("tick 2");
+            scheduler.drain_inflight_jobs().await;
+
+            assert_eq!(counting.loads_for("ns.a"), 2);
+        }
+
+        /// A table created between two ticks is picked up on the next one:
+        /// `list_tables` is the change signal, so a cache hit for the
+        /// tables it already knows never hides a NEW table.
+        #[tokio::test]
+        async fn a_newly_listed_table_is_loaded_on_the_next_tick() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let inner = sqlite_catalog(&dir).await;
+            create_table(&inner, "ns", "a").await;
+            let counting = Arc::new(CountingCatalog::new(inner.clone()));
+            let idp = mock_idp().await;
+            let scheduler = build_scheduler(&idp, Arc::clone(&counting), 5);
+
+            scheduler.advisory_tick().await.expect("tick 1");
+            scheduler.drain_inflight_jobs().await;
+            create_table(&inner, "ns", "b").await;
+            scheduler.advisory_tick().await.expect("tick 2");
+            scheduler.drain_inflight_jobs().await;
+
+            assert_eq!(counting.loads_for("ns.a"), 1, "already cached");
+            assert_eq!(
+                counting.loads_for("ns.b"),
+                1,
+                "a newly listed table must be loaded immediately, not after the TTL"
+            );
+        }
     }
 }

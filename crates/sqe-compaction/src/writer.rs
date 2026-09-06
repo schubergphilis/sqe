@@ -498,19 +498,28 @@ fn build_stamped_schema(iceberg_schema: &IcebergSchema) -> sqe_core::Result<Arc<
         .iter()
         .enumerate()
         .map(|(i, arrow_field)| {
-            let field_id = iceberg_fields
-                .get(i)
-                .map(|f| f.id)
-                .unwrap_or((i + 1) as i32);
+            // `expected_arrow_schema` is derived from `iceberg_schema`, so this
+            // lookup cannot miss. It used to fall back to a fabricated
+            // `(i + 1)` id, which would stamp a parquet column with an id that
+            // belongs to no Iceberg field (505). A missing target field is an
+            // error, never an invented id.
+            let field_id = iceberg_fields.get(i).map(|f| f.id).ok_or_else(|| {
+                SqeError::Execution(format!(
+                    "internal error: stamped schema column {i} ('{}') has no \
+                     Iceberg field (schema has {} fields)",
+                    arrow_field.name(),
+                    iceberg_fields.len()
+                ))
+            })?;
             let mut meta = arrow_field.metadata().clone();
             meta.insert("PARQUET:field_id".to_string(), field_id.to_string());
             // Mark all columns nullable. Safe default; avoids cross-batch null scan.
-            Arc::new(
+            Ok(Arc::new(
                 arrow_schema::Field::new(arrow_field.name(), arrow_field.data_type().clone(), true)
                     .with_metadata(meta),
-            )
+            ))
         })
-        .collect();
+        .collect::<sqe_core::Result<Vec<_>>>()?;
 
     Ok(Arc::new(ArrowSchema::new(new_fields)))
 }
@@ -519,10 +528,24 @@ fn build_stamped_schema(iceberg_schema: &IcebergSchema) -> sqe_core::Result<Arc<
 ///
 /// Casts columns whose type differs from the target schema (e.g. Timestamp(ns)
 /// -> Timestamp(µs)) and re-wraps the batch with the stamped schema.
+///
+/// Arity is checked first (505). `ArrowSchema::field(i)` is `&self.fields[i]`
+/// and panics past the end, so a batch wider than the target used to abort the
+/// write task mid-stream — the client saw a generic internal error and the log
+/// showed a panic instead of a SQL-level message. A mismatch on either side is
+/// a user error (`INSERT INTO t2 SELECT a, b, c` against a two-column `t2`) and
+/// is reported as one.
 fn apply_stamped_schema(
     batch: RecordBatch,
     stamped_schema: &Arc<ArrowSchema>,
 ) -> sqe_core::Result<RecordBatch> {
+    if batch.num_columns() != stamped_schema.fields().len() {
+        return Err(SqeError::Execution(format!(
+            "INSERT has {} columns but target has {}",
+            batch.num_columns(),
+            stamped_schema.fields().len()
+        )));
+    }
     let new_columns: Result<Vec<_>, _> = batch
         .columns()
         .iter()
@@ -847,6 +870,62 @@ impl<B: IcebergWriterBuilder> BoundedFanoutWriter<B> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    // ---- apply_stamped_schema arity (505) ------------------------------
+    //
+    // `ArrowSchema::field(i)` is `&self.fields[i]` and panics past the end, so
+    // a batch wider than the target used to abort the write task from inside a
+    // tokio task: the client saw a generic internal error, the log showed a
+    // panic, and the `WriteCleanupGuard` ran from `Drop` during unwinding.
+
+    fn arity_batch(cols: usize) -> RecordBatch {
+        let fields: Vec<arrow_schema::Field> = (0..cols)
+            .map(|i| arrow_schema::Field::new(format!("c{i}"), arrow_schema::DataType::Int32, true))
+            .collect();
+        let schema = Arc::new(arrow_schema::Schema::new(fields));
+        let columns: Vec<arrow_array::ArrayRef> = (0..cols)
+            .map(|i| {
+                Arc::new(arrow_array::Int32Array::from(vec![i as i32])) as arrow_array::ArrayRef
+            })
+            .collect();
+        RecordBatch::try_new(schema, columns).unwrap()
+    }
+
+    fn arity_schema(cols: usize) -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(
+            (0..cols)
+                .map(|i| {
+                    arrow_schema::Field::new(format!("c{i}"), arrow_schema::DataType::Int32, true)
+                })
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    #[test]
+    fn apply_stamped_schema_rejects_wider_batch() {
+        let err = apply_stamped_schema(arity_batch(3), &arity_schema(2))
+            .expect_err("a 3-column batch against a 2-field schema must be an error, not a panic");
+        assert!(
+            format!("{err}").contains("INSERT has 3 columns but target has 2"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_stamped_schema_rejects_narrower_batch() {
+        let err = apply_stamped_schema(arity_batch(1), &arity_schema(2)).expect_err("narrower");
+        assert!(
+            format!("{err}").contains("INSERT has 1 columns but target has 2"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_stamped_schema_accepts_matching_arity() {
+        let out = apply_stamped_schema(arity_batch(2), &arity_schema(2)).expect("matching arity");
+        assert_eq!(out.num_columns(), 2);
+        assert_eq!(out.num_rows(), 1);
+    }
 
     /// `parse_parquet_compression` maps "lz4" to the modern `LZ4_RAW` frame,
     /// not the deprecated Hadoop-framed `Compression::LZ4`. The distinction

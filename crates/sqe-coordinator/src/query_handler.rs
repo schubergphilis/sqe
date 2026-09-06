@@ -325,7 +325,12 @@ impl QueryHandler {
         // A table HEAD cannot validate a cached row filter, mask or local deny.
         // Default every policy implementation to no result reuse unless it
         // explicitly declares that it is a passthrough enforcer.
-        let query_cache = query_cache.filter(|_| policy_enforcer.permits_result_cache());
+        // Finding 902: the materialized result cache is allowed when the
+        // enforcer either applies no local policy or can fingerprint its
+        // policy state; hits are then bound to that fingerprint.
+        let query_cache = query_cache.filter(|_| {
+            policy_enforcer.permits_result_cache() || policy_enforcer.policy_fingerprint().is_some()
+        });
 
         let query_semaphore = if config.query.max_concurrent_queries > 0 {
             Some(Arc::new(tokio::sync::Semaphore::new(
@@ -1107,10 +1112,12 @@ impl QueryHandler {
         // Check result cache for read queries (before execution)
         if let StatementKind::Query(_) = &kind {
             if let Some(ref cache) = self.query_cache {
+                let policy_fingerprint = self.policy_enforcer.policy_fingerprint();
                 let authorized = cache
-                    .lookup_authorized(
+                    .lookup_bound(
                         &ResultCache::session_scope(session),
                         sql,
+                        policy_fingerprint.as_deref(),
                         |cached| async move {
                             self.authorize_cached_tables(session, &cached.tables_touched)
                                 .await
@@ -1559,9 +1566,10 @@ impl QueryHandler {
                 }
 
                 StatementKind::CreateTable(stmt) => {
-                    let result = self.write_handler.handle_create_table(session, stmt).await;
-                    crate::session_context::invalidate_session_cache(&session.user.username).await;
-                    result
+                    // The session-cache drop lives in
+                    // `WriteHandler::after_commit` with every other write path
+                    // (architecture review 507).
+                    self.write_handler.handle_create_table(session, stmt).await
                 }
 
                 // `CREATE EXTERNAL TABLE` (Hive/Athena) is classified separately
@@ -1715,15 +1723,19 @@ impl QueryHandler {
                             return Ok(written);
                         }
                         if let Some(ref query) = ct.query {
-                            // Handle CREATE OR REPLACE TABLE AS SELECT:
-                            // drop the existing table first, then create a new one.
-                            if ct.or_replace {
-                                self.drop_table_if_exists(session, &ct.name).await?;
-                            }
+                            // CREATE OR REPLACE TABLE AS SELECT is handled
+                            // inside the write handler (architecture review
+                            // 500). It used to drop the target here first —
+                            // against the DEFAULT warehouse, whatever catalog
+                            // the name qualified, and before the SELECT had
+                            // even been planned. The handler resolves the
+                            // target catalog, keeps the existing table until
+                            // the new data is written, and only then swaps.
+                            // The post-commit cache invalidation moved with it
+                            // (`WriteHandler::after_commit`, 507).
                             let select_sql = sqe_sql::rewrite_named_tvf_args(&format!("{query}"));
                             let (ctx, _) = self.create_session_context(session).await?;
-                            let result = self
-                                .write_handler
+                            self.write_handler
                                 .handle_ctas_streaming(
                                     session,
                                     stmt,
@@ -1732,12 +1744,7 @@ impl QueryHandler {
                                     &mut captured_plan,
                                     &mut policy_summary,
                                 )
-                                .await;
-                            crate::session_context::invalidate_session_cache(
-                                &session.user.username,
-                            )
-                            .await;
-                            result
+                                .await
                         } else {
                             Err(SqeError::Execution("CTAS without SELECT query".into()))
                         }
@@ -2136,6 +2143,14 @@ impl QueryHandler {
                         Some(sqe_lineage::PlanOrHint::Plan(p)) => Some(*p),
                         _ => None,
                     };
+                    // A source that returned zero batches carries no schema, but
+                    // WHEN NOT MATCHED BY SOURCE still has to run against the
+                    // whole target (architecture review 501). Hand the write
+                    // handler the source plan's Arrow schema so it can register
+                    // an empty but typed source relation.
+                    let merge_source_schema = merge_source_logical
+                        .as_ref()
+                        .map(|p| Arc::new(p.schema().as_arrow().clone()));
                     // Dispatch on `write.merge.mode` table property. Default CoW
                     // matches prior behaviour; `merge-on-read` routes to the
                     // equality-delete path when the target has a declared PK.
@@ -2148,6 +2163,7 @@ impl QueryHandler {
                             session,
                             stmt,
                             source_batches,
+                            merge_source_schema,
                             session_catalog,
                             &ctx,
                             merge_source_logical,
@@ -2269,27 +2285,18 @@ impl QueryHandler {
             result = Ok(crate::write_handler::affected_rows_batch(0));
         }
 
-        // Iceberg DML changes the table snapshot for every user. A cached
-        // DataFusion TableProvider is bound to the snapshot from which it was
-        // constructed, so invalidating only the writer lets another user plan
-        // a write or read against stale files until the session-cache TTL.
-        //
-        // The catalog bridge separately evicts matching metadata entries when
-        // the commit updates the table. Both layers therefore refresh without
-        // discarding unrelated tables and catalog clients.
-        if result.is_ok()
-            && matches!(
-                kind,
-                StatementKind::Insert(_)
-                    | StatementKind::Ctas(_)
-                    | StatementKind::Merge(_)
-                    | StatementKind::Delete(_)
-                    | StatementKind::Update(_)
-                    | StatementKind::Truncate(_)
-            )
-        {
-            crate::session_context::invalidate_all_session_caches().await;
-        }
+        // Findings 407 + 507: a DML commit drops the WRITER's cached
+        // SessionContext (refreshing the pieces bound to that user: Hive
+        // manifests, TVF MemTables) but not every user's, because
+        // `SqeSchemaProvider::table` resolves each table through
+        // `SessionCatalog::load_table` at planning time and the catalog bridge
+        // evicts that table for every token on commit (finding 302). That drop
+        // now happens at the commit site inside `WriteHandler::after_commit`,
+        // which every Iceberg write path reaches — including Flight `DoPut`
+        // ingest, which never passed through this function. The statement-kind
+        // match that used to sit here was a duplicate of it. The Hive arms keep
+        // their own explicit calls: they return early above and never reach the
+        // WriteHandler.
 
         // Record metrics and audit
         let duration = start.elapsed();
@@ -2341,9 +2348,10 @@ impl QueryHandler {
             if let Some(ref cache) = self.query_cache {
                 if matches!(&kind, StatementKind::Query(_)) {
                     if let Ok(ref batches) = result {
-                        cache.store(
+                        cache.store_bound(
                             &ResultCache::session_scope(session),
                             sql,
+                            self.policy_enforcer.policy_fingerprint(),
                             query_id,
                             batches.clone(),
                             tt_for_complete.clone(),
@@ -2396,6 +2404,12 @@ impl QueryHandler {
                         // Such entries have no secondary-index bucket for a
                         // targeted eviction. A successful MERGE must never
                         // leave those pre-write results observable.
+                        cache.invalidate_all();
+                    }
+                    // Schema, tag and rename DDL changes what a cached result
+                    // would contain (finding 902 follow-up: tag masks live on
+                    // the table, outside the policy fingerprint).
+                    StatementKind::AlterSchema(_) | StatementKind::Rename(_) => {
                         cache.invalidate_all();
                     }
                     _ => {}
@@ -6917,45 +6931,6 @@ impl QueryHandler {
         let batch = RecordBatch::try_new(schema, vec![Arc::new(role_b.finish()) as ArrayRef])
             .map_err(|e| SqeError::Execution(format!("Failed to build SHOW ROLES result: {e}")))?;
         Ok(vec![batch])
-    }
-
-    /// Drop a table if it exists — used for CREATE OR REPLACE TABLE.
-    async fn drop_table_if_exists(
-        &self,
-        session: &Session,
-        table_name: &sqlparser::ast::ObjectName,
-    ) -> sqe_core::Result<()> {
-        use crate::catalog_ops::resolve_table_ident;
-        use iceberg::Catalog;
-
-        let table_ident = resolve_table_ident(table_name, session)?;
-
-        let session_catalog = Arc::new(
-            SessionCatalog::for_session(
-                &self.config,
-                self.table_cache.clone(),
-                session.access_token().expose(),
-            )
-            .await?,
-        );
-
-        let catalog = session_catalog.as_catalog();
-        match catalog.table_exists(&table_ident).await {
-            Ok(true) => {
-                info!(table = %table_ident, "DROP existing table for CREATE OR REPLACE");
-                catalog.drop_table(&table_ident).await.map_err(|e| {
-                    SqeError::Catalog(format!("Failed to drop table for replace: {e}"))
-                })?;
-            }
-            Ok(false) => {}
-            Err(e) => {
-                return Err(SqeError::Catalog(format!(
-                    "Failed to check table existence for replace: {e}"
-                )));
-            }
-        }
-
-        Ok(())
     }
 }
 
