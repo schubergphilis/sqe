@@ -4,8 +4,6 @@ use std::time::Duration;
 use arrow_array::RecordBatch;
 use arrow_array::{builder::StringBuilder, ArrayRef, BooleanArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
-use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::TableReference;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -13,7 +11,9 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::JoinType;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::joins::HashJoinExec;
+use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::physical_plan::{execute_stream, ExecutionPlan};
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
 use tracing::Instrument;
@@ -441,7 +441,10 @@ impl QueryHandler {
     /// Exposed on `QueryHandler` so dispatch sites in this file and
     /// integration tests share one answer for "is this table Hive or
     /// Iceberg" instead of each growing their own detection.
-    pub fn resolve_table_kind(&self, table_ref: &TableReference) -> crate::hive_ddl_handler::TableKind {
+    pub fn resolve_table_kind(
+        &self,
+        table_ref: &TableReference,
+    ) -> crate::hive_ddl_handler::TableKind {
         self.hive_ddl_handler.resolve_table_kind(table_ref)
     }
 
@@ -1089,10 +1092,14 @@ impl QueryHandler {
         if let StatementKind::Query(_) = &kind {
             if let Some(ref cache) = self.query_cache {
                 let authorized = cache
-                    .lookup_authorized(&ResultCache::session_scope(session), sql, |cached| async move {
-                        self.authorize_cached_tables(session, &cached.tables_touched)
-                            .await
-                    })
+                    .lookup_authorized(
+                        &ResultCache::session_scope(session),
+                        sql,
+                        |cached| async move {
+                            self.authorize_cached_tables(session, &cached.tables_touched)
+                                .await
+                        },
+                    )
                     .await;
                 // On denial (or an authorization-check transport failure), the
                 // cache entry has already been evicted. Continue through normal
@@ -1305,8 +1312,7 @@ impl QueryHandler {
                                 "materialized views are not supported".to_string(),
                             )),
                         }
-                    } else if let sqlparser::ast::Statement::AlterTable(ref alter) = stmt.as_ref()
-                    {
+                    } else if let sqlparser::ast::Statement::AlterTable(ref alter) = stmt.as_ref() {
                         // The only ALTER TABLE shape that reaches this
                         // catch-all: every other variant already has a
                         // dedicated StatementKind (AlterSchema, AlterTableProps,
@@ -1317,11 +1323,12 @@ impl QueryHandler {
                         // Hive-specific naming; anything else falls to the
                         // generic error below unchanged, same as before this
                         // branch existed.
-                        if alter
-                            .operations
-                            .iter()
-                            .any(|op| matches!(op, sqlparser::ast::AlterTableOperation::AddPartitions { .. }))
-                        {
+                        if alter.operations.iter().any(|op| {
+                            matches!(
+                                op,
+                                sqlparser::ast::AlterTableOperation::AddPartitions { .. }
+                            )
+                        }) {
                             self.reject_if_hive_table(
                                 session,
                                 &table_reference_of(&alter.name),
@@ -1378,20 +1385,21 @@ impl QueryHandler {
                         ..
                     } = stmt.as_ref()
                     {
-                        names.first().map(|name| {
-                            (table_reference_of(name), *if_exists, *purge)
-                        })
+                        names
+                            .first()
+                            .map(|name| (table_reference_of(name), *if_exists, *purge))
                     } else {
                         None
                     };
-                    let routed_to_hive = match &hive_drop {
-                        Some((table_ref, if_exists, purge))
-                            if matches!(
-                                self.hive_ddl_handler.resolve_table_kind(table_ref),
-                                crate::hive_ddl_handler::TableKind::Hive { .. }
-                            ) =>
-                        {
-                            match self
+                    let routed_to_hive =
+                        match &hive_drop {
+                            Some((table_ref, if_exists, purge))
+                                if matches!(
+                                    self.hive_ddl_handler.resolve_table_kind(table_ref),
+                                    crate::hive_ddl_handler::TableKind::Hive { .. }
+                                ) =>
+                            {
+                                match self
                                 .hive_ddl_handler
                                 .drop_table(session, table_ref, *purge)
                                 .await
@@ -1405,9 +1413,9 @@ impl QueryHandler {
                                 }
                                 Err(e) => return Err(e),
                             }
-                        }
-                        _ => false,
-                    };
+                            }
+                            _ => false,
+                        };
                     if !routed_to_hive {
                         self.catalog_ops.drop_table(session, stmt).await?;
                     }
@@ -1549,7 +1557,10 @@ impl QueryHandler {
                 // disagree about), a new table under an already-attached
                 // root carries no such cross-session policy-key ambiguity.
                 StatementKind::CreateExternalTable(ref spec) => {
-                    let result = self.hive_ddl_handler.create_external_table(session, spec).await;
+                    let result = self
+                        .hive_ddl_handler
+                        .create_external_table(session, spec)
+                        .await;
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
                     result.map(|()| Vec::new())
                 }
@@ -1599,8 +1610,8 @@ impl QueryHandler {
                         // not, the failure modes swap.
                         if self.is_hive_table(session, &table_reference_of(&ct.name)) {
                             let (ctx, _) = self.create_session_context(session).await?;
-                            let select_sql = crate::hive_write::ctas_select_sql(ct)
-                                .ok_or_else(|| {
+                            let select_sql =
+                                crate::hive_write::ctas_select_sql(ct).ok_or_else(|| {
                                     SqeError::Execution("CTAS without SELECT query".into())
                                 })?;
 
@@ -1653,17 +1664,27 @@ impl QueryHandler {
                                     "hive_external: CTAS load produced no statement".into(),
                                 )
                             })?;
+                            // Gate the target before any object lands (503).
+                            self.hive_ddl_handler
+                                .refuse_write_if_denied(
+                                    session,
+                                    &table_reference_of(&ct.name),
+                                    "CREATE TABLE AS SELECT",
+                                )
+                                .await?;
                             let (load_ctx, _) = self.create_session_context(session).await?;
                             let written = crate::hive_write::handle_insert(
-                                &load_ctx, &load_stmt, &load,
+                                &load_ctx,
+                                &load_stmt,
+                                &load,
+                                self.policy_enforcer.as_ref(),
+                                &session.user,
+                                &mut policy_summary,
                             )
                             .await?;
                             if let Err(e) = self
                                 .hive_ddl_handler
-                                .refresh_index_after_write(
-                                    session,
-                                    &table_reference_of(&ct.name),
-                                )
+                                .refresh_index_after_write(session, &table_reference_of(&ct.name))
                                 .await
                             {
                                 return Err(SqeError::Execution(format!(
@@ -1720,11 +1741,25 @@ impl QueryHandler {
                         if let sqlparser::ast::TableObject::TableName(ref name) = ins.table {
                             let hive_ref = table_reference_of(name);
                             if self.is_hive_table(session, &hive_ref) {
+                                // Syntax first: an OVERWRITE is refused on the
+                                // statement alone, before any table lookup, so
+                                // the refusal cannot be masked by a lookup
+                                // error on a table that does not exist.
+                                crate::hive_write::reject_overwrite(stmt)?;
+                                // Gate the target before any object lands (503):
+                                // the post-write index refresh repeats the check,
+                                // but by then the files are in the bucket.
+                                self.hive_ddl_handler
+                                    .refuse_write_if_denied(session, &hive_ref, "INSERT")
+                                    .await?;
                                 let (ctx, _) = self.create_session_context(session).await?;
                                 let written = crate::hive_write::handle_insert(
                                     &ctx,
                                     stmt,
                                     &format!("{stmt}"),
+                                    self.policy_enforcer.as_ref(),
+                                    &session.user,
+                                    &mut policy_summary,
                                 )
                                 .await?;
 
@@ -1864,7 +1899,9 @@ impl QueryHandler {
                             )]));
                             let batch = RecordBatch::try_new(
                                 schema,
-                                vec![Arc::new(arrow_array::StringArray::from(vec![ddl])) as ArrayRef],
+                                vec![
+                                    Arc::new(arrow_array::StringArray::from(vec![ddl])) as ArrayRef
+                                ],
                             )
                             .map_err(|e| {
                                 SqeError::Execution(format!("Failed to create result batch: {e}"))
@@ -2086,7 +2123,11 @@ impl QueryHandler {
                     // Dispatch on `write.merge.mode` table property. Default CoW
                     // matches prior behaviour; `merge-on-read` routes to the
                     // equality-delete path when the target has a declared PK.
-                    self.write_handler
+                    // The target's own policy (row filter / masks, 202) is
+                    // audited together with the source summary above.
+                    let mut target_summary: Option<sqe_policy::PolicySummary> = None;
+                    let merged = self
+                        .write_handler
                         .handle_merge_dispatch(
                             session,
                             stmt,
@@ -2095,8 +2136,16 @@ impl QueryHandler {
                             &ctx,
                             merge_source_logical,
                             &mut captured_plan,
+                            &mut target_summary,
                         )
-                        .await
+                        .await;
+                    if let Some(target) = target_summary {
+                        match policy_summary.as_mut() {
+                            Some(source) => source.merge(&target),
+                            None => policy_summary = Some(target),
+                        }
+                    }
+                    merged
                 }
 
                 // Coordinator-wide DDL — ATTACH / DETACH mount and unmount
@@ -3086,9 +3135,16 @@ impl QueryHandler {
     ) -> sqe_core::Result<OpenStreamResult> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
 
-        let sql = self.handle_incremental(sql, &ctx, &session_catalog).await?;
+        let (sql, incremental_identities) =
+            self.handle_incremental(sql, &ctx, &session_catalog).await?;
         let (sql, tt_cleanup) = self
-            .handle_time_travel(&sql, &ctx, session, &session_catalog)
+            .handle_time_travel(
+                &sql,
+                &ctx,
+                session,
+                &session_catalog,
+                incremental_identities,
+            )
             .await?;
         // Apply Trino-compat AST rewrites before planning, matching the
         // execute() path. Today this matters for the empty-input ROLLUP /
@@ -3105,7 +3161,9 @@ impl QueryHandler {
             .instrument(plan_span)
             .await
             .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
-        let plan = df.logical_plan().clone();
+        // Pinned (time-travel / incremental) scans get their real table
+        // identity back before the policy rewriter sees the plan (400).
+        let plan = tt_cleanup.restore_identities(df.logical_plan().clone())?;
         // Streaming path: the audit entry is recorded by the
         // TrackedRecordBatchStream finalizer (not the `execute` path), so carry
         // the policy summary out to the caller, which stows it on the
@@ -3331,9 +3389,16 @@ impl QueryHandler {
             // tables with their augmented schemas. The FOR INCREMENTAL clause
             // must be stripped before handle_time_travel sees it because that
             // step parses the SQL with sqlparser.
-            let sql_for_plan = self.handle_incremental(sql, &ctx, &session_catalog).await?;
+            let (sql_for_plan, incremental_identities) =
+                self.handle_incremental(sql, &ctx, &session_catalog).await?;
             let (sql_for_plan, _tt_cleanup) = self
-                .handle_time_travel(&sql_for_plan, &ctx, session, &session_catalog)
+                .handle_time_travel(
+                    &sql_for_plan,
+                    &ctx,
+                    session,
+                    &session_catalog,
+                    incremental_identities,
+                )
                 .await?;
             let df = ctx
                 .sql(&sql_for_plan)
@@ -3449,14 +3514,21 @@ impl QueryHandler {
         // handle_time_travel call (which parses SQL) would fail if we left it
         // in place. handle_incremental strips the clause text and registers
         // an IncrementalTableProvider per target table.
-        let sql = self.handle_incremental(sql, &ctx, &session_catalog).await?;
+        let (sql, incremental_identities) =
+            self.handle_incremental(sql, &ctx, &session_catalog).await?;
         // Pre-process time travel: detect FOR SYSTEM_TIME AS OF, resolve
         // snapshot IDs, register snapshot-specific table providers, and
-        // strip the temporal clause. `_tt_cleanup` deregisters the pinned
+        // strip the temporal clause. `tt_cleanup` deregisters the pinned
         // providers when this function returns, so the bare table name
         // resolves to HEAD on the next query in the same session (#44).
-        let (sql, _tt_cleanup) = self
-            .handle_time_travel(&sql, &ctx, session, &session_catalog)
+        let (sql, tt_cleanup) = self
+            .handle_time_travel(
+                &sql,
+                &ctx,
+                session,
+                &session_catalog,
+                incremental_identities,
+            )
             .await?;
         // Pre-process Trino-compat AST patterns DataFusion does not natively
         // recognize. Today this only rewrites `CAST(v AS JSON)` to
@@ -3476,8 +3548,9 @@ impl QueryHandler {
             .await
             .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
 
-        // Get the logical plan and run policy enforcement
-        let plan = df.logical_plan().clone();
+        // Get the logical plan, give pinned scans their real identity back
+        // (400), and run policy enforcement.
+        let plan = tt_cleanup.restore_identities(df.logical_plan().clone())?;
         let (enforced_plan, policy_summary) = {
             let _policy_span = tracing::info_span!(
                 "sqe.policy_rewrite",
@@ -4196,12 +4269,7 @@ impl QueryHandler {
                     ),
                     std::time::Duration::from_secs(self.config.coordinator.worker_rpc_timeout_secs),
                 )
-                .with_message_limit(
-                    self.config
-                        .coordinator
-                        .transport
-                        .max_decoding_message_bytes,
-                );
+                .with_message_limit(self.config.coordinator.transport.max_decoding_message_bytes);
 
         // Attach worker registry for health tracking / failover
         exec = exec.with_worker_registry(Arc::clone(registry));
@@ -4269,11 +4337,7 @@ impl QueryHandler {
             Ok(p) => p,
             Err(e) => {
                 warn!(error = %e, "listing hive partitions failed; executing locally");
-                return local(
-                    &plan,
-                    &hive_node,
-                    format!("listing partitions failed: {e}"),
-                );
+                return local(&plan, &hive_node, format!("listing partitions failed: {e}"));
             }
         };
 
@@ -4794,8 +4858,9 @@ impl QueryHandler {
                     table_builder.append_value(name);
                 }
                 let table_array: ArrayRef = Arc::new(table_builder.finish());
-                let batch = RecordBatch::try_new(schema, vec![table_array])
-                    .map_err(|e| SqeError::Execution(format!("Failed to create result batch: {e}")))?;
+                let batch = RecordBatch::try_new(schema, vec![table_array]).map_err(|e| {
+                    SqeError::Execution(format!("Failed to create result batch: {e}"))
+                })?;
                 return Ok(vec![batch]);
             }
         }
@@ -4944,6 +5009,7 @@ impl QueryHandler {
         ctx: &SessionContext,
         session: &Session,
         session_catalog: &Arc<SessionCatalog>,
+        mut identities: Vec<(String, TableReference)>,
     ) -> sqe_core::Result<(String, TimeTravelCleanup)> {
         use sqlparser::ast::SetExpr;
         use sqlparser::dialect::GenericDialect;
@@ -4975,6 +5041,7 @@ impl QueryHandler {
                     Self::apply_version_spec(spec, ctx, &resolved_catalog, prefetch_concurrency)
                         .await?;
                 cleanup_aliases.push(alias.clone());
+                identities.push((alias.clone(), TableReference::from(spec.table.as_str())));
                 rewritten_for_version =
                     replace_table_reference(&rewritten_for_version, &spec.table, &alias);
             }
@@ -4991,7 +5058,10 @@ impl QueryHandler {
         })?;
 
         if statements.is_empty() {
-            return Ok((sql_for_ast, TimeTravelCleanup::new(ctx, cleanup_aliases)));
+            return Ok((
+                sql_for_ast,
+                TimeTravelCleanup::new(ctx, cleanup_aliases).with_identities(identities),
+            ));
         }
 
         let stmt = &mut statements[0];
@@ -5008,6 +5078,7 @@ impl QueryHandler {
                             session,
                             session_catalog,
                             cleanup,
+                            &mut identities,
                             prefetch_concurrency,
                         )
                         .await?
@@ -5022,6 +5093,7 @@ impl QueryHandler {
                                 session,
                                 session_catalog,
                                 cleanup,
+                                &mut identities,
                                 prefetch_concurrency,
                             )
                             .await?
@@ -5033,7 +5105,7 @@ impl QueryHandler {
             }
         }
 
-        let guard = TimeTravelCleanup::new(ctx, cleanup_aliases);
+        let guard = TimeTravelCleanup::new(ctx, cleanup_aliases).with_identities(identities);
         if found_time_travel {
             Ok((statements[0].to_string(), guard))
         } else if version_resolved {
@@ -5190,6 +5262,7 @@ impl QueryHandler {
     ///
     /// The alias is pushed into `cleanup` so the caller can deregister it
     /// once query execution completes.
+    #[allow(clippy::too_many_arguments)]
     async fn process_time_travel_table_factor(
         &self,
         relation: &mut TableFactor,
@@ -5197,6 +5270,7 @@ impl QueryHandler {
         session: &Session,
         session_catalog: &Arc<SessionCatalog>,
         cleanup: &mut Vec<String>,
+        identities: &mut Vec<(String, TableReference)>,
         prefetch_concurrency: usize,
     ) -> sqe_core::Result<bool> {
         use sqlparser::ast::TableVersion;
@@ -5262,6 +5336,7 @@ impl QueryHandler {
                         ))
                     })?;
                 cleanup.push(qualified.clone());
+                identities.push((qualified.clone(), TableReference::from(table_name.as_str())));
 
                 // Rewrite the AST to point at the qualified alias so the
                 // planner resolves it under the writable `datafusion.public`
@@ -5297,13 +5372,17 @@ impl QueryHandler {
         sql: &str,
         ctx: &SessionContext,
         session_catalog: &Arc<SessionCatalog>,
-    ) -> sqe_core::Result<String> {
+    ) -> sqe_core::Result<(String, Vec<(String, TableReference)>)> {
         let (mut rewritten, specs) = sqe_sql::extract_incremental_spec(sql)?;
         if specs.is_empty() {
-            return Ok(sql.to_string());
+            return Ok((sql.to_string(), Vec::new()));
         }
+        let mut identities = Vec::with_capacity(specs.len());
         for spec in &specs {
             let alias = Self::apply_incremental_spec(spec, ctx, session_catalog).await?;
+            // The alias hides the table from the policy rewriter; remember
+            // the real reference so the plan can be given it back (400).
+            identities.push((alias.clone(), TableReference::from(spec.table.as_str())));
             // Rewrite the table reference (e.g. `ns.events`) to the qualified
             // MemoryCatalog path (`datafusion.public.<alias>`). The replacement
             // is whole-token so `events.id` inside a SELECT list is preserved
@@ -5314,7 +5393,7 @@ impl QueryHandler {
             specs = specs.len(),
             "Handled FOR INCREMENTAL BETWEEN SNAPSHOT clauses"
         );
-        Ok(rewritten)
+        Ok((rewritten, identities))
     }
 
     /// Resolve one `IncrementalSpec` against the catalog, register an
@@ -6567,10 +6646,7 @@ impl QueryHandler {
                 max_bytes: self.config.hive.manifest_max_bytes,
                 max_columns: self.config.hive.manifest_max_columns,
                 max_partition_keys: self.config.hive.manifest_max_partition_keys,
-                max_partition_index_entries: self
-                    .config
-                    .hive
-                    .manifest_max_partition_index_entries,
+                max_partition_index_entries: self.config.hive.manifest_max_partition_index_entries,
             };
             let store = sqe_catalog::mount::build_hive_root(
                 &stmt.location,
@@ -6582,7 +6658,10 @@ impl QueryHandler {
             .await
             .map_err(SqeError::Execution)?;
             self.runtime_catalogs
-                .attach_hive_root(&stmt.name, sqe_catalog::hive::source::HiveRoot::from_store(store))
+                .attach_hive_root(
+                    &stmt.name,
+                    sqe_catalog::hive::source::HiveRoot::from_store(store),
+                )
                 .map_err(SqeError::Execution)?;
             hive_catalogs.insert(&stmt.name);
             crate::session_context::invalidate_all_session_caches().await;
@@ -6832,6 +6911,10 @@ impl QueryHandler {
 pub struct TimeTravelCleanup {
     ctx: SessionContext,
     qualified_aliases: Vec<String>,
+    /// `qualified alias -> the table reference the user wrote`, for every
+    /// pinned provider registered under `datafusion.public`. Consumed by
+    /// [`Self::restore_identities`].
+    identities: Vec<(String, TableReference)>,
 }
 
 impl TimeTravelCleanup {
@@ -6839,7 +6922,71 @@ impl TimeTravelCleanup {
         Self {
             ctx: ctx.clone(),
             qualified_aliases,
+            identities: Vec::new(),
         }
+    }
+
+    fn with_identities(mut self, identities: Vec<(String, TableReference)>) -> Self {
+        self.identities = identities;
+        self
+    }
+
+    /// Give every pinned scan its real table identity back before policy
+    /// enforcement (architecture review 400).
+    ///
+    /// Time-travel, version and incremental reads register their pinned
+    /// provider under `datafusion.public.__sqe_*` and rewrite the SQL to that
+    /// alias, so the planner's `TableScan` carried the alias. The policy
+    /// rewriter keys row filters, masks and tag lookups on the scan's
+    /// `TableReference`, found no policy for the alias, and treated the
+    /// `datafusion` catalog as reserved (known-no-tags): every fine-grained
+    /// control was inert on these paths, and the audit named the alias.
+    ///
+    /// The scan is renamed to the reference the user wrote and wrapped in a
+    /// `SubqueryAlias` carrying the old alias, so column qualifiers above it
+    /// stay valid while the rewriter, audit and lineage see the real table.
+    pub(crate) fn restore_identities(
+        &self,
+        plan: datafusion::logical_expr::LogicalPlan,
+    ) -> sqe_core::Result<datafusion::logical_expr::LogicalPlan> {
+        use datafusion::common::tree_node::{Transformed, TreeNodeRecursion};
+        use datafusion::logical_expr::{LogicalPlan, SubqueryAlias, TableScanBuilder};
+
+        if self.identities.is_empty() {
+            return Ok(plan);
+        }
+        let identities: std::collections::HashMap<&str, &TableReference> = self
+            .identities
+            .iter()
+            .map(|(alias, real)| (alias.as_str(), real))
+            .collect();
+        plan.transform_down_with_subqueries(|node| {
+            let LogicalPlan::TableScan(scan) = &node else {
+                return Ok(Transformed::no(node));
+            };
+            let alias = scan.table_name.to_string();
+            let Some(real) = identities.get(alias.as_str()) else {
+                return Ok(Transformed::no(node));
+            };
+            let renamed = TableScanBuilder::new((*real).clone(), Arc::clone(&scan.source))
+                .with_projection(scan.projection.clone())
+                .with_filters(scan.filters.clone())
+                .with_fetch(scan.fetch)
+                .build()?;
+            let aliased = SubqueryAlias::try_new(
+                Arc::new(LogicalPlan::TableScan(renamed)),
+                scan.table_name.clone(),
+            )?;
+            Ok(Transformed::new(
+                LogicalPlan::SubqueryAlias(aliased),
+                true,
+                TreeNodeRecursion::Jump,
+            ))
+        })
+        .map(|t| t.data)
+        .map_err(|e| {
+            SqeError::Execution(format!("restoring time-travel table identity failed: {e}"))
+        })
     }
 }
 
@@ -7460,7 +7607,11 @@ pub fn replace_scan_in_plan(
         .any(|(new, old)| !Arc::ptr_eq(new, old));
 
     if changed {
-        plan.clone().replace_children(new_children, ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute))
+        plan.clone()
+            .replace_children(
+                new_children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
             .unwrap_or_else(|_| Arc::clone(plan))
     } else {
         Arc::clone(plan)
@@ -7819,9 +7970,9 @@ impl QueryHandler {
             .hive_ddl_handler
             .resolve_table_kind_for_session(session.default_catalog.as_deref(), table_ref)
         {
-            crate::hive_ddl_handler::TableKind::Hive { .. } => {
-                Err(self.hive_ddl_handler.reject_unsupported(statement_label, cycle))
-            }
+            crate::hive_ddl_handler::TableKind::Hive { .. } => Err(self
+                .hive_ddl_handler
+                .reject_unsupported(statement_label, cycle)),
             crate::hive_ddl_handler::TableKind::Iceberg => Ok(()),
         }
     }
@@ -9907,6 +10058,91 @@ mod masking_policy_resolution_tests {
         assert_eq!(
             resolve_masking_policy_tag(&policies, "mask_ssn").expect("resolves"),
             "PII"
+        );
+    }
+
+    /// 400: a pinned provider registered under a `datafusion.public.__sqe_*`
+    /// alias must present the user's table reference to the policy rewriter
+    /// and the audit, while the plan above the scan keeps resolving.
+    #[tokio::test]
+    async fn restore_identities_renames_pinned_scans_and_keeps_the_plan_valid() {
+        use crate::query_handler::TimeTravelCleanup;
+        use arrow_array::Int32Array;
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::common::TableReference;
+        use datafusion::datasource::MemTable;
+        use datafusion::logical_expr::LogicalPlan;
+        use datafusion::prelude::SessionContext;
+        use std::sync::Arc;
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let alias = "datafusion.public.__sqe_tt_orders_abc";
+        ctx.register_table(
+            alias,
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),
+        )
+        .unwrap();
+        let cleanup = TimeTravelCleanup::new(&ctx, vec![]).with_identities(vec![(
+            alias.to_string(),
+            TableReference::from("sales.orders"),
+        )]);
+
+        let plan = ctx
+            .state()
+            .create_logical_plan(&format!(
+                "SELECT o.id FROM {alias} AS o WHERE o.id > 1 AND o.id IN (SELECT id FROM {alias})"
+            ))
+            .await
+            .unwrap();
+        let restored = cleanup.restore_identities(plan).unwrap();
+
+        let mut names = Vec::new();
+        restored
+            .apply_with_subqueries(|node| {
+                if let LogicalPlan::TableScan(scan) = node {
+                    names.push(scan.table_name.to_string());
+                }
+                Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+        assert_eq!(
+            names,
+            vec!["sales.orders".to_string(), "sales.orders".to_string()],
+            "every pinned scan, including the one inside the subquery, carries the real name"
+        );
+
+        let batches = ctx
+            .execute_logical_plan(restored)
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 2, "the renamed plan still resolves and executes");
+
+        // No identities registered: the plan is returned untouched.
+        let plain = TimeTravelCleanup::new(&ctx, vec![]);
+        let plan = ctx
+            .state()
+            .create_logical_plan(&format!("SELECT id FROM {alias}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            format!(
+                "{}",
+                plain
+                    .restore_identities(plan.clone())
+                    .unwrap()
+                    .display_indent()
+            ),
+            format!("{}", plan.display_indent())
         );
     }
 }

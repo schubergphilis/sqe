@@ -4,7 +4,8 @@
 - Severity: high
 - Category: security
 - Effort: M (days)
-- Status: open
+- Status: fixed (branch `fix/authz-policy-enforcement-p1`, 2026-09-05)
+- Issue: #554
 
 ## Problem
 
@@ -91,3 +92,7 @@ copied, not called.
 
 - 200 (subquery bypass), 202 (MERGE target not gated), 205 (SHOW STATS leak).
 - Issue #205 (read-side fix that created the drift).
+
+## Resolution (2026-09-05)
+
+`resolve_policy_key` in `crates/sqe-policy/src/plan_rewriter.rs` is now the single derivation of the `(namespace, table)` policy key, and `resolve_policy_key_for_ident` adapts the catalog/namespace/table triple that the write and Hive paths hold into the same function. `compute_write_predicates` (write_handler) uses the full dotted namespace instead of the last segment, `info_schema.rs` looks tags up under the same key, and the write-predicate and Ranger `hive_database` docs state which key they expect. Unit test `ident_and_table_ref_keys_agree` pins the ident and `TableReference` derivations to the same result for bare, partial, full and Hive-catalog references; `hive_tag_source_test` uses the production function instead of a test shim.

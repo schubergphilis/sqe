@@ -5,6 +5,7 @@
 - Category: operability
 - Effort: M
 - Status: fixed (branch `fix/config-startup-code-structure`, 2026-09-05)
+- Issue: #634
 
 ## Resolution (2026-09-05)
 
