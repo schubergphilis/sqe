@@ -4,13 +4,21 @@
 //! `X-Trino-Prepared-Statement: name=<urlencoded-sql>` header on every request
 //! (it accumulates them from the `X-Trino-Added-Prepare` response headers SQE
 //! already emits). So the server needs no statement store: when a body is
-//! `EXECUTE <name> [USING ...]` we look the template up in the header map and
-//! substitute the `USING` arguments into its `?` placeholders. `EXECUTE
+//! `EXECUTE <name> [USING ...]` the server looks the template up in the header
+//! map and binds the `USING` arguments into its `?` placeholders. `EXECUTE
 //! IMMEDIATE '<sql>' [USING ...]` carries the SQL inline.
+//!
+//! The statement itself is parsed by the SQL front door
+//! (`sqe_sql::StatementKind::Execute` carries the name and the already-parsed
+//! `USING` expressions); this module only owns the header codec and the bind
+//! step. Binding uses [`sqe_core::substitute_placeholders`], the one
+//! comment-aware placeholder scanner shared with the Flight SQL
+//! `DoPutPreparedStatement` path (finding 708).
 
 use std::collections::HashMap;
 
 use sqe_core::substitute_placeholders;
+use sqlparser::ast::Expr;
 
 /// Parse `X-Trino-Prepared-Statement` header value(s) into a name->SQL map.
 ///
@@ -56,142 +64,30 @@ pub fn form_urlencode(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
-/// Strip a leading uppercase keyword (with trailing space) case-insensitively,
-/// returning the case-preserved remainder.
-fn strip_kw<'a>(s: &'a str, upper: &str, kw: &str) -> Option<&'a str> {
-    if upper.starts_with(kw) {
-        Some(&s[kw.len()..])
-    } else {
-        None
-    }
-}
-
-/// Split `s` on top-level `delim`, ignoring delimiters inside single-quoted
-/// strings or `()`/`[]` groups.
-fn split_top_level(s: &str, delim: char) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut depth: i32 = 0;
-    let mut in_single = false;
-    let mut seg_start = 0usize;
-    for (idx, c) in s.char_indices() {
-        if in_single {
-            if c == '\'' {
-                in_single = false;
-            }
-            continue;
-        }
-        match c {
-            '\'' => in_single = true,
-            '(' | '[' => depth += 1,
-            ')' | ']' => depth -= 1,
-            _ if c == delim && depth == 0 => {
-                out.push(s[seg_start..idx].to_string());
-                seg_start = idx + c.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    out.push(s[seg_start..].to_string());
-    out
-}
-
-/// Parse a leading single-quoted SQL string literal (with `''` escaping).
-/// Returns the unescaped content and the remainder after the closing quote.
-fn parse_string_literal(s: &str) -> Option<(String, &str)> {
-    let s = s.trim_start();
-    let mut chars = s.char_indices();
-    if chars.next().map(|(_, c)| c) != Some('\'') {
-        return None;
-    }
-    let mut content = String::new();
-    while let Some((idx, c)) = chars.next() {
-        if c == '\'' {
-            let mut peek = chars.clone();
-            if let Some((_, '\'')) = peek.next() {
-                content.push('\'');
-                chars.next();
-                continue;
-            }
-            return Some((content, &s[idx + c.len_utf8()..]));
-        }
-        content.push(c);
-    }
-    None
-}
-
-/// Parse an optional trailing `USING a, b, ...` clause into raw SQL-literal
-/// argument strings. An empty tail yields no arguments.
-fn parse_using(after: &str) -> Result<Vec<String>, String> {
-    let after = after.trim();
-    if after.is_empty() {
-        return Ok(vec![]);
-    }
-    let upper = after.to_uppercase();
-    match strip_kw(after, &upper, "USING ") {
-        Some(rest) => Ok(split_top_level(rest, ',')
-            .into_iter()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()),
-        None => Err(format!("expected USING clause but found: {after}")),
-    }
-}
-
-/// If `sql` is an `EXECUTE` statement, resolve it to concrete SQL; otherwise
-/// return `Ok(None)` so the caller runs `sql` unchanged.
-///
-/// - `EXECUTE <name> [USING a, b, ...]` -> look up `<name>` (error if absent),
-///   substitute the `USING` args into the template's `?` placeholders.
-/// - `EXECUTE IMMEDIATE '<sql>' [USING ...]` -> bind into the inline SQL.
-pub fn rewrite_execute(
-    sql: &str,
-    prepared: &HashMap<String, String>,
-) -> Result<Option<String>, String> {
-    let trimmed = sql.trim().trim_end_matches(';').trim();
-    let upper = trimmed.to_uppercase();
-
-    // EXECUTE IMMEDIATE '<sql>' [USING ...] -- inline SQL, checked first since
-    // "EXECUTE IMMEDIATE " also starts with "EXECUTE ".
-    if let Some(rest) = strip_kw(trimmed, &upper, "EXECUTE IMMEDIATE ") {
-        let (inline_sql, after) = parse_string_literal(rest)
-            .ok_or_else(|| "EXECUTE IMMEDIATE requires a quoted SQL string".to_string())?;
-        let args = parse_using(after)?;
-        return substitute_placeholders(&inline_sql, &args).map(Some);
-    }
-
-    // EXECUTE <name> [USING ...] -- resolve <name> from the header-carried map.
-    if let Some(rest) = strip_kw(trimmed, &upper, "EXECUTE ") {
-        let rest = rest.trim();
-        let (name, after) = match rest.find(char::is_whitespace) {
-            Some(idx) => (&rest[..idx], &rest[idx..]),
-            None => (rest, ""),
-        };
-        let name = name.trim();
-        if name.is_empty() {
-            return Err("EXECUTE requires a statement name".to_string());
-        }
-        let template = prepared.get(name).ok_or_else(|| {
-            format!(
-                "prepared statement '{name}' not found; the client must carry it \
-                 in the X-Trino-Prepared-Statement header"
-            )
-        })?;
-        let args = parse_using(after)?;
-        return substitute_placeholders(template, &args).map(Some);
-    }
-
-    Ok(None)
+/// Bind the parsed `USING` expressions of an `EXECUTE` into `template`'s `?`
+/// placeholders. Each expression is rendered back to SQL text (`1`, `'foo'`,
+/// `DATE '2020-01-01'`) and spliced by [`substitute_placeholders`], which
+/// skips `?` inside strings, quoted identifiers, dollar quotes and `--` /
+/// `/* */` comments, so `SELECT ? /* why? */` binds exactly one value. A
+/// count mismatch is an error rather than a partial bind.
+pub fn bind_execute(template: &str, params: &[Expr]) -> Result<String, String> {
+    let literals: Vec<String> = params.iter().map(Expr::to_string).collect();
+    substitute_placeholders(template, &literals)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
 
-    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
+    fn exprs(list: &str) -> Vec<Expr> {
+        let mut parser = Parser::new(&GenericDialect {})
+            .try_with_sql(list)
+            .expect("tokenize");
+        parser
+            .parse_comma_separated(Parser::parse_expr)
+            .expect("parse expressions")
     }
 
     #[test]
@@ -230,76 +126,49 @@ mod tests {
     }
 
     #[test]
-    fn non_execute_returns_none() {
-        let m = HashMap::new();
-        assert_eq!(rewrite_execute("SELECT 1", &m).unwrap(), None);
+    fn bind_renders_expressions_as_sql_literals() {
+        let out = bind_execute(
+            "SELECT * FROM t WHERE a = ? AND b = ? AND c = ?",
+            &exprs("1, 'foo', DATE '2020-01-01'"),
+        )
+        .unwrap();
         assert_eq!(
-            rewrite_execute("INSERT INTO t VALUES (1)", &m).unwrap(),
-            None
+            out,
+            "SELECT * FROM t WHERE a = 1 AND b = 'foo' AND c = DATE '2020-01-01'"
         );
     }
 
     #[test]
-    fn execute_named_substitutes_using_args() {
-        let m = map(&[("q1", "SELECT * FROM t WHERE a = ? AND b = ?")]);
-        let out = rewrite_execute("EXECUTE q1 USING 1, 'foo'", &m).unwrap();
+    fn bind_without_parameters_returns_template() {
+        assert_eq!(bind_execute("SELECT 1", &[]).unwrap(), "SELECT 1");
+    }
+
+    #[test]
+    fn bind_count_mismatch_is_an_error() {
+        assert!(bind_execute("SELECT ?, ?", &exprs("1")).is_err());
+        assert!(bind_execute("SELECT ?", &exprs("1, 2")).is_err());
+    }
+
+    /// Finding 708 acceptance: a `?` inside a comment is not a placeholder, so
+    /// `EXECUTE p USING 1` against `SELECT ? /* why? */` binds exactly one.
+    #[test]
+    fn bind_is_comment_aware() {
         assert_eq!(
-            out.as_deref(),
-            Some("SELECT * FROM t WHERE a = 1 AND b = 'foo'")
+            bind_execute("SELECT ? /* why? */", &exprs("1")).unwrap(),
+            "SELECT 1 /* why? */"
         );
-    }
-
-    #[test]
-    fn execute_named_without_using() {
-        let m = map(&[("q1", "SELECT 1")]);
         assert_eq!(
-            rewrite_execute("EXECUTE q1", &m).unwrap().as_deref(),
-            Some("SELECT 1")
+            bind_execute("SELECT ? -- really?\n", &exprs("1")).unwrap(),
+            "SELECT 1 -- really?\n"
         );
+        assert!(bind_execute("SELECT ? /* why? */", &exprs("1, 2")).is_err());
     }
 
     #[test]
-    fn execute_unknown_name_errors() {
-        let m = HashMap::new();
-        assert!(rewrite_execute("EXECUTE missing USING 1", &m).is_err());
-    }
-
-    #[test]
-    fn execute_immediate_inline_sql() {
-        let m = HashMap::new();
-        let out = rewrite_execute("EXECUTE IMMEDIATE 'SELECT ? + ?' USING 1, 2", &m).unwrap();
-        assert_eq!(out.as_deref(), Some("SELECT 1 + 2"));
-    }
-
-    #[test]
-    fn execute_immediate_without_using() {
-        let m = HashMap::new();
-        let out = rewrite_execute("EXECUTE IMMEDIATE 'SELECT 1'", &m).unwrap();
-        assert_eq!(out.as_deref(), Some("SELECT 1"));
-    }
-
-    #[test]
-    fn using_arg_comma_inside_string_is_not_a_separator() {
-        let m = map(&[("q", "SELECT ?, ?")]);
-        let out = rewrite_execute("EXECUTE q USING 'a,b', 2", &m).unwrap();
-        assert_eq!(out.as_deref(), Some("SELECT 'a,b', 2"));
-    }
-
-    #[test]
-    fn execute_keyword_is_case_insensitive() {
-        let m = map(&[("q", "SELECT 1")]);
+    fn bind_preserves_string_argument_with_comma() {
         assert_eq!(
-            rewrite_execute("execute q", &m).unwrap().as_deref(),
-            Some("SELECT 1")
-        );
-    }
-
-    #[test]
-    fn trailing_semicolon_tolerated() {
-        let m = map(&[("q", "SELECT 1")]);
-        assert_eq!(
-            rewrite_execute("EXECUTE q;", &m).unwrap().as_deref(),
-            Some("SELECT 1")
+            bind_execute("SELECT ?, ?", &exprs("'a,b', 2")).unwrap(),
+            "SELECT 'a,b', 2"
         );
     }
 }

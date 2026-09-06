@@ -1,0 +1,82 @@
+[
+  {
+    "body": {
+      "id": "<query-id>",
+      "infoUri": "http://<host>/v1/query/<query-id>",
+      "nextUri": "http://<host>/v1/statement/queued/<query-id>/<poll-token>/1",
+      "stats": {
+        "completedSplits": 0,
+        "cpuTimeMillis": 0,
+        "elapsedTimeMillis": 0,
+        "nodes": 0,
+        "peakMemoryBytes": 0,
+        "physicalInputBytes": 0,
+        "processedBytes": 0,
+        "processedRows": 0,
+        "queued": true,
+        "queuedSplits": 0,
+        "queuedTimeMillis": 0,
+        "rootStage": null,
+        "runningSplits": 0,
+        "scheduled": false,
+        "spilledBytes": 0,
+        "state": "QUEUED",
+        "totalSplits": 0,
+        "wallTimeMillis": 0
+      },
+      "warnings": []
+    },
+    "status": 200,
+    "step": "post"
+  },
+  {
+    "status": 204,
+    "step": "delete",
+    "text": ""
+  },
+  {
+    "status": 401,
+    "step": "poll-after-cancel-no-creds",
+    "text": ""
+  },
+  {
+    "body": {
+      "error": {
+        "errorCode": 1,
+        "errorName": "USER_ERROR",
+        "errorType": "USER_ERROR",
+        "message": "Query not found"
+      },
+      "id": "<query-id>",
+      "infoUri": "http://<host>/v1/query/<query-id>",
+      "stats": {
+        "completedSplits": 0,
+        "cpuTimeMillis": 0,
+        "elapsedTimeMillis": 0,
+        "nodes": 1,
+        "peakMemoryBytes": 0,
+        "physicalInputBytes": 0,
+        "processedBytes": 0,
+        "processedRows": 0,
+        "queued": false,
+        "queuedSplits": 0,
+        "queuedTimeMillis": 0,
+        "rootStage": null,
+        "runningSplits": 0,
+        "scheduled": true,
+        "spilledBytes": 0,
+        "state": "FAILED",
+        "totalSplits": 1,
+        "wallTimeMillis": 0
+      },
+      "warnings": []
+    },
+    "status": 404,
+    "step": "poll-after-cancel"
+  },
+  {
+    "status": 204,
+    "step": "delete-again",
+    "text": ""
+  }
+]

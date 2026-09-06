@@ -1,0 +1,69 @@
+[
+  {
+    "body": {
+      "columns": [
+        {
+          "name": "one",
+          "type": "bigint",
+          "typeSignature": {
+            "arguments": [],
+            "rawType": "bigint"
+          }
+        },
+        {
+          "name": "s",
+          "type": "varchar",
+          "typeSignature": {
+            "arguments": [
+              {
+                "kind": "LONG",
+                "value": 2147483647
+              }
+            ],
+            "rawType": "varchar"
+          }
+        },
+        {
+          "name": "_col2",
+          "type": "bigint",
+          "typeSignature": {
+            "arguments": [],
+            "rawType": "bigint"
+          }
+        }
+      ],
+      "data": [
+        [
+          1,
+          "x",
+          2
+        ]
+      ],
+      "id": "<query-id>",
+      "infoUri": "http://<host>/v1/query/<query-id>",
+      "stats": {
+        "completedSplits": 1,
+        "cpuTimeMillis": 0,
+        "elapsedTimeMillis": 0,
+        "nodes": 1,
+        "peakMemoryBytes": 0,
+        "physicalInputBytes": 0,
+        "processedBytes": 0,
+        "processedRows": 1,
+        "queued": false,
+        "queuedSplits": 0,
+        "queuedTimeMillis": 0,
+        "rootStage": null,
+        "runningSplits": 0,
+        "scheduled": true,
+        "spilledBytes": 0,
+        "state": "FINISHED",
+        "totalSplits": 1,
+        "wallTimeMillis": 0
+      },
+      "warnings": []
+    },
+    "status": 200,
+    "step": "post"
+  }
+]

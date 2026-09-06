@@ -771,99 +771,52 @@ impl ScalarUDFImpl for DateDiff {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        use datafusion::common::ScalarValue;
+        use crate::helpers::{arg, lift3, StrArg, TsArg};
+        const EXPECTED: &str = "varchar, timestamp, timestamp";
 
-        let unit_str = match &args.args[0] {
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => parse_unit(s)?,
-            ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => parse_unit(s)?,
-            other => {
-                return Err(DataFusionError::Plan(format!(
-                    "date_diff: first arg must be a string literal, got {other:?}"
-                )))
-            }
+        // Any scalar/array mix is accepted: `date_diff('day', col, CURRENT_DATE)`
+        // used to fail with "mixed scalar/array args not supported".
+        let unit: StrArg = arg("date_diff", EXPECTED, &args.args, 0)?;
+        let t1: TsArg = arg("date_diff", EXPECTED, &args.args, 1)?;
+        let t2: TsArg = arg("date_diff", EXPECTED, &args.args, 2)?;
+
+        // Parse the unit once when it is the usual literal.
+        let const_unit = match &args.args[0] {
+            ColumnarValue::Scalar(sv) => match sv.try_as_str() {
+                Some(Some(s)) => Some(parse_unit(s)?),
+                _ => None,
+            },
+            ColumnarValue::Array(_) => None,
         };
 
-        fn scalar_to_naive_date(sv: &ScalarValue) -> DFResult<Option<NaiveDate>> {
-            match sv {
-                ScalarValue::Date32(Some(days)) => {
-                    // None for out-of-range Date32; yield a NULL result
-                    // instead of unwrapping into a panic.
-                    Ok(temporal_conversions::date32_to_datetime(*days).map(|dt| dt.date()))
-                }
-                ScalarValue::Date32(None) => Ok(None),
-                ScalarValue::TimestampMicrosecond(Some(us), _) => Ok(Some(us_to_naive(*us).date())),
-                ScalarValue::TimestampMicrosecond(None, _) => Ok(None),
-                ScalarValue::TimestampNanosecond(Some(ns), _) => Ok(Some(ns_to_naive(*ns).date())),
-                ScalarValue::TimestampNanosecond(None, _) => Ok(None),
-                other => Err(DataFusionError::Plan(format!(
-                    "date_diff: unsupported scalar type {other:?}"
-                ))),
-            }
-        }
-
-        fn compute_diff(unit: TimeUnit, d1: NaiveDate, d2: NaiveDate) -> i64 {
+        /// Whole units between two UTC-microsecond instants. Year and month
+        /// are calendar differences; the sub-day units are exact so that
+        /// `date_diff('hour', ts1, ts2)` no longer rounds to whole days.
+        fn compute_diff(unit: TimeUnit, us1: i64, us2: i64) -> Option<i64> {
             match unit {
-                TimeUnit::Year => (d2.year() - d1.year()) as i64,
-                TimeUnit::Month => {
-                    (d2.year() - d1.year()) as i64 * 12 + (d2.month() as i64 - d1.month() as i64)
+                TimeUnit::Year | TimeUnit::Month => {
+                    let d1 = chrono::DateTime::from_timestamp_micros(us1)?.date_naive();
+                    let d2 = chrono::DateTime::from_timestamp_micros(us2)?.date_naive();
+                    let years = (d2.year() - d1.year()) as i64;
+                    Some(match unit {
+                        TimeUnit::Year => years,
+                        _ => years * 12 + (d2.month() as i64 - d1.month() as i64),
+                    })
                 }
-                TimeUnit::Day => d2.signed_duration_since(d1).num_days(),
-                TimeUnit::Hour => d2.signed_duration_since(d1).num_hours(),
-                TimeUnit::Minute => d2.signed_duration_since(d1).num_minutes(),
-                TimeUnit::Second => d2.signed_duration_since(d1).num_seconds(),
+                TimeUnit::Day => us2.checked_sub(us1).map(|d| d / 86_400_000_000),
+                TimeUnit::Hour => us2.checked_sub(us1).map(|d| d / 3_600_000_000),
+                TimeUnit::Minute => us2.checked_sub(us1).map(|d| d / 60_000_000),
+                TimeUnit::Second => us2.checked_sub(us1).map(|d| d / 1_000_000),
             }
         }
 
-        // Both args must be scalars for now (the most common case in Trino SQL).
-        // Array support could be added later.
-        match (&args.args[1], &args.args[2]) {
-            (ColumnarValue::Scalar(sv1), ColumnarValue::Scalar(sv2)) => {
-                let d1 = scalar_to_naive_date(sv1)?;
-                let d2 = scalar_to_naive_date(sv2)?;
-                match (d1, d2) {
-                    (Some(a), Some(b)) => Ok(ColumnarValue::Scalar(ScalarValue::Int64(Some(
-                        compute_diff(unit_str, a, b),
-                    )))),
-                    _ => Ok(ColumnarValue::Scalar(ScalarValue::Int64(None))),
-                }
-            }
-            (ColumnarValue::Array(arr1), ColumnarValue::Array(arr2)) => {
-                let get_date = |arr: &ArrayRef, i: usize| -> Option<NaiveDate> {
-                    if arr.is_null(i) {
-                        return None;
-                    }
-                    arr.as_any()
-                        .downcast_ref::<Date32Array>()
-                        .and_then(|a| {
-                            // None for out-of-range Date32; propagate as a NULL
-                            // date rather than panicking on unwrap.
-                            temporal_conversions::date32_to_datetime(a.value(i)).map(|dt| dt.date())
-                        })
-                        .or_else(|| {
-                            arr.as_any()
-                                .downcast_ref::<TimestampMicrosecondArray>()
-                                .map(|a| us_to_naive(a.value(i)).date())
-                        })
-                        .or_else(|| {
-                            arr.as_any()
-                                .downcast_ref::<TimestampNanosecondArray>()
-                                .map(|a| ns_to_naive(a.value(i)).date())
-                        })
-                };
-                let len = arr1.len();
-                let result: Int64Array = (0..len)
-                    .map(|i| {
-                        let d1 = get_date(arr1, i)?;
-                        let d2 = get_date(arr2, i)?;
-                        Some(compute_diff(unit_str, d1, d2))
-                    })
-                    .collect();
-                Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
-            }
-            _ => Err(DataFusionError::Plan(
-                "date_diff: mixed scalar/array args not supported".to_string(),
-            )),
-        }
+        lift3(&unit, &t1, &t2, |u, a, b| {
+            let unit = match const_unit {
+                Some(unit) => unit,
+                None => parse_unit(u)?,
+            };
+            Ok(compute_diff(unit, a, b))
+        })
     }
 }
 
@@ -1494,6 +1447,7 @@ impl ScalarUDFImpl for JsonObject {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        use crate::helpers::{arg, AnyArg, RowArg, StrArg};
         use datafusion::common::ScalarValue;
 
         // `is_multiple_of` would be clearer but is stable only from 1.87;
@@ -1504,45 +1458,82 @@ impl ScalarUDFImpl for JsonObject {
             ));
         }
 
-        // Build JSON from scalar key-value pairs.
-        let mut map = serde_json::Map::new();
-        for pair in args.args.chunks(2) {
-            let key = match &pair[0] {
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
-                | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => s.clone(),
+        // Keys are strings, values are anything JSON can hold. Either side may
+        // be a column: `json_object('id', id_col)` used to fail with
+        // "unsupported value type Array".
+        let mut keys: Vec<StrArg> = Vec::with_capacity(args.args.len() / 2);
+        let mut values: Vec<AnyArg> = Vec::with_capacity(args.args.len() / 2);
+        for i in 0..args.args.len() / 2 {
+            keys.push(arg("json_object", "varchar, any, ...", &args.args, 2 * i)?);
+            values.push(arg(
+                "json_object",
+                "varchar, any, ...",
+                &args.args,
+                2 * i + 1,
+            )?);
+        }
+        debug_assert_eq!(keys.len(), values.len());
+
+        fn json_value(sv: &ScalarValue) -> DFResult<serde_json::Value> {
+            Ok(match sv {
+                ScalarValue::Utf8(Some(s))
+                | ScalarValue::LargeUtf8(Some(s))
+                | ScalarValue::Utf8View(Some(s)) => serde_json::Value::String(s.clone()),
+                ScalarValue::Int8(Some(v)) => serde_json::Value::from(*v),
+                ScalarValue::Int16(Some(v)) => serde_json::Value::from(*v),
+                ScalarValue::Int32(Some(v)) => serde_json::Value::from(*v),
+                ScalarValue::Int64(Some(v)) => serde_json::Value::from(*v),
+                ScalarValue::UInt8(Some(v)) => serde_json::Value::from(*v),
+                ScalarValue::UInt16(Some(v)) => serde_json::Value::from(*v),
+                ScalarValue::UInt32(Some(v)) => serde_json::Value::from(*v),
+                ScalarValue::UInt64(Some(v)) => serde_json::Value::from(*v),
+                ScalarValue::Float32(Some(v)) => serde_json::json!(*v),
+                ScalarValue::Float64(Some(v)) => serde_json::json!(*v),
+                ScalarValue::Boolean(Some(v)) => serde_json::Value::Bool(*v),
+                other if other.is_null() => serde_json::Value::Null,
                 other => {
                     return Err(DataFusionError::Plan(format!(
-                        "json_object: key must be a string, got {other:?}"
+                        "json_object: unsupported value type {}",
+                        other.data_type()
                     )))
                 }
-            };
-            let value = match &pair[1] {
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
-                | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => {
-                    serde_json::Value::String(s.clone())
-                }
-                ColumnarValue::Scalar(ScalarValue::Int64(Some(v))) => {
-                    serde_json::Value::Number(serde_json::Number::from(*v))
-                }
-                ColumnarValue::Scalar(ScalarValue::Int32(Some(v))) => {
-                    serde_json::Value::Number(serde_json::Number::from(*v))
-                }
-                ColumnarValue::Scalar(ScalarValue::Float64(Some(v))) => {
-                    serde_json::json!(*v)
-                }
-                ColumnarValue::Scalar(ScalarValue::Boolean(Some(v))) => serde_json::Value::Bool(*v),
-                ColumnarValue::Scalar(ScalarValue::Null) => serde_json::Value::Null,
-                other => {
-                    return Err(DataFusionError::Plan(format!(
-                        "json_object: unsupported value type {other:?}"
-                    )))
-                }
-            };
-            map.insert(key, value);
+            })
         }
 
-        let json_str = serde_json::Value::Object(map).to_string();
-        Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(json_str))))
+        let n_rows = keys
+            .iter()
+            .map(RowArg::array_len)
+            .chain(values.iter().map(RowArg::array_len))
+            .flatten()
+            .max();
+
+        let render = |i: usize| -> DFResult<Option<String>> {
+            let mut map = serde_json::Map::new();
+            for (k, v) in keys.iter().zip(values.iter()) {
+                // A NULL key drops the pair (Trino rejects NULL keys; this is
+                // the lenient reading), a NULL value is JSON null.
+                let Some(key) = k.get(i) else { continue };
+                let value = match v.get(i) {
+                    Some(sv) => json_value(&sv)?,
+                    None => serde_json::Value::Null,
+                };
+                map.insert(key.to_string(), value);
+            }
+            Ok(Some(serde_json::Value::Object(map).to_string()))
+        };
+
+        match n_rows {
+            None => Ok(ColumnarValue::Scalar(ScalarValue::Utf8(render(0)?))),
+            Some(n) => {
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    out.push(render(i)?);
+                }
+                Ok(ColumnarValue::Array(
+                    Arc::new(StringArray::from(out)) as ArrayRef
+                ))
+            }
+        }
     }
 }
 
@@ -2015,12 +2006,7 @@ use crate::helpers::{str_transform, str_transform_2};
 
 use url::Url;
 
-fn extract_url_component(
-    url_str: &str,
-    component: &str,
-    param_arg: Option<&ColumnarValue>,
-) -> Option<String> {
-    use datafusion::common::ScalarValue;
+fn extract_url_component(url_str: &str, component: &str, param: Option<&str>) -> Option<String> {
     let parsed = Url::parse(url_str).ok()?;
     match component {
         "host" => parsed.host_str().map(|s| s.to_string()),
@@ -2029,15 +2015,10 @@ fn extract_url_component(
         "protocol" => Some(parsed.scheme().to_string()),
         "query" => parsed.query().map(|s| s.to_string()),
         "parameter" => {
-            let param_cv = param_arg?;
-            let param_name = match param_cv {
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
-                | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => s.clone(),
-                _ => return None,
-            };
+            let param_name = param?;
             parsed
                 .query_pairs()
-                .find(|(k, _)| k == param_name.as_str())
+                .find(|(k, _)| k == param_name)
                 .map(|(_, v)| v.to_string())
         }
         _ => None,
@@ -2045,27 +2026,17 @@ fn extract_url_component(
 }
 
 fn parse_url_component(args: &[ColumnarValue], component: &str) -> DFResult<ColumnarValue> {
-    use datafusion::common::ScalarValue;
-    match &args[0] {
-        ColumnarValue::Scalar(v) => {
-            let s = match v {
-                ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => s.clone(),
-                _ => return Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None))),
-            };
-            let result = extract_url_component(&s, component, args.get(1));
-            Ok(ColumnarValue::Scalar(ScalarValue::Utf8(result)))
-        }
-        ColumnarValue::Array(arr) => {
-            let str_arr = arr
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| DataFusionError::Plan("Expected string array".into()))?;
-            let results: StringArray = str_arr
-                .iter()
-                .map(|opt| opt.and_then(|u| extract_url_component(u, component, args.get(1))))
-                .collect();
-            Ok(ColumnarValue::Array(Arc::new(results)))
-        }
+    // Utf8 / LargeUtf8 / Utf8View, scalar or column, all go through the
+    // shared string lifters; non-string input is a Trino-style Plan error.
+    let fn_name = format!("url_extract_{component}");
+    if component == "parameter" {
+        crate::helpers::str_transform_2(&fn_name, args, |u, p| {
+            extract_url_component(u, component, Some(p))
+        })
+    } else {
+        crate::helpers::str_transform(&fn_name, &args[0], |u| {
+            extract_url_component(u, component, None)
+        })
     }
 }
 
@@ -2142,7 +2113,7 @@ impl ScalarUDFImpl for UrlEncode {
         Ok(DataType::Utf8)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        str_transform(&args.args[0], |s| {
+        str_transform("url_encode", &args.args[0], |s| {
             use std::fmt::Write;
             let mut result = String::new();
             for b in s.bytes() {
@@ -2174,7 +2145,9 @@ impl ScalarUDFImpl for UrlDecode {
         Ok(DataType::Utf8)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        str_transform(&args.args[0], |s| Some(percent_decode(s.as_bytes())))
+        str_transform("url_decode", &args.args[0], |s| {
+            Some(percent_decode(s.as_bytes()))
+        })
     }
 }
 
@@ -2204,7 +2177,7 @@ macro_rules! encoding_udf {
             }
             fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
                 let transform = $transform;
-                str_transform(&args.args[0], |s| Some(transform(s)))
+                str_transform($func_name, &args.args[0], |s| Some(transform(s)))
             }
         }
     };
@@ -2329,7 +2302,7 @@ impl ScalarUDFImpl for JsonExtract {
         Ok(DataType::Utf8)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        str_transform_2(&args.args, |json, path| {
+        str_transform_2("json_extract", &args.args, |json, path| {
             let key = path.trim_start_matches("$.");
             let key = if key == "$" { "" } else { key };
             extract_json_value(json, key)
@@ -2357,7 +2330,7 @@ impl ScalarUDFImpl for JsonExtractScalar {
         Ok(DataType::Utf8)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        str_transform_2(&args.args, |json, path| {
+        str_transform_2("json_extract_scalar", &args.args, |json, path| {
             let key = path.trim_start_matches("$.");
             let key = if key == "$" { "" } else { key };
             extract_json_scalar(json, key)
@@ -2433,7 +2406,7 @@ impl ScalarUDFImpl for JsonParse {
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         // json_parse validates and normalises the JSON string (compact form).
-        str_transform(&args.args[0], |s| {
+        str_transform("json_parse", &args.args[0], |s| {
             Some(
                 serde_json::from_str::<serde_json::Value>(s)
                     .map(|v| v.to_string())

@@ -49,6 +49,7 @@ mod spark_access_control_e2e;
 mod spark_mask_parity_e2e;
 mod sql_compat_test;
 mod table_health_test;
+mod trino_cli_test;
 mod trino_describe_test;
 mod trino_metadata_test;
 mod trino_session_catalog_test;

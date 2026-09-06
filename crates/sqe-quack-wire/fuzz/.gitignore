@@ -1,0 +1,6 @@
+# cargo-fuzz build output and crash artifacts. The seed corpus under
+# corpus/ is checked in; anything the fuzzer discovers is not.
+target/
+artifacts/
+coverage/
+Cargo.lock

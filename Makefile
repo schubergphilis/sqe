@@ -117,6 +117,7 @@ help:
 	@echo "    make test-integration     Integration suite vs the Polaris + RustFS test stack"
 	@echo "                              (local gate: no CI equivalent, see issue #387)"
 	@echo "                              Knob: FILTER=test_ctas_roundtrip to run one test"
+	@echo "                              FILTER=trino_cli runs the official trino-cli golden case"
 	@echo "    make test-distributed     The same suite with coordinator + 2 workers"
 	@echo "    make test-integration-down  Tear the integration stack back down"
 	@echo "    make test-access-control  Ranger/Polaris access-control e2e (brings up the Ranger stack)"
@@ -234,6 +235,10 @@ test:
 #   make test-integration                             full suite (Polaris + RustFS)
 #   make test-integration FILTER=test_ctas_roundtrip   one test by substring
 #   make test-integration FILTER=hive_external         Hive external tables on real RustFS
+#   make test-integration FILTER=trino_cli             official trino-cli against the Trino
+#                                                     endpoint, output diffed against goldens
+#                                                     (needs `trino` or `trino-cli` on PATH,
+#                                                     or TRINO_CLI=/path; skips otherwise)
 #   make test-distributed                             coordinator + 2 workers
 #   make test-integration-down                        tear the stack back down
 #

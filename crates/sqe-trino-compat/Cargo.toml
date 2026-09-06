@@ -11,6 +11,9 @@ sqe-core = { path = "../sqe-core" }
 sqe-auth = { path = "../sqe-auth" }
 sqe-sql = { path = "../sqe-sql" }
 sqe-metrics = { path = "../sqe-metrics" }
+# Session-control and prepared-statement handling reads the AST the SQL front
+# door produced (USE targets, EXECUTE arguments) instead of the statement text.
+sqlparser = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 arrow = { workspace = true }
@@ -44,3 +47,8 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
+# tests/wire.rs drives the real HTTP listener the way a Trino client does
+# (POST, follow nextUri, DELETE) and diffs the JSON against goldens. Issue #630.
+reqwest = { workspace = true }
+# Identity / literal-preservation properties for the source-level rewriters.
+proptest = "1"

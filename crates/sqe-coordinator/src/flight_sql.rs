@@ -50,8 +50,11 @@ use tracing::{debug, info, warn, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use sqe_core::SqeConfig;
-use sqe_sql::{parse_and_classify_typed, pre_parse_pipeline, StatementKind, UserSql};
+use sqe_sql::{
+    classify_normalized, pre_parse_pipeline, SqlFrontDoor, StatementKind, UserSql, WireDialect,
+};
 
+use crate::prepared_statements::{PreparedStatement, PreparedStatementStore};
 use crate::query_handler::QueryHandler;
 use crate::query_tracker::QueryTracker;
 use crate::session_manager::SessionManager;
@@ -471,18 +474,15 @@ pub struct SqeFlightSqlService {
     /// `AuditKind::Auth` events on handshake success/failure and on
     /// per-request bearer/session validation failures.
     audit: Option<Arc<sqe_metrics::audit::AuditLogger>>,
-    /// Parameter bindings for outstanding prepared statements.
+    /// Server-side prepared statements (finding 406, #586).
     ///
-    /// Keyed by `(authenticated session id, encoded statement handle)` so one
-    /// session can never read or overwrite another session's bound parameters
-    /// (WEB-03). Each entry holds the inbound parameter `RecordBatch` decoded
-    /// into a list of SQL literals; `do_get_prepared_statement` substitutes `?`
-    /// placeholders in left-to-right order before executing.
-    ///
-    /// A bounded, TTL'd `moka` cache (WEB-04): abandoned binds expire instead
-    /// of leaking forever, and the entry count is capped so a client looping
-    /// binds it never fetches cannot exhaust coordinator memory.
-    prepared_params: Arc<moka::future::Cache<Vec<u8>, Vec<String>>>,
+    /// Keyed by `(authenticated session id, statement id)` so one session can
+    /// never read, bind or execute another session's statement (WEB-03). Each
+    /// entry holds the plan built once at `CreatePreparedStatement` with its
+    /// `$n` placeholders, the inferred parameter types, the output schema and
+    /// the current typed bind. Bounded and idle-expiring (WEB-04) so abandoned
+    /// statements cannot exhaust coordinator memory.
+    prepared_statements: PreparedStatementStore,
     /// Statements whose `FlightInfo` has been issued but whose `DoGet` has
     /// not yet arrived, keyed by the query id carried in the ticket.
     ///
@@ -490,8 +490,8 @@ pub struct SqeFlightSqlService {
     /// was minted only inside `execute_stream`, so the client never learned
     /// an id it could cancel. The id is now minted at `GetFlightInfo`, the
     /// ticket carries it, `DoGet` resolves the SQL here and runs under the
-    /// same id, and `CancelQuery` can reach the tracker. Same bounded TTL
-    /// shape as `prepared_params`: an abandoned `FlightInfo` expires.
+    /// same id, and `CancelQuery` can reach the tracker. Bounded and TTL'd:
+    /// an abandoned `FlightInfo` expires.
     pending_statements: Arc<moka::future::Cache<uuid::Uuid, PendingStatement>>,
 }
 
@@ -501,31 +501,24 @@ struct PendingStatement {
     sql: String,
     /// Owner: the ticket may only be redeemed by the user it was issued to.
     username: String,
-    /// For prepared statements, the raw handle bytes so `DoGet` can pick up
-    /// the parameters bound under `(session, handle)` in `prepared_params`.
-    prepared_handle: Option<Vec<u8>>,
+    /// For prepared statements, the statement id so `DoGet` runs the stored
+    /// plan with the bind current at execution time (finding 406).
+    prepared: Option<uuid::Uuid>,
 }
 
-/// Maximum outstanding prepared-statement parameter binds across all sessions.
-const PREPARED_PARAMS_MAX_ENTRIES: u64 = 10_000;
-/// How long an unused parameter bind survives before eviction.
-const PREPARED_PARAMS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+/// What a redeemed ticket resolves to.
+enum ResolvedStatement {
+    /// Ad-hoc SQL text (`GetFlightInfo(CommandStatementQuery)` or a legacy
+    /// raw-SQL ticket).
+    Sql(String),
+    /// A prepared statement: the stored plan plus whatever is bound.
+    Prepared(Arc<PreparedStatement>),
+}
+
 /// Maximum issued-but-not-fetched statement tickets across all sessions.
 const PENDING_STATEMENTS_MAX_ENTRIES: u64 = 10_000;
 /// How long a ticket from `GetFlightInfo` stays redeemable by `DoGet`.
 const PENDING_STATEMENTS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
-
-/// Build the per-session prepared-statement key from the authenticated session
-/// id and the client-supplied handle bytes. Binding to `session.id` (server
-/// assigned at authentication) means a peer cannot target another session's
-/// bind by guessing the deterministic handle (WEB-03).
-fn prepared_param_key(session_id: &str, handle: &[u8]) -> Vec<u8> {
-    let mut key = Vec::with_capacity(session_id.len() + 1 + handle.len());
-    key.extend_from_slice(session_id.as_bytes());
-    key.push(0); // separator that cannot appear in the utf-8 session id
-    key.extend_from_slice(handle);
-    key
-}
 
 impl SqeFlightSqlService {
     pub fn new(
@@ -548,12 +541,7 @@ impl SqeFlightSqlService {
             auth_rate_limiter: None,
             metadata_rate_limiter: None,
             audit,
-            prepared_params: Arc::new(
-                moka::future::Cache::builder()
-                    .max_capacity(PREPARED_PARAMS_MAX_ENTRIES)
-                    .time_to_live(PREPARED_PARAMS_TTL)
-                    .build(),
-            ),
+            prepared_statements: PreparedStatementStore::default(),
             pending_statements: Arc::new(
                 moka::future::Cache::builder()
                     .max_capacity(PENDING_STATEMENTS_MAX_ENTRIES)
@@ -569,7 +557,7 @@ impl SqeFlightSqlService {
         &self,
         session: &sqe_core::Session,
         sql: String,
-        prepared_handle: Option<Vec<u8>>,
+        prepared: Option<uuid::Uuid>,
     ) -> (uuid::Uuid, Ticket) {
         let query_id = uuid::Uuid::now_v7();
         self.pending_statements
@@ -578,7 +566,7 @@ impl SqeFlightSqlService {
                 PendingStatement {
                     sql,
                     username: session.user.username.clone(),
-                    prepared_handle,
+                    prepared,
                 },
             )
             .await;
@@ -591,20 +579,21 @@ impl SqeFlightSqlService {
         (query_id, ticket)
     }
 
-    /// Resolve a ticket handle into the SQL to run and the query id to run
-    /// it under.
+    /// Resolve a ticket handle into the statement to run and the query id to
+    /// run it under.
     ///
     /// New tickets carry a UUID minted by [`Self::issue_statement_ticket`];
-    /// the entry is consumed (single-use) and any parameters bound against a
-    /// prepared handle are substituted. A handle that is not a UUID is a
-    /// legacy raw-SQL ticket from an older client and runs under a fresh id.
+    /// the entry is consumed (single-use). A prepared-statement ticket
+    /// resolves to the stored statement (finding 406), whose bind current at
+    /// execution time is applied. A handle that is not a UUID is a legacy
+    /// raw-SQL ticket from an older client and runs under a fresh id.
     async fn resolve_statement_handle(
         &self,
         session: &sqe_core::Session,
         handle: &str,
-    ) -> Result<(String, Option<uuid::Uuid>), Status> {
+    ) -> Result<(ResolvedStatement, Option<uuid::Uuid>), Status> {
         let Ok(query_id) = uuid::Uuid::parse_str(handle) else {
-            return Ok((handle.to_string(), None));
+            return Ok((ResolvedStatement::Sql(handle.to_string()), None));
         };
         let Some(pending) = self.pending_statements.get(&query_id).await else {
             return Err(Status::not_found(format!(
@@ -625,23 +614,79 @@ impl SqeFlightSqlService {
         }
         self.pending_statements.invalidate(&query_id).await;
 
-        let sql = match pending.prepared_handle {
-            Some(ref handle_bytes) => {
-                // Same bind lookup as `do_get_prepared_statement` (WEB-03):
-                // parameters live under this session's key.
-                let key = prepared_param_key(&session.id, handle_bytes);
-                match self.prepared_params.get(&key).await {
-                    Some(params) => {
-                        self.prepared_params.invalidate(&key).await;
-                        sqe_core::substitute_placeholders(&pending.sql, &params)
-                            .map_err(Status::invalid_argument)?
-                    }
-                    None => pending.sql.clone(),
-                }
+        let resolved = match pending.prepared {
+            Some(statement_id) => {
+                ResolvedStatement::Prepared(self.lookup_prepared(session, statement_id).await?)
             }
-            None => pending.sql.clone(),
+            None => ResolvedStatement::Sql(pending.sql),
         };
-        Ok((sql, Some(query_id)))
+        Ok((resolved, Some(query_id)))
+    }
+
+    /// Look up a prepared statement by id, scoped to the caller's session
+    /// (WEB-03): another session's id is simply unknown.
+    async fn lookup_prepared(
+        &self,
+        session: &sqe_core::Session,
+        statement_id: uuid::Uuid,
+    ) -> Result<Arc<PreparedStatement>, Status> {
+        self.prepared_statements
+            .get(&session.id, statement_id)
+            .await
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "Prepared statement {statement_id} is unknown, closed, or expired; \
+                     prepare it again"
+                ))
+            })
+    }
+
+    /// Decode a client-supplied prepared-statement handle and look it up.
+    async fn prepared_from_handle(
+        &self,
+        session: &sqe_core::Session,
+        handle: &[u8],
+    ) -> Result<(uuid::Uuid, Arc<PreparedStatement>), Status> {
+        let statement_id =
+            PreparedStatementStore::parse_handle(handle).map_err(Status::invalid_argument)?;
+        let statement = self.lookup_prepared(session, statement_id).await?;
+        Ok((statement_id, statement))
+    }
+
+    /// Decode an inbound parameter stream and bind it to `statement`.
+    ///
+    /// Finding 406: values are bound as typed Arrow scalars and checked
+    /// against the inferred placeholder types here, so a wrong-type bind is
+    /// rejected before anything is planned or executed. An empty batch (a
+    /// driver's bind call for a statement without parameters) leaves any
+    /// existing bind alone; the bind otherwise persists until `Close`, a
+    /// re-bind, or eviction, so a second `executeQuery()` without new
+    /// `setX` calls runs with the previous values.
+    async fn bind_prepared_from_stream<S>(
+        &self,
+        statement: &PreparedStatement,
+        stream: S,
+    ) -> Result<(), Status>
+    where
+        S: futures::Stream<Item = Result<arrow_flight::FlightData, Status>>
+            + Send
+            + Unpin
+            + 'static,
+    {
+        let values = match decode_parameter_stream(stream).await {
+            Ok(values) => values,
+            // A statement without parameters has nothing to bind; tolerate a
+            // driver that sends a malformed empty bind for it.
+            Err(e) if statement.param_count() == 0 => {
+                warn!(error = %e, "Ignoring undecodable bind for a statement without parameters");
+                return Ok(());
+            }
+            Err(e) => return Err(Status::invalid_argument(e)),
+        };
+        if values.is_empty() {
+            return Ok(());
+        }
+        statement.bind(values).map_err(Status::invalid_argument)
     }
 
     #[must_use = "with_metrics consumes self; bind the returned service"]
@@ -987,13 +1032,18 @@ impl SqeFlightSqlService {
 
         // Classify through the pre-parse pipeline (strips FOR INCREMENTAL /
         // VERSION AS OF, rewrites Hive `PARTITIONED BY` -> sqlparser `PARTITION
-        // BY`) so routing matches the execute path. Classifying raw SQL here
-        // parse-fails on `PARTITIONED BY (month(col))` before the normalized
-        // execute() path is ever reached.
-        let kind = parse_and_classify_typed(
-            &pre_parse_pipeline(&UserSql::from(sql)).map_err(|e| sqe_error_to_status(&e, None))?,
-        )
-        .map_err(|e| sqe_error_to_status(&e, None))?;
+        // BY`) and the SQL front door (`WireDialect::Flight`; finding 700) so
+        // routing matches the execute path and accepts the same Trino shapes
+        // (`INSERT INTO t VALUES 1`, `TABLE t`) the Trino door accepts. The
+        // raw text is handed on; the engine normalizes it once when planning.
+        let kind = pre_parse_pipeline(&UserSql::from(sql))
+            .and_then(|classifiable| {
+                SqlFrontDoor::new(WireDialect::Flight)
+                    .with_session_catalog(session.default_catalog.clone())
+                    .normalize(classifiable.as_str())
+            })
+            .and_then(classify_normalized)
+            .map_err(|e| sqe_error_to_status(&e, None))?;
 
         if matches!(kind, StatementKind::Query(_)) {
             let (schema, stream) = self
@@ -1001,17 +1051,7 @@ impl SqeFlightSqlService {
                 .execute_stream_with_id(session, sql, client_ip, query_id)
                 .await
                 .map_err(|e| sqe_error_to_status(&e, None))?;
-
-            let options = self.flight_ipc_options()?;
-            let batch_stream =
-                stream.map(|res| res.map_err(|e| FlightError::ExternalError(Box::new(e))));
-            let flight_stream = FlightDataEncoderBuilder::new()
-                .with_schema(schema)
-                .with_options(options)
-                .build(batch_stream)
-                .map_err(Status::from);
-
-            return Ok(Response::new(Box::pin(flight_stream)));
+            return self.stream_to_flight_response(schema, stream);
         }
 
         let batches = self
@@ -1020,6 +1060,86 @@ impl SqeFlightSqlService {
             .await
             .map_err(|e| sqe_error_to_status(&e, None))?;
         self.batches_to_stream(batches)
+    }
+
+    /// Wrap an opened DataFusion record-batch stream in the Flight encoder.
+    /// Batches pass straight through; the coordinator never holds more than
+    /// a few in flight.
+    fn stream_to_flight_response(
+        &self,
+        schema: arrow_schema::SchemaRef,
+        stream: datafusion::execution::SendableRecordBatchStream,
+    ) -> Result<Response<FlightStream>, Status> {
+        let options = self.flight_ipc_options()?;
+        let batch_stream =
+            stream.map(|res| res.map_err(|e| FlightError::ExternalError(Box::new(e))));
+        let flight_stream = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .with_options(options)
+            .build(batch_stream)
+            .map_err(Status::from);
+        Ok(Response::new(Box::pin(flight_stream)))
+    }
+
+    /// Run whatever a redeemed ticket resolved to.
+    async fn run_resolved_into_flight_response(
+        &self,
+        session: &sqe_core::Session,
+        resolved: ResolvedStatement,
+        client_ip: Option<String>,
+        query_id: Option<uuid::Uuid>,
+    ) -> Result<Response<FlightStream>, Status> {
+        match resolved {
+            ResolvedStatement::Sql(sql) => {
+                self.run_sql_into_flight_response(session, &sql, client_ip, query_id)
+                    .await
+            }
+            ResolvedStatement::Prepared(statement) => {
+                self.run_prepared_into_flight_response(session, &statement, client_ip, query_id)
+                    .await
+            }
+        }
+    }
+
+    /// Execute a prepared statement (finding 406).
+    ///
+    /// Queries reuse the plan built at `CreatePreparedStatement`: the current
+    /// bind is substituted with `LogicalPlan::with_param_values` and the
+    /// bound plan goes through [`QueryHandler::execute_plan_stream_with_id`],
+    /// which runs the policy enforcer for the executing user before physical
+    /// planning exactly as the SQL path does. The bind is not consumed, so
+    /// the next execution without a re-bind reuses it.
+    ///
+    /// Statements without a stored plan (DML, DDL, metadata) still execute
+    /// through the buffered text path; their bound values are rendered as SQL
+    /// literals into the original text.
+    async fn run_prepared_into_flight_response(
+        &self,
+        session: &sqe_core::Session,
+        statement: &PreparedStatement,
+        client_ip: Option<String>,
+        query_id: Option<uuid::Uuid>,
+    ) -> Result<Response<FlightStream>, Status> {
+        if statement.plan.is_some() {
+            let plan = statement
+                .bound_plan()
+                .map_err(Status::failed_precondition)?;
+            let (schema, stream) = self
+                .query_handler
+                .execute_plan_stream_with_id(
+                    session,
+                    &statement.numbered_sql,
+                    plan,
+                    client_ip,
+                    query_id,
+                )
+                .await
+                .map_err(|e| sqe_error_to_status(&e, None))?;
+            return self.stream_to_flight_response(schema, stream);
+        }
+        let sql = render_bound_sql(statement)?;
+        self.run_sql_into_flight_response(session, &sql, client_ip, query_id)
+            .await
     }
 
     // -----------------------------------------------------------------
@@ -1388,10 +1508,10 @@ impl FlightSqlService for SqeFlightSqlService {
         // the raw SQL string.
         let handle_str = std::str::from_utf8(handle)
             .map_err(|e| Status::internal(format!("Invalid statement handle: {e}")))?;
-        let (sql, query_id) = self.resolve_statement_handle(&session, handle_str).await?;
+        let (resolved, query_id) = self.resolve_statement_handle(&session, handle_str).await?;
 
         let client_ip = Some(self.extract_client_ip(&request));
-        self.run_sql_into_flight_response(&session, &sql, client_ip, query_id)
+        self.run_resolved_into_flight_response(&session, resolved, client_ip, query_id)
             .await
     }
 
@@ -1413,12 +1533,12 @@ impl FlightSqlService for SqeFlightSqlService {
                 "do_get_fallback executing query"
             );
 
-            let (sql, query_id) = self
+            let (resolved, query_id) = self
                 .resolve_statement_handle(&session, &fetch.handle)
                 .await?;
             let client_ip = Some(self.extract_client_ip(&request));
             return self
-                .run_sql_into_flight_response(&session, &sql, client_ip, query_id)
+                .run_resolved_into_flight_response(&session, resolved, client_ip, query_id)
                 .await;
         }
 
@@ -1702,28 +1822,19 @@ impl FlightSqlService for SqeFlightSqlService {
     ) -> Result<Response<FlightInfo>, Status> {
         let session = self.get_session_from_request(&request).await?;
 
-        // Decode the SQL from the prepared statement handle
-        let fetch: FetchResults =
-            Message::decode(&*cmd.prepared_statement_handle).map_err(|e| {
-                Status::internal(format!("Failed to decode prepared statement handle: {e}"))
-            })?;
-
-        let schema = self
-            .query_handler
-            .get_schema(&session, &fetch.handle)
-            .await
-            .map_err(|e| sqe_error_to_status(&e, None))?;
+        let (statement_id, statement) = self
+            .prepared_from_handle(&session, &cmd.prepared_statement_handle)
+            .await?;
+        // Finding 406: the schema comes from the plan built at
+        // CreatePreparedStatement; nothing is re-planned here.
+        let schema = Arc::clone(&statement.dataset_schema);
 
         // Finding 403: each execution of a prepared statement is its own
         // query, so mint the id here (not at CreatePreparedStatement, whose
         // handle is reused across executions). The pending entry keeps the
-        // raw handle so DoGet finds the parameters bound against it.
+        // statement id so DoGet runs the stored plan with the current bind.
         let (query_id, ticket) = self
-            .issue_statement_ticket(
-                &session,
-                fetch.handle.clone(),
-                Some(cmd.prepared_statement_handle.to_vec()),
-            )
+            .issue_statement_ticket(&session, statement.sql.clone(), Some(statement_id))
             .await;
         debug!(query_id = %query_id, "issued prepared statement ticket");
         let endpoint = FlightEndpoint {
@@ -1862,35 +1973,22 @@ impl FlightSqlService for SqeFlightSqlService {
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         let session = self.get_session_from_request(&request).await?;
 
-        // Decode the SQL from the prepared statement handle
-        let fetch: FetchResults =
-            Message::decode(&*query.prepared_statement_handle).map_err(|e| {
-                Status::internal(format!("Failed to decode prepared statement handle: {e}"))
-            })?;
-
-        // Substitute any bound parameters before execution. Without this
-        // the SQL still contains `?` placeholders and DataFusion rejects
-        // the plan; previous behaviour silently returned wrong results.
-        // The bind is looked up under this authenticated session's key, so a
-        // peer cannot inject parameters into another user's statement (WEB-03).
-        let key = prepared_param_key(&session.id, &query.prepared_statement_handle);
-        let sql = match self.prepared_params.get(&key).await {
-            Some(params) => {
-                self.prepared_params.invalidate(&key).await;
-                sqe_core::substitute_placeholders(&fetch.handle, &params)
-                    .map_err(Status::invalid_argument)?
-            }
-            None => fetch.handle.clone(),
-        };
+        // A client that puts the CommandPreparedStatementQuery itself in the
+        // ticket (instead of the FlightInfo ticket we issued) still runs the
+        // stored plan with its current bind, under a fresh query id. The
+        // lookup is scoped to this session (WEB-03).
+        let (_, statement) = self
+            .prepared_from_handle(&session, &query.prepared_statement_handle)
+            .await?;
 
         debug!(
             username = %session.user.username,
-            sql = %sql,
+            sql = %statement.sql,
             "Executing prepared statement"
         );
 
         let client_ip = Some(self.extract_client_ip(&request));
-        self.run_sql_into_flight_response(&session, &sql, client_ip, None)
+        self.run_prepared_into_flight_response(&session, &statement, client_ip, None)
             .await
     }
 
@@ -2227,28 +2325,15 @@ impl FlightSqlService for SqeFlightSqlService {
         // key the bind to this session.
         let session = self.get_session_from_request(&request).await?;
 
-        // The inbound stream carries a parameter `RecordBatch` produced by
-        // the JDBC driver. Decode it into a flat list of SQL literals and
-        // park the list on the per-session handle key; `do_get_prepared_statement`
-        // then substitutes `?` placeholders in left-to-right order before
-        // executing.
-        let key = prepared_param_key(&session.id, &query.prepared_statement_handle);
-        let stream = request.into_inner();
-        match decode_parameter_stream(stream).await {
-            Ok(params) if !params.is_empty() => {
-                self.prepared_params.insert(key, params).await;
-            }
-            Ok(_) => {
-                // Empty parameter batch (driver issued bind with zero params).
-                self.prepared_params.invalidate(&key).await;
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "Failed to decode prepared statement parameter stream; ignoring bind",
-                );
-            }
-        }
+        // The inbound stream carries the parameter `RecordBatch` produced by
+        // the driver. Finding 406: it is decoded into typed scalars and bound
+        // onto the stored statement, type-checked against the planned
+        // placeholders; a mismatch is rejected here, before any execution.
+        let (_, statement) = self
+            .prepared_from_handle(&session, &query.prepared_statement_handle)
+            .await?;
+        self.bind_prepared_from_stream(&statement, request.into_inner())
+            .await?;
         Ok(DoPutPreparedStatementResult {
             prepared_statement_handle: Some(query.prepared_statement_handle),
         })
@@ -2262,15 +2347,20 @@ impl FlightSqlService for SqeFlightSqlService {
         let session = self.get_session_from_request(&request).await?;
         let client_ip = Some(self.extract_client_ip(&request));
 
-        // Decode the SQL from the prepared statement handle
-        let fetch: FetchResults =
-            Message::decode(&*query.prepared_statement_handle).map_err(|e| {
-                Status::internal(format!("Failed to decode prepared statement handle: {e}"))
-            })?;
+        // Prepared DML: bind whatever parameters the DoPut stream carries,
+        // then run the statement through the buffered path with the bound
+        // values rendered as literals (these statement kinds have no stored
+        // plan; see `run_prepared_into_flight_response`).
+        let (_, statement) = self
+            .prepared_from_handle(&session, &query.prepared_statement_handle)
+            .await?;
+        self.bind_prepared_from_stream(&statement, request.into_inner())
+            .await?;
+        let sql = render_bound_sql(&statement)?;
 
         let batches = self
             .query_handler
-            .execute(&session, &fetch.handle, client_ip)
+            .execute(&session, &sql, client_ip)
             .await
             .map_err(|e| sqe_error_to_status(&e, None))?;
 
@@ -2293,29 +2383,74 @@ impl FlightSqlService for SqeFlightSqlService {
 
         debug!(username = %session.user.username, sql_len = sql.len(), "Creating prepared statement");
 
-        // Get schema by planning the query
-        let schema = self
+        // Finding 406: plan once. `?` placeholders become `$1..$N` so
+        // DataFusion can plan the statement without values, inferring each
+        // placeholder's type and the output schema. The plan is stored and
+        // reused by every GetFlightInfo/DoGet for this statement; policy
+        // enforcement is applied per execution, not here.
+        let (numbered_sql, numbered_count) = sqe_core::number_placeholders(sql);
+        let plan = self
             .query_handler
-            .get_schema(&session, sql)
+            .plan_prepared_statement(&session, &numbered_sql)
             .await
             .map_err(|e| sqe_error_to_status(&e, None))?;
-
-        // Encode the SQL in the handle so we can execute it later
-        let fetch = FetchResults {
-            handle: sql.clone(),
+        let (param_types, dataset_schema): (
+            Vec<Option<arrow_schema::DataType>>,
+            arrow_schema::SchemaRef,
+        ) = match &plan {
+            Some(plan) => (
+                PreparedStatement::param_types_from_plan(plan, numbered_count)
+                    .map_err(Status::internal)?,
+                Arc::new(plan.schema().as_arrow().clone()),
+            ),
+            // DML, DDL and metadata statements have no streaming plan;
+            // their result schema is the one `get_schema` advertises and
+            // their parameters are untyped until bound.
+            None => (
+                vec![None; numbered_count],
+                self.query_handler
+                    .get_schema(&session, sql)
+                    .await
+                    .map_err(|e| sqe_error_to_status(&e, None))?,
+            ),
         };
-        let handle = fetch.encode_to_vec();
+        let statement = PreparedStatement::new(
+            sql.clone(),
+            numbered_sql,
+            plan,
+            param_types,
+            Arc::clone(&dataset_schema),
+        );
+        let parameter_schema = statement.parameter_schema();
+        let statement_id = self
+            .prepared_statements
+            .insert(&session.id, statement)
+            .await;
+        debug!(
+            statement_id = %statement_id,
+            parameters = parameter_schema.fields().len(),
+            "Prepared statement stored"
+        );
 
-        // Encode the schema as IPC for the prepared statement result.
-        // Use FlightInfo's try_with_schema to get the encoded bytes, then extract them.
-        let encoded_info = FlightInfo::new()
-            .try_with_schema(&schema)
-            .map_err(|e| Status::internal(format!("Failed to encode schema: {e}")))?;
+        // Encode both schemas as IPC for the result. FlightInfo's
+        // try_with_schema produces the encoded bytes.
+        let dataset_schema = FlightInfo::new()
+            .try_with_schema(&dataset_schema)
+            .map_err(|e| Status::internal(format!("Failed to encode schema: {e}")))?
+            .schema;
+        let parameter_schema = if parameter_schema.fields().is_empty() {
+            Default::default()
+        } else {
+            FlightInfo::new()
+                .try_with_schema(&parameter_schema)
+                .map_err(|e| Status::internal(format!("Failed to encode parameter schema: {e}")))?
+                .schema
+        };
 
         Ok(ActionCreatePreparedStatementResult {
-            prepared_statement_handle: handle.into(),
-            dataset_schema: encoded_info.schema,
-            parameter_schema: Default::default(),
+            prepared_statement_handle: PreparedStatementStore::handle_bytes(statement_id).into(),
+            dataset_schema,
+            parameter_schema,
         })
     }
 
@@ -2324,11 +2459,17 @@ impl FlightSqlService for SqeFlightSqlService {
         query: ActionClosePreparedStatementRequest,
         request: Request<Action>,
     ) -> Result<(), Status> {
-        // WEB-03: authenticate so a peer cannot evict another session's bind,
-        // and scope the key to this session.
+        // WEB-03: authenticate so a peer cannot evict another session's
+        // statement, and scope the lookup to this session. Closing an unknown
+        // or already-closed handle is a no-op, as JDBC expects.
         let session = self.get_session_from_request(&request).await?;
-        let key = prepared_param_key(&session.id, &query.prepared_statement_handle);
-        self.prepared_params.invalidate(&key).await;
+        if let Ok(statement_id) =
+            PreparedStatementStore::parse_handle(&query.prepared_statement_handle)
+        {
+            self.prepared_statements
+                .remove(&session.id, statement_id)
+                .await;
+        }
         Ok(())
     }
 
@@ -2643,36 +2784,64 @@ impl FlightSqlService for SqeFlightSqlService {
 }
 
 // ---------------------------------------------------------------------------
-/// Decode a Flight inbound parameter stream into a flat list of SQL literals.
+/// Decode a Flight inbound parameter stream into one typed scalar per
+/// placeholder.
 ///
 /// The Flight SQL spec ships parameter values as a single-row `RecordBatch`
-/// where each column corresponds to one `?` placeholder. JDBC drivers stay
-/// within this row-count contract; we still walk every row in case a future
-/// driver issues batched binds.
-async fn decode_parameter_stream<S>(stream: S) -> Result<Vec<String>, String>
+/// where each column corresponds to one placeholder, in order. Only the
+/// first non-empty row is read; one bind row is the JDBC contract.
+async fn decode_parameter_stream<S>(
+    stream: S,
+) -> Result<Vec<datafusion::scalar::ScalarValue>, String>
 where
     S: futures::Stream<Item = Result<arrow_flight::FlightData, Status>> + Send + Unpin + 'static,
 {
     use arrow_flight::decode::FlightRecordBatchStream;
+    use datafusion::scalar::ScalarValue;
     use futures::StreamExt;
 
     let mapped = stream.map(|item| item.map_err(arrow_flight::error::FlightError::from));
     let mut batches = FlightRecordBatchStream::new_from_flight_data(mapped);
-    let mut literals: Vec<String> = Vec::new();
+    let mut values: Vec<ScalarValue> = Vec::new();
     while let Some(item) = batches.next().await {
         let batch = item.map_err(|e| format!("Failed to read parameter batch: {e}"))?;
         if batch.num_rows() == 0 {
             continue;
         }
-        for col_idx in 0..batch.num_columns() {
-            let array = batch.column(col_idx).as_ref();
-            literals.push(arrow_value_to_sql_literal(array, 0));
+        for (col_idx, column) in batch.columns().iter().enumerate() {
+            values.push(
+                ScalarValue::try_from_array(column.as_ref(), 0).map_err(|e| {
+                    format!("parameter ${}: unsupported Arrow value: {e}", col_idx + 1)
+                })?,
+            );
         }
-        // Subsequent rows would replay against the same SQL; one bind row
-        // is the JDBC contract. Stop here.
         break;
     }
-    Ok(literals)
+    Ok(values)
+}
+
+/// Render a prepared statement's bound values into its original text for the
+/// buffered (non-query) path, which has no stored plan to bind into.
+fn render_bound_sql(statement: &PreparedStatement) -> Result<String, Status> {
+    if statement.param_count() == 0 {
+        return Ok(statement.sql.clone());
+    }
+    let values = statement.bound_values().ok_or_else(|| {
+        Status::failed_precondition(format!(
+            "prepared statement has {} parameters but no values are bound",
+            statement.param_count()
+        ))
+    })?;
+    let literals = values
+        .iter()
+        .map(|value| {
+            value
+                .to_array()
+                .map(|array| arrow_value_to_sql_literal(array.as_ref(), 0))
+                .map_err(|e| Status::internal(format!("Failed to render bound parameter: {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    sqe_core::substitute_placeholders(&statement.sql, &literals).map_err(Status::invalid_argument)
 }
 
 /// Render one Arrow scalar as a SQL literal usable in textual substitution.
@@ -3562,5 +3731,280 @@ catalog_url = ""
         })
         .await;
         assert!(rest.is_ok(), "cancel must end the open DoGet stream");
+    }
+
+    // ---------------------------------------------------------------
+    // Prepared statements (finding 406)
+    // ---------------------------------------------------------------
+
+    /// Drain a DoGet response into record batches.
+    async fn collect_batches<S>(stream: S) -> Vec<RecordBatch>
+    where
+        S: Stream<Item = Result<arrow_flight::FlightData, Status>> + Send + Unpin + 'static,
+    {
+        arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
+            stream.map_err(FlightError::from),
+        )
+        .try_collect()
+        .await
+        .expect("decodes result batches")
+    }
+
+    /// The single Int64 value of a one-row, one-column result.
+    fn single_i64(batches: &[RecordBatch]) -> i64 {
+        let rows: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_primitive::<arrow_array::types::Int64Type>()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(rows.len(), 1, "expected exactly one row, got {rows:?}");
+        rows[0]
+    }
+
+    /// Encode a one-row parameter batch the way a Flight SQL driver does.
+    fn param_stream(
+        values: Vec<(DataType, arrow_array::ArrayRef)>,
+    ) -> impl Stream<Item = Result<arrow_flight::FlightData, Status>> + Send + Unpin + 'static {
+        let schema = Arc::new(Schema::new(
+            values
+                .iter()
+                .enumerate()
+                .map(|(i, (dt, _))| Field::new(format!("${}", i + 1), dt.clone(), true))
+                .collect::<Vec<_>>(),
+        ));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            values.into_iter().map(|(_, a)| a).collect(),
+        )
+        .expect("parameter batch");
+        let data = arrow_flight::utils::batches_to_flight_data(&schema, vec![batch])
+            .expect("encodes parameter batch");
+        stream::iter(data.into_iter().map(Ok))
+    }
+
+    /// GetFlightInfo + DoGet for a prepared statement, returning the result.
+    async fn execute_prepared(
+        service: &SqeFlightSqlService,
+        token: &str,
+        handle: &bytes::Bytes,
+    ) -> Result<Vec<RecordBatch>, Status> {
+        let info = service
+            .get_flight_info_prepared_statement(
+                CommandPreparedStatementQuery {
+                    prepared_statement_handle: handle.clone(),
+                },
+                authed(token, FlightDescriptor::new_cmd(vec![])),
+            )
+            .await?
+            .into_inner();
+        let ticket = info.endpoint[0].ticket.as_ref().expect("ticket").clone();
+        let fetch = decode_ticket(&ticket);
+        let stream = service
+            .do_get_fallback(authed(token, ticket), fetch.as_any())
+            .await?
+            .into_inner();
+        Ok(collect_batches(stream).await)
+    }
+
+    /// Acceptance for finding 406: the handle is a statement id, the
+    /// parameter schema is real, a typed bind executes, and a second
+    /// execution WITHOUT re-binding still returns rows (the bind is not
+    /// consumed). A wrong-type bind is rejected before anything runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepared_statement_binds_once_and_executes_twice() {
+        let (service, token, tracker) = cancel_test_service().await;
+
+        let created = service
+            .do_action_create_prepared_statement(
+                ActionCreatePreparedStatementRequest {
+                    query: "SELECT ? + 1 AS v".to_string(),
+                    transaction_id: None,
+                },
+                authed(&token, Action::new("CreatePreparedStatement", vec![])),
+            )
+            .await
+            .expect("create prepared statement");
+
+        // The handle is a server-issued statement id, not the SQL.
+        let statement_id = PreparedStatementStore::parse_handle(&created.prepared_statement_handle)
+            .expect("handle is a statement id");
+        let stored = service
+            .prepared_statements
+            .get(&token, statement_id)
+            .await
+            .expect("statement stored under the session");
+        assert!(
+            stored.plan.is_some(),
+            "query plan is stored at prepare time"
+        );
+        assert_eq!(stored.param_types, vec![Some(DataType::Int64)]);
+
+        // Non-empty parameter schema carrying the inferred type.
+        assert!(!created.parameter_schema.is_empty());
+        let param_schema: Schema = arrow_flight::IpcMessage(created.parameter_schema.clone())
+            .try_into()
+            .expect("parameter schema decodes");
+        assert_eq!(param_schema.fields().len(), 1);
+        assert_eq!(param_schema.field(0).data_type(), &DataType::Int64);
+
+        // Unbound: executing must fail cleanly rather than run with a bare `$1`.
+        let err = execute_prepared(&service, &token, &created.prepared_statement_handle)
+            .await
+            .expect_err("unbound parameters must not execute");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+        // Wrong Arrow type is rejected at bind time, before execution.
+        let err = service
+            .bind_prepared_from_stream(
+                &stored,
+                param_stream(vec![(
+                    DataType::Utf8,
+                    Arc::new(arrow_array::StringArray::from(vec!["abc"])),
+                )]),
+            )
+            .await
+            .expect_err("Utf8 must not bind to an Int64 placeholder");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("expected Int64, got Utf8"), "{err}");
+        assert!(!stored.is_bound());
+
+        // Correct bind (Int32, as JDBC setInt would send for a BIGINT param).
+        service
+            .bind_prepared_from_stream(
+                &stored,
+                param_stream(vec![(
+                    DataType::Int32,
+                    Arc::new(arrow_array::Int32Array::from(vec![41])),
+                )]),
+            )
+            .await
+            .expect("bind");
+
+        let first = execute_prepared(&service, &token, &created.prepared_statement_handle)
+            .await
+            .expect("first execution");
+        assert_eq!(single_i64(&first), 42);
+
+        // Second executeQuery() without re-binding: same rows, bind intact.
+        let second = execute_prepared(&service, &token, &created.prepared_statement_handle)
+            .await
+            .expect("second execution without re-bind");
+        assert_eq!(single_i64(&second), 42);
+        assert!(stored.is_bound());
+
+        // Re-bind replaces the values.
+        service
+            .bind_prepared_from_stream(
+                &stored,
+                param_stream(vec![(
+                    DataType::Int64,
+                    Arc::new(arrow_array::Int64Array::from(vec![99])),
+                )]),
+            )
+            .await
+            .expect("re-bind");
+        let third = execute_prepared(&service, &token, &created.prepared_statement_handle)
+            .await
+            .expect("third execution");
+        assert_eq!(single_i64(&third), 100);
+
+        // Close evicts; the handle is then unknown.
+        service
+            .do_action_close_prepared_statement(
+                ActionClosePreparedStatementRequest {
+                    prepared_statement_handle: created.prepared_statement_handle.clone(),
+                },
+                authed(&token, Action::new("ClosePreparedStatement", vec![])),
+            )
+            .await
+            .expect("close");
+        let err = execute_prepared(&service, &token, &created.prepared_statement_handle)
+            .await
+            .expect_err("closed statement must be unknown");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        assert_eq!(tracker.active_count(), 0);
+    }
+
+    /// Plan-once evidence: DoGet executes the plan stored at prepare time,
+    /// not a re-plan of the SQL text. The stored plan deliberately disagrees
+    /// with the text; the result follows the plan.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepared_execution_reuses_stored_plan_instead_of_replanning() {
+        let (service, token, _tracker) = cancel_test_service().await;
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let plan = ctx
+            .state()
+            .create_logical_plan("SELECT $1 + 100 AS v")
+            .await
+            .expect("plans");
+        let types = PreparedStatement::param_types_from_plan(&plan, 1).expect("types");
+        let schema = Arc::new(plan.schema().as_arrow().clone());
+        let statement = PreparedStatement::new(
+            "SELECT $1 + 1 AS v".to_string(),
+            "SELECT $1 + 1 AS v".to_string(),
+            Some(plan),
+            types,
+            schema,
+        );
+        statement
+            .bind(vec![datafusion::scalar::ScalarValue::Int64(Some(1))])
+            .expect("bind");
+        let id = service.prepared_statements.insert(&token, statement).await;
+        let handle = bytes::Bytes::from(PreparedStatementStore::handle_bytes(id));
+
+        let batches = execute_prepared(&service, &token, &handle)
+            .await
+            .expect("executes");
+        assert_eq!(
+            single_i64(&batches),
+            101,
+            "result must come from the stored plan, not from re-planning the SQL"
+        );
+
+        // Another session cannot see or run this statement.
+        let other = service
+            .session_manager
+            .authenticate("bob", "pw")
+            .await
+            .expect("second session");
+        let err = execute_prepared(&service, &other.id, &handle)
+            .await
+            .expect_err("foreign session must not resolve the handle");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    /// A statement without parameters needs no bind and runs repeatedly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepared_statement_without_parameters_runs_without_bind() {
+        let (service, token, _tracker) = cancel_test_service().await;
+        let created = service
+            .do_action_create_prepared_statement(
+                ActionCreatePreparedStatementRequest {
+                    query: "SELECT 7 AS v -- what?".to_string(),
+                    transaction_id: None,
+                },
+                authed(&token, Action::new("CreatePreparedStatement", vec![])),
+            )
+            .await
+            .expect("create");
+        assert!(created.parameter_schema.is_empty());
+        for _ in 0..2 {
+            let batches = execute_prepared(&service, &token, &created.prepared_statement_handle)
+                .await
+                .expect("executes");
+            assert_eq!(single_i64(&batches), 7);
+        }
+        // A handle that is not a statement id is rejected, not executed as SQL.
+        let err = execute_prepared(&service, &token, &bytes::Bytes::from_static(b"SELECT 1"))
+            .await
+            .expect_err("raw SQL handle must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }
