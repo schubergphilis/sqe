@@ -36,33 +36,53 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Channel, Server};
 
-/// `catalog_url` points at a closed port on purpose. These queries never touch
-/// a catalog, and a dead URL proves it: if the statement path grew a dependency
-/// on catalog reachability, this test would fail rather than quietly pass
-/// against whatever happens to be listening on a developer's machine.
-const SMOKE_TOML: &str = r#"
-[coordinator]
+/// `catalog_url` points at an in-process Polaris mock that serves an empty
+/// catalog. The queries never touch a table, so an empty catalog keeps the
+/// transport as the only thing under test. This used to be a closed port: since
+/// finding 306 (#657) an unreachable catalog fails the session build loudly
+/// instead of degrading to an empty namespace list, so a dead URL now proves
+/// the fail-closed rule rather than the statement path.
+fn smoke_config(catalog_url: &str) -> SqeConfig {
+    let toml = format!("[coordinator]\n\n[auth]\n\n[catalog]\ncatalog_url = \"{catalog_url}\"\n");
+    toml::from_str(&toml).expect("smoke config parses")
+}
 
-[auth]
-
-[catalog]
-catalog_url = "http://127.0.0.1:59997"
-"#;
-
-fn smoke_config() -> SqeConfig {
-    toml::from_str(SMOKE_TOML).expect("smoke config parses")
+/// Polaris mock with a config endpoint and zero namespaces.
+async fn mount_empty_polaris() -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let server = wiremock::MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/config"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"overrides":{},"defaults":{}}"#),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"namespaces":[]}"#))
+        .mount(&server)
+        .await;
+    server
 }
 
 /// A running Flight SQL server. Dropping it shuts the server task down.
 struct FlightServer {
     addr: std::net::SocketAddr,
+    /// The server's query tracker, so tests can observe query state the way
+    /// the admin API does.
+    tracker: Arc<QueryTracker>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<()>>,
+    /// The Polaris mock the session build talks to; dropped with the server.
+    _polaris: wiremock::MockServer,
 }
 
 impl FlightServer {
     async fn start() -> Self {
-        let config = smoke_config();
+        let polaris = mount_empty_polaris().await;
+        let config = smoke_config(&polaris.uri());
         let tracker = Arc::new(QueryTracker::new(&config.query_history));
         let handler = QueryHandler::new(
             Arc::new(PassthroughEnforcer),
@@ -72,7 +92,7 @@ impl FlightServer {
             None, // credential_tracker
             None, // metrics
             None, // audit
-            tracker,
+            Arc::clone(&tracker),
             None, // query_cache
             None, // grant_backend
             None, // lineage
@@ -107,8 +127,10 @@ impl FlightServer {
 
         Self {
             addr,
+            tracker,
             shutdown: Some(tx),
             task: Some(task),
+            _polaris: polaris,
         }
     }
 
@@ -184,6 +206,101 @@ async fn handshake_then_statement_returns_rows_over_grpc() {
         .downcast_ref::<arrow_array::Int64Array>()
         .expect("1 + 1 is an Int64");
     assert_eq!(values.value(0), 2);
+}
+
+/// Finding 403: the ADBC/JDBC cancel sequence over the wire. `GetFlightInfo`
+/// for a long `SELECT`, `DoGet` left streaming, then `CancelQuery` with the
+/// returned `FlightInfo`. Before the fix the ticket carried the SQL, so the
+/// server could not map it to a tracked query and answered UNSPECIFIED (0).
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_query_with_flight_info_cancels_the_running_statement() {
+    use arrow_flight::sql::{ActionCancelQueryRequest, ActionCancelQueryResult, ProstMessageExt};
+    use arrow_flight::Action;
+    use prost::Message;
+    use sqe_coordinator::query_tracker::QueryState;
+
+    let server = FlightServer::start().await;
+    let mut client = FlightSqlServiceClient::new(server.channel().await);
+    let token = client.handshake("smoke", "smoke").await.expect("handshake");
+    client.set_token(String::from_utf8(token.to_vec()).expect("token is utf-8"));
+
+    // Effectively unbounded work, catalog-free.
+    let info = client
+        .execute(
+            "SELECT count(*) FROM generate_series(1, 100000000000)".to_string(),
+            None,
+        )
+        .await
+        .expect("GetFlightInfo");
+    let ticket = info.endpoint[0].ticket.clone().expect("ticket");
+
+    // Start DoGet on a second client and leave it draining in the background.
+    let mut reader = FlightSqlServiceClient::new(server.channel().await);
+    reader.set_token(client.token().expect("token set").to_string());
+    let drain = tokio::spawn(async move {
+        let stream = reader.do_get(ticket).await.expect("DoGet opens");
+        stream.try_collect::<Vec<_>>().await
+    });
+
+    // Wait until the tracker shows the query running.
+    let tracker = Arc::clone(&server.tracker);
+    let running_id = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(r) = tracker
+                .records()
+                .into_iter()
+                .find(|r| r.state == QueryState::Running)
+            {
+                break r.query_id;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("query must reach Running");
+
+    let request = ActionCancelQueryRequest {
+        info: info.encode_to_vec().into(),
+    };
+    let action = Action {
+        r#type: "CancelQuery".to_string(),
+        body: request.as_any().encode_to_vec().into(),
+    };
+    let mut results = client
+        .do_action(action)
+        .await
+        .expect("DoAction CancelQuery");
+    let first = results
+        .try_next()
+        .await
+        .expect("action stream")
+        .expect("one result");
+    let any = arrow_flight::sql::Any::decode(&*first.body).expect("Any");
+    let result: ActionCancelQueryResult = any.unpack().expect("unpack").expect("typed result");
+    assert_eq!(result.result, 1, "CancelResult must be CANCELLED (1)");
+
+    // The tracker shows Canceled within a second.
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if tracker
+                .get(&running_id)
+                .is_some_and(|r| r.state == QueryState::Canceled)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("tracker must show Canceled within one second");
+
+    // And the DoGet stream is released rather than pinned until the idle timer.
+    // The stream may end with a Cancelled status or cleanly; only its
+    // termination is asserted here.
+    let _stream_outcome = tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+        .await
+        .expect("cancel must end the DoGet stream")
+        .expect("drain task");
 }
 
 /// A statement without a bearer token must be refused by the transport.

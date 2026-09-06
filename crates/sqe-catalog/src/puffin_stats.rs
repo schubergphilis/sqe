@@ -49,10 +49,15 @@ use std::sync::{Arc, RwLock};
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, TimeUnit};
-use datasketches::theta::ThetaSketch;
+/// Re-exported so downstream crates (the coordinator's carry-forward helper)
+/// can name the sketch type inside [`ColumnSketches`] without depending on
+/// `datasketches` directly.
+pub use datasketches::theta::ThetaSketch;
 
 use iceberg::io::FileIO;
-use iceberg::puffin::{Blob, CompressionCodec, PuffinWriter, APACHE_DATASKETCHES_THETA_V1};
+use iceberg::puffin::{
+    Blob, CompressionCodec, PuffinReader, PuffinWriter, APACHE_DATASKETCHES_THETA_V1,
+};
 use iceberg::spec::BlobMetadata as SpecBlobMetadata;
 use iceberg::spec::{Schema as IcebergSchema, StatisticsFile};
 use tracing::{debug, warn};
@@ -90,6 +95,25 @@ pub const PROP_NDV: &str = "ndv";
 /// `fields`).
 pub const PROP_FIELD_ID: &str = "field_id";
 
+/// Blob property key for the sketch's `theta64` at emit time. The body
+/// stores only the retained hashes (see the module docs), so without this
+/// value a later reader can only derive theta from `ndv`; with it the body
+/// decodes back into an exact sketch that unions losslessly (finding 512).
+pub const PROP_THETA: &str = "sqe.theta";
+
+/// Blob property flag (`"true"`): the `ndv` value is an upper bound carried
+/// from an earlier snapshot, not a fresh estimate over this snapshot's rows.
+/// Set by DELETE/UPDATE row-delta carry-forward and by INSERT merges whose
+/// previous body could not be decoded.
+pub const PROP_NDV_UPPER_BOUND: &str = "sqe.ndv_upper_bound";
+
+/// Blob property key naming the snapshot whose statistics this blob was
+/// carried or merged from.
+pub const PROP_CARRIED_FROM: &str = "sqe.carried_from_snapshot";
+
+/// Blob property carrying the column name for human readers.
+pub const PROP_COLUMN: &str = "column";
+
 /// Snapshot-keyed cache of NDV estimates advertised in Iceberg statistics
 /// metadata.
 ///
@@ -101,9 +125,52 @@ pub const PROP_FIELD_ID: &str = "field_id";
 #[derive(Debug, Default)]
 pub struct PuffinNdvCache {
     by_snapshot: RwLock<HashMap<i64, Arc<HashMap<i32, usize>>>>,
+    /// `(table uuid, snapshot id)` keyed entries for the process-global
+    /// instance, where snapshots of different tables share one map.
+    by_table_snapshot: RwLock<HashMap<(uuid::Uuid, i64), NdvByFieldId>>,
 }
 
+/// Parsed `field id -> NDV estimate` map for one snapshot.
+type NdvByFieldId = Arc<HashMap<i32, usize>>;
+
+/// Process-global NDV cache shared by every table provider (review 307).
+///
+/// `SqeTableProvider::try_new` used to allocate a private cache per provider,
+/// and a provider is built per `table()` lookup, so "shared by clones" never
+/// crossed a query boundary. Keyed by `(table uuid, snapshot id)` like the
+/// snapshot statistics cache; a snapshot's statistics file is immutable, so
+/// no DDL invalidation is needed.
+pub static PUFFIN_NDV_CACHE: std::sync::LazyLock<PuffinNdvCache> =
+    std::sync::LazyLock::new(PuffinNdvCache::default);
+
 impl PuffinNdvCache {
+    /// Return parsed field-id to NDV estimates for `snapshot_id` of the
+    /// table identified by `table_uuid`. Same semantics as
+    /// [`Self::for_snapshot`] with the table folded into the key.
+    pub fn for_table_snapshot(
+        &self,
+        table_uuid: uuid::Uuid,
+        snapshot_id: i64,
+        statistics_file: Option<&StatisticsFile>,
+    ) -> Arc<HashMap<i32, usize>> {
+        let key = (table_uuid, snapshot_id);
+        if let Ok(cache) = self.by_table_snapshot.read() {
+            if let Some(ndv) = cache.get(&key) {
+                return Arc::clone(ndv);
+            }
+        }
+
+        let parsed = Arc::new(
+            statistics_file
+                .map(parse_ndv_properties)
+                .unwrap_or_default(),
+        );
+        if let Ok(mut cache) = self.by_table_snapshot.write() {
+            return Arc::clone(cache.entry(key).or_insert_with(|| Arc::clone(&parsed)));
+        }
+        parsed
+    }
+
     /// Return parsed field-id to NDV estimates for `snapshot_id`.
     pub fn for_snapshot(
         &self,
@@ -245,7 +312,12 @@ impl ThetaSketchAccumulator {
                         );
                         return None;
                     }
-                    Some((col_idx, *field_id, name.clone(), ThetaSketch::builder().build()))
+                    Some((
+                        col_idx,
+                        *field_id,
+                        name.clone(),
+                        ThetaSketch::builder().build(),
+                    ))
                 })
                 .collect()
         });
@@ -546,27 +618,84 @@ pub async fn write_puffin_sidecar_from_sketches(
     snapshot_id: i64,
     sequence_number: i64,
 ) -> iceberg::Result<StatisticsFile> {
+    let blobs = sketches_to_blobs(sketches);
+    write_puffin_sidecar_from_blobs(file_io, base_dir, &blobs, snapshot_id, sequence_number).await
+}
+
+/// One per-column NDV blob, decoupled from the live `ThetaSketch` so a
+/// sidecar can be rebuilt from a previous snapshot's file (carry-forward
+/// after compaction, union after INSERT, upper bound after DELETE) without
+/// re-scanning data. `properties` carries anything beyond the standard
+/// `ndv` / `field_id` / `column` keys, which the writer always sets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NdvBlob {
+    pub field_id: i32,
+    pub name: String,
+    /// Serialised body in the layout of [`serialise_theta_body`].
+    pub body: Vec<u8>,
+    pub ndv: u64,
+    pub properties: HashMap<String, String>,
+}
+
+impl NdvBlob {
+    /// Build a blob from a live sketch, recording `theta64` so the body can
+    /// be decoded exactly later.
+    pub fn from_sketch(field_id: i32, name: &str, sketch: &ThetaSketch, ndv: u64) -> Self {
+        let mut properties = HashMap::new();
+        properties.insert(PROP_THETA.to_string(), sketch.theta64().to_string());
+        Self {
+            field_id,
+            name: name.to_string(),
+            body: serialise_theta_body(sketch),
+            ndv,
+            properties,
+        }
+    }
+
+    /// Full property map as written to the Puffin footer and mirrored into
+    /// the Iceberg `StatisticsFile` blob metadata.
+    fn full_properties(&self) -> HashMap<String, String> {
+        let mut props = self.properties.clone();
+        props.insert(PROP_NDV.to_string(), self.ndv.to_string());
+        props.insert(PROP_FIELD_ID.to_string(), self.field_id.to_string());
+        props.insert(PROP_COLUMN.to_string(), self.name.clone());
+        props
+    }
+}
+
+/// Convert freshly built sketches into writable blobs.
+pub fn sketches_to_blobs(sketches: &ColumnSketches) -> Vec<NdvBlob> {
+    sketches
+        .iter()
+        .map(|(field_id, name, sketch, ndv)| NdvBlob::from_sketch(*field_id, name, sketch, *ndv))
+        .collect()
+}
+
+/// Write a Puffin sidecar from pre-built blobs. This is the single writer
+/// every emission path ends in; see [`write_puffin_sidecar`] for the layout.
+pub async fn write_puffin_sidecar_from_blobs(
+    file_io: &FileIO,
+    base_dir: &str,
+    blobs: &[NdvBlob],
+    snapshot_id: i64,
+    sequence_number: i64,
+) -> iceberg::Result<StatisticsFile> {
     let uuid = uuid::Uuid::new_v4();
     let sidecar_path = format!("{base_dir}/{snapshot_id}-{uuid}.stats");
 
     let output_file = file_io.new_output(&sidecar_path)?;
     let mut writer = PuffinWriter::new(&output_file, HashMap::new(), false).await?;
 
-    let mut blob_metadata_specs: Vec<SpecBlobMetadata> = Vec::with_capacity(sketches.len());
+    let mut blob_metadata_specs: Vec<SpecBlobMetadata> = Vec::with_capacity(blobs.len());
 
-    for (field_id, name, sketch, ndv) in sketches {
-        let mut props = HashMap::new();
-        props.insert(PROP_NDV.to_string(), ndv.to_string());
-        props.insert(PROP_FIELD_ID.to_string(), field_id.to_string());
-        props.insert("column".to_string(), name.clone());
-
-        let body = serialise_theta_body(sketch);
+    for ndv_blob in blobs {
+        let props = ndv_blob.full_properties();
         let blob = Blob::builder()
             .r#type(APACHE_DATASKETCHES_THETA_V1.to_string())
-            .fields(vec![*field_id])
+            .fields(vec![ndv_blob.field_id])
             .snapshot_id(snapshot_id)
             .sequence_number(sequence_number)
-            .data(body)
+            .data(ndv_blob.body.clone())
             .properties(props.clone())
             .build();
 
@@ -576,7 +705,7 @@ pub async fn write_puffin_sidecar_from_sketches(
             r#type: APACHE_DATASKETCHES_THETA_V1.to_string(),
             snapshot_id,
             sequence_number,
-            fields: vec![*field_id],
+            fields: vec![ndv_blob.field_id],
             properties: props,
         });
     }
@@ -584,7 +713,7 @@ pub async fn write_puffin_sidecar_from_sketches(
     let result = writer.close_with_metadata().await?;
     debug!(
         path = %sidecar_path,
-        blob_count = sketches.len(),
+        blob_count = blobs.len(),
         size = result.file_size_in_bytes,
         "wrote Puffin NDV sidecar"
     );
@@ -601,6 +730,74 @@ pub async fn write_puffin_sidecar_from_sketches(
         key_metadata: None,
         blob_metadata: blob_metadata_specs,
     })
+}
+
+/// Read every single-field theta blob of an existing sidecar back into
+/// [`NdvBlob`]s (body included), so a later snapshot can carry or union them.
+///
+/// Blobs of other types, multi-field blobs, and blobs without a parsable
+/// `ndv` property are skipped. Any I/O or footer error propagates: the caller
+/// decides whether to fall back to the metadata-only `ndv` values.
+pub async fn read_ndv_blobs(
+    file_io: &FileIO,
+    statistics_file: &StatisticsFile,
+) -> iceberg::Result<Vec<NdvBlob>> {
+    let input = file_io.new_input(&statistics_file.statistics_path)?;
+    let reader = PuffinReader::new(input);
+    let file_metadata = reader.file_metadata().await?;
+    let mut out = Vec::new();
+    for meta in file_metadata.blobs() {
+        if meta.blob_type() != APACHE_DATASKETCHES_THETA_V1 || meta.fields().len() != 1 {
+            continue;
+        }
+        let Some(ndv) = meta
+            .properties()
+            .get(PROP_NDV)
+            .and_then(|v| v.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let blob = reader.blob(meta).await?;
+        let field_id = meta.fields()[0];
+        let mut properties = blob.properties().clone();
+        properties.remove(PROP_NDV);
+        properties.remove(PROP_FIELD_ID);
+        let name = properties.remove(PROP_COLUMN).unwrap_or_default();
+        out.push(NdvBlob {
+            field_id,
+            name,
+            body: blob.data().to_vec(),
+            ndv,
+            properties,
+        });
+    }
+    Ok(out)
+}
+
+/// Metadata-only fallback for [`read_ndv_blobs`]: rebuild blobs from the
+/// `ndv` properties mirrored into the Iceberg `StatisticsFile`, with empty
+/// bodies. Used when the sidecar object itself cannot be read; the caller
+/// is expected to flag the result as an upper bound.
+pub fn ndv_blobs_from_metadata(statistics_file: &StatisticsFile) -> Vec<NdvBlob> {
+    statistics_file
+        .blob_metadata
+        .iter()
+        .filter(|blob| blob.r#type == APACHE_DATASKETCHES_THETA_V1 && blob.fields.len() == 1)
+        .filter_map(|blob| {
+            let ndv = blob.properties.get(PROP_NDV)?.parse::<u64>().ok()?;
+            let mut properties = blob.properties.clone();
+            properties.remove(PROP_NDV);
+            properties.remove(PROP_FIELD_ID);
+            let name = properties.remove(PROP_COLUMN).unwrap_or_default();
+            Some(NdvBlob {
+                field_id: blob.fields[0],
+                name,
+                body: Vec::new(),
+                ndv,
+                properties,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -875,6 +1072,47 @@ mod tests {
             .expect("id blob");
         assert_eq!(id_meta.r#type, APACHE_DATASKETCHES_THETA_V1);
         assert_eq!(id_meta.properties.get(PROP_NDV), Some(&"4".to_string()));
+    }
+
+    #[tokio::test]
+    async fn read_ndv_blobs_round_trips_body_and_properties() {
+        let temp = TempDir::new().unwrap();
+        let base_dir = temp.path().to_string_lossy().to_string();
+        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let schema = schema_id_name();
+        let batch = sample_batch(vec![1, 2, 3, 4], vec!["a", "b", "c", "d"]);
+        let sketches = build_theta_sketches(&schema, &[batch]);
+        let written = sketches_to_blobs(&sketches);
+
+        let stats = write_puffin_sidecar_from_blobs(&file_io, &base_dir, &written, 7, 3)
+            .await
+            .expect("write puffin");
+
+        let read_back = read_ndv_blobs(&file_io, &stats).await.expect("read puffin");
+        assert_eq!(read_back.len(), written.len());
+        for (w, r) in written.iter().zip(read_back.iter()) {
+            assert_eq!(w.field_id, r.field_id);
+            assert_eq!(w.name, r.name);
+            assert_eq!(w.ndv, r.ndv);
+            assert_eq!(w.body, r.body, "body bytes survive the round trip");
+            assert_eq!(
+                w.properties.get(PROP_THETA),
+                r.properties.get(PROP_THETA),
+                "theta property survives the round trip"
+            );
+            assert!(
+                !r.properties.contains_key(PROP_NDV) && !r.properties.contains_key(PROP_COLUMN),
+                "standard keys are lifted into the struct fields, not duplicated"
+            );
+        }
+
+        // Metadata-only fallback agrees on field ids and ndv, with empty bodies.
+        let from_meta = ndv_blobs_from_metadata(&stats);
+        assert_eq!(from_meta.len(), written.len());
+        for (w, m) in written.iter().zip(from_meta.iter()) {
+            assert_eq!((w.field_id, w.ndv), (m.field_id, m.ndv));
+            assert!(m.body.is_empty());
+        }
     }
 
     #[tokio::test]

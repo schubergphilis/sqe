@@ -88,6 +88,10 @@ pub struct MaintenanceHandler {
     /// other. Always present (cheap to construct) even when `worker_registry`
     /// is `None`, since only the distributed path ever reads it.
     worker_load: Arc<WorkerLoadTracker>,
+    /// Coordinator metrics, for `sqe_puffin_sidecar_total` on the compaction
+    /// carry-forward path (architecture review 512). `None` in tests and in
+    /// handlers built without a registry; the carry-forward still runs.
+    metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
     /// TEST-ONLY synchronization seam (`#[cfg(test)]`, so it compiles only
     /// for this crate's own unit test binary -- never for a release build or
     /// an external integration test). See `RewriteRaceSeam`'s doc comment and
@@ -111,9 +115,18 @@ impl MaintenanceHandler {
             runtime: None,
             worker_registry: None,
             worker_load: Arc::new(WorkerLoadTracker::new()),
+            metrics: None,
             #[cfg(test)]
             race_seam: None,
         }
+    }
+
+    /// Attach the coordinator metrics registry so compaction commits report
+    /// `sqe_puffin_sidecar_total{op="rewrite",outcome}`.
+    #[must_use = "with_metrics consumes self; bind the returned handler"]
+    pub fn with_metrics(mut self, metrics: Arc<sqe_metrics::MetricsRegistry>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// TEST-ONLY: attach a [`RewriteRaceSeam`] so the first attempt of
@@ -1299,6 +1312,19 @@ impl MaintenanceHandler {
         cleanup_guard.mark_committed();
         let new_snapshot_id = committed.metadata().current_snapshot_id();
 
+        // Compaction rewrites files, not rows: the previous snapshot's Puffin
+        // NDV statistics stay exact for the new one, so re-register them
+        // (architecture review 512). Best effort; the data commit is done.
+        crate::puffin_carry::carry_forward_statistics(
+            catalog.as_ref(),
+            &ident,
+            &committed,
+            crate::puffin_carry::CarryOp::Rewrite,
+            None,
+            self.metrics.as_deref(),
+        )
+        .await;
+
         // After the commit, invalidate the shared TableMetadataCache entry so
         // subsequent load_table calls (including the table_files TVF used by
         // readers) do not serve stale metadata with the pre-rewrite manifest
@@ -1694,6 +1720,7 @@ impl MaintenanceHandler {
             input_count,
             total_bytes,
             &dispatcher,
+            self.metrics.as_deref(),
         )
         .await
     }
@@ -1837,6 +1864,7 @@ impl MaintenanceHandler {
         input_count: usize,
         total_bytes: i64,
         dispatcher: &dyn crate::compaction_dispatch::GroupBatchDispatcher,
+        metrics: Option<&sqe_metrics::MetricsRegistry>,
     ) -> sqe_core::Result<RewriteOutcome> {
         // `partial_progress` off: one chunk containing every eligible group,
         // i.e. exactly the pre-Task-3 single dispatch-then-commit call.
@@ -1881,6 +1909,7 @@ impl MaintenanceHandler {
                 live_expected,
                 dispatcher,
                 retry_on_conflict,
+                metrics,
             )
             .await;
 
@@ -2009,6 +2038,7 @@ impl MaintenanceHandler {
         live_expected_before: i64,
         dispatcher: &dyn crate::compaction_dispatch::GroupBatchDispatcher,
         retry_on_conflict: bool,
+        metrics: Option<&sqe_metrics::MetricsRegistry>,
     ) -> sqe_core::Result<BatchCommitResult> {
         let batch_old_files: Vec<DataFile> = batch.iter().flatten().cloned().collect();
         let batch_old_paths: std::collections::HashSet<String> = batch_old_files
@@ -2152,6 +2182,7 @@ impl MaintenanceHandler {
                 snapshot_properties.clone(),
                 table_cache,
                 live_expected_before,
+                metrics,
             )
             .await;
 
@@ -2227,6 +2258,7 @@ impl MaintenanceHandler {
         snapshot_properties: Option<std::collections::HashMap<String, String>>,
         table_cache: Option<&TableMetadataCache>,
         live_expected_before: i64,
+        metrics: Option<&sqe_metrics::MetricsRegistry>,
     ) -> sqe_core::Result<BatchCommitResult> {
         let output_count = aggregated.new_files.len() as i64;
         let output_bytes: i64 = aggregated
@@ -2287,6 +2319,18 @@ impl MaintenanceHandler {
             .await
             .map_err(|e| classify_commit_error(e, "rewrite_data_files_distributed"))?;
         let new_snapshot_id = committed.metadata().current_snapshot_id();
+
+        // Same as the local path: carry the previous snapshot's Puffin NDV
+        // statistics onto the compacted snapshot (architecture review 512).
+        crate::puffin_carry::carry_forward_statistics(
+            catalog.as_ref(),
+            ident,
+            &committed,
+            crate::puffin_carry::CarryOp::Rewrite,
+            None,
+            metrics,
+        )
+        .await;
 
         let cache_key = format!("{}.{}", ident.namespace(), ident.name());
         if let Some(tc) = table_cache {
@@ -2470,6 +2514,18 @@ impl MaintenanceHandler {
             .commit(catalog.as_ref())
             .await
             .map_err(|e| classify_commit_error(e, "rewrite_manifests"))?;
+
+        // Manifest rewrite touches no data: the previous snapshot's Puffin
+        // NDV statistics remain exact for the new one (architecture review 512).
+        crate::puffin_carry::carry_forward_statistics(
+            catalog.as_ref(),
+            &ident,
+            &committed,
+            crate::puffin_carry::CarryOp::Rewrite,
+            None,
+            self.metrics.as_deref(),
+        )
+        .await;
 
         let manifest_count = committed
             .metadata()
@@ -4021,6 +4077,262 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // Architecture review 512: compaction must not drop Puffin NDV statistics.
+    //
+    // Run with `RUST_MIN_STACK=33554432 cargo test -p sqe-coordinator --lib
+    // --features test-sqlite maintenance::tests::puffin_carry_forward`.
+    // ---------------------------------------------------------------------
+    #[cfg(feature = "test-sqlite")]
+    mod puffin_carry_forward {
+        use super::*;
+        use iceberg::spec::Schema as IcebergSchema;
+        use iceberg::TableCreation;
+        use sqe_catalog::puffin_stats::{
+            build_theta_sketches, parse_ndv_properties, read_ndv_blobs,
+            write_puffin_sidecar_from_sketches, PROP_CARRIED_FROM, PROP_NDV_UPPER_BOUND,
+            PROP_PUFFIN_STATS,
+        };
+
+        async fn sqlite_catalog(dir: &tempfile::TempDir) -> Arc<dyn Catalog> {
+            let location = dir.path().to_str().expect("tempdir path is UTF-8");
+            sqe_catalog::mount::build_catalog(
+                location,
+                sqe_sql::CatalogKind::Sqlite,
+                &std::collections::BTreeMap::new(),
+                &sqe_core::SecretStore::new(),
+            )
+            .await
+            .expect("sqlite catalog builds")
+        }
+
+        fn test_config() -> SqeConfig {
+            toml::from_str("[coordinator]\n[auth]\n[catalog]\ncatalog_url = \"\"\n")
+                .expect("minimal SqeConfig parses")
+        }
+
+        fn id_schema() -> Arc<Schema> {
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
+        }
+
+        fn id_batch(range: std::ops::Range<i64>) -> RecordBatch {
+            RecordBatch::try_new(
+                id_schema(),
+                vec![Arc::new(Int64Array::from(range.collect::<Vec<i64>>()))],
+            )
+            .expect("build batch")
+        }
+
+        /// Create an opted-in table and commit `batches` as one data file
+        /// each in a single fast-append. Returns the ident and the table as
+        /// committed.
+        async fn seeded_table(
+            catalog: &Arc<dyn Catalog>,
+            name: &str,
+            batches: Vec<RecordBatch>,
+        ) -> (TableIdent, IcebergTable) {
+            let ns = NamespaceIdent::new("default".to_string());
+            catalog
+                .create_namespace(&ns, std::collections::HashMap::new())
+                .await
+                .expect("create namespace");
+            let iceberg_schema: IcebergSchema =
+                iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&id_schema())
+                    .expect("arrow schema converts");
+            let creation = TableCreation::builder()
+                .name(name.to_string())
+                .schema(iceberg_schema)
+                .properties(std::collections::HashMap::from([(
+                    PROP_PUFFIN_STATS.to_string(),
+                    "true".to_string(),
+                )]))
+                .build();
+            catalog
+                .create_table(&ns, creation)
+                .await
+                .expect("create table");
+            let ident = TableIdent::new(ns, name.to_string());
+            let table = catalog.load_table(&ident).await.expect("load table");
+
+            let compression = parse_parquet_compression("zstd");
+            let mut files = Vec::new();
+            for batch in batches {
+                let written = crate::writer::write_data_files(
+                    &table,
+                    vec![batch],
+                    "seed",
+                    compression,
+                    new_upload_tracker(),
+                )
+                .await
+                .expect("write seed data file");
+                files.extend(written);
+            }
+            let tx = Transaction::new(&table);
+            let action = tx.fast_append().add_data_files(files);
+            let tx = action.apply(tx).expect("apply fast_append");
+            let committed = tx.commit(catalog.as_ref()).await.expect("commit seed");
+            (ident, committed)
+        }
+
+        async fn rewrite_all(catalog: &Arc<dyn Catalog>, name: &str) -> RewriteOutcome {
+            MaintenanceHandler::new(test_config())
+                .rewrite_data_files_once(
+                    catalog,
+                    &TableRef::parse(&format!("default.{name}")).expect("parse table ref"),
+                    None,
+                    Some(1),
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                    None,
+                )
+                .await
+                .expect("rewrite_data_files_once succeeds")
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn rewrite_data_files_carries_statistics_onto_the_new_snapshot() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let catalog = sqlite_catalog(&dir).await;
+            let batch_a = id_batch(0..100);
+            let batch_b = id_batch(100..150);
+            let (ident, seeded) = seeded_table(
+                &catalog,
+                "stats_carry",
+                vec![batch_a.clone(), batch_b.clone()],
+            )
+            .await;
+            let seed_snapshot = seeded
+                .metadata()
+                .current_snapshot_id()
+                .expect("seed snapshot");
+
+            // Register statistics for the seed snapshot the way an INSERT
+            // would: sketch the rows, write the sidecar, commit with retry.
+            let sketches =
+                build_theta_sketches(seeded.metadata().current_schema(), &[batch_a, batch_b]);
+            let base_dir = format!(
+                "{}/metadata",
+                seeded.metadata().location().trim_end_matches('/')
+            );
+            let stats = write_puffin_sidecar_from_sketches(
+                seeded.file_io(),
+                &base_dir,
+                &sketches,
+                seed_snapshot,
+                seeded.metadata().last_sequence_number(),
+            )
+            .await
+            .expect("write seed sidecar");
+            let seed_stats_path = stats.statistics_path.clone();
+            crate::puffin_carry::commit_statistics_with_retry(catalog.as_ref(), &ident, stats)
+                .await
+                .expect("commit seed statistics");
+            let before = catalog.load_table(&ident).await.expect("reload");
+            let seed_ndv = parse_ndv_properties(
+                before
+                    .metadata()
+                    .statistics_for_snapshot(seed_snapshot)
+                    .expect("seed snapshot has statistics"),
+            );
+            assert_eq!(seed_ndv.get(&1), Some(&150), "setup: 150 distinct ids");
+
+            let outcome = rewrite_all(&catalog, "stats_carry").await;
+            assert!(
+                outcome.skipped_reason.is_none(),
+                "compaction must run: {outcome:?}"
+            );
+
+            let after = catalog
+                .load_table(&ident)
+                .await
+                .expect("reload after rewrite");
+            let new_snapshot = after
+                .metadata()
+                .current_snapshot_id()
+                .expect("rewrite produced a snapshot");
+            assert_ne!(new_snapshot, seed_snapshot);
+            let carried = after
+                .metadata()
+                .statistics_for_snapshot(new_snapshot)
+                .expect("the compacted snapshot must have its own statistics file");
+            assert_ne!(
+                carried.statistics_path, seed_stats_path,
+                "carried statistics get their own object so expiring the old snapshot cannot orphan them"
+            );
+            assert_eq!(carried.snapshot_id, new_snapshot);
+            assert_eq!(
+                parse_ndv_properties(carried).get(&1),
+                Some(&150),
+                "compaction does not change row identity: ndv is unchanged"
+            );
+            let blob = &carried.blob_metadata[0];
+            assert_eq!(blob.snapshot_id, new_snapshot);
+            assert_eq!(
+                blob.properties.get(PROP_CARRIED_FROM),
+                Some(&seed_snapshot.to_string())
+            );
+            assert!(
+                !blob.properties.contains_key(PROP_NDV_UPPER_BOUND),
+                "rewrite keeps the estimate exact, not an upper bound"
+            );
+            assert!(
+                after
+                    .metadata()
+                    .statistics_for_snapshot(seed_snapshot)
+                    .is_some(),
+                "the previous snapshot keeps its own statistics"
+            );
+
+            // The carried body is a real sketch, so a later INSERT can union it.
+            let blobs = read_ndv_blobs(after.file_io(), carried)
+                .await
+                .expect("carried sidecar is readable");
+            assert_eq!(blobs.len(), 1);
+            let decoded = crate::puffin_carry::RawThetaSketch::decode(&blobs[0])
+                .expect("carried body decodes");
+            assert_eq!(decoded.estimate(), 150);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn rewrite_without_previous_statistics_registers_nothing() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let catalog = sqlite_catalog(&dir).await;
+            let (ident, seeded) = seeded_table(
+                &catalog,
+                "no_stats",
+                vec![id_batch(0..10), id_batch(10..20)],
+            )
+            .await;
+            assert_eq!(seeded.metadata().statistics_iter().len(), 0);
+
+            let outcome = rewrite_all(&catalog, "no_stats").await;
+            assert!(outcome.skipped_reason.is_none());
+
+            let after = catalog.load_table(&ident).await.expect("reload");
+            let new_snapshot = after.metadata().current_snapshot_id().expect("snapshot");
+            assert!(
+                after
+                    .metadata()
+                    .statistics_for_snapshot(new_snapshot)
+                    .is_none(),
+                "nothing to carry: no statistics are invented"
+            );
+            let stats_dir = std::fs::read_dir(format!(
+                "{}/metadata",
+                after.metadata().location().trim_start_matches("file://")
+            ))
+            .expect("metadata dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "stats"))
+            .count();
+            assert_eq!(stats_dir, 0, "no orphan .stats object is staged");
+        }
+    }
+
+    // ---------------------------------------------------------------------
     // Phase 4d Task 3: opt-in partial-progress batched commits
     //
     // `MaintenanceHandler::commit_eligible_groups` is the code the
@@ -4376,6 +4688,7 @@ mod tests {
                 6,
                 600,
                 &dispatcher,
+                None,
             )
             .await
             .expect("partial_progress must report Ok, not fail the whole job");
@@ -4454,6 +4767,7 @@ mod tests {
                 6,
                 600,
                 &dispatcher,
+                None,
             )
             .await;
 
@@ -4523,6 +4837,7 @@ mod tests {
                 6,
                 600,
                 &dispatcher,
+                None,
             )
             .await
             .expect("the injected conflict is retryable and must not fail the job");
@@ -4765,6 +5080,7 @@ mod tests {
                 6,
                 600,
                 &dispatcher,
+                None,
             )
             .await
             .expect("the injected conflict is retryable and must not fail the job");

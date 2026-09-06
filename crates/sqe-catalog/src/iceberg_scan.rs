@@ -7,18 +7,16 @@ use arrow::array::BooleanArray;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
-use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
-use datafusion::physical_plan::statistics::StatisticsArgs;
-use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
-use datafusion::physical_plan::apply_expression_roots;
 use datafusion::common::config::ConfigOptions;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningPredicateBuilder};
+use datafusion::physical_plan::apply_expression_roots;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
@@ -27,6 +25,8 @@ use datafusion::physical_plan::filter_pushdown::{
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
+use datafusion::physical_plan::statistics::StatisticsArgs;
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr, PlanProperties,
 };
@@ -35,9 +35,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use iceberg::arrow::DecodeGate;
 use iceberg::expr::Predicate;
 use iceberg::scan::{FileScanTask, FileScanTaskStream};
-use iceberg::spec::{
-    DataContentType, DataFile, DataFileFormat, ManifestContentType, ManifestStatus,
-};
+use iceberg::spec::{DataFile, DataFileFormat, ManifestContentType};
 use iceberg::table::Table;
 use parquet::arrow::arrow_reader::{
     ArrowPredicate, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowFilter,
@@ -695,45 +693,15 @@ impl IcebergScanExec {
     /// GETs. Cold reads are parallelised with `buffer_unordered` at
     /// `self.manifest_concurrency`.
     pub async fn collect_data_files(&self) -> Result<Vec<DataFile>, iceberg::Error> {
-        let metadata_ref = self.table.metadata_ref();
-        let snapshot = if let Some(sid) = self.snapshot_id {
-            match metadata_ref.snapshot_by_id(sid) {
-                Some(s) => s,
-                None => return Ok(vec![]),
-            }
-        } else {
-            match metadata_ref.current_snapshot() {
-                Some(s) => s,
-                None => return Ok(vec![]),
-            }
-        };
-        let cache = self.table.object_cache();
-        let manifest_list = cache.get_manifest_list(snapshot, &metadata_ref).await?;
-        let concurrency = self.manifest_concurrency.max(1);
-        let manifests: Vec<Arc<iceberg::spec::Manifest>> =
-            futures::stream::iter(manifest_list.entries().iter().cloned())
-                .map(|mf| {
-                    let cache = cache.clone();
-                    async move { cache.get_manifest(&mf).await }
-                })
-                .buffer_unordered(concurrency)
-                .try_collect()
-                .await?;
-        let data_files = manifests
-            .into_iter()
-            .flat_map(|manifest| {
-                manifest
-                    .entries()
-                    .iter()
-                    .filter(|e| {
-                        e.status() != ManifestStatus::Deleted
-                            && e.data_file().content_type() == DataContentType::Data
-                    })
-                    .map(|e| e.data_file().clone())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        Ok(data_files)
+        // Read through the process-global per-snapshot cache (review 308):
+        // the decode happens once per snapshot, and every later caller
+        // (statistics, pruning, split planning) shares the same entry.
+        let files = crate::snapshot_stats::SNAPSHOT_STATS_CACHE
+            .snapshot_files(&self.table, self.snapshot_id, self.manifest_concurrency)
+            .await?;
+        Ok(files
+            .map(|(files, _hit)| files.data_files.clone())
+            .unwrap_or_default())
     }
 
     pub fn prune_data_files(
@@ -760,33 +728,31 @@ impl IcebergScanExec {
         };
         let ctx = SessionContext::new();
         let state = ctx.state();
-        let physical_expr =
-            match create_physical_expr(
-                &combined,
-                &df_schema,
-                state.execution_props(),
-                // DataFusion 55 added a planning context for subqueries and
-                // lambda scoping. This predicate is a plain conjunction built
-                // for pruning, with neither, so the default is correct.
-                &PhysicalPlanningContext::default(),
-            ) {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!(error=%e, "Physical expr failed");
-                    return (data_files, 0);
-                }
-            };
-        let pruning_pred: PruningPredicate =
-            match PruningPredicateBuilder::new()
-                .with_file_schema(schema.clone())
-                .try_build(physical_expr)
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!(error=%e, "PruningPredicate failed");
-                    return (data_files, 0);
-                }
-            };
+        let physical_expr = match create_physical_expr(
+            &combined,
+            &df_schema,
+            state.execution_props(),
+            // DataFusion 55 added a planning context for subqueries and
+            // lambda scoping. This predicate is a plain conjunction built
+            // for pruning, with neither, so the default is correct.
+            &PhysicalPlanningContext::default(),
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error=%e, "Physical expr failed");
+                return (data_files, 0);
+            }
+        };
+        let pruning_pred: PruningPredicate = match PruningPredicateBuilder::new()
+            .with_file_schema(schema.clone())
+            .try_build(physical_expr)
+        {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error=%e, "PruningPredicate failed");
+                return (data_files, 0);
+            }
+        };
         let stats =
             IcebergManifestStatistics::new(data_files.clone(), schema.clone(), iceberg_schema);
         match pruning_pred.prune(&stats) {
@@ -840,17 +806,16 @@ impl IcebergScanExec {
             if current_files.is_empty() {
                 break;
             }
-            let pruning_pred =
-                match PruningPredicateBuilder::new()
-                    .with_file_schema(schema.clone())
-                    .try_build(Arc::clone(filter_expr))
-                {
-                    Ok(p) => p,
-                    Err(e) => {
-                        debug!(error = %e, "PruningPredicate from dynamic filter failed, skipping");
-                        continue;
-                    }
-                };
+            let pruning_pred = match PruningPredicateBuilder::new()
+                .with_file_schema(schema.clone())
+                .try_build(Arc::clone(filter_expr))
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    debug!(error = %e, "PruningPredicate from dynamic filter failed, skipping");
+                    continue;
+                }
+            };
             let stats = IcebergManifestStatistics::new(
                 current_files.clone(),
                 schema.clone(),
@@ -2355,54 +2320,22 @@ async fn collect_data_files_for_pruning(
     file_paths: &std::collections::HashSet<String>,
     concurrency: usize,
 ) -> DFResult<Vec<DataFile>> {
-    let metadata_ref = table.metadata_ref();
-    let snapshot = if let Some(sid) = snapshot_id {
-        match metadata_ref.snapshot_by_id(sid) {
-            Some(s) => s,
-            None => return Ok(Vec::new()),
-        }
-    } else {
-        match metadata_ref.current_snapshot() {
-            Some(s) => s,
-            None => return Ok(Vec::new()),
-        }
-    };
-
-    let cache = table.object_cache();
-    let manifest_list = cache
-        .get_manifest_list(snapshot, &metadata_ref)
+    // No second manifest walk (review 308): the snapshot's decoded entries
+    // come from the shared per-snapshot cache that statistics planning
+    // already populated, and only the planned paths are cloned out.
+    let files = crate::snapshot_stats::SNAPSHOT_STATS_CACHE
+        .snapshot_files(table, snapshot_id, concurrency)
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-    let concurrency = concurrency.max(1);
-    let manifests: Vec<Arc<iceberg::spec::Manifest>> =
-        futures::stream::iter(manifest_list.entries().iter().cloned())
-            .map(|mf| {
-                let cache = cache.clone();
-                async move { cache.get_manifest(&mf).await }
-            })
-            .buffer_unordered(concurrency)
-            .try_collect()
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-    let data_files = manifests
-        .into_iter()
-        .flat_map(|manifest| {
-            manifest
-                .entries()
-                .iter()
-                .filter(|entry| {
-                    entry.status() != ManifestStatus::Deleted
-                        && entry.data_file().content_type() == DataContentType::Data
-                        && file_paths.contains(entry.data_file().file_path())
-                })
-                .map(|entry| entry.data_file().clone())
-                .collect::<Vec<_>>()
-        })
-        .collect();
-
-    Ok(data_files)
+    let Some((files, _hit)) = files else {
+        return Ok(Vec::new());
+    };
+    Ok(files
+        .data_files
+        .iter()
+        .filter(|df| file_paths.contains(df.file_path()))
+        .cloned()
+        .collect())
 }
 
 /// Reads all data-file manifest entries for a snapshot and aggregates their
@@ -2442,72 +2375,36 @@ pub async fn compute_table_statistics(
     arrow_schema: &arrow::datatypes::Schema,
     concurrency: usize,
 ) -> DFResult<datafusion::common::Statistics> {
-    let metadata_ref = table.metadata_ref();
-    let snapshot = if let Some(sid) = snapshot_id {
-        match metadata_ref.snapshot_by_id(sid) {
-            Some(s) => s,
-            None => {
-                return Ok(datafusion::common::Statistics::new_unknown(arrow_schema));
-            }
-        }
-    } else {
-        match metadata_ref.current_snapshot() {
-            Some(s) => s,
-            None => {
-                return Ok(datafusion::common::Statistics::new_unknown(arrow_schema));
-            }
-        }
-    };
-
-    let cache = table.object_cache();
-    let manifest_list = cache
-        .get_manifest_list(snapshot, &metadata_ref)
+    compute_table_statistics_cached(table, snapshot_id, arrow_schema, concurrency)
         .await
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        .map(|(stats, _hit)| stats)
+}
 
-    let concurrency = concurrency.max(1);
-    let manifests: Vec<Arc<iceberg::spec::Manifest>> =
-        futures::stream::iter(manifest_list.entries().iter().cloned())
-            .map(|mf| {
-                let cache = cache.clone();
-                async move { cache.get_manifest(&mf).await }
-            })
-            .buffer_unordered(concurrency)
-            .try_collect()
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-    // Track live delete files (position or equality) alongside collecting data
-    // files. Merge-on-Read deletes remove rows at read time that the manifest
-    // record counts still include, so the aggregated row count is exact only
-    // when the snapshot carries no live delete entries.
-    let mut has_live_delete_files = false;
-    let data_files: Vec<DataFile> = manifests
-        .into_iter()
-        .flat_map(|manifest| {
-            manifest
-                .entries()
-                .iter()
-                .filter(|entry| {
-                    let live = entry.status() != ManifestStatus::Deleted;
-                    let is_data = entry.data_file().content_type() == DataContentType::Data;
-                    if live && !is_data {
-                        has_live_delete_files = true;
-                    }
-                    live && is_data
-                })
-                .map(|entry| entry.data_file().clone())
-                .collect::<Vec<_>>()
-        })
-        .collect();
-
-    let iceberg_schema = table.metadata().current_schema();
-    Ok(crate::pruning_stats::aggregate_table_statistics(
-        &data_files,
-        arrow_schema,
-        iceberg_schema,
-        !has_live_delete_files,
-    ))
+/// [`compute_table_statistics`] plus whether the manifest walk was served
+/// from the per-snapshot cache, so callers can label the walk histogram.
+///
+/// Reads through [`crate::snapshot_stats::SNAPSHOT_STATS_CACHE`] (review
+/// 308): the manifests of a snapshot are decoded once per process and the
+/// aggregated `Statistics` are cached per `(snapshot, projection)`. Live
+/// delete entries (position or equality) still downgrade the row count to
+/// inexact because Merge-on-Read removes rows the record counts include.
+pub async fn compute_table_statistics_cached(
+    table: &Table,
+    snapshot_id: Option<i64>,
+    arrow_schema: &arrow::datatypes::Schema,
+    concurrency: usize,
+) -> DFResult<(datafusion::common::Statistics, bool)> {
+    match crate::snapshot_stats::SNAPSHOT_STATS_CACHE
+        .statistics(table, snapshot_id, arrow_schema, concurrency)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+    {
+        Some((stats, hit)) => Ok(((*stats).clone(), hit)),
+        None => Ok((
+            datafusion::common::Statistics::new_unknown(arrow_schema),
+            true,
+        )),
+    }
 }
 
 /// Default target size for file coalescing: 64 MB.

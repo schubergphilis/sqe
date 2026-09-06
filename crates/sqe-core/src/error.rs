@@ -162,12 +162,23 @@ impl SqeError {
     /// Catalog boundary error that keeps its cause. The code is classified from
     /// the message exactly like [`SqeError::Catalog`], so this is a drop-in
     /// upgrade that additionally preserves the source chain. (#268)
+    ///
+    /// When the message alone says nothing more specific than `CatalogError`,
+    /// the source chain is consulted: a transport-level timeout or connection
+    /// failure underneath a catalog call is a catalog availability problem and
+    /// is reported as `CatalogUnavailable`, which the circuit breaker and
+    /// client retry logic both act on (architecture review 300). reqwest's
+    /// `Display` stops at "error sending request for url", so without this
+    /// walk a Polaris deadline looked like a generic internal error.
     pub fn catalog_src(
         message: impl Into<String>,
         source: impl std::error::Error + Send + Sync + 'static,
     ) -> Self {
         let message = message.into();
-        let code = classify_catalog_error(&message);
+        let mut code = classify_catalog_error(&message);
+        if code == SqeErrorCode::CatalogError && source_chain_is_transport_failure(&source) {
+            code = SqeErrorCode::CatalogUnavailable;
+        }
         SqeError::Sourced {
             code,
             message,
@@ -559,6 +570,47 @@ impl std::fmt::Display for SqeErrorCode {
 // ---------------------------------------------------------------------------
 // Classifier helpers
 // ---------------------------------------------------------------------------
+
+/// Walk an error's source chain looking for a transport failure: a typed
+/// [`std::io::Error`] with a network kind, or a link whose own message says it
+/// timed out (reqwest's private `TimedOut` type prints "operation timed out"
+/// and offers no public type to downcast to; `sqe-core` does not depend on
+/// reqwest, so the chain text is the narrowest handle available).
+fn source_chain_is_transport_failure(source: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(source);
+    let mut hops = 0;
+    while let Some(err) = cur {
+        if hops > 16 {
+            break;
+        }
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            ) {
+                return true;
+            }
+        }
+        let text = err.to_string().to_lowercase();
+        if text.contains("timed out")
+            || text.contains("timeout")
+            || text.contains("connection refused")
+            || text.contains("connection reset")
+            || text.contains("dns error")
+        {
+            return true;
+        }
+        cur = err.source();
+        hops += 1;
+    }
+    false
+}
 
 /// Classify a structured catalog HTTP status code. Replaces the brittle
 /// substring search for "401 unauthorized" / "404 not found" etc. when the
@@ -1268,6 +1320,37 @@ mod tests {
     fn classify_catalog_504_gateway_timeout_is_unavailable() {
         let err = SqeError::Catalog("HTTP 504 Gateway Timeout".to_string());
         assert_eq!(err.error_code(), SqeErrorCode::CatalogUnavailable);
+    }
+
+    /// Review 300: a transport timeout underneath an otherwise unclassifiable
+    /// catalog message is `CatalogUnavailable`, found through the source
+    /// chain, not the top-level text. A message that already classifies
+    /// (401) keeps its code regardless of the chain.
+    #[test]
+    fn catalog_src_transport_timeout_in_chain_is_unavailable() {
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("error sending request for url (http://polaris/v1/config)")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let io = std::io::Error::new(std::io::ErrorKind::TimedOut, "operation timed out");
+        let err = SqeError::catalog_src("Failed to authorize table sales.orders", Outer(io));
+        assert_eq!(err.error_code(), SqeErrorCode::CatalogUnavailable);
+
+        let io = std::io::Error::new(std::io::ErrorKind::TimedOut, "operation timed out");
+        let err = SqeError::catalog_src("Polaris said 401 Unauthorized", Outer(io));
+        assert_eq!(err.error_code(), SqeErrorCode::AuthenticationFailed);
+
+        let io = std::io::Error::other("bad json");
+        let err = SqeError::catalog_src("Failed to parse view response", Outer(io));
+        assert_eq!(err.error_code(), SqeErrorCode::CatalogError);
     }
 
     #[test]

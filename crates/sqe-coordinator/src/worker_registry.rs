@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9,71 +9,114 @@ use tracing::{debug, info, warn};
 
 use crate::channel_pool::ChannelPool;
 
-/// Tracks in-flight fragment counts per worker URL across all concurrent
-/// queries. The scheduler consults this counter as the initial load so two
-/// queries planning at the same time do not both pick the same idle worker.
+/// Tracks in-flight work per worker URL across all concurrent queries: a
+/// fragment count and the reserved *load* in the scheduler's cost unit
+/// (megabytes of scan input, see `scheduler::estimate_cost`). The scheduler
+/// reads the load back as its initial per-worker weight so two queries
+/// planning at the same time do not both pick the same idle worker.
 ///
-/// Increment via [`WorkerLoadTracker::reserve`] right after assignment;
-/// decrement via [`ReservationGuard::drop`] when the fragment completes
-/// (success, error, or cancel). The guard makes the decrement automatic
-/// and panic-safe.
+/// Finding 408: the tracker used to expose only the fragment count, which the
+/// scheduler then added MB costs to. Reserve with the task's estimated cost
+/// via [`WorkerLoadTracker::reserve_load`]; the count-only
+/// [`WorkerLoadTracker::reserve`] remains for callers whose unit is a job
+/// slot (compaction dispatch).
+///
+/// Release is automatic: [`ReservationGuard::drop`] subtracts both the count
+/// and the reserved load when the fragment completes (success, error, or
+/// cancel), so it is panic-safe.
 #[derive(Debug, Default, Clone)]
 pub struct WorkerLoadTracker {
-    counts: Arc<DashMap<String, AtomicU32>>,
+    entries: Arc<DashMap<String, LoadEntry>>,
+}
+
+#[derive(Debug, Default)]
+struct LoadEntry {
+    count: AtomicU32,
+    load: AtomicU64,
 }
 
 impl WorkerLoadTracker {
     pub fn new() -> Self {
         Self {
-            counts: Arc::new(DashMap::new()),
+            entries: Arc::new(DashMap::new()),
         }
     }
 
     /// Return the current in-flight fragment count for `url`.
     pub fn in_flight(&self, url: &str) -> u32 {
-        self.counts
+        self.entries
             .get(url)
-            .map(|c| c.load(Ordering::Relaxed))
+            .map(|e| e.count.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
 
-    /// Snapshot `(url, count)` pairs without holding the map locked.
-    pub fn snapshot(&self) -> Vec<(String, u32)> {
-        self.counts
+    /// Return the load currently reserved on `url`, in `estimate_cost` units.
+    pub fn in_flight_load(&self, url: &str) -> u64 {
+        self.entries
+            .get(url)
+            .map(|e| e.load.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Snapshot `(url, count, load)` triples without holding the map locked.
+    pub fn snapshot(&self) -> Vec<(String, u32, u64)> {
+        self.entries
             .iter()
-            .map(|kv| (kv.key().clone(), kv.value().load(Ordering::Relaxed)))
+            .map(|kv| {
+                (
+                    kv.key().clone(),
+                    kv.value().count.load(Ordering::Relaxed),
+                    kv.value().load.load(Ordering::Relaxed),
+                )
+            })
             .collect()
     }
 
-    /// Reserve a fragment slot on `url`. The returned guard decrements the
-    /// counter on drop.
+    /// Reserve one fragment slot on `url` with no load weight. Use
+    /// [`Self::reserve_load`] for scan fragments so the scheduler sees the
+    /// cost; this form is for slot-counted dispatch (compaction groups).
     pub fn reserve(&self, url: &str) -> ReservationGuard {
-        self.counts
-            .entry(url.to_string())
-            .or_insert_with(|| AtomicU32::new(0))
-            .fetch_add(1, Ordering::Relaxed);
+        self.reserve_load(url, 0)
+    }
+
+    /// Reserve one fragment slot on `url` carrying `load` units (the task's
+    /// `estimate_cost`). The returned guard releases both on drop.
+    pub fn reserve_load(&self, url: &str, load: u64) -> ReservationGuard {
+        let entry = self.entries.entry(url.to_string()).or_default();
+        entry.count.fetch_add(1, Ordering::Relaxed);
+        entry.load.fetch_add(load, Ordering::Relaxed);
         ReservationGuard {
-            tracker: self.counts.clone(),
+            tracker: self.entries.clone(),
             url: url.to_string(),
+            load,
         }
     }
 }
 
-/// RAII guard returned by [`WorkerLoadTracker::reserve`]. Decrements the
-/// in-flight count for the reserved worker URL when dropped.
+/// RAII guard returned by [`WorkerLoadTracker::reserve`] /
+/// [`WorkerLoadTracker::reserve_load`]. Releases the fragment slot and the
+/// reserved load for the worker URL when dropped.
 pub struct ReservationGuard {
-    tracker: Arc<DashMap<String, AtomicU32>>,
+    tracker: Arc<DashMap<String, LoadEntry>>,
     url: String,
+    load: u64,
 }
 
 impl Drop for ReservationGuard {
     fn drop(&mut self) {
-        if let Some(c) = self.tracker.get(&self.url) {
-            let prev = c.fetch_sub(1, Ordering::Relaxed);
+        if let Some(e) = self.tracker.get(&self.url) {
+            let prev = e.count.fetch_sub(1, Ordering::Relaxed);
             if prev == 0 {
-                c.fetch_add(1, Ordering::Relaxed);
+                e.count.fetch_add(1, Ordering::Relaxed);
                 debug!(worker = %self.url, "reservation underflow guarded");
             }
+            // Saturate rather than wrap: a guard can only release what it
+            // reserved, but keep the same defensive shape as the count.
+            let _ = e
+                .load
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                    Some(cur.saturating_sub(self.load))
+                });
         }
     }
 }
@@ -116,6 +159,18 @@ pub enum RegistrationError {
     /// every misconfigured worker collide on one bogus loopback entry that
     /// the scheduler then targets (issue #220).
     InvalidAdvertiseUrl { url: String },
+    /// Finding 408: the worker speaks a different `sqe.proto.version` or was
+    /// built against a different DataFusion release than this coordinator.
+    /// The `datafusion_proto` `Expr` bytes in a `ScanTask` are coupled to the
+    /// exact DataFusion version, so such a worker would fail at decode time
+    /// mid-query; refuse it at registration instead.
+    ProtocolMismatch {
+        url: String,
+        worker_proto: u32,
+        coordinator_proto: u32,
+        worker_datafusion: String,
+        coordinator_datafusion: String,
+    },
 }
 
 impl std::fmt::Display for RegistrationError {
@@ -131,11 +186,76 @@ impl std::fmt::Display for RegistrationError {
                  an unspecified 0.0.0.0 / :: address); the worker must advertise a \
                  routable address. Set worker.advertise_url or expose POD_IP."
             ),
+            Self::ProtocolMismatch {
+                url,
+                worker_proto,
+                coordinator_proto,
+                worker_datafusion,
+                coordinator_datafusion,
+            } => write!(
+                f,
+                "worker {url} protocol mismatch: worker sqe.proto.version={worker_proto} \
+                 datafusion={worker_datafusion:?}, coordinator sqe.proto.version=\
+                 {coordinator_proto} datafusion={coordinator_datafusion:?} (0 / \"\" means \
+                 the worker predates the handshake). Deploy the same SQE build on both \
+                 sides; ScanTask predicate bytes are not portable across DataFusion releases."
+            ),
         }
     }
 }
 
 impl std::error::Error for RegistrationError {}
+
+/// Finding 408: decide whether a heartbeating worker is protocol-compatible
+/// with this coordinator.
+///
+/// - Versions present and equal: accepted.
+/// - Versions present and different: refused, always. A DataFusion or
+///   `sqe.proto.version` skew would otherwise fail at `Expr` decode inside the
+///   worker with a generic error.
+/// - Versions absent (legacy bare-URL heartbeat, `proto_version == 0`):
+///   refused when `strict` (`coordinator.production_mode`), otherwise accepted
+///   with a warning so a mixed rolling upgrade is explicit rather than silent.
+pub fn check_worker_protocol(
+    payload: &sqe_planner::HeartbeatPayload,
+    strict: bool,
+) -> Result<(), RegistrationError> {
+    let coordinator_proto = sqe_planner::PROTO_VERSION;
+    let coordinator_datafusion = datafusion::DATAFUSION_VERSION;
+    let mismatch = || RegistrationError::ProtocolMismatch {
+        url: payload.worker_url.clone(),
+        worker_proto: payload.proto_version,
+        coordinator_proto,
+        worker_datafusion: payload.datafusion_version.clone(),
+        coordinator_datafusion: coordinator_datafusion.to_string(),
+    };
+    if payload.is_legacy() {
+        if strict {
+            warn!(
+                worker = %payload.worker_url,
+                "Rejected heartbeat: worker sent no protocol version and production_mode is on"
+            );
+            return Err(mismatch());
+        }
+        warn!(
+            worker = %payload.worker_url,
+            coordinator_proto,
+            coordinator_datafusion,
+            "Worker heartbeat carries no protocol version (pre-handshake build); \
+             accepting because production_mode is off. Upgrade the worker: a \
+             DataFusion skew will fail ScanTask predicate decode mid-query."
+        );
+        return Ok(());
+    }
+    if payload.proto_version != coordinator_proto
+        || payload.datafusion_version != coordinator_datafusion
+    {
+        let err = mismatch();
+        warn!(worker = %payload.worker_url, error = %err, "Rejected heartbeat: protocol mismatch");
+        return Err(err);
+    }
+    Ok(())
+}
 
 /// Returns `true` when an advertised worker URL is safe to register: it has a
 /// non-empty host that is not the unspecified address (`0.0.0.0` / `::`).
@@ -782,6 +902,88 @@ mod tests {
             .await
             .expect("routable URL accepted");
         assert_eq!(registry.total_workers().await, 1);
+    }
+
+    /// Finding 408: a worker on another `sqe.proto.version` or DataFusion
+    /// release is refused with the dedicated `ProtocolMismatch` variant.
+    #[test]
+    fn test_check_worker_protocol_refuses_mismatch() {
+        use sqe_planner::{HeartbeatPayload, PROTO_VERSION};
+
+        let current = HeartbeatPayload::current("http://w1:50052", datafusion::DATAFUSION_VERSION);
+        check_worker_protocol(&current, true).expect("same build accepted in strict mode");
+        check_worker_protocol(&current, false).expect("same build accepted");
+
+        let mut other_df = current.clone();
+        other_df.datafusion_version = "1.0.0".to_string();
+        for strict in [true, false] {
+            let err = check_worker_protocol(&other_df, strict)
+                .expect_err("DataFusion skew must be refused regardless of strictness");
+            assert!(matches!(
+                err,
+                RegistrationError::ProtocolMismatch {
+                    coordinator_proto,
+                    ..
+                } if coordinator_proto == PROTO_VERSION
+            ));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("1.0.0") && msg.contains("protocol mismatch"),
+                "{msg}"
+            );
+        }
+
+        let mut other_proto = current.clone();
+        other_proto.proto_version = PROTO_VERSION + 1;
+        assert!(matches!(
+            check_worker_protocol(&other_proto, false),
+            Err(RegistrationError::ProtocolMismatch { .. })
+        ));
+    }
+
+    /// Finding 408: a legacy bare-URL heartbeat (version 0) is refused only
+    /// under production_mode; otherwise it is accepted with a warning so a
+    /// rolling upgrade keeps working.
+    #[test]
+    fn test_check_worker_protocol_legacy_gated_by_strict() {
+        let legacy = sqe_planner::HeartbeatPayload::parse(b"http://w1:50052").unwrap();
+        assert!(legacy.is_legacy());
+        check_worker_protocol(&legacy, false).expect("legacy accepted when not strict");
+        let err = check_worker_protocol(&legacy, true).expect_err("legacy refused when strict");
+        assert!(matches!(
+            err,
+            RegistrationError::ProtocolMismatch {
+                worker_proto: 0,
+                ..
+            }
+        ));
+    }
+
+    /// Finding 408: the load tracker carries reserved load in `estimate_cost`
+    /// units alongside the fragment count, and the guard releases both.
+    #[test]
+    fn test_load_tracker_reserves_and_releases_load() {
+        let tracker = WorkerLoadTracker::new();
+        assert_eq!(tracker.in_flight_load("http://w1:50052"), 0);
+
+        let g1 = tracker.reserve_load("http://w1:50052", 500);
+        let g2 = tracker.reserve_load("http://w1:50052", 250);
+        let slot = tracker.reserve("http://w1:50052");
+        assert_eq!(tracker.in_flight("http://w1:50052"), 3);
+        assert_eq!(tracker.in_flight_load("http://w1:50052"), 750);
+
+        drop(g1);
+        assert_eq!(tracker.in_flight("http://w1:50052"), 2);
+        assert_eq!(tracker.in_flight_load("http://w1:50052"), 250);
+
+        drop(slot);
+        drop(g2);
+        assert_eq!(tracker.in_flight("http://w1:50052"), 0);
+        assert_eq!(tracker.in_flight_load("http://w1:50052"), 0);
+        assert_eq!(
+            tracker.snapshot(),
+            vec![("http://w1:50052".to_string(), 0, 0)]
+        );
     }
 
     #[test]
