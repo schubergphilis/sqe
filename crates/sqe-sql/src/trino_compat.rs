@@ -132,7 +132,29 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
         Ok(s) => s,
         Err(_) => return sql.to_string(),
     };
+    if !apply_trino_compat(&mut statements, sql) {
+        // Parsed cleanly but no rewrite fired. Avoid the round-trip
+        // through Display: some SQL constructs do not round-trip exactly,
+        // so leaving the original string alone preserves user formatting.
+        return sql.to_string();
+    }
+    // Re-serialize each statement and join with `; `. sqlparser's Display
+    // impl emits semicolon-separated statements without a trailing
+    // semicolon, matching what `ctx.sql()` accepts.
+    statements
+        .iter()
+        .map(Statement::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
 
+/// AST-level entry point of [`rewrite_trino_compat`]: rewrite `statements`
+/// in place and return whether anything changed. `source` is the SQL the
+/// statements were parsed from; it only feeds the substring fast path that
+/// skips the AST walk when no rewriter trigger word is present. Used by the
+/// SQL front door so the statement is parsed once.
+pub fn apply_trino_compat(statements: &mut Vec<Statement>, source: &str) -> bool {
+    let sql = source;
     // Cheap fast path: if the lowercased text contains none of the
     // rewriter triggers, no rewriter can fire. Skip the AST walk and the
     // re-serialization, which together cost more than the substring check
@@ -218,7 +240,7 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
         && !has_recursive
         && !has_ordinality
     {
-        return sql.to_string();
+        return false;
     }
 
     // Guard against a wire-crafted deep expression tree BEFORE the recursive
@@ -229,8 +251,8 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
     // and return the SQL untouched so the engine surfaces a normal error
     // rather than aborting the process; `parse_and_classify` rejects the same
     // input up front with a clean parse error.
-    if check_expression_depth(&statements).is_err() {
-        return sql.to_string();
+    if check_expression_depth(statements).is_err() {
+        return false;
     }
 
     let mut visitor = TrinoCompatVisitor::default();
@@ -238,23 +260,9 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
     // with both traits in scope (DepthGuard needs `Visit`) a bare
     // `statements.visit(..)` resolves to the `&self` `Visit::visit`, whose
     // `Visitor` bound `TrinoCompatVisitor` (a `VisitorMut`) does not satisfy.
-    let _ = VisitMut::visit(&mut statements, &mut visitor);
+    let _ = VisitMut::visit(statements, &mut visitor);
 
-    if visitor.rewrites == 0 {
-        // Parsed cleanly but no rewrite fired. Avoid the round-trip
-        // through Display: some SQL constructs do not round-trip exactly,
-        // so leaving the original string alone preserves user formatting.
-        return sql.to_string();
-    }
-
-    // Re-serialize each statement and join with `; `. sqlparser's Display
-    // impl emits semicolon-separated statements without a trailing
-    // semicolon, matching what `ctx.sql()` accepts.
-    statements
-        .iter()
-        .map(Statement::to_string)
-        .collect::<Vec<_>>()
-        .join("; ")
+    visitor.rewrites > 0
 }
 
 /// Give each unaliased expression column in the top-level projection Trino's
@@ -278,10 +286,11 @@ pub fn rewrite_trino_compat(sql: &str) -> String {
 ///   absolute positions of any following expressions cannot be computed at the
 ///   AST level. A wrong `_colN` is worse than DataFusion's fallback name.
 ///
-/// This is applied on the Trino wire path only (the HTTP server's pre-parse
-/// chain), so native Flight SQL clients keep DataFusion's column names. Returns
-/// the rewritten SQL, or the input unchanged when nothing was renamed or the
-/// input does not parse.
+/// Historically this ran on the Trino wire path only. The SQL front door
+/// ([`crate::front_door::SqlFrontDoor`]) applies it to every protocol, so
+/// Flight SQL and the embedded CLI see the same column names as Trino HTTP
+/// for the same query (finding 700). Returns the rewritten SQL, or the input
+/// unchanged when nothing was renamed or the input does not parse.
 pub fn alias_anonymous_select_columns(sql: &str) -> String {
     let dialect = GenericDialect {};
     let mut statements = match Parser::parse_sql(&dialect, sql) {
@@ -289,18 +298,7 @@ pub fn alias_anonymous_select_columns(sql: &str) -> String {
         Err(_) => return sql.to_string(),
     };
 
-    let mut changed = false;
-    for stmt in &mut statements {
-        if let Statement::Query(query) = stmt {
-            if let Some(select) = leftmost_select_mut(query.body.as_mut()) {
-                if alias_select_projection(select) {
-                    changed = true;
-                }
-            }
-        }
-    }
-
-    if !changed {
+    if !apply_anonymous_column_aliases(&mut statements) {
         // Preserve the user's exact text when no rename fired; the Display
         // round-trip does not reproduce every input verbatim.
         return sql.to_string();
@@ -311,6 +309,23 @@ pub fn alias_anonymous_select_columns(sql: &str) -> String {
         .map(Statement::to_string)
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// AST-level entry point of [`alias_anonymous_select_columns`]: alias the
+/// anonymous output columns of each top-level query in place and return
+/// whether anything changed.
+pub fn apply_anonymous_column_aliases(statements: &mut [Statement]) -> bool {
+    let mut changed = false;
+    for stmt in statements.iter_mut() {
+        if let Statement::Query(query) = stmt {
+            if let Some(select) = leftmost_select_mut(query.body.as_mut()) {
+                if alias_select_projection(select) {
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
 }
 
 /// Follow a set-expression tree to the leftmost `Select`, whose projection

@@ -16,3 +16,4 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 reqwest = { workspace = true, features = ["blocking"] }
+proptest = "1"

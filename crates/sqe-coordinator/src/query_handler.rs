@@ -4,13 +4,10 @@ use std::time::Duration;
 use arrow_array::RecordBatch;
 use arrow_array::{builder::StringBuilder, ArrayRef, BooleanArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::TableReference;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::logical_expr::JoinType;
-use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::joins::HashJoinExec;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::physical_plan::{execute_stream, ExecutionPlan};
 use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
@@ -99,6 +96,51 @@ pub fn timeout_for_session(config: &QueryConfig, session: &Session) -> u64 {
 /// or raise the limit.
 fn reject_oversized_sql(query: &QueryConfig, sql: &str) -> sqe_core::Result<()> {
     query.check_sql_bytes(sql)
+}
+
+/// The SQL front door at the engine boundary (finding 700).
+///
+/// Every statement the coordinator classifies or plans goes through
+/// `sqe_sql::SqlFrontDoor`, so Flight SQL, the MCP server, the Trino adapter
+/// and the integration tests all accept the same SQL and name columns the same
+/// way. The Trino HTTP server runs its own `WireDialect::Trino` door for the
+/// protocol decisions it must make before it can call the executor and hands
+/// over the normalized text, for which this pass is an identity. The dialect
+/// here is `Flight`: it is the protocol whose text arrives raw, and no rewrite
+/// is dialect-specific (see `WireDialect`).
+///
+/// The session catalog is passed so an unqualified `information_schema.<x>`
+/// resolves against the catalog the client selected rather than the engine
+/// default (#2), for every protocol.
+fn engine_front_door(session: &Session) -> sqe_sql::SqlFrontDoor {
+    sqe_sql::SqlFrontDoor::new(sqe_sql::WireDialect::Flight)
+        .with_session_catalog(session.default_catalog.clone())
+}
+
+/// Classify user SQL through the pre-parse pipeline and the front door.
+///
+/// The pre-parse pipeline strips the SQE clauses sqlparser cannot see (`FOR
+/// VERSION AS OF`, `FOR INCREMENTAL`, Hive `PARTITIONED BY`) and folds the
+/// Trino CTAS/VIEW modifiers; the front door then parses once, applies the
+/// source-level fallbacks and the AST rewrites, and classifies from that AST.
+/// Replaces the `parse_and_classify_typed(pre_parse_pipeline(..))` call every
+/// entry point used to spell out (issue #117 kept the ordering; this keeps it
+/// and adds the normalization).
+fn classify_user_sql(session: &Session, sql: &str) -> sqe_core::Result<StatementKind> {
+    let classifiable = sqe_sql::pre_parse_pipeline(&sqe_sql::UserSql::from(sql))?;
+    let normalized = engine_front_door(session).normalize(classifiable.as_str())?;
+    sqe_sql::classify_normalized(normalized)
+}
+
+/// Normalize SQL for the DataFusion planner, once, after the time-travel and
+/// incremental clauses have been resolved and stripped. This is the single
+/// rewrite pass on the planning path: Trino-compat AST rewrites, `_colN`
+/// aliasing, `information_schema` qualification. The DF54 named-TVF-argument
+/// rewrite stays separate because it is a DataFusion version shim, not
+/// dialect normalization.
+fn normalize_for_planning(session: &Session, sql: &str) -> sqe_core::Result<String> {
+    let normalized = engine_front_door(session).normalize(sql)?;
+    Ok(sqe_sql::rewrite_named_tvf_args(normalized.sql()))
 }
 
 fn refuse_if_audit_closed(
@@ -339,8 +381,11 @@ impl QueryHandler {
             });
             maintenance_handler = maintenance_handler.with_query_history(f);
         }
-        let explain_handler =
-            crate::explain::ExplainHandler::new(Arc::clone(&policy_enforcer), &config.query);
+        let explain_handler = crate::explain::ExplainHandler::new(
+            Arc::clone(&policy_enforcer),
+            &config.query,
+            metrics.clone(),
+        );
         // A table HEAD cannot validate a cached row filter, mask or local deny.
         // Default every policy implementation to no result reuse unless it
         // explicitly declares that it is a passthrough enforcer.
@@ -1019,14 +1064,11 @@ impl QueryHandler {
         };
 
         let start = std::time::Instant::now();
-        // Run the pre-parse pipeline: strip FOR INCREMENTAL / FOR VERSION AS OF
-        // (sqlparser does not model them) and rewrite Hive-style
-        // PARTITIONED BY into sqlparser-friendly PARTITION BY. The returned
-        // ClassifiableSql proves at the type level that the input is safe
-        // to hand to the classifier (issue #117).
-        let kind = sqe_sql::parse_and_classify_typed(&sqe_sql::pre_parse_pipeline(
-            &sqe_sql::UserSql::from(sql),
-        )?)?;
+        // Pre-parse pipeline (strip FOR INCREMENTAL / FOR VERSION AS OF,
+        // Hive PARTITIONED BY -> PARTITION BY; issue #117) then the SQL front
+        // door: one parse, Trino-shape fallbacks, AST rewrites, classify
+        // (finding 700).
+        let kind = classify_user_sql(session, sql)?;
         let kind_name = kind.name().to_string();
 
         // Issue #408: cap concurrent sorted writes so several CTAS ORDER BY
@@ -1630,6 +1672,57 @@ impl QueryHandler {
                 StatementKind::ShowPartitions(ref table_name) => {
                     Box::pin(self.handle_hive_show_partitions(session, table_name)).await
                 }
+
+                // SET CATALOG is USE without a schema: the default catalog is
+                // client-protocol state (the Trino client replays it in
+                // X-Trino-Catalog; Flight clients pass it per connection), so
+                // the engine has nothing to change. Same no-op as USE above.
+                StatementKind::SetCatalog(ref catalog) => {
+                    tracing::info!(
+                        "SET CATALOG {catalog} — session catalog switch (no-op at engine level)"
+                    );
+                    Ok(vec![])
+                }
+
+                // Trino session properties live in the Trino HTTP protocol:
+                // the server validates them against its allow-list and the
+                // client replays them in X-Trino-Session (#628). A connection
+                // that reaches the engine with the statement itself has no
+                // session-property store to set, so say so instead of
+                // pretending it took effect.
+                StatementKind::SetSession { ref name, .. }
+                | StatementKind::ResetSession(ref name) => Err(SqeError::with_code(
+                    SqeErrorCode::NotSupported,
+                    format!(
+                        "session property '{name}' can only be set over the Trino HTTP \
+                         protocol (SET SESSION / X-Trino-Session); this connection has \
+                         no session-property store"
+                    ),
+                )),
+                StatementKind::ShowSession { .. } => Err(SqeError::with_code(
+                    SqeErrorCode::NotSupported,
+                    "SHOW SESSION is answered by the Trino HTTP protocol layer; this \
+                     connection has no session properties"
+                        .to_string(),
+                )),
+
+                // Textual prepared statements are Trino HTTP protocol state:
+                // the client carries them in X-Trino-Prepared-Statement and
+                // the server binds EXECUTE before the engine sees the SQL.
+                // Flight SQL has its own prepared-statement actions
+                // (CreatePreparedStatement / DoPut / ClosePreparedStatement).
+                StatementKind::Prepare { ref name, .. }
+                | StatementKind::Deallocate(ref name)
+                | StatementKind::Execute { ref name, .. }
+                | StatementKind::DescribeOutput(ref name)
+                | StatementKind::DescribeInput(ref name) => Err(SqeError::with_code(
+                    SqeErrorCode::NotSupported,
+                    format!(
+                        "prepared statement '{name}': PREPARE / EXECUTE / DEALLOCATE / \
+                         DESCRIBE OUTPUT|INPUT are Trino HTTP protocol statements; Flight \
+                         SQL clients use the CreatePreparedStatement action"
+                    ),
+                )),
 
                 StatementKind::Ctas(stmt) => {
                     if let Statement::CreateTable(ref ct) = **stmt {
@@ -2914,8 +3007,68 @@ impl QueryHandler {
     /// and puts it in the ticket, so the id the client holds and the id the
     /// [`QueryTracker`] records are the same one; `CancelQuery` can then
     /// reach the running stream. `None` mints a fresh id (all other callers).
+    pub async fn execute_stream_with_id(
+        &self,
+        session: &Session,
+        sql: &str,
+        client_ip: Option<String>,
+        query_id: Option<uuid::Uuid>,
+    ) -> sqe_core::Result<(SchemaRef, SendableRecordBatchStream)> {
+        self.execute_stream_inner(session, sql, None, client_ip, query_id)
+            .await
+    }
+
+    /// [`Self::execute_stream_with_id`] for a plan that was already built.
+    ///
+    /// Finding 406: a Flight SQL prepared statement is planned once at
+    /// `CreatePreparedStatement` and its bound plan is handed in here for
+    /// every execution, so `GetFlightInfo` + `DoGet` no longer re-parse and
+    /// re-plan the SQL. `sql` is the statement text for admission, the
+    /// tracker and the audit record only. The plan must be the *unenforced*
+    /// user plan: policy enforcement still runs inside `open_stream` for the
+    /// executing user on every call, exactly as on the SQL path.
+    pub async fn execute_plan_stream_with_id(
+        &self,
+        session: &Session,
+        sql: &str,
+        plan: LogicalPlan,
+        client_ip: Option<String>,
+        query_id: Option<uuid::Uuid>,
+    ) -> sqe_core::Result<(SchemaRef, SendableRecordBatchStream)> {
+        self.execute_stream_inner(session, sql, Some(plan), client_ip, query_id)
+            .await
+    }
+
+    /// Plan a statement once for the prepared-statement store (finding 406).
+    ///
+    /// Same front half as the streaming path: size cap, classification,
+    /// catalog preflight, session context, incremental / time-travel
+    /// rewrites, Trino-compat rewrites, then a DataFusion plan that still
+    /// carries its `$n` placeholders (no values are bound yet). Returns
+    /// `None` for statement kinds the streaming path does not run (DML, DDL,
+    /// metadata); those keep executing through the buffered text path.
+    pub async fn plan_prepared_statement(
+        &self,
+        session: &Session,
+        numbered_sql: &str,
+    ) -> sqe_core::Result<Option<LogicalPlan>> {
+        reject_oversized_sql(&self.config.query, numbered_sql)?;
+        let kind = classify_user_sql(session, numbered_sql)?;
+        if !matches!(kind, StatementKind::Query(_)) {
+            return Ok(None);
+        }
+        if let Some(stmt) = kind.statement() {
+            self.preflight_resolve_catalogs(stmt, session).await?;
+        }
+        let (ctx, session_catalog) = self.create_session_context(session).await?;
+        let (plan, _tt_cleanup) = self
+            .plan_sql_for_stream(&ctx, &session_catalog, session, numbered_sql, None)
+            .await?;
+        Ok(Some(plan))
+    }
+
     #[tracing::instrument(
-        skip(self, session, sql, query_id),
+        skip(self, session, sql, prebuilt, query_id),
         fields(
             db.system.name = "sqe",
             username = %session.user.username,
@@ -2923,10 +3076,11 @@ impl QueryHandler {
         ),
         name = "execute_stream",
     )]
-    pub async fn execute_stream_with_id(
+    async fn execute_stream_inner(
         &self,
         session: &Session,
         sql: &str,
+        prebuilt: Option<LogicalPlan>,
         client_ip: Option<String>,
         query_id: Option<uuid::Uuid>,
     ) -> sqe_core::Result<(SchemaRef, SendableRecordBatchStream)> {
@@ -3024,12 +3178,9 @@ impl QueryHandler {
             };
 
         // --- Classify ---------------------------------------------------------
-        // See execute() for the pipeline rationale. The typed wrapper proves
-        // at compile time that the classifier sees normalized SQL only
-        // (issue #117).
-        let kind = sqe_sql::parse_and_classify_typed(&sqe_sql::pre_parse_pipeline(
-            &sqe_sql::UserSql::from(sql),
-        )?)?;
+        // See execute() for the pipeline rationale: pre-parse pipeline, then
+        // the SQL front door (issue #117, finding 700).
+        let kind = classify_user_sql(session, sql)?;
         let kind_name = kind.name().to_string();
         if !matches!(kind, StatementKind::Query(_)) {
             return Err(SqeError::NotImplemented(
@@ -3096,7 +3247,10 @@ impl QueryHandler {
                 .set(self.query_tracker.active_count() as i64);
         }
 
-        match self.open_stream(session, sql, &query_id, start).await {
+        match self
+            .open_stream(session, sql, prebuilt, &query_id, start)
+            .await
+        {
             Ok((
                 schema,
                 inner_stream,
@@ -3189,48 +3343,32 @@ impl QueryHandler {
     ///
     /// This is the streaming counterpart to [`Self::execute_query`]: it
     /// reproduces the same planning, policy-enforcement, physical-plan
-    /// building, star-schema reorder, adaptive-sort, and `try_distribute`
-    /// steps, but returns the opened [`SendableRecordBatchStream`] plus
+    /// building and [`Self::finish_physical_plan`] (post-planning rules +
+    /// `try_distribute`) steps, but returns the opened [`SendableRecordBatchStream`] plus
     /// the final plan instead of draining into a `Vec<RecordBatch>`.
-    #[tracing::instrument(skip(self, session, sql, start), fields(username = %session.user.username, query_id = %query_id), name = "sqe.execute")]
+    ///
+    /// `prebuilt` is a prepared statement's stored plan with its parameters
+    /// bound (finding 406); when present the SQL front half is skipped and
+    /// the plan goes straight to policy enforcement, so plan reuse never
+    /// bypasses the rewriter.
+    #[tracing::instrument(skip(self, session, sql, prebuilt, start), fields(username = %session.user.username, query_id = %query_id), name = "sqe.execute")]
     async fn open_stream(
         &self,
         session: &Session,
         sql: &str,
+        prebuilt: Option<LogicalPlan>,
         query_id: &uuid::Uuid,
         start: std::time::Instant,
     ) -> sqe_core::Result<OpenStreamResult> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
 
-        let (sql, incremental_identities) =
-            self.handle_incremental(sql, &ctx, &session_catalog).await?;
-        let (sql, tt_cleanup) = self
-            .handle_time_travel(
-                &sql,
-                &ctx,
-                session,
-                &session_catalog,
-                incremental_identities,
-            )
-            .await?;
-        // Apply Trino-compat AST rewrites before planning, matching the
-        // execute() path. Today this matters for the empty-input ROLLUP /
-        // CUBE / GROUPING SETS wrap that works around apache/datafusion#21570;
-        // CAST(v AS JSON) -> to_json(v) and the $-suffix metadata-table
-        // rewrite also apply here when present.
-        let sql = sqe_sql::rewrite_trino_compat(&sql);
-        let sql = sqe_sql::rewrite_named_tvf_args(&sql);
-        let sql = sql.as_str();
-
-        let plan_span = tracing::info_span!("sqe.plan", query_id = %query_id);
-        let df = ctx
-            .sql(sql)
-            .instrument(plan_span)
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
-        // Pinned (time-travel / incremental) scans get their real table
-        // identity back before the policy rewriter sees the plan (400).
-        let plan = tt_cleanup.restore_identities(df.logical_plan().clone())?;
+        let (plan, tt_cleanup) = match prebuilt {
+            Some(plan) => (plan, TimeTravelCleanup::new(&ctx, Vec::new())),
+            None => {
+                self.plan_sql_for_stream(&ctx, &session_catalog, session, sql, Some(query_id))
+                    .await?
+            }
+        };
         // Streaming path: the audit entry is recorded by the
         // TrackedRecordBatchStream finalizer (not the `execute` path), so carry
         // the policy summary out to the caller, which stows it on the
@@ -3270,140 +3408,16 @@ impl QueryHandler {
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Physical plan creation failed: {e}")))?;
 
-        // Star-schema join reorder
-        let physical_plan = if self.config.query.star_schema_reorder {
-            let rule =
-                sqe_planner::StarSchemaReorderRule::new(self.config.query.star_schema_min_ratio);
-            match rule.optimize(
-                physical_plan.clone(),
-                &datafusion::config::ConfigOptions::new(),
-            ) {
-                Ok(optimized) => optimized,
-                Err(e) => {
-                    debug!(error = %e, "Star-schema join reorder failed, using original plan");
-                    physical_plan
-                }
-            }
-        } else {
-            physical_plan
-        };
-
-        // Dim-build swap: put the dimension scan on the build side of
-        // star-tail CollectLeft joins when cascaded estimates left the fact
-        // stream there (SSB q4.x partkey class). Runs before the parallel
-        // probe rule so build/probe roles are final, and re-wires dynamic
-        // filters itself for the new orientation.
-        let physical_plan = if self.config.query.dim_build_swap {
-            let state = ctx.state();
-            let rule = crate::dim_build_swap::DimBuildSwapRule::new();
-            match rule.optimize(physical_plan.clone(), state.config_options()) {
-                Ok(optimized) => optimized,
-                Err(e) => {
-                    debug!(error = %e, "Dim-build swap failed, using original plan");
-                    physical_plan
-                }
-            }
-        } else {
-            physical_plan
-        };
-
-        // Probe-side scan parallelization (issue #235). Default ON since
-        // 2026-07-08: bumps the probe-side Iceberg scan of CollectLeft joins to
-        // N output partitions so the fact-table decode runs across cores;
-        // build-side scans are never touched (the q72 regression guard). Uses
-        // the real session config so EnforceDistribution sees the configured
-        // target_partitions. Runs BEFORE ParallelScanRule and takes the scans
-        // it can, which is why that rule fires twice instead of 26 times on a
-        // three-suite SF1 sweep (measured 2026-08-18, issue #414).
-        let physical_plan = if self.config.query.parallel_probe_scan {
-            let state = ctx.state();
-            let rule = crate::parallel_probe_scan::ParallelProbeScanRule::new();
-            match rule.optimize(physical_plan.clone(), state.config_options()) {
-                Ok(optimized) => optimized,
-                Err(e) => {
-                    debug!(error = %e, "Probe-side scan parallelization failed, using original plan");
-                    physical_plan
-                }
-            }
-        } else {
-            physical_plan
-        };
-
-        // Single-node parallel scan (issue #131 follow-up). Default ON since
-        // 2026-07-08: gives each qualifying Iceberg scan N output partitions,
-        // choosing partitioning the parent can consume so EnforceDistribution
-        // inserts no redundant gather. Build-side and single-partition-ordered
-        // scans stay serial (the q72 guard falls out of
-        // `required_input_distribution`). Runs after the probe rule so join
-        // distribution is final. It covers what that rule does not reach
-        // (Partitioned-mode joins, join-free plans above the size gate), but the
-        // two OVERLAP rather than complement: the probe rule has already bumped
-        // most scans past `partition_count() == 1` by the time this runs.
-        let physical_plan = if self.config.query.parallel_scan {
-            let byte_threshold =
-                sqe_core::parse_memory_limit(&self.config.query.distribution_threshold)
-                    .unwrap_or(0);
-            let state = ctx.state();
-            let rule = crate::parallel_scan::ParallelScanRule::new(byte_threshold);
-            match rule.optimize(physical_plan.clone(), state.config_options()) {
-                Ok(optimized) => optimized,
-                Err(e) => {
-                    debug!(error = %e, "Parallel scan pass failed, using original plan");
-                    physical_plan
-                }
-            }
-        } else {
-            physical_plan
-        };
-
-        // Spillable join fallback (unknown/large build → SortMergeJoin).
-        let physical_plan = {
-            let rule = sqe_planner::JoinStrategyRule::new(sqe_planner::DEFAULT_HASH_JOIN_THRESHOLD);
-            match rule.optimize(
-                physical_plan.clone(),
-                &datafusion::config::ConfigOptions::new(),
-            ) {
-                Ok(optimized) => optimized,
-                Err(e) => {
-                    debug!(error = %e, "JoinStrategyRule failed, using original plan");
-                    physical_plan
-                }
-            }
-        };
-
-        // Adaptive sort stripping
-        let sort_mode = self.config.query.sort_mode;
-        let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
-        let (physical_plan, sort_decisions) = adaptive_sort::apply_adaptive_sort(
-            physical_plan,
-            sort_mode,
-            pressure,
-            self.metrics.as_ref(),
-        );
-        if let Some(warning) = adaptive_sort::format_sort_warning(&sort_decisions, sort_mode) {
-            debug!(warning = %warning, "Adaptive sort stripping applied (streaming)");
-        }
-
-        // Fail closed when remaining SortExec nodes cannot reserve merge
-        // headroom (ExternalSorterMerge is non-spillable in DF 54).
-        let physical_plan = {
-            let sort_grant = sqe_core::parse_memory_limit(&self.config.query.max_query_memory)
-                .unwrap_or(256 * 1024 * 1024)
-                .max(8 * 1024 * 1024);
-            let rule = sqe_planner::SortMemoryRule::new(sort_grant);
-            rule.optimize(physical_plan, &datafusion::config::ConfigOptions::new())
-                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Sort memory admission failed: {e}")))?
-        };
-
-        // Distribute scan across workers if possible.
-        let final_plan = self.try_distribute(physical_plan, session, query_id).await;
+        // Post-planning rule pipeline + distribution. The rule order lives in
+        // `crate::post_planning`; this is the same call `execute_query` makes.
+        let final_plan = self
+            .finish_physical_plan(&ctx, session, query_id, physical_plan)
+            .await?;
 
         // Planning complete — promote tracker to Running
         self.query_tracker
             .running(query_id, start.elapsed().as_millis() as u64);
 
-        // Remove dynamic filters from Iceberg self-joins (q95-class inlist blowup).
-        let final_plan = strip_self_join_dynamic_filters(final_plan);
         let schema = final_plan.schema();
         let stream = execute_stream(Arc::clone(&final_plan), ctx.task_ctx())
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Query execution failed: {e}")))?;
@@ -3419,6 +3433,50 @@ impl QueryHandler {
         ))
     }
 
+    /// SQL front half of [`Self::open_stream`]: incremental and time-travel
+    /// rewrites, Trino-compat rewrites, DataFusion planning, and the pinned
+    /// scan identity restore (400). Shared with
+    /// [`Self::plan_prepared_statement`] so a prepared statement is planned
+    /// through exactly the pipeline the ad-hoc path uses. Returns the
+    /// unenforced plan and the cleanup guard for any pinned providers.
+    async fn plan_sql_for_stream(
+        &self,
+        ctx: &SessionContext,
+        session_catalog: &Arc<SessionCatalog>,
+        session: &Session,
+        sql: &str,
+        query_id: Option<&uuid::Uuid>,
+    ) -> sqe_core::Result<(LogicalPlan, TimeTravelCleanup)> {
+        let (sql, incremental_identities) =
+            self.handle_incremental(sql, ctx, session_catalog).await?;
+        let (sql, tt_cleanup) = self
+            .handle_time_travel(&sql, ctx, session, session_catalog, incremental_identities)
+            .await?;
+        // The single normalization pass before planning, matching the
+        // execute() path (finding 700): Trino-compat AST rewrites (the
+        // empty-input ROLLUP / CUBE / GROUPING SETS wrap for
+        // apache/datafusion#21570, CAST(v AS JSON) -> to_json(v), the $-suffix
+        // metadata-table rewrite), `_colN` aliasing and `information_schema`
+        // qualification.
+        let sql = normalize_for_planning(session, &sql)?;
+        let sql = sql.as_str();
+
+        let plan_span = tracing::info_span!(
+            "sqe.plan",
+            query_id = query_id.map(|q| q.to_string()).unwrap_or_default()
+        );
+        let df = ctx.sql(sql).instrument(plan_span).await.map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("SQL planning failed: {e}"),
+            )
+        })?;
+        // Pinned (time-travel / incremental) scans get their real table
+        // identity back before the policy rewriter sees the plan (400).
+        let plan = tt_cleanup.restore_identities(df.logical_plan().clone())?;
+        Ok((plan, tt_cleanup))
+    }
+
     /// Return the schema for a SQL statement without executing it.
     ///
     /// Only pure SELECT/WITH queries are planned via DataFusion. DML advertises
@@ -3432,11 +3490,9 @@ impl QueryHandler {
         // cannot burn the parser on an arbitrarily large query (#403).
         reject_oversized_sql(&self.config.query, sql)?;
 
-        // Run the pre-parse pipeline before handing to the classifier;
-        // see `pipeline_types.rs` for the trust-boundary contract (issue #117).
-        let kind = sqe_sql::parse_and_classify_typed(&sqe_sql::pre_parse_pipeline(
-            &sqe_sql::UserSql::from(sql),
-        )?)?;
+        // Pre-parse pipeline then the SQL front door; see `pipeline_types.rs`
+        // for the trust-boundary contract (issue #117).
+        let kind = classify_user_sql(session, sql)?;
 
         if matches!(kind, StatementKind::Query(_)) {
             // get_flight_info plans the result schema WITHOUT executing, so it
@@ -3532,9 +3588,7 @@ impl QueryHandler {
         numbered_sql: &str,
         param_count: usize,
     ) -> sqe_core::Result<Vec<Option<DataType>>> {
-        let kind = sqe_sql::parse_and_classify_typed(&sqe_sql::pre_parse_pipeline(
-            &sqe_sql::UserSql::from(numbered_sql),
-        )?)?;
+        let kind = classify_user_sql(session, numbered_sql)?;
         if let Some(stmt) = kind.statement() {
             self.preflight_resolve_catalogs(stmt, session).await?;
         }
@@ -3611,14 +3665,11 @@ impl QueryHandler {
                 incremental_identities,
             )
             .await?;
-        // Pre-process Trino-compat AST patterns DataFusion does not natively
-        // recognize. Today this only rewrites `CAST(v AS JSON)` to
-        // `to_json(v)`; the rewriter is a no-op when the input does not
-        // contain `as json` (case-insensitive). Errors during parse fall
-        // through as the original string so DataFusion produces its own
-        // error message.
-        let sql = sqe_sql::rewrite_trino_compat(&sql);
-        let sql = sqe_sql::rewrite_named_tvf_args(&sql);
+        // The single normalization pass before planning (finding 700):
+        // Trino-compat AST rewrites (`CAST(v AS JSON)` -> `to_json(v)`, ...),
+        // `_colN` aliasing and `information_schema` qualification, through the
+        // same front door every entry point uses.
+        let sql = normalize_for_planning(session, &sql)?;
         let sql = sql.as_str();
 
         // Plan the query via DataFusion's SQL planner
@@ -3667,84 +3718,12 @@ impl QueryHandler {
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Physical plan creation failed: {e}")))?;
 
-        // Apply star-schema join reordering: reorder inner equi-join chains so
-        // small dimension tables are joined first and the large fact table is
-        // probed last.
-        let physical_plan = if self.config.query.star_schema_reorder {
-            let rule =
-                sqe_planner::StarSchemaReorderRule::new(self.config.query.star_schema_min_ratio);
-            match rule.optimize(
-                physical_plan.clone(),
-                &datafusion::config::ConfigOptions::new(),
-            ) {
-                Ok(optimized) => optimized,
-                Err(e) => {
-                    debug!(
-                        error = %e,
-                        "Star-schema join reorder failed, using original plan"
-                    );
-                    physical_plan
-                }
-            }
-        } else {
-            physical_plan
-        };
-
-        // Dim-build swap (see the streaming path for rationale).
-        let physical_plan = if self.config.query.dim_build_swap {
-            let state = ctx.state();
-            let rule = crate::dim_build_swap::DimBuildSwapRule::new();
-            match rule.optimize(physical_plan.clone(), state.config_options()) {
-                Ok(optimized) => optimized,
-                Err(e) => {
-                    debug!(error = %e, "Dim-build swap failed, using original plan");
-                    physical_plan
-                }
-            }
-        } else {
-            physical_plan
-        };
-
-        // Spillable join fallback (unknown/large build → SortMergeJoin).
-        let physical_plan = {
-            let rule = sqe_planner::JoinStrategyRule::new(sqe_planner::DEFAULT_HASH_JOIN_THRESHOLD);
-            match rule.optimize(
-                physical_plan.clone(),
-                &datafusion::config::ConfigOptions::new(),
-            ) {
-                Ok(optimized) => optimized,
-                Err(e) => {
-                    debug!(error = %e, "JoinStrategyRule failed, using original plan");
-                    physical_plan
-                }
-            }
-        };
-
-        // Apply adaptive sort stripping based on sort_mode config and memory pressure.
-        let sort_mode = self.config.query.sort_mode;
-        let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
-        let (physical_plan, sort_decisions) = adaptive_sort::apply_adaptive_sort(
-            physical_plan,
-            sort_mode,
-            pressure,
-            self.metrics.as_ref(),
-        );
-        if let Some(warning) = adaptive_sort::format_sort_warning(&sort_decisions, sort_mode) {
-            debug!(warning = %warning, "Adaptive sort stripping applied");
-        }
-
-        // Fail closed when remaining SortExec nodes cannot reserve merge headroom.
-        let physical_plan = {
-            let sort_grant = sqe_core::parse_memory_limit(&self.config.query.max_query_memory)
-                .unwrap_or(256 * 1024 * 1024)
-                .max(8 * 1024 * 1024);
-            let rule = sqe_planner::SortMemoryRule::new(sort_grant);
-            rule.optimize(physical_plan, &datafusion::config::ConfigOptions::new())
-                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Sort memory admission failed: {e}")))?
-        };
-
-        // Try to distribute scan work across workers
-        let final_plan = self.try_distribute(physical_plan, session, query_id).await;
+        // Post-planning rule pipeline + distribution. The rule order lives in
+        // `crate::post_planning`; this is the same call `open_stream` makes,
+        // so the batch path gets the parallel-scan rules too (review 404).
+        let final_plan = self
+            .finish_physical_plan(&ctx, session, query_id, physical_plan)
+            .await?;
 
         // Execute the (possibly distributed) plan.
         //
@@ -3782,8 +3761,6 @@ impl QueryHandler {
             (c, 0) => c,
             (c, m) => c.min(m),
         };
-        // Remove dynamic filters from Iceberg self-joins (q95-class inlist blowup).
-        let final_plan = strip_self_join_dynamic_filters(final_plan);
         let mut stream = execute_stream(final_plan.clone(), ctx.task_ctx())
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Query execution failed: {e}")))?;
         let mut batches: Vec<RecordBatch> = Vec::new();
@@ -3860,6 +3837,33 @@ impl QueryHandler {
         );
 
         Ok(batches)
+    }
+
+    /// Turn DataFusion's optimized physical plan into the plan the coordinator
+    /// executes: the ordered post-planning rule pipeline
+    /// ([`crate::post_planning`], the only place that names the rule sequence)
+    /// followed by [`Self::try_distribute`]. Both `execute_query` and
+    /// `open_stream` call this and nothing else, so the batch and streaming
+    /// entry points cannot diverge in plan shape (review 404, #584).
+    ///
+    /// `try_distribute` stays outside the rule list because it is async
+    /// (worker health, manifest listing, ticket signing) and needs the
+    /// session; it runs last, after `StripSelfJoinDynamicFiltersRule`, so the
+    /// ScanTask predicate shipped to workers matches the coordinator join.
+    async fn finish_physical_plan(
+        &self,
+        ctx: &SessionContext,
+        session: &Session,
+        query_id: &uuid::Uuid,
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> sqe_core::Result<Arc<dyn ExecutionPlan>> {
+        let plan = crate::post_planning::apply_post_planning_rules(
+            ctx,
+            &self.config.query,
+            self.metrics.as_ref(),
+            plan,
+        )?;
+        Ok(self.try_distribute(plan, session, query_id).await)
     }
 
     /// Attempt to distribute scan work across available workers.
@@ -7527,7 +7531,9 @@ pub(crate) fn aggregate_spill_metrics(
 /// self-join detection when it reaches the join without an aggregation in
 /// between, which distinguishes q95's raw `web_sales ⋈ web_sales` from the
 /// benign aggregated-CTE joins.
-fn collect_raw_iceberg_table_idents(
+///
+/// Used by `crate::post_planning::StripSelfJoinDynamicFiltersRule`.
+pub(crate) fn collect_raw_iceberg_table_idents(
     plan: &Arc<dyn ExecutionPlan>,
     out: &mut std::collections::HashSet<String>,
 ) {
@@ -7540,74 +7546,6 @@ fn collect_raw_iceberg_table_idents(
     }
     for child in plan.children() {
         collect_raw_iceberg_table_idents(child, out);
-    }
-}
-
-/// Strip the runtime dynamic filter from any `Inner` `HashJoinExec` whose two
-/// inputs both scan the **same** Iceberg table -- a self-join (e.g. TPC-DS
-/// q95's `ws_wh` CTE).
-///
-/// DataFusion only attaches a dynamic (runtime) filter to `Inner` joins, and
-/// below `hash_join_inlist_pushdown_max_distinct_values` it materializes that
-/// filter as an IN-list of the build side's distinct keys. For a self-join the
-/// build side carries tens of thousands of fact-table keys and the IN-list path
-/// collapses the join into a materialized cross product (q95: 0.2s -> 17s at the
-/// 65536 threshold SQE uses for SSB dimension pushdown). We rebuild only the
-/// offending self-join node without its dynamic filter, via
-/// [`HashJoinExec::try_new`] (which starts with `dynamic_filter: None`). Every
-/// other join -- including the dimension/fact joins inside the same query that
-/// legitimately prune via the key-set push-down -- is left untouched.
-///
-/// Detection keys on table *identity*, not cardinality, so it is scale-invariant
-/// (SF1/SF10/SF100) and never fires on dimension/fact joins (different tables).
-/// Removing a runtime filter only changes pruning, never results.
-///
-/// Note: this runs on the post-distribution coordinator plan; a self-join that
-/// is ever distributed (its `IcebergScanExec` replaced by a distributed exec)
-/// would no-op here, which is safe because workers do not raise the inlist
-/// threshold above DataFusion's default.
-fn strip_self_join_dynamic_filters(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-    let original = Arc::clone(&plan);
-    let result = plan.transform_up(|node| {
-        let Some(hj) = node.downcast_ref::<HashJoinExec>() else {
-            return Ok(Transformed::no(node));
-        };
-        // DataFusion 55: dynamic_filter_expr is deprecated. This is only a
-        // presence check, and dynamic_expressions_produced() is built from the
-        // same Option, so is_empty() is exactly is_none().
-        if *hj.join_type() != JoinType::Inner || hj.dynamic_expressions_produced().is_empty() {
-            return Ok(Transformed::no(node));
-        }
-        let mut left = std::collections::HashSet::new();
-        let mut right = std::collections::HashSet::new();
-        collect_raw_iceberg_table_idents(hj.left(), &mut left);
-        collect_raw_iceberg_table_idents(hj.right(), &mut right);
-        if left.intersection(&right).next().is_none() {
-            return Ok(Transformed::no(node));
-        }
-        let rebuilt = HashJoinExec::try_new(
-            Arc::clone(hj.left()),
-            Arc::clone(hj.right()),
-            hj.on().to_vec(),
-            hj.filter().cloned(),
-            hj.join_type(),
-            hj.projection.as_ref().map(|p| p.to_vec()),
-            *hj.partition_mode(),
-            hj.null_equality(),
-            hj.null_aware,
-        )?;
-        debug!(
-            on = ?hj.on(),
-            "Stripped dynamic filter from Iceberg self-join HashJoinExec (q95-class)"
-        );
-        Ok(Transformed::yes(Arc::new(rebuilt) as Arc<dyn ExecutionPlan>))
-    });
-    match result {
-        Ok(t) => t.data,
-        Err(e) => {
-            debug!(error = %e, "strip_self_join_dynamic_filters failed; using original plan");
-            original
-        }
     }
 }
 

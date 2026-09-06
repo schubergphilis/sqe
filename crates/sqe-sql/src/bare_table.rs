@@ -158,4 +158,133 @@ mod tests {
         let sql = "TABLE";
         assert_eq!(rewrite_bare_table(sql), sql);
     }
+
+    // ── Adversarial inputs: comments, quoted identifiers, literals (#630) ──
+
+    #[test]
+    fn leading_line_comment_is_skipped_and_preserved() {
+        let out = rewrite_bare_table("-- pick everything\nTABLE nation");
+        assert_eq!(out, "-- pick everything\nSELECT * FROM nation");
+        assert!(parses(&out));
+    }
+
+    #[test]
+    fn leading_block_comment_is_skipped_and_preserved() {
+        let out = rewrite_bare_table("/* table ) */ TABLE nation LIMIT 1");
+        assert_eq!(out, "/* table ) */ SELECT * FROM nation LIMIT 1");
+        assert!(parses(&out));
+    }
+
+    #[test]
+    fn quoted_table_named_table_is_the_target() {
+        let out = rewrite_bare_table("TABLE \"table\"");
+        assert_eq!(out, "SELECT * FROM \"table\"");
+        assert!(parses(&out));
+    }
+
+    #[test]
+    fn quoted_column_named_table_is_untouched() {
+        // Parses as-is: `"table"` is an identifier, not the keyword.
+        let sql = "SELECT \"table\" FROM t";
+        assert_eq!(rewrite_bare_table(sql), sql);
+    }
+
+    #[test]
+    fn close_paren_inside_quoted_identifier_and_comment() {
+        let out = rewrite_bare_table("TABLE \"a)b\" -- )");
+        assert_eq!(out, "SELECT * FROM \"a)b\" -- )");
+        assert!(parses(&out));
+    }
+
+    #[test]
+    fn table_keyword_inside_literal_is_untouched() {
+        let sql = "SELECT 'table t' AS s";
+        assert_eq!(rewrite_bare_table(sql), sql);
+    }
+
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Scanner-hostile bytes with no quotes (so they drop into a literal,
+        /// a quoted identifier or a comment unescaped) and no `*` (so they
+        /// cannot close a block comment early).
+        fn payload() -> impl Strategy<Value = String> {
+            prop::collection::vec(
+                prop_oneof![
+                    Just(")".to_string()),
+                    Just("(".to_string()),
+                    Just(",".to_string()),
+                    Just(" table ".to_string()),
+                    Just(" select ".to_string()),
+                    Just(" from ".to_string()),
+                    Just(" -- ".to_string()),
+                    Just(" /* ".to_string()),
+                    "[a-z0-9 ]{1,4}",
+                ],
+                1..6,
+            )
+            .prop_map(|parts| parts.concat())
+        }
+
+        fn literal() -> impl Strategy<Value = String> {
+            payload().prop_map(|p| format!("'{p}'"))
+        }
+
+        fn quoted_ident() -> impl Strategy<Value = String> {
+            payload().prop_map(|p| format!("\"{p}\""))
+        }
+
+        fn line_comment() -> impl Strategy<Value = String> {
+            payload().prop_map(|p| format!("--{p}\n"))
+        }
+
+        /// sqlparser nests block comments, so an opener inside the body would
+        /// leave the comment unterminated; defuse it.
+        fn block_comment() -> impl Strategy<Value = String> {
+            payload().prop_map(|p| format!("/*{}*/", p.replace("/*", "/ *")))
+        }
+
+        fn parseable_statement() -> impl Strategy<Value = String> {
+            (literal(), quoted_ident(), line_comment(), block_comment()).prop_flat_map(
+                |(l, q, lc, bc)| {
+                    prop_oneof![
+                        Just(format!("SELECT {l}, {q} FROM {q} {bc}")),
+                        Just(format!("{lc}CREATE TABLE {q} (a int)")),
+                        Just(format!("DROP TABLE {q} {bc}")),
+                        Just(format!("SELECT * FROM t WHERE {q} = {l} {lc}")),
+                        Just(format!("SHOW CREATE TABLE {q}")),
+                    ]
+                },
+            )
+        }
+
+        proptest! {
+            /// (a) Already-parseable SQL is returned byte-identical.
+            #[test]
+            fn parseable_input_is_returned_byte_identical(sql in parseable_statement()) {
+                if parses(&sql) {
+                    prop_assert_eq!(rewrite_bare_table(&sql), sql);
+                }
+            }
+
+            /// (b) A bare `TABLE` statement wrapped in comments and naming a
+            /// hostile quoted identifier: the comment and identifier bytes
+            /// survive, and the expansion parses.
+            #[test]
+            fn comment_and_identifier_bytes_survive_the_rewrite(
+                q in quoted_ident(),
+                lc in line_comment(),
+                bc in block_comment(),
+            ) {
+                let sql = format!("{lc}TABLE {q} ORDER BY 1 {bc}");
+                let out = rewrite_bare_table(&sql);
+                prop_assert!(out.contains(&q), "identifier changed: {out}");
+                prop_assert!(out.contains(&lc), "line comment changed: {out}");
+                prop_assert!(out.contains(&bc), "block comment changed: {out}");
+                prop_assert!(parses(&out), "rewrite did not fire: {out}");
+                prop_assert_eq!(out, format!("{lc}SELECT * FROM {q} ORDER BY 1 {bc}"));
+            }
+        }
+    }
 }

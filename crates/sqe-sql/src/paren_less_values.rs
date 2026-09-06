@@ -319,4 +319,143 @@ mod tests {
         assert!(parses(&out), "got: {out}");
         assert_eq!(out, "VALUES (1), (2) ORDER BY 1");
     }
+
+    // ── Adversarial inputs: comments, quoted identifiers, literals (#630) ──
+
+    #[test]
+    fn leading_line_comment_is_preserved() {
+        let out = rewrite_paren_less_values("-- one row\nINSERT INTO t VALUES 1");
+        assert_eq!(out, "-- one row\nINSERT INTO t VALUES (1)");
+        assert!(parses(&out));
+    }
+
+    #[test]
+    fn leading_block_comment_is_preserved() {
+        let out = rewrite_paren_less_values("/* values ) */ VALUES 1, 2");
+        assert_eq!(out, "/* values ) */ VALUES (1), (2)");
+        assert!(parses(&out));
+    }
+
+    #[test]
+    fn close_paren_inside_literal_is_one_value() {
+        let out = rewrite_paren_less_values("VALUES 'a)b', 2");
+        assert_eq!(out, "VALUES ('a)b'), (2)");
+        assert!(parses(&out));
+    }
+
+    #[test]
+    fn close_paren_inside_comment_between_rows_is_ignored() {
+        let out = rewrite_paren_less_values("INSERT INTO t VALUES 1 /* ) */, 2");
+        assert_eq!(out, "INSERT INTO t VALUES (1) /* ) */, (2)");
+        assert!(parses(&out));
+    }
+
+    #[test]
+    fn quoted_table_named_values_is_the_target() {
+        let out = rewrite_paren_less_values("INSERT INTO \"values\" VALUES 1");
+        assert_eq!(out, "INSERT INTO \"values\" VALUES (1)");
+        assert!(parses(&out));
+    }
+
+    #[test]
+    fn quoted_column_named_values_is_untouched() {
+        let sql = "SELECT \"values\" FROM t";
+        assert_eq!(rewrite_paren_less_values(sql), sql);
+    }
+
+    #[test]
+    fn values_keyword_inside_literal_is_untouched() {
+        let sql = "SELECT 'values 1, 2' AS s";
+        assert_eq!(rewrite_paren_less_values(sql), sql);
+    }
+
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Scanner-hostile bytes with no quotes (so they drop into a literal,
+        /// a quoted identifier or a comment unescaped) and no `*` (so they
+        /// cannot close a block comment early).
+        fn payload() -> impl Strategy<Value = String> {
+            prop::collection::vec(
+                prop_oneof![
+                    Just(")".to_string()),
+                    Just("(".to_string()),
+                    Just(",".to_string()),
+                    Just(" values ".to_string()),
+                    Just(" order by ".to_string()),
+                    Just(" union ".to_string()),
+                    Just(" -- ".to_string()),
+                    Just(" /* ".to_string()),
+                    "[a-z0-9 ]{1,4}",
+                ],
+                1..6,
+            )
+            .prop_map(|parts| parts.concat())
+        }
+
+        fn literal() -> impl Strategy<Value = String> {
+            payload().prop_map(|p| format!("'{p}'"))
+        }
+
+        fn quoted_ident() -> impl Strategy<Value = String> {
+            payload().prop_map(|p| format!("\"{p}\""))
+        }
+
+        fn line_comment() -> impl Strategy<Value = String> {
+            payload().prop_map(|p| format!("--{p}\n"))
+        }
+
+        /// sqlparser nests block comments, so an opener inside the body would
+        /// leave the comment unterminated; defuse it.
+        fn block_comment() -> impl Strategy<Value = String> {
+            payload().prop_map(|p| format!("/*{}*/", p.replace("/*", "/ *")))
+        }
+
+        fn parseable_statement() -> impl Strategy<Value = String> {
+            (literal(), quoted_ident(), line_comment(), block_comment()).prop_flat_map(
+                |(l, q, lc, bc)| {
+                    prop_oneof![
+                        Just(format!("SELECT {l}, {q} FROM t {bc}")),
+                        Just(format!("{lc}INSERT INTO {q} VALUES ({l}, 1)")),
+                        Just(format!("VALUES ({l}), ({q}) {bc}")),
+                        Just(format!(
+                            "SELECT * FROM (VALUES ({l})) AS v(x) WHERE x = {l} {lc}"
+                        )),
+                        Just(format!("INSERT INTO t VALUES ({l}, {q}) {bc}")),
+                    ]
+                },
+            )
+        }
+
+        proptest! {
+            /// (a) Already-parseable SQL is returned byte-identical.
+            #[test]
+            fn parseable_input_is_returned_byte_identical(sql in parseable_statement()) {
+                if parses(&sql) {
+                    prop_assert_eq!(rewrite_paren_less_values(&sql), sql);
+                }
+            }
+
+            /// (b) A bare-VALUES statement whose single-column row IS the
+            /// hostile literal, wrapped in comments: literal and comment bytes
+            /// survive, the row is wrapped, and the result parses.
+            #[test]
+            fn literal_and_comment_bytes_survive_the_rewrite(
+                l in literal(),
+                q in quoted_ident(),
+                lc in line_comment(),
+                bc in block_comment(),
+            ) {
+                let sql = format!("{lc}INSERT INTO {q} VALUES {l}, 2 {bc}");
+                let out = rewrite_paren_less_values(&sql);
+                prop_assert!(out.contains(&l), "literal changed: {out}");
+                prop_assert!(out.contains(&q), "identifier changed: {out}");
+                prop_assert!(out.contains(&lc), "line comment changed: {out}");
+                prop_assert!(out.contains(&bc), "block comment changed: {out}");
+                prop_assert!(parses(&out), "rewrite did not fire: {out}");
+                prop_assert_eq!(out, format!("{lc}INSERT INTO {q} VALUES ({l}), (2) {bc}"));
+            }
+        }
+    }
 }

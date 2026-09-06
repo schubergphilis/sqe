@@ -656,12 +656,12 @@ impl IcebergScanExec {
                     .filter(|df| planned.contains(df.file_path()))
                     .collect();
                 if !relevant.is_empty() {
-                    let ischema = self.table.metadata().current_schema();
+                    let ischema = snapshot_schema(&self.table, self.snapshot_id);
                     let (kept, pc) = Self::prune_data_files(
                         relevant,
                         &self.df_filters,
                         &self.projected_schema,
-                        ischema,
+                        &ischema,
                     );
                     pruned_count = pc;
                     if pruned_count > 0 {
@@ -1411,13 +1411,13 @@ impl ExecutionPlan for IcebergScanExec {
                         file_entries.iter().map(|(p, _)| p.clone()).collect();
                     match collect_data_files_for_pruning(&table, snapshot_id, &file_paths, manifest_concurrency).await {
                         Ok(data_files) if !data_files.is_empty() => {
-                            let iceberg_schema = table.metadata().current_schema();
+                            let iceberg_schema = snapshot_schema(&table, snapshot_id);
                             let (kept, pruned_count) =
                                 IcebergScanExec::prune_data_files_with_physical_exprs(
                                     data_files,
                                     &resolved_filters,
                                     &schema,
-                                    iceberg_schema,
+                                    &iceberg_schema,
                                 );
                             if pruned_count > 0 {
                                 let kept_paths: std::collections::HashSet<String> =
@@ -1466,10 +1466,15 @@ impl ExecutionPlan for IcebergScanExec {
                 // rather than dropped: see `resolve_projection_in_file`.
                 //
                 // `None` when the projection is absent (whole-row read) or when a
-                // projected name is not in the current schema, which cannot happen
+                // projected name is not in the scanned schema, which cannot happen
                 // for a plan that passed analysis and simply falls back to names.
+                //
+                // Resolved against the SNAPSHOT's schema, not the current one: a
+                // time-travel scan must map names to the ids that snapshot
+                // wrote, or a column added since would be looked up by an id
+                // the files never carried (architecture review 312).
                 let projected_field_ids: Option<Vec<i32>> = projection.as_ref().and_then(|cols| {
-                    let iceberg_schema = table.metadata().current_schema();
+                    let iceberg_schema = snapshot_schema(&table, snapshot_id);
                     cols.iter()
                         .map(|c| iceberg_schema.field_id_by_name(c))
                         .collect::<Option<Vec<i32>>>()
@@ -1768,8 +1773,8 @@ impl ExecutionPlan for IcebergScanExec {
                         file_entries.iter().map(|(p, _)| p.clone()).collect();
                     match collect_data_files_for_pruning(&table, snapshot_id, &file_paths, manifest_concurrency).await {
                         Ok(dfs) if !dfs.is_empty() => {
-                            let iceberg_schema = table.metadata().current_schema();
-                            let stats = IcebergManifestStatistics::new(dfs, schema.clone(), iceberg_schema);
+                            let iceberg_schema = snapshot_schema(&table, snapshot_id);
+                            let stats = IcebergManifestStatistics::new(dfs, schema.clone(), &iceberg_schema);
                             let keep = stats.clustered_on_filters(&filter_columns, runtime_filter_uniform_threshold);
                             if !keep {
                                 debug!(
@@ -2367,6 +2372,18 @@ fn degrade_row_count_for_filtered_scan(
         stats.num_rows = stats.num_rows.to_inexact();
     }
     stats
+}
+
+/// The Iceberg schema a scan of `snapshot_id` must be read with: the
+/// snapshot's own `schema-id`, falling back to the table's current schema
+/// only when the snapshot has none (pre-`schema-id` v1 metadata) or is
+/// unknown to this metadata (architecture review 312).
+pub fn snapshot_schema(table: &Table, snapshot_id: Option<i64>) -> iceberg::spec::SchemaRef {
+    let metadata = table.metadata();
+    snapshot_id
+        .and_then(|id| metadata.snapshot_by_id(id))
+        .and_then(|snapshot| snapshot.schema(metadata).ok())
+        .unwrap_or_else(|| metadata.current_schema().clone())
 }
 
 pub async fn compute_table_statistics(

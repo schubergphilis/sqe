@@ -754,10 +754,18 @@ impl Vector {
             d.expect_field(101)?;
             let raw = d.read_data_ptr()?;
             // `count` is the parent's row_count, itself a wire-supplied value.
-            // Allocate incrementally instead of `with_capacity(count)` so a
-            // bogus 4e9 row_count does not pre-allocate gigabytes before the
-            // first byte is read.
-            let mut bits = Vec::new();
+            // DuckDB always writes `ceil(count / 64) * 8` mask bytes, so a
+            // mask shorter than `count` bits is a header/payload mismatch.
+            // Rejecting it here bounds the `bits` allocation by the bytes
+            // actually present instead of by the wire header (issue #612).
+            let capacity_bits = raw.len().saturating_mul(8);
+            if capacity_bits < count {
+                return Err(crate::WireError::CountExceedsRemaining {
+                    count: count as u64,
+                    remaining: capacity_bits as u64,
+                });
+            }
+            let mut bits = Vec::with_capacity(count);
             for i in 0..count {
                 let byte = raw.get(i / 8).copied().unwrap_or(0);
                 bits.push(byte & (1 << (i % 8)) != 0);
@@ -785,7 +793,30 @@ impl Vector {
                     d.expect_field(101)?;
                     let length = d.read_u64()?;
                     d.expect_object_end()?;
+                    // Every entry must address a range inside the child
+                    // vector; anything else would make the Arrow bridge
+                    // slice past the child array.
+                    let end = offset.checked_add(length).ok_or(
+                        crate::WireError::CountExceedsRemaining {
+                            count: u64::MAX,
+                            remaining: child_count,
+                        },
+                    )?;
+                    if end > child_count {
+                        return Err(crate::WireError::CountExceedsRemaining {
+                            count: end,
+                            remaining: child_count,
+                        });
+                    }
                     entries.push((offset, length));
+                }
+                // The header promised `count` rows; the entries list must
+                // back every one of them.
+                if actual < count {
+                    return Err(crate::WireError::CountExceedsRemaining {
+                        count: count as u64,
+                        remaining: actual as u64,
+                    });
                 }
                 d.expect_field(106)?;
                 let child_logical = match &logical_type.extra {
@@ -814,12 +845,19 @@ impl Vector {
                         ))
                     }
                 };
-                let child_vec = Vector::decode_with_depth(
-                    child_logical,
-                    (array_size as usize).saturating_mul(count),
-                    d,
-                    child_depth,
-                )?;
+                // `array_size * count` is the child's row count. Arrow's
+                // FixedSizeList carries the size as an i32, so anything past
+                // that (or a multiplication overflow) can never be materialised.
+                let child_rows = usize::try_from(array_size)
+                    .ok()
+                    .filter(|_| array_size <= i32::MAX as u64)
+                    .and_then(|size| size.checked_mul(count))
+                    .ok_or(crate::WireError::CountExceedsRemaining {
+                        count: array_size,
+                        remaining: i32::MAX as u64,
+                    })?;
+                let child_vec =
+                    Vector::decode_with_depth(child_logical, child_rows, d, child_depth)?;
                 d.expect_object_end()?;
                 VectorData::Array {
                     array_size,
@@ -846,6 +884,13 @@ impl Vector {
                         expected: field_types.len() as u16,
                         actual: child_count as u16,
                     });
+                }
+                // DuckDB never emits a STRUCT without members. Rejecting the
+                // shape keeps the invariant that every decoded vector carries
+                // data backing `count` rows; an empty struct would let a bogus
+                // row_count sail through with zero bytes behind it.
+                if field_types.is_empty() {
+                    return Err(crate::WireError::UnsupportedLogicalType(logical_type.id));
                 }
                 let mut children = Vec::with_capacity(child_count);
                 for ty in field_types {
@@ -905,6 +950,7 @@ impl Vector {
                         values.push(None);
                     }
                 }
+                ensure_decoded_rows(actual, count)?;
                 VectorData::Strings(values)
             }
             LogicalTypeId::Blob => {
@@ -920,6 +966,7 @@ impl Vector {
                         .unwrap_or(true);
                     values.push(if valid { Some(bytes) } else { None });
                 }
+                ensure_decoded_rows(actual, count)?;
                 VectorData::Blobs(values)
             }
             other => return Err(crate::WireError::UnsupportedLogicalType(other)),
@@ -931,6 +978,19 @@ impl Vector {
             data,
         })
     }
+}
+
+/// Reject a variable-width vector whose wire list carried fewer rows than
+/// the header's `count`. The Arrow bridge sizes its builders from `count`,
+/// so the decoded payload has to back every promised row (issue #612).
+fn ensure_decoded_rows(actual: usize, count: usize) -> crate::Result<()> {
+    if actual < count {
+        return Err(crate::WireError::CountExceedsRemaining {
+            count: count as u64,
+            remaining: actual as u64,
+        });
+    }
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------

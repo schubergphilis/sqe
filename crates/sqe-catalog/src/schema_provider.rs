@@ -496,15 +496,26 @@ impl SchemaProvider for SqeSchemaProvider {
             }
         }
 
-        // Second: try loading as an Iceberg view
+        // Second: try loading as an Iceberg view. Views are a REST-only
+        // surface; other backends have no view endpoint to consult.
+        if !self.session_catalog.is_rest_backend() {
+            return Ok(None);
+        }
         match self.session_catalog.load_view_sql(&ns_ident, name).await {
             Ok(Some(sql)) => {
                 debug!(view = name, sql = %sql, "Loaded view SQL, planning...");
                 return self.plan_view(name, sql).await;
             }
             Ok(None) => {}
+            Err(e) if e.is_not_found() => {
+                debug!(view = name, error = %e, "View not found");
+            }
             Err(e) => {
-                debug!(view = name, error = %e, "Failed to load view SQL");
+                // Same rule as the table path above: a 403, a 5xx, an open
+                // breaker or an unsupported view dialect must reach the user
+                // as itself, not as DataFusion's "table not found"
+                // (architecture review 311).
+                return Err(DataFusionError::External(Box::new(e)));
             }
         }
 

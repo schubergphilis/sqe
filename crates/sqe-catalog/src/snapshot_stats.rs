@@ -179,11 +179,14 @@ impl SnapshotStatsCache {
         let Some((files, hit)) = self.snapshot_files(table, Some(sid), concurrency).await? else {
             return Ok(None);
         };
-        let iceberg_schema = table.metadata().current_schema();
+        // The snapshot's schema, not the current one: manifest column stats
+        // are keyed by field id, and a time-travel scan projects the ids the
+        // snapshot wrote (architecture review 312).
+        let iceberg_schema = crate::iceberg_scan::snapshot_schema(table, Some(sid));
         let stats = Arc::new(crate::pruning_stats::aggregate_table_statistics(
             &files.data_files,
             arrow_schema,
-            iceberg_schema,
+            &iceberg_schema,
             !files.has_live_delete_files,
         ));
         self.stats.insert(key, Arc::clone(&stats)).await;

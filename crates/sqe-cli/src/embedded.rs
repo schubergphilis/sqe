@@ -165,10 +165,7 @@ impl EmbeddedS3Options {
             if let Some(v) = flag.as_deref().filter(|v| !v.is_empty()) {
                 return Some(v.to_string());
             }
-            names
-                .iter()
-                .filter_map(|n| env(n))
-                .find(|v| !v.is_empty())
+            names.iter().filter_map(|n| env(n)).find(|v| !v.is_empty())
         };
 
         Self {
@@ -760,10 +757,24 @@ impl EmbeddedClient {
 #[async_trait]
 impl SqlClient for EmbeddedClient {
     async fn execute(&mut self, sql: &str) -> Result<QueryResult, Box<dyn std::error::Error>> {
+        // The SQL front door (finding 700): the same normalization the
+        // coordinator applies over Flight SQL and the Trino server applies
+        // over HTTP, so `INSERT INTO t VALUES 1`, `TABLE t` and `SELECT 1+1`
+        // behave (and name their columns) identically in `--embedded`. The
+        // text handed to DataFusion below is the normalized text when the
+        // front door parsed the statement; a statement it cannot parse falls
+        // through verbatim so DataFusion's own grammar (`CREATE EXTERNAL
+        // TABLE ... STORED AS`, `COPY`) and error messages still apply.
+        let mut exec_sql = sql.to_string();
         // Intercept ATTACH / DETACH / CREATE SECRET / DROP SECRET / SHOW SECRETS
         // before DataFusion's parser sees the SQL — these are SQE-specific
         // syntax extensions that DataFusion has no AST for.
-        match sqe_sql::parse_and_classify(sql) {
+        match sqe_sql::SqlFrontDoor::new(sqe_sql::WireDialect::Embedded)
+            .normalize(sql)
+            .and_then(|normalized| {
+                exec_sql = normalized.sql().to_string();
+                sqe_sql::classify_normalized(normalized)
+            }) {
             Ok(kind) => match kind {
                 sqe_sql::StatementKind::Attach(stmt) => {
                     return self.embedded_handle_attach(&stmt).await;
@@ -812,9 +823,7 @@ impl SqlClient for EmbeddedClient {
                     }
                 }
                 sqe_sql::StatementKind::ShowCreateTable(ref stmt) => {
-                    if let Some(result) =
-                        self.embedded_handle_show_create_hive_table(stmt).await?
-                    {
+                    if let Some(result) = self.embedded_handle_show_create_hive_table(stmt).await? {
                         return Ok(result);
                     }
                 }
@@ -848,11 +857,13 @@ impl SqlClient for EmbeddedClient {
         // same way `SELECT * FROM 'https://...'` already does. The TVF
         // path (`read_csv('hf://...')`) is unaffected; it does its own
         // rewrite via `rewrite_hf_path_in_place` inside the TVF.
-        let rewritten = sqe_catalog::file_tvf_common::rewrite_hf_urls_in_sql(sql)?;
+        let rewritten = sqe_catalog::file_tvf_common::rewrite_hf_urls_in_sql(&exec_sql)?;
         // DF54: named TVF arguments (`delimiter => ';'`) are no longer
         // accepted by DataFusion directly.  Convert them to the positional
         // `'key=value'` form that `parse_file_tvf_args` understands, exactly
-        // as the coordinator does before handing SQL to DataFusion.
+        // as the coordinator does before handing SQL to DataFusion. This is a
+        // DataFusion version shim, not dialect normalization, which is why it
+        // sits outside the front door.
         let rewritten = sqe_sql::rewrite_named_tvf_args(rewritten.as_ref());
         let df = self.ctx.sql(&rewritten).await?;
         // Snapshot the DataFrame schema before collecting so we still
@@ -991,26 +1002,25 @@ impl EmbeddedClient {
         &mut self,
         spec: &sqe_sql::hive_ddl::HiveTableSpec,
     ) -> Result<QueryResult, Box<dyn std::error::Error>> {
-        let catalog_name = spec.catalog.as_deref().ok_or_else(
-            || -> Box<dyn std::error::Error> {
-                "CREATE EXTERNAL TABLE needs a catalog-qualified name in embedded mode \
+        let catalog_name =
+            spec.catalog
+                .as_deref()
+                .ok_or_else(|| -> Box<dyn std::error::Error> {
+                    "CREATE EXTERNAL TABLE needs a catalog-qualified name in embedded mode \
                  (e.g. `lake.sales.orders`); there is no \"current\" Hive root to fall \
                  back to"
-                    .into()
-            },
-        )?;
-        let provider = self
-            .hive_roots
-            .get(catalog_name)
-            .cloned()
-            .ok_or_else(|| -> Box<dyn std::error::Error> {
+                        .into()
+                })?;
+        let provider = self.hive_roots.get(catalog_name).cloned().ok_or_else(
+            || -> Box<dyn std::error::Error> {
                 format!(
                     "hive root '{catalog_name}' is not attached; attach it with \
                      --hive-root {catalog_name}=<url> (or ATTACH ... TYPE hive_external) \
                      before creating tables in it"
                 )
                 .into()
-            })?;
+            },
+        )?;
 
         // "default", not a value read back from the session config: every
         // `WarehouseMode` in `build_embedded_context` hardcodes
@@ -1097,7 +1107,10 @@ impl EmbeddedClient {
             .into());
         }
 
-        match writable_store(&provider, catalog)?.delete(database, table).await {
+        match writable_store(&provider, catalog)?
+            .delete(database, table)
+            .await
+        {
             Ok(()) => {}
             Err(sqe_catalog::hive::HiveError::NotFound(_)) if *if_exists => {}
             Err(e) => return Err(e.into()),
@@ -1130,7 +1143,9 @@ impl EmbeddedClient {
             return Ok(None);
         };
 
-        let manifest = writable_store(&provider, catalog)?.get(database, table).await?;
+        let manifest = writable_store(&provider, catalog)?
+            .get(database, table)
+            .await?;
         let spec = sqe_catalog::hive::hive_spec_from_manifest(catalog, &manifest);
         let ddl = sqe_catalog::hive::render_hive_create_table_ddl(&spec);
 
@@ -1301,7 +1316,11 @@ mod tests {
         // anonymous reads with a token that does not match the keys.
         let resolved = EmbeddedS3Options::resolve(&EmbeddedS3Options::default(), env_of(&[]));
         assert_eq!(resolved.session_token, None);
-        assert!(resolved.to_storage_config().s3_session_token.expose().is_empty());
+        assert!(resolved
+            .to_storage_config()
+            .s3_session_token
+            .expose()
+            .is_empty());
     }
 
     #[test]
@@ -1328,7 +1347,10 @@ mod tests {
                 ("AWS_ENDPOINT_URL_S3", "http://s3-specific:9000"),
             ]),
         );
-        assert_eq!(resolved.endpoint.as_deref(), Some("http://s3-specific:9000"));
+        assert_eq!(
+            resolved.endpoint.as_deref(),
+            Some("http://s3-specific:9000")
+        );
     }
 
     #[test]
@@ -1415,8 +1437,31 @@ mod tests {
     async fn embedded_client_returns_zero_rows_for_empty_select() {
         let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
         let result = client.execute("SELECT 1 WHERE FALSE").await.expect("query");
-        assert_eq!(result.columns, vec!["Int64(1)".to_string()]);
+        // The SQL front door names anonymous columns `_colN` on every wire,
+        // embedded included (finding 700); DataFusion's `Int64(1)` is gone.
+        assert_eq!(result.columns, vec!["_col0".to_string()]);
         assert!(result.rows.is_empty());
+    }
+
+    /// Finding 700: Trino shapes that only the Trino HTTP door used to accept
+    /// work in `--embedded` too, through the same front door.
+    #[tokio::test]
+    async fn embedded_client_accepts_trino_shapes_through_the_front_door() {
+        let mut client = EmbeddedClient::new(64 * 1024 * 1024).expect("build client");
+        client
+            .execute("CREATE TABLE fd_t (id BIGINT)")
+            .await
+            .expect("create");
+        client
+            .execute("INSERT INTO fd_t VALUES 1")
+            .await
+            .expect("paren-less VALUES insert");
+        let result = client.execute("TABLE fd_t").await.expect("bare TABLE");
+        assert_eq!(result.columns, vec!["id".to_string()]);
+        assert_eq!(result.rows, vec![vec!["1".to_string()]]);
+        let result = client.execute("SELECT 1+1").await.expect("query");
+        assert_eq!(result.columns, vec!["_col0".to_string()]);
+        assert_eq!(result.rows, vec![vec!["2".to_string()]]);
     }
 
     /// V9: `SELECT * EXCLUDE (col)` removes the named column from the
@@ -1542,7 +1587,9 @@ mod tests {
                 },
             ],
         };
-        let result = EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode, &EmbeddedS3Options::default()).await;
+        let result =
+            EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode, &EmbeddedS3Options::default())
+                .await;
         let err = result.map(|_| ()).expect_err("duplicate names must error");
         let msg = format!("{err}");
         assert!(
@@ -1621,9 +1668,10 @@ mod tests {
             ],
         };
 
-        let mut c = EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode, &EmbeddedS3Options::default())
-            .await
-            .expect("two-catalog client builds");
+        let mut c =
+            EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode, &EmbeddedS3Options::default())
+                .await
+                .expect("two-catalog client builds");
 
         let r = c
             .execute(
@@ -1707,7 +1755,11 @@ mod tests {
             let mut c = bounded(
                 "phase1_open",
                 90,
-                EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode, &EmbeddedS3Options::default()),
+                EmbeddedClient::with_warehouse(
+                    64 * 1024 * 1024,
+                    &mode,
+                    &EmbeddedS3Options::default(),
+                ),
             )
             .await
             .expect("first client");
@@ -1773,9 +1825,10 @@ mod tests {
     #[tokio::test]
     async fn memory_mode_skips_warehouse_setup() {
         let mode = WarehouseMode::Memory;
-        let mut c = EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode, &EmbeddedS3Options::default())
-            .await
-            .expect("memory client builds without disk");
+        let mut c =
+            EmbeddedClient::with_warehouse(64 * 1024 * 1024, &mode, &EmbeddedS3Options::default())
+                .await
+                .expect("memory client builds without disk");
         // Sanity: the session works.
         let r = c.execute("SELECT 1").await.expect("query");
         assert_eq!(r.rows, vec![vec!["1".to_string()]]);
@@ -2311,9 +2364,8 @@ mod tests {
         // (not by rebuilding a `HiveManifestStore`, which would only prove
         // the renderer agrees with itself): the rendered DDL must re-parse
         // to a spec equal to what the manifest on disk actually holds.
-        let manifest_bytes =
-            std::fs::read(dir.path().join("wh/sales/orders/_sqe/table.json"))
-                .expect("read manifest from disk");
+        let manifest_bytes = std::fs::read(dir.path().join("wh/sales/orders/_sqe/table.json"))
+            .expect("read manifest from disk");
         let manifest: sqe_catalog::hive::manifest::HiveManifest =
             serde_json::from_slice(&manifest_bytes).expect("parse manifest json");
         let expected = sqe_catalog::hive::hive_spec_from_manifest("lake", &manifest);

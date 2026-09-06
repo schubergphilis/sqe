@@ -1,0 +1,261 @@
+[
+  {
+    "body": {
+      "columns": [],
+      "id": "<query-id>",
+      "infoUri": "http://<host>/v1/query/<query-id>",
+      "stats": {
+        "completedSplits": 1,
+        "cpuTimeMillis": 0,
+        "elapsedTimeMillis": 0,
+        "nodes": 1,
+        "peakMemoryBytes": 0,
+        "physicalInputBytes": 0,
+        "processedBytes": 0,
+        "processedRows": 0,
+        "queued": false,
+        "queuedSplits": 0,
+        "queuedTimeMillis": 0,
+        "rootStage": null,
+        "runningSplits": 0,
+        "scheduled": true,
+        "spilledBytes": 0,
+        "state": "FINISHED",
+        "totalSplits": 1,
+        "wallTimeMillis": 0
+      },
+      "updateCount": 0,
+      "updateType": "USE",
+      "warnings": []
+    },
+    "headers": {
+      "x-trino-set-catalog": [
+        "lake"
+      ],
+      "x-trino-set-schema": [
+        "gold"
+      ]
+    },
+    "status": 200,
+    "step": "use"
+  },
+  {
+    "body": {
+      "error": {
+        "errorCode": 14,
+        "errorName": "INVALID_SESSION_PROPERTY",
+        "errorType": "USER_ERROR",
+        "failureInfo": {
+          "message": "Session property 'query_max_run_time' does not exist",
+          "stack": [],
+          "suppressed": [],
+          "type": "io.trino.spi.USER_ERROR"
+        },
+        "message": "Session property 'query_max_run_time' does not exist",
+        "queryId": "<query-id>"
+      },
+      "id": "<query-id>",
+      "infoUri": "http://<host>/v1/query/<query-id>",
+      "stats": {
+        "completedSplits": 0,
+        "cpuTimeMillis": 0,
+        "elapsedTimeMillis": 0,
+        "nodes": 1,
+        "peakMemoryBytes": 0,
+        "physicalInputBytes": 0,
+        "processedBytes": 0,
+        "processedRows": 0,
+        "queued": false,
+        "queuedSplits": 0,
+        "queuedTimeMillis": 0,
+        "rootStage": null,
+        "runningSplits": 0,
+        "scheduled": true,
+        "spilledBytes": 0,
+        "state": "FAILED",
+        "totalSplits": 1,
+        "wallTimeMillis": 0
+      },
+      "warnings": []
+    },
+    "status": 200,
+    "step": "set-session-unknown"
+  },
+  {
+    "body": {
+      "columns": [],
+      "id": "<query-id>",
+      "infoUri": "http://<host>/v1/query/<query-id>",
+      "stats": {
+        "completedSplits": 1,
+        "cpuTimeMillis": 0,
+        "elapsedTimeMillis": 0,
+        "nodes": 1,
+        "peakMemoryBytes": 0,
+        "physicalInputBytes": 0,
+        "processedBytes": 0,
+        "processedRows": 0,
+        "queued": false,
+        "queuedSplits": 0,
+        "queuedTimeMillis": 0,
+        "rootStage": null,
+        "runningSplits": 0,
+        "scheduled": true,
+        "spilledBytes": 0,
+        "state": "FINISHED",
+        "totalSplits": 1,
+        "wallTimeMillis": 0
+      },
+      "updateType": "SET SESSION",
+      "warnings": []
+    },
+    "headers": {
+      "x-trino-set-session": [
+        "iceberg.compression_codec=ZSTD"
+      ]
+    },
+    "status": 200,
+    "step": "set-session"
+  },
+  {
+    "body": {
+      "columns": [
+        {
+          "name": "Name",
+          "type": "varchar",
+          "typeSignature": {
+            "arguments": [
+              {
+                "kind": "LONG",
+                "value": 2147483647
+              }
+            ],
+            "rawType": "varchar"
+          }
+        },
+        {
+          "name": "Value",
+          "type": "varchar",
+          "typeSignature": {
+            "arguments": [
+              {
+                "kind": "LONG",
+                "value": 2147483647
+              }
+            ],
+            "rawType": "varchar"
+          }
+        },
+        {
+          "name": "Default",
+          "type": "varchar",
+          "typeSignature": {
+            "arguments": [
+              {
+                "kind": "LONG",
+                "value": 2147483647
+              }
+            ],
+            "rawType": "varchar"
+          }
+        },
+        {
+          "name": "Type",
+          "type": "varchar",
+          "typeSignature": {
+            "arguments": [
+              {
+                "kind": "LONG",
+                "value": 2147483647
+              }
+            ],
+            "rawType": "varchar"
+          }
+        },
+        {
+          "name": "Description",
+          "type": "varchar",
+          "typeSignature": {
+            "arguments": [
+              {
+                "kind": "LONG",
+                "value": 2147483647
+              }
+            ],
+            "rawType": "varchar"
+          }
+        }
+      ],
+      "data": [
+        [
+          "iceberg.compression_codec",
+          "ZSTD",
+          null,
+          "varchar",
+          "Parquet compression codec for files written by this session (ZSTD, SNAPPY, LZ4, NONE); the coordinator's configured codec applies when unset"
+        ]
+      ],
+      "id": "<query-id>",
+      "infoUri": "http://<host>/v1/query/<query-id>",
+      "stats": {
+        "completedSplits": 1,
+        "cpuTimeMillis": 0,
+        "elapsedTimeMillis": 0,
+        "nodes": 1,
+        "peakMemoryBytes": 0,
+        "physicalInputBytes": 0,
+        "processedBytes": 0,
+        "processedRows": 1,
+        "queued": false,
+        "queuedSplits": 0,
+        "queuedTimeMillis": 0,
+        "rootStage": null,
+        "runningSplits": 0,
+        "scheduled": true,
+        "spilledBytes": 0,
+        "state": "FINISHED",
+        "totalSplits": 1,
+        "wallTimeMillis": 0
+      },
+      "warnings": []
+    },
+    "status": 200,
+    "step": "show-session"
+  },
+  {
+    "body": {
+      "columns": [],
+      "id": "<query-id>",
+      "infoUri": "http://<host>/v1/query/<query-id>",
+      "stats": {
+        "completedSplits": 1,
+        "cpuTimeMillis": 0,
+        "elapsedTimeMillis": 0,
+        "nodes": 1,
+        "peakMemoryBytes": 0,
+        "physicalInputBytes": 0,
+        "processedBytes": 0,
+        "processedRows": 0,
+        "queued": false,
+        "queuedSplits": 0,
+        "queuedTimeMillis": 0,
+        "rootStage": null,
+        "runningSplits": 0,
+        "scheduled": true,
+        "spilledBytes": 0,
+        "state": "FINISHED",
+        "totalSplits": 1,
+        "wallTimeMillis": 0
+      },
+      "updateType": "RESET SESSION",
+      "warnings": []
+    },
+    "headers": {
+      "x-trino-clear-session": [
+        "iceberg.compression_codec"
+      ]
+    },
+    "status": 200,
+    "step": "reset-session"
+  }
+]

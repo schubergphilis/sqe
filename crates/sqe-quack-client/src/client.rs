@@ -45,6 +45,42 @@ pub enum ClientError {
     /// The decoded result grew past the configured cap.
     #[error("quack result exceeds {cap} bytes (received {seen}); narrow the query or raise quack_client.max_result_bytes")]
     ResultTooLarge { cap: usize, seen: usize },
+    /// The wire decoder or the Arrow bridge panicked on the peer's bytes.
+    /// The codec is meant to return `WireError` for every malformed input;
+    /// this is the last line of defence so a hostile or buggy Quack server
+    /// fails one query instead of aborting the coordinator (issue #612).
+    #[error("quack response decode panicked ({stage}): {message}")]
+    DecodePanic {
+        stage: &'static str,
+        message: String,
+    },
+}
+
+/// Run a decode step under `catch_unwind` so a panic in `sqe-quack-wire`
+/// surfaces as [`ClientError::DecodePanic`] rather than unwinding into the
+/// caller's runtime thread. Only pure decode work runs inside; nothing here
+/// holds locks or half-updated client state, so `AssertUnwindSafe` is sound.
+fn guard_decode<T>(
+    stage: &'static str,
+    f: impl FnOnce() -> Result<T, ClientError>,
+) -> Result<T, ClientError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(payload) => Err(ClientError::DecodePanic {
+            stage,
+            message: panic_message(payload.as_ref()),
+        }),
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }
 
 /// Synchronous, single-connection Quack client. Holds the `connection_id`
@@ -150,7 +186,9 @@ impl QuackClient {
         // fails early instead of after it has been fully materialised.
         let mut seen_bytes = 0usize;
         for chunk in &prepare.results {
-            let batch = data_chunk_to_record_batch(&names, chunk)?;
+            let batch = guard_decode("prepare chunk to arrow", || {
+                Ok(data_chunk_to_record_batch(&names, chunk)?)
+            })?;
             self.policy
                 .charge(&mut seen_bytes, batch.get_array_memory_size())?;
             batches.push(batch);
@@ -172,7 +210,9 @@ impl QuackClient {
                 other => return Err(ClientError::UnexpectedMessage(other.message_type())),
             };
             for chunk in &fetch.results {
-                let batch = data_chunk_to_record_batch(&names, chunk)?;
+                let batch = guard_decode("fetch chunk to arrow", || {
+                    Ok(data_chunk_to_record_batch(&names, chunk)?)
+                })?;
                 self.policy
                     .charge(&mut seen_bytes, batch.get_array_memory_size())?;
                 batches.push(batch);
@@ -231,8 +271,9 @@ impl QuackClient {
                 body: String::from_utf8_lossy(&payload).into_owned(),
             });
         }
-        let decoded = decode_message(&payload)?;
-        Ok(decoded)
+        // The peer controls every byte of `payload`; keep a decoder panic
+        // from unwinding into the caller's runtime thread.
+        guard_decode("decode_message", || Ok(decode_message(&payload)?))
     }
 }
 
@@ -289,6 +330,32 @@ fn parse_quack_uri(input: &str) -> Result<Url, ClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guard_decode_turns_panic_into_client_error() {
+        // Silence the default hook's stderr spew for this test only; the hook
+        // is process-global, so restore it afterwards.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result: Result<(), ClientError> = guard_decode("unit", || {
+            panic!("hostile peer bytes: {}", 42);
+        });
+        std::panic::set_hook(previous);
+        match result {
+            Err(ClientError::DecodePanic { stage, message }) => {
+                assert_eq!(stage, "unit");
+                assert_eq!(message, "hostile peer bytes: 42");
+            }
+            other => panic!("expected DecodePanic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn guard_decode_passes_results_through() {
+        assert_eq!(guard_decode("unit", || Ok(7)).unwrap(), 7);
+        let err = guard_decode::<()>("unit", || Err(ClientError::NotConnected)).unwrap_err();
+        assert!(matches!(err, ClientError::NotConnected));
+    }
 
     #[test]
     fn parse_quack_uri_strips_scheme_and_defaults_port() {
