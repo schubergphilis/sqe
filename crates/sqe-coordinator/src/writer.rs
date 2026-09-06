@@ -328,43 +328,6 @@ pub async fn write_position_delete_files(
         return Ok(vec![]);
     }
 
-    info!(
-        table = %table.identifier(),
-        delete_count = deletes.len(),
-        "Writing position delete files"
-    );
-
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Location generator error: {e}")))?;
-
-    let write_id = Uuid::now_v7();
-    let file_name_generator = DefaultFileNameGenerator::new(
-        format!("{write_id}-delete"),
-        None,
-        iceberg::spec::DataFileFormat::Parquet,
-    );
-
-    // ParquetWriterBuilder for position delete files uses the fixed position-delete
-    // schema (file_path, pos), not the table's data schema.
-    let parquet_writer_builder = ParquetWriterBuilder::new(
-        writer_props(compression),
-        Arc::new(POSITION_DELETE_SCHEMA.clone()),
-    );
-
-    let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
-        parquet_writer_builder,
-        table.file_io().clone(),
-        location_generator,
-        file_name_generator,
-    );
-
-    let pos_delete_builder = PositionDeleteFileWriterBuilder::new(rolling_writer_builder);
-
-    let mut writer = pos_delete_builder
-        .build(None)
-        .await
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build position delete writer: {e}")))?;
-
     // Convert to PositionDeleteInput and sort by (file_path, pos) as required by spec.
     let mut inputs: Vec<PositionDeleteInput> = deletes
         .into_iter()
@@ -372,22 +335,275 @@ pub async fn write_position_delete_files(
         .collect();
     inputs.sort();
 
-    writer
-        .write(inputs)
-        .await
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to write position deletes: {e}")))?;
+    let mut writer = PositionDeleteWriter::open(table, compression).await?;
+    writer.write_sorted(inputs).await?;
+    writer.close().await
+}
 
+/// Incremental position-delete writer (architecture review 504).
+///
+/// The MoR DELETE path used to collect every `(file_path, pos)` pair for the
+/// whole statement into one `Vec<(String, i64)>` -- one heap `String` holding
+/// the full object-store path per deleted row -- and only then hand it to the
+/// writer. This handle lets the caller flush per data file instead: one
+/// `Arc<str>` per file, positions written as they are found, and nothing but
+/// the rolling parquet writer's in-progress row group resident between files.
+///
+/// The Iceberg spec requires rows inside a delete file to be sorted by
+/// `(file_path, pos)`. Callers must therefore feed files in ascending path
+/// order and positions in ascending order within each file; [`write_file`]
+/// (Self::write_file) sorts the positions it is given, the path order is the
+/// caller's contract.
+pub struct PositionDeleteWriter {
+    inner: Box<dyn IcebergWriter<Vec<PositionDeleteInput>>>,
+    written: usize,
+    table_ident: String,
+}
+
+impl PositionDeleteWriter {
+    /// Open a rolling position-delete writer for `table`.
+    pub async fn open(table: &Table, compression: Compression) -> sqe_core::Result<Self> {
+        let location_generator =
+            DefaultLocationGenerator::new(table.metadata().clone()).map_err(|e| {
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Location generator error: {e}"),
+                )
+            })?;
+
+        let write_id = Uuid::now_v7();
+        let file_name_generator = DefaultFileNameGenerator::new(
+            format!("{write_id}-delete"),
+            None,
+            iceberg::spec::DataFileFormat::Parquet,
+        );
+
+        // ParquetWriterBuilder for position delete files uses the fixed position-delete
+        // schema (file_path, pos), not the table's data schema.
+        let parquet_writer_builder = ParquetWriterBuilder::new(
+            writer_props(compression),
+            Arc::new(POSITION_DELETE_SCHEMA.clone()),
+        );
+
+        let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+            parquet_writer_builder,
+            table.file_io().clone(),
+            location_generator,
+            file_name_generator,
+        );
+
+        let pos_delete_builder = PositionDeleteFileWriterBuilder::new(rolling_writer_builder);
+
+        let writer = pos_delete_builder
+            .build(None)
+            .await
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build position delete writer: {e}")))?;
+
+        Ok(Self {
+            inner: Box::new(writer),
+            written: 0,
+            table_ident: table.identifier().to_string(),
+        })
+    }
+
+    /// Write the deleted positions of one data file. `positions` is sorted
+    /// here; `path` is shared (one allocation) across every row of the file.
+    pub async fn write_file(
+        &mut self,
+        path: Arc<str>,
+        mut positions: Vec<i64>,
+    ) -> sqe_core::Result<()> {
+        if positions.is_empty() {
+            return Ok(());
+        }
+        positions.sort_unstable();
+        let inputs: Vec<PositionDeleteInput> = positions
+            .into_iter()
+            .map(|pos| PositionDeleteInput::new(Arc::clone(&path), pos))
+            .collect();
+        self.write_sorted(inputs).await
+    }
+
+    async fn write_sorted(&mut self, inputs: Vec<PositionDeleteInput>) -> sqe_core::Result<()> {
+        self.written += inputs.len();
+        self.inner.write(inputs).await.map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("Failed to write position deletes: {e}"),
+            )
+        })
+    }
+
+    /// Number of positions written so far.
+    pub fn written(&self) -> usize {
+        self.written
+    }
+
+    /// Close the writer and return the delete `DataFile`s. Returns an empty
+    /// set (and writes nothing) when no position was ever written.
+    pub async fn close(mut self) -> sqe_core::Result<Vec<DataFile>> {
+        if self.written == 0 {
+            return Ok(vec![]);
+        }
+        let delete_files = self
+            .inner
+            .close()
+            .await
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to close position delete writer: {e}")))?;
+
+        info!(
+            table = %self.table_ident,
+            delete_count = self.written,
+            delete_file_count = delete_files.len(),
+            "Position delete files written"
+        );
+
+        Ok(delete_files)
+    }
+}
+
+/// Project `batch` down to the table's identifier (primary-key) columns, in
+/// `identifier_field_ids` order (architecture review 504, item 3).
+///
+/// The MoR DELETE / UPDATE / MERGE paths buffer the keys of every matched row
+/// until commit. Buffering the full-width row when only the PK bytes are
+/// needed multiplies that residency by the table width; project first so the
+/// tracked key buffer holds only what the equality-delete file will contain.
+/// Pair with [`write_equality_delete_key_files`], which expects exactly this
+/// shape.
+pub fn project_to_identifier_columns(
+    batch: &RecordBatch,
+    iceberg_schema: &IcebergSchema,
+    identifier_field_ids: &[i32],
+) -> sqe_core::Result<RecordBatch> {
+    let indices = identifier_field_ids
+        .iter()
+        .map(|id| {
+            let field = iceberg_schema.field_by_id(*id).ok_or_else(|| {
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("identifier field id {id} is not in the table schema"),
+                )
+            })?;
+            batch.schema().index_of(&field.name).map_err(|e| {
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("identifier column '{}' missing from batch: {e}", field.name),
+                )
+            })
+        })
+        .collect::<sqe_core::Result<Vec<usize>>>()?;
+    batch.project(&indices).map_err(|e| {
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("failed to project identifier columns: {e}"))
+    })
+}
+
+/// Write equality-delete files from batches that hold only the identifier
+/// columns, in `identifier_field_ids` order, as produced by
+/// [`project_to_identifier_columns`].
+///
+/// Same output as [`write_equality_delete_files`]; the difference is that the
+/// key-only batches are stamped against a schema projected to the identifier
+/// fields, so the caller can buffer PK bytes instead of full rows.
+pub async fn write_equality_delete_key_files(
+    table: &Table,
+    key_batches: Vec<RecordBatch>,
+    identifier_field_ids: Vec<i32>,
+    compression: Compression,
+) -> sqe_core::Result<Vec<DataFile>> {
+    let total_rows: usize = key_batches.iter().map(|b| b.num_rows()).sum();
+    if total_rows == 0 {
+        return Ok(vec![]);
+    }
+    if identifier_field_ids.is_empty() {
+        return Err(SqeError::Execution(
+            "equality delete requires identifier-field-ids on the table".to_string(),
+        ));
+    }
+
+    let full_schema = table.metadata().current_schema();
+    let key_fields = identifier_field_ids
+        .iter()
+        .map(|id| {
+            full_schema.field_by_id(*id).cloned().ok_or_else(|| {
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("identifier field id {id} is not in the table schema"),
+                )
+            })
+        })
+        .collect::<sqe_core::Result<Vec<_>>>()?;
+    let key_schema = IcebergSchema::builder()
+        .with_schema_id(full_schema.schema_id())
+        .with_identifier_field_ids(identifier_field_ids.iter().copied())
+        .with_fields(key_fields)
+        .build()
+        .map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("Failed to build key schema: {e}"),
+            )
+        })?;
+
+    info!(
+        table = %table.identifier(),
+        total_rows,
+        equality_ids = ?identifier_field_ids,
+        "Writing equality delete files (key-projected)"
+    );
+
+    let stamped = stamp_field_ids(key_batches, &key_schema)?;
+
+    let location_generator =
+        DefaultLocationGenerator::new(table.metadata().clone()).map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("Location generator error: {e}"),
+            )
+        })?;
+    let write_id = Uuid::now_v7();
+    let file_name_generator = DefaultFileNameGenerator::new(
+        format!("{write_id}-eq-delete"),
+        None,
+        iceberg::spec::DataFileFormat::Parquet,
+    );
+    let key_schema = Arc::new(key_schema);
+    let parquet_writer_builder =
+        ParquetWriterBuilder::new(writer_props(compression), key_schema.clone());
+    let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_writer_builder,
+        table.file_io().clone(),
+        location_generator,
+        file_name_generator,
+    );
+    let config =
+        EqualityDeleteWriterConfig::new(identifier_field_ids, key_schema).map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("Equality delete config error: {e}"),
+            )
+        })?;
+    let mut writer = EqualityDeleteFileWriterBuilder::new(rolling_writer_builder, config)
+        .build(None)
+        .await
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build equality delete writer: {e}")))?;
+
+    for batch in stamped {
+        writer
+            .write(batch)
+            .await
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to write equality deletes: {e}")))?;
+    }
     let delete_files = writer
         .close()
         .await
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to close position delete writer: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to close equality delete writer: {e}")))?;
 
     info!(
         table = %table.identifier(),
         delete_file_count = delete_files.len(),
-        "Position delete files written"
+        "Equality delete files written"
     );
-
     Ok(delete_files)
 }
 
@@ -622,6 +838,66 @@ mod tests {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::arrow::ArrowWriter;
     use parquet::basic::ZstdLevel;
+
+    /// 504: key batches are projected to the identifier columns, in
+    /// identifier-field order, before they are buffered.
+    #[test]
+    fn project_to_identifier_columns_keeps_only_pk_in_id_order() {
+        use iceberg::spec::{NestedField, PrimitiveType, Type};
+        let iceberg_schema = IcebergSchema::builder()
+            .with_schema_id(1)
+            .with_identifier_field_ids(vec![3, 1])
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "payload",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+                Arc::new(NestedField::required(
+                    3,
+                    "tenant",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("payload", DataType::Utf8, true),
+            Field::new("tenant", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["x", "y"])),
+                Arc::new(StringArray::from(vec!["t1", "t2"])),
+            ],
+        )
+        .unwrap();
+
+        let keys = project_to_identifier_columns(&batch, &iceberg_schema, &[3, 1]).unwrap();
+        let key_schema = keys.schema();
+        let names: Vec<&str> = key_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, vec!["tenant", "id"]);
+        assert_eq!(keys.num_rows(), 2);
+        assert!(
+            keys.get_array_memory_size() < batch.get_array_memory_size(),
+            "projected keys must be smaller than the full row"
+        );
+
+        let err = project_to_identifier_columns(&batch, &iceberg_schema, &[99]).unwrap_err();
+        assert!(err.to_string().contains("99"), "{err}");
+    }
 
     #[test]
     fn resolve_write_compression_session_wins_over_config() {

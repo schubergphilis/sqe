@@ -146,6 +146,8 @@ futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
+# reqwest 0.12 `Client` type for the vendored REST catalog's `with_client`.
+reqwest_legacy = { workspace = true }
 moka = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }

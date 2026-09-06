@@ -59,6 +59,57 @@ pub fn extract_catalog_qualifiers_from_sql(sql: &str) -> Vec<String> {
     all.into_iter().collect()
 }
 
+/// Collect every distinct `(catalog, schema)` pair from schema-qualified
+/// table references in `sql`: `ns.t` yields `(None, "ns")`, `cat.ns.t`
+/// yields `(Some("cat"), "ns")`. Bare names contribute nothing. Returns an
+/// empty `Vec` when the SQL fails to parse.
+///
+/// Used by the coordinator's pre-plan step to refresh the table-name
+/// snapshots of exactly the namespaces a statement will plan against
+/// (architecture review 806).
+pub fn extract_schema_qualifiers_from_sql(sql: &str) -> Vec<(Option<String>, String)> {
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    let Ok(statements) = Parser::parse_sql(&GenericDialect {}, sql) else {
+        return Vec::new();
+    };
+    let mut visitor = SchemaQualifierCollector {
+        schemas: BTreeSet::new(),
+    };
+    for stmt in &statements {
+        let _ = stmt.visit(&mut visitor);
+    }
+    visitor.schemas.into_iter().collect()
+}
+
+struct SchemaQualifierCollector {
+    schemas: BTreeSet<(Option<String>, String)>,
+}
+
+impl Visitor for SchemaQualifierCollector {
+    type Break = ();
+
+    fn pre_visit_relation(&mut self, name: &ObjectName) -> ControlFlow<Self::Break> {
+        let idents: Vec<&str> = name
+            .0
+            .iter()
+            .filter_map(|p| p.as_ident().map(|i| i.value.as_str()))
+            .collect();
+        match idents.as_slice() {
+            [schema, _table] => {
+                self.schemas.insert((None, schema.to_string()));
+            }
+            [catalog, schema, _table] => {
+                self.schemas
+                    .insert((Some(catalog.to_string()), schema.to_string()));
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 struct CatalogQualifierCollector {
     catalogs: BTreeSet<String>,
 }
@@ -123,6 +174,24 @@ mod tests {
             extract_catalog_qualifiers(&stmt),
             vec!["tf_main_warehouse".to_string()]
         );
+    }
+
+    /// Review 806: the pre-plan refresh needs the schema of every qualified
+    /// reference, with the catalog when present and without it otherwise;
+    /// bare names contribute nothing.
+    #[test]
+    fn schema_qualifiers_cover_two_and_three_part_names() {
+        let got = extract_schema_qualifiers_from_sql(
+            "SELECT * FROM ns.t JOIN cat.other.u ON t.id = u.id JOIN bare ON 1=1",
+        );
+        assert_eq!(
+            got,
+            vec![
+                (None, "ns".to_string()),
+                (Some("cat".to_string()), "other".to_string()),
+            ]
+        );
+        assert!(extract_schema_qualifiers_from_sql("not sql at all (").is_empty());
     }
 
     #[test]

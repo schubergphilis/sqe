@@ -159,9 +159,9 @@ Client (JDBC / Flight SQL / Trino HTTP / MCP)
          | Bearer token passthrough
     +----+----+
     v    v    v
-   +---++---++---+   Stateless workers
-   | W1|| W2|| W3|  (distributed mode)
-   +---++---++---+
+   +---++---++---+   Stateless scan workers
+   | W1|| W2|| W3|  (distributed mode: workers scan
+   +---++---++---+   and stream Arrow back)
     |     |     |
     v     v     v
    +-----------+
@@ -170,7 +170,9 @@ Client (JDBC / Flight SQL / Trino HTTP / MCP)
    +-----------+
 ```
 
-Detailed Mermaid diagrams (query pipeline, crate dependencies, caching layers, distributed execution, write path) in [`docs/site/book/src/architecture/overview.md`](docs/site/book/src/architecture/overview.md).
+Distributed mode is a **distributed scan**: the coordinator hands each worker a secured `ScanTask` (file list, projection, predicate, limit) with the user's bearer token, workers scan and stream Arrow batches back, and every join, aggregate and sort runs on the coordinator. There is no stage-based shuffle on any query path; the `DoExchange` intake exists only behind the `worker-shuffle` cargo feature. Size the coordinator for the post-scan work. Worker heartbeats carry `sqe.proto.version` and the DataFusion version, and a mismatched worker is refused at registration (a legacy versionless heartbeat is refused only under `production_mode`).
+
+Detailed Mermaid diagrams (query pipeline, crate dependencies, caching layers, distributed scan, write path) in [`docs/site/book/src/architecture/overview.md`](docs/site/book/src/architecture/overview.md).
 
 ## Web UI
 
@@ -246,7 +248,7 @@ The reference docs:
 | [Benchmark history](docs/evidence/benchmark/index.md) | Per-suite, per-scale, per-query plots over time |
 | [Roadmap](docs/site/book/src/development/roadmap.md) | Full feature checklist |
 | Security Audit | 43 findings, all resolved |
-| [Architecture, security and scale reviews 2026-09](docs/internal/reviews/2026-09-05-combined-prioritized-findings.md) | 109 findings, GitLab issues #543-#651 in eight work packages (#652-#659); 42 fixed |
+| [Architecture, security and scale reviews 2026-09](docs/internal/reviews/2026-09-05-combined-prioritized-findings.md) | 109 findings, GitLab issues #543-#651 in eight work packages (#652-#659); 54 fixed |
 
 ## The book
 

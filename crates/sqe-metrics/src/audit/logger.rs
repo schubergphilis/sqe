@@ -315,6 +315,17 @@ fn open_sink_file(path: &std::path::Path) -> Result<std::fs::File, String> {
         .map_err(|e| format!("Failed to open audit log file '{}': {e}", path.display()))
 }
 
+/// Lock the spool sink tolerating poison. The writer thread is the only
+/// steady-state holder; if a sink panicked while a guard was live, the data
+/// behind the mutex is still a valid `Option<OcsfJsonlSink>`, and refusing to
+/// take it would stop every later audit write (#643). Recover the guard and
+/// keep shipping.
+fn spool_lock(
+    sink: &Mutex<Option<OcsfJsonlSink>>,
+) -> std::sync::MutexGuard<'_, Option<OcsfJsonlSink>> {
+    sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn record_drop(dropped: &Option<IntCounterVec>, reason: &'static str) {
     if let Some(c) = dropped {
         c.with_label_values(&[reason]).inc();
@@ -335,7 +346,8 @@ fn read_last_nonempty_line(path: &std::path::Path) -> Result<Option<String>, Str
         return Ok(None);
     }
     let start = len.saturating_sub(64 * 1024);
-    file.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| e.to_string())?;
     let mut buf = String::new();
     file.read_to_string(&mut buf).map_err(|e| e.to_string())?;
     Ok(buf
@@ -443,11 +455,7 @@ impl AuditLogger {
         Self::build(path, format, AuditLoggerOptions::default())
     }
 
-    fn build(
-        path: &str,
-        format: AuditFormat,
-        options: AuditLoggerOptions,
-    ) -> Result<Self, String> {
+    fn build(path: &str, format: AuditFormat, options: AuditLoggerOptions) -> Result<Self, String> {
         let fail_mode = options.fail_mode;
         let dropped = options.dropped;
         let queue_capacity = options.queue_capacity.max(1);
@@ -522,7 +530,7 @@ impl AuditLogger {
                         &mut native_sink,
                         native_events,
                         &mut ocsf_sink,
-                        &mut spool_sink_worker.lock().unwrap(),
+                        &mut spool_lock(&spool_sink_worker),
                         &mut chain,
                         audit_resume_event(&reason),
                         None,
@@ -570,7 +578,7 @@ impl AuditLogger {
                                         Self::flush_sinks(
                                             &mut native_sink,
                                             &mut ocsf_sink,
-                                            &mut spool_sink_worker.lock().unwrap(),
+                                            &mut spool_lock(&spool_sink_worker),
                                             &path_owned,
                                         );
                                         // Now stamp and write the canonical event.
@@ -578,7 +586,7 @@ impl AuditLogger {
                                             &mut native_sink,
                                             native_events,
                                             &mut ocsf_sink,
-                                            &mut spool_sink_worker.lock().unwrap(),
+                                            &mut spool_lock(&spool_sink_worker),
                                             &mut chain,
                                             *e,
                                             gdpr_snap.as_ref(),
@@ -588,7 +596,7 @@ impl AuditLogger {
                                         Self::flush_sinks(
                                             &mut native_sink,
                                             &mut ocsf_sink,
-                                            &mut spool_sink_worker.lock().unwrap(),
+                                            &mut spool_lock(&spool_sink_worker),
                                             &path_owned,
                                         );
                                     }
@@ -604,7 +612,7 @@ impl AuditLogger {
                                         Self::flush_sinks(
                                             &mut native_sink,
                                             &mut ocsf_sink,
-                                            &mut spool_sink_worker.lock().unwrap(),
+                                            &mut spool_lock(&spool_sink_worker),
                                             &path_owned,
                                         );
                                         let _ = ack.send(());
@@ -622,7 +630,7 @@ impl AuditLogger {
                                 Self::flush_sinks(
                                     &mut native_sink,
                                     &mut ocsf_sink,
-                                    &mut spool_sink_worker.lock().unwrap(),
+                                    &mut spool_lock(&spool_sink_worker),
                                     &path_owned,
                                 );
                             }
@@ -637,7 +645,7 @@ impl AuditLogger {
                                             &mut native_sink,
                                             native_events,
                                             &mut ocsf_sink,
-                                            &mut spool_sink_worker.lock().unwrap(),
+                                            &mut spool_lock(&spool_sink_worker),
                                             &mut chain,
                                             &mut batch,
                                             gdpr_snap.as_ref(),
@@ -648,7 +656,7 @@ impl AuditLogger {
                                         Self::flush_sinks(
                                             &mut native_sink,
                                             &mut ocsf_sink,
-                                            &mut spool_sink_worker.lock().unwrap(),
+                                            &mut spool_lock(&spool_sink_worker),
                                             &path_owned,
                                         );
                                         // Process this legacy entry immediately.
@@ -662,7 +670,7 @@ impl AuditLogger {
                                         Self::flush_sinks(
                                             &mut native_sink,
                                             &mut ocsf_sink,
-                                            &mut spool_sink_worker.lock().unwrap(),
+                                            &mut spool_lock(&spool_sink_worker),
                                             &path_owned,
                                         );
                                     }
@@ -671,7 +679,7 @@ impl AuditLogger {
                                             &mut native_sink,
                                             native_events,
                                             &mut ocsf_sink,
-                                            &mut spool_sink_worker.lock().unwrap(),
+                                            &mut spool_lock(&spool_sink_worker),
                                             &mut chain,
                                             &mut batch,
                                             gdpr_snap.as_ref(),
@@ -682,7 +690,7 @@ impl AuditLogger {
                                         Self::flush_sinks(
                                             &mut native_sink,
                                             &mut ocsf_sink,
-                                            &mut spool_sink_worker.lock().unwrap(),
+                                            &mut spool_lock(&spool_sink_worker),
                                             &path_owned,
                                         );
                                         let _ = ack.send(());
@@ -694,7 +702,7 @@ impl AuditLogger {
                                     &mut native_sink,
                                     native_events,
                                     &mut ocsf_sink,
-                                    &mut spool_sink_worker.lock().unwrap(),
+                                    &mut spool_lock(&spool_sink_worker),
                                     &mut chain,
                                     &mut batch,
                                     gdpr_snap.as_ref(),
@@ -704,7 +712,7 @@ impl AuditLogger {
                                 Self::flush_sinks(
                                     &mut native_sink,
                                     &mut ocsf_sink,
-                                    &mut spool_sink_worker.lock().unwrap(),
+                                    &mut spool_lock(&spool_sink_worker),
                                     &path_owned,
                                 );
                             }
@@ -713,7 +721,7 @@ impl AuditLogger {
                             Self::flush_sinks(
                                 &mut native_sink,
                                 &mut ocsf_sink,
-                                &mut spool_sink_worker.lock().unwrap(),
+                                &mut spool_lock(&spool_sink_worker),
                                 &path_owned,
                             );
                             let _ = ack.send(());
@@ -723,7 +731,7 @@ impl AuditLogger {
                 Self::flush_sinks(
                     &mut native_sink,
                     &mut ocsf_sink,
-                    &mut spool_sink_worker.lock().unwrap(),
+                    &mut spool_lock(&spool_sink_worker),
                     &path_owned,
                 );
             })

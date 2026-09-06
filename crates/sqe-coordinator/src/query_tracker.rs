@@ -105,9 +105,23 @@ impl QueryRecord {
     }
 }
 
+/// An in-flight query: its current record plus the token that aborts it.
+struct ActiveQuery {
+    record: Arc<QueryRecord>,
+    token: CancellationToken,
+}
+
+/// Tracks queries through their lifecycle.
+///
+/// Finding 403: in-flight records live in `active`, a plain map with no
+/// TTL, so a long-running query can never be evicted while it runs (the
+/// old single moka map evicted a `Running` record after `ttl_secs` of no
+/// state change, after which `owner_of` returned `None` and cancel/complete
+/// became no-ops). A record moves to the TTL'd `history` cache only when it
+/// reaches a terminal state (Finished / Failed / Canceled).
 pub struct QueryTracker {
     history: Cache<Uuid, Arc<QueryRecord>>,
-    active: DashMap<Uuid, CancellationToken>,
+    active: DashMap<Uuid, ActiveQuery>,
 }
 
 impl QueryTracker {
@@ -117,7 +131,46 @@ impl QueryTracker {
     /// later [`Self::cancel`] aborts the work cleanly. Returns `None` once
     /// the query is no longer active (complete, failed, or already cancelled).
     pub fn token_for(&self, query_id: &Uuid) -> Option<CancellationToken> {
-        self.active.get(query_id).map(|t| t.clone())
+        self.active.get(query_id).map(|a| a.token.clone())
+    }
+
+    /// Look up a record whether it is in flight or already in history.
+    pub fn get(&self, query_id: &Uuid) -> Option<Arc<QueryRecord>> {
+        if let Some(a) = self.active.get(query_id) {
+            return Some(Arc::clone(&a.record));
+        }
+        self.history.get(query_id)
+    }
+
+    /// Copy-on-write update of a record in whichever map holds it.
+    fn update(&self, query_id: &Uuid, f: impl FnOnce(&mut QueryRecord)) {
+        if let Some(mut a) = self.active.get_mut(query_id) {
+            let mut record = (*a.record).clone();
+            f(&mut record);
+            a.record = Arc::new(record);
+            return;
+        }
+        if let Some(old) = self.history.get(query_id) {
+            let mut record = (*old).clone();
+            f(&mut record);
+            self.history.insert(*query_id, Arc::new(record));
+        }
+    }
+
+    /// Move a record from `active` to `history`, applying the terminal
+    /// transition. Falls back to updating a history record in place when
+    /// the query already finished (e.g. the stream finalizer running after
+    /// an explicit cancel).
+    fn finish(&self, query_id: &Uuid, f: impl FnOnce(&mut QueryRecord)) {
+        if let Some((_, a)) = self.active.remove(query_id) {
+            let mut record = (*a.record).clone();
+            f(&mut record);
+            self.history.insert(*query_id, Arc::new(record));
+        } else if let Some(old) = self.history.get(query_id) {
+            let mut record = (*old).clone();
+            f(&mut record);
+            self.history.insert(*query_id, Arc::new(record));
+        }
     }
 }
 
@@ -175,22 +228,25 @@ impl QueryTracker {
             trace_id,
             fragments: Arc::new(Mutex::new(Vec::new())),
         };
-        self.history.insert(query_id, Arc::new(record));
-        self.active.insert(query_id, token.clone());
+        self.active.insert(
+            query_id,
+            ActiveQuery {
+                record: Arc::new(record),
+                token: token.clone(),
+            },
+        );
         token
     }
 
     pub fn running(&self, query_id: &Uuid, planning_ms: u64) {
-        if let Some(old) = self.history.get(query_id) {
-            let mut record = (*old).clone();
+        self.update(query_id, |record| {
             let now = Utc::now();
             record.state = QueryState::Running;
             record.started = Some(now);
             let elapsed = (now - record.created).num_milliseconds();
             record.queued_ms = elapsed.max(0) as u64;
             record.planning_ms = planning_ms;
-            self.history.insert(*query_id, Arc::new(record));
-        }
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -205,8 +261,7 @@ impl QueryTracker {
         spill_bytes: u64,
         peak_memory_bytes: u64,
     ) {
-        if let Some(old) = self.history.get(query_id) {
-            let mut record = (*old).clone();
+        self.finish(query_id, |record| {
             record.state = QueryState::Finished;
             record.ended = Some(Utc::now());
             record.output_rows = rows;
@@ -216,44 +271,32 @@ impl QueryTracker {
             record.rows_scanned = rows_scanned;
             record.spill_bytes = spill_bytes;
             record.peak_memory_bytes = peak_memory_bytes;
-            self.history.insert(*query_id, Arc::new(record));
-        }
-        self.active.remove(query_id);
+        });
     }
 
     pub fn failed(&self, query_id: &Uuid, error: &sqe_core::SqeError) {
-        if let Some(old) = self.history.get(query_id) {
-            let mut record = (*old).clone();
-            let code = error.error_code();
+        let code = error.error_code();
+        self.finish(query_id, |record| {
             record.state = QueryState::Failed;
             record.ended = Some(Utc::now());
             record.error_type = Some(code.trino_error_type().to_string());
             record.error_code = Some(code.name().to_string());
             record.error_message = Some(error.client_message());
-            self.history.insert(*query_id, Arc::new(record));
-        }
-        self.active.remove(query_id);
+        });
     }
 
     pub fn canceled(&self, query_id: &Uuid) {
-        if let Some(old) = self.history.get(query_id) {
-            let mut record = (*old).clone();
+        self.finish(query_id, |record| {
             record.state = QueryState::Canceled;
             record.ended = Some(Utc::now());
-            self.history.insert(*query_id, Arc::new(record));
-        }
-        self.active.remove(query_id);
+        });
     }
 
     /// Attach a rendered per-operator profile to a query record. Called by
     /// the stream finalizer after `complete` / `failed`, so the terminal
     /// record carries the profile.
     pub fn set_profile(&self, query_id: &Uuid, profile: String) {
-        if let Some(old) = self.history.get(query_id) {
-            let mut record = (*old).clone();
-            record.profile = Some(profile);
-            self.history.insert(*query_id, Arc::new(record));
-        }
+        self.update(query_id, |record| record.profile = Some(profile));
     }
 
     /// Record the rows written/affected by a DML statement. Called from the
@@ -261,17 +304,19 @@ impl QueryTracker {
     /// result. Mirrors [`Self::set_profile`]: a copy-on-write update of the
     /// terminal record so it carries the count alongside the other stats.
     pub fn set_rows_written(&self, query_id: &Uuid, rows_written: u64) {
-        if let Some(old) = self.history.get(query_id) {
-            let mut record = (*old).clone();
-            record.rows_written = Some(rows_written);
-            self.history.insert(*query_id, Arc::new(record));
-        }
+        self.update(query_id, |record| record.rows_written = Some(rows_written));
     }
 
+    /// Cancel an in-flight query: fire its token and move the record to
+    /// history as `Canceled`. Returns `false` when the query is not active
+    /// (unknown, or already terminal).
     pub fn cancel(&self, query_id: &Uuid) -> bool {
-        if let Some((_, token)) = self.active.remove(query_id) {
-            token.cancel();
-            self.canceled(query_id);
+        if let Some((_, active)) = self.active.remove(query_id) {
+            active.token.cancel();
+            let mut record = (*active.record).clone();
+            record.state = QueryState::Canceled;
+            record.ended = Some(Utc::now());
+            self.history.insert(*query_id, Arc::new(record));
             true
         } else {
             false
@@ -280,12 +325,13 @@ impl QueryTracker {
 
     /// Look up the submitting username for a query, if known.
     /// Returned for ownership checks on cancel/inspect operations.
+    /// In-flight queries are found regardless of age (finding 403).
     pub fn owner_of(&self, query_id: &Uuid) -> Option<String> {
-        self.history.get(query_id).map(|r| r.user.clone())
+        self.get(query_id).map(|r| r.user.clone())
     }
 
     pub fn set_fragments(&self, query_id: &Uuid, fragments: Vec<FragmentInfo>) {
-        if let Some(record) = self.history.get(query_id) {
+        if let Some(record) = self.get(query_id) {
             let mut guard = record.fragments.lock().expect("fragments mutex poisoned");
             *guard = fragments;
         }
@@ -299,7 +345,7 @@ impl QueryTracker {
         elapsed_ms: u64,
         output_rows: usize,
     ) {
-        if let Some(record) = self.history.get(query_id) {
+        if let Some(record) = self.get(query_id) {
             let mut guard = record.fragments.lock().expect("fragments mutex poisoned");
             if let Some(frag) = guard.iter_mut().find(|f| f.task_id == task_id) {
                 frag.state = state;
@@ -316,7 +362,7 @@ impl QueryTracker {
     /// is in a terminal state (`Finished` or `Failed`).  Returns `None` if any
     /// fragment is still `Running` or `Retried`, or if the query is unknown.
     pub fn all_fragments_done(&self, query_id: &Uuid) -> Option<Vec<(String, String, u64)>> {
-        let record = self.history.get(query_id)?;
+        let record = self.get(query_id)?;
         let guard = record.fragments.lock().expect("fragments mutex poisoned");
         if guard.is_empty() {
             return None;
@@ -336,10 +382,19 @@ impl QueryTracker {
         }
     }
 
+    /// All known records: in-flight first, then history. A record that is
+    /// moving between the maps while we iterate is de-duplicated by id.
     pub fn records(&self) -> Vec<Arc<QueryRecord>> {
+        let mut seen = std::collections::HashSet::new();
         let mut records = Vec::new();
-        for (_, v) in &self.history {
-            records.push(v);
+        for entry in self.active.iter() {
+            seen.insert(*entry.key());
+            records.push(Arc::clone(&entry.value().record));
+        }
+        for (k, v) in &self.history {
+            if seen.insert(*k) {
+                records.push(v);
+            }
         }
         records
     }
@@ -388,7 +443,7 @@ mod tests {
         tracker.start(id, "bob", None, "SELECT *", "s2", None, vec![], None);
         tracker.running(&id, 10);
         tracker.complete(&id, 42, 150, vec!["ns.table1".to_string()], 0, 0, 0, 0);
-        let rec = tracker.history.get(&id).unwrap();
+        let rec = tracker.get(&id).unwrap();
         assert_eq!(rec.state, QueryState::Finished);
         assert_eq!(rec.output_rows, 42);
         assert_eq!(rec.execution_ms, 150);
@@ -403,9 +458,12 @@ mod tests {
         let id = Uuid::now_v7();
         tracker.start(id, "carol", None, "BAD SQL", "s3", None, vec![], None);
         tracker.running(&id, 0);
-        let err = sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, "syntax error near BAD".to_string());
+        let err = sqe_core::SqeError::with_code(
+            sqe_core::SqeErrorCode::ExecutionFailed,
+            "syntax error near BAD".to_string(),
+        );
         tracker.failed(&id, &err);
-        let rec = tracker.history.get(&id).unwrap();
+        let rec = tracker.get(&id).unwrap();
         assert_eq!(rec.state, QueryState::Failed);
         assert!(rec.error_type.is_some());
         assert!(rec.error_code.is_some());
@@ -422,7 +480,7 @@ mod tests {
         let cancelled = tracker.cancel(&id);
         assert!(cancelled);
         assert!(token.is_cancelled());
-        let rec = tracker.history.get(&id).unwrap();
+        let rec = tracker.get(&id).unwrap();
         assert_eq!(rec.state, QueryState::Canceled);
     }
 
@@ -434,7 +492,7 @@ mod tests {
         tracker.running(&id, 1);
         tracker.complete(&id, 5, 10, vec![], 0, 0, 0, 0);
         tracker.set_profile(&id, "elapsed_ms=10\nProjectionExec".to_string());
-        let rec = tracker.history.get(&id).unwrap();
+        let rec = tracker.get(&id).unwrap();
         assert_eq!(rec.state, QueryState::Finished);
         assert!(rec.profile.as_deref().unwrap().contains("ProjectionExec"));
 
@@ -561,7 +619,7 @@ mod tests {
 
         // Verify states match the modulo pattern
         for (id, remainder) in &outcomes {
-            let rec = tracker.history.get(id).unwrap();
+            let rec = tracker.get(id).unwrap();
             match remainder {
                 0 => assert_eq!(rec.state, QueryState::Finished),
                 1 => assert_eq!(rec.state, QueryState::Failed),
@@ -596,11 +654,11 @@ mod tests {
         ];
         tracker.set_fragments(&id, frags);
 
-        let rec = tracker.history.get(&id).unwrap();
+        let rec = tracker.get(&id).unwrap();
         assert_eq!(rec.fragments_snapshot().len(), 2);
 
         tracker.update_fragment(&id, "frag-0", FragmentState::Finished, 42, 100);
-        let rec = tracker.history.get(&id).unwrap();
+        let rec = tracker.get(&id).unwrap();
         let snap = rec.fragments_snapshot();
         assert_eq!(snap[0].state, FragmentState::Finished);
         assert_eq!(snap[0].elapsed_ms, 42);
@@ -707,6 +765,59 @@ mod tests {
         tracker.update_fragment(&id, "frag-1", FragmentState::Failed, 50, 0);
         // Both are terminal (Finished / Failed) — should be "done"
         assert!(tracker.all_fragments_done(&id).is_some());
+    }
+
+    /// Finding 403: an in-flight record must survive `ttl_secs`. The old
+    /// single moka map evicted a `Running` record with no state change after
+    /// the TTL, so `owner_of` returned `None` and cancel reported "not found"
+    /// for exactly the long queries that need cancelling.
+    #[tokio::test]
+    async fn running_record_outlives_history_ttl() {
+        let config = QueryHistoryConfig {
+            max_entries: 100,
+            ttl_secs: 1,
+        };
+        let tracker = QueryTracker::new(&config);
+        let id = Uuid::now_v7();
+        let token = tracker.start(id, "alice", None, "SELECT 1", "s1", None, vec![], None);
+        tracker.running(&id, 1);
+
+        // Well past the TTL; flush moka's deferred eviction too.
+        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+        tracker.history.run_pending_tasks();
+
+        assert_eq!(tracker.owner_of(&id).as_deref(), Some("alice"));
+        assert_eq!(tracker.get(&id).unwrap().state, QueryState::Running);
+        assert!(tracker.records().iter().any(|r| r.query_id == id));
+        assert!(tracker.cancel(&id), "cancel must find the in-flight record");
+        assert!(token.is_cancelled());
+        assert_eq!(tracker.get(&id).unwrap().state, QueryState::Canceled);
+        assert_eq!(tracker.active_count(), 0);
+    }
+
+    /// Terminal transitions move the record out of `active`; a late
+    /// finalizer running after an explicit cancel updates the history copy
+    /// instead of resurrecting the query.
+    #[tokio::test]
+    async fn terminal_state_moves_record_to_history() {
+        let tracker = QueryTracker::new(&test_config());
+        let id = Uuid::now_v7();
+        tracker.start(id, "bob", None, "SELECT 1", "s", None, vec![], None);
+        assert!(
+            tracker.history.get(&id).is_none(),
+            "in-flight is not history"
+        );
+        assert!(tracker.cancel(&id));
+        assert!(tracker.history.get(&id).is_some());
+        assert_eq!(tracker.active_count(), 0);
+        // Late finalizer after cancel: no-op on active, in-place on history.
+        tracker.canceled(&id);
+        tracker.set_profile(&id, "p".to_string());
+        assert_eq!(
+            tracker.history.get(&id).unwrap().profile.as_deref(),
+            Some("p")
+        );
+        assert_eq!(tracker.records().len(), 1);
     }
 
     #[tokio::test]

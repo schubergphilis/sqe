@@ -101,9 +101,17 @@ async fn send_heartbeat(
     };
     let mut client = FlightServiceClient::new(channel);
 
+    // Finding 408: the body is a JSON `HeartbeatPayload` carrying
+    // `sqe.proto.version` and this build's DataFusion version, so a
+    // coordinator/worker skew is refused at registration instead of failing
+    // at `Expr` decode time mid-query. Coordinators predating the handshake
+    // never read the body as JSON; they see it as a bare URL and reject it,
+    // which is the loud failure a mixed rollout should produce.
+    let payload =
+        sqe_planner::HeartbeatPayload::current(worker_url, datafusion::DATAFUSION_VERSION);
     let action = Action {
         r#type: "heartbeat".to_string(),
-        body: bytes::Bytes::from(worker_url.to_string()),
+        body: bytes::Bytes::from(payload.to_json()),
     };
 
     let mut request = tonic::Request::new(action);

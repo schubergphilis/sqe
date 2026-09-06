@@ -2529,6 +2529,29 @@ pub struct CatalogConfig {
     pub backend: CatalogBackend,
     #[serde(default = "default_cache_ttl")]
     pub metadata_cache_ttl_secs: u64,
+    /// Whole-request deadline (seconds) for every HTTP call to the catalog,
+    /// both SQE's raw HEAD/GET path and iceberg-rust's own requests. A
+    /// catalog that accepts TCP and then goes silent used to stall planning
+    /// for every table lookup with nothing for the circuit breaker to record
+    /// (architecture review 300). Timeouts surface as `CatalogUnavailable`.
+    /// The shared client is process-wide, so the first catalog's value wins.
+    #[serde(default = "default_catalog_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+    /// TCP connect deadline (seconds) for catalog HTTP calls.
+    #[serde(default = "default_catalog_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    /// How long (seconds) a successful `HEAD loadTable` authorization check
+    /// is reused for the same `(bearer token, table)` before Polaris is asked
+    /// again. A fresh metadata-cache hit used to cost one HEAD round trip per
+    /// table per query; within this window a burst of lookups (one query, one
+    /// dbt step) pays a single HEAD (architecture review 307).
+    ///
+    /// Security window: a Ranger or Polaris REVOKE is observed at most
+    /// `authorization_recheck_secs` seconds after it is issued for a principal
+    /// that already held a fresh authorization; a new bearer token is always
+    /// re-checked. Set to `0` to re-check on every lookup. Default: 10.
+    #[serde(default = "default_authorization_recheck_secs")]
+    pub authorization_recheck_secs: u64,
     /// Default Iceberg table format version for new tables (2 or 3).
     #[serde(default = "default_table_format_version")]
     pub default_table_format_version: u8,
@@ -4933,6 +4956,20 @@ fn default_true() -> bool {
 fn default_cache_ttl() -> u64 {
     30
 }
+/// Default `[catalog] request_timeout_secs`. `pub` because `sqe-catalog`
+/// builds its shared HTTP client from the same value when no config has
+/// reached it yet.
+pub fn default_catalog_request_timeout_secs() -> u64 {
+    30
+}
+/// Default `[catalog] connect_timeout_secs`; see
+/// [`default_catalog_request_timeout_secs`].
+pub fn default_catalog_connect_timeout_secs() -> u64 {
+    5
+}
+fn default_authorization_recheck_secs() -> u64 {
+    10
+}
 fn default_table_format_version() -> u8 {
     2
 }
@@ -4995,9 +5032,11 @@ impl SqeConfig {
     /// so the caller doesn't pay clone cost during dispatch.
     pub fn flattened_catalogs(&self) -> Vec<(String, &CatalogConfig)> {
         if self.catalogs.is_empty() {
-            return catalog_is_configured(&self.catalog)
-                .then(|| vec![(Self::LEGACY_CATALOG_NAME.to_string(), &self.catalog)])
-                .unwrap_or_default();
+            return if catalog_is_configured(&self.catalog) {
+                vec![(Self::LEGACY_CATALOG_NAME.to_string(), &self.catalog)]
+            } else {
+                Vec::new()
+            };
         }
         let mut out: Vec<(String, &CatalogConfig)> =
             self.catalogs.iter().map(|(k, v)| (k.clone(), v)).collect();
@@ -5420,6 +5459,25 @@ impl SqeConfig {
             );
         }
 
+        // Catalog HTTP deadlines. Zero would mean "no deadline", which is the
+        // unbounded-stall bug the fields exist to remove (review 300).
+        for (name, catalog) in std::iter::once(("catalog", &self.catalog))
+            .chain(self.catalogs.iter().map(|(n, c)| (n.as_str(), c)))
+        {
+            if catalog.request_timeout_secs == 0 {
+                errors.push(format!(
+                    "{name}.request_timeout_secs must be >= 1 (0 would disable the \
+                     catalog request deadline)"
+                ));
+            }
+            if catalog.connect_timeout_secs == 0 {
+                errors.push(format!(
+                    "{name}.connect_timeout_secs must be >= 1 (0 would disable the \
+                     catalog connect deadline)"
+                ));
+            }
+        }
+
         // Distributed-mode worker secret is required unless explicitly waived.
         if !self.coordinator.worker_urls.is_empty()
             && self.coordinator.worker_secret.is_empty()
@@ -5829,7 +5887,6 @@ impl SqeConfig {
             None
         }
     }
-
 }
 
 /// Validate the relationship between `query.per_user_memory_budget` and
@@ -6092,7 +6149,6 @@ fn validate_urls(config: &SqeConfig, errors: &mut Vec<String>) {
     check("access_control.url", &config.access_control.url);
     check("policy.ranger.url", &config.policy.ranger.url);
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -6623,6 +6679,9 @@ partial_progress_batch = 5
                 warehouse: "wh".to_string(),
                 backend: CatalogBackend::default(),
                 metadata_cache_ttl_secs: 30,
+                request_timeout_secs: 30,
+                connect_timeout_secs: 5,
+                authorization_recheck_secs: 10,
                 default_table_format_version: 2,
                 trust_sort_order: false,
                 namespace_visibility_filter: true,
@@ -7769,6 +7828,9 @@ s3_secret_key = "configured-secret"
                 warehouse: "main".to_string(),
                 backend: CatalogBackend::default(),
                 metadata_cache_ttl_secs: 30,
+                request_timeout_secs: 30,
+                connect_timeout_secs: 5,
+                authorization_recheck_secs: 10,
                 default_table_format_version: 2,
                 trust_sort_order: false,
                 namespace_visibility_filter: true,
@@ -7801,6 +7863,9 @@ s3_secret_key = "configured-secret"
                     warehouse: name.to_string(),
                     backend: CatalogBackend::default(),
                     metadata_cache_ttl_secs: 30,
+                    request_timeout_secs: 30,
+                    connect_timeout_secs: 5,
+                    authorization_recheck_secs: 10,
                     default_table_format_version: 2,
                     trust_sort_order: false,
                     namespace_visibility_filter: true,
@@ -7840,6 +7905,9 @@ s3_secret_key = "configured-secret"
                 warehouse: "s3://wh/".to_string(),
                 backend: CatalogBackend::default(),
                 metadata_cache_ttl_secs: 30,
+                request_timeout_secs: 30,
+                connect_timeout_secs: 5,
+                authorization_recheck_secs: 10,
                 default_table_format_version: 2,
                 trust_sort_order: false,
                 namespace_visibility_filter: true,
@@ -9824,7 +9892,38 @@ audience = "polaris"
             .unwrap_err()
             .to_string();
         std::env::remove_var("SQE_COORDINATOR__MEMORY_LIMIT");
-        assert!(err.contains("8 GBs") || err.contains("memory_limit"), "got: {err}");
+        assert!(
+            err.contains("8 GBs") || err.contains("memory_limit"),
+            "got: {err}"
+        );
+    }
+
+    /// Review 300: catalog HTTP deadlines default on, are overridable through
+    /// the generic `SQE_CATALOG__*` overlay, and reject zero at validation.
+    #[test]
+    fn catalog_http_timeouts_default_override_and_reject_zero() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let cfg = load_with_env();
+        assert_eq!(cfg.catalog.request_timeout_secs, 30);
+        assert_eq!(cfg.catalog.connect_timeout_secs, 5);
+
+        std::env::set_var("SQE_CATALOG__REQUEST_TIMEOUT_SECS", "7");
+        std::env::set_var("SQE_CATALOG__CONNECT_TIMEOUT_SECS", "2");
+        let cfg = load_with_env();
+        std::env::remove_var("SQE_CATALOG__REQUEST_TIMEOUT_SECS");
+        std::env::remove_var("SQE_CATALOG__CONNECT_TIMEOUT_SECS");
+        assert_eq!(cfg.catalog.request_timeout_secs, 7);
+        assert_eq!(cfg.catalog.connect_timeout_secs, 2);
+
+        let mut cfg = valid_config();
+        cfg.catalog.request_timeout_secs = 0;
+        cfg.catalog.connect_timeout_secs = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("catalog.request_timeout_secs")
+                && err.contains("catalog.connect_timeout_secs"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -9896,7 +9995,10 @@ warehouse = "wh"
         let err = toml::from_str::<QueryConfig>(r#"sort_mode = "adaptve""#)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("adaptve") || err.contains("unknown"), "got: {err}");
+        assert!(
+            err.contains("adaptve") || err.contains("unknown"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -9904,7 +10006,10 @@ warehouse = "wh"
         let err = toml::from_str::<CoordinatorConfig>(r#"memory_pool = "Fair""#)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("Fair") || err.contains("unknown"), "got: {err}");
+        assert!(
+            err.contains("Fair") || err.contains("unknown"),
+            "got: {err}"
+        );
     }
 
     #[test]

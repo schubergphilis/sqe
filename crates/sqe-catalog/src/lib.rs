@@ -44,6 +44,7 @@ pub mod read_json;
 mod read_json_buffer;
 pub mod read_parquet;
 pub mod scan_memory;
+pub mod snapshot_stats;
 pub mod sort_order;
 #[cfg(feature = "rest")]
 pub mod system_catalog;
