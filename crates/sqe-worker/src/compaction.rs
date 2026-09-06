@@ -39,7 +39,7 @@ use sqe_compaction::writer::{new_upload_tracker, parse_parquet_compression, Uplo
 use sqe_compaction::{
     collect_live_delete_files, plan_delete_aware_read, rewrite_group, ProgressReporter, SortCtx,
 };
-use sqe_core::{Result as SqeResult, SqeError};
+use sqe_core::{Result as SqeResult, SqeError, SqeErrorCode};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -216,7 +216,7 @@ pub async fn delete_orphan_uploads(file_io: &FileIO, tracker: &UploadedPaths) ->
 /// Error returned when the RPC layer cancelled the rewrite (response stream
 /// dropped, or worker-side deadline fired).
 fn cancelled_error(request: &CompactGroupRequest, stage: &str) -> SqeError {
-    SqeError::Execution(format!(
+    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
         "compact_file_group: group {} of job '{}' was cancelled during {stage} \
          (the coordinator dropped the response stream, or the worker-side \
          compaction deadline fired)",
@@ -255,7 +255,7 @@ pub fn build_file_io(s3: &S3Conn) -> SqeResult<FileIO> {
         builder = builder.with_prop(iceberg::io::S3_PATH_STYLE_ACCESS, "true");
     }
     builder.build().map_err(|e| {
-        SqeError::Execution(format!(
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "compact_file_group: failed to build FileIO from S3 config: {e}"
         ))
     })
@@ -285,7 +285,7 @@ fn data_file_from_task(task: &FileScanTask) -> SqeResult<DataFile> {
         .referenced_data_file(task.referenced_data_file.clone())
         .build()
         .map_err(|e| {
-            SqeError::Execution(format!(
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "compact_file_group: failed to build data file metadata for '{}': {e}",
                 task.data_file_path
             ))
@@ -310,14 +310,14 @@ fn resolve_group_data_files(
         .iter()
         .map(|path| {
             let tasks = tasks_by_path.get(path).ok_or_else(|| {
-                SqeError::Execution(format!(
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "compact_file_group: requested data file '{path}' is missing from the \
                      delete-aware scan plan; refusing to compact it without confirming its \
                      applicable deletes (resurrection guard)"
                 ))
             })?;
             let first = tasks.first().ok_or_else(|| {
-                SqeError::Execution(format!(
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "compact_file_group: data file '{path}' resolved to zero scan tasks"
                 ))
             })?;
@@ -332,7 +332,7 @@ fn resolve_group_data_files(
 /// wrong table the way a real catalog lookup could.
 fn parse_table_ident(table_ident: &str) -> SqeResult<TableIdent> {
     TableIdent::from_strs(table_ident.split('.')).map_err(|e| {
-        SqeError::Execution(format!(
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "compact_file_group: invalid table_ident '{table_ident}': {e}"
         ))
     })
@@ -364,7 +364,7 @@ async fn compact_pinned_table(
     // below), so a mismatch never triggers a scan.
     let actual_snapshot_id = table.metadata().current_snapshot_id();
     if actual_snapshot_id != Some(request.snapshot_id) {
-        return Err(SqeError::Execution(format!(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "compact_file_group: snapshot mismatch for table '{}': request is pinned to \
              snapshot {}, but '{}' resolves to current snapshot {:?}; the read plan is only \
              valid against the pinned snapshot, refusing to compact",
@@ -373,7 +373,7 @@ async fn compact_pinned_table(
     }
 
     let plan = plan_delete_aware_read(&table).await.map_err(|e| {
-        SqeError::Execution(format!(
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "compact_file_group: failed to plan delete-aware read: {e}"
         ))
     })?;
@@ -384,7 +384,7 @@ async fn compact_pinned_table(
     let arrow_schema: arrow_schema::SchemaRef = Arc::new(
         iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema().as_ref())
             .map_err(|e| {
-                SqeError::Execution(format!("compact_file_group: schema conversion failed: {e}"))
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("compact_file_group: schema conversion failed: {e}"))
             })?,
     );
 
@@ -450,7 +450,7 @@ async fn compact_pinned_table(
         biased;
         () = cancel.cancelled() => return Err(cancelled_error(request, "the group rewrite")),
         result = &mut rewrite => result
-            .map_err(|e| SqeError::Execution(format!("compact_file_group: rewrite failed: {e}")))?,
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("compact_file_group: rewrite failed: {e}")))?,
     };
 
     let partition_type = table.metadata().default_partition_type().clone();
@@ -463,7 +463,7 @@ async fn compact_pinned_table(
         format_version,
     )
     .map_err(|e| {
-        SqeError::Execution(format!(
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "compact_file_group: failed to encode data files to avro: {e}"
         ))
     })?;
@@ -471,7 +471,7 @@ async fn compact_pinned_table(
     let uploaded_paths = tracker
         .lock()
         .map_err(|_| {
-            SqeError::Execution("compact_file_group: upload tracker mutex poisoned".to_string())
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, "compact_file_group: upload tracker mutex poisoned".to_string())
         })?
         .clone();
 
@@ -533,7 +533,7 @@ pub async fn run_group_rewrite(ctx: GroupRewriteCtx) -> SqeResult<CompactGroupRe
         () = cancel.cancelled() => return Err(cancelled_error(&request, "the table metadata load")),
         loaded = StaticTable::from_metadata_file(&request.metadata_location, ident, file_io) => {
             loaded.map_err(|e| {
-                SqeError::Execution(format!(
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "compact_file_group: failed to load table metadata '{}': {e}",
                     request.metadata_location
                 ))

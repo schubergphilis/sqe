@@ -96,7 +96,7 @@ impl Accumulator for CountIfAccumulator {
         let arr = values[0]
             .as_any()
             .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| DataFusionError::Internal("count_if: arg is not Boolean".into()))?;
+            .ok_or_else(|| DataFusionError::Plan("count_if: arg is not Boolean".into()))?;
         // Only TRUE increments; false and NULL are skipped.
         self.count += arr.iter().filter(|v| *v == Some(true)).count() as i64;
         Ok(())
@@ -114,7 +114,7 @@ impl Accumulator for CountIfAccumulator {
         let arr = states[0]
             .as_any()
             .downcast_ref::<Int64Array>()
-            .ok_or_else(|| DataFusionError::Internal("count_if: state is not Int64".into()))?;
+            .ok_or_else(|| DataFusionError::Plan("count_if: state is not Int64".into()))?;
         for v in arr.iter().flatten() {
             self.count += v;
         }
@@ -162,7 +162,7 @@ impl ScalarUDFImpl for ElementAt {
             let offsets = list.value_offsets();
             let values = list.values();
             let idx = keys.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                DataFusionError::Internal("element_at: array index must be bigint".into())
+                DataFusionError::Plan("element_at: array index must be bigint".into())
             })?;
             let mut take_idx: Vec<Option<i64>> = Vec::with_capacity(rows);
             for i in 0..rows {
@@ -219,7 +219,7 @@ impl ScalarUDFImpl for ElementAt {
             return Ok(ColumnarValue::Array(result));
         }
 
-        Err(DataFusionError::Internal(format!(
+        Err(DataFusionError::Plan(format!(
             "element_at: unsupported container type {:?}",
             container.data_type()
         )))

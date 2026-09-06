@@ -101,6 +101,22 @@ fn reject_oversized_sql(query: &QueryConfig, sql: &str) -> sqe_core::Result<()> 
     query.check_sql_bytes(sql)
 }
 
+fn refuse_if_audit_closed(
+    audit: Option<&Arc<sqe_metrics::audit::AuditLogger>>,
+) -> sqe_core::Result<()> {
+    if let Some(audit) = audit {
+        if !audit.is_writable() {
+            return Err(SqeError::sourced(
+                SqeErrorCode::InternalError,
+                "audit logger unavailable (fail_mode=closed)",
+                sqe_metrics::audit::AuditWriteError::WriterGone,
+            ));
+        }
+    }
+    Ok(())
+}
+
+
 /// True for CTAS / INSERT whose *query* has a top-level ORDER BY
 /// (the ExternalSorterMerge cliff on a greedy pool, issue #408).
 ///
@@ -905,6 +921,7 @@ impl QueryHandler {
         // Issue #403: reject oversized SQL before parse so a client cannot
         // burn coordinator memory/CPU on an arbitrarily large statement.
         reject_oversized_sql(&self.config.query, sql)?;
+        refuse_if_audit_closed(self.audit.as_ref())?;
 
         // Memory pressure admission control: reject new queries when the
         // coordinator's FairSpillPool is >95% utilized (Red).
@@ -949,7 +966,7 @@ impl QueryHandler {
             match sem.try_acquire_owned() {
                 Ok(permit) => Some(permit),
                 Err(_) => {
-                    return Err(SqeError::Execution(format!(
+                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "Too many concurrent queries for user '{}' ({} active). Please retry later.",
                         username, self.config.query.max_concurrent_per_user
                     )));
@@ -973,7 +990,7 @@ impl QueryHandler {
                     Some(r) => Some(r),
                     None => {
                         let used = self.per_user_memory.used_bytes(&username);
-                        return Err(SqeError::Execution(format!(
+                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                             "Per-user memory budget exceeded for '{}': {} bytes reserved, \
                          limit {} bytes. Wait for in-flight queries to complete.",
                             username, used, self.per_user_memory_budget_bytes
@@ -988,7 +1005,7 @@ impl QueryHandler {
             match sem.clone().try_acquire_owned() {
                 Ok(permit) => Some(permit),
                 Err(_) => {
-                    return Err(SqeError::Execution(format!(
+                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "Too many concurrent queries ({} active). Please retry later.",
                         self.config.query.max_concurrent_queries
                     )));
@@ -1068,7 +1085,7 @@ impl QueryHandler {
             otel.status_code = tracing::field::Empty,
         );
         sqe_metrics::propagation::record_trace_fields(&query_span);
-        let _query_guard = query_span.enter();
+        // span not entered across await (finding 410)
         let trace_id = sqe_metrics::propagation::current_trace_id();
 
         let cancel_token = self.query_tracker.start(
@@ -1524,9 +1541,7 @@ impl QueryHandler {
                     if let Some(ref manager) = self.session_manager {
                         let updated = manager.set_write_branch(&session.id, branch.clone());
                         if !updated {
-                            return Err(SqeError::Execution(
-                                "SET WRITE_BRANCH: session not found in manager".into(),
-                            ));
+                            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, "SET WRITE_BRANCH: session not found in manager".to_string()));
                         }
                         tracing::info!(
                             username = %session.user.username,
@@ -1636,7 +1651,10 @@ impl QueryHandler {
                             let (ctx, _) = self.create_session_context(session).await?;
                             let select_sql =
                                 crate::hive_write::ctas_select_sql(ct).ok_or_else(|| {
-                                    SqeError::Execution("CTAS without SELECT query".into())
+                                    SqeError::with_code(
+                                        SqeErrorCode::ExecutionFailed,
+                                        "CTAS without SELECT query",
+                                    )
                                 })?;
 
                             // Plan the SELECT for its schema only. The column
@@ -1646,7 +1664,7 @@ impl QueryHandler {
                                 .sql(&select_sql)
                                 .await
                                 .map_err(|e| {
-                                    SqeError::Execution(format!(
+                                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                                         "hive_external: CTAS query does not plan: {e}"
                                     ))
                                 })?
@@ -1677,16 +1695,14 @@ impl QueryHandler {
                                 &load,
                             )
                             .map_err(|e| {
-                                SqeError::Execution(format!(
+                                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                                     "hive_external: CTAS load statement does not parse: {e}"
                                 ))
                             })?
                             .into_iter()
                             .next()
                             .ok_or_else(|| {
-                                SqeError::Execution(
-                                    "hive_external: CTAS load produced no statement".into(),
-                                )
+                                SqeError::with_code(SqeErrorCode::ExecutionFailed, "hive_external: CTAS load produced no statement".to_string())
                             })?;
                             // Gate the target before any object lands (503).
                             self.hive_ddl_handler
@@ -1711,7 +1727,7 @@ impl QueryHandler {
                                 .refresh_index_after_write(session, &table_reference_of(&ct.name))
                                 .await
                             {
-                                return Err(SqeError::Execution(format!(
+                                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                                     "hive_external: the table was created and its rows WERE                                      written, but they are not yet visible: refreshing the                                      partition index failed ({e}). Run `MSCK REPAIR TABLE {}`                                      to make them visible.",
                                     ct.name
                                 )));
@@ -1746,10 +1762,10 @@ impl QueryHandler {
                                 )
                                 .await
                         } else {
-                            Err(SqeError::Execution("CTAS without SELECT query".into()))
+                            Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, "CTAS without SELECT query"))
                         }
                     } else {
-                        Err(SqeError::Execution("Expected CreateTable statement".into()))
+                        Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, "Expected CreateTable statement"))
                     }
                 }
 
@@ -1799,7 +1815,7 @@ impl QueryHandler {
                                     // Naming the recovery is the whole point. A
                                     // generic error here sends the user looking
                                     // for data that is sitting in the bucket.
-                                    return Err(SqeError::Execution(format!(
+                                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                                         "hive_external: the rows were WRITTEN but are not yet                                          visible: refreshing the partition index failed ({e}).                                          The data files are on storage and intact. Run                                          `MSCK REPAIR TABLE {hive_ref}` to make them visible."
                                     )));
                                 }
@@ -1824,7 +1840,7 @@ impl QueryHandler {
                             .as_ref()
                             .map(|q| sqe_sql::rewrite_named_tvf_args(&format!("{q}")))
                             .ok_or_else(|| {
-                                SqeError::Execution("INSERT without SELECT source".into())
+                                SqeError::with_code(SqeErrorCode::ExecutionFailed, "INSERT without SELECT source")
                             })?;
                         let (ctx, _) = self.create_session_context(session).await?;
                         self.write_handler
@@ -1838,7 +1854,7 @@ impl QueryHandler {
                             )
                             .await
                     } else {
-                        Err(SqeError::Execution("Expected Insert statement".into()))
+                        Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, "Expected Insert statement"))
                     }
                 }
 
@@ -1927,7 +1943,7 @@ impl QueryHandler {
                                 ],
                             )
                             .map_err(|e| {
-                                SqeError::Execution(format!("Failed to create result batch: {e}"))
+                                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to create result batch: {e}"))
                             })?;
                             return Ok(vec![batch]);
                         }
@@ -1969,9 +1985,7 @@ impl QueryHandler {
                             )
                             .await
                     } else {
-                        Err(SqeError::Execution(
-                            "Failed to rewrite TRUNCATE as DELETE".into(),
-                        ))
+                        Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, "Failed to rewrite TRUNCATE as DELETE".to_string()))
                     }
                 }
 
@@ -2055,7 +2069,7 @@ impl QueryHandler {
                             ],
                         )
                         .map(|b| vec![b])
-                        .map_err(|e| SqeError::Execution(e.to_string()))
+                        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))
                     } else {
                         let result = self.maintenance_handler.handle(session, call).await;
 
@@ -2118,7 +2132,7 @@ impl QueryHandler {
                     let source_sql = if let Statement::Merge(merge) = stmt.as_ref() {
                         merge_source_sql(&merge.source)?
                     } else {
-                        return Err(SqeError::Execution("Expected MERGE statement".into()));
+                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, "Expected MERGE statement"));
                     };
                     let (ctx, session_catalog) = self.create_session_context(session).await?;
                     // Capture the MERGE source plan from `execute_query`. The
@@ -2223,7 +2237,7 @@ impl QueryHandler {
                     username = %session.user.username,
                     "Query cancelled by admin or client"
                 );
-                Err(SqeError::Execution("Query cancelled".to_string()))
+                Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, "Query cancelled".to_string()))
             }
             inner = tokio::time::timeout(timeout_duration, execution_future) => {
                 match inner {
@@ -2234,7 +2248,7 @@ impl QueryHandler {
                             timeout_secs = timeout_secs,
                             "Query timed out"
                         );
-                        let timeout_error = SqeError::Execution(format!(
+                        let timeout_error = SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                             "Query timed out after {timeout_secs}s"
                         ));
                         self.query_tracker.failed(&query_id, &timeout_error);
@@ -2282,7 +2296,7 @@ impl QueryHandler {
                 | StatementKind::Truncate(_)
         ) && matches!(&result, Ok(batches) if batches.is_empty())
         {
-            result = Ok(crate::write_handler::affected_rows_batch(0));
+            result = crate::write_handler::affected_rows_batch(0);
         }
 
         // Findings 407 + 507: a DML commit drops the WRITER's cached
@@ -2898,6 +2912,7 @@ impl QueryHandler {
     ) -> sqe_core::Result<(SchemaRef, SendableRecordBatchStream)> {
         // Issue #403: same pre-parse size cap as execute().
         reject_oversized_sql(&self.config.query, sql)?;
+        refuse_if_audit_closed(self.audit.as_ref())?;
 
         // --- Admission control -------------------------------------------------
         let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
@@ -2943,7 +2958,7 @@ impl QueryHandler {
             match sem.try_acquire_owned() {
                 Ok(p) => permits.push(p),
                 Err(_) => {
-                    return Err(SqeError::Execution(format!(
+                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "Too many concurrent queries for user '{}' ({} active). Please retry later.",
                         username, self.config.query.max_concurrent_per_user
                     )));
@@ -2954,7 +2969,7 @@ impl QueryHandler {
             match Arc::clone(sem).try_acquire_owned() {
                 Ok(p) => permits.push(p),
                 Err(_) => {
-                    return Err(SqeError::Execution(format!(
+                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "Too many concurrent queries ({} active). Please retry later.",
                         self.config.query.max_concurrent_queries
                     )));
@@ -2977,7 +2992,7 @@ impl QueryHandler {
                     Some(r) => Some(r),
                     None => {
                         let used = self.per_user_memory.used_bytes(&username);
-                        return Err(SqeError::Execution(format!(
+                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                             "Per-user memory budget exceeded for '{}': {} bytes reserved, \
                          limit {} bytes. Wait for in-flight queries to complete.",
                             username, used, self.per_user_memory_budget_bytes
@@ -3035,7 +3050,7 @@ impl QueryHandler {
             otel.status_code = tracing::field::Empty,
         );
         sqe_metrics::propagation::record_trace_fields(&query_span);
-        let _query_guard = query_span.enter();
+        // span not entered across await (finding 410)
         let trace_id = sqe_metrics::propagation::current_trace_id();
         info!(
             query_id = %query_id,
@@ -3190,7 +3205,7 @@ impl QueryHandler {
             .sql(sql)
             .instrument(plan_span)
             .await
-            .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
         // Pinned (time-travel / incremental) scans get their real table
         // identity back before the policy rewriter sees the plan (400).
         let plan = tt_cleanup.restore_identities(df.logical_plan().clone())?;
@@ -3227,11 +3242,11 @@ impl QueryHandler {
         let enforced_df = ctx
             .execute_logical_plan(enforced_plan)
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to create execution plan: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to create execution plan: {e}")))?;
         let physical_plan = enforced_df
             .create_physical_plan()
             .await
-            .map_err(|e| SqeError::Execution(format!("Physical plan creation failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Physical plan creation failed: {e}")))?;
 
         // Star-schema join reorder
         let physical_plan = if self.config.query.star_schema_reorder {
@@ -3355,7 +3370,7 @@ impl QueryHandler {
                 .max(8 * 1024 * 1024);
             let rule = sqe_planner::SortMemoryRule::new(sort_grant);
             rule.optimize(physical_plan, &datafusion::config::ConfigOptions::new())
-                .map_err(|e| SqeError::Execution(format!("Sort memory admission failed: {e}")))?
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Sort memory admission failed: {e}")))?
         };
 
         // Distribute scan across workers if possible.
@@ -3369,7 +3384,7 @@ impl QueryHandler {
         let final_plan = strip_self_join_dynamic_filters(final_plan);
         let schema = final_plan.schema();
         let stream = execute_stream(Arc::clone(&final_plan), ctx.task_ctx())
-            .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Query execution failed: {e}")))?;
 
         Ok((
             schema,
@@ -3433,7 +3448,7 @@ impl QueryHandler {
             let df = ctx
                 .sql(&sql_for_plan)
                 .await
-                .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
             // `_tt_cleanup` drops here, deregistering any pinned providers
             // that schema-resolution required. Schema-only paths never read
             // batches, so dropping right after `df.schema()` is fine.
@@ -3505,11 +3520,11 @@ impl QueryHandler {
         let df = ctx
             .sql(numbered_sql)
             .await
-            .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
         let types_map = df
             .logical_plan()
             .get_parameter_types()
-            .map_err(|e| SqeError::Execution(format!("parameter type inference failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("parameter type inference failed: {e}")))?;
         Ok((1..=param_count)
             .map(|i| types_map.get(&format!("${i}")).cloned().flatten())
             .collect())
@@ -3576,7 +3591,7 @@ impl QueryHandler {
             .sql(sql)
             .instrument(plan_span)
             .await
-            .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
 
         // Get the logical plan, give pinned scans their real identity back
         // (400), and run policy enforcement.
@@ -3608,13 +3623,13 @@ impl QueryHandler {
         let enforced_df = ctx
             .execute_logical_plan(enforced_plan)
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to create execution plan: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to create execution plan: {e}")))?;
 
         // Get the physical plan
         let physical_plan = enforced_df
             .create_physical_plan()
             .await
-            .map_err(|e| SqeError::Execution(format!("Physical plan creation failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Physical plan creation failed: {e}")))?;
 
         // Apply star-schema join reordering: reorder inner equi-join chains so
         // small dimension tables are joined first and the large fact table is
@@ -3689,7 +3704,7 @@ impl QueryHandler {
                 .max(8 * 1024 * 1024);
             let rule = sqe_planner::SortMemoryRule::new(sort_grant);
             rule.optimize(physical_plan, &datafusion::config::ConfigOptions::new())
-                .map_err(|e| SqeError::Execution(format!("Sort memory admission failed: {e}")))?
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Sort memory admission failed: {e}")))?
         };
 
         // Try to distribute scan work across workers
@@ -3734,13 +3749,13 @@ impl QueryHandler {
         // Remove dynamic filters from Iceberg self-joins (q95-class inlist blowup).
         let final_plan = strip_self_join_dynamic_filters(final_plan);
         let mut stream = execute_stream(final_plan.clone(), ctx.task_ctx())
-            .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Query execution failed: {e}")))?;
         let mut batches: Vec<RecordBatch> = Vec::new();
         let mut rows_so_far: usize = 0;
         while let Some(batch) = stream
             .try_next()
             .await
-            .map_err(|e| SqeError::Execution(format!("Query execution failed: {e}")))?
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Query execution failed: {e}")))?
         {
             rows_so_far = rows_so_far.saturating_add(batch.num_rows());
             if effective_max > 0 && rows_so_far > effective_max {
@@ -3751,7 +3766,7 @@ impl QueryHandler {
                         "memory-derived ceiling={effective_max} (memory_limit / 256 bytes-per-row)"
                     )
                 };
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Query result exceeds maximum allowed rows ({rows_so_far} > {effective_max}). \
                      Reason: {reason}. Use LIMIT to reduce output or raise the limit in config."
                 )));
@@ -4567,7 +4582,7 @@ impl QueryHandler {
         // Extract object name from the ShowCreate statement
         let table_name = match stmt {
             Statement::ShowCreate { obj_name, .. } => obj_name.to_string(),
-            _ => return Err(SqeError::Execution("Expected ShowCreate statement".into())),
+            _ => return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, "Expected ShowCreate statement".to_string())),
         };
 
         // Query information_schema.columns for the table's column definitions,
@@ -4580,11 +4595,11 @@ impl QueryHandler {
         let df = ctx
             .sql(&col_sql)
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to query column metadata: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to query column metadata: {e}")))?;
         let batches = df
             .collect()
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to collect column metadata: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to collect column metadata: {e}")))?;
 
         // Reconstruct CREATE TABLE DDL
         let mut ddl = format!("CREATE TABLE {table_name} (\n");
@@ -4594,17 +4609,17 @@ impl QueryHandler {
                 .column(0)
                 .as_any()
                 .downcast_ref::<ArrowStringArray>()
-                .ok_or_else(|| SqeError::Execution("Unexpected column_name type".into()))?;
+                .ok_or_else(|| SqeError::with_code(SqeErrorCode::ExecutionFailed, "Unexpected column_name type".to_string()))?;
             let types = batch
                 .column(1)
                 .as_any()
                 .downcast_ref::<ArrowStringArray>()
-                .ok_or_else(|| SqeError::Execution("Unexpected data_type type".into()))?;
+                .ok_or_else(|| SqeError::with_code(SqeErrorCode::ExecutionFailed, "Unexpected data_type type".to_string()))?;
             let nullables = batch
                 .column(2)
                 .as_any()
                 .downcast_ref::<ArrowStringArray>()
-                .ok_or_else(|| SqeError::Execution("Unexpected is_nullable type".into()))?;
+                .ok_or_else(|| SqeError::with_code(SqeErrorCode::ExecutionFailed, "Unexpected is_nullable type".to_string()))?;
 
             for i in 0..batch.num_rows() {
                 if !first {
@@ -4675,7 +4690,7 @@ impl QueryHandler {
             schema,
             vec![Arc::new(ArrowStringArray::from(vec![ddl.as_str()])) as ArrayRef],
         )
-        .map_err(|e| SqeError::Execution(format!("Failed to build result batch: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build result batch: {e}")))?;
 
         Ok(vec![result])
     }
@@ -4707,7 +4722,7 @@ impl QueryHandler {
         let ns_name = parts
             .last()
             .filter(|p| !p.is_empty())
-            .ok_or_else(|| SqeError::Execution("SHOW CREATE SCHEMA requires a schema name".into()))?
+            .ok_or_else(|| SqeError::with_code(SqeErrorCode::ExecutionFailed, "SHOW CREATE SCHEMA requires a schema name".to_string()))?
             .clone();
 
         let ns_ident = iceberg::NamespaceIdent::new(ns_name.clone());
@@ -4718,7 +4733,7 @@ impl QueryHandler {
         let location = match session_catalog.get_namespace(&ns_ident).await {
             Ok(ns) => ns.properties().get("location").cloned(),
             Err(e) => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Failed to describe schema {ns_name}: {e}"
                 )))
             }
@@ -4739,7 +4754,7 @@ impl QueryHandler {
             schema,
             vec![Arc::new(ArrowStringArray::from(vec![ddl.as_str()])) as ArrayRef],
         )
-        .map_err(|e| SqeError::Execution(format!("Failed to build result batch: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build result batch: {e}")))?;
 
         Ok(vec![result])
     }
@@ -4789,7 +4804,7 @@ impl QueryHandler {
         let array: ArrayRef = Arc::new(builder.finish());
 
         let batch = RecordBatch::try_new(schema, vec![array])
-            .map_err(|e| SqeError::Execution(format!("Failed to create result batch: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to create result batch: {e}")))?;
 
         Ok(vec![batch])
     }
@@ -4830,7 +4845,7 @@ impl QueryHandler {
         let array: ArrayRef = Arc::new(builder.finish());
 
         let batch = RecordBatch::try_new(schema, vec![array])
-            .map_err(|e| SqeError::Execution(format!("Failed to create result batch: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to create result batch: {e}")))?;
 
         Ok(vec![batch])
     }
@@ -4878,11 +4893,11 @@ impl QueryHandler {
 
         let (ctx, _) = self.create_session_context(session).await?;
         let df = ctx.sql(&col_sql).await.map_err(|e| {
-            SqeError::Execution(format!("failed to query information_schema.columns: {e}"))
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("failed to query information_schema.columns: {e}"))
         })?;
         df.collect()
             .await
-            .map_err(|e| SqeError::Execution(format!("failed to collect column metadata: {e}")))
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("failed to collect column metadata: {e}")))
     }
 
     /// Handle SHOW TABLES by listing tables in a namespace from the Polaris catalog.
@@ -4932,7 +4947,10 @@ impl QueryHandler {
                 }
                 let table_array: ArrayRef = Arc::new(table_builder.finish());
                 let batch = RecordBatch::try_new(schema, vec![table_array]).map_err(|e| {
-                    SqeError::Execution(format!("Failed to create result batch: {e}"))
+                    SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!("Failed to create result batch: {e}"),
+                    )
                 })?;
                 return Ok(vec![batch]);
             }
@@ -5001,7 +5019,7 @@ impl QueryHandler {
         let table_array: ArrayRef = Arc::new(table_builder.finish());
 
         let batch = RecordBatch::try_new(schema, vec![table_array])
-            .map_err(|e| SqeError::Execution(format!("Failed to create result batch: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to create result batch: {e}")))?;
 
         Ok(vec![batch])
     }
@@ -5023,7 +5041,7 @@ impl QueryHandler {
         let query = match stmt {
             Statement::CreateView(cv) => &cv.query,
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Expected CREATE VIEW statement, got: {other}"
                 )));
             }
@@ -5127,7 +5145,7 @@ impl QueryHandler {
 
         let dialect = GenericDialect {};
         let mut statements = Parser::parse_sql(&dialect, &sql_for_ast).map_err(|e| {
-            SqeError::Execution(format!("Parse error in time travel detection: {e}"))
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Parse error in time travel detection: {e}"))
         })?;
 
         if statements.is_empty() {
@@ -5212,7 +5230,7 @@ impl QueryHandler {
             2 => (parts[0], parts[1]),
             3 => (parts[1], parts[2]),
             _ => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Unsupported table name format for time travel: {}",
                     spec.table
                 )));
@@ -5227,7 +5245,7 @@ impl QueryHandler {
         let snapshot_id = match &spec.version {
             VersionRef::SnapshotId(id) => {
                 if metadata.snapshot_by_id(*id).is_none() {
-                    return Err(SqeError::Execution(format!(
+                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "FOR VERSION AS OF {id}: snapshot id not found on {}",
                         spec.table
                     )));
@@ -5237,7 +5255,7 @@ impl QueryHandler {
             VersionRef::Named(name) => {
                 match metadata.reference_by_name(name) {
                     None => {
-                        return Err(SqeError::Execution(format!(
+                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                             "FOR VERSION AS OF '{name}': no branch or tag with that name on {}",
                             spec.table
                         )));
@@ -5278,7 +5296,7 @@ impl QueryHandler {
                     .try_with_sql(raw)
                     .and_then(|mut p| p.parse_expr())
                     .map_err(|e| {
-                        SqeError::Execution(format!(
+                        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                             "FOR TIMESTAMP AS OF: cannot parse timestamp '{raw}': {e}"
                         ))
                     })?;
@@ -5309,7 +5327,7 @@ impl QueryHandler {
         let qualified = format!("datafusion.public.{alias}");
         ctx.register_table(qualified.as_str(), Arc::new(provider))
             .map_err(|e| {
-                SqeError::Execution(format!(
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Failed to register time-travel provider for {bare_table}: {e}"
                 ))
             })?;
@@ -5372,7 +5390,7 @@ impl QueryHandler {
                     2 => (parts[0], parts[1]),
                     3 => (parts[1], parts[2]), // catalog.schema.table — skip catalog
                     _ => {
-                        return Err(SqeError::Execution(format!(
+                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                             "Unsupported table name format for time travel: {table_name}"
                         )))
                     }
@@ -5404,7 +5422,7 @@ impl QueryHandler {
                 let qualified = format!("datafusion.public.{alias}");
                 ctx.register_table(qualified.as_str(), Arc::new(provider))
                     .map_err(|e| {
-                        SqeError::Execution(format!(
+                        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                             "Failed to register time-travel provider for {bare_table}: {e}"
                         ))
                     })?;
@@ -5487,7 +5505,7 @@ impl QueryHandler {
             2 => (parts[0], parts[1]),
             3 => (parts[1], parts[2]),
             _ => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Unsupported table name format for incremental scan: {}",
                     spec.table
                 )));
@@ -5554,7 +5572,7 @@ impl QueryHandler {
         let qualified = format!("datafusion.public.{alias}");
         ctx.register_table(qualified.as_str(), Arc::new(provider))
             .map_err(|e| {
-                SqeError::Execution(format!(
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Failed to register incremental provider for {bare_table}: {e}"
                 ))
             })?;
@@ -5621,7 +5639,7 @@ impl QueryHandler {
             Statement::Revoke(r) => (&r.privileges, &r.objects, &r.grantees),
             Statement::Deny(d) => (&d.privileges, &deny_objects, &d.grantees),
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Expected GRANT/REVOKE/DENY statement, got: {other}"
                 )));
             }
@@ -5719,7 +5737,7 @@ impl QueryHandler {
         };
 
         let raw_grantee = grantees.first().ok_or_else(|| {
-            SqeError::Execution("GRANT/REVOKE requires at least one grantee".to_string())
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, "GRANT/REVOKE requires at least one grantee".to_string())
         })?;
 
         // Extract the raw grantee name without surrounding quotes.
@@ -5972,7 +5990,7 @@ impl QueryHandler {
         let reason_array: ArrayRef = Arc::new(reason_builder.finish());
 
         let batch = RecordBatch::try_new(schema, vec![allowed_array, reason_array])
-            .map_err(|e| SqeError::Execution(format!("Failed to build result batch: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build result batch: {e}")))?;
 
         Ok(vec![batch])
     }
@@ -6154,7 +6172,7 @@ impl QueryHandler {
                 Arc::new(source_b.finish()) as ArrayRef,
             ],
         )
-        .map_err(|e| SqeError::Execution(format!("Failed to build result batch: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build result batch: {e}")))?;
 
         Ok(vec![batch])
     }
@@ -6353,7 +6371,7 @@ impl QueryHandler {
                 Arc::new(enabled_b.finish()) as ArrayRef,
             ],
         )
-        .map_err(|e| SqeError::Execution(format!("Failed to build result batch: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build result batch: {e}")))?;
         Ok(vec![batch])
     }
 
@@ -6398,7 +6416,7 @@ impl QueryHandler {
                 Arc::new(tag_b.finish()) as ArrayRef,
             ],
         )
-        .map_err(|e| SqeError::Execution(format!("Failed to build result batch: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build result batch: {e}")))?;
 
         Ok(vec![batch])
     }
@@ -6453,7 +6471,7 @@ impl QueryHandler {
                 Arc::new(at_builder.finish()) as ArrayRef,
             ],
         )
-        .map_err(|e| SqeError::Execution(format!("Failed to build result batch: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build result batch: {e}")))?;
 
         Ok(vec![batch])
     }
@@ -6480,7 +6498,7 @@ impl QueryHandler {
                 ..
             } => (object_type, object_name, comment),
             other => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Expected COMMENT statement, got: {other}"
                 )));
             }
@@ -6693,7 +6711,7 @@ impl QueryHandler {
             // take the Iceberg branch regardless.
             let default_catalog = self.config.resolve_default_catalog();
             if stmt.name == default_catalog {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "hive_external: '{}' collides with the session default catalog '{default_catalog}': \
                      a two-part table reference under this default resolves to a Hive table \
                      without either the policy key or the tag route ever seeing its catalog \
@@ -6843,7 +6861,7 @@ impl QueryHandler {
                 Arc::new(type_b.finish()) as ArrayRef,
             ],
         )
-        .map_err(|e| SqeError::Execution(format!("Failed to build SHOW SECRETS result: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build SHOW SECRETS result: {e}")))?;
 
         Ok(vec![batch])
     }
@@ -6911,7 +6929,7 @@ impl QueryHandler {
                 Arc::new(desc_b.finish()) as ArrayRef,
             ],
         )
-        .map_err(|e| SqeError::Execution(format!("Failed to build SHOW FUNCTIONS result: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build SHOW FUNCTIONS result: {e}")))?;
 
         Ok(vec![batch])
     }
@@ -6929,7 +6947,7 @@ impl QueryHandler {
             role_b.append_value(role);
         }
         let batch = RecordBatch::try_new(schema, vec![Arc::new(role_b.finish()) as ArrayRef])
-            .map_err(|e| SqeError::Execution(format!("Failed to build SHOW ROLES result: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build SHOW ROLES result: {e}")))?;
         Ok(vec![batch])
     }
 }
@@ -7183,7 +7201,7 @@ fn resolve_timestamp_expr(expr: &sqlparser::ast::Expr) -> sqe_core::Result<i64> 
         // rejected by the catch-all arm below).
         Expr::TypedString(ts) => match ts.value.clone().into_string() {
             Some(s) => parse_timestamp_str(&s),
-            None => Err(SqeError::Execution(format!(
+            None => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "Unsupported time travel expression: {expr}. \
                  Use TIMESTAMP '2026-01-01 00:00:00' or epoch milliseconds."
             ))),
@@ -7196,10 +7214,10 @@ fn resolve_timestamp_expr(expr: &sqlparser::ast::Expr) -> sqe_core::Result<i64> 
             value: Value::Number(n, _),
             ..
         }) => n.parse::<i64>().map_err(|_| {
-            SqeError::Execution(format!("Cannot parse time travel integer expression: {n}"))
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Cannot parse time travel integer expression: {n}"))
         }),
         Expr::Cast { expr: inner, .. } => resolve_timestamp_expr(inner),
-        other => Err(SqeError::Execution(format!(
+        other => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "Unsupported time travel expression: {other}. \
              Use TIMESTAMP '2026-01-01 00:00:00' or epoch milliseconds."
         ))),
@@ -7228,7 +7246,7 @@ fn parse_timestamp_str(s: &str) -> sqe_core::Result<i64> {
             return Ok(dt.and_utc().timestamp_millis());
         }
     }
-    Err(SqeError::Execution(format!(
+    Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
         "Cannot parse time travel timestamp '{s}'. \
          Use format 'YYYY-MM-DD HH:MM:SS', 'YYYY-MM-DD', or epoch milliseconds."
     )))
@@ -7251,7 +7269,7 @@ fn find_snapshot_at_timestamp(
     }
 
     best.map(|(id, _)| id).ok_or_else(|| {
-        SqeError::Execution(format!(
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "No Iceberg snapshot found at or before timestamp {}ms. \
              The table may not have existed yet at that point in time.",
             target_ms
@@ -8121,7 +8139,7 @@ impl QueryHandler {
             schema,
             vec![Arc::new(datafusion::arrow::array::StringArray::from(specs))],
         )
-        .map_err(|e| SqeError::Execution(e.to_string()))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
         Ok(vec![batch])
     }
 }
@@ -8187,7 +8205,7 @@ fn build_show_stats_batch(
             Arc::new(high_b.finish()) as ArrayRef,
         ],
     )
-    .map_err(|e| SqeError::Execution(format!("Failed to build SHOW STATS result: {e}")))?;
+    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build SHOW STATS result: {e}")))?;
     Ok(vec![batch])
 }
 
@@ -8240,7 +8258,7 @@ fn build_describe_output(schema: &SchemaRef) -> sqe_core::Result<Vec<RecordBatch
             Arc::new(aliased_b.finish()) as ArrayRef,
         ],
     )
-    .map_err(|e| SqeError::Execution(format!("Failed to build DESCRIBE OUTPUT batch: {e}")))?;
+    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build DESCRIBE OUTPUT batch: {e}")))?;
     Ok(vec![batch])
 }
 
@@ -8269,7 +8287,7 @@ fn build_describe_input(param_types: &[Option<DataType>]) -> sqe_core::Result<Ve
             Arc::new(type_b.finish()) as ArrayRef,
         ],
     )
-    .map_err(|e| SqeError::Execution(format!("Failed to build DESCRIBE INPUT batch: {e}")))?;
+    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build DESCRIBE INPUT batch: {e}")))?;
     Ok(vec![batch])
 }
 
@@ -8555,7 +8573,7 @@ fn merge_source_sql(source: &TableFactor) -> Result<String, SqeError> {
             // No column-alias list: preserve the original behaviour exactly.
             _ => Ok(format!("{subquery}")),
         },
-        other => Err(SqeError::Execution(format!(
+        other => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "Unsupported MERGE source: {other}"
         ))),
     }
@@ -9150,7 +9168,7 @@ mod tests {
         // report "no namespaces": that hides a real fault behind an answer the
         // caller cannot distinguish from an empty catalog.
         let broken: sqe_core::Result<Vec<iceberg::NamespaceIdent>> = Err(
-            sqe_core::SqeError::Execution("connection refused".to_string()),
+            sqe_core::SqeError::with_code(SqeErrorCode::ExecutionFailed, "connection refused".to_string()),
         );
         let err = namespaces_or_empty_on_denial(broken)
             .expect_err("a non-denial failure must still propagate");
@@ -9922,7 +9940,7 @@ fn resolve_masking_policy_tag(
         .collect();
 
     if matching.is_empty() {
-        return Err(SqeError::Execution(format!(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "no masking policy named `{policy_name}`. \
              Run SHOW MASKING POLICIES to see what is available."
         )));
@@ -9943,7 +9961,7 @@ fn resolve_masking_policy_tag(
             .into_iter()
             .collect::<Vec<_>>()
             .join(", ");
-        return Err(SqeError::Execution(format!(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "`{policy_name}` is a resource masking policy: it already names the \
              columns it covers ({target}), so it cannot be attached to another one. \
              Ranger evaluates a policy's database/table/column lists as a cross \
@@ -9954,7 +9972,7 @@ fn resolve_masking_policy_tag(
         )));
     }
     if tags.len() > 1 {
-        return Err(SqeError::Execution(format!(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "`{policy_name}` is keyed on more than one tag ({}), so attaching it is \
              ambiguous. Attach the tag you want with \
              ALTER TABLE ... MODIFY COLUMN ... SET TAG.",

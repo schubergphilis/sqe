@@ -17,7 +17,7 @@
 //!    `FOR SYSTEM_TIME AS OF <expr>`   -> a timestamp; the coordinator picks the
 //!    latest snapshot at or before it.
 
-use sqe_core::{Result, SqeError};
+use sqe_core::{Result, SqeError, SqeErrorCode};
 
 /// A version reference extracted from a `FOR {VERSION|TIMESTAMP|SYSTEM_TIME}
 /// AS OF <x>` clause.
@@ -199,7 +199,7 @@ fn parse_version_token(input: &str) -> Result<(VersionRef, usize)> {
     let leading_ws = input.len() - trimmed.len();
 
     if trimmed.is_empty() {
-        return Err(SqeError::Execution(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
             "FOR VERSION AS OF requires a snapshot id or ref name".to_string(),
         ));
     }
@@ -213,7 +213,7 @@ fn parse_version_token(input: &str) -> Result<(VersionRef, usize)> {
             end += 1;
         }
         if end >= bytes.len() {
-            return Err(SqeError::Execution(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
                 "FOR VERSION AS OF: unterminated string literal".to_string(),
             ));
         }
@@ -225,13 +225,13 @@ fn parse_version_token(input: &str) -> Result<(VersionRef, usize)> {
             .unwrap_or(trimmed.len());
         let num_str = &trimmed[..end];
         let id: i64 = num_str.parse().map_err(|_| {
-            SqeError::Execution(format!(
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "FOR VERSION AS OF: '{num_str}' is not a valid snapshot id"
             ))
         })?;
         Ok((VersionRef::SnapshotId(id), leading_ws + end))
     } else {
-        Err(SqeError::Execution(format!(
+        Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "FOR VERSION AS OF: expected integer or quoted ref name, got '{}'",
             trimmed.split_whitespace().next().unwrap_or("")
         )))
@@ -253,7 +253,7 @@ fn parse_timestamp_token(input: &str) -> Result<(VersionRef, usize)> {
     let leading_ws = input.len() - trimmed.len();
 
     if trimmed.is_empty() {
-        return Err(SqeError::Execution(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
             "FOR TIMESTAMP AS OF requires a timestamp literal or epoch milliseconds".to_string(),
         ));
     }
@@ -281,7 +281,7 @@ fn parse_timestamp_token(input: &str) -> Result<(VersionRef, usize)> {
                 end += 1;
             }
             if end >= bytes.len() {
-                return Err(SqeError::Execution(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
                     "FOR TIMESTAMP AS OF: unterminated timestamp string literal".to_string(),
                 ));
             }
@@ -297,7 +297,7 @@ fn parse_timestamp_token(input: &str) -> Result<(VersionRef, usize)> {
             let raw = trimmed[..end].to_string();
             Ok((VersionRef::Timestamp(raw), leading_ws + end))
         }
-        _ => Err(SqeError::Execution(format!(
+        _ => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "FOR TIMESTAMP AS OF: expected a TIMESTAMP literal, quoted string, \
              or epoch-millis integer, got '{}'",
             trimmed.split_whitespace().next().unwrap_or("")
@@ -357,7 +357,7 @@ pub fn extract_incremental_spec(sql: &str) -> Result<(String, Vec<IncrementalSpe
                 let rest_trimmed = rest_upper.trim_start();
                 let leading_ws = rest_upper.len() - rest_trimmed.len();
                 if leading_ws == 0 || !rest_trimmed.starts_with(and_marker) {
-                    return Err(SqeError::Execution(
+                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
                         "FOR INCREMENTAL BETWEEN SNAPSHOT: expected 'AND SNAPSHOT <id>'"
                             .to_string(),
                     ));
@@ -367,7 +367,7 @@ pub fn extract_incremental_spec(sql: &str) -> Result<(String, Vec<IncrementalSpe
                 cursor = after_and_kw + consumed_end;
 
                 if start_id > end_id {
-                    return Err(SqeError::Execution(format!(
+                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "FOR INCREMENTAL BETWEEN SNAPSHOT {start_id} AND SNAPSHOT {end_id}: start must be older than end"
                     )));
                 }
@@ -393,14 +393,14 @@ fn parse_integer_token(input: &str) -> Result<(i64, usize)> {
     let leading_ws = input.len() - trimmed.len();
 
     if trimmed.is_empty() {
-        return Err(SqeError::Execution(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
             "FOR INCREMENTAL BETWEEN SNAPSHOT: expected snapshot id".to_string(),
         ));
     }
 
     let first = trimmed.as_bytes()[0];
     if !first.is_ascii_digit() && first != b'-' {
-        return Err(SqeError::Execution(format!(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "FOR INCREMENTAL BETWEEN SNAPSHOT: expected integer, got '{}'",
             trimmed.split_whitespace().next().unwrap_or("")
         )));
@@ -410,7 +410,7 @@ fn parse_integer_token(input: &str) -> Result<(i64, usize)> {
         .unwrap_or(trimmed.len());
     let num_str = &trimmed[..end];
     let id: i64 = num_str.parse().map_err(|_| {
-        SqeError::Execution(format!(
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "FOR INCREMENTAL BETWEEN SNAPSHOT: '{num_str}' is not a valid snapshot id"
         ))
     })?;

@@ -1,6 +1,6 @@
 # SQE — Next Steps
 
-> **STATUS 2026-09-05 (night): data consistency batch fixed; 42 of 109 combined findings closed.**
+> **STATUS 2026-09-06: data consistency batch (#654) fixed and rebased on main; 42 of 109 combined findings closed.**
 >
 > Branch `fix/data-consistency-p1` (work package #654) closes 302, 304,
 > 407, 500, 501, 502, 505, 506, 507, 511, 514, 608 and the 902 follow-up:
@@ -15,7 +15,7 @@
 > **NEXT:** work package #655 memory safety (701, 504, 403, 300, 301, 408,
 > 308, 307, 806, 509, 811, 512), then #656 SQL planning and protocol.
 
-> **STATUS 2026-09-05 (evening): identity, credentials and transport trust batch fixed; 30 of 109 combined findings closed.**
+> **STATUS 2026-09-06: identity, credentials and transport trust batch (#652) fixed and rebased on main, which now carries #657 (errors, audit, observability).**
 >
 > Branch `fix/identity-transport-trust-p1` (work package #652) closes 204,
 > 207, 208, 405, 604, 401, 601, 702, 606, 600, 603 and 210: scan tickets are
@@ -33,6 +33,20 @@
 > **NEXT:** work package #654 (data consistency: caches, writes and
 > transactions: 302, 304, 507, 407, 500, 502, 501, 506, 505, 608, 511, 514,
 > plus the 902 fingerprint-bound result cache), then #655 memory safety.
+
+> **Previous (2026-09-05, merged): work package #657 (errors, audit, observability) on `fix/errors-audit-observability`.**
+>
+> Closed findings 607, 800, 104, 305, 709, 306, 812, 410, 612 (610 partial).
+> Audit chain resumes across restarts with a bounded queue and drop counter;
+> error codes are typed (`with_code`, `From<DataFusionError>`, catalog HTTP
+> status) instead of English substring; Trino HTTP errors map by status;
+> listing outages no longer look like empty catalogs; swallowed restore and
+> rows-affected errors surface; query spans are not entered across await;
+> telemetry init and metrics bind fail closed. Each finding file has a
+> Resolution section.
+> **NEXT:** remaining P1s (202, 400, 503, worker trust) and 610 lineage mask
+> facet.
+
 
 > **STATUS 2026-09-05 (later): authorization P1 batch fixed; 24 of 109 combined findings closed.**
 >
@@ -58,8 +72,10 @@
 >
 > Fail-closed `SQE_*` overlay, typed mode knobs, one tokio runtime builder,
 > `sqe-coordinator` binary removed in favour of `sqe-server`, worker
-> `--config` + `/healthz`, dead `deploy/k8s` removed. Partial: stacker for
-> debug `RUST_MIN_STACK`, Dockerfile unification, QueryHandler split.
+> `--config` + `/healthz`, dead `deploy/k8s` removed, one Dockerfile with
+> `CATALOG_FEATURES`, embedded `--config` for mask key, buffered write
+> twins deleted. Partial: stacker for debug `RUST_MIN_STACK`, QueryHandler
+> split, dual field-stamping.
 > **NEXT:** remaining P1s in the combined index (202, 400, 503, 601/401/603).
 >
 > **STATUS 2026-09-05: security/scale review filed (7 findings) and fixed; 11 of 109 combined findings closed.**

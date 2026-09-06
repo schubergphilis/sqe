@@ -46,6 +46,7 @@ use crate::query_handler::{
     aggregate_spill_metrics, extract_iceberg_scan_metrics, extract_plan_metrics,
 };
 use crate::query_tracker::QueryTracker;
+use sqe_core::SqeErrorCode;
 
 /// Hard cap on a rendered profile. Deep plans with long predicate lists can
 /// blow up the tree text; 64 KiB keeps the log event and the tracker record
@@ -801,7 +802,7 @@ impl Stream for TrackedRecordBatchStream {
             Poll::Ready(Some(Err(e))) => {
                 if let Some(f) = self.finalizer.take() {
                     let sqe_err =
-                        sqe_core::SqeError::Execution(format!("Query execution failed: {e}"));
+                        sqe_core::SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Query execution failed: {e}"));
                     f.on_error(self.rows_so_far, &sqe_err);
                 }
                 Poll::Ready(Some(Err(e)))

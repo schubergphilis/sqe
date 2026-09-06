@@ -262,6 +262,16 @@ pub fn build_embedded_context(
     memory_limit_bytes: usize,
     storage: &StorageConfig,
 ) -> anyhow::Result<SessionContext> {
+    build_embedded_context_with_mask(memory_limit_bytes, storage, None)
+}
+
+/// Like [`build_embedded_context`], with an explicit HMAC mask key (from
+/// `[policy] mask_key` in a loaded `sqe.toml`).
+pub fn build_embedded_context_with_mask(
+    memory_limit_bytes: usize,
+    storage: &StorageConfig,
+    mask_key: Option<&str>,
+) -> anyhow::Result<SessionContext> {
     let session_config = sqe_catalog::engine_session_config()
         .with_information_schema(true)
         .with_default_catalog_and_schema("default", "default");
@@ -298,10 +308,10 @@ pub fn build_embedded_context(
     // Scalar UDFs. SQE_POLICY__MASK_KEY enables HMAC-SHA256 in embedded
     // mode (issue #37). Without it the UDF stays plain SHA-256 and prints
     // a one-shot warning on registration.
-    let mask_key = std::env::var("SQE_POLICY__MASK_KEY")
-        .ok()
+    let mask_key = mask_key
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| Arc::new(s.into_bytes()));
+        .map(|s| Arc::new(s.as_bytes().to_vec()));
     ctx.register_udf(sqe_policy::sha256_udf::sha256_udf(mask_key));
 
     // Trino dialect compatibility — year(), month(), day_of_week(),
@@ -418,8 +428,9 @@ pub async fn build_embedded_context_with_warehouse(
     memory_limit_bytes: usize,
     mode: &WarehouseMode,
     storage: &StorageConfig,
+    mask_key: Option<&str>,
 ) -> anyhow::Result<(SessionContext, IcebergCatalogMap)> {
-    let ctx = build_embedded_context(memory_limit_bytes, storage)?;
+    let ctx = build_embedded_context_with_mask(memory_limit_bytes, storage, mask_key)?;
     let mut iceberg_catalogs: IcebergCatalogMap = HashMap::new();
 
     let catalogs = match mode {
@@ -533,8 +544,9 @@ pub async fn build_embedded_context_with_backend(
     backend: &sqe_core::config::CatalogBackend,
     catalog_name: &str,
     storage: &StorageConfig,
+    mask_key: Option<&str>,
 ) -> anyhow::Result<SessionContext> {
-    let ctx = build_embedded_context(memory_limit_bytes, storage)?;
+    let ctx = build_embedded_context_with_mask(memory_limit_bytes, storage, mask_key)?;
     let catalog = sqe_catalog::SessionCatalog::build_backend_catalog(backend)
         .await
         .map_err(|e| anyhow::anyhow!("failed to build `{catalog_name}` catalog: {e}"))?;
@@ -611,14 +623,27 @@ impl EmbeddedClient {
     /// `Persistent` attaches a SQLite-backed Iceberg catalog;
     /// `Memory` matches the legacy `new()` behaviour with no
     /// iceberg catalogs attached.
+    #[allow(dead_code)]
     pub async fn with_warehouse(
         memory_limit_bytes: usize,
         mode: &WarehouseMode,
         s3: &EmbeddedS3Options,
     ) -> anyhow::Result<Self> {
+        Self::with_warehouse_and_policy(memory_limit_bytes, mode, s3, None).await
+    }
+
+    /// Like [`Self::with_warehouse`], applying `[policy] mask_key` from a
+    /// loaded `sqe.toml` so HMAC-SHA256 matches the server.
+    pub async fn with_warehouse_and_policy(
+        memory_limit_bytes: usize,
+        mode: &WarehouseMode,
+        s3: &EmbeddedS3Options,
+        mask_key: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let storage = s3.to_storage_config();
         let (ctx, iceberg_catalogs) =
-            build_embedded_context_with_warehouse(memory_limit_bytes, mode, &storage).await?;
+            build_embedded_context_with_warehouse(memory_limit_bytes, mode, &storage, mask_key)
+                .await?;
         Ok(Self {
             ctx,
             iceberg_catalogs,
@@ -635,11 +660,22 @@ impl EmbeddedClient {
     /// Auth uses the AWS credential chain. Requires the `aws` cargo
     /// feature; without it the backend constructor returns a clear
     /// error naming the missing feature.
+    #[allow(dead_code)]
     pub async fn with_backend(
         memory_limit_bytes: usize,
         backend: sqe_core::config::CatalogBackend,
         catalog_name: &str,
         s3: &EmbeddedS3Options,
+    ) -> anyhow::Result<Self> {
+        Self::with_backend_and_policy(memory_limit_bytes, backend, catalog_name, s3, None).await
+    }
+
+    pub async fn with_backend_and_policy(
+        memory_limit_bytes: usize,
+        backend: sqe_core::config::CatalogBackend,
+        catalog_name: &str,
+        s3: &EmbeddedS3Options,
+        mask_key: Option<&str>,
     ) -> anyhow::Result<Self> {
         let storage = s3.to_storage_config();
         let ctx = build_embedded_context_with_backend(
@@ -647,6 +683,7 @@ impl EmbeddedClient {
             &backend,
             catalog_name,
             &storage,
+            mask_key,
         )
         .await?;
         Ok(Self {

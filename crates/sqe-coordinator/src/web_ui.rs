@@ -793,7 +793,7 @@ mod tests {
         t.start(id, "bob", None, "SELECT 1", "s1", None, vec![], None);
         // Simulate a failed query whose error message contains an email address.
         let err =
-            sqe_core::SqeError::Execution("constraint violation for user 'a@b.com'".to_string());
+            sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, "constraint violation for user 'a@b.com'".to_string());
         t.failed(&id, &err);
 
         let list = query_list(&t, None, 100);

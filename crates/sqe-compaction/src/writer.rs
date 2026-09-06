@@ -30,7 +30,7 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::basic::{Compression, ZstdLevel};
-use sqe_core::SqeError;
+use sqe_core::{SqeError, SqeErrorCode};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -278,7 +278,7 @@ pub async fn write_data_files_streaming(
     mut progress: Option<crate::progress::ProgressReporter>,
 ) -> sqe_core::Result<(Vec<DataFile>, usize)> {
     let inner_loc = DefaultLocationGenerator::new(table.metadata().clone())
-        .map_err(|e| SqeError::Execution(format!("Location generator error: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Location generator error: {e}")))?;
     let location_generator = TrackingLocationGenerator::new(inner_loc, tracker);
 
     let _ = file_prefix; // kept for parity with non-streaming API; not used in file names
@@ -336,11 +336,11 @@ pub async fn write_data_files_streaming(
         let mut writer = data_file_writer_builder
             .build(partition_key)
             .await
-            .map_err(|e| SqeError::Execution(format!("Failed to build data file writer: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build data file writer: {e}")))?;
 
         while let Some(batch_result) = stream.next().await {
             let batch =
-                batch_result.map_err(|e| SqeError::Execution(format!("Stream error: {e}")))?;
+                batch_result.map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Stream error: {e}")))?;
             if batch.num_rows() == 0 {
                 continue;
             }
@@ -349,7 +349,7 @@ pub async fn write_data_files_streaming(
             writer
                 .write(stamped)
                 .await
-                .map_err(|e| SqeError::Execution(format!("Write error: {e}")))?;
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Write error: {e}")))?;
             if let Some(p) = progress.as_mut() {
                 p.on_batch(total_rows as u64);
             }
@@ -359,7 +359,7 @@ pub async fn write_data_files_streaming(
             // Propagate close errors even on the empty-write path: a failed
             // close can signal a file build/flush problem we must not mask.
             writer.close().await.map_err(|e| {
-                SqeError::Execution(format!("Close writer error (empty write): {e}"))
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Close writer error (empty write): {e}"))
             })?;
             return Ok((vec![], 0));
         }
@@ -367,7 +367,7 @@ pub async fn write_data_files_streaming(
         writer
             .close()
             .await
-            .map_err(|e| SqeError::Execution(format!("Close writer error: {e}")))?
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Close writer error: {e}")))?
     } else {
         // Partitioned streaming. The splitter computes partition values from
         // source columns at runtime so the input stream does not need a
@@ -378,7 +378,7 @@ pub async fn write_data_files_streaming(
             iceberg_schema.clone(),
             partition_spec.clone(),
         )
-        .map_err(|e| SqeError::Execution(format!("Failed to build partition splitter: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build partition splitter: {e}")))?;
 
         if fanout.is_bounded() {
             // Memory-bounded path: SQE's BoundedFanoutWriter caps open writers
@@ -399,7 +399,7 @@ pub async fn write_data_files_streaming(
             );
             while let Some(batch_result) = stream.next().await {
                 let batch =
-                    batch_result.map_err(|e| SqeError::Execution(format!("Stream error: {e}")))?;
+                    batch_result.map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Stream error: {e}")))?;
                 if batch.num_rows() == 0 {
                     continue;
                 }
@@ -434,7 +434,7 @@ pub async fn write_data_files_streaming(
 
             while let Some(batch_result) = stream.next().await {
                 let batch =
-                    batch_result.map_err(|e| SqeError::Execution(format!("Stream error: {e}")))?;
+                    batch_result.map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Stream error: {e}")))?;
                 if batch.num_rows() == 0 {
                     continue;
                 }
@@ -443,7 +443,7 @@ pub async fn write_data_files_streaming(
                 writer
                     .write(stamped)
                     .await
-                    .map_err(|e| SqeError::Execution(format!("Partitioned write error: {e}")))?;
+                    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Partitioned write error: {e}")))?;
                 if let Some(p) = progress.as_mut() {
                     p.on_batch(total_rows as u64);
                 }
@@ -453,7 +453,7 @@ pub async fn write_data_files_streaming(
                 // Propagate close errors even on the empty-write path: a failed
                 // close can signal a file build/flush problem we must not mask.
                 writer.close().await.map_err(|e| {
-                    SqeError::Execution(format!(
+                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "Close partitioned writer error (empty write): {e}"
                     ))
                 })?;
@@ -463,7 +463,7 @@ pub async fn write_data_files_streaming(
             writer
                 .close()
                 .await
-                .map_err(|e| SqeError::Execution(format!("Close partitioned writer error: {e}")))?
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Close partitioned writer error: {e}")))?
         }
     };
 
@@ -490,7 +490,7 @@ pub fn new_upload_tracker() -> UploadedPaths {
 /// default for Iceberg) and takes types from the Iceberg schema directly.
 fn build_stamped_schema(iceberg_schema: &IcebergSchema) -> sqe_core::Result<Arc<ArrowSchema>> {
     let expected_arrow_schema = schema_to_arrow_schema(iceberg_schema)
-        .map_err(|e| SqeError::Execution(format!("Failed to derive expected Arrow schema: {e}")))?;
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to derive expected Arrow schema: {e}")))?;
 
     let iceberg_fields = iceberg_schema.as_struct().fields();
     let new_fields: Vec<Arc<arrow_schema::Field>> = expected_arrow_schema
@@ -556,7 +556,7 @@ fn apply_stamped_schema(
                 Ok(col.clone())
             } else {
                 cast(col, target).map_err(|e| {
-                    SqeError::Execution(format!(
+                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "Failed to cast column '{}' from {:?} to {:?}: {e}",
                         stamped_schema.field(i).name(),
                         col.data_type(),
@@ -567,7 +567,7 @@ fn apply_stamped_schema(
         })
         .collect();
     RecordBatch::try_new(stamped_schema.clone(), new_columns?)
-        .map_err(|e| SqeError::Execution(format!("Failed to apply stamped schema: {e}")))
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to apply stamped schema: {e}")))
 }
 
 /// Resolved fanout limits for a partitioned streaming write. Both `0` means
@@ -735,7 +735,7 @@ impl<B: IcebergWriterBuilder> BoundedFanoutWriter<B> {
         let partitioned = self
             .splitter
             .split(&batch)
-            .map_err(|e| SqeError::Execution(format!("Partition split error: {e}")))?;
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Partition split error: {e}")))?;
 
         for (partition_key, part_batch, _row_ids) in partitioned {
             if part_batch.num_rows() == 0 {
@@ -789,7 +789,7 @@ impl<B: IcebergWriterBuilder> BoundedFanoutWriter<B> {
                 .await?
                 .write(part_batch)
                 .await
-                .map_err(|e| SqeError::Execution(format!("Partitioned write error: {e}")))?;
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Partitioned write error: {e}")))?;
 
             self.total_bytes += bytes;
             *self.est_bytes.entry(key.clone()).or_insert(0) += bytes;
@@ -806,7 +806,7 @@ impl<B: IcebergWriterBuilder> BoundedFanoutWriter<B> {
         for key in keys {
             if let Some(mut writer) = self.open.remove(&key) {
                 let files = writer.close().await.map_err(|e| {
-                    SqeError::Execution(format!("Close partition writer error: {e}"))
+                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Close partition writer error: {e}"))
                 })?;
                 self.output.extend(files);
             }
@@ -824,13 +824,13 @@ impl<B: IcebergWriterBuilder> BoundedFanoutWriter<B> {
                 .build(Some(partition_key.clone()))
                 .await
                 .map_err(|e| {
-                    SqeError::Execution(format!("Failed to build partition writer: {e}"))
+                    SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build partition writer: {e}"))
                 })?;
             self.open.insert(key.clone(), writer);
         }
         self.open
             .get_mut(&key)
-            .ok_or_else(|| SqeError::Execution("partition writer missing after build".into()))
+            .ok_or_else(|| SqeError::with_code(SqeErrorCode::ExecutionFailed, "partition writer missing after build"))
     }
 
     /// Close and flush the least-recently-written open writer (never `protect`),
@@ -850,7 +850,7 @@ impl<B: IcebergWriterBuilder> BoundedFanoutWriter<B> {
             let files = writer
                 .close()
                 .await
-                .map_err(|e| SqeError::Execution(format!("Cutover close error: {e}")))?;
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Cutover close error: {e}")))?;
             self.output.extend(files);
         }
         let freed = self.est_bytes.remove(&key).unwrap_or(0);

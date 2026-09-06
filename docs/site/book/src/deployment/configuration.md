@@ -271,6 +271,14 @@ traces_otlp_endpoint = ""       # trace-only OTLP gRPC endpoint
 trace_sample_rate = 0.01         # 0.0 to 1.0
 audit_log_path = ""             # Audit JSONL file (empty = disabled)
 
+[metrics.audit]
+format = "native"               # native | ocsf | both
+queue_capacity = 10000          # bounded writer queue; drops increment
+                                # sqe_audit_events_dropped_total{reason="queue_full"}
+fail_mode = "open"              # open: drop events and keep serving
+                                # closed: QueryHandler refuses new statements
+                                # when the queue is full or the writer is gone
+
 # Advisory / active auto-compaction (Phase 4a+). Off by default: no
 # maintenance principal is constructed and no scheduler task runs
 # unless mode is set. See "Maintenance (auto-compaction)" below.
@@ -383,6 +391,8 @@ Every config field can be overridden via environment variable. Convention: `SQE_
 | `SQE_METRICS__TRACES_OTLP_ENDPOINT` | `metrics.traces_otlp_endpoint` | string |
 | `SQE_METRICS__TRACE_SAMPLE_RATE` | `metrics.trace_sample_rate` | f64 |
 | `SQE_METRICS__AUDIT_LOG_PATH` | `metrics.audit_log_path` | string |
+| `SQE_METRICS__AUDIT__QUEUE_CAPACITY` | `metrics.audit.queue_capacity` | usize |
+| `SQE_METRICS__AUDIT__FAIL_MODE` | `metrics.audit.fail_mode` | string (`open` or `closed`) |
 
 Boolean values accept: `true`/`false`, `1`/`0`, `yes`/`no`.
 

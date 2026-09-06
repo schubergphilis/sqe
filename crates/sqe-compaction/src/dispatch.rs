@@ -19,7 +19,7 @@
 use std::collections::HashSet;
 
 use iceberg::spec::{DataFile, FormatVersion, Schema, StructType};
-use sqe_core::SqeError;
+use sqe_core::{SqeError, SqeErrorCode};
 
 use crate::wire::CompactGroupResponse;
 
@@ -225,7 +225,7 @@ pub fn decode_group_response(
         format_version,
     )
     .map_err(|e| {
-        SqeError::Execution(format!(
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "compact_file_group: failed to decode group {}'s data files from avro: {e}",
             response.group_id
         ))
@@ -283,7 +283,7 @@ pub fn aggregate_group_outcomes(
     let removed_rows: u64 = old_files.iter().map(|f| f.record_count()).sum();
     let added_rows: u64 = new_files.iter().map(|f| f.record_count()).sum();
     if added_rows > removed_rows {
-        return Err(SqeError::Execution(format!(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "distributed compaction row-count invariant violated: added={added_rows} exceeds \
              removed={removed_rows} (rows_written across groups={rows_written}); a rewrite \
              cannot increase row count; aborting before commit"

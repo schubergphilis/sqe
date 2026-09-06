@@ -4,7 +4,7 @@
 - Severity: medium
 - Category: reliability
 - Effort: L (week+)
-- Status: open
+- Status: fixed (branch `fix/errors-audit-observability`, 2026-09-05)
 - Issue: #547
 
 ## Problem
@@ -96,3 +96,7 @@ is classified by whichever `contains` wins first.
 - Scope 800 cross-cutting error-handling review may pick up the client-message
   leakage side; this file is about classification.
 - Overlaps `305-error-classification-by-substring.md` (catalog side) and `800-error-classification-by-string-matching.md` (cross-cutting); this file owns the `sqe-core` type and the migration counts.
+
+## Resolution (2026-09-05)
+
+Same change as 800. `error_code()` on `Catalog`/`Execution` string variants still classifies by text but records `sqe_error_classified_by_text_total` via `classified_by_text_total()`. Typed `Sourced`/`CatalogHttp`/`with_code` never consult the message. `SqeError::Execution(` construction in non-test code is below the 100-site bar.

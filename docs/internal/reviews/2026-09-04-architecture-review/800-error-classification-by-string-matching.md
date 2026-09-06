@@ -4,7 +4,7 @@
 - Severity: high
 - Category: reliability
 - Effort: L
-- Status: open
+- Status: fixed (branch `fix/errors-audit-observability`, 2026-09-05)
 - Issue: #632
 
 ## Problem
@@ -109,3 +109,7 @@ grown in surface.
   and `crates/sqe-trino-compat/src/protocol.rs` consume `error_code()` and
   are the two client boundaries that benefit.
 - Overlaps 104 (sqe-core view) and 305 (catalog view) and 709 (Trino view); this file is the cross-crate count and the auto-recovery dependence. Fix once, close all four.
+
+## Resolution (2026-09-05)
+
+`SqeError::with_code` is the typed constructor. `From<DataFusionError>` maps Plan/Schema/ResourcesExhausted/NotImplemented by variant. Catalog HTTP status maps via `CatalogHttp` / `iceberg::Error::http_status()`. Legacy `Execution(String)` sites were migrated to `with_code` (739 replacements). Substring classifiers remain only for leftover string variants and increment `classified_by_text_total()` with a warn. Tests in `sqe-core/src/error.rs`.

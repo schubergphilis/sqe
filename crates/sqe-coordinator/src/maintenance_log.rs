@@ -134,7 +134,7 @@ use iceberg::{Catalog, ErrorKind, NamespaceIdent, TableIdent};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use sqe_core::SqeError;
+use sqe_core::{SqeError, SqeErrorCode};
 
 use crate::catalog_ops::is_namespace_not_found;
 use crate::table_health::TableHealth;
@@ -482,7 +482,7 @@ pub(crate) fn rows_to_record_batch(rows: &[MaintenanceLogRow]) -> sqe_core::Resu
             ),
         ],
     )
-    .map_err(|e| SqeError::Execution(format!("maintenance_log: failed to build row batch: {e}")))
+    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("maintenance_log: failed to build row batch: {e}")))
 }
 
 /// Resolve `state_table` (a plain `ns.table` string, e.g. the
@@ -602,7 +602,7 @@ pub async fn append_row(
         },
     )
     .await
-    .map_err(|e| SqeError::Execution(format!("maintenance_log: failed to commit append: {e}")))?;
+    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("maintenance_log: failed to commit append: {e}")))?;
     cleanup_guard.mark_committed();
 
     Ok(())

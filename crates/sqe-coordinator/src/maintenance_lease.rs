@@ -108,7 +108,7 @@ use iceberg::{Catalog, ErrorKind};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use sqe_core::SqeError;
+use sqe_core::{SqeError, SqeErrorCode};
 
 use crate::maintenance_log::{
     collect_live_data_files, field_id, read_batches, resolve_state_table_ident,
@@ -287,23 +287,23 @@ async fn read_single_row_batch(
         .into_iter()
         .find(|b| b.num_rows() > 0)
         .ok_or_else(|| {
-            SqeError::Execution(format!("maintenance_lease: '{file_path}' contains no rows"))
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("maintenance_lease: '{file_path}' contains no rows"))
         })
 }
 
 fn get_str_col(batch: &RecordBatch, name: &str, file_path: &str) -> sqe_core::Result<String> {
     let col = batch.column_by_name(name).ok_or_else(|| {
-        SqeError::Execution(format!(
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "maintenance_lease: '{file_path}' is missing column '{name}'"
         ))
     })?;
     let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-        SqeError::Execution(format!(
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "maintenance_lease: '{file_path}' column '{name}' is not Utf8"
         ))
     })?;
     if arr.is_null(0) {
-        return Err(SqeError::Execution(format!(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "maintenance_lease: '{file_path}' column '{name}' is unexpectedly null"
         )));
     }
@@ -312,17 +312,17 @@ fn get_str_col(batch: &RecordBatch, name: &str, file_path: &str) -> sqe_core::Re
 
 fn get_i64_col(batch: &RecordBatch, name: &str, file_path: &str) -> sqe_core::Result<i64> {
     let col = batch.column_by_name(name).ok_or_else(|| {
-        SqeError::Execution(format!(
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "maintenance_lease: '{file_path}' is missing column '{name}'"
         ))
     })?;
     let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-        SqeError::Execution(format!(
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "maintenance_lease: '{file_path}' column '{name}' is not Int64"
         ))
     })?;
     if arr.is_null(0) {
-        return Err(SqeError::Execution(format!(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "maintenance_lease: '{file_path}' column '{name}' is unexpectedly null"
         )));
     }
@@ -454,7 +454,7 @@ async fn commit_cas(
     let commit_result = if delete_targets.is_empty() {
         let action = tx.fast_append().add_data_files(vec![new_file]);
         let tx = action.apply(tx).map_err(|e| {
-            SqeError::Execution(format!(
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "maintenance_lease: failed to apply bootstrap claim: {e}"
             ))
         })?;
@@ -466,7 +466,7 @@ async fn commit_cas(
             .add_data_files(vec![new_file])
             .set_check_file_existence(true);
         let tx = action.apply(tx).map_err(|e| {
-            SqeError::Execution(format!(
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "maintenance_lease: failed to apply claim rewrite: {e}"
             ))
         })?;
@@ -479,7 +479,7 @@ async fn commit_cas(
         Err(e) if e.retryable() || is_conflict_message(&e.to_string()) => {
             Ok(CasOutcome::Transient(e))
         }
-        Err(e) => Err(SqeError::Execution(format!(
+        Err(e) => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "maintenance_lease: commit failed: {e}"
         ))),
     }
@@ -499,7 +499,7 @@ async fn write_lease_file(
     let mut files = write_data_files(table, vec![batch], op, compression, tracker).await?;
     if files.is_empty() {
         cleanup_guard.mark_committed();
-        return Err(SqeError::Execution(format!(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "maintenance_lease: writing a {op} row produced no data file"
         )));
     }
@@ -594,7 +594,7 @@ pub async fn try_acquire(
                     }
                     CasOutcome::Lost => return Ok(None),
                     CasOutcome::Transient(e) => {
-                        last_err = Some(SqeError::Execution(format!(
+                        last_err = Some(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                             "maintenance_lease: transient conflict claiming '{job_key}': {e}"
                         )));
                         if attempt < MAX_LEASE_ATTEMPTS {
@@ -608,7 +608,7 @@ pub async fn try_acquire(
     }
 
     Err(last_err.unwrap_or_else(|| {
-        SqeError::Execution(format!(
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "maintenance_lease: exhausted attempts acquiring '{job_key}'"
         ))
     }))
@@ -641,13 +641,13 @@ pub async fn renew(
             .iter()
             .find(|r| r.state.claim_path == handle.claim_path && !r.state.released);
         let Some(current) = current else {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "maintenance_lease: lease for '{}' is no longer live (expired/released/stolen), cannot renew",
                 handle.job_key
             )));
         };
         if current.state.holder_id != handle.holder_id {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "maintenance_lease: lease for '{}' is held by '{}', not '{}'; cannot renew",
                 handle.job_key, current.state.holder_id, handle.holder_id
             )));
@@ -675,13 +675,13 @@ pub async fn renew(
                 return Ok(());
             }
             CasOutcome::Lost => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "maintenance_lease: lost the lease for '{}' while renewing (raced out by another holder)",
                     handle.job_key
                 )));
             }
             CasOutcome::Transient(e) => {
-                last_err = Some(SqeError::Execution(format!(
+                last_err = Some(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "maintenance_lease: transient conflict renewing '{}': {e}",
                     handle.job_key
                 )));
@@ -694,7 +694,7 @@ pub async fn renew(
     }
 
     Err(last_err.unwrap_or_else(|| {
-        SqeError::Execution(format!(
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "maintenance_lease: exhausted attempts renewing '{}'",
             handle.job_key
         ))
@@ -784,7 +784,7 @@ pub async fn release(
                 return Ok(());
             }
             CasOutcome::Transient(e) => {
-                last_err = Some(SqeError::Execution(format!(
+                last_err = Some(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "maintenance_lease: transient conflict releasing '{}': {e}",
                     handle.job_key
                 )));
@@ -797,7 +797,7 @@ pub async fn release(
     }
 
     Err(last_err.unwrap_or_else(|| {
-        SqeError::Execution(format!(
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "maintenance_lease: exhausted attempts releasing '{}'",
             handle.job_key
         ))
