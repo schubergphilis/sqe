@@ -99,7 +99,7 @@ BENCH_ENV       = PROFILE=$(BENCH_PROFILE) BENCH_LOG_DIR=$(BENCH_LOG_DIR)
         benchmark_sf0.1 benchmark_sf1 benchmark_sf10 benchmark_all \
         benchmark_sf0.1_trino benchmark_sf1_trino benchmark_sf10_trino \
         benchmark_all_trino \
-        clippy fmt fmt-check clean clean-rust clean-rustbook \
+        clippy fmt fmt-check pre-commit clean clean-rust clean-rustbook \
         clean-ebook clean-benchmark-charts clean-images check-tools maintain \
         build build-sqe sbom sbom-sqe sqe-config images \
         login buildx-builder push push-sqe leak-scan
@@ -123,6 +123,7 @@ help:
 	@echo "    make clippy       cargo clippy --all-targets -- -D warnings"
 	@echo "    make fmt          cargo fmt --all"
 	@echo "    make fmt-check    cargo fmt --all --check"
+	@echo "    make pre-commit   gitleaks + file checks (Aikido .pre secret-scan analog)"
 	@echo ""
 	@echo "  Supply chain:"
 	@echo "    make audit        cargo audit + cargo deny check (advisories, bans, sources)"
@@ -339,6 +340,12 @@ fmt:
 fmt-check:
 	@echo "==> Checking formatting"
 	$(CARGO) fmt --all --check
+
+# Local analog of Aikido aikido-secret-scan (gitleaks via .pre-commit-config.yaml).
+# Requires `pre-commit` on PATH (`pipx install pre-commit` / `brew install pre-commit`).
+pre-commit:
+	@echo "==> Running pre-commit hooks"
+	pre-commit run
 
 # ── Container image: build / SBOM / config / push ─────────────────────────
 # Build context is the repo root (the Dockerfile COPYs Cargo.toml, crates/,

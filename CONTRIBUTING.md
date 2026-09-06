@@ -66,6 +66,34 @@ fix: handle expired JWT tokens in bearer auth
 docs: update pluggable catalogs design spec
 ```
 
+## Pre-commit hooks
+
+This repo ships a [pre-commit](https://pre-commit.com) config that mirrors
+Aikido's `.pre` secret-scan gate (`aikido-secret-scan`: gitleaks against
+`.gitleaks.toml`) plus a few cheap file checks. The hook is already installed
+in many local clones; without `.pre-commit-config.yaml` it used to skip.
+
+```bash
+# once per clone (skip if `git config core.hooksPath` is already set;
+# this repo's git template installs the pre-commit wrapper into .git/hooks)
+pre-commit install
+
+# against staged files (also runs as the git pre-commit hook)
+pre-commit run
+make pre-commit
+
+# against the whole tree
+pre-commit run --all-files
+```
+
+The gitleaks hook compiles the pinned `v8.30.1` tag (same 8.30.x line as the
+aikido-tools image) rather than calling a system `gitleaks`. Allowlists live
+in `.gitleaks.toml`, not in the hook.
+
+Semgrep, grype, trivy, and syft stay in CI. They need the aikido-tools image
+and are too heavy for a commit hook. The full-history gitleaks pass is
+schedule-only in CI (`aikido-secret-scan-history`).
+
 ## Code Style
 
 SQE follows standard Rust conventions:
