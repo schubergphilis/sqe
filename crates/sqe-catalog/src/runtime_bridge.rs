@@ -139,7 +139,11 @@ where
         // the scheduler, so the runtime keeps driving IO and timers while this
         // await runs and the deadlock this module guards against cannot arise.
         // Bounding it would need its own thread, on the hot path of every TVF
-        // call, to protect against nothing.
+        // call, to protect against nothing. The bound this path relies on is
+        // the catalog HTTP client's `[catalog] request_timeout_secs`: every
+        // Polaris call underneath a blocked `table_names` carries that
+        // deadline, so a silent catalog returns here in bounded time
+        // (architecture review 300).
         return Ok(tokio::task::block_in_place(|| handle.block_on(fut)));
     }
 

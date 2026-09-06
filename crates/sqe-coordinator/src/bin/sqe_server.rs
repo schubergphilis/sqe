@@ -14,7 +14,9 @@ use sqe_coordinator::mode::Mode;
 use sqe_coordinator::{QueryHandler, SessionManager};
 use sqe_core::SqeConfig;
 use sqe_policy::grants::GrantBackend;
-use sqe_trino_compat::server::{NodeContext, TrinoAuthenticator, TrinoQueryExecutor};
+use sqe_trino_compat::server::{
+    NodeContext, TrinoAuthenticator, TrinoQueryExecutor, TrinoResultStream,
+};
 
 // ── CLI ────────────────────────────────────────────────────────
 #[derive(Parser)]
@@ -730,11 +732,18 @@ struct QueryHandlerAdapter {
 
 #[async_trait::async_trait]
 impl TrinoQueryExecutor for QueryHandlerAdapter {
+    /// SELECTs stream through [`QueryHandler::execute_stream`] so the Trino
+    /// path never holds more than one page of a result (#621); every other
+    /// statement kind (DML counts, DDL, SHOW, ...) takes the buffered
+    /// `execute` path exactly as Flight SQL does.
     async fn execute(
         &self,
         session: &sqe_core::Session,
         sql: &str,
-    ) -> Result<Vec<arrow_array::RecordBatch>, sqe_core::SqeError> {
+    ) -> Result<TrinoResultStream, sqe_core::SqeError> {
+        use futures::StreamExt;
+        use sqe_sql::{parse_and_classify_typed, pre_parse_pipeline, StatementKind, UserSql};
+
         self.rate_limiter
             .check(&session.user.username)
             .map_err(|e| {
@@ -743,7 +752,25 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
                     format!("rate limit: {e}"),
                 )
             })?;
-        self.handler.execute(session, sql, None).await
+        // Classification failures fall through to `execute`, which produces
+        // the engine's own parse error for the client.
+        let is_query = pre_parse_pipeline(&UserSql::from(sql))
+            .and_then(|c| parse_and_classify_typed(&c))
+            .map(|kind| matches!(kind, StatementKind::Query(_)))
+            .unwrap_or(false);
+        if is_query {
+            let (schema, stream) = self.handler.execute_stream(session, sql, None).await?;
+            let stream = stream.map(|res| res.map_err(sqe_core::SqeError::from));
+            return Ok(TrinoResultStream::new(schema, Box::pin(stream)));
+        }
+        self.handler
+            .execute(session, sql, None)
+            .await
+            .map(TrinoResultStream::from_batches)
+    }
+
+    fn memory_pool(&self) -> Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>> {
+        Some(self.handler.runtime().memory_pool.clone())
     }
 
     async fn describe_prepared(
@@ -1210,9 +1237,11 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     // Table metadata is user-independent. Schema, partitions, and snapshots are the
     // same regardless of who queries. The cache is invalidated on DDL/DML operations.
     let table_cache = sqe_catalog::TableMetadataCache::new(config.catalog.metadata_cache_ttl_secs)
+        .with_authorization_recheck(config.catalog.authorization_recheck_secs)
         .with_metrics(Arc::clone(&metrics));
     tracing::info!(
         metadata_cache_ttl_secs = config.catalog.metadata_cache_ttl_secs,
+        authorization_recheck_secs = config.catalog.authorization_recheck_secs,
         "Initialized global table metadata cache (shared across all sessions)"
     );
 
@@ -1320,6 +1349,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             sqe_coordinator::maintenance::MaintenanceHandler::new(config.clone())
                 .with_table_cache(table_cache.clone())
                 .with_audit(Arc::clone(&audit))
+                .with_metrics(Arc::clone(&metrics))
                 // Phase 4c Task 5: same registry the interactive `CALL` path's
                 // `MaintenanceHandler` gets (see `QueryHandler::new`), so the
                 // scheduler's active-mode `distribution.mode` routing sees the

@@ -32,7 +32,7 @@
 │  PolicyEnforcer trait (no-op now, OPA/Cedar later)          │
 │  Metrics Collector (Prometheus)                             │
 └──────────────────────────┬──────────────────────────────────┘
-                           │  Arrow Flight (plan fragments)
+                           │  Arrow Flight (ScanTasks; distributed scan)
               ┌────────────┼────────────┐
 ┌─────────────▼──┐  ┌──────▼───────┐  ┌─▼──────────────┐
 │   Worker Node   │  │  Worker Node  │  │  Worker Node   │
@@ -123,8 +123,8 @@ Coordinator (Scheduler)
   ├── Runs DataFusion optimizer (predicate pushdown, projection pruning)
   ├── Converts to PhysicalPlan
   ├── Partitions by Iceberg manifest/data file groups
-  ├── Assigns fragments to workers (locality-aware if on-prem)
-  └── Streams results back via Arrow Flight
+  ├── Assigns scan tasks to workers (least reserved load, path affinity)
+  └── Runs joins, aggregates and sorts over the returned Arrow streams
 
 Worker (Executor)
   ├── Receives a ScanTask (file list + projection + predicate + limit) and the bearer token
@@ -306,8 +306,8 @@ sovereign-query-engine/
 - Manifest caching for metadata performance
 - Audit logging (structured JSON query log)
 
-### Phase 3: Distributed execution (4-6 weeks)
-- Ballista-derived scheduler + worker model
+### Phase 3: Distributed scan (4-6 weeks)
+- Bespoke scheduler + stateless scan workers (shipped as scan offload, not plan-fragment execution; see 2.3)
 - Auth context propagation via Flight metadata
 - Partition-aware query splitting (Iceberg manifest-level)
 - Multi-worker execution with result aggregation

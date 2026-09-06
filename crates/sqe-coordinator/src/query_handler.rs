@@ -314,6 +314,9 @@ impl QueryHandler {
         if let Some(ref a) = audit {
             maintenance_handler = maintenance_handler.with_audit(Arc::clone(a));
         }
+        if let Some(ref m) = metrics {
+            maintenance_handler = maintenance_handler.with_metrics(Arc::clone(m));
+        }
         // Phase 4c Task 5: wire the same worker registry the query path
         // already got as a constructor argument, so the interactive `CALL
         // system.rewrite_data_files(...)`'s `distribution.mode` routing sees
@@ -2895,8 +2898,24 @@ impl QueryHandler {
     /// to [`Self::execute`] in that case. DML that materializes a result
     /// set (INSERT, MERGE, DELETE, UPDATE) still goes through the
     /// buffered path because the write handlers consume a `Vec<RecordBatch>`.
+    pub async fn execute_stream(
+        &self,
+        session: &Session,
+        sql: &str,
+        client_ip: Option<String>,
+    ) -> sqe_core::Result<(SchemaRef, SendableRecordBatchStream)> {
+        self.execute_stream_with_id(session, sql, client_ip, None)
+            .await
+    }
+
+    /// [`Self::execute_stream`] with a caller-minted `query_id`.
+    ///
+    /// Finding 403: Flight SQL mints the id in `get_flight_info_statement`
+    /// and puts it in the ticket, so the id the client holds and the id the
+    /// [`QueryTracker`] records are the same one; `CancelQuery` can then
+    /// reach the running stream. `None` mints a fresh id (all other callers).
     #[tracing::instrument(
-        skip(self, session, sql),
+        skip(self, session, sql, query_id),
         fields(
             db.system.name = "sqe",
             username = %session.user.username,
@@ -2904,11 +2923,12 @@ impl QueryHandler {
         ),
         name = "execute_stream",
     )]
-    pub async fn execute_stream(
+    pub async fn execute_stream_with_id(
         &self,
         session: &Session,
         sql: &str,
         client_ip: Option<String>,
+        query_id: Option<uuid::Uuid>,
     ) -> sqe_core::Result<(SchemaRef, SendableRecordBatchStream)> {
         // Issue #403: same pre-parse size cap as execute().
         reject_oversized_sql(&self.config.query, sql)?;
@@ -3028,7 +3048,7 @@ impl QueryHandler {
 
         // --- Start tracker ----------------------------------------------------
         let start = std::time::Instant::now();
-        let query_id = uuid::Uuid::now_v7();
+        let query_id = query_id.unwrap_or_else(uuid::Uuid::now_v7);
         let query_span = tracing::info_span!(
             "sqe.query",
             query_id = %query_id,
@@ -3128,9 +3148,11 @@ impl QueryHandler {
                 .with_idle_timeout(std::time::Duration::from_secs(
                     self.config.query.stream_idle_timeout_secs,
                 ))
-                // Bounds progress-based idle extensions (issue #365): the
-                // streaming path has no outer tokio timeout, so this is
-                // where `query.timeout_secs` gets enforced for streams.
+                // Absolute wall-clock deadline for the streaming path
+                // (finding 403). The stream polls it on every `Pending`
+                // independently of the idle timer, so `query.timeout_secs`
+                // bounds a stream that keeps trickling batches too; it also
+                // caps progress-based idle extensions (issue #365).
                 .with_query_deadline(std::time::Duration::from_secs(
                     timeout_for_session(&self.config.query, session),
                 ));
@@ -3553,6 +3575,20 @@ impl QueryHandler {
         summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
+
+        // Review 806: refresh the table-name snapshots of the namespaces this
+        // statement references here, on the async path, so DataFusion's
+        // synchronous `SchemaProvider::table_names()` never bridges onto the
+        // network. Snapshots younger than the TTL are skipped; failures are
+        // recorded in the snapshot (served as last-known + warning) and the
+        // table lookup itself reports the precise error.
+        sqe_catalog::schema_provider::refresh_referenced_namespaces(
+            &session_catalog,
+            session_catalog.warehouse(),
+            sql,
+            session.default_schema.as_deref(),
+        )
+        .await;
 
         // Pre-process incremental (CDC) first. The FOR INCREMENTAL BETWEEN
         // clause is not modelled by sqlparser-rs, so the downstream
@@ -4225,7 +4261,9 @@ impl QueryHandler {
             .map(|url| crate::scheduler::WorkerInfo {
                 url: url.clone(),
                 healthy: true,
-                active_fragments: self.worker_load.in_flight(url),
+                // Finding 408: same unit as `scheduler::estimate_cost`
+                // (MB), reserved below via `reserve_load`.
+                in_flight_load: self.worker_load.in_flight_load(url),
             })
             .collect();
 
@@ -4247,7 +4285,11 @@ impl QueryHandler {
         let reservations: Arc<dashmap::DashMap<String, crate::worker_registry::ReservationGuard>> =
             Arc::new(dashmap::DashMap::new());
         for (task, url) in scan_tasks.iter().zip(worker_urls.iter()) {
-            reservations.insert(task.fragment_id.clone(), self.worker_load.reserve(url));
+            reservations.insert(
+                task.fragment_id.clone(),
+                self.worker_load
+                    .reserve_load(url, crate::scheduler::estimate_cost(task)),
+            );
         }
 
         let fragment_infos: Vec<crate::query_tracker::FragmentInfo> = scan_tasks
@@ -4269,12 +4311,19 @@ impl QueryHandler {
         let callback_metrics = self.metrics.clone();
         let reservations_cb = reservations.clone();
         let callback: crate::distributed_scan::FragmentCallback =
-            Arc::new(move |task_id, success, elapsed_ms, rows| {
+            Arc::new(move |task_id, outcome, elapsed_ms, rows| {
+                // Finding 408: released on every outcome, including a stream
+                // dropped before EOF (LIMIT / cancel), so the worker's reserved
+                // load does not linger until the plan Arc drops.
                 let _ = reservations_cb.remove(task_id);
-                let state = if success {
-                    FragmentState::Finished
-                } else {
-                    FragmentState::Failed
+                use crate::distributed_scan::FragmentOutcome;
+                let state = match outcome {
+                    FragmentOutcome::Finished => FragmentState::Finished,
+                    FragmentOutcome::Failed => FragmentState::Failed,
+                    // No `FragmentState::Cancelled` yet; leave the tracker row
+                    // as it was (previously Drop never reported at all) rather
+                    // than mislabel a clean stop as Failed.
+                    FragmentOutcome::Cancelled => return,
                 };
                 tracker.update_fragment(&qid, task_id, state, elapsed_ms, rows);
 

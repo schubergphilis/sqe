@@ -110,10 +110,7 @@ pub fn verify_chain(events: &[AuditEvent]) -> Result<(), ChainError> {
     let mut expected_seq = first.integrity.seq;
     // A chain that claims to start at seq 0 must be rooted at genesis or an
     // explicit BROKEN marker. Anything else is a broken link at seq 0.
-    if expected_seq == 0
-        && prev != GENESIS
-        && !prev.starts_with("BROKEN:")
-    {
+    if expected_seq == 0 && prev != GENESIS && !prev.starts_with("BROKEN:") {
         return Err(ChainError::BrokenLink { seq: 0 });
     }
     for ev in events {

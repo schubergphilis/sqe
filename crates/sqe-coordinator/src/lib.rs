@@ -29,6 +29,7 @@ pub mod mode;
 pub mod parallel_probe_scan;
 pub mod parallel_scan;
 pub mod policy_wiring;
+pub mod puffin_carry;
 pub mod quack_executor;
 pub mod mcp_server;
 pub mod query_cache;

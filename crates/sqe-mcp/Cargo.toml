@@ -24,6 +24,9 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
+[lints]
+workspace = true
+
 [dev-dependencies]
 arrow-schema = { workspace = true }
 tower = { version = "0.5", features = ["util"] }

@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use datafusion::catalog::SchemaProvider;
@@ -10,7 +10,7 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use iceberg::NamespaceIdent;
 use moka::sync::Cache as SyncCache;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use sqe_core::config::StorageConfig;
 
@@ -18,10 +18,201 @@ use crate::catalog_provider::SqeCatalogProvider;
 use crate::rest_catalog::SessionCatalog;
 use crate::table_provider::SqeTableProvider;
 
-/// TTL for the per-namespace table_names() cache. Short so DDL becomes
-/// visible within a few seconds without each planning lookup paying two
-/// REST round trips against Polaris.
+/// Refresh interval for a namespace's table-name snapshot. A snapshot older
+/// than this is re-listed by the next async pre-plan refresh, so DDL by other
+/// writers becomes visible within a few seconds without any planning lookup
+/// paying a REST round trip.
 const TABLE_NAMES_TTL_SECS: u64 = 5;
+
+/// Last known table + view names of one namespace for one principal
+/// (architecture review 806).
+///
+/// `SchemaProvider::table_names()` is synchronous and has no error channel.
+/// It used to bridge onto the network from inside a DataFusion hook and turn
+/// a Polaris 503 into "this schema has no tables". It now serves this
+/// snapshot, which is refreshed by [`refresh_namespace_listing`] from the
+/// coordinator's async pre-plan path. A failed refresh keeps the previous
+/// `names` and records why in `stale_error`, so readers can tell "empty"
+/// from "unavailable".
+#[derive(Debug, Clone)]
+pub struct NamespaceListing {
+    /// Tables then views, as of the last successful refresh.
+    pub names: Vec<String>,
+    /// When the last refresh (successful or not) was attempted.
+    pub checked_at: Instant,
+    /// Error text of the most recent failed refresh, or `None` when `names`
+    /// reflects the catalog as of `checked_at`.
+    pub stale_error: Option<String>,
+    /// True when `stale_error` came from an authorization failure rather
+    /// than an outage. Denied is a legitimate (empty) answer; unavailable
+    /// is not.
+    pub denied: bool,
+}
+
+impl NamespaceListing {
+    /// True when a refresh should run before the next planning pass.
+    pub fn needs_refresh(&self) -> bool {
+        self.checked_at.elapsed() >= Duration::from_secs(TABLE_NAMES_TTL_SECS)
+    }
+
+    /// True when the snapshot is stale because the catalog could not be
+    /// reached (not because the principal was denied).
+    pub fn unavailable(&self) -> bool {
+        self.stale_error.is_some() && !self.denied
+    }
+}
+
+/// Process-global table-name snapshots keyed
+/// `{token_fingerprint}|{warehouse}|{namespace}`. Global rather than per
+/// provider because the coordinator builds a fresh `SessionContext` (and so
+/// fresh providers) per query; a per-provider cache never survived to the
+/// next statement, which is why the old 5 s TTL was "only within a single
+/// provider instance's lifetime" (review 307). The principal is part of the
+/// key so one user's visible names never serve another.
+static TABLE_NAMES_SNAPSHOTS: LazyLock<SyncCache<String, Arc<NamespaceListing>>> =
+    LazyLock::new(|| {
+        SyncCache::builder()
+            .max_capacity(20_000)
+            .time_to_idle(Duration::from_secs(3600))
+            .build()
+    });
+
+fn listing_key(catalog: &SessionCatalog, warehouse: &str, namespace: &str) -> String {
+    format!("{}|{warehouse}|{namespace}", catalog.token_fingerprint())
+}
+
+/// Snapshot for `(catalog principal, warehouse, namespace)`, if any.
+pub fn cached_namespace_listing(
+    catalog: &SessionCatalog,
+    warehouse: &str,
+    namespace: &str,
+) -> Option<Arc<NamespaceListing>> {
+    TABLE_NAMES_SNAPSHOTS.get(&listing_key(catalog, warehouse, namespace))
+}
+
+/// Drop the snapshot for one namespace so the next pre-plan refresh
+/// re-lists it. Call after DDL that creates or drops a table/view.
+pub fn invalidate_namespace_listing(catalog: &SessionCatalog, warehouse: &str, namespace: &str) {
+    TABLE_NAMES_SNAPSHOTS.invalidate(&listing_key(catalog, warehouse, namespace));
+}
+
+/// Fold one refresh outcome into the previous snapshot: success replaces the
+/// names, failure keeps them and records the error. Pure so it is testable
+/// without a catalog; `a_bridge_failure_keeps_previous_snapshot` in
+/// `catalog_provider.rs` is the same rule for namespaces.
+pub(crate) fn merge_listing(
+    previous: Option<&NamespaceListing>,
+    outcome: Result<Vec<String>, (String, bool)>,
+) -> NamespaceListing {
+    match outcome {
+        Ok(names) => NamespaceListing {
+            names,
+            checked_at: Instant::now(),
+            stale_error: None,
+            denied: false,
+        },
+        Err((error, denied)) => NamespaceListing {
+            names: previous.map(|p| p.names.clone()).unwrap_or_default(),
+            checked_at: Instant::now(),
+            stale_error: Some(error),
+            denied,
+        },
+    }
+}
+
+/// List tables and views of `namespace` with the caller's bearer and store
+/// the result as the namespace's snapshot. On failure the previous names are
+/// kept and the error recorded; the error is also returned so an async caller
+/// can decide whether to surface it.
+///
+/// This is the only place the table-name snapshot touches the network, and
+/// it is `async`: call it from the coordinator's pre-plan path
+/// (`refresh_referenced_namespaces`) or from `SqeCatalogProvider::refresh_namespace`.
+pub async fn refresh_namespace_listing(
+    catalog: &SessionCatalog,
+    warehouse: &str,
+    namespace: &str,
+) -> sqe_core::Result<Arc<NamespaceListing>> {
+    let key = listing_key(catalog, warehouse, namespace);
+    let previous = TABLE_NAMES_SNAPSHOTS.get(&key);
+    let ns_ident = NamespaceIdent::new(namespace.to_string());
+
+    let outcome = match catalog.list_tables(&ns_ident).await {
+        Ok(tables) => {
+            let mut names: Vec<String> = tables.iter().map(|t| t.name().to_string()).collect();
+            // Views are additive: a failed view listing degrades to
+            // tables-only rather than failing the whole snapshot, as before.
+            match catalog.list_views(&ns_ident).await {
+                Ok(views) => names.extend(views),
+                Err(e) => {
+                    warn!(namespace = %namespace, error = %e, "Failed to list views; snapshot carries tables only");
+                }
+            }
+            Ok(names)
+        }
+        Err(e) => {
+            let denied = matches!(
+                e.error_code(),
+                sqe_core::SqeErrorCode::AccessDenied | sqe_core::SqeErrorCode::AuthenticationFailed
+            );
+            Err((e.to_string(), denied, e))
+        }
+    };
+
+    let (merged, err) = match outcome {
+        Ok(names) => (merge_listing(previous.as_deref(), Ok(names)), None),
+        Err((text, denied, e)) => (
+            merge_listing(previous.as_deref(), Err((text, denied))),
+            Some(e),
+        ),
+    };
+    let merged = Arc::new(merged);
+    TABLE_NAMES_SNAPSHOTS.insert(key, Arc::clone(&merged));
+    match err {
+        Some(e) => {
+            error!(namespace = %namespace, error = %e, kept = merged.names.len(), "Failed to list tables; keeping previous snapshot");
+            Err(e)
+        }
+        None => Ok(merged),
+    }
+}
+
+/// Refresh the snapshots a statement is about to plan against, off the async
+/// path (review 806). Refreshes the session default schema plus every
+/// schema-qualified reference in `sql` that targets `warehouse`; schemas
+/// whose snapshot is younger than [`TABLE_NAMES_TTL_SECS`] are skipped, so the
+/// steady-state cost is two catalog calls per namespace per window, not per
+/// query. Refresh failures are recorded in the snapshot, never propagated:
+/// planning proceeds and `table()` reports the precise error for the table
+/// it actually needs.
+pub async fn refresh_referenced_namespaces(
+    catalog: &SessionCatalog,
+    warehouse: &str,
+    sql: &str,
+    default_schema: Option<&str>,
+) {
+    let mut namespaces: Vec<String> = Vec::new();
+    if let Some(ns) = default_schema {
+        namespaces.push(ns.to_string());
+    }
+    for (cat, schema) in sqe_sql::extract_schema_qualifiers_from_sql(sql) {
+        if cat.as_deref().is_none_or(|c| c == warehouse) && !namespaces.contains(&schema) {
+            namespaces.push(schema);
+        }
+    }
+    for ns in namespaces {
+        if ns.eq_ignore_ascii_case("information_schema") {
+            continue;
+        }
+        let fresh =
+            cached_namespace_listing(catalog, warehouse, &ns).is_some_and(|l| !l.needs_refresh());
+        if fresh {
+            continue;
+        }
+        // Errors are already folded into the snapshot with their reason.
+        let _ = refresh_namespace_listing(catalog, warehouse, &ns).await;
+    }
+}
 
 /// Return true if `name` is present in the namespace's table/view name set.
 ///
@@ -40,9 +231,9 @@ fn should_try_view_after_table_error(error: &sqe_core::SqeError) -> bool {
 
 /// DataFusion `SchemaProvider` that maps an Iceberg namespace to a DataFusion schema.
 ///
-/// Tables are loaded lazily when `table()` is called. The `table_names()` method
-/// performs an async call via `tokio::task::block_in_place` to list tables and views
-/// from the Iceberg catalog.
+/// Tables are loaded lazily when `table()` is called (async, so it may talk
+/// to the catalog). `table_names()` is synchronous and serves the namespace's
+/// last known snapshot; see [`NamespaceListing`].
 #[derive(Debug)]
 pub struct SqeSchemaProvider {
     session_catalog: Arc<SessionCatalog>,
@@ -71,11 +262,12 @@ pub struct SqeSchemaProvider {
     /// Fetch/decode pipelining depth (sqe#scan-fetch-pipeline); see
     /// `SqeTableProvider::with_scan_fetch_ahead`.
     scan_fetch_ahead: Option<usize>,
-    /// Short-TTL cache of table_names() results so repeated planning
-    /// lookups during a single dbt run do not pay two REST round trips
-    /// per call.
-    table_names_cache: SyncCache<String, Arc<Vec<String>>>,
-    /// Set when `list_tables`/`list_views` failed so `table_exist` does not
+    /// Namespace names the owning `SqeCatalogProvider` already resolved for
+    /// this session. `plan_view` builds its planning catalog from these
+    /// instead of re-listing Polaris (review 307).
+    known_namespaces: Vec<String>,
+    /// Set when the most recent `table_names()` served no fresh snapshot
+    /// (none yet, or stale after a failed refresh) so `table_exist` does not
     /// treat an outage as "table missing".
     listing_failed: AtomicBool,
 }
@@ -88,10 +280,6 @@ impl SqeSchemaProvider {
         storage_config: StorageConfig,
         warehouse: String,
     ) -> Self {
-        let table_names_cache = SyncCache::builder()
-            .max_capacity(128)
-            .time_to_live(Duration::from_secs(TABLE_NAMES_TTL_SECS))
-            .build();
         Self {
             session_catalog,
             namespace,
@@ -107,16 +295,39 @@ impl SqeSchemaProvider {
             runtime_filter_bloom_probe: true,
             runtime_filter_bloom_max_values: 65536,
             scan_fetch_ahead: None,
-            table_names_cache,
+            known_namespaces: Vec::new(),
             listing_failed: AtomicBool::new(false),
         }
     }
 
-    /// Drop any cached `table_names()` result for this namespace. Call after
-    /// DDL that creates or drops a table/view so the next planning lookup
-    /// sees the change without waiting for the TTL.
+    /// Drop the cached `table_names()` snapshot for this namespace. Call after
+    /// DDL that creates or drops a table/view so the next pre-plan refresh
+    /// re-lists instead of waiting for the TTL.
     pub fn invalidate_table_names(&self) {
-        self.table_names_cache.invalidate(&self.namespace);
+        invalidate_namespace_listing(&self.session_catalog, &self.warehouse, &self.namespace);
+    }
+
+    /// Re-list this namespace now (async). See [`refresh_namespace_listing`].
+    pub async fn refresh_table_names(&self) -> sqe_core::Result<Arc<NamespaceListing>> {
+        refresh_namespace_listing(&self.session_catalog, &self.warehouse, &self.namespace).await
+    }
+
+    /// The current snapshot, if one exists.
+    pub fn cached_listing(&self) -> Option<Arc<NamespaceListing>> {
+        cached_namespace_listing(&self.session_catalog, &self.warehouse, &self.namespace)
+    }
+
+    /// True when there is no snapshot or it is older than the TTL.
+    pub fn needs_refresh(&self) -> bool {
+        self.cached_listing().is_none_or(|l| l.needs_refresh())
+    }
+
+    /// Namespace names already resolved by the owning catalog provider, used
+    /// by `plan_view` to avoid a fresh namespace listing.
+    #[must_use = "with_known_namespaces consumes self; bind the returned provider"]
+    pub fn with_known_namespaces(mut self, namespaces: Vec<String>) -> Self {
+        self.known_namespaces = namespaces;
+        self
     }
 
     /// Set the small-file threshold (bytes) for the direct-read fast path.
@@ -186,92 +397,52 @@ impl SqeSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for SqeSchemaProvider {
-    // SAFETY NOTE: DataFusion's SchemaProvider::table_names() is synchronous by design
-    // (returns Vec<String>, not a Future). Since our catalog is async (HTTP calls to
-    // Polaris), we use `block_in_place` to bridge the sync-async gap. This yields the
-    // current tokio thread first (avoiding deadlock with the current-thread runtime),
-    // then blocks on the async call. This is a known DataFusion design constraint —
-    // the SchemaProvider trait predates DataFusion's async catalog work. A future
-    // DataFusion version may provide an async alternative.
+    // `SchemaProvider::table_names()` is synchronous by design (returns
+    // `Vec<String>`, not a `Future`) and has no error channel. It serves the
+    // namespace's last known snapshot and never touches the network: the
+    // snapshot is refreshed by `refresh_namespace_listing` from the
+    // coordinator's async pre-plan path (review 806). A stale snapshot is
+    // served with a warning; `listing_failed` lets `table_exist` treat it as
+    // unknown rather than "absent".
     fn table_names(&self) -> Vec<String> {
-        if let Some(cached) = self.table_names_cache.get(&self.namespace) {
-            return (*cached).clone();
-        }
-
-        let catalog = self.session_catalog.clone();
-        let catalog_for_views = catalog.clone();
-        let ns = self.namespace.clone();
-        let ns_for_views = ns.clone();
-
-        let ns_ident = NamespaceIdent::new(ns.clone());
-        let ns_ident_views = ns_ident.clone();
-
-        let tables =
-            crate::runtime_bridge::block_on_compat(
-                async move { catalog.list_tables(&ns_ident).await },
-            );
-        let mut names: Vec<String> = match tables {
-            Ok(Ok(t)) => {
-                self.listing_failed.store(false, Ordering::Relaxed);
-                t.iter().map(|t| t.name().to_string()).collect()
+        match self.cached_listing() {
+            Some(listing) => {
+                if let Some(err) = &listing.stale_error {
+                    warn!(
+                        namespace = %self.namespace,
+                        error = %err,
+                        denied = listing.denied,
+                        age_secs = listing.checked_at.elapsed().as_secs(),
+                        known = listing.names.len(),
+                        "Serving last known table list; catalog listing is stale"
+                    );
+                }
+                self.listing_failed
+                    .store(listing.stale_error.is_some(), Ordering::Relaxed);
+                listing.names.clone()
             }
-            Ok(Err(e)) => {
-                error!(namespace = %ns, error = %e, "Failed to list tables");
+            None => {
+                debug!(
+                    namespace = %self.namespace,
+                    "No table-name snapshot yet; refresh_namespace_listing has not run for this namespace"
+                );
                 self.listing_failed.store(true, Ordering::Relaxed);
-                return Vec::new();
-            }
-            Err(bridge) => {
-                error!(namespace = %ns, error = %bridge, "Could not list tables");
-                self.listing_failed.store(true, Ordering::Relaxed);
-                return Vec::new();
-            }
-        };
-
-        let views = crate::runtime_bridge::block_on_compat(async move {
-            catalog_for_views.list_views(&ns_ident_views).await
-        });
-        match views {
-            Ok(Ok(view_names)) => names.extend(view_names),
-            Ok(Err(e)) => {
-                error!(namespace = %ns_for_views, error = %e, "Failed to list views");
-            }
-            Err(bridge) => {
-                error!(namespace = %ns_for_views, error = %bridge, "Could not list views");
+                Vec::new()
             }
         }
-
-        self.table_names_cache
-            .insert(self.namespace.clone(), Arc::new(names.clone()));
-        names
     }
 
     fn table_exist(&self, name: &str) -> bool {
         // Issue #238: derive existence from the cached `table_names()` set
         // instead of issuing a fresh `table_exists()` + `load_view_sql` round
-        // trip per call. `table_names()` already merges tables and views and is
-        // backed by the 5s `table_names_cache`, so repeated existence probes
-        // during one planning pass (DataFusion may call `table_exist` then
-        // `table_names` on the same provider, and a dbt run checks many
-        // relations) cost zero extra REST calls once the namespace list is warm.
-        // None of these probes steals a tokio worker thread via the
-        // `block_in_place + block_on` bridge any more.
-        //
-        // Freshness: `SqeCatalogProvider::schema()` builds a fresh
-        // `SqeSchemaProvider` (with an empty cache) per lookup, so a new query
-        // re-lists from Polaris and sees DDL committed by an earlier query. The
-        // 5s window only applies within a single provider instance's lifetime;
-        // `invalidate_table_names()` is available to drop the cache earlier if a
-        // future caller mutates and re-checks on the same provider.
-        //
-        // Tradeoff: a cold cache lists every table/view in the namespace once
-        // (one `list_tables` + one `list_views`) rather than a single
-        // `table_exists` HEAD. The dbt burst pattern warms the cache on the
-        // first probe, so subsequent checks are free. Issue #238.
+        // trip per call. The snapshot is process-global and refreshed off the
+        // async path, so repeated existence probes during one planning pass
+        // (and across the statements of a dbt run) cost zero REST calls.
         let names = self.table_names();
         if self.listing_failed.load(Ordering::Relaxed) {
-            // An outage must not look like "table does not exist". Treat
-            // existence as unknown-true so DROP/CREATE IF EXISTS hit the
-            // catalog and surface CatalogUnavailable instead of no-op.
+            // No usable snapshot must not look like "table does not exist".
+            // Treat existence as unknown-true so DROP/CREATE IF EXISTS hit the
+            // catalog and surface the real error instead of no-op.
             return true;
         }
         name_exists_in(&names, name)
@@ -342,10 +513,49 @@ impl SchemaProvider for SqeSchemaProvider {
 }
 
 impl SqeSchemaProvider {
+    /// A catalog provider for view planning built from the calling session's
+    /// already-resolved namespace list and scan settings: zero namespace
+    /// probes (review 307). Reused for the same warehouse and for siblings
+    /// (with their own session catalog and namespace list).
+    fn planning_catalog_provider(
+        &self,
+        session_catalog: Arc<SessionCatalog>,
+        warehouse: String,
+        namespaces: Vec<String>,
+    ) -> SqeCatalogProvider {
+        let mut provider = SqeCatalogProvider::with_namespaces(
+            session_catalog,
+            self.storage_config.clone(),
+            warehouse,
+            namespaces,
+        )
+        .with_small_file_threshold(self.small_file_threshold_bytes)
+        .with_manifest_concurrency(self.manifest_concurrency)
+        .with_prefetch_concurrency(self.prefetch_concurrency)
+        .with_runtime_filter_clustering(
+            self.runtime_filter_clustering_skip,
+            self.runtime_filter_uniform_threshold,
+        )
+        .with_runtime_filter_wait_ms(self.runtime_filter_wait_ms)
+        .with_runtime_filter_bloom(
+            self.runtime_filter_bloom_probe,
+            self.runtime_filter_bloom_max_values,
+        )
+        .with_scan_fetch_ahead(self.scan_fetch_ahead);
+        if let Some(m) = &self.prom_metrics {
+            provider = provider.with_metrics(Arc::clone(m));
+        }
+        provider
+    }
+
     /// Plan a view's SQL and wrap it in a DataFusion ViewTable.
     ///
-    /// Creates a minimal SessionContext with the same catalog registered so that
-    /// the view's SQL can reference tables in the same namespace.
+    /// Creates a minimal SessionContext with the calling session's catalog
+    /// (same `SessionCatalog`, same namespace snapshot) registered so the
+    /// view's SQL can reference tables in the same warehouse without a
+    /// single `list_namespaces` call. Sibling warehouses named by the view
+    /// body are registered lazily, only when planning fails to resolve a
+    /// reference.
     async fn plan_view(&self, name: &str, sql: String) -> DFResult<Option<Arc<dyn TableProvider>>> {
         let catalog_name = &self.warehouse;
 
@@ -355,70 +565,79 @@ impl SqeSchemaProvider {
                 .with_default_catalog_and_schema(catalog_name, "default"),
         );
 
-        // Register the same catalog so the view's SQL can reference its tables
-        let catalog_provider = SqeCatalogProvider::try_new(
-            self.session_catalog.clone(),
-            self.storage_config.clone(),
-            self.warehouse.clone(),
-        )
-        .await
-        .map_err(|e| {
-            datafusion::error::DataFusionError::External(
-                format!("Failed to create catalog for view planning: {e}").into(),
-            )
-        })?;
+        // The view's own namespace is always resolvable even when the
+        // owning provider's list was built before it existed.
+        let mut namespaces = self.known_namespaces.clone();
+        if !namespaces.contains(&self.namespace) {
+            namespaces.push(self.namespace.clone());
+        }
+        mini_ctx.register_catalog(
+            catalog_name,
+            Arc::new(self.planning_catalog_provider(
+                self.session_catalog.clone(),
+                self.warehouse.clone(),
+                namespaces,
+            )),
+        );
 
-        mini_ctx.register_catalog(catalog_name, Arc::new(catalog_provider));
+        let plan_err = |e: DataFusionError| {
+            DataFusionError::External(format!("Failed to plan view '{name}' SQL: {e}").into())
+        };
 
-        // A view body may reference tables in OTHER catalogs (e.g. a workspace
-        // ontology view in `ws_team_a.ontology` selecting from
-        // `team_a_data.public.events`). Register every sibling warehouse the
-        // view's SQL names, using the same user token — Polaris/OPA still
-        // enforce access. Failures are logged and skipped so the planner
-        // below reports the precise unresolved reference.
-        for sibling in sqe_sql::extract_catalog_qualifiers_from_sql(&sql) {
-            if &sibling == catalog_name {
-                continue;
-            }
-            match self.session_catalog.for_sibling_warehouse(&sibling).await {
-                Ok(sc) => {
-                    match SqeCatalogProvider::try_new(
-                        Arc::new(sc),
-                        self.storage_config.clone(),
-                        sibling.clone(),
-                    )
-                    .await
-                    {
-                        Ok(p) => {
-                            mini_ctx.register_catalog(&sibling, Arc::new(p));
-                            tracing::info!(
-                                view = %name,
-                                catalog = %sibling,
-                                "view planning: registered sibling catalog referenced by view body"
-                            );
+        let df = match mini_ctx.sql(&sql).await {
+            Ok(df) => df,
+            Err(first_err) => {
+                // A view body may reference tables in OTHER catalogs (e.g. a
+                // workspace ontology view in `ws_team_a.ontology` selecting
+                // from `team_a_data.public.events`). Register every sibling
+                // warehouse the view's SQL names, using the same user token
+                // (Polaris/OPA still enforce access), and plan once more.
+                // Failures are logged and skipped so the planner reports the
+                // precise unresolved reference.
+                let siblings: Vec<String> = sqe_sql::extract_catalog_qualifiers_from_sql(&sql)
+                    .into_iter()
+                    .filter(|s| s != catalog_name)
+                    .collect();
+                if siblings.is_empty() {
+                    return Err(plan_err(first_err));
+                }
+                for sibling in siblings {
+                    match self.session_catalog.for_sibling_warehouse(&sibling).await {
+                        Ok(sc) => {
+                            match SqeCatalogProvider::try_new(
+                                Arc::new(sc),
+                                self.storage_config.clone(),
+                                sibling.clone(),
+                            )
+                            .await
+                            {
+                                Ok(p) => {
+                                    mini_ctx.register_catalog(&sibling, Arc::new(p));
+                                    tracing::info!(
+                                        view = %name,
+                                        catalog = %sibling,
+                                        "view planning: registered sibling catalog referenced by view body"
+                                    );
+                                }
+                                Err(e) => tracing::warn!(
+                                    view = %name,
+                                    catalog = %sibling,
+                                    error = %e,
+                                    "view planning: failed to build sibling catalog provider"
+                                ),
+                            }
                         }
                         Err(e) => tracing::warn!(
                             view = %name,
                             catalog = %sibling,
                             error = %e,
-                            "view planning: failed to build sibling catalog provider"
+                            "view planning: failed to open sibling warehouse session"
                         ),
                     }
                 }
-                Err(e) => tracing::warn!(
-                    view = %name,
-                    catalog = %sibling,
-                    error = %e,
-                    "view planning: failed to open sibling warehouse session"
-                ),
+                mini_ctx.sql(&sql).await.map_err(plan_err)?
             }
-        }
-
-        let df = mini_ctx.sql(&sql).await.map_err(|e| {
-            datafusion::error::DataFusionError::External(
-                format!("Failed to plan view '{name}' SQL: {e}").into(),
-            )
-        })?;
+        };
 
         let plan = df.into_optimized_plan().map_err(|e| {
             datafusion::error::DataFusionError::External(
@@ -433,7 +652,6 @@ impl SqeSchemaProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn name_exists_in_matches_tables_and_views() {
@@ -464,40 +682,49 @@ mod tests {
         assert!(!should_try_view_after_table_error(&denied));
     }
 
-    /// Issue #238: a warm `table_names_cache` serves repeated existence probes
-    /// without recomputing the (in production, REST-backed) name list. We model
-    /// the REST round trip with a counter that increments only on a cache miss;
-    /// the second and third reads must not bump it.
+    /// Review 806: a failed refresh keeps the previous names and records the
+    /// reason, so `SHOW TABLES` on a warm session during an outage answers
+    /// with the last known list plus a warning, never with zero rows.
     #[test]
-    fn cached_table_names_avoid_recompute_on_repeated_existence_checks() {
-        let cache: SyncCache<String, Arc<Vec<String>>> = SyncCache::builder()
-            .max_capacity(128)
-            .time_to_live(Duration::from_secs(TABLE_NAMES_TTL_SECS))
-            .build();
-        let ns = "analytics".to_string();
-        let rest_calls = AtomicUsize::new(0);
+    fn failed_refresh_keeps_previous_names_and_records_error() {
+        let previous = merge_listing(None, Ok(vec!["orders".into(), "customers".into()]));
+        assert!(previous.stale_error.is_none());
+        assert!(!previous.unavailable());
 
-        // Mirror table_names(): cache hit short-circuits, miss "lists" once.
-        let names_for = |ns: &str| -> Arc<Vec<String>> {
-            if let Some(cached) = cache.get(ns) {
-                return cached;
-            }
-            rest_calls.fetch_add(1, Ordering::SeqCst);
-            let names = Arc::new(vec!["orders".to_string(), "customers".to_string()]);
-            cache.insert(ns.to_string(), names.clone());
-            names
-        };
-
-        // First probe: cold cache, one "REST" list.
-        assert!(name_exists_in(&names_for(&ns), "orders"));
-        // Repeated probes during the same dbt burst: served from cache.
-        assert!(name_exists_in(&names_for(&ns), "customers"));
-        assert!(!name_exists_in(&names_for(&ns), "missing"));
-
-        assert_eq!(
-            rest_calls.load(Ordering::SeqCst),
-            1,
-            "table_exist should hit the catalog at most once while the cache is warm"
+        let stale = merge_listing(
+            Some(&previous),
+            Err(("503 service unavailable".to_string(), false)),
         );
+        assert_eq!(stale.names, vec!["orders", "customers"]);
+        assert_eq!(
+            stale.stale_error.as_deref(),
+            Some("503 service unavailable")
+        );
+        assert!(stale.unavailable(), "non-auth failure is 'unavailable'");
+
+        let denied = merge_listing(Some(&previous), Err(("403 forbidden".to_string(), true)));
+        assert!(denied.denied);
+        assert!(
+            !denied.unavailable(),
+            "denied is a legitimate answer, not an outage"
+        );
+    }
+
+    /// A cold snapshot that fails on first refresh carries no names but is
+    /// still distinguishable from an empty namespace.
+    #[test]
+    fn cold_failed_refresh_is_empty_but_flagged() {
+        let l = merge_listing(None, Err(("timeout".to_string(), false)));
+        assert!(l.names.is_empty());
+        assert!(l.unavailable());
+    }
+
+    /// A freshly refreshed snapshot is inside the TTL; an old one is not.
+    #[test]
+    fn needs_refresh_follows_ttl() {
+        let mut l = merge_listing(None, Ok(vec![]));
+        assert!(!l.needs_refresh());
+        l.checked_at = Instant::now() - Duration::from_secs(TABLE_NAMES_TTL_SECS + 1);
+        assert!(l.needs_refresh());
     }
 }

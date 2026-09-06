@@ -187,7 +187,24 @@ pub trait LocalExecutor: Send + Sync + std::fmt::Debug {
 
 /// Callback invoked when a fragment stream completes or fails.
 /// Args: (fragment_id, success: bool, elapsed_ms, output_rows)
-pub type FragmentCallback = Arc<dyn Fn(&str, bool, u64, usize) + Send + Sync>;
+pub type FragmentCallback = Arc<dyn Fn(&str, FragmentOutcome, u64, usize) + Send + Sync>;
+
+/// How a fragment stream ended, as reported to the [`FragmentCallback`].
+///
+/// Finding 408: `Cancelled` is distinct from `Failed` so the callback can
+/// release the worker-load reservation for a stream dropped before EOF
+/// (`LIMIT`-terminated or cancelled query) without mislabelling a clean stop
+/// as a failure. Before this the reservation lived until the plan `Arc`
+/// dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FragmentOutcome {
+    /// The stream reached EOF.
+    Finished,
+    /// The stream yielded an error, or a dispatch attempt failed.
+    Failed,
+    /// The stream was dropped before EOF or error.
+    Cancelled,
+}
 
 /// Newtype wrapper around [`FragmentCallback`] that provides a `Debug` implementation
 /// so it can be used inside `#[derive(Debug)]` structs.
@@ -812,7 +829,7 @@ impl ExecutionPlan for DistributedScanExec {
                         if let Some(ref cb) = fragment_callback {
                             cb(
                                 &task.fragment_id,
-                                false,
+                                FragmentOutcome::Failed,
                                 start.elapsed().as_millis() as u64,
                                 0,
                             );
@@ -1162,7 +1179,8 @@ impl datafusion::physical_plan::RecordBatchStream for DistributedRecordBatchStre
 ///
 /// The callback receives:
 /// - `fragment_id` — the fragment that was executed
-/// - `success` — `true` if the stream ended cleanly, `false` on the first error
+/// - `outcome` — [`FragmentOutcome::Finished`] at EOF, `Failed` on the first
+///   error, `Cancelled` when the stream is dropped before either
 /// - `elapsed_ms` — wall-clock time from the start of `execute()` to completion
 /// - `output_rows` — total number of rows produced across all batches
 struct CallbackStream {
@@ -1171,9 +1189,12 @@ struct CallbackStream {
     callback: Option<FragmentCallback>,
     start: std::time::Instant,
     output_rows: usize,
-    /// Whether the teardown (callback + credential unregister) has already
-    /// fired (ensures exactly-once semantics).
-    fired: bool,
+    /// Once-flag: whether the teardown (callback + credential unregister) has
+    /// already fired. Shared by the poll path (EOF / error) and `Drop`
+    /// (cancellation) so the callback -- and therefore the worker-load
+    /// reservation release behind it -- runs exactly once. Atomic `swap` makes
+    /// the claim unambiguous even though both paths hold `&mut self`.
+    fired: std::sync::atomic::AtomicBool,
     /// COORD-02: credential tracker to unregister this fragment from on
     /// completion. The success path used to leak an entry per finished fragment
     /// (register on dispatch, unregister only on the all-attempts-failed path),
@@ -1197,9 +1218,30 @@ impl CallbackStream {
             callback,
             start,
             output_rows: 0,
-            fired: false,
+            fired: std::sync::atomic::AtomicBool::new(false),
             credential_tracker,
         }
+    }
+
+    /// Claim the exactly-once teardown. Returns `true` for the first caller
+    /// only.
+    fn claim_teardown(&self) -> bool {
+        !self.fired.swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Run the exactly-once teardown for `outcome`: fire the fragment callback
+    /// (which releases the worker-load reservation on the dispatcher side) and
+    /// unregister the credential-tracker entry (COORD-02). No-op after the
+    /// first call.
+    fn finish(&self, outcome: FragmentOutcome) {
+        if !self.claim_teardown() {
+            return;
+        }
+        let elapsed_ms = self.start.elapsed().as_millis() as u64;
+        if let Some(cb) = &self.callback {
+            cb(&self.fragment_id, outcome, elapsed_ms, self.output_rows);
+        }
+        self.unregister_credentials();
     }
 
     /// COORD-02: fire-and-forget unregister of this fragment from the
@@ -1287,29 +1329,15 @@ impl Stream for CallbackStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(None) => {
-                // Stream exhausted — fire callback with success=true
-                if !self.fired {
-                    self.fired = true;
-                    let elapsed_ms = self.start.elapsed().as_millis() as u64;
-                    if let Some(cb) = &self.callback {
-                        cb(&self.fragment_id, true, elapsed_ms, self.output_rows);
-                    }
-                    // COORD-02: release the credential-tracker entry on success.
-                    self.unregister_credentials();
-                }
+                // Stream exhausted: callback with Finished, release the
+                // credential-tracker entry (COORD-02).
+                self.finish(FragmentOutcome::Finished);
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(e))) => {
-                // Stream produced an error — fire callback with success=false
-                if !self.fired {
-                    self.fired = true;
-                    let elapsed_ms = self.start.elapsed().as_millis() as u64;
-                    if let Some(cb) = &self.callback {
-                        cb(&self.fragment_id, false, elapsed_ms, self.output_rows);
-                    }
-                    // COORD-02: release the credential-tracker entry on error too.
-                    self.unregister_credentials();
-                }
+                // Stream produced an error: callback with Failed, release the
+                // credential-tracker entry (COORD-02).
+                self.finish(FragmentOutcome::Failed);
                 Poll::Ready(Some(Err(e)))
             }
             Poll::Ready(Some(Ok(batch))) => {
@@ -1328,15 +1356,17 @@ impl Drop for CallbackStream {
     /// poll-path teardown never runs. Release the credential-tracker entry here
     /// so cancelled / short-circuited fragments do not leak.
     ///
-    /// Deliberately tracker-only: the `fragment_callback` marks the fragment
-    /// `Failed` and removes its memory reservation, which would mislabel a
-    /// cleanly-cancelled fragment, so it is NOT fired from `Drop`. The `fired`
-    /// guard gives exactly-once semantics shared with the poll path.
+    /// Finding 408: the callback fires too, with the distinct
+    /// [`FragmentOutcome::Cancelled`], so the dispatcher releases the
+    /// worker-load reservation as soon as the stream is dropped instead of
+    /// holding it until the plan `Arc` goes away. The callback used to be
+    /// skipped here because its only non-success outcome was `Failed`, which
+    /// would have mislabelled a clean stop; the tri-state outcome removes that
+    /// reason. The `fired` once-flag keeps exactly-once semantics with the
+    /// poll path, so a stream that already reached EOF or an error does not
+    /// report a second outcome (double-release) from `Drop`.
     fn drop(&mut self) {
-        if !self.fired {
-            self.fired = true;
-            self.unregister_credentials();
-        }
+        self.finish(FragmentOutcome::Cancelled);
     }
 }
 
@@ -1870,6 +1900,84 @@ mod tests {
             0,
             "COORD-02: a fragment dropped before EOF (LIMIT / cancel) must be unregistered"
         );
+    }
+
+    /// Finding 408: dropping the stream before EOF fires the fragment callback
+    /// exactly once with `Cancelled`, so the dispatcher's worker-load
+    /// reservation is released at drop time (LIMIT / cancellation) rather than
+    /// when the plan `Arc` finally goes away.
+    #[tokio::test]
+    async fn finding408_callback_stream_releases_reservation_on_drop() {
+        use std::sync::Mutex;
+
+        let load = crate::worker_registry::WorkerLoadTracker::new();
+        let guard = load.reserve_load("http://w1:50052", 500);
+        assert_eq!(load.in_flight_load("http://w1:50052"), 500);
+
+        let reservations: Arc<dashmap::DashMap<String, crate::worker_registry::ReservationGuard>> =
+            Arc::new(dashmap::DashMap::new());
+        reservations.insert("frag-408".to_string(), guard);
+
+        let outcomes: Arc<Mutex<Vec<FragmentOutcome>>> = Arc::new(Mutex::new(Vec::new()));
+        let cb: FragmentCallback = {
+            let reservations = Arc::clone(&reservations);
+            let outcomes = Arc::clone(&outcomes);
+            Arc::new(move |task_id, outcome, _elapsed, _rows| {
+                let _ = reservations.remove(task_id);
+                outcomes.lock().unwrap().push(outcome);
+            })
+        };
+
+        let inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
+            Box::pin(futures::stream::pending());
+        let stream = CallbackStream::new(
+            inner,
+            "frag-408".to_string(),
+            Some(cb),
+            std::time::Instant::now(),
+            None,
+        );
+        drop(stream);
+
+        assert_eq!(*outcomes.lock().unwrap(), vec![FragmentOutcome::Cancelled]);
+        assert!(
+            reservations.is_empty(),
+            "reservation guard must be removed on drop"
+        );
+        assert_eq!(
+            load.in_flight_load("http://w1:50052"),
+            0,
+            "worker load reserved for the fragment must be released when the stream drops"
+        );
+    }
+
+    /// Finding 408: a stream that already completed (EOF) must not report a
+    /// second outcome from `Drop` -- the once-flag protects against a
+    /// double-release of the reservation.
+    #[tokio::test]
+    async fn finding408_callback_fires_once_when_eof_then_dropped() {
+        use std::sync::Mutex;
+
+        let outcomes: Arc<Mutex<Vec<FragmentOutcome>>> = Arc::new(Mutex::new(Vec::new()));
+        let cb: FragmentCallback = {
+            let outcomes = Arc::clone(&outcomes);
+            Arc::new(move |_task_id, outcome, _elapsed, _rows| {
+                outcomes.lock().unwrap().push(outcome);
+            })
+        };
+        let inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
+            Box::pin(futures::stream::empty());
+        let mut stream = CallbackStream::new(
+            inner,
+            "frag-408-eof".to_string(),
+            Some(cb),
+            std::time::Instant::now(),
+            None,
+        );
+        assert!(stream.next().await.is_none());
+        drop(stream);
+
+        assert_eq!(*outcomes.lock().unwrap(), vec![FragmentOutcome::Finished]);
     }
 
     #[test]

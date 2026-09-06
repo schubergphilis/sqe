@@ -10,56 +10,246 @@ use moka::future::Cache as MokaCache;
 use tracing::{debug, info, instrument, warn, Instrument};
 use uuid::Uuid;
 
-use sqe_core::config::{SqeConfig, StorageConfig};
+use sqe_core::config::{CatalogConfig, SqeConfig, StorageConfig};
 use sqe_core::{SqeError, SqeErrorCode};
 use sqe_metrics::propagation::trace_context_http_headers;
 
 use crate::circuit_breaker::CircuitBreaker;
 
-/// Process-wide reqwest client reused across every SessionCatalog so
-/// non-REST backends stop opening a fresh connection pool and a fresh
-/// TLS slow-start per authenticated session. The REST path already
-/// honoured the shared-client contract; this lets the non-REST path
-/// share the same default when callers pass `None`.
-static SHARED_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
-    std::sync::LazyLock::new(reqwest::Client::new);
+/// Build the reqwest client every Polaris request goes through.
+///
+/// Both deadlines come from `[catalog]` (`request_timeout_secs`,
+/// `connect_timeout_secs`). A default-built client has neither, so a Polaris
+/// pod that accepts TCP and then goes silent (GC pause, half-open LB
+/// connection) used to park every planning call forever, and the circuit
+/// breaker never saw a failure to record (architecture review 300). Zero is
+/// clamped to one second: "no deadline" is the bug this exists to remove.
+pub fn build_catalog_http_client(
+    request_timeout_secs: u64,
+    connect_timeout_secs: u64,
+) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs.max(1)))
+        .timeout(std::time::Duration::from_secs(request_timeout_secs.max(1)))
+        .build()
+        .unwrap_or_else(|e| {
+            // Builder failure means a broken TLS backend, not bad input; the
+            // process cannot talk to any catalog either way.
+            panic!("failed to build catalog HTTP client: {e}")
+        })
+}
 
-/// Per-user circuit breakers keyed by token fingerprint.
+/// The reqwest 0.12 twin of [`build_catalog_http_client`], handed to the
+/// vendored `RestCatalogBuilder::with_client` so iceberg-rust's own requests
+/// (`list_namespaces`, `load_table`, `update_table`) carry the same deadlines.
+/// Two clients only because the vendored crate has not moved to reqwest 0.13;
+/// both are built from the same two config values.
+fn build_vendored_catalog_http_client(
+    request_timeout_secs: u64,
+    connect_timeout_secs: u64,
+) -> reqwest_legacy::Client {
+    reqwest_legacy::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs.max(1)))
+        .timeout(std::time::Duration::from_secs(request_timeout_secs.max(1)))
+        .build()
+        .unwrap_or_else(|e| panic!("failed to build vendored catalog HTTP client: {e}"))
+}
+
+/// The pair of process-wide clients every SessionCatalog shares, so each
+/// authenticated session does not open a fresh connection pool and a fresh
+/// TLS slow-start. `raw` serves SQE's own HEAD/GET path; `vendored` is the
+/// reqwest 0.12 client the vendored REST catalog runs on.
+struct CatalogHttpClients {
+    raw: reqwest::Client,
+    vendored: reqwest_legacy::Client,
+}
+
+impl CatalogHttpClients {
+    fn build(request_timeout_secs: u64, connect_timeout_secs: u64) -> Self {
+        Self {
+            raw: build_catalog_http_client(request_timeout_secs, connect_timeout_secs),
+            vendored: build_vendored_catalog_http_client(
+                request_timeout_secs,
+                connect_timeout_secs,
+            ),
+        }
+    }
+}
+
+/// Initialised once from the first `CatalogConfig` seen by
+/// [`shared_http_client_for`]; callers that never carry a config
+/// ([`SessionCatalog::unconfigured`], tests) fall back to the defaults from
+/// `CatalogConfig` (30 s request, 5 s connect).
+static SHARED_HTTP_CLIENTS: std::sync::OnceLock<CatalogHttpClients> = std::sync::OnceLock::new();
+
+fn shared_http_clients_with_defaults() -> &'static CatalogHttpClients {
+    SHARED_HTTP_CLIENTS.get_or_init(|| {
+        CatalogHttpClients::build(
+            sqe_core::config::default_catalog_request_timeout_secs(),
+            sqe_core::config::default_catalog_connect_timeout_secs(),
+        )
+    })
+}
+
+/// Shared client, built with `catalog`'s deadlines if nothing built it yet.
+///
+/// The client is process-wide, so the first catalog's deadlines win; a later
+/// `[catalogs.*]` entry with different values is logged and ignored.
+pub fn shared_http_client_for(catalog: &CatalogConfig) -> reqwest::Client {
+    let mut built_here = false;
+    let clients = SHARED_HTTP_CLIENTS.get_or_init(|| {
+        built_here = true;
+        CatalogHttpClients::build(catalog.request_timeout_secs, catalog.connect_timeout_secs)
+    });
+    if !built_here {
+        debug!(
+            request_timeout_secs = catalog.request_timeout_secs,
+            connect_timeout_secs = catalog.connect_timeout_secs,
+            "shared catalog HTTP client already built; per-catalog deadlines are process-wide"
+        );
+    }
+    clients.raw.clone()
+}
+
+/// Shared raw client with the `CatalogConfig` default deadlines when no
+/// config has reached [`shared_http_client_for`] yet.
+fn shared_http_client() -> reqwest::Client {
+    shared_http_clients_with_defaults().raw.clone()
+}
+
+/// Shared reqwest 0.12 client for the vendored REST catalog; same deadlines
+/// as [`shared_http_client`].
+fn shared_vendored_http_client() -> reqwest_legacy::Client {
+    shared_http_clients_with_defaults().vendored.clone()
+}
+
+/// Idle window after which a per-user breaker is dropped. Matches the
+/// `REST_CATALOG_CACHE` TTL: a token that has not touched the catalog for
+/// this long has no failure budget worth remembering.
+const USER_CIRCUIT_BREAKER_IDLE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Hard cap on live per-user breakers. Bounds the registry against a login
+/// storm inside one idle window; the same order of magnitude as
+/// `REST_CATALOG_CACHE_MAX_CAPACITY`.
+const USER_CIRCUIT_BREAKER_MAX_CAPACITY: u64 = 10_000;
+
+/// Registry of per-(token, catalog) circuit breakers.
 ///
 /// A single global breaker blast-radiused one user's bad token (rapid
-/// retries on an expired bearer count as failures) into "no user can
-/// talk to Polaris until the recovery timeout". Keying the breaker by
-/// token fingerprint isolates each user's failure budget without
-/// changing the rest of the wiring.
-static USER_CIRCUIT_BREAKERS: std::sync::LazyLock<DashMap<String, Arc<CircuitBreaker>>> =
-    std::sync::LazyLock::new(DashMap::new);
+/// retries on an expired bearer count as failures) into "no user can talk to
+/// Polaris until the recovery timeout". Keying by token fingerprint isolates
+/// each user's failure budget. Keying on the token alone let one unreachable
+/// catalog take out every other catalog the same user could reach, so the key
+/// is `(fingerprint, catalog)`: a breaker exists to stop hammering an upstream
+/// that is down, and that argument is per upstream.
+///
+/// The old `DashMap` never dropped an entry. OIDC tokens rotate on every dbt
+/// run and every login, so the map grew with logins over process lifetime,
+/// not with concurrent users (architecture review 301). Entries now expire
+/// after [`USER_CIRCUIT_BREAKER_IDLE`] without a lookup and the registry is
+/// capped at [`USER_CIRCUIT_BREAKER_MAX_CAPACITY`].
+pub(crate) struct UserCircuitBreakers {
+    cache: moka::sync::Cache<String, Arc<CircuitBreaker>>,
+}
 
-/// One breaker per (user, catalog), never per user alone.
-///
-/// Keying on the token by itself let one unreachable catalog take out every
-/// other catalog the same user could reach: five failed calls to a dead
-/// endpoint opened the circuit, and the next 30 seconds of calls to healthy
-/// catalogs were refused with `CircuitBreakerOpen` before leaving the
-/// process. `information_schema.tables` and `describe_table` walk every
-/// attached catalog, so they tripped it on their own and then blocked the
-/// queries that had been working a second earlier.
-///
-/// A breaker exists to stop hammering an upstream that is down. That
-/// argument is per upstream, so the key is too.
-fn user_circuit_breaker(token_fingerprint: &str, catalog: &str) -> Arc<CircuitBreaker> {
-    let key = format!("{token_fingerprint}|{catalog}");
-    if let Some(existing) = USER_CIRCUIT_BREAKERS.get(&key) {
-        return Arc::clone(existing.value());
+impl UserCircuitBreakers {
+    pub(crate) fn new(idle: std::time::Duration, max_capacity: u64) -> Self {
+        Self {
+            cache: moka::sync::Cache::builder()
+                .max_capacity(max_capacity)
+                .time_to_idle(idle)
+                .build(),
+        }
     }
-    let cb = Arc::new(CircuitBreaker::new(
-        format!("polaris-user-{token_fingerprint}-{catalog}"),
-        5,
-        std::time::Duration::from_secs(30),
-    ));
-    USER_CIRCUIT_BREAKERS
-        .entry(key)
-        .or_insert_with(|| Arc::clone(&cb))
-        .clone()
+
+    fn key(token_fingerprint: &str, catalog: &str) -> String {
+        format!("{token_fingerprint}|{catalog}")
+    }
+
+    /// Breaker for one `(token, catalog)` pair, created on first use.
+    ///
+    /// The breaker's *name* still carries the fingerprint because it is only
+    /// ever written to logs, where per-user diagnosis is the point. It must
+    /// never become a metric label (see [`SessionCatalog::record_catalog_call`]).
+    pub(crate) fn get_or_create(
+        &self,
+        token_fingerprint: &str,
+        catalog: &str,
+    ) -> Arc<CircuitBreaker> {
+        self.cache
+            .entry(Self::key(token_fingerprint, catalog))
+            .or_insert_with(|| {
+                Arc::new(CircuitBreaker::new(
+                    format!("polaris-user-{token_fingerprint}-{catalog}"),
+                    5,
+                    std::time::Duration::from_secs(30),
+                ))
+            })
+            .into_value()
+    }
+
+    /// Drop every breaker built for one bearer fingerprint. Called alongside
+    /// `REST_CATALOG_CACHE` invalidation so an expired token releases both.
+    pub(crate) fn evict_token(&self, token_fingerprint: &str) -> usize {
+        if token_fingerprint.is_empty() {
+            return 0;
+        }
+        let prefix = format!("{token_fingerprint}|");
+        let keys: Vec<String> = self
+            .cache
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, _)| (*k).clone())
+            .collect();
+        for key in &keys {
+            self.cache.invalidate(key);
+        }
+        keys.len()
+    }
+
+    /// Roll every breaker on `catalog` up into `(max_state_code, open_count)`.
+    ///
+    /// This is what the Prometheus gauges export: one series per catalog, not
+    /// one per token. The pass is bounded by the registry capacity and costs
+    /// atomic loads only; every caller has just paid a network round trip.
+    pub(crate) fn aggregate_for_catalog(&self, catalog: &str) -> (u8, u64) {
+        let suffix = format!("|{catalog}");
+        let mut max_state = 0u8;
+        let mut open = 0u64;
+        for (key, breaker) in self.cache.iter() {
+            if !key.ends_with(&suffix) {
+                continue;
+            }
+            let code = breaker.state_code();
+            max_state = max_state.max(code);
+            if code == 2 {
+                open += 1;
+            }
+        }
+        (max_state, open)
+    }
+
+    /// Flush pending moka maintenance (expiry, capacity eviction) so a test
+    /// can observe `entry_count` deterministically.
+    #[cfg(test)]
+    pub(crate) fn run_pending_tasks(&self) {
+        self.cache.run_pending_tasks();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entry_count(&self) -> u64 {
+        self.cache.entry_count()
+    }
+}
+
+static USER_CIRCUIT_BREAKERS: std::sync::LazyLock<UserCircuitBreakers> =
+    std::sync::LazyLock::new(|| {
+        UserCircuitBreakers::new(USER_CIRCUIT_BREAKER_IDLE, USER_CIRCUIT_BREAKER_MAX_CAPACITY)
+    });
+
+/// One breaker per (user, catalog); see [`UserCircuitBreakers`].
+fn user_circuit_breaker(token_fingerprint: &str, catalog: &str) -> Arc<CircuitBreaker> {
+    USER_CIRCUIT_BREAKERS.get_or_create(token_fingerprint, catalog)
 }
 
 fn insert_s3_location_props(props: &mut HashMap<String, String>, storage: &StorageConfig) {
@@ -238,9 +428,12 @@ pub async fn invalidate_rest_catalog_cache_for_token(token_fingerprint: &str) {
         REST_CATALOG_CACHE.invalidate(&key).await;
     }
     REST_CATALOG_CACHE.run_pending_tasks().await;
+    // The same token's circuit breakers go with it: an expired bearer must
+    // not keep a failure budget alive once its catalog handle is gone.
+    let breakers_dropped = USER_CIRCUIT_BREAKERS.evict_token(token_fingerprint);
     debug!(
         token_fingerprint,
-        dropped, "REST_CATALOG_CACHE invalidated for one token"
+        dropped, breakers_dropped, "REST_CATALOG_CACHE invalidated for one token"
     );
 }
 
@@ -310,6 +503,16 @@ pub struct TableMetadataCache {
     inner: MokaCache<String, CachedTableEntry>,
     /// Soft TTL: entries older than this are revalidated via conditional GET.
     soft_ttl: std::time::Duration,
+    /// Last successful `HEAD loadTable` per cache key (same
+    /// `{token_fingerprint}|{warehouse}|{ns}.{table}` shape as `inner`, so the
+    /// principal is part of the key and a new bearer is always re-checked).
+    /// A fresh metadata hit used to pay one HEAD per lookup; within
+    /// `authorization_recheck` the check is served from here instead
+    /// (architecture review 307).
+    authorization: MokaCache<String, Instant>,
+    /// How long a successful authorization check is reused. `ZERO` re-checks
+    /// on every lookup. Sourced from `catalog.authorization_recheck_secs`.
+    authorization_recheck: std::time::Duration,
     /// Optional Prometheus metrics for catalog roundtrip + circuit
     /// breaker state. Threaded through the cache so every
     /// `SessionCatalog` clone shares the same handle without changing
@@ -359,6 +562,11 @@ impl TableMetadataCache {
         Self {
             inner,
             soft_ttl,
+            authorization: MokaCache::builder()
+                .max_capacity(10_000)
+                .time_to_live(std::time::Duration::from_secs(3600))
+                .build(),
+            authorization_recheck: std::time::Duration::ZERO,
             metrics: None,
             generation_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             global_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -380,6 +588,40 @@ impl TableMetadataCache {
     /// Returns the attached metrics registry, if any.
     pub fn metrics(&self) -> Option<&std::sync::Arc<sqe_metrics::MetricsRegistry>> {
         self.metrics.as_ref()
+    }
+
+    /// Reuse a successful `HEAD loadTable` authorization for `secs` seconds
+    /// per `(token, table)` before asking Polaris again. `0` re-checks on
+    /// every lookup (the pre-307 behaviour). Ranger / Polaris revokes are
+    /// observed within this window; see
+    /// `CatalogConfig::authorization_recheck_secs`.
+    #[must_use = "with_authorization_recheck consumes self; bind the returned cache"]
+    pub fn with_authorization_recheck(mut self, secs: u64) -> Self {
+        self.authorization_recheck = std::time::Duration::from_secs(secs);
+        self
+    }
+
+    /// True when `key` was authorized less than `authorization_recheck` ago.
+    /// Always false when the recheck window is zero.
+    pub async fn authorization_fresh(&self, key: &str) -> bool {
+        if self.authorization_recheck.is_zero() {
+            return false;
+        }
+        match self.authorization.get(key).await {
+            Some(at) => at.elapsed() < self.authorization_recheck,
+            None => false,
+        }
+    }
+
+    /// Record a successful authorization check for `key`. No-op when the
+    /// recheck window is zero so a disabled cache stores nothing.
+    pub async fn mark_authorized(&self, key: &str) {
+        if self.authorization_recheck.is_zero() {
+            return;
+        }
+        self.authorization
+            .insert(key.to_string(), Instant::now())
+            .await;
     }
 
     /// Issue the next cache-wide generation stamp. Strictly increasing and
@@ -599,6 +841,8 @@ impl TableMetadataCache {
         // stop it from storing what it read.
         self.bump_generation(&self.key_generations, key);
         self.inner.invalidate(key).await;
+        // A denial is exactly the moment the cached authorization is wrong.
+        self.authorization.invalidate(key).await;
     }
 
     /// Evict EVERY cached table entry, across all token fingerprints and
@@ -619,7 +863,9 @@ impl TableMetadataCache {
         self.global_generation
             .store(stamp, std::sync::atomic::Ordering::SeqCst);
         self.inner.invalidate_all();
+        self.authorization.invalidate_all();
         self.inner.run_pending_tasks().await;
+        self.authorization.run_pending_tasks().await;
         debug!("TableMetadataCache invalidated (catalog refresh)");
     }
 
@@ -1102,9 +1348,9 @@ fn classify_iceberg_catalog_error(context: &str, e: iceberg::Error) -> SqeError 
                 e,
             )
         }
-        iceberg::ErrorKind::CatalogCommitConflicts => SqeError::IcebergCommitConflict(format!(
-            "{context}: {e}"
-        )),
+        iceberg::ErrorKind::CatalogCommitConflicts => {
+            SqeError::IcebergCommitConflict(format!("{context}: {e}"))
+        }
         iceberg::ErrorKind::DataInvalid => SqeError::sourced(
             sqe_core::SqeErrorCode::TypeMismatch,
             format!("{context}: {e}"),
@@ -1161,7 +1407,7 @@ impl SessionCatalog {
             bearer_token: String::new(),
             token_fingerprint: "unconfigured".to_string(),
             storage_config: storage_config.clone(),
-            http_client: SHARED_HTTP_CLIENT.clone(),
+            http_client: shared_http_client(),
             circuit_breaker: user_circuit_breaker("unconfigured", "unconfigured"),
             require_vended_credentials: false,
             table_cache: table_cache.unwrap_or_else(|| TableMetadataCache::new(0)),
@@ -1232,7 +1478,7 @@ impl SessionCatalog {
                     bearer_token,
                     storage,
                     table_cache,
-                    None,
+                    Some(shared_http_client_for(catalog)),
                     None,
                     catalog.require_vended_credentials,
                 )
@@ -1297,7 +1543,7 @@ impl SessionCatalog {
             bearer_token: bearer_token.to_string(),
             token_fingerprint,
             storage_config: storage.clone(),
-            http_client: SHARED_HTTP_CLIENT.clone(),
+            http_client: shared_http_client(),
             circuit_breaker,
             require_vended_credentials: catalog.require_vended_credentials,
             table_cache,
@@ -1458,7 +1704,7 @@ impl SessionCatalog {
             bearer_token: "test-token".to_string(),
             token_fingerprint: token_fingerprint.to_string(),
             storage_config: StorageConfig::default(),
-            http_client: SHARED_HTTP_CLIENT.clone(),
+            http_client: shared_http_client(),
             circuit_breaker: user_circuit_breaker(token_fingerprint, "http://127.0.0.1:1"),
             require_vended_credentials: false,
             table_cache,
@@ -1557,12 +1803,19 @@ impl SessionCatalog {
             "{}-{}-{}-vended{}",
             catalog_url, warehouse, token_fingerprint, require_vended_credentials as u8
         );
+        // iceberg-rust's own calls (list_namespaces, load_table, update_table)
+        // get a client with the same deadlines as SQE's raw HEAD/GET path.
+        // Left to its default, the vendored client has no timeout at all
+        // (review 300). It is a separate reqwest 0.12 object only because the
+        // vendored crate has not moved to 0.13 yet.
+        let http_client = http_client.unwrap_or_else(shared_http_client);
         let inner = if let Some(cached) = REST_CATALOG_CACHE.get(&catalog_key).await {
             debug!(token_fingerprint = %token_fingerprint, "REST catalog cache hit");
             cached
         } else {
             debug!(token_fingerprint = %token_fingerprint, "REST catalog cache miss, creating");
             let catalog = RestCatalogBuilder::default()
+                .with_client(shared_vendored_http_client())
                 .load(format!("sqe-session-{}", token_fingerprint), props)
                 .await
                 .map_err(|e| {
@@ -1575,7 +1828,6 @@ impl SessionCatalog {
             arc_catalog
         };
 
-        let http_client = http_client.unwrap_or_else(|| SHARED_HTTP_CLIENT.clone());
         let circuit_breaker = circuit_breaker
             .unwrap_or_else(|| user_circuit_breaker(&token_fingerprint, catalog_url));
 
@@ -1764,7 +2016,14 @@ impl SessionCatalog {
             // bearer token and this cache key stay unchanged. Re-check the
             // cheap HEAD form of loadTable before handing back metadata whose
             // FileIO may still carry previously vended credentials.
-            self.authorize_table_access(table_ident).await?;
+            //
+            // Within `authorization_recheck_secs` of the last successful check
+            // for this (token, table) the HEAD is skipped: a burst of lookups
+            // inside one query or one dbt step pays one round trip, and a
+            // revoke is observed once the window lapses (review 307).
+            if !self.table_cache.authorization_fresh(&cache_key).await {
+                self.authorize_table_access(table_ident).await?;
+            }
             debug!(
                 token_fingerprint = %self.token_fingerprint,
                 table = ?table_ident,
@@ -1983,6 +2242,9 @@ impl SessionCatalog {
         if status.is_success() {
             self.circuit_breaker.record_success();
             self.record_catalog_call("authorize_table", started, true);
+            self.table_cache
+                .mark_authorized(&self.table_cache_key(table_ident))
+                .await;
             return Ok(());
         }
 
@@ -1998,6 +2260,11 @@ impl SessionCatalog {
                 .map_err(|e| classify_iceberg_catalog_error("Failed to authorize table", e));
             self.record_breaker_outcome(&result);
             self.record_catalog_call("authorize_table", started, result.is_ok());
+            if result.is_ok() {
+                self.table_cache
+                    .mark_authorized(&self.table_cache_key(table_ident))
+                    .await;
+            }
             return result;
         }
 
@@ -2023,10 +2290,26 @@ impl SessionCatalog {
         })
     }
 
+    /// Prometheus label for this session's catalog. The configured endpoint
+    /// (or warehouse for non-REST backends): one value per configured
+    /// catalog, never anything derived from a bearer token.
+    fn breaker_metric_catalog(&self) -> &str {
+        if self.catalog_url.is_empty() {
+            &self.warehouse
+        } else {
+            &self.catalog_url
+        }
+    }
+
     /// Record catalog roundtrip latency + circuit breaker state into
     /// the optional MetricsRegistry attached to the table cache. The
     /// helper is a no-op when no metrics handle is attached, so
     /// test-only SessionCatalogs pay nothing.
+    ///
+    /// Breaker gauges are labelled by catalog and aggregated over every
+    /// per-token breaker on that catalog. Labelling by breaker name put a
+    /// token fingerprint in a Prometheus label, so `/metrics` grew a series
+    /// per login for the life of the process (architecture review 301).
     fn record_catalog_call(&self, op: &'static str, started: Instant, ok: bool) {
         if let Some(metrics) = self.table_cache.metrics() {
             let status = if ok { "ok" } else { "err" };
@@ -2034,10 +2317,20 @@ impl SessionCatalog {
                 .catalog_request_duration_seconds
                 .with_label_values(&[op, status])
                 .observe(started.elapsed().as_secs_f64());
+            let catalog = self.breaker_metric_catalog();
+            let (max_state, open) = USER_CIRCUIT_BREAKERS.aggregate_for_catalog(catalog);
+            // A breaker handed in by a caller (tests, sibling warehouses)
+            // may not live in the registry; fold it in so its state counts.
+            let own = self.circuit_breaker.state_code();
+            let max_state = max_state.max(own);
             metrics
                 .catalog_circuit_breaker_state
-                .with_label_values(&[self.circuit_breaker.name()])
-                .set(self.circuit_breaker.state_code() as f64);
+                .with_label_values(&[catalog])
+                .set(max_state as f64);
+            metrics
+                .catalog_circuit_breakers_open
+                .with_label_values(&[catalog])
+                .set(open as f64);
         }
     }
 
@@ -2211,9 +2504,10 @@ impl SessionCatalog {
                 )));
             }
             if status == reqwest::StatusCode::CONFLICT {
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "Catalog commit conflict: {text}"
-                )));
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Catalog commit conflict: {text}"),
+                ));
             }
             return Err(SqeError::Catalog(format!(
                 "Failed to create view (HTTP {status}): {text}"
@@ -2258,9 +2552,10 @@ impl SessionCatalog {
                 )));
             }
             if status == reqwest::StatusCode::CONFLICT {
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "Catalog commit conflict: {text}"
-                )));
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Catalog commit conflict: {text}"),
+                ));
             }
             return Err(SqeError::Catalog(format!(
                 "Failed to list views (HTTP {status}): {text}"
@@ -2332,9 +2627,10 @@ impl SessionCatalog {
                 )));
             }
             if status == reqwest::StatusCode::CONFLICT {
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "Catalog commit conflict: {text}"
-                )));
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Catalog commit conflict: {text}"),
+                ));
             }
             return Err(SqeError::Catalog(format!(
                 "Failed to load view '{name}' (HTTP {status}): {text}"
@@ -2401,9 +2697,10 @@ impl SessionCatalog {
                 )));
             }
             if status == reqwest::StatusCode::CONFLICT {
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "Catalog commit conflict: {text}"
-                )));
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Catalog commit conflict: {text}"),
+                ));
             }
             return Err(SqeError::Catalog(format!(
                 "Failed to drop view (HTTP {status}): {text}"
@@ -2482,9 +2779,10 @@ impl SessionCatalog {
                 )));
             }
             if status == reqwest::StatusCode::CONFLICT {
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "Catalog commit conflict: {text}"
-                )));
+                return Err(SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Catalog commit conflict: {text}"),
+                ));
             }
             return Err(SqeError::Catalog(format!(
                 "Failed to commit schema update for '{table_ident}' (HTTP {status}): {text}"
@@ -2749,7 +3047,8 @@ mod cache_capacity_tests {
         cb.record_failure();
         assert!(cb.check().is_ok());
         assert_eq!(cb.state_label(), "half_open");
-        let err: sqe_core::Result<()> = Err(sqe_core::SqeError::Catalog("403 Forbidden".to_string()));
+        let err: sqe_core::Result<()> =
+            Err(sqe_core::SqeError::Catalog("403 Forbidden".to_string()));
         assert_eq!(
             err.as_ref().unwrap_err().error_code(),
             sqe_core::SqeErrorCode::AccessDenied
@@ -2961,6 +3260,144 @@ mod cache_capacity_tests {
             "cache should retain far more than the old cap of 100, got {}",
             cache.entry_count()
         );
+    }
+
+    /// Review 301: 10,000 rotated tokens against one catalog must not leave
+    /// 10,000 breakers behind. With a short idle window the registry drains to
+    /// zero once nothing touches it, and a later lookup simply rebuilds one.
+    #[tokio::test]
+    async fn user_circuit_breakers_drain_after_idle() {
+        let registry = super::UserCircuitBreakers::new(
+            std::time::Duration::from_millis(50),
+            super::USER_CIRCUIT_BREAKER_MAX_CAPACITY,
+        );
+        for i in 0..10_000u32 {
+            registry.get_or_create(&format!("{i:016x}"), "http://polaris:8181");
+        }
+        registry.run_pending_tasks();
+        assert!(
+            registry.entry_count() <= super::USER_CIRCUIT_BREAKER_MAX_CAPACITY,
+            "registry exceeded its cap: {}",
+            registry.entry_count()
+        );
+        assert!(registry.entry_count() > 0);
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        registry.run_pending_tasks();
+        assert_eq!(
+            registry.entry_count(),
+            0,
+            "idle breakers must be evicted, {} remain",
+            registry.entry_count()
+        );
+
+        let again = registry.get_or_create("0000000000000001", "http://polaris:8181");
+        assert_eq!(again.state_code(), 0, "a rebuilt breaker starts closed");
+    }
+
+    /// Token invalidation drops that token's breakers on every catalog and
+    /// leaves other tokens alone.
+    #[test]
+    fn user_circuit_breakers_evict_token_is_scoped() {
+        let registry = super::UserCircuitBreakers::new(
+            std::time::Duration::from_secs(300),
+            super::USER_CIRCUIT_BREAKER_MAX_CAPACITY,
+        );
+        registry.get_or_create("aaaa", "http://a");
+        registry.get_or_create("aaaa", "http://b");
+        registry.get_or_create("bbbb", "http://a");
+        registry.run_pending_tasks();
+        assert_eq!(registry.entry_count(), 3);
+
+        assert_eq!(registry.evict_token("aaaa"), 2);
+        assert_eq!(registry.evict_token(""), 0);
+        registry.run_pending_tasks();
+        assert_eq!(registry.entry_count(), 1);
+    }
+
+    /// The exported gauges roll per-token breakers up per catalog: worst
+    /// state and open count, with no token in sight.
+    #[test]
+    fn user_circuit_breakers_aggregate_per_catalog() {
+        let registry = super::UserCircuitBreakers::new(
+            std::time::Duration::from_secs(300),
+            super::USER_CIRCUIT_BREAKER_MAX_CAPACITY,
+        );
+        let healthy = registry.get_or_create("t1", "http://polaris");
+        let tripped = registry.get_or_create("t2", "http://polaris");
+        let other = registry.get_or_create("t3", "http://nessie");
+        for _ in 0..5 {
+            tripped.record_failure();
+            other.record_failure();
+        }
+        assert_eq!(healthy.state_code(), 0);
+        assert_eq!(tripped.state_code(), 2);
+
+        assert_eq!(registry.aggregate_for_catalog("http://polaris"), (2, 1));
+        assert_eq!(registry.aggregate_for_catalog("http://nessie"), (2, 1));
+        assert_eq!(registry.aggregate_for_catalog("http://unknown"), (0, 0));
+    }
+
+    /// The metric label is the configured endpoint (or warehouse), never the
+    /// breaker name that carries the token fingerprint.
+    #[test]
+    fn breaker_metric_label_never_contains_fingerprint() {
+        let fp = super::rest_catalog_token_fingerprint("some-bearer-token");
+        let catalog =
+            SessionCatalog::unconfigured(&sqe_core::config::StorageConfig::default(), None);
+        let label = catalog.breaker_metric_catalog().to_string();
+        assert!(!label.contains(&fp));
+        assert!(!label.contains(catalog.circuit_breaker.name()));
+        assert!(catalog.circuit_breaker.name().contains("unconfigured"));
+    }
+
+    /// Review 300: the shared client carries both deadlines; zero is clamped
+    /// rather than meaning "no deadline".
+    #[test]
+    fn build_catalog_http_client_accepts_zero_by_clamping() {
+        let _client = super::build_catalog_http_client(0, 0);
+        let _client = super::build_catalog_http_client(
+            sqe_core::config::default_catalog_request_timeout_secs(),
+            sqe_core::config::default_catalog_connect_timeout_secs(),
+        );
+    }
+
+    /// Review 307: a successful `HEAD` is reused for the recheck window, so a
+    /// burst of fresh-hit lookups on one (token, table) pays one round trip;
+    /// a zero window never caches; a single-key `invalidate` (the denial
+    /// path) and `invalidate_all` both drop the authorization.
+    #[tokio::test]
+    async fn authorization_recheck_window_is_honoured() {
+        let key = "tokenA|wh|ns.t1";
+
+        let disabled = TableMetadataCache::new(60);
+        disabled.mark_authorized(key).await;
+        assert!(
+            !disabled.authorization_fresh(key).await,
+            "zero window must re-check on every lookup"
+        );
+
+        let cache = TableMetadataCache::new(60).with_authorization_recheck(10);
+        assert!(
+            !cache.authorization_fresh(key).await,
+            "never authorized yet"
+        );
+        cache.mark_authorized(key).await;
+        assert!(cache.authorization_fresh(key).await);
+        assert!(
+            !cache.authorization_fresh("tokenB|wh|ns.t1").await,
+            "another principal's bearer is never covered"
+        );
+
+        cache.invalidate(key).await;
+        assert!(
+            !cache.authorization_fresh(key).await,
+            "a denial evicts the cached authorization"
+        );
+
+        cache.mark_authorized(key).await;
+        cache.invalidate_all().await;
+        assert!(!cache.authorization_fresh(key).await);
     }
 
     /// Minimal in-memory `Table` for cache tests: a valid v1 metadata document
