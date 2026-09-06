@@ -5,6 +5,7 @@
 - Category: reliability
 - Effort: M
 - Status: partial (branch `fix/config-startup-code-structure`, 2026-09-05)
+- Issue: #640
 
 ## Resolution (2026-09-05)
 

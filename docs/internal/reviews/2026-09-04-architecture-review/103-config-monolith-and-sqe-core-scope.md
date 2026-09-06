@@ -5,6 +5,7 @@
 - Category: architecture
 - Effort: M (days)
 - Status: partial (branch `fix/config-startup-code-structure`, 2026-09-05)
+- Issue: #546
 
 ## Resolution (2026-09-05)
 

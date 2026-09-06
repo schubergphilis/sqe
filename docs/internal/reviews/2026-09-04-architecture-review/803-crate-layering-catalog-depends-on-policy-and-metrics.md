@@ -5,6 +5,7 @@
 - Category: architecture
 - Effort: M
 - Status: open
+- Issue: #635
 
 ## Problem
 

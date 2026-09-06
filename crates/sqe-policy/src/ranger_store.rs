@@ -367,11 +367,10 @@ impl RangerStore {
 /// (hive has no catalog level); cross-engine policies must be written without a
 /// catalog prefix. See docs/ranger-fine-grained-service-type.md.
 ///
-/// NOTE: `plan_rewriter.rs::resolve_policy_key` passes the **last** dotted
-/// component of the schema as `namespace` (e.g. schema `"sales_wh.sales"` ->
-/// `"sales"`). Ranger `database` resource values must match that last component
-/// for policies to fire. See project tracking for the namespace convention
-/// alignment task.
+/// `plan_rewriter.rs::resolve_policy_key` passes the **whole** dotted
+/// namespace as `namespace` (schema `"sales_wh.sales"` stays `"sales_wh.sales"`),
+/// on every path: SELECT, DML, `information_schema`. Ranger `database`
+/// resource values must be written against that full dotted name.
 fn hive_database(namespace: &str) -> String {
     namespace.to_string()
 }
