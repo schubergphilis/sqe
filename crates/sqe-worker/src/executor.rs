@@ -28,6 +28,11 @@ use tokio::sync::{mpsc, watch, Notify};
 use tracing::{debug, info, warn};
 use url::Url;
 
+/// Apply `[worker] row_group_pruning` (and its env overlay) once at bootstrap.
+pub fn configure_row_group_pruning(enabled: bool) {
+    row_group_prune::configure(enabled);
+}
+
 use sqe_catalog::FooterCache;
 use sqe_metrics::{MetricsRegistry, WorkerMetricsRegistry};
 use sqe_planner::ScanTask;
@@ -185,11 +190,14 @@ mod row_group_prune {
     /// Read once and cached: the value cannot change within a process, and a
     /// per-file `std::env::var` on the scan path would be a lock acquisition
     /// per file for no reason.
+    static PRUNING_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+    pub fn configure(enabled: bool) {
+        let _ = PRUNING_ENABLED.set(enabled);
+    }
+
     pub(super) fn pruning_enabled() -> bool {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            enabled_from_env(std::env::var("SQE_WORKER_ROW_GROUP_PRUNING").ok().as_deref())
-        })
+        *PRUNING_ENABLED.get_or_init(|| true)
     }
 
     /// The switch's parsing, split out so it is testable without touching the
@@ -200,6 +208,7 @@ mod row_group_prune {
     ///
     /// Unset, or any value that is not a recognised negative, leaves pruning
     /// ON, so a typo cannot silently disable a scan optimization.
+    #[cfg(test)]
     pub(super) fn enabled_from_env(value: Option<&str>) -> bool {
         match value {
             Some(raw) => !matches!(

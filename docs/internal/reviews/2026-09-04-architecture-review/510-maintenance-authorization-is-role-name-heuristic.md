@@ -4,7 +4,8 @@
 - Severity: medium
 - Category: security
 - Effort: S (hours)
-- Status: open
+- Status: fixed (branch `fix/authz-policy-enforcement-p1`, 2026-09-05)
+- Issue: #602
 
 ## Problem
 
@@ -87,3 +88,7 @@ excluded, but that depends on how their IdP names roles.
   "keep execution separately authorized" for maintenance recommendations.
 - 511 (scheduler is the legitimate non-admin caller; it uses
   `has_maintenance_authority`).
+
+## Resolution (2026-09-05)
+
+Maintenance procedures are tiered in `crates/sqe-coordinator/src/maintenance.rs`: `ProcedureTier::ReadOnly` needs no role, `TableWrite` needs the table write grant or the explicit maintenance authority, and `Admin` (expire/remove-orphans class procedures) requires a role listed in `config.auth.has_admin_role`. Sessions with no roles are denied every non-read-only tier, and the old role-name substring heuristic survives only as `session_is_explicitly_read_only`, which can deny but never admit. The scheduler uses `session.has_maintenance_authority()`. Tests: `procedure_tiers_are_assigned_by_blast_radius`, `admin_tier_denies_empty_roles_and_non_admins`, `table_write_tier_admits_writers_and_maintenance_authority`, `read_only_tier_needs_no_roles`. The permissions section of `docs/site/book/src/sql-reference/procedures.md` documents the tiers.

@@ -29,6 +29,8 @@ pub mod read_csv;
 #[cfg(feature = "rest")]
 pub mod rest_catalog;
 pub mod runtime_bridge;
+pub mod session_tuning;
+pub use session_tuning::engine_session_config;
 #[cfg(feature = "rest")]
 pub mod schema_provider;
 #[cfg(feature = "rest")]

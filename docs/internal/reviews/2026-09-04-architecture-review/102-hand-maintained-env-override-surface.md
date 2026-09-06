@@ -4,7 +4,18 @@
 - Severity: medium
 - Category: maintainability
 - Effort: M (days)
-- Status: open
+- Status: fixed (branch `fix/config-startup-code-structure`, 2026-09-05)
+- Issue: #545
+
+## Resolution (2026-09-05)
+
+Fixed on `fix/config-startup-code-structure`. The 700-line `apply_env_overrides`
+allowlist is replaced by `config/env_overlay.rs`. Any `SQE_<SECTION>__<FIELD>`
+path overlays the serde schema; unknown TOML keys under owned structs
+(`#[serde(deny_unknown_fields)]` on `SqeConfig`, `CoordinatorConfig`,
+`QueryConfig`, `WorkerConfig`, `CatalogConfig`) fail load. `sqe-server
+--print-config` dumps the merged redacted TOML.
+
 
 ## Problem
 

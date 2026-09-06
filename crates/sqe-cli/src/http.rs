@@ -11,10 +11,21 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
+    pub fn with_bearer(base_url: &str, token: &str, accept_invalid_certs: bool) -> Self {
+        Self::with_auth_header(base_url, format!("Bearer {token}"), accept_invalid_certs)
+    }
+
     pub fn new(base_url: &str, username: &str, password: &str, accept_invalid_certs: bool) -> Self {
         let credentials =
             base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
-        let auth_header = format!("Basic {credentials}");
+        Self::with_auth_header(base_url, format!("Basic {credentials}"), accept_invalid_certs)
+    }
+
+    fn with_auth_header(
+        base_url: &str,
+        auth_header: String,
+        accept_invalid_certs: bool,
+    ) -> Self {
 
         let client = reqwest::Client::builder()
             .danger_accept_invalid_certs(accept_invalid_certs)

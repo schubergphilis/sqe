@@ -4,7 +4,17 @@
 - Severity: medium
 - Category: operability
 - Effort: M
-- Status: open
+- Status: partial (branch `fix/config-startup-code-structure`, 2026-09-05)
+- Issue: #641
+
+## Resolution (2026-09-05)
+
+Partial on `fix/config-startup-code-structure`. Deleted `deploy/k8s/` and
+`deploy/docker-compose.sqe.yml`; `deploy/` is `helm/` + `observability/`.
+Chart `version` matches `appVersion` (0.37.0) and `scripts/release.sh` bumps
+both. Distributed compose has `healthcheck` + `mem_limit`. Dockerfile.full
+is not yet a build-arg of Dockerfile (follow-up).
+
 
 ## Problem
 

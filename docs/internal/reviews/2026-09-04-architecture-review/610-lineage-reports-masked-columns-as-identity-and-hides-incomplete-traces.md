@@ -5,6 +5,7 @@
 - Category: architecture
 - Effort: S (hours) to M (days)
 - Status: fixed (branch `fix/errors-audit-observability`, 2026-09-05)
+- Issue: #617
 
 ## Problem
 

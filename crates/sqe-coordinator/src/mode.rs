@@ -1,4 +1,4 @@
-use sqe_core::config::CoordinatorConfig;
+use sqe_core::config::{CoordinatorConfig, ServerMode};
 use sqe_core::SqeConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,36 +55,31 @@ fn warns_unauthenticated_workers_inner(
 ///
 /// Priority: config file `mode` field → `SQE_MODE` env var → legacy modes default to coordinator.
 pub fn resolve_mode(config: &SqeConfig) -> Result<Mode, String> {
-    let env_mode = std::env::var("SQE_MODE").ok();
-    resolve_mode_inner(&config.coordinator.mode, env_mode.as_deref())
+    // `SQE_MODE` is applied as an alias onto `coordinator.mode` during
+    // `SqeConfig::load`. CLI `--mode` still wins later in sqe-server.
+    Ok(match config.coordinator.mode.as_role() {
+        ServerMode::Worker => Mode::Worker,
+        _ => Mode::Coordinator,
+    })
 }
 
 fn resolve_mode_inner(config_mode: &str, env_mode: Option<&str>) -> Result<Mode, String> {
-    let config_lower = config_mode.to_lowercase();
-
-    if config_lower == "coordinator" {
-        return Ok(Mode::Coordinator);
+    let parsed = config_mode.parse::<ServerMode>();
+    if let Ok(mode) = parsed {
+        return Ok(match mode.as_role() {
+            ServerMode::Worker => Mode::Worker,
+            _ => Mode::Coordinator,
+        });
     }
-    if config_lower == "worker" {
-        return Ok(Mode::Worker);
-    }
-
-    // Fall back to SQE_MODE env var
     if let Some(val) = env_mode {
-        return match val.to_lowercase().as_str() {
-            "coordinator" => Ok(Mode::Coordinator),
-            "worker" => Ok(Mode::Worker),
-            other => Err(format!(
-                "Invalid SQE_MODE={other:?}. Valid values: coordinator, worker"
+        return match val.parse::<ServerMode>() {
+            Ok(ServerMode::Worker) => Ok(Mode::Worker),
+            Ok(_) => Ok(Mode::Coordinator),
+            Err(_) => Err(format!(
+                "Invalid SQE_MODE={val:?}. Valid values: coordinator, worker"
             )),
         };
     }
-
-    // Legacy modes default to coordinator
-    if config_lower == "hybrid" || config_lower == "local" || config_lower == "distributed" {
-        return Ok(Mode::Coordinator);
-    }
-
     Err(format!(
         "SQE_MODE is not set and config mode={config_mode:?} is not recognized.\n\
          Set SQE_MODE=coordinator or SQE_MODE=worker, or set mode in config file."
@@ -170,11 +165,12 @@ mod tests {
 
     #[test]
     fn env_var_with_legacy_config_prefers_legacy() {
-        // Legacy modes (hybrid/local/distributed) prefer env var since it's more specific
-        // Actually env var is checked first for non-coordinator/worker config modes
+        // Legacy modes deserialize as coordinator. `SQE_MODE` is applied as a
+        // config overlay at load time, so by the time resolve_mode runs the
+        // field is already Worker or Coordinator.
         assert_eq!(
             resolve_mode_inner("hybrid", Some("worker")).unwrap(),
-            Mode::Worker
+            Mode::Coordinator
         );
     }
 

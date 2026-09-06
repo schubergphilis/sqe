@@ -5,6 +5,7 @@
 - Category: reliability
 - Effort: M (days)
 - Status: fixed (branch `fix/errors-audit-observability`, 2026-09-05)
+- Issue: #571
 
 ## Problem
 

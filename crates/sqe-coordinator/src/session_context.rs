@@ -2,7 +2,7 @@ use std::sync::{Arc, LazyLock, OnceLock};
 
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
 use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::prelude::SessionContext;
 use moka::future::Cache;
 use sha2::{Digest, Sha256};
 use tracing::debug;
@@ -317,36 +317,9 @@ pub async fn create_session_context(
             };
             drop(config_catalog_names);
 
-            let session_config = SessionConfig::new()
+            let session_config = sqe_catalog::engine_session_config()
                 .with_information_schema(true)
-                .with_default_catalog_and_schema(&default_catalog, &session_schema)
-                // Parse numeric literals like 0.06 as DECIMAL instead of DOUBLE.
-                // Matches Trino/SQL standard behavior: 0.06 - 0.01 = 0.05 (exact),
-                // not 0.049999999999999996 (floating-point). Critical for correct
-                // BETWEEN predicates and aggregate precision.
-                .set_bool("datafusion.sql_parser.parse_float_as_decimal", true)
-                // Parse with the DuckDB SQL dialect instead of the default
-                // Generic. DuckDB keeps Generic's double-quoted-identifier and
-                // backtick behavior (no change to how existing SQL parses) but
-                // adds `x -> expr` lambda syntax, which unlocks the Trino
-                // higher-order array functions (filter/transform, aliased onto
-                // DataFusion's array_filter/array_transform). See #354.
-                .set_str("datafusion.sql_parser.dialect", "DuckDB")
-                // Broadcast threshold for hash joins: dimension tables below this
-                // size use CollectLeft mode (build entire table in memory, broadcast
-                // to probe side). Default 1MB is too low for TPC-DS dimension tables
-                // like date_dim (73K rows ~5MB), customer_demographics (1.9M ~80MB).
-                // 64MB matches Trino/Spark's broadcast join threshold.
-                .set_usize("datafusion.optimizer.hash_join_single_partition_threshold", 64 * 1024 * 1024)
-                // Dynamic filter pushdown: hash join build-side min/max values
-                // pushed to probe-side scans at runtime.
-                .set_bool("datafusion.optimizer.enable_dynamic_filter_pushdown", true)
-                // Parquet filter pushdown: DataFusion pushes predicates into
-                // the Parquet reader as RowFilters. Type mismatches (Utf8 >= Int32)
-                // are handled gracefully by PhysicalExprPredicate (returns all-true
-                // on error, lets parent FilterExec handle the coercion).
-                .set_bool("datafusion.execution.parquet.pushdown_filters", true)
-                .set_bool("datafusion.execution.parquet.reorder_filters", true);
+                .with_default_catalog_and_schema(&default_catalog, &session_schema);
 
             // Dynamic-filter membership pushdown sizing. DataFusion only
             // materializes the build-side key set as an IN-list (extractable,

@@ -1001,7 +1001,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn error_from_code_maps_auth_and_internal() {
         let unauthorized = TrinoError::from_code(
             sqe_core::SqeErrorCode::AuthenticationFailed,
@@ -1029,6 +1028,7 @@ mod tests {
         assert_eq!(panic.error_type, "INTERNAL_ERROR");
     }
 
+    #[test]
     fn test_trino_error_includes_failure_info() {
         let err = TrinoError {
             message: "broken".to_string(),

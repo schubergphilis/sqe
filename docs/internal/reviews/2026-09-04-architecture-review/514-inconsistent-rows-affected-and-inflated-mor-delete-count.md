@@ -5,6 +5,7 @@
 - Category: reliability
 - Effort: S (hours)
 - Status: open
+- Issue: #606
 
 ## Problem
 

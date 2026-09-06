@@ -892,7 +892,7 @@ mod tests {
             "Failed to create table: status: 403 Forbidden, ... Unable to \
              create table at location 's3://iceberg-warehouse/main_warehouse/\
              dev_silver/stg_customers__dbt_tmp' because it conflicts with \
-             existing table or namespace",
+             existing table or namespace".to_string(),
         );
         let msg = err.client_message();
         assert!(msg.contains("conflicts with existing table"));
@@ -1030,7 +1030,7 @@ mod tests {
         // SqeSchemaProvider::table(), which made every Iceberg view
         // unreadable. See scripts/access-control-parity-demo.sh section 7.
         let err = SqeError::Catalog(
-            "Failed to load table: Unexpected => Tried to load a table that does not exist",
+            "Failed to load table: Unexpected => Tried to load a table that does not exist".to_string(),
         );
         assert_eq!(err.error_code(), SqeErrorCode::TableNotFound);
     }
@@ -1074,7 +1074,7 @@ mod tests {
         let err = SqeError::Execution(
             "Resources exhausted: Failed to allocate additional 134217728 bytes for \
              iceberg-scan-decode:iceberg.tpch.lineitem with 0 bytes already allocated \
-             for this reservation - 1048576 bytes remain available for the total pool",
+             for this reservation - 1048576 bytes remain available for the total pool".to_string(),
         );
         assert_eq!(err.error_code(), SqeErrorCode::ResourceExhausted);
     }
@@ -1088,7 +1088,7 @@ mod tests {
         let err = SqeError::Execution(
             "Query execution error: Failed to commit INSERT transaction: \
              Unexpected, context: { status: 401 Unauthorized, \
-             headers: {\"www-authenticate\": \"Bearer\"} }",
+             headers: {\"www-authenticate\": \"Bearer\"} }".to_string(),
         );
         assert_eq!(err.error_code(), SqeErrorCode::AuthenticationFailed);
     }
@@ -1098,7 +1098,7 @@ mod tests {
         let err = SqeError::Execution(
             "Query execution error: Failed to create table: \
              Unexpected, context: { status: 403 Forbidden, \
-             headers: {\"content-type\": \"application/json\"} }",
+             headers: {\"content-type\": \"application/json\"} }".to_string(),
         );
         assert_eq!(err.error_code(), SqeErrorCode::AccessDenied);
     }
@@ -1111,7 +1111,7 @@ mod tests {
         // "403 forbidden") so a regular table-not-found error still routes
         // to TableNotFound, not AuthenticationFailed.
         let err = SqeError::Execution(
-            "Query execution error: table 'orders' not found in catalog",
+            "Query execution error: table 'orders' not found in catalog".to_string(),
         );
         assert_eq!(err.error_code(), SqeErrorCode::TableNotFound);
     }
@@ -1142,7 +1142,7 @@ mod tests {
         let err = SqeError::Execution(
             "Function 'lower' requires String, but received Boolean (DataType: Boolean).. \
              No function matches the given name and argument types 'lower(Boolean)'. \
-             You might need to add explicit type casts.",
+             You might need to add explicit type casts.".to_string(),
         );
         assert_eq!(err.error_code(), SqeErrorCode::TypeMismatch);
     }
@@ -1157,7 +1157,7 @@ mod tests {
         // USER_ERROR over Trino), not fall through to ExecutionFailed
         // (INTERNAL_ERROR), which mislabels a bad predicate as a server bug.
         let err = SqeError::Execution(
-            "DataInvalid => Can't convert datum from long type to string type.",
+            "DataInvalid => Can't convert datum from long type to string type.".to_string(),
         );
         assert_eq!(err.error_code(), SqeErrorCode::TypeMismatch);
         assert!(err.error_code().is_user_error());
@@ -1168,7 +1168,7 @@ mod tests {
         // The raw iceberg `DataInvalid => ` wrapper should not leak to clients;
         // the readable cause survives.
         let err = SqeError::Execution(
-            "DataInvalid => Can't convert datum from long type to string type.",
+            "DataInvalid => Can't convert datum from long type to string type.".to_string(),
         );
         let msg = err.client_message();
         assert!(!msg.contains("DataInvalid =>"), "prefix leaked: {msg}");
@@ -1197,7 +1197,7 @@ mod tests {
         // race was active. Must NOT classify as TableNotFound.
         let err = SqeError::Catalog(
             "Failed to list namespaces: Unexpected, context: \
-             { status: 401 Unauthorized, headers: { www-authenticate: \"Bearer\" } }",
+             { status: 401 Unauthorized, headers: { www-authenticate: \"Bearer\" } }".to_string(),
         );
         let code = err.error_code();
         assert_eq!(code, SqeErrorCode::AuthenticationFailed);
@@ -1208,7 +1208,7 @@ mod tests {
     #[test]
     fn error_code_catalog_403_classifies_as_access_denied() {
         let err = SqeError::Catalog(
-            "Failed to load table: 403 Forbidden: principal not authorised",
+            "Failed to load table: 403 Forbidden: principal not authorised".to_string(),
         );
         let code = err.error_code();
         assert_eq!(code, SqeErrorCode::AccessDenied);
@@ -1220,7 +1220,7 @@ mod tests {
         // DataFusion's External wrapper is flattened by the coordinator today.
         // The catalog marker must still map it to PERMISSION_DENIED.
         let err = SqeError::Execution(
-            "SQL planning failed: External error: Access denied: Failed to load table",
+            "SQL planning failed: External error: Access denied: Failed to load table".to_string(),
         );
         assert_eq!(err.error_code(), SqeErrorCode::AccessDenied);
     }
@@ -1430,7 +1430,7 @@ mod tests {
     fn execution_auth_401_is_authentication_failed() {
         let err = SqeError::ExecutionAuth {
             status: 401,
-            body: "token expired",
+            body: "token expired".to_string(),
         };
         assert_eq!(err.error_code(), SqeErrorCode::AuthenticationFailed);
     }
@@ -1446,13 +1446,13 @@ mod tests {
 
     #[test]
     fn iceberg_commit_conflict_variant_is_commit_conflict() {
-        let err = SqeError::IcebergCommitConflict("snapshot N has already been added");
+        let err = SqeError::IcebergCommitConflict("snapshot N has already been added".to_string());
         assert_eq!(err.error_code(), SqeErrorCode::CommitConflict);
     }
 
     #[test]
     fn s3_throttled_variant_is_resource_exhausted() {
-        let err = SqeError::S3Throttled("SlowDown");
+        let err = SqeError::S3Throttled("SlowDown".to_string());
         assert_eq!(err.error_code(), SqeErrorCode::ResourceExhausted);
     }
 
@@ -1475,7 +1475,7 @@ mod tests {
     #[test]
     fn datafusion_resources_exhausted_maps_by_variant_not_text() {
         let err: SqeError = DataFusionError::ResourcesExhausted(
-            "table timeout_events not found while allocating",
+            "table timeout_events not found while allocating".to_string(),
         )
         .into();
         assert_eq!(err.error_code(), SqeErrorCode::ResourceExhausted);
@@ -1483,7 +1483,7 @@ mod tests {
 
     #[test]
     fn datafusion_plan_maps_to_semantic_error() {
-        let err: SqeError = DataFusionError::Plan("Error during planning").into();
+        let err: SqeError = DataFusionError::Plan("Error during planning".to_string()).into();
         assert_eq!(err.error_code(), SqeErrorCode::SemanticError);
     }
 
@@ -1501,7 +1501,7 @@ mod tests {
         let err = SqeError::CatalogHttp {
             status: 500,
             op: CatalogOp::LoadTable,
-            body: "forbidden by policy engine for table forbidden_words",
+            body: "forbidden by policy engine for table forbidden_words".to_string(),
         };
         assert_eq!(err.error_code(), SqeErrorCode::CatalogUnavailable);
         assert!(!err.error_code().is_user_error());

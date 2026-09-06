@@ -826,7 +826,7 @@ impl HiveCatalogs {
 /// deliberate: every Ranger policy already written against the
 /// `hive_database` convention keys on the bare Iceberg namespace, and making
 /// both branches symmetric would be its own migration, not this one.
-fn resolve_policy_key(
+pub fn resolve_policy_key(
     table_ref: &datafusion::common::TableReference,
     hive_catalogs: &HiveCatalogs,
 ) -> Option<(String, String)> {
@@ -848,16 +848,30 @@ fn resolve_policy_key(
     Some((namespace, table.to_string()))
 }
 
-/// Test-only door into `resolve_policy_key`. The key rule itself stays
-/// private; only the coordinator's cross-crate regression test (proving a
-/// root attached after the rewriter was built still resolves under the Hive
-/// branch) needs to reach it, not the public API.
-#[doc(hidden)]
-pub fn resolve_policy_key_for_test(
-    table_ref: &datafusion::common::TableReference,
+/// The same key rule for callers that hold an Iceberg-style identity
+/// (`catalog`, namespace path, table) instead of a DataFusion
+/// `TableReference`: DML handlers, `information_schema.columns`, the
+/// write-predicate probe. Every policy lookup in the engine must go through
+/// one of these two entry points; the review found three hand-copied
+/// "last namespace component" variants that had drifted from the read path
+/// (architecture review 201), so the rule is now called, not copied.
+///
+/// The namespace path is display-joined with `.`, exactly as the SQL planner
+/// spells a multi-level namespace in the scan's `TableReference`.
+pub fn resolve_policy_key_for_ident(
+    catalog: Option<&str>,
+    namespace: &[String],
+    table: &str,
     hive_catalogs: &HiveCatalogs,
 ) -> Option<(String, String)> {
-    resolve_policy_key(table_ref, hive_catalogs)
+    use datafusion::common::TableReference;
+    let namespace = namespace.join(".");
+    let table_ref = match (catalog, namespace.is_empty()) {
+        (Some(catalog), false) => TableReference::full(catalog, namespace, table),
+        (_, false) => TableReference::partial(namespace, table),
+        (_, true) => TableReference::bare(table),
+    };
+    resolve_policy_key(&table_ref, hive_catalogs)
 }
 
 /// Widen a `TableScan`'s projection so a row filter can reference a column the
@@ -1665,6 +1679,34 @@ mod tests {
         );
     }
 
+    /// 201: the read path (TableReference) and the ident path (DML,
+    /// information_schema) must agree on every shape, including
+    /// multi-level namespaces and Hive roots.
+    #[test]
+    fn ident_and_table_ref_keys_agree() {
+        use datafusion::common::TableReference;
+        let cats = HiveCatalogs::default();
+        let ns = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            resolve_policy_key(&TableReference::partial("a.b", "t"), &cats),
+            resolve_policy_key_for_ident(None, &ns(&["a", "b"]), "t", &cats)
+        );
+        assert_eq!(
+            resolve_policy_key(&TableReference::full("cat", "a.b", "t"), &cats),
+            resolve_policy_key_for_ident(Some("cat"), &ns(&["a", "b"]), "t", &cats)
+        );
+        assert_eq!(
+            resolve_policy_key(&TableReference::bare("t"), &cats),
+            resolve_policy_key_for_ident(None, &[], "t", &cats)
+        );
+        assert_eq!(
+            resolve_policy_key_for_ident(None, &ns(&["a", "b"]), "t", &cats),
+            Some(("a.b".to_string(), "t".to_string())),
+            "the whole namespace is the key, never its last component"
+        );
+        assert_eq!(resolve_policy_key_for_ident(None, &[], "", &cats), None);
+    }
+
     #[test]
     fn namespaces_sharing_a_last_component_no_longer_collide() {
         // The point of keeping the whole namespace. Before, both of these produced
@@ -1773,13 +1815,13 @@ mod tests {
         let cats = HiveCatalogs::default();
         let r = datafusion::common::TableReference::full("lake", "sales", "orders");
         assert_eq!(
-            resolve_policy_key_for_test(&r, &cats),
+            resolve_policy_key(&r, &cats),
             Some(("sales".to_string(), "orders".to_string())),
             "before ATTACH the root is unknown, so the Iceberg branch is correct"
         );
         cats.insert("lake");
         assert_eq!(
-            resolve_policy_key_for_test(&r, &cats),
+            resolve_policy_key(&r, &cats),
             Some(("lake.sales".to_string(), "orders".to_string())),
             "after ATTACH the same reference must key under the root"
         );

@@ -5,6 +5,7 @@
 - Category: security
 - Effort: S (hours) to M (days)
 - Status: open
+- Issue: #610
 
 ## Problem
 

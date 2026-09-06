@@ -254,17 +254,17 @@ Order matters: expire snapshots before removing orphan files (otherwise files re
 
 ## Permissions
 
-Procedures inherit the calling user's grants on the target table:
+Procedures are gated in three tiers, by blast radius. Polaris grants on the target table still apply underneath every tier.
 
-- `system.rewrite_data_files`, `system.rewrite_manifests` need `MODIFY` (writes new files, commits a snapshot).
-- `system.expire_snapshots`, `system.remove_orphan_files` need `MODIFY` and `DROP` (alters retention, deletes files).
-- `system.suggest_bloom_filter_columns` is read-only against query history; `SELECT` on the table is enough.
-- `system.table_health` is read-only against the table's live metadata; `SELECT` on the table is enough. It bypasses the write-privilege gate entirely, unlike every other procedure in this table.
-- `system.refresh_catalog_cache` is self-scoped (it refreshes only the caller's own session view) and bypasses the write-privilege gate, like `system.table_health`. A global flush across all sessions is intentionally not a SQL procedure: use the admin-gated `POST /api/v1/catalogs/refresh` endpoint instead.
+| Tier | Procedures | Who may call |
+|---|---|---|
+| Read-only | `system.table_health`, `system.suggest_bloom_filter_columns`, `system.refresh_catalog_cache`, `system.purge_orphan_locations(dry_run => true)` | Anyone who can read the table's metadata. |
+| Table write | `system.rewrite_data_files`, `system.rewrite_manifests` | Any session whose roles are not explicitly read-only (a role starting with `read` or `select`, or containing `readonly`, with no `write`, `admin` or `owner` role beside it). The commit runs with the caller's token, so Polaris `MODIFY` is the backstop. The maintenance scheduler's own session is admitted here. |
+| Admin | `system.expire_snapshots`, `system.remove_orphan_files`, `system.purge_orphan_locations(dry_run => false)`, `system.drop_table`, `system.register_table`, `system.set_current_snapshot`, `system.rollback_to_snapshot`, `system.reproject_column_tags` | One of the roles in `[auth] admin_roles`. Sessions with no roles are denied, and so is the scheduler's session. With no admin roles configured this tier is closed. |
 
-A user without the right grant gets a clear "policy denied" error instead of a generic execution failure.
+The admin tier exists because these procedures delete data files or history without a catalog commit Polaris could refuse, or move the table's main branch for everyone. They are administrative in Spark and Trino as well.
 
-When no OPA / Cedar policy store is wired, an engine-level heuristic acts as the last line of defence. A session is treated as read-only when any of its roles matches `read*`, `select*`, or contains `readonly`, and no role contains `write`, `admin`, or `owner`. Read-only sessions are denied every maintenance procedure and the attempt is recorded in the audit log with `status = "denied"`. A policy store overrides this heuristic once configured.
+A denied call fails with `403 Forbidden` and is recorded in the audit log as `AdminGateDenied`.
 
 ## Safety notes
 

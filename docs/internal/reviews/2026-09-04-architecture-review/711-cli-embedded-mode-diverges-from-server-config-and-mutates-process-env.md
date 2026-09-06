@@ -4,7 +4,18 @@
 - Severity: low
 - Category: maintainability
 - Effort: S (hours)
-- Status: open
+- Status: partial (branch `fix/config-startup-code-structure`, 2026-09-05)
+- Issue: #631
+
+## Resolution (2026-09-05)
+
+Partial on `fix/config-startup-code-structure`. Coordinator and CLI embedded
+mode share `sqe_catalog::engine_session_config()`. `std::env::set_var` after
+runtime start is gone; `--token` works on the HTTP protocol; missing TTY
+credentials exit with a one-line error. Mask-key still reads
+`SQE_POLICY__MASK_KEY` in embedded mode (follow-up: load `[policy]` from
+`--config`).
+
 
 ## Problem
 
