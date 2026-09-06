@@ -282,7 +282,7 @@ pub trait PolicyStore: Send + Sync {
     ///
     /// A backend gains the statement by overriding this. Only the Ranger store does.
     async fn list_mask_policies(&self) -> sqe_core::Result<Vec<MaskPolicyInfo>> {
-        Err(sqe_core::SqeError::Execution(
+        Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed,
             "SHOW MASKING POLICIES is not available: the configured policy backend \
              cannot list mask policies. It needs [policy] engine = \"ranger\"."
                 .to_string(),

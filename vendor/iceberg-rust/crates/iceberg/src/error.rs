@@ -313,6 +313,27 @@ impl Error {
         &self.backtrace
     }
 
+    /// HTTP status attached by the REST catalog client via `with_context("status", ...)`
+    /// or `with_context("code", ...)`. Parses the leading integer so `"403 Forbidden"`
+    /// and `"403"` both yield `Some(403)`. Returns `None` when no numeric status was
+    /// recorded — callers must not guess from the message text.
+    pub fn http_status(&self) -> Option<u16> {
+        for (key, value) in &self.context {
+            if *key != "status" && *key != "code" {
+                continue;
+            }
+            let token = value
+                .split(|c: char| !c.is_ascii_digit())
+                .find(|t| !t.is_empty())?;
+            if let Ok(code) = token.parse::<u16>() {
+                if (100..600).contains(&code) {
+                    return Some(code);
+                }
+            }
+        }
+        None
+    }
+
     /// Return error's kind.
     ///
     /// Users can use this method to check error's kind and take actions.

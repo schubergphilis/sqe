@@ -32,11 +32,11 @@ BIN_SERVER   := sqe-server
 #   * `push` produces a multi-arch image (amd64+arm64) via `docker buildx` and
 #     pushes it straight to the registry (manifest lists can't be `--load`ed).
 #
-# The image is built from Dockerfile.full by default (all catalog backends
-# compiled in: Polaris + Nessie + Glue + HMS + Unity). Override for the slim
-# image: `make SQE_DOCKERFILE=Dockerfile build`.
+# One Dockerfile. Kitchen-sink backends are a build-arg (the previous
+# Dockerfile.full). Slim REST image: `make CATALOG_FEATURES= build`.
 DOCKER         ?= docker
-SQE_DOCKERFILE ?= Dockerfile.full
+SQE_DOCKERFILE ?= Dockerfile
+CATALOG_FEATURES ?= sqe-catalog/full-backends
 
 # Optional registry/namespace prefix for the LOCAL `build`. Empty = bare name.
 # A trailing slash is added automatically when set.
@@ -77,7 +77,8 @@ CONFIG_OUT_DIR ?= dist/sqe-config
 SQE_BUILD_ARGS := \
 	--build-arg BUILD_DATE=$(BUILD_DATE) \
 	--build-arg GIT_REVISION=$(GIT_REVISION) \
-	--build-arg VERSION=$(IMAGE_TAG)
+	--build-arg VERSION=$(IMAGE_TAG) \
+	--build-arg CATALOG_FEATURES=$(CATALOG_FEATURES)
 
 # ── Benchmarks ─────────────────────────────────────────────────────────────
 # `make benchmark_sf1` etc. wrap scripts/benchmark-make-run.sh, which wraps
@@ -99,7 +100,7 @@ BENCH_ENV       = PROFILE=$(BENCH_PROFILE) BENCH_LOG_DIR=$(BENCH_LOG_DIR)
         benchmark_sf0.1 benchmark_sf1 benchmark_sf10 benchmark_all \
         benchmark_sf0.1_trino benchmark_sf1_trino benchmark_sf10_trino \
         benchmark_all_trino \
-        clippy fmt fmt-check clean clean-rust clean-rustbook \
+        clippy fmt fmt-check pre-commit clean clean-rust clean-rustbook \
         clean-ebook clean-benchmark-charts clean-images check-tools maintain \
         build build-sqe sbom sbom-sqe sqe-config images \
         login buildx-builder push push-sqe leak-scan
@@ -123,6 +124,7 @@ help:
 	@echo "    make clippy       cargo clippy --all-targets -- -D warnings"
 	@echo "    make fmt          cargo fmt --all"
 	@echo "    make fmt-check    cargo fmt --all --check"
+	@echo "    make pre-commit   gitleaks + file checks (Aikido .pre secret-scan analog)"
 	@echo ""
 	@echo "  Supply chain:"
 	@echo "    make audit        cargo audit + cargo deny check (advisories, bans, sources)"
@@ -160,7 +162,7 @@ help:
 	@echo ""
 	@echo "  Combined:"
 	@echo "    make all          audit + test + image build + benchmark_all (hours, not minutes:"
-	@echo "                      full Dockerfile.full compile then SF0.1+SF1+SF10 over all suites)"
+	@echo "                      full image compile then SF0.1+SF1+SF10 over all suites)"
 	@echo "    make all_trino    Same, with the SQE-vs-Trino comparison on"
 	@echo "    make docs-and-image  dev build + rustbook + ebook + image build + sbom"
 	@echo ""
@@ -182,7 +184,7 @@ help:
 # The previous meaning of `all` (docs + image) lives on as `docs-and-image`.
 # Steps are recipe lines, not prerequisites, so they stay ordered under `-j`:
 # the benchmark stack owns fixed ports and must not overlap with anything.
-# This is a long gate, not a quick check: `build` compiles Dockerfile.full and
+# This is a long gate, not a quick check: `build` compiles the server image and
 # the benchmark step cargo-builds sqe-bench/sqe-coordinator separately, then
 # sweeps three scale factors. For a fast pre-push loop use `make audit test`.
 all:
@@ -339,6 +341,12 @@ fmt:
 fmt-check:
 	@echo "==> Checking formatting"
 	$(CARGO) fmt --all --check
+
+# Local analog of Aikido aikido-secret-scan (gitleaks via .pre-commit-config.yaml).
+# Requires `pre-commit` on PATH (`pipx install pre-commit` / `brew install pre-commit`).
+pre-commit:
+	@echo "==> Running pre-commit hooks"
+	pre-commit run
 
 # ── Container image: build / SBOM / config / push ─────────────────────────
 # Build context is the repo root (the Dockerfile COPYs Cargo.toml, crates/,

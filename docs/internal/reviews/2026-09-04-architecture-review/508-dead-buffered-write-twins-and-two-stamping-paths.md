@@ -4,8 +4,15 @@
 - Severity: medium
 - Category: maintainability
 - Effort: M (days)
-- Status: open
-- Issue: #600
+- Status: partial (branch `fix/config-startup-code-structure`, 2026-09-05)
+
+## Resolution (2026-09-05)
+
+Partial on `fix/config-startup-code-structure`. Deleted unused buffered
+`handle_ctas` / `handle_insert` / `handle_ingest`. `stamp_field_ids` vs
+compaction stamping still both exist (CoW rewrite still uses the buffered
+writer). Follow-up: one stamping path.
+
 
 ## Problem
 

@@ -11,7 +11,7 @@ use tracing::{debug, info, instrument, warn, Instrument};
 use uuid::Uuid;
 
 use sqe_core::config::{SqeConfig, StorageConfig};
-use sqe_core::SqeError;
+use sqe_core::{SqeError, SqeErrorCode};
 use sqe_metrics::propagation::trace_context_http_headers;
 
 use crate::circuit_breaker::CircuitBreaker;
@@ -1046,8 +1046,7 @@ fn warn_shared_backend_identity_once(backend: &sqe_core::config::CatalogBackend)
 /// read as NOT forbidden — visibility probes must fail the listing on
 /// those rather than leak the namespace name (#401).
 pub(crate) fn iceberg_error_is_forbidden(e: &iceberg::Error) -> bool {
-    let rendered = format!("{e:?}").to_ascii_lowercase();
-    rendered.contains("403") || rendered.contains("forbidden")
+    e.http_status() == Some(403)
 }
 
 fn table_metadata_cache_key(
@@ -1077,17 +1076,49 @@ fn table_metadata_cache_suffix(table_ident: &TableIdent) -> String {
 /// classifier sees can omit it). This is used for both listings and table loads:
 /// callers must distinguish an absent table from one Polaris refused.
 fn classify_iceberg_catalog_error(context: &str, e: iceberg::Error) -> SqeError {
-    if iceberg_error_is_forbidden(&e) {
-        // DataFusion wraps provider errors during planning and the coordinator
-        // currently classifies that wrapper from its Display text. Keep an
-        // explicit marker when the 403 exists only in Iceberg's Debug context.
-        SqeError::sourced(
-            sqe_core::SqeErrorCode::AccessDenied,
-            format!("Access denied: {context}: {e}"),
+    if let Some(status) = e.http_status() {
+        let body = format!("{context}: {e}");
+        return SqeError::CatalogHttp {
+            status,
+            op: sqe_core::CatalogOp::Other,
+            body,
+        };
+    }
+    match e.kind() {
+        iceberg::ErrorKind::TableNotFound => SqeError::sourced(
+            sqe_core::SqeErrorCode::TableNotFound,
+            format!("{context}: {e}"),
             e,
-        )
-    } else {
-        SqeError::catalog_src(format!("{context}: {e}"), e)
+        ),
+        iceberg::ErrorKind::NamespaceNotFound => SqeError::sourced(
+            sqe_core::SqeErrorCode::SchemaNotFound,
+            format!("{context}: {e}"),
+            e,
+        ),
+        iceberg::ErrorKind::TableAlreadyExists | iceberg::ErrorKind::NamespaceAlreadyExists => {
+            SqeError::sourced(
+                sqe_core::SqeErrorCode::DuplicateTable,
+                format!("{context}: {e}"),
+                e,
+            )
+        }
+        iceberg::ErrorKind::CatalogCommitConflicts => SqeError::IcebergCommitConflict(format!(
+            "{context}: {e}"
+        )),
+        iceberg::ErrorKind::DataInvalid => SqeError::sourced(
+            sqe_core::SqeErrorCode::TypeMismatch,
+            format!("{context}: {e}"),
+            e,
+        ),
+        iceberg::ErrorKind::FeatureUnsupported => SqeError::sourced(
+            sqe_core::SqeErrorCode::NotSupported,
+            format!("{context}: {e}"),
+            e,
+        ),
+        iceberg::ErrorKind::PreconditionFailed | iceberg::ErrorKind::Unexpected => {
+            SqeError::catalog_src(format!("{context}: {e}"), e)
+        }
+        _ => SqeError::catalog_src(format!("{context}: {e}"), e),
     }
 }
 
@@ -1296,7 +1327,7 @@ impl SessionCatalog {
             CatalogBackend::Rest => {
                 return Err(SqeError::Catalog(
                     "build_backend_catalog is for non-REST backends; REST is built via for_session"
-                        .into(),
+                        .to_string(),
                 ));
             }
 
@@ -1311,7 +1342,7 @@ impl SessionCatalog {
             #[cfg(not(feature = "hms"))]
             CatalogBackend::Hms { .. } => {
                 return Err(SqeError::Catalog(
-                    "HMS backend requires the `hms` cargo feature on sqe-catalog".into(),
+                    "HMS backend requires the `hms` cargo feature on sqe-catalog".to_string(),
                 ));
             }
 
@@ -1337,7 +1368,7 @@ impl SessionCatalog {
             #[cfg(not(feature = "glue"))]
             CatalogBackend::Glue { .. } => {
                 return Err(SqeError::Catalog(
-                    "Glue backend requires the `glue` cargo feature on sqe-catalog".into(),
+                    "Glue backend requires the `glue` cargo feature on sqe-catalog".to_string(),
                 ));
             }
 
@@ -1352,7 +1383,8 @@ impl SessionCatalog {
             #[cfg(not(feature = "sql-postgres"))]
             CatalogBackend::Jdbc { .. } => {
                 return Err(SqeError::Catalog(
-                    "JDBC backend requires the `sql-postgres` cargo feature on sqe-catalog".into(),
+                    "JDBC backend requires the `sql-postgres` cargo feature on sqe-catalog"
+                        .to_string(),
                 ));
             }
 
@@ -1377,7 +1409,8 @@ impl SessionCatalog {
             #[cfg(not(feature = "s3tables"))]
             CatalogBackend::S3tables { .. } => {
                 return Err(SqeError::Catalog(
-                    "S3 Tables backend requires the `s3tables` cargo feature on sqe-catalog".into(),
+                    "S3 Tables backend requires the `s3tables` cargo feature on sqe-catalog"
+                        .to_string(),
                 ));
             }
         };
@@ -2178,7 +2211,7 @@ impl SessionCatalog {
                 )));
             }
             if status == reqwest::StatusCode::CONFLICT {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Catalog commit conflict: {text}"
                 )));
             }
@@ -2225,7 +2258,7 @@ impl SessionCatalog {
                 )));
             }
             if status == reqwest::StatusCode::CONFLICT {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Catalog commit conflict: {text}"
                 )));
             }
@@ -2299,7 +2332,7 @@ impl SessionCatalog {
                 )));
             }
             if status == reqwest::StatusCode::CONFLICT {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Catalog commit conflict: {text}"
                 )));
             }
@@ -2368,7 +2401,7 @@ impl SessionCatalog {
                 )));
             }
             if status == reqwest::StatusCode::CONFLICT {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Catalog commit conflict: {text}"
                 )));
             }
@@ -2449,7 +2482,7 @@ impl SessionCatalog {
                 )));
             }
             if status == reqwest::StatusCode::CONFLICT {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Catalog commit conflict: {text}"
                 )));
             }
@@ -2716,7 +2749,7 @@ mod cache_capacity_tests {
         cb.record_failure();
         assert!(cb.check().is_ok());
         assert_eq!(cb.state_label(), "half_open");
-        let err: sqe_core::Result<()> = Err(sqe_core::SqeError::Catalog("403 Forbidden".into()));
+        let err: sqe_core::Result<()> = Err(sqe_core::SqeError::Catalog("403 Forbidden".to_string()));
         assert_eq!(
             err.as_ref().unwrap_err().error_code(),
             sqe_core::SqeErrorCode::AccessDenied
@@ -3065,7 +3098,11 @@ mod cache_capacity_tests {
         .with_context("status", "403 Forbidden");
         let wrapped = super::classify_iceberg_catalog_error("Failed to list tables", e);
         assert_eq!(wrapped.error_code(), sqe_core::SqeErrorCode::AccessDenied);
-        assert!(wrapped.client_message().starts_with("Access denied:"));
+        assert!(
+            wrapped.client_message().contains("403"),
+            "client message should carry the typed status, got {}",
+            wrapped.client_message()
+        );
         assert!(super::listing_error_is_forbidden(&wrapped));
     }
 
@@ -3093,6 +3130,27 @@ mod cache_capacity_tests {
         )
         .with_context("status", "500 Internal Server Error");
         let wrapped = super::classify_iceberg_catalog_error("Failed to list tables", e);
+        assert!(!super::listing_error_is_forbidden(&wrapped));
+        assert_eq!(
+            wrapped.error_code(),
+            sqe_core::SqeErrorCode::CatalogUnavailable
+        );
+    }
+
+    /// A table whose name contains "forbidden" with a 500 must not classify as
+    /// AccessDenied — status is the only signal (finding 305).
+    #[test]
+    fn classify_iceberg_does_not_match_forbidden_in_table_name() {
+        let e = iceberg::Error::new(
+            iceberg::ErrorKind::Unexpected,
+            "Failed to load table forbidden_words",
+        )
+        .with_context("status", "500 Internal Server Error");
+        let wrapped = super::classify_iceberg_catalog_error("load table forbidden_words", e);
+        assert_eq!(
+            wrapped.error_code(),
+            sqe_core::SqeErrorCode::CatalogUnavailable
+        );
         assert!(!super::listing_error_is_forbidden(&wrapped));
     }
 

@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use crate::error::{Result, SqeError};
+use crate::error::{Result, SqeError, SqeErrorCode};
 
 /// Table property key: write mode for DELETE statements.
 pub const WRITE_DELETE_MODE: &str = "write.delete.mode";
@@ -51,7 +51,7 @@ impl WriteMode {
         match value {
             "copy-on-write" => Ok(WriteMode::CopyOnWrite),
             "merge-on-read" => Ok(WriteMode::MergeOnRead),
-            other => Err(SqeError::Execution(format!(
+            other => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "unsupported write mode '{other}'; expected 'copy-on-write' or 'merge-on-read'"
             ))),
         }

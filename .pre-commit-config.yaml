@@ -1,0 +1,65 @@
+# Local analog of Aikido's `.pre` guardrails, focused on the cheap
+# secret-scan gate that should fail a commit before CI does.
+#
+# CI (aikido v0.12.0 `ci/templates/guardrails.yml`, job `aikido-secret-scan`)
+# runs, when `.asset` has `secret_scan = true` (it does):
+#
+#   gitleaks detect --source $CI_PROJECT_DIR --no-git --redact -v \
+#     --config .gitleaks.toml
+#
+# against the whole working tree. This hook scans *staged* files with the
+# same config: gitleaks auto-discovers `.gitleaks.toml` at the repo root, so
+# no `--config` flag is needed (and none is passed, matching the "gitleaks
+# takes one config" rule documented in that file). The full-history pass
+# stays schedule-only in CI (`aikido-secret-scan-history`).
+#
+# Semgrep, grype, trivy, and syft stay in CI: they need the aikido-tools
+# image and are too heavy for a commit hook.
+#
+# Install once from the repo root:
+#   pre-commit install
+# Run against staged files:
+#   pre-commit run
+#   make pre-commit
+# Run everything:
+#   pre-commit run --all-files
+
+default_install_hook_types: [pre-commit]
+exclude: ^(vendor/|target/|docs/target/)
+
+repos:
+  # Same scanner as aikido-secret-scan. The official `gitleaks` hook compiles
+  # from this tag (language: golang) so we do not pick up a system binary.
+  # Homebrew's v8.30.1 bottle is a known silent no-op (gitleaks/gitleaks#2170);
+  # aikido-tools vendors the same 8.30.1 line via a digest-pinned image.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: no-env-files
+        name: no .env files
+        entry: bash -c 'echo ".env file staged — use .env.example instead" && exit 1'
+        language: system
+        files: (^|/)\.env$
+        exclude: \.env\.(example|test)$
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: check-added-large-files
+      - id: check-symlinks
+      - id: check-toml
+      - id: check-yaml
+        # Helm templates are not YAML until rendered; multi-doc compose/k8s
+        # manifests are valid and must not be split to appease the linter.
+        args: [--allow-multiple-documents]
+        exclude: ^deploy/helm/.*/templates/
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]

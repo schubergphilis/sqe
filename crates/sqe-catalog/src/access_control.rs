@@ -8,7 +8,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
-use sqe_core::SqeError;
+use sqe_core::{SqeError, SqeErrorCode};
 
 /// HTTP client for the platform access control API.
 ///
@@ -117,7 +117,7 @@ impl AccessControlClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "GRANT failed (HTTP {status}): {text}"
             )));
         }
@@ -145,7 +145,7 @@ impl AccessControlClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "REVOKE failed (HTTP {status}): {text}"
             )));
         }
@@ -177,7 +177,7 @@ impl AccessControlClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "SHOW GRANTS failed (HTTP {status}): {text}"
             )));
         }
@@ -213,7 +213,7 @@ impl AccessControlClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "SHOW EFFECTIVE GRANTS failed (HTTP {status}): {text}"
             )));
         }
@@ -249,7 +249,7 @@ impl AccessControlClient {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "CHECK ACCESS failed (HTTP {status}): {text}"
             )));
         }

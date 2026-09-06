@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -74,6 +75,9 @@ pub struct SqeSchemaProvider {
     /// lookups during a single dbt run do not pay two REST round trips
     /// per call.
     table_names_cache: SyncCache<String, Arc<Vec<String>>>,
+    /// Set when `list_tables`/`list_views` failed so `table_exist` does not
+    /// treat an outage as "table missing".
+    listing_failed: AtomicBool,
 }
 
 impl SqeSchemaProvider {
@@ -104,6 +108,7 @@ impl SqeSchemaProvider {
             runtime_filter_bloom_max_values: 65536,
             scan_fetch_ahead: None,
             table_names_cache,
+            listing_failed: AtomicBool::new(false),
         }
     }
 
@@ -206,16 +211,18 @@ impl SchemaProvider for SqeSchemaProvider {
                 async move { catalog.list_tables(&ns_ident).await },
             );
         let mut names: Vec<String> = match tables {
-            Ok(Ok(t)) => t.iter().map(|t| t.name().to_string()).collect(),
+            Ok(Ok(t)) => {
+                self.listing_failed.store(false, Ordering::Relaxed);
+                t.iter().map(|t| t.name().to_string()).collect()
+            }
             Ok(Err(e)) => {
                 error!(namespace = %ns, error = %e, "Failed to list tables");
-                Vec::new()
+                self.listing_failed.store(true, Ordering::Relaxed);
+                return Vec::new();
             }
             Err(bridge) => {
-                // Says which failure it was. The old arm reported "no tokio
-                // runtime" for every cause, including a bridged call that timed
-                // out on a runtime that was present.
                 error!(namespace = %ns, error = %bridge, "Could not list tables");
+                self.listing_failed.store(true, Ordering::Relaxed);
                 return Vec::new();
             }
         };
@@ -260,7 +267,14 @@ impl SchemaProvider for SqeSchemaProvider {
         // (one `list_tables` + one `list_views`) rather than a single
         // `table_exists` HEAD. The dbt burst pattern warms the cache on the
         // first probe, so subsequent checks are free. Issue #238.
-        name_exists_in(&self.table_names(), name)
+        let names = self.table_names();
+        if self.listing_failed.load(Ordering::Relaxed) {
+            // An outage must not look like "table does not exist". Treat
+            // existence as unknown-true so DROP/CREATE IF EXISTS hit the
+            // catalog and surface CatalogUnavailable instead of no-op.
+            return true;
+        }
+        name_exists_in(&names, name)
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {

@@ -79,7 +79,7 @@ fn build_map_array(
     value_type: &DataType,
 ) -> DFResult<MapArray> {
     if keys.len() != values.len() {
-        return Err(DataFusionError::Internal(format!(
+        return Err(DataFusionError::Plan(format!(
             "build_map_array: keys.len()={} values.len()={}",
             keys.len(),
             values.len()
@@ -221,7 +221,7 @@ impl MapAggAccumulator {
 impl Accumulator for MapAggAccumulator {
     fn update_batch(&mut self, args: &[ArrayRef]) -> DFResult<()> {
         if args.len() != 2 {
-            return Err(DataFusionError::Internal(format!(
+            return Err(DataFusionError::Plan(format!(
                 "map_agg::update_batch expected 2 arrays, got {}",
                 args.len()
             )));
@@ -369,7 +369,7 @@ impl MultimapAggAccumulator {
 impl Accumulator for MultimapAggAccumulator {
     fn update_batch(&mut self, args: &[ArrayRef]) -> DFResult<()> {
         if args.len() != 2 {
-            return Err(DataFusionError::Internal(format!(
+            return Err(DataFusionError::Plan(format!(
                 "multimap_agg::update_batch expected 2 arrays, got {}",
                 args.len()
             )));
@@ -583,7 +583,7 @@ impl MapUnionAccumulator {
 impl Accumulator for MapUnionAccumulator {
     fn update_batch(&mut self, args: &[ArrayRef]) -> DFResult<()> {
         if args.len() != 1 {
-            return Err(DataFusionError::Internal(format!(
+            return Err(DataFusionError::Plan(format!(
                 "map_union::update_batch expected 1 array, got {}",
                 args.len()
             )));
@@ -603,7 +603,7 @@ impl Accumulator for MapUnionAccumulator {
                 .as_any()
                 .downcast_ref::<StructArray>()
                 .ok_or_else(|| {
-                    DataFusionError::Internal("map_union: map entries are not a StructArray".into())
+                    DataFusionError::Plan("map_union: map entries are not a StructArray".into())
                 })?;
             let keys = s.column(0);
             let values = s.column(1);
@@ -667,13 +667,13 @@ fn decompose_map_type(map_type: &DataType) -> DFResult<(DataType, DataType)> {
         )));
     };
     let DataType::Struct(fields) = entries_field.data_type() else {
-        return Err(DataFusionError::Internal(format!(
+        return Err(DataFusionError::Plan(format!(
             "map_union: MAP entries field is not a Struct: {:?}",
             entries_field.data_type()
         )));
     };
     if fields.len() != 2 {
-        return Err(DataFusionError::Internal(format!(
+        return Err(DataFusionError::Plan(format!(
             "map_union: MAP entries struct must have 2 fields (key, value), got {}",
             fields.len()
         )));
@@ -689,7 +689,7 @@ fn merge_flat_state(
     mut f: impl FnMut(ScalarValue, ScalarValue),
 ) -> DFResult<()> {
     if states.len() != 1 {
-        return Err(DataFusionError::Internal(format!(
+        return Err(DataFusionError::Plan(format!(
             "map aggregate merge_batch expected 1 state array, got {}",
             states.len()
         )));
@@ -698,7 +698,7 @@ fn merge_flat_state(
         .as_any()
         .downcast_ref::<ListArray>()
         .ok_or_else(|| {
-            DataFusionError::Internal(
+            DataFusionError::Plan(
                 "map aggregate merge_batch state[0] is not a ListArray".into(),
             )
         })?;
@@ -711,7 +711,7 @@ fn merge_flat_state(
             .as_any()
             .downcast_ref::<StructArray>()
             .ok_or_else(|| {
-                DataFusionError::Internal(
+                DataFusionError::Plan(
                     "map aggregate merge_batch list element is not a StructArray".into(),
                 )
             })?;

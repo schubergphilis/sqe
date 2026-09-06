@@ -21,7 +21,7 @@ use tracing_subscriber::Layer;
 ///   exporters via OTLP/gRPC
 ///
 /// Returns an [`OtelGuard`] that flushes and shuts down providers on drop.
-pub fn init_telemetry(service_name: &str, otlp_endpoint: &str) -> OtelGuard {
+pub fn init_telemetry(service_name: &str, otlp_endpoint: &str) -> Result<OtelGuard, String> {
     init_telemetry_with_sampling(service_name, otlp_endpoint, "", 0.01)
 }
 
@@ -35,7 +35,7 @@ pub fn init_telemetry_with_sampling(
     otlp_endpoint: &str,
     traces_otlp_endpoint: &str,
     trace_sample_rate: f64,
-) -> OtelGuard {
+) -> Result<OtelGuard, String> {
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("sqe=info"));
 
@@ -57,11 +57,11 @@ pub fn init_telemetry_with_sampling(
             .with(fmt_layer)
             .try_init();
 
-        return OtelGuard {
+        return Ok(OtelGuard {
             tracer_provider: None,
             meter_provider: None,
             logger_provider: None,
-        };
+        });
     }
 
     let resource = Resource::builder()
@@ -73,7 +73,9 @@ pub fn init_telemetry_with_sampling(
         .with_tonic()
         .with_endpoint(trace_endpoint)
         .build()
-        .expect("Failed to create OTLP span exporter");
+        .map_err(|e| {
+            format!("Failed to create OTLP span exporter (metrics.traces_otlp_endpoint): {e}")
+        })?;
 
     // Use ParentBased sampling: if the parent span is sampled, always sample
     // the child; otherwise use the configured ratio for root spans.
@@ -104,7 +106,7 @@ pub fn init_telemetry_with_sampling(
             .with_tonic()
             .with_endpoint(otlp_endpoint)
             .build()
-            .expect("Failed to create OTLP log exporter");
+            .map_err(|e| format!("Failed to create OTLP log exporter (metrics.otlp_endpoint): {e}"))?;
         let logger_provider = SdkLoggerProvider::builder()
             .with_resource(resource.clone())
             .with_batch_exporter(log_exporter)
@@ -113,7 +115,9 @@ pub fn init_telemetry_with_sampling(
             .with_tonic()
             .with_endpoint(otlp_endpoint)
             .build()
-            .expect("Failed to create OTLP metric exporter");
+            .map_err(|e| {
+                format!("Failed to create OTLP metric exporter (metrics.otlp_endpoint): {e}")
+            })?;
         let meter_provider = SdkMeterProvider::builder()
             .with_resource(resource)
             .with_periodic_exporter(metric_exporter)
@@ -149,11 +153,11 @@ pub fn init_telemetry_with_sampling(
         "OpenTelemetry initialized"
     );
 
-    OtelGuard {
+    Ok(OtelGuard {
         tracer_provider: Some(tracer_provider),
         meter_provider,
         logger_provider,
-    }
+    })
 }
 
 /// RAII guard that shuts down OTel providers on drop.
@@ -262,5 +266,11 @@ mod tests {
         assert!(output.contains("session-42"));
         assert!(output.contains("query-42"));
         provider.shutdown().unwrap();
+    }
+
+    #[test]
+    fn init_telemetry_rejects_malformed_endpoint() {
+        let err = init_telemetry_with_sampling("svc", "not a url", "", 1.0);
+        assert!(err.is_err(), "malformed OTLP endpoint must not panic");
     }
 }

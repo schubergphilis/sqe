@@ -45,14 +45,14 @@ use crate::session_udf::SessionIdentity;
 pub fn parse_sql_predicate(sql: &str, identity: &SessionIdentity) -> sqe_core::Result<Expr> {
     let trimmed = sql.trim();
     if trimmed.is_empty() {
-        return Err(sqe_core::error::SqeError::Execution(
+        return Err(sqe_core::error::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
             "empty policy expression".to_string(),
         ));
     }
 
     // Pass 1: syntactic parse via DFParser (catches garbage + trailing tokens).
     let parsed = DFParser::parse_sql_into_expr(trimmed).map_err(|e| {
-        sqe_core::error::SqeError::Execution(format!(
+        sqe_core::error::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
             "failed to parse policy expression '{trimmed}': {e}"
         ))
     })?;
@@ -78,7 +78,7 @@ pub fn parse_sql_predicate(sql: &str, identity: &SessionIdentity) -> sqe_core::R
         .collect();
     let df_schema = DFSchemaRef::new(
         DFSchema::from_unqualified_fields(fields, Default::default()).map_err(|e| {
-            sqe_core::error::SqeError::Execution(format!(
+            sqe_core::error::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
                 "failed to build policy stub schema for '{trimmed}': {e}"
             ))
         })?,
@@ -97,7 +97,7 @@ pub fn parse_sql_predicate(sql: &str, identity: &SessionIdentity) -> sqe_core::R
         ctx.register_udf(udf);
     }
     ctx.parse_sql_expr(trimmed, &df_schema).map_err(|e| {
-        sqe_core::error::SqeError::Execution(format!(
+        sqe_core::error::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
             "failed to plan policy expression '{trimmed}': {e}"
         ))
     })

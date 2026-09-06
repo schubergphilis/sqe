@@ -4,6 +4,7 @@
 # in this repo. gitleaks auto-discovers this file when it scans from the repo
 # root, so it is honored by:
 #   * local runs        -> gitleaks dir .        (or gitleaks detect)
+#   * the commit hook    -> .pre-commit-config.yaml (gitleaks git --staged)
 #   * the CI gate        -> aikido-secret-scan job (gitleaks detect --no-git)
 # without any --config flag.
 #
@@ -65,8 +66,9 @@ regexes = [
     # an inline gitleaks:allow comment.
     '''MIIEowIBAAKCAQEAvX0NLGQkeecTCMwoDPx6Qkutsf0PWBEjZnNm4vkmTTvHD1F0''',
     # PKCS#8 P-256 key used only for ES256 JWT-signing tests (bearer_token.rs
-    # TEST_EC_PRIVATE_KEY_PEM), matched by its unique leading bytes.
-    '''MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcb/PT1Xj+xW0FvVc''',
+    # TEST_EC_PRIVATE_KEY_PEM), matched by its unique leading bytes. The `+`
+    # is base64 payload, not a quantifier, so it must be escaped.
+    '''MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcb/PT1Xj\+xW0FvVc''',
     # Test fixtures in crates/sqe-core/src/secret.rs. These carry inline
     # `gitleaks:allow` comments in the working tree, but the history scan
     # (aikido-secret-scan-history) reads old blobs where the comment was not
