@@ -83,13 +83,25 @@ async fn async_main(config: SqeConfig, config_path: String) -> anyhow::Result<()
 
     ready.store(true, Ordering::Relaxed);
 
-    let tls_config = sqe_worker::tls::build_server_tls_config(&config.coordinator.tls)
+    // Optional TLS, from the one shared builder in `sqe_core::tls` (the
+    // hand-copied mirror in `sqe_worker::tls` is gone). `[worker.tls]` when
+    // the worker carries its own certificate, else the inherited
+    // `[coordinator.tls]`: a single certificate with the coordinator's SAN
+    // cannot validate for a worker's own URL (finding 603).
+    let worker_tls = config.worker.effective_tls(&config.coordinator.tls).clone();
+    let tls_material = sqe_core::ServerTlsMaterial::load_optional(&worker_tls)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let mut server_builder = tonic::transport::Server::builder();
-    if let Some(tls) = tls_config {
-        server_builder = server_builder.tls_config(tls)?;
-        tracing::info!("Worker Flight listening on {addr} (TLS)");
+    if let Some(material) = tls_material.as_ref() {
+        server_builder = server_builder.tls_config(material.tonic_server())?;
+        tracing::info!(
+            mtls = material.requires_client_cert(),
+            cert_fingerprint = material.cert_fingerprint(),
+            // tonic cannot swap a live acceptor; rotation needs a restart.
+            hot_reload = false,
+            "Worker Flight listening on {addr} (TLS)"
+        );
     } else {
         tracing::info!("Worker Flight listening on {addr} (plaintext)");
     }

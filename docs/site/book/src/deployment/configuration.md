@@ -32,11 +32,22 @@ session_context_cache_ttl_secs = 60  # Per-user SessionContext cache TTL. Also t
                                 # this window. POST /api/v1/catalogs/refresh (health
                                 # port, admin) is the instant path. Lower = fresher
                                 # catalogs, more session rebuilds under concurrency.
+ticket_signing_key_file = ""        # Path to Ed25519 PKCS#8 private key for signing scan tickets
+                                # Empty: generate ephemeral key at boot (multi-coordinator needs this set).
+                                # For multi-coordinator HA, set to the same key on all coordinators.
+ticket_ttl_secs = 300           # Seconds scan tickets remain valid; workers refuse expired tickets (finding 601)
+allow_unverified_advertise = false  # Accept worker heartbeats whose advertised URL doesn't match the peer (test-only, behind NAT/proxy)
+distributed_credentials = "auto" # "auto" (default), "vended", "static", "worker_default"; which storage creds scan tickets carry (finding 401)
+
 
 [coordinator.tls]
 cert_file = ""                  # PEM certificate (TLS enabled when both cert + key are set)
+                                # HTTP listeners hot-reload this every 60s; Flight needs a restart
 key_file = ""                   # PEM private key
-ca_file = ""                    # Optional PEM CA for mTLS client certificate verification
+ca_file = ""                    # Optional PEM CA. Server side: requires a client certificate on
+                                # every listener. Client side: trust root for https:// worker and
+                                # coordinator URLs. Required for a private cluster CA.
+allow_ip_advertise = false      # Permit a bare-IP worker.advertise_url under TLS (needs IP SANs)
 
 [mcp]                           # Model Context Protocol endpoint. Off by default.
 enabled = false                 # true mounts /mcp; a nonzero port also enables it
@@ -78,10 +89,23 @@ advertise_url = ""              # URL the coordinator uses to reach this worker.
                                 # Empty -> auto-derived (POD_IP, else HOSTNAME if
                                 # an IP, else first non-loopback interface). Never
                                 # advertise 0.0.0.0; the coordinator rejects it.
+                                # Under TLS this must be a hostname the worker
+                                # certificate covers, unless allow_ip_advertise.
 heartbeat_interval_secs = 5     # Health check interval
 memory_limit = "8GB"            # Worker memory limit (supports B/KB/MB/GB/TB)
 spill_to_disk = true            # Allow spilling large sorts/joins to disk
 spill_dir = "/tmp/sqe-spill"    # Temp directory for spilling
+ticket_public_key = ""              # Base64 Ed25519 public key for verifying coordinator scan tickets (finding 601)
+                                # Empty: receive from heartbeat response (normal). Set when heartbeat unavailable.
+accept_hmac_tickets = false     # Accept legacy HMAC-signed scan tickets keyed by worker_secret (finding 601)
+                                # Migration only: off by default. Turn on while rolling pre-Ed25519 coordinators.
+
+# [worker.tls]                  # Optional. Absent means the worker inherits [coordinator.tls].
+# cert_file = ""                # This worker's own certificate, covering its advertise_url
+# key_file = ""
+# ca_file = ""                  # Trust root for the coordinator, and client CA for this listener
+# allow_ip_advertise = false    # Permit a bare-IP advertise_url under TLS (needs IP SANs)
+
 
 [auth]
 keycloak_url = ""               # Keycloak base URL (OIDC password grant mode)
@@ -217,6 +241,19 @@ enabled = false                 # Enable per-user and global rate limiting
 per_user_queries_per_minute = 60
 global_queries_per_minute = 1000
 
+[quack_client]
+enabled = false                 # Enable quack_query(uri, sql) TVF (finding 604). Disabled by default: SSRF risk.
+allowed_roles = []              # Roles permitted to call quack_query; must be non-empty when enabled
+allowed_hosts = []              # Exact host:port allow-list for quack_query targets; must be non-empty when enabled
+max_result_bytes = 67108864     # Byte cap for quack_query results (default 64 MiB); enforced while decoding chunks
+
+# When enabled, quack_query(uri, sql) takes exactly two arguments (URI string and SQL string).
+# The session's own bearer token is forwarded; no SQL-literal tokens accepted.
+# Destinations are validated against allowed_hosts before any socket is opened.
+# Loopback, link-local (169.254.x.x), and private (10/172.16/192.168) addresses must be listed explicitly.
+
+
+
 [metrics]
 prometheus_port = 9090          # Prometheus /metrics endpoint
 otlp_endpoint = ""              # OTLP gRPC endpoint (empty = disabled)
@@ -346,23 +383,57 @@ Boolean values accept: `true`/`false`, `1`/`0`, `yes`/`no`.
 
 ## TLS
 
-SQE supports optional TLS encryption for the Flight SQL gRPC listener.
+One TLS block configures every SQE listener and every in-cluster client hop: Flight SQL, the worker Flight port, the MCP endpoint, and the DuckDB Quack endpoint.
 
 **Server-side TLS:** Set `cert_file` and `key_file` to enable. When both are set, the server listens on TLS; when omitted, plaintext.
 
-**mTLS (mutual TLS):** Set `ca_file` to a PEM CA bundle. Clients must present a certificate signed by this CA.
+**mTLS (mutual TLS):** Set `ca_file` to a PEM CA bundle. Clients must present a certificate signed by this CA. The requirement applies to all listeners, not only Flight SQL.
+
+**Client side:** `ca_file` is also the trust root the coordinator uses to reach `https://` workers and the worker uses to reach an `https://` coordinator. Without it the client falls back to the platform trust store, which will not contain a private cluster CA. Set `ca_file` on both ends of a cluster that runs its own CA.
+
+Every listener negotiates TLS 1.2 or TLS 1.3 and nothing older.
 
 ```toml
 [coordinator.tls]
 cert_file = "/etc/sqe/server.crt"
 key_file  = "/etc/sqe/server.key"
-ca_file   = "/etc/sqe/ca.crt"    # Optional: enables mTLS
+ca_file   = "/etc/sqe/ca.crt"    # Optional: enables mTLS, and is the client trust root
 ```
+
+### Per-worker certificates
+
+Workers inherit `[coordinator.tls]` by default, which is the single-cert development setup. In a real cluster the coordinator's certificate cannot validate for a worker's own URL, so give each worker its own identity:
+
+```toml
+[worker.tls]
+cert_file = "/etc/sqe/worker.crt"
+key_file  = "/etc/sqe/worker.key"
+ca_file   = "/etc/sqe/ca.crt"
+# allow_ip_advertise = true   # only when the certificate carries IP SANs
+```
+
+With TLS on, `worker.advertise_url` must resolve to a hostname. A worker that would advertise a bare IP, which is what the default `POD_IP` derivation produces, refuses to start: the coordinator verifies the worker certificate against the address it dials. Set `advertise_url` to the pod's DNS name, or set `allow_ip_advertise = true` when the certificate really does carry the IP SANs.
+
+### Certificate rotation
+
+The HTTP listeners (MCP, Quack) poll `cert_file` and `key_file` every 60 seconds and swap the certificate in place. A cert-manager renewal is picked up within about a minute, with no dropped connections and no restart. A half-written pair is rejected and retried on the next poll, so the listener never serves a mismatched cert and key.
+
+The Flight (gRPC) listener does not do this. tonic builds its TLS acceptor once at startup and offers no way to replace it on a live server, so the Flight port keeps serving the certificate it booted with. Cover that in Kubernetes with a reloader sidecar that restarts the pod when the TLS secret changes:
+
+```yaml
+metadata:
+  annotations:
+    reloader.stakater.com/auto: "true"
+```
+
+With `coordinator.shutdown_drain_secs` set, that restart drains in-flight queries at the graceful boundary instead of killing them.
 
 Validation rules:
 - If either `cert_file` or `key_file` is set, both must be set
 - All referenced files must exist when TLS is enabled
-- `ca_file` is optional -- when set, it must also exist
+- `ca_file` is optional; when set, it must also exist
+- The same shape rules apply to `[worker.tls]`
+- TLS on with `https://` entries in `coordinator.worker_urls` requires a client trust root, either `ca_file` or the platform store
 
 ## Authentication Modes
 
@@ -425,6 +496,23 @@ type = "bearer_token"
 jwks_url = "https://keycloak.example.com/realms/iceberg/protocol/openid-connect/certs"
 issuer = "https://keycloak.example.com/realms/iceberg"
 ```
+
+**Bearer Token Provider Options (finding 207):**
+
+```toml
+[[auth.providers]]
+type = "bearer_token"
+jwks_url = "https://keycloak.example.com/realms/iceberg/protocol/openid-connect/certs"
+issuer = "https://keycloak.example.com/realms/iceberg"  # Required unless allow_unbounded_issuer = true
+leeway_secs = 60                                        # Clock skew tolerance (default 60)
+allow_unbounded_issuer = false                          # Allow missing/empty issuer (dev/test only)
+```
+
+- `issuer`: Required. The OIDC `iss` claim must match this value. Required unless `allow_unbounded_issuer = true`. When omitted, SQE fails at startup.
+- `leeway_secs`: Clock skew tolerance for token validation, including `exp`, `nbf` and `iat` claims. Default 60 seconds.
+- `allow_unbounded_issuer`: Opt-out for development. Allows tokens without issuer validation. Never set in production.
+- EC keys (`ES256`, `ES384`) are supported automatically. Keys are pinned per-entry based on the JWK `alg` field.
+
 
 Auth0 and Okta use the same two-provider shape, differing only in `token_url`, `jwks_url`, `issuer`, and the `roles_claim` path (Auth0 uses a namespaced claim, Okta uses `groups`).
 

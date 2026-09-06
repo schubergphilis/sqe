@@ -881,14 +881,24 @@ pub async fn create_session_context(
             // Symmetric to DuckDB's quack_query(): pull rows from a remote
             // Quack endpoint inline.
             //   SELECT * FROM quack_query('quack:host:9495', 'SELECT 42');
-            //   SELECT * FROM quack_query('quack:host:9495', 'token', 'SELECT 42');
-            // The 2-arg form uses an empty auth string; the 3-arg form sends
-            // the supplied token. Returned columns are materialised eagerly
-            // at planning time and exposed as an in-memory table.
-            ctx.register_udtf(
-                "quack_query",
-                Arc::new(sqe_quack_client::QuackQueryTvf::new()),
-            );
+            // Outbound HTTP from the coordinator is an SSRF primitive
+            // (finding 604), so the function exists only when
+            // `[quack_client] enabled = true` AND the session holds one of
+            // `allowed_roles`; destinations are limited to `allowed_hosts`,
+            // the session's own bearer is forwarded (no token literal in
+            // SQL), and the decoded result is capped by `max_result_bytes`.
+            if config.quack_client.permits(&session.user.roles) {
+                let policy = sqe_quack_client::QuackTargetPolicy::new(
+                    config.quack_client.allowed_hosts.clone(),
+                    config.quack_client.max_result_bytes,
+                );
+                let token = session.access_token().expose().to_string();
+                let token = (!token.is_empty()).then_some(token);
+                ctx.register_udtf(
+                    "quack_query",
+                    Arc::new(sqe_quack_client::QuackQueryTvf::with_policy(policy, token)),
+                );
+            }
 
             debug!(
                 catalog_name = %catalog_name,

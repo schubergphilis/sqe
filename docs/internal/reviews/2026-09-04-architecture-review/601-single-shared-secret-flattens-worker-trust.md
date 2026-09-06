@@ -4,7 +4,7 @@
 - Severity: high
 - Category: security
 - Effort: M (days)
-- Status: open
+- Status: fixed (branch `fix/identity-transport-trust-p1`, 2026-09-05)
 - Issue: #608
 
 ## Problem
@@ -90,3 +90,7 @@ Split identities and make the registry trust the transport, not a string:
 - Issue 609 (heartbeat protocol content).
 - July 2026 production-readiness review, "signed worker tickets" was listed as a
   strength; the signature exists but is keyed identically to the bearer header.
+
+## Resolution (2026-09-05)
+
+Tickets are signed with a coordinator-only Ed25519 key (`sqe_core::ticket_signing`; `TicketSigner` from `coordinator.ticket_signing_key_file` or an ephemeral key at boot, `TicketVerifier` on workers). The public key reaches workers in the heartbeat response body over the secret-authenticated channel and is pinned in `sqe_worker::ticket_pin::TicketKeyPin` (or fixed via `worker.ticket_public_key`); the legacy HMAC tag, keyed by the shared secret, is refused unless `worker.accept_hmac_tickets = true`. Each ticket now carries its `audience` (target worker URL) and `expires_at` (`coordinator.ticket_ttl_secs`, default 300) inside the signed bytes; `verify_ticket_binding` rejects other audiences, expired tickets and signed tickets lacking either. Heartbeats are bound to the peer: `worker_registry::advertise_matches_peer` requires the advertised host to be (or resolve to) the sending address unless `coordinator.allow_unverified_advertise`, mismatches and newly discovered workers emit audit events. Tests: `ticket_signing` (round trip, other keys, PKCS#8), `ticket_pin`, worker `do_get_*ed25519*` and `do_get_rejects_hmac_tag_without_opt_in`, `advertise_peer_tests` (10.9.9.9 from 127.0.0.1 refused). Remaining: the book's security chapter describing the two-key model.

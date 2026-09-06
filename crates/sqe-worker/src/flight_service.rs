@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
+#[cfg(feature = "worker-shuffle")]
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
@@ -23,16 +24,19 @@ use sqe_core::FlightCompression;
 use sqe_metrics::propagation::extract_trace_context;
 use sqe_metrics::WorkerMetricsRegistry;
 use sqe_planner::ScanTask;
+#[cfg(feature = "worker-shuffle")]
 use sqe_spill::{
-    split_default_read_headroom, AdmissionRequest, AttemptManifest, ByteBudget, BytePermit,
-    ExchangeAttemptStore, LiveConsumerRegistry, MemoryGovernor, ReclaimableConsumer, SpillManager,
-    SpillScope, TaskKey, WorkloadClass,
+    split_default_read_headroom, AdmissionRequest, AttemptManifest, ExchangeAttemptStore,
+    ReclaimableConsumer, SpillScope, TaskKey, WorkloadClass,
 };
+use sqe_spill::{ByteBudget, BytePermit, LiveConsumerRegistry, MemoryGovernor, SpillManager};
 
 use crate::compaction::compact_file_group;
 use crate::credential_channel::{CredentialStore, RefreshableCredentials};
 use crate::executor;
+#[cfg(feature = "worker-shuffle")]
 use crate::shuffle::{ExchangeDescriptor, ShuffleManager};
+#[cfg(feature = "worker-shuffle")]
 use crate::spill_buffer::SpillablePartitionBuffer;
 
 /// Streams `RecordBatch`es into the Flight encoder while holding each batch's
@@ -229,6 +233,7 @@ pub struct WorkerFlightService {
     credential_store: CredentialStore,
     session_ctx: SessionContext,
     footer_cache: Option<Arc<FooterCache>>,
+    #[cfg(feature = "worker-shuffle")]
     shuffle_manager: ShuffleManager,
     /// Maximum duration for a single scan task. 0 means no timeout.
     scan_timeout: std::time::Duration,
@@ -237,15 +242,23 @@ pub struct WorkerFlightService {
     flight_compression: FlightCompression,
     /// IPC compression for DoExchange shuffle responses.
     /// Default: ZSTD.
+    #[cfg(feature = "worker-shuffle")]
     shuffle_compression: FlightCompression,
     /// Shared secret used to authenticate inbound Flight calls. When empty
     /// the worker accepts unauthenticated traffic (operators must opt in
     /// via `worker.allow_unauthenticated = true`, enforced at config load).
     worker_secret: String,
+    /// Finding 601: pinned coordinator public key for Ed25519 ticket signatures.
+    ticket_pin: Option<Arc<crate::ticket_pin::TicketKeyPin>>,
+    /// Finding 601: this worker's advertised URL; tickets must name it.
+    advertise_url: String,
+    /// Finding 601: accept legacy HMAC ticket tags (migration only).
+    accept_hmac_tickets: bool,
     /// Shared spill manager for shuffle / operator spill (Phase 3+).
     spill_manager: Option<Arc<SpillManager>>,
     /// Byte budget for shuffle partition buffers (from
     /// `worker.memory.shuffle_memory_budget`). Atomic for hot config reload.
+    #[cfg(feature = "worker-shuffle")]
     shuffle_memory_budget: Arc<std::sync::atomic::AtomicUsize>,
     /// Scan timeout seconds (0 = none). Atomic for hot config reload.
     scan_timeout_secs: Arc<std::sync::atomic::AtomicU64>,
@@ -255,6 +268,7 @@ pub struct WorkerFlightService {
     /// Live reclaimable operators (join/agg/sort) registered under the governor.
     live_consumers: Arc<LiveConsumerRegistry>,
     /// Durable exchange attempt manifests (Phase 8).
+    #[cfg(feature = "worker-shuffle")]
     exchange_store: Arc<ExchangeAttemptStore>,
     /// Byte budget for encoded Flight frames in flight to the coordinator
     /// (`worker.memory.flight_budget`, issue #407). `None` means "not
@@ -264,12 +278,14 @@ pub struct WorkerFlightService {
 }
 
 /// Lightweight reclaimable consumer for one DoExchange partition grant.
+#[cfg(feature = "worker-shuffle")]
 struct ShufflePartitionConsumer {
     name: String,
     desired: usize,
     minimum: usize,
 }
 
+#[cfg(feature = "worker-shuffle")]
 impl ReclaimableConsumer for ShufflePartitionConsumer {
     fn name(&self) -> &str {
         &self.name
@@ -287,6 +303,7 @@ impl ReclaimableConsumer for ShufflePartitionConsumer {
 
 /// Default shuffle budget when not configured (64 MiB) — enough for laptop
 /// tests and small clusters without an explicit sub-budget.
+#[cfg(feature = "worker-shuffle")]
 const DEFAULT_SHUFFLE_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
 
 impl WorkerFlightService {
@@ -296,19 +313,26 @@ impl WorkerFlightService {
             credential_store: CredentialStore::new(),
             session_ctx,
             footer_cache: None,
+            #[cfg(feature = "worker-shuffle")]
             shuffle_manager: ShuffleManager::new(),
             scan_timeout: std::time::Duration::from_secs(600),
             flight_compression: FlightCompression::Zstd,
+            #[cfg(feature = "worker-shuffle")]
             shuffle_compression: FlightCompression::Zstd,
             worker_secret: String::new(),
+            ticket_pin: None,
+            advertise_url: String::new(),
+            accept_hmac_tickets: false,
             spill_manager: None,
             flight_budget: None,
+            #[cfg(feature = "worker-shuffle")]
             shuffle_memory_budget: Arc::new(std::sync::atomic::AtomicUsize::new(
                 DEFAULT_SHUFFLE_MEMORY_BUDGET,
             )),
             scan_timeout_secs: Arc::new(std::sync::atomic::AtomicU64::new(600)),
             memory_governor: None,
             live_consumers: Arc::new(LiveConsumerRegistry::new()),
+            #[cfg(feature = "worker-shuffle")]
             exchange_store: Arc::new(ExchangeAttemptStore::new()),
         }
     }
@@ -327,19 +351,26 @@ impl WorkerFlightService {
             credential_store,
             session_ctx,
             footer_cache: None,
+            #[cfg(feature = "worker-shuffle")]
             shuffle_manager: ShuffleManager::new(),
             scan_timeout: std::time::Duration::from_secs(600),
             flight_compression: FlightCompression::Zstd,
+            #[cfg(feature = "worker-shuffle")]
             shuffle_compression: FlightCompression::Zstd,
             worker_secret: String::new(),
+            ticket_pin: None,
+            advertise_url: String::new(),
+            accept_hmac_tickets: false,
             spill_manager: None,
             flight_budget: None,
+            #[cfg(feature = "worker-shuffle")]
             shuffle_memory_budget: Arc::new(std::sync::atomic::AtomicUsize::new(
                 DEFAULT_SHUFFLE_MEMORY_BUDGET,
             )),
             scan_timeout_secs: Arc::new(std::sync::atomic::AtomicU64::new(600)),
             memory_governor: None,
             live_consumers: Arc::new(LiveConsumerRegistry::new()),
+            #[cfg(feature = "worker-shuffle")]
             exchange_store: Arc::new(ExchangeAttemptStore::new()),
         }
     }
@@ -380,6 +411,7 @@ impl WorkerFlightService {
     }
 
     /// Set the IPC compression for DoExchange shuffle responses.
+    #[cfg(feature = "worker-shuffle")]
     #[must_use = "with_shuffle_compression consumes self; bind the returned service"]
     pub fn with_shuffle_compression(mut self, compression: FlightCompression) -> Self {
         self.shuffle_compression = compression;
@@ -393,6 +425,29 @@ impl WorkerFlightService {
     #[must_use = "with_worker_secret consumes self; bind the returned service"]
     pub fn with_worker_secret(mut self, secret: String) -> Self {
         self.worker_secret = secret;
+        self
+    }
+
+    /// Finding 601: the pinned coordinator public key used to verify
+    /// `ed25519:` ticket signatures.
+    #[must_use = "with_ticket_pin consumes self; bind the returned service"]
+    pub fn with_ticket_pin(mut self, pin: Arc<crate::ticket_pin::TicketKeyPin>) -> Self {
+        self.ticket_pin = Some(pin);
+        self
+    }
+
+    /// Finding 601: the URL this worker advertises; signed tickets must carry
+    /// it as their audience.
+    #[must_use = "with_advertise_url consumes self; bind the returned service"]
+    pub fn with_advertise_url(mut self, url: String) -> Self {
+        self.advertise_url = url;
+        self
+    }
+
+    /// Finding 601: accept legacy HMAC ticket tags keyed by `worker_secret`.
+    #[must_use = "with_accept_hmac_tickets consumes self; bind the returned service"]
+    pub fn with_accept_hmac_tickets(mut self, yes: bool) -> Self {
+        self.accept_hmac_tickets = yes;
         self
     }
 
@@ -417,6 +472,7 @@ impl WorkerFlightService {
     }
 
     /// Set the shuffle partition byte budget used by spillable DoExchange.
+    #[cfg(feature = "worker-shuffle")]
     #[must_use = "with_shuffle_memory_budget consumes self; bind the returned service"]
     pub fn with_shuffle_memory_budget(self, bytes: usize) -> Self {
         self.shuffle_memory_budget
@@ -425,6 +481,7 @@ impl WorkerFlightService {
     }
 
     /// Share the shuffle-budget atom with hot-reload.
+    #[cfg(feature = "worker-shuffle")]
     #[must_use = "with_shuffle_memory_budget_atom consumes self; bind the returned service"]
     pub fn with_shuffle_memory_budget_atom(
         mut self,
@@ -462,14 +519,29 @@ impl WorkerFlightService {
     }
 
     /// Durable exchange attempt store (Phase 8).
+    #[cfg(feature = "worker-shuffle")]
     pub fn exchange_store(&self) -> &Arc<ExchangeAttemptStore> {
         &self.exchange_store
     }
 
     /// Configured shuffle memory budget in bytes.
+    #[cfg(feature = "worker-shuffle")]
     pub fn shuffle_memory_budget(&self) -> usize {
         self.shuffle_memory_budget
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Release every worker-side registry entry keyed by `query_id`.
+    ///
+    /// The DoExchange registries are keyed by a network-supplied
+    /// `query_id`/`stage_id`, so the coordinator's "query finished" action must
+    /// call this or they grow for the lifetime of the process (review finding
+    /// 600). Returns the number of entries dropped across the receiver
+    /// registry, the attempt gate and the durable exchange store.
+    #[cfg(feature = "worker-shuffle")]
+    pub async fn forget_query(&self, query_id: &str) -> usize {
+        self.shuffle_manager.forget_query(query_id).await
+            + self.exchange_store.forget_query(query_id)
     }
 
     /// Live scan timeout, honouring hot-reloaded `scan_timeout_secs` when set.
@@ -536,6 +608,26 @@ impl WorkerFlightService {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
+        // Finding 601: an `ed25519:` tag is checked against the pinned
+        // coordinator public key. Only the coordinator can produce it, so a
+        // compromised worker holding the shared secret cannot forge tickets.
+        if sqe_core::ticket_signing::TicketVerifier::is_asymmetric_signature(provided) {
+            let verifier = self.ticket_pin.as_ref().and_then(|p| p.verifier());
+            return match verifier {
+                Some(v) if v.verify(ticket_bytes, provided) => Ok(()),
+                Some(_) => Err(Status::unauthenticated("Invalid scan task signature")),
+                None => Err(Status::unauthenticated(
+                    "Coordinator ticket-signing key not pinned yet; retry after the next heartbeat",
+                )),
+            };
+        }
+        if !self.accept_hmac_tickets {
+            return Err(Status::unauthenticated(
+                "HMAC scan-ticket signatures are not accepted; set worker.accept_hmac_tickets \
+                 only while migrating from pre-Ed25519 coordinators",
+            ));
+        }
+
         let mut mac = <Hmac<Sha256>>::new_from_slice(self.worker_secret.as_bytes())
             .expect("HMAC accepts keys of any length");
         mac.update(ticket_bytes);
@@ -584,12 +676,50 @@ impl WorkerFlightService {
         Ok(())
     }
 
+    /// Finding 601: a signed ticket names the worker it was issued to and a
+    /// deadline. Refuse tickets addressed elsewhere, expired, or (on the
+    /// asymmetric path) lacking either, so a captured ticket cannot be
+    /// replayed to another worker or later.
+    fn verify_ticket_binding(
+        &self,
+        task: &ScanTask,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<(), Status> {
+        let asymmetric = metadata
+            .get(SCAN_SIGNATURE_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(sqe_core::ticket_signing::TicketVerifier::is_asymmetric_signature);
+        if asymmetric && (task.audience.is_empty() || task.expires_at == 0) {
+            return Err(Status::unauthenticated(
+                "Signed scan ticket lacks audience or expiry",
+            ));
+        }
+        if !task.audience.is_empty()
+            && !self.advertise_url.is_empty()
+            && task.audience != self.advertise_url
+        {
+            warn!(
+                audience = %task.audience,
+                advertise_url = %self.advertise_url,
+                "Rejected scan ticket addressed to another worker"
+            );
+            return Err(Status::unauthenticated(
+                "Scan ticket audience does not match this worker",
+            ));
+        }
+        if task.expires_at != 0 && chrono::Utc::now().timestamp() > task.expires_at {
+            return Err(Status::unauthenticated("Scan ticket has expired"));
+        }
+        Ok(())
+    }
+
     /// Returns a reference to the credential store for use by executors.
     pub fn credential_store(&self) -> &CredentialStore {
         &self.credential_store
     }
 
     /// Returns a reference to the shuffle manager.
+    #[cfg(feature = "worker-shuffle")]
     pub fn shuffle_manager(&self) -> &ShuffleManager {
         &self.shuffle_manager
     }
@@ -597,6 +727,7 @@ impl WorkerFlightService {
     /// Spillable DoExchange path: append into a per-attempt
     /// [`SpillablePartitionBuffer`], finish (force residual spill), then stream
     /// segments back without holding the full exchange volume in RAM.
+    #[cfg(feature = "worker-shuffle")]
     async fn do_exchange_spill(
         &self,
         query_id: &str,
@@ -898,11 +1029,13 @@ type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'stati
 
 /// Holds a governor [`sqe_spill::GrantGuard`] for the lifetime of a Flight
 /// response stream so shuffle memory is not released mid-drain.
+#[cfg(feature = "worker-shuffle")]
 struct GrantHeldStream<S> {
     inner: Pin<Box<S>>,
     _guard: Option<sqe_spill::GrantGuard>,
 }
 
+#[cfg(feature = "worker-shuffle")]
 impl<S> Stream for GrantHeldStream<S>
 where
     S: Stream + Unpin,
@@ -915,6 +1048,7 @@ where
 }
 
 /// Detect client disconnect / RPC cancellation on the DoExchange request stream.
+#[cfg(feature = "worker-shuffle")]
 fn is_exchange_cancelled(err: &arrow_flight::error::FlightError) -> bool {
     match err {
         arrow_flight::error::FlightError::Tonic(status) => {
@@ -968,6 +1102,7 @@ impl FlightService for WorkerFlightService {
         scan_task
             .validate_version()
             .map_err(|e| Status::invalid_argument(format!("ScanTask version rejected: {e}")))?;
+        self.verify_ticket_binding(&scan_task, &metadata_owned)?;
 
         let worker_span = info_span!(
             "sqe.worker.scan",
@@ -1290,6 +1425,26 @@ impl FlightService for WorkerFlightService {
         Err(Status::unimplemented("Workers don't support do_put"))
     }
 
+    /// Inert DoExchange for the default build (`worker-shuffle` off).
+    ///
+    /// No query plan produces shuffle traffic, so serving an intake here would
+    /// be pure attack surface: a secret holder could fill the spill volume and
+    /// grow two process-lifetime maps keyed by a caller-chosen
+    /// `query_id`/`stage_id` (review finding 600). With the feature off those
+    /// maps do not exist in this binary at all; the secret gate is kept so an
+    /// unauthenticated caller still learns nothing about the build.
+    #[cfg(not(feature = "worker-shuffle"))]
+    async fn do_exchange(
+        &self,
+        request: Request<Streaming<FlightData>>,
+    ) -> Result<Response<Self::DoExchangeStream>, Status> {
+        self.verify_worker_secret(request.metadata())?;
+        Err(Status::unimplemented(
+            "DoExchange shuffle intake is not enabled on this worker",
+        ))
+    }
+
+    #[cfg(feature = "worker-shuffle")]
     async fn do_exchange(
         &self,
         request: Request<Streaming<FlightData>>,
@@ -1608,7 +1763,10 @@ mod tests {
             budget.clone(),
             metrics.clone(),
         ));
-        assert!(first.next().await.is_some(), "first stream takes the budget");
+        assert!(
+            first.next().await.is_some(),
+            "first stream takes the budget"
+        );
         assert_eq!(budget.used_bytes(), 4096);
 
         let mut second = Box::pin(accounted_frame_stream(
@@ -1660,6 +1818,7 @@ mod tests {
         let metrics = Arc::new(WorkerMetricsRegistry::new().unwrap());
         WorkerFlightService::new(metrics, SessionContext::new())
             .with_worker_secret(secret.to_string())
+            .with_accept_hmac_tickets(true)
     }
 
     /// Recompute the HMAC-SHA256 tag (hex) the coordinator would attach, used
@@ -1690,9 +1849,9 @@ mod tests {
             projected_field_ids: vec![],
             s3_endpoint: String::new(),
             s3_region: String::new(),
-            s3_access_key: String::new(),
-            s3_secret_key: String::new(),
-            s3_session_token: String::new(),
+            credentials: sqe_planner::ScanCredentials::default(),
+            audience: String::new(),
+            expires_at: 0,
             s3_path_style: false,
             s3_allow_http: false,
             predicate_proto: None,
@@ -1795,6 +1954,134 @@ mod tests {
         assert_ne!(err.code(), tonic::Code::Unauthenticated);
     }
 
+    // ------------------------------------------------------------------
+    // Finding 601: Ed25519 ticket signatures, audience and expiry binding.
+    // ------------------------------------------------------------------
+
+    const W1: &str = "http://w1.cluster:50052";
+
+    fn ed25519_service(
+        signer: Option<&sqe_core::ticket_signing::TicketSigner>,
+    ) -> WorkerFlightService {
+        let pin = Arc::new(crate::ticket_pin::TicketKeyPin::floating());
+        if let Some(s) = signer {
+            pin.pin_b64(s.public_key_b64()).unwrap();
+        }
+        let metrics = Arc::new(WorkerMetricsRegistry::new().unwrap());
+        WorkerFlightService::new(metrics, SessionContext::new())
+            .with_worker_secret("expected-secret".to_string())
+            .with_ticket_pin(pin)
+            .with_advertise_url(W1.to_string())
+    }
+
+    fn bound_ticket(audience: &str, expires_at: i64) -> Vec<u8> {
+        let mut task = sqe_planner::ScanTask::from_bytes(&make_scan_task_bytes()).unwrap();
+        task.audience = audience.to_string();
+        task.expires_at = expires_at;
+        task.to_bytes().unwrap()
+    }
+
+    async fn do_get_signed(
+        svc: &WorkerFlightService,
+        signer: &sqe_core::ticket_signing::TicketSigner,
+        ticket: Vec<u8>,
+    ) -> Status {
+        let signature = signer.sign(&ticket);
+        let mut request = Request::new(Ticket {
+            ticket: bytes::Bytes::from(ticket),
+        });
+        request
+            .metadata_mut()
+            .insert(WORKER_SECRET_HEADER, "expected-secret".parse().unwrap());
+        request
+            .metadata_mut()
+            .insert(SCAN_SIGNATURE_HEADER, signature.parse().unwrap());
+        unwrap_err(svc.do_get(request).await)
+    }
+
+    fn future() -> i64 {
+        Utc::now().timestamp() + 300
+    }
+
+    /// A ticket signed by the pinned coordinator key, addressed to this worker
+    /// and not yet expired passes every trust gate; it then fails downstream
+    /// (no real S3), which must NOT be Unauthenticated.
+    #[tokio::test]
+    async fn do_get_accepts_ed25519_ticket_bound_to_this_worker() {
+        let signer = sqe_core::ticket_signing::TicketSigner::generate().unwrap();
+        let svc = ed25519_service(Some(&signer));
+        let err = do_get_signed(&svc, &signer, bound_ticket(W1, future())).await;
+        assert_ne!(err.code(), tonic::Code::Unauthenticated, "{err}");
+    }
+
+    /// 601 acceptance: a ticket signed for audience w1 presented to w2 is
+    /// UNAUTHENTICATED.
+    #[tokio::test]
+    async fn do_get_rejects_ed25519_ticket_for_another_worker() {
+        let signer = sqe_core::ticket_signing::TicketSigner::generate().unwrap();
+        let svc = ed25519_service(Some(&signer));
+        let err = do_get_signed(
+            &svc,
+            &signer,
+            bound_ticket("http://w2.cluster:50052", future()),
+        )
+        .await;
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert!(err.message().contains("audience"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn do_get_rejects_expired_or_unbound_ed25519_ticket() {
+        let signer = sqe_core::ticket_signing::TicketSigner::generate().unwrap();
+        let svc = ed25519_service(Some(&signer));
+        let expired =
+            do_get_signed(&svc, &signer, bound_ticket(W1, Utc::now().timestamp() - 1)).await;
+        assert_eq!(expired.code(), tonic::Code::Unauthenticated);
+        assert!(expired.message().contains("expired"), "{expired}");
+        let unbound = do_get_signed(&svc, &signer, bound_ticket("", 0)).await;
+        assert_eq!(unbound.code(), tonic::Code::Unauthenticated);
+        assert!(
+            unbound.message().contains("audience or expiry"),
+            "{unbound}"
+        );
+    }
+
+    /// 601: only the coordinator's key verifies. Another key pair (a worker
+    /// that generated its own) and a worker with nothing pinned yet both fail.
+    #[tokio::test]
+    async fn do_get_rejects_ed25519_ticket_from_other_key_or_before_pinning() {
+        let coordinator = sqe_core::ticket_signing::TicketSigner::generate().unwrap();
+        let impostor = sqe_core::ticket_signing::TicketSigner::generate().unwrap();
+        let svc = ed25519_service(Some(&coordinator));
+        let err = do_get_signed(&svc, &impostor, bound_ticket(W1, future())).await;
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+        let unpinned = ed25519_service(None);
+        let err = do_get_signed(&unpinned, &coordinator, bound_ticket(W1, future())).await;
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert!(err.message().contains("not pinned"), "{err}");
+    }
+
+    /// 601: the legacy HMAC tag is refused unless the operator opts in.
+    #[tokio::test]
+    async fn do_get_rejects_hmac_tag_without_opt_in() {
+        let svc = ed25519_service(None);
+        let body = make_scan_task_bytes();
+        let mut request = Request::new(Ticket {
+            ticket: bytes::Bytes::from(body.clone()),
+        });
+        request
+            .metadata_mut()
+            .insert(WORKER_SECRET_HEADER, "expected-secret".parse().unwrap());
+        request.metadata_mut().insert(
+            SCAN_SIGNATURE_HEADER,
+            sign("expected-secret", &body).parse().unwrap(),
+        );
+        let err = unwrap_err(svc.do_get(request).await);
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert!(err.message().contains("HMAC"), "{err}");
+    }
+
     #[tokio::test]
     async fn do_get_rejects_missing_signature() {
         // Right secret, no signature header: the #206 gate rejects before decode.
@@ -1866,6 +2153,68 @@ mod tests {
         let request = Request::new(ticket);
         let err = unwrap_err(svc.do_get(request).await);
         assert_ne!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    // ── Review finding 600: DoExchange is inert without `worker-shuffle` ─────
+
+    /// Stands in for the gRPC frame decoder. The inert `do_exchange` must
+    /// refuse before it reads a frame, so decoding here is a test failure.
+    #[cfg(not(feature = "worker-shuffle"))]
+    struct NeverDecoder;
+
+    #[cfg(not(feature = "worker-shuffle"))]
+    impl tonic::codec::Decoder for NeverDecoder {
+        type Item = FlightData;
+        type Error = Status;
+
+        fn decode(
+            &mut self,
+            _src: &mut tonic::codec::DecodeBuf<'_>,
+        ) -> Result<Option<FlightData>, Status> {
+            panic!("inert do_exchange must not decode the request stream")
+        }
+    }
+
+    #[cfg(not(feature = "worker-shuffle"))]
+    fn empty_exchange_request() -> Request<Streaming<FlightData>> {
+        Request::new(Streaming::new_request(
+            NeverDecoder,
+            tonic::body::Body::empty(),
+            None,
+            None,
+        ))
+    }
+
+    /// With the shuffle subsystem compiled out there is no receiver registry,
+    /// attempt gate or exchange store in the process, so the endpoint must
+    /// refuse outright rather than half-serve.
+    #[cfg(not(feature = "worker-shuffle"))]
+    #[tokio::test]
+    async fn do_exchange_is_unimplemented_without_worker_shuffle() {
+        let svc = make_service("");
+        let err = unwrap_err(svc.do_exchange(empty_exchange_request()).await);
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert_eq!(
+            err.message(),
+            "DoExchange shuffle intake is not enabled on this worker"
+        );
+    }
+
+    /// The secret gate stays in front of the refusal, so an anonymous caller
+    /// cannot probe which features a worker was built with.
+    #[cfg(not(feature = "worker-shuffle"))]
+    #[tokio::test]
+    async fn do_exchange_still_rejects_a_bad_secret_first() {
+        let svc = make_service("expected-secret");
+        let err = unwrap_err(svc.do_exchange(empty_exchange_request()).await);
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+        let mut request = empty_exchange_request();
+        request
+            .metadata_mut()
+            .insert(WORKER_SECRET_HEADER, "expected-secret".parse().unwrap());
+        let err = unwrap_err(svc.do_exchange(request).await);
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
     }
 
     #[tokio::test]

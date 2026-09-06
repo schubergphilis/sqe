@@ -23,6 +23,13 @@ vendor/iceberg-rust/Cargo.lock
 *.key
 *.crt
 *.p12
+# Allowlist the TLS unit-test fixtures, and only those. Throwaway self-signed
+# material (a test CA and two leaf pairs, 20 year validity, SANs
+# worker-1.sqe.test / localhost / 127.0.0.1) that the sqe-core and
+# sqe-coordinator TLS tests read; it secures nothing, and without it those
+# tests cannot run on a fresh clone. Every other path stays covered above.
+!crates/sqe-core/tests/fixtures/tls/*.crt
+!crates/sqe-core/tests/fixtures/tls/*.key
 
 # Logs
 *.log

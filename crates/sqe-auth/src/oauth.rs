@@ -1,15 +1,20 @@
 use std::time::Duration;
 
 use serde::Deserialize;
+use sqe_core::SecretString;
 use tracing::{debug, warn};
 
 /// Token response from a generic OAuth2 token endpoint (client_credentials grant).
 ///
 /// This is intentionally separate from `oidc_password::TokenResponse` — the two
 /// endpoints can return different shapes and we don't want to couple them.
+///
+/// `access_token` is a [`SecretString`], which deserializes straight from a
+/// JSON string: the bearer never exists as a plain `String`, the derived
+/// `Debug` renders `<set>`, and the bytes are zeroized on drop. Finding 208.
 #[derive(Debug, Deserialize)]
 pub struct TokenResponse {
-    pub access_token: String,
+    pub access_token: SecretString,
     pub expires_in: u64,
     pub token_type: String,
 }
@@ -178,7 +183,10 @@ mod tests {
         let response: TokenResponse =
             serde_json::from_str(json).expect("should deserialise standard response");
 
-        assert_eq!(response.access_token, "eyJhbGciOiJSUzI1NiJ9.payload.sig");
+        assert_eq!(
+            response.access_token.expose(),
+            "eyJhbGciOiJSUzI1NiJ9.payload.sig"
+        );
         assert_eq!(response.expires_in, 3600);
         assert_eq!(response.token_type, "Bearer");
     }

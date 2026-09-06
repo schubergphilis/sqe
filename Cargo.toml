@@ -112,7 +112,13 @@ axum = "0.8"
 reqwest = { version = "0.13", features = ["json", "rustls", "form", "query"], default-features = false }
 
 # gRPC (Arrow Flight) — arrow-flight 57 requires tonic 0.14
-tonic = { version = "0.14", features = ["transport", "tls-ring"] }
+# `tls-native-roots` is what lets `sqe_core::tls::tonic_client` reach an
+# `https://` peer that has no explicit `[coordinator.tls] ca_file`. Finding
+# 603: with no root-store feature at all, tonic refuses every `https` URI
+# ("Connecting to HTTPS without TLS enabled"), so there was no configuration
+# that produced an encrypted, working distributed cluster. A private cluster
+# CA still has to be named in `ca_file`; the OS trust store will not have it.
+tonic = { version = "0.14", features = ["transport", "tls-ring", "tls-native-roots"] }
 prost = "0.14"
 
 # Serialization
@@ -170,6 +176,7 @@ csv = "1"
 # API: gen_range -> random_range, gen_bool -> random_bool, gen -> random,
 # thread_rng -> rng, Rng -> RngExt. rusqlite stays on 0.39 (#389).
 rand = "0.10"
+ring = "0.17"
 
 # Crypto
 sha2 = "0.11"

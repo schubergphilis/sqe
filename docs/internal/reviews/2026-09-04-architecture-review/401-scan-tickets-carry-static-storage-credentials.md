@@ -4,7 +4,7 @@
 - Severity: high
 - Category: security
 - Effort: L (week+)
-- Status: open
+- Status: fixed (branch `fix/identity-transport-trust-p1`, 2026-09-05)
 - Issue: #581
 
 ## Problem
@@ -87,3 +87,7 @@ tests) but it is a ready-made leak if anyone wires it.
   distributed-path half that P0-5 did not examine.
 - Memory notes "S3 session token gap" and "Glue sidecar bridge".
 - Issue 408 (scan-offload architecture) decides where the credential decision should live.
+
+## Resolution (2026-09-05)
+
+`ScanTask` carries `credentials: ScanCredentials` (`crates/sqe-planner/src/scan_task.rs`) instead of three plain strings: `WorkerDefault` (no keys; the worker uses its own chain via `AmazonS3Builder::from_env`), `Vended { .., session_token, expires_at }` or `Static`. Secrets are `TicketSecret`, which serializes as the value (the ticket is the transport, now signed per 601 and meant for TLS per 603) but prints `[REDACTED]`. `ticket_credentials::select_scan_credentials` picks the source per `coordinator.distributed_credentials` (`auto` default: vended from the table's FileIO properties incl. `s3.session-token` and `s3.session-token-expires-at-ms`, else the static pair with a one-time warning; `vended`, `static`, `worker_default` are strict), `production_mode` rejects `auto` in distributed setups, the vended expiry feeds `DistributedScanExec::with_credential_expiry`, and the choice is logged as `sqe.credential_source`. The caller-less `codec.rs` is deleted. Tests in `ticket_credentials.rs`: `vended_props_become_vended_credentials_with_expiry`, `modes_select_the_documented_source`, `debug_never_prints_key_material`.

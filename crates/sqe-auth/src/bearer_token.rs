@@ -7,13 +7,15 @@
 //! This provider:
 //! 1. Detects credentials that look like a JWT (starts with `eyJ`)
 //! 2. Fetches and caches the JWKS from the configured endpoint
-//! 3. Validates the JWT signature (RS256), expiry, and optionally audience/issuer
+//! 3. Validates the JWT signature (RSA or EC, algorithm pinned per JWKS key),
+//!    `exp`, `nbf`, audience and issuer
 //! 4. Extracts user identity and roles from configurable claim paths
 //! 5. Returns the same JWT as the catalog token (passthrough)
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, TokenData, Validation};
@@ -30,7 +32,18 @@ pub struct BearerTokenProviderConfig {
     /// URL to fetch the JSON Web Key Set (JWKS) from.
     /// Example: `https://idp.example.com/.well-known/jwks.json`
     pub jwks_url: String,
-    /// Optional: expected JWT `iss` (issuer) claim. Skipped if empty.
+    /// Expected JWT `iss` (issuer) claim. Required by default — a
+    /// multi-tenant IdP (Entra, an Okta org with several authorization
+    /// servers) serves one JWKS for many issuers, so audience binding alone
+    /// does not stop a token minted by a sibling issuer for the same
+    /// audience string. Operators who genuinely need to accept any issuer
+    /// must set `allow_unbounded_issuer = true` (visible in config diffs).
+    /// See finding 207.
+    ///
+    /// There is no OIDC-discovery hook on this provider: the JWKS URL is
+    /// taken verbatim from config, so the config loader (or the operator) is
+    /// responsible for setting `issuer` to the discovery document's `issuer`
+    /// value when the JWKS URL came from a discovery document.
     pub issuer: Option<String>,
     /// Expected JWT `aud` (audience) claim. Required by default — without
     /// audience binding, any JWT signed by the configured JWKS issuer would
@@ -69,7 +82,21 @@ pub struct BearerTokenProviderConfig {
     /// SQE accepts as valid. Setting this `true` (visible in config diffs)
     /// acknowledges that risk and is intended only for local/dev setups.
     pub allow_insecure_jwks: bool,
+    /// Explicit opt-in to accept tokens from any issuer. Defaults to
+    /// `false`: an empty/missing `issuer` then yields a config error at
+    /// construction. Setting this `true` acknowledges that a token minted by
+    /// any issuer sharing the JWKS will be accepted.
+    pub allow_unbounded_issuer: bool,
+    /// Clock-skew allowance, in seconds, applied to `exp` and `nbf`.
+    /// Defaults to 60 (the `jsonwebtoken` default, now visible in config).
+    /// `nbf` is validated — pre-dated tokens are rejected once they are more
+    /// than `leeway_secs` in the future.
+    pub leeway_secs: u64,
 }
+
+/// Default clock-skew allowance for `exp`/`nbf`, in seconds. Matches the
+/// historical `jsonwebtoken` default so existing deployments see no change.
+pub const DEFAULT_LEEWAY_SECS: u64 = 60;
 
 impl Default for BearerTokenProviderConfig {
     fn default() -> Self {
@@ -85,6 +112,8 @@ impl Default for BearerTokenProviderConfig {
             accept_invalid_certs: false,
             allow_unbounded_audience: false,
             allow_insecure_jwks: false,
+            allow_unbounded_issuer: false,
+            leeway_secs: DEFAULT_LEEWAY_SECS,
         }
     }
 }
@@ -94,15 +123,24 @@ impl Default for BearerTokenProviderConfig {
 struct Jwk {
     /// Key ID (used to match against JWT `kid` header).
     kid: Option<String>,
-    /// Key type (e.g. "RSA").
+    /// Key type (`"RSA"` or `"EC"`).
     kty: String,
     /// RSA modulus (base64url-encoded).
     n: Option<String>,
     /// RSA exponent (base64url-encoded).
     e: Option<String>,
-    /// Algorithm (e.g. "RS256").
+    /// EC curve name (e.g. `"P-256"`).
     #[serde(default)]
-    #[allow(dead_code)]
+    crv: Option<String>,
+    /// EC public key x coordinate (base64url-encoded).
+    #[serde(default)]
+    x: Option<String>,
+    /// EC public key y coordinate (base64url-encoded).
+    #[serde(default)]
+    y: Option<String>,
+    /// Algorithm (e.g. "RS256", "ES256"). Pins the algorithm accepted for
+    /// this key so a token cannot downgrade/confuse the signature family.
+    #[serde(default)]
     alg: Option<String>,
 }
 
@@ -112,8 +150,22 @@ struct JwksResponse {
     keys: Vec<Jwk>,
 }
 
-/// Cached JWKS: maps `kid` -> `DecodingKey`.
-type JwksMap = HashMap<String, DecodingKey>;
+/// A JWKS key plus the metadata needed to validate with it.
+#[derive(Clone)]
+struct CachedJwk {
+    /// The decoding key material.
+    key: DecodingKey,
+    /// Algorithm pinned to this key (from the JWK `alg`, else derived from
+    /// `kty`/`crv`). Validation accepts only this algorithm, so an attacker
+    /// cannot present, say, an `ES256` token against an RSA key entry.
+    alg: Algorithm,
+    /// When this key was last seen in a JWKS fetch. Drives the retirement
+    /// grace window in [`BearerTokenProvider::refetch_jwks`].
+    last_seen: Instant,
+}
+
+/// Cached JWKS: maps `kid` -> [`CachedJwk`].
+type JwksMap = HashMap<String, CachedJwk>;
 
 /// Bearer token authentication provider.
 ///
@@ -129,7 +181,10 @@ pub struct BearerTokenProvider {
     /// Monotonic instant of the last successful or attempted refetch. Used to
     /// rate-limit refetches triggered by unknown-`kid` / signature-mismatch
     /// bearers so a stream of bad tokens cannot hammer the IdP (AUTH-07).
-    last_refetch: Mutex<Option<std::time::Instant>>,
+    last_refetch: Mutex<Option<Instant>>,
+    /// How long a key that has disappeared from the JWKS is still honoured
+    /// after a successful refetch. Injectable so tests can set it to zero.
+    key_grace_window: Duration,
 }
 
 /// Minimum interval between JWKS refetches triggered by an unknown `kid` or a
@@ -137,6 +192,19 @@ pub struct BearerTokenProvider {
 /// IdP is protected even when rate limiting is disabled. A legitimate key
 /// rotation is still picked up within this window or by the 15-minute TTL.
 const REFETCH_MIN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long a key that has vanished from a freshly fetched JWKS is still
+/// accepted.
+///
+/// Trade-off: rotation and revocation look identical to a relying party. A
+/// long window is friendly to rotation (tokens signed just before the IdP
+/// dropped the old key keep working); a short window is the right answer for
+/// revocation (a compromised key stops being honoured as soon as the IdP
+/// removes it). Five minutes is the compromise — it covers the seconds-scale
+/// propagation delay of a rotation without keeping a revoked key alive for
+/// the full 15-minute cache TTL, which is what the previous merge-on-refetch
+/// did. See finding 207.
+const KEY_RETIREMENT_GRACE: Duration = Duration::from_secs(5 * 60);
 
 impl BearerTokenProvider {
     /// Create a new bearer token provider with the given configuration.
@@ -162,6 +230,30 @@ impl BearerTokenProvider {
                 return Err(AuthError::Internal(anyhow::anyhow!(
                     "bearer_token provider requires a non-empty `audience` (set audience, \
                      or set allow_unbounded_audience = true to opt in to token-soup mode)"
+                )));
+            }
+        }
+
+        // Issuer binding is required by default for the same reason audience
+        // binding is: a multi-tenant IdP shares one JWKS across issuers, so a
+        // token minted by a sibling issuer for the same audience string would
+        // otherwise be accepted. Finding 207.
+        let has_issuer = config
+            .issuer
+            .as_deref()
+            .map(|i| !i.is_empty())
+            .unwrap_or(false);
+        if !has_issuer {
+            if config.allow_unbounded_issuer {
+                tracing::warn!(
+                    "JWT issuer validation is DISABLED via allow_unbounded_issuer = true. \
+                     Tokens minted by any issuer sharing this JWKS will be accepted."
+                );
+            } else {
+                return Err(AuthError::Internal(anyhow::anyhow!(
+                    "bearer_token provider requires a non-empty `issuer` (set issuer to the \
+                     IdP's `iss` value — the OIDC discovery document's `issuer` field — or \
+                     set allow_unbounded_issuer = true to accept any issuer)"
                 )));
             }
         }
@@ -212,6 +304,7 @@ impl BearerTokenProvider {
             jwks_cache,
             fetch_mutex: Mutex::new(()),
             last_refetch: Mutex::new(None),
+            key_grace_window: KEY_RETIREMENT_GRACE,
         })
     }
 
@@ -230,7 +323,15 @@ impl BearerTokenProvider {
             jwks_cache,
             fetch_mutex: Mutex::new(()),
             last_refetch: Mutex::new(None),
+            key_grace_window: KEY_RETIREMENT_GRACE,
         }
+    }
+
+    /// Override the key-retirement grace window (tests only).
+    #[cfg(test)]
+    fn with_key_grace_window(mut self, window: Duration) -> Self {
+        self.key_grace_window = window;
+        self
     }
 
     /// The fixed cache key for the JWKS.
@@ -268,33 +369,119 @@ impl BearerTokenProvider {
             AuthError::Internal(anyhow::anyhow!("Failed to parse JWKS response: {e}"))
         })?;
 
+        let now = Instant::now();
         let mut map = HashMap::new();
         for key in &jwks.keys {
-            // Only process RSA keys.
-            if key.kty != "RSA" {
+            let Some(kid) = key.kid.clone() else {
+                warn!(kty = %key.kty, "Skipping JWKS key without a `kid`");
                 continue;
-            }
-
-            let (n, e) = match (&key.n, &key.e) {
-                (Some(n), Some(e)) => (n.as_str(), e.as_str()),
-                _ => continue,
             };
 
-            let decoding_key = match DecodingKey::from_rsa_components(n, e) {
-                Ok(dk) => dk,
-                Err(err) => {
-                    warn!(kid = ?key.kid, error = %err, "Skipping malformed RSA key");
+            let Some(alg) = Self::key_algorithm(key) else {
+                warn!(
+                    kid = %kid,
+                    kty = %key.kty,
+                    alg = ?key.alg,
+                    crv = ?key.crv,
+                    "Skipping JWKS key with an unsupported algorithm"
+                );
+                continue;
+            };
+
+            let decoding_key = match key.kty.as_str() {
+                "RSA" => {
+                    let (Some(n), Some(e)) = (&key.n, &key.e) else {
+                        warn!(kid = %kid, "Skipping RSA key without `n`/`e`");
+                        continue;
+                    };
+                    match DecodingKey::from_rsa_components(n, e) {
+                        Ok(dk) => dk,
+                        Err(err) => {
+                            warn!(kid = %kid, error = %err, "Skipping malformed RSA key");
+                            continue;
+                        }
+                    }
+                }
+                "EC" => {
+                    let (Some(x), Some(y)) = (&key.x, &key.y) else {
+                        warn!(kid = %kid, "Skipping EC key without `x`/`y`");
+                        continue;
+                    };
+                    match DecodingKey::from_ec_components(x, y) {
+                        Ok(dk) => dk,
+                        Err(err) => {
+                            warn!(kid = %kid, error = %err, "Skipping malformed EC key");
+                            continue;
+                        }
+                    }
+                }
+                other => {
+                    debug!(kid = %kid, kty = %other, "Skipping JWKS key of unsupported type");
                     continue;
                 }
             };
 
-            if let Some(kid) = &key.kid {
-                map.insert(kid.clone(), decoding_key);
-            }
+            map.insert(
+                kid,
+                CachedJwk {
+                    key: decoding_key,
+                    alg,
+                    last_seen: now,
+                },
+            );
         }
 
-        debug!(key_count = map.len(), "JWKS loaded");
+        if map.is_empty() {
+            // Every bearer will now fail until the next successful fetch, so
+            // say so loudly rather than emitting "Key ID not found in JWKS"
+            // per request with no explanation of why.
+            warn!(
+                url = %self.config.jwks_url,
+                advertised_keys = jwks.keys.len(),
+                "JWKS contains no loadable key (only RSA and EC keys with a `kid` are supported) \
+                 — all bearer token authentication will fail"
+            );
+        } else {
+            debug!(key_count = map.len(), "JWKS loaded");
+        }
         Ok(map)
+    }
+
+    /// Resolve the algorithm to pin to a JWKS key.
+    ///
+    /// Prefers the JWK's own `alg`; falls back to the key type (and, for EC,
+    /// the curve) when the IdP omits it. Returns `None` for anything
+    /// `jsonwebtoken` cannot verify, or for an `alg` whose family does not
+    /// match `kty` (an RSA entry advertising `ES256` is malformed at best and
+    /// an algorithm-confusion attempt at worst).
+    fn key_algorithm(key: &Jwk) -> Option<Algorithm> {
+        if let Some(alg) = key.alg.as_deref().filter(|a| !a.is_empty()) {
+            let parsed = Algorithm::from_str(alg).ok()?;
+            let family_matches = match key.kty.as_str() {
+                "RSA" => matches!(
+                    parsed,
+                    Algorithm::RS256
+                        | Algorithm::RS384
+                        | Algorithm::RS512
+                        | Algorithm::PS256
+                        | Algorithm::PS384
+                        | Algorithm::PS512
+                ),
+                "EC" => matches!(parsed, Algorithm::ES256 | Algorithm::ES384),
+                _ => false,
+            };
+            return family_matches.then_some(parsed);
+        }
+
+        match key.kty.as_str() {
+            "RSA" => Some(Algorithm::RS256),
+            "EC" => match key.crv.as_deref() {
+                Some("P-256") => Some(Algorithm::ES256),
+                Some("P-384") => Some(Algorithm::ES384),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Fetch the JWKS from the configured URL and cache it.
@@ -316,7 +503,7 @@ impl BearerTokenProvider {
         Ok(cached)
     }
 
-    /// Refetch the JWKS and merge new keys into the cached map.
+    /// Refetch the JWKS and replace the cached map with the fresh one.
     ///
     /// Unlike a naive invalidate-then-fetch, the existing cache is never
     /// dropped until a fresh fetch succeeds, so a transient IdP outage (or a
@@ -325,6 +512,19 @@ impl BearerTokenProvider {
     /// `REFETCH_MIN_INTERVAL` to bound IdP amplification independent of the
     /// request-level limiter. Within the cooldown the current cache is
     /// returned unchanged.
+    ///
+    /// On a successful fetch the fresh JWKS *replaces* the cache rather than
+    /// merging into it: a key the IdP has dropped is a revocation as often as
+    /// it is a rotation, and the safe reading is the revocation one. Keys
+    /// that disappeared are kept only while they are within
+    /// `key_grace_window` of when they were last seen, and only when the
+    /// fresh JWKS still carries at least one key. A successful fetch that
+    /// yields zero loadable keys gets no grace at all: the cache is emptied
+    /// and every bearer fails until the next successful fetch (at most
+    /// `REFETCH_MIN_INTERVAL` later). That is deliberate — "the IdP published
+    /// an empty key set" must not be the one input that extends the life of a
+    /// retired key. See `KEY_RETIREMENT_GRACE` for the rotation-vs-revocation
+    /// trade-off.
     async fn refetch_jwks(&self) -> Result<Arc<JwksMap>, AuthError> {
         let _guard = self.fetch_mutex.lock().await;
 
@@ -343,21 +543,35 @@ impl BearerTokenProvider {
             *last = Some(std::time::Instant::now());
         }
 
-        let fresh = self.fetch_jwks_map().await?;
+        let mut fresh = self.fetch_jwks_map().await?;
 
-        // Merge fresh keys over the existing cache. New keys win; keys that
-        // disappeared from the JWKS are retained until the TTL expires so an
-        // in-flight token signed by a still-valid-but-rotating key is not
-        // rejected mid-rotation.
-        let mut merged: JwksMap = match self.jwks_cache.get(Self::CACHE_KEY).await {
-            Some(existing) => (*existing).clone(),
-            None => HashMap::new(),
-        };
-        for (kid, key) in fresh {
-            merged.insert(kid, key);
+        // Replace-on-success. Retired keys survive only inside the grace
+        // window, and only when the IdP still published at least one key.
+        if !fresh.is_empty() && !self.key_grace_window.is_zero() {
+            if let Some(existing) = self.jwks_cache.get(Self::CACHE_KEY).await {
+                for (kid, entry) in existing.iter() {
+                    if fresh.contains_key(kid) {
+                        continue;
+                    }
+                    if entry.last_seen.elapsed() <= self.key_grace_window {
+                        debug!(
+                            kid = %kid,
+                            "Key absent from fresh JWKS, honouring it for the rest of the \
+                             retirement grace window"
+                        );
+                        fresh.insert(kid.clone(), entry.clone());
+                    } else {
+                        warn!(
+                            kid = %kid,
+                            "Key absent from fresh JWKS and past the retirement grace window, \
+                             dropping it"
+                        );
+                    }
+                }
+            }
         }
 
-        let cached = Arc::new(merged);
+        let cached = Arc::new(fresh);
         self.jwks_cache
             .insert(Self::CACHE_KEY.to_string(), Arc::clone(&cached))
             .await;
@@ -376,34 +590,12 @@ impl BearerTokenProvider {
             .kid
             .ok_or_else(|| AuthError::AuthFailed("JWT header missing `kid` field".to_string()))?;
 
-        // Build the validation configuration.
-        let mut validation = Validation::new(Algorithm::RS256);
-
-        // Configure audience validation.
-        match &self.config.audience {
-            Some(aud) if !aud.is_empty() => {
-                validation.set_audience(&[aud]);
-            }
-            _ => {
-                validation.validate_aud = false;
-            }
-        }
-
-        // Configure issuer validation.
-        match &self.config.issuer {
-            Some(iss) if !iss.is_empty() => {
-                validation.set_issuer(&[iss]);
-            }
-            _ => {}
-        }
-
-        // exp is validated by default in jsonwebtoken.
-
         // First attempt: use cached JWKS.
         let jwks = self.get_jwks().await?;
 
-        if let Some(decoding_key) = jwks.get(&kid) {
-            match decode::<serde_json::Value>(token, decoding_key, &validation) {
+        if let Some(entry) = jwks.get(&kid) {
+            let validation = self.build_validation(entry.alg);
+            match decode::<serde_json::Value>(token, &entry.key, &validation) {
                 Ok(token_data) => return Ok(token_data),
                 Err(e) => {
                     // Only a signature mismatch is worth a JWKS refetch (a key
@@ -424,11 +616,50 @@ impl BearerTokenProvider {
         // Second attempt: refetch JWKS and retry (handles key rotation).
         let jwks = self.refetch_jwks().await?;
 
-        let decoding_key = jwks.get(&kid).ok_or_else(|| {
+        let entry = jwks.get(&kid).ok_or_else(|| {
             AuthError::AuthFailed(format!("Key ID '{kid}' not found in JWKS after refresh"))
         })?;
 
-        decode::<serde_json::Value>(token, decoding_key, &validation).map_err(Self::map_jwt_error)
+        let validation = self.build_validation(entry.alg);
+        decode::<serde_json::Value>(token, &entry.key, &validation).map_err(Self::map_jwt_error)
+    }
+
+    /// Build the `Validation` used for one JWKS key.
+    ///
+    /// The accepted algorithm is pinned to the key's own `alg` rather than a
+    /// global RS256, `nbf` is checked, and the clock-skew allowance comes
+    /// from `leeway_secs` instead of the library default.
+    fn build_validation(&self, alg: Algorithm) -> Validation {
+        let mut validation = Validation::new(alg);
+
+        // exp is validated by default in jsonwebtoken; nbf is not.
+        validation.validate_nbf = true;
+        validation.leeway = self.config.leeway_secs;
+
+        // Configure audience validation.
+        match &self.config.audience {
+            Some(aud) if !aud.is_empty() => {
+                validation.set_audience(&[aud]);
+            }
+            _ => {
+                validation.validate_aud = false;
+            }
+        }
+
+        // Configure issuer validation. Required unless the operator opted
+        // into `allow_unbounded_issuer`, which `new` already warned about.
+        // `iss` also joins the required-claims set: jsonwebtoken only
+        // compares the issuer when the claim is *present*, so without this a
+        // token that simply omits `iss` would sail past a configured issuer.
+        match &self.config.issuer {
+            Some(iss) if !iss.is_empty() => {
+                validation.set_issuer(&[iss]);
+                validation.set_required_spec_claims(&["exp", "iss"]);
+            }
+            _ => {}
+        }
+
+        validation
     }
 
     /// Map a `jsonwebtoken::errors::Error` to an `AuthError`.
@@ -436,10 +667,19 @@ impl BearerTokenProvider {
         use jsonwebtoken::errors::ErrorKind;
         match err.kind() {
             ErrorKind::ExpiredSignature => AuthError::AuthFailed("JWT has expired".to_string()),
+            ErrorKind::ImmatureSignature => {
+                AuthError::AuthFailed("JWT is not valid yet (nbf is in the future)".to_string())
+            }
+            ErrorKind::InvalidAlgorithm => AuthError::AuthFailed(
+                "JWT algorithm does not match the signing key's algorithm".to_string(),
+            ),
             ErrorKind::InvalidAudience => {
                 AuthError::AuthFailed("JWT audience mismatch".to_string())
             }
             ErrorKind::InvalidIssuer => AuthError::AuthFailed("JWT issuer mismatch".to_string()),
+            ErrorKind::MissingRequiredClaim(claim) => {
+                AuthError::AuthFailed(format!("JWT missing required claim '{claim}'"))
+            }
             ErrorKind::InvalidSignature => {
                 AuthError::AuthFailed("JWT signature verification failed".to_string())
             }
@@ -610,6 +850,8 @@ mod tests {
     use std::sync::LazyLock;
 
     const TEST_KID: &str = "test-key-1";
+    const TEST_EC_KID: &str = "test-ec-key-1";
+    const TEST_ISSUER: &str = "https://idp.example.com";
 
     // -----------------------------------------------------------------------
     // Static RSA 2048-bit test keypair — NOT for production use.
@@ -670,12 +912,46 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         }
     });
 
+    // -----------------------------------------------------------------------
+    // Static EC P-256 test keypair — NOT for production use.
+    // Generated with:
+    //   openssl ecparam -name prime256v1 -genkey -noout -out ec.pem
+    //   openssl pkcs8 -topk8 -nocrypt -in ec.pem
+    // The x/y coordinates below are the uncompressed public point, split and
+    // base64url-encoded. Static material keeps EC coverage without adding a
+    // key-generation dev-dependency (same reasoning as the RSA pair above).
+    // -----------------------------------------------------------------------
+
+    /// PKCS#8 PEM-encoded EC P-256 private key for test ES256 JWT signing.
+    const TEST_EC_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcb/PT1Xj+xW0FvVc
+0YZLwJCPra8OSopguEXNw3d3TbihRANCAASkMxNpk8e4ypVo60ZUB3Q4TIHOcXSJ
+Gsk+TB4BOZOZvvRKOPj1Dj5tcKc/tv2Hx8kiS4egVEC2qWmKaBDbv9kN
+-----END PRIVATE KEY-----";
+
+    /// Base64url-encoded EC public key x coordinate for JWKS mock responses.
+    const TEST_EC_X: &str = "pDMTaZPHuMqVaOtGVAd0OEyBznF0iRrJPkweATmTmb4";
+
+    /// Base64url-encoded EC public key y coordinate for JWKS mock responses.
+    const TEST_EC_Y: &str = "9Eo4-PUOPm1wpz-2_YfHySJLh6BUQLapaYpoENu_2Q0";
+
+    static TEST_EC_ENCODING_KEY: LazyLock<EncodingKey> =
+        LazyLock::new(|| EncodingKey::from_ec_pem(TEST_EC_PRIVATE_KEY_PEM.as_bytes()).unwrap());
+
     /// Build a valid JWT signed with the test RSA key.
     fn build_signed_jwt(claims: &serde_json::Value) -> String {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(TEST_KID.to_string());
 
         encode(&header, claims, &TEST_KEYS.encoding_key).unwrap()
+    }
+
+    /// Build a valid ES256 JWT signed with the test EC key.
+    fn build_signed_es256_jwt(claims: &serde_json::Value) -> String {
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(TEST_EC_KID.to_string());
+
+        encode(&header, claims, &TEST_EC_ENCODING_KEY).unwrap()
     }
 
     /// Build a JWKS JSON response containing the test public key.
@@ -692,12 +968,44 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         })
     }
 
+    /// Build a JWKS JSON response containing the test EC public key.
+    fn build_ec_jwks_json() -> serde_json::Value {
+        json!({
+            "keys": [{
+                "kty": "EC",
+                "kid": TEST_EC_KID,
+                "alg": "ES256",
+                "crv": "P-256",
+                "use": "sig",
+                "x": TEST_EC_X,
+                "y": TEST_EC_Y
+            }]
+        })
+    }
+
+    /// Build a JWKS JSON response containing a single unrelated RSA key, so
+    /// the document is non-empty but no longer carries [`TEST_KID`].
+    fn build_jwks_json_without_test_key() -> serde_json::Value {
+        json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": "some-other-key",
+                "alg": "RS256",
+                "use": "sig",
+                "n": &TEST_KEYS.n,
+                "e": &TEST_KEYS.e
+            }]
+        })
+    }
+
     /// Default config for tests.
     ///
-    /// Tests opt in to `allow_unbounded_audience` because they cover JWKS,
-    /// signature, and claim-handling behaviour rather than the audience
-    /// guard itself. The audience-required default is exercised by
-    /// [`requires_audience_unless_explicitly_unbounded`].
+    /// Tests opt in to `allow_unbounded_audience` and
+    /// `allow_unbounded_issuer` because they cover JWKS, signature, and
+    /// claim-handling behaviour rather than the audience/issuer guards
+    /// themselves. Those defaults are exercised by
+    /// [`new_rejects_missing_audience_by_default`] and
+    /// [`new_rejects_missing_issuer_by_default`].
     fn test_config(jwks_url: &str) -> BearerTokenProviderConfig {
         BearerTokenProviderConfig {
             jwks_url: jwks_url.to_string(),
@@ -712,6 +1020,8 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             allow_unbounded_audience: true,
             // Tests serve JWKS over a local http listener; opt in explicitly.
             allow_insecure_jwks: true,
+            allow_unbounded_issuer: true,
+            leeway_secs: DEFAULT_LEEWAY_SECS,
         }
     }
 
@@ -875,6 +1185,11 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         assert!(config.audience.is_none());
         assert_eq!(config.user_claim, "sub");
         assert_eq!(config.roles_claim, "realm_access.roles");
+        // Finding 207: the unbounded escapes are opt-in, and the clock-skew
+        // allowance is visible rather than inherited from jsonwebtoken.
+        assert!(!config.allow_unbounded_issuer);
+        assert!(!config.allow_unbounded_audience);
+        assert_eq!(config.leeway_secs, DEFAULT_LEEWAY_SECS);
     }
 
     // -----------------------------------------------------------------------
@@ -956,6 +1271,50 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         });
 
         (handle, url, counter)
+    }
+
+    /// Start a mock JWKS server that serves a scripted sequence of bodies:
+    /// request *n* gets `responses[n]`, and every request past the end of the
+    /// script repeats the last entry. Responses carry `Connection: close` so
+    /// reqwest does not reuse a pooled connection the server has already
+    /// stopped reading from.
+    async fn start_scripted_jwks_server(
+        responses: Vec<serde_json::Value>,
+    ) -> (tokio::task::JoinHandle<()>, String) {
+        assert!(!responses.is_empty(), "script must have at least one body");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://127.0.0.1:{}", addr.port());
+
+        let bodies: Vec<String> = responses
+            .iter()
+            .map(|v| serde_json::to_string(v).unwrap())
+            .collect();
+
+        let handle = tokio::spawn(async move {
+            for served in 0usize..10 {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+
+                let body = &bodies[served.min(bodies.len() - 1)];
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        (handle, url)
     }
 
     // -----------------------------------------------------------------------
@@ -1053,6 +1412,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             jwks_url: "http://localhost:0/jwks".to_string(),
             allow_unbounded_audience: true,
             allow_insecure_jwks: true,
+            allow_unbounded_issuer: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1077,6 +1437,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             jwks_url: "http://localhost:0/jwks".to_string(),
             allow_unbounded_audience: true,
             allow_insecure_jwks: true,
+            allow_unbounded_issuer: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1153,6 +1514,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             jwks_url: jwks_url.clone(),
             audience: Some("expected-audience".to_string()),
             allow_insecure_jwks: true,
+            allow_unbounded_issuer: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1192,6 +1554,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             jwks_url: jwks_url.clone(),
             audience: Some("sqe".to_string()),
             allow_insecure_jwks: true,
+            allow_unbounded_issuer: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1259,6 +1622,377 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         }
     }
 
+    #[tokio::test]
+    async fn issuer_match_succeeds() {
+        let jwks = build_jwks_json();
+        let (_handle, jwks_url) = start_jwks_server(jwks).await;
+
+        let config = BearerTokenProviderConfig {
+            jwks_url: jwks_url.clone(),
+            issuer: Some(TEST_ISSUER.to_string()),
+            allow_unbounded_audience: true,
+            allow_insecure_jwks: true,
+            ..Default::default()
+        };
+        let provider = BearerTokenProvider::new(config).unwrap();
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = json!({
+            "sub": "alice",
+            "iss": TEST_ISSUER,
+            "exp": now + 3600,
+            "iat": now
+        });
+
+        let creds = FlightCredentials {
+            bearer_token: Some(sqe_core::SecretString::new(build_signed_jwt(&claims))),
+            ..Default::default()
+        };
+
+        let identity = provider
+            .authenticate(&creds)
+            .await
+            .expect("should succeed with a matching issuer");
+        assert_eq!(identity.user_id, "alice");
+    }
+
+    /// A token that simply omits `iss` must not slip past a configured
+    /// issuer: `jsonwebtoken` only compares the claim when it is present, so
+    /// the provider marks `iss` required. Finding 207.
+    #[tokio::test]
+    async fn missing_issuer_claim_rejected_when_issuer_configured() {
+        let jwks = build_jwks_json();
+        let (_handle, jwks_url) = start_jwks_server(jwks).await;
+
+        let config = BearerTokenProviderConfig {
+            jwks_url: jwks_url.clone(),
+            issuer: Some(TEST_ISSUER.to_string()),
+            allow_unbounded_audience: true,
+            allow_insecure_jwks: true,
+            ..Default::default()
+        };
+        let provider = BearerTokenProvider::new(config).unwrap();
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = json!({
+            "sub": "alice",
+            // no "iss" claim at all
+            "exp": now + 3600,
+            "iat": now
+        });
+
+        let creds = FlightCredentials {
+            bearer_token: Some(sqe_core::SecretString::new(build_signed_jwt(&claims))),
+            ..Default::default()
+        };
+
+        match provider.authenticate(&creds).await {
+            Err(AuthError::AuthFailed(msg)) => {
+                assert!(msg.contains("iss"), "Expected an issuer claim error: {msg}");
+            }
+            other => panic!("Expected AuthFailed for a missing iss claim, got: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // nbf validation (finding 207)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn nbf_in_the_future_returns_auth_failed() {
+        let jwks = build_jwks_json();
+        let (_handle, jwks_url) = start_jwks_server(jwks).await;
+
+        let provider = BearerTokenProvider::new(test_config(&jwks_url)).unwrap();
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = json!({
+            "sub": "alice",
+            // Well outside the 60 s default leeway.
+            "nbf": now + 3600,
+            "exp": now + 7200,
+            "iat": now
+        });
+
+        let creds = FlightCredentials {
+            bearer_token: Some(sqe_core::SecretString::new(build_signed_jwt(&claims))),
+            ..Default::default()
+        };
+
+        match provider.authenticate(&creds).await {
+            Err(AuthError::AuthFailed(msg)) => {
+                assert!(
+                    msg.contains("not valid yet"),
+                    "Expected an nbf error, got: {msg}"
+                );
+            }
+            other => panic!("Expected AuthFailed for a future nbf, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn nbf_in_the_past_is_accepted() {
+        let jwks = build_jwks_json();
+        let (_handle, jwks_url) = start_jwks_server(jwks).await;
+
+        let provider = BearerTokenProvider::new(test_config(&jwks_url)).unwrap();
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = json!({
+            "sub": "alice",
+            "nbf": now - 60,
+            "exp": now + 3600,
+            "iat": now - 60
+        });
+
+        let creds = FlightCredentials {
+            bearer_token: Some(sqe_core::SecretString::new(build_signed_jwt(&claims))),
+            ..Default::default()
+        };
+
+        let identity = provider
+            .authenticate(&creds)
+            .await
+            .expect("a token whose nbf has passed must still authenticate");
+        assert_eq!(identity.user_id, "alice");
+    }
+
+    // -----------------------------------------------------------------------
+    // EC (ES256) JWKS support (finding 207)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn es256_token_validates_against_ec_jwks() {
+        let (_handle, jwks_url) = start_jwks_server(build_ec_jwks_json()).await;
+
+        let provider = BearerTokenProvider::new(test_config(&jwks_url)).unwrap();
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = json!({
+            "sub": "erika",
+            "realm_access": { "roles": ["analyst"] },
+            "exp": now + 3600,
+            "iat": now
+        });
+
+        let creds = FlightCredentials {
+            bearer_token: Some(sqe_core::SecretString::new(build_signed_es256_jwt(&claims))),
+            ..Default::default()
+        };
+
+        let identity = provider
+            .authenticate(&creds)
+            .await
+            .expect("an ES256 token must validate against an EC JWKS");
+        assert_eq!(identity.user_id, "erika");
+        assert_eq!(identity.roles, vec!["analyst"]);
+    }
+
+    /// The algorithm is pinned per key, so an RSA-signed token presented
+    /// against an EC key entry is rejected rather than silently accepted.
+    #[tokio::test]
+    async fn rs256_token_rejected_against_ec_key_entry() {
+        // EC JWKS that reuses the RSA key's `kid`, so the lookup hits the EC
+        // entry with the RSA-signed token.
+        let jwks = json!({
+            "keys": [{
+                "kty": "EC",
+                "kid": TEST_KID,
+                "alg": "ES256",
+                "crv": "P-256",
+                "use": "sig",
+                "x": TEST_EC_X,
+                "y": TEST_EC_Y
+            }]
+        });
+        let (_handle, jwks_url) = start_jwks_server(jwks).await;
+
+        let provider = BearerTokenProvider::new(test_config(&jwks_url)).unwrap();
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = json!({ "sub": "mallory", "exp": now + 3600, "iat": now });
+
+        let creds = FlightCredentials {
+            bearer_token: Some(sqe_core::SecretString::new(build_signed_jwt(&claims))),
+            ..Default::default()
+        };
+
+        assert!(
+            provider.authenticate(&creds).await.is_err(),
+            "an RS256 token must not validate against an ES256 key entry"
+        );
+    }
+
+    #[test]
+    fn key_algorithm_pins_alg_per_key() {
+        let rsa = Jwk {
+            kid: Some("k".into()),
+            kty: "RSA".into(),
+            n: Some("n".into()),
+            e: Some("AQAB".into()),
+            crv: None,
+            x: None,
+            y: None,
+            alg: Some("RS512".into()),
+        };
+        assert_eq!(
+            BearerTokenProvider::key_algorithm(&rsa),
+            Some(Algorithm::RS512)
+        );
+
+        // No `alg`: derived from kty/crv.
+        let ec_p256 = Jwk {
+            kid: Some("k".into()),
+            kty: "EC".into(),
+            n: None,
+            e: None,
+            crv: Some("P-256".into()),
+            x: Some("x".into()),
+            y: Some("y".into()),
+            alg: None,
+        };
+        assert_eq!(
+            BearerTokenProvider::key_algorithm(&ec_p256),
+            Some(Algorithm::ES256)
+        );
+
+        // Family mismatch (RSA key advertising an EC alg) is rejected.
+        let confused = Jwk {
+            alg: Some("ES256".into()),
+            ..rsa.clone()
+        };
+        assert_eq!(BearerTokenProvider::key_algorithm(&confused), None);
+
+        // Symmetric algorithms never come from a JWKS we would trust.
+        let hmac = Jwk {
+            alg: Some("HS256".into()),
+            ..rsa
+        };
+        assert_eq!(BearerTokenProvider::key_algorithm(&hmac), None);
+
+        // Unsupported key type.
+        let oct = Jwk {
+            kid: Some("k".into()),
+            kty: "oct".into(),
+            n: None,
+            e: None,
+            crv: None,
+            x: None,
+            y: None,
+            alg: None,
+        };
+        assert_eq!(BearerTokenProvider::key_algorithm(&oct), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Key retirement on refetch (finding 207)
+    // -----------------------------------------------------------------------
+
+    /// A key the IdP has dropped from its JWKS must stop being honoured once
+    /// the grace window has passed — rotation and revocation look identical
+    /// from here, and revocation is the safe reading.
+    #[tokio::test]
+    async fn key_removed_from_jwks_is_rejected_after_refetch() {
+        let (_handle, jwks_url) =
+            start_scripted_jwks_server(vec![build_jwks_json(), build_jwks_json_without_test_key()])
+                .await;
+
+        // Zero grace window: a key absent from the fresh JWKS is dropped
+        // immediately.
+        let provider = BearerTokenProvider::new(test_config(&jwks_url))
+            .unwrap()
+            .with_key_grace_window(Duration::ZERO);
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = json!({ "sub": "alice", "exp": now + 3600, "iat": now });
+        let token = build_signed_jwt(&claims);
+        let creds = FlightCredentials {
+            bearer_token: Some(sqe_core::SecretString::new(token)),
+            ..Default::default()
+        };
+
+        // First fetch serves the key: authentication succeeds.
+        provider
+            .authenticate(&creds)
+            .await
+            .expect("first authentication should succeed while the key is published");
+
+        // The IdP retires the key; a refetch picks up the new key set.
+        provider
+            .refetch_jwks()
+            .await
+            .expect("refetch should succeed");
+
+        // The retired key is gone, so the same token is now rejected. (The
+        // refetch cooldown keeps this second attempt from re-fetching.)
+        match provider.authenticate(&creds).await {
+            Err(AuthError::AuthFailed(msg)) => {
+                assert!(
+                    msg.contains(TEST_KID),
+                    "Expected the retired kid to be reported, got: {msg}"
+                );
+            }
+            other => panic!("Expected AuthFailed after key retirement, got: {other:?}"),
+        }
+    }
+
+    /// Inside the grace window the same retired key is still honoured, so a
+    /// routine rotation does not reject in-flight tokens.
+    #[tokio::test]
+    async fn key_removed_from_jwks_is_honoured_inside_grace_window() {
+        let (_handle, jwks_url) =
+            start_scripted_jwks_server(vec![build_jwks_json(), build_jwks_json_without_test_key()])
+                .await;
+
+        let provider = BearerTokenProvider::new(test_config(&jwks_url))
+            .unwrap()
+            .with_key_grace_window(Duration::from_secs(300));
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = json!({ "sub": "alice", "exp": now + 3600, "iat": now });
+        let creds = FlightCredentials {
+            bearer_token: Some(sqe_core::SecretString::new(build_signed_jwt(&claims))),
+            ..Default::default()
+        };
+
+        provider
+            .authenticate(&creds)
+            .await
+            .expect("first authentication should succeed");
+
+        provider
+            .refetch_jwks()
+            .await
+            .expect("refetch should succeed");
+
+        let identity = provider
+            .authenticate(&creds)
+            .await
+            .expect("a just-retired key must stay valid inside the grace window");
+        assert_eq!(identity.user_id, "alice");
+    }
+
+    /// A JWKS that parses but carries no loadable key must not resurrect the
+    /// previous key set.
+    #[tokio::test]
+    async fn empty_fresh_jwks_clears_the_cache() {
+        let (_handle, jwks_url) =
+            start_scripted_jwks_server(vec![build_jwks_json(), json!({ "keys": [] })]).await;
+
+        let provider = BearerTokenProvider::new(test_config(&jwks_url))
+            .unwrap()
+            .with_key_grace_window(Duration::from_secs(300));
+
+        let jwks = provider.get_jwks().await.expect("initial fetch");
+        assert!(jwks.contains_key(TEST_KID));
+
+        let jwks = provider.refetch_jwks().await.expect("refetch");
+        assert!(
+            jwks.is_empty(),
+            "an empty fresh JWKS must replace the cache, not be ignored"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // JWT passed as password field (Flight Basic auth workaround)
     // -----------------------------------------------------------------------
@@ -1309,6 +2043,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             roles_claim: "groups".to_string(),
             allow_unbounded_audience: true,
             allow_insecure_jwks: true,
+            allow_unbounded_issuer: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1350,6 +2085,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             user_claim: "email".to_string(),
             allow_unbounded_audience: true,
             allow_insecure_jwks: true,
+            allow_unbounded_issuer: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1390,6 +2126,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             jwks_url: "http://localhost:0/jwks".to_string(),
             allow_unbounded_audience: true,
             allow_insecure_jwks: true,
+            allow_unbounded_issuer: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1419,6 +2156,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             jwks_url: "http://localhost:0/jwks".to_string(),
             allow_unbounded_audience: true,
             allow_insecure_jwks: true,
+            allow_unbounded_issuer: true,
             ..Default::default()
         };
         let provider = BearerTokenProvider::new(config).unwrap();
@@ -1460,6 +2198,8 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             accept_invalid_certs: false,
             allow_unbounded_audience: false,
             allow_insecure_jwks: true,
+            allow_unbounded_issuer: false,
+            leeway_secs: DEFAULT_LEEWAY_SECS,
         };
         assert!(BearerTokenProvider::new(config).is_ok());
     }
@@ -1511,6 +2251,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             audience: None,
             allow_unbounded_audience: true,
             allow_insecure_jwks: true,
+            allow_unbounded_issuer: true,
             ..Default::default()
         };
         assert!(BearerTokenProvider::new(config).is_ok());
@@ -1523,6 +2264,73 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
             audience: Some("sqe".to_string()),
             allow_unbounded_audience: false,
             allow_insecure_jwks: true,
+            allow_unbounded_issuer: true,
+            ..Default::default()
+        };
+        assert!(BearerTokenProvider::new(config).is_ok());
+    }
+
+    // --- Finding 207: JWT issuer required by default ---
+
+    #[test]
+    fn new_rejects_missing_issuer_by_default() {
+        let config = BearerTokenProviderConfig {
+            jwks_url: "https://idp.example.com/jwks".to_string(),
+            audience: Some("sqe".to_string()),
+            issuer: None,
+            allow_unbounded_issuer: false,
+            ..Default::default()
+        };
+        match BearerTokenProvider::new(config) {
+            Err(AuthError::Internal(e)) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("issuer") || msg.contains("allow_unbounded_issuer"),
+                    "error must mention the issuer guard: {msg}"
+                );
+            }
+            Err(other) => panic!("expected Internal config error, got: {other:?}"),
+            Ok(_) => panic!("must reject a missing issuer"),
+        }
+    }
+
+    #[test]
+    fn new_rejects_empty_string_issuer() {
+        let config = BearerTokenProviderConfig {
+            jwks_url: "https://idp.example.com/jwks".to_string(),
+            audience: Some("sqe".to_string()),
+            issuer: Some(String::new()),
+            allow_unbounded_issuer: false,
+            ..Default::default()
+        };
+        match BearerTokenProvider::new(config) {
+            Err(AuthError::Internal(e)) => {
+                assert!(format!("{e}").to_lowercase().contains("issuer"));
+            }
+            Err(other) => panic!("expected Internal config error, got: {other:?}"),
+            Ok(_) => panic!("must reject an empty issuer"),
+        }
+    }
+
+    #[test]
+    fn new_accepts_missing_issuer_when_explicit_opt_in() {
+        let config = BearerTokenProviderConfig {
+            jwks_url: "https://idp.example.com/jwks".to_string(),
+            audience: Some("sqe".to_string()),
+            issuer: None,
+            allow_unbounded_issuer: true,
+            ..Default::default()
+        };
+        assert!(BearerTokenProvider::new(config).is_ok());
+    }
+
+    #[test]
+    fn new_accepts_non_empty_issuer_without_opt_in() {
+        let config = BearerTokenProviderConfig {
+            jwks_url: "https://idp.example.com/jwks".to_string(),
+            audience: Some("sqe".to_string()),
+            issuer: Some(TEST_ISSUER.to_string()),
+            allow_unbounded_issuer: false,
             ..Default::default()
         };
         assert!(BearerTokenProvider::new(config).is_ok());
@@ -1535,6 +2343,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         let config = BearerTokenProviderConfig {
             jwks_url: "http://idp.example.com/jwks".to_string(),
             audience: Some("sqe".to_string()),
+            issuer: Some(TEST_ISSUER.to_string()),
             allow_unbounded_audience: false,
             allow_insecure_jwks: false,
             ..Default::default()
@@ -1557,6 +2366,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         let config = BearerTokenProviderConfig {
             jwks_url: "https://idp.example.com/jwks".to_string(),
             audience: Some("sqe".to_string()),
+            issuer: Some(TEST_ISSUER.to_string()),
             allow_unbounded_audience: false,
             allow_insecure_jwks: false,
             ..Default::default()
@@ -1569,6 +2379,7 @@ fGaGdPurwOnXPCbnSxiTHsQWwcx2KhPWpUsg/msrL8LU3DRravWV
         let config = BearerTokenProviderConfig {
             jwks_url: "http://localhost:8080/jwks".to_string(),
             audience: Some("sqe".to_string()),
+            issuer: Some(TEST_ISSUER.to_string()),
             allow_unbounded_audience: false,
             allow_insecure_jwks: true,
             ..Default::default()

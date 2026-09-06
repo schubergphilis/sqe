@@ -39,6 +39,123 @@ pub fn record_batch_to_data_chunk(batch: &RecordBatch) -> crate::Result<DataChun
     })
 }
 
+/// Map an Arrow [`DataType`] to the `LogicalType` that `column_to_vector`
+/// would stamp on a vector of that type. This is the *type-only* mirror of the
+/// encode path: a server has to fill `PrepareResponse.result_types` from the
+/// result **schema**, not from the first batch, otherwise a query that returns
+/// zero rows reports zero columns.
+///
+/// Everything except `Dictionary` (DuckDB `ENUM`) is derivable from the Arrow
+/// type alone. `ENUM` carries its dictionary values in `ExtraTypeInfo::Enum`,
+/// and those live in the *array*, not the type, so this function rejects
+/// `Dictionary`; a caller holding an encoded chunk should read the types off
+/// the chunk instead.
+pub fn arrow_type_to_logical(dt: &DataType) -> crate::Result<LogicalType> {
+    let id = match dt {
+        DataType::Int8 => LogicalTypeId::TinyInt,
+        DataType::Int16 => LogicalTypeId::SmallInt,
+        DataType::Int32 => LogicalTypeId::Integer,
+        DataType::Int64 => LogicalTypeId::BigInt,
+        DataType::UInt8 => LogicalTypeId::UTinyInt,
+        DataType::UInt16 => LogicalTypeId::USmallInt,
+        DataType::UInt32 => LogicalTypeId::UInteger,
+        DataType::UInt64 => LogicalTypeId::UBigInt,
+        DataType::Float32 => LogicalTypeId::Float,
+        DataType::Float64 => LogicalTypeId::Double,
+        DataType::Boolean => LogicalTypeId::Boolean,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => LogicalTypeId::Varchar,
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => LogicalTypeId::Blob,
+        // Date64 narrows to DuckDB's 4-byte DATE on the value path, so the
+        // declared type has to narrow with it.
+        DataType::Date32 | DataType::Date64 => LogicalTypeId::Date,
+        DataType::Timestamp(TimeUnit::Second, _) => LogicalTypeId::TimestampSec,
+        DataType::Timestamp(TimeUnit::Millisecond, _) => LogicalTypeId::TimestampMs,
+        DataType::Timestamp(TimeUnit::Microsecond, _) => LogicalTypeId::Timestamp,
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => LogicalTypeId::TimestampNs,
+        // Time32(s|ms) widen into DuckDB TIME (i64 micros-of-day).
+        DataType::Time32(TimeUnit::Second)
+        | DataType::Time32(TimeUnit::Millisecond)
+        | DataType::Time64(TimeUnit::Microsecond) => LogicalTypeId::Time,
+        DataType::Time64(TimeUnit::Nanosecond) => LogicalTypeId::TimeNs,
+        DataType::FixedSizeBinary(16) => LogicalTypeId::Uuid,
+        DataType::Interval(_) => LogicalTypeId::Interval,
+        DataType::Decimal128(precision, scale) => {
+            let scale_u8 = u8::try_from(*scale).map_err(|_| {
+                crate::WireError::UnsupportedArrowType(format!(
+                    "Decimal128 with negative scale {scale} is not representable in \
+                     DuckDB DecimalTypeInfo"
+                ))
+            })?;
+            return Ok(LogicalType::with_extra(
+                LogicalTypeId::Decimal,
+                ExtraTypeInfo::Decimal {
+                    precision: *precision,
+                    scale: scale_u8,
+                },
+            ));
+        }
+        DataType::List(field) | DataType::LargeList(field) => {
+            let child = arrow_type_to_logical(field.data_type())?;
+            return Ok(LogicalType::with_extra(
+                LogicalTypeId::List,
+                ExtraTypeInfo::List {
+                    child: Box::new(child),
+                },
+            ));
+        }
+        DataType::Struct(fields) => {
+            let mut out = Vec::with_capacity(fields.len());
+            for f in fields {
+                out.push((f.name().clone(), arrow_type_to_logical(f.data_type())?));
+            }
+            return Ok(LogicalType::with_extra(
+                LogicalTypeId::Struct,
+                ExtraTypeInfo::Struct { fields: out },
+            ));
+        }
+        // Arrow MAP is `Map(entries: Struct<key, value>)`; DuckDB stores it as
+        // LIST<STRUCT<key, value>> with the parent id stamped MAP — the same
+        // shape `map_array_to_map` produces on the value path.
+        DataType::Map(entries, _) => {
+            let child = arrow_type_to_logical(entries.data_type())?;
+            return Ok(LogicalType::with_extra(
+                LogicalTypeId::Map,
+                ExtraTypeInfo::List {
+                    child: Box::new(child),
+                },
+            ));
+        }
+        DataType::FixedSizeList(field, size) => {
+            let child = arrow_type_to_logical(field.data_type())?;
+            let size = u32::try_from(*size).map_err(|_| {
+                crate::WireError::UnsupportedArrowType(format!(
+                    "FixedSizeList with negative size {size}"
+                ))
+            })?;
+            return Ok(LogicalType::with_extra(
+                LogicalTypeId::Array,
+                ExtraTypeInfo::Array {
+                    child: Box::new(child),
+                    size,
+                },
+            ));
+        }
+        other => return Err(crate::WireError::UnsupportedArrowType(format!("{other:?}"))),
+    };
+    Ok(LogicalType::new(id))
+}
+
+/// Column types for a whole Arrow [`Schema`], in field order. See
+/// [`arrow_type_to_logical`] for why the schema (rather than the first batch)
+/// is the right source for `PrepareResponse.result_types`.
+pub fn arrow_schema_to_logical(schema: &arrow_schema::Schema) -> crate::Result<Vec<LogicalType>> {
+    schema
+        .fields()
+        .iter()
+        .map(|f| arrow_type_to_logical(f.data_type()))
+        .collect()
+}
+
 /// Map a single `LogicalType` to an Arrow [`DataType`]. Mirrors the
 /// type-level choices made by `column_to_vector` so a server's
 /// `PrepareResponse.result_types` can be turned into an Arrow [`Schema`]
@@ -2456,6 +2573,74 @@ mod tests {
         assert!(matches!(
             err,
             crate::WireError::CountExceedsRemaining { .. }
+        ));
+    }
+
+    /// 606: `result_types` is derived from the stream schema so a zero-row
+    /// result still names its columns. The schema-derived type must be
+    /// byte-identical to what the value path would have stamped, or a client
+    /// that decodes with the declared type reads the wrong bytes.
+    #[test]
+    fn schema_derived_types_match_value_derived_types() {
+        let cases: Vec<(DataType, Arc<dyn Array>)> = vec![
+            (
+                DataType::Int32,
+                Arc::new(Int32Array::from(vec![1])) as Arc<dyn Array>,
+            ),
+            (DataType::Int64, Arc::new(Int64Array::from(vec![1i64]))),
+            (DataType::Float64, Arc::new(Float64Array::from(vec![1.0]))),
+            (DataType::Utf8, Arc::new(StringArray::from(vec!["a"]))),
+            (
+                DataType::Date64,
+                Arc::new(Date64Array::from(vec![86_400_000i64])),
+            ),
+            (
+                DataType::Time32(TimeUnit::Millisecond),
+                Arc::new(Time32MillisecondArray::from(vec![1_000i32])),
+            ),
+            (
+                DataType::Decimal128(12, 3),
+                Arc::new(
+                    Decimal128Array::from(vec![1234i128])
+                        .with_precision_and_scale(12, 3)
+                        .unwrap(),
+                ),
+            ),
+        ];
+        for (dt, array) in cases {
+            let batch = batch_with(vec![("c", dt.clone(), array)]);
+            let chunk = record_batch_to_data_chunk(&batch).unwrap();
+            let from_schema = arrow_schema_to_logical(batch.schema().as_ref()).unwrap();
+            assert_eq!(
+                from_schema[0], chunk.columns[0].logical_type,
+                "schema-derived type disagrees with value-derived type for {dt:?}"
+            );
+        }
+    }
+
+    /// The schema path must cover an *empty* result too: that is the whole
+    /// reason it exists (there is no first batch to read types off).
+    #[test]
+    fn empty_schema_still_yields_column_types() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Utf8, true),
+        ]);
+        let types = arrow_schema_to_logical(&schema).unwrap();
+        assert_eq!(types.len(), 2);
+        assert_eq!(types[0].id, LogicalTypeId::Integer);
+        assert_eq!(types[1].id, LogicalTypeId::Varchar);
+    }
+
+    /// ENUM values are data, not type, so the type-only path has to refuse
+    /// rather than invent an empty dictionary (whose physical key width would
+    /// differ from the one the value path picks).
+    #[test]
+    fn dictionary_is_rejected_by_the_type_only_path() {
+        let dt = DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8));
+        assert!(matches!(
+            arrow_type_to_logical(&dt),
+            Err(crate::WireError::UnsupportedArrowType(_))
         ));
     }
 }

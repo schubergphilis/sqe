@@ -6,10 +6,10 @@
 
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
 use async_trait::async_trait;
+use futures::StreamExt;
 use sqe_core::{Session, SqeError};
-use sqe_quack_server::{QueryError, QueryExecutor};
+use sqe_quack_server::{QueryError, QueryExecutor, QueryStream};
 
 use crate::QueryHandler;
 
@@ -25,11 +25,42 @@ impl CoordinatorExecutor {
 
 #[async_trait]
 impl QueryExecutor for CoordinatorExecutor {
-    async fn execute(&self, session: &Session, sql: &str) -> Result<Vec<RecordBatch>, QueryError> {
-        self.query_handler
-            .execute(session, sql, None)
-            .await
-            .map_err(sqe_error_to_query_error)
+    /// Streaming by default (finding 606): `execute_stream` returns as soon as
+    /// the schema is known, so the Quack server can page the result out under a
+    /// byte cap instead of materialising it whole. `execute_stream` also emits
+    /// the same `AuditEvent` as `execute`, via the stream finalizer.
+    ///
+    /// It only serves `SELECT`, though — DML and metadata statements come back
+    /// as `NotImplemented` with an explicit instruction to fall back to
+    /// `execute`, which we do so `CREATE TABLE`/`INSERT` over Quack keep
+    /// working. The fallback is cheap: `execute_stream` rejects at classify
+    /// time, before any planning or execution.
+    async fn execute(&self, session: &Session, sql: &str) -> Result<QueryStream, QueryError> {
+        match self.query_handler.execute_stream(session, sql, None).await {
+            Ok((schema, stream)) => Ok(QueryStream {
+                schema,
+                batches: stream
+                    .map(|item| {
+                        item.map_err(|e: datafusion::error::DataFusionError| {
+                            QueryError::Execution(e.to_string())
+                        })
+                    })
+                    .boxed(),
+            }),
+            Err(SqeError::NotImplemented(_)) => {
+                let batches = self
+                    .query_handler
+                    .execute(session, sql, None)
+                    .await
+                    .map_err(sqe_error_to_query_error)?;
+                let schema = match batches.first() {
+                    Some(b) => b.schema(),
+                    None => Arc::new(arrow_schema::Schema::empty()),
+                };
+                Ok(QueryStream::from_batches(schema, batches))
+            }
+            Err(e) => Err(sqe_error_to_query_error(e)),
+        }
     }
 }
 
@@ -69,15 +100,17 @@ pub fn sqe_error_to_query_error(err: SqeError) -> QueryError {
         SqeError::Internal(_) => QueryError::Internal(msg),
 
         // Source-preserving boundary errors: route by code. InternalError
-        // (e.g. config_src) is an operator problem -> Internal; everything else
-        // (catalog/exec/auth/storage boundaries) surfaces as Execution.
-        SqeError::Sourced { ref code, .. } => {
-            if *code == sqe_core::SqeErrorCode::InternalError {
-                QueryError::Internal(msg)
-            } else {
-                QueryError::Execution(msg)
-            }
-        }
+        // (e.g. config_src) is an operator problem -> Internal; AccessDenied is
+        // a policy decision -> Policy, which is what makes the server's
+        // "SQE-POLICY: access denied" masking branch live (606: it used to fall
+        // through to Execution, so the full denial reason reached the client);
+        // everything else (catalog/exec/storage boundaries) surfaces as
+        // Execution.
+        SqeError::Sourced { ref code, .. } => match *code {
+            sqe_core::SqeErrorCode::InternalError => QueryError::Internal(msg),
+            sqe_core::SqeErrorCode::AccessDenied => QueryError::Policy(msg),
+            _ => QueryError::Execution(msg),
+        },
     }
 }
 
@@ -153,5 +186,54 @@ mod tests {
     fn internal_anyhow_maps_to_internal() {
         let mapped = sqe_error_to_query_error(SqeError::Internal(anyhow_msg()));
         assert!(matches!(mapped, QueryError::Internal(_)));
+    }
+
+    fn sourced(code: sqe_core::SqeErrorCode, message: &str) -> SqeError {
+        SqeError::Sourced {
+            code,
+            message: message.to_string(),
+            source: Box::new(std::io::Error::other("cause")),
+        }
+    }
+
+    /// 606: the Quack server masks `QueryError::Policy` down to the generic
+    /// "SQE-POLICY: access denied". That branch was dead because every
+    /// `Sourced` error, `AccessDenied` included, routed to `Execution` — so the
+    /// client received the full denial reason, which is the row-filter /
+    /// column-mask payload the masking exists to hide.
+    #[test]
+    fn access_denied_maps_to_policy() {
+        let mapped = sqe_error_to_query_error(sourced(
+            sqe_core::SqeErrorCode::AccessDenied,
+            "user 'bob' lacks SELECT on hr.salaries (row filter dept='HR')",
+        ));
+        match mapped {
+            QueryError::Policy(msg) => assert!(
+                msg.contains("hr.salaries"),
+                "the detail must survive into the server log: {msg}"
+            ),
+            other => panic!("expected Policy, got {other:?}"),
+        }
+    }
+
+    /// The neighbouring codes must not follow AccessDenied into Policy:
+    /// InternalError stays Internal, everything else stays Execution.
+    #[test]
+    fn other_sourced_codes_keep_their_mapping() {
+        let mapped =
+            sqe_error_to_query_error(sourced(sqe_core::SqeErrorCode::InternalError, "bad config"));
+        assert!(matches!(mapped, QueryError::Internal(_)));
+
+        let mapped = sqe_error_to_query_error(sourced(
+            sqe_core::SqeErrorCode::AuthenticationFailed,
+            "token rejected",
+        ));
+        assert!(matches!(mapped, QueryError::Execution(_)));
+
+        let mapped = sqe_error_to_query_error(sourced(
+            sqe_core::SqeErrorCode::TableNotFound,
+            "no such table",
+        ));
+        assert!(matches!(mapped, QueryError::Execution(_)));
     }
 }

@@ -737,16 +737,21 @@ impl SqeFlightSqlService {
         // proper session. The username comes from the validated JWT claims,
         // not from a client-supplied header.
         if token.contains('.') {
-            let credentials = sqe_auth::FlightCredentials {
-                bearer_token: Some(sqe_core::SecretString::new(token.to_string())),
-                ..Default::default()
-            };
-            match self
-                .session_manager
-                .authenticate_credentials(&credentials)
-                .await
-            {
-                Ok(session) => {
+            // Finding 405: the token fingerprint indexes the session, so a
+            // client replaying the same JWT on every RPC authenticates once
+            // and reuses one session. `created` is true only on that first
+            // sight, which is the only time an auth-success event belongs.
+            match self.session_manager.session_for_bearer(token).await {
+                Ok((session, created)) => {
+                    if !created {
+                        debug!(
+                            username = %session.user.username,
+                            client_ip = %client_ip,
+                            session_id = %session.id,
+                            "Flight: JWT bearer matched an existing session"
+                        );
+                        return Ok(session);
+                    }
                     debug!(
                         username = %session.user.username,
                         client_ip = %client_ip,
@@ -766,12 +771,10 @@ impl SqeFlightSqlService {
                         Some(client_ip),
                         Some(session.id.clone()),
                     );
-                    // No Session event here: authenticate_credentials mints a
-                    // new session on every JWT bearer call (no dedup by token),
-                    // so emitting Session here would fire per-request rather
-                    // than per-session-establishment. Session events (OCSF 3003)
-                    // are only emitted on do_handshake(), which is the single
-                    // true session-establishment gate for interactive clients.
+                    // Session events (OCSF 3003) are only emitted on
+                    // do_handshake(), the session-establishment gate for
+                    // interactive clients; bearer replay clients establish
+                    // no handshake session.
                     return Ok(session);
                 }
                 Err(e) => {
@@ -2322,6 +2325,7 @@ impl FlightSqlService for SqeFlightSqlService {
         &self,
         request: Request<Action>,
     ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
+        let peer = request.remote_addr();
         let (metadata, _, action) = request.into_parts();
         match action.r#type.as_str() {
             "heartbeat" => {
@@ -2355,8 +2359,44 @@ impl FlightSqlService for SqeFlightSqlService {
                     ));
                 }
 
+                // Finding 601: a secret holder must not be able to register an
+                // attacker URL and receive other users' tickets. The advertised
+                // host has to resolve to the peer that sent the heartbeat.
+                if !self.config.coordinator.allow_unverified_advertise {
+                    if let Err(reason) =
+                        crate::worker_registry::advertise_matches_peer(worker_url, peer).await
+                    {
+                        warn!(
+                            worker = %worker_url,
+                            peer = ?peer,
+                            reason = %reason,
+                            "Rejected heartbeat: advertised URL does not resolve to the sending peer"
+                        );
+                        self.emit_auth_event(
+                            sqe_metrics::audit::Outcome::Failure {
+                                error_type: Some("WorkerAdvertiseMismatch".to_string()),
+                                error_code: Some("PERMISSION_DENIED".to_string()),
+                                message: Some(reason.clone()),
+                            },
+                            sqe_metrics::audit::Actor::from_parts(
+                                format!("worker:{worker_url}"),
+                                None,
+                                None,
+                                vec![],
+                                vec![],
+                            ),
+                            peer.map(|p| p.ip().to_string()),
+                            None,
+                        );
+                        return Err(Status::permission_denied(format!(
+                            "heartbeat advertise URL does not match the sending peer: {reason}"
+                        )));
+                    }
+                }
+
                 if let Some(ref registry) = self.worker_registry {
                     debug!(worker = %worker_url, "Received heartbeat from worker");
+                    let newly_discovered = !registry.is_known(worker_url).await;
                     if let Err(err) = registry.register_heartbeat(worker_url).await {
                         use crate::worker_registry::RegistrationError;
                         let msg = format!("worker heartbeat rejected: {err}");
@@ -2371,6 +2411,21 @@ impl FlightSqlService for SqeFlightSqlService {
                             }
                         });
                     }
+                    if newly_discovered {
+                        // Finding 601: registry changes are security-relevant; audit them.
+                        self.emit_auth_event(
+                            sqe_metrics::audit::Outcome::Success,
+                            sqe_metrics::audit::Actor::from_parts(
+                                format!("worker:{worker_url}"),
+                                None,
+                                None,
+                                vec![],
+                                vec![],
+                            ),
+                            peer.map(|p| p.ip().to_string()),
+                            None,
+                        );
+                    }
                 } else {
                     warn!(
                         worker = %worker_url,
@@ -2381,8 +2436,17 @@ impl FlightSqlService for SqeFlightSqlService {
                     );
                 }
 
+                // Finding 601: hand the worker the public half of the ticket-signing
+                // key over this secret-authenticated channel so it can verify
+                // tickets without ever holding a signing key. Old workers ignore
+                // the body.
+                let body = serde_json::json!({
+                    "status": "ok",
+                    "ticket_public_key": self.query_handler.ticket_signer().public_key_b64(),
+                })
+                .to_string();
                 let result = arrow_flight::Result {
-                    body: bytes::Bytes::from_static(b"ok"),
+                    body: bytes::Bytes::from(body),
                 };
                 Ok(Response::new(Box::pin(stream::once(async { Ok(result) }))
                     as <Self as FlightService>::DoActionStream))

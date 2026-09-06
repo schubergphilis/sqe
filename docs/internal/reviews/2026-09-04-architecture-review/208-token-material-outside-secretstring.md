@@ -4,7 +4,7 @@
 - Severity: medium
 - Category: security
 - Effort: S (hours)
-- Status: open
+- Status: fixed (branch `fix/identity-transport-trust-p1`, 2026-09-05)
 - Issue: #561
 
 ## Problem
@@ -78,3 +78,36 @@ highest-value single credential in the process.
 - docs/internal/reviews/2026-06-26-codebase-analysis.md item 7 (plaintext
   session file) is resolved by the snapshot omitting tokens; this is the
   in-memory remainder.
+
+## Resolution (2026-09-05)
+
+The legacy path now carries the same `SecretString` discipline as the provider
+chain. `CachedToken` (`crates/sqe-auth/src/token_cache.rs`) holds
+`SecretString` / `Option<SecretString>` and has a hand-written redacting `Debug`
+mirroring the `FlightCredentials` formatter in `provider.rs`; `ServiceToken`
+(`crates/sqe-auth/src/authenticator.rs`) — the shared `client_credentials`
+service token, SEC-03's single highest-value credential — is a `SecretString`
+too. `TokenResponse.access_token` in `crates/sqe-auth/src/oauth.rs` and
+`TokenResponse.access_token` / `.refresh_token` in
+`crates/sqe-auth/src/oidc_password.rs` are `SecretString`: no `deserialize_with`
+helper was needed because `sqe_core::SecretString` already implements
+`Deserialize` from a JSON string, so the bearer never exists as a plain `String`
+and is zeroized on drop. Call sites updated inside sqe-auth
+(`authenticator.rs` session/cache construction and the background refresh loop,
+`per_catalog.rs` which exposes at its `String`-returning boundary) and in
+`crates/sqe-coordinator/src/session_manager.rs::get_session`, which now compares
+via `expose()` on both sides and moves the `SecretString` into
+`Credentials::new` instead of re-wrapping a plain `String`. New guard test
+`token_cache::tests::debug_does_not_leak_token_material` formats a `CachedToken`
+with `{:?}` and asserts the access/refresh bytes and the `eyJ` JWT prefix are
+absent and the `<set>` sentinel is present (mirrors
+`identity_debug_does_not_leak_token`). `cargo test -p sqe-auth` is green (282
+passed, 0 failed) and `cargo check -p sqe-coordinator` builds.
+
+Scope note: the acceptance grep is not fully clean yet. The newer provider-chain
+response/cache types still hold raw `String` bearers under `#[derive(Debug)]` —
+`oidc_provider.rs:66`, `oidc_client_credentials.rs:80`, `oidc_m2m.rs:28,84`,
+`auth_code.rs:51`, `device_code.rs:69`, `token_exchange.rs:91`,
+`pending_auth.rs:10`, `per_catalog.rs:52`. This change covered the legacy path
+named in the problem statement; those eight are the same class of exposure and
+should be swept in a follow-up.

@@ -67,10 +67,34 @@ pub async fn start_mcp_server(
     let app = mcp_router(auth, handler, rate_limiter, auth_rate_limiter, config);
 
     if tls.is_enabled() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        // Checked, not discarded: the old `let _ = ...install_default()`
+        // silently no-opped when another component had installed a provider
+        // first, so the MCP port could end up on a different crypto backend
+        // than the Flight port with no trace of it (finding 210).
+        crate::tls::ensure_crypto_provider();
+
+        // One builder for every listener. This is what makes `ca_file` apply
+        // to MCP: the old path called `RustlsConfig::from_pem_file` directly
+        // and ignored the CA entirely, so an mTLS deployment had an mTLS
+        // Flight port and a server-only MCP port on the same certificate.
+        let material = sqe_core::ServerTlsMaterial::load(tls)?;
+        if material.requires_client_cert() {
+            tracing::info!(
+                ca_file = %tls.ca_file,
+                "MCP HTTPS listener requires a client certificate (mTLS)"
+            );
+        }
         let rustls_config =
-            axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_file, &tls.key_file)
-                .await?;
+            axum_server::tls_rustls::RustlsConfig::from_config(material.rustls_server_config());
+
+        // Rotation without a restart. The Flight listener cannot do this; see
+        // the module docs on `crate::tls`.
+        let _reload_task = crate::tls::spawn_cert_reload_watch(
+            tls.clone(),
+            rustls_config.clone(),
+            crate::tls::DEFAULT_CERT_RELOAD_INTERVAL,
+        );
+
         Ok(tokio::spawn(async move {
             if let Err(error) = axum_server::bind_rustls(addr, rustls_config)
                 .serve(app.into_make_service_with_connect_info::<SocketAddr>())

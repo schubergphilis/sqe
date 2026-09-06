@@ -18,8 +18,8 @@ trino_http_port = 8080    # 0 to disable
 | `/v1/info` | GET | Node info (version, uptime, coordinator status) |
 | `/v1/info/state` | GET | Plain text: `ACTIVE` or `STARTING` |
 | `/v1/statement` | POST | Submit a SQL query |
-| `/v1/statement/queued/{id}/{token}` | GET | Poll a queued/running query until results are ready |
-| `/v1/statement/{id}/{token}` | GET | Fetch paginated results |
+| `/v1/statement/queued/{id}/{slug}/{token}` | GET | Poll a queued/running query until results are ready (finding 702) |
+| `/v1/statement/{id}/{slug}/{token}` | GET | Fetch paginated results (finding 702) |
 | `/v1/statement/{id}` | DELETE | Cancel a running query |
 
 ## Authentication
@@ -73,6 +73,19 @@ Query results are paginated. The initial response includes a `nextUri` field. Fo
 ```
 
 When `nextUri` is absent, all results have been consumed.
+
+## Poll Token Security (finding 702)
+
+Every `nextUri` in poll responses carries a session-binding token (`{slug}/{token}` in the URL) that proves the poll is from the same client that submitted the query. Clients must:
+
+1. Follow `nextUri` **verbatim** (SQE clients do this already via the JDBC driver and CLI).
+2. Pass credentials only on the initial `POST /v1/statement`; subsequent polls on `{slug}/{token}` do not require authentication if the token is valid.
+
+The rate limiter runs on every route (including polls), protecting against credential-guessing attacks. A token is 32 random bytes (base64url, non-predictable). Ownership is checked by session ID and subject (`sub` claim), not by display username, so a second authentication provider in the chain cannot hijack another user's session.
+
+The two-segment `GET /v1/statement/{id}` form (without slug/token) is no longer accepted; clients must use the three-segment form with the poll token from the previous response's `nextUri`.
+
+
 
 ## Async Submission
 

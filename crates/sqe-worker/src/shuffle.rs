@@ -152,6 +152,25 @@ impl AttemptGate {
         let key = (query_id.to_string(), stage_id.to_string(), partition_id);
         self.winners.lock().await.get(&key).copied()
     }
+
+    /// Drop every winner entry belonging to `query_id`, returning how many
+    /// were removed.
+    ///
+    /// `admit` inserts one entry per (query, stage, partition) it has ever
+    /// seen, and the key comes off the wire. Without a removal path the map
+    /// grows for the lifetime of the process (review finding 600), so the
+    /// query-finished hook must call this.
+    pub async fn forget_query(&self, query_id: &str) -> usize {
+        let mut map = self.winners.lock().await;
+        let before = map.len();
+        map.retain(|(q, _, _), _| q != query_id);
+        before - map.len()
+    }
+
+    /// Number of (query, stage, partition) winners currently retained.
+    pub async fn tracked_attempts(&self) -> usize {
+        self.winners.lock().await.len()
+    }
 }
 
 // ───────────────────────────── ShuffleReceiver ────────────────────────────────
@@ -415,6 +434,33 @@ impl ShuffleManager {
             "Removing shuffle receiver"
         );
         self.receivers.lock().await.remove(&key)
+    }
+
+    /// Drop every receiver and attempt winner belonging to `query_id`.
+    ///
+    /// [`Self::remove`] takes a `(query_id, stage_id)` pair, so a query that
+    /// ends without a per-stage teardown (cancel, worker-side error, a stage
+    /// that never completed) leaves entries behind in both maps, and both are
+    /// keyed by network-supplied ids (review finding 600). This is the
+    /// query-finished hook: it clears the receiver registry and the attempt
+    /// gate together and returns the total number of entries dropped.
+    pub async fn forget_query(&self, query_id: &str) -> usize {
+        let mut receivers = self.receivers.lock().await;
+        let before = receivers.len();
+        receivers.retain(|(q, _), _| q != query_id);
+        let dropped = before - receivers.len();
+        drop(receivers);
+        debug!(
+            query_id = %query_id,
+            receivers_dropped = dropped,
+            "Forgetting shuffle state for finished query"
+        );
+        dropped + self.attempts.forget_query(query_id).await
+    }
+
+    /// Number of (query, stage) receivers currently registered.
+    pub async fn tracked_stages(&self) -> usize {
+        self.receivers.lock().await.len()
     }
 }
 
@@ -1289,5 +1335,102 @@ mod tests {
         );
         assert_eq!(groups[0], vec![0]);
         assert_eq!(groups[1], vec![1]);
+    }
+
+    // ─── Query-finished removal path (review finding 600) ───
+
+    /// Every DoExchange map is keyed by ids the caller puts on the wire, so
+    /// they are unbounded unless the query-finished hook empties them. Drive
+    /// 10,000 attempts through all three registries and assert each is empty
+    /// afterwards -- a per-stage `remove` alone leaves the attempt gate and the
+    /// exchange store full.
+    #[tokio::test]
+    async fn forget_query_empties_every_registry_after_ten_thousand_attempts() {
+        use sqe_spill::{AttemptManifest, ExchangeAttemptStore, TaskKey};
+
+        const STAGES: u32 = 100;
+        const PARTITIONS: u32 = 100;
+        const ATTEMPTS: usize = (STAGES * PARTITIONS) as usize; // 10,000
+
+        let manager = ShuffleManager::new();
+        let exchange = ExchangeAttemptStore::new();
+        let schema = test_schema();
+
+        for stage in 0..STAGES {
+            let stage_id = format!("s{stage}");
+            manager
+                .register(
+                    "q-leak",
+                    &stage_id,
+                    Arc::new(ShuffleReceiver::with_defaults(1, schema.clone())),
+                )
+                .await;
+            for partition in 0..PARTITIONS {
+                assert!(
+                    manager
+                        .attempts()
+                        .admit("q-leak", &stage_id, partition, 0)
+                        .await,
+                    "first attempt for a partition is always admissible"
+                );
+                let task_id = format!("p{partition}");
+                exchange
+                    .publish(AttemptManifest::new(
+                        "q-leak", &stage_id, &task_id, partition, 0,
+                    ))
+                    .expect("publish");
+                exchange
+                    .commit_winner(&TaskKey::new("q-leak", &stage_id, &task_id, partition), 0)
+                    .expect("commit winner");
+            }
+        }
+
+        assert_eq!(manager.tracked_stages().await, STAGES as usize);
+        assert_eq!(manager.attempts().tracked_attempts().await, ATTEMPTS);
+        assert_eq!(exchange.tracked_manifests(), ATTEMPTS);
+        assert_eq!(exchange.tracked_winners(), ATTEMPTS);
+
+        // A second query must survive the sweep: forgetting is per query, not
+        // a global flush.
+        manager
+            .register(
+                "q-other",
+                "s0",
+                Arc::new(ShuffleReceiver::with_defaults(1, schema)),
+            )
+            .await;
+        assert!(manager.attempts().admit("q-other", "s0", 0, 0).await);
+        exchange
+            .publish(AttemptManifest::new("q-other", "s0", "p0", 0, 0))
+            .expect("publish");
+
+        let dropped = manager.forget_query("q-leak").await + exchange.forget_query("q-leak");
+        assert_eq!(
+            dropped,
+            STAGES as usize + ATTEMPTS * 3,
+            "receivers + attempt winners + manifests + exchange winners"
+        );
+
+        assert_eq!(
+            manager.tracked_stages().await,
+            1,
+            "q-other's receiver stays"
+        );
+        assert_eq!(
+            manager.attempts().tracked_attempts().await,
+            1,
+            "q-other's attempt stays"
+        );
+        assert_eq!(exchange.tracked_manifests(), 1, "q-other's manifest stays");
+        assert_eq!(exchange.tracked_winners(), 0, "q-leak's winners are gone");
+
+        assert_eq!(
+            manager.forget_query("q-other").await + exchange.forget_query("q-other"),
+            3
+        );
+        assert_eq!(manager.tracked_stages().await, 0);
+        assert_eq!(manager.attempts().tracked_attempts().await, 0);
+        assert_eq!(exchange.tracked_manifests(), 0);
+        assert_eq!(exchange.tracked_winners(), 0);
     }
 }

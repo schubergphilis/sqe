@@ -12,6 +12,8 @@ use sqe_quack_wire::message::{
 use thiserror::Error;
 use url::Url;
 
+use crate::QuackTargetPolicy;
+
 const CONTENT_TYPE: &str = "application/vnd.duckdb";
 const CLIENT_DUCKDB_VERSION: &str = "v1.5.3";
 const CLIENT_PLATFORM: &str = "sqe-quack-client";
@@ -36,6 +38,13 @@ pub enum ClientError {
     ServerError(String),
     #[error("not connected — call connect() first")]
     NotConnected,
+    /// The destination failed [`crate::QuackTargetPolicy::check_destination`].
+    /// Raised before any socket is opened.
+    #[error("quack destination refused: {0}")]
+    DestinationDenied(String),
+    /// The decoded result grew past the configured cap.
+    #[error("quack result exceeds {cap} bytes (received {seen}); narrow the query or raise quack_client.max_result_bytes")]
+    ResultTooLarge { cap: usize, seen: usize },
 }
 
 /// Synchronous, single-connection Quack client. Holds the `connection_id`
@@ -46,23 +55,40 @@ pub struct QuackClient {
     endpoint: Url,
     connection_id: String,
     next_query_id: u64,
+    policy: QuackTargetPolicy,
 }
 
 impl QuackClient {
     /// Open a Quack connection to `uri` (form `quack:host[:port]`, optional
-    /// `quacks:` for TLS). `token` is sent as the `auth_string` in the
-    /// initial handshake and is whatever the server's auth provider expects
-    /// (typically a bearer JWT or an opaque secret).
+    /// `quacks:` for TLS) with no destination restriction. For direct Rust
+    /// callers only; anything driven by user SQL must go through
+    /// [`QuackClient::connect_with_policy`].
     pub fn connect(uri: &str, token: Option<&str>) -> Result<Self, ClientError> {
+        Self::connect_with_policy(uri, token, QuackTargetPolicy::permissive())
+    }
+
+    /// Open a Quack connection after `policy` has accepted the destination.
+    /// `token` is sent as the `auth_string` in the initial handshake and is
+    /// whatever the server's auth provider expects (typically a bearer JWT).
+    /// Redirects are never followed, so an allowed host cannot bounce the
+    /// coordinator to a disallowed one.
+    pub fn connect_with_policy(
+        uri: &str,
+        token: Option<&str>,
+        policy: QuackTargetPolicy,
+    ) -> Result<Self, ClientError> {
         let endpoint = parse_quack_uri(uri)?;
+        policy.check_destination(&endpoint)?;
         let http = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let mut client = QuackClient {
             http,
             endpoint,
             connection_id: String::new(),
             next_query_id: 1,
+            policy,
         };
         client.handshake(token.unwrap_or(""))?;
         Ok(client)
@@ -119,8 +145,15 @@ impl QuackClient {
         let names = prepare.result_names.clone();
         let schema = logical_schema_to_arrow(&names, &prepare.result_types)?;
         let mut batches: Vec<RecordBatch> = Vec::new();
+        // Decoded bytes across every batch of this call; the policy cap is
+        // checked as each chunk lands so a hostile or merely huge reply
+        // fails early instead of after it has been fully materialised.
+        let mut seen_bytes = 0usize;
         for chunk in &prepare.results {
-            batches.push(data_chunk_to_record_batch(&names, chunk)?);
+            let batch = data_chunk_to_record_batch(&names, chunk)?;
+            self.policy
+                .charge(&mut seen_bytes, batch.get_array_memory_size())?;
+            batches.push(batch);
         }
 
         let mut needs_more = prepare.needs_more_fetch;
@@ -139,7 +172,10 @@ impl QuackClient {
                 other => return Err(ClientError::UnexpectedMessage(other.message_type())),
             };
             for chunk in &fetch.results {
-                batches.push(data_chunk_to_record_batch(&names, chunk)?);
+                let batch = data_chunk_to_record_batch(&names, chunk)?;
+                self.policy
+                    .charge(&mut seen_bytes, batch.get_array_memory_size())?;
+                batches.push(batch);
             }
             // The server flips needs_more_fetch off implicitly via batch_index
             // being None — or it never sets it in the first place for a small
