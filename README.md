@@ -14,7 +14,7 @@ type             = "s3tables"
 table_bucket_arn = "arn:aws:s3tables:us-east-1:ACCOUNT:bucket/sales"
 EOF
 
-cargo run --release --bin sqe-coordinator -- sqe.toml &
+cargo run --release --bin sqe-server -- --config sqe.toml &
 cargo run --bin sqe-cli -- --host localhost --port 50051
 
 # Iceberg time travel + manifest-derived stats + per-query identity.
@@ -206,7 +206,7 @@ Full embedded reference: [`docs/site/book/src/getting-started/cli.md`](docs/site
 ```bash
 docker compose -f docker-compose.test.yml up -d
 ./scripts/bootstrap-test.sh
-cargo run --release --bin sqe-coordinator -- tests/sqe-test.toml
+cargo run --release --bin sqe-server -- --config tests/sqe-test.toml
 
 # Connect with the CLI
 cargo run --bin sqe-cli -- --host localhost --port 50051 --username root --protocol flight
@@ -246,6 +246,7 @@ The reference docs:
 | [Benchmark history](docs/evidence/benchmark/index.md) | Per-suite, per-scale, per-query plots over time |
 | [Roadmap](docs/site/book/src/development/roadmap.md) | Full feature checklist |
 | Security Audit | 43 findings, all resolved |
+| [Architecture, security and scale reviews 2026-09](docs/internal/reviews/2026-09-05-combined-prioritized-findings.md) | 109 findings, GitLab issues #543-#651 in eight work packages (#652-#659); 18 fixed |
 
 ## The book
 

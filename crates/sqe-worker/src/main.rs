@@ -1,16 +1,48 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use sqe_core::SqeConfig;
 use sqe_metrics::WorkerMetricsRegistry;
 use sqe_worker::runtime;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let config_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "sqe.toml".to_string());
+fn parse_config_path() -> String {
+    let mut args = std::env::args().skip(1);
+    let mut positional = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--config" | "-c" => {
+                return args.next().unwrap_or_else(|| "sqe.toml".to_string());
+            }
+            "--help" | "-h" => {
+                eprintln!("sqe-worker --config <path>");
+                std::process::exit(0);
+            }
+            other if other.starts_with('-') => {
+                eprintln!("unknown argument {other}; use --config <path>");
+                std::process::exit(2);
+            }
+            other => {
+                eprintln!("warning: positional config path is deprecated; use --config");
+                positional = Some(other.to_string());
+            }
+        }
+    }
+    positional
+        .or_else(|| std::env::var("SQE_CONFIG").ok())
+        .unwrap_or_else(|| "sqe.toml".to_string())
+}
+
+fn main() -> anyhow::Result<()> {
+    let config_path = parse_config_path();
     let config = SqeConfig::load(&config_path)?;
+    config.validate()?;
+    let runtime = sqe_core::build_server_runtime(&config.coordinator, "sqe-worker")
+        .map_err(|e| anyhow::anyhow!("Failed to build tokio runtime: {e}"))?;
+    runtime.block_on(async_main(config, config_path))
+}
 
+async fn async_main(config: SqeConfig, config_path: String) -> anyhow::Result<()> {
     let _otel_guard = sqe_metrics::otel::init_telemetry_with_sampling(
         "sqe-worker",
         &config.metrics.otlp_endpoint,
@@ -19,7 +51,6 @@ async fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!(e))?;
 
-    // Worker-specific Prometheus metrics
     let worker_metrics = Arc::new(
         WorkerMetricsRegistry::new()
             .map_err(|e| anyhow::anyhow!("failed to initialize worker metrics registry: {e}"))?,
@@ -30,9 +61,11 @@ async fn main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!("failed to bind metrics server: {e}"))?;
 
-    // Build a configured DataFusion SessionContext with a resizable memory pool.
-    // The context is created early to fail fast on invalid config (e.g. bad memory_limit).
-    // Pool is shared so hot config reload can change memory_limit without rebuild.
+    let ready = Arc::new(AtomicBool::new(false));
+    let health_port = config.metrics.prometheus_port.saturating_add(1);
+    tokio::spawn(serve_health(health_port, ready.clone()));
+    tracing::info!("Health endpoints on port {health_port} (/healthz, /readyz)");
+
     let (session_ctx, memory_pool) = runtime::build_session_context(&config.worker)?;
 
     let port = config.worker.flight_port;
@@ -40,20 +73,6 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting SQE worker on port {port}");
 
-    // Validate the worker config before binding any sockets. The check
-    // refuses to boot a coordinator-connected worker with an empty secret
-    // unless the operator explicitly waives via
-    // `worker.allow_unauthenticated = true`, and refuses plaintext on a
-    // non-loopback distributed setup unless `security.allow_insecure_transport
-    // = true`.
-    config.validate()?;
-
-    // Build the fully-wired Flight service (worker secret + footer cache +
-    // credential store + compression) and start the heartbeat task. Shared
-    // with `sqe-server --mode worker` so both worker paths stay identical
-    // (#219). The advertise URL is derived here and must be routable: an
-    // undeliverable URL aborts boot instead of poisoning the registry (#220).
-    // Hot-reload watches `config_path` for worker.memory_limit / sub-budgets.
     let flight_service = sqe_worker::bootstrap::build_worker_service_with_hot_reload(
         &config,
         worker_metrics,
@@ -62,7 +81,8 @@ async fn main() -> anyhow::Result<()> {
         Some(&config_path),
     )?;
 
-    // Optional TLS (QUACK-07): workers reuse the coordinator's TLS config.
+    ready.store(true, Ordering::Relaxed);
+
     let tls_config = sqe_worker::tls::build_server_tls_config(&config.coordinator.tls)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -75,7 +95,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     server_builder
-        .add_service(flight_service.into_server(config.coordinator.transport.max_decoding_message_bytes))
+        .add_service(
+            flight_service.into_server(config.coordinator.transport.max_decoding_message_bytes),
+        )
         .serve_with_shutdown(addr, shutdown_signal())
         .await?;
 
@@ -83,10 +105,43 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolve once a SIGINT or SIGTERM arrives. Drives `serve_with_shutdown` so
-/// tonic stops accepting new connections and lets in-flight scans finish at
-/// the graceful boundary instead of being hard-killed on signal (#225).
-/// Mirrors the `shutdown_signal` helper in `sqe-coordinator/src/bin/sqe_server.rs`.
+async fn serve_health(port: u16, ready: Arc<AtomicBool>) {
+    let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(port, error = %e, "failed to bind worker health port");
+            return;
+        }
+    };
+    loop {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            continue;
+        };
+        let ready = ready.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 256];
+            let _ = sock.read(&mut buf).await;
+            let req = String::from_utf8_lossy(&buf);
+            let is_readyz = req.contains(" /readyz");
+            let ok = if is_readyz {
+                ready.load(Ordering::Relaxed)
+            } else {
+                true
+            };
+            let (status, body) = if ok {
+                ("200 OK", "ok")
+            } else {
+                ("503 Service Unavailable", "not ready")
+            };
+            let resp = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+        });
+    }
+}
+
 async fn shutdown_signal() {
     use tokio::signal;
 

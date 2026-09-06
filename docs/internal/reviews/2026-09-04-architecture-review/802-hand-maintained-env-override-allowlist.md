@@ -4,7 +4,17 @@
 - Severity: medium
 - Category: operability
 - Effort: M
-- Status: open
+- Status: fixed (branch `fix/config-startup-code-structure`, 2026-09-05)
+- Issue: #634
+
+## Resolution (2026-09-05)
+
+Fixed with 102 on `fix/config-startup-code-structure`. Alias table covers
+`SQE_PRODUCTION_MODE`, `SQE_MEMORY_LIMIT` / `SQE_MEMORY_POOL`, `SQE_MODE`,
+`SQE_TLS__*`, `SQE_CATALOG__POLARIS_URL`, `SQE_WORKER_ROW_GROUP_PRUNING`.
+Credential-push timeouts and worker row-group pruning moved onto config
+fields. `SQE_IT_*` remains only in an ignored worker test.
+
 
 ## Problem
 

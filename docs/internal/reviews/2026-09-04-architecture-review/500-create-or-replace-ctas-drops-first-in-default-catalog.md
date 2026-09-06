@@ -5,6 +5,7 @@
 - Category: reliability
 - Effort: M (days)
 - Status: open
+- Issue: #592
 
 ## Problem
 

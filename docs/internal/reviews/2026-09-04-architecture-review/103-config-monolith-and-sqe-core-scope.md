@@ -4,7 +4,16 @@
 - Severity: medium
 - Category: architecture
 - Effort: M (days)
-- Status: open
+- Status: partial (branch `fix/config-startup-code-structure`, 2026-09-05)
+- Issue: #546
+
+## Resolution (2026-09-05)
+
+Partial on `fix/config-startup-code-structure`. `config.rs` is now
+`crates/sqe-core/src/config/` (`mod.rs` + `env_overlay.rs`) and the tokio
+runtime builder lives in `sqe-core::runtime`. Full split of 39 structs and
+moving auth/runtime out of sqe-core is follow-up (overlaps 805).
+
 
 ## Problem
 

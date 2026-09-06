@@ -278,14 +278,14 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "  Building sqe-bench (profile: $PROFILE)..."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 if [ "$PROFILE" = "release" ]; then
-    cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-coordinator --release 2>&1
+    cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-server --release 2>&1
 elif [ "$PROFILE" = "dev-release" ]; then
-    cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-coordinator --profile dev-release 2>&1
+    cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-server --profile dev-release 2>&1
 else
-    cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-coordinator 2>&1
+    cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-server 2>&1
 fi
 BENCH_BIN="$ROOT_DIR/target/$PROFILE/sqe-bench"
-SQE_BIN="$ROOT_DIR/target/$PROFILE/sqe-coordinator"
+SQE_BIN="$ROOT_DIR/target/$PROFILE/sqe-server"
 
 if [ ! -x "$BENCH_BIN" ]; then
     echo "ERROR: sqe-bench binary not found at $BENCH_BIN"

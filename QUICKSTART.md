@@ -82,7 +82,7 @@ s3_path_style = false
 Save as `~/sqe-config.toml`. Start the coordinator:
 
 ```bash
-./target/release/sqe-coordinator ~/sqe-config.toml
+./target/release/sqe-server ~/sqe-config.toml
 ```
 
 In another shell, connect with the CLI:
@@ -150,7 +150,7 @@ warehouse = "s3://my-bucket/warehouse"
 Run with the right AWS credentials:
 
 ```bash
-AWS_PROFILE=my-profile ./target/release/sqe-coordinator ~/sqe-config.toml
+AWS_PROFILE=my-profile ./target/release/sqe-server ~/sqe-config.toml
 ```
 
 The AWS SDK reads `AWS_PROFILE`, `AWS_ACCESS_KEY_ID`, `AWS_REGION`,
@@ -178,7 +178,7 @@ Same AWS credential story as Glue:
 
 ```bash
 AWS_PROFILE=my-profile AWS_REGION=eu-west-1 \
-    ./target/release/sqe-coordinator ~/sqe-config.toml
+    ./target/release/sqe-server ~/sqe-config.toml
 ```
 
 The bucket ARN format is

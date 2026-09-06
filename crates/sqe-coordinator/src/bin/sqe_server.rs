@@ -24,6 +24,10 @@ struct Cli {
     #[arg(short, long)]
     config: Option<String>,
 
+    /// Deprecated positional config path. Prefer `--config`.
+    #[arg(value_name = "CONFIG")]
+    config_positional: Option<String>,
+
     /// Server mode (overrides SQE_MODE env var and config file)
     #[arg(short, long, value_enum, default_value = "coordinator")]
     mode: CliMode,
@@ -61,6 +65,10 @@ struct Cli {
     /// configuration when omitted.
     #[arg(long, requires = "glue_catalog")]
     glue_region: Option<String>,
+
+    /// Print the merged, redacted configuration and exit.
+    #[arg(long)]
+    print_config: bool,
 }
 
 #[derive(Clone, clap::ValueEnum)]
@@ -764,13 +772,33 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
 // stream, and absorb large plans instead. An 8 MiB worker stack gives us ~4x
 // the headroom at zero runtime cost.
 fn main() -> anyhow::Result<()> {
-    const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+    let cli = Cli::parse();
+    let config_path = cli
+        .config
+        .clone()
+        .or_else(|| cli.config_positional.clone())
+        .or_else(|| std::env::var("SQE_CONFIG").ok())
+        .unwrap_or_else(|| "sqe.toml".to_string());
+    if cli.config_positional.is_some() && cli.config.is_none() {
+        eprintln!("warning: positional config path is deprecated; use --config");
+    }
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(WORKER_STACK_BYTES)
-        .thread_name("sqe-coordinator")
-        .build()
+    if cli.print_config {
+        print!(
+            "{}",
+            SqeConfig::load_redacted_toml(&config_path)
+                .map_err(|e| anyhow::anyhow!("Failed to load config from {config_path}: {e}"))?
+        );
+        return Ok(());
+    }
+
+    let config = SqeConfig::load(&config_path)
+        .map_err(|e| anyhow::anyhow!("Failed to load config from {config_path}: {e}"))?;
+    sqe_coordinator::credential_refresh::configure_push_timeouts(
+        config.coordinator.credential_push_connect_timeout_secs,
+        config.coordinator.credential_push_request_timeout_secs,
+    );
+    let runtime = sqe_core::build_server_runtime(&config.coordinator, "sqe-server")
         .map_err(|e| anyhow::anyhow!("Failed to build tokio runtime: {e}"))?;
 
     runtime.block_on(async_main())
@@ -781,6 +809,8 @@ async fn async_main() -> anyhow::Result<()> {
 
     let config_path = cli
         .config
+        .clone()
+        .or_else(|| cli.config_positional.clone())
         .or_else(|| std::env::var("SQE_CONFIG").ok())
         .unwrap_or_else(|| "sqe.toml".to_string());
 
@@ -2647,8 +2677,8 @@ mod tests {
             // "admin-tok" -> admin; "user-tok" -> non-admin; anything else -> fail
             match token.as_str() {
                 "admin-tok" => Ok(sqe_auth::Identity {
-                    user_id: "admin",
-                    display_name: "Admin",
+                    user_id: "admin".into(),
+                    display_name: "Admin".into(),
                     roles: self.admin_roles.clone(),
                     subject: None,
                     email: None,
@@ -2658,9 +2688,9 @@ mod tests {
                     expires_at: None,
                 }),
                 "user-tok" => Ok(sqe_auth::Identity {
-                    user_id: "user",
-                    display_name: "User",
-                    roles: vec!["analyst"],
+                    user_id: "user".into(),
+                    display_name: "User".into(),
+                    roles: vec!["analyst".into()],
                     subject: None,
                     email: None,
                     groups: vec![],
@@ -2668,7 +2698,7 @@ mod tests {
                     refresh_token: None,
                     expires_at: None,
                 }),
-                _ => Err(sqe_auth::AuthError::AuthFailed("bad token")),
+                _ => Err(sqe_auth::AuthError::AuthFailed("bad token".into())),
             }
         }
     }
@@ -2679,11 +2709,11 @@ mod tests {
 
     fn make_guarded_state_with_web_ui(web_ui: bool) -> Arc<HealthState> {
         let provider: Arc<dyn sqe_auth::AuthProvider> = Arc::new(StubAuthProvider {
-            admin_roles: vec!["sqe-admin"],
+            admin_roles: vec!["sqe-admin".into()],
         });
         let mut auth_cfg: sqe_core::config::AuthConfig =
             toml::from_str("").expect("empty auth config");
-        auth_cfg.admin_roles = vec!["sqe-admin"];
+        auth_cfg.admin_roles = vec!["sqe-admin".into()];
         Arc::new(HealthState {
             ready: Arc::new(AtomicBool::new(true)),
             started_at: Instant::now(),

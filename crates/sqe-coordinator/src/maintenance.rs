@@ -709,12 +709,19 @@ impl MaintenanceHandler {
         Ok(vec![crate::table_health::table_health_batch(&health)])
     }
 
-    /// Privilege check. Maintenance procedures mutate table state; we insist
-    /// on a write-capable session. The read-only check is intentionally
-    /// conservative: any role containing "read" or "select" in its name
-    /// (case-insensitive) is treated as read-only unless the role also
-    /// contains "write" or "admin". This matches the Polaris role naming
-    /// convention and keeps the rule simple pending OPA/Cedar wiring.
+    /// Authorization gate for `CALL system.*` (architecture review 510).
+    ///
+    /// Procedures are tiered by blast radius, see [`procedure_tier`]:
+    /// - read-only procedures need nothing beyond the table access Polaris
+    ///   already enforced when the metadata loaded;
+    /// - table-write procedures (compaction, manifest rewrite) commit through
+    ///   the caller's own token, so Polaris is the backstop; the engine only
+    ///   refuses sessions whose roles are explicitly read-only, plus grants
+    ///   the scheduler's minted maintenance session;
+    /// - admin procedures delete data files or history without a catalog
+    ///   commit that Polaris could refuse, or move the table's main branch.
+    ///   They require a configured admin role; a session with no roles is
+    ///   denied. The maintenance-authority marker does NOT reach this tier.
     ///
     /// Denial paths record an audit entry so operators can detect probing.
     async fn authorize_or_deny(
@@ -722,33 +729,30 @@ impl MaintenanceHandler {
         session: &Session,
         call: &ProcedureCall,
     ) -> sqe_core::Result<()> {
-        // Read-only procedures bypass the write-privilege gate.
-        if matches!(
-            call,
-            ProcedureCall::SuggestBloomFilterColumns { .. } | ProcedureCall::TableHealth { .. }
-        ) {
-            return Ok(());
-        }
-        // Catalog-wide Ranger write. Admin-only; a table writer must not
-        // reproject someone else's tags.
-        if matches!(call, ProcedureCall::ReprojectColumnTags { .. }) {
-            if self.config.auth.has_admin_role(&session.user.roles) {
-                return Ok(());
+        let tier = procedure_tier(call);
+        let target = call.target_label();
+        let denial = match tier {
+            ProcedureTier::ReadOnly => return Ok(()),
+            ProcedureTier::TableWrite => {
+                if session.has_maintenance_authority() || !session_is_explicitly_read_only(session)
+                {
+                    return Ok(());
+                }
+                format!(
+                    "user '{}' has read-only roles {:?} and cannot run '{target}'",
+                    session.user.username, session.user.roles
+                )
             }
-            return Err(SqeError::Catalog(format!(
-                "403 Forbidden: CALL system.reproject_column_tags requires one of \
-                 admin roles {:?}; caller has roles {:?}",
-                self.config.auth.admin_roles, session.user.roles
-            )));
-        }
-        // `purge_orphan_locations` in dry_run mode is also read-only.
-        if let ProcedureCall::PurgeOrphanLocations { dry_run: true, .. } = call {
-            return Ok(());
-        }
-
-        if session_has_write_privilege(session) {
-            return Ok(());
-        }
+            ProcedureTier::Admin => {
+                if self.config.auth.has_admin_role(&session.user.roles) {
+                    return Ok(());
+                }
+                format!(
+                    "'{target}' requires one of admin roles {:?}; caller '{}' has roles {:?}",
+                    self.config.auth.admin_roles, session.user.username, session.user.roles
+                )
+            }
+        };
 
         let target = call.target_label();
         if let Some(ref audit) = self.audit {
@@ -770,10 +774,7 @@ impl MaintenanceHandler {
                 outcome: sqe_metrics::audit::Outcome::Failure {
                     error_type: Some("AdminGateDenied".to_string()),
                     error_code: None,
-                    message: Some(format!(
-                        "user '{}' lacks write privilege on '{target}'",
-                        session.user.username
-                    )),
+                    message: Some(denial.clone()),
                 },
                 resources: vec![],
                 policy: None,
@@ -800,12 +801,14 @@ impl MaintenanceHandler {
             target = %target,
             "Maintenance procedure denied: user lacks write privilege"
         );
-        Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-            "Access denied: user '{}' does not have write privilege on '{target}' required by \
-             CALL system.{}",
-            session.user.username,
-            call.name()
-        )))
+        // Authenticated, not authorised: gRPC PermissionDenied via the typed code.
+        Err(SqeError::with_code(
+            SqeErrorCode::AccessDenied,
+            format!(
+                "CALL system.{}: {denial}",
+                call.name()
+            ),
+        ))
     }
 
     /// Delete-aware bin-pack rewrite with bounded conflict retry.
@@ -3254,34 +3257,48 @@ fn summary_batch(
     Ok(batch)
 }
 
-/// Treat the session as write-capable when it carries the explicit
-/// maintenance-authority marker, or when no explicit read-only role is set.
-///
-/// Rules, applied in order:
-/// 0. If `session.has_maintenance_authority()` is true, the session is
-///    write-capable, full stop. This is the explicit Phase 4b authorization
-///    path for the in-process maintenance principal (set only by
-///    `MaintenancePrincipal::session_from_identity`); it is checked before
-///    and independent of the role-name heuristic below, so the maintenance
-///    session's write authority never depends on how its Polaris roles
-///    happen to be named.
-/// 1. If any role name matches `^read` or `^select` (case-insensitive),
-///    AND no role contains "write" or "admin", the session is read-only.
-/// 2. Otherwise the session is write-capable.
-///
-/// The Polaris/Cedar backends will override this with richer decisions once
-/// the policy enforcement wiring lands; this function is the engine-level
-/// fallback and is the source of truth for the `#[ignore]` integration tests.
-pub(crate) fn session_has_write_privilege(session: &Session) -> bool {
-    if session.has_maintenance_authority() {
-        return true;
-    }
+/// Blast-radius tier of a maintenance procedure; decides which gate
+/// [`MaintenanceHandler::authorize_or_deny`] applies (architecture review 510).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcedureTier {
+    /// Reads metadata or history only; no gate beyond table access.
+    ReadOnly,
+    /// Writes new files and commits a snapshot through the caller's token, so
+    /// the catalog is the backstop. Denied only to explicitly read-only roles.
+    TableWrite,
+    /// Deletes files or history without a refusable commit, moves the main
+    /// branch, or registers/drops tables. Requires a configured admin role.
+    Admin,
+}
 
+/// Classify a procedure call into its authorization tier.
+pub(crate) fn procedure_tier(call: &ProcedureCall) -> ProcedureTier {
+    match call {
+        ProcedureCall::SuggestBloomFilterColumns { .. }
+        | ProcedureCall::TableHealth { .. }
+        | ProcedureCall::RefreshCatalogCache => ProcedureTier::ReadOnly,
+        ProcedureCall::PurgeOrphanLocations { dry_run: true, .. } => ProcedureTier::ReadOnly,
+        ProcedureCall::RewriteDataFiles { .. } | ProcedureCall::RewriteManifests { .. } => {
+            ProcedureTier::TableWrite
+        }
+        ProcedureCall::ExpireSnapshots { .. }
+        | ProcedureCall::RemoveOrphanFiles { .. }
+        | ProcedureCall::PurgeOrphanLocations { .. }
+        | ProcedureCall::DropTable { .. }
+        | ProcedureCall::RegisterTable { .. }
+        | ProcedureCall::SetCurrentSnapshot { .. }
+        | ProcedureCall::RollbackToSnapshot { .. }
+        | ProcedureCall::ReprojectColumnTags { .. } => ProcedureTier::Admin,
+    }
+}
+
+/// A session whose roles say "read-only" and nothing says otherwise. This is
+/// the only remaining use of role-name matching: it can refuse a table-write
+/// procedure early, it can never grant anything. Sessions with no roles are
+/// not read-only here (the catalog decides their commit); they are still
+/// denied every admin-tier procedure by `authorize_or_deny`.
+pub(crate) fn session_is_explicitly_read_only(session: &Session) -> bool {
     let roles = &session.user.roles;
-    if roles.is_empty() {
-        return true;
-    }
-
     let has_write_like = roles.iter().any(|r| {
         let lower = r.to_ascii_lowercase();
         lower.contains("write") || lower.contains("admin") || lower.contains("owner")
@@ -3290,11 +3307,7 @@ pub(crate) fn session_has_write_privilege(session: &Session) -> bool {
         let lower = r.to_ascii_lowercase();
         lower.starts_with("read") || lower.starts_with("select") || lower.contains("readonly")
     });
-
-    if has_read_only && !has_write_like {
-        return false;
-    }
-    true
+    has_read_only && !has_write_like
 }
 
 /// TEST-ONLY (`#[cfg(test)]`) two-way handshake used by
@@ -3352,62 +3365,170 @@ mod tests {
         )
     }
 
-    #[test]
-    fn write_privilege_empty_roles_allows() {
-        let session = session_with_roles(vec![]);
-        assert!(session_has_write_privilege(&session));
+    fn parse_call(sql: &str) -> ProcedureCall {
+        let stmt =
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, sql)
+                .expect("parse")
+                .remove(0);
+        sqe_sql::procedures::try_parse_call(&stmt)
+            .expect("procedure parse")
+            .expect("is a procedure")
+    }
+
+    fn table_call(name: &str) -> ProcedureCall {
+        parse_call(&format!("CALL system.{name}(table => 'ns.t')"))
+    }
+
+    async fn gate(config: SqeConfig, session: &Session, call: &ProcedureCall) -> bool {
+        MaintenanceHandler::new(config)
+            .authorize_or_deny(session, call)
+            .await
+            .is_ok()
+    }
+
+    fn base_config() -> SqeConfig {
+        toml::from_str("[coordinator]\n[auth]\n[catalog]\ncatalog_url = \"\"\n")
+            .expect("minimal config parses")
+    }
+
+    fn config_with_admins(admins: &[&str]) -> SqeConfig {
+        let mut config = base_config();
+        config.auth.admin_roles = admins.iter().map(|r| r.to_string()).collect();
+        config
     }
 
     #[test]
-    fn write_privilege_read_only_denied() {
-        let session = session_with_roles(vec!["readonly"]);
-        assert!(!session_has_write_privilege(&session));
+    fn procedure_tiers_are_assigned_by_blast_radius() {
+        assert_eq!(
+            procedure_tier(&table_call("table_health")),
+            ProcedureTier::ReadOnly
+        );
+        assert_eq!(
+            procedure_tier(&table_call("rewrite_data_files")),
+            ProcedureTier::TableWrite
+        );
+        assert_eq!(
+            procedure_tier(&table_call("rewrite_manifests")),
+            ProcedureTier::TableWrite
+        );
+        for admin in [
+            "expire_snapshots",
+            "remove_orphan_files",
+            "drop_table",
+            "set_current_snapshot(table => 'ns.t', snapshot_id => 1)",
+        ] {
+            let call = if admin.contains('(') {
+                parse_call(&format!("CALL system.{admin}"))
+            } else {
+                table_call(admin)
+            };
+            assert_eq!(procedure_tier(&call), ProcedureTier::Admin, "{admin}");
+        }
     }
 
-    #[test]
-    fn write_privilege_read_prefix_denied() {
-        let session = session_with_roles(vec!["read_analyst"]);
-        assert!(!session_has_write_privilege(&session));
+    #[tokio::test]
+    async fn admin_tier_denies_empty_roles_and_non_admins() {
+        let config = config_with_admins(&["sqe_admin"]);
+        let expire = table_call("expire_snapshots");
+        let orphans = table_call("remove_orphan_files");
+        assert!(!gate(config.clone(), &session_with_roles(vec![]), &expire).await);
+        assert!(
+            !gate(
+                config.clone(),
+                &session_with_roles(vec!["analyst"]),
+                &orphans
+            )
+            .await
+        );
+        assert!(
+            !gate(
+                config.clone(),
+                &session_with_roles(vec!["co-writer-viewer"]),
+                &orphans
+            )
+            .await
+        );
+        assert!(
+            gate(
+                config.clone(),
+                &session_with_roles(vec!["sqe_admin"]),
+                &expire
+            )
+            .await
+        );
+        // The scheduler's minted session is a table writer, not an admin.
+        let minted = session_with_roles(vec![]).with_maintenance_authority(true);
+        assert!(!gate(config.clone(), &minted, &expire).await);
+        // No admin roles configured at all: the admin tier is closed.
+        assert!(!gate(base_config(), &session_with_roles(vec!["admin"]), &expire).await);
     }
 
-    #[test]
-    fn write_privilege_writer_role_allows() {
-        let session = session_with_roles(vec!["table_writer"]);
-        assert!(session_has_write_privilege(&session));
+    #[tokio::test]
+    async fn table_write_tier_admits_writers_and_maintenance_authority() {
+        let config = config_with_admins(&["sqe_admin"]);
+        let rewrite = table_call("rewrite_data_files");
+        assert!(
+            gate(
+                config.clone(),
+                &session_with_roles(vec!["analyst"]),
+                &rewrite
+            )
+            .await
+        );
+        assert!(
+            gate(
+                config.clone(),
+                &session_with_roles(vec!["table_writer"]),
+                &rewrite
+            )
+            .await
+        );
+        assert!(gate(config.clone(), &session_with_roles(vec![]), &rewrite).await);
+        assert!(
+            gate(
+                config.clone(),
+                &session_with_roles(vec!["readonly", "admin"]),
+                &rewrite
+            )
+            .await
+        );
+        let minted = session_with_roles(vec!["readonly"]).with_maintenance_authority(true);
+        assert!(gate(config.clone(), &minted, &rewrite).await);
+        assert!(
+            !gate(
+                config.clone(),
+                &session_with_roles(vec!["readonly"]),
+                &rewrite
+            )
+            .await
+        );
+        assert!(
+            !gate(
+                config.clone(),
+                &session_with_roles(vec!["read_analyst"]),
+                &rewrite
+            )
+            .await
+        );
     }
 
-    #[test]
-    fn write_privilege_admin_overrides_read_only() {
-        let session = session_with_roles(vec!["readonly", "admin"]);
-        assert!(session_has_write_privilege(&session));
-    }
-
-    #[test]
-    fn write_privilege_unknown_role_allows() {
-        // Unknown roles default to allow so the engine never blocks callers
-        // whose policy enforcement runs elsewhere (OPA/Cedar/Polaris).
-        let session = session_with_roles(vec!["analyst"]);
-        assert!(session_has_write_privilege(&session));
-    }
-
-    #[test]
-    fn write_privilege_maintenance_authority_overrides_read_only_roles() {
-        // A session carrying the explicit maintenance-authority marker must
-        // pass the write gate even if its roles would otherwise mark it
-        // read-only. This is the Phase 4b explicit authorization path: the
-        // maintenance session must not depend on how its Polaris roles
-        // happen to be spelled.
-        let session = session_with_roles(vec!["readonly"]).with_maintenance_authority(true);
-        assert!(session_has_write_privilege(&session));
-    }
-
-    #[test]
-    fn write_privilege_normal_read_only_session_without_marker_still_denied() {
-        // Without the explicit marker, a normal read-only session is denied
-        // exactly as before: the new marker must not weaken the existing
-        // role-name heuristic for non-maintenance sessions.
-        let session = session_with_roles(vec!["readonly"]);
-        assert!(!session_has_write_privilege(&session));
+    #[tokio::test]
+    async fn read_only_tier_needs_no_roles() {
+        let config = config_with_admins(&["sqe_admin"]);
+        assert!(
+            gate(
+                config.clone(),
+                &session_with_roles(vec!["readonly"]),
+                &table_call("table_health")
+            )
+            .await
+        );
+        let dry =
+            parse_call("CALL system.purge_orphan_locations(namespace => 'ns', dry_run => true)");
+        assert!(gate(config.clone(), &session_with_roles(vec![]), &dry).await);
+        let wet =
+            parse_call("CALL system.purge_orphan_locations(namespace => 'ns', dry_run => false)");
+        assert!(!gate(config, &session_with_roles(vec![]), &wet).await);
     }
 
     #[test]

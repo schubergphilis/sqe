@@ -24,10 +24,6 @@ name = "sqe_coordinator"
 path = "src/lib.rs"
 
 [[bin]]
-name = "sqe-coordinator"
-path = "src/main.rs"
-
-[[bin]]
 name = "sqe-server"
 path = "src/bin/sqe_server.rs"
 

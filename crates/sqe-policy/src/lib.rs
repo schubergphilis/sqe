@@ -42,6 +42,23 @@ pub struct PolicySummary {
     pub denied: bool,
 }
 
+impl PolicySummary {
+    /// Fold another summary into this one (a MERGE audits its source SELECT
+    /// and its target policy as one statement).
+    pub fn merge(&mut self, other: &PolicySummary) {
+        self.row_filters_applied += other.row_filters_applied;
+        self.columns_masked
+            .extend(other.columns_masked.iter().cloned());
+        self.columns_masked.sort();
+        self.columns_masked.dedup();
+        self.columns_restricted
+            .extend(other.columns_restricted.iter().cloned());
+        self.columns_restricted.sort();
+        self.columns_restricted.dedup();
+        self.denied |= other.denied;
+    }
+}
+
 /// Policy enforcement trait. Implementations receive a user and a logical plan,
 /// and return a (possibly rewritten) plan with security filters applied, plus a
 /// [`PolicySummary`] describing what was applied (for the audit log).

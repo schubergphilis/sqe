@@ -16,10 +16,12 @@
 //! Each `Expr` is unparsed to SQL text so the coordinator can splice it
 //! into the WHERE clause and the SET RHS.
 //!
-//! Multi-level namespaces are flattened to the last component, matching
-//! the SELECT-side rewriter that does the same when keying its policy
-//! lookup. A namespace key drift here would silently bypass policies on
-//! DML, so the SELECT path and DML path resolve through the same string.
+//! The probe scan carries the target's FULL dotted namespace as its schema,
+//! which is exactly what the SELECT planner puts in a `TableScan`'s
+//! `TableReference`, so the rewriter derives the identical policy key for
+//! reads and DML (`plan_rewriter::resolve_policy_key`). Never flatten the
+//! namespace here: a key drift silently bypasses row filters on DML
+//! (architecture review 201).
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -57,9 +59,10 @@ impl WritePolicyPredicates {
 /// the target table and project its row filter and column masks into SQL
 /// fragments the DML handlers can splice into their per-batch evaluator.
 ///
-/// `namespace_key` and `table_name` form the `TableReference` the rewriter
-/// uses to look up policy. The SELECT path keys lookup the same way; see
-/// `plan_rewriter::PolicyPlanRewriter::evaluate`.
+/// `namespace_key` is the target's full dotted namespace (`ns.to_string()`
+/// of the Iceberg `NamespaceIdent`) and together with `table_name` forms the
+/// `TableReference` the rewriter keys policy on, the same way the SELECT
+/// planner does; see `plan_rewriter::resolve_policy_key`.
 pub async fn extract_write_predicates(
     enforcer: &dyn PolicyEnforcer,
     user: &SessionUser,

@@ -5,6 +5,7 @@
 - Category: operability
 - Effort: S (hours)
 - Status: fixed (branch `fix/errors-audit-observability`, 2026-09-05)
+- Issue: #619
 
 ## Problem
 

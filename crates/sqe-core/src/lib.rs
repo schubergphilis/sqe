@@ -1,6 +1,7 @@
 pub mod config;
 pub mod error;
 pub mod process_memory;
+pub mod runtime;
 pub mod secret;
 pub mod secret_string;
 pub mod session;
@@ -17,9 +18,11 @@ pub use process_memory::{
 
 pub use config::{
     parse_memory_limit, AuthProviderConfig, DeviceAuthConfig, ExternalAuthConfig,
-    FlightCompression, ProfileMode, QueryCacheConfig, QueryConfig, QueryHistoryConfig,
-    ResolvedWorkerMemory, SortMode, SqeConfig, WorkerMemoryConfig, WorkerSpillConfig,
+    FlightCompression, MemoryPoolKind, ProfileMode, QueryCacheConfig, QueryConfig,
+    QueryHistoryConfig, ResolvedWorkerMemory, ServerMode, SortMode, SqeConfig,
+    WorkerMemoryConfig, WorkerSpillConfig,
 };
+pub use runtime::{build_server_runtime, DEFAULT_RUNTIME_STACK_MIB};
 pub use error::{classified_by_text_total, CatalogOp, Result, SqeError, SqeErrorCode};
 pub use secret::{Secret, SecretStore, SecretStoreError};
 pub use secret_string::SecretString;
