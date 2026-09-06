@@ -4,7 +4,7 @@
 - Severity: high
 - Category: reliability
 - Effort: M (days)
-- Status: open
+- Status: fixed (branch `fix/data-consistency-p1`, 2026-09-05)
 - Issue: #594
 
 ## Problem
@@ -86,3 +86,55 @@ count reported to the client is internally consistent with the wrong result.
 
 - 513 (sqlite write-test rig makes the above runnable in `cargo test`).
 - Memory note "Partition-on-write gap" in `nextsteps.md` history.
+
+## Resolution (2026-09-05)
+
+Both places now consult `DataFile::partition_spec_id()` instead of assuming
+every live file was written under the table's current default spec.
+
+**What changed** (`crates/sqe-coordinator/src/write_handler.rs`)
+
+- `partition_prune_cow_files` looks each file's own spec up with
+  `table.metadata().partition_spec_by_id(df.partition_spec_id())` and evaluates
+  `partition_could_match` against *that* spec. A file whose spec id is not in
+  the metadata is kept, and so is one written under a spec with no fields. The
+  old code took `default_partition_spec()` once and indexed every file's
+  partition struct with the default spec's field index, so an old-spec file's
+  value for one column was compared against a constraint on another — a
+  `DELETE ... WHERE region = 'EU'` pruned files that did hold EU rows.
+- `commit_written_files`' dynamic `INSERT OVERWRITE` branch reads the default
+  spec from the *reloaded* snapshot inside the retry closure and treats every
+  live file whose `partition_spec_id()` differs from it as touched: legacy-spec
+  files are removed wholesale (full-replace semantics for the generations the
+  writer cannot address partition-by-partition), with a `warn!` naming the spec
+  ids and pointing at `rewrite_data_files` to normalise the layout. Before this
+  an old-spec file's partition struct never compared equal to a new file's, so
+  the "replaced" partition kept its old-spec rows next to the new ones.
+- `distinct_spec_ids(&[DataFile])` feeds a `spec_ids` field into the CoW
+  DELETE/UPDATE rewrite summaries, the truncate summary and the INSERT
+  OVERWRITE swap summary (which also logs `default_spec_id`), so a rewrite
+  spanning spec generations is visible in the log.
+
+**Tests** (`cargo test -p sqe-coordinator --lib -- write_handler`, 132 passed /
+0 failed)
+
+- `write_handler::tests::partition_prune_keeps_files_from_an_older_partition_spec`
+  — a table whose spec 0 partitions by `country` and whose default spec 1
+  partitions by `region` (both string, both at index 0: the shape that made the
+  old code misread). `DELETE ... WHERE region = 'EU'` keeps the spec-0
+  `country=US` file and the spec-1 `region=EU` file, prunes only the spec-1
+  `region=US` file. The test also pins the bug's fingerprint: evaluated against
+  the DEFAULT spec, that same spec-0 file *does* look provably different, which
+  is exactly what used to prune it.
+- `write_handler::tests::partition_prune_keeps_files_with_an_unknown_spec_id`
+- `write_handler::tests::distinct_spec_ids_reports_every_generation_once`
+
+The fabricated `DataFile`s follow the `data_file_part(..., spec_id, part)`
+pattern from `crates/sqe-compaction/src/rewrite.rs`; the table is built from
+JSON metadata with a local fs `FileIO`, so no catalog is involved.
+
+**Not covered by unit tests.** The two end-to-end scenarios (add a partition
+field, `INSERT OVERWRITE` one partition, assert no duplicates across spec
+generations; `DELETE` after evolution removing matching rows in both
+generations) need the docker rig — the `#[ignore]`d
+`tests/it/partition_evolution_e2e.rs` is where they belong.

@@ -95,6 +95,10 @@ heartbeat_interval_secs = 5     # Health check interval
 memory_limit = "8GB"            # Worker memory limit (supports B/KB/MB/GB/TB)
 spill_to_disk = true            # Allow spilling large sorts/joins to disk
 spill_dir = "/tmp/sqe-spill"    # Temp directory for spilling
+compaction_timeout_secs = 3600  # Max wall-clock seconds for do_action("compact_file_group").
+                                # Default: 3600 (1 hour). Set to 0 to disable.
+                                # On expiry, the worker cancels the rewrite, deletes
+                                # uploaded objects, and fails with DeadlineExceeded (finding 608).
 ticket_public_key = ""              # Base64 Ed25519 public key for verifying coordinator scan tickets (finding 601)
                                 # Empty: receive from heartbeat response (normal). Set when heartbeat unavailable.
 accept_hmac_tickets = false     # Accept legacy HMAC-signed scan tickets keyed by worker_secret (finding 601)
@@ -227,10 +231,16 @@ merge_target_streaming = false  # Stream CoW MERGE target from files instead of 
 # analyst = 600                 # Analysts get 10 minutes
 
 [query_cache]
-enabled = false                 # Enable query result caching
+enabled = false                 # Enable query result caching (disabled by default under policy engines)
 max_memory_mb = 128             # Total cache memory budget
 max_entry_mb = 5                # Max size per cached result
 ttl_secs = 300                  # Cache entry TTL
+# Cache semantics under policy engines (Ranger, OPA, Cedar, in-memory, plan rewriter):
+# Each cached entry is bound to the policy fingerprint active when it was produced.
+# A policy change (bundle update, row filter tighten, new mask) makes older entries
+# misses. ALTER TABLE and RENAME evict everything (tag-based masks live on the table,
+# outside the fingerprint). Engines without a fingerprint keep the cache off.
+# PassthroughEnforcer has a constant fingerprint, so cache works normally.
 
 [query_history]
 max_entries = 10000             # Max queries retained in history
@@ -284,7 +294,12 @@ enabled = false                 # in-process tick loop off by default; drive via
 tick_secs = 60                  # how often the loop wakes up when enabled
 schedule = "0 2 * * *"          # global default cron; per-table property overrides
 jitter_secs = 900               # per-table jitter so a fleet doesn't all fire at once
-max_concurrent_jobs = 1
+max_concurrent_jobs = 1         # bounded concurrency: 1 compaction at a time by default
+                                # increases parallelism when > 1 (discovery cache allows this).
+                                # Discovery caches properties per table across ticks.
+discovery_cache_ticks = 5       # How many scheduler ticks a table's cached properties stay fresh.
+                                # 0 is treated as 1 (re-load every tick). Discovery
+                                # lists all tables every tick to detect new tables and changes.
 lease = "catalog"               # "none" | "catalog" | "kubernetes"
 lease_ttl_secs = 300
 state_table = "sqe_system.maintenance_log"  # operator-created; see note below

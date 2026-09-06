@@ -40,6 +40,49 @@ use crate::writer::{
     FanoutLimits, WriteCleanupGuard,
 };
 
+/// Check an INSERT's projected columns against the target table's schema
+/// before execution starts (architecture review 505).
+///
+/// Arity is an error. Without this the mismatch surfaces deep inside the write
+/// task: a wider SELECT used to index past the end of the stamped schema and
+/// panic (the client saw a generic internal error and the log a panic), and a
+/// narrower one failed at `RecordBatch::try_new` after the full SELECT had run
+/// and the first parquet part had been opened.
+///
+/// Names are NOT an error: INSERT matches columns positionally per the SQL
+/// standard, so `INSERT INTO t SELECT b, a FROM s` legitimately swaps them.
+/// A positional name difference is logged at info so an operator can spot an
+/// accidental swap.
+fn check_insert_arity(
+    source_columns: &[String],
+    target_schema: &IcebergSchema,
+    table_ident: &TableIdent,
+) -> sqe_core::Result<()> {
+    let target_fields = target_schema.as_struct().fields();
+    if source_columns.len() != target_fields.len() {
+        return Err(SqeError::Execution(format!(
+            "INSERT has {} columns but target has {}",
+            source_columns.len(),
+            target_fields.len()
+        )));
+    }
+    let swapped: Vec<String> = source_columns
+        .iter()
+        .zip(target_fields.iter())
+        .filter(|(src, tgt)| !src.eq_ignore_ascii_case(&tgt.name))
+        .map(|(src, tgt)| format!("{src} -> {}", tgt.name))
+        .collect();
+    if !swapped.is_empty() {
+        info!(
+            table = %table_ident,
+            positions = %swapped.join(", "),
+            "INSERT column names differ from the target's in the same position; \
+             columns are written positionally"
+        );
+    }
+    Ok(())
+}
+
 /// Rewrap the source SELECT of an `INSERT INTO t (c1, c2, ...) SELECT ...` so
 /// the resulting projection matches the target table's column order.
 ///
@@ -175,8 +218,54 @@ fn finish_puffin_sketches(acc: Option<SharedSketchAccumulator>) -> Option<Column
     Some(acc.finish())
 }
 
+/// How many rows a MoR position DELETE newly hides in one data file (514).
+///
+/// `raw_matches` is the number of WHERE matches found by the raw,
+/// position-preserving scan — the scan that produces the physical positions,
+/// and the one that must stay raw because position deletes address physical
+/// offsets. `live_matches` is `Some(n)` when the file carries live delete
+/// files and the same predicate was re-evaluated over a delete-aware read of
+/// it, and `None` when the file has no delete files (every raw match is then
+/// live by construction).
+///
+/// A row an earlier DELETE already hid is re-marked by the raw scan but is not
+/// deleted again, so it must not be counted: otherwise the second run of an
+/// idempotent `DELETE ... WHERE x = 1` reports the same non-zero count as the
+/// first. `min` clamps the pathological case where the delete-aware read
+/// somehow returns more matches than the raw one (a snapshot skew between the
+/// two reads) so the count can never exceed the positions actually marked.
+pub(crate) fn newly_deleted_row_count(raw_matches: usize, live_matches: Option<usize>) -> usize {
+    match live_matches {
+        Some(live) => live.min(raw_matches),
+        None => raw_matches,
+    }
+}
+
+/// Sum of the manifest `record_count` over a set of data files.
+///
+/// The truncate paths drop whole files, so the number of rows they removed is
+/// known from metadata alone; reporting it beats handing the driver an empty
+/// result it renders as "unknown" (514).
+///
+/// Caveat: on a table that still carries live position or equality deletes,
+/// some of those rows were already hidden, so this over-reports by the number
+/// of live delete records. Counting exactly would mean a full delete-aware
+/// scan of a table that is about to be emptied anyway.
+pub(crate) fn data_file_record_count(files: &[DataFile]) -> usize {
+    files.iter().map(|f| f.record_count() as usize).sum()
+}
+
 /// Build a single-row RecordBatch reporting affected row count.
 /// Matches Trino's DML response which returns the update count.
+///
+/// Every DML handler (INSERT / DELETE / UPDATE / MERGE, including every early
+/// return on a no-op) must return through this helper. A bare `Ok(vec![])` is
+/// an empty *result set*, which ADBC, Trino JDBC and dbt each render
+/// differently ("unknown", 0, or nothing at all) — so the same statement
+/// reported different numbers depending on which early return it hit (514).
+/// `#[must_use]` is here so a dropped call stands out in review; only DDL
+/// (CREATE TABLE / CTAS) legitimately returns no rows at all.
+#[must_use]
 pub(crate) fn affected_rows_batch(count: usize) -> Vec<RecordBatch> {
     use arrow_array::Int64Array;
     use arrow_schema::{DataType, Field};
@@ -191,6 +280,28 @@ pub(crate) fn affected_rows_batch(count: usize) -> Vec<RecordBatch> {
     }
 }
 
+/// Plan and run a one-row, one-column `COUNT(*)` query and return the value.
+/// `label` names the caller in the two error messages. Shared by the MERGE
+/// cardinality check and the empty-source affected-row count (501).
+async fn scalar_count(ctx: &DFSessionContext, sql: &str, label: &str) -> sqe_core::Result<i64> {
+    let batches = ctx
+        .sql(sql)
+        .await
+        .map_err(|e| SqeError::Execution(format!("{label} failed to plan: {e}")))?
+        .collect()
+        .await
+        .map_err(|e| SqeError::Execution(format!("{label} failed: {e}")))?;
+    Ok(batches
+        .first()
+        .and_then(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+        })
+        .map(|a| a.value(0))
+        .unwrap_or(0))
+}
+
 /// Run the MERGE cardinality check against the registered target/source
 /// scratch tables. Errors when a single target row is matched by more than one
 /// source row (Spark / Trino / Athena all reject this rather than silently
@@ -203,29 +314,8 @@ async fn check_merge_cardinality(
     pair_count_sql: &str,
     matched_count_sql: &str,
 ) -> sqe_core::Result<()> {
-    async fn scalar_count(ctx: &DFSessionContext, sql: &str) -> sqe_core::Result<i64> {
-        let batches = ctx
-            .sql(sql)
-            .await
-            .map_err(|e| {
-                SqeError::Execution(format!("MERGE cardinality check failed to plan: {e}"))
-            })?
-            .collect()
-            .await
-            .map_err(|e| SqeError::Execution(format!("MERGE cardinality check failed: {e}")))?;
-        Ok(batches
-            .first()
-            .and_then(|b| {
-                b.column(0)
-                    .as_any()
-                    .downcast_ref::<arrow_array::Int64Array>()
-            })
-            .map(|a| a.value(0))
-            .unwrap_or(0))
-    }
-
-    let pair_count = scalar_count(ctx, pair_count_sql).await?;
-    let matched_count = scalar_count(ctx, matched_count_sql).await?;
+    let pair_count = scalar_count(ctx, pair_count_sql, "MERGE cardinality check").await?;
+    let matched_count = scalar_count(ctx, matched_count_sql, "MERGE cardinality check").await?;
     if pair_count > matched_count {
         return Err(SqeError::Execution(
             "One MERGE target table row matched more than one source row \
@@ -627,6 +717,327 @@ pub(crate) fn is_conflict_message(msg: &str) -> bool {
         || lower.contains("stale snapshot")
         || lower.contains("rowdelta conflict")
         || lower.contains("retryable")
+}
+
+/// One attempt of a copy-on-write rewrite, produced by the closure
+/// [`WriteHandler::commit_rewrite_with_retry`] runs against a freshly loaded
+/// snapshot.
+///
+/// `add` / `remove` become the `RewriteFilesAction`'s file sets. `cleanup` is
+/// the attempt's [`WriteCleanupGuard`]: the helper marks it committed when the
+/// commit lands and drops it (which deletes the attempt's orphan parquet files)
+/// when the attempt loses its commit race. `value` is whatever the caller wants
+/// back from the winning attempt — a row count, `()`, ...
+pub(crate) struct RewriteAttempt<T> {
+    pub add: Vec<DataFile>,
+    pub remove: Vec<DataFile>,
+    pub cleanup: Option<WriteCleanupGuard>,
+    pub value: T,
+}
+
+impl WriteHandler {
+    /// Bounded retry around a copy-on-write `rewrite_files` commit, with the
+    /// whole rewrite re-run against a reloaded snapshot on an
+    /// optimistic-concurrency conflict (architecture review 506).
+    ///
+    /// [`commit_with_retry`] cannot be reused for these: it re-commits the
+    /// *same* data files on every attempt, which is correct for an append but
+    /// wrong for a rewrite, whose removed-file set and rewritten contents are
+    /// snapshot-specific. Before this helper, four commit sites carried a
+    /// hand-rolled copy of the loop (truncate, CoW DELETE, CoW UPDATE, INSERT
+    /// OVERWRITE) and three had no retry at all (CoW MERGE and the two MoR
+    /// truncate fast paths), so the same statement survived or failed a
+    /// concurrent writer depending on `write.delete.mode`.
+    ///
+    /// `build_attempt` receives the reloaded table and must do the whole read →
+    /// rewrite → collect-files pass against it. Returning `Ok(None)` means
+    /// "nothing to do on this snapshot" (empty table, no partition matched the
+    /// WHERE): no commit is attempted and the helper returns `Ok(None)`.
+    ///
+    /// `op` is the low-cardinality metric/log label
+    /// (`sqe_write_commit_retries_total{op}`); `stmt_label` is what the user
+    /// sees in `Failed to commit {stmt_label}`.
+    async fn commit_rewrite_with_retry<T, F, Fut>(
+        &self,
+        catalog: &dyn Catalog,
+        table_ident: &TableIdent,
+        op: &'static str,
+        stmt_label: &str,
+        mut build_attempt: F,
+    ) -> sqe_core::Result<Option<T>>
+    where
+        F: FnMut(IcebergTable) -> Fut,
+        Fut: std::future::Future<Output = sqe_core::Result<Option<RewriteAttempt<T>>>>,
+    {
+        let mut attempt = 1u32;
+        loop {
+            let table = catalog.load_table(table_ident).await.map_err(|e| {
+                SqeError::Catalog(format!("Failed to load table {table_ident}: {e}"))
+            })?;
+            let Some(RewriteAttempt {
+                add,
+                remove,
+                cleanup,
+                value,
+            }) = build_attempt(table.clone()).await?
+            else {
+                return Ok(None);
+            };
+
+            let tx = Transaction::new(&table);
+            let mut action = tx.rewrite_files();
+            if !add.is_empty() {
+                action = action.add_data_files(add);
+            }
+            if !remove.is_empty() {
+                action = action.delete_files(remove);
+            }
+            let commit_result = match action.apply(tx) {
+                Ok(tx) => tx.commit(catalog).await,
+                Err(e) => Err(e),
+            };
+
+            match commit_result {
+                Ok(_) => {
+                    if let Some(guard) = &cleanup {
+                        guard.mark_committed();
+                    }
+                    if attempt > 1 {
+                        info!(
+                            table = %table_ident,
+                            op,
+                            attempts = attempt,
+                            "rewrite commit succeeded after retry"
+                        );
+                    }
+                    return Ok(Some(value));
+                }
+                Err(e)
+                    if (e.retryable() || is_conflict_message(&e.to_string()))
+                        && attempt < COW_MAX_ATTEMPTS =>
+                {
+                    // Drop the guard so this attempt's orphan parquet files are
+                    // deleted before the rewrite re-runs against the reloaded
+                    // snapshot and writes a fresh set.
+                    drop(cleanup);
+                    if let Some(metrics) = &self.metrics {
+                        metrics
+                            .write_commit_retries_total
+                            .with_label_values(&[op])
+                            .inc();
+                    }
+                    let sleep_ms = cow_conflict_backoff_ms(attempt);
+                    warn!(
+                        table = %table_ident,
+                        op,
+                        attempt,
+                        backoff_ms = sleep_ms,
+                        error = %e,
+                        "commit conflict; reloading table and retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                    attempt += 1;
+                }
+                Err(e) => {
+                    return Err(SqeError::Execution(format!(
+                        "Failed to commit {stmt_label}: {e}"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Truncate fast path shared by the CoW, MoR-position-delete and
+    /// MoR-equality-delete DELETE handlers: one retryable rewrite that removes
+    /// every live data file plus the position deletes those files supersede.
+    ///
+    /// Returns the number of rows the removed manifests accounted for (514),
+    /// or 0 when the table had no data files. Before 506 the CoW handler
+    /// retried this commit and the two MoR handlers did not, so a
+    /// `DELETE FROM t` racing another writer succeeded or failed depending on
+    /// `write.delete.mode`.
+    async fn truncate_via_rewrite(
+        &self,
+        session: &Session,
+        catalog: &Arc<SessionCatalog>,
+        table_ident: &TableIdent,
+        log_label: &str,
+    ) -> sqe_core::Result<usize> {
+        let truncated = self
+            .commit_rewrite_with_retry(
+                catalog.as_catalog().as_ref(),
+                table_ident,
+                "truncate",
+                "truncate",
+                move |fresh_table| async move {
+                    let old_data_files = self.collect_data_files(&fresh_table).await?;
+                    if old_data_files.is_empty() {
+                        info!(
+                            table = %table_ident,
+                            "{log_label}: table has no data files, nothing to delete"
+                        );
+                        return Ok(None);
+                    }
+                    // The manifest record counts are in hand, so report them
+                    // (514) rather than an empty result the driver renders as
+                    // "unknown".
+                    let truncated_rows = data_file_record_count(&old_data_files);
+                    info!(
+                        table = %table_ident,
+                        file_count = old_data_files.len(),
+                        spec_ids = ?distinct_spec_ids(&old_data_files),
+                        "{log_label}: truncating table (no WHERE clause)"
+                    );
+                    let files_to_remove = self
+                        .extend_with_superseded_deletes(&fresh_table, old_data_files)
+                        .await?;
+                    Ok(Some(RewriteAttempt {
+                        add: vec![],
+                        remove: files_to_remove,
+                        cleanup: None,
+                        value: truncated_rows,
+                    }))
+                },
+            )
+            .await?;
+
+        match truncated {
+            Some(truncated_rows) => {
+                info!(table = %table_ident, truncated_rows, "{log_label}: table truncated successfully");
+                self.after_commit(session, catalog.as_ref(), table_ident)
+                    .await;
+                Ok(truncated_rows)
+            }
+            None => Ok(0),
+        }
+    }
+
+    /// Post-commit cache invalidation, at the commit site rather than at the
+    /// caller (architecture review 507).
+    ///
+    /// Two caches hold pre-commit state after a successful Iceberg commit:
+    ///
+    /// 1. the writer's own cached DataFusion `SessionContext`, whose registered
+    ///    table providers and TVF MemTables were built from the old snapshot;
+    /// 2. the shared table-metadata cache, for *every* token — table metadata
+    ///    is a property of the table, not of the principal that wrote it.
+    ///
+    /// Before this hook the invariant lived at ~20 call sites in
+    /// `query_handler`, and the one caller outside it (Flight `DoPut` ingest)
+    /// had no call at all: an ADBC client that bulk-loaded and then counted
+    /// rows on the same connection read the pre-ingest snapshot until the TTL
+    /// expired. Every `WriteHandler` path that reaches a commit calls this.
+    async fn after_commit(
+        &self,
+        session: &Session,
+        catalog: &dyn TableCacheInvalidator,
+        table_ident: &TableIdent,
+    ) {
+        crate::session_context::invalidate_session_cache(&session.user.username).await;
+        catalog.invalidate_table_all_tokens(table_ident).await;
+    }
+}
+
+/// The one thing `after_commit` needs from a catalog, extracted as a trait so
+/// the hook is unit-testable (architecture review 507).
+///
+/// `SessionCatalog` is only constructible against a live REST catalog (it warms
+/// itself with a `list_namespaces` round-trip), so a test cannot hand
+/// `after_commit` a real one and assert the invalidation happened. Everything
+/// on the write path that commits holds either an `Arc<SessionCatalog>` or the
+/// `Arc<dyn Catalog>` bridge built from one, and both deref to something that
+/// implements this trait.
+#[async_trait::async_trait]
+pub(crate) trait TableCacheInvalidator: Send + Sync {
+    /// Evict every cached copy of the table, regardless of the bearer token
+    /// that populated it: a commit is visible to every principal, so evicting
+    /// only the writer's key leaves others planning against pre-commit
+    /// metadata until the soft TTL (architecture review 302).
+    async fn invalidate_table_all_tokens(&self, table_ident: &TableIdent);
+}
+
+#[async_trait::async_trait]
+impl TableCacheInvalidator for SessionCatalog {
+    async fn invalidate_table_all_tokens(&self, table_ident: &TableIdent) {
+        SessionCatalog::invalidate_table_all_tokens(self, table_ident).await;
+    }
+}
+
+/// Can `CREATE OR REPLACE TABLE ... AS SELECT` swap this table's contents in
+/// place, or does the replacement have to be staged and renamed (500)?
+///
+/// In place requires that what the streaming writer would produce fits the live
+/// table exactly, because the writer stamps every batch onto the live table's
+/// schema and partitions it with the live default spec:
+///
+/// - same column names, Arrow types and nullability, in the same order. A
+///   positional type difference would be silently cast to the OLD type, which
+///   is not what `CREATE OR REPLACE` asked for, and a different column set
+///   cannot be written into the live schema at all.
+/// - an explicit `PARTITIONED BY` must name the same source columns with the
+///   same transforms as the live default spec (source columns are compared by
+///   name: field ids differ between a freshly assigned schema and an evolved
+///   one). No `PARTITIONED BY` keeps the live table's partitioning.
+fn ctas_replace_is_in_place(
+    live: &IcebergTable,
+    new_arrow_schema: &ArrowSchema,
+    new_partition_spec: Option<&iceberg::spec::UnboundPartitionSpec>,
+    new_iceberg_schema: &IcebergSchema,
+) -> bool {
+    let live_schema = live.metadata().current_schema();
+    let Ok(live_arrow) = iceberg::arrow::schema_to_arrow_schema(live_schema) else {
+        return false;
+    };
+    if live_arrow.fields().len() != new_arrow_schema.fields().len() {
+        return false;
+    }
+    for (a, b) in live_arrow
+        .fields()
+        .iter()
+        .zip(new_arrow_schema.fields().iter())
+    {
+        if a.name() != b.name()
+            || a.data_type() != b.data_type()
+            || a.is_nullable() != b.is_nullable()
+        {
+            return false;
+        }
+    }
+
+    let Some(unbound) = new_partition_spec else {
+        return true;
+    };
+    let live_spec = live.metadata().default_partition_spec();
+    if unbound.fields().len() != live_spec.fields().len() {
+        return false;
+    }
+    unbound
+        .fields()
+        .iter()
+        .zip(live_spec.fields().iter())
+        .all(|(new_field, live_field)| {
+            if new_field.transform != live_field.transform || new_field.name != live_field.name {
+                return false;
+            }
+            let new_source = new_iceberg_schema
+                .field_by_id(new_field.source_id)
+                .map(|f| f.name.as_str());
+            let live_source = live_schema
+                .field_by_id(live_field.source_id)
+                .map(|f| f.name.as_str());
+            new_source.is_some() && new_source == live_source
+        })
+}
+
+/// Distinct partition-spec ids across a file set, for the CoW/overwrite file
+/// summary logs. A set with more than one entry means the table has been
+/// through `ALTER TABLE ... ADD/DROP PARTITION FIELD` and the rewrite is
+/// spanning spec generations (architecture review 502).
+fn distinct_spec_ids(files: &[DataFile]) -> Vec<i32> {
+    let mut ids: Vec<i32> = files.iter().map(|f| f.partition_spec_id()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 /// Build a unique table location under the namespace base by appending a UUID
@@ -1076,10 +1487,12 @@ impl WriteHandler {
 
         // Create the catalog bridge for this session, resolving the target
         // catalog qualifier (`catalog.ns.table`) rather than the default warehouse.
+        // The `SessionCatalog` itself is kept for `after_commit` (507).
         let target_catalog = resolve_target_catalog(catalog_qualifier(table_name), session);
-        let catalog = self
-            .create_catalog_bridge(session, target_catalog.as_deref())
+        let session_catalog = self
+            .resolve_session_catalog(session, target_catalog.as_deref())
             .await?;
+        let catalog: Arc<dyn Catalog> = session_catalog.as_catalog();
 
         // Create the table in the catalog. Honor PARTITIONED BY (see the
         // streaming CTAS path for why).
@@ -1195,6 +1608,11 @@ impl WriteHandler {
         }
         post_create?;
 
+        // The table exists and holds its data now: drop the caller's cached
+        // session context and every token's metadata entry for it (507).
+        self.after_commit(session, session_catalog.as_ref(), &table_ident)
+            .await;
+
         Ok(vec![]) // DDL success, no result rows
     }
 
@@ -1219,7 +1637,7 @@ impl WriteHandler {
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
         policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        let (table_name, _or_replace, partition_by, user_options) = match stmt {
+        let (table_name, or_replace, partition_by, user_options) = match stmt {
             Statement::CreateTable(ct) => {
                 if ct.query.is_none() {
                     return Err(SqeError::Execution(
@@ -1273,9 +1691,12 @@ impl WriteHandler {
         );
 
         let target_catalog = resolve_target_catalog(catalog_qualifier(table_name), session);
-        let catalog = self
-            .create_catalog_bridge(session, target_catalog.as_deref())
+        // Keep the `SessionCatalog`: `after_commit` (507) and the OR REPLACE
+        // path (500) both need more than the erased `Catalog` trait object.
+        let session_catalog = self
+            .resolve_session_catalog(session, target_catalog.as_deref())
             .await?;
+        let catalog: Arc<dyn Catalog> = session_catalog.as_catalog();
 
         // Defense-in-depth: ensure the target namespace exists in this catalog
         // (dbt's CREATE SCHEMA may not have landed here); idempotent.
@@ -1286,15 +1707,103 @@ impl WriteHandler {
         // AS SELECT ...` silently produced an unpartitioned table.
         let partition_spec = build_partition_spec(partition_by, &iceberg_schema)?;
 
+        // Capture the SELECT plan as a synthetic INSERT-into-target wrapper for
+        // OpenLineage extraction. The wrapper is never executed; it lets the
+        // extractor walk the source plan for inputs + column lineage and the
+        // wrapper for the output dataset. Captured before either CREATE OR
+        // REPLACE path executes the stream.
+        let source_plan = df.logical_plan().clone();
+        let (lin_catalog, lin_namespace, lin_table) =
+            lineage_target_parts(&self.config, &table_ident);
+        if let Ok(wrapper) =
+            build_lineage_insert_plan(source_plan, &lin_catalog, &lin_namespace, &lin_table)
+        {
+            *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(wrapper)));
+        }
+
+        // CREATE OR REPLACE TABLE ... AS SELECT on an EXISTING table (500).
+        // This used to be an unconditional `drop_table` in `query_handler`,
+        // resolved against the default warehouse, issued BEFORE the SELECT ran:
+        // `CREATE OR REPLACE TABLE t AS SELECT ... FROM t` dropped `t` and then
+        // failed to plan, any later failure left the user with no table at all,
+        // and a 3-part name dropped the same-named table in the wrong catalog.
+        // Two replacement shapes now, both of which keep the original table
+        // until the new data is on storage:
+        //
+        //  - the SELECT's schema and partitioning match the live table: swap
+        //    the contents in with one `rewrite_files` commit. The table keeps
+        //    its UUID, its snapshot history and its grants.
+        //  - they differ (the streaming writer stamps every batch onto the
+        //    live table's schema, so a different column set, order or type
+        //    cannot be written into it): stage the replacement under a
+        //    temporary name in the same namespace and swap with DROP + RENAME.
+        let existing = if or_replace {
+            if session_catalog.table_exists(&table_ident).await? {
+                Some(catalog.load_table(&table_ident).await.map_err(|e| {
+                    SqeError::Catalog(format!(
+                        "CREATE OR REPLACE: failed to load the existing table '{table_ident}': {e}"
+                    ))
+                })?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let staged_ident = match &existing {
+            Some(live)
+                if ctas_replace_is_in_place(
+                    live,
+                    &arrow_schema,
+                    partition_spec.as_ref(),
+                    &iceberg_schema,
+                ) =>
+            {
+                let total_rows = self
+                    .ctas_replace_in_place(
+                        session,
+                        ctx,
+                        df,
+                        &session_catalog,
+                        live.clone(),
+                        &table_ident,
+                    )
+                    .await?;
+                return Ok(affected_rows_batch(total_rows));
+            }
+            Some(_) => Some(TableIdent::new(
+                namespace.clone(),
+                format!("{name}__sqe_replace_{}", Uuid::new_v4().simple()),
+            )),
+            None => None,
+        };
+
+        // The name the table is CREATEd under: the target itself, or the
+        // staging name when an incompatible replacement has to be swapped in.
+        let create_ident = staged_ident.clone().unwrap_or_else(|| table_ident.clone());
+        let create_name = create_ident.name().to_string();
+        if let Some(staged) = &staged_ident {
+            warn!(
+                table = %table_ident,
+                staged = %staged,
+                "CREATE OR REPLACE: the SELECT's schema or partitioning differs from \
+                 the live table, so the replacement is staged under a temporary name \
+                 and swapped in with DROP + RENAME. The existing table survives a \
+                 failing SELECT; only the swap itself is two catalog calls, and the \
+                 replaced table's snapshot history does not carry over."
+            );
+        }
+
         let create_format_version = self.format_version();
-        let location = unique_table_location(catalog.as_ref(), &namespace, &name).await;
+        let location = unique_table_location(catalog.as_ref(), &namespace, &create_name).await;
         // Merge user TBLPROPERTIES / WITH options (see handle_ctas for why):
         // a CTAS must keep properties like write.parquet.bloom-filter-* that
         // drive the data write, matching the plain CREATE TABLE path.
         let mut props = self.format_version_props(create_format_version);
         merge_user_table_properties(&mut props, user_options);
         let table_creation = TableCreation::builder()
-            .name(name.clone())
+            .name(create_name.clone())
             .schema(iceberg_schema)
             .location_opt(location)
             .format_version(create_format_version)
@@ -1308,22 +1817,9 @@ impl WriteHandler {
             .map_err(|e| SqeError::Catalog(format!("Failed to create table: {e}")))?;
 
         let table = catalog
-            .load_table(&table_ident)
+            .load_table(&create_ident)
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to load created table: {e}")))?;
-
-        // Capture the SELECT plan as a synthetic INSERT-into-target wrapper for
-        // OpenLineage extraction. The wrapper is never executed; it lets the
-        // extractor walk the source plan for inputs + column lineage and the
-        // wrapper for the output dataset.
-        let source_plan = df.logical_plan().clone();
-        let (lin_catalog, lin_namespace, lin_table) =
-            lineage_target_parts(&self.config, &table_ident);
-        if let Ok(wrapper) =
-            build_lineage_insert_plan(source_plan, &lin_catalog, &lin_namespace, &lin_table)
-        {
-            *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(wrapper)));
-        }
 
         // Stream + commit wrapped so any failure after `catalog.create_table`
         // rolls back the partially-created table. Same rationale as the
@@ -1359,7 +1855,7 @@ impl WriteHandler {
                 let catalog_for_commit = catalog.clone();
                 commit_with_retry(
                     catalog.as_ref(),
-                    &table_ident,
+                    &create_ident,
                     "ctas-streaming",
                     move |fresh_table| {
                         let files = files_for_retry.clone();
@@ -1378,18 +1874,22 @@ impl WriteHandler {
                 })?;
                 cleanup_guard.mark_committed();
                 info!(
-                    table = %table_ident,
+                    table = %create_ident,
                     total_rows,
                     "CTAS committed successfully (streaming)"
                 );
                 if let Some(sketches) = finish_puffin_sketches(sketch_acc) {
-                    self.maybe_emit_puffin_sidecar_from_sketches(&catalog, &table_ident, &sketches)
-                        .await;
+                    self.maybe_emit_puffin_sidecar_from_sketches(
+                        &catalog,
+                        &create_ident,
+                        &sketches,
+                    )
+                    .await;
                 }
             } else {
                 cleanup_guard.mark_committed();
                 info!(
-                    table = %table_ident,
+                    table = %create_ident,
                     "CTAS created empty table (no data to write)"
                 );
             }
@@ -1399,18 +1899,165 @@ impl WriteHandler {
 
         if let Err(ref err) = post_create {
             warn!(
-                table = %table_ident,
+                table = %create_ident,
                 error = %err,
                 "CTAS (streaming) failed after create_table; rolling back to prevent orphan"
             );
-            rollback_ctas_partial_create(&catalog, &table, &table_ident).await;
+            rollback_ctas_partial_create(&catalog, &table, &create_ident).await;
         }
         let total_rows = post_create?;
+
+        // Swap a staged replacement into place (500). Both calls are metadata
+        // only. The failure message names the staged table so the swap can be
+        // finished by hand rather than leaving the data unreachable.
+        if let Some(staged) = &staged_ident {
+            catalog.drop_table(&table_ident).await.map_err(|e| {
+                SqeError::Catalog(format!(
+                    "CREATE OR REPLACE: failed to drop the existing table \
+                     '{table_ident}': {e}. The replacement is committed as '{staged}'; \
+                     no data was lost."
+                ))
+            })?;
+            catalog
+                .rename_table(staged, &table_ident)
+                .await
+                .map_err(|e| {
+                    SqeError::Catalog(format!(
+                        "CREATE OR REPLACE: '{table_ident}' was dropped and the replacement \
+                     is committed as '{staged}', but renaming it into place failed: {e}. \
+                     Run ALTER TABLE {staged} RENAME TO {table_ident} to finish the swap."
+                    ))
+                })?;
+            self.after_commit(session, session_catalog.as_ref(), staged)
+                .await;
+        }
+
+        // The table exists and holds its data now: drop the caller's cached
+        // session context and every token's metadata entry for it (507).
+        self.after_commit(session, session_catalog.as_ref(), &table_ident)
+            .await;
 
         // Report the written-row count as a 1-row `rows_affected` batch,
         // consistent with the buffered INSERT path and the DELETE/UPDATE/MERGE
         // handlers. The coordinator recovers it (O2) into query history + audit.
         Ok(affected_rows_batch(total_rows))
+    }
+
+    /// `CREATE OR REPLACE TABLE ... AS SELECT` against an existing Iceberg
+    /// table the SELECT already fits (architecture review 500).
+    ///
+    /// Writes the new data files into the live table first, then swaps them in
+    /// with ONE `rewrite_files` commit that removes every live data file plus
+    /// the position deletes those files supersede. Consequences, all of which
+    /// the previous drop-then-create got wrong:
+    ///
+    /// - the table keeps its UUID and its snapshot history, so time travel and
+    ///   `rollback_to_snapshot` still cross the replace;
+    /// - `CREATE OR REPLACE TABLE t AS SELECT ... FROM t` works: the stream is
+    ///   fully consumed (against the pre-swap snapshot) before the commit;
+    /// - a failing SELECT, a failing write or four lost commit races leave the
+    ///   original table and its data exactly as they were — the cleanup guard
+    ///   removes the parquet files this attempt wrote;
+    /// - grants survive, because nothing is dropped.
+    ///
+    /// Table properties from the statement's `WITH` / `TBLPROPERTIES` clause
+    /// are NOT re-applied: an in-place replace keeps the live table's
+    /// properties. `ALTER TABLE ... SET TBLPROPERTIES` changes them.
+    async fn ctas_replace_in_place(
+        &self,
+        session: &Session,
+        ctx: &DFSessionContext,
+        df: datafusion::dataframe::DataFrame,
+        catalog: &Arc<SessionCatalog>,
+        table: IcebergTable,
+        table_ident: &TableIdent,
+    ) -> sqe_core::Result<usize> {
+        info!(
+            table = %table_ident,
+            "CREATE OR REPLACE TABLE: replacing contents in place (schema and \
+             partitioning unchanged)"
+        );
+
+        let tracker = new_upload_tracker();
+        let cleanup_guard =
+            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "ctas-replace")
+                .with_metrics(self.metrics.clone());
+
+        let stream = df
+            .execute_stream()
+            .await
+            .map_err(|e| SqeError::Execution(format!("Failed to start execution stream: {e}")))?;
+        let (stream, sketch_acc) = tap_stream_for_puffin_sketches(&table, stream);
+        let (data_files, total_rows) = write_data_files_streaming_with_metrics(
+            &table,
+            stream,
+            "ctas",
+            self.metrics.as_ref(),
+            self.compression(session),
+            tracker,
+            self.fanout_limits(Some(ctx.runtime_env().memory_pool.clone())),
+        )
+        .await?;
+
+        let borrowed = (&data_files, table_ident);
+        let committed = self
+            .commit_rewrite_with_retry(
+                catalog.as_catalog().as_ref(),
+                table_ident,
+                "ctas-replace",
+                "CREATE OR REPLACE TABLE",
+                move |fresh_table| {
+                    let (data_files, table_ident) = borrowed;
+                    async move {
+                        let live = self.collect_data_files(&fresh_table).await?;
+                        if live.is_empty() && data_files.is_empty() {
+                            info!(
+                                table = %table_ident,
+                                "CREATE OR REPLACE: empty table replaced by an empty \
+                                 SELECT; nothing to commit"
+                            );
+                            return Ok(None);
+                        }
+                        let removed_files = live.len();
+                        let files_to_remove = self
+                            .extend_with_superseded_deletes(&fresh_table, live)
+                            .await?;
+                        info!(
+                            table = %table_ident,
+                            removed_files,
+                            new_files = data_files.len(),
+                            "CREATE OR REPLACE: committing atomic content swap"
+                        );
+                        Ok(Some(RewriteAttempt {
+                            add: data_files.clone(),
+                            remove: files_to_remove,
+                            cleanup: None,
+                            value: (),
+                        }))
+                    }
+                },
+            )
+            .await;
+
+        // On failure the guard's Drop deletes the parquet files this statement
+        // wrote; the table keeps the contents it had.
+        committed?;
+        cleanup_guard.mark_committed();
+
+        if let Some(sketches) = finish_puffin_sketches(sketch_acc) {
+            let bridge: Arc<dyn Catalog> = catalog.as_catalog();
+            self.maybe_emit_puffin_sidecar_from_sketches(&bridge, table_ident, &sketches)
+                .await;
+        }
+
+        self.after_commit(session, catalog.as_ref(), table_ident)
+            .await;
+        info!(
+            table = %table_ident,
+            total_rows,
+            "CREATE OR REPLACE TABLE committed successfully (in-place swap)"
+        );
+        Ok(total_rows)
     }
 
     /// Handle INSERT INTO ns.table SELECT ... — streaming variant.
@@ -1464,9 +2111,13 @@ impl WriteHandler {
         );
 
         let target_catalog = resolve_target_catalog(catalog_qualifier(table_name), session);
-        let catalog = self
-            .create_catalog_bridge(session, target_catalog.as_deref())
+        // Keep the resolved `SessionCatalog`, not only the erased bridge:
+        // `commit_written_files` needs it for the post-commit cache
+        // invalidation (507).
+        let session_catalog = self
+            .resolve_session_catalog(session, target_catalog.as_deref())
             .await?;
+        let catalog: Arc<dyn Catalog> = session_catalog.as_catalog();
         let table = catalog
             .load_table(&table_ident)
             .await
@@ -1486,6 +2137,20 @@ impl WriteHandler {
             .sql(&effective_sql)
             .await
             .map_err(|e| SqeError::Execution(format!("SQL planning failed: {e}")))?;
+
+        // 505: fail a mis-shaped INSERT here, at planning time, before the
+        // stream starts and before the writer opens its first parquet part.
+        let source_columns: Vec<String> = df
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        check_insert_arity(
+            &source_columns,
+            table.metadata().current_schema().as_ref(),
+            &table_ident,
+        )?;
 
         // Enforce row filters, column masks, and restricted columns on the
         // source SELECT. Without this, INSERT INTO sink SELECT FROM masked
@@ -1539,12 +2204,22 @@ impl WriteHandler {
             return Ok(affected_rows_batch(0));
         }
 
-        self.commit_written_files(catalog.as_ref(), table, &table_ident, data_files, overwrite)
-            .await?;
+        self.commit_written_files(
+            session,
+            &session_catalog,
+            &table_ident,
+            data_files,
+            overwrite,
+        )
+        .await?;
         cleanup_guard.mark_committed();
 
         if let Some(sketches) = finish_puffin_sketches(sketch_acc) {
             self.maybe_emit_puffin_sidecar_from_sketches(&catalog, &table_ident, &sketches)
+                .await;
+            // The sidecar is a SECOND metadata commit on this table, after the
+            // data commit's own `after_commit` already refreshed the caches.
+            self.after_commit(session, session_catalog.as_ref(), &table_ident)
                 .await;
         }
 
@@ -1627,9 +2302,10 @@ impl WriteHandler {
         // fallback a dbt/Trino client connected with catalog=ws_team_a issuing an
         // unqualified statement resolves against the default warehouse.
         let target_catalog = resolve_target_catalog(catalog_qualifier(&ct.name), session);
-        let catalog = self
-            .create_catalog_bridge(session, target_catalog.as_deref())
+        let session_catalog = self
+            .resolve_session_catalog(session, target_catalog.as_deref())
             .await?;
+        let catalog: Arc<dyn Catalog> = session_catalog.as_catalog();
 
         // Defense-in-depth: make sure the namespace exists in THIS catalog before
         // creating the table. dbt issues CREATE SCHEMA IF NOT EXISTS first; if that
@@ -1678,6 +2354,11 @@ impl WriteHandler {
             table = %name,
             "Table created successfully"
         );
+
+        // A new table changes what the caller's cached session context can
+        // resolve, so the same hook every write path uses runs here too (507).
+        self.after_commit(session, session_catalog.as_ref(), &table_ident)
+            .await;
 
         Ok(vec![])
     }
@@ -1740,9 +2421,10 @@ impl WriteHandler {
         );
 
         let target_catalog = resolve_target_catalog(catalog_qualifier(&ct.name), session);
-        let catalog = self
-            .create_catalog_bridge(session, target_catalog.as_deref())
+        let session_catalog = self
+            .resolve_session_catalog(session, target_catalog.as_deref())
             .await?;
+        let catalog: Arc<dyn Catalog> = session_catalog.as_catalog();
 
         ensure_namespace(catalog.as_ref(), &namespace).await?;
 
@@ -1768,6 +2450,8 @@ impl WriteHandler {
             .map_err(|e| SqeError::Catalog(format!("Failed to create table: {e}")))?;
 
         info!(namespace = %namespace, table = %name, "Table created successfully (LIKE)");
+        self.after_commit(session, session_catalog.as_ref(), &table_ident)
+            .await;
         Ok(vec![])
     }
 
@@ -1825,15 +2509,17 @@ impl WriteHandler {
 
         if total_rows == 0 && !overwrite {
             info!(table = %table_ident, "INSERT SELECT returned no rows — nothing to write");
-            return Ok(vec![]);
+            return Ok(affected_rows_batch(0));
         }
 
-        // Create the catalog bridge and load the existing table, resolving the
-        // target catalog qualifier rather than the default warehouse.
+        // Resolve the session catalog (and derive the erased bridge from it),
+        // then load the existing table, honouring the target catalog qualifier
+        // rather than the default warehouse.
         let target_catalog = resolve_target_catalog(catalog_qualifier(table_name), session);
-        let catalog = self
-            .create_catalog_bridge(session, target_catalog.as_deref())
+        let session_catalog = self
+            .resolve_session_catalog(session, target_catalog.as_deref())
             .await?;
+        let catalog: Arc<dyn Catalog> = session_catalog.as_catalog();
 
         let table = catalog
             .load_table(&table_ident)
@@ -1859,12 +2545,21 @@ impl WriteHandler {
         )
         .await?;
 
-        self.commit_written_files(catalog.as_ref(), table, &table_ident, data_files, overwrite)
-            .await?;
+        self.commit_written_files(
+            session,
+            &session_catalog,
+            &table_ident,
+            data_files,
+            overwrite,
+        )
+        .await?;
         cleanup_guard.mark_committed();
 
         if let Some(stats_batches) = stats_snapshot {
             self.maybe_emit_puffin_sidecar(&catalog, &table_ident, &stats_batches)
+                .await;
+            // Second metadata commit on this table; see the streaming twin.
+            self.after_commit(session, session_catalog.as_ref(), &table_ident)
                 .await;
         }
 
@@ -1913,12 +2608,30 @@ impl WriteHandler {
             "Executing DoPut ingest"
         );
 
-        let catalog = self.create_catalog_bridge(session, target_catalog).await?;
+        let session_catalog = self
+            .resolve_session_catalog(session, target_catalog)
+            .await?;
+        let catalog: Arc<dyn Catalog> = session_catalog.as_catalog();
 
         let table = catalog
             .load_table(&table_ident)
             .await
             .map_err(|e| SqeError::Catalog(format!("Failed to load table: {e}")))?;
+
+        // 505: reject a mis-shaped upload before any parquet part is opened.
+        if let Some(first) = batches.first() {
+            let source_columns: Vec<String> = first
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            check_insert_arity(
+                &source_columns,
+                table.metadata().current_schema().as_ref(),
+                &table_ident,
+            )?;
+        }
 
         let tracker = new_upload_tracker();
         let cleanup_guard =
@@ -1957,6 +2670,9 @@ impl WriteHandler {
                 SqeError::Execution(format!("Failed to commit ingest transaction: {e}"))
             })?;
             cleanup_guard.mark_committed();
+
+            self.after_commit(session, session_catalog.as_ref(), &table_ident)
+                .await;
 
             info!(table = %table_ident, total_rows, "DoPut ingest committed successfully");
         } else {
@@ -2013,7 +2729,10 @@ impl WriteHandler {
             "Executing streaming DoPut ingest"
         );
 
-        let catalog = self.create_catalog_bridge(session, target_catalog).await?;
+        let session_catalog = self
+            .resolve_session_catalog(session, target_catalog)
+            .await?;
+        let catalog: Arc<dyn Catalog> = session_catalog.as_catalog();
 
         let table = catalog
             .load_table(&table_ident)
@@ -2023,6 +2742,11 @@ impl WriteHandler {
         // The streaming sink re-stamps every batch onto the table schema, so the
         // adapter's declared schema is only the stream contract, not the write
         // schema. Derive it from the table's current Iceberg schema.
+        //
+        // There is nothing to arity-check up front here: the uploaded batches
+        // have not arrived yet. A mis-shaped batch is caught per batch by
+        // `apply_stamped_schema`, which since 505 returns
+        // "INSERT has N columns but target has M" instead of panicking.
         let arrow_schema = Arc::new(
             iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).map_err(
                 |e| SqeError::Execution(format!("Failed to derive ingest Arrow schema: {e}")),
@@ -2076,6 +2800,13 @@ impl WriteHandler {
             })?;
             cleanup_guard.mark_committed();
 
+            // The Flight `DoPut` caller has no query_handler statement to
+            // mirror the invalidation for it: before 507 an ADBC client that
+            // bulk-loaded and then ran `SELECT count(*)` on the same connection
+            // read the pre-ingest snapshot until the cache TTL expired.
+            self.after_commit(session, session_catalog.as_ref(), &table_ident)
+                .await;
+
             info!(
                 table = %table_ident,
                 total_rows,
@@ -2116,7 +2847,7 @@ impl WriteHandler {
             }
         };
 
-        let mut table = catalog.load_table(&table_ident).await?;
+        let table = catalog.load_table(&table_ident).await?;
 
         let where_clause = &delete.selection;
         // Snapshot-independent setup (schema + policy predicates) runs once;
@@ -2132,45 +2863,10 @@ impl WriteHandler {
         // outside the user's view, so the truncate degrades into a CoW
         // rewrite under the row filter (handled by the main path below).
         if where_clause.is_none() && predicates.row_filter_sql.is_none() {
-            let mut attempt = 1u32;
-            loop {
-                let old_data_files = self.collect_data_files(&table).await?;
-                if old_data_files.is_empty() {
-                    info!(table = %table_ident, "DELETE: table has no data files, nothing to delete");
-                    return Ok(vec![]);
-                }
-                info!(table = %table_ident, file_count = old_data_files.len(), attempt, "DELETE: truncating table (no WHERE clause)");
-                let files_to_remove = self
-                    .extend_with_superseded_deletes(&table, old_data_files)
-                    .await?;
-                let tx = Transaction::new(&table);
-                let action = tx.rewrite_files().delete_files(files_to_remove);
-                let commit_result = match action.apply(tx) {
-                    Ok(tx) => tx.commit(catalog.as_catalog().as_ref()).await,
-                    Err(e) => Err(e),
-                };
-                match commit_result {
-                    Ok(_) => {
-                        info!(table = %table_ident, "DELETE: table truncated successfully");
-                        return Ok(vec![]);
-                    }
-                    Err(e)
-                        if (e.retryable() || is_conflict_message(&e.to_string()))
-                            && attempt < COW_MAX_ATTEMPTS =>
-                    {
-                        let sleep_ms = cow_conflict_backoff_ms(attempt);
-                        warn!(table = %table_ident, op = "truncate", attempt, backoff_ms = sleep_ms, error = %e, "commit conflict; reloading table and retrying");
-                        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-                        table = catalog.load_table(&table_ident).await?;
-                        attempt += 1;
-                    }
-                    Err(e) => {
-                        return Err(SqeError::Execution(format!(
-                            "Failed to commit truncate: {e}"
-                        )));
-                    }
-                }
-            }
+            let truncated_rows = self
+                .truncate_via_rewrite(session, &catalog, &table_ident, "DELETE")
+                .await?;
+            return Ok(affected_rows_batch(truncated_rows));
         }
 
         // Lift any `IN (subquery)` expressions out of the WHERE into materialised
@@ -2186,139 +2882,134 @@ impl WriteHandler {
         // Partition-pruned CoW under optimistic-concurrency retry: each attempt
         // re-reads the snapshot, rewrites only data files whose partition could
         // match the WHERE (rest untouched, #263), and commits. A commit conflict
-        // re-runs the whole rewrite against the reloaded snapshot (#47).
-        let mut attempt = 1u32;
-        let total_deleted = loop {
-            let old_data_files = self.collect_data_files(&table).await?;
-            if old_data_files.is_empty() {
-                info!(table = %table_ident, "DELETE: table has no data files, nothing to delete");
-                return Ok(vec![]);
-            }
-            let (to_rewrite, pruned_files) =
-                partition_prune_cow_files(old_data_files, &table, where_clause.as_ref());
-            if to_rewrite.is_empty() {
-                info!(table = %table_ident, "DELETE: no partitions match the WHERE clause; nothing to rewrite");
-                return Ok(affected_rows_batch(0));
-            }
-            if pruned_files > 0 {
-                info!(table = %table_ident, pruned_files, rewrite_files = to_rewrite.len(), "DELETE: partition-pruned CoW rewrite");
-            }
-            info!(
-                table = %table_ident,
-                file_count = to_rewrite.len(),
-                where_clause = %where_sql,
-                policy_row_filter = predicates.row_filter_sql.is_some(),
-                policy_masks = predicates.column_mask_sqls.len(),
-                attempt,
-                "DELETE: CoW rewrite"
-            );
+        // re-runs the whole rewrite against the reloaded snapshot (#47) — the
+        // loop itself lives in `commit_rewrite_with_retry` (506).
+        let borrowed = (&where_sql[..], &joins_sql[..], &predicates, &table_ident);
+        let total_deleted = self
+            .commit_rewrite_with_retry(
+                catalog.as_catalog().as_ref(),
+                &table_ident,
+                "delete-cow",
+                "DELETE",
+                move |fresh_table| {
+                    // Every capture is a `Copy` reference so the per-attempt
+                    // `async move` block can take its own copy out of the
+                    // `FnMut` closure.
+                    let (where_sql, joins_sql, predicates, table_ident) = borrowed;
+                    async move {
+                        let old_data_files = self.collect_data_files(&fresh_table).await?;
+                        if old_data_files.is_empty() {
+                            info!(table = %table_ident, "DELETE: table has no data files, nothing to delete");
+                            return Ok(None);
+                        }
+                        let (to_rewrite, pruned_files) = partition_prune_cow_files(
+                            old_data_files,
+                            &fresh_table,
+                            where_clause.as_ref(),
+                        );
+                        if to_rewrite.is_empty() {
+                            info!(table = %table_ident, "DELETE: no partitions match the WHERE clause; nothing to rewrite");
+                            return Ok(None);
+                        }
+                        if pruned_files > 0 {
+                            info!(table = %table_ident, pruned_files, rewrite_files = to_rewrite.len(), "DELETE: partition-pruned CoW rewrite");
+                        }
+                        info!(
+                            table = %table_ident,
+                            file_count = to_rewrite.len(),
+                            spec_ids = ?distinct_spec_ids(&to_rewrite),
+                            where_clause = %where_sql,
+                            policy_row_filter = predicates.row_filter_sql.is_some(),
+                            policy_masks = predicates.column_mask_sqls.len(),
+                            "DELETE: CoW rewrite"
+                        );
 
-            let mut new_data_files = Vec::new();
-            let mut deleted_this_attempt = 0usize;
-            let tracker = new_upload_tracker();
-            let cleanup_guard =
-                WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "delete-cow")
-                    .with_metrics(self.metrics.clone());
-            let pool = ctx.runtime_env().memory_pool.clone();
-            let read_plan = self.plan_delete_aware_read(&table).await?;
-
-            for data_file in &to_rewrite {
-                let file_path = data_file.file_path();
-                let batches = self
-                    .read_data_file_applying_deletes(&read_plan, file_path, ctx, true)
-                    .await?;
-                if batches.is_empty() {
-                    continue;
-                }
-                // Pool-track the surviving-rows accumulation (Layer A,
-                // cow-keep-buffer). Per-file and a subset of the file, but the
-                // decode reservation has already released by now, so this is
-                // its own tracked buffer, not a double-count.
-                let mut surviving = TrackedBatchBuffer::gated(
-                    &pool,
-                    "cow-keep-buffer",
-                    self.config.query.write_buffer_tracking,
-                );
-                for batch in &batches {
-                    let filtered = self
-                        .filter_batch_negate(
-                            ctx,
-                            batch,
-                            &where_sql,
-                            &joins_sql,
-                            &table_ident,
-                            &predicates,
+                        let mut new_data_files = Vec::new();
+                        let mut deleted_this_attempt = 0usize;
+                        let tracker = new_upload_tracker();
+                        let cleanup_guard = WriteCleanupGuard::new(
+                            fresh_table.file_io().clone(),
+                            tracker.clone(),
+                            "delete-cow",
                         )
-                        .await?;
-                    deleted_this_attempt += batch.num_rows() - filtered.num_rows();
-                    if filtered.num_rows() > 0 {
-                        surviving.push(filtered)?;
+                        .with_metrics(self.metrics.clone());
+                        let pool = ctx.runtime_env().memory_pool.clone();
+                        let read_plan = self.plan_delete_aware_read(&fresh_table).await?;
+
+                        for data_file in &to_rewrite {
+                            let file_path = data_file.file_path();
+                            let batches = self
+                                .read_data_file_applying_deletes(&read_plan, file_path, ctx, true)
+                                .await?;
+                            if batches.is_empty() {
+                                continue;
+                            }
+                            // Pool-track the surviving-rows accumulation (Layer A,
+                            // cow-keep-buffer). Per-file and a subset of the file, but the
+                            // decode reservation has already released by now, so this is
+                            // its own tracked buffer, not a double-count.
+                            let mut surviving = TrackedBatchBuffer::gated(
+                                &pool,
+                                "cow-keep-buffer",
+                                self.config.query.write_buffer_tracking,
+                            );
+                            for batch in &batches {
+                                let filtered = self
+                                    .filter_batch_negate(
+                                        ctx,
+                                        batch,
+                                        where_sql,
+                                        joins_sql,
+                                        table_ident,
+                                        predicates,
+                                    )
+                                    .await?;
+                                deleted_this_attempt += batch.num_rows() - filtered.num_rows();
+                                if filtered.num_rows() > 0 {
+                                    surviving.push(filtered)?;
+                                }
+                            }
+                            if !surviving.is_empty() {
+                                let new_files = write_data_files_with_metrics(
+                                    &fresh_table,
+                                    surviving.into_inner(),
+                                    "delete",
+                                    self.metrics.as_ref(),
+                                    self.compression(session),
+                                    tracker.clone(),
+                                )
+                                .await?;
+                                new_data_files.extend(new_files);
+                            }
+                        }
+
+                        info!(
+                            table = %table_ident,
+                            deleted_rows = deleted_this_attempt,
+                            rewrite_files = to_rewrite.len(),
+                            new_files = new_data_files.len(),
+                            "DELETE: committing CoW rewrite"
+                        );
+
+                        let files_to_remove = self
+                            .extend_with_superseded_deletes(&fresh_table, to_rewrite)
+                            .await?;
+                        Ok(Some(RewriteAttempt {
+                            add: new_data_files,
+                            remove: files_to_remove,
+                            cleanup: Some(cleanup_guard),
+                            value: deleted_this_attempt,
+                        }))
                     }
-                }
-                if !surviving.is_empty() {
-                    let new_files = write_data_files_with_metrics(
-                        &table,
-                        surviving.into_inner(),
-                        "delete",
-                        self.metrics.as_ref(),
-                        self.compression(session),
-                        tracker.clone(),
-                    )
-                    .await?;
-                    new_data_files.extend(new_files);
-                }
-            }
+                },
+            )
+            .await?;
 
-            info!(
-                table = %table_ident,
-                deleted_rows = deleted_this_attempt,
-                rewrite_files = to_rewrite.len(),
-                new_files = new_data_files.len(),
-                "DELETE: committing CoW rewrite"
-            );
-
-            let files_to_remove = self
-                .extend_with_superseded_deletes(&table, to_rewrite)
-                .await?;
-            let tx = Transaction::new(&table);
-            let action = tx
-                .rewrite_files()
-                .add_data_files(new_data_files)
-                .delete_files(files_to_remove);
-            let commit_result = match action.apply(tx) {
-                Ok(tx) => tx.commit(catalog.as_catalog().as_ref()).await,
-                Err(e) => Err(e),
-            };
-            match commit_result {
-                Ok(_) => {
-                    cleanup_guard.mark_committed();
-                    break deleted_this_attempt;
-                }
-                Err(e)
-                    if (e.retryable() || is_conflict_message(&e.to_string()))
-                        && attempt < COW_MAX_ATTEMPTS =>
-                {
-                    drop(cleanup_guard);
-                    let sleep_ms = cow_conflict_backoff_ms(attempt);
-                    warn!(
-                        table = %table_ident,
-                        op = "delete-cow",
-                        attempt,
-                        backoff_ms = sleep_ms,
-                        error = %e,
-                        "commit conflict; reloading table and retrying"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-                    table = catalog.load_table(&table_ident).await?;
-                    attempt += 1;
-                    continue;
-                }
-                Err(e) => {
-                    return Err(SqeError::Execution(format!("Failed to commit DELETE: {e}")));
-                }
-            }
+        let Some(total_deleted) = total_deleted else {
+            return Ok(affected_rows_batch(0));
         };
-
+        self.after_commit(session, catalog.as_ref(), &table_ident)
+            .await;
         info!(table = %table_ident, deleted_rows = total_deleted, "DELETE committed successfully");
         Ok(affected_rows_batch(total_deleted))
     }
@@ -2361,7 +3052,7 @@ impl WriteHandler {
 
         if old_data_files.is_empty() {
             info!(table = %table_ident, "MoR DELETE: table has no data files, nothing to delete");
-            return Ok(vec![]);
+            return Ok(affected_rows_batch(0));
         }
 
         let where_clause = &delete.selection;
@@ -2381,19 +3072,13 @@ impl WriteHandler {
                 file_count = old_data_files.len(),
                 "MoR DELETE: no WHERE clause, truncating table via CoW"
             );
-            let files_to_remove = self
-                .extend_with_superseded_deletes(&table, old_data_files)
+            // Through the shared retryable truncate (506): this commit used to
+            // be single-shot, so the same statement survived a concurrent
+            // writer on a copy-on-write table and failed on a merge-on-read one.
+            let truncated_rows = self
+                .truncate_via_rewrite(session, &catalog, &table_ident, "MoR DELETE")
                 .await?;
-            let tx = Transaction::new(&table);
-            let action = tx.rewrite_files().delete_files(files_to_remove);
-            let tx = action.apply(tx).map_err(|e| {
-                SqeError::Execution(format!("Failed to apply truncate transaction: {e}"))
-            })?;
-            tx.commit(catalog.as_catalog().as_ref())
-                .await
-                .map_err(|e| SqeError::Execution(format!("Failed to commit truncate: {e}")))?;
-            info!(table = %table_ident, "MoR DELETE: table truncated successfully");
-            return Ok(vec![]);
+            return Ok(affected_rows_batch(truncated_rows));
         }
 
         let raw_where = where_clause
@@ -2420,7 +3105,18 @@ impl WriteHandler {
         // file, so applying existing delete files here would shift positions
         // and delete the wrong rows. Re-marking an already-deleted position
         // is harmless.
+        //
+        // It is NOT harmless for the reported count (514): a row a previous
+        // DELETE already hid is marked again, so re-running the same statement
+        // reported the same non-zero count instead of 0 and defeated the
+        // simplest reconciliation check. The count therefore comes from a
+        // second, delete-aware read of the same file — only rows still visible
+        // can be newly deleted. That read only happens for files that both
+        // carry delete files and had a raw match, so an ordinary MoR DELETE on
+        // a table with no deletes still reads each file once.
+        let read_plan = self.plan_delete_aware_read(&table).await?;
         let mut position_deletes: Vec<(String, i64)> = Vec::new();
+        let mut deleted_count: usize = 0;
 
         for data_file in &old_data_files {
             let file_path = data_file.file_path().to_string();
@@ -2433,6 +3129,7 @@ impl WriteHandler {
             }
 
             // Row positions are 0-based and contiguous across all batches in the file.
+            let mut raw_matches: usize = 0;
             let mut row_offset: i64 = 0;
             for batch in &batches {
                 let match_mask = self
@@ -2448,22 +3145,59 @@ impl WriteHandler {
 
                 for row_idx in 0..batch.num_rows() {
                     if match_mask.value(row_idx) {
+                        raw_matches += 1;
                         position_deletes.push((file_path.clone(), row_offset + row_idx as i64));
                     }
                 }
                 row_offset += batch.num_rows() as i64;
             }
+
+            let file_has_deletes = read_plan
+                .tasks_by_path
+                .get(&file_path)
+                .is_some_and(|tasks| tasks.iter().any(|t| !t.deletes.is_empty()));
+            let live_matches = if raw_matches > 0 && file_has_deletes {
+                let mut live = 0usize;
+                for batch in self
+                    .read_data_file_applying_deletes(&read_plan, &file_path, ctx, true)
+                    .await?
+                {
+                    let mask = self
+                        .filter_batch_match(
+                            ctx,
+                            &batch,
+                            &where_sql,
+                            &joins_sql,
+                            &table_ident,
+                            &predicates,
+                        )
+                        .await?;
+                    live += (0..mask.len()).filter(|i| mask.value(*i)).count();
+                }
+                Some(live)
+            } else {
+                None
+            };
+            deleted_count += newly_deleted_row_count(raw_matches, live_matches);
         }
 
-        if position_deletes.is_empty() {
-            info!(table = %table_ident, "MoR DELETE: no matching rows, nothing to commit");
-            return Ok(vec![]);
+        // Zero live matches means either nothing matched at all or every match
+        // is already hidden by a live delete file. Both are no-ops: writing a
+        // delete file that re-marks already-deleted positions would burn a
+        // snapshot without changing a single visible row.
+        if deleted_count == 0 {
+            info!(
+                table = %table_ident,
+                marked_positions = position_deletes.len(),
+                "MoR DELETE: no live matching rows, nothing to commit"
+            );
+            return Ok(affected_rows_batch(0));
         }
 
-        let deleted_count = position_deletes.len();
         info!(
             table = %table_ident,
             delete_count = deleted_count,
+            marked_positions = position_deletes.len(),
             "MoR DELETE: writing position delete files"
         );
 
@@ -2493,6 +3227,9 @@ impl WriteHandler {
         )
         .await
         .map_err(|e| SqeError::Execution(format!("Failed to commit MoR DELETE: {e}")))?;
+
+        self.after_commit(session, catalog.as_ref(), &table_ident)
+            .await;
 
         info!(table = %table_ident, deleted_rows = deleted_count, "MoR DELETE committed successfully");
         Ok(affected_rows_batch(deleted_count))
@@ -2549,7 +3286,7 @@ impl WriteHandler {
         let old_data_files = self.collect_data_files(&table).await?;
         if old_data_files.is_empty() {
             info!(table = %table_ident, "equality DELETE: table has no data files");
-            return Ok(vec![]);
+            return Ok(affected_rows_batch(0));
         }
 
         let where_clause = &delete.selection;
@@ -2568,18 +3305,11 @@ impl WriteHandler {
                 file_count = old_data_files.len(),
                 "equality DELETE: no WHERE clause, falling back to CoW truncate"
             );
-            let files_to_remove = self
-                .extend_with_superseded_deletes(&table, old_data_files)
+            // Shared retryable truncate (506); see `handle_delete_mor`.
+            let truncated_rows = self
+                .truncate_via_rewrite(session, &catalog, &table_ident, "equality DELETE")
                 .await?;
-            let tx = Transaction::new(&table);
-            let action = tx.rewrite_files().delete_files(files_to_remove);
-            let tx = action.apply(tx).map_err(|e| {
-                SqeError::Execution(format!("Failed to apply truncate transaction: {e}"))
-            })?;
-            tx.commit(catalog.as_catalog().as_ref())
-                .await
-                .map_err(|e| SqeError::Execution(format!("Failed to commit truncate: {e}")))?;
-            return Ok(vec![]);
+            return Ok(affected_rows_batch(truncated_rows));
         }
 
         let raw_where = where_clause
@@ -2639,7 +3369,7 @@ impl WriteHandler {
 
         if total_matched == 0 {
             info!(table = %table_ident, "equality DELETE: no matching rows, nothing to commit");
-            return Ok(vec![]);
+            return Ok(affected_rows_batch(0));
         }
 
         let delete_files = write_equality_delete_files(
@@ -2683,6 +3413,9 @@ impl WriteHandler {
                 SqeError::Execution(format!("Failed to commit equality DELETE: {e}"))
             }
         })?;
+
+        self.after_commit(session, catalog.as_ref(), &table_ident)
+            .await;
 
         info!(
             table = %table_ident,
@@ -2810,7 +3543,7 @@ impl WriteHandler {
             }
         };
 
-        let mut table = catalog.load_table(&table_ident).await?;
+        let table = catalog.load_table(&table_ident).await?;
 
         // Snapshot-independent setup runs once. Schema, policy predicates, and
         // lifted IN-subqueries do not depend on the data snapshot, so they are
@@ -2837,149 +3570,145 @@ impl WriteHandler {
         // commits. On a commit conflict the whole rewrite re-runs against the
         // reloaded snapshot -- re-committing snapshot-specific rewritten files
         // would drop a concurrent writer's changes (#47, write-path race).
-        let mut attempt = 1u32;
-        let total_updated = loop {
-            let old_data_files = self.collect_data_files(&table).await?;
-            if old_data_files.is_empty() {
-                info!(table = %table_ident, "UPDATE: table has no data files");
-                return Ok(vec![]);
-            }
-            let (to_rewrite, pruned_files) =
-                partition_prune_cow_files(old_data_files, &table, selection.as_ref());
-            if to_rewrite.is_empty() {
-                info!(table = %table_ident, "UPDATE: no partitions match the WHERE clause; nothing to rewrite");
-                return Ok(affected_rows_batch(0));
-            }
-            if pruned_files > 0 {
-                info!(table = %table_ident, pruned_files, rewrite_files = to_rewrite.len(), "UPDATE: partition-pruned CoW rewrite");
-            }
-            info!(
-                table = %table_ident,
-                file_count = to_rewrite.len(),
-                assignments = assignments.len(),
-                where_clause = %where_sql,
-                policy_row_filter = predicates.row_filter_sql.is_some(),
-                policy_masks = predicates.column_mask_sqls.len(),
-                attempt,
-                "UPDATE: CoW rewrite"
-            );
+        let borrowed = (
+            &where_sql[..],
+            &joins_sql[..],
+            &predicates,
+            &table_ident,
+            assignments,
+        );
+        let total_updated = self
+            .commit_rewrite_with_retry(
+                catalog.as_catalog().as_ref(),
+                &table_ident,
+                "update-cow",
+                "UPDATE",
+                move |fresh_table| {
+                    // Copy references only; see `handle_delete` for why.
+                    let (where_sql, joins_sql, predicates, table_ident, assignments) = borrowed;
+                    async move {
+                        let old_data_files = self.collect_data_files(&fresh_table).await?;
+                        if old_data_files.is_empty() {
+                            info!(table = %table_ident, "UPDATE: table has no data files");
+                            return Ok(None);
+                        }
+                        let (to_rewrite, pruned_files) = partition_prune_cow_files(
+                            old_data_files,
+                            &fresh_table,
+                            selection.as_ref(),
+                        );
+                        if to_rewrite.is_empty() {
+                            info!(table = %table_ident, "UPDATE: no partitions match the WHERE clause; nothing to rewrite");
+                            return Ok(None);
+                        }
+                        if pruned_files > 0 {
+                            info!(table = %table_ident, pruned_files, rewrite_files = to_rewrite.len(), "UPDATE: partition-pruned CoW rewrite");
+                        }
+                        info!(
+                            table = %table_ident,
+                            file_count = to_rewrite.len(),
+                            spec_ids = ?distinct_spec_ids(&to_rewrite),
+                            assignments = assignments.len(),
+                            where_clause = %where_sql,
+                            policy_row_filter = predicates.row_filter_sql.is_some(),
+                            policy_masks = predicates.column_mask_sqls.len(),
+                            "UPDATE: CoW rewrite"
+                        );
 
-            let mut new_data_files = Vec::new();
-            let mut updated_this_attempt = 0usize;
-            let tracker = new_upload_tracker();
-            let cleanup_guard =
-                WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "update-cow")
-                    .with_metrics(self.metrics.clone());
-            let pool = ctx.runtime_env().memory_pool.clone();
-            let read_plan = self.plan_delete_aware_read(&table).await?;
-
-            for data_file in &to_rewrite {
-                let file_path = data_file.file_path();
-                let batches = self
-                    .read_data_file_applying_deletes(&read_plan, file_path, ctx, true)
-                    .await?;
-                if batches.is_empty() {
-                    continue;
-                }
-                // Pool-track the per-file rewritten accumulation (Layer A,
-                // cow-keep-buffer). The decode reservation has released by now,
-                // so this is its own tracked buffer.
-                let mut rewritten = TrackedBatchBuffer::gated(
-                    &pool,
-                    "cow-keep-buffer",
-                    self.config.query.write_buffer_tracking,
-                );
-                for batch in &batches {
-                    let out = self
-                        .apply_update(
-                            ctx,
-                            batch,
-                            assignments,
-                            &where_sql,
-                            &joins_sql,
-                            &table_ident,
-                            &predicates,
+                        let mut new_data_files = Vec::new();
+                        let mut updated_this_attempt = 0usize;
+                        let tracker = new_upload_tracker();
+                        let cleanup_guard = WriteCleanupGuard::new(
+                            fresh_table.file_io().clone(),
+                            tracker.clone(),
+                            "update-cow",
                         )
-                        .await?;
-                    rewritten.push(out)?;
-                }
-                for batch in &batches {
-                    let count = self
-                        .count_matching_rows(
-                            ctx,
-                            batch,
-                            &where_sql,
-                            &joins_sql,
-                            &table_ident,
-                            &predicates,
-                        )
-                        .await?;
-                    updated_this_attempt += count;
-                }
-                let new_files = write_data_files_with_metrics(
-                    &table,
-                    rewritten.into_inner(),
-                    "update",
-                    self.metrics.as_ref(),
-                    self.compression(session),
-                    tracker.clone(),
-                )
-                .await?;
-                new_data_files.extend(new_files);
-            }
+                        .with_metrics(self.metrics.clone());
+                        let pool = ctx.runtime_env().memory_pool.clone();
+                        let read_plan = self.plan_delete_aware_read(&fresh_table).await?;
 
-            info!(
-                table = %table_ident,
-                updated_rows = updated_this_attempt,
-                rewrite_files = to_rewrite.len(),
-                new_files = new_data_files.len(),
-                "UPDATE: committing CoW rewrite"
-            );
+                        for data_file in &to_rewrite {
+                            let file_path = data_file.file_path();
+                            let batches = self
+                                .read_data_file_applying_deletes(&read_plan, file_path, ctx, true)
+                                .await?;
+                            if batches.is_empty() {
+                                continue;
+                            }
+                            // Pool-track the per-file rewritten accumulation (Layer A,
+                            // cow-keep-buffer). The decode reservation has released by now,
+                            // so this is its own tracked buffer.
+                            let mut rewritten = TrackedBatchBuffer::gated(
+                                &pool,
+                                "cow-keep-buffer",
+                                self.config.query.write_buffer_tracking,
+                            );
+                            for batch in &batches {
+                                let out = self
+                                    .apply_update(
+                                        ctx,
+                                        batch,
+                                        assignments,
+                                        where_sql,
+                                        joins_sql,
+                                        table_ident,
+                                        predicates,
+                                    )
+                                    .await?;
+                                rewritten.push(out)?;
+                            }
+                            for batch in &batches {
+                                let count = self
+                                    .count_matching_rows(
+                                        ctx,
+                                        batch,
+                                        where_sql,
+                                        joins_sql,
+                                        table_ident,
+                                        predicates,
+                                    )
+                                    .await?;
+                                updated_this_attempt += count;
+                            }
+                            let new_files = write_data_files_with_metrics(
+                                &fresh_table,
+                                rewritten.into_inner(),
+                                "update",
+                                self.metrics.as_ref(),
+                                self.compression(session),
+                                tracker.clone(),
+                            )
+                            .await?;
+                            new_data_files.extend(new_files);
+                        }
 
-            let files_to_remove = self
-                .extend_with_superseded_deletes(&table, to_rewrite)
-                .await?;
-            let tx = Transaction::new(&table);
-            let action = tx
-                .rewrite_files()
-                .add_data_files(new_data_files)
-                .delete_files(files_to_remove);
-            let commit_result = match action.apply(tx) {
-                Ok(tx) => tx.commit(catalog.as_catalog().as_ref()).await,
-                Err(e) => Err(e),
-            };
-            match commit_result {
-                Ok(_) => {
-                    cleanup_guard.mark_committed();
-                    break updated_this_attempt;
-                }
-                Err(e)
-                    if (e.retryable() || is_conflict_message(&e.to_string()))
-                        && attempt < COW_MAX_ATTEMPTS =>
-                {
-                    // Drop the guard so this attempt's orphan parquet files are
-                    // deleted before we reload and rewrite again.
-                    drop(cleanup_guard);
-                    let sleep_ms = cow_conflict_backoff_ms(attempt);
-                    warn!(
-                        table = %table_ident,
-                        op = "update-cow",
-                        attempt,
-                        backoff_ms = sleep_ms,
-                        error = %e,
-                        "commit conflict; reloading table and retrying"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-                    table = catalog.load_table(&table_ident).await?;
-                    attempt += 1;
-                    continue;
-                }
-                Err(e) => {
-                    return Err(SqeError::Execution(format!("Failed to commit UPDATE: {e}")));
-                }
-            }
+                        info!(
+                            table = %table_ident,
+                            updated_rows = updated_this_attempt,
+                            rewrite_files = to_rewrite.len(),
+                            new_files = new_data_files.len(),
+                            "UPDATE: committing CoW rewrite"
+                        );
+
+                        let files_to_remove = self
+                            .extend_with_superseded_deletes(&fresh_table, to_rewrite)
+                            .await?;
+                        Ok(Some(RewriteAttempt {
+                            add: new_data_files,
+                            remove: files_to_remove,
+                            cleanup: Some(cleanup_guard),
+                            value: updated_this_attempt,
+                        }))
+                    }
+                },
+            )
+            .await?;
+
+        let Some(total_updated) = total_updated else {
+            return Ok(affected_rows_batch(0));
         };
-
+        self.after_commit(session, catalog.as_ref(), &table_ident)
+            .await;
         info!(table = %table_ident, updated_rows = total_updated, "UPDATE committed successfully");
         Ok(affected_rows_batch(total_updated))
     }
@@ -3121,7 +3850,7 @@ impl WriteHandler {
         let old_data_files = self.collect_data_files(&table).await?;
         if old_data_files.is_empty() {
             info!(table = %table_ident, "MoR UPDATE: table has no data files");
-            return Ok(vec![]);
+            return Ok(affected_rows_batch(0));
         }
 
         let target_schema = build_arrow_schema_for_table(&table)?;
@@ -3225,7 +3954,7 @@ impl WriteHandler {
 
         if total_updated == 0 {
             info!(table = %table_ident, "MoR UPDATE: no matching rows, nothing to commit");
-            return Ok(vec![]);
+            return Ok(affected_rows_batch(0));
         }
 
         // Write the data file with the new values and the equality delete
@@ -3292,6 +4021,8 @@ impl WriteHandler {
             }
         })?;
         cleanup_guard.mark_committed();
+        self.after_commit(session, catalog.as_ref(), &table_ident)
+            .await;
 
         info!(
             table = %table_ident,
@@ -3312,12 +4043,20 @@ impl WriteHandler {
     /// The caller is responsible for executing the source query and providing
     /// the result batches. This follows the same pattern as `handle_ctas` and
     /// `handle_insert`.
-    #[instrument(skip(self, session, stmt, source_batches, catalog, ctx), fields(username = %session.user.username))]
+    ///
+    /// `source_schema_hint` is the Arrow schema of the source's logical plan,
+    /// supplied by the caller because zero batches carry no schema
+    /// (architecture review 501). It is only consulted when the source
+    /// returned no rows and the statement carries a `WHEN NOT MATCHED BY
+    /// SOURCE` clause, which must still run against the whole target.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(self, session, stmt, source_batches, source_schema_hint, catalog, ctx), fields(username = %session.user.username))]
     pub async fn handle_merge(
         &self,
         session: &Session,
         stmt: &Statement,
         source_batches: Vec<RecordBatch>,
+        source_schema_hint: Option<arrow_schema::SchemaRef>,
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
         policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
@@ -3365,113 +4104,22 @@ impl WriteHandler {
             "Executing MERGE INTO"
         );
 
-        // Load target table and read all data files
+        // Load the target table for the snapshot-independent setup below (its
+        // column names, the policy predicates, the compiled merge SQL). The
+        // rewrite itself re-reads the target inside the retry closure: on a
+        // commit conflict the whole merge re-runs against the reloaded
+        // snapshot, because rewritten files are snapshot-specific (506).
         let table = catalog.load_table(&table_ident).await?;
 
-        let old_data_files = self.collect_data_files(&table).await?;
-        let read_plan = self.plan_delete_aware_read(&table).await?;
-
-        // Build the target relation for the merge SELECT. Two paths:
-        //  - Buffered (default): read the whole target into a pool-tracked Vec
-        //    (Layer A `merge-target-buffer`) and register it as a MemTable.
-        //  - Streaming (B2, opt-in via `merge_target_streaming`): scan the
-        //    pinned `old_data_files` lazily so the target flows through the
-        //    merge join as governed operator memory instead of a MemTable Vec.
-        // See docs/internal/specs/2026-07-02-write-path-memory-safety-design.md.
-        //
-        // The streaming provider decodes raw parquet, so it must stand down
-        // when the snapshot carries delete files (#371): rewriting a target
-        // read without its position/equality deletes applied resurrects
-        // MoR-deleted rows. The buffered path below applies them.
-        let stream_target = self.config.query.merge_target_streaming
-            && self.config.query.write_buffer_tracking
-            && !read_plan.has_deletes();
-        if self.config.query.merge_target_streaming
-            && self.config.query.write_buffer_tracking
-            && read_plan.has_deletes()
-        {
-            info!(
-                table = %table_ident,
-                "MERGE: target carries delete files; using the buffered \
-                 (delete-applying) path instead of the streaming provider"
-            );
-        }
-
-        // Holds the Layer A target reservation alive to the end of the merge in
-        // the buffered path (the MemTable clones its Arc-backed batches). None
-        // in the streaming path.
-        let mut _target_buf_hold: Option<TrackedBatchBuffer> = None;
-
-        let (target_schema, target_provider): (
-            arrow_schema::SchemaRef,
-            Arc<dyn datafusion::datasource::TableProvider>,
-        ) = if stream_target {
-            let schema = Arc::new(
-                iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).map_err(
-                    |e| {
-                        SqeError::Execution(format!(
-                            "Failed to convert Iceberg schema to Arrow: {e}"
-                        ))
-                    },
-                )?,
-            );
-            let provider = crate::merge_target_provider::merge_target_table(
-                &table,
-                &old_data_files,
-                schema.clone(),
-            )?;
-            info!(
-                table = %table_ident,
-                files = old_data_files.len(),
-                "MERGE: streaming target from pinned data files (B2)"
-            );
-            (schema, Arc::new(provider))
-        } else {
-            let pool = ctx.runtime_env().memory_pool.clone();
-            let mut target_buf = TrackedBatchBuffer::gated(
-                &pool,
-                "merge-target-buffer",
-                self.config.query.write_buffer_tracking,
-            );
-            for data_file in &old_data_files {
-                let file_path = data_file.file_path();
-                // track = false: the returned batches are re-registered into
-                // `merge-target-buffer` just below, so tracking the decode here
-                // too would double-count the same bytes.
-                let batches = self
-                    .read_data_file_applying_deletes(&read_plan, file_path, ctx, false)
-                    .await?;
-                for batch in batches {
-                    target_buf.push(batch)?;
-                }
-            }
-
-            // Target schema from existing data (or table metadata if empty).
-            let target_schema = if let Some(first) = target_buf.as_slice().first() {
-                first.schema()
-            } else {
-                let iceberg_schema = table.metadata().current_schema();
-                Arc::new(
-                    iceberg::arrow::schema_to_arrow_schema(iceberg_schema).map_err(|e| {
-                        SqeError::Execution(format!(
-                            "Failed to convert Iceberg schema to Arrow: {e}"
-                        ))
-                    })?,
-                )
-            };
-
-            let target_mem = if target_buf.is_empty() {
-                datafusion::datasource::MemTable::try_new(target_schema.clone(), vec![vec![]])
-            } else {
-                datafusion::datasource::MemTable::try_new(
-                    target_schema.clone(),
-                    vec![target_buf.as_slice().to_vec()],
-                )
-            }
-            .map_err(|e| SqeError::Execution(format!("Failed to create target MemTable: {e}")))?;
-            _target_buf_hold = Some(target_buf);
-            (target_schema, Arc::new(target_mem))
-        };
+        // Column names for the merge SQL come from the table's current schema.
+        // The per-attempt target relation derives its own Arrow schema from the
+        // batches it read (or from this same metadata when the table is empty),
+        // and the column names are identical either way.
+        let target_schema = Arc::new(
+            iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).map_err(
+                |e| SqeError::Execution(format!("Failed to convert Iceberg schema to Arrow: {e}")),
+            )?,
+        );
 
         let target_columns: Vec<String> = target_schema
             .fields()
@@ -3517,22 +4165,41 @@ impl WriteHandler {
             vec![qualified_target_ref.clone(), qualified_source_ref.clone()],
         );
 
-        // Register the target relation in the full session context (which has
-        // all catalog tables registered for cross-table subqueries).
-        ctx.register_table(&qualified_target_ref, target_provider)
-            .map_err(|e| SqeError::Execution(format!("Failed to register target provider: {e}")))?;
+        // Use the pre-executed source batches (caller handles source query
+        // execution). An empty source is NOT a shortcut: with no source rows
+        // every target row is unmatched-by-source, so a WHEN NOT MATCHED BY
+        // SOURCE clause has to run (501). The decision needs the clause
+        // classification, which needs the source's column names, which zero
+        // batches cannot supply -- hence `source_schema_hint` from the
+        // caller's source plan. Without a hint we cannot build the merge SQL
+        // at all and fall back to the historical no-op.
+        let source_empty = source_batches.is_empty();
+        let source_schema = match source_batches.first() {
+            Some(first) => first.schema(),
+            None => match source_schema_hint {
+                Some(schema) => schema,
+                None => {
+                    info!(
+                        table = %table_ident,
+                        "MERGE: source returned no data and no source schema was \
+                         supplied, nothing to merge"
+                    );
+                    return Ok(affected_rows_batch(0));
+                }
+            },
+        };
 
-        // Use the pre-executed source batches (caller handles source query execution)
-        if source_batches.is_empty() {
-            info!(table = %table_ident, "MERGE: source returned no data, nothing to merge");
-            return Ok(vec![]);
-        }
-
-        let source_schema = source_batches[0].schema();
-
-        // Register source data as a MemTable
+        // Register source data as a MemTable (an empty partition list when the
+        // source produced no batches, so the FULL OUTER JOIN still plans). The
+        // source is snapshot-independent, so it is registered once; only the
+        // target relation is rebuilt per attempt.
+        let source_partitions = if source_empty {
+            vec![vec![]]
+        } else {
+            vec![source_batches]
+        };
         let source_mem =
-            datafusion::datasource::MemTable::try_new(source_schema.clone(), vec![source_batches])
+            datafusion::datasource::MemTable::try_new(source_schema.clone(), source_partitions)
                 .map_err(|e| {
                     SqeError::Execution(format!("Failed to create source MemTable: {e}"))
                 })?;
@@ -3581,19 +4248,54 @@ impl WriteHandler {
         let classified = crate::merge_sql::classify_merge_clauses(clauses, &merge_names)?;
         let (matched_clauses, not_matched_clauses, by_source_clauses) = classified.counts();
 
+        // 501: the emptiness shortcut lives *after* classification. With an
+        // empty source and no BY SOURCE clause nothing can change, so return
+        // before the rewrite (no new snapshot). With a BY SOURCE clause the
+        // merge runs: every target row is unmatched-by-source.
+        //
+        // The CoW affected-row count is normally the number of rows written,
+        // which is 0 after a BY SOURCE DELETE emptied the table. Count the
+        // claimed target rows instead, which is exact here: an empty source
+        // matches nothing and inserts nothing, so BY SOURCE is the only class
+        // that can change a row. The count runs per attempt (inside the retry
+        // closure) because it reads the target relation of that attempt.
+        let mut empty_source_count_sql: Option<String> = None;
+        if source_empty {
+            if crate::merge_sql::empty_source_is_no_op(&classified) {
+                info!(
+                    table = %table_ident,
+                    "MERGE: source returned no data and no WHEN NOT MATCHED BY \
+                     SOURCE clause, nothing to merge"
+                );
+                return Ok(affected_rows_batch(0));
+            }
+            empty_source_count_sql = crate::merge_sql::empty_source_claim_count_sql(
+                &classified,
+                &merge_names,
+                &qualified_target_ref,
+            );
+            info!(
+                table = %table_ident,
+                by_source_clauses,
+                "MERGE: empty source, applying WHEN NOT MATCHED BY SOURCE to \
+                 every target row"
+            );
+        }
+
         // Cardinality check: a target row matched by >1 source row would be
         // silently duplicated by the FULL OUTER JOIN. Only matched clauses can
         // trigger it, so skip the extra count pass for insert-only / by-source
         // merges.
-        if self.config.query.merge_cardinality_check && matched_clauses > 0 {
-            let (pair_sql, matched_sql) = crate::merge_sql::build_cardinality_check_sql(
+        let cardinality_sql = if self.config.query.merge_cardinality_check && matched_clauses > 0 {
+            Some(crate::merge_sql::build_cardinality_check_sql(
                 &merge_names,
                 &qualified_target_ref,
                 &qualified_source_ref,
                 &on_rewritten,
-            );
-            check_merge_cardinality(ctx, &pair_sql, &matched_sql).await?;
-        }
+            ))
+        } else {
+            None
+        };
 
         let select_sql = crate::merge_sql::build_merge_select(
             &classified,
@@ -3612,83 +4314,258 @@ impl WriteHandler {
             "MERGE: executing merge query"
         );
 
-        let df = ctx
-            .sql(&select_sql)
-            .await
-            .map_err(|e| SqeError::Execution(format!("Failed to plan MERGE query: {e}")))?;
-
-        // Layer B (output side): stream the merged output straight into the
-        // streaming sink instead of `df.collect()`-ing the whole merged result
-        // into a Vec and buffering it through `write_data_files_with_metrics`.
-        // The merged output is at least as large as the target table, so this
-        // removes the single biggest MERGE buffer. The join/CASE state stays
-        // inside DataFusion operators, which are pool-tracked (and spillable
-        // under subsystem A) rather than an invisible Vec.
-        //
-        // The stream must be fully consumed by the awaited write below before
-        // the `target_buf` reservation and the `MergeScratchCleanup` guard
-        // (both declared above) drop: the MemTableExec feeding the join holds
-        // Arc refs into the tracked target batches for the duration of the read.
-        // Rows removed by the MERGE (DELETE clauses, unclaimed source-only
-        // rows) are filtered by the keep-column WHERE inside `select_sql`, so
-        // the stream carries exactly the surviving rows.
-        let stream = df
-            .execute_stream()
-            .await
-            .map_err(|e| SqeError::Execution(format!("Failed to execute MERGE query: {e}")))?;
-
-        // Write new data files from the merged results (streaming).
-        let tracker = new_upload_tracker();
-        let cleanup_guard =
-            WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "merge-cow");
-        let (new_data_files, total_rows) = write_data_files_streaming_with_metrics(
-            &table,
-            stream,
-            "merge",
-            self.metrics.as_ref(),
-            self.compression(session),
-            tracker,
-            self.fanout_limits(Some(ctx.runtime_env().memory_pool.clone())),
-        )
-        .await?;
-
-        info!(
-            table = %table_ident,
-            old_files = old_data_files.len(),
-            new_files = new_data_files.len(),
-            total_rows,
-            "MERGE: committing CoW rewrite"
+        // The rewrite under optimistic-concurrency retry (506). Each attempt
+        // re-reads the target's data files, re-registers the target scratch
+        // relation over that snapshot, re-runs the merge SELECT and writes new
+        // files; a conflict drops the attempt's parquet files and starts over.
+        // Before this, MERGE — the dbt incremental hot path, and the statement
+        // most likely to run against a table the compaction scheduler is
+        // rewriting — failed the whole statement on the first lost race.
+        let borrowed = (
+            &table_ident,
+            &qualified_target_ref[..],
+            &select_sql[..],
+            empty_source_count_sql.as_deref(),
+            cardinality_sql.as_ref(),
         );
+        let outcome = self
+            .commit_rewrite_with_retry(
+                catalog.as_catalog().as_ref(),
+                &table_ident,
+                "merge-cow",
+                "MERGE",
+                move |fresh_table| {
+                    let (
+                        table_ident,
+                        qualified_target_ref,
+                        select_sql,
+                        empty_source_count_sql,
+                        cardinality_sql,
+                    ) = borrowed;
+                    async move {
+                        let old_data_files = self.collect_data_files(&fresh_table).await?;
+                        let read_plan = self.plan_delete_aware_read(&fresh_table).await?;
+                        let (target_provider, _target_buf_hold) = self
+                            .build_merge_target(
+                                &fresh_table,
+                                &old_data_files,
+                                &read_plan,
+                                ctx,
+                                table_ident,
+                            )
+                            .await?;
 
-        // Atomic commit: remove all old files, add new merged files
-        if old_data_files.is_empty() && new_data_files.is_empty() {
-            cleanup_guard.mark_committed();
-            info!(table = %table_ident, "MERGE: no changes to commit");
-            return Ok(vec![]);
-        }
+                        // Register the target relation in the full session
+                        // context (which has all catalog tables registered for
+                        // cross-table subqueries). A retry replaces the
+                        // previous attempt's registration under the same name.
+                        ctx.register_table(qualified_target_ref, target_provider)
+                            .map_err(|e| {
+                                SqeError::Execution(format!(
+                                    "Failed to register target provider: {e}"
+                                ))
+                            })?;
 
-        let files_to_remove = self
-            .extend_with_superseded_deletes(&table, old_data_files)
+                        if let Some((pair_sql, matched_sql)) = cardinality_sql {
+                            check_merge_cardinality(ctx, pair_sql, matched_sql).await?;
+                        }
+
+                        let mut empty_source_affected: Option<usize> = None;
+                        if let Some(count_sql) = empty_source_count_sql {
+                            let claimed =
+                                scalar_count(ctx, count_sql, "MERGE empty-source row count")
+                                    .await?;
+                            empty_source_affected = Some(claimed.max(0) as usize);
+                        }
+
+                        let df = ctx.sql(select_sql).await.map_err(|e| {
+                            SqeError::Execution(format!("Failed to plan MERGE query: {e}"))
+                        })?;
+
+                        // Layer B (output side): stream the merged output straight into the
+                        // streaming sink instead of `df.collect()`-ing the whole merged result
+                        // into a Vec and buffering it through `write_data_files_with_metrics`.
+                        // The merged output is at least as large as the target table, so this
+                        // removes the single biggest MERGE buffer. The join/CASE state stays
+                        // inside DataFusion operators, which are pool-tracked (and spillable
+                        // under subsystem A) rather than an invisible Vec.
+                        //
+                        // The stream must be fully consumed by the awaited write below before
+                        // the `_target_buf_hold` reservation and the `MergeScratchCleanup`
+                        // guard drop: the MemTableExec feeding the join holds Arc refs into
+                        // the tracked target batches for the duration of the read.
+                        // Rows removed by the MERGE (DELETE clauses, unclaimed source-only
+                        // rows) are filtered by the keep-column WHERE inside `select_sql`, so
+                        // the stream carries exactly the surviving rows.
+                        let stream = df.execute_stream().await.map_err(|e| {
+                            SqeError::Execution(format!("Failed to execute MERGE query: {e}"))
+                        })?;
+
+                        // Write new data files from the merged results (streaming).
+                        let tracker = new_upload_tracker();
+                        let cleanup_guard = WriteCleanupGuard::new(
+                            fresh_table.file_io().clone(),
+                            tracker.clone(),
+                            "merge-cow",
+                        )
+                        .with_metrics(self.metrics.clone());
+                        let (new_data_files, total_rows) = write_data_files_streaming_with_metrics(
+                            &fresh_table,
+                            stream,
+                            "merge",
+                            self.metrics.as_ref(),
+                            self.compression(session),
+                            tracker,
+                            self.fanout_limits(Some(ctx.runtime_env().memory_pool.clone())),
+                        )
+                        .await?;
+
+                        info!(
+                            table = %table_ident,
+                            old_files = old_data_files.len(),
+                            new_files = new_data_files.len(),
+                            total_rows,
+                            "MERGE: committing CoW rewrite"
+                        );
+
+                        // Atomic commit: remove all old files, add new merged files
+                        if old_data_files.is_empty() && new_data_files.is_empty() {
+                            cleanup_guard.mark_committed();
+                            info!(table = %table_ident, "MERGE: no changes to commit");
+                            return Ok(None);
+                        }
+
+                        let files_to_remove = self
+                            .extend_with_superseded_deletes(&fresh_table, old_data_files)
+                            .await?;
+                        Ok(Some(RewriteAttempt {
+                            add: new_data_files,
+                            remove: files_to_remove,
+                            cleanup: Some(cleanup_guard),
+                            value: (total_rows, empty_source_affected),
+                        }))
+                    }
+                },
+            )
             .await?;
-        let tx = Transaction::new(&table);
-        let mut action = tx.rewrite_files();
-        if !new_data_files.is_empty() {
-            action = action.add_data_files(new_data_files);
-        }
-        if !files_to_remove.is_empty() {
-            action = action.delete_files(files_to_remove);
-        }
-        let tx = action
-            .apply(tx)
-            .map_err(|e| SqeError::Execution(format!("Failed to apply MERGE rewrite: {e}")))?;
-        tx.commit(catalog.as_catalog().as_ref())
-            .await
-            .map_err(|e| SqeError::Execution(format!("Failed to commit MERGE: {e}")))?;
-        cleanup_guard.mark_committed();
-        catalog.invalidate_table_all_tokens(&table_ident).await;
 
-        info!(table = %table_ident, total_rows, "MERGE committed successfully");
-        Ok(affected_rows_batch(total_rows))
+        let Some((total_rows, empty_source_affected)) = outcome else {
+            return Ok(affected_rows_batch(0));
+        };
+        self.after_commit(session, catalog.as_ref(), &table_ident)
+            .await;
+
+        // With an empty source the rows the statement *changed* are the target
+        // rows a BY SOURCE clause claimed, counted before the rewrite; the
+        // rows it *wrote* (`total_rows`) is 0 after a BY SOURCE DELETE (501).
+        let affected = empty_source_affected.unwrap_or(total_rows);
+        info!(table = %table_ident, total_rows, affected, "MERGE committed successfully");
+        Ok(affected_rows_batch(affected))
+    }
+
+    /// Build the DataFusion relation the merge SELECT reads its target from,
+    /// for one snapshot. Returns the provider plus the pool reservation the
+    /// caller must hold until the merged stream has been fully consumed
+    /// (buffered path only; `None` in the streaming path).
+    ///
+    /// Two paths:
+    ///  - Buffered (default): read the whole target into a pool-tracked Vec
+    ///    (Layer A `merge-target-buffer`) and register it as a MemTable.
+    ///  - Streaming (B2, opt-in via `merge_target_streaming`): scan the pinned
+    ///    `old_data_files` lazily so the target flows through the merge join as
+    ///    governed operator memory instead of a MemTable Vec.
+    ///    See docs/internal/specs/2026-07-02-write-path-memory-safety-design.md.
+    ///
+    /// The streaming provider decodes raw parquet, so it must stand down when
+    /// the snapshot carries delete files (#371): rewriting a target read
+    /// without its position/equality deletes applied resurrects MoR-deleted
+    /// rows. The buffered path applies them.
+    async fn build_merge_target(
+        &self,
+        table: &IcebergTable,
+        old_data_files: &[DataFile],
+        read_plan: &DeleteAwareReadPlan,
+        ctx: &DFSessionContext,
+        table_ident: &TableIdent,
+    ) -> sqe_core::Result<(
+        Arc<dyn datafusion::datasource::TableProvider>,
+        Option<TrackedBatchBuffer>,
+    )> {
+        let stream_target = self.config.query.merge_target_streaming
+            && self.config.query.write_buffer_tracking
+            && !read_plan.has_deletes();
+        if self.config.query.merge_target_streaming
+            && self.config.query.write_buffer_tracking
+            && read_plan.has_deletes()
+        {
+            info!(
+                table = %table_ident,
+                "MERGE: target carries delete files; using the buffered \
+                 (delete-applying) path instead of the streaming provider"
+            );
+        }
+
+        if stream_target {
+            let schema = Arc::new(
+                iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).map_err(
+                    |e| {
+                        SqeError::Execution(format!(
+                            "Failed to convert Iceberg schema to Arrow: {e}"
+                        ))
+                    },
+                )?,
+            );
+            let provider =
+                crate::merge_target_provider::merge_target_table(table, old_data_files, schema)?;
+            info!(
+                table = %table_ident,
+                files = old_data_files.len(),
+                "MERGE: streaming target from pinned data files (B2)"
+            );
+            return Ok((Arc::new(provider), None));
+        }
+
+        let pool = ctx.runtime_env().memory_pool.clone();
+        let mut target_buf = TrackedBatchBuffer::gated(
+            &pool,
+            "merge-target-buffer",
+            self.config.query.write_buffer_tracking,
+        );
+        for data_file in old_data_files {
+            let file_path = data_file.file_path();
+            // track = false: the returned batches are re-registered into
+            // `merge-target-buffer` just below, so tracking the decode here
+            // too would double-count the same bytes.
+            let batches = self
+                .read_data_file_applying_deletes(read_plan, file_path, ctx, false)
+                .await?;
+            for batch in batches {
+                target_buf.push(batch)?;
+            }
+        }
+
+        // Target schema from existing data (or table metadata if empty).
+        let target_schema = if let Some(first) = target_buf.as_slice().first() {
+            first.schema()
+        } else {
+            let iceberg_schema = table.metadata().current_schema();
+            Arc::new(
+                iceberg::arrow::schema_to_arrow_schema(iceberg_schema).map_err(|e| {
+                    SqeError::Execution(format!("Failed to convert Iceberg schema to Arrow: {e}"))
+                })?,
+            )
+        };
+
+        let target_mem = if target_buf.is_empty() {
+            datafusion::datasource::MemTable::try_new(target_schema, vec![vec![]])
+        } else {
+            datafusion::datasource::MemTable::try_new(
+                target_schema,
+                vec![target_buf.as_slice().to_vec()],
+            )
+        }
+        .map_err(|e| SqeError::Execution(format!("Failed to create target MemTable: {e}")))?;
+        Ok((Arc::new(target_mem), Some(target_buf)))
     }
 
     /// Plan + collect one MoR MERGE sub-query, mapping errors to a labelled
@@ -3717,12 +4594,17 @@ impl WriteHandler {
     /// - `merge-on-read`: route to `handle_merge_equality` when the table
     ///   declares a primary key. Without a PK we fall back to CoW because
     ///   the MATCHED clauses need old-row keys for the equality delete.
+    ///
+    /// `source_schema_hint` carries the source plan's Arrow schema so an empty
+    /// source can still be registered as a typed relation and a `WHEN NOT
+    /// MATCHED BY SOURCE` clause can run against it (501).
     #[allow(clippy::too_many_arguments)]
     pub async fn handle_merge_dispatch(
         &self,
         session: &Session,
         stmt: &Statement,
         source_batches: Vec<RecordBatch>,
+        source_schema_hint: Option<arrow_schema::SchemaRef>,
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
         source_plan: Option<LogicalPlan>,
@@ -3753,6 +4635,7 @@ impl WriteHandler {
                         session,
                         stmt,
                         source_batches,
+                        source_schema_hint,
                         catalog,
                         ctx,
                         policy_summary_out,
@@ -3768,6 +4651,7 @@ impl WriteHandler {
                         session,
                         stmt,
                         source_batches,
+                        source_schema_hint,
                         catalog,
                         ctx,
                         policy_summary_out,
@@ -3781,6 +4665,7 @@ impl WriteHandler {
                     session,
                     stmt,
                     source_batches,
+                    source_schema_hint,
                     catalog,
                     ctx,
                     policy_summary_out,
@@ -3793,6 +4678,7 @@ impl WriteHandler {
                     session,
                     stmt,
                     source_batches,
+                    source_schema_hint,
                     catalog,
                     ctx,
                     policy_summary_out,
@@ -3846,6 +4732,7 @@ impl WriteHandler {
                         session,
                         stmt,
                         source_batches,
+                        source_schema_hint,
                         catalog,
                         ctx,
                         policy_summary_out,
@@ -3860,6 +4747,7 @@ impl WriteHandler {
                         session,
                         stmt,
                         source_batches,
+                        source_schema_hint,
                         catalog,
                         ctx,
                         policy_summary_out,
@@ -3873,6 +4761,7 @@ impl WriteHandler {
                     session,
                     stmt,
                     source_batches,
+                    source_schema_hint,
                     catalog,
                     ctx,
                     policy_summary_out,
@@ -3902,8 +4791,13 @@ impl WriteHandler {
     /// per-clause guards are mutually exclusive and no row is emitted twice.
     /// All outputs commit in one `RowDeltaAction`. Target rows claimed by no
     /// clause pass through untouched: no rewrite, no delete.
+    ///
+    /// `source_schema_hint` supplies the source's Arrow schema when the source
+    /// produced zero batches, so a `WHEN NOT MATCHED BY SOURCE` clause still
+    /// runs against every target row (501).
+    #[allow(clippy::too_many_arguments)]
     #[instrument(
-        skip(self, session, stmt, source_batches, catalog, ctx),
+        skip(self, session, stmt, source_batches, source_schema_hint, catalog, ctx),
         fields(username = %session.user.username)
     )]
     pub async fn handle_merge_equality(
@@ -3911,6 +4805,7 @@ impl WriteHandler {
         session: &Session,
         stmt: &Statement,
         source_batches: Vec<RecordBatch>,
+        source_schema_hint: Option<arrow_schema::SchemaRef>,
         catalog: Arc<SessionCatalog>,
         ctx: &DFSessionContext,
         policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
@@ -4022,13 +4917,31 @@ impl WriteHandler {
         ctx.register_table(&q_target, Arc::new(target_mem))
             .map_err(|e| SqeError::Execution(format!("Failed to register target MemTable: {e}")))?;
 
-        if source_batches.is_empty() {
-            info!(table = %table_ident, "MoR MERGE: source returned no data, nothing to merge");
-            return Ok(vec![]);
-        }
-        let source_schema = source_batches[0].schema();
+        // An empty source is not a shortcut here either (501): the decision
+        // needs the clause classification, which is below. Register the source
+        // as an empty typed relation so the per-clause anti-joins still plan.
+        let source_empty = source_batches.is_empty();
+        let source_schema = match source_batches.first() {
+            Some(first) => first.schema(),
+            None => match source_schema_hint {
+                Some(schema) => schema,
+                None => {
+                    info!(
+                        table = %table_ident,
+                        "MoR MERGE: source returned no data and no source schema \
+                         was supplied, nothing to merge"
+                    );
+                    return Ok(affected_rows_batch(0));
+                }
+            },
+        };
+        let source_partitions = if source_empty {
+            vec![vec![]]
+        } else {
+            vec![source_batches]
+        };
         let source_mem =
-            datafusion::datasource::MemTable::try_new(source_schema.clone(), vec![source_batches])
+            datafusion::datasource::MemTable::try_new(source_schema.clone(), source_partitions)
                 .map_err(|e| {
                     SqeError::Execution(format!("Failed to create source MemTable: {e}"))
                 })?;
@@ -4085,6 +4998,19 @@ impl WriteHandler {
             .unwrap_or_default();
         let classified = crate::merge_sql::classify_merge_clauses(clauses, &merge_names)?;
         let (matched_count, not_matched_count, by_source_count) = classified.counts();
+
+        // 501: emptiness shortcut after classification. Without a BY SOURCE
+        // clause an empty source cannot change anything, so return before the
+        // row delta (no new snapshot). With one, every target row is
+        // unmatched-by-source and the BY SOURCE loop below acts on all of them.
+        if source_empty && crate::merge_sql::empty_source_is_no_op(&classified) {
+            info!(
+                table = %table_ident,
+                "MoR MERGE: source returned no data and no WHEN NOT MATCHED BY \
+                 SOURCE clause, nothing to merge"
+            );
+            return Ok(affected_rows_batch(0));
+        }
 
         // Cardinality check (shared with CoW): a matched target row hit by more
         // than one source row would be emitted multiple times. Only matched
@@ -4309,7 +5235,7 @@ impl WriteHandler {
         let total_touched = updated_rows + deleted_rows + inserted_rows;
         if total_touched == 0 {
             info!(table = %table_ident, "MoR MERGE: no matched or not-matched rows");
-            return Ok(vec![]);
+            return Ok(affected_rows_batch(0));
         }
 
         let tracker = new_upload_tracker();
@@ -4390,7 +5316,8 @@ impl WriteHandler {
             }
         })?;
         cleanup_guard.mark_committed();
-        catalog.invalidate_table_all_tokens(&table_ident).await;
+        self.after_commit(session, catalog.as_ref(), &table_ident)
+            .await;
 
         info!(
             table = %table_ident,
@@ -4428,129 +5355,148 @@ impl WriteHandler {
     /// touched). Callers MUST route zero-row overwrites here rather than taking
     /// an "empty SELECT" early return.
     ///
-    /// `catalog` is `&dyn Catalog` (the bridge handed out by
-    /// `create_catalog_bridge`), not `&SessionCatalog`: both INSERT entrypoints
-    /// only hold the erased catalog trait object. `SessionCatalogBridge::load_table`
-    /// delegates through `SessionCatalog::load_table` (cache-aware), so this loses
-    /// no behaviour versus going through `SessionCatalog` directly.
+    /// `catalog` is the `SessionCatalog` the caller resolved: the erased
+    /// `&dyn Catalog` bridge is derived from it for the commit, and the
+    /// `SessionCatalog` itself is what [`Self::after_commit`] needs to evict
+    /// the committed table for every token (507).
     async fn commit_written_files(
         &self,
-        catalog: &dyn Catalog,
-        mut table: IcebergTable,
+        session: &Session,
+        catalog: &Arc<SessionCatalog>,
         table_ident: &TableIdent,
         new_data_files: Vec<DataFile>,
         overwrite: bool,
     ) -> sqe_core::Result<()> {
+        let bridge = catalog.as_catalog();
         if !overwrite {
             if new_data_files.is_empty() {
                 return Ok(());
             }
-            commit_with_retry(catalog, table_ident, "insert", move |fresh_table| {
+            let bridge_ref = bridge.as_ref();
+            commit_with_retry(bridge_ref, table_ident, "insert", move |fresh_table| {
                 let files = new_data_files.clone();
                 async move {
                     let tx = Transaction::new(&fresh_table);
                     let action = tx.fast_append().add_data_files(files);
                     let tx = action.apply(tx)?;
-                    tx.commit(catalog).await
+                    tx.commit(bridge_ref).await
                 }
             })
             .await
             .map_err(|e| SqeError::Execution(format!("Failed to commit INSERT: {e}")))?;
+            self.after_commit(session, catalog.as_ref(), table_ident)
+                .await;
             return Ok(());
         }
-
-        // Partitioned iff the default spec has fields.
-        let partitioned = !table
-            .metadata()
-            .default_partition_spec()
-            .fields()
-            .is_empty();
 
         // Distinct partitions touched by the new files (dynamic overwrite).
         // `Struct` derives PartialEq/Eq/Hash; partition cardinality per write
         // is small, so a Vec + linear membership check is fine.
-        let touched_partitions: Vec<iceberg::spec::Struct> = if partitioned {
-            let mut v: Vec<iceberg::spec::Struct> = Vec::new();
-            for f in &new_data_files {
-                let p = f.partition().clone();
-                if !v.contains(&p) {
-                    v.push(p);
-                }
-            }
-            v
-        } else {
-            Vec::new()
-        };
-
-        let mut attempt = 1u32;
-        loop {
-            let all_old = self.collect_data_files(&table).await?;
-
-            let removed_data: Vec<DataFile> = if !partitioned {
-                all_old
-            } else {
-                all_old
-                    .into_iter()
-                    .filter(|df| touched_partitions.contains(df.partition()))
-                    .collect()
-            };
-
-            // Nothing to replace and nothing to add: genuine no-op.
-            if removed_data.is_empty() && new_data_files.is_empty() {
-                info!(table = %table_ident, "INSERT OVERWRITE: no partitions touched and no new rows; no-op");
-                return Ok(());
-            }
-
-            // Drop position-delete files whose data files are all being
-            // removed, in the same atomic swap (#376).
-            let removed_data_count = removed_data.len();
-            let files_to_remove = self
-                .extend_with_superseded_deletes(&table, removed_data)
-                .await?;
-
-            info!(
-                table = %table_ident,
-                partitioned,
-                new_files = new_data_files.len(),
-                removed_data = removed_data_count,
-                attempt,
-                "INSERT OVERWRITE: committing atomic swap"
-            );
-
-            let tx = Transaction::new(&table);
-            let mut action = tx.rewrite_files().add_data_files(new_data_files.clone());
-            if !files_to_remove.is_empty() {
-                action = action.delete_files(files_to_remove);
-            }
-            let commit_result = match action.apply(tx) {
-                Ok(tx) => tx.commit(catalog).await,
-                Err(e) => Err(e),
-            };
-            match commit_result {
-                Ok(_) => {
-                    info!(table = %table_ident, "INSERT OVERWRITE committed successfully");
-                    return Ok(());
-                }
-                Err(e)
-                    if (e.retryable() || is_conflict_message(&e.to_string()))
-                        && attempt < COW_MAX_ATTEMPTS =>
-                {
-                    let sleep_ms = cow_conflict_backoff_ms(attempt);
-                    warn!(table = %table_ident, op = "insert-overwrite", attempt, backoff_ms = sleep_ms, error = %e, "commit conflict; reloading table and retrying");
-                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-                    table = catalog
-                        .load_table(table_ident)
-                        .await
-                        .map_err(|e| SqeError::Catalog(format!("Failed to reload table: {e}")))?;
-                    attempt += 1;
-                }
-                Err(e) => {
-                    return Err(SqeError::Execution(format!(
-                        "Failed to commit INSERT OVERWRITE: {e}"
-                    )));
-                }
+        let mut touched_partitions: Vec<iceberg::spec::Struct> = Vec::new();
+        for f in &new_data_files {
+            let p = f.partition().clone();
+            if !touched_partitions.contains(&p) {
+                touched_partitions.push(p);
             }
         }
+
+        let borrowed = (&new_data_files, &touched_partitions, table_ident);
+        let committed = self
+            .commit_rewrite_with_retry(
+                bridge.as_ref(),
+                table_ident,
+                "insert-overwrite",
+                "INSERT OVERWRITE",
+                move |fresh_table| {
+                    let (new_data_files, touched_partitions, table_ident) = borrowed;
+                    async move {
+                        // Partitioned iff the *current* default spec has fields;
+                        // read it from the reloaded snapshot, not from a table
+                        // loaded before the retry.
+                        let default_spec = fresh_table.metadata().default_partition_spec().clone();
+                        let partitioned = !default_spec.fields().is_empty();
+                        let all_old = self.collect_data_files(&fresh_table).await?;
+
+                        let removed_data: Vec<DataFile> = if !partitioned {
+                            all_old
+                        } else {
+                            // A live file written under an older partition spec
+                            // has a partition struct with a different arity or
+                            // field order, so it never equals a new file's
+                            // struct and dynamic overwrite used to leave its
+                            // rows next to the replacement ones (architecture
+                            // review 502). Legacy-spec files are therefore
+                            // treated as touched: full-replace semantics for
+                            // the spec generations the writer cannot address
+                            // partition-by-partition.
+                            let legacy: Vec<&DataFile> = all_old
+                                .iter()
+                                .filter(|df| df.partition_spec_id() != default_spec.spec_id())
+                                .collect();
+                            if !legacy.is_empty() {
+                                warn!(
+                                    table = %table_ident,
+                                    default_spec_id = default_spec.spec_id(),
+                                    legacy_files = legacy.len(),
+                                    legacy_spec_ids = ?distinct_spec_ids(
+                                        &legacy.into_iter().cloned().collect::<Vec<_>>()
+                                    ),
+                                    "INSERT OVERWRITE: table holds files from an older \
+                                     partition spec; replacing all of them (their partition \
+                                     values cannot be compared against the new spec). Run \
+                                     rewrite_data_files to normalise the layout."
+                                );
+                            }
+                            all_old
+                                .into_iter()
+                                .filter(|df| {
+                                    df.partition_spec_id() != default_spec.spec_id()
+                                        || touched_partitions.contains(df.partition())
+                                })
+                                .collect()
+                        };
+
+                        // Nothing to replace and nothing to add: genuine no-op.
+                        if removed_data.is_empty() && new_data_files.is_empty() {
+                            info!(table = %table_ident, "INSERT OVERWRITE: no partitions touched and no new rows; no-op");
+                            return Ok(None);
+                        }
+
+                        // Drop position-delete files whose data files are all being
+                        // removed, in the same atomic swap (#376).
+                        let removed_data_count = removed_data.len();
+                        let removed_spec_ids = distinct_spec_ids(&removed_data);
+                        let files_to_remove = self
+                            .extend_with_superseded_deletes(&fresh_table, removed_data)
+                            .await?;
+
+                        info!(
+                            table = %table_ident,
+                            partitioned,
+                            default_spec_id = default_spec.spec_id(),
+                            new_files = new_data_files.len(),
+                            removed_data = removed_data_count,
+                            spec_ids = ?removed_spec_ids,
+                            "INSERT OVERWRITE: committing atomic swap"
+                        );
+
+                        Ok(Some(RewriteAttempt {
+                            add: new_data_files.clone(),
+                            remove: files_to_remove,
+                            cleanup: None,
+                            value: (),
+                        }))
+                    }
+                },
+            )
+            .await?;
+
+        if committed.is_some() {
+            info!(table = %table_ident, "INSERT OVERWRITE committed successfully");
+            self.after_commit(session, catalog.as_ref(), table_ident)
+                .await;
+        }
+        Ok(())
     }
 
     /// Extend an about-to-be-removed set of data files with the position-delete
@@ -6368,8 +7314,20 @@ fn partition_could_match(
 /// Partition-prune the data files a CoW UPDATE/DELETE must rewrite. Returns the
 /// subset of `files` whose partition could match `where_expr` (these get
 /// rewritten); the rest are left untouched in the new snapshot. Falls back to
-/// all files when the table is unpartitioned, the WHERE is absent, or no
-/// identity-partition equality can be lifted. Returns `(to_rewrite, pruned_count)`.
+/// all files when the WHERE is absent or no identity-partition equality can be
+/// lifted. Returns `(to_rewrite, pruned_count)`.
+///
+/// Each file is evaluated against *its own* partition spec
+/// (`DataFile::partition_spec_id`), not the table's default one (architecture
+/// review 502). After `ALTER TABLE ... ADD/DROP PARTITION FIELD` a table holds
+/// files from several spec generations whose partition structs differ in arity
+/// and field order; indexing an old-spec struct with the default spec's field
+/// index lands on a different column, and a literal that "provably differs"
+/// there pruned a file that did hold matching rows — a
+/// `DELETE ... WHERE region = 'EU'` left EU rows alive in pre-evolution files.
+/// A file whose spec id is absent from the metadata (should not happen, but a
+/// manifest is data we do not control) is kept, as is one written under a spec
+/// with no fields.
 fn partition_prune_cow_files(
     files: Vec<DataFile>,
     table: &IcebergTable,
@@ -6382,15 +7340,18 @@ fn partition_prune_cow_files(
     if constraints.is_empty() {
         return (files, 0);
     }
-    let spec = table.metadata().default_partition_spec();
-    if spec.fields().is_empty() {
-        return (files, 0);
-    }
-    let schema = table.metadata().current_schema();
+    let metadata = table.metadata();
+    let schema = metadata.current_schema();
     let total = files.len();
     let to_rewrite: Vec<DataFile> = files
         .into_iter()
         .filter(|df| {
+            let Some(spec) = metadata.partition_spec_by_id(df.partition_spec_id()) else {
+                return true;
+            };
+            if spec.fields().is_empty() {
+                return true;
+            }
             partition_could_match(df.partition(), spec.as_ref(), schema.as_ref(), &constraints)
         })
         .collect();
@@ -8384,6 +9345,111 @@ SET c = ( \
     }
 
     // -------------------------------------------------------------------------
+    // 505: INSERT arity is checked at planning time, before the writer opens a
+    // parquet part. A wider SELECT used to panic inside `apply_stamped_schema`
+    // (indexing past the end of the stamped schema) in the write task.
+    // -------------------------------------------------------------------------
+
+    fn arity_table_ident() -> TableIdent {
+        TableIdent::new(NamespaceIdent::new("default".to_string()), "t".to_string())
+    }
+
+    #[test]
+    fn check_insert_arity_rejects_wider_select() {
+        let schema = make_target_schema(); // a, b, c
+        let source = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+        ];
+        let err = check_insert_arity(&source, &schema, &arity_table_ident()).unwrap_err();
+        assert_eq!(
+            format!("{err}"),
+            "Query execution error: INSERT has 4 columns but target has 3",
+            "the arity message must name both widths"
+        );
+    }
+
+    #[test]
+    fn check_insert_arity_rejects_narrower_select() {
+        let schema = make_target_schema();
+        let source = vec!["a".to_string(), "b".to_string()];
+        let err = check_insert_arity(&source, &schema, &arity_table_ident()).unwrap_err();
+        assert!(
+            format!("{err}").contains("INSERT has 2 columns but target has 3"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
+    fn check_insert_arity_accepts_matching_and_reordered_names() {
+        let schema = make_target_schema();
+        // Exact match.
+        check_insert_arity(
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+            &schema,
+            &arity_table_ident(),
+        )
+        .unwrap();
+        // Positional semantics are SQL-standard: a name swap is legal (and
+        // only logged), never an error.
+        check_insert_arity(
+            &["c".to_string(), "b".to_string(), "a".to_string()],
+            &schema,
+            &arity_table_ident(),
+        )
+        .unwrap();
+        // Case differences are not a swap.
+        check_insert_arity(
+            &["A".to_string(), "B".to_string(), "C".to_string()],
+            &schema,
+            &arity_table_ident(),
+        )
+        .unwrap();
+    }
+
+    // -------------------------------------------------------------------------
+    // 514: a MoR position DELETE must not count rows a live delete file
+    // already hides, or the second run of an idempotent DELETE reports the
+    // same non-zero count as the first.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn newly_deleted_row_count_ignores_already_hidden_rows() {
+        // No delete files on the data file: every raw match is live.
+        assert_eq!(newly_deleted_row_count(3, None), 3);
+        assert_eq!(newly_deleted_row_count(0, None), 0);
+        // Re-running the same DELETE: the rows still match the raw scan but
+        // none of them is visible any more.
+        assert_eq!(newly_deleted_row_count(3, Some(0)), 0);
+        // Partially overlapping: only the rows still visible are deleted.
+        assert_eq!(newly_deleted_row_count(3, Some(2)), 2);
+        // Snapshot skew between the two reads can never inflate the count
+        // past the positions actually marked.
+        assert_eq!(newly_deleted_row_count(3, Some(9)), 3);
+    }
+
+    #[test]
+    fn data_file_record_count_sums_manifest_counts() {
+        use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+        let file = |rows: u64| {
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(format!("s3://b/{rows}.parquet"))
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(1)
+                .record_count(rows)
+                .partition(Struct::from_iter(std::iter::empty()))
+                .partition_spec_id(0)
+                .build()
+                .unwrap()
+        };
+        assert_eq!(data_file_record_count(&[]), 0);
+        assert_eq!(data_file_record_count(&[file(10), file(5), file(1)]), 16);
+    }
+
+    // -------------------------------------------------------------------------
     // Policy enforcement on write paths (#36). The WriteHandler must run the
     // source SELECT through the configured PolicyEnforcer before writing.
     // -------------------------------------------------------------------------
@@ -8810,5 +9876,593 @@ s3_path_style = true
         assert!(!is_conflict_message("table not found"));
         assert!(!is_conflict_message("malformed parquet footer"));
         assert!(!is_conflict_message("connection refused"));
+    }
+
+    // -------------------------------------------------------------------------
+    // 506: the shared rewrite-commit retry helper
+    // 502: partition-spec-aware CoW pruning
+    // 507: the post-commit invalidation hook
+    // -------------------------------------------------------------------------
+
+    /// Local `Table` with fs FileIO rooted at `dir` and the metadata in `json`
+    /// (the `{location}` placeholder is filled in). No snapshots: the rewrite
+    /// commit under test only ADDS files, and `check_file_existence` is off by
+    /// default in `RewriteFilesAction`, so nothing has to exist on storage.
+    fn local_table(dir: &tempfile::TempDir, json: &str) -> IcebergTable {
+        let json = json.replace("{location}", dir.path().to_str().unwrap());
+        let metadata: iceberg::spec::TableMetadata =
+            serde_json::from_str(&json).expect("test table metadata");
+        let file_io = iceberg::io::FileIOBuilder::new_fs_io().build().unwrap();
+        IcebergTable::builder()
+            .metadata(metadata)
+            .identifier(TableIdent::from_strs(["ns", "tbl"]).unwrap())
+            .file_io(file_io)
+            .build()
+            .expect("test table")
+    }
+
+    const UNPARTITIONED_META: &str = r#"{
+      "format-version": 2,
+      "table-uuid": "0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d",
+      "location": "{location}",
+      "last-sequence-number": 1,
+      "last-updated-ms": 1602638573590,
+      "last-column-id": 1,
+      "current-schema-id": 0,
+      "schemas": [
+        {"type": "struct", "schema-id": 0, "fields": [
+          {"id": 1, "name": "id", "required": true, "type": "int"}
+        ]}
+      ],
+      "default-spec-id": 0,
+      "partition-specs": [{"spec-id": 0, "fields": []}],
+      "last-partition-id": 999,
+      "default-sort-order-id": 0,
+      "sort-orders": [{"order-id": 0, "fields": []}],
+      "properties": {}
+    }"#;
+
+    /// A table that has been through `ALTER TABLE ... REPLACE PARTITION FIELD`:
+    /// spec 0 (the generation the older files were written under) partitions by
+    /// `country`, spec 1 — the default — by `region`. Both partition values are
+    /// strings at index 0, which is exactly the shape the pre-502 pruning
+    /// misread: it indexed an old-spec file's struct with the DEFAULT spec's
+    /// field index and compared the file's `country` value against a `region`
+    /// constraint.
+    const EVOLVED_SPEC_META: &str = r#"{
+      "format-version": 2,
+      "table-uuid": "1a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d",
+      "location": "{location}",
+      "last-sequence-number": 3,
+      "last-updated-ms": 1602638573590,
+      "last-column-id": 3,
+      "current-schema-id": 0,
+      "schemas": [
+        {"type": "struct", "schema-id": 0, "fields": [
+          {"id": 1, "name": "id", "required": true, "type": "int"},
+          {"id": 2, "name": "region", "required": false, "type": "string"},
+          {"id": 3, "name": "country", "required": false, "type": "string"}
+        ]}
+      ],
+      "default-spec-id": 1,
+      "partition-specs": [
+        {"spec-id": 0, "fields": [
+          {"source-id": 3, "field-id": 1000, "name": "country", "transform": "identity"}
+        ]},
+        {"spec-id": 1, "fields": [
+          {"source-id": 2, "field-id": 1001, "name": "region", "transform": "identity"}
+        ]}
+      ],
+      "last-partition-id": 1001,
+      "default-sort-order-id": 0,
+      "sort-orders": [{"order-id": 0, "fields": []}],
+      "properties": {}
+    }"#;
+
+    /// Fabricated `DataFile` carrying an explicit spec id and partition struct
+    /// (same shape as `crates/sqe-compaction/src/rewrite.rs`'s `data_file_part`).
+    fn test_data_file(path: &str, spec_id: i32, partition: iceberg::spec::Struct) -> DataFile {
+        use iceberg::spec::{DataFileBuilder, DataFileFormat};
+        DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Parquet)
+            .file_size_in_bytes(128)
+            .record_count(1)
+            .partition(partition)
+            .partition_spec_id(spec_id)
+            .build()
+            .expect("build data file")
+    }
+
+    /// `iceberg::Catalog` whose `update_table` loses the first `fail_first`
+    /// optimistic-concurrency races. The conflict is reported the way a real
+    /// catalog reports it in the *message* but WITHOUT `retryable`: the
+    /// vendored `Transaction::commit` has its own inner retry for retryable
+    /// errors, which would swallow the conflict before the helper under test
+    /// ever saw it.
+    #[derive(Debug)]
+    struct FlakyCatalog {
+        table: IcebergTable,
+        fail_first: usize,
+        commits: std::sync::Mutex<usize>,
+    }
+
+    impl FlakyCatalog {
+        fn commit_count(&self) -> usize {
+            *self.commits.lock().expect("commit counter")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Catalog for FlakyCatalog {
+        async fn load_table(&self, _table: &TableIdent) -> iceberg::Result<IcebergTable> {
+            Ok(self.table.clone())
+        }
+
+        async fn update_table(
+            &self,
+            _commit: iceberg::TableCommit,
+        ) -> iceberg::Result<IcebergTable> {
+            let mut n = self.commits.lock().expect("commit counter");
+            *n += 1;
+            if *n <= self.fail_first {
+                Err(iceberg::Error::new(
+                    iceberg::ErrorKind::DataInvalid,
+                    "Commit conflicted for table: ns.tbl",
+                ))
+            } else {
+                Ok(self.table.clone())
+            }
+        }
+
+        async fn list_namespaces(
+            &self,
+            _parent: Option<&NamespaceIdent>,
+        ) -> iceberg::Result<Vec<NamespaceIdent>> {
+            unimplemented!("not used by the retry helper")
+        }
+        async fn create_namespace(
+            &self,
+            _namespace: &NamespaceIdent,
+            _properties: std::collections::HashMap<String, String>,
+        ) -> iceberg::Result<iceberg::Namespace> {
+            unimplemented!("not used by the retry helper")
+        }
+        async fn get_namespace(
+            &self,
+            _namespace: &NamespaceIdent,
+        ) -> iceberg::Result<iceberg::Namespace> {
+            unimplemented!("not used by the retry helper")
+        }
+        async fn namespace_exists(&self, _namespace: &NamespaceIdent) -> iceberg::Result<bool> {
+            unimplemented!("not used by the retry helper")
+        }
+        async fn update_namespace(
+            &self,
+            _namespace: &NamespaceIdent,
+            _properties: std::collections::HashMap<String, String>,
+        ) -> iceberg::Result<()> {
+            unimplemented!("not used by the retry helper")
+        }
+        async fn drop_namespace(&self, _namespace: &NamespaceIdent) -> iceberg::Result<()> {
+            unimplemented!("not used by the retry helper")
+        }
+        async fn list_tables(
+            &self,
+            _namespace: &NamespaceIdent,
+        ) -> iceberg::Result<Vec<TableIdent>> {
+            unimplemented!("not used by the retry helper")
+        }
+        async fn create_table(
+            &self,
+            _namespace: &NamespaceIdent,
+            _creation: TableCreation,
+        ) -> iceberg::Result<IcebergTable> {
+            unimplemented!("not used by the retry helper")
+        }
+        async fn drop_table(&self, _table: &TableIdent) -> iceberg::Result<()> {
+            unimplemented!("not used by the retry helper")
+        }
+        async fn table_exists(&self, _table: &TableIdent) -> iceberg::Result<bool> {
+            unimplemented!("not used by the retry helper")
+        }
+        async fn rename_table(&self, _src: &TableIdent, _dest: &TableIdent) -> iceberg::Result<()> {
+            unimplemented!("not used by the retry helper")
+        }
+        async fn register_table(
+            &self,
+            _table: &TableIdent,
+            _metadata_location: String,
+        ) -> iceberg::Result<IcebergTable> {
+            unimplemented!("not used by the retry helper")
+        }
+    }
+
+    /// 506: the closure re-runs the whole rewrite per attempt, the helper stops
+    /// once the commit lands, and each lost race is counted on
+    /// `sqe_write_commit_retries_total{op}`.
+    #[tokio::test]
+    async fn commit_rewrite_with_retry_reruns_the_rewrite_and_counts_conflicts() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = local_table(&dir, UNPARTITIONED_META);
+        let catalog = FlakyCatalog {
+            table: table.clone(),
+            fail_first: 2,
+            commits: std::sync::Mutex::new(0),
+        };
+        let metrics = Arc::new(sqe_metrics::MetricsRegistry::new().expect("metrics"));
+        let handler = WriteHandler::new(write_test_config()).with_metrics(metrics.clone());
+        let ident = TableIdent::from_strs(["ns", "tbl"]).unwrap();
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_closure = attempts.clone();
+        let outcome = handler
+            .commit_rewrite_with_retry(&catalog, &ident, "unit-test", "UNIT TEST", move |_fresh| {
+                let attempts = attempts_for_closure.clone();
+                async move {
+                    let n = attempts.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                    Ok(Some(RewriteAttempt {
+                        add: vec![test_data_file(
+                            &format!("s3://bucket/attempt-{n}.parquet"),
+                            0,
+                            iceberg::spec::Struct::empty(),
+                        )],
+                        remove: vec![],
+                        cleanup: None,
+                        value: n,
+                    }))
+                }
+            })
+            .await
+            .expect("the third attempt commits");
+
+        assert_eq!(outcome, Some(3), "the winning attempt's value is returned");
+        assert_eq!(
+            attempts.load(AtomicOrdering::SeqCst),
+            3,
+            "the rewrite re-runs per attempt; re-committing stale files would \
+             drop the concurrent writer's changes"
+        );
+        assert_eq!(catalog.commit_count(), 3);
+        assert_eq!(
+            metrics
+                .write_commit_retries_total
+                .with_label_values(&["unit-test"])
+                .get(),
+            2,
+            "one increment per lost race, not per attempt"
+        );
+    }
+
+    /// 506: a closure that reports "nothing to do" never reaches a commit.
+    #[tokio::test]
+    async fn commit_rewrite_with_retry_skips_the_commit_when_there_is_nothing_to_do() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = local_table(&dir, UNPARTITIONED_META);
+        let catalog = FlakyCatalog {
+            table,
+            fail_first: 0,
+            commits: std::sync::Mutex::new(0),
+        };
+        let handler = WriteHandler::new(write_test_config());
+        let ident = TableIdent::from_strs(["ns", "tbl"]).unwrap();
+
+        let outcome: Option<usize> = handler
+            .commit_rewrite_with_retry(&catalog, &ident, "unit-test", "UNIT TEST", |_fresh| async {
+                Ok(None)
+            })
+            .await
+            .expect("no-op is not an error");
+
+        assert!(outcome.is_none());
+        assert_eq!(catalog.commit_count(), 0, "no snapshot for a no-op");
+    }
+
+    /// 506: a non-conflict error propagates on the first attempt, labelled with
+    /// the statement the user typed.
+    #[tokio::test]
+    async fn commit_rewrite_with_retry_does_not_retry_a_non_conflict_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = local_table(&dir, UNPARTITIONED_META);
+        let catalog = FlakyCatalog {
+            table,
+            // Any positive count: the error message below is what decides.
+            fail_first: 1,
+            commits: std::sync::Mutex::new(0),
+        };
+        let handler = WriteHandler::new(write_test_config());
+        let ident = TableIdent::from_strs(["ns", "tbl"]).unwrap();
+
+        let err = handler
+            .commit_rewrite_with_retry(
+                &catalog,
+                &ident,
+                "unit-test",
+                "DELETE",
+                |_fresh| async move {
+                    Err::<Option<RewriteAttempt<()>>, _>(SqeError::Execution(
+                        "read failed".to_string(),
+                    ))
+                },
+            )
+            .await
+            .expect_err("the closure's error propagates");
+        assert!(format!("{err}").contains("read failed"), "err: {err}");
+        assert_eq!(catalog.commit_count(), 0);
+    }
+
+    /// 502: an old-spec file is partitioned by `country`, not by `region`, so
+    /// `DELETE ... WHERE region = 'EU'` cannot rule it out. Evaluated against
+    /// the DEFAULT spec (as it was before this fix) its `country = 'US'` value
+    /// read as `region = 'US'`, "provably differed" from `'EU'`, and the file
+    /// was dropped from the rewrite set — leaving its EU rows alive.
+    #[test]
+    fn partition_prune_keeps_files_from_an_older_partition_spec() {
+        use iceberg::spec::{Literal, Struct};
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = local_table(&dir, EVOLVED_SPEC_META);
+
+        let sql = "DELETE FROM t WHERE region = 'EU'";
+        let stmt = Parser::parse_sql(&GenericDialect {}, sql)
+            .unwrap()
+            .remove(0);
+        let where_expr = match &stmt {
+            Statement::Delete(d) => d.selection.clone().expect("WHERE"),
+            other => panic!("expected DELETE, got {other}"),
+        };
+
+        // Old-spec file partitioned by country=US (it may still hold EU rows),
+        // plus two files from the current spec.
+        let legacy = test_data_file(
+            "s3://b/legacy.parquet",
+            0,
+            Struct::from_iter([Some(Literal::string("US"))]),
+        );
+        let eu = test_data_file(
+            "s3://b/eu.parquet",
+            1,
+            Struct::from_iter([Some(Literal::string("EU"))]),
+        );
+        let us = test_data_file(
+            "s3://b/us.parquet",
+            1,
+            Struct::from_iter([Some(Literal::string("US"))]),
+        );
+
+        let (to_rewrite, pruned) = partition_prune_cow_files(
+            vec![legacy.clone(), eu.clone(), us.clone()],
+            &table,
+            Some(&where_expr),
+        );
+        let paths: Vec<&str> = to_rewrite.iter().map(|f| f.file_path()).collect();
+        assert!(
+            paths.contains(&"s3://b/legacy.parquet"),
+            "a pre-evolution file must never be pruned: {paths:?}"
+        );
+        assert!(paths.contains(&"s3://b/eu.parquet"), "{paths:?}");
+        assert!(
+            !paths.contains(&"s3://b/us.parquet"),
+            "a new-spec file whose partition provably differs is still pruned: {paths:?}"
+        );
+        assert_eq!(pruned, 1);
+
+        // The bug's fingerprint, pinned so the fix cannot be undone quietly:
+        // evaluated against the DEFAULT spec the legacy file DOES look
+        // provably different, which is what used to prune it.
+        let constraints = extract_partition_eq_constraints(&where_expr);
+        assert!(
+            !partition_could_match(
+                legacy.partition(),
+                table.metadata().default_partition_spec().as_ref(),
+                table.metadata().current_schema().as_ref(),
+                &constraints,
+            ),
+            "the default spec misreads an old-spec file; per-file spec lookup is the fix"
+        );
+    }
+
+    /// 502: a file whose spec id is not in the table metadata is kept. The
+    /// manifest is data we do not control, and dropping such a file from the
+    /// rewrite set loses rows silently.
+    #[test]
+    fn partition_prune_keeps_files_with_an_unknown_spec_id() {
+        use iceberg::spec::{Literal, Struct};
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = local_table(&dir, EVOLVED_SPEC_META);
+        let stmt = Parser::parse_sql(&GenericDialect {}, "DELETE FROM t WHERE region = 'EU'")
+            .unwrap()
+            .remove(0);
+        let where_expr = match &stmt {
+            Statement::Delete(d) => d.selection.clone().expect("WHERE"),
+            other => panic!("expected DELETE, got {other}"),
+        };
+
+        let unknown = test_data_file(
+            "s3://b/unknown-spec.parquet",
+            7,
+            Struct::from_iter([Some(Literal::string("US"))]),
+        );
+        let (to_rewrite, pruned) =
+            partition_prune_cow_files(vec![unknown], &table, Some(&where_expr));
+        assert_eq!(to_rewrite.len(), 1, "unknown spec id is never pruned");
+        assert_eq!(pruned, 0);
+    }
+
+    /// 507: `after_commit` evicts the committed table for EVERY token, not just
+    /// the writer's. `SessionCatalog` needs a live REST catalog to construct,
+    /// so the assertion runs through the `TableCacheInvalidator` seam the hook
+    /// takes.
+    #[tokio::test]
+    async fn after_commit_evicts_the_table_for_every_token() {
+        #[derive(Default)]
+        struct RecordingInvalidator {
+            seen: std::sync::Mutex<Vec<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl TableCacheInvalidator for RecordingInvalidator {
+            async fn invalidate_table_all_tokens(&self, table_ident: &TableIdent) {
+                self.seen
+                    .lock()
+                    .expect("recorded idents")
+                    .push(table_ident.to_string());
+            }
+        }
+
+        let handler = WriteHandler::new(write_test_config());
+        let session = test_session(Some("ns"));
+        let recorder = RecordingInvalidator::default();
+        let ident = TableIdent::from_strs(["ns", "tbl"]).unwrap();
+
+        handler.after_commit(&session, &recorder, &ident).await;
+
+        assert_eq!(
+            recorder.seen.lock().expect("recorded idents").as_slice(),
+            &["ns.tbl".to_string()]
+        );
+    }
+
+    /// 502: the file summary logs report which spec generations a rewrite spans.
+    #[test]
+    fn distinct_spec_ids_reports_every_generation_once() {
+        use iceberg::spec::Struct;
+        let files = vec![
+            test_data_file("s3://b/a.parquet", 1, Struct::empty()),
+            test_data_file("s3://b/b.parquet", 0, Struct::empty()),
+            test_data_file("s3://b/c.parquet", 1, Struct::empty()),
+        ];
+        assert_eq!(distinct_spec_ids(&files), vec![0, 1]);
+        assert!(distinct_spec_ids(&[]).is_empty());
+    }
+
+    // -------------------------------------------------------------------------
+    // 500: CREATE OR REPLACE TABLE AS SELECT — in-place swap vs. staged rename
+    // -------------------------------------------------------------------------
+
+    /// Iceberg + Arrow schema pair for a SELECT, the way
+    /// `handle_ctas_streaming` derives them from the DataFrame.
+    fn select_schemas(fields: Vec<arrow_schema::Field>) -> (Arc<ArrowSchema>, IcebergSchema) {
+        let arrow = Arc::new(ArrowSchema::new(fields));
+        let iceberg = arrow_schema_to_iceberg(&arrow).expect("iceberg schema");
+        (arrow, iceberg)
+    }
+
+    /// A SELECT that reproduces the live table's schema swaps in place: the
+    /// table keeps its identity, its history and its grants.
+    #[test]
+    fn ctas_replace_is_in_place_for_a_matching_schema() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live = local_table(&dir, UNPARTITIONED_META);
+        let (arrow, iceberg) = select_schemas(vec![Field::new("id", DataType::Int32, false)]);
+        assert!(ctas_replace_is_in_place(&live, &arrow, None, &iceberg));
+    }
+
+    /// Column set, order, type and nullability all have to match: the
+    /// streaming writer stamps each batch onto the LIVE schema positionally, so
+    /// anything else would cast into the old types or fail mid-write.
+    #[test]
+    fn ctas_replace_is_not_in_place_when_the_schema_differs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live = local_table(&dir, UNPARTITIONED_META);
+
+        let (extra_col, extra_ice) = select_schemas(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("added", DataType::Utf8, true),
+        ]);
+        assert!(!ctas_replace_is_in_place(
+            &live, &extra_col, None, &extra_ice
+        ));
+
+        let (widened, widened_ice) = select_schemas(vec![Field::new("id", DataType::Int64, false)]);
+        assert!(!ctas_replace_is_in_place(
+            &live,
+            &widened,
+            None,
+            &widened_ice
+        ));
+
+        let (renamed, renamed_ice) =
+            select_schemas(vec![Field::new("key", DataType::Int32, false)]);
+        assert!(!ctas_replace_is_in_place(
+            &live,
+            &renamed,
+            None,
+            &renamed_ice
+        ));
+
+        let (nullable, nullable_ice) =
+            select_schemas(vec![Field::new("id", DataType::Int32, true)]);
+        assert!(!ctas_replace_is_in_place(
+            &live,
+            &nullable,
+            None,
+            &nullable_ice
+        ));
+    }
+
+    /// An explicit `PARTITIONED BY` has to name the same source columns and
+    /// transforms as the live default spec — the writer partitions with the
+    /// live spec, so a differing clause would be silently ignored.
+    #[test]
+    fn ctas_replace_in_place_requires_matching_partitioning() {
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Default spec partitions by `region`; spec 0 by `country`.
+        let live = local_table(&dir, EVOLVED_SPEC_META);
+        let (arrow, iceberg) = select_schemas(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("region", DataType::Utf8, true),
+            Field::new("country", DataType::Utf8, true),
+        ]);
+
+        let partition_expr = |sql: &str| -> sqlparser::ast::Expr {
+            let stmt = Parser::parse_sql(&GenericDialect {}, sql)
+                .unwrap()
+                .remove(0);
+            match stmt {
+                Statement::Query(q) => match *q.body {
+                    sqlparser::ast::SetExpr::Select(select) => {
+                        select.projection.first().cloned().map(|p| match p {
+                            sqlparser::ast::SelectItem::UnnamedExpr(e) => e,
+                            other => panic!("expected a bare expression, got {other}"),
+                        })
+                    }
+                    other => panic!("expected SELECT, got {other}"),
+                }
+                .expect("projection"),
+                other => panic!("expected query, got {other}"),
+            }
+        };
+
+        let same = build_partition_spec(Some(&partition_expr("SELECT region")), &iceberg)
+            .expect("spec")
+            .expect("some");
+        assert!(ctas_replace_is_in_place(
+            &live,
+            &arrow,
+            Some(&same),
+            &iceberg
+        ));
+
+        let different = build_partition_spec(Some(&partition_expr("SELECT country")), &iceberg)
+            .expect("spec")
+            .expect("some");
+        assert!(!ctas_replace_is_in_place(
+            &live,
+            &arrow,
+            Some(&different),
+            &iceberg
+        ));
     }
 }

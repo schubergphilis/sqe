@@ -516,16 +516,32 @@ fn stamp_field_ids(
         .map_err(|e| SqeError::Execution(format!("Failed to derive expected Arrow schema: {e}")))?;
 
     let iceberg_fields = iceberg_schema.as_struct().fields();
+    // A batch wider than the target has no field to stamp its extra columns
+    // against. This used to fabricate a `(i + 1)` field id and an
+    // Arrow-type fallback, writing a parquet column carrying an Iceberg field
+    // id that belongs to no field (505). Reject it with the same message the
+    // streaming path uses.
+    if first.schema().fields().len() > iceberg_fields.len() {
+        return Err(SqeError::Execution(format!(
+            "INSERT has {} columns but target has {}",
+            first.schema().fields().len(),
+            iceberg_fields.len()
+        )));
+    }
     let new_fields: Vec<Arc<arrow_schema::Field>> = first
         .schema()
         .fields()
         .iter()
         .enumerate()
         .map(|(i, arrow_field)| {
-            let field_id = iceberg_fields
-                .get(i)
-                .map(|f| f.id)
-                .unwrap_or((i + 1) as i32);
+            let field_id = iceberg_fields.get(i).map(|f| f.id).ok_or_else(|| {
+                SqeError::Execution(format!(
+                    "internal error: batch column {i} ('{}') has no Iceberg field \
+                     (schema has {} fields)",
+                    arrow_field.name(),
+                    iceberg_fields.len()
+                ))
+            })?;
             let mut meta = arrow_field.metadata().clone();
             meta.insert("PARQUET:field_id".to_string(), field_id.to_string());
             // DataFusion sometimes marks a field as non-nullable even when the column
@@ -538,13 +554,19 @@ fn stamp_field_ids(
                 .fields()
                 .get(i)
                 .map(|f| f.data_type().clone())
-                .unwrap_or_else(|| arrow_field.data_type().clone());
-            Arc::new(
+                .ok_or_else(|| {
+                    SqeError::Execution(format!(
+                        "internal error: batch column {i} ('{}') has no Arrow field \
+                         in the target schema",
+                        arrow_field.name()
+                    ))
+                })?;
+            Ok(Arc::new(
                 arrow_schema::Field::new(arrow_field.name(), target_type, nullable)
                     .with_metadata(meta),
-            )
+            ))
         })
-        .collect();
+        .collect::<sqe_core::Result<Vec<_>>>()?;
 
     let new_schema = Arc::new(ArrowSchema::new(new_fields));
 

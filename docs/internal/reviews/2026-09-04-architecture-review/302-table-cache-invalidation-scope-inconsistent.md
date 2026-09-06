@@ -4,7 +4,7 @@
 - Severity: high
 - Category: reliability
 - Effort: S (hours)
-- Status: open
+- Status: fixed (branch `fix/data-consistency-p1`, 2026-09-05)
 - Issue: #568
 
 ## Problem
@@ -42,3 +42,68 @@ Schema changes are the case where staleness is most visible: dbt runs as one pri
 
 - Memory note "Writes need session-cache invalidation" covers the coordinator-side session context; this issue is the crate-side metadata cache.
 - 303 (tag reads across tokens make the same inconsistency a security problem), 304 (insert-after-invalidate race).
+
+## Resolution (2026-09-05)
+
+Every commit path in `crates/sqe-catalog/src/rest_catalog.rs` now evicts all
+tokens, so the rule lives in the crate that owns the cache:
+
+| Path | Before | After |
+|---|---|---|
+| `SessionCatalogBridge::create_table` | own key | `invalidate_table_all_tokens` |
+| `SessionCatalogBridge::drop_table` | own key | `invalidate_table_all_tokens` |
+| `SessionCatalogBridge::rename_table` | none | `invalidate_table_all_tokens` for source AND destination |
+| `SessionCatalogBridge::register_table` | none | `invalidate_table_all_tokens` |
+| `SessionCatalog::commit_schema_update` | own key | `invalidate_table_all_tokens` |
+| `SessionCatalogBridge::update_table` | all tokens | unchanged |
+
+`rename_table` and `register_table` also gained the eviction they never had.
+Both evict on failure as well as success: a partially applied rename is exactly
+when a surviving entry describes a table that is not there.
+
+`TableMetadataCache::invalidate` (single key) is now documented as reserved for
+`SessionCatalog::authorize_table_access`, the authorization-revoke path where
+dropping one principal's vended credentials is the point. The type-level doc
+comment on `TableMetadataCache` states the invariant: any commit evicts all
+tokens; only authorization failures evict one.
+
+The compensating call at the `ALTER TABLE SET TBLPROPERTIES` site in
+`crates/sqe-coordinator/src/catalog_ops.rs` is deleted; the comment there now
+points at the crate-side rule. The other `invalidate_table_all_tokens` calls in
+`catalog_ops.rs` (tag authoring, tag rollback, schema-evolution tag carry) were
+left in place: they are redundant now but they are inside `_guard`-held
+read-modify-write sequences whose ordering is load-bearing, and rewriting them
+was out of scope for this change.
+
+`table_metadata_cache_suffix` replaces two hand-rolled `format!`s so the
+eviction scope and the fenced-insert scope (finding 304) cannot drift apart.
+
+### Tests
+
+Unit tests in `rest_catalog.rs`, module `invalidation_tests`. Each seeds the
+table under the committer's fingerprint AND a second principal's, asserts both
+are present, then asserts both are gone:
+
+- `bridge_create_table_evicts_every_token`
+- `bridge_drop_table_evicts_every_token`
+- `bridge_rename_table_evicts_every_token_for_source_and_destination`
+- `bridge_register_table_evicts_every_token`
+- `bridge_update_table_evicts_every_token`
+- `commit_schema_update_evicts_every_token` (wiremock POST 200)
+- `single_key_invalidate_leaves_other_principals_cached` is the control: it
+  pins the pre-fix behaviour, so the six tests above cannot pass vacuously
+  against a cache that stores nothing.
+
+The DDL verbs are driven through a `StubCatalog` backend behind the new
+`SessionCatalog::for_test_with_backend` test hook rather than a mock REST server
+per verb; `commit_schema_update` goes through wiremock because it talks HTTP
+directly.
+
+`cargo test -p sqe-catalog`: 570 lib tests plus every integration binary pass.
+`cargo clippy -p sqe-catalog -p sqe-coordinator --all-targets`: no warnings in
+the changed files.
+
+The integration-test acceptance item (session A `ALTER TABLE ADD COLUMN`,
+session B reads the new column immediately with a 300 s TTL) is NOT done: it
+needs the docker Polaris + RustFS stack. The unit tests cover the eviction
+scope; the end-to-end freshness claim is unverified.

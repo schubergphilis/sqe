@@ -1024,21 +1024,15 @@ impl CatalogOps {
             .commit_schema_update(&table_ident, table_updates, requirements)
             .await?;
 
-        // Explicitly evict the table metadata cache entry so the updated
-        // properties (e.g. sqe.column-tags) take effect on the next query.
-        // commit_schema_update already evicts the entry internally; this call
-        // is redundant but makes the intent visible at the DDL site and mirrors
-        // how SessionCatalog's own DDL handlers signal freshness.
+        // No metadata-cache eviction here: `commit_schema_update` now evicts
+        // every token's entry itself, so the rule that a commit is visible to
+        // all principals lives in one place (architecture review 302). This
+        // call site used to compensate for the crate evicting only the
+        // writer's key.
         //
         // Note: policy-store cache invalidation (Arc<dyn PolicyStore>::invalidate_all)
         // is handled one level up in QueryHandler::handle_statement, which has
         // the policy store in scope. CatalogOps does not hold a PolicyStore.
-        //
-        // Properties (incl. sqe.column-tags) are read user-independently via
-        // `properties_for`, which reads the first entry matching `|{ns}.{table}`
-        // from ANY token. Evict every token's entry so the updated properties
-        // are visible to all users immediately, not just the writer.
-        self.invalidate_table_all_tokens(&table_ident).await;
 
         info!(
             table = %table_ident,

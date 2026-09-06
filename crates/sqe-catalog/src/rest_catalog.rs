@@ -244,6 +244,65 @@ pub async fn invalidate_rest_catalog_cache_for_token(token_fingerprint: &str) {
     );
 }
 
+/// A monotonic snapshot of every invalidation counter that can evict one cache
+/// key, taken *before* a network fetch and checked again before the result is
+/// stored.
+///
+/// Three counters, because three eviction scopes exist and a cold load has no
+/// entry in the cache for the eviction to hit: `invalidate_all` bumps `global`,
+/// `invalidate_table_all_tokens` bumps the counter for `{ns}.{table}`, and
+/// `invalidate` bumps the counter for one full cache key. A reader that was
+/// already awaiting the REST `GET` when any of the three fired must not store
+/// what it fetched: the writer's eviction found nothing to evict, so an
+/// unfenced insert would resurrect pre-commit metadata and mark it fresh for a
+/// whole soft TTL (architecture review 304).
+///
+/// Generation values come from one process-monotonic counter and are never
+/// reused, so a pruned (absent) entry can never compare equal to a generation
+/// some in-flight reader is holding — there is no ABA window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheGeneration {
+    /// `{namespace_display}.{table_name}` — the key tail every token's entry
+    /// for this table shares, i.e. what `invalidate_table_all_tokens` bumps.
+    table_suffix: String,
+    global: u64,
+    table: u64,
+    key: u64,
+}
+
+/// Cap on the per-key/per-table generation maps. Entries are only created by
+/// an actual invalidation, so this is reached only by a coordinator that has
+/// written to tens of thousands of distinct tables; past it the maps are
+/// dropped and every absent key reads the prune floor instead, which is
+/// strictly newer than any generation an in-flight reader can hold (so pruning
+/// can only refuse an insert, never admit a stale one).
+const GENERATION_MAP_MAX_KEYS: usize = 10_000;
+
+/// Global table metadata cache shared by every session.
+///
+/// # Invalidation invariant
+///
+/// **Any commit evicts all tokens; only authorization failures evict one.**
+///
+/// Entries are keyed `{token_fingerprint}|{warehouse}|{ns}.{table}` because a
+/// cached `Table` carries per-user vended S3 credentials (issue #49), but the
+/// *metadata* it wraps is a property of the table, not of the principal. So
+/// every path that commits — `create_table`, `drop_table`, `rename_table`
+/// (source and destination), `register_table`, `update_table`,
+/// `commit_schema_update` — must call
+/// [`TableMetadataCache::invalidate_table_all_tokens`]. Evicting only the
+/// writer's own key leaves every other principal planning against pre-commit
+/// metadata until the soft TTL: the user who ran `ALTER TABLE ADD COLUMN` sees
+/// the column and everyone else gets "column not found" (architecture review
+/// 302).
+///
+/// [`TableMetadataCache::invalidate`] — single key — is reserved for
+/// `SessionCatalog::authorize_table_access`, where dropping exactly the
+/// no-longer-authorized principal's vended credentials *is* the point and
+/// evicting other principals would be a denial of service.
+///
+/// Callers that populate the cache after a network fetch must fence the insert
+/// with [`CacheGeneration`]; see [`TableMetadataCache::insert_if_generation`].
 #[derive(Clone)]
 pub struct TableMetadataCache {
     /// Long-lived cache (1 hour hard TTL) holding table metadata + ETag.
@@ -256,6 +315,20 @@ pub struct TableMetadataCache {
     /// `SessionCatalog` clone shares the same handle without changing
     /// the constructor signature.
     metrics: Option<std::sync::Arc<sqe_metrics::MetricsRegistry>>,
+    /// Source of generation stamps. Shared by all three scopes so a stamp is
+    /// unique cache-wide and never reused.
+    generation_counter: Arc<std::sync::atomic::AtomicU64>,
+    /// Generation of the last `invalidate_all`.
+    global_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Generation of the last `invalidate_table_all_tokens`, per
+    /// `{ns}.{table}`.
+    table_generations: Arc<DashMap<String, u64>>,
+    /// Generation of the last single-key `invalidate`, per full cache key.
+    key_generations: Arc<DashMap<String, u64>>,
+    /// Highest stamp issued when the generation maps were last pruned. An
+    /// absent map entry reads as this value, which is newer than anything a
+    /// reader that snapshotted before the prune can hold.
+    prune_floor: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl TableMetadataCache {
@@ -287,6 +360,11 @@ impl TableMetadataCache {
             inner,
             soft_ttl,
             metrics: None,
+            generation_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            global_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            table_generations: Arc::new(DashMap::new()),
+            key_generations: Arc::new(DashMap::new()),
+            prune_floor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -302,6 +380,62 @@ impl TableMetadataCache {
     /// Returns the attached metrics registry, if any.
     pub fn metrics(&self) -> Option<&std::sync::Arc<sqe_metrics::MetricsRegistry>> {
         self.metrics.as_ref()
+    }
+
+    /// Issue the next cache-wide generation stamp. Strictly increasing and
+    /// never reused, which is what lets an absent map entry stand in for "older
+    /// than everything" without an ABA hazard.
+    fn next_generation(&self) -> u64 {
+        self.generation_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
+    }
+
+    /// Read one generation map, treating an absent key as the prune floor.
+    fn lookup_generation(&self, map: &DashMap<String, u64>, key: &str) -> u64 {
+        map.get(key).map_or_else(
+            || self.prune_floor.load(std::sync::atomic::Ordering::SeqCst),
+            |g| *g,
+        )
+    }
+
+    /// Stamp `key` in `map` with a fresh generation, pruning the map first if
+    /// it has grown past [`GENERATION_MAP_MAX_KEYS`].
+    fn bump_generation(&self, map: &DashMap<String, u64>, key: &str) {
+        let stamp = self.next_generation();
+        if map.len() >= GENERATION_MAP_MAX_KEYS {
+            // Raise the floor BEFORE clearing: between the clear and the store,
+            // an absent key must not read as an older generation than it did a
+            // moment ago, or a fenced insert could wrongly conclude nothing
+            // changed.
+            self.prune_floor
+                .store(stamp, std::sync::atomic::Ordering::SeqCst);
+            map.clear();
+        }
+        map.insert(key.to_string(), stamp);
+    }
+
+    /// Snapshot the invalidation generations that govern `key`, whose table
+    /// tail is `ns_table_suffix` (`"{namespace_display}.{table_name}"`, the
+    /// same string [`Self::invalidate_table_all_tokens`] takes).
+    ///
+    /// Take this BEFORE the network fetch whose result you intend to cache,
+    /// then hand it to [`Self::insert_if_generation`], [`Self::revalidate`] or
+    /// [`Self::update_etag`].
+    pub fn generation(&self, key: &str, ns_table_suffix: &str) -> CacheGeneration {
+        CacheGeneration {
+            table_suffix: ns_table_suffix.to_string(),
+            global: self
+                .global_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            table: self.lookup_generation(&self.table_generations, ns_table_suffix),
+            key: self.lookup_generation(&self.key_generations, key),
+        }
+    }
+
+    /// True when any invalidation touched `key` since `snapshot` was taken.
+    fn generation_changed(&self, key: &str, snapshot: &CacheGeneration) -> bool {
+        self.generation(key, &snapshot.table_suffix) != *snapshot
     }
 
     /// Get a cached entry if it exists and is still fresh (within soft TTL).
@@ -323,10 +457,19 @@ impl TableMetadataCache {
     }
 
     /// Refresh the soft TTL on an existing entry (called after a 304 revalidation).
-    pub async fn revalidate(&self, key: &str) {
+    ///
+    /// Fenced by `snapshot`, taken before the conditional `GET` that produced
+    /// the 304: a `get`-then-`insert` pair whose two halves straddle an
+    /// invalidation would otherwise put the evicted entry back and stamp it
+    /// fresh (architecture review 304).
+    pub async fn revalidate(&self, key: &str, snapshot: &CacheGeneration) {
+        if self.generation_changed(key, snapshot) {
+            return;
+        }
         if let Some(mut entry) = self.inner.get(key).await {
             entry.validated_at = Instant::now();
             self.inner.insert(key.to_string(), entry).await;
+            self.undo_if_raced(key, snapshot).await;
         }
     }
 
@@ -340,6 +483,10 @@ impl TableMetadataCache {
     }
 
     /// Insert a table with an optional ETag from the response headers.
+    ///
+    /// Unfenced: only safe when nothing could have been invalidated since the
+    /// value was produced. Anything that awaits the catalog before inserting
+    /// must use [`Self::insert_if_generation`].
     pub async fn insert_with_etag(&self, key: String, table: Table, etag: Option<String>) {
         self.inner
             .insert(
@@ -351,6 +498,59 @@ impl TableMetadataCache {
                 },
             )
             .await;
+    }
+
+    /// Insert `table` only if no invalidation touched `key`, its table, or the
+    /// whole cache since `snapshot` was taken. Returns whether the entry was
+    /// stored.
+    ///
+    /// The fence is lock-free because the two sides run their steps in
+    /// opposite orders: every `invalidate*` bumps its generation BEFORE it
+    /// evicts, and this checks the generation both before and after its own
+    /// insert. So for any interleaving either the eviction runs after the
+    /// insert and removes it, or the bump is already visible to the post-check
+    /// and this call removes what it just wrote. The moka cache offers no
+    /// compare-and-swap, and holding a lock across the insert would serialise
+    /// every session on one table.
+    pub async fn insert_if_generation(
+        &self,
+        key: String,
+        snapshot: &CacheGeneration,
+        table: Table,
+        etag: Option<String>,
+    ) -> bool {
+        if self.generation_changed(&key, snapshot) {
+            debug!(
+                cache_key = %key,
+                "Dropping table metadata fetched before an invalidation (pre-check)"
+            );
+            return false;
+        }
+        self.inner
+            .insert(
+                key.clone(),
+                CachedTableEntry {
+                    table,
+                    etag,
+                    validated_at: Instant::now(),
+                },
+            )
+            .await;
+        !self.undo_if_raced(&key, snapshot).await
+    }
+
+    /// Evict `key` when an invalidation raced the write that just stored it.
+    /// Returns whether the entry was rolled back.
+    async fn undo_if_raced(&self, key: &str, snapshot: &CacheGeneration) -> bool {
+        if self.generation_changed(key, snapshot) {
+            self.inner.invalidate(key).await;
+            debug!(
+                cache_key = %key,
+                "Rolled back a table metadata insert that raced an invalidation"
+            );
+            return true;
+        }
+        false
     }
 
     /// Insert an entry whose freshness clock is already `age` old. Test-only:
@@ -373,14 +573,31 @@ impl TableMetadataCache {
     /// table or refreshing the soft-TTL clock. Used by the background HEAD
     /// path so the ETag becomes available for future conditional revalidation
     /// without blocking the cold load_table().
-    pub async fn update_etag(&self, key: &str, etag: Option<String>) {
+    ///
+    /// Fenced by `snapshot`, taken before the `HEAD`: the task runs
+    /// fire-and-forget and can land after a commit invalidated the entry, at
+    /// which point re-inserting it would resurrect pre-commit metadata
+    /// (architecture review 304).
+    pub async fn update_etag(&self, key: &str, snapshot: &CacheGeneration, etag: Option<String>) {
+        if self.generation_changed(key, snapshot) {
+            return;
+        }
         if let Some(mut entry) = self.inner.get(key).await {
             entry.etag = etag;
             self.inner.insert(key.to_string(), entry).await;
+            self.undo_if_raced(key, snapshot).await;
         }
     }
 
+    /// Evict ONE principal's entry.
+    ///
+    /// Reserved for `SessionCatalog::authorize_table_access`; commits must use
+    /// [`Self::invalidate_table_all_tokens`]. See the type-level invariant.
     pub async fn invalidate(&self, key: &str) {
+        // Bump before evicting: a reader awaiting a fetch for this key has no
+        // entry here to remove, so the generation is the only thing that can
+        // stop it from storing what it read.
+        self.bump_generation(&self.key_generations, key);
         self.inner.invalidate(key).await;
     }
 
@@ -395,6 +612,12 @@ impl TableMetadataCache {
     /// entries, it must stay behind the admin gate -- never wire it into the
     /// self-scoped `CALL system.refresh_catalog_cache()` path.
     pub async fn invalidate_all(&self) {
+        // Bump before evicting, and bump the scope that also covers keys with
+        // no entry yet: an in-flight load must not repopulate the cache the
+        // refresh just cleared.
+        let stamp = self.next_generation();
+        self.global_generation
+            .store(stamp, std::sync::atomic::Ordering::SeqCst);
         self.inner.invalidate_all();
         self.inner.run_pending_tasks().await;
         debug!("TableMetadataCache invalidated (catalog refresh)");
@@ -415,6 +638,11 @@ impl TableMetadataCache {
     /// `"{namespace_display}.{table_name}"` (same shape as
     /// `table_ident.namespace()` + `.` + `table_ident.name()`).
     pub async fn invalidate_table_all_tokens(&self, ns_table_suffix: &str) {
+        // Bump before evicting. The scan below can only remove entries that
+        // already exist; a session whose `load_table` is still awaiting Polaris
+        // has no entry to find, and the generation is what stops it from
+        // storing the pre-commit metadata it is about to receive.
+        self.bump_generation(&self.table_generations, ns_table_suffix);
         // Collect first, then invalidate, to avoid mutating the map mid-iter.
         let keys = select_keys_for_suffix(
             self.inner.iter().map(|(k, _)| (*k).clone()),
@@ -834,6 +1062,15 @@ fn table_metadata_cache_key(
     )
 }
 
+/// The `{namespace_display}.{table_name}` tail every token's cache key for this
+/// table shares. This is both the eviction scope of
+/// [`TableMetadataCache::invalidate_table_all_tokens`] and the scope a fenced
+/// insert snapshots, so the two must be built the same way — hence one helper
+/// rather than two `format!`s that could drift.
+fn table_metadata_cache_suffix(table_ident: &TableIdent) -> String {
+    format!("{}.{}", table_ident.namespace(), table_ident.name())
+}
+
 /// Wrap an Iceberg catalog failure, classifying a Forbidden (403) answer as
 /// [`sqe_core::SqeErrorCode::AccessDenied`] even when the status surfaces only
 /// in the error's Debug rendering (the Display string the message-based
@@ -1167,6 +1404,34 @@ impl SessionCatalog {
         }
     }
 
+    /// Build a `SessionCatalog` over an arbitrary `iceberg::Catalog`.
+    ///
+    /// Test hook, in the same spirit as `TableMetadataCache::insert_aged`: it
+    /// lets the cache-invalidation and cache-fencing paths be driven with a
+    /// backend that can block or succeed on demand, without a live Polaris and
+    /// without a mock server per DDL verb. `catalog_url` points at a closed
+    /// port so any background HTTP the paths under test fire is refused
+    /// immediately rather than reaching a real host.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_backend(
+        backend: Arc<dyn iceberg::Catalog>,
+        table_cache: TableMetadataCache,
+        token_fingerprint: &str,
+    ) -> Self {
+        Self {
+            inner: CatalogHandle::Other(backend),
+            catalog_url: "http://127.0.0.1:1".to_string(),
+            warehouse: "test-warehouse".to_string(),
+            bearer_token: "test-token".to_string(),
+            token_fingerprint: token_fingerprint.to_string(),
+            storage_config: StorageConfig::default(),
+            http_client: SHARED_HTTP_CLIENT.clone(),
+            circuit_breaker: user_circuit_breaker(token_fingerprint, "http://127.0.0.1:1"),
+            require_vended_credentials: false,
+            table_cache,
+        }
+    }
+
     /// Build a `SessionCatalog` for a SIBLING warehouse on the same Polaris
     /// endpoint, reusing this session's bearer token, storage config, shared
     /// HTTP client, circuit breaker, and table cache.
@@ -1445,6 +1710,13 @@ impl SessionCatalog {
     #[instrument(name = "sqe.catalog", skip(self), fields(op = "load_table", table = %table_ident, warehouse = %self.warehouse))]
     pub async fn load_table(&self, table_ident: &TableIdent) -> sqe_core::Result<Table> {
         let cache_key = self.table_cache_key(table_ident);
+        // Snapshot the invalidation generations BEFORE any fetch below. Every
+        // insert on this path is fenced with it, so a commit by another session
+        // that lands while we are awaiting Polaris discards what we read
+        // instead of being overwritten by it (architecture review 304).
+        let generation = self
+            .table_cache
+            .generation(&cache_key, &table_metadata_cache_suffix(table_ident));
 
         // CAT-04: when the ETag revalidation GET below fetches a changed
         // metadata document (non-304), its response carries a fresh `ETag`
@@ -1516,7 +1788,7 @@ impl SessionCatalog {
                             "ETag revalidation: 304 Not Modified, reusing cached metadata"
                         );
                         self.circuit_breaker.record_success();
-                        self.table_cache.revalidate(&cache_key).await;
+                        self.table_cache.revalidate(&cache_key, &generation).await;
                         return Ok(stale_table);
                     }
                     // Non-304: fall through to the full load path below.
@@ -1576,36 +1848,52 @@ impl SessionCatalog {
                     // extra HEAD request to Polaris.
                     debug!(table = ?table_ident, etag = %etag, "Captured ETag from revalidation response");
                     self.table_cache
-                        .insert_with_etag(cache_key.clone(), table.clone(), Some(etag))
+                        .insert_if_generation(
+                            cache_key.clone(),
+                            &generation,
+                            table.clone(),
+                            Some(etag),
+                        )
                         .await;
                 } else {
                     // Cold load with no prior stale entry: iceberg-rust's
                     // `load_table` hides the HTTP response headers, so the ETag
                     // is only obtainable via a follow-up HEAD. Keep it
                     // fire-and-forget so the cold load isn't blocked on it.
-                    self.table_cache
-                        .insert_with_etag(cache_key.clone(), table.clone(), None)
+                    let cached = self
+                        .table_cache
+                        .insert_if_generation(cache_key.clone(), &generation, table.clone(), None)
                         .await;
 
-                    let http_client = self.http_client.clone();
-                    let bearer_token = self.bearer_token.clone();
-                    let url = self.table_url(table_ident);
-                    let table_cache = self.table_cache.clone();
-                    let table_ident_log = table_ident.clone();
-                    let etag_span = tracing::info_span!(
-                        "iceberg.rest.etag",
-                        db.system.name = "iceberg",
-                        catalog.operation = "load_table_etag",
-                        table = %table_ident,
-                    );
-                    tokio::spawn(async move {
-                        let etag = fetch_table_etag_inner(&http_client, &bearer_token, &url).await;
-                        if let Some(e) = etag.as_deref() {
-                            debug!(table = %table_ident_log, etag = %e, "Captured ETag for table");
-                        }
-                        table_cache.update_etag(&cache_key, etag).await;
+                    // Skip the HEAD when a commit raced this load: nothing was
+                    // cached, so there is no entry for an ETag to attach to.
+                    if cached {
+                        let http_client = self.http_client.clone();
+                        let bearer_token = self.bearer_token.clone();
+                        let url = self.table_url(table_ident);
+                        let table_cache = self.table_cache.clone();
+                        let table_ident_log = table_ident.clone();
+                        let generation = generation.clone();
+                        let etag_span = tracing::info_span!(
+                            "iceberg.rest.etag",
+                            db.system.name = "iceberg",
+                            catalog.operation = "load_table_etag",
+                            table = %table_ident,
+                        );
+                        tokio::spawn(
+                            async move {
+                                let etag =
+                                    fetch_table_etag_inner(&http_client, &bearer_token, &url).await;
+                                if let Some(e) = etag.as_deref() {
+                                    debug!(table = %table_ident_log, etag = %e, "Captured ETag for table");
+                                }
+                                // Fenced: this task outlives the load, so a
+                                // commit can have evicted the entry by now.
+                                table_cache.update_etag(&cache_key, &generation, etag).await;
+                            }
+                            .instrument(etag_span),
+                        );
                     }
-                    .instrument(etag_span));
                 }
             }
             // Auth failures (401/403) are per-principal decisions, not faults:
@@ -1764,11 +2052,14 @@ async fn fetch_table_etag_inner(
 }
 
 impl SessionCatalog {
-    /// Evict a table from the metadata cache.
+    /// Evict THIS session's cached copy of a table.
     ///
-    /// Call this after any DDL/DML operation that changes the table's metadata
-    /// (DROP TABLE, CREATE TABLE, ALTER TABLE, INSERT, MERGE, DELETE) so that
-    /// the next `load_table()` fetches fresh metadata from Polaris.
+    /// Not for DDL/DML. A commit is visible to every principal, so it must use
+    /// [`Self::invalidate_table_all_tokens`]; evicting only the writer's key
+    /// leaves other principals planning against pre-commit metadata until the
+    /// soft TTL (architecture review 302). This form exists for the
+    /// authorization-revoke path, where dropping exactly the affected
+    /// principal's vended credentials is the point.
     pub async fn invalidate_table(&self, table_ident: &TableIdent) {
         let key = self.table_cache_key(table_ident);
         self.table_cache.invalidate(&key).await;
@@ -1776,10 +2067,12 @@ impl SessionCatalog {
     }
 
     /// Evict every cached copy of a table, regardless of the bearer token that
-    /// populated it. DML commits must use this form because a Trino client may
-    /// receive a freshly exchanged access token for its next statement.
+    /// populated it. Every commit path uses this form: table metadata is a
+    /// property of the table, not of the principal that wrote it, and a Trino
+    /// client may even present a freshly exchanged access token for its next
+    /// statement.
     pub async fn invalidate_table_all_tokens(&self, table_ident: &TableIdent) {
-        let suffix = format!("{}.{}", table_ident.namespace(), table_ident.name());
+        let suffix = table_metadata_cache_suffix(table_ident);
         self.table_cache.invalidate_table_all_tokens(&suffix).await;
         debug!(table = %table_ident, "Table cache invalidated for all tokens");
     }
@@ -2166,8 +2459,13 @@ impl SessionCatalog {
         }
 
         info!(table = %table_ident, "Schema update committed");
-        // Invalidate cache so the next load_table() fetches the updated metadata.
-        self.invalidate_table(table_ident).await;
+        // Evict EVERY token's entry, not just the committer's: an added or
+        // dropped column, a rename, or a changed `sqe.column-tags` property is
+        // visible to every principal the moment Polaris accepts it. Evicting
+        // one key is how `ALTER TABLE ADD COLUMN` used to succeed for the
+        // author while everyone else got "column not found" until the soft TTL
+        // (architecture review 302).
+        self.invalidate_table_all_tokens(table_ident).await;
         Ok(())
     }
 
@@ -2242,12 +2540,12 @@ impl Catalog for SessionCatalogBridge {
     ) -> iceberg::Result<Table> {
         let table_name = creation.name.clone();
         let result = dispatch_catalog!(self.session.inner, create_table(namespace, creation))?;
-        // Invalidate any stale cache entry for this table name.
+        // Evict every token's entry for this name, not just the creator's: a
+        // DROP+CREATE with a different schema otherwise leaves other principals
+        // holding a `Table` whose FileIO and metadata location point at the
+        // dropped table's files (architecture review 302).
         let ident = TableIdent::new(namespace.clone(), table_name);
-        self.session
-            .table_cache
-            .invalidate(&self.session.table_cache_key(&ident))
-            .await;
+        self.session.invalidate_table_all_tokens(&ident).await;
         Ok(result)
     }
 
@@ -2262,10 +2560,9 @@ impl Catalog for SessionCatalogBridge {
     async fn drop_table(&self, table: &TableIdent) -> iceberg::Result<()> {
         let result = dispatch_catalog!(self.session.inner, drop_table(table));
         // Invalidate on success or failure: stale data is worse than a miss.
-        self.session
-            .table_cache
-            .invalidate(&self.session.table_cache_key(table))
-            .await;
+        // All tokens, because a dropped table is dropped for everyone and a
+        // surviving entry hands out a FileIO for deleted files.
+        self.session.invalidate_table_all_tokens(table).await;
         result
     }
 
@@ -2274,7 +2571,15 @@ impl Catalog for SessionCatalogBridge {
     }
 
     async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> iceberg::Result<()> {
-        dispatch_catalog!(self.session.inner, rename_table(src, dest))
+        let result = dispatch_catalog!(self.session.inner, rename_table(src, dest));
+        // BOTH names, and every token holding either. The source name no longer
+        // resolves and the destination may have shadowed a cached entry, so a
+        // surviving copy of either is metadata for a table that is not there.
+        // On failure too: the rename may have partially applied, and a miss is
+        // cheaper than a wrong answer.
+        self.session.invalidate_table_all_tokens(src).await;
+        self.session.invalidate_table_all_tokens(dest).await;
+        result
     }
 
     async fn register_table(
@@ -2282,7 +2587,12 @@ impl Catalog for SessionCatalogBridge {
         table: &TableIdent,
         metadata_location: String,
     ) -> iceberg::Result<Table> {
-        dispatch_catalog!(self.session.inner, register_table(table, metadata_location))
+        let result =
+            dispatch_catalog!(self.session.inner, register_table(table, metadata_location));
+        // Registering binds this name to a different metadata document; any
+        // principal's cached entry for the name is now for the wrong table.
+        self.session.invalidate_table_all_tokens(table).await;
+        result
     }
 
     async fn update_table(&self, commit: iceberg::TableCommit) -> iceberg::Result<Table> {
@@ -2589,7 +2899,8 @@ mod cache_capacity_tests {
         );
         assert!(cache.properties_for(None, "sales", "orders").is_some());
 
-        cache.revalidate(&key_a).await;
+        let generation = cache.generation(&key_a, "sales.orders");
+        cache.revalidate(&key_a, &generation).await;
         assert!(cache
             .properties_for(Some("warehouse_a"), "sales", "orders")
             .is_some());
@@ -2624,7 +2935,7 @@ mod cache_capacity_tests {
     /// `ObjectCache` (no I/O). Identifier is required by the builder but the
     /// cache is keyed by the string we pass to `insert`, so its value is
     /// irrelevant to what we assert.
-    fn test_table() -> iceberg::table::Table {
+    pub(super) fn test_table() -> iceberg::table::Table {
         const META_V1: &str = r#"{
             "format-version": 1,
             "table-uuid": "d20125c8-7284-442c-9aea-15fee620737c",
@@ -2825,5 +3136,604 @@ mod cache_capacity_tests {
         let err = super::namespace_visible_from_probe::<()>(Err(e))
             .expect_err("5xx must fail the listing, not keep the name");
         assert_eq!(err.error_code(), sqe_core::SqeErrorCode::CatalogUnavailable);
+    }
+}
+
+/// Invalidation-scope (architecture review 302) and insert-fencing
+/// (architecture review 304) tests.
+///
+/// Two token fingerprints cache the same table throughout: the whole point of
+/// both findings is what happens to the OTHER principal's copy.
+#[cfg(test)]
+mod invalidation_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::cache_capacity_tests::test_table;
+    use super::{
+        rest_catalog_token_fingerprint, table_metadata_cache_key, SessionCatalog,
+        TableMetadataCache,
+    };
+
+    const WAREHOUSE: &str = "test-warehouse";
+    const NS: &str = "sales";
+    const SUFFIX: &str = "sales.orders";
+    /// Some other principal's cached copy of the same table.
+    const OTHER_TOKEN: &str = "fingerprint_of_another_user";
+
+    fn orders() -> TableIdent {
+        TableIdent::new(NamespaceIdent::new(NS.to_string()), "orders".to_string())
+    }
+
+    fn orders_v2() -> TableIdent {
+        TableIdent::new(NamespaceIdent::new(NS.to_string()), "orders_v2".to_string())
+    }
+
+    fn key_for(fingerprint: &str, ident: &TableIdent) -> String {
+        table_metadata_cache_key(fingerprint, WAREHOUSE, ident)
+    }
+
+    fn unsupported<T>() -> iceberg::Result<T> {
+        Err(iceberg::Error::new(
+            iceberg::ErrorKind::FeatureUnsupported,
+            "not exercised by the invalidation tests",
+        ))
+    }
+
+    /// Catalog backend stub. Mutations succeed without a server so the bridge's
+    /// eviction can be asserted per DDL verb, and `load_table` can be held open
+    /// so an invalidation can be made to land strictly inside a load.
+    #[derive(Debug, Default)]
+    struct StubCatalog {
+        block_load: bool,
+        /// Fired as `load_table` enters, before it blocks.
+        entered: tokio::sync::Notify,
+        /// Awaited by a blocking `load_table` before it returns.
+        release: tokio::sync::Notify,
+    }
+
+    impl StubCatalog {
+        fn blocking() -> Self {
+            Self {
+                block_load: true,
+                ..Self::default()
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Catalog for StubCatalog {
+        async fn list_namespaces(
+            &self,
+            _parent: Option<&NamespaceIdent>,
+        ) -> iceberg::Result<Vec<NamespaceIdent>> {
+            Ok(Vec::new())
+        }
+
+        async fn create_namespace(
+            &self,
+            _namespace: &NamespaceIdent,
+            _properties: HashMap<String, String>,
+        ) -> iceberg::Result<iceberg::Namespace> {
+            unsupported()
+        }
+
+        async fn get_namespace(
+            &self,
+            _namespace: &NamespaceIdent,
+        ) -> iceberg::Result<iceberg::Namespace> {
+            unsupported()
+        }
+
+        async fn namespace_exists(&self, _namespace: &NamespaceIdent) -> iceberg::Result<bool> {
+            Ok(true)
+        }
+
+        async fn update_namespace(
+            &self,
+            _namespace: &NamespaceIdent,
+            _properties: HashMap<String, String>,
+        ) -> iceberg::Result<()> {
+            unsupported()
+        }
+
+        async fn drop_namespace(&self, _namespace: &NamespaceIdent) -> iceberg::Result<()> {
+            unsupported()
+        }
+
+        async fn list_tables(
+            &self,
+            _namespace: &NamespaceIdent,
+        ) -> iceberg::Result<Vec<TableIdent>> {
+            Ok(Vec::new())
+        }
+
+        async fn create_table(
+            &self,
+            _namespace: &NamespaceIdent,
+            _creation: TableCreation,
+        ) -> iceberg::Result<iceberg::table::Table> {
+            Ok(test_table())
+        }
+
+        async fn load_table(&self, _table: &TableIdent) -> iceberg::Result<iceberg::table::Table> {
+            if self.block_load {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(test_table())
+        }
+
+        async fn drop_table(&self, _table: &TableIdent) -> iceberg::Result<()> {
+            Ok(())
+        }
+
+        async fn table_exists(&self, _table: &TableIdent) -> iceberg::Result<bool> {
+            Ok(true)
+        }
+
+        async fn rename_table(&self, _src: &TableIdent, _dest: &TableIdent) -> iceberg::Result<()> {
+            Ok(())
+        }
+
+        async fn register_table(
+            &self,
+            _table: &TableIdent,
+            _metadata_location: String,
+        ) -> iceberg::Result<iceberg::table::Table> {
+            Ok(test_table())
+        }
+
+        async fn update_table(
+            &self,
+            _commit: iceberg::TableCommit,
+        ) -> iceberg::Result<iceberg::table::Table> {
+            Ok(test_table())
+        }
+    }
+
+    /// A cache holding `idents` under the writer's fingerprint AND under a
+    /// second principal's, which is the copy every one of these tests is about.
+    async fn cache_with_two_tokens(writer: &str, idents: &[TableIdent]) -> TableMetadataCache {
+        let cache = TableMetadataCache::new(300);
+        for ident in idents {
+            cache.insert(key_for(writer, ident), test_table()).await;
+            cache
+                .insert(key_for(OTHER_TOKEN, ident), test_table())
+                .await;
+            // Guard against a vacuous assertion later: an eviction can only be
+            // proved by entries that were really there to begin with.
+            assert!(
+                cache.get_fresh(&key_for(writer, ident)).await.is_some(),
+                "seeding the writer's entry for {ident} failed"
+            );
+            assert!(
+                cache
+                    .get_fresh(&key_for(OTHER_TOKEN, ident))
+                    .await
+                    .is_some(),
+                "seeding the other principal's entry for {ident} failed"
+            );
+        }
+        cache
+    }
+
+    async fn assert_evicted_for_both_tokens(
+        cache: &TableMetadataCache,
+        writer: &str,
+        ident: &TableIdent,
+    ) {
+        assert!(
+            cache.get_fresh(&key_for(writer, ident)).await.is_none(),
+            "the committer's own entry for {ident} survived"
+        );
+        assert!(
+            cache
+                .get_fresh(&key_for(OTHER_TOKEN, ident))
+                .await
+                .is_none(),
+            "another principal's entry for {ident} survived: they keep planning \
+             against pre-commit metadata until the soft TTL (finding 302)"
+        );
+    }
+
+    fn bridged(
+        backend: Arc<dyn Catalog>,
+        cache: TableMetadataCache,
+        fingerprint: &str,
+    ) -> Arc<super::SessionCatalogBridge> {
+        let session = Arc::new(SessionCatalog::for_test_with_backend(
+            backend,
+            cache,
+            fingerprint,
+        ));
+        session.as_catalog()
+    }
+
+    fn creation(name: &str) -> TableCreation {
+        TableCreation::builder()
+            .name(name.to_string())
+            .schema(test_table().metadata().current_schema().as_ref().clone())
+            .build()
+    }
+
+    #[tokio::test]
+    async fn bridge_create_table_evicts_every_token() {
+        let cache = cache_with_two_tokens("tok_create", &[orders()]).await;
+        let bridge = bridged(
+            Arc::new(StubCatalog::default()),
+            cache.clone(),
+            "tok_create",
+        );
+
+        bridge
+            .create_table(&NamespaceIdent::new(NS.to_string()), creation("orders"))
+            .await
+            .expect("stub create_table succeeds");
+
+        assert_evicted_for_both_tokens(&cache, "tok_create", &orders()).await;
+    }
+
+    #[tokio::test]
+    async fn bridge_drop_table_evicts_every_token() {
+        let cache = cache_with_two_tokens("tok_drop", &[orders()]).await;
+        let bridge = bridged(Arc::new(StubCatalog::default()), cache.clone(), "tok_drop");
+
+        bridge
+            .drop_table(&orders())
+            .await
+            .expect("stub drop_table succeeds");
+
+        assert_evicted_for_both_tokens(&cache, "tok_drop", &orders()).await;
+    }
+
+    #[tokio::test]
+    async fn bridge_rename_table_evicts_every_token_for_source_and_destination() {
+        let cache = cache_with_two_tokens("tok_rename", &[orders(), orders_v2()]).await;
+        let bridge = bridged(
+            Arc::new(StubCatalog::default()),
+            cache.clone(),
+            "tok_rename",
+        );
+
+        bridge
+            .rename_table(&orders(), &orders_v2())
+            .await
+            .expect("stub rename_table succeeds");
+
+        assert_evicted_for_both_tokens(&cache, "tok_rename", &orders()).await;
+        assert_evicted_for_both_tokens(&cache, "tok_rename", &orders_v2()).await;
+    }
+
+    #[tokio::test]
+    async fn bridge_register_table_evicts_every_token() {
+        let cache = cache_with_two_tokens("tok_register", &[orders()]).await;
+        let bridge = bridged(
+            Arc::new(StubCatalog::default()),
+            cache.clone(),
+            "tok_register",
+        );
+
+        bridge
+            .register_table(&orders(), "s3://bucket/meta.json".to_string())
+            .await
+            .expect("stub register_table succeeds");
+
+        assert_evicted_for_both_tokens(&cache, "tok_register", &orders()).await;
+    }
+
+    #[tokio::test]
+    async fn bridge_update_table_evicts_every_token() {
+        // `update_table` already evicted all tokens before finding 302; the
+        // test pins the behaviour the other four verbs were aligned to.
+        let cache = cache_with_two_tokens("tok_update", &[orders()]).await;
+        let session = Arc::new(SessionCatalog::for_test_with_backend(
+            Arc::new(StubCatalog::default()),
+            cache.clone(),
+            "tok_update",
+        ));
+
+        session.invalidate_table_all_tokens(&orders()).await;
+
+        assert_evicted_for_both_tokens(&cache, "tok_update", &orders()).await;
+    }
+
+    /// Schema evolution (`ALTER TABLE ADD/DROP/RENAME COLUMN`, `SET
+    /// TBLPROPERTIES`) used to evict only the committer's key, so the author
+    /// saw the new column and everybody else got "column not found".
+    #[tokio::test]
+    async fn commit_schema_update_evicts_every_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/test-warehouse/namespaces/sales/tables/orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+
+        let bearer = "commit-schema-update-token";
+        let fingerprint = rest_catalog_token_fingerprint(bearer);
+        let cache = cache_with_two_tokens(&fingerprint, &[orders()]).await;
+
+        let session = SessionCatalog::new(
+            &server.uri(),
+            WAREHOUSE,
+            bearer,
+            &sqe_core::config::StorageConfig::default(),
+            Some(cache.clone()),
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("construct session catalog");
+
+        session
+            .commit_schema_update(&orders(), Vec::new(), Vec::new())
+            .await
+            .expect("mocked commit succeeds");
+
+        assert_evicted_for_both_tokens(&cache, &fingerprint, &orders()).await;
+    }
+
+    /// Positive control for the test below: the identical blocked load, with no
+    /// invalidation, DOES populate the cache. Without this, an eviction
+    /// assertion would pass just as happily against a load that never caches.
+    #[tokio::test]
+    async fn load_blocked_without_an_invalidation_populates_the_cache() {
+        let cache = TableMetadataCache::new(300);
+        let stub = Arc::new(StubCatalog::blocking());
+        let session = Arc::new(SessionCatalog::for_test_with_backend(
+            stub.clone(),
+            cache.clone(),
+            "tok_unblocked",
+        ));
+        let key = key_for("tok_unblocked", &orders());
+
+        let loader = {
+            let session = Arc::clone(&session);
+            tokio::spawn(async move { session.load_table(&orders()).await })
+        };
+
+        stub.entered.notified().await;
+        stub.release.notify_one();
+        loader.await.expect("loader task").expect("load succeeds");
+
+        assert!(
+            cache.get_fresh(&key).await.is_some(),
+            "the load path must cache when nothing invalidated"
+        );
+    }
+
+    /// Finding 304, the case the eviction alone cannot cover: while the reader
+    /// is inside the catalog fetch there is no entry for the writer's eviction
+    /// to remove, so only the generation fence can stop the pre-commit snapshot
+    /// from being stored and marked fresh for a whole soft TTL.
+    #[tokio::test]
+    async fn load_blocked_across_an_invalidation_does_not_repopulate_the_cache() {
+        let cache = TableMetadataCache::new(300);
+        let stub = Arc::new(StubCatalog::blocking());
+        let session = Arc::new(SessionCatalog::for_test_with_backend(
+            stub.clone(),
+            cache.clone(),
+            "tok_blocked",
+        ));
+        let key = key_for("tok_blocked", &orders());
+
+        let loader = {
+            let session = Arc::clone(&session);
+            tokio::spawn(async move { session.load_table(&orders()).await })
+        };
+
+        // The load is now inside the backend fetch, holding the pre-commit
+        // metadata it is about to return.
+        stub.entered.notified().await;
+        cache.invalidate_table_all_tokens(SUFFIX).await;
+        stub.release.notify_one();
+
+        loader
+            .await
+            .expect("loader task")
+            .expect("the blocked load still answers its own caller");
+
+        assert!(
+            cache.get_fresh(&key).await.is_none(),
+            "a load that started before the commit repopulated the cache with \
+             pre-commit metadata (finding 304)"
+        );
+        assert!(
+            cache.get_stale(&key).await.is_none(),
+            "the stale copy is what ETag revalidation would rebuild from"
+        );
+    }
+
+    /// Control for the fenced-insert tests: the unfenced primitive — what the
+    /// load path called before finding 304 — puts the evicted entry straight
+    /// back and stamps it fresh. Without this, "the entry is gone" could pass
+    /// against a cache that simply never stores anything.
+    #[tokio::test]
+    async fn unfenced_insert_after_an_invalidation_resurrects_the_entry() {
+        let cache = TableMetadataCache::new(300);
+        let key = key_for("tok_unfenced", &orders());
+
+        cache.invalidate_table_all_tokens(SUFFIX).await;
+        cache
+            .insert_with_etag(key.clone(), test_table(), None)
+            .await;
+
+        assert!(
+            cache.get_fresh(&key).await.is_some(),
+            "the unfenced insert is the behaviour finding 304 is about; if this \
+             stops resurrecting the entry the fenced tests prove nothing"
+        );
+    }
+
+    /// Control for the all-token eviction tests: evicting one key — what every
+    /// commit path did before finding 302 — leaves the other principal's copy
+    /// in place.
+    #[tokio::test]
+    async fn single_key_invalidate_leaves_other_principals_cached() {
+        let cache = cache_with_two_tokens("tok_single", &[orders()]).await;
+
+        cache.invalidate(&key_for("tok_single", &orders())).await;
+
+        assert!(
+            cache
+                .get_fresh(&key_for("tok_single", &orders()))
+                .await
+                .is_none(),
+            "the targeted key must go"
+        );
+        assert!(
+            cache
+                .get_fresh(&key_for(OTHER_TOKEN, &orders()))
+                .await
+                .is_some(),
+            "single-key eviction leaving other principals cached is the \
+             behaviour finding 302 is about"
+        );
+    }
+
+    #[tokio::test]
+    async fn fenced_insert_on_a_cold_key_is_refused_after_a_commit() {
+        let cache = TableMetadataCache::new(300);
+        let key = key_for("tok_cold", &orders());
+
+        // Nothing cached yet: this is exactly the window the all-token eviction
+        // scan cannot see.
+        let generation = cache.generation(&key, SUFFIX);
+        cache.invalidate_table_all_tokens(SUFFIX).await;
+
+        assert!(
+            !cache
+                .insert_if_generation(key.clone(), &generation, test_table(), None)
+                .await,
+            "the insert must be refused"
+        );
+        assert!(cache.get_fresh(&key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn fenced_insert_is_refused_after_a_single_key_invalidate() {
+        let cache = TableMetadataCache::new(300);
+        let key = key_for("tok_revoked", &orders());
+
+        let generation = cache.generation(&key, SUFFIX);
+        // The authorization-revoke path: one principal's entry, dropped because
+        // their vended credentials are no longer valid.
+        cache.invalidate(&key).await;
+
+        assert!(
+            !cache
+                .insert_if_generation(key.clone(), &generation, test_table(), None)
+                .await
+        );
+        assert!(cache.get_fresh(&key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn fenced_insert_is_refused_after_invalidate_all() {
+        let cache = TableMetadataCache::new(300);
+        let key = key_for("tok_refresh", &orders());
+
+        let generation = cache.generation(&key, SUFFIX);
+        cache.invalidate_all().await;
+
+        assert!(
+            !cache
+                .insert_if_generation(key.clone(), &generation, test_table(), None)
+                .await,
+            "an admin catalog refresh must not be undone by a load already in flight"
+        );
+        assert!(cache.get_fresh(&key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn fenced_insert_succeeds_when_nothing_was_invalidated() {
+        let cache = TableMetadataCache::new(300);
+        let key = key_for("tok_quiet", &orders());
+        let generation = cache.generation(&key, SUFFIX);
+
+        assert!(
+            cache
+                .insert_if_generation(key.clone(), &generation, test_table(), None)
+                .await,
+            "the fence must not block the ordinary path"
+        );
+        assert!(cache.get_fresh(&key).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn update_etag_after_invalidate_does_not_resurrect_the_entry() {
+        let cache = TableMetadataCache::new(300);
+        let key = key_for("tok_etag", &orders());
+        cache.insert(key.clone(), test_table()).await;
+
+        // The background HEAD task snapshots when the entry is inserted and can
+        // land arbitrarily later.
+        let generation = cache.generation(&key, SUFFIX);
+        cache.invalidate_table_all_tokens(SUFFIX).await;
+        cache
+            .update_etag(&key, &generation, Some("etag-after-commit".to_string()))
+            .await;
+
+        assert!(
+            cache.get_fresh(&key).await.is_none(),
+            "the ETag task put the evicted entry back (finding 304)"
+        );
+        assert!(cache.get_stale(&key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn revalidate_after_invalidate_does_not_undo_it() {
+        let cache = TableMetadataCache::new(300);
+        let key = key_for("tok_reval", &orders());
+        cache.insert(key.clone(), test_table()).await;
+
+        // Snapshot taken before the conditional GET, 304 processed after a
+        // commit evicted the entry.
+        let generation = cache.generation(&key, SUFFIX);
+        cache.invalidate_table_all_tokens(SUFFIX).await;
+        cache.revalidate(&key, &generation).await;
+
+        assert!(
+            cache.get_fresh(&key).await.is_none(),
+            "revalidate re-inserted an evicted entry and stamped it fresh"
+        );
+    }
+
+    /// The same pair with no imposed ordering: whatever the runtime interleaves
+    /// at the awaits inside `revalidate` and `invalidate_table_all_tokens`, the
+    /// invalidation must win. Spinning the revalidator a varying number of
+    /// yields first samples the orderings a fixed-order test cannot.
+    #[tokio::test]
+    async fn revalidate_racing_invalidate_never_leaves_an_entry() {
+        for spins in 0..8 {
+            let cache = TableMetadataCache::new(300);
+            let key = key_for("tok_race", &orders());
+            cache.insert(key.clone(), test_table()).await;
+            let generation = cache.generation(&key, SUFFIX);
+
+            let revalidator = {
+                let cache = cache.clone();
+                let key = key.clone();
+                tokio::spawn(async move {
+                    for _ in 0..spins {
+                        tokio::task::yield_now().await;
+                    }
+                    cache.revalidate(&key, &generation).await;
+                })
+            };
+            cache.invalidate_table_all_tokens(SUFFIX).await;
+            revalidator.await.expect("revalidator task");
+
+            assert!(
+                cache.get_fresh(&key).await.is_none(),
+                "revalidate undid the invalidation at spins={spins}"
+            );
+        }
     }
 }
