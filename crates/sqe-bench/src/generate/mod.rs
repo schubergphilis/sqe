@@ -254,6 +254,7 @@ mod sweep_tests {
     /// schema/value drift in tables that have no dedicated test.
     #[test]
     fn every_generator_table_builds_clean_batches() {
+        // nosemgrep: opt.aikido.semgrep-rules.rust.lang.security.temp-dir -- test-only scratch dir for synthetic benchmark data, pid suffixed
         let dir = std::env::temp_dir().join(format!("sqe-bench-sweep-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = GenerateConfig {

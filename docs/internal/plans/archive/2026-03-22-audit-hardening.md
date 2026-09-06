@@ -222,12 +222,14 @@ fn test_debug_redacts_credentials() {
         projected_columns: vec![],
         s3_endpoint: "http://localhost:9000".to_string(),
         s3_region: "us-east-1".to_string(),
+        // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS documentation example key
         s3_access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
         s3_secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
         s3_session_token: "session-token-value".to_string(),
         s3_path_style: true,
     };
     let debug_output = format!("{task:?}");
+    // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS documentation example key
     assert!(!debug_output.contains("AKIAIOSFODNN7EXAMPLE"));
     assert!(!debug_output.contains("wJalrXUtnFEMI"));
     assert!(!debug_output.contains("session-token-value"));

@@ -29,6 +29,7 @@ def _req(url, auth, data=None):
         r.add_header(k, v)
     if auth:
         r.add_header("Authorization", "Basic " + base64.b64encode(b"root:s3cr3t").decode())
+    # nosemgrep: opt.aikido.semgrep-rules.python.lang.security.audit.dynamic-urllib-use-detected -- URL is the local test stack endpoint passed on the command line
     return json.load(urllib.request.urlopen(r, timeout=120))
 
 def run(engine, sql):

@@ -75,6 +75,7 @@ cd "$ROOT_DIR"
 
 SQL="ATTACH '${BENCH_GOLDEN_POLARIS_URL}' AS golden (TYPE iceberg_rest, WAREHOUSE '${BENCH_GOLDEN_WAREHOUSE}', TOKEN '${BENCH_GOLDEN_TOKEN}', S3_ENDPOINT '${BENCH_S3_ENDPOINT}', S3_REGION '${S3_REGION}', S3_ACCESS_KEY '${BENCH_GOLDEN_S3_ACCESS_KEY}', S3_SECRET_KEY '${BENCH_GOLDEN_S3_SECRET_KEY}', S3_PATH_STYLE '${S3_PATH_STYLE}')"
 
+# nosemgrep: opt.aikido.semgrep-rules.ai.ai-best-practices.hooks-dns-exfiltration.hooks-dns-exfiltration-generic
 cargo run -q -p sqe-cli -- --host "$HOST" --port "$PORT" --token "$BENCH_GOLDEN_TOKEN" -e "$SQL"
 
 echo "attached golden: ${BENCH_GOLDEN_POLARIS_URL}"

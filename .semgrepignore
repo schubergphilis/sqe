@@ -1,0 +1,7 @@
+# Generated data artifacts (benchmark charts, EXPLAIN captures, matrix/perf
+# JSON). Not source; the files cannot carry nosemgrep comments.
+docs/evidence/
+
+# Test-only TLS fixtures (self-signed PEM key pairs). PEM files cannot carry
+# nosemgrep comments.
+crates/sqe-core/tests/fixtures/tls/

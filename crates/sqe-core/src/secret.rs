@@ -400,6 +400,7 @@ mod tests {
     #[test]
     fn aws_debug_redacts_credentials_but_keeps_region() {
         let s = Secret::Aws {
+            // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- synthetic EXAMPLE key id, test fixture
             access_key: Some("AKIAEXAMPLEXXXXXXXXX".to_string()),
             secret_key: Some("supersecret-key-value".to_string()),
             session_token: Some("session-token-payload".to_string()),
@@ -408,6 +409,7 @@ mod tests {
         };
         let d = format!("{:?}", s);
         assert!(
+            // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- synthetic EXAMPLE key id, asserting it is redacted
             !d.contains("AKIAEXAMPLEXXXXXXXXX"),
             "access_key leaked: {d}"
         );
@@ -552,6 +554,7 @@ mod tests {
             .create(
                 "bearer_test",
                 Secret::Bearer {
+                    // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.generic-api-key -- placeholder hex string, test fixture
                     token: "0123456789abcdef".to_string(), // gitleaks:allow (test fixture)
                 },
             )
@@ -562,6 +565,7 @@ mod tests {
     }
 
     fn temp_secrets_dir() -> std::path::PathBuf {
+        // nosemgrep: opt.aikido.semgrep-rules.rust.lang.security.temp-dir -- test-only store dir holding fixture secrets, nanosecond-suffixed
         let dir = std::env::temp_dir().join(format!(
             "sqe-secrets-test-{}",
             std::time::SystemTime::now()

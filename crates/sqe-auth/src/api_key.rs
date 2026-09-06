@@ -37,7 +37,7 @@ use crate::provider::{AuthError, AuthProvider, FlightCredentials, Identity};
 ///
 /// ```toml
 /// [[keys]]
-/// key = "sqe_abc123def456"
+/// key = "sqe_<random-key-material>"
 /// description = "CI pipeline read-only"
 /// user = "ci-bot"
 /// groups = ["readers"]
@@ -488,6 +488,7 @@ user = "other"
 
     #[tokio::test]
     async fn reload_picks_up_new_key() {
+        // nosemgrep: opt.aikido.semgrep-rules.rust.lang.security.temp-dir -- test-only scratch dir, pid+nonce suffixed, holds no secret material
         let dir = std::env::temp_dir().join(format!(
             "sqe-api-key-test-{}-{}",
             std::process::id(),

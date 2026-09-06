@@ -299,6 +299,7 @@ mod tests {
         S3Conn {
             endpoint: "http://localhost:9000".to_string(),
             region: "us-east-1".to_string(),
+            // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS's documented example key, test fixture
             access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
             secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
             session_token: "session-token-value".to_string(),
@@ -490,6 +491,7 @@ mod tests {
     fn s3_conn_debug_redacts_secrets() {
         let s3 = sample_s3();
         let debug_output = format!("{s3:?}");
+        // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS's documented example key, asserting it is redacted
         assert!(!debug_output.contains("AKIAIOSFODNN7EXAMPLE"));
         assert!(!debug_output.contains("wJalrXUtnFEMI"));
         assert!(!debug_output.contains("session-token-value"));
@@ -500,6 +502,7 @@ mod tests {
     fn compact_group_request_debug_redacts_secrets() {
         let req = sample_request();
         let debug_output = format!("{req:?}");
+        // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS's documented example key, asserting it is redacted
         assert!(!debug_output.contains("AKIAIOSFODNN7EXAMPLE"));
         assert!(!debug_output.contains("wJalrXUtnFEMI"));
         assert!(!debug_output.contains("session-token-value"));

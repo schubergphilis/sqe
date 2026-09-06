@@ -106,6 +106,7 @@ token_env = "SQE_MCP_READ_TOKEN"      # preferred
 [[mcp.auth.principals]]
 user      = "mcp-writer"
 roles     = ["data_writer"]
+# nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.generic-api-key -- placeholder value
 token_b64 = "c3FlLXdyaXRlci10b2tlbi0x"
 ```
 
