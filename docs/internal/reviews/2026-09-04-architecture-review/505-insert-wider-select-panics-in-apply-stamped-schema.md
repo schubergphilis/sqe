@@ -4,7 +4,7 @@
 - Severity: medium
 - Category: reliability
 - Effort: S (hours)
-- Status: open
+- Status: fixed (branch `fix/data-consistency-p1`, 2026-09-05)
 - Issue: #597
 
 ## Problem
@@ -76,3 +76,56 @@ error on the narrower side wastes the full SELECT execution before reporting.
 - 508 (two stamping implementations).
 - `docs/internal/reviews/2026-06-26-codebase-analysis.md` item 9 (panics in
   write handler) covered explicit `panic!` calls; this is an implicit one.
+
+## Resolution (2026-09-05)
+
+The arity mismatch is now a SQL-level error raised at planning time, and no
+stamping path invents a field id any more.
+
+**What changed**
+
+- `crates/sqe-coordinator/src/write_handler.rs`
+  - New `check_insert_arity(&[String], &IcebergSchema, &TableIdent)`. Arity is
+    an error (`SqeError::Execution("INSERT has N columns but target has M")`);
+    a positional *name* difference is not, because INSERT is positional per the
+    SQL standard — it is logged at info (`positions = "b -> a, a -> b"`) so an
+    operator can spot an accidental swap.
+  - `handle_insert_streaming` calls it right after `ctx.sql(...)`, before
+    policy enforcement, before `execute_stream`, and before the upload tracker
+    and `WriteCleanupGuard` exist — so no parquet part can have been opened.
+  - `handle_ingest` (batched DoPut) calls it on the first uploaded batch.
+    `handle_ingest_streaming` has nothing to check up front (the batches have
+    not arrived); its mis-shaped batches are caught per batch by
+    `apply_stamped_schema`, which now errors instead of panicking. A comment
+    at the call site says so.
+- `crates/sqe-compaction/src/writer.rs`
+  - `apply_stamped_schema` checks `batch.num_columns() != stamped_schema.fields().len()`
+    up front and returns the same "INSERT has N columns but target has M"
+    error. This is the panic site: `ArrowSchema::field(i)` is `&self.fields[i]`.
+  - `build_stamped_schema` — `unwrap_or((i + 1) as i32)` replaced by an
+    `ok_or_else` error.
+- `crates/sqe-coordinator/src/writer.rs`
+  - `stamp_field_ids` — rejects a batch wider than the target schema with the
+    same message, and both fallbacks (`unwrap_or((i + 1) as i32)` for the field
+    id, `unwrap_or_else` for the Arrow target type) are now errors. A wider
+    batch on this path used to write a parquet column stamped with an Iceberg
+    field id belonging to no field.
+- `grep -rn 'unwrap_or((i + 1) as i32)' crates/` returns nothing.
+
+**Tests**
+
+- `sqe-compaction --lib writer` (13 passed / 0 failed):
+  `apply_stamped_schema_rejects_wider_batch` (3-column batch, 2-field schema →
+  `Err`, not a panic), `apply_stamped_schema_rejects_narrower_batch`,
+  `apply_stamped_schema_accepts_matching_arity`.
+- `sqe-coordinator --lib` (112 passed / 0 failed):
+  `check_insert_arity_rejects_wider_select` (asserts the exact message),
+  `check_insert_arity_rejects_narrower_select`,
+  `check_insert_arity_accepts_matching_and_reordered_names` (a name swap and a
+  case difference both stay legal).
+
+**Not covered by unit tests.** The acceptance criterion's "assert the tracker
+is empty" needs a loaded Iceberg table, so it needs the docker e2e suite. The
+check is placed above every line that creates the tracker or the cleanup
+guard, so the property holds by construction; `check_insert_arity` is unit
+tested in isolation instead.

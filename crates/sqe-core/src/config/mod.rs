@@ -1676,6 +1676,25 @@ pub struct WorkerConfig {
     /// Set to 0 to disable the timeout.
     #[serde(default = "default_scan_timeout")]
     pub scan_timeout_secs: u64,
+    /// Maximum wall-clock duration in seconds for one
+    /// `do_action("compact_file_group")` rewrite. Default: 3600 (1 hour).
+    /// Set to 0 to disable the deadline.
+    ///
+    /// Review finding 608: without this the rewrite had no worker-side
+    /// ceiling at all. `scan_timeout_secs` covers only `do_get`, so a group
+    /// that stalled on object storage kept reading, sorting and uploading
+    /// long after the coordinator's `group_heartbeat_timeout` had given up
+    /// and retried the group on another worker -- two workers burning CPU,
+    /// memory pool and S3 bandwidth on the same group. On expiry the worker
+    /// cancels the rewrite, best-effort deletes the objects it had already
+    /// uploaded, and fails the action with `DeadlineExceeded`.
+    ///
+    /// Size it above the coordinator's
+    /// `distributed_compaction.group_heartbeat_timeout_secs` times its retry
+    /// budget: a worker deadline that fires *before* the coordinator's is a
+    /// self-inflicted failure on a group that was merely slow.
+    #[serde(default = "default_compaction_timeout")]
+    pub compaction_timeout_secs: u64,
     /// Shared secret that the coordinator must supply in the
     /// `x-sqe-worker-secret` metadata header on every `do_get` and
     /// `do_action("refresh_credentials")` call. Must match
@@ -1762,6 +1781,7 @@ impl Default for WorkerConfig {
             spill_dir: default_spill_dir(),
             spill: WorkerSpillConfig::default(),
             scan_timeout_secs: default_scan_timeout(),
+            compaction_timeout_secs: default_compaction_timeout(),
             worker_secret: String::new(),
             allow_unauthenticated: false,
             row_group_pruning: true,
@@ -4466,8 +4486,23 @@ pub struct MaintenanceSchedulerConfig {
     /// at once do not all fire in the same tick.
     #[serde(default = "default_maintenance_jitter_secs")]
     pub jitter_secs: u64,
+    /// How many per-table maintenance jobs one coordinator runs at the same
+    /// time. The scheduler tick hands every due table to a bounded
+    /// `JoinSet` and returns immediately, so this is the only thing keeping
+    /// a slow rewrite from being run alongside every other due table's.
+    /// Default `1` = the historical behaviour (one table's job at a time,
+    /// the rest queued), just without a long job blocking the tick loop.
     #[serde(default = "default_maintenance_max_concurrent_jobs")]
     pub max_concurrent_jobs: usize,
+    /// How many ticks a discovered table's properties stay cached before the
+    /// scheduler re-reads them with `load_table`. Discovery lists every
+    /// namespace/table every tick (that is the change signal: a newly listed
+    /// table is loaded immediately, a table that disappears is evicted), but
+    /// only tables whose cache entry is this many ticks old are re-loaded.
+    /// Default `5`; `0` is treated as `1` (re-load every tick, the pre-cache
+    /// behaviour).
+    #[serde(default = "default_maintenance_discovery_cache_ticks")]
+    pub discovery_cache_ticks: u64,
     /// Double-fire guard for multi-coordinator deployments. `catalog`
     /// (default) claims a lease in the Iceberg state table; `none` runs
     /// with no lease and requires `single_scheduler_acknowledged = true`;
@@ -4499,6 +4534,7 @@ impl Default for MaintenanceSchedulerConfig {
             schedule: default_maintenance_schedule(),
             jitter_secs: default_maintenance_jitter_secs(),
             max_concurrent_jobs: default_maintenance_max_concurrent_jobs(),
+            discovery_cache_ticks: default_maintenance_discovery_cache_ticks(),
             lease: LeaseMode::default(),
             lease_ttl_secs: default_maintenance_lease_ttl_secs(),
             state_table: default_maintenance_state_table(),
@@ -4692,6 +4728,9 @@ fn default_maintenance_jitter_secs() -> u64 {
 fn default_maintenance_max_concurrent_jobs() -> usize {
     1
 }
+fn default_maintenance_discovery_cache_ticks() -> u64 {
+    5
+}
 fn default_maintenance_lease_ttl_secs() -> u64 {
     300
 }
@@ -4879,6 +4918,12 @@ fn default_spill_dir() -> String {
 fn default_scan_timeout() -> u64 {
     600
 } // 10 minutes
+/// One hour: comfortably above the coordinator's default group heartbeat
+/// timeout times its retry budget, so the worker deadline only ever fires on
+/// a genuinely wedged rewrite, never on a merely slow one (finding 608).
+fn default_compaction_timeout() -> u64 {
+    3600
+} // 1 hour
 fn default_refresh_buffer() -> u64 {
     60
 }
@@ -6360,6 +6405,7 @@ partial_progress_batch = 5
         assert_eq!(d.schedule, "0 2 * * *");
         assert_eq!(d.jitter_secs, 900);
         assert_eq!(d.max_concurrent_jobs, 1);
+        assert_eq!(d.discovery_cache_ticks, 5);
         assert_eq!(d.lease, LeaseMode::Catalog);
         assert_eq!(d.lease_ttl_secs, 300);
         assert_eq!(d.state_table, "sqe_system.maintenance_log");
@@ -10039,4 +10085,3 @@ write_buffer_tracking = false
         assert!(!c.write_buffer_tracking);
     }
 }
-

@@ -49,10 +49,10 @@ FOR INCREMENTAL BETWEEN SNAPSHOT 1234 AND SNAPSHOT 5678;
 
 | Form | Origin | Notes |
 |---|---|---|
-| `INSERT INTO t (cols) VALUES (...), (...)` | `sqlparser-rs` + `sqe-coordinator` | Multi-row literal insert. |
-| `INSERT INTO t SELECT ... FROM s` | `sqlparser-rs` + `sqe-coordinator` | Insert from query. |
-| `INSERT INTO t (col1, col2) SELECT ... FROM s` | `sqlparser-rs` + `sqe-coordinator` | Subset of columns; others get DEFAULT or NULL. |
-| `INSERT OVERWRITE t SELECT ... FROM s` | `sqlparser-rs` + `sqe-coordinator` | Replace partition or table data. Targets the partitions implied by the SELECT. |
+| `INSERT INTO t (cols) VALUES (...), (...)` | `sqlparser-rs` + `sqe-coordinator` | Multi-row literal insert. Returns `rows_affected`. |
+| `INSERT INTO t SELECT ... FROM s` | `sqlparser-rs` + `sqe-coordinator` | Insert from query. Returns `rows_affected`. |
+| `INSERT INTO t (col1, col2) SELECT ... FROM s` | `sqlparser-rs` + `sqe-coordinator` | Subset of columns; others get DEFAULT or NULL. Returns `rows_affected`. Fails at planning if column count mismatches target. |
+| `INSERT OVERWRITE t SELECT ... FROM s` | `sqlparser-rs` + `sqe-coordinator` | Replace partition or table data. Targets the partitions implied by the SELECT. Returns `rows_affected`. Retries on conflict. |
 
 ```sql
 INSERT INTO events VALUES
@@ -67,9 +67,9 @@ SELECT id, kind, ts FROM staging.raw_events;
 
 | Form | Origin | Notes | Trino | Snowflake | Spark SQL | DuckDB |
 |---|---|---|---|---|---|---|
-| `UPDATE t SET col = expr [WHERE pred]` | `sqlparser-rs` + `sqe-coordinator` | CoW or MoR by table property. | yes | yes | yes | yes |
-| `UPDATE t SET col1 = e1, col2 = e2 [WHERE pred]` | `sqlparser-rs` + `sqe-coordinator` | Multi-column set. | yes | yes | yes | yes |
-| `UPDATE t SET col = expr FROM other o WHERE t.k = o.k` | `sqlparser-rs` + `sqe-coordinator` | Update from another table. | partial | yes | yes | yes |
+| `UPDATE t SET col = expr [WHERE pred]` | `sqlparser-rs` + `sqe-coordinator` | CoW or MoR by table property. Returns `rows_affected`. Retries on conflict. | yes | yes | yes | yes |
+| `UPDATE t SET col1 = e1, col2 = e2 [WHERE pred]` | `sqlparser-rs` + `sqe-coordinator` | Multi-column set. Returns `rows_affected`. Retries on conflict. | yes | yes | yes | yes |
+| `UPDATE t SET col = expr FROM other o WHERE t.k = o.k` | `sqlparser-rs` + `sqe-coordinator` | Update from another table. Returns `rows_affected`. Retries on conflict. | partial | yes | yes | yes |
 
 ```sql
 UPDATE orders
@@ -81,9 +81,10 @@ WHERE tracking_id IS NOT NULL;
 
 | Form | Origin | Notes | Trino | Snowflake | Spark SQL | DuckDB |
 |---|---|---|---|---|---|---|
-| `DELETE FROM t [WHERE pred]` | `sqlparser-rs` + `sqe-coordinator` | CoW (default) or MoR (`write.delete.mode = 'merge-on-read'`). | yes | yes | yes | yes |
-| `DELETE FROM t USING other o WHERE t.k = o.k` | `sqlparser-rs` + `sqe-coordinator` | Delete by join. | partial | yes | yes | yes |
-| `TRUNCATE TABLE t` | `sqe-sql/classifier.rs` | Rewrites to `DELETE FROM t`. Same MoR / CoW behaviour. | yes | yes | yes | yes |
+| `DELETE FROM t [WHERE pred]` | `sqlparser-rs` + `sqe-coordinator` | CoW (default) or MoR (`write.delete.mode = 'merge-on-read'`). Returns `rows_affected`. Retries on conflict. | yes | yes | yes | yes |
+| `DELETE FROM t USING other o WHERE t.k = o.k` | `sqlparser-rs` + `sqe-coordinator` | Delete by join. Returns `rows_affected`. Retries on conflict. | partial | yes | yes | yes |
+| `TRUNCATE TABLE t` | `sqe-sql/classifier.rs` | Rewrites to `DELETE FROM t`. Returns the deleted row count. MoR/CoW behaviour per property. | yes | yes | yes | yes |
+| `DELETE ... WHERE ...` (MoR, repeated) | `sqe-coordinator` write_handler | Identical statement run twice on MoR: first returns the deleted count, second returns 0 (rows already hidden). | - | - | - | - |
 
 ```sql
 DELETE FROM events WHERE event_type = 'spam';
@@ -94,9 +95,10 @@ TRUNCATE TABLE staging.tmp;
 
 | Form | Origin | Notes |
 |---|---|---|
-| `MERGE INTO t USING s ON cond WHEN MATCHED THEN UPDATE SET ... WHEN NOT MATCHED THEN INSERT (...) VALUES (...)` | `sqlparser-rs` + `sqe-coordinator` | CoW or MoR. Multiple `WHEN MATCHED` branches with extra predicates allowed. |
-| `MERGE INTO t USING s ON cond WHEN MATCHED THEN DELETE` | `sqlparser-rs` + `sqe-coordinator` | Delete matched rows. |
-| `MERGE INTO t USING s ON cond WHEN MATCHED AND pred THEN UPDATE SET ... WHEN MATCHED THEN DELETE` | `sqlparser-rs` + `sqe-coordinator` | Conditional MATCHED branches. |
+| `MERGE INTO t USING s ON cond WHEN MATCHED THEN UPDATE SET ... WHEN NOT MATCHED THEN INSERT (...) VALUES (...)` | `sqlparser-rs` + `sqe-coordinator` | CoW or MoR. Multiple `WHEN MATCHED` branches with extra predicates allowed. Returns `rows_affected`. Retries on conflict. |
+| `MERGE INTO t USING s ON cond WHEN MATCHED THEN DELETE` | `sqlparser-rs` + `sqe-coordinator` | Delete matched rows. Returns `rows_affected`. Retries on conflict. |
+| `MERGE INTO t USING s ON cond WHEN MATCHED AND pred THEN UPDATE SET ... WHEN MATCHED THEN DELETE` | `sqlparser-rs` + `sqe-coordinator` | Conditional MATCHED branches. Returns `rows_affected`. Retries on conflict. |
+| `MERGE INTO t USING (empty source) ...` | `sqe-coordinator` | If `WHEN NOT MATCHED BY SOURCE` clauses exist, they apply (source is empty, so all target rows match that condition). Returns claimed-row count (number of target rows affected by BY SOURCE clauses). | - |
 
 ```sql
 MERGE INTO orders t
@@ -131,6 +133,10 @@ When to choose:
 
 - **CoW**: small tables, infrequent writes, predictable read latency. Default.
 - **MoR**: large tables, frequent small deletes, willing to trade read amplification for write speed. Compact periodically with `system.rewrite_data_files`.
+
+## DML result semantics
+
+All DML statements (INSERT, UPDATE, DELETE, MERGE, TRUNCATE) return one row containing a single column `rows_affected`, the count of rows the statement inserted, updated, or deleted. Conflicts (concurrent writes on the same table) retry automatically for all DML statement types, not just INSERT/OVERWRITE.
 
 ## COPY TO
 

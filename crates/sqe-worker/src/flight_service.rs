@@ -18,8 +18,10 @@ use tracing::{debug, info, info_span, warn, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use datafusion::prelude::SessionContext;
+use iceberg::io::FileIO;
 use sqe_catalog::FooterCache;
-use sqe_compaction::wire::{CompactGroupFrame, CompactGroupRequest};
+use sqe_compaction::wire::{CompactGroupFrame, CompactGroupRequest, CompactGroupResponse};
+use sqe_compaction::writer::{new_upload_tracker, UploadedPaths};
 use sqe_core::FlightCompression;
 use sqe_metrics::propagation::extract_trace_context;
 use sqe_metrics::WorkerMetricsRegistry;
@@ -30,8 +32,11 @@ use sqe_spill::{
     ReclaimableConsumer, SpillScope, TaskKey, WorkloadClass,
 };
 use sqe_spill::{ByteBudget, BytePermit, LiveConsumerRegistry, MemoryGovernor, SpillManager};
+use tokio_util::sync::CancellationToken;
 
-use crate::compaction::compact_file_group;
+use crate::compaction::{
+    build_file_io, delete_orphan_uploads, run_group_rewrite, CleanupOutcome, GroupRewriteCtx,
+};
 use crate::credential_channel::{CredentialStore, RefreshableCredentials};
 use crate::executor;
 #[cfg(feature = "worker-shuffle")]
@@ -275,6 +280,43 @@ pub struct WorkerFlightService {
     /// configured": `do_get` then falls back to [`default_flight_budget`], so
     /// frames are charged either way.
     flight_budget: Option<ByteBudget>,
+    /// Worker-side ceiling on one `compact_file_group` rewrite
+    /// (`worker.compaction_timeout_secs`, finding 608). `None` means the
+    /// operator disabled it with 0.
+    compaction_timeout: Option<std::time::Duration>,
+    /// TEST-ONLY (`#[cfg(test)]`, so it compiles only for this crate's own
+    /// unit test binary) replacement for the real rewrite, plus the `FileIO`
+    /// the orphan cleanup runs against. Lets the finding-608 tests drive the
+    /// supervision logic -- abort on drop, deadline, cleanup, bounded
+    /// progress -- with a stub that sleeps or fails after N uploads, instead
+    /// of needing a live S3 endpoint and a real Iceberg table. Always `None`
+    /// unless a test opts in via `with_test_compaction_seam`.
+    #[cfg(test)]
+    compaction_seam: Option<Arc<CompactionSeam>>,
+}
+
+/// TEST-ONLY stub for the `compact_file_group` rewrite. See the
+/// `compaction_seam` field on [`WorkerFlightService`].
+#[cfg(test)]
+pub(crate) struct CompactionSeam {
+    /// Runs in place of [`run_group_rewrite`], with the same `GroupRewriteCtx`
+    /// the real rewrite would have received (so a stub can record uploads in
+    /// `ctx.tracker`, push progress through `ctx.progress_tx`, or observe
+    /// `ctx.cancel`).
+    #[allow(clippy::type_complexity)]
+    pub(crate) run: Box<
+        dyn Fn(
+                GroupRewriteCtx,
+            )
+                -> futures::future::BoxFuture<'static, sqe_core::Result<CompactGroupResponse>>
+            + Send
+            + Sync,
+    >,
+    /// Handed to the stub as `ctx.file_io` and used for orphan cleanup, in
+    /// place of the `FileIO` built from the request's S3 credentials. Tests
+    /// pass an in-memory `FileIO` so the stub's "uploads" and the cleanup
+    /// share one store.
+    pub(crate) file_io: FileIO,
 }
 
 /// Lightweight reclaimable consumer for one DoExchange partition grant.
@@ -306,6 +348,238 @@ impl ReclaimableConsumer for ShufflePartitionConsumer {
 #[cfg(feature = "worker-shuffle")]
 const DEFAULT_SHUFFLE_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
 
+/// Worker-side compaction deadline used when nothing configured one
+/// (embedded / test construction). Mirrors `worker.compaction_timeout_secs`'s
+/// own default so a service built without `with_compaction_timeout` is not
+/// silently deadline-free — the exact hole finding 608 is about.
+const DEFAULT_COMPACTION_TIMEOUT_SECS: u64 = 3600;
+
+/// Depth of the `compact_file_group` progress channel (finding 608).
+///
+/// Progress frames are advisory heartbeats, so this is a drop queue, not a
+/// buffer: when it is full the writer's callback drops the tick rather than
+/// awaiting capacity. Sixteen is far more than the coordinator needs (it only
+/// rearms a timer per frame) and small enough that a coordinator which
+/// stopped reading cannot pin meaningful memory per in-flight group.
+const PROGRESS_CHANNEL_CAPACITY: usize = 16;
+
+/// A `compact_file_group` rewrite that did not produce a response, together
+/// with what the worker managed to clean up before giving up (finding 608).
+struct GroupRewriteFailure {
+    /// Human-readable cause, already carrying its own stage prefix.
+    cause: String,
+    /// True when the cause was the worker-side deadline rather than a
+    /// failure inside the rewrite. Selects `DeadlineExceeded` over
+    /// `Internal`, which is what lets the coordinator tell "this group is
+    /// too big / this worker is wedged" apart from "this group is broken".
+    deadline_exceeded: bool,
+    /// Orphan cleanup result. `leaked` is what the coordinator must retry.
+    cleanup: CleanupOutcome,
+}
+
+impl GroupRewriteFailure {
+    /// Render as the `Status` that terminates the `do_action` response
+    /// stream. The full uploaded/deleted/leaked path lists travel in the
+    /// details payload so the coordinator can retry deletion without
+    /// scraping the message (finding 608, proposed change 3).
+    fn into_status(self, job_id: &str, group_id: u32) -> Status {
+        let code = if self.deadline_exceeded {
+            tonic::Code::DeadlineExceeded
+        } else {
+            tonic::Code::Internal
+        };
+        let message = format!(
+            "compact_file_group failed for group {group_id} of job '{job_id}': {}{}",
+            self.cause,
+            self.cleanup.summary()
+        );
+        Status::with_details(
+            code,
+            message,
+            bytes::Bytes::from(self.cleanup.to_details_json(job_id, group_id)),
+        )
+    }
+}
+
+/// Run one group rewrite under the worker-side deadline, and clean up its
+/// orphan uploads on any failure it can observe (finding 608).
+///
+/// Free function rather than a method so both the production and the
+/// test-seam spawn paths share exactly one supervision body.
+async fn supervise_group_rewrite(
+    rewrite: futures::future::BoxFuture<'static, sqe_core::Result<CompactGroupResponse>>,
+    deadline: Option<std::time::Duration>,
+    file_io: FileIO,
+    tracker: UploadedPaths,
+) -> Result<CompactGroupResponse, GroupRewriteFailure> {
+    // `timeout` drops the rewrite future on expiry, which is what actually
+    // stops the read/sort/upload; the cleanup below then runs against
+    // whatever the tracker recorded up to that point.
+    let result = match deadline {
+        Some(d) => match tokio::time::timeout(d, rewrite).await {
+            Ok(inner) => inner.map_err(|e| (e.to_string(), false)),
+            Err(_) => Err((
+                format!(
+                    "exceeded the worker-side compaction deadline of {d:?} \
+                     (worker.compaction_timeout_secs)"
+                ),
+                true,
+            )),
+        },
+        None => rewrite.await.map_err(|e| (e.to_string(), false)),
+    };
+
+    match result {
+        Ok(response) => Ok(response),
+        Err((cause, deadline_exceeded)) => {
+            let cleanup = delete_orphan_uploads(&file_io, &tracker).await;
+            Err(GroupRewriteFailure {
+                cause,
+                deadline_exceeded,
+                cleanup,
+            })
+        }
+    }
+}
+
+/// Ties the spawned rewrite task to the RPC that started it (finding 608).
+///
+/// Before this, `do_action` spawned the rewrite and returned a stream that
+/// merely joined it: a coordinator that dropped the RPC (heartbeat timeout,
+/// job cancelled, coordinator restart) left the worker reading, sorting and
+/// uploading the same group the coordinator had already retried elsewhere.
+///
+/// Dropping this guard -- which happens exactly when the response stream is
+/// dropped, because the `done` half of that stream owns it -- does three
+/// things in order:
+///
+/// 1. cancels the [`CancellationToken`] the rewrite selects on, the
+///    cooperative stop that lets it quit between record batches;
+/// 2. aborts the task, so a rewrite that somehow never reaches an await
+///    point still cannot outlive its RPC;
+/// 3. spawns a best-effort deletion of every object the rewrite had already
+///    uploaded, after waiting for the abort to land so no path can be
+///    generated behind the drain.
+struct CompactionRpcGuard {
+    /// `None` once [`Self::join`] has consumed it: the task is finished and
+    /// has already run its own cleanup, so `Drop` must not fire.
+    handle: Option<tokio::task::JoinHandle<Result<CompactGroupResponse, GroupRewriteFailure>>>,
+    cancel: CancellationToken,
+    tracker: UploadedPaths,
+    file_io: FileIO,
+    job_id: String,
+    group_id: u32,
+}
+
+impl CompactionRpcGuard {
+    fn new(
+        handle: tokio::task::JoinHandle<Result<CompactGroupResponse, GroupRewriteFailure>>,
+        cancel: CancellationToken,
+        tracker: UploadedPaths,
+        file_io: FileIO,
+        job_id: String,
+        group_id: u32,
+    ) -> Self {
+        Self {
+            handle: Some(handle),
+            cancel,
+            tracker,
+            file_io,
+            job_id,
+            group_id,
+        }
+    }
+
+    /// Await the rewrite. Disarms the guard: whatever comes back, the task
+    /// is over and either it or this call has already cleaned up.
+    async fn join(&mut self) -> Result<CompactGroupResponse, Status> {
+        let joined = match self.handle.as_mut() {
+            Some(handle) => handle.await,
+            None => {
+                return Err(Status::internal(
+                    "compact_file_group: internal error, rewrite task joined twice",
+                ))
+            }
+        };
+        self.handle = None;
+
+        match joined {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(failure)) => Err(failure.into_status(&self.job_id, self.group_id)),
+            Err(join_err) => {
+                // Panic (or an abort from outside this guard): the in-task
+                // cleanup never ran, so do it here where we can await it.
+                let cleanup = delete_orphan_uploads(&self.file_io, &self.tracker).await;
+                let failure = GroupRewriteFailure {
+                    cause: format!("rewrite task did not complete: {join_err}"),
+                    deadline_exceeded: false,
+                    cleanup,
+                };
+                Err(failure.into_status(&self.job_id, self.group_id))
+            }
+        }
+    }
+
+    /// Delete orphan uploads for a failure discovered after a successful
+    /// join (frame encoding), where the task itself saw no error.
+    async fn cleanup_now(&self) -> CleanupOutcome {
+        delete_orphan_uploads(&self.file_io, &self.tracker).await
+    }
+}
+
+impl Drop for CompactionRpcGuard {
+    fn drop(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        self.cancel.cancel();
+        handle.abort();
+
+        let file_io = self.file_io.clone();
+        let tracker = self.tracker.clone();
+        let job_id = self.job_id.clone();
+        let group_id = self.group_id;
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(async move {
+                    warn!(
+                        job_id = %job_id,
+                        group_id,
+                        "compact_file_group: response stream dropped; cancelling the rewrite \
+                         and deleting whatever it already uploaded"
+                    );
+                    // Wait for the abort to actually land before draining the
+                    // tracker: the rolling writer records a path before it
+                    // opens the file, so a path generated between `abort()`
+                    // and the task stopping would otherwise slip past the
+                    // drain and be left for the orphan sweep.
+                    let _ = handle.await;
+                    let outcome = delete_orphan_uploads(&file_io, &tracker).await;
+                    if !outcome.leaked.is_empty() {
+                        warn!(
+                            job_id = %job_id,
+                            group_id,
+                            leaked = outcome.leaked.len(),
+                            "compact_file_group: orphan cleanup after RPC drop left files on \
+                             object storage; the orphan sweep is the backstop"
+                        );
+                    }
+                });
+            }
+            Err(_) => {
+                // No runtime at drop: nothing can be deleted here. The
+                // age-thresholded orphan sweep remains the backstop.
+                warn!(
+                    job_id = %self.job_id,
+                    group_id,
+                    "compact_file_group: response stream dropped outside a tokio runtime; \
+                     uploaded files are left for the orphan sweep"
+                );
+            }
+        }
+    }
+}
+
 impl WorkerFlightService {
     pub fn new(metrics: Arc<WorkerMetricsRegistry>, session_ctx: SessionContext) -> Self {
         Self {
@@ -334,6 +608,11 @@ impl WorkerFlightService {
             live_consumers: Arc::new(LiveConsumerRegistry::new()),
             #[cfg(feature = "worker-shuffle")]
             exchange_store: Arc::new(ExchangeAttemptStore::new()),
+            compaction_timeout: Some(std::time::Duration::from_secs(
+                DEFAULT_COMPACTION_TIMEOUT_SECS,
+            )),
+            #[cfg(test)]
+            compaction_seam: None,
         }
     }
 
@@ -372,6 +651,11 @@ impl WorkerFlightService {
             live_consumers: Arc::new(LiveConsumerRegistry::new()),
             #[cfg(feature = "worker-shuffle")]
             exchange_store: Arc::new(ExchangeAttemptStore::new()),
+            compaction_timeout: Some(std::time::Duration::from_secs(
+                DEFAULT_COMPACTION_TIMEOUT_SECS,
+            )),
+            #[cfg(test)]
+            compaction_seam: None,
         }
     }
 
@@ -389,6 +673,99 @@ impl WorkerFlightService {
         self.scan_timeout_secs
             .store(timeout_secs, std::sync::atomic::Ordering::Release);
         self
+    }
+
+    /// Set the worker-side ceiling on one `compact_file_group` rewrite from
+    /// config (`worker.compaction_timeout_secs`, finding 608). 0 disables it.
+    #[must_use = "with_compaction_timeout consumes self; bind the returned service"]
+    pub fn with_compaction_timeout(mut self, timeout_secs: u64) -> Self {
+        self.compaction_timeout = match timeout_secs {
+            0 => None,
+            secs => Some(std::time::Duration::from_secs(secs)),
+        };
+        self
+    }
+
+    /// TEST-ONLY: replace the `compact_file_group` rewrite with a stub and
+    /// point orphan cleanup at an in-memory `FileIO`. See the
+    /// `compaction_seam` field doc.
+    #[cfg(test)]
+    #[must_use = "with_test_compaction_seam consumes self; bind the returned service"]
+    pub(crate) fn with_test_compaction_seam(mut self, seam: Arc<CompactionSeam>) -> Self {
+        self.compaction_seam = Some(seam);
+        self
+    }
+
+    /// TEST-ONLY: a sub-second compaction deadline. `worker.compaction_timeout_secs`
+    /// has one-second granularity, which is a whole second of wall clock per
+    /// deadline test; the seconds-to-`Duration` mapping is covered separately
+    /// by `compaction_timeout_maps_zero_to_disabled`.
+    #[cfg(test)]
+    #[must_use = "with_test_compaction_deadline consumes self; bind the returned service"]
+    pub(crate) fn with_test_compaction_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.compaction_timeout = Some(deadline);
+        self
+    }
+
+    /// The `FileIO` a group rewrite reads/writes through, and that its orphan
+    /// cleanup deletes through. Built from the request's S3 credentials in
+    /// production; overridden by the test seam.
+    fn compaction_file_io(&self, request: &CompactGroupRequest) -> Result<FileIO, Status> {
+        #[cfg(test)]
+        {
+            if let Some(seam) = self.compaction_seam.as_ref() {
+                return Ok(seam.file_io.clone());
+            }
+        }
+        build_file_io(&request.s3).map_err(|e| {
+            Status::invalid_argument(format!(
+                "compact_file_group: unusable S3 configuration for group {}: {e}",
+                request.group_id
+            ))
+        })
+    }
+
+    /// Spawn the rewrite under its deadline, cleaning up its own orphan
+    /// uploads on every failure it can observe (finding 608).
+    ///
+    /// The deadline lives INSIDE the task on purpose. The response stream is
+    /// `progress.chain(done)`, so the `done` half -- and anything wrapped
+    /// around it -- is not polled until the progress channel closes, which
+    /// only happens when the rewrite future is dropped. A `timeout()` on the
+    /// outer join would therefore never be armed for exactly the wedged
+    /// rewrite it exists to bound.
+    #[cfg(not(test))]
+    fn spawn_group_rewrite(
+        &self,
+        ctx: GroupRewriteCtx,
+        deadline: Option<std::time::Duration>,
+    ) -> tokio::task::JoinHandle<Result<CompactGroupResponse, GroupRewriteFailure>> {
+        let file_io = ctx.file_io.clone();
+        let tracker = ctx.tracker.clone();
+        tokio::spawn(supervise_group_rewrite(
+            Box::pin(run_group_rewrite(ctx)),
+            deadline,
+            file_io,
+            tracker,
+        ))
+    }
+
+    /// Test build of [`Self::spawn_group_rewrite`]: routes through the
+    /// installed [`CompactionSeam`] stub when a test set one.
+    #[cfg(test)]
+    fn spawn_group_rewrite(
+        &self,
+        ctx: GroupRewriteCtx,
+        deadline: Option<std::time::Duration>,
+    ) -> tokio::task::JoinHandle<Result<CompactGroupResponse, GroupRewriteFailure>> {
+        let file_io = ctx.file_io.clone();
+        let tracker = ctx.tracker.clone();
+        let rewrite: futures::future::BoxFuture<'static, sqe_core::Result<CompactGroupResponse>> =
+            match self.compaction_seam.as_ref() {
+                Some(seam) => (seam.run)(ctx),
+                None => Box::pin(run_group_rewrite(ctx)),
+            };
+        tokio::spawn(supervise_group_rewrite(rewrite, deadline, file_io, tracker))
     }
 
     /// Share the scan-timeout atom with hot-reload (keeps existing value).
@@ -1326,51 +1703,79 @@ impl FlightService for WorkerFlightService {
                 // only ever produced back-to-back after the whole group was
                 // computed, so the heartbeat only ever bounded frame
                 // delivery, never the compute itself.
-                let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
-                let session_ctx = self.session_ctx.clone();
-                let request_for_task = request.clone();
-                let rewrite_task = tokio::spawn(async move {
-                    compact_file_group(&session_ctx, &request_for_task, Some(progress_tx)).await
-                });
+                //
+                // Finding 608 adds the other half of that story: the task is
+                // now tied to this RPC (`CompactionRpcGuard`), bounded by
+                // `worker.compaction_timeout_secs`, and cleans up after
+                // itself on every failure path. The channel is bounded, so a
+                // coordinator that stops reading drops frames instead of
+                // growing a queue for the life of the rewrite.
+                let (progress_tx, progress_rx) =
+                    tokio::sync::mpsc::channel::<u64>(PROGRESS_CHANNEL_CAPACITY);
+                let file_io = self.compaction_file_io(&request)?;
+                let tracker = new_upload_tracker();
+                let cancel = CancellationToken::new();
+                let deadline = self.compaction_timeout;
+                let job_id = request.job_id.clone();
 
-                let progress_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(
-                    progress_rx,
-                )
-                .map(move |rows_read| {
-                    let frame = CompactGroupFrame::Progress {
-                        group_id,
-                        rows_read,
-                    };
-                    let body = frame.to_bytes().map_err(|e| {
-                        Status::internal(format!("Failed to encode CompactGroupFrame: {e}"))
-                    })?;
-                    Ok(arrow_flight::Result {
-                        body: bytes::Bytes::from(body),
-                    })
-                });
+                let handle = self.spawn_group_rewrite(
+                    GroupRewriteCtx {
+                        session_ctx: self.session_ctx.clone(),
+                        request: request.clone(),
+                        progress_tx: Some(progress_tx),
+                        tracker: tracker.clone(),
+                        cancel: cancel.clone(),
+                        file_io: file_io.clone(),
+                    },
+                    deadline,
+                );
+                let guard = CompactionRpcGuard::new(
+                    handle,
+                    cancel,
+                    tracker,
+                    file_io,
+                    job_id.clone(),
+                    group_id,
+                );
 
+                let progress_stream = tokio_stream::wrappers::ReceiverStream::new(progress_rx).map(
+                    move |rows_read| {
+                        let frame = CompactGroupFrame::Progress {
+                            group_id,
+                            rows_read,
+                        };
+                        let body = frame.to_bytes().map_err(|e| {
+                            Status::internal(format!("Failed to encode CompactGroupFrame: {e}"))
+                        })?;
+                        Ok(arrow_flight::Result {
+                            body: bytes::Bytes::from(body),
+                        })
+                    },
+                );
+
+                // `guard` lives inside this future, which is owned by the
+                // returned stream: dropping the response drops the future,
+                // which drops the guard, which cancels + aborts + cleans up.
                 let done_stream = stream::once(async move {
-                    let response = match rewrite_task.await {
-                        Ok(Ok(resp)) => resp,
-                        Ok(Err(e)) => {
-                            return Err(Status::internal(format!(
-                                "compact_file_group failed for group {group_id}: {e}"
-                            )));
-                        }
-                        Err(join_err) => {
-                            return Err(Status::internal(format!(
-                                "compact_file_group task for group {group_id} panicked: \
-                                 {join_err}"
-                            )));
-                        }
-                    };
+                    let mut guard = guard;
+                    let response = guard.join().await?;
                     let frame = CompactGroupFrame::Done(response);
-                    let body = frame.to_bytes().map_err(|e| {
-                        Status::internal(format!("Failed to encode CompactGroupFrame: {e}"))
-                    })?;
-                    Ok(arrow_flight::Result {
-                        body: bytes::Bytes::from(body),
-                    })
+                    match frame.to_bytes() {
+                        Ok(body) => Ok(arrow_flight::Result {
+                            body: bytes::Bytes::from(body),
+                        }),
+                        Err(e) => {
+                            // The rewrite succeeded but its result can never
+                            // be delivered, so its output files are orphans
+                            // exactly like a failed rewrite's.
+                            let cleanup = guard.cleanup_now().await;
+                            Err(Status::internal(format!(
+                                "Failed to encode CompactGroupFrame for group {group_id} of \
+                                 job '{job_id}': {e}{}",
+                                cleanup.summary()
+                            )))
+                        }
+                    }
                 });
 
                 Ok(Response::new(Box::pin(progress_stream.chain(done_stream))))
@@ -2442,5 +2847,380 @@ mod tests {
         let request = Request::new(action);
         let err = unwrap_err(svc.do_action(request).await);
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // ---- finding 608: the rewrite is tied to the RPC -------------------
+    //
+    // These drive the supervision logic (abort on drop, worker-side
+    // deadline, orphan cleanup, bounded progress) through a stubbed rewrite
+    // installed via `with_test_compaction_seam`, so they need neither a live
+    // S3 endpoint nor a real Iceberg table. The stub receives the very same
+    // `GroupRewriteCtx` the real rewrite would have: it records "uploads" in
+    // `ctx.tracker` against an in-memory `FileIO`, pushes progress through
+    // `ctx.progress_tx`, and can observe `ctx.cancel`.
+
+    use crate::compaction::GroupRewriteCtx;
+    use iceberg::io::FileIOBuilder;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    // Plain `Duration` is `chrono::Duration` in this module (imported for the
+    // credential-refresh tests above), hence the alias.
+    use std::time::Duration as StdDuration;
+
+    /// In-memory object store. Every clone shares one map, so the stub's
+    /// uploads and the handler's cleanup see the same objects.
+    fn memory_io() -> FileIO {
+        FileIOBuilder::new("memory").build().unwrap()
+    }
+
+    async fn write_object(io: &FileIO, path: &str) {
+        io.new_output(path)
+            .unwrap()
+            .write(bytes::Bytes::from_static(b"parquet"))
+            .await
+            .unwrap();
+    }
+
+    fn install_seam<F>(svc: WorkerFlightService, io: FileIO, run: F) -> WorkerFlightService
+    where
+        F: Fn(
+                GroupRewriteCtx,
+            )
+                -> futures::future::BoxFuture<'static, sqe_core::Result<CompactGroupResponse>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        svc.with_test_compaction_seam(Arc::new(CompactionSeam {
+            run: Box::new(run),
+            file_io: io,
+        }))
+    }
+
+    /// A well-formed, unsigned `compact_file_group` action (paired with
+    /// `make_service("")`, which skips both auth gates).
+    fn compact_action() -> Request<Action> {
+        Request::new(Action {
+            r#type: "compact_file_group".to_string(),
+            body: bytes::Bytes::from(make_compact_request_bytes()),
+        })
+    }
+
+    fn stub_response(uploaded_paths: Vec<String>) -> CompactGroupResponse {
+        CompactGroupResponse {
+            group_id: 1,
+            new_data_files_avro: Vec::new(),
+            rows_written: 7,
+            bytes_written: 70,
+            uploaded_paths,
+        }
+    }
+
+    /// Signals on drop, so a test can observe that an aborted task's future
+    /// was actually torn down rather than left running.
+    struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) {
+            // `notify_one` stores a permit when nobody is waiting yet, so a
+            // test that calls `notified()` after the drop still wakes.
+            self.0.notify_one();
+        }
+    }
+
+    fn error_details(status: &Status) -> serde_json::Value {
+        serde_json::from_slice(status.details()).expect("failure details must be JSON")
+    }
+
+    #[tokio::test]
+    async fn dropping_the_do_action_response_stops_the_rewrite() {
+        // The regression: `tokio::spawn` + a stream that merely joins the
+        // handle meant a coordinator which gave up on a group (heartbeat
+        // timeout, cancelled job, restart) left the worker rewriting it
+        // anyway -- competing with the retry it had already placed elsewhere.
+        let started = Arc::new(tokio::sync::Notify::new());
+        let stopped = Arc::new(tokio::sync::Notify::new());
+        let ran_to_completion = Arc::new(AtomicBool::new(false));
+        let token_slot: Arc<std::sync::Mutex<Option<CancellationToken>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        let svc = install_seam(make_service(""), memory_io(), {
+            let started = started.clone();
+            let stopped = stopped.clone();
+            let ran_to_completion = ran_to_completion.clone();
+            let token_slot = token_slot.clone();
+            move |ctx: GroupRewriteCtx| {
+                let started = started.clone();
+                let stopped = stopped.clone();
+                let ran_to_completion = ran_to_completion.clone();
+                *token_slot.lock().unwrap() = Some(ctx.cancel.clone());
+                Box::pin(async move {
+                    let _stop_signal = NotifyOnDrop(stopped);
+                    started.notify_one();
+                    // Far longer than any test would wait: only an abort can
+                    // end this future early.
+                    tokio::time::sleep(StdDuration::from_secs(30)).await;
+                    ran_to_completion.store(true, Ordering::SeqCst);
+                    Ok(stub_response(vec![]))
+                })
+            }
+        });
+
+        let response = unwrap_ok(svc.do_action(compact_action()).await);
+        tokio::time::timeout(StdDuration::from_secs(5), started.notified())
+            .await
+            .expect("the stubbed rewrite must start");
+
+        drop(response);
+
+        tokio::time::timeout(StdDuration::from_millis(100), stopped.notified())
+            .await
+            .expect("dropping the response must stop the rewrite within 100ms");
+        assert!(
+            !ran_to_completion.load(Ordering::SeqCst),
+            "the rewrite must not have finished its work"
+        );
+        assert!(
+            token_slot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("the seam must have seen a token")
+                .is_cancelled(),
+            "the cooperative cancellation token must be signalled too, so a \
+             rewrite mid-batch stops between batches rather than only when \
+             the abort lands"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_rewrite_deletes_exactly_the_objects_it_uploaded() {
+        let io = memory_io();
+        // A file the rewrite never wrote: cleanup must not touch it.
+        write_object(&io, "/warehouse/ns/tbl/data/committed.parquet").await;
+
+        let svc = install_seam(make_service(""), io.clone(), |ctx: GroupRewriteCtx| {
+            Box::pin(async move {
+                for i in 0..2 {
+                    let path = format!("/warehouse/ns/tbl/data/orphan-{i}.parquet");
+                    ctx.file_io
+                        .new_output(&path)
+                        .unwrap()
+                        .write(bytes::Bytes::from_static(b"parquet"))
+                        .await
+                        .unwrap();
+                    ctx.tracker.lock().unwrap().push(path);
+                }
+                Err(sqe_core::SqeError::Execution(
+                    "rewrite blew up after two uploads".to_string(),
+                ))
+            })
+        });
+
+        let response = unwrap_ok(svc.do_action(compact_action()).await);
+        let err = drain_to_first_error(response).await;
+
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(
+            err.message()
+                .contains("uploaded 2 orphan file(s), deleted 2"),
+            "the failure must report what it cleaned up: {}",
+            err.message()
+        );
+
+        for i in 0..2 {
+            let path = format!("/warehouse/ns/tbl/data/orphan-{i}.parquet");
+            assert!(
+                !io.exists(&path).await.unwrap(),
+                "{path} must have been deleted before the error returned"
+            );
+        }
+        assert!(
+            io.exists("/warehouse/ns/tbl/data/committed.parquet")
+                .await
+                .unwrap(),
+            "cleanup must delete only the paths the rewrite recorded"
+        );
+
+        // The coordinator retries deletion from the details payload, so the
+        // full list has to be machine-readable, not just in the message.
+        let details = error_details(&err);
+        assert_eq!(details["kind"], "compact_file_group_cleanup");
+        assert_eq!(details["group_id"], 1);
+        assert_eq!(details["uploaded_paths"].as_array().unwrap().len(), 2);
+        assert_eq!(details["deleted_paths"].as_array().unwrap().len(), 2);
+        assert!(details["leaked_paths"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn compaction_timeout_maps_zero_to_disabled() {
+        // 0 is the documented "no deadline" value; anything else is seconds.
+        assert_eq!(
+            make_service("")
+                .with_compaction_timeout(0)
+                .compaction_timeout,
+            None
+        );
+        assert_eq!(
+            make_service("")
+                .with_compaction_timeout(5)
+                .compaction_timeout,
+            Some(StdDuration::from_secs(5))
+        );
+        assert_eq!(
+            make_service("").compaction_timeout,
+            Some(StdDuration::from_secs(DEFAULT_COMPACTION_TIMEOUT_SECS)),
+            "a service nobody configured must still carry a deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rewrite_past_the_compaction_deadline_fails_and_cleans_up() {
+        let io = memory_io();
+        let svc = install_seam(
+            // 50ms rather than the 1s config granularity: the mapping from
+            // `worker.compaction_timeout_secs` is asserted just above.
+            make_service("").with_test_compaction_deadline(StdDuration::from_millis(50)),
+            io.clone(),
+            |ctx: GroupRewriteCtx| {
+                Box::pin(async move {
+                    let path = "/warehouse/ns/tbl/data/slow-0.parquet".to_string();
+                    ctx.file_io
+                        .new_output(&path)
+                        .unwrap()
+                        .write(bytes::Bytes::from_static(b"parquet"))
+                        .await
+                        .unwrap();
+                    ctx.tracker.lock().unwrap().push(path);
+                    // Wedged: only the deadline can end this.
+                    tokio::time::sleep(StdDuration::from_secs(3600)).await;
+                    Ok(stub_response(vec![]))
+                })
+            },
+        );
+
+        let response = unwrap_ok(svc.do_action(compact_action()).await);
+        let err = drain_to_first_error(response).await;
+
+        assert_eq!(
+            err.code(),
+            tonic::Code::DeadlineExceeded,
+            "a worker-side deadline must be distinguishable from a broken \
+             group: {err}"
+        );
+        assert!(
+            err.message().contains("compaction deadline of 50ms"),
+            "the error must name the deadline it hit: {}",
+            err.message()
+        );
+        assert!(
+            !io.exists("/warehouse/ns/tbl/data/slow-0.parquet")
+                .await
+                .unwrap(),
+            "a timed-out rewrite must not leave its partial output behind"
+        );
+        assert_eq!(
+            error_details(&err)["uploaded_paths"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_frames_are_dropped_not_queued_when_the_reader_stalls() {
+        // Progress is advisory. A coordinator that stops reading used to
+        // grow an unbounded queue for the life of the rewrite.
+        const ATTEMPTS: usize = 1000;
+        let sends_done = Arc::new(tokio::sync::Notify::new());
+        let accepted = Arc::new(AtomicUsize::new(0));
+
+        let svc = install_seam(make_service(""), memory_io(), {
+            let sends_done = sends_done.clone();
+            let accepted = accepted.clone();
+            move |ctx: GroupRewriteCtx| {
+                let sends_done = sends_done.clone();
+                let accepted = accepted.clone();
+                Box::pin(async move {
+                    let tx = ctx.progress_tx.as_ref().expect("handler wires progress");
+                    for rows in 0..ATTEMPTS as u64 {
+                        if tx.try_send(rows).is_ok() {
+                            accepted.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                    sends_done.notify_one();
+                    Err(sqe_core::SqeError::Execution("done sending".to_string()))
+                })
+            }
+        });
+
+        let response = unwrap_ok(svc.do_action(compact_action()).await);
+        // Deliberately do NOT poll the response stream here: the reader is
+        // stalled, which is the whole point.
+        tokio::time::timeout(StdDuration::from_secs(5), sends_done.notified())
+            .await
+            .expect("the stub must finish its sends without blocking");
+
+        let accepted = accepted.load(Ordering::SeqCst);
+        assert!(
+            accepted <= PROGRESS_CHANNEL_CAPACITY,
+            "a stalled reader must cap the queue at {PROGRESS_CHANNEL_CAPACITY} \
+             frames, accepted {accepted} of {ATTEMPTS}"
+        );
+        assert!(accepted > 0, "some progress must still get through");
+
+        // What was accepted is what the coordinator eventually reads: the
+        // dropped frames are gone, not deferred.
+        let mut stream = response.into_inner();
+        let mut frames = 0usize;
+        loop {
+            match stream.next().await {
+                Some(Ok(_)) => frames += 1,
+                Some(Err(_)) => break,
+                None => panic!("stream ended without the terminal error"),
+            }
+        }
+        assert_eq!(frames, accepted);
+    }
+
+    #[tokio::test]
+    async fn a_successful_rewrite_keeps_its_output_and_returns_a_done_frame() {
+        // The other half of the cleanup contract: the guard must not delete
+        // the files of a rewrite that actually succeeded.
+        let io = memory_io();
+        let svc = install_seam(make_service(""), io.clone(), |ctx: GroupRewriteCtx| {
+            Box::pin(async move {
+                let path = "/warehouse/ns/tbl/data/good-0.parquet".to_string();
+                ctx.file_io
+                    .new_output(&path)
+                    .unwrap()
+                    .write(bytes::Bytes::from_static(b"parquet"))
+                    .await
+                    .unwrap();
+                ctx.tracker.lock().unwrap().push(path.clone());
+                Ok(stub_response(vec![path]))
+            })
+        });
+
+        let response = unwrap_ok(svc.do_action(compact_action()).await);
+        let mut stream = response.into_inner();
+        let frame = stream
+            .next()
+            .await
+            .expect("a Done frame")
+            .expect("a successful rewrite must not error");
+        match CompactGroupFrame::from_bytes(&frame.body).unwrap() {
+            CompactGroupFrame::Done(done) => {
+                assert_eq!(done.group_id, 1);
+                assert_eq!(done.rows_written, 7);
+            }
+            other => panic!("expected a Done frame, got {other:?}"),
+        }
+        assert!(stream.next().await.is_none(), "Done is terminal");
+        assert!(
+            io.exists("/warehouse/ns/tbl/data/good-0.parquet")
+                .await
+                .unwrap(),
+            "a successful rewrite's output must survive"
+        );
     }
 }

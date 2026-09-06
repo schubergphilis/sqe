@@ -310,6 +310,24 @@ fn sample_count(metrics: &MetricsRegistry, family_name: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// Run one tick and then wait for the jobs that tick scheduled.
+///
+/// Since review finding 511 a returned `advisory_tick` means "every due
+/// table has been handed to the job set", not "every due table's job has
+/// finished" -- the whole point of the change is that a slow rewrite no
+/// longer holds up the tick. Every assertion in this file is about what a
+/// JOB did (gauges, compacted files, ledger rows), so each tick is followed
+/// by an explicit join. The tests that assert on the hand-off itself (the
+/// non-blocking and in-flight-skip ones below) deliberately do not use this
+/// helper.
+async fn tick_and_drain(scheduler: &MaintenanceScheduler, what: &str) {
+    scheduler
+        .advisory_tick()
+        .await
+        .unwrap_or_else(|e| panic!("{what}: {e}"));
+    scheduler.drain_inflight_jobs().await;
+}
+
 #[tokio::test]
 async fn advisory_tick_reports_opted_table_and_mutates_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -373,10 +391,7 @@ async fn advisory_tick_reports_opted_table_and_mutates_nothing() {
         handler,
     );
 
-    scheduler
-        .advisory_tick()
-        .await
-        .expect("advisory_tick succeeds");
+    tick_and_drain(&scheduler, "advisory_tick succeeds").await;
 
     // --- Gauges: the opted table's are set to the expected values ---
     assert_eq!(
@@ -783,10 +798,7 @@ async fn active_tick_compacts_opted_table_and_leaves_others_untouched() {
         handler,
     );
 
-    scheduler
-        .advisory_tick()
-        .await
-        .expect("active tick succeeds");
+    tick_and_drain(&scheduler, "active tick succeeds").await;
 
     // --- The opted table actually compacted: fewer live files, same rows ---
     let files_after = live_data_file_count(&catalog, &opted_ident).await;
@@ -960,10 +972,7 @@ async fn active_tick_honors_per_table_override_that_global_config_would_have_ski
         handler,
     );
 
-    scheduler
-        .advisory_tick()
-        .await
-        .expect("active tick succeeds");
+    tick_and_drain(&scheduler, "active tick succeeds").await;
 
     let files_after = live_data_file_count(&catalog, &opted_ident).await;
     assert!(
@@ -1046,10 +1055,7 @@ async fn active_tick_skips_table_with_no_eligible_debt_and_audits_it() {
         handler,
     );
 
-    scheduler
-        .advisory_tick()
-        .await
-        .expect("active tick succeeds");
+    tick_and_drain(&scheduler, "active tick succeeds").await;
 
     // --- Never touched: same file count, same snapshot ---
     let files_after = live_data_file_count(&catalog, &opted_ident).await;
@@ -1203,10 +1209,7 @@ async fn active_tick_require_mode_skips_loudly_when_no_workers_are_healthy() {
         handler,
     );
 
-    scheduler
-        .advisory_tick()
-        .await
-        .expect("active tick succeeds");
+    tick_and_drain(&scheduler, "active tick succeeds").await;
 
     // --- Never touched: same file count, same snapshot ---
     let files_after = live_data_file_count(&catalog, &opted_ident).await;
@@ -1379,10 +1382,11 @@ async fn active_tick_records_failed_job_and_audits_it() {
         handler,
     );
 
-    scheduler
-        .advisory_tick()
-        .await
-        .expect("active tick succeeds despite the per-table failure");
+    tick_and_drain(
+        &scheduler,
+        "active tick succeeds despite the per-table failure",
+    )
+    .await;
 
     // --- Never touched: same file count ---
     let files_after = live_data_file_count(&catalog, &opted_ident).await;
@@ -1500,10 +1504,7 @@ async fn advisory_tick_on_active_fixture_still_mutates_nothing() {
         handler,
     );
 
-    scheduler
-        .advisory_tick()
-        .await
-        .expect("advisory tick succeeds");
+    tick_and_drain(&scheduler, "advisory tick succeeds").await;
 
     let files_after = live_data_file_count(&catalog, &opted_ident).await;
     assert_eq!(
@@ -1653,10 +1654,7 @@ async fn active_tick_lease_none_compacts_with_zero_lease_traffic() {
         catalog_factory,
         handler,
     );
-    scheduler
-        .advisory_tick()
-        .await
-        .expect("active tick succeeds");
+    tick_and_drain(&scheduler, "active tick succeeds").await;
 
     let files_after = live_data_file_count(&catalog, &opted_ident).await;
     assert!(
@@ -1761,10 +1759,11 @@ async fn active_tick_catalog_lease_prevents_concurrent_compaction_then_recovers_
     .with_holder_id("coordinator-b");
 
     // --- Window 1: coordinator-a still holds the lease; coordinator-b skips ---
-    scheduler_b
-        .advisory_tick()
-        .await
-        .expect("scheduler_b tick 1 succeeds (a routine skip, not an error)");
+    tick_and_drain(
+        &scheduler_b,
+        "scheduler_b tick 1 succeeds (a routine skip, not an error)",
+    )
+    .await;
 
     let files_after_tick1 = live_data_file_count(&catalog, &opted_ident).await;
     assert_eq!(
@@ -1791,10 +1790,7 @@ async fn active_tick_catalog_lease_prevents_concurrent_compaction_then_recovers_
         .expect("coordinator-a releases cleanly");
 
     // --- Window 2 (a later tick): coordinator-b now acquires and compacts ---
-    scheduler_b
-        .advisory_tick()
-        .await
-        .expect("scheduler_b tick 2 succeeds");
+    tick_and_drain(&scheduler_b, "scheduler_b tick 2 succeeds").await;
 
     let files_after_tick2 = live_data_file_count(&catalog, &opted_ident).await;
     assert!(
@@ -1824,4 +1820,410 @@ async fn active_tick_catalog_lease_prevents_concurrent_compaction_then_recovers_
         1,
         "expected exactly one LIVE lease row (coordinator-b's final release tombstone)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Review finding 511: the tick schedules, the job set works
+// ---------------------------------------------------------------------------
+
+/// Wait (up to ~15s) for a gauge sample to appear for `table_label`.
+///
+/// Jobs run on the scheduler's `JoinSet` now, so "the tick returned" no
+/// longer means "the gauge is set". Polling is the honest way to assert on
+/// another task's progress; the timeout keeps a regression a failure rather
+/// than a hang.
+async fn await_gauge(metrics: &MetricsRegistry, family_name: &str, table_label: &str) -> f64 {
+    for _ in 0..300 {
+        if let Some(v) = gauge_sample(metrics, family_name, table_label) {
+            return v;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for {family_name} sample for table {table_label}");
+}
+
+/// A job that outlives its tick must not hold up the next tick's work for
+/// OTHER tables (finding 511's second acceptance criterion).
+///
+/// The stall is injected through the `catalog_factory` seam -- the second
+/// factory call is the per-table commit-catalog build inside
+/// `active_one_table`, so awaiting a `Notify` there parks that table's job
+/// exactly where a long `rewrite_data_files` would, without needing a
+/// stub rewrite engine. `max_concurrent_jobs = 2` is what lets a second
+/// table's job run while the first is parked; at the default of 1 the tick
+/// still returns immediately, but the parked job holds the only permit.
+///
+/// Three things are asserted, and the third is the one that would regress
+/// silently: the parked table is not scheduled a SECOND time by the next
+/// tick.
+#[tokio::test]
+async fn a_parked_job_does_not_delay_the_next_ticks_gauges_for_other_tables() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let catalog = sqlite_catalog(&dir).await;
+
+    let slow_ident = create_table(&catalog, "ns", "a_slow", true).await;
+    seed_small_files(&catalog, &slow_ident, 5).await;
+    create_maintenance_log_table(&catalog).await;
+
+    let idp = mock_idp().await;
+    // `lease = "none"`: this test is about the job set, and lease
+    // bookkeeping would add unrelated concurrent commits to the ledger
+    // between two jobs running at once.
+    let mut cfg =
+        active_maintenance_config_with_lease(&idp, 2, sqe_core::config::LeaseMode::None, 60);
+    cfg.scheduler.max_concurrent_jobs = 2;
+    let principal = Arc::new(
+        MaintenancePrincipal::from_config(cfg.principal.as_ref().expect("principal set"))
+            .expect("build principal"),
+    );
+    let metrics = Arc::new(MetricsRegistry::new().expect("metrics registry builds"));
+
+    // Factory call 0 is tick 1's discovery; call 1 is `ns.a_slow`'s
+    // commit-catalog build, which parks until `release` is notified; every
+    // later call passes straight through.
+    let release = Arc::new(tokio::sync::Notify::new());
+    let parked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let resumed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let injected_catalog = catalog.clone();
+    let catalog_factory: sqe_coordinator::maintenance_scheduler::CatalogFactory = {
+        let release = release.clone();
+        let parked = parked.clone();
+        let resumed = resumed.clone();
+        let calls = calls.clone();
+        Arc::new(move |_session: &sqe_core::Session| {
+            let catalog = injected_catalog.clone();
+            let release = release.clone();
+            let parked = parked.clone();
+            let resumed = resumed.clone();
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if n == 1 {
+                    parked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    release.notified().await;
+                    resumed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(catalog)
+            })
+        })
+    };
+    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(
+        minimal_sqe_config(),
+    ));
+
+    let scheduler = MaintenanceScheduler::new(
+        cfg,
+        principal,
+        metrics.clone(),
+        None,
+        catalog_factory,
+        handler,
+    );
+
+    // --- Tick 1: returns even though the job it scheduled is parked ---
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        scheduler.advisory_tick(),
+    )
+    .await
+    .expect("tick 1 must return without waiting for the job it scheduled")
+    .expect("tick 1 succeeds");
+    let slow_small_files = await_gauge(&metrics, "sqe_table_small_files", "ns.a_slow").await;
+    assert_eq!(slow_small_files, 5.0);
+    for _ in 0..300 {
+        if parked.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        parked.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the slow table's job must have reached the parking point"
+    );
+
+    // --- Tick 2: a second table, discovered and reported while the first
+    // table's job is still parked ---
+    let fast_ident = create_table(&catalog, "ns", "b_fast", true).await;
+    seed_small_files(&catalog, &fast_ident, 5).await;
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        scheduler.advisory_tick(),
+    )
+    .await
+    .expect("tick 2 must not wait on tick 1's parked job")
+    .expect("tick 2 succeeds");
+
+    let fast_small_files = await_gauge(&metrics, "sqe_table_small_files", "ns.b_fast").await;
+    assert_eq!(fast_small_files, 5.0);
+    assert_eq!(
+        resumed.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the second table's health must have been reported while the first job was STILL parked"
+    );
+
+    // --- The parked table was not scheduled twice ---
+    assert_eq!(
+        parked.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a table with a job in flight must be skipped by the next tick, not queued again"
+    );
+
+    // --- Releasing the parked job lets it finish normally ---
+    release.notify_waiters();
+    scheduler.drain_inflight_jobs().await;
+    assert_eq!(resumed.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(
+        live_data_file_count(&catalog, &slow_ident).await < 5,
+        "the parked job must still compact once it resumes"
+    );
+}
+
+/// An idle table (no compaction debt) writes ONE `skipped` ledger row per
+/// schedule window, not one per tick (finding 511's third acceptance
+/// criterion).
+///
+/// 100 ticks against a table whose schedule fires every minute: the row
+/// count is 1, or 2 if the run happens to straddle a minute boundary (a
+/// second window is new information and SHOULD be recorded). Before the
+/// fix this was 100 rows, i.e. 100 Parquet files.
+#[tokio::test]
+async fn a_hundred_idle_ticks_write_at_most_one_skipped_row_per_window() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let catalog = sqlite_catalog(&dir).await;
+
+    // 1 file with min_input_files = 2: never any eligible debt, so every
+    // tick takes the "no eligible compaction debt" skip path.
+    let opted_ident = create_table(&catalog, "ns", "idle", true).await;
+    seed_small_files(&catalog, &opted_ident, 1).await;
+    create_maintenance_log_table(&catalog).await;
+
+    let idp = mock_idp().await;
+    let cfg = active_maintenance_config_with_lease(&idp, 2, sqe_core::config::LeaseMode::None, 60);
+    let principal = Arc::new(
+        MaintenancePrincipal::from_config(cfg.principal.as_ref().expect("principal set"))
+            .expect("build principal"),
+    );
+    let metrics = Arc::new(MetricsRegistry::new().expect("metrics registry builds"));
+
+    let injected_catalog = catalog.clone();
+    let catalog_factory: sqe_coordinator::maintenance_scheduler::CatalogFactory =
+        Arc::new(move |_session: &sqe_core::Session| {
+            let catalog = injected_catalog.clone();
+            Box::pin(async move { Ok(catalog) })
+        });
+    let handler = Arc::new(sqe_coordinator::maintenance::MaintenanceHandler::new(
+        minimal_sqe_config(),
+    ));
+
+    let scheduler = MaintenanceScheduler::new(
+        cfg,
+        principal,
+        metrics.clone(),
+        None,
+        catalog_factory,
+        handler,
+    );
+
+    for i in 0..100 {
+        tick_and_drain(&scheduler, &format!("idle tick {i} succeeds")).await;
+    }
+
+    let rows = scan_log_rows(&catalog).await;
+    let skipped: Vec<&LogRowView> = rows
+        .iter()
+        .filter(|r| r.table_name == "ns.idle" && r.status == "skipped")
+        .collect();
+    assert!(
+        !skipped.is_empty(),
+        "the first skip in a window must still be recorded"
+    );
+    assert!(
+        skipped.len() <= 2,
+        "100 idle ticks must write one skipped row per schedule window (2 only if the run \
+         straddled a minute boundary), got {}",
+        skipped.len()
+    );
+
+    // The metric is deliberately NOT deduped: it counts skip DECISIONS.
+    let skipped_samples = metrics
+        .registry
+        .gather()
+        .into_iter()
+        .find(|f| f.name() == "sqe_maintenance_job_total")
+        .and_then(|f| {
+            f.get_metric()
+                .iter()
+                .find(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.name() == "status" && l.value() == "skipped")
+                })
+                .map(|m| m.get_counter().value())
+        });
+    assert_eq!(
+        skipped_samples,
+        Some(100.0),
+        "every tick's skip must still be counted, even when its ledger row is deduped"
+    );
+}
+
+/// The ledger retention pass: aged rows collapse into one data file per UTC
+/// day, no row is lost, lease rows are left alone, and a second pass is a
+/// no-op (finding 511's ledger arm).
+#[tokio::test]
+async fn history_retention_rewrites_aged_rows_into_one_file_per_day() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let catalog = sqlite_catalog(&dir).await;
+    create_maintenance_log_table(&catalog).await;
+
+    let now_ms = chrono_now_ms();
+    let day_ms = 86_400_000i64;
+
+    // Three rows on one aged day, two on another, two recent ones.
+    let mut expected_rows = 0usize;
+    for (age_days, count) in [(30i64, 3usize), (31, 2), (0, 2)] {
+        for i in 0..count {
+            let ts = now_ms - age_days * day_ms + i as i64;
+            let row = sqe_coordinator::maintenance_log::skipped_row(
+                &format!("job-{age_days}-{i}"),
+                "ns.idle",
+                "svc-sqe-maintenance",
+                ts,
+                "no eligible compaction debt",
+            );
+            sqe_coordinator::maintenance_log::append_row(
+                &catalog,
+                "sqe_system.maintenance_log",
+                &row,
+            )
+            .await
+            .expect("append ledger row");
+            expected_rows += 1;
+        }
+    }
+
+    let files_before = live_data_file_count(&catalog, &log_ident()).await;
+    assert_eq!(
+        files_before, expected_rows,
+        "every append is its own file: that is the growth this pass exists to fix"
+    );
+
+    let outcome = sqe_coordinator::maintenance_log::compact_history(
+        &catalog,
+        "sqe_system.maintenance_log",
+        7,
+        now_ms,
+    )
+    .await
+    .expect("retention pass succeeds");
+
+    assert_eq!(outcome.files_in, 5, "the five aged rows' files");
+    assert_eq!(outcome.files_out, 2, "one file per aged day");
+    assert_eq!(outcome.rows, 5);
+    assert_eq!(outcome.days, 2);
+
+    let files_after = live_data_file_count(&catalog, &log_ident()).await;
+    assert_eq!(
+        files_after, 4,
+        "two day files plus the two recent rows' own files"
+    );
+
+    // Not an expiry: every row is still there.
+    let rows_after = scan_log_rows(&catalog).await;
+    assert_eq!(
+        rows_after.len(),
+        expected_rows,
+        "retention COMPACTS history, it must never drop a row"
+    );
+
+    // Idempotent: one file per day already, so nothing left to do.
+    let second = sqe_coordinator::maintenance_log::compact_history(
+        &catalog,
+        "sqe_system.maintenance_log",
+        7,
+        now_ms,
+    )
+    .await
+    .expect("second retention pass succeeds");
+    assert!(
+        second.is_noop(),
+        "a second pass must find nothing to rewrite, got {second:?}"
+    );
+}
+
+/// Retention must never rewrite a file holding a lease row: the lease CAS
+/// deletes its claim by exact file path, so moving one into a day bundle
+/// would break the next renew/release.
+#[tokio::test]
+async fn history_retention_leaves_lease_rows_alone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let catalog = sqlite_catalog(&dir).await;
+    create_maintenance_log_table(&catalog).await;
+
+    let now_ms = chrono_now_ms();
+    let aged_ms = now_ms - 30 * 86_400_000;
+
+    // An aged lease claim (deliberately old enough to be a retention
+    // candidate on age alone) plus two aged job rows on the same day.
+    let lease = sqe_coordinator::maintenance_lease::try_acquire(
+        &catalog,
+        "sqe_system.maintenance_log",
+        "ns.leased",
+        "holder-a",
+        60,
+        aged_ms,
+    )
+    .await
+    .expect("lease acquire succeeds")
+    .expect("lease is acquirable");
+
+    for i in 0..2 {
+        let row = sqe_coordinator::maintenance_log::skipped_row(
+            &format!("job-{i}"),
+            "ns.idle",
+            "svc-sqe-maintenance",
+            aged_ms + i,
+            "no eligible compaction debt",
+        );
+        sqe_coordinator::maintenance_log::append_row(&catalog, "sqe_system.maintenance_log", &row)
+            .await
+            .expect("append ledger row");
+    }
+
+    let outcome = sqe_coordinator::maintenance_log::compact_history(
+        &catalog,
+        "sqe_system.maintenance_log",
+        7,
+        now_ms,
+    )
+    .await
+    .expect("retention pass succeeds");
+    assert_eq!(outcome.files_in, 2, "only the two job rows are candidates");
+    assert_eq!(outcome.files_out, 1);
+
+    // The claim file is untouched, so the lease still renews and releases.
+    sqe_coordinator::maintenance_lease::release(
+        lease,
+        &catalog,
+        "sqe_system.maintenance_log",
+        now_ms,
+    )
+    .await
+    .expect("the lease must still be releasable after a retention pass");
+}
+
+fn chrono_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the epoch")
+        .as_millis() as i64
+}
+
+fn log_ident() -> TableIdent {
+    TableIdent::new(
+        NamespaceIdent::new("sqe_system".to_string()),
+        "maintenance_log".to_string(),
+    )
 }

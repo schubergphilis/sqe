@@ -4,7 +4,7 @@
 - Severity: medium
 - Category: performance
 - Effort: M (days)
-- Status: open
+- Status: fixed (branch `fix/data-consistency-p1`, 2026-09-05; the `static` cache remains, see Resolution)
 - Issue: #587
 
 ## Problem
@@ -76,3 +76,9 @@ function (`session_context.rs:190-201`).
 - 2026-07-25 review P1-6 still holds; same remedy (invalidate by identity, not globally).
 - Memory notes "Writes need session-cache invalidation", "Catalog cache refresh".
 - 409 (QueryHandler shape) for where the factory should live.
+
+## Resolution (2026-09-05)
+
+The fleet-wide flush is gone from the DML path. `QueryHandler::execute` (`crates/sqe-coordinator/src/query_handler.rs`) now drops only the writer's own cached contexts after INSERT, CTAS, MERGE, DELETE, UPDATE and TRUNCATE (`invalidate_session_cache(username)`), because step 1 of the proposal already holds structurally: `SqeSchemaProvider::table` resolves every table through `SessionCatalog::load_table` at planning time, nothing memoizes a snapshot-bound provider inside the cached `SessionContext`, and finding 302 makes every catalog commit evict the table's metadata entry for every token. Other users therefore see the new snapshot on their next query without rebuilding their contexts. `invalidate_all_session_caches` remains only for namespace-list DDL (CREATE/DROP SCHEMA, RENAME, ATTACH/DETACH), which is the finding's acceptance grep.
+
+Not done: moving `SESSION_CONTEXT_CACHE` off the `static` into a factory owned by `QueryHandler`. That refactor touches 27 call sites for no behavioural gain once the DML flush is table-scoped; it stays a code-structure follow-up (see area 11 of the combined index).

@@ -246,7 +246,7 @@ The reference docs:
 | [Benchmark history](docs/evidence/benchmark/index.md) | Per-suite, per-scale, per-query plots over time |
 | [Roadmap](docs/site/book/src/development/roadmap.md) | Full feature checklist |
 | Security Audit | 43 findings, all resolved |
-| [Architecture, security and scale reviews 2026-09](docs/internal/reviews/2026-09-05-combined-prioritized-findings.md) | 109 findings, GitLab issues #543-#651 in eight work packages (#652-#659); 30 fixed |
+| [Architecture, security and scale reviews 2026-09](docs/internal/reviews/2026-09-05-combined-prioritized-findings.md) | 109 findings, GitLab issues #543-#651 in eight work packages (#652-#659); 42 fixed |
 
 ## The book
 

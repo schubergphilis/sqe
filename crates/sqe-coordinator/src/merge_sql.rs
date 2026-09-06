@@ -361,6 +361,68 @@ pub(crate) fn classify_merge_clauses<'a>(
     Ok(out)
 }
 
+/// Is a MERGE whose source returned zero rows a genuine no-op?
+///
+/// Only when the statement has no `WHEN NOT MATCHED BY SOURCE` clause
+/// (architecture review 501). With an empty source every target row is
+/// unmatched-by-source, so a BY SOURCE clause must still run: the canonical
+/// "make the target equal to the source" MERGE has to empty the target when
+/// the upstream extract came back empty, not silently leave it alone.
+///
+/// The parameter is the *classification result* on purpose: both MERGE
+/// handlers can only reach this decision after `classify_merge_clauses` has
+/// run, which is the ordering the fix depends on. A future refactor that
+/// moves the emptiness shortcut back above classification cannot call this
+/// function, so the type system carries the invariant.
+pub(crate) fn empty_source_is_no_op(classified: &ClassifiedMerge<'_>) -> bool {
+    classified.by_source.is_empty()
+}
+
+/// COUNT query for the rows a MERGE with an *empty source* changes.
+///
+/// With no source rows there is nothing to match and nothing to insert, so
+/// the only rows the statement touches are the target rows a BY SOURCE clause
+/// claims. The anti-join collapses to a plain scan of the target relation and
+/// the surviving filters are the caller's row filter (hidden rows are out of
+/// scope, 202) and the union of the clause predicates: first-match-wins makes
+/// the union exact, because a row is claimed exactly when at least one clause
+/// predicate passes.
+///
+/// The copy-on-write handler needs this because its normal affected-row count
+/// is the number of rows it *wrote*, which is zero after a BY SOURCE DELETE
+/// emptied the table. Returns `None` when there are no BY SOURCE clauses (the
+/// statement is a no-op and the handler returns before committing).
+pub(crate) fn empty_source_claim_count_sql(
+    classified: &ClassifiedMerge<'_>,
+    names: &MergeNames<'_>,
+    qualified_target_ref: &str,
+) -> Option<String> {
+    if classified.by_source.is_empty() {
+        return None;
+    }
+    // An unpredicated clause claims every row not already claimed, so the
+    // union degenerates to TRUE as soon as one appears.
+    let claimed = if classified.by_source.iter().any(|c| c.predicate.is_none()) {
+        "TRUE".to_string()
+    } else {
+        classified
+            .by_source
+            .iter()
+            .filter_map(|c| c.predicate.as_ref())
+            .map(|p| format!("({p})"))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    };
+    let admit = admit_guard(names)
+        .map(|g| format!(" AND {g}"))
+        .unwrap_or_default();
+    let relation = target_relation(names, qualified_target_ref);
+    Some(format!(
+        "SELECT COUNT(*) FROM {relation} AS {} WHERE ({claimed}){admit}",
+        names.target_ref
+    ))
+}
+
 fn case_arm(class_cond: &str, predicate: Option<&str>, value: &str) -> String {
     match predicate {
         Some(p) => format!("WHEN {class_cond} AND ({p}) THEN {value}"),
@@ -964,6 +1026,233 @@ mod tests {
             ],
             "hidden rows are neither matched nor claimed by NOT MATCHED BY SOURCE"
         );
+    }
+
+    /// 501: the empty-source shortcut must sit *after* clause classification.
+    ///
+    /// Two halves. First, the shortcut's input is a `ClassifiedMerge`, so it
+    /// can only be evaluated once `classify_merge_clauses` has run — a
+    /// refactor that hoists the emptiness check above classification has
+    /// nothing to pass it. Second, classification itself does not depend on
+    /// the source having produced rows or columns, so there is no reason to
+    /// bail early: a source with zero columns still classifies fine.
+    #[test]
+    fn empty_source_shortcut_requires_classification() {
+        let tc = cols(&["id", "region"]);
+        let empty_source: Vec<String> = Vec::new();
+        let n = names(&tc, &empty_source);
+
+        let by_source = merge_clauses(
+            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+             WHEN NOT MATCHED BY SOURCE THEN DELETE",
+        );
+        let classified = classify_merge_clauses(&by_source, &n).expect("classify");
+        assert_eq!(classified.counts(), (0, 0, 1));
+        assert!(
+            !empty_source_is_no_op(&classified),
+            "an empty source with a BY SOURCE clause deletes every target row"
+        );
+
+        let matched_only = merge_clauses(
+            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+             WHEN MATCHED THEN DELETE \
+             WHEN NOT MATCHED THEN INSERT (id, region) VALUES (s.id, s.region)",
+        );
+        let classified = classify_merge_clauses(&matched_only, &n).expect("classify");
+        assert_eq!(classified.counts(), (1, 1, 0));
+        assert!(
+            empty_source_is_no_op(&classified),
+            "without a BY SOURCE clause an empty source changes nothing"
+        );
+    }
+
+    /// 501, executed: an empty source plus `WHEN NOT MATCHED BY SOURCE THEN
+    /// DELETE` empties the target (the merge SELECT the CoW handler writes
+    /// back returns zero rows) and the affected-row count is the target's row
+    /// count, not the number of rows written (which is zero).
+    #[tokio::test]
+    async fn empty_source_by_source_delete_empties_target_end_to_end() {
+        use arrow_array::{Int32Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::prelude::SessionContext;
+        use std::sync::Arc;
+
+        let ctx = SessionContext::new();
+        let tschema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+        let target = arrow_array::RecordBatch::try_new(
+            tschema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["EU", "US", "US"])),
+            ],
+        )
+        .unwrap();
+        // The source produced no batches. Its schema comes from the source
+        // plan (`source_schema_hint` in the handler), not from the data.
+        let sschema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        ctx.register_table(
+            "datafusion.public.__merge_target_x",
+            Arc::new(
+                datafusion::datasource::MemTable::try_new(tschema, vec![vec![target]]).unwrap(),
+            ),
+        )
+        .unwrap();
+        ctx.register_table(
+            "datafusion.public.__merge_source_x",
+            Arc::new(datafusion::datasource::MemTable::try_new(sschema, vec![vec![]]).unwrap()),
+        )
+        .unwrap();
+
+        let tc = cols(&["id", "region"]);
+        let sc = cols(&["id"]);
+        let n = names(&tc, &sc);
+        let clauses = merge_clauses(
+            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+             WHEN NOT MATCHED BY SOURCE THEN DELETE",
+        );
+        let classified = classify_merge_clauses(&clauses, &n).expect("classify");
+        assert!(!empty_source_is_no_op(&classified));
+
+        // The rows the CoW rewrite writes back: none, the table is emptied.
+        let select = build_merge_select(
+            &classified,
+            &n,
+            "datafusion.public.__merge_target_x",
+            "datafusion.public.__merge_source_x",
+            "__merge_target_x.id = __merge_source_x.id",
+        );
+        let batches = ctx.sql(&select).await.unwrap().collect().await.unwrap();
+        let surviving: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(surviving, 0, "every target row is deleted: {select}");
+
+        // ... and the reported count is the 3 rows it claimed.
+        let count_sql =
+            empty_source_claim_count_sql(&classified, &n, "datafusion.public.__merge_target_x")
+                .expect("BY SOURCE clauses produce a count query");
+        let counted = ctx.sql(&count_sql).await.unwrap().collect().await.unwrap();
+        assert_eq!(
+            counted[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .unwrap()
+                .value(0),
+            3,
+            "rows_affected must be the 3 deleted target rows: {count_sql}"
+        );
+
+        // The same statement shape the MoR handler builds for its BY SOURCE
+        // DELETE (anti-join against the empty source) claims the same 3 rows.
+        let mor_sql = "SELECT __merge_target_x.\"id\" FROM datafusion.public.__merge_target_x \
+                       WHERE NOT EXISTS (SELECT 1 FROM datafusion.public.__merge_source_x \
+                       WHERE __merge_target_x.id = __merge_source_x.id) AND (TRUE)";
+        let mor = ctx.sql(mor_sql).await.unwrap().collect().await.unwrap();
+        let mor_rows: usize = mor.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            mor_rows, 3,
+            "MoR BY SOURCE DELETE deletes all 3 target rows"
+        );
+    }
+
+    /// The empty-source count honours per-clause predicates and the caller's
+    /// row filter: only rows a BY SOURCE clause actually claims are counted,
+    /// and rows the caller cannot see are out of scope (202).
+    #[tokio::test]
+    async fn empty_source_claim_count_honours_predicates_and_row_filter() {
+        use arrow_array::{Int32Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::prelude::SessionContext;
+        use std::sync::Arc;
+
+        let ctx = SessionContext::new();
+        let tschema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("region", DataType::Utf8, false),
+        ]));
+        let target = arrow_array::RecordBatch::try_new(
+            tschema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["EU", "US", "US"])),
+            ],
+        )
+        .unwrap();
+        ctx.register_table(
+            "datafusion.public.__merge_target_x",
+            Arc::new(
+                datafusion::datasource::MemTable::try_new(tschema, vec![vec![target]]).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let tc = cols(&["id", "region"]);
+        let sc = cols(&["id"]);
+        let clauses = merge_clauses(
+            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+             WHEN NOT MATCHED BY SOURCE AND t.region = 'US' THEN DELETE",
+        );
+
+        let count = |policy: WritePolicyPredicates| {
+            let ctx = ctx.clone();
+            let tc = tc.clone();
+            let sc = sc.clone();
+            let clauses = clauses.clone();
+            async move {
+                let n = names_with_policy(&tc, &sc, &policy);
+                let classified = classify_merge_clauses(&clauses, &n).expect("classify");
+                let sql = empty_source_claim_count_sql(
+                    &classified,
+                    &n,
+                    "datafusion.public.__merge_target_x",
+                )
+                .expect("BY SOURCE clause present");
+                let out = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+                out[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                    .unwrap()
+                    .value(0)
+            }
+        };
+
+        assert_eq!(
+            count(WritePolicyPredicates::default()).await,
+            2,
+            "only the two US rows are claimed by the predicated clause"
+        );
+        assert_eq!(
+            count(WritePolicyPredicates {
+                row_filter_sql: Some("region = 'EU'".to_string()),
+                column_mask_sqls: Default::default(),
+            })
+            .await,
+            0,
+            "an EU-only caller claims no US row"
+        );
+    }
+
+    /// Without a BY SOURCE clause there is nothing to count: the handler
+    /// returns before committing, so no count query is built.
+    #[test]
+    fn empty_source_claim_count_is_none_without_by_source_clauses() {
+        let tc = cols(&["id", "region"]);
+        let sc = cols(&["id"]);
+        let n = names(&tc, &sc);
+        let clauses = merge_clauses(
+            "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET region = s.id",
+        );
+        let classified = classify_merge_clauses(&clauses, &n).expect("classify");
+        assert!(empty_source_claim_count_sql(
+            &classified,
+            &n,
+            "datafusion.public.__merge_target_x"
+        )
+        .is_none());
     }
 
     fn cols(names: &[&str]) -> Vec<String> {

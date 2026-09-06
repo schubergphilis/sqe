@@ -79,6 +79,16 @@ pub trait PolicyEnforcer: Send + Sync {
         false
     }
 
+    /// Stable identifier of the policy state this enforcer applies (finding
+    /// 902 follow-up). Cached results are stored with the fingerprint that was
+    /// current when they were produced and served only while it is unchanged,
+    /// so a governing engine can keep the materialized result cache on. `None`
+    /// (the default) means the enforcer cannot vouch for policy stability and
+    /// the cache stays off unless `permits_result_cache` is true.
+    fn policy_fingerprint(&self) -> Option<String> {
+        None
+    }
+
     async fn evaluate(
         &self,
         user: &SessionUser,
@@ -94,6 +104,10 @@ pub struct PassthroughEnforcer;
 impl PolicyEnforcer for PassthroughEnforcer {
     fn permits_result_cache(&self) -> bool {
         true
+    }
+
+    fn policy_fingerprint(&self) -> Option<String> {
+        Some("passthrough".to_string())
     }
 
     async fn evaluate(
@@ -207,6 +221,13 @@ pub struct MaskPolicyInfo {
 /// for a given (user, table) pair from an external system.
 #[async_trait]
 pub trait PolicyStore: Send + Sync {
+    /// Stable identifier of the store's current policy set (finding 902
+    /// follow-up): must change whenever any resolved policy could change.
+    /// `None` means the store cannot tell, which keeps the result cache off.
+    fn policy_fingerprint(&self) -> Option<String> {
+        None
+    }
+
     /// Look up the resolved policy for a user accessing a specific table.
     async fn resolve(
         &self,
@@ -261,7 +282,7 @@ pub trait PolicyStore: Send + Sync {
     ///
     /// A backend gains the statement by overriding this. Only the Ranger store does.
     async fn list_mask_policies(&self) -> sqe_core::Result<Vec<MaskPolicyInfo>> {
-        Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
+        Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed,
             "SHOW MASKING POLICIES is not available: the configured policy backend \
              cannot list mask policies. It needs [policy] engine = \"ranger\"."
                 .to_string(),

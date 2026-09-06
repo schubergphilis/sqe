@@ -4,7 +4,7 @@
 - Severity: medium
 - Category: architecture
 - Effort: S (hours)
-- Status: open
+- Status: fixed (branch `fix/data-consistency-p1`, 2026-09-05)
 - Issue: #599
 
 ## Problem
@@ -69,3 +69,83 @@ arms were added recently and needed two each) is a chance to miss one.
 
 - Memory note "Writes need session-cache invalidation".
 - 508 (handler consolidation makes the single hook natural).
+
+## Resolution (2026-09-05)
+
+Invalidation moved from the callers to the commit site. Every `WriteHandler`
+path that reaches a commit calls one private hook, including the Flight `DoPut`
+ingest path that had no caller to mirror.
+
+**What changed**
+
+- `crates/sqe-coordinator/src/write_handler.rs`
+  - `WriteHandler::after_commit(session, catalog, table_ident)` calls
+    `crate::session_context::invalidate_session_cache(&session.user.username)`
+    and `invalidate_table_all_tokens` on the catalog.
+  - `TableCacheInvalidator` — a one-method trait implemented for
+    `SessionCatalog`, so the hook is unit-testable. `SessionCatalog` is only
+    constructible against a live REST catalog (it warms itself with a
+    `list_namespaces` round-trip), so a fake `SessionCatalog` was not an
+    option; the seam is what the test drives instead.
+  - Called from: `commit_written_files` (both INSERT entrypoints, append and
+    overwrite), `handle_ctas`, `handle_ctas_streaming`, `ctas_replace_in_place`,
+    `handle_create_table`, `handle_create_table_like`, `handle_ingest`,
+    `handle_ingest_streaming`, `handle_delete` (CoW), `truncate_via_rewrite`,
+    `handle_delete_mor`, `handle_delete_equality`, `handle_update` (CoW),
+    `handle_update_equality`, `handle_merge` (CoW) and `handle_merge_equality`
+    (MoR). The two hand-written `catalog.invalidate_table_all_tokens(...)`
+    calls in the MERGE handlers were replaced by it.
+  - The write paths that only held the erased `Arc<dyn Catalog>` bridge now
+    resolve the `SessionCatalog` first (`resolve_session_catalog`) and derive
+    the bridge from it; `commit_written_files` takes `session` and
+    `&Arc<SessionCatalog>` instead of `&dyn Catalog` + the already-loaded
+    `IcebergTable` (which it no longer used — the retry helper loads it).
+  - The Puffin sidecar is a SECOND metadata commit on the same table, so the
+    two INSERT paths invalidate again after emitting it.
+- `crates/sqe-coordinator/src/flight_sql.rs` — `do_put_statement_ingest`
+  already routed through `WriteHandler::handle_ingest_streaming`, and that
+  handler now ends in `after_commit`, so the `DoPut` path invalidates with no
+  behavioural change needed at the Flight layer. The arm gained a comment
+  recording the invariant: this path never passes through
+  `QueryHandler::execute`, which is where the invalidation used to live, so the
+  ingest has to keep going through a `WriteHandler` entry point. An ADBC client
+  that bulk-loads and then counts rows on the same connection no longer reads
+  the pre-ingest snapshot.
+- `crates/sqe-coordinator/src/query_handler.rs` — removed the three calls that
+  only mirrored a `WriteHandler` commit: the `StatementKind::Ctas` arm, the
+  `StatementKind::CreateTable` arm, and the writer-scoped DML block at the end
+  of `execute()` (the `Insert | Ctas | Merge | Delete | Update | Truncate`
+  match). Every kind in that match reaches `after_commit` now — `Truncate` via
+  `handle_delete_dispatch` — so it was a duplicate; the comment in its place
+  records why and that the Hive arms keep their own calls (they `return` early
+  and never reach the WriteHandler).
+
+**Acceptance grep.** `grep -c invalidate_session_cache
+crates/sqe-coordinator/src/query_handler.rs` is **17**, not under 8. The
+remaining calls are all outside the WriteHandler and all still required: DROP
+TABLE, ALTER SCHEMA, DROP NESTED COLUMN, SET TBLPROPERTIES, SET TAGS, SET
+MASKING POLICY, ref DDL, partition evolution, CREATE VIEW, DROP VIEW, CREATE
+EXTERNAL TABLE, the two Hive CTAS steps, Hive INSERT, `CALL
+system.refresh_catalog_cache`, the maintenance `CALL` arm, and the
+auth-failure recovery path. Getting the literal count under 8 would mean
+collapsing those DDL sites into a private `invalidate_after_ddl(session)`
+helper — a mechanical change to arms this work package does not own. Worth
+doing in the DDL-side pass; called out here rather than done quietly.
+
+**Tests** (`cargo test -p sqe-coordinator --lib -- write_handler`, 132 passed /
+0 failed)
+
+- `write_handler::tests::after_commit_evicts_the_table_for_every_token` — a
+  recording `TableCacheInvalidator` asserts the hook evicts the committed table
+  for every token, not just the writer's key.
+
+**Not covered by unit tests.** The per-entry-point assertion the acceptance
+criteria asks for ("a fake `SessionCatalog` records
+`invalidate_table_all_tokens` for every public entry point that reaches a
+commit") cannot be written in-process: every one of those entry points needs a
+real catalog to load a table and commit. The hook is tested through the trait
+seam, and the wiring is verifiable by inspection (`grep -n
+'commit_with_retry(\|commit_rewrite_with_retry(\|after_commit(' write_handler.rs`
+shows an `after_commit` after every commit site). The `DoPut` N rows →
+`SELECT count(*)` scenario belongs in `tests/it/integration_test.rs` on the
+docker rig.
