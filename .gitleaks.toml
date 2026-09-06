@@ -4,6 +4,7 @@
 # in this repo. gitleaks auto-discovers this file when it scans from the repo
 # root, so it is honored by:
 #   * local runs        -> gitleaks dir .        (or gitleaks detect)
+#   * the commit hook    -> .pre-commit-config.yaml (gitleaks git --staged)
 #   * the CI gate        -> aikido-secret-scan job (gitleaks detect --no-git)
 # without any --config flag.
 #
