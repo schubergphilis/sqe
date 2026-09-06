@@ -40,7 +40,7 @@ use sqlparser::ast::{
     ValueWithSpan,
 };
 
-use sqe_core::SqeError;
+use sqe_core::{SqeError, SqeErrorCode};
 
 /// A parsed `CALL system.<proc>(...)` invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -280,7 +280,7 @@ impl NamespaceRef {
                 catalog: Some((*cat).to_string()),
                 namespace: (*ns).to_string(),
             }),
-            _ => Err(SqeError::Execution(format!(
+            _ => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "Invalid namespace reference in CALL: '{s}' (expected 1 or 2 dotted parts)"
             ))),
         }
@@ -327,7 +327,7 @@ impl TableRef {
                 namespace: (*ns).to_string(),
                 name: (*name).to_string(),
             }),
-            _ => Err(SqeError::Execution(format!(
+            _ => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "Invalid table reference in CALL: '{s}' (expected 1, 2, or 3 dotted parts)"
             ))),
         }
@@ -390,8 +390,8 @@ fn parse_register_table(mut args: Vec<(String, Expr)>) -> sqe_core::Result<Proce
         expect_string(e, "metadata_location")
     })?
     .ok_or_else(|| {
-        SqeError::Execution(
-            "CALL system.register_table requires `metadata_location => 's3://...'`".into(),
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+            "CALL system.register_table requires `metadata_location => 's3://...'`",
         )
     })?;
     expect_no_remaining(&args, "register_table")?;
@@ -417,8 +417,8 @@ fn parse_set_current_snapshot(mut args: Vec<(String, Expr)>) -> sqe_core::Result
     let table = take_table(&mut args)?;
     let snapshot_id = take_option(&mut args, "snapshot_id", |e| expect_i64(e, "snapshot_id"))?
         .ok_or_else(|| {
-            SqeError::Execution(
-                "CALL system.set_current_snapshot requires `snapshot_id => <id>`".into(),
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+                "CALL system.set_current_snapshot requires `snapshot_id => <id>`",
             )
         })?;
     expect_no_remaining(&args, "set_current_snapshot")?;
@@ -430,8 +430,8 @@ fn parse_rollback_to_snapshot(mut args: Vec<(String, Expr)>) -> sqe_core::Result
     let table = take_table(&mut args)?;
     let snapshot_id = take_option(&mut args, "snapshot_id", |e| expect_i64(e, "snapshot_id"))?
         .ok_or_else(|| {
-            SqeError::Execution(
-                "CALL system.rollback_to_snapshot requires `snapshot_id => <id>`".into(),
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+                "CALL system.rollback_to_snapshot requires `snapshot_id => <id>`",
             )
         })?;
     expect_no_remaining(&args, "rollback_to_snapshot")?;
@@ -450,7 +450,7 @@ fn expect_i64(expr: &Expr, field: &str) -> sqe_core::Result<i64> {
             ..
         }) => n
             .parse::<i64>()
-            .map_err(|e| SqeError::Execution(format!("Invalid integer for '{field}': {n} ({e})"))),
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Invalid integer for '{field}': {n} ({e})"))),
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
             expr: inner,
@@ -458,9 +458,9 @@ fn expect_i64(expr: &Expr, field: &str) -> sqe_core::Result<i64> {
             let inner_val = expect_i64(inner, field)?;
             inner_val
                 .checked_neg()
-                .ok_or_else(|| SqeError::Execution(format!("Value for '{field}' overflows i64")))
+                .ok_or_else(|| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Value for '{field}' overflows i64")))
         }
-        other => Err(SqeError::Execution(format!(
+        other => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "Expected integer for '{field}', got: {other}"
         ))),
     }
@@ -483,8 +483,8 @@ fn take_namespace(args: &mut Vec<(String, Expr)>) -> sqe_core::Result<NamespaceR
         .iter()
         .position(|(k, _)| k.eq_ignore_ascii_case("namespace"))
         .ok_or_else(|| {
-            SqeError::Execution(
-                "CALL system.purge_orphan_locations requires a `namespace => 'ns'` argument".into(),
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+                "CALL system.purge_orphan_locations requires a `namespace => 'ns'` argument",
             )
         })?;
     let (_, expr) = args.remove(pos);
@@ -498,7 +498,7 @@ fn expect_bool(expr: &Expr, field: &str) -> sqe_core::Result<bool> {
             value: Value::Boolean(b),
             ..
         }) => Ok(*b),
-        other => Err(SqeError::Execution(format!(
+        other => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "Expected boolean literal for '{field}', got: {other}"
         ))),
     }
@@ -539,7 +539,7 @@ fn extract_args(proc: &str, args: &FunctionArguments) -> sqe_core::Result<Vec<(S
         FunctionArguments::List(list) => list,
         FunctionArguments::None => return Ok(Vec::new()),
         FunctionArguments::Subquery(_) => {
-            return Err(SqeError::Execution(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
                 "CALL system.* does not accept subquery arguments".to_string(),
             ));
         }
@@ -561,7 +561,7 @@ fn extract_args(proc: &str, args: &FunctionArguments) -> sqe_core::Result<Vec<(S
             } => named.push((ident.value.clone(), expr.clone())),
             FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => positional.push(expr.clone()),
             _ => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Unsupported argument shape for CALL system.*: {arg}"
                 )));
             }
@@ -569,7 +569,7 @@ fn extract_args(proc: &str, args: &FunctionArguments) -> sqe_core::Result<Vec<(S
     }
 
     if !named.is_empty() && !positional.is_empty() {
-        return Err(SqeError::Execution(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
             "Named and positional arguments cannot be mixed".to_string(),
         ));
     }
@@ -606,7 +606,7 @@ fn positional_spec(proc: &str) -> Option<&'static [PosSlot]> {
 /// Map positional arguments onto their procedure's named parameters.
 fn positional_to_named(proc: &str, exprs: Vec<Expr>) -> sqe_core::Result<Vec<(String, Expr)>> {
     let spec = positional_spec(proc).ok_or_else(|| {
-        SqeError::Execution(format!(
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "CALL system.{proc} does not support positional arguments; use named arguments like `table => 'ns.t'`"
         ))
     })?;
@@ -633,7 +633,7 @@ fn positional_to_named(proc: &str, exprs: Vec<Expr>) -> sqe_core::Result<Vec<(St
         }
     }
     if it.next().is_some() {
-        return Err(SqeError::Execution(format!(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "Too many positional arguments for CALL system.{proc}"
         )));
     }
@@ -642,7 +642,7 @@ fn positional_to_named(proc: &str, exprs: Vec<Expr>) -> sqe_core::Result<Vec<(St
 
 fn next_positional(it: &mut std::vec::IntoIter<Expr>, proc: &str) -> sqe_core::Result<Expr> {
     it.next().ok_or_else(|| {
-        SqeError::Execution(format!(
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "Too few positional arguments for CALL system.{proc}"
         ))
     })
@@ -662,7 +662,7 @@ fn is_null(expr: &Expr) -> bool {
 /// phrasing (asserted by testRollbackToSnapshotWithNullArgument).
 fn reject_null(expr: &Expr, field: &str) -> sqe_core::Result<()> {
     if is_null(expr) {
-        return Err(SqeError::Execution(format!("{field} cannot be null")));
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("{field} cannot be null")));
     }
     Ok(())
 }
@@ -681,7 +681,7 @@ fn take_table(args: &mut Vec<(String, Expr)>) -> sqe_core::Result<TableRef> {
         .iter()
         .position(|(k, _)| k.eq_ignore_ascii_case("table"))
         .ok_or_else(|| {
-            SqeError::Execution("CALL system.* requires a `table => 'ns.t'` argument".to_string())
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, "CALL system.* requires a `table => 'ns.t'` argument".to_string())
         })?;
     let (_, expr) = args.remove(pos);
     let s = expect_string(&expr, "table")?;
@@ -707,7 +707,7 @@ where
 
 fn expect_no_remaining(args: &[(String, Expr)], proc: &str) -> sqe_core::Result<()> {
     if let Some((k, _)) = args.first() {
-        return Err(SqeError::Execution(format!(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "Unknown argument '{k}' for CALL system.{proc}"
         )));
     }
@@ -720,7 +720,7 @@ fn expect_string(expr: &Expr, field: &str) -> sqe_core::Result<String> {
             value: Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
             ..
         }) => Ok(s.clone()),
-        other => Err(SqeError::Execution(format!(
+        other => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "Expected string literal for '{field}', got: {other}"
         ))),
     }
@@ -733,8 +733,8 @@ fn expect_u64(expr: &Expr, field: &str) -> sqe_core::Result<u64> {
             ..
         }) => n
             .parse::<u64>()
-            .map_err(|e| SqeError::Execution(format!("Invalid integer for '{field}': {n} ({e})"))),
-        other => Err(SqeError::Execution(format!(
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Invalid integer for '{field}': {n} ({e})"))),
+        other => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "Expected integer for '{field}', got: {other}"
         ))),
     }
@@ -743,7 +743,7 @@ fn expect_u64(expr: &Expr, field: &str) -> sqe_core::Result<u64> {
 fn expect_usize(expr: &Expr, field: &str) -> sqe_core::Result<usize> {
     expect_u64(expr, field).and_then(|v| {
         usize::try_from(v).map_err(|_| {
-            SqeError::Execution(format!("Value for '{field}' does not fit in usize: {v}"))
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Value for '{field}' does not fit in usize: {v}"))
         })
     })
 }
@@ -757,13 +757,13 @@ fn expect_timestamp(expr: &Expr, field: &str) -> sqe_core::Result<DateTime<Utc>>
         Expr::TypedString(ts) => match ts.value.clone().into_string() {
             Some(s) => s,
             None => {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "Expected timestamp literal for '{field}', got: {expr}"
                 )));
             }
         },
         other => {
-            return Err(SqeError::Execution(format!(
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "Expected timestamp literal for '{field}', got: {other}"
             )));
         }
@@ -777,7 +777,7 @@ fn expect_timestamp(expr: &Expr, field: &str) -> sqe_core::Result<DateTime<Utc>>
         return Ok(ts.with_timezone(&Utc));
     }
 
-    Err(SqeError::Execution(format!(
+    Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
         "Could not parse timestamp for '{field}': '{s}' (expected RFC 3339 or 'YYYY-MM-DD HH:MM:SS')"
     )))
 }
@@ -874,10 +874,9 @@ fn parse_reproject_column_tags(mut args: Vec<(String, Expr)>) -> sqe_core::Resul
         + usize::from(namespace.is_some())
         + usize::from(catalog.is_some());
     if filled != 1 {
-        return Err(SqeError::Execution(
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
             "CALL system.reproject_column_tags requires exactly one of \
-             `table => 'ns.t'`, `namespace => 'ns'`, or `catalog => 'cat'`"
-                .into(),
+             `table => 'ns.t'`, `namespace => 'ns'`, or `catalog => 'cat'`",
         ));
     }
 

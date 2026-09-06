@@ -402,8 +402,8 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
     if let Some(rest) = strip_prefix_ci(trimmed, "SHOW CREATE SCHEMA ") {
         let schema = rest.trim().trim_end_matches(';').trim().to_string();
         if schema.is_empty() {
-            return Err(sqe_core::SqeError::Execution(
-                "SHOW CREATE SCHEMA requires a schema name".into(),
+            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
+                "SHOW CREATE SCHEMA requires a schema name",
             ));
         }
         return Ok(StatementKind::ShowCreateSchema(schema));
@@ -430,7 +430,7 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
         let rest = trimmed["SHOW PARTITIONS".len()..].trim();
         let table = rest.trim_end_matches(';').trim().to_string();
         if table.is_empty() {
-            return Err(sqe_core::SqeError::Execution(
+            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
                 "SHOW PARTITIONS requires: SHOW PARTITIONS <table>".to_string(),
             ));
         }
@@ -438,7 +438,7 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
         // into the table name would make `SHOW PARTITIONS t LIKE 'dt%'`
         // look up a table that does not exist instead of naming the gap.
         if table.split_whitespace().count() > 1 {
-            return Err(sqe_core::SqeError::Execution(
+            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
                 "SHOW PARTITIONS does not support LIKE or extra clauses; use \
                  SHOW PARTITIONS <table>"
                     .to_string(),
@@ -493,7 +493,7 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
                 grantee_name,
             }));
         }
-        return Err(sqe_core::SqeError::Execution(
+        return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
             "SHOW GRANTS TO requires: SHOW GRANTS TO GROUP|USER \"name\"".to_string(),
         ));
     }
@@ -559,7 +559,7 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
     if let Some(rest) = show_tags_rest {
         let table = rest.trim().trim_end_matches(';').trim().to_string();
         if table.is_empty() {
-            return Err(sqe_core::SqeError::Execution(
+            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
                 "SHOW TAGS requires: SHOW TAGS ON <table>".to_string(),
             ));
         }
@@ -695,7 +695,7 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
 
     let dialect = GenericDialect {};
     let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|e| sqe_core::SqeError::Execution(format!("Parse error: {e}")))?;
+        .map_err(|e| sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Parse error: {e}")))?;
 
     // Reject pathologically deep expression trees up front, before any
     // recursive AST visitor (the Trino-compat rewrite, then DataFusion's
@@ -703,12 +703,12 @@ pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
     // chain parses cleanly but builds a depth-N tree; the guard turns that
     // into a clean parse error instead of an uncatchable process abort.
     crate::trino_compat::check_expression_depth(&statements)
-        .map_err(|e| sqe_core::SqeError::Execution(format!("Parse error: {e}")))?;
+        .map_err(|e| sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Parse error: {e}")))?;
 
     let stmt = statements
         .into_iter()
         .next()
-        .ok_or_else(|| sqe_core::SqeError::Execution("Empty SQL".to_string()))?;
+        .ok_or_else(|| sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, "Empty SQL".to_string()))?;
 
     classify(stmt)
 }
@@ -1079,7 +1079,7 @@ fn parse_analyze(rest: &str) -> sqe_core::Result<StatementKind> {
         .unwrap_or("")
         .trim();
     if table.is_empty() {
-        return Err(sqe_core::SqeError::Execution(
+        return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
             "ANALYZE requires a table name: ANALYZE [catalog.][schema.]table [WITH (...)]"
                 .to_string(),
         ));
@@ -1102,7 +1102,7 @@ fn parse_resource_reference(
             Some(parts[1].to_string()),
             Some(parts[2].to_string()),
         )),
-        n => Err(sqe_core::SqeError::Execution(format!(
+        n => Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
             "Resource reference has {n} parts (max 3): {s}"
         ))),
     }
@@ -1113,7 +1113,7 @@ fn parse_check_access(rest: &str) -> sqe_core::Result<StatementKind> {
     let upper = rest.to_ascii_uppercase();
     // Find " ON " to split privilege from the rest
     let on_pos = upper.find(" ON ").ok_or_else(|| {
-        sqe_core::SqeError::Execution(
+        sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
             "CHECK ACCESS requires: CHECK ACCESS <privilege> ON <resource> FOR USER \"<name>\""
                 .to_string(),
         )
@@ -1124,7 +1124,7 @@ fn parse_check_access(rest: &str) -> sqe_core::Result<StatementKind> {
     // Find " FOR USER " to split resource from user
     let after_on_upper = after_on.to_ascii_uppercase();
     let for_user_pos = after_on_upper.find(" FOR USER ").ok_or_else(|| {
-        sqe_core::SqeError::Execution(
+        sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
             "CHECK ACCESS requires: CHECK ACCESS <privilege> ON <resource> FOR USER \"<name>\""
                 .to_string(),
         )
@@ -1153,7 +1153,7 @@ fn parse_check_access(rest: &str) -> sqe_core::Result<StatementKind> {
 /// and the user defaults to the session user (`None`).
 fn parse_show_effective_policy(rest: &str, has_user: bool) -> sqe_core::Result<StatementKind> {
     let bad_syntax = || {
-        sqe_core::SqeError::Execution(
+        sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
             "SHOW EFFECTIVE POLICY requires: SHOW EFFECTIVE POLICY [FOR USER \"<name>\"] ON <table>"
                 .to_string(),
         )
@@ -1169,7 +1169,7 @@ fn parse_show_effective_policy(rest: &str, has_user: bool) -> sqe_core::Result<S
             .trim_matches('\'')
             .to_string();
         if user.is_empty() {
-            return Err(sqe_core::SqeError::Execution(
+            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
                 "SHOW EFFECTIVE POLICY FOR USER requires a non-empty user name".to_string(),
             ));
         }
@@ -1181,7 +1181,7 @@ fn parse_show_effective_policy(rest: &str, has_user: bool) -> sqe_core::Result<S
     };
 
     if table.is_empty() {
-        return Err(sqe_core::SqeError::Execution(
+        return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
             "SHOW EFFECTIVE POLICY requires a table after ON".to_string(),
         ));
     }

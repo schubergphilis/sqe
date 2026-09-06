@@ -11,6 +11,14 @@ pub mod ranger;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// Read an HTTP error body, or a placeholder when the body itself is unreadable.
+pub(crate) async fn response_body_or_unreadable(resp: reqwest::Response) -> String {
+    match resp.text().await {
+        Ok(b) => b,
+        Err(e) => format!("<body unreadable: {e}>"),
+    }
+}
+
 // ── Trait ────────────────────────────────────────────────────────────────────
 
 /// Backend for access control operations (GRANT, REVOKE, SHOW GRANTS, etc.).

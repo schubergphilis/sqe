@@ -17,7 +17,10 @@ pub use event::{
     QueryStats, Resource, Timing,
 };
 pub use export::SeqCursor;
-pub use logger::{query_hash, AuditEntry, AuditLogger};
+pub use logger::{
+    default_audit_queue_capacity, query_hash, AuditEntry, AuditFailMode, AuditLogger,
+    AuditLoggerOptions, AuditWriteError,
+};
 pub use ocsf::to_ocsf;
 pub use redact::{mask_gdpr_columns, redact_pii, strip_sql_literals, GdprIdentifierMode};
 pub use sink::{AuditFormat, AuditSink, NativeJsonlSink, OcsfJsonlSink};

@@ -4,7 +4,7 @@
 - Severity: low
 - Category: operability
 - Effort: S (hours)
-- Status: open
+- Status: fixed (branch `fix/errors-audit-observability`, 2026-09-05)
 - Issue: #619
 
 ## Problem
@@ -79,3 +79,7 @@ metrics looks healthy to a fleet dashboard.
 - July 2026 production-readiness review, "distributed stage/shuffle profiles,
   SLOs" observability gaps.
 - Issue 602 (fault-kind labels on failure counters).
+
+## Resolution (2026-09-05)
+
+`init_telemetry_with_sampling` returns `Result` and names the config key on exporter failure (no `.expect`). `start_metrics_server` binds synchronously before spawn so a taken port fails boot. Tests: `init_telemetry_rejects_malformed_endpoint`, `second_bind_on_same_port_fails`. Per-stream gauge add/sub is follow-up; bind and boot panics were the operator-visible defects.

@@ -189,15 +189,27 @@ impl TrinoError {
     /// naming a prepared statement the client never sent). USER_ERROR is
     /// returned as HTTP 200 with an error body, per the Trino protocol.
     pub fn user_error(message: impl Into<String>, query_id: Option<&str>) -> Self {
+        Self::from_code(sqe_core::SqeErrorCode::SyntaxError, message, query_id)
+    }
+
+    pub fn internal_error(message: impl Into<String>, query_id: Option<&str>) -> Self {
+        Self::from_code(sqe_core::SqeErrorCode::InternalError, message, query_id)
+    }
+
+    pub fn from_code(
+        code: sqe_core::SqeErrorCode,
+        message: impl Into<String>,
+        query_id: Option<&str>,
+    ) -> Self {
         let message = message.into();
         Self {
             message: message.clone(),
-            error_code: 1,
-            error_name: "SYNTAX_ERROR".to_string(),
-            error_type: "USER_ERROR".to_string(),
+            error_code: code.trino_error_code(),
+            error_name: code.name().to_string(),
+            error_type: code.trino_error_type().to_string(),
             query_id: query_id.map(|s| s.to_string()),
             failure_info: Some(TrinoFailureInfo {
-                r#type: "io.trino.spi.TrinoException".to_string(),
+                r#type: format!("io.trino.spi.{}", code.trino_error_type()),
                 message,
                 suppressed: Vec::new(),
                 cause: None,
@@ -986,6 +998,34 @@ mod tests {
     fn test_parse_session_unrelated_returns_none() {
         assert!(parse_session_statement("SELECT 1").is_none());
         assert!(parse_session_statement("INSERT INTO t VALUES (1)").is_none());
+    }
+
+    #[test]
+    fn error_from_code_maps_auth_and_internal() {
+        let unauthorized = TrinoError::from_code(
+            sqe_core::SqeErrorCode::AuthenticationFailed,
+            "authentication failed",
+            None,
+        );
+        assert_eq!(unauthorized.error_type, "USER_ERROR");
+        assert_eq!(unauthorized.error_name, "AUTHENTICATION_FAILED");
+
+        let missing = TrinoError::from_code(
+            sqe_core::SqeErrorCode::CatalogNotFound,
+            "unknown query",
+            None,
+        );
+        assert_eq!(missing.error_name, "CATALOG_NOT_FOUND");
+
+        let exhausted = TrinoError::from_code(
+            sqe_core::SqeErrorCode::ResourceExhausted,
+            "rate limit",
+            None,
+        );
+        assert_eq!(exhausted.error_name, "RESOURCE_EXHAUSTED");
+
+        let panic = TrinoError::internal_error("query task terminated unexpectedly", None);
+        assert_eq!(panic.error_type, "INTERNAL_ERROR");
     }
 
     #[test]

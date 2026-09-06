@@ -44,7 +44,7 @@ use futures::StreamExt;
 use iceberg::spec::{DataFile, FormatVersion, Schema, StructType};
 use sqe_compaction::dispatch::{decode_group_response, GroupOutcome};
 use sqe_compaction::wire::{CompactGroupRequest, CompactGroupResponse, S3Conn, SortSpecWire};
-use sqe_core::{Result as SqeResult, SqeError};
+use sqe_core::{Result as SqeResult, SqeError , SqeErrorCode};
 use tracing::warn;
 
 use crate::channel_pool::ChannelPool;
@@ -437,7 +437,7 @@ pub(crate) async fn dispatch_and_collect_groups(
                 .iter()
                 .find(|g| is_permanently_stuck(&g.excluded, &healthy))
             {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "distributed compaction job {job_id}: group {} has failed on every currently \
                      healthy worker ({:?}); no worker left to retry on",
                     stuck.group_id, stuck.excluded
@@ -507,7 +507,7 @@ pub(crate) async fn dispatch_and_collect_groups(
             // handled by the backoff-and-retry below.
             let healthy = registry.healthy_workers().await;
             if healthy.is_empty() {
-                return Err(SqeError::Execution(format!(
+                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                     "distributed compaction job {job_id}: no healthy workers available; \
                      {} group(s) undispatched",
                     pending.len()
@@ -553,7 +553,7 @@ pub(crate) async fn dispatch_and_collect_groups(
                 group.excluded.insert(worker_url.clone());
                 group.attempts_left = group.attempts_left.saturating_sub(1);
                 if group.attempts_left == 0 {
-                    return Err(SqeError::Execution(format!(
+                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                         "distributed compaction job {job_id}: group {} exhausted retries \
                          (last failure on {worker_url}): {e}",
                         group.group_id
