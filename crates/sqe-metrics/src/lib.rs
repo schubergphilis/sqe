@@ -197,9 +197,27 @@ pub struct MetricsRegistry {
     // contending on the same table (architecture review 506).
     pub write_commit_retries_total: IntCounterVec,
 
+    // Write path: Puffin NDV sidecar outcomes per commit shape (architecture
+    // review 512). `op` is insert / rewrite / row_delta; `outcome` is
+    // registered, skipped_* (no previous statistics, already present, no
+    // snapshot), write_failed or commit_failed. Statistics that silently
+    // disappear after a DELETE or a compaction used to leave only a warn log.
+    pub puffin_sidecar_total: IntCounterVec,
+
     // Catalog (Polaris) roundtrip + circuit breaker state
     pub catalog_request_duration_seconds: HistogramVec,
+    /// Wall time of one Iceberg manifest walk (manifest list + every
+    /// manifest decoded into `DataFile`s) feeding table statistics and
+    /// file pruning. Labelled `outcome` = `ok` | `err`; a `cache_hit`
+    /// outcome records the (near-zero) cost of serving the walk from the
+    /// per-snapshot cache so hit/miss ratios are readable from one series
+    /// (architecture review 308).
+    pub catalog_manifest_walk_seconds: HistogramVec,
+    /// Labelled by catalog (`circuit` = configured endpoint), never by token.
     pub catalog_circuit_breaker_state: GaugeVec,
+    /// Count of open per-session breakers per catalog; the aggregate that
+    /// replaced the per-fingerprint series.
+    pub catalog_circuit_breakers_open: GaugeVec,
 
     // Policy backend (OPA / Cedar) roundtrip + cache
     pub policy_resolve_duration_seconds: HistogramVec,
@@ -599,10 +617,33 @@ impl MetricsRegistry {
             &["op", "status"],
         )?;
 
+        let catalog_manifest_walk_seconds = register_histogram_vec(
+            &registry,
+            HistogramOpts::new(
+                "sqe_catalog_manifest_walk_seconds",
+                "Iceberg manifest walk (manifest list + manifests decoded to DataFiles) \
+                 wall time in seconds, per table snapshot",
+            )
+            .buckets(vec![
+                0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ]),
+            &["outcome"],
+        )?;
+
+        // `circuit` is the configured catalog endpoint (or warehouse), one
+        // value per configured catalog. It must never carry a per-token
+        // breaker name: that grew a series per login (review 301).
         let catalog_circuit_breaker_state = register_gauge_vec(
             &registry,
             "sqe_catalog_circuit_breaker_state",
-            "Catalog circuit breaker state (0=closed, 1=half_open, 2=open)",
+            "Worst catalog circuit breaker state across sessions on the catalog \
+             (0=closed, 1=half_open, 2=open)",
+            &["circuit"],
+        )?;
+        let catalog_circuit_breakers_open = register_gauge_vec(
+            &registry,
+            "sqe_catalog_circuit_breakers_open",
+            "Number of per-session catalog circuit breakers currently open on the catalog",
             &["circuit"],
         )?;
 
@@ -658,6 +699,13 @@ impl MetricsRegistry {
             "sqe_write_commit_retries_total",
             "Rewrite commits retried after an optimistic-concurrency conflict, by op",
             &["op"],
+        )?;
+
+        let puffin_sidecar_total = register_int_counter_vec(
+            &registry,
+            "sqe_puffin_sidecar_total",
+            "Puffin NDV sidecar emissions by commit shape (insert/rewrite/row_delta) and outcome",
+            &["op", "outcome"],
         )?;
 
         let audit_events_dropped_total = register_int_counter_vec(
@@ -822,7 +870,9 @@ impl MetricsRegistry {
             token_refresh_total,
             sorts_stripped_total,
             catalog_request_duration_seconds,
+            catalog_manifest_walk_seconds,
             catalog_circuit_breaker_state,
+            catalog_circuit_breakers_open,
             policy_resolve_duration_seconds,
             policy_cache_hits_total,
             policy_cache_misses_total,
@@ -830,6 +880,7 @@ impl MetricsRegistry {
             ranger_group_only_items,
             write_orphan_files_total,
             write_commit_retries_total,
+            puffin_sidecar_total,
             audit_events_dropped_total,
             audit_export_records_total,
             audit_export_batch_failures_total,
@@ -1169,6 +1220,40 @@ mod tests {
             metrics
                 .write_commit_retries_total
                 .with_label_values(&["truncate"])
+                .get(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_puffin_sidecar_total() {
+        let metrics = MetricsRegistry::new().unwrap();
+        metrics
+            .puffin_sidecar_total
+            .with_label_values(&["rewrite", "registered"])
+            .inc();
+        metrics
+            .puffin_sidecar_total
+            .with_label_values(&["insert", "commit_failed"])
+            .inc_by(2);
+        assert_eq!(
+            metrics
+                .puffin_sidecar_total
+                .with_label_values(&["rewrite", "registered"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .puffin_sidecar_total
+                .with_label_values(&["insert", "commit_failed"])
+                .get(),
+            2
+        );
+        assert_eq!(
+            metrics
+                .puffin_sidecar_total
+                .with_label_values(&["row_delta", "registered"])
                 .get(),
             0
         );

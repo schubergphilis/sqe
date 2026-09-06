@@ -106,7 +106,9 @@ pub fn init_telemetry_with_sampling(
             .with_tonic()
             .with_endpoint(otlp_endpoint)
             .build()
-            .map_err(|e| format!("Failed to create OTLP log exporter (metrics.otlp_endpoint): {e}"))?;
+            .map_err(|e| {
+                format!("Failed to create OTLP log exporter (metrics.otlp_endpoint): {e}")
+            })?;
         let logger_provider = SdkLoggerProvider::builder()
             .with_resource(resource.clone())
             .with_batch_exporter(log_exporter)

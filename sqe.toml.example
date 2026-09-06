@@ -163,6 +163,13 @@ roles_claim = "realm_access.roles"
 polaris_url = "http://polaris:8181/api/catalog"
 warehouse = "iceberg"
 metadata_cache_ttl_secs = 30
+# Deadlines for every HTTP call to the catalog (SQE's own HEAD/GET path and
+# iceberg-rust's requests share one client). A silent catalog fails the call
+# with CATALOG_UNAVAILABLE and trips the circuit breaker instead of stalling
+# planning. Must be >= 1. The client is process-wide: with several
+# [catalogs.*] entries the first one loaded sets the values.
+# request_timeout_secs = 30
+# connect_timeout_secs = 5
 default_table_format_version = 2  # 2 (default) or 3 for Iceberg v3 tables
 # trust_sort_order = false  # default: only partition columns declared as pre-sorted (safe)
 # trust_sort_order = true   # trust ALL Iceberg sort order columns (faster but risky for mixed-writer tables)

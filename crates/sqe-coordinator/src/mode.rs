@@ -63,6 +63,7 @@ pub fn resolve_mode(config: &SqeConfig) -> Result<Mode, String> {
     })
 }
 
+#[cfg(test)]
 fn resolve_mode_inner(config_mode: &str, env_mode: Option<&str>) -> Result<Mode, String> {
     let parsed = config_mode.parse::<ServerMode>();
     if let Ok(mode) = parsed {

@@ -11,7 +11,7 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::table::Table;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::expr_to_predicate;
 
@@ -62,8 +62,6 @@ pub struct SqeTableProvider {
     /// scan_fetch_ahead`. `None` = scan default (3x cores); `Some(0)` =
     /// staging disabled; `Some(n)` = absolute depth.
     scan_fetch_ahead: Option<usize>,
-    /// Parsed Puffin NDV metadata, shared by clones and keyed by snapshot.
-    puffin_ndv_cache: Arc<crate::puffin_stats::PuffinNdvCache>,
 }
 
 impl SqeTableProvider {
@@ -97,7 +95,6 @@ impl SqeTableProvider {
             runtime_filter_bloom_probe: true,
             runtime_filter_bloom_max_values: 65536,
             scan_fetch_ahead: None,
-            puffin_ndv_cache: Arc::new(crate::puffin_stats::PuffinNdvCache::default()),
         })
     }
 
@@ -318,7 +315,14 @@ impl SqeTableProvider {
         // sensible build sides. Falls back to row-count-only stats if the
         // manifest read fails — incomplete stats are better than blocking
         // the scan, and the existing fallback path stays correct.
-        match crate::iceberg_scan::compute_table_statistics(
+        //
+        // Served through the per-snapshot cache (review 308): the manifest
+        // walk runs once per snapshot per process; every later scan of the
+        // same snapshot is a lookup. The walk time is exported as
+        // `sqe_catalog_manifest_walk_seconds{outcome}` so operators can see
+        // what planning pays on cold snapshots.
+        let walk_started = std::time::Instant::now();
+        match crate::iceberg_scan::compute_table_statistics_cached(
             &self.table,
             self.snapshot_id,
             projected_schema.as_ref(),
@@ -326,7 +330,11 @@ impl SqeTableProvider {
         )
         .await
         {
-            Ok(mut stats) => {
+            Ok((mut stats, cache_hit)) => {
+                self.observe_manifest_walk(
+                    if cache_hit { "cache_hit" } else { "ok" },
+                    walk_started,
+                );
                 self.apply_requested_puffin_ndv(
                     &mut stats,
                     projected_schema.as_ref(),
@@ -335,15 +343,28 @@ impl SqeTableProvider {
                 exec = exec.with_cached_statistics(stats);
             }
             Err(e) => {
-                debug!(
+                self.observe_manifest_walk("err", walk_started);
+                // A slow or failing manifest read used to be invisible at
+                // `debug!`; it is a planning-latency event worth noticing.
+                warn!(
                     error = %e,
                     table = %self.table.identifier(),
+                    elapsed_ms = walk_started.elapsed().as_millis() as u64,
                     "Failed to pre-compute manifest column stats; using row-count fallback"
                 );
             }
         }
 
         Ok(Arc::new(exec))
+    }
+
+    /// Record one manifest-walk observation when metrics are attached.
+    fn observe_manifest_walk(&self, outcome: &str, started: std::time::Instant) {
+        if let Some(m) = &self.prom_metrics {
+            m.catalog_manifest_walk_seconds
+                .with_label_values(&[outcome])
+                .observe(started.elapsed().as_secs_f64());
+        }
     }
 
     fn apply_requested_puffin_ndv(
@@ -372,9 +393,13 @@ impl SqeTableProvider {
             return;
         };
         let snapshot_id = snapshot.snapshot_id();
-        let ndv_by_field_id = self
-            .puffin_ndv_cache
-            .for_snapshot(snapshot_id, metadata.statistics_for_snapshot(snapshot_id));
+        // Process-global, keyed by (table uuid, snapshot id): shared across
+        // every provider built for this table (review 307).
+        let ndv_by_field_id = crate::puffin_stats::PUFFIN_NDV_CACHE.for_table_snapshot(
+            metadata.uuid(),
+            snapshot_id,
+            metadata.statistics_for_snapshot(snapshot_id),
+        );
         let Ok(iceberg_schema) = snapshot.schema(metadata) else {
             return;
         };

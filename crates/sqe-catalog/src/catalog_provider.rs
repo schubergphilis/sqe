@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use futures::StreamExt;
 use iceberg::NamespaceIdent;
@@ -208,6 +209,12 @@ pub struct SqeCatalogProvider {
     /// Fetch/decode pipelining depth (sqe#scan-fetch-pipeline); see
     /// `SqeTableProvider::with_scan_fetch_ahead`.
     scan_fetch_ahead: Option<usize>,
+    /// One `SqeSchemaProvider` per namespace for the life of this provider,
+    /// so repeated `schema()` lookups during a planning pass (DataFusion
+    /// resolves each table reference separately) share one instance instead
+    /// of rebuilding it per lookup (review 307). Table-name snapshots
+    /// themselves are process-global; see `schema_provider.rs`.
+    schema_providers: DashMap<String, Arc<SqeSchemaProvider>>,
 }
 
 impl std::fmt::Debug for SqeCatalogProvider {
@@ -342,6 +349,7 @@ impl SqeCatalogProvider {
             runtime_filter_bloom_probe: true,
             runtime_filter_bloom_max_values: 65536,
             scan_fetch_ahead: None,
+            schema_providers: DashMap::new(),
         })
     }
 
@@ -438,7 +446,104 @@ impl SqeCatalogProvider {
             runtime_filter_bloom_probe: true,
             runtime_filter_bloom_max_values: 65536,
             scan_fetch_ahead: None,
+            schema_providers: DashMap::new(),
         }
+    }
+
+    /// The session catalog this provider plans against.
+    pub fn session_catalog(&self) -> &Arc<SessionCatalog> {
+        &self.session_catalog
+    }
+
+    /// Drop the cached table-name snapshot for `namespace` after DDL that
+    /// created or dropped a table/view, so the next pre-plan refresh
+    /// re-lists it instead of waiting for the TTL.
+    pub fn invalidate_table_names(&self, namespace: &str) {
+        crate::schema_provider::invalidate_namespace_listing(
+            &self.session_catalog,
+            &self.warehouse,
+            namespace,
+        );
+    }
+
+    /// Async pre-plan refresh for one namespace (review 806): re-list the
+    /// visible namespaces if `namespace` is not in the snapshot yet (the #368
+    /// miss case, cooldown-gated), then refresh its table-name snapshot when
+    /// it is older than the TTL. Errors are folded into the snapshot with
+    /// their reason and returned for the caller to log.
+    pub async fn refresh_namespace(&self, namespace: &str) -> sqe_core::Result<()> {
+        let known = self
+            .cached_namespaces
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|n| n == namespace);
+        if !known {
+            let due = {
+                let mut last = self
+                    .namespace_relist_at
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let due = !last.is_some_and(|at| at.elapsed() < NAMESPACE_RELIST_COOLDOWN);
+                if due {
+                    *last = Some(Instant::now());
+                }
+                due
+            };
+            if due {
+                let fresh = Self::list_visible_namespace_names(
+                    Arc::clone(&self.session_catalog),
+                    self.namespace_visibility_filter,
+                )
+                .await?;
+                *self
+                    .cached_namespaces
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner) = fresh;
+            }
+        }
+        let provider = self.schema_provider(namespace);
+        if provider.needs_refresh() {
+            provider.refresh_table_names().await?;
+        }
+        Ok(())
+    }
+
+    /// The cached per-namespace schema provider, built on first use.
+    fn schema_provider(&self, name: &str) -> Arc<SqeSchemaProvider> {
+        if let Some(existing) = self.schema_providers.get(name) {
+            return Arc::clone(&existing);
+        }
+        let mut provider = SqeSchemaProvider::new(
+            self.session_catalog.clone(),
+            name.to_string(),
+            self.storage_config.clone(),
+            self.warehouse.clone(),
+        )
+        .with_known_namespaces(self.cached_namespace_names());
+        if let Some(ref m) = self.prom_metrics {
+            provider = provider.with_metrics(Arc::clone(m));
+        }
+        provider = provider.with_small_file_threshold(self.small_file_threshold_bytes);
+        provider = provider.with_manifest_concurrency(self.manifest_concurrency);
+        provider = provider.with_prefetch_concurrency(self.prefetch_concurrency);
+        provider = provider.with_runtime_filter_clustering(
+            self.runtime_filter_clustering_skip,
+            self.runtime_filter_uniform_threshold,
+        );
+        provider = provider.with_runtime_filter_wait_ms(self.runtime_filter_wait_ms);
+        provider = provider.with_scan_fetch_ahead(self.scan_fetch_ahead);
+        provider = provider.with_runtime_filter_bloom(
+            self.runtime_filter_bloom_probe,
+            self.runtime_filter_bloom_max_values,
+        );
+        let provider = Arc::new(provider);
+        Arc::clone(
+            self.schema_providers
+                .entry(name.to_string())
+                .or_insert(provider)
+                .value(),
+        )
     }
 
     /// List namespace names visible to this session, applying the same
@@ -543,30 +648,7 @@ impl CatalogProvider for SqeCatalogProvider {
             return None;
         }
 
-        let mut provider = SqeSchemaProvider::new(
-            self.session_catalog.clone(),
-            name.to_string(),
-            self.storage_config.clone(),
-            self.warehouse.clone(),
-        );
-        if let Some(ref m) = self.prom_metrics {
-            provider = provider.with_metrics(Arc::clone(m));
-        }
-        provider = provider.with_small_file_threshold(self.small_file_threshold_bytes);
-        provider = provider.with_manifest_concurrency(self.manifest_concurrency);
-        provider = provider.with_prefetch_concurrency(self.prefetch_concurrency);
-        provider = provider.with_runtime_filter_clustering(
-            self.runtime_filter_clustering_skip,
-            self.runtime_filter_uniform_threshold,
-        );
-        provider = provider.with_runtime_filter_wait_ms(self.runtime_filter_wait_ms);
-        provider = provider.with_scan_fetch_ahead(self.scan_fetch_ahead);
-        provider = provider.with_runtime_filter_bloom(
-            self.runtime_filter_bloom_probe,
-            self.runtime_filter_bloom_max_values,
-        );
-
-        Some(Arc::new(provider))
+        Some(self.schema_provider(name))
     }
 }
 
