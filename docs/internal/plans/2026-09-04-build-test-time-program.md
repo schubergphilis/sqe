@@ -245,6 +245,15 @@ and are to be re-measured, not assumed.
   43.5 min (28 thin-LTO link), `target/` 37 GiB. Open: lifecycle rule on
   the bucket (tenant admin), read-only key, reachability of the acc
   endpoint from the production runners.
+- 2026-09-07, C1/C2 re-planned from a timing report
+  (`2026-09-07-coordinator-crate-split.md`): after `touch sqe-core` the
+  chain rebuilds in 154 s, the coordinator library alone 96 s (64 s of it
+  type-checking, per `cargo check --timings`), its binary 30 s more, every
+  other crate done by 44 s. C1's ceiling is the 12 s between the shared
+  tier finishing and the coordinator starting, so it is dropped; C2 goes
+  first, as siblings (write path next to distribution path), because a
+  deeper chain does not shorten a cold build. MR A (decoupling, no moves)
+  on `refactor/write-path-decouple`.
 - 2026-09-07, C4 found and done for the coordinator
   (`2026-09-07-compile-time-async-hubs.md`). A first crate-split re-plan
   measured with a warm incremental cache (154 s chain, coordinator 96 s) is

@@ -74,14 +74,17 @@ variables:
   # sccache against an S3 bucket when AIKIDO_SCCACHE_BUCKET is set; it replaces
   # the target/ cache that never fit the 5 GiB single-PUT limit (see the
   # release-binaries comment below). The four AIKIDO_SCCACHE_* settings and the
-  # bucket credentials live in this project's CI variables, not here:
-  #   AIKIDO_SCCACHE_BUCKET=sqe-cargocache, _ENDPOINT (StorageGRID acc),
-  #   _REGION=us-east-1, and the protected+masked AIKIDO_SCCACHE_ACCESS_KEY_ID /
-  #   AIKIDO_SCCACHE_SECRET_ACCESS_KEY (read-write; protected = main and tags only,
-  #   so merge requests compile cold until a read-only key pair is added as
-  #   AIKIDO_SCCACHE_READ_*). Objects expire by a 30-day bucket lifecycle rule.
-  # Each Rust job's log ends with `sccache --show-stats`; a warm main run below
-  # ~70% hits means a CARGO_HOME/prefix/feature mismatch between jobs.
+  # bucket credentials live in this project's CI variables, not here. As of
+  # 2026-09-07 they are DELETED (cache off): the only bucket we have is on the
+  # StorageGRID acc endpoint, which the prd runners cannot reach (curl timeout,
+  # probe MR !958), and creating a bucket on the prd endpoint needs prod
+  # access. To re-enable: bucket on s3.object02.storage.sbp.services with a
+  # 30-day lifecycle rule, then set AIKIDO_SCCACHE_BUCKET, _ENDPOINT,
+  # _REGION=us-east-1, protected+masked AIKIDO_SCCACHE_ACCESS_KEY_ID /
+  # AIKIDO_SCCACHE_SECRET_ACCESS_KEY (read-write, main and tags) and optionally
+  # a read-only pair as AIKIDO_SCCACHE_READ_* for merge requests. Each Rust
+  # job's log ends with `sccache --show-stats`; a warm main run below ~70%
+  # hits means a CARGO_HOME/prefix/feature mismatch between jobs.
   # Live policy/scripts until aikido-tools image is rebuilt with CDLA + r-efi
   # exception + SQE reviewed_evidence (aikido!51). After tools image digest
   # updates, this override can be removed and AIKIDO_HOME from the image used.

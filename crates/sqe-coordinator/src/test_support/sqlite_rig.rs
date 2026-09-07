@@ -229,7 +229,7 @@ impl SqliteRig {
     /// after a reload.
     pub async fn live_files(&self, ident: &TableIdent) -> Vec<DataFile> {
         let table = self.load(ident).await;
-        crate::maintenance::collect_live_data_files(&table)
+        crate::writer::collect_live_data_files(&table)
             .await
             .expect("collect live data files")
     }
