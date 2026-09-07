@@ -1086,7 +1086,16 @@ pub(crate) async fn discover_session_catalog(
 /// Also called after CALL system.<maintenance procedure>(...) so the
 /// cached DataFusion TVF MemTables (table_files, table_snapshots, etc.)
 /// rebuild from the post-rewrite Polaris snapshot.
-pub async fn invalidate_session_cache(username: &str) {
+///
+/// Boxed for compile time: the moka iteration and removal futures carry the
+/// cache's value type (a DataFusion `SessionContext` and friends), and every
+/// `Send` future that awaited this re-proved `Send` over that whole type
+/// graph (3.7 s per call site, `-Zself-profile` 2026-09-07).
+pub fn invalidate_session_cache(username: &str) -> futures::future::BoxFuture<'_, ()> {
+    Box::pin(invalidate_session_cache_inner(username))
+}
+
+async fn invalidate_session_cache_inner(username: &str) {
     let prefix = format!("{username}:");
     let keys_to_remove: Vec<String> = SESSION_CONTEXT_CACHE
         .iter()
