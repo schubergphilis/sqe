@@ -394,10 +394,10 @@ impl CatalogOps {
     /// infers the output schema by planning the SELECT via DataFusion, converts
     /// it to the Iceberg REST API schema format, and calls `SessionCatalog::create_view()`.
     ///
-    /// When `or_replace` is `true` (i.e. `CREATE OR REPLACE VIEW`), the existing
-    /// view is dropped first if it exists, then the new view is created. This is
-    /// the simple non-atomic approach — there is a brief window between drop and
-    /// create where the view does not exist.
+    /// When `or_replace` is `true` (i.e. `CREATE OR REPLACE VIEW`), an existing
+    /// view is replaced in a single Iceberg REST `replaceView` commit via
+    /// `SessionCatalog::create_or_replace_view()`: no drop/create window, and
+    /// the view keeps its UUID and version history (architecture review 311).
     #[instrument(skip(self, session, stmt, schema_json), fields(username = %session.user.username))]
     pub async fn create_view(
         &self,
@@ -436,22 +436,15 @@ impl CatalogOps {
             .session_catalog_for(session, catalog_qualifier(view_name).as_deref())
             .await?;
 
-        // For CREATE OR REPLACE VIEW: drop the existing view first (if it exists).
         if or_replace {
-            match session_catalog.drop_view(namespace, name).await {
-                Ok(()) => {
-                    info!(view = %name, "Dropped existing view for CREATE OR REPLACE VIEW");
-                }
-                Err(e) if e.is_not_found() => {
-                    // View didn't exist — nothing to drop
-                }
-                Err(e) => return Err(e),
-            }
+            session_catalog
+                .create_or_replace_view(namespace, name, &select_sql, schema_json, &properties)
+                .await
+        } else {
+            session_catalog
+                .create_view(namespace, name, &select_sql, schema_json, &properties)
+                .await
         }
-
-        session_catalog
-            .create_view(namespace, name, &select_sql, schema_json, &properties)
-            .await
     }
 
     /// Drop a view via the Polaris REST API.

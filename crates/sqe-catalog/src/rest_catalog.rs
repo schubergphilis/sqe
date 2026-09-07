@@ -2041,36 +2041,20 @@ impl SessionCatalog {
                 "Table cache stale, attempting ETag revalidation"
             );
 
-            self.circuit_breaker
-                .check()
-                .map_err(sqe_core::SqeError::Catalog)?;
-
-            // Build the REST URL for the loadTable endpoint.
-            let ns_str = table_ident
-                .namespace()
-                .as_ref()
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join("\u{1F}");
-            let url = format!(
-                "{}/namespaces/{}/tables/{}",
-                self.rest_prefix(),
-                ns_str,
-                table_ident.name()
-            );
-
-            let mut req = self
-                .http_client
-                .get(&url)
-                .bearer_auth(&self.bearer_token)
-                .header("If-None-Match", &etag)
-                .header("X-Request-ID", Uuid::new_v4().to_string());
-            for (k, v) in trace_context_http_headers() {
-                req = req.header(k, v);
-            }
-
-            match req.send().await {
+            // Conditional GET on the loadTable endpoint through the shared
+            // REST helper (breaker check, trace headers, metrics, breaker
+            // outcome). The helper treats 304 as success.
+            let url = self.table_url(table_ident);
+            match self
+                .rest_request(
+                    sqe_core::CatalogOp::LoadTable,
+                    reqwest::Method::GET,
+                    &url,
+                    None,
+                    &[("If-None-Match", etag.as_str())],
+                )
+                .await
+            {
                 Ok(resp) => {
                     let status = resp.status();
                     if status == reqwest::StatusCode::NOT_MODIFIED {
@@ -2079,7 +2063,6 @@ impl SessionCatalog {
                             table = ?table_ident,
                             "ETag revalidation: 304 Not Modified, reusing cached metadata"
                         );
-                        self.circuit_breaker.record_success();
                         self.table_cache.revalidate(&cache_key, &generation).await;
                         return Ok(stale_table);
                     }
@@ -2101,16 +2084,18 @@ impl SessionCatalog {
                         status = %status,
                         "ETag revalidation: metadata changed, performing full reload"
                     );
-                    self.circuit_breaker.record_success();
+                }
+                Err(e) if e.error_code() == sqe_core::SqeErrorCode::CircuitBreakerOpen => {
+                    return Err(e);
                 }
                 Err(e) => {
-                    // Network error during revalidation — fall through to normal load.
+                    // Network or HTTP error during revalidation: fall through to
+                    // the normal load, which decides whether the table is gone.
                     warn!(
                         table = ?table_ident,
                         error = %e,
                         "ETag revalidation request failed, falling back to full load"
                     );
-                    self.circuit_breaker.record_failure();
                 }
             }
         } else {
@@ -2335,20 +2320,275 @@ impl SessionCatalog {
     }
 
     fn table_url(&self, table_ident: &TableIdent) -> String {
-        let ns_str = table_ident
-            .namespace()
-            .as_ref()
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join("\u{1F}");
-        format!(
-            "{}/namespaces/{}/tables/{}",
-            self.rest_prefix(),
-            ns_str,
-            table_ident.name()
-        )
+        self.rest_url(&[
+            "namespaces",
+            &namespace_path_segment(table_ident.namespace()),
+            "tables",
+            table_ident.name(),
+        ])
     }
+
+    fn views_url(&self, namespace: &NamespaceIdent) -> String {
+        self.rest_url(&["namespaces", &namespace_path_segment(namespace), "views"])
+    }
+
+    fn view_url(&self, namespace: &NamespaceIdent, name: &str) -> String {
+        self.rest_url(&[
+            "namespaces",
+            &namespace_path_segment(namespace),
+            "views",
+            name,
+        ])
+    }
+
+    /// `{rest_prefix}/{segments...}` with every segment percent-encoded as a
+    /// path segment, so a table or view named `a/b?c%` and the `\u{1F}`
+    /// namespace separator both travel as their escaped forms
+    /// (architecture review 311).
+    fn rest_url(&self, segments: &[&str]) -> String {
+        let prefix = self.rest_prefix();
+        match url::Url::parse(&prefix) {
+            Ok(mut base) => {
+                if let Ok(mut path) = base.path_segments_mut() {
+                    path.pop_if_empty().extend(segments);
+                }
+                base.to_string()
+            }
+            // Not a URL (unconfigured catalog_url): keep the legacy join so
+            // the failure surfaces as the connection error it always was.
+            Err(_) => format!("{prefix}/{}", segments.join("/")),
+        }
+    }
+
+    /// One authenticated Iceberg REST round trip with the operational
+    /// plumbing every raw call needs (architecture review 311): breaker
+    /// admission, `X-Request-ID` + W3C trace headers, the
+    /// `sqe_catalog_request_duration_seconds{op}` observation, the breaker
+    /// outcome, and the typed status mapping.
+    ///
+    /// Returns the response for any 2xx or 304. Any other status is read and
+    /// returned as [`SqeError::CatalogHttp`] (409 on a commit becomes
+    /// [`SqeError::IcebergCommitConflict`]), so callers match on
+    /// `error_code()` / `is_not_found()` instead of on status text.
+    ///
+    /// Breaker accounting: transport failures, 429 and 5xx trip it; a 4xx
+    /// answer means the catalog is reachable and counts as success, matching
+    /// [`record_catalog_breaker_outcome`].
+    async fn rest_request(
+        &self,
+        op: sqe_core::CatalogOp,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<serde_json::Value>,
+        extra_headers: &[(&str, &str)],
+    ) -> sqe_core::Result<reqwest::Response> {
+        self.circuit_breaker
+            .check()
+            .map_err(|msg| SqeError::with_code(SqeErrorCode::CircuitBreakerOpen, msg))?;
+        let started = Instant::now();
+        let mut req = self
+            .http_client
+            .request(method, url)
+            .bearer_auth(&self.bearer_token)
+            .header("X-Request-ID", Uuid::new_v4().to_string());
+        for (k, v) in trace_context_http_headers() {
+            req = req.header(k, v);
+        }
+        for (k, v) in extra_headers {
+            req = req.header(*k, *v);
+        }
+        if let Some(body) = body {
+            req = req.json(&body);
+        }
+
+        let resp = match req.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                self.circuit_breaker.record_failure();
+                self.record_catalog_call(op.name(), started, false);
+                return Err(SqeError::catalog_src(
+                    format!("Catalog request failed ({}): {e}", op.name()),
+                    e,
+                ));
+            }
+        };
+
+        let status = resp.status();
+        if status.is_success() || status == reqwest::StatusCode::NOT_MODIFIED {
+            self.circuit_breaker.record_success();
+            self.record_catalog_call(op.name(), started, true);
+            return Ok(resp);
+        }
+
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            self.circuit_breaker.record_failure();
+        } else {
+            self.circuit_breaker.record_success();
+        }
+        self.record_catalog_call(op.name(), started, false);
+        Err(map_rest_status(op, status.as_u16(), body))
+    }
+}
+
+/// Typed error for a non-2xx Iceberg REST answer. Status codes carry the
+/// classification ([`SqeError::error_code`]); a 409 on a commit is the
+/// retryable [`SqeError::IcebergCommitConflict`].
+fn map_rest_status(op: sqe_core::CatalogOp, status: u16, body: String) -> SqeError {
+    if status == 409 && op == sqe_core::CatalogOp::Commit {
+        return SqeError::IcebergCommitConflict(format!("Catalog commit conflict: {body}"));
+    }
+    SqeError::CatalogHttp { status, op, body }
+}
+
+/// Iceberg REST encodes a multi-level namespace as one path segment joined
+/// by the unit separator; [`SessionCatalog::rest_url`] percent-encodes it.
+fn namespace_path_segment(namespace: &NamespaceIdent) -> String {
+    namespace
+        .as_ref()
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join("\u{1F}")
+}
+
+/// The dialects SQE can plan, in preference order (architecture review 311).
+/// `sqe` is native; `trino` and `spark` go through the compatibility rewrite
+/// the query path already applies to client SQL.
+const SUPPORTED_VIEW_DIALECTS: [&str; 3] = ["sqe", "trino", "spark"];
+
+/// Select the SQL of the view's *current* version (`current-version-id`,
+/// not `versions.last()`), preferring representation dialects in
+/// [`SUPPORTED_VIEW_DIALECTS`] order.
+///
+/// Returns a typed `NotSupported` error when no representation carries a
+/// dialect SQE can plan, so a Trino- or Spark-only view never gets planned as
+/// SQE SQL by accident.
+fn select_view_sql(
+    metadata: &iceberg::spec::ViewMetadata,
+    view_name: &str,
+) -> sqe_core::Result<String> {
+    let version = metadata.current_version();
+    let sql_reps: Vec<&iceberg::spec::SqlViewRepresentation> = version
+        .representations()
+        .iter()
+        .map(|rep| match rep {
+            iceberg::spec::ViewRepresentation::Sql(sql) => sql,
+        })
+        .collect();
+    for dialect in SUPPORTED_VIEW_DIALECTS {
+        if let Some(rep) = sql_reps
+            .iter()
+            .find(|rep| rep.dialect.eq_ignore_ascii_case(dialect))
+        {
+            return Ok(rep.sql.clone());
+        }
+    }
+    let found: Vec<&str> = sql_reps.iter().map(|rep| rep.dialect.as_str()).collect();
+    Err(SqeError::with_code(
+        SqeErrorCode::NotSupported,
+        format!(
+            "Unsupported view dialect for view '{view_name}' (version {}): found {:?}, \
+             SQE can plan {:?}",
+            version.version_id(),
+            found,
+            SUPPORTED_VIEW_DIALECTS
+        ),
+    ))
+}
+
+/// `loadView` response body: the metadata document plus its location.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct LoadViewResponse {
+    #[allow(dead_code)]
+    metadata_location: Option<String>,
+    metadata: iceberg::spec::ViewMetadata,
+}
+
+/// `createView` request body (Iceberg REST `CreateViewRequest`).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct CreateViewRequest<'a> {
+    name: &'a str,
+    schema: &'a iceberg::spec::Schema,
+    view_version: &'a iceberg::spec::ViewVersion,
+    properties: &'a HashMap<String, String>,
+}
+
+/// `replaceView` request body (Iceberg REST `CommitViewRequest`). The
+/// requirement list is a plain value: the vendored crate has no
+/// `ViewRequirement` type yet, and `assert-view-uuid` is its only member.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct CommitViewRequest<'a> {
+    identifier: TableIdent,
+    requirements: Vec<serde_json::Value>,
+    updates: &'a [iceberg::ViewUpdate],
+}
+
+/// Build the single SQE-dialect version SQE writes for a view definition.
+fn sqe_view_version(
+    version_id: i32,
+    schema_id: i32,
+    sql: &str,
+    namespace: &NamespaceIdent,
+    default_catalog: &str,
+) -> sqe_core::Result<iceberg::spec::ViewVersion> {
+    let representation: iceberg::spec::ViewRepresentation = iceberg::spec::SqlViewRepresentation {
+        sql: sql.to_string(),
+        dialect: "sqe".to_string(),
+    }
+    .into();
+    // `ViewRepresentations` has no public constructor; it is a transparent
+    // newtype over the list, so round-trip the typed representation.
+    let representations: iceberg::spec::ViewRepresentations =
+        serde_json::from_value(serde_json::to_value(vec![representation]).map_err(|e| {
+            SqeError::execution_src(format!("Failed to serialize view representation: {e}"), e)
+        })?)
+        .map_err(|e| {
+            SqeError::execution_src(format!("Failed to build view representations: {e}"), e)
+        })?;
+    let summary = HashMap::from([
+        ("engine-name".to_string(), "sqe".to_string()),
+        (
+            "engine-version".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        ),
+    ]);
+    Ok(iceberg::spec::ViewVersion::builder()
+        .with_version_id(version_id)
+        .with_schema_id(schema_id)
+        .with_timestamp_ms(chrono::Utc::now().timestamp_millis())
+        .with_summary(summary)
+        .with_representations(representations)
+        .with_default_catalog(Some(default_catalog.to_string()))
+        .with_default_namespace(namespace.clone())
+        .build())
+}
+
+/// Parse the coordinator's Iceberg-JSON view schema into the typed schema,
+/// re-numbered to `schema_id` so a replace never collides with the schema
+/// ids already in the view document.
+fn view_schema_from_json(
+    schema: &serde_json::Value,
+    schema_id: i32,
+) -> sqe_core::Result<iceberg::spec::Schema> {
+    let mut schema = schema.clone();
+    if let Some(obj) = schema.as_object_mut() {
+        obj.entry("schema-id").or_insert(serde_json::json!(0));
+        obj.entry("type").or_insert(serde_json::json!("struct"));
+    }
+    let parsed: iceberg::spec::Schema = serde_json::from_value(schema)
+        .map_err(|e| SqeError::execution_src(format!("Invalid view schema document: {e}"), e))?;
+    if parsed.schema_id() == schema_id {
+        return Ok(parsed);
+    }
+    iceberg::spec::Schema::builder()
+        .with_schema_id(schema_id)
+        .with_fields(parsed.as_struct().fields().iter().cloned())
+        .build()
+        .map_err(|e| SqeError::execution_src(format!("Invalid view schema: {e}"), e))
 }
 
 /// HEAD-based ETag fetch usable from a background `tokio::spawn`.
@@ -2437,10 +2677,13 @@ impl SessionCatalog {
         }
     }
 
-    /// Create a view via the Polaris REST API.
+    /// Create a view via the Iceberg REST API.
     ///
-    /// Calls `POST /v1/{prefix}/namespaces/{namespace}/views` with the
-    /// Iceberg view creation payload.
+    /// Calls `POST /v1/{prefix}/namespaces/{namespace}/views` with a typed
+    /// `CreateViewRequest`: the schema parsed into [`iceberg::spec::Schema`]
+    /// and one [`iceberg::spec::ViewVersion`] carrying a single `sqe`-dialect
+    /// SQL representation, `default-catalog` = this warehouse and
+    /// `default-namespace` = the view's namespace.
     #[instrument(skip(self, sql, schema), fields(namespace = ?namespace, view = %name, warehouse = %self.warehouse))]
     pub async fn create_view(
         &self,
@@ -2451,116 +2694,132 @@ impl SessionCatalog {
         properties: &std::collections::HashMap<String, String>,
     ) -> sqe_core::Result<()> {
         self.require_rest_backend("create_view")?;
-        let ns_str = namespace
-            .as_ref()
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join("\u{1F}"); // Iceberg REST uses unit separator for multi-level namespaces
-        let url = format!("{}/namespaces/{}/views", self.rest_prefix(), ns_str);
+        let url = self.views_url(namespace);
+        let schema = view_schema_from_json(schema, 0)?;
+        let version = sqe_view_version(1, schema.schema_id(), sql, namespace, &self.warehouse)?;
+        let body = serde_json::to_value(CreateViewRequest {
+            name,
+            schema: &schema,
+            view_version: &version,
+            properties,
+        })
+        .map_err(|e| {
+            SqeError::execution_src(format!("Failed to serialize view request: {e}"), e)
+        })?;
 
-        let now_ms = chrono::Utc::now().timestamp_millis();
-
-        let body = serde_json::json!({
-            "name": name,
-            "schema": schema,
-            "view-version": {
-                "version-id": 1,
-                "schema-id": 0,
-                "timestamp-ms": now_ms,
-                "summary": { "engine-name": "sqe" },
-                "representations": [{
-                    "type": "sql",
-                    "sql": sql,
-                    "dialect": "sqe"
-                }],
-                "default-namespace": namespace.as_ref(),
-            },
-            "properties": properties,
-        });
-
-        debug!(url = %url, view = name, "Creating view via Polaris REST");
-
-        let mut req = self
-            .http_client
-            .post(&url)
-            .bearer_auth(&self.bearer_token)
-            .header("X-Request-ID", Uuid::new_v4().to_string())
-            .json(&body);
-        for (k, v) in trace_context_http_headers() {
-            req = req.header(k, v);
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| SqeError::catalog_src(format!("Failed to create view: {e}"), e))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(SqeError::Catalog(format!(
-                    "Rate limited by Polaris catalog: {text}"
-                )));
-            }
-            if status == reqwest::StatusCode::CONFLICT {
-                return Err(SqeError::with_code(
-                    SqeErrorCode::ExecutionFailed,
-                    format!("Catalog commit conflict: {text}"),
-                ));
-            }
-            return Err(SqeError::Catalog(format!(
-                "Failed to create view (HTTP {status}): {text}"
-            )));
-        }
+        debug!(url = %url, view = name, "Creating view via Iceberg REST");
+        self.rest_request(
+            sqe_core::CatalogOp::CreateView,
+            reqwest::Method::POST,
+            &url,
+            Some(body),
+            &[],
+        )
+        .await?;
 
         info!(view = name, namespace = ?namespace, "View created");
         Ok(())
     }
 
-    /// List views in a namespace via the Polaris REST API.
+    /// `CREATE OR REPLACE VIEW` with real replace semantics.
+    ///
+    /// When the view exists, its definition is replaced in one
+    /// `replaceView` commit (`POST .../views/{view}` with an
+    /// `assert-view-uuid` requirement and `add-schema`, `add-view-version`,
+    /// `set-current-view-version` updates), so readers never observe a window
+    /// in which the view is missing and the version history is kept. When it
+    /// does not exist, this is [`Self::create_view`].
+    #[instrument(skip(self, sql, schema), fields(namespace = ?namespace, view = %name, warehouse = %self.warehouse))]
+    pub async fn create_or_replace_view(
+        &self,
+        namespace: &NamespaceIdent,
+        name: &str,
+        sql: &str,
+        schema: &serde_json::Value,
+        properties: &std::collections::HashMap<String, String>,
+    ) -> sqe_core::Result<()> {
+        self.require_rest_backend("create_or_replace_view")?;
+        let Some(existing) = self.load_view_metadata(namespace, name).await? else {
+            return self
+                .create_view(namespace, name, sql, schema, properties)
+                .await;
+        };
+
+        let next_schema_id = existing
+            .schemas_iter()
+            .map(|s| s.schema_id())
+            .max()
+            .map_or(0, |id| id + 1);
+        let next_version_id = existing
+            .versions()
+            .map(|v| v.version_id())
+            .max()
+            .map_or(1, |id| id + 1);
+        let schema = view_schema_from_json(schema, next_schema_id)?;
+        let version = sqe_view_version(
+            next_version_id,
+            schema.schema_id(),
+            sql,
+            namespace,
+            &self.warehouse,
+        )?;
+        let last_column_id = Some(schema.highest_field_id());
+        let mut updates = vec![
+            iceberg::ViewUpdate::AddSchema {
+                schema,
+                last_column_id,
+            },
+            iceberg::ViewUpdate::AddViewVersion {
+                view_version: version,
+            },
+            iceberg::ViewUpdate::SetCurrentViewVersion {
+                view_version_id: -1,
+            },
+        ];
+        if !properties.is_empty() {
+            updates.push(iceberg::ViewUpdate::SetProperties {
+                updates: properties.clone(),
+            });
+        }
+        let body = serde_json::to_value(CommitViewRequest {
+            identifier: TableIdent::new(namespace.clone(), name.to_string()),
+            requirements: vec![serde_json::json!({
+                "type": "assert-view-uuid",
+                "uuid": existing.uuid(),
+            })],
+            updates: &updates,
+        })
+        .map_err(|e| SqeError::execution_src(format!("Failed to serialize view commit: {e}"), e))?;
+
+        let url = self.view_url(namespace, name);
+        debug!(url = %url, view = name, version = next_version_id, "Replacing view via Iceberg REST");
+        self.rest_request(
+            sqe_core::CatalogOp::Commit,
+            reqwest::Method::POST,
+            &url,
+            Some(body),
+            &[],
+        )
+        .await?;
+
+        info!(view = name, namespace = ?namespace, version = next_version_id, "View replaced");
+        Ok(())
+    }
+
+    /// List views in a namespace via the Iceberg REST API.
     #[instrument(skip(self), fields(namespace = ?namespace, warehouse = %self.warehouse))]
     pub async fn list_views(&self, namespace: &NamespaceIdent) -> sqe_core::Result<Vec<String>> {
         self.require_rest_backend("list_views")?;
-        let ns_str = namespace
-            .as_ref()
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join("\u{1F}");
-        let url = format!("{}/namespaces/{}/views", self.rest_prefix(), ns_str);
-
-        let mut req = self
-            .http_client
-            .get(&url)
-            .bearer_auth(&self.bearer_token)
-            .header("X-Request-ID", Uuid::new_v4().to_string());
-        for (k, v) in trace_context_http_headers() {
-            req = req.header(k, v);
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| SqeError::catalog_src(format!("Failed to list views: {e}"), e))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(SqeError::Catalog(format!(
-                    "Rate limited by Polaris catalog: {text}"
-                )));
-            }
-            if status == reqwest::StatusCode::CONFLICT {
-                return Err(SqeError::with_code(
-                    SqeErrorCode::ExecutionFailed,
-                    format!("Catalog commit conflict: {text}"),
-                ));
-            }
-            return Err(SqeError::Catalog(format!(
-                "Failed to list views (HTTP {status}): {text}"
-            )));
-        }
+        let url = self.views_url(namespace);
+        let resp = self
+            .rest_request(
+                sqe_core::CatalogOp::LoadView,
+                reqwest::Method::GET,
+                &url,
+                None,
+                &[],
+            )
+            .await?;
 
         let body: serde_json::Value = resp
             .json()
@@ -2579,9 +2838,42 @@ impl SessionCatalog {
         Ok(names)
     }
 
-    /// Load a view's SQL definition from the Polaris REST API.
+    /// Load a view's metadata document. `None` when the view does not exist.
+    async fn load_view_metadata(
+        &self,
+        namespace: &NamespaceIdent,
+        name: &str,
+    ) -> sqe_core::Result<Option<iceberg::spec::ViewMetadata>> {
+        let url = self.view_url(namespace, name);
+        let resp = match self
+            .rest_request(
+                sqe_core::CatalogOp::LoadView,
+                reqwest::Method::GET,
+                &url,
+                None,
+                &[],
+            )
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) if e.is_not_found() => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let body: LoadViewResponse = resp.json().await.map_err(|e| {
+            SqeError::catalog_src(
+                format!("Failed to parse view response for '{name}': {e}"),
+                e,
+            )
+        })?;
+        Ok(Some(body.metadata))
+    }
+
+    /// Load a view's SQL definition from the Iceberg REST API.
     ///
-    /// Returns `None` if the view does not exist (404), or the SQL string on success.
+    /// Returns `None` if the view does not exist (404). The SQL comes from
+    /// the version `current-version-id` points at, preferring a `sqe`, then
+    /// `trino`, then `spark` representation; a view with none of those fails
+    /// with a typed `NotSupported` error (architecture review 311).
     #[instrument(skip(self), fields(namespace = ?namespace, view = %name, warehouse = %self.warehouse))]
     pub async fn load_view_sql(
         &self,
@@ -2589,123 +2881,28 @@ impl SessionCatalog {
         name: &str,
     ) -> sqe_core::Result<Option<String>> {
         self.require_rest_backend("load_view_sql")?;
-        let ns_str = namespace
-            .as_ref()
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join("\u{1F}");
-        let url = format!(
-            "{}/namespaces/{}/views/{}",
-            self.rest_prefix(),
-            ns_str,
-            name
-        );
-
-        let mut req = self
-            .http_client
-            .get(&url)
-            .bearer_auth(&self.bearer_token)
-            .header("X-Request-ID", Uuid::new_v4().to_string());
-        for (k, v) in trace_context_http_headers() {
-            req = req.header(k, v);
+        match self.load_view_metadata(namespace, name).await? {
+            Some(metadata) => select_view_sql(&metadata, name).map(Some),
+            None => Ok(None),
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| SqeError::catalog_src(format!("Failed to load view: {e}"), e))?;
-
-        if resp.status().as_u16() == 404 {
-            return Ok(None);
-        }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(SqeError::Catalog(format!(
-                    "Rate limited by Polaris catalog: {text}"
-                )));
-            }
-            if status == reqwest::StatusCode::CONFLICT {
-                return Err(SqeError::with_code(
-                    SqeErrorCode::ExecutionFailed,
-                    format!("Catalog commit conflict: {text}"),
-                ));
-            }
-            return Err(SqeError::Catalog(format!(
-                "Failed to load view '{name}' (HTTP {status}): {text}"
-            )));
-        }
-
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| SqeError::catalog_src(format!("Failed to parse view response: {e}"), e))?;
-
-        // Iceberg REST view response: metadata.versions[last].representations[type=sql].sql
-        let sql = body["metadata"]["versions"]
-            .as_array()
-            .and_then(|v| v.last())
-            .and_then(|v| v["representations"].as_array())
-            .and_then(|r| r.iter().find(|rep| rep["type"] == "sql"))
-            .and_then(|rep| rep["sql"].as_str())
-            .map(String::from);
-
-        Ok(sql)
     }
 
-    /// Drop a view via the Polaris REST API.
+    /// Drop a view via the Iceberg REST API.
     ///
     /// Calls `DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}`.
     #[instrument(skip(self), fields(namespace = ?namespace, view = %name, warehouse = %self.warehouse))]
     pub async fn drop_view(&self, namespace: &NamespaceIdent, name: &str) -> sqe_core::Result<()> {
         self.require_rest_backend("drop_view")?;
-        let ns_str = namespace
-            .as_ref()
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join("\u{1F}");
-        let url = format!(
-            "{}/namespaces/{}/views/{}",
-            self.rest_prefix(),
-            ns_str,
-            name
-        );
-
-        debug!(url = %url, view = name, "Dropping view via Polaris REST");
-
-        let mut req = self
-            .http_client
-            .delete(&url)
-            .bearer_auth(&self.bearer_token)
-            .header("X-Request-ID", Uuid::new_v4().to_string());
-        for (k, v) in trace_context_http_headers() {
-            req = req.header(k, v);
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| SqeError::catalog_src(format!("Failed to drop view: {e}"), e))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(SqeError::Catalog(format!(
-                    "Rate limited by Polaris catalog: {text}"
-                )));
-            }
-            if status == reqwest::StatusCode::CONFLICT {
-                return Err(SqeError::with_code(
-                    SqeErrorCode::ExecutionFailed,
-                    format!("Catalog commit conflict: {text}"),
-                ));
-            }
-            return Err(SqeError::Catalog(format!(
-                "Failed to drop view (HTTP {status}): {text}"
-            )));
-        }
+        let url = self.view_url(namespace, name);
+        debug!(url = %url, view = name, "Dropping view via Iceberg REST");
+        self.rest_request(
+            sqe_core::CatalogOp::DropView,
+            reqwest::Method::DELETE,
+            &url,
+            None,
+            &[],
+        )
+        .await?;
 
         info!(view = name, namespace = ?namespace, "View dropped");
         Ok(())
@@ -2729,20 +2926,7 @@ impl SessionCatalog {
         requirements: Vec<TableRequirement>,
     ) -> sqe_core::Result<()> {
         self.require_rest_backend("commit_schema_update")?;
-        let ns_str = table_ident
-            .namespace()
-            .as_ref()
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join("\u{1F}");
-
-        let url = format!(
-            "{}/namespaces/{}/tables/{}",
-            self.rest_prefix(),
-            ns_str,
-            table_ident.name()
-        );
+        let url = self.table_url(table_ident);
 
         let body = serde_json::json!({
             "identifier": {
@@ -2755,39 +2939,23 @@ impl SessionCatalog {
                 .map_err(|e| SqeError::execution_src(format!("Failed to serialize updates: {e}"), e))?,
         });
 
-        debug!(url = %url, table = %table_ident, "Committing schema update via Polaris REST");
-
-        let mut req = self
-            .http_client
-            .post(&url)
-            .bearer_auth(&self.bearer_token)
-            .header("X-Request-ID", Uuid::new_v4().to_string())
-            .json(&body);
-        for (k, v) in trace_context_http_headers() {
-            req = req.header(k, v);
-        }
-        let resp = req.send().await.map_err(|e| {
-            SqeError::catalog_src(format!("Failed to commit schema update: {e}"), e)
+        debug!(url = %url, table = %table_ident, "Committing schema update via Iceberg REST");
+        self.rest_request(
+            sqe_core::CatalogOp::Commit,
+            reqwest::Method::POST,
+            &url,
+            Some(body),
+            &[],
+        )
+        .await
+        .map_err(|e| match e {
+            SqeError::CatalogHttp { status, op, body } => SqeError::CatalogHttp {
+                status,
+                op,
+                body: format!("schema update for '{table_ident}': {body}"),
+            },
+            other => other,
         })?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(SqeError::Catalog(format!(
-                    "Rate limited by Polaris catalog: {text}"
-                )));
-            }
-            if status == reqwest::StatusCode::CONFLICT {
-                return Err(SqeError::with_code(
-                    SqeErrorCode::ExecutionFailed,
-                    format!("Catalog commit conflict: {text}"),
-                ));
-            }
-            return Err(SqeError::Catalog(format!(
-                "Failed to commit schema update for '{table_ident}' (HTTP {status}): {text}"
-            )));
-        }
 
         info!(table = %table_ident, "Schema update committed");
         // Evict EVERY token's entry, not just the committer's: an added or
@@ -4230,5 +4398,386 @@ mod invalidation_tests {
                 "revalidate undid the invalidation at spins={spins}"
             );
         }
+    }
+}
+
+/// Architecture review 311: view version/dialect selection, percent-encoded
+/// REST paths, and the shared `rest_request` plumbing (breaker + metrics).
+#[cfg(test)]
+mod view_rest_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use iceberg::{NamespaceIdent, TableIdent};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::{select_view_sql, SessionCatalog, TableMetadataCache};
+    use crate::circuit_breaker::CircuitBreaker;
+
+    const WAREHOUSE: &str = "test-warehouse";
+
+    fn sales() -> NamespaceIdent {
+        NamespaceIdent::new("sales".to_string())
+    }
+
+    fn view_schema_json() -> serde_json::Value {
+        serde_json::json!({
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [{"id": 1, "name": "x", "required": false, "type": "long"}]
+        })
+    }
+
+    /// A view document with two versions. `current` picks the active one;
+    /// `reps` are the `(dialect, sql)` representations of version 1.
+    fn view_metadata_json(current: i32, v1_reps: &[(&str, &str)]) -> serde_json::Value {
+        let reps: Vec<serde_json::Value> = v1_reps
+            .iter()
+            .map(
+                |(dialect, sql)| serde_json::json!({"type": "sql", "sql": sql, "dialect": dialect}),
+            )
+            .collect();
+        serde_json::json!({
+            "format-version": 1,
+            "view-uuid": "fa6506c3-7681-40c8-86dc-e36561f83385",
+            "location": "s3://bucket/sales/v",
+            "current-version-id": current,
+            "versions": [
+                {
+                    "version-id": 1,
+                    "schema-id": 0,
+                    "timestamp-ms": 1,
+                    "summary": {"engine-name": "sqe"},
+                    "representations": reps,
+                    "default-namespace": ["sales"]
+                },
+                {
+                    "version-id": 2,
+                    "schema-id": 0,
+                    "timestamp-ms": 2,
+                    "summary": {"engine-name": "spark"},
+                    "representations": [
+                        {"type": "sql", "sql": "SELECT 2 AS x", "dialect": "spark"}
+                    ],
+                    "default-namespace": ["sales"]
+                }
+            ],
+            "version-log": [{"version-id": 1, "timestamp-ms": 1}],
+            "schemas": [view_schema_json()],
+            "properties": {}
+        })
+    }
+
+    fn metadata(current: i32, v1_reps: &[(&str, &str)]) -> iceberg::spec::ViewMetadata {
+        serde_json::from_value(view_metadata_json(current, v1_reps)).expect("valid view document")
+    }
+
+    #[test]
+    fn current_version_id_wins_over_last_version() {
+        let md = metadata(1, &[("sqe", "SELECT 1 AS x")]);
+        assert_eq!(
+            select_view_sql(&md, "v").unwrap(),
+            "SELECT 1 AS x",
+            "current-version-id points at version 1; versions.last() would be version 2"
+        );
+        let md = metadata(2, &[("sqe", "SELECT 1 AS x")]);
+        assert_eq!(select_view_sql(&md, "v").unwrap(), "SELECT 2 AS x");
+    }
+
+    #[test]
+    fn dialect_preference_is_sqe_then_trino_then_spark() {
+        let md = metadata(
+            1,
+            &[
+                ("trino", "SELECT 't'"),
+                ("spark", "SELECT 's'"),
+                ("SQE", "SELECT 'q'"),
+            ],
+        );
+        assert_eq!(select_view_sql(&md, "v").unwrap(), "SELECT 'q'");
+        let md = metadata(1, &[("spark", "SELECT 's'"), ("trino", "SELECT 't'")]);
+        assert_eq!(select_view_sql(&md, "v").unwrap(), "SELECT 't'");
+    }
+
+    #[test]
+    fn unsupported_dialect_is_a_typed_error_not_planned_sql() {
+        let md = metadata(1, &[("hive", "SELECT 1")]);
+        let err = select_view_sql(&md, "v").expect_err("hive-only view must be refused");
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::NotSupported);
+        let msg = err.to_string();
+        assert!(msg.contains("Unsupported view dialect"), "{msg}");
+        assert!(msg.contains("hive"), "{msg}");
+    }
+
+    #[test]
+    fn rest_paths_are_percent_encoded() {
+        let session = SessionCatalog::for_test_with_backend(
+            Arc::new(super::UnconfiguredCatalog),
+            TableMetadataCache::new(0),
+            "tok_paths",
+        );
+        let ns = NamespaceIdent::from_vec(vec!["a".to_string(), "b c".to_string()]).unwrap();
+        let url = session.view_url(&ns, "x/y?z%");
+        assert_eq!(
+            url,
+            "http://127.0.0.1:1/v1/test-warehouse/namespaces/a%1Fb%20c/views/x%2Fy%3Fz%25"
+        );
+        let table = session.table_url(&TableIdent::new(ns, "t".to_string()));
+        assert!(table.ends_with("/namespaces/a%1Fb%20c/tables/t"), "{table}");
+    }
+
+    async fn session_with(
+        server: &MockServer,
+        cache: TableMetadataCache,
+        breaker: Option<Arc<CircuitBreaker>>,
+    ) -> SessionCatalog {
+        SessionCatalog::new(
+            &server.uri(),
+            WAREHOUSE,
+            "view-rest-token",
+            &sqe_core::config::StorageConfig::default(),
+            Some(cache),
+            None,
+            breaker,
+            false,
+        )
+        .await
+        .expect("construct session catalog")
+    }
+
+    /// `create_view` posts a typed `CreateViewRequest` and shows up in
+    /// `sqe_catalog_request_duration_seconds{op="create_view"}`.
+    #[tokio::test]
+    async fn create_view_records_the_catalog_call_metric() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/test-warehouse/namespaces/sales/views"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        let metrics = Arc::new(sqe_metrics::MetricsRegistry::new().unwrap());
+        let cache = TableMetadataCache::new(300).with_metrics(Arc::clone(&metrics));
+        let session = session_with(&server, cache, None).await;
+
+        session
+            .create_view(
+                &sales(),
+                "v",
+                "SELECT 1 AS x",
+                &view_schema_json(),
+                &HashMap::from([("comment".to_string(), "c".to_string())]),
+            )
+            .await
+            .expect("mocked create succeeds");
+
+        let observed = metrics
+            .catalog_request_duration_seconds
+            .with_label_values(&["create_view", "ok"])
+            .get_sample_count();
+        assert_eq!(
+            observed, 1,
+            "create_view must be visible in the catalog latency histogram"
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["name"], "v");
+        assert_eq!(body["schema"]["schema-id"], 0);
+        assert_eq!(body["view-version"]["version-id"], 1);
+        assert_eq!(body["view-version"]["representations"][0]["dialect"], "sqe");
+        assert_eq!(
+            body["view-version"]["representations"][0]["sql"],
+            "SELECT 1 AS x"
+        );
+        assert_eq!(body["view-version"]["default-catalog"], WAREHOUSE);
+        assert_eq!(
+            body["view-version"]["default-namespace"],
+            serde_json::json!(["sales"])
+        );
+        assert_eq!(body["properties"]["comment"], "c");
+        assert!(
+            requests[0].headers.get("x-request-id").is_some(),
+            "raw REST calls carry a request id"
+        );
+    }
+
+    /// An open breaker refuses the call before any bytes hit the wire and is
+    /// reported as the typed `CircuitBreakerOpen` code.
+    #[tokio::test]
+    async fn create_view_respects_an_open_breaker() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        let breaker = Arc::new(CircuitBreaker::new(
+            "view-test",
+            1,
+            Duration::from_secs(3600),
+        ));
+        breaker.record_failure();
+        assert!(breaker.check().is_err(), "precondition: breaker is open");
+        let metrics = Arc::new(sqe_metrics::MetricsRegistry::new().unwrap());
+        let cache = TableMetadataCache::new(300).with_metrics(Arc::clone(&metrics));
+        let session = session_with(&server, cache, Some(breaker)).await;
+
+        let err = session
+            .create_view(
+                &sales(),
+                "v",
+                "SELECT 1",
+                &view_schema_json(),
+                &HashMap::new(),
+            )
+            .await
+            .expect_err("open breaker must refuse");
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::CircuitBreakerOpen);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            0,
+            "nothing may reach the catalog while the breaker is open"
+        );
+        assert_eq!(
+            metrics
+                .catalog_request_duration_seconds
+                .with_label_values(&["create_view", "err"])
+                .get_sample_count(),
+            0,
+            "a refused call is not a catalog round trip"
+        );
+    }
+
+    /// `load_view_sql` parses the typed document and applies the version and
+    /// dialect selection; 404 is `None`, 403 is a typed denial (not "not
+    /// found").
+    #[tokio::test]
+    async fn load_view_sql_selects_current_version_and_maps_status() {
+        let server = MockServer::start().await;
+        let doc = serde_json::json!({
+            "metadata-location": "s3://bucket/sales/v/metadata/v2.json",
+            "metadata": view_metadata_json(1, &[("sqe", "SELECT 1 AS x")]),
+        });
+        Mock::given(method("GET"))
+            .and(path("/v1/test-warehouse/namespaces/sales/views/v"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(doc))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/test-warehouse/namespaces/sales/views/missing"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/test-warehouse/namespaces/sales/views/secret"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("denied"))
+            .mount(&server)
+            .await;
+        let metrics = Arc::new(sqe_metrics::MetricsRegistry::new().unwrap());
+        let cache = TableMetadataCache::new(300).with_metrics(Arc::clone(&metrics));
+        let session = session_with(&server, cache, None).await;
+
+        assert_eq!(
+            session.load_view_sql(&sales(), "v").await.unwrap(),
+            Some("SELECT 1 AS x".to_string())
+        );
+        assert_eq!(
+            session.load_view_sql(&sales(), "missing").await.unwrap(),
+            None
+        );
+        let err = session
+            .load_view_sql(&sales(), "secret")
+            .await
+            .expect_err("403 must not read as not-found");
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::AccessDenied);
+        assert!(!err.is_not_found());
+
+        let ok = metrics
+            .catalog_request_duration_seconds
+            .with_label_values(&["load_view", "ok"])
+            .get_sample_count();
+        let failed = metrics
+            .catalog_request_duration_seconds
+            .with_label_values(&["load_view", "err"])
+            .get_sample_count();
+        assert_eq!((ok, failed), (1, 2));
+    }
+
+    /// `CREATE OR REPLACE VIEW` on an existing view is one `replaceView`
+    /// commit carrying `assert-view-uuid` and a new version, never a drop.
+    #[tokio::test]
+    async fn create_or_replace_view_commits_a_new_version() {
+        let server = MockServer::start().await;
+        let doc = serde_json::json!({
+            "metadata-location": "s3://bucket/sales/v/metadata/v2.json",
+            "metadata": view_metadata_json(2, &[("sqe", "SELECT 1 AS x")]),
+        });
+        Mock::given(method("GET"))
+            .and(path("/v1/test-warehouse/namespaces/sales/views/v"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(doc))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/test-warehouse/namespaces/sales/views/v"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        let session = session_with(&server, TableMetadataCache::new(300), None).await;
+
+        session
+            .create_or_replace_view(
+                &sales(),
+                "v",
+                "SELECT 3 AS x",
+                &view_schema_json(),
+                &HashMap::new(),
+            )
+            .await
+            .expect("mocked replace succeeds");
+
+        let requests = server.received_requests().await.unwrap();
+        let posts: Vec<_> = requests
+            .iter()
+            .filter(|r| r.method == wiremock::http::Method::POST)
+            .collect();
+        assert_eq!(posts.len(), 1, "exactly one commit, no drop/create");
+        let body: serde_json::Value = serde_json::from_slice(&posts[0].body).unwrap();
+        assert_eq!(body["requirements"][0]["type"], "assert-view-uuid");
+        assert_eq!(
+            body["requirements"][0]["uuid"],
+            "fa6506c3-7681-40c8-86dc-e36561f83385"
+        );
+        let actions: Vec<&str> = body["updates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["action"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            actions,
+            ["add-schema", "add-view-version", "set-current-view-version"]
+        );
+        assert_eq!(
+            body["updates"][0]["schema"]["schema-id"], 1,
+            "fresh schema id"
+        );
+        assert_eq!(
+            body["updates"][1]["view-version"]["version-id"], 3,
+            "max(1,2)+1"
+        );
+        assert_eq!(body["updates"][1]["view-version"]["schema-id"], 1);
+        assert_eq!(
+            body["updates"][1]["view-version"]["representations"][0]["sql"],
+            "SELECT 3 AS x"
+        );
+        assert_eq!(body["updates"][2]["view-version-id"], -1);
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r.method == wiremock::http::Method::DELETE),
+            "replace must not drop the view"
+        );
     }
 }

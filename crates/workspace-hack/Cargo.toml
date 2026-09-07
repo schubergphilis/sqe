@@ -87,8 +87,10 @@ ordered-float = { version = "4", features = ["serde"] }
 parquet = { version = "59", features = ["object_store", "variant_experimental"] }
 percent-encoding = { version = "2" }
 portable-atomic = { version = "1", features = ["require-cas"] }
+ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
 rand-93f6ce9d446188ac = { package = "rand", version = "0.10" }
+rand_chacha = { version = "0.9", default-features = false, features = ["std"] }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-lite = { version = "0.1" }

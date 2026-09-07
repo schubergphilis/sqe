@@ -1,0 +1,43 @@
+[package]
+name = "sqe-quack-wire-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sqe-quack-wire = { path = ".." }
+
+# Standalone workspace: keeps the fuzz crate (and libFuzzer's C++ runtime)
+# out of the root workspace so `cargo test --workspace` on stable is unaffected.
+# `sqe-quack-wire` still resolves its `workspace = true` fields from the root
+# manifest because cargo locates a path dependency's own workspace.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode_message"
+path = "fuzz_targets/decode_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_data_chunk"
+path = "fuzz_targets/decode_data_chunk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "data_chunk_to_record_batch"
+path = "fuzz_targets/data_chunk_to_record_batch.rs"
+test = false
+doc = false
+bench = false

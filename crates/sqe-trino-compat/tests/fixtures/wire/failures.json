@@ -1,0 +1,162 @@
+[
+  {
+    "body": {
+      "error": {
+        "errorCode": 11,
+        "errorName": "TABLE_NOT_FOUND",
+        "errorType": "USER_ERROR",
+        "failureInfo": {
+          "message": "table 'datafusion.public.missing_table' not found",
+          "stack": [],
+          "suppressed": [],
+          "type": "io.trino.spi.USER_ERROR"
+        },
+        "message": "table 'datafusion.public.missing_table' not found",
+        "queryId": "<query-id>"
+      },
+      "id": "<query-id>",
+      "infoUri": "http://<host>/v1/query/<query-id>",
+      "stats": {
+        "completedSplits": 0,
+        "cpuTimeMillis": 0,
+        "elapsedTimeMillis": 0,
+        "nodes": 1,
+        "peakMemoryBytes": 0,
+        "physicalInputBytes": 0,
+        "processedBytes": 0,
+        "processedRows": 0,
+        "queued": false,
+        "queuedSplits": 0,
+        "queuedTimeMillis": 0,
+        "rootStage": null,
+        "runningSplits": 0,
+        "scheduled": true,
+        "spilledBytes": 0,
+        "state": "FAILED",
+        "totalSplits": 1,
+        "wallTimeMillis": 0
+      },
+      "warnings": []
+    },
+    "status": 200,
+    "step": "missing-table"
+  },
+  {
+    "body": {
+      "error": {
+        "errorCode": 1,
+        "errorName": "SYNTAX_ERROR",
+        "errorType": "USER_ERROR",
+        "failureInfo": {
+          "message": "Parse error: sql parser error: Expected: an SQL statement, found: SELEC at Line: 1, Column: 1",
+          "stack": [],
+          "suppressed": [],
+          "type": "io.trino.spi.USER_ERROR"
+        },
+        "message": "Parse error: sql parser error: Expected: an SQL statement, found: SELEC at Line: 1, Column: 1",
+        "queryId": "<query-id>"
+      },
+      "id": "<query-id>",
+      "infoUri": "http://<host>/v1/query/<query-id>",
+      "stats": {
+        "completedSplits": 0,
+        "cpuTimeMillis": 0,
+        "elapsedTimeMillis": 0,
+        "nodes": 1,
+        "peakMemoryBytes": 0,
+        "physicalInputBytes": 0,
+        "processedBytes": 0,
+        "processedRows": 0,
+        "queued": false,
+        "queuedSplits": 0,
+        "queuedTimeMillis": 0,
+        "rootStage": null,
+        "runningSplits": 0,
+        "scheduled": true,
+        "spilledBytes": 0,
+        "state": "FAILED",
+        "totalSplits": 1,
+        "wallTimeMillis": 0
+      },
+      "warnings": []
+    },
+    "status": 200,
+    "step": "syntax-error"
+  },
+  {
+    "body": {
+      "error": {
+        "errorCode": 21,
+        "errorName": "INVALID_ARGUMENTS",
+        "errorType": "USER_ERROR",
+        "failureInfo": {
+          "message": "Empty query",
+          "stack": [],
+          "suppressed": [],
+          "type": "io.trino.spi.USER_ERROR"
+        },
+        "message": "Empty query"
+      },
+      "id": "",
+      "infoUri": null,
+      "stats": {
+        "completedSplits": 0,
+        "cpuTimeMillis": 0,
+        "elapsedTimeMillis": 0,
+        "nodes": 1,
+        "peakMemoryBytes": 0,
+        "physicalInputBytes": 0,
+        "processedBytes": 0,
+        "processedRows": 0,
+        "queued": false,
+        "queuedSplits": 0,
+        "queuedTimeMillis": 0,
+        "rootStage": null,
+        "runningSplits": 0,
+        "scheduled": true,
+        "spilledBytes": 0,
+        "state": "FAILED",
+        "totalSplits": 1,
+        "wallTimeMillis": 0
+      },
+      "warnings": []
+    },
+    "status": 400,
+    "step": "empty-body"
+  },
+  {
+    "body": {
+      "error": {
+        "errorCode": 1,
+        "errorName": "USER_ERROR",
+        "errorType": "USER_ERROR",
+        "message": "Query not found"
+      },
+      "id": "<query-id>",
+      "infoUri": "http://<host>/v1/query/<query-id>",
+      "stats": {
+        "completedSplits": 0,
+        "cpuTimeMillis": 0,
+        "elapsedTimeMillis": 0,
+        "nodes": 1,
+        "peakMemoryBytes": 0,
+        "physicalInputBytes": 0,
+        "processedBytes": 0,
+        "processedRows": 0,
+        "queued": false,
+        "queuedSplits": 0,
+        "queuedTimeMillis": 0,
+        "rootStage": null,
+        "runningSplits": 0,
+        "scheduled": true,
+        "spilledBytes": 0,
+        "state": "FAILED",
+        "totalSplits": 1,
+        "wallTimeMillis": 0
+      },
+      "warnings": []
+    },
+    "status": 404,
+    "step": "unknown-id"
+  }
+]

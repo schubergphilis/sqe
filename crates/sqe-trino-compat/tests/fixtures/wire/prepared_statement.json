@@ -1,0 +1,244 @@
+[
+  {
+    "body": {
+      "columns": [],
+      "id": "<query-id>",
+      "infoUri": "http://<host>/v1/query/<query-id>",
+      "stats": {
+        "completedSplits": 1,
+        "cpuTimeMillis": 0,
+        "elapsedTimeMillis": 0,
+        "nodes": 1,
+        "peakMemoryBytes": 0,
+        "physicalInputBytes": 0,
+        "processedBytes": 0,
+        "processedRows": 0,
+        "queued": false,
+        "queuedSplits": 0,
+        "queuedTimeMillis": 0,
+        "rootStage": null,
+        "runningSplits": 0,
+        "scheduled": true,
+        "spilledBytes": 0,
+        "state": "FINISHED",
+        "totalSplits": 1,
+        "wallTimeMillis": 0
+      },
+      "updateType": "PREPARE",
+      "warnings": []
+    },
+    "headers": {
+      "x-trino-added-prepare": [
+        "q1=SELECT+%3F+AS+v"
+      ]
+    },
+    "status": 200,
+    "step": "prepare"
+  },
+  {
+    "body": {
+      "columns": [
+        {
+          "name": "v",
+          "type": "bigint",
+          "typeSignature": {
+            "arguments": [],
+            "rawType": "bigint"
+          }
+        }
+      ],
+      "data": [
+        [
+          42
+        ]
+      ],
+      "id": "<query-id>",
+      "infoUri": "http://<host>/v1/query/<query-id>",
+      "stats": {
+        "completedSplits": 1,
+        "cpuTimeMillis": 0,
+        "elapsedTimeMillis": 0,
+        "nodes": 1,
+        "peakMemoryBytes": 0,
+        "physicalInputBytes": 0,
+        "processedBytes": 0,
+        "processedRows": 1,
+        "queued": false,
+        "queuedSplits": 0,
+        "queuedTimeMillis": 0,
+        "rootStage": null,
+        "runningSplits": 0,
+        "scheduled": true,
+        "spilledBytes": 0,
+        "state": "FINISHED",
+        "totalSplits": 1,
+        "wallTimeMillis": 0
+      },
+      "warnings": []
+    },
+    "status": 200,
+    "step": "execute"
+  },
+  {
+    "body": {
+      "error": {
+        "errorCode": 100,
+        "errorName": "NOT_SUPPORTED",
+        "errorType": "USER_ERROR",
+        "failureInfo": {
+          "message": "DESCRIBE OUTPUT / DESCRIBE INPUT is not supported by this executor",
+          "stack": [],
+          "suppressed": [],
+          "type": "io.trino.spi.USER_ERROR"
+        },
+        "message": "DESCRIBE OUTPUT / DESCRIBE INPUT is not supported by this executor",
+        "queryId": "<query-id>"
+      },
+      "id": "<query-id>",
+      "infoUri": "http://<host>/v1/query/<query-id>",
+      "stats": {
+        "completedSplits": 0,
+        "cpuTimeMillis": 0,
+        "elapsedTimeMillis": 0,
+        "nodes": 1,
+        "peakMemoryBytes": 0,
+        "physicalInputBytes": 0,
+        "processedBytes": 0,
+        "processedRows": 0,
+        "queued": false,
+        "queuedSplits": 0,
+        "queuedTimeMillis": 0,
+        "rootStage": null,
+        "runningSplits": 0,
+        "scheduled": true,
+        "spilledBytes": 0,
+        "state": "FAILED",
+        "totalSplits": 1,
+        "wallTimeMillis": 0
+      },
+      "warnings": []
+    },
+    "status": 200,
+    "step": "describe-output"
+  },
+  {
+    "body": {
+      "error": {
+        "errorCode": 5,
+        "errorName": "NOT_FOUND",
+        "errorType": "USER_ERROR",
+        "failureInfo": {
+          "message": "Prepared statement not found: q1",
+          "stack": [],
+          "suppressed": [],
+          "type": "io.trino.spi.USER_ERROR"
+        },
+        "message": "Prepared statement not found: q1",
+        "queryId": "<query-id>"
+      },
+      "id": "<query-id>",
+      "infoUri": "http://<host>/v1/query/<query-id>",
+      "stats": {
+        "completedSplits": 0,
+        "cpuTimeMillis": 0,
+        "elapsedTimeMillis": 0,
+        "nodes": 1,
+        "peakMemoryBytes": 0,
+        "physicalInputBytes": 0,
+        "processedBytes": 0,
+        "processedRows": 0,
+        "queued": false,
+        "queuedSplits": 0,
+        "queuedTimeMillis": 0,
+        "rootStage": null,
+        "runningSplits": 0,
+        "scheduled": true,
+        "spilledBytes": 0,
+        "state": "FAILED",
+        "totalSplits": 1,
+        "wallTimeMillis": 0
+      },
+      "warnings": []
+    },
+    "status": 200,
+    "step": "deallocate-unknown"
+  },
+  {
+    "body": {
+      "columns": [],
+      "id": "<query-id>",
+      "infoUri": "http://<host>/v1/query/<query-id>",
+      "stats": {
+        "completedSplits": 1,
+        "cpuTimeMillis": 0,
+        "elapsedTimeMillis": 0,
+        "nodes": 1,
+        "peakMemoryBytes": 0,
+        "physicalInputBytes": 0,
+        "processedBytes": 0,
+        "processedRows": 0,
+        "queued": false,
+        "queuedSplits": 0,
+        "queuedTimeMillis": 0,
+        "rootStage": null,
+        "runningSplits": 0,
+        "scheduled": true,
+        "spilledBytes": 0,
+        "state": "FINISHED",
+        "totalSplits": 1,
+        "wallTimeMillis": 0
+      },
+      "updateType": "DEALLOCATE",
+      "warnings": []
+    },
+    "headers": {
+      "x-trino-deallocated-prepare": [
+        "q1"
+      ]
+    },
+    "status": 200,
+    "step": "deallocate"
+  },
+  {
+    "body": {
+      "error": {
+        "errorCode": 5,
+        "errorName": "NOT_FOUND",
+        "errorType": "USER_ERROR",
+        "failureInfo": {
+          "message": "Prepared statement not found: q1",
+          "stack": [],
+          "suppressed": [],
+          "type": "io.trino.spi.USER_ERROR"
+        },
+        "message": "Prepared statement not found: q1",
+        "queryId": "<query-id>"
+      },
+      "id": "<query-id>",
+      "infoUri": "http://<host>/v1/query/<query-id>",
+      "stats": {
+        "completedSplits": 0,
+        "cpuTimeMillis": 0,
+        "elapsedTimeMillis": 0,
+        "nodes": 1,
+        "peakMemoryBytes": 0,
+        "physicalInputBytes": 0,
+        "processedBytes": 0,
+        "processedRows": 0,
+        "queued": false,
+        "queuedSplits": 0,
+        "queuedTimeMillis": 0,
+        "rootStage": null,
+        "runningSplits": 0,
+        "scheduled": true,
+        "spilledBytes": 0,
+        "state": "FAILED",
+        "totalSplits": 1,
+        "wallTimeMillis": 0
+      },
+      "warnings": []
+    },
+    "status": 200,
+    "step": "execute-unknown"
+  }
+]

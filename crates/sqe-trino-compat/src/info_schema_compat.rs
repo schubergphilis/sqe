@@ -13,8 +13,14 @@
 //!     `table_schema` sees engine internals. We scope the listing to the
 //!     session catalog (or, absent one, drop the internal catalogs).
 //!
-//! This runs only for metadata queries (`is_metadata_query`) on the Trino path;
-//! Flight SQL metadata RPCs build Arrow directly and are untouched.
+//! This runs only for statements the SQL front door classified as metadata
+//! reads (`sqe_sql::NormalizedSql::is_metadata_query`, decided from the AST:
+//! an `information_schema` relation, `SHOW COLUMNS` or `DESCRIBE <table>`) on
+//! the Trino path; Flight SQL metadata RPCs build Arrow directly and are
+//! untouched. Qualifying an unqualified `information_schema.<x>` with the
+//! session catalog (#2) is likewise an AST pass in the front door
+//! (`sqe_sql::qualify_information_schema`), so literals and comments that
+//! mention `information_schema` are never touched (finding 704).
 
 use std::sync::Arc;
 
@@ -23,63 +29,6 @@ use arrow_array::{Array, BooleanArray, RecordBatch, StringArray};
 /// Internal catalogs the built-in `information_schema` exposes that a Trino BI
 /// client should never see.
 const INTERNAL_CATALOGS: [&str; 2] = ["system", "datafusion"];
-
-/// Does this SQL read table metadata (so its result should be Trino-normalized)?
-pub fn is_metadata_query(sql: &str) -> bool {
-    let s = sql.trim_start().to_ascii_lowercase();
-    s.contains("information_schema")
-        || s.starts_with("show columns")
-        || s.starts_with("describe ")
-        || s.starts_with("desc ")
-}
-
-/// Qualify an UNqualified `information_schema.<x>` reference with the session
-/// catalog, so it resolves to that catalog's `information_schema` (which, under
-/// `catalog_discovery = polaris-auto`, also triggers discovery + registration
-/// of the catalog so the built-in `information_schema` lists its tables).
-///
-/// Trino clients send unqualified `information_schema` relying on the session
-/// catalog (`X-Trino-Catalog`); SQE otherwise resolves it against the default
-/// catalog and never sees the session's discovered catalog (#2). Already-
-/// qualified references (`cat.information_schema...`), identifiers that merely
-/// contain the word, and string literals are left untouched.
-pub fn qualify_information_schema(sql: &str, session_catalog: &str) -> String {
-    if session_catalog.is_empty() {
-        return sql.to_string();
-    }
-    // SECURITY: the session catalog is attacker-controllable (the
-    // X-Trino-Catalog header). Escape it as a SQL quoted identifier by doubling
-    // any embedded double-quote, so a value like `x"; DROP ...` cannot break out
-    // of the `"..."` and inject SQL into the rewritten statement.
-    let escaped_catalog = session_catalog.replace('"', "\"\"");
-    const NEEDLE: &str = "information_schema";
-    let lower = sql.to_ascii_lowercase();
-    let mut out = String::with_capacity(sql.len() + session_catalog.len() + 4);
-    let mut i = 0;
-    while i < sql.len() {
-        if lower[i..].starts_with(NEEDLE) {
-            let prev = sql[..i].chars().next_back();
-            let after = i + NEEDLE.len();
-            let next = sql[after..].chars().next();
-            // Standalone `information_schema.` not already catalog-qualified.
-            let already_qualified = prev == Some('.');
-            let part_of_ident = matches!(prev, Some(c) if c.is_alphanumeric() || c == '_');
-            let followed_by_dot = next == Some('.');
-            if !already_qualified && !part_of_ident && followed_by_dot {
-                out.push('"');
-                out.push_str(&escaped_catalog);
-                out.push_str("\".");
-                out.push_str(&sql[i..after]); // preserve original case
-                i = after;
-                continue;
-            }
-        }
-        let ch = sql[i..].chars().next().unwrap();
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    out
-}
 
 /// Map a DataFusion Arrow type *display string* (as emitted by the built-in
 /// `information_schema.data_type` column) to a Trino SQL type name. Unknown
@@ -164,23 +113,13 @@ pub fn apply_info_schema_compat(
         .collect()
 }
 
-/// True when `sql` is a `SHOW COLUMNS` or a `DESCRIBE <table>` / `DESC <table>`
-/// (not `DESCRIBE OUTPUT/INPUT`, which are intercepted earlier). Used to gate
-/// the Trino column-shape reshape so plain `information_schema.columns` selects
-/// keep their native column names.
-pub fn is_describe_or_show_columns(sql: &str) -> bool {
-    let s = sql.trim_start().to_ascii_lowercase();
-    s.starts_with("show columns")
-        || ((s.starts_with("describe ") || s.starts_with("desc "))
-            && !s.starts_with("describe output")
-            && !s.starts_with("describe input"))
-}
-
 /// Reshape a SHOW COLUMNS / DESCRIBE result from SQE's
 /// `[column_name, data_type, is_nullable]` to Trino's
 /// `[Column, Type, Extra, Comment]`. The `data_type` values must already be
 /// Trino type names (run [`apply_info_schema_compat`] first). Batches whose
-/// shape doesn't match are returned unchanged.
+/// shape doesn't match are returned unchanged. The server gates the call on
+/// the statement being `SHOW COLUMNS` or `DESCRIBE <table>` in the AST, so
+/// plain `information_schema.columns` selects keep their native column names.
 pub fn reshape_describe_to_trino(batches: Vec<RecordBatch>) -> Vec<RecordBatch> {
     batches.into_iter().map(reshape_describe_batch).collect()
 }
@@ -273,14 +212,6 @@ mod tests {
 
     #[test]
     fn describe_reshape_to_trino_columns() {
-        assert!(is_describe_or_show_columns("SHOW COLUMNS FROM t"));
-        assert!(is_describe_or_show_columns("describe gold.t"));
-        assert!(is_describe_or_show_columns("DESC t"));
-        assert!(!is_describe_or_show_columns("DESCRIBE OUTPUT p"));
-        assert!(!is_describe_or_show_columns(
-            "SELECT * FROM information_schema.columns"
-        ));
-
         // [column_name, data_type, is_nullable] -> [Column, Type, Extra, Comment]
         let schema = Arc::new(Schema::new(vec![
             Field::new("column_name", DataType::Utf8, false),
@@ -439,47 +370,80 @@ mod tests {
         assert_eq!(out[0].num_rows(), 3);
     }
 
-    // ── qualify_information_schema (#2) ─────────────────────────────────────
+    // ── information_schema qualification on the Trino path (#2, 704) ───────
+    //
+    // The qualification itself is `sqe_sql::qualify_information_schema`, an
+    // AST pass the SQL front door runs when the session has a catalog. These
+    // tests drive it exactly the way the Trino server does, so they pin the
+    // behaviour the wire sees: relations are qualified, literals, comments and
+    // identifier substrings are not.
+
+    use sqe_sql::{SqlFrontDoor, WireDialect};
+
+    fn qualify(sql: &str, session_catalog: Option<&str>) -> String {
+        SqlFrontDoor::new(WireDialect::Trino)
+            .with_session_catalog(session_catalog)
+            .normalize(sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .sql()
+            .to_string()
+    }
+
+    fn qualifier(catalog: &str) -> String {
+        format!("\"{}\".information_schema", catalog.replace('"', "\"\""))
+    }
+
     #[test]
     fn qualifies_unqualified_information_schema() {
-        let out = qualify_information_schema(
+        let out = qualify(
             "SELECT table_name FROM information_schema.tables WHERE table_schema='gold'",
-            "ws_energy_co",
+            Some("ws_energy_co"),
         );
         assert_eq!(
             out,
-            "SELECT table_name FROM \"ws_energy_co\".information_schema.tables WHERE table_schema='gold'"
+            "SELECT table_name FROM \"ws_energy_co\".information_schema.tables WHERE table_schema = 'gold'"
         );
     }
 
     #[test]
     fn leaves_already_qualified_unchanged() {
-        let sql = "SELECT 1 FROM ws_energy_co.information_schema.columns";
-        assert_eq!(qualify_information_schema(sql, "ws_energy_co"), sql);
+        let out = qualify(
+            "SELECT 1 FROM ws_energy_co.information_schema.columns",
+            Some("ws_energy_co"),
+        );
+        assert!(!out.contains(&qualifier("ws_energy_co")), "{out}");
+        assert!(
+            out.contains("FROM ws_energy_co.information_schema.columns"),
+            "{out}"
+        );
     }
 
     #[test]
     fn leaves_string_literal_unchanged() {
-        let sql = "SELECT 1 WHERE table_schema = 'information_schema'";
-        assert_eq!(qualify_information_schema(sql, "ws_energy_co"), sql);
+        let out = qualify(
+            "SELECT 1 WHERE table_schema = 'information_schema'",
+            Some("ws_energy_co"),
+        );
+        assert!(!out.contains(&qualifier("ws_energy_co")), "{out}");
+        assert!(out.contains("'information_schema'"), "{out}");
     }
 
     #[test]
     fn leaves_identifier_substring_unchanged() {
         let sql = "SELECT * FROM my_information_schema.t";
-        assert_eq!(qualify_information_schema(sql, "ws_energy_co"), sql);
+        assert_eq!(qualify(sql, Some("ws_energy_co")), sql);
     }
 
     #[test]
-    fn empty_session_catalog_is_noop() {
-        let sql = "SELECT 1 FROM information_schema.tables";
-        assert_eq!(qualify_information_schema(sql, ""), sql);
+    fn no_session_catalog_is_noop() {
+        let sql = "SELECT * FROM information_schema.tables";
+        assert_eq!(qualify(sql, None), sql);
     }
 
     #[test]
     fn case_insensitive_preserves_original_case() {
-        let out = qualify_information_schema("FROM INFORMATION_SCHEMA.TABLES", "ws");
-        assert_eq!(out, "FROM \"ws\".INFORMATION_SCHEMA.TABLES");
+        let out = qualify("SELECT * FROM INFORMATION_SCHEMA.TABLES", Some("ws"));
+        assert_eq!(out, "SELECT * FROM \"ws\".INFORMATION_SCHEMA.TABLES");
     }
 
     #[test]
@@ -487,11 +451,13 @@ mod tests {
         // The X-Trino-Catalog header is attacker-controlled. A double-quote in
         // the value must be doubled so it cannot close the quoted identifier
         // and inject SQL into the rewritten statement.
-        let out =
-            qualify_information_schema("SELECT 1 FROM information_schema.tables", "evil\".oops--");
+        let out = qualify(
+            "SELECT * FROM information_schema.tables",
+            Some("evil\".oops--"),
+        );
         assert_eq!(
             out,
-            "SELECT 1 FROM \"evil\"\".oops--\".information_schema.tables"
+            "SELECT * FROM \"evil\"\".oops--\".information_schema.tables"
         );
         // The raw (un-doubled) breakout sequence must not appear.
         assert!(!out.contains("evil\".oops"), "breakout present: {out}");
@@ -499,13 +465,137 @@ mod tests {
 
     #[test]
     fn qualifies_multiple_occurrences() {
-        let out = qualify_information_schema(
+        let out = qualify(
             "SELECT * FROM information_schema.tables t JOIN information_schema.columns c ON true",
-            "ws",
+            Some("ws"),
         );
-        assert_eq!(
-            out,
-            "SELECT * FROM \"ws\".information_schema.tables t JOIN \"ws\".information_schema.columns c ON true"
+        assert_eq!(out.matches(&qualifier("ws")).count(), 2, "{out}");
+        assert!(out.contains("\"ws\".information_schema.tables"), "{out}");
+        assert!(out.contains("\"ws\".information_schema.columns"), "{out}");
+    }
+
+    // ── Adversarial inputs: comments, quoted identifiers, literals (#630) ──
+
+    #[test]
+    fn quoted_information_schema_identifier_is_qualified_too() {
+        // `"information_schema".tables` names the same relation as the bare
+        // form; the AST pass sees the identifier value, not the quoting, so
+        // it is qualified as well (the text scanner used to skip it).
+        let out = qualify("SELECT * FROM \"information_schema\".tables", Some("ws"));
+        assert_eq!(out, "SELECT * FROM \"ws\".\"information_schema\".tables");
+    }
+
+    #[test]
+    fn leading_comment_does_not_block_qualification() {
+        // A leading comment used to defeat prefix detection. It is dropped
+        // when the AST is re-serialized, which is the documented cost of any
+        // rewrite firing.
+        let out = qualify(
+            "-- list tables )\nSELECT * FROM information_schema.tables",
+            Some("ws"),
         );
+        assert_eq!(out, "SELECT * FROM \"ws\".information_schema.tables");
+    }
+
+    /// Finding 704 acceptance: `'information_schema.tables'` in a WHERE clause
+    /// is a value the query compares against, not a relation, and keeps its
+    /// bytes.
+    #[test]
+    fn information_schema_dot_inside_literal_is_untouched() {
+        let out = qualify(
+            "SELECT 1 WHERE table_schema = 'information_schema.tables'",
+            Some("ws"),
+        );
+        assert!(!out.contains(&qualifier("ws")), "{out}");
+        assert!(out.contains("= 'information_schema.tables'"), "{out}");
+
+        // Returned verbatim when nothing else rewrites the statement.
+        let sql = "SELECT * FROM t WHERE note LIKE '%information_schema.%'";
+        assert_eq!(qualify(sql, Some("ws")), sql);
+    }
+
+    #[test]
+    fn information_schema_dot_inside_comment_is_untouched() {
+        let sql = "SELECT * FROM t -- see information_schema.tables";
+        assert_eq!(qualify(sql, Some("ws")), sql);
+
+        let out = qualify("-- see information_schema.tables\nSELECT 1", Some("ws"));
+        assert!(!out.contains(&qualifier("ws")), "{out}");
+    }
+
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Scanner-hostile bytes with no quotes and no `*`, plus the needle
+        /// itself in both cases and followed by a dot.
+        fn payload() -> impl Strategy<Value = String> {
+            prop::collection::vec(
+                prop_oneof![
+                    Just(")".to_string()),
+                    Just(".".to_string()),
+                    Just(" information_schema".to_string()),
+                    Just(" INFORMATION_SCHEMA.".to_string()),
+                    Just("information_schema.tables".to_string()),
+                    Just("x_information_schema.".to_string()),
+                    Just(" -- ".to_string()),
+                    Just(" /* ".to_string()),
+                    "[a-z0-9 ]{1,4}",
+                ],
+                1..6,
+            )
+            .prop_map(|parts| parts.concat())
+        }
+
+        fn catalog() -> impl Strategy<Value = String> {
+            prop_oneof![
+                "[a-z][a-z0-9_]{0,8}",
+                Just("evil\".oops--".to_string()),
+                Just("ws energy".to_string()),
+            ]
+        }
+
+        fn literal() -> impl Strategy<Value = String> {
+            payload().prop_map(|p| format!("'{p}'"))
+        }
+
+        fn line_comment() -> impl Strategy<Value = String> {
+            payload().prop_map(|p| format!("--{p}\n"))
+        }
+
+        fn block_comment() -> impl Strategy<Value = String> {
+            payload().prop_map(|p| format!("/*{}*/", p.replace("/*", "/ *")))
+        }
+
+        proptest! {
+            /// (a) A literal's bytes survive the rewrite untouched, and exactly
+            /// the one relation is qualified, however hostile the literal and
+            /// the surrounding comments look to a text scanner.
+            #[test]
+            fn literal_bytes_survive_the_rewrite(
+                l in literal(),
+                lc in line_comment(),
+                bc in block_comment(),
+                cat in catalog(),
+            ) {
+                let sql = format!("{lc}SELECT {l} AS v FROM information_schema.tables {bc}");
+                let out = qualify(&sql, Some(&cat));
+                prop_assert!(out.contains(&l), "literal changed: {out}");
+                prop_assert_eq!(out.matches(&qualifier(&cat)).count(), 1, "{}", out);
+            }
+
+            /// (b) With no relation to qualify, comments and literals that
+            /// mention the needle leave the statement byte-identical.
+            #[test]
+            fn needle_in_literal_or_comment_is_identity(
+                l in literal(),
+                lc in line_comment(),
+                bc in block_comment(),
+                cat in catalog(),
+            ) {
+                let sql = format!("{lc}SELECT * FROM t WHERE x = {l} {bc}");
+                prop_assert_eq!(qualify(&sql, Some(&cat)), sql);
+            }
+        }
     }
 }

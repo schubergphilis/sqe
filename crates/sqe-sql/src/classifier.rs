@@ -1,18 +1,25 @@
-use sqlparser::ast::{AlterTableOperation, ObjectType, Statement};
+use sqlparser::ast::{
+    AlterTableOperation, Expr, ObjectName, ObjectNamePart, ObjectType, Statement, Use, Value,
+};
 use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
+use sqlparser::parser::{Parser, ParserError};
+use sqlparser::tokenizer::Token;
 
 use crate::attach::{
-    is_show_secrets, try_parse_attach, try_parse_create_secret, try_parse_detach,
-    try_parse_drop_secret, AttachStatement, CreateSecretStatement, DetachStatement,
-    DropSecretStatement,
+    try_parse_attach, try_parse_create_secret, try_parse_detach, try_parse_drop_secret,
+    AttachStatement, CreateSecretStatement, DetachStatement, DropSecretStatement,
 };
 use crate::ddl::{try_parse_ref_ddl, RefDdl};
+use crate::metadata::UpdateType;
 use crate::partition_evolution::{try_parse_partition_evolution, PartitionEvolution};
 use crate::policy_ddl::{try_parse_policy_ddl, PolicyDdlStatement};
 use crate::procedures::{try_parse_call, ProcedureCall};
 use crate::tags::{
     try_parse_masking_policy, try_parse_set_tags, MaskingPolicyOp, SetTagsStatement,
+};
+use crate::token_scan::{
+    at_end, consume_word, consume_words, expect_end, expect_word, leading_words, parse_error,
+    parse_name_ref, parse_principal_name, remaining_text, syntax_error, word_at,
 };
 
 /// Target for SHOW GRANTS statements.
@@ -195,6 +202,42 @@ pub enum StatementKind {
     /// added partition spec or `PURGE` after a dropped one; see
     /// [`crate::hive_partitions`].
     HivePartitionDdl(Box<crate::hive_partitions::HivePartitionDdl>),
+    /// `SET CATALOG <name>` -- switch the session's default catalog. Parsed
+    /// from the token stream (sqlparser has no form for it). (#628)
+    SetCatalog(String),
+    /// `SET SESSION <name> = <value>` -- Trino session property. `value` is
+    /// the literal's unquoted text (`'ZSTD'` -> `ZSTD`, `1` -> `1`); the
+    /// protocol layer validates the property name against its allow-list.
+    SetSession {
+        name: String,
+        value: String,
+    },
+    /// `RESET SESSION <name>`.
+    ResetSession(String),
+    /// `PREPARE <name> FROM <statement>` (Trino) or `PREPARE <name> AS
+    /// <statement>` (PostgreSQL). The body is parsed here, so `PREPARE p
+    /// FROM SELEC 1` fails at PREPARE time, as it does in Trino.
+    Prepare {
+        name: String,
+        body: Box<Statement>,
+    },
+    /// `DEALLOCATE [PREPARE] <name>`.
+    Deallocate(String),
+    /// `EXECUTE <name> [USING <expr>, ...]`. `params` are the `USING`
+    /// arguments (or the parenthesised argument list), already parsed, so
+    /// the protocol layer binds expressions rather than splicing text.
+    Execute {
+        name: String,
+        params: Vec<Expr>,
+    },
+    /// `DESCRIBE OUTPUT <prepared-statement>`.
+    DescribeOutput(String),
+    /// `DESCRIBE INPUT <prepared-statement>`.
+    DescribeInput(String),
+    /// `SHOW SESSION [LIKE '<pattern>']`.
+    ShowSession {
+        like: Option<String>,
+    },
 }
 
 impl StatementKind {
@@ -258,7 +301,48 @@ impl StatementKind {
             StatementKind::MsckRepairTable(_) => "msckrepairtable",
             StatementKind::ShowPartitions(_) => "showpartitions",
             StatementKind::HivePartitionDdl(_) => "hivepartitionddl",
+            StatementKind::SetCatalog(_) => "setcatalog",
+            StatementKind::SetSession { .. } => "setsession",
+            StatementKind::ResetSession(_) => "resetsession",
+            StatementKind::Prepare { .. } => "prepare",
+            StatementKind::Deallocate(_) => "deallocate",
+            StatementKind::Execute { .. } => "execute",
+            StatementKind::DescribeOutput(_) => "describeoutput",
+            StatementKind::DescribeInput(_) => "describeinput",
+            StatementKind::ShowSession { .. } => "showsession",
         }
+    }
+
+    /// The Trino `updateType` for this statement, or `None` for reads. Kinds
+    /// that wrap a sqlparser statement defer to [`crate::metadata::update_type`];
+    /// SQE-only kinds map to the closest Trino name (a partition-spec change
+    /// is an `ALTER TABLE`, a maintenance procedure is a `CALL`).
+    pub fn update_type(&self) -> Option<UpdateType> {
+        use UpdateType as U;
+        if let Some(stmt) = self.statement() {
+            return crate::metadata::update_type(stmt);
+        }
+        Some(match self {
+            StatementKind::CreateExternalTable(_) => U::CreateTable,
+            StatementKind::Begin => U::StartTransaction,
+            StatementKind::Commit => U::Commit,
+            StatementKind::Rollback => U::Rollback,
+            StatementKind::Use(_) | StatementKind::SetCatalog(_) => U::Use,
+            StatementKind::DropNestedColumn { .. }
+            | StatementKind::RefDdl(_)
+            | StatementKind::PartitionEvolution(_)
+            | StatementKind::SetTags(_)
+            | StatementKind::SetMaskingPolicy(_)
+            | StatementKind::HivePartitionDdl(_) => U::AlterTable,
+            StatementKind::Truncate(_) => U::Truncate,
+            StatementKind::Analyze(_) => U::Analyze,
+            StatementKind::Procedure(_) => U::Call,
+            StatementKind::SetWriteBranch(_) | StatementKind::SetSession { .. } => U::SetSession,
+            StatementKind::ResetSession(_) => U::ResetSession,
+            StatementKind::Prepare { .. } => U::Prepare,
+            StatementKind::Deallocate(_) => U::Deallocate,
+            _ => return None,
+        })
     }
 
     /// Borrow the underlying parsed `sqlparser::ast::Statement` when
@@ -379,341 +463,455 @@ fn detect_nested_drop_column(trimmed: &str) -> Option<(String, Vec<String>, bool
     Some((table_ref.to_string(), path, if_exists))
 }
 
-/// Parse a SQL string and classify the first statement.
-pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
-    // Before parsing with sqlparser, check for SHOW CATALOGS which sqlparser
-    // may not natively support.
-    let trimmed = sql.trim();
-    let upper = trimmed.to_ascii_uppercase();
+/// Outcome of the shared tokenize-and-dispatch step: either an SQE-only
+/// statement classified from the token stream, or the sqlparser result for
+/// everything else (the parser error is kept so the front door can decide
+/// whether a source-level fallback applies).
+pub(crate) enum Dispatch {
+    Custom(StatementKind),
+    Standard(Result<Vec<Statement>, ParserError>),
+}
 
-    if let Some(policy) = try_parse_policy_ddl(trimmed)? {
-        return Ok(StatementKind::PolicyDdl(Box::new(policy)));
-    }
-
-    if upper == "SHOW CATALOGS" || upper.starts_with("SHOW CATALOGS ") {
-        return Ok(StatementKind::ShowCatalogs);
-    }
-
-    // Pre-scan for SHOW CREATE SCHEMA <name>. sqlparser 0.62 only models
-    // SHOW CREATE for TABLE/VIEW/... and rejects the SCHEMA form at parse time,
-    // so it never reaches the AST match below. Intercept it here and carry the
-    // raw schema reference for the handler to resolve. (#351a). SHOW CREATE
-    // TABLE / VIEW still parse normally and flow through the AST match.
-    if let Some(rest) = strip_prefix_ci(trimmed, "SHOW CREATE SCHEMA ") {
-        let schema = rest.trim().trim_end_matches(';').trim().to_string();
-        if schema.is_empty() {
-            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
-                "SHOW CREATE SCHEMA requires a schema name",
-            ));
-        }
-        return Ok(StatementKind::ShowCreateSchema(schema));
-    }
-
-    // Pre-scan for EXPLAIN FULL — not standard SQL, sqlparser won't parse it.
-    if let Some(rest) = strip_prefix_ci(trimmed, "EXPLAIN FULL ") {
-        let inner = rest.trim().to_string();
-        return Ok(StatementKind::ExplainFull(inner));
-    }
-
-    // Pre-scan for SHOW STATS FOR — sqlparser parses this as ShowVariable,
-    // but we intercept it here for direct table name extraction.
-    if let Some(rest) = strip_prefix_ci(trimmed, "SHOW STATS FOR ") {
-        let table = rest.trim().trim_end_matches(';').to_string();
-        return Ok(StatementKind::ShowStats(table));
-    }
-
-    // Pre-scan for SHOW PARTITIONS <table>. sqlparser delivers this as a
-    // generic ShowVariable (the same mis-classification SHOW STATS and
-    // SHOW TAGS suffer), so intercept by prefix. The bare form with no
-    // table yields a precise error rather than a variable-not-found one.
-    if upper.starts_with("SHOW PARTITIONS") {
-        let rest = trimmed["SHOW PARTITIONS".len()..].trim();
-        let table = rest.trim_end_matches(';').trim().to_string();
-        if table.is_empty() {
-            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
-                "SHOW PARTITIONS requires: SHOW PARTITIONS <table>".to_string(),
-            ));
-        }
-        // LIKE / WHERE / extra clauses are not implemented. Swallowing them
-        // into the table name would make `SHOW PARTITIONS t LIKE 'dt%'`
-        // look up a table that does not exist instead of naming the gap.
-        if table.split_whitespace().count() > 1 {
-            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
-                "SHOW PARTITIONS does not support LIKE or extra clauses; use \
-                 SHOW PARTITIONS <table>"
-                    .to_string(),
-            ));
-        }
-        return Ok(StatementKind::ShowPartitions(table));
-    }
-
-    // Pre-scan for ANALYZE [TABLE] <table> [WITH (...)]. sqlparser's
-    // `parse_analyze` stops at the `WITH` keyword, so Trino's
-    // `ANALYZE t WITH (...)` form leaves trailing tokens and fails to parse.
-    // Intercept the whole statement here, extract the table reference, and
-    // drop any WITH/PARTITION/FOR-COLUMNS clause: SQE treats ANALYZE as a
-    // stats no-op (#329), so the analyze properties do not affect behaviour.
-    if let Some(rest) = strip_prefix_ci(trimmed, "ANALYZE ") {
-        return parse_analyze(rest);
-    }
-
-    // Pre-scan for SHOW EFFECTIVE GRANTS FOR USER "name"
-    if let Some(rest) = strip_prefix_ci(trimmed, "SHOW EFFECTIVE GRANTS FOR USER ") {
-        let user = rest
-            .trim()
-            .trim_end_matches(';')
-            .trim_matches('"')
-            .trim_matches('\'')
-            .to_string();
-        return Ok(StatementKind::ShowEffectiveGrants(user));
-    }
-
-    // Pre-scan for SHOW GRANTS ON resource / SHOW GRANTS TO type "name"
-    if let Some(rest) = strip_prefix_ci(trimmed, "SHOW GRANTS ON ") {
-        let rest = rest.trim().trim_end_matches(';').to_string();
-        let (catalog, namespace, table) = parse_resource_reference(&rest)?;
-        return Ok(StatementKind::ShowGrants(ShowGrantsTarget::OnResource {
-            catalog,
-            namespace,
-            table,
-        }));
-    }
-    if let Some(rest) = strip_prefix_ci(trimmed, "SHOW GRANTS TO ") {
-        let rest = rest.trim().trim_end_matches(';');
-        let parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
-        if parts.len() == 2 {
-            let grantee_type = parts[0].to_ascii_uppercase();
-            let grantee_name = parts[1]
-                .trim()
-                .trim_matches('"')
-                .trim_matches('\'')
-                .to_string();
-            return Ok(StatementKind::ShowGrants(ShowGrantsTarget::ToGrantee {
-                grantee_type,
-                grantee_name,
-            }));
-        }
-        return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
-            "SHOW GRANTS TO requires: SHOW GRANTS TO GROUP|USER \"name\"".to_string(),
-        ));
-    }
-
-    // Pre-scan for CHECK ACCESS privilege ON resource FOR USER "name"
-    if let Some(rest) = strip_prefix_ci(trimmed, "CHECK ACCESS ") {
-        let rest = rest.trim().trim_end_matches(';');
-        return parse_check_access(rest);
-    }
-
-    // Pre-scan for SHOW EFFECTIVE POLICY [FOR USER "name"] ON <table>.
-    // Check the FOR USER form before the bare form so the longer prefix wins.
-    if let Some(rest) = strip_prefix_ci(trimmed, "SHOW EFFECTIVE POLICY FOR USER ") {
-        let rest = rest.trim().trim_end_matches(';');
-        return parse_show_effective_policy(rest, true);
-    }
-    if let Some(rest) = strip_prefix_ci(trimmed, "SHOW EFFECTIVE POLICY ") {
-        let rest = rest.trim().trim_end_matches(';');
-        return parse_show_effective_policy(rest, false);
-    }
-
-    // Pre-scan for SHOW TAGS ON <table>. sqlparser would mis-classify "SHOW
-    // TAGS" as a generic SHOW variable, so intercept it here. The bare
-    // `SHOW TAGS ON` (no table) is also matched so it yields a precise error
-    // rather than falling through to sqlparser.
-    let show_tags_rest = strip_prefix_ci(trimmed, "SHOW TAGS ON ").or_else(|| {
-        if trimmed
-            .trim_end_matches(';')
-            .trim_end()
-            .eq_ignore_ascii_case("SHOW TAGS ON")
-        {
-            Some("")
-        } else {
-            None
-        }
-    });
-    // SHOW MASKING POLICIES / SHOW MASKING POLICY <name>. Handled before
-    // sqlparser, which has no notion of either.
-    //
-    // Both spellings are accepted because operators type both, and refusing the
-    // singular for a list (or vice versa) is a pointless papercut. The plural with a
-    // name is also fine: the name simply filters.
-    //
-    // The order here is cosmetic, not load-bearing: "POLICIES" is "POLIC" + "IES"
-    // and the singular prefix ends "POLICY", so they diverge at that character and
-    // neither prefix can swallow the other's input.
-    for prefix in ["SHOW MASKING POLICIES", "SHOW MASKING POLICY"] {
-        if let Some(rest) = strip_prefix_ci(trimmed, prefix) {
-            let name = rest
-                .trim()
-                .trim_end_matches(';')
-                .trim()
-                .trim_matches('"')
-                .to_string();
-            return Ok(StatementKind::ShowMaskingPolicies(if name.is_empty() {
-                None
-            } else {
-                Some(name)
-            }));
-        }
-    }
-
-    if let Some(rest) = show_tags_rest {
-        let table = rest.trim().trim_end_matches(';').trim().to_string();
-        if table.is_empty() {
-            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
-                "SHOW TAGS requires: SHOW TAGS ON <table>".to_string(),
-            ));
-        }
-        return Ok(StatementKind::ShowTags(table));
-    }
-
-    // Pre-scan for ALTER TABLE ... CREATE/DROP BRANCH|TAG. These are not part of
-    // standard SQL and sqlparser-rs will either reject them or classify them as
-    // generic AlterTable statements, losing the branch/tag semantics.
-    if upper.starts_with("ALTER TABLE ") {
-        // Trino spells Iceberg table-property updates
-        // `ALTER TABLE t SET PROPERTIES k = v [, ...]` (no parentheses, no
-        // TBLPROPERTIES keyword). sqlparser only accepts the parenthesized
-        // `SET TBLPROPERTIES (k = v, ...)` form, so rewrite the Trino form and
-        // re-classify; the existing AlterTableProps handler then commits them
-        // as Iceberg SetProperties (#338).
-        if let Some(rewritten) = rewrite_set_properties(trimmed) {
-            return parse_and_classify(&rewritten);
-        }
-        if let Some(ref_ddl) = try_parse_ref_ddl(trimmed)? {
-            return Ok(StatementKind::RefDdl(Box::new(ref_ddl)));
-        }
-        // Pre-scan for ALTER TABLE ... ADD/DROP PARTITION (Hive-style,
-        // concrete partition values, optional LOCATION / PURGE). Tried
-        // BEFORE the partition-evolution parser: both start with
-        // "ADD/DROP PARTITION", but the evolution form continues with
-        // FIELD and this one with `(`. Each returns Ok(None) for the
-        // other's shape, so the order is belt-and-braces rather than
-        // load-bearing -- but keeping the paren form first means a future
-        // loosening of either parser cannot silently capture the other.
-        if let Some(ddl) = crate::hive_partitions::try_parse_hive_partition_ddl(trimmed)? {
-            return Ok(StatementKind::HivePartitionDdl(Box::new(ddl)));
-        }
-        // Pre-scan for ALTER TABLE ... ADD/DROP/REPLACE PARTITION FIELD. The
-        // transform expression form is non-standard and sqlparser-rs models
-        // only Hive-style PARTITION (col=val), so we intercept here.
-        if let Some(pe) = try_parse_partition_evolution(trimmed)? {
-            return Ok(StatementKind::PartitionEvolution(Box::new(pe)));
-        }
-        // ALTER TABLE ... MODIFY|ALTER COLUMN ... SET|UNSET MASKING POLICY.
-        // Tried BEFORE the tag forms. The tag parser returns Ok(None) for these
-        // (asserted by `the_tag_parser_does_not_claim_the_masking_policy_forms`),
-        // so the order is not load-bearing today -- but keeping the more specific
-        // form first means a future loosening of the tag parser cannot silently
-        // capture a masking-policy statement.
-        if let Some(op) = try_parse_masking_policy(sql)? {
-            return Ok(StatementKind::SetMaskingPolicy(Box::new(op)));
-        }
-        // ALTER TABLE ... SET TAGS / UNSET TAGS / MODIFY|ALTER COLUMN ... SET TAG.
-        // Column-tag authoring; distinct from Iceberg snapshot CREATE/DROP TAG above.
-        if let Some(set_tags) = try_parse_set_tags(trimmed)? {
-            return Ok(StatementKind::SetTags(Box::new(set_tags)));
-        }
-        // ALTER TABLE t DROP COLUMN a.b — a dotted path drops a nested struct
-        // subfield. sqlparser 0.62 rejects the `.` with a baffling
-        // `Expected: end of statement, found: .`, so intercept the dotted form
-        // and route it to the nested-drop handler, which rewrites the struct
-        // field without the subfield. A non-dotted DROP COLUMN still flows to
-        // sqlparser and the normal AlterSchema handler. (#336)
-        if let Some((table, path, if_exists)) = detect_nested_drop_column(trimmed) {
-            return Ok(StatementKind::DropNestedColumn {
-                table,
-                path,
-                if_exists,
-            });
-        }
-    }
-
-    // ATTACH/DETACH/CREATE SECRET/DROP SECRET/SHOW SECRETS: SQE extensions
-    // that sqlparser-rs does not understand. Match these before falling
-    // through to sqlparser so the user sees a precise diagnostic if they
-    // get the option-list shape wrong, and so SHOW SECRETS doesn't get
-    // mis-classified as a generic SHOW variable.
-    if is_show_secrets(trimmed) {
-        return Ok(StatementKind::ShowSecrets);
-    }
-    if upper.starts_with("ATTACH ") {
-        if let Some(stmt) = try_parse_attach(trimmed)? {
-            return Ok(StatementKind::Attach(Box::new(stmt)));
-        }
-        // Fell through: legacy SQLite `ATTACH '<file>' AS <name>` shape, or a
-        // malformed input. Hand to sqlparser; it will produce
-        // `Statement::AttachDatabase` which the classifier currently has no
-        // arm for, so the existing NotImplemented error surfaces (preserving
-        // old behaviour for any SQL that worked before this change).
-    }
-    if upper.starts_with("DETACH ") || upper == "DETACH" {
-        if let Some(stmt) = try_parse_detach(trimmed)? {
-            return Ok(StatementKind::Detach(Box::new(stmt)));
-        }
-    }
-    if upper.starts_with("CREATE SECRET ") {
-        if let Some(stmt) = try_parse_create_secret(trimmed)? {
-            return Ok(StatementKind::CreateSecret(Box::new(stmt)));
-        }
-    }
-    if upper.starts_with("DROP SECRET ") {
-        if let Some(stmt) = try_parse_drop_secret(trimmed)? {
-            return Ok(StatementKind::DropSecret(Box::new(stmt)));
-        }
-    }
-
-    // SET WRITE_BRANCH = '<name>' routes writes to a named Iceberg branch.
-    // We intercept it here so the coordinator can update session state
-    // without going through DataFusion's generic SET handling.
-    if let Some(rest) = strip_prefix_ci(trimmed, "SET WRITE_BRANCH") {
-        let rest = rest.trim().trim_end_matches(';').trim();
-        // Accept: SET WRITE_BRANCH = 'name', SET WRITE_BRANCH 'name',
-        //         SET WRITE_BRANCH = DEFAULT, SET WRITE_BRANCH = NULL
-        let stripped = rest.strip_prefix('=').unwrap_or(rest).trim();
-        let upper_val = stripped.to_ascii_uppercase();
-        if upper_val == "DEFAULT" || upper_val == "NULL" || stripped.is_empty() {
-            return Ok(StatementKind::SetWriteBranch(None));
-        }
-        let name = stripped
-            .trim_start_matches('\'')
-            .trim_end_matches('\'')
-            .trim_start_matches('"')
-            .trim_end_matches('"')
-            .to_string();
-        return Ok(StatementKind::SetWriteBranch(Some(name)));
-    }
-
-    // Trino's `CREATE TABLE new (LIKE src)` copies a table's schema. sqlparser's
-    // GenericDialect does not support the parenthesized LIKE form (it parses the
-    // body as a column named `LIKE` of type `src`), so rewrite the pure form to
-    // the plain `CREATE TABLE new LIKE src`, which sqlparser records in
-    // `CreateTable.like`. The coordinator's create handler copies the source
-    // schema (#343).
-    if let Some(rewritten) = rewrite_create_table_like(trimmed) {
-        return parse_and_classify(&rewritten);
-    }
-
+/// Tokenize once, reject multi-statement input, classify SQE-only grammar
+/// from the tokens, and otherwise parse with sqlparser. Both
+/// [`parse_and_classify`] and the SQL front door start here.
+pub(crate) fn dispatch(sql: &str) -> sqe_core::Result<Dispatch> {
     let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
-        .map_err(|e| sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Parse error: {e}")))?;
+    let tokens = crate::token_scan::tokenize(&dialect, sql)?;
+    crate::token_scan::reject_multi_statement(&tokens)?;
+    let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens);
+    if let Some(kind) = try_classify_custom(&mut parser, sql)? {
+        return Ok(Dispatch::Custom(kind));
+    }
+    Ok(Dispatch::Standard(parser.parse_statements()))
+}
 
+/// Parse a SQL string and classify its statement.
+///
+/// Exactly one statement is accepted: `SELECT 1; SELECT 2` is a
+/// `SyntaxError` naming the position of the second statement, never a
+/// silent execution of the first (finding 107). SQE-only grammar is
+/// recognised on the token stream, so comments, quoting and case are
+/// handled the way the parser handles them; standard statements are
+/// classified from the sqlparser AST. Errors carry `SqeErrorCode::SyntaxError`
+/// with the parser error as source.
+pub fn parse_and_classify(sql: &str) -> sqe_core::Result<StatementKind> {
+    match dispatch(sql)? {
+        Dispatch::Custom(kind) => Ok(kind),
+        Dispatch::Standard(parsed) => {
+            let statements = parsed.map_err(parse_error)?;
+            classify_single(statements)
+        }
+    }
+}
+
+/// Classify the one statement in `statements` after the expression-depth
+/// guard. Shared by [`parse_and_classify`] and the front door.
+pub(crate) fn classify_single(statements: Vec<Statement>) -> sqe_core::Result<StatementKind> {
     // Reject pathologically deep expression trees up front, before any
     // recursive AST visitor (the Trino-compat rewrite, then DataFusion's
     // analyzer) walks them and overflows the stack. A flat `a OR a OR ...`
     // chain parses cleanly but builds a depth-N tree; the guard turns that
     // into a clean parse error instead of an uncatchable process abort.
     crate::trino_compat::check_expression_depth(&statements)
-        .map_err(|e| sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!("Parse error: {e}")))?;
-
+        .map_err(|e| syntax_error(format!("Parse error: {e}")))?;
     let stmt = statements
         .into_iter()
         .next()
-        .ok_or_else(|| sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, "Empty SQL".to_string()))?;
-
+        .ok_or_else(|| syntax_error("Empty SQL"))?;
     classify(stmt)
 }
 
-fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
+/// Recognise SQE-only grammar from the leading tokens and parse it.
+///
+/// Dispatch is on the leading unquoted words, so a quoted identifier such as
+/// `"show"` never matches, a leading `-- comment` is skipped, and `ShOw TaGs`
+/// is the same as `SHOW TAGS`. Every arm that consumes tokens returns; the
+/// arms that hand the statement text to a string-based sub-parser only peek,
+/// so on `Ok(None)` the parser is still at the first token and the caller
+/// can run the standard parse on the same token stream.
+///
+/// `body` is the statement text from its first significant token (leading
+/// comments and whitespace removed). It is what the remaining string-based
+/// sub-parsers (`ALTER TABLE` extensions, `ATTACH`, secrets, policy DDL)
+/// receive.
+fn try_classify_custom(parser: &mut Parser, sql: &str) -> sqe_core::Result<Option<StatementKind>> {
+    let words = leading_words(parser, 5);
+    let w: Vec<&str> = words.iter().map(String::as_str).collect();
+    let body = remaining_text(parser, sql);
+
+    let kind = match w.as_slice() {
+        // `CREATE [OR REPLACE] POLICY ...` / `DROP POLICY ...` (string-based
+        // sub-parser; returns None for every other CREATE/DROP).
+        ["CREATE", ..] | ["DROP", ..] if try_parse_policy_ddl(body)?.is_some() => {
+            try_parse_policy_ddl(body)?.map(|p| StatementKind::PolicyDdl(Box::new(p)))
+        }
+        // SHOW CATALOGS [anything]: sqlparser reads it as a variable.
+        ["SHOW", "CATALOGS", ..] => Some(StatementKind::ShowCatalogs),
+        // SHOW CREATE SCHEMA <name>: sqlparser 0.62 only models SHOW CREATE
+        // for TABLE/VIEW/... and rejects the SCHEMA form outright. (#351a)
+        ["SHOW", "CREATE", "SCHEMA", ..] => {
+            consume_words(parser, &["SHOW", "CREATE", "SCHEMA"]);
+            if at_end(parser) {
+                return Err(syntax_error("SHOW CREATE SCHEMA requires a schema name"));
+            }
+            let schema = parse_name_ref(parser)?;
+            expect_end(parser)?;
+            Some(StatementKind::ShowCreateSchema(schema))
+        }
+        // EXPLAIN FULL <statement>: not standard SQL. The inner statement is
+        // carried as text and goes through the normal path later.
+        ["EXPLAIN", "FULL", ..] => {
+            consume_words(parser, &["EXPLAIN", "FULL"]);
+            let inner = remaining_text(parser, sql);
+            if inner.is_empty() {
+                return Err(syntax_error("EXPLAIN FULL requires a statement"));
+            }
+            Some(StatementKind::ExplainFull(inner.to_string()))
+        }
+        // SHOW STATS FOR <table>: sqlparser reads it as a variable.
+        ["SHOW", "STATS", "FOR", ..] => {
+            consume_words(parser, &["SHOW", "STATS", "FOR"]);
+            let table = parse_name_ref(parser)?;
+            expect_end(parser)?;
+            Some(StatementKind::ShowStats(table))
+        }
+        // SHOW PARTITIONS <table>: sqlparser reads it as a variable. LIKE /
+        // WHERE / extra clauses are not implemented and are rejected rather
+        // than swallowed into the table name.
+        ["SHOW", "PARTITIONS", ..] => {
+            consume_words(parser, &["SHOW", "PARTITIONS"]);
+            if at_end(parser) {
+                return Err(syntax_error(
+                    "SHOW PARTITIONS requires: SHOW PARTITIONS <table>",
+                ));
+            }
+            let table = parse_name_ref(parser)?;
+            if !at_end(parser) {
+                return Err(syntax_error(
+                    "SHOW PARTITIONS does not support LIKE or extra clauses; use \
+                     SHOW PARTITIONS <table>",
+                ));
+            }
+            Some(StatementKind::ShowPartitions(table))
+        }
+        // ANALYZE [TABLE] <table> [WITH (...)]: sqlparser's parse_analyze
+        // stops at WITH. SQE treats ANALYZE as a stats no-op (#329), so the
+        // trailing properties clause is accepted and ignored.
+        ["ANALYZE", ..] => {
+            consume_word(parser, "ANALYZE");
+            consume_word(parser, "TABLE");
+            if at_end(parser) {
+                return Err(syntax_error(
+                    "ANALYZE requires a table name: ANALYZE [catalog.][schema.]table [WITH (...)]",
+                ));
+            }
+            let table = parse_name_ref(parser)?;
+            Some(StatementKind::Analyze(table))
+        }
+        // SHOW EFFECTIVE GRANTS FOR USER "name"
+        ["SHOW", "EFFECTIVE", "GRANTS", "FOR", "USER"] => {
+            consume_words(parser, &["SHOW", "EFFECTIVE", "GRANTS", "FOR", "USER"]);
+            let user = parse_principal_name(parser)?;
+            expect_end(parser)?;
+            Some(StatementKind::ShowEffectiveGrants(user))
+        }
+        // SHOW GRANTS ON [catalog.]namespace[.table]
+        ["SHOW", "GRANTS", "ON", ..] => {
+            consume_words(parser, &["SHOW", "GRANTS", "ON"]);
+            let name = parser.parse_object_name(false).map_err(parse_error)?;
+            expect_end(parser)?;
+            let (catalog, namespace, table) = resource_parts(&name)?;
+            Some(StatementKind::ShowGrants(ShowGrantsTarget::OnResource {
+                catalog,
+                namespace,
+                table,
+            }))
+        }
+        // SHOW GRANTS TO GROUP|USER|ROLE "name"
+        ["SHOW", "GRANTS", "TO", ..] => {
+            consume_words(parser, &["SHOW", "GRANTS", "TO"]);
+            let Some(grantee_type) = word_at(parser, 0) else {
+                return Err(syntax_error(
+                    "SHOW GRANTS TO requires: SHOW GRANTS TO GROUP|USER \"name\"",
+                ));
+            };
+            parser.next_token();
+            if at_end(parser) {
+                return Err(syntax_error(
+                    "SHOW GRANTS TO requires: SHOW GRANTS TO GROUP|USER \"name\"",
+                ));
+            }
+            let grantee_name = parse_principal_name(parser)?;
+            expect_end(parser)?;
+            Some(StatementKind::ShowGrants(ShowGrantsTarget::ToGrantee {
+                grantee_type,
+                grantee_name,
+            }))
+        }
+        // CHECK ACCESS <privilege> ON <resource> FOR USER "name"
+        ["CHECK", "ACCESS", ..] => {
+            consume_words(parser, &["CHECK", "ACCESS"]);
+            Some(parse_check_access(parser)?)
+        }
+        // SHOW EFFECTIVE POLICY [FOR USER "name"] ON <table>
+        ["SHOW", "EFFECTIVE", "POLICY", ..] => {
+            consume_words(parser, &["SHOW", "EFFECTIVE", "POLICY"]);
+            Some(parse_show_effective_policy(parser)?)
+        }
+        // SHOW TAGS ON <table>: sqlparser reads `SHOW TAGS` as a variable.
+        ["SHOW", "TAGS", ..] => {
+            consume_words(parser, &["SHOW", "TAGS"]);
+            if !consume_word(parser, "ON") || at_end(parser) {
+                return Err(syntax_error("SHOW TAGS requires: SHOW TAGS ON <table>"));
+            }
+            let table = parse_name_ref(parser)?;
+            expect_end(parser)?;
+            Some(StatementKind::ShowTags(table))
+        }
+        // SHOW MASKING POLICIES / SHOW MASKING POLICY [<name>]. Both spellings
+        // are accepted with or without a name: operators type both, and the
+        // name simply filters.
+        ["SHOW", "MASKING", "POLICIES" | "POLICY", ..] => {
+            parser.next_token();
+            parser.next_token();
+            parser.next_token();
+            let name = if at_end(parser) {
+                None
+            } else {
+                let n = parse_principal_name(parser)?;
+                expect_end(parser)?;
+                Some(n)
+            };
+            Some(StatementKind::ShowMaskingPolicies(name))
+        }
+        // SHOW SECRETS: names and kinds only, never values.
+        ["SHOW", "SECRETS", ..] => {
+            consume_words(parser, &["SHOW", "SECRETS"]);
+            expect_end(parser)?;
+            Some(StatementKind::ShowSecrets)
+        }
+        // SHOW SESSION [LIKE '<pattern>'] (Trino session properties). (#628)
+        ["SHOW", "SESSION", ..] => {
+            consume_words(parser, &["SHOW", "SESSION"]);
+            let like = if consume_word(parser, "LIKE") {
+                Some(parser.parse_literal_string().map_err(parse_error)?)
+            } else {
+                None
+            };
+            expect_end(parser)?;
+            Some(StatementKind::ShowSession { like })
+        }
+        // SET WRITE_BRANCH [=] 'name' | DEFAULT | NULL: route this session's
+        // writes to a named Iceberg branch, bypassing DataFusion's generic SET.
+        ["SET", "WRITE_BRANCH", ..] => {
+            consume_words(parser, &["SET", "WRITE_BRANCH"]);
+            // The `=` is optional: `SET WRITE_BRANCH 'name'` is accepted too.
+            let _ = parser.consume_token(&Token::Eq);
+            let branch = parse_write_branch_value(parser)?;
+            expect_end(parser)?;
+            Some(StatementKind::SetWriteBranch(branch))
+        }
+        // SET SESSION <name> = <value> (Trino session property). (#628)
+        ["SET", "SESSION", ..] => {
+            consume_words(parser, &["SET", "SESSION"]);
+            let name = parse_name_ref(parser)?;
+            parser.expect_token(&Token::Eq).map_err(parse_error)?;
+            let value = literal_text(parser.parse_expr().map_err(parse_error)?);
+            expect_end(parser)?;
+            Some(StatementKind::SetSession { name, value })
+        }
+        // SET CATALOG <name>. (#628)
+        ["SET", "CATALOG", ..] => {
+            consume_words(parser, &["SET", "CATALOG"]);
+            let catalog = parse_name_ref(parser)?;
+            expect_end(parser)?;
+            Some(StatementKind::SetCatalog(catalog))
+        }
+        // RESET SESSION <name>. (#628)
+        ["RESET", "SESSION", ..] => {
+            consume_words(parser, &["RESET", "SESSION"]);
+            let name = parse_name_ref(parser)?;
+            expect_end(parser)?;
+            Some(StatementKind::ResetSession(name))
+        }
+        // DESCRIBE OUTPUT|INPUT <prepared>: sqlparser would read these as
+        // `DESCRIBE <table>`. (#628)
+        ["DESCRIBE" | "DESC", "OUTPUT", ..] => {
+            parser.next_token();
+            parser.next_token();
+            let name = parser.parse_identifier().map_err(parse_error)?.value;
+            expect_end(parser)?;
+            Some(StatementKind::DescribeOutput(name))
+        }
+        ["DESCRIBE" | "DESC", "INPUT", ..] => {
+            parser.next_token();
+            parser.next_token();
+            let name = parser.parse_identifier().map_err(parse_error)?.value;
+            expect_end(parser)?;
+            Some(StatementKind::DescribeInput(name))
+        }
+        // PREPARE <name> FROM <statement> (Trino). The PostgreSQL `AS` form
+        // parses natively and is classified from the AST. The body is parsed
+        // here so a malformed statement fails at PREPARE time. (#628)
+        ["PREPARE", _, "FROM", ..] => {
+            consume_word(parser, "PREPARE");
+            let name = parser.parse_identifier().map_err(parse_error)?.value;
+            expect_word(parser, "FROM")?;
+            let body = parser.parse_statement().map_err(parse_error)?;
+            expect_end(parser)?;
+            crate::trino_compat::check_expression_depth(std::slice::from_ref(&body))
+                .map_err(|e| syntax_error(format!("Parse error: {e}")))?;
+            Some(StatementKind::Prepare {
+                name,
+                body: Box::new(body),
+            })
+        }
+        // ALTER TABLE extensions that sqlparser rejects or flattens
+        // (branch/tag DDL, partition evolution, Hive partitions, tags,
+        // masking policies, nested DROP COLUMN, Trino SET PROPERTIES).
+        ["ALTER", "TABLE", ..] => classify_alter_table_extension(body)?,
+        // ATTACH / DETACH / CREATE SECRET / DROP SECRET: SQE extensions with a
+        // DuckDB-style option list. A legacy SQLite `ATTACH '<file>' AS
+        // <name>` falls through to sqlparser and its NotImplemented error.
+        ["ATTACH", ..] => try_parse_attach(body)?.map(|s| StatementKind::Attach(Box::new(s))),
+        ["DETACH", ..] => try_parse_detach(body)?.map(|s| StatementKind::Detach(Box::new(s))),
+        ["CREATE", "SECRET", ..] => {
+            try_parse_create_secret(body)?.map(|s| StatementKind::CreateSecret(Box::new(s)))
+        }
+        ["DROP", "SECRET", ..] => {
+            try_parse_drop_secret(body)?.map(|s| StatementKind::DropSecret(Box::new(s)))
+        }
+        // Trino's `CREATE TABLE new (LIKE src)`: rewritten to the plain
+        // `CREATE TABLE new LIKE src` sqlparser records in `CreateTable.like`,
+        // then re-classified. (#343)
+        ["CREATE", "TABLE", ..] => match rewrite_create_table_like(body) {
+            Some(rewritten) => Some(parse_and_classify(&rewritten)?),
+            None => None,
+        },
+        _ => None,
+    };
+    Ok(kind)
+}
+
+/// The `ALTER TABLE` family that sqlparser cannot express. Each sub-parser
+/// returns `Ok(None)` for the others' shapes; the order is belt-and-braces
+/// (most specific first) rather than load-bearing. These sub-parsers still
+/// take the statement text; `body` has leading comments removed.
+fn classify_alter_table_extension(body: &str) -> sqe_core::Result<Option<StatementKind>> {
+    // Trino spells Iceberg table-property updates
+    // `ALTER TABLE t SET PROPERTIES k = v [, ...]` (no parentheses, no
+    // TBLPROPERTIES keyword). sqlparser only accepts the parenthesized
+    // `SET TBLPROPERTIES (k = v, ...)` form, so rewrite the Trino form and
+    // re-classify; the existing AlterTableProps handler then commits them
+    // as Iceberg SetProperties (#338).
+    if let Some(rewritten) = rewrite_set_properties(body) {
+        return parse_and_classify(&rewritten).map(Some);
+    }
+    if let Some(ref_ddl) = try_parse_ref_ddl(body)? {
+        return Ok(Some(StatementKind::RefDdl(Box::new(ref_ddl))));
+    }
+    // Hive-style ADD/DROP PARTITION (concrete values, optional LOCATION /
+    // PURGE) before the partition-evolution form: both start with ADD/DROP
+    // PARTITION, the evolution form continues with FIELD and this one with
+    // `(`.
+    if let Some(ddl) = crate::hive_partitions::try_parse_hive_partition_ddl(body)? {
+        return Ok(Some(StatementKind::HivePartitionDdl(Box::new(ddl))));
+    }
+    if let Some(pe) = try_parse_partition_evolution(body)? {
+        return Ok(Some(StatementKind::PartitionEvolution(Box::new(pe))));
+    }
+    // MODIFY|ALTER COLUMN ... SET|UNSET MASKING POLICY before the tag forms:
+    // the tag parser returns Ok(None) for these (asserted by
+    // `the_tag_parser_does_not_claim_the_masking_policy_forms`), so keeping
+    // the more specific form first means a future loosening of the tag parser
+    // cannot silently capture a masking-policy statement.
+    if let Some(op) = try_parse_masking_policy(body)? {
+        return Ok(Some(StatementKind::SetMaskingPolicy(Box::new(op))));
+    }
+    if let Some(set_tags) = try_parse_set_tags(body)? {
+        return Ok(Some(StatementKind::SetTags(Box::new(set_tags))));
+    }
+    // DROP COLUMN a.b drops a nested struct subfield; sqlparser 0.62 rejects
+    // the `.`. A non-dotted DROP COLUMN flows to sqlparser. (#336)
+    if let Some((table, path, if_exists)) = detect_nested_drop_column(body) {
+        return Ok(Some(StatementKind::DropNestedColumn {
+            table,
+            path,
+            if_exists,
+        }));
+    }
+    Ok(None)
+}
+
+/// `SET WRITE_BRANCH` value: a quoted or bare name, or `DEFAULT` / `NULL` /
+/// nothing to reset to main.
+fn parse_write_branch_value(parser: &mut Parser) -> sqe_core::Result<Option<String>> {
+    let tok = parser.peek_token();
+    let value = match tok.token {
+        Token::EOF | Token::SemiColon => return Ok(None),
+        Token::Word(w) if w.quote_style.is_none() => {
+            if w.value.eq_ignore_ascii_case("DEFAULT") || w.value.eq_ignore_ascii_case("NULL") {
+                parser.next_token();
+                return Ok(None);
+            }
+            w.value
+        }
+        Token::Word(w) => w.value,
+        Token::SingleQuotedString(s) | Token::DoubleQuotedString(s) => s,
+        other => {
+            return Err(syntax_error(format!(
+                "SET WRITE_BRANCH expects a branch name, DEFAULT or NULL, found: {other}"
+            )));
+        }
+    };
+    parser.next_token();
+    Ok(Some(value))
+}
+
+/// The user-facing text of a literal expression: the unquoted string for
+/// string literals, the SQL text for everything else (`1`, `true`, `1.5`).
+fn literal_text(expr: Expr) -> String {
+    match expr {
+        Expr::Value(v) => match v.value {
+            Value::SingleQuotedString(s)
+            | Value::DoubleQuotedString(s)
+            | Value::EscapedStringLiteral(s)
+            | Value::NationalStringLiteral(s) => s,
+            other => other.to_string(),
+        },
+        other => other.to_string(),
+    }
+}
+
+/// Split a parsed `[catalog.][namespace.]table` reference into its unquoted
+/// parts. One part is a catalog, two are catalog.namespace, three are
+/// catalog.namespace.table; four or more is an error.
+fn resource_parts(
+    name: &ObjectName,
+) -> sqe_core::Result<(Option<String>, Option<String>, Option<String>)> {
+    let parts: Vec<String> = name
+        .0
+        .iter()
+        .map(|p| match p {
+            ObjectNamePart::Identifier(i) => i.value.clone(),
+            ObjectNamePart::Function(f) => f.to_string(),
+        })
+        .collect();
+    let mut it = parts.iter().cloned();
+    match parts.len() {
+        1 => Ok((it.next(), None, None)),
+        2 => Ok((it.next(), it.next(), None)),
+        3 => Ok((it.next(), it.next(), it.next())),
+        n => Err(syntax_error(format!(
+            "Resource reference has {n} parts (max 3): {name}"
+        ))),
+    }
+}
+
+/// Classify a parsed statement. Custom SQE grammar never reaches this
+/// function; see [`try_classify_custom`].
+pub(crate) fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
     match stmt {
         // SELECT / WITH ... SELECT
         Statement::Query(_) => Ok(StatementKind::Query(Box::new(stmt))),
@@ -849,29 +1047,19 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
 
         // SHOW <variable> — could be "SHOW CATALOGS" parsed as variable
         Statement::ShowVariable { ref variable } => {
-            let var_str: String = variable
+            let words: Vec<String> = variable
                 .iter()
                 .map(|i| i.value.to_ascii_uppercase())
-                .collect::<Vec<_>>()
-                .join(" ");
-            if var_str == "CATALOGS" {
-                Ok(StatementKind::ShowCatalogs)
-            } else if var_str.starts_with("SCHEMAS") {
-                let rest = var_str
-                    .strip_prefix("SCHEMAS")
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                Ok(StatementKind::ShowSchemas(rest))
-            } else if var_str.starts_with("TABLES") {
-                let rest = var_str
-                    .strip_prefix("TABLES")
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                Ok(StatementKind::ShowTables(rest))
-            } else {
-                Ok(StatementKind::Utility(Box::new(stmt)))
+                .collect();
+            match words.split_first() {
+                Some((first, [])) if first == "CATALOGS" => Ok(StatementKind::ShowCatalogs),
+                Some((first, rest)) if first == "SCHEMAS" => {
+                    Ok(StatementKind::ShowSchemas(rest.join(" ")))
+                }
+                Some((first, rest)) if first == "TABLES" => {
+                    Ok(StatementKind::ShowTables(rest.join(" ")))
+                }
+                _ => Ok(StatementKind::Utility(Box::new(stmt))),
             }
         }
 
@@ -894,23 +1082,69 @@ fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
         Statement::Commit { .. } => Ok(StatementKind::Commit),
         Statement::Rollback { .. } => Ok(StatementKind::Rollback),
 
-        // USE catalog.schema — session context switching
-        Statement::Use(ref use_stmt) => {
-            let target = use_stmt.to_string();
-            // Strip the "USE " prefix that Display adds
-            let target = target.strip_prefix("USE ").unwrap_or(&target).to_string();
-            Ok(StatementKind::Use(target))
+        // USE [CATALOG|SCHEMA|DATABASE] catalog.schema — session context
+        // switching. Read from the AST: the target is the object name as
+        // written (quotes preserved). Role / warehouse / secondary-role forms
+        // have no meaning here.
+        Statement::Use(ref use_stmt) => match use_stmt {
+            Use::Object(name) | Use::Catalog(name) | Use::Schema(name) | Use::Database(name) => {
+                Ok(StatementKind::Use(name.to_string()))
+            }
+            Use::Warehouse(_) | Use::Role(_) | Use::SecondaryRoles(_) | Use::Default => Err(
+                sqe_core::SqeError::NotImplemented(format!("Statement type not supported: {stmt}")),
+            ),
+        },
+
+        // TRUNCATE TABLE — routes to DELETE FROM without WHERE. Exactly one
+        // table: `TRUNCATE a, b` used to truncate `a` and report success
+        // (finding 107).
+        Statement::Truncate(ref truncate) => match truncate.table_names.as_slice() {
+            [single] => Ok(StatementKind::Truncate(single.name.to_string())),
+            many => Err(syntax_error(format!(
+                "TRUNCATE accepts exactly one table; got {} ({}). Run one TRUNCATE per table.",
+                many.len(),
+                many.iter()
+                    .map(|t| t.name.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        },
+
+        // PREPARE name AS <statement> (PostgreSQL form; the Trino FROM form
+        // is parsed from the token stream). The body is already parsed, so a
+        // malformed body never gets this far. (#628)
+        Statement::Prepare {
+            name, statement, ..
+        } => {
+            crate::trino_compat::check_expression_depth(std::slice::from_ref(&statement))
+                .map_err(|e| syntax_error(format!("Parse error: {e}")))?;
+            Ok(StatementKind::Prepare {
+                name: name.value,
+                body: statement,
+            })
         }
 
-        // TRUNCATE TABLE — routes to DELETE FROM without WHERE
-        Statement::Truncate(ref truncate) => {
-            let name = truncate
-                .table_names
-                .first()
-                .map(|t| t.name.to_string())
-                .unwrap_or_default();
-            Ok(StatementKind::Truncate(name))
+        // EXECUTE name [USING a, b] / EXECUTE name (a, b). (#628)
+        Statement::Execute {
+            name: Some(name),
+            parameters,
+            using,
+            immediate: false,
+            ..
+        } => {
+            let params = if using.is_empty() {
+                parameters
+            } else {
+                using.into_iter().map(|e| e.expr).collect()
+            };
+            Ok(StatementKind::Execute {
+                name: name.to_string(),
+                params,
+            })
         }
+
+        // DEALLOCATE [PREPARE] name. (#628)
+        Statement::Deallocate { name, .. } => Ok(StatementKind::Deallocate(name.value)),
 
         // CALL procedure — dispatch to Iceberg maintenance procedures when the
         // name is `system.<known>`. Unknown calls fall through to the generic
@@ -1040,10 +1274,8 @@ fn split_top_level(s: &str, delim: char) -> Vec<String> {
 /// `INCLUDING`/`EXCLUDING PROPERTIES` suffix is dropped (SQE copies the schema
 /// only). See #343.
 fn rewrite_create_table_like(trimmed: &str) -> Option<String> {
-    if !trimmed.to_ascii_uppercase().starts_with("CREATE TABLE ") {
-        return None;
-    }
-    // The parenthesized body begins at the first `(`.
+    // The caller has already established `CREATE TABLE` from the token
+    // stream. The parenthesized body begins at the first `(`.
     let lparen = trimmed.find('(')?;
     let inner = trimmed[lparen + 1..].trim_start();
     let after_like = strip_prefix_ci(inner, "LIKE ")?;
@@ -1061,84 +1293,41 @@ fn rewrite_create_table_like(trimmed: &str) -> Option<String> {
     Some(format!("{head} LIKE {src}"))
 }
 
-/// Parse the remainder of an `ANALYZE ...` statement (everything after the
-/// `ANALYZE ` prefix) into [`StatementKind::Analyze`] carrying the table
-/// reference. Accepts the optional `TABLE` keyword and ignores any trailing
-/// `WITH (...)`, `PARTITION (...)`, or `FOR COLUMNS ...` clause: the table
-/// name ends at the first whitespace or `(`. The reference is kept raw
-/// (possibly dotted) and resolved by the coordinator handler.
-fn parse_analyze(rest: &str) -> sqe_core::Result<StatementKind> {
-    let rest = rest.trim().trim_end_matches(';').trim();
-    // Optional `TABLE` keyword (Hive-style `ANALYZE TABLE t`).
-    let rest = strip_prefix_ci(rest, "TABLE ")
-        .map(str::trim)
-        .unwrap_or(rest);
-    let table = rest
-        .split(|c: char| c.is_whitespace() || c == '(')
-        .next()
-        .unwrap_or("")
-        .trim();
-    if table.is_empty() {
-        return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
-            "ANALYZE requires a table name: ANALYZE [catalog.][schema.]table [WITH (...)]"
-                .to_string(),
-        ));
-    }
-    Ok(StatementKind::Analyze(table.to_string()))
-}
-
-/// Parse a dotted resource reference like `catalog.namespace.table` into
-/// (catalog, namespace, table). Supports 1-part, 2-part, and 3-part names.
-/// Returns an error for 4+ part names (e.g. `a.b.c.d`).
-fn parse_resource_reference(
-    s: &str,
-) -> sqe_core::Result<(Option<String>, Option<String>, Option<String>)> {
-    let parts: Vec<&str> = s.split('.').map(|p| p.trim()).collect();
-    match parts.len() {
-        1 => Ok((Some(parts[0].to_string()), None, None)),
-        2 => Ok((Some(parts[0].to_string()), Some(parts[1].to_string()), None)),
-        3 => Ok((
-            Some(parts[0].to_string()),
-            Some(parts[1].to_string()),
-            Some(parts[2].to_string()),
-        )),
-        n => Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, format!(
-            "Resource reference has {n} parts (max 3): {s}"
-        ))),
-    }
-}
-
-/// Parse `CHECK ACCESS privilege ON resource FOR USER "name"`.
-fn parse_check_access(rest: &str) -> sqe_core::Result<StatementKind> {
-    let upper = rest.to_ascii_uppercase();
-    // Find " ON " to split privilege from the rest
-    let on_pos = upper.find(" ON ").ok_or_else(|| {
-        sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
-            "CHECK ACCESS requires: CHECK ACCESS <privilege> ON <resource> FOR USER \"<name>\""
-                .to_string(),
+/// Parse the tail of `CHECK ACCESS <privilege> ON <resource> FOR USER "name"`
+/// (the parser is positioned after `CHECK ACCESS`). The privilege is one or
+/// more words up to `ON`, kept as written.
+fn parse_check_access(parser: &mut Parser) -> sqe_core::Result<StatementKind> {
+    let bad_syntax = || {
+        syntax_error(
+            "CHECK ACCESS requires: CHECK ACCESS <privilege> ON <resource> FOR USER \"<name>\"",
         )
-    })?;
-    let privilege = rest[..on_pos].trim().to_string();
-    let after_on = rest[on_pos + 4..].trim();
-
-    // Find " FOR USER " to split resource from user
-    let after_on_upper = after_on.to_ascii_uppercase();
-    let for_user_pos = after_on_upper.find(" FOR USER ").ok_or_else(|| {
-        sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
-            "CHECK ACCESS requires: CHECK ACCESS <privilege> ON <resource> FOR USER \"<name>\""
-                .to_string(),
-        )
-    })?;
-    let resource = after_on[..for_user_pos].trim();
-    let user = after_on[for_user_pos + " FOR USER ".len()..]
-        .trim()
-        .trim_matches('"')
-        .trim_matches('\'')
-        .to_string();
-
-    let (catalog, namespace, table) = parse_resource_reference(resource)?;
+    };
+    let mut privilege_words: Vec<String> = Vec::new();
+    loop {
+        match parser.peek_token().token {
+            Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case("ON") => {
+                parser.next_token();
+                break;
+            }
+            Token::Word(w) => {
+                parser.next_token();
+                privilege_words.push(w.value);
+            }
+            _ => return Err(bad_syntax()),
+        }
+    }
+    if privilege_words.is_empty() {
+        return Err(bad_syntax());
+    }
+    let resource = parser.parse_object_name(false).map_err(|_| bad_syntax())?;
+    if !consume_words(parser, &["FOR", "USER"]) || at_end(parser) {
+        return Err(bad_syntax());
+    }
+    let user = parse_principal_name(parser)?;
+    expect_end(parser)?;
+    let (catalog, namespace, table) = resource_parts(&resource)?;
     Ok(StatementKind::CheckAccess(CheckAccessParams {
-        privilege,
+        privilege: privilege_words.join(" "),
         catalog,
         namespace,
         table,
@@ -1146,46 +1335,35 @@ fn parse_check_access(rest: &str) -> sqe_core::Result<StatementKind> {
     }))
 }
 
-/// Parse the remainder of a `SHOW EFFECTIVE POLICY ...` statement.
-///
-/// When `has_user` is true the input is `"<name>" ON <table>` (the
-/// `FOR USER ` prefix was already stripped); otherwise it is just `ON <table>`
-/// and the user defaults to the session user (`None`).
-fn parse_show_effective_policy(rest: &str, has_user: bool) -> sqe_core::Result<StatementKind> {
+/// Parse the tail of `SHOW EFFECTIVE POLICY [FOR USER "name"] ON <table>`
+/// (the parser is positioned after `SHOW EFFECTIVE POLICY`). Without `FOR
+/// USER` the user is `None` and the coordinator substitutes the session user.
+fn parse_show_effective_policy(parser: &mut Parser) -> sqe_core::Result<StatementKind> {
     let bad_syntax = || {
-        sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
-            "SHOW EFFECTIVE POLICY requires: SHOW EFFECTIVE POLICY [FOR USER \"<name>\"] ON <table>"
-                .to_string(),
+        syntax_error(
+            "SHOW EFFECTIVE POLICY requires: SHOW EFFECTIVE POLICY [FOR USER \"<name>\"] ON <table>",
         )
     };
-
-    let (user, table) = if has_user {
-        // Input is `<name> ON <table>` (the `FOR USER ` prefix was stripped).
-        let upper = rest.to_ascii_uppercase();
-        let on_pos = upper.find(" ON ").ok_or_else(bad_syntax)?;
-        let user = rest[..on_pos]
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .to_string();
-        if user.is_empty() {
-            return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
-                "SHOW EFFECTIVE POLICY FOR USER requires a non-empty user name".to_string(),
+    let user = if consume_words(parser, &["FOR", "USER"]) {
+        if at_end(parser) || word_at(parser, 0).as_deref() == Some("ON") {
+            return Err(syntax_error(
+                "SHOW EFFECTIVE POLICY FOR USER requires a non-empty user name",
             ));
         }
-        (Some(user), rest[on_pos + 4..].trim().to_string())
+        Some(parse_principal_name(parser)?)
     } else {
-        // Input is `ON <table>` (the bare-form remainder starts with `ON`).
-        let table = strip_prefix_ci(rest, "ON ").ok_or_else(bad_syntax)?;
-        (None, table.trim().to_string())
+        None
     };
-
-    if table.is_empty() {
-        return Err(sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
-            "SHOW EFFECTIVE POLICY requires a table after ON".to_string(),
+    if !consume_word(parser, "ON") {
+        return Err(bad_syntax());
+    }
+    if at_end(parser) {
+        return Err(syntax_error(
+            "SHOW EFFECTIVE POLICY requires a table after ON",
         ));
     }
-
+    let table = parse_name_ref(parser)?;
+    expect_end(parser)?;
     Ok(StatementKind::ShowEffectivePolicy(
         ShowEffectivePolicyParams { user, table },
     ))
@@ -2620,5 +2798,323 @@ mod show_masking_policy_tests {
             parse_and_classify("SHOW TAGS ON cat.ns.t").expect("show tags"),
             StatementKind::ShowTags(ref t) if t == "cat.ns.t"
         ));
+    }
+}
+
+/// Token-based dispatch (finding 107) and the Trino session statements
+/// (finding 708, item 1).
+#[cfg(test)]
+mod token_dispatch_tests {
+    use super::*;
+    use sqe_core::SqeErrorCode;
+
+    #[test]
+    fn multi_statement_input_is_rejected_with_a_typed_syntax_error() {
+        let err =
+            parse_and_classify("CREATE TABLE t (id INT); INSERT INTO t VALUES (1)").unwrap_err();
+        assert_eq!(err.error_code(), SqeErrorCode::SyntaxError);
+        assert!(
+            err.to_string().contains("line 1, column 26"),
+            "must name the second statement's position: {err}"
+        );
+        let err = parse_and_classify("SELECT 1; SELECT 2").unwrap_err();
+        assert_eq!(err.error_code(), SqeErrorCode::SyntaxError);
+        // Custom grammar goes through the same guard.
+        let err = parse_and_classify("SHOW TAGS ON t; SELECT 1").unwrap_err();
+        assert_eq!(err.error_code(), SqeErrorCode::SyntaxError);
+    }
+
+    #[test]
+    fn trailing_semicolons_and_semicolons_inside_literals_are_fine() {
+        assert!(matches!(
+            parse_and_classify("SELECT 1;"),
+            Ok(StatementKind::Query(_))
+        ));
+        assert!(matches!(
+            parse_and_classify("SELECT 'a; b';;"),
+            Ok(StatementKind::Query(_))
+        ));
+        assert!(matches!(
+            parse_and_classify("SHOW TAGS ON t;"),
+            Ok(StatementKind::ShowTags(ref t)) if t == "t"
+        ));
+    }
+
+    #[test]
+    fn truncate_of_several_tables_errors_instead_of_truncating_the_first() {
+        let err = parse_and_classify("TRUNCATE a, b").unwrap_err();
+        assert_eq!(err.error_code(), SqeErrorCode::SyntaxError);
+        assert!(err.to_string().contains("a, b"), "{err}");
+        assert!(matches!(
+            parse_and_classify("TRUNCATE TABLE a"),
+            Ok(StatementKind::Truncate(ref t)) if t == "a"
+        ));
+    }
+
+    #[test]
+    fn use_is_read_from_the_ast() {
+        assert!(matches!(
+            parse_and_classify("USE cat.sch"),
+            Ok(StatementKind::Use(ref t)) if t == "cat.sch"
+        ));
+        assert!(matches!(
+            parse_and_classify("use \"My Cat\".\"my schema\""),
+            Ok(StatementKind::Use(ref t)) if t == "\"My Cat\".\"my schema\""
+        ));
+        // Snowflake-style role/warehouse forms are not SQE grammar. The
+        // Generic dialect rejects them outright; either way, not a `Use`.
+        assert!(parse_and_classify("USE ROLE admin").is_err());
+    }
+
+    #[test]
+    fn a_leading_comment_does_not_hide_the_statement() {
+        assert!(matches!(
+            parse_and_classify("-- switch\nUSE x"),
+            Ok(StatementKind::Use(ref t)) if t == "x"
+        ));
+        assert!(matches!(
+            parse_and_classify("/* c */ show tags on t"),
+            Ok(StatementKind::ShowTags(ref t)) if t == "t"
+        ));
+        assert!(matches!(
+            parse_and_classify("-- c\nALTER TABLE t CREATE BRANCH b"),
+            Ok(StatementKind::RefDdl(_))
+        ));
+        assert!(matches!(
+            parse_and_classify("-- c\nSET WRITE_BRANCH = 'b'"),
+            Ok(StatementKind::SetWriteBranch(Some(ref b))) if b == "b"
+        ));
+    }
+
+    #[test]
+    fn parse_errors_are_typed_syntax_errors_with_the_parser_error_as_source() {
+        let err = parse_and_classify("SELEC 1").unwrap_err();
+        assert_eq!(err.error_code(), SqeErrorCode::SyntaxError);
+        assert!(err.to_string().contains("Parse error"), "{err}");
+        assert!(std::error::Error::source(&err).is_some());
+        let err = parse_and_classify("").unwrap_err();
+        assert_eq!(err.error_code(), SqeErrorCode::SyntaxError);
+        let err = parse_and_classify("SHOW TAGS").unwrap_err();
+        assert_eq!(err.error_code(), SqeErrorCode::SyntaxError);
+        let err = parse_and_classify("SELECT 'unterminated").unwrap_err();
+        assert_eq!(err.error_code(), SqeErrorCode::SyntaxError);
+    }
+
+    #[test]
+    fn quoted_identifiers_never_match_the_custom_dispatch() {
+        // `"show"` is a table name, not the SHOW keyword.
+        let err = parse_and_classify("\"show\" tags on t").unwrap_err();
+        assert_eq!(err.error_code(), SqeErrorCode::SyntaxError);
+        // A statement whose first word only looks like a keyword.
+        assert!(matches!(
+            parse_and_classify("SELECT * FROM analyze"),
+            Ok(StatementKind::Query(_))
+        ));
+    }
+
+    #[test]
+    fn custom_statements_reject_trailing_garbage() {
+        for sql in [
+            "SHOW STATS FOR t extra",
+            "SHOW TAGS ON t LIKE 'x'",
+            "SHOW SECRETS please",
+            "SHOW CREATE SCHEMA s t",
+            "SET WRITE_BRANCH = 'b' extra",
+        ] {
+            let err = parse_and_classify(sql).unwrap_err();
+            assert_eq!(err.error_code(), SqeErrorCode::SyntaxError, "{sql}");
+        }
+    }
+
+    #[test]
+    fn show_grants_and_check_access_unquote_their_parts() {
+        match parse_and_classify("SHOW GRANTS ON \"cat\".\"my ns\".t").unwrap() {
+            StatementKind::ShowGrants(ShowGrantsTarget::OnResource {
+                catalog,
+                namespace,
+                table,
+            }) => {
+                assert_eq!(catalog.as_deref(), Some("cat"));
+                assert_eq!(namespace.as_deref(), Some("my ns"));
+                assert_eq!(table.as_deref(), Some("t"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_and_classify("check access CREATE TABLE on cat.ns for user 'al ice'").unwrap() {
+            StatementKind::CheckAccess(p) => {
+                assert_eq!(p.privilege, "CREATE TABLE");
+                assert_eq!(p.catalog.as_deref(), Some("cat"));
+                assert_eq!(p.namespace.as_deref(), Some("ns"));
+                assert_eq!(p.table, None);
+                assert_eq!(p.user, "al ice");
+            }
+            other => panic!("{other:?}"),
+        }
+        let err = parse_and_classify("SHOW GRANTS TO").unwrap_err();
+        assert_eq!(err.error_code(), SqeErrorCode::SyntaxError);
+        let err = parse_and_classify("CHECK ACCESS ON t FOR USER x").unwrap_err();
+        assert_eq!(err.error_code(), SqeErrorCode::SyntaxError);
+    }
+
+    #[test]
+    fn explain_full_keeps_the_inner_text_verbatim() {
+        match parse_and_classify("-- c\nexplain full SELECT  a,b FROM t WHERE s = 'x;y';").unwrap()
+        {
+            StatementKind::ExplainFull(inner) => {
+                assert_eq!(inner, "SELECT  a,b FROM t WHERE s = 'x;y'")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(parse_and_classify("EXPLAIN FULL").is_err());
+    }
+
+    #[test]
+    fn analyze_accepts_and_ignores_trino_properties() {
+        assert!(matches!(
+            parse_and_classify("ANALYZE \"c\".\"s\".t WITH (columns = ARRAY['x'])"),
+            Ok(StatementKind::Analyze(ref t)) if t == "\"c\".\"s\".t"
+        ));
+        assert!(parse_and_classify("ANALYZE").is_err());
+        assert!(parse_and_classify("ANALYZE TABLE").is_err());
+    }
+
+    // -- Trino session statements (finding 708, item 1) --------------------
+
+    #[test]
+    fn prepare_from_parses_the_body_at_prepare_time() {
+        let err = parse_and_classify("PREPARE p FROM SELEC 1").unwrap_err();
+        assert_eq!(err.error_code(), SqeErrorCode::SyntaxError);
+        match parse_and_classify("PREPARE p FROM SELECT * FROM t WHERE x = ?").unwrap() {
+            StatementKind::Prepare { name, body } => {
+                assert_eq!(name, "p");
+                assert!(matches!(*body, Statement::Query(_)));
+            }
+            other => panic!("{other:?}"),
+        }
+        // PostgreSQL spelling classifies the same way.
+        assert!(matches!(
+            parse_and_classify("PREPARE p AS SELECT 1"),
+            Ok(StatementKind::Prepare { .. })
+        ));
+        assert_eq!(
+            parse_and_classify("PREPARE p FROM SELECT 1")
+                .unwrap()
+                .name(),
+            "prepare"
+        );
+    }
+
+    #[test]
+    fn execute_and_deallocate_come_from_the_ast() {
+        match parse_and_classify("EXECUTE p USING 1, 'a'").unwrap() {
+            StatementKind::Execute { name, params } => {
+                assert_eq!(name, "p");
+                assert_eq!(params.len(), 2);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            parse_and_classify("EXECUTE p"),
+            Ok(StatementKind::Execute { ref name, ref params }) if name == "p" && params.is_empty()
+        ));
+        assert!(matches!(
+            parse_and_classify("DEALLOCATE PREPARE p"),
+            Ok(StatementKind::Deallocate(ref n)) if n == "p"
+        ));
+        assert!(matches!(
+            parse_and_classify("deallocate p"),
+            Ok(StatementKind::Deallocate(ref n)) if n == "p"
+        ));
+    }
+
+    #[test]
+    fn session_property_statements() {
+        match parse_and_classify("SET SESSION iceberg.compression_codec = 'ZSTD'").unwrap() {
+            StatementKind::SetSession { name, value } => {
+                assert_eq!(name, "iceberg.compression_codec");
+                assert_eq!(value, "ZSTD");
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_and_classify("set session query_max_memory = 1").unwrap() {
+            StatementKind::SetSession { name, value } => {
+                assert_eq!(name, "query_max_memory");
+                assert_eq!(value, "1");
+            }
+            other => panic!("{other:?}"),
+        }
+        let err = parse_and_classify("SET SESSION x").unwrap_err();
+        assert_eq!(err.error_code(), SqeErrorCode::SyntaxError);
+        assert!(matches!(
+            parse_and_classify("RESET SESSION iceberg.compression_codec"),
+            Ok(StatementKind::ResetSession(ref n)) if n == "iceberg.compression_codec"
+        ));
+        assert!(matches!(
+            parse_and_classify("SHOW SESSION"),
+            Ok(StatementKind::ShowSession { like: None })
+        ));
+        assert!(matches!(
+            parse_and_classify("SHOW SESSION LIKE 'iceberg%'"),
+            Ok(StatementKind::ShowSession { like: Some(ref p) }) if p == "iceberg%"
+        ));
+        assert!(matches!(
+            parse_and_classify("SET CATALOG iceberg"),
+            Ok(StatementKind::SetCatalog(ref c)) if c == "iceberg"
+        ));
+        // Plain SET stays a utility statement for DataFusion.
+        assert!(matches!(
+            parse_and_classify("SET x = 1"),
+            Ok(StatementKind::Utility(_))
+        ));
+        // SET WRITE_BRANCH is still its own kind.
+        assert!(matches!(
+            parse_and_classify("SET WRITE_BRANCH = \"dev\""),
+            Ok(StatementKind::SetWriteBranch(Some(ref b))) if b == "dev"
+        ));
+    }
+
+    #[test]
+    fn describe_output_and_input() {
+        assert!(matches!(
+            parse_and_classify("DESCRIBE OUTPUT p"),
+            Ok(StatementKind::DescribeOutput(ref n)) if n == "p"
+        ));
+        assert!(matches!(
+            parse_and_classify("desc input p"),
+            Ok(StatementKind::DescribeInput(ref n)) if n == "p"
+        ));
+        // A plain DESCRIBE <table> still reaches sqlparser.
+        assert!(matches!(
+            parse_and_classify("DESCRIBE t"),
+            Ok(StatementKind::Utility(_))
+        ));
+    }
+
+    #[test]
+    fn update_type_of_kinds() {
+        use crate::metadata::UpdateType;
+        assert_eq!(
+            parse_and_classify("CREATE VIEW v AS SELECT 1")
+                .unwrap()
+                .update_type(),
+            Some(UpdateType::CreateView)
+        );
+        assert_eq!(
+            parse_and_classify("ALTER TABLE t ADD PARTITION FIELD bucket(16, id)")
+                .unwrap()
+                .update_type(),
+            Some(UpdateType::AlterTable)
+        );
+        assert_eq!(
+            parse_and_classify("SET SESSION a = 1")
+                .unwrap()
+                .update_type(),
+            Some(UpdateType::SetSession)
+        );
+        assert_eq!(
+            parse_and_classify("SHOW TAGS ON t").unwrap().update_type(),
+            None
+        );
+        assert_eq!(parse_and_classify("SELECT 1").unwrap().update_type(), None);
     }
 }

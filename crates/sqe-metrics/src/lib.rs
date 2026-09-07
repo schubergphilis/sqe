@@ -185,6 +185,11 @@ pub struct MetricsRegistry {
     // Adaptive sort metrics
     pub sorts_stripped_total: IntCounterVec,
 
+    // Post-planning physical rule failures (review 404 / #584). Labelled by
+    // rule name; a non-zero rate means a plan-shape rule is silently falling
+    // back to the previous plan (or, for fail-closed rules, aborting queries).
+    pub plan_rule_failures_total: IntCounterVec,
+
     // Write path: orphan parquet files from cancelled/failed writes (COORD-06).
     // Labelled by op (ctas/insert/...) and cleanup outcome (deleted/leaked) so
     // operators can alert on `outcome="leaked"` accumulation in S3.
@@ -605,6 +610,13 @@ impl MetricsRegistry {
             &["mode", "reason"],
         )?;
 
+        let plan_rule_failures_total = register_int_counter_vec(
+            &registry,
+            "sqe_plan_rule_failures_total",
+            "Post-planning physical rule failures, by rule name",
+            &["rule"],
+        )?;
+
         let catalog_request_duration_seconds = register_histogram_vec(
             &registry,
             HistogramOpts::new(
@@ -869,6 +881,7 @@ impl MetricsRegistry {
             auth_duration_seconds,
             token_refresh_total,
             sorts_stripped_total,
+            plan_rule_failures_total,
             catalog_request_duration_seconds,
             catalog_manifest_walk_seconds,
             catalog_circuit_breaker_state,

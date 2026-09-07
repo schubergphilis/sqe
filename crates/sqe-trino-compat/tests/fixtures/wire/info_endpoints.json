@@ -1,0 +1,20 @@
+[
+  {
+    "body": {
+      "coordinator": true,
+      "environment": "production",
+      "nodeVersion": {
+        "version": "test-version"
+      },
+      "starting": false,
+      "uptime": "<uptime>"
+    },
+    "status": 200,
+    "step": "info"
+  },
+  {
+    "status": 200,
+    "step": "state",
+    "text": "ACTIVE"
+  }
+]

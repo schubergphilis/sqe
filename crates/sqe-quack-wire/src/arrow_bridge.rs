@@ -240,6 +240,10 @@ pub fn logical_type_to_arrow(t: &LogicalType) -> crate::Result<arrow_schema::Dat
                 _ => return Err(crate::WireError::UnsupportedLogicalType(LogicalTypeId::Map)),
             };
             let entries_dt = logical_type_to_arrow(entries_struct)?;
+            // The Arrow spec requires the key field to be non-nullable and
+            // `MapArray::try_new` enforces it; the generic STRUCT mapping
+            // above marks every field nullable, so rebuild the entries type.
+            let entries_dt = map_entries_type(entries_dt)?;
             let entries_field = arrow_schema::Field::new("entries", entries_dt, false);
             A::Map(std::sync::Arc::new(entries_field), false)
         }
@@ -253,9 +257,16 @@ pub fn logical_type_to_arrow(t: &LogicalType) -> crate::Result<arrow_schema::Dat
                 }
             };
             let item_dt = logical_type_to_arrow(child)?;
+            // Arrow carries the list size as i32; a wire size past that can
+            // never be materialised, so refuse it at the schema step already.
+            let size = i32::try_from(size).map_err(|_| {
+                crate::WireError::UnsupportedArrowType(format!(
+                    "ARRAY size {size} exceeds Arrow's i32 FixedSizeList limit"
+                ))
+            })?;
             A::FixedSizeList(
                 std::sync::Arc::new(arrow_schema::Field::new("item", item_dt, true)),
-                size as i32,
+                size,
             )
         }
         LogicalTypeId::Enum => {
@@ -283,6 +294,26 @@ pub fn logical_type_to_arrow(t: &LogicalType) -> crate::Result<arrow_schema::Dat
         }
         other => return Err(crate::WireError::UnsupportedLogicalType(other)),
     })
+}
+
+/// Shape a MAP's `STRUCT(key, value)` entries type the way Arrow requires:
+/// exactly two fields, key non-nullable. Anything else is a malformed type
+/// from the wire and surfaces as an error rather than an assert later in
+/// `MapArray::try_new`.
+fn map_entries_type(entries_dt: DataType) -> crate::Result<DataType> {
+    let fields = match &entries_dt {
+        DataType::Struct(fields) if fields.len() == 2 => fields,
+        other => {
+            return Err(crate::WireError::UnsupportedArrowType(format!(
+                "MAP entries must be STRUCT(key, value), got {other:?}"
+            )))
+        }
+    };
+    let key = fields[0].as_ref().clone().with_nullable(false);
+    let value = fields[1].clone();
+    Ok(DataType::Struct(
+        vec![std::sync::Arc::new(key), value].into(),
+    ))
 }
 
 /// Build an Arrow [`Schema`] from a parallel `(names, types)` pair, suitable
@@ -1251,10 +1282,12 @@ fn string_to_strings<A: StringLikeArray>(
 /// `column_to_vector`.
 fn vector_to_array(vector: &Vector, row_count: usize) -> crate::Result<std::sync::Arc<dyn Array>> {
     use std::sync::Arc;
-    let nulls = validity_to_null_buffer(vector.validity.as_deref(), row_count);
+    let nulls = validity_to_null_buffer(vector.validity.as_deref(), row_count)?;
     match (&vector.data, vector.logical_type.id) {
         (VectorData::Strings(values), _) => {
-            // VARCHAR -> StringArray.
+            // VARCHAR -> StringArray. Capacity is bounded by the decoded
+            // payload, never by the wire header alone (issue #612).
+            ensure_rows_backed(values.len(), row_count)?;
             let mut builder = arrow_array::builder::StringBuilder::with_capacity(row_count, 0);
             for v in values.iter().take(row_count) {
                 match v {
@@ -1265,6 +1298,7 @@ fn vector_to_array(vector: &Vector, row_count: usize) -> crate::Result<std::sync
             Ok(Arc::new(builder.finish()))
         }
         (VectorData::Blobs(values), _) => {
+            ensure_rows_backed(values.len(), row_count)?;
             let mut builder = arrow_array::builder::BinaryBuilder::with_capacity(row_count, 0);
             for v in values.iter().take(row_count) {
                 match v {
@@ -1330,40 +1364,74 @@ fn list_or_map_to_array(
 ) -> crate::Result<std::sync::Arc<dyn Array>> {
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use std::sync::Arc;
-    let child_array = vector_to_array(child, child_count as usize)?;
-    // Build i32 offsets from the (offset, length) pairs. DuckDB sometimes
-    // stores list entries with gaps in the child buffer, so we cannot just
-    // accumulate lengths — we use the actual offsets.
-    let mut offsets: Vec<i32> = Vec::with_capacity(row_count + 1);
-    offsets.push(0);
-    for (off, len) in entries.iter().take(row_count) {
-        offsets.push((off + len) as i32);
+    // The header promised `row_count` rows; the entries list has to back every
+    // one of them before anything is sized from `row_count` (issue #612).
+    ensure_rows_backed(entries.len(), row_count)?;
+    let entries = &entries[..row_count];
+
+    // Pass 1 (pure arithmetic, no allocation): every `(off, len)` must fit
+    // Arrow's i32 offsets, and so must the compacted total. `off + len` and
+    // the running total are wire-controlled u64s; unchecked they wrap in
+    // release and hand `OffsetBuffer::new` a non-monotonic buffer (a panic).
+    let i32_max = i32::MAX as u64;
+    let mut total: u64 = 0;
+    let mut contiguous = true;
+    let mut expected_off: u64 = 0;
+    for &(off, len) in entries {
+        let end = off
+            .checked_add(len)
+            .filter(|end| *end <= i32_max)
+            .ok_or_else(|| list_offset_error(off, len))?;
+        total = total
+            .checked_add(len)
+            .filter(|t| *t <= i32_max)
+            .ok_or_else(|| list_offset_error(off, len))?;
+        if off != expected_off {
+            contiguous = false;
+        }
+        expected_off = end;
     }
-    // For Arrow ListArray the offsets must be monotonic starting at 0. When
-    // the source has gaps (a row's `offset` doesn't match the prior row's
-    // `offset + length`), we compact by copying the relevant child slice for
-    // each row. We use a fast path when offsets are already contiguous.
-    let contiguous = entries
-        .iter()
-        .scan(0u64, |acc, (off, len)| {
-            let ok = *off == *acc;
-            *acc = off + len;
-            Some(ok)
-        })
-        .all(|ok| ok);
+
+    let child_array = vector_to_array(child, child_count as usize)?;
+    let child_len = child_array.len() as u64;
+    // Pass 2: every range must lie inside the decoded child. `Array::slice`
+    // asserts this and would panic on a hostile entry.
+    for &(off, len) in entries {
+        // Cannot overflow: checked against i32::MAX in pass 1.
+        let end = off + len;
+        if end > child_len {
+            return Err(crate::WireError::CountExceedsRemaining {
+                count: end,
+                remaining: child_len,
+            });
+        }
+    }
+
+    // For Arrow ListArray the offsets must be monotonic starting at 0. DuckDB
+    // sometimes stores list entries with gaps in the child buffer (a row's
+    // `offset` doesn't match the prior row's `offset + length`); when it does
+    // we compact by copying the relevant child slice for each row. The fast
+    // path reuses the child as-is when the entries are already contiguous.
     let (final_offsets, final_child) = if contiguous {
+        let mut offsets: Vec<i32> = Vec::with_capacity(row_count + 1);
+        offsets.push(0);
+        for &(off, len) in entries {
+            // Fits: `off + len <= i32::MAX` was established in pass 1.
+            offsets.push((off + len) as i32);
+        }
         (offsets, child_array)
     } else {
         // Compact: build new offsets [0, len0, len0+len1, ...] and a new child
         // array that's a concatenation of each row's slice.
         let mut new_offsets: Vec<i32> = Vec::with_capacity(row_count + 1);
         new_offsets.push(0);
-        let mut accum: i32 = 0;
+        let mut accum: u64 = 0;
         let mut slices: Vec<std::sync::Arc<dyn Array>> = Vec::with_capacity(row_count);
-        for (off, len) in entries.iter().take(row_count) {
-            accum += *len as i32;
-            new_offsets.push(accum);
-            slices.push(child_array.slice(*off as usize, *len as usize));
+        for &(off, len) in entries {
+            // `total <= i32::MAX` from pass 1 bounds every partial sum.
+            accum += len;
+            new_offsets.push(accum as i32);
+            slices.push(child_array.slice(off as usize, len as usize));
         }
         let refs: Vec<&dyn Array> = slices.iter().map(|a| a.as_ref()).collect();
         let concatenated = arrow::compute::concat(&refs).map_err(|e| {
@@ -1385,12 +1453,9 @@ fn list_or_map_to_array(
                     )))
                 }
             };
-            Ok(Arc::new(arrow_array::ListArray::new(
-                field,
-                offsets_buf,
-                final_child,
-                nulls,
-            )))
+            let list = arrow_array::ListArray::try_new(field, offsets_buf, final_child, nulls)
+                .map_err(arrow_err)?;
+            Ok(Arc::new(list))
         }
         LogicalTypeId::Map => {
             // The child of MAP is STRUCT(key, value). Arrow MapArray wraps it
@@ -1403,25 +1468,103 @@ fn list_or_map_to_array(
                     )))
                 }
             };
-            let struct_arr = final_child
+            let decoded_struct = final_child
                 .as_any()
                 .downcast_ref::<arrow_array::StructArray>()
                 .ok_or_else(|| {
                     crate::WireError::UnsupportedArrowType(
                         "MAP child must decode as StructArray".to_string(),
                     )
-                })?
-                .clone();
-            Ok(Arc::new(arrow_array::MapArray::new(
+                })?;
+            // `struct_to_array` marks every field nullable; the map entries
+            // type has a non-nullable key. Rebuild the entries with the exact
+            // field set `logical_type_to_arrow` produced so the two agree.
+            // `try_new` rejects a key column that carries nulls.
+            let entries_fields = match entries_field.data_type() {
+                arrow_schema::DataType::Struct(f) => f.clone(),
+                other => {
+                    return Err(crate::WireError::UnsupportedArrowType(format!(
+                        "MAP entries field must be a struct, got {other:?}"
+                    )))
+                }
+            };
+            let (_, columns, struct_nulls) = decoded_struct.clone().into_parts();
+            let struct_arr = arrow_array::StructArray::try_new_with_length(
+                entries_fields,
+                columns,
+                struct_nulls,
+                decoded_struct.len(),
+            )
+            .map_err(arrow_err)?;
+            let map = arrow_array::MapArray::try_new(
                 entries_field,
                 offsets_buf,
                 struct_arr,
                 nulls,
                 false,
-            )))
+            )
+            .map_err(arrow_err)?;
+            Ok(Arc::new(map))
         }
         other => Err(crate::WireError::UnsupportedLogicalType(other)),
     }
+}
+
+/// A LIST/MAP entry whose `offset + length` (or the compacted running total)
+/// does not fit Arrow's i32 offsets.
+fn list_offset_error(off: u64, len: u64) -> crate::WireError {
+    crate::WireError::UnsupportedArrowType(format!(
+        "list entry (offset {off}, length {len}) exceeds Arrow's i32 offset limit"
+    ))
+}
+
+/// Map an arrow constructor failure to a codec error. Every `try_new` in this
+/// module goes through here so a malformed chunk is a `WireError`, never an
+/// arrow assert.
+fn arrow_err(e: arrow_schema::ArrowError) -> crate::WireError {
+    crate::WireError::UnsupportedArrowType(format!("arrow rejected decoded chunk: {e}"))
+}
+
+/// The header promised `row_count` rows but the decoded payload only backs
+/// `backed`. Every `row_count`-sized allocation in this module is preceded by
+/// this check so a hostile header cannot drive a huge reservation (issue #612).
+fn ensure_rows_backed(backed: usize, row_count: usize) -> crate::Result<()> {
+    if backed < row_count {
+        return Err(crate::WireError::CountExceedsRemaining {
+            count: row_count as u64,
+            remaining: backed as u64,
+        });
+    }
+    Ok(())
+}
+
+/// Fixed-width variant of [`ensure_rows_backed`]: the buffer must hold at
+/// least `row_count * width` bytes. Overflow of the product is itself a
+/// mismatch.
+fn ensure_fixed_backed(bytes: &[u8], row_count: usize, width: usize) -> crate::Result<()> {
+    let needed = row_count
+        .checked_mul(width)
+        .ok_or(crate::WireError::CountExceedsRemaining {
+            count: row_count as u64,
+            remaining: bytes.len() as u64,
+        })?;
+    if bytes.len() < needed {
+        return Err(crate::WireError::CountExceedsRemaining {
+            count: needed as u64,
+            remaining: bytes.len() as u64,
+        });
+    }
+    Ok(())
+}
+
+/// Build a primitive array through `try_new` so a values/nulls length
+/// mismatch surfaces as a [`crate::WireError`] instead of an arrow panic.
+fn primitive<T: arrow_array::ArrowPrimitiveType>(
+    values: arrow_buffer::ScalarBuffer<T::Native>,
+    nulls: Option<arrow_buffer::NullBuffer>,
+) -> crate::Result<std::sync::Arc<dyn Array>> {
+    let array = arrow_array::PrimitiveArray::<T>::try_new(values, nulls).map_err(arrow_err)?;
+    Ok(std::sync::Arc::new(array))
 }
 
 fn struct_to_array(
@@ -1457,11 +1600,12 @@ fn struct_to_array(
         arrow_arrays.push(arr);
     }
     let fields_ref: arrow_schema::Fields = arrow_fields.into();
-    Ok(Arc::new(arrow_array::StructArray::new(
-        fields_ref,
-        arrow_arrays,
-        nulls,
-    )))
+    // `try_new_with_length` validates every child against `row_count` and
+    // returns an error instead of asserting.
+    let array =
+        arrow_array::StructArray::try_new_with_length(fields_ref, arrow_arrays, nulls, row_count)
+            .map_err(arrow_err)?;
+    Ok(Arc::new(array))
 }
 
 fn fixed_size_list_to_array_arrow(
@@ -1481,14 +1625,26 @@ fn fixed_size_list_to_array_arrow(
             )))
         }
     };
-    let child_count = (array_size as usize) * row_count;
+    // `logical_type_to_arrow` already rejected sizes past i32::MAX; the
+    // product is still wire-controlled and must not wrap.
+    let size = i32::try_from(array_size).map_err(|_| {
+        crate::WireError::UnsupportedArrowType(format!(
+            "ARRAY size {array_size} exceeds Arrow's i32 FixedSizeList limit"
+        ))
+    })?;
+    let child_count =
+        (size as usize)
+            .checked_mul(row_count)
+            .ok_or(crate::WireError::CountExceedsRemaining {
+                count: array_size,
+                remaining: row_count as u64,
+            })?;
     let child_arr = vector_to_array(child, child_count)?;
-    Ok(Arc::new(arrow_array::FixedSizeListArray::new(
-        field,
-        array_size as i32,
-        child_arr,
-        nulls,
-    )))
+    let array = arrow_array::FixedSizeListArray::try_new_with_length(
+        field, size, child_arr, nulls, row_count,
+    )
+    .map_err(arrow_err)?;
+    Ok(Arc::new(array))
 }
 
 /// Build a typed Arrow array from a tightly-packed little-endian byte buffer.
@@ -1501,9 +1657,11 @@ fn fixed_to_array(
     logical_type: &LogicalType,
 ) -> crate::Result<std::sync::Arc<dyn Array>> {
     use arrow_buffer::ScalarBuffer;
+    use arrow_types as t;
     use std::sync::Arc;
     match id {
         LogicalTypeId::Boolean => {
+            ensure_fixed_backed(bytes, row_count, 1)?;
             let mut builder = arrow_array::builder::BooleanBuilder::with_capacity(row_count);
             for (i, byte) in bytes.iter().enumerate().take(row_count) {
                 let valid = nulls.as_ref().map(|n| n.is_valid(i)).unwrap_or(true);
@@ -1515,81 +1673,62 @@ fn fixed_to_array(
             }
             Ok(Arc::new(builder.finish()))
         }
-        LogicalTypeId::TinyInt => Ok(Arc::new(Int8Array::new(
-            scalar_buffer_le::<i8>(bytes, row_count)?,
-            nulls,
-        ))),
-        LogicalTypeId::SmallInt => Ok(Arc::new(Int16Array::new(
-            scalar_buffer_le::<i16>(bytes, row_count)?,
-            nulls,
-        ))),
-        LogicalTypeId::Integer => Ok(Arc::new(Int32Array::new(
-            scalar_buffer_le::<i32>(bytes, row_count)?,
-            nulls,
-        ))),
-        LogicalTypeId::BigInt => Ok(Arc::new(Int64Array::new(
+        LogicalTypeId::TinyInt => {
+            primitive::<t::Int8Type>(scalar_buffer_le::<i8>(bytes, row_count)?, nulls)
+        }
+        LogicalTypeId::SmallInt => {
+            primitive::<t::Int16Type>(scalar_buffer_le::<i16>(bytes, row_count)?, nulls)
+        }
+        LogicalTypeId::Integer => {
+            primitive::<t::Int32Type>(scalar_buffer_le::<i32>(bytes, row_count)?, nulls)
+        }
+        LogicalTypeId::BigInt => {
+            primitive::<t::Int64Type>(scalar_buffer_le::<i64>(bytes, row_count)?, nulls)
+        }
+        LogicalTypeId::UTinyInt => {
+            primitive::<t::UInt8Type>(scalar_buffer_le::<u8>(bytes, row_count)?, nulls)
+        }
+        LogicalTypeId::USmallInt => {
+            primitive::<t::UInt16Type>(scalar_buffer_le::<u16>(bytes, row_count)?, nulls)
+        }
+        LogicalTypeId::UInteger => {
+            primitive::<t::UInt32Type>(scalar_buffer_le::<u32>(bytes, row_count)?, nulls)
+        }
+        LogicalTypeId::UBigInt => {
+            primitive::<t::UInt64Type>(scalar_buffer_le::<u64>(bytes, row_count)?, nulls)
+        }
+        LogicalTypeId::Float => {
+            primitive::<t::Float32Type>(scalar_buffer_le::<f32>(bytes, row_count)?, nulls)
+        }
+        LogicalTypeId::Double => {
+            primitive::<t::Float64Type>(scalar_buffer_le::<f64>(bytes, row_count)?, nulls)
+        }
+        LogicalTypeId::Date => {
+            primitive::<t::Date32Type>(scalar_buffer_le::<i32>(bytes, row_count)?, nulls)
+        }
+        LogicalTypeId::Time => {
+            primitive::<t::Time64MicrosecondType>(scalar_buffer_le::<i64>(bytes, row_count)?, nulls)
+        }
+        LogicalTypeId::TimeNs => {
+            primitive::<t::Time64NanosecondType>(scalar_buffer_le::<i64>(bytes, row_count)?, nulls)
+        }
+        LogicalTypeId::Timestamp => primitive::<t::TimestampMicrosecondType>(
             scalar_buffer_le::<i64>(bytes, row_count)?,
             nulls,
-        ))),
-        LogicalTypeId::UTinyInt => Ok(Arc::new(UInt8Array::new(
-            scalar_buffer_le::<u8>(bytes, row_count)?,
-            nulls,
-        ))),
-        LogicalTypeId::USmallInt => Ok(Arc::new(UInt16Array::new(
-            scalar_buffer_le::<u16>(bytes, row_count)?,
-            nulls,
-        ))),
-        LogicalTypeId::UInteger => Ok(Arc::new(UInt32Array::new(
-            scalar_buffer_le::<u32>(bytes, row_count)?,
-            nulls,
-        ))),
-        LogicalTypeId::UBigInt => Ok(Arc::new(UInt64Array::new(
-            scalar_buffer_le::<u64>(bytes, row_count)?,
-            nulls,
-        ))),
-        LogicalTypeId::Float => Ok(Arc::new(Float32Array::new(
-            scalar_buffer_le::<f32>(bytes, row_count)?,
-            nulls,
-        ))),
-        LogicalTypeId::Double => Ok(Arc::new(Float64Array::new(
-            scalar_buffer_le::<f64>(bytes, row_count)?,
-            nulls,
-        ))),
-        LogicalTypeId::Date => Ok(Arc::new(Date32Array::new(
-            ScalarBuffer::from(
-                bytes
-                    .chunks_exact(4)
-                    .take(row_count)
-                    .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
-                    .collect::<Vec<_>>(),
-            ),
-            nulls,
-        ))),
-        LogicalTypeId::Time => Ok(Arc::new(Time64MicrosecondArray::new(
+        ),
+        LogicalTypeId::TimestampSec => {
+            primitive::<t::TimestampSecondType>(scalar_buffer_le::<i64>(bytes, row_count)?, nulls)
+        }
+        LogicalTypeId::TimestampMs => primitive::<t::TimestampMillisecondType>(
             scalar_buffer_le::<i64>(bytes, row_count)?,
             nulls,
-        ))),
-        LogicalTypeId::TimeNs => Ok(Arc::new(Time64NanosecondArray::new(
+        ),
+        LogicalTypeId::TimestampNs => primitive::<t::TimestampNanosecondType>(
             scalar_buffer_le::<i64>(bytes, row_count)?,
             nulls,
-        ))),
-        LogicalTypeId::Timestamp => Ok(Arc::new(TimestampMicrosecondArray::new(
-            scalar_buffer_le::<i64>(bytes, row_count)?,
-            nulls,
-        ))),
-        LogicalTypeId::TimestampSec => Ok(Arc::new(TimestampSecondArray::new(
-            scalar_buffer_le::<i64>(bytes, row_count)?,
-            nulls,
-        ))),
-        LogicalTypeId::TimestampMs => Ok(Arc::new(TimestampMillisecondArray::new(
-            scalar_buffer_le::<i64>(bytes, row_count)?,
-            nulls,
-        ))),
-        LogicalTypeId::TimestampNs => Ok(Arc::new(TimestampNanosecondArray::new(
-            scalar_buffer_le::<i64>(bytes, row_count)?,
-            nulls,
-        ))),
+        ),
         LogicalTypeId::Uuid => {
+            ensure_fixed_backed(bytes, row_count, 16)?;
             let mut builder =
                 arrow_array::builder::FixedSizeBinaryBuilder::with_capacity(row_count, 16);
             for i in 0..row_count {
@@ -1610,6 +1749,7 @@ fn fixed_to_array(
             // closest match is Interval(MonthDayNano) which stores months/days/ns.
             // Widen micros -> nanoseconds on the way back.
             use arrow_array::types::IntervalMonthDayNano;
+            ensure_fixed_backed(bytes, row_count, 16)?;
             let mut values: Vec<IntervalMonthDayNano> = Vec::with_capacity(row_count);
             for i in 0..row_count {
                 // Checked slicing: row_count is wire-controlled and may exceed
@@ -1624,10 +1764,7 @@ fn fixed_to_array(
                     nanoseconds: micros.saturating_mul(1_000),
                 });
             }
-            Ok(Arc::new(IntervalMonthDayNanoArray::new(
-                ScalarBuffer::from(values),
-                nulls,
-            )))
+            primitive::<t::IntervalMonthDayNanoType>(ScalarBuffer::from(values), nulls)
         }
         LogicalTypeId::Decimal => {
             let (precision, scale) = match &logical_type.extra {
@@ -1641,6 +1778,7 @@ fn fixed_to_array(
                 }
             };
             let width = crate::data_chunk::decimal_physical_width(precision);
+            ensure_fixed_backed(bytes, row_count, width)?;
             let mut values: Vec<i128> = Vec::with_capacity(row_count);
             for i in 0..row_count {
                 // `width` is wire-influenced via `precision`; slice with bounds
@@ -1659,7 +1797,8 @@ fn fixed_to_array(
                 };
                 values.push(v);
             }
-            let arr = Decimal128Array::new(ScalarBuffer::from(values), nulls)
+            let arr = Decimal128Array::try_new(ScalarBuffer::from(values), nulls)
+                .map_err(arrow_err)?
                 .with_precision_and_scale(precision, scale as i8)
                 .map_err(|e| {
                     crate::WireError::UnsupportedArrowType(format!("decimal precision/scale: {e}"))
@@ -1675,33 +1814,47 @@ fn fixed_to_array(
                     ))
                 }
             };
-            let value_arr = StringArray::from_iter_values(values.iter().map(|s| s.as_str()));
+            let value_arr: Arc<dyn Array> = Arc::new(StringArray::from_iter_values(
+                values.iter().map(|s| s.as_str()),
+            ));
             let width = crate::data_chunk::enum_physical_width(values.len());
+            // `DictionaryArray::try_new` validates every key against the
+            // dictionary; a wire index past `values.len()` is an error here
+            // rather than an assert inside arrow.
             match width {
-                1 => Ok(Arc::new(arrow_array::DictionaryArray::<
-                    arrow_array::types::UInt8Type,
-                >::new(
-                    arrow_array::UInt8Array::new(scalar_buffer_le::<u8>(bytes, row_count)?, nulls),
-                    Arc::new(value_arr),
-                ))),
-                2 => Ok(Arc::new(arrow_array::DictionaryArray::<
-                    arrow_array::types::UInt16Type,
-                >::new(
-                    arrow_array::UInt16Array::new(
+                1 => {
+                    let keys = arrow_array::UInt8Array::try_new(
+                        scalar_buffer_le::<u8>(bytes, row_count)?,
+                        nulls,
+                    )
+                    .map_err(arrow_err)?;
+                    let dict =
+                        arrow_array::DictionaryArray::<t::UInt8Type>::try_new(keys, value_arr)
+                            .map_err(arrow_err)?;
+                    Ok(Arc::new(dict))
+                }
+                2 => {
+                    let keys = arrow_array::UInt16Array::try_new(
                         scalar_buffer_le::<u16>(bytes, row_count)?,
                         nulls,
-                    ),
-                    Arc::new(value_arr),
-                ))),
-                4 => Ok(Arc::new(arrow_array::DictionaryArray::<
-                    arrow_array::types::UInt32Type,
-                >::new(
-                    arrow_array::UInt32Array::new(
+                    )
+                    .map_err(arrow_err)?;
+                    let dict =
+                        arrow_array::DictionaryArray::<t::UInt16Type>::try_new(keys, value_arr)
+                            .map_err(arrow_err)?;
+                    Ok(Arc::new(dict))
+                }
+                4 => {
+                    let keys = arrow_array::UInt32Array::try_new(
                         scalar_buffer_le::<u32>(bytes, row_count)?,
                         nulls,
-                    ),
-                    Arc::new(value_arr),
-                ))),
+                    )
+                    .map_err(arrow_err)?;
+                    let dict =
+                        arrow_array::DictionaryArray::<t::UInt32Type>::try_new(keys, value_arr)
+                            .map_err(arrow_err)?;
+                    Ok(Arc::new(dict))
+                }
                 _ => Err(crate::WireError::UnsupportedLogicalType(
                     LogicalTypeId::Enum,
                 )),
@@ -1730,17 +1883,23 @@ fn checked_fixed_slice(bytes: &[u8], index: usize, width: usize) -> crate::Resul
         })
 }
 
+/// Turn a decoded validity mask into an Arrow null buffer of exactly
+/// `row_count` bits. A mask shorter than `row_count` is a header/payload
+/// mismatch: arrow's array constructors reject (or assert on) a null buffer
+/// whose length differs from the values, so fail here with a codec error.
 fn validity_to_null_buffer(
     validity: Option<&[bool]>,
     row_count: usize,
-) -> Option<arrow_buffer::NullBuffer> {
-    validity.map(|bits| {
-        let mut builder = arrow_buffer::BooleanBufferBuilder::new(row_count);
-        for &b in bits.iter().take(row_count) {
-            builder.append(b);
-        }
-        arrow_buffer::NullBuffer::new(builder.finish())
-    })
+) -> crate::Result<Option<arrow_buffer::NullBuffer>> {
+    let Some(bits) = validity else {
+        return Ok(None);
+    };
+    ensure_rows_backed(bits.len(), row_count)?;
+    let mut builder = arrow_buffer::BooleanBufferBuilder::new(row_count);
+    for &b in bits.iter().take(row_count) {
+        builder.append(b);
+    }
+    Ok(Some(arrow_buffer::NullBuffer::new(builder.finish())))
 }
 
 trait FromLeBytesScalar: Sized + arrow_array::ArrowNativeTypeOp {
@@ -1772,25 +1931,16 @@ fn scalar_buffer_le<T: FromLeBytesScalar>(
     row_count: usize,
 ) -> crate::Result<arrow_buffer::ScalarBuffer<T>> {
     let width = std::mem::size_of::<T>();
-    // Checked slicing: a wire `row_count` that exceeds the supplied byte
-    // buffer must surface a clear error instead of an index-out-of-bounds
-    // panic that aborts the consuming query task (remote DoS).
-    let mut values: Vec<T> = Vec::with_capacity(row_count);
-    for i in 0..row_count {
-        let start = i.checked_mul(width).ok_or_else(|| {
-            crate::WireError::UnsupportedArrowType("fixed buffer offset overflow".to_string())
-        })?;
-        let end = start.checked_add(width).ok_or_else(|| {
-            crate::WireError::UnsupportedArrowType("fixed buffer offset overflow".to_string())
-        })?;
-        let slice = bytes
-            .get(start..end)
-            .ok_or(crate::WireError::CountExceedsRemaining {
-                count: end as u64,
-                remaining: bytes.len() as u64,
-            })?;
-        values.push(T::from_le(slice));
-    }
+    // A wire `row_count` that exceeds the supplied byte buffer must surface a
+    // clear error instead of an index-out-of-bounds panic that aborts the
+    // consuming query task (remote DoS). Checking up front also bounds the
+    // allocation below by the bytes actually present, not by the header.
+    ensure_fixed_backed(bytes, row_count, width)?;
+    let values: Vec<T> = bytes
+        .chunks_exact(width)
+        .take(row_count)
+        .map(T::from_le)
+        .collect();
     Ok(arrow_buffer::ScalarBuffer::from(values))
 }
 
