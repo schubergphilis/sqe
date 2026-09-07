@@ -1,0 +1,20 @@
+[package]
+name = "sqe-policy-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+description = "Policy and grant interfaces shared by sqe-catalog and sqe-policy: PolicyStore, ResolvedPolicy, MaskType, GrantBackend, HiveCatalogs"
+
+[lib]
+name = "sqe_policy_api"
+path = "src/lib.rs"
+
+[dependencies]
+sqe-core = { path = "../sqe-core" }
+sqe-sql = { path = "../sqe-sql" }
+datafusion = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }

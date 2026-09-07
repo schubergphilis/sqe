@@ -13,7 +13,7 @@ use crate::access_control::{
     ShowGrantsParams,
 };
 
-use sqe_policy::grants::{
+use sqe_policy_api::grants::{
     AccessCheck, AccessCheckResult, GrantBackend, GrantEntry, GrantFilter, GrantStatement, Grantee,
     RevokeStatement,
 };
