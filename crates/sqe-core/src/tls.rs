@@ -497,6 +497,7 @@ mod tests {
 
     #[test]
     fn tls_load_rejects_garbage_pem() {
+        // nosemgrep: opt.aikido.semgrep-rules.rust.lang.security.temp-dir -- test-only scratch dir holding a garbage PEM, pid suffixed
         let dir = std::env::temp_dir().join(format!("sqe-tls-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let cert = dir.join("bad.crt");

@@ -128,6 +128,7 @@ def main() -> None:
     if git_rm:
         chunk = 200
         for i in range(0, len(git_rm), chunk):
+            # nosemgrep: opt.aikido.semgrep-rules.python.lang.security.audit.dangerous-subprocess-use-audit -- argv list, no shell
             subprocess.run(
                 ["git", "rm", "--quiet"] + git_rm[i : i + chunk],
                 check=True,

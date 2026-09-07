@@ -24,6 +24,7 @@ fn disable_imds() {
     // Safety: we are in a test binary; concurrent test threads inside
     // the same process all want this var set, so a duplicated set is a
     // no-op rather than a race.
+    // nosemgrep: opt.aikido.semgrep-rules.rust.lang.security.unsafe-usage -- test-only env var set (Rust 2024 requires unsafe); safety argued above
     unsafe {
         std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
     }

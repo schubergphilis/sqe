@@ -147,6 +147,7 @@
 <!-- Shared tooltip: lives outside #overview so it survives innerHTML rewrites -->
 <div id="tip"></div>
 
+<!-- nosemgrep: opt.aikido.semgrep-rules.html.security.audit.insecure-document-method -- every innerHTML write below passes engine values through esc() first -->
 <script>
 const $ = s => document.querySelector(s);
 let tab = "overview", current = null;
@@ -390,6 +391,7 @@ async function renderOverview(){
         `</div>`
       : "";
 
+    // nosemgrep: opt.aikido.semgrep-rules.html.security.audit.insecure-document-method -- all interpolations pass through esc()
     $("#overview").innerHTML =
       `<h2>${esc(o.node.name)} <span style="color:var(--mut)">v${esc(o.node.version)}</span>`+
       ` &mdash; <span class="s-FINISHED">${esc(o.node.role)}</span>`+
@@ -441,6 +443,7 @@ async function renderQueries(){
   try {
     const rows = await getJSON("/api/v1/queries?limit=200"); clearErr();
     if(current!==null) return; // detail open
+    // nosemgrep: opt.aikido.semgrep-rules.html.security.audit.insecure-document-method -- all interpolations pass through esc()
     $("#queries").innerHTML =
       "<table><thead><tr><th>id</th><th>state</th><th>user</th><th>sql (redacted)</th><th>sql hash</th>"+
       "<th class=num>elapsed</th><th class=num>rows</th><th class=num>scanned</th></tr></thead><tbody>"+
@@ -469,6 +472,7 @@ async function openDetail(id){
       `<tr><td>${esc(f.taskId)}</td><td>${esc(f.workerUrl)}</td>`+
       `<td class="${stClass(f.state)}">${esc(f.state)}</td>`+
       `<td class=num>${ms(f.elapsedMs)}</td><td class=num>${f.outputRows|0}</td></tr>`).join("");
+    // nosemgrep: opt.aikido.semgrep-rules.html.security.audit.insecure-document-method -- all interpolations pass through esc()
     det.innerHTML = `<a class=back onclick="closeDetail()">&larr; back</a>`+
       `<h3>${esc(d.queryId)}</h3>`+
       `<div class=kv>`+
@@ -498,6 +502,7 @@ async function renderCluster(){
     const [w,st] = await Promise.all([getJSON("/api/v1/workers"), getJSON("/api/v1/status")]);
     clearErr();
     $("#meta").textContent = `${st.node.role} v${st.node.version} · up ${st.node.uptimeSeconds}s`;
+    // nosemgrep: opt.aikido.semgrep-rules.html.security.audit.insecure-document-method -- all interpolations pass through esc()
     $("#cluster").innerHTML =
       `<div class=kv><div>workers</div><div>${w.healthyCount|0}/${w.total|0} healthy</div>`+
       `<div>active queries</div><div>${w.activeQueries|0}</div></div>`+

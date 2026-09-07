@@ -147,6 +147,7 @@ mod tests {
 
     #[test]
     fn test_spill_enabled_uses_temp_dir() {
+        // nosemgrep: opt.aikido.semgrep-rules.rust.lang.security.temp-dir -- test-only spill dir; production spill_dir is operator-configured
         let tmpdir = std::env::temp_dir().join("sqe-test-spill-enabled");
         let config = WorkerConfig {
             spill_to_disk: true,

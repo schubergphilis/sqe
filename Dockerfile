@@ -12,14 +12,13 @@
 # Final stage MUST stay named `runtime` (AIKIDO_DOCKER_TARGET in .gitlab-ci.yml).
 # Runtime stays Chainguard glibc-dynamic (UID 65532), with no shell.
 
-ARG RUST_VERSION=1.97.1
-
 # Reuse the packaged cargo-chef binary without surrendering the repository's
 # pinned Rust toolchain to whichever compiler the cargo-chef image currently
 # carries.
-FROM lukemathwalker/cargo-chef:latest-rust-bookworm AS cargo-chef-bin
+FROM lukemathwalker/cargo-chef:latest-rust-bookworm@sha256:b1ed45bf65418f5daa5348b39f05ec6a6f5950996e0b797dbe38326d18d42e41 AS cargo-chef-bin
 
-FROM rust:${RUST_VERSION}-bookworm AS chef
+# Renovate's "container images" group bumps tag and digest together; the rust tag must match rust-toolchain.toml.
+FROM rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS chef
 
 ARG TARGETARCH
 ARG SCCACHE_VERSION=0.9.0

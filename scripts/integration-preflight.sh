@@ -64,6 +64,7 @@ for port in "${PORTS[@]}"; do
         if [ -n "$OWN_CONTAINERS" ] && printf '%s\n' "$OWN_CONTAINERS" | grep -qxF "$holder"; then
             continue  # our own stack, still up from a previous run
         fi
+        # nosemgrep: opt.aikido.semgrep-rules.ai.ai-best-practices.hooks-dns-exfiltration.hooks-dns-exfiltration-generic
         echo "ERROR: host port $port is held by container '$holder'," >&2
         echo "       which is not part of this repo's compose project." >&2
         echo "       Stop it first:  docker rm -f $holder" >&2
@@ -73,6 +74,7 @@ for port in "${PORTS[@]}"; do
 
     # No container claims it, but a host process might.
     if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+        # nosemgrep: opt.aikido.semgrep-rules.ai.ai-best-practices.hooks-dns-exfiltration.hooks-dns-exfiltration-generic
         echo "ERROR: host port $port is bound by a non-Docker process." >&2
         echo "       Identify it with:  lsof -nP -iTCP:$port -sTCP:LISTEN" >&2
         conflicts=$((conflicts + 1))

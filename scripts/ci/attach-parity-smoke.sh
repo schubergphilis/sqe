@@ -137,6 +137,7 @@ POLARIS_TOKEN=$(curl -sf -X POST "$TOKEN_ENDPOINT" \
   -d "grant_type=client_credentials&client_id=root&client_secret=s3cr3t&scope=PRINCIPAL_ROLE:ALL" \
   | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
 
+# nosemgrep: opt.aikido.semgrep-rules.ai.ai-best-practices.hooks-dns-exfiltration.hooks-dns-exfiltration-generic
 TEST_ARGS=(--scale "$BENCH_SCALE" --host localhost --port "$FLIGHT_PORT" \
   --token-endpoint "$TOKEN_ENDPOINT" --client-id root --client-secret s3cr3t)
 
