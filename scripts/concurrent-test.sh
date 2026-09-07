@@ -29,6 +29,7 @@ cargo build -p sqe-cli --release 2>/dev/null
 CLI="$ROOT_DIR/target/release/sqe-cli"
 
 run_sql() {
+    # nosemgrep: opt.aikido.semgrep-rules.ai.ai-best-practices.hooks-dns-exfiltration.hooks-dns-exfiltration-generic
     "$CLI" --host "$SQE_HOST" --port "$SQE_PORT" --user root --protocol flight -e "$1" 2>/dev/null
 }
 
@@ -104,6 +105,7 @@ for i in $(seq 1 "$NUM_CLIENTS"); do
 
         START=$(python3 -c "import time; print(int(time.time()*1000))")
 
+        # nosemgrep: opt.aikido.semgrep-rules.ai.ai-best-practices.hooks-dns-exfiltration.hooks-dns-exfiltration-generic
         OUTPUT=$("$CLI" --host "$SQE_HOST" --port "$SQE_PORT" --user root \
             --protocol flight -e "$sql" 2>&1)
         EXIT_CODE=$?

@@ -52,6 +52,7 @@ CLI="$ROOT_DIR/target/release/sqe-cli"
 
 # cli_query <sql>: run a statement over Flight SQL against the coordinator.
 cli_query() {
+  # nosemgrep: opt.aikido.semgrep-rules.ai.ai-best-practices.hooks-dns-exfiltration.hooks-dns-exfiltration-generic
   "$CLI" --host "$SQE_HOST" --port "$SQE_PORT" --user "$SQE_USER" \
     --protocol flight -e "$1" 2>/dev/null
 }

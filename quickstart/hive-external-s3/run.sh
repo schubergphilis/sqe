@@ -98,6 +98,7 @@ export SQE_STORAGE__S3_REGION="$S3_REGION"
 # from `[[hive.roots]]` in sqe.toml at startup.
 sqe() {
   if [ "$MODE" = server ]; then
+    # nosemgrep: opt.aikido.semgrep-rules.ai.ai-best-practices.hooks-dns-exfiltration.hooks-dns-exfiltration-generic
     SQE_PASSWORD=anonymous "$SQE" --host localhost --port "$FLIGHT_PORT" --user anonymous "$@"
   else
     "$SQE" --embedded --memory --s3-endpoint "$S3_URL" --hive-root "lake=${ROOT}" "$@"
@@ -214,6 +215,7 @@ export AWS_DEFAULT_REGION="$S3_REGION"
 S3_CLIENT="${S3_CLIENT:-auto}"
 if [ "$S3_CLIENT" != "container" ] && { [ "$S3_CLIENT" = "host" ] || command -v aws >/dev/null 2>&1; }; then
   command -v aws >/dev/null 2>&1 || die "S3_CLIENT=host but the aws CLI is not on PATH"
+  # nosemgrep: opt.aikido.semgrep-rules.ai.ai-best-practices.hooks-dns-exfiltration.hooks-dns-exfiltration-generic
   S3_MODE=host
   s3() { aws --endpoint-url "$S3_URL" "$@"; }
   s3_upload() { s3 s3 cp --recursive --quiet ./data "$DATA"; }

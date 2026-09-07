@@ -7,6 +7,7 @@ use sqe_worker::runtime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn parse_config_path() -> String {
+    // nosemgrep: opt.aikido.semgrep-rules.rust.lang.security.args -- CLI argument parse for --config; value is only used as a config file path
     let mut args = std::env::args().skip(1);
     let mut positional = None;
     while let Some(arg) = args.next() {

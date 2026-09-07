@@ -556,6 +556,7 @@ key_prefix = "sqe_"
 ```toml
 # api-keys.toml
 [[keys]]
+# nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.generic-api-key -- placeholder value
 key = "sqe_abc123def456"
 user = "service-account-etl"
 roles = ["writer"]
