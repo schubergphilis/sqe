@@ -56,7 +56,10 @@ repos:
       - id: check-yaml
         # Helm templates are not YAML until rendered; multi-doc compose/k8s
         # manifests are valid and must not be split to appease the linter.
-        args: [--allow-multiple-documents]
+        # `--unsafe` keeps the syntax check but stops the hook constructing
+        # values, which is what lets .gitlab-ci.yml carry GitLab's own
+        # `!reference` tag; `glab ci lint` is the semantic check for that file.
+        args: [--allow-multiple-documents, --unsafe]
         exclude: ^deploy/helm/.*/templates/
       - id: trailing-whitespace
         args: [--markdown-linebreak-ext=md]
