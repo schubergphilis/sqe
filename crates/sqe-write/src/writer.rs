@@ -44,10 +44,10 @@ pub use sqe_compaction::writer::{
 
 /// Collect the live data files of the current snapshot. Mirrors the helper
 /// in `WriteHandler` but does not need access to the compression config.
-/// `pub(crate)` for the maintenance procedures (re-exported from
-/// `maintenance.rs`) and the shared sqlite test rig
+/// `pub` for the coordinator's maintenance procedures (re-exported from
+/// its `maintenance.rs`) and the shared sqlite test rig
 /// (`test_support::sqlite_rig::SqliteRig::live_files`, review 513).
-pub(crate) async fn collect_live_data_files(table: &Table) -> sqe_core::Result<Vec<DataFile>> {
+pub async fn collect_live_data_files(table: &Table) -> sqe_core::Result<Vec<DataFile>> {
     use futures::{StreamExt, TryStreamExt};
 
     let metadata_ref = table.metadata_ref();

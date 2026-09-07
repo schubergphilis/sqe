@@ -8,6 +8,7 @@ members = [
     "crates/sqe-policy",
     "crates/sqe-planner",
     "crates/sqe-trino-functions",
+    "crates/sqe-write",
     "crates/sqe-coordinator",
     "crates/sqe-compaction",
     "crates/sqe-worker",
