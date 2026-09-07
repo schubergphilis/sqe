@@ -19,9 +19,6 @@ pub(crate) fn scaled(scale: f64, base: f64) -> usize {
     (scale * base).max(1.0) as usize
 }
 
-// These fields and methods will be consumed by the generator implementations
-// added in Task 7; allow dead_code for now so clippy stays clean.
-#[allow(dead_code)]
 pub struct TableDef {
     pub name: String,
     pub schema: SchemaRef,
@@ -42,13 +39,11 @@ pub struct BatchSource {
     /// consumers that validate or introspect the shape before writing; the
     /// current `run_direct` driver derives its write schema from the
     /// catalog table instead, so it does not read this field.
-    #[allow(dead_code)]
     pub schema: SchemaRef,
     pub total_rows: usize,
     pub shards: Vec<BatchShard>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct GenerateStats {
     pub table: String,
@@ -59,7 +54,6 @@ pub struct GenerateStats {
 }
 
 pub trait BenchmarkGenerator: Send + Sync {
-    #[allow(dead_code)]
     fn name(&self) -> &str;
     fn tables(&self) -> Vec<TableDef>;
     fn generate_table(

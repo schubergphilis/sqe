@@ -174,6 +174,25 @@ impl QuackClientConfig {
     }
 }
 
+/// What the coordinator does when distributing a scan FAILS (finding 402 /
+/// #582): the manifest listing errored, the scheduler found no worker in the
+/// race window, the plan could not be rebuilt around the distributed scan.
+///
+/// Policy skips (below threshold, single-node, no Iceberg scan) are not
+/// failures and always run locally; this only governs infrastructure errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DistributionFallback {
+    /// Fail the query. A cluster whose workers cannot be reached says so
+    /// instead of silently running an N-worker scan on the coordinator.
+    #[default]
+    Error,
+    /// Log a warning, count it in `sqe_scheduler_decisions_total
+    /// {decision="local",reason="infrastructure_error"}` and run the scan on
+    /// the coordinator. The pre-402 behaviour, now opt-in.
+    Local,
+}
+
 /// Controls adaptive sort stripping behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -345,6 +364,12 @@ pub struct QueryConfig {
     /// Target size per scan task for bin-packing. Default: "256MB".
     #[serde(default = "default_target_task_size")]
     pub target_task_size: String,
+    /// What happens when distributing a scan fails for an infrastructure
+    /// reason (finding 402): `"error"` (default) fails the query, `"local"`
+    /// logs, counts and runs the scan on the coordinator. Irrelevant when no
+    /// worker registry is configured; policy skips always run locally.
+    #[serde(default)]
+    pub distribution_fallback: DistributionFallback,
     /// Dispatch Hive external table scans to workers (cycle 5).
     ///
     /// Defaults to FALSE. Hive scans have run coordinator-local since cycle 1,
@@ -563,6 +588,7 @@ impl Default for QueryConfig {
             distribution_threshold: default_distribution_threshold(),
             distribution_file_threshold: default_distribution_file_threshold(),
             target_task_size: default_target_task_size(),
+            distribution_fallback: DistributionFallback::Error,
             distributed_hive_scans: false,
             sort_mode: SortMode::Adaptive,
             late_materialization_min_projection_cols: default_late_mat_min_projection_cols(),

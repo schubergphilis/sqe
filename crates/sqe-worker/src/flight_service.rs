@@ -25,7 +25,7 @@ use sqe_compaction::writer::{new_upload_tracker, UploadedPaths};
 use sqe_core::FlightCompression;
 use sqe_metrics::propagation::extract_trace_context;
 use sqe_metrics::WorkerMetricsRegistry;
-use sqe_planner::ScanTask;
+use sqe_planner::{ScanTask, WorkerCapacity, WorkerFault, SCAN_TASK_VERSION_CURRENT};
 #[cfg(feature = "worker-shuffle")]
 use sqe_spill::{
     split_default_read_headroom, AdmissionRequest, AttemptManifest, ExchangeAttemptStore,
@@ -38,9 +38,48 @@ use crate::compaction::{
     build_file_io, delete_orphan_uploads, run_group_rewrite, CleanupOutcome, GroupRewriteCtx,
 };
 use crate::credential_channel::{CredentialStore, RefreshableCredentials};
-use crate::executor;
+use crate::executor::{self, ObjectStoreFactory};
 #[cfg(feature = "worker-shuffle")]
 use crate::shuffle::{ExchangeDescriptor, ShuffleManager};
+use crate::status::WorkerStatus;
+
+/// Yields `inner`'s items unchanged and drops `held` when the stream ends,
+/// errors out, or is dropped by a disconnected client.
+///
+/// Replaces the cleanup-sentinel idiom (finding 602): end-of-stream
+/// cleanup used to be a fake error chained after the batches and filtered back
+/// out by substring match, so a control signal travelled in the error channel
+/// and any real error containing the sentinel text was swallowed. Here the
+/// guard is plain state: the item stream is never touched.
+struct HoldUntilEnd<S, G> {
+    inner: Pin<Box<S>>,
+    held: Option<G>,
+}
+
+impl<S, G> HoldUntilEnd<S, G> {
+    fn new(inner: S, held: G) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            held: Some(held),
+        }
+    }
+}
+
+impl<S, G> Stream for HoldUntilEnd<S, G>
+where
+    S: Stream,
+    G: Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let item = Pin::new(&mut self.inner).poll_next(cx);
+        if let Poll::Ready(None) = item {
+            self.held = None;
+        }
+        item
+    }
+}
 #[cfg(feature = "worker-shuffle")]
 use crate::spill_buffer::SpillablePartitionBuffer;
 
@@ -90,7 +129,17 @@ where
                 self.metrics.flight_encode_resident_bytes.set(0.0);
                 Poll::Ready(None)
             }
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                // Being polled again is the proof the encoder is done with the
+                // previous batch, whether or not the next one is ready.
+                // Holding the permit across Pending deadlocked a budget
+                // smaller than two batches plus the fetch charge: the producer
+                // waited for this permit while the encoder waited for the
+                // producer (surfaced by the finding-611 refresh scenario).
+                self.held_permit = None;
+                self.metrics.flight_encode_resident_bytes.set(0.0);
+                Poll::Pending
+            }
         }
     }
 }
@@ -284,6 +333,17 @@ pub struct WorkerFlightService {
     /// (`worker.compaction_timeout_secs`, finding 608). `None` means the
     /// operator disabled it with 0.
     compaction_timeout: Option<std::time::Duration>,
+    /// Process identity and load counters the heartbeat reports (finding 609).
+    status: Arc<WorkerStatus>,
+    /// Builds the object store a scan reads through, initially and on every
+    /// credential refresh. Production: [`executor::s3_object_store_factory`].
+    /// The protocol tests install stubs so faults, refresh and cancellation
+    /// are observable without S3.
+    store_factory: ObjectStoreFactory,
+    /// Worker-wide scan byte budget shared by every `do_get`. `None` (the
+    /// default, and what bootstrap wires today) derives one budget per scan
+    /// from the session pool, as before.
+    scan_budget: Option<ByteBudget>,
     /// TEST-ONLY (`#[cfg(test)]`, so it compiles only for this crate's own
     /// unit test binary) replacement for the real rewrite, plus the `FileIO`
     /// the orphan cleanup runs against. Lets the finding-608 tests drive the
@@ -611,6 +671,9 @@ impl WorkerFlightService {
             compaction_timeout: Some(std::time::Duration::from_secs(
                 DEFAULT_COMPACTION_TIMEOUT_SECS,
             )),
+            status: WorkerStatus::new(),
+            store_factory: executor::s3_object_store_factory(),
+            scan_budget: None,
             #[cfg(test)]
             compaction_seam: None,
         }
@@ -654,6 +717,9 @@ impl WorkerFlightService {
             compaction_timeout: Some(std::time::Duration::from_secs(
                 DEFAULT_COMPACTION_TIMEOUT_SECS,
             )),
+            status: WorkerStatus::new(),
+            store_factory: executor::s3_object_store_factory(),
+            scan_budget: None,
             #[cfg(test)]
             compaction_seam: None,
         }
@@ -878,6 +944,75 @@ impl WorkerFlightService {
     pub fn with_memory_governor(mut self, governor: Arc<MemoryGovernor>) -> Self {
         self.memory_governor = Some(governor);
         self
+    }
+
+    /// Replace the object-store factory scans read through. Tests and
+    /// embedded hosts only; production keeps the S3 default.
+    #[must_use = "with_object_store_factory consumes self; bind the returned service"]
+    pub fn with_object_store_factory(mut self, factory: ObjectStoreFactory) -> Self {
+        self.store_factory = factory;
+        self
+    }
+
+    /// Share one scan byte budget across every `do_get` instead of deriving
+    /// one per scan from the session pool.
+    #[must_use = "with_scan_budget consumes self; bind the returned service"]
+    pub fn with_scan_budget(mut self, budget: ByteBudget) -> Self {
+        self.scan_budget = Some(budget);
+        self
+    }
+
+    /// Share a [`WorkerStatus`] created elsewhere (the heartbeat task reads
+    /// the same one).
+    #[must_use = "with_status consumes self; bind the returned service"]
+    pub fn with_status(mut self, status: Arc<WorkerStatus>) -> Self {
+        self.status = status;
+        self
+    }
+
+    /// Process identity and load counters (finding 609).
+    pub fn status(&self) -> &Arc<WorkerStatus> {
+        &self.status
+    }
+
+    /// Current load vector for the heartbeat hello.
+    ///
+    /// `memory_limit_bytes` is the session pool limit (0 when unbounded).
+    /// `scan_budget_free_bytes` is what the shared scan budget would still
+    /// admit, or, without one, what the pool would (limit minus reserved).
+    /// `spill_free_bytes` is 0 = unknown: the `SegmentStore` trait exposes
+    /// used bytes only, not the volume's free space. `inflight_scans` comes
+    /// from [`WorkerStatus`].
+    pub fn capacity(&self) -> WorkerCapacity {
+        let mut capacity = (self.capacity_probe())();
+        capacity.inflight_scans = self.status.inflight_scans();
+        capacity
+    }
+
+    /// A closure that measures [`Self::capacity`] without holding the
+    /// service itself, for [`WorkerStatus::set_capacity_probe`].
+    pub fn capacity_probe(&self) -> crate::status::CapacityProbe {
+        use datafusion::execution::memory_pool::MemoryLimit;
+        let pool = self.session_ctx.runtime_env().memory_pool.clone();
+        let scan_budget = self.scan_budget.clone();
+        Arc::new(move || {
+            let (limit, free) = match pool.memory_limit() {
+                MemoryLimit::Finite(limit) => {
+                    (limit as u64, limit.saturating_sub(pool.reserved()) as u64)
+                }
+                _ => (0, 0),
+            };
+            let scan_budget_free_bytes = match &scan_budget {
+                Some(budget) => budget.free_bytes() as u64,
+                None => free,
+            };
+            WorkerCapacity {
+                memory_limit_bytes: limit,
+                scan_budget_free_bytes,
+                spill_free_bytes: 0,
+                inflight_scans: 0,
+            }
+        })
     }
 
     /// Spill manager when local spill is enabled at bootstrap.
@@ -1474,11 +1609,12 @@ impl FlightService for WorkerFlightService {
 
         let ticket = request.into_inner();
 
-        let scan_task = ScanTask::from_bytes(&ticket.ticket)
-            .map_err(|e| Status::invalid_argument(format!("Failed to decode ScanTask: {e}")))?;
-        scan_task
-            .validate_version()
-            .map_err(|e| Status::invalid_argument(format!("ScanTask version rejected: {e}")))?;
+        // Finding 109: one decoder that checks the version range, that the
+        // populated fields do not need a higher version than declared, and
+        // that no top-level key was silently dropped. All three are the
+        // coordinator's fault, so they are `TaskInvalid` (INVALID_ARGUMENT).
+        let scan_task = ScanTask::decode_for_worker(&ticket.ticket, SCAN_TASK_VERSION_CURRENT)
+            .map_err(|e| WorkerFault::TaskInvalid.into_status(format!("ScanTask rejected: {e}")))?;
         self.verify_ticket_binding(&scan_task, &metadata_owned)?;
 
         let worker_span = info_span!(
@@ -1506,6 +1642,9 @@ impl FlightService for WorkerFlightService {
             .flight_budget
             .clone()
             .unwrap_or_else(|| default_flight_budget(&self.session_ctx));
+        let store_factory = self.store_factory.clone();
+        let scan_budget = self.scan_budget.clone();
+        let status = Arc::clone(&self.status);
         let stream_span = worker_span.clone();
         let result_span = worker_span.clone();
         let result = async move {
@@ -1514,6 +1653,10 @@ impl FlightService for WorkerFlightService {
                 file_count = scan_task.data_file_paths.len(),
                 "Worker received scan task"
             );
+
+            // Finding 609: in flight from here until the response stream is
+            // dropped, whichever way that happens.
+            let inflight_guard = status.scan_started();
 
             // Subscribe to credential updates for this fragment. The guard
             // removes the entry on drop so timeouts, setup errors, and panics
@@ -1525,13 +1668,15 @@ impl FlightService for WorkerFlightService {
             // The pushed-down predicate (#233) is carried inside `scan_task`
             // (`predicate_proto`) and decoded by the executor; the late
             // materialization RowFilter is wired from it there.
-            let prepare = executor::execute_scan_streaming(
+            let prepare = executor::execute_scan_streaming_with_factory(
                 scan_task,
                 Some(metrics.clone()),
                 session_ctx.clone(),
                 Some(cred_rx),
                 footer_cache.clone(),
                 None, // Coordinator metrics (workers don't have coordinator registry)
+                store_factory,
+                scan_budget,
             );
 
             let (schema, batch_stream) = if scan_timeout.is_zero() {
@@ -1553,39 +1698,45 @@ impl FlightService for WorkerFlightService {
                     })?
             }
             .map_err(|e| {
-                warn!(error = %e, "Scan task setup failed");
-                Status::internal(format!("Scan execution failed: {e}"))
+                // Finding 602: classify from the typed chain (the executor
+                // tagged it) and ship the fault in the Status metadata plus
+                // the matching gRPC code, so the coordinator can tell a
+                // user's expired token from a worker fault.
+                let fault = executor::scan_fault(&e);
+                status.record_fault(fault);
+                warn!(error = %format!("{e:#}"), fault = %fault, "Scan task setup failed");
+                fault.into_status(format!("Scan execution failed: {e:#}"))
             })?;
 
-            // Stream lifetime carries the guard; once the encoder finishes
-            // (or the client disconnects mid-stream) the guard drops and the
-            // credential entry is removed via `tokio::spawn`.
+            // Mid-stream failures travel as `FlightError::Tonic(Status)`:
+            // the encoder passes them through untouched and `Status::from`
+            // unwraps the box, so the fault metadata reaches the trailers.
+            let status_for_stream = Arc::clone(&status);
+            let fragment_for_stream = fragment_id.clone();
+            let mapped_stream = batch_stream.map(move |item| match item {
+                Ok(accounted) => Ok(accounted),
+                Err(e) => {
+                    let fault = executor::scan_fault(&e);
+                    status_for_stream.record_fault(fault);
+                    warn!(
+                        fragment_id = %fragment_for_stream,
+                        error = %format!("{e:#}"),
+                        fault = %fault,
+                        "Scan task failed mid-stream"
+                    );
+                    Err(arrow_flight::error::FlightError::Tonic(Box::new(
+                        fault.into_status(format!("Scan failed: {e:#}")),
+                    )))
+                }
+            });
+            // Stream lifetime carries both guards: once the encoder finishes
+            // (or the client disconnects mid-stream) they drop, the credential
+            // entry is removed via `tokio::spawn` and the in-flight count
+            // steps down. No sentinel item is ever emitted.
+            let mapped_stream = HoldUntilEnd::new(mapped_stream, (cleanup_guard, inflight_guard));
             // AccountedFlightStream: retain each batch's scan-budget permit
             // until the Flight encoder polls for the next batch (or the
             // client disconnects and the stream drops).
-            let mapped_stream = batch_stream
-                .map(|item| match item {
-                    Ok(accounted) => Ok(accounted),
-                    Err(e) => Err(arrow_flight::error::FlightError::from_external_error(
-                        Box::new(std::io::Error::other(e.to_string())),
-                    )),
-                })
-                .chain(stream::once(async move {
-                    drop(cleanup_guard);
-                    Err::<executor::AccountedBatch, arrow_flight::error::FlightError>(
-                        arrow_flight::error::FlightError::from_external_error(Box::new(
-                            std::io::Error::other("__SQE_CLEANUP_SENTINEL__"),
-                        )),
-                    )
-                }))
-                .filter_map(|item| async move {
-                    match item {
-                        Ok(b) => Some(Ok(b)),
-                        Err(e) if e.to_string().contains("__SQE_CLEANUP_SENTINEL__") => None,
-                        Err(e) => Some(Err(e)),
-                    }
-                });
-
             let batch_for_encoder = AccountedEncodeStream {
                 inner: Box::pin(mapped_stream),
                 held_permit: None,
@@ -2336,6 +2487,74 @@ mod tests {
             .insert(WORKER_SECRET_HEADER, "wrong".parse().unwrap());
         let err = unwrap_err(svc.do_get(request).await);
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    /// Sign `ticket` with the HMAC secret and run it through `do_get`.
+    async fn do_get_hmac_signed(svc: &WorkerFlightService, ticket: Vec<u8>) -> Status {
+        let mut request = Request::new(Ticket {
+            ticket: bytes::Bytes::from(ticket.clone()),
+        });
+        request
+            .metadata_mut()
+            .insert(WORKER_SECRET_HEADER, "expected-secret".parse().unwrap());
+        request.metadata_mut().insert(
+            SCAN_SIGNATURE_HEADER,
+            sign("expected-secret", &ticket).parse().unwrap(),
+        );
+        unwrap_err(svc.do_get(request).await)
+    }
+
+    fn assert_task_invalid(err: &Status, needle: &str) {
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err}");
+        assert_eq!(
+            err.metadata()
+                .get(sqe_planner::FAULT_METADATA_KEY)
+                .and_then(|v| v.to_str().ok()),
+            Some(WorkerFault::TaskInvalid.metric_label()),
+            "{err}"
+        );
+        assert!(err.message().contains(needle), "{err}");
+    }
+
+    /// Finding 109: a byte-range morsel that still declares `version: 1` would
+    /// have made a pre-morsel worker scan the whole file once per morsel and
+    /// duplicate every row. The worker refuses it as INVALID_ARGUMENT before
+    /// the auth-independent parts of setup run.
+    #[tokio::test]
+    async fn do_get_rejects_v1_ticket_carrying_byte_range_fields() {
+        let svc = make_service("expected-secret");
+        let mut task = sqe_planner::ScanTask::from_bytes(&make_scan_task_bytes()).unwrap();
+        task.version = sqe_planner::SCAN_TASK_VERSION_V1;
+        task.start_byte = Some(0);
+        task.end_byte = Some(512);
+        // `to_bytes` would refuse this on the producer; serialise directly to
+        // model a coordinator that bypassed the builder.
+        let bytes = serde_json::to_vec(&task).unwrap();
+        let err = do_get_hmac_signed(&svc, bytes).await;
+        assert_task_invalid(&err, "start_byte");
+    }
+
+    /// Finding 109: a top-level key this build does not know means a newer
+    /// coordinator filled a field that would be silently dropped. Refuse.
+    #[tokio::test]
+    async fn do_get_rejects_ticket_with_unknown_top_level_keys() {
+        let svc = make_service("expected-secret");
+        let mut value: serde_json::Value = serde_json::from_slice(&make_scan_task_bytes()).unwrap();
+        value["delete_files"] = serde_json::json!(["s3://bucket/d.parquet"]);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let err = do_get_hmac_signed(&svc, bytes).await;
+        assert_task_invalid(&err, "delete_files");
+    }
+
+    /// And a version above what this worker implements is refused the same way.
+    #[tokio::test]
+    async fn do_get_rejects_ticket_from_the_future() {
+        let svc = make_service("expected-secret");
+        let mut task = sqe_planner::ScanTask::from_bytes(&make_scan_task_bytes()).unwrap();
+        task.version = sqe_planner::SCAN_TASK_VERSION_CURRENT + 1;
+        let bytes = serde_json::to_vec(&task).unwrap();
+        let err = do_get_hmac_signed(&svc, bytes).await;
+        assert_task_invalid(&err, "unsupported ScanTask version");
     }
 
     #[tokio::test]

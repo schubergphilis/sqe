@@ -593,6 +593,12 @@ impl QueryHandler {
         &self.ticket_signer
     }
 
+    /// Finding 609: the credential-refresh tracker, so the heartbeat handler
+    /// can drop a restarted worker's fragment-scoped entries.
+    pub fn credential_tracker(&self) -> Option<&Arc<CredentialRefreshTracker>> {
+        self.credential_tracker.as_ref()
+    }
+
     /// Returns a reference to the shared DataFusion runtime.
     ///
     /// The runtime contains the [`FairSpillPool`] memory pool shared across
@@ -3863,43 +3869,62 @@ impl QueryHandler {
             self.metrics.as_ref(),
             plan,
         )?;
-        Ok(self.try_distribute(plan, session, query_id).await)
+        self.try_distribute(plan, session, query_id).await
+    }
+
+    /// Count one exit of the distribution decision (finding 402). Every scan
+    /// that reaches [`Self::try_distribute`] records exactly one
+    /// `(decision, reason)` pair, so the series sum to the decisions taken.
+    fn record_scheduler_decision(&self, decision: &str, reason: &str) {
+        if let Some(ref metrics) = self.metrics {
+            metrics
+                .scheduler_decisions
+                .with_label_values(&[decision, reason])
+                .inc();
+        }
     }
 
     /// Attempt to distribute scan work across available workers.
     ///
-    /// If distribution is possible, the plan's IcebergScanExec is replaced
-    /// with a DistributedScanExec that fans out to workers via Arrow Flight.
-    /// Otherwise, the original plan is returned unchanged for local execution.
+    /// Finding 402 (#582): this is a DECISION followed by an ACTION, and the
+    /// two fail differently.
     ///
-    /// Distribution is skipped when:
-    /// - No worker registry is configured (single-node mode)
-    /// - No healthy workers are available
-    /// - The query has no IcebergScanExec (e.g., metadata queries)
-    /// - The scan is below the configured file-count threshold (`distribution_file_threshold`)
-    /// - The estimated scan size is below the configured byte threshold (`distribution_threshold`)
-    /// - The total data file count is less than the number of healthy workers
-    /// - The query has multiple IcebergScanExec nodes (joins — not yet supported)
+    /// The decision ([`Self::decide_iceberg_distribution`]) is policy: no
+    /// registry, no healthy workers, no Iceberg scan, below the file or byte
+    /// threshold, too small to morsel-split, no usable credentials. Each of
+    /// those returns [`DistributionDecision::Local`] with a stable reason,
+    /// which is counted in `sqe_scheduler_decisions_total{decision="local",
+    /// reason}` and, in distributed mode, written into the plan as a
+    /// [`crate::distributed_scan::CoordinatorLocalScanExec`] so the executed
+    /// plan says why the cluster sat idle.
+    ///
+    /// The action ([`Self::distribute_iceberg_scan`]) is infrastructure:
+    /// listing the manifest, scheduling, rebuilding the plan. Those failures
+    /// used to `warn!` and run the N-worker scan on the coordinator. They are
+    /// now `Err`, and `query.distribution_fallback` decides: `error` (default)
+    /// fails the query; `local` logs, counts
+    /// `{decision="local",reason="infrastructure_error"}` and runs locally.
     async fn try_distribute(
         &self,
         plan: Arc<dyn ExecutionPlan>,
         session: &Session,
         query_id: &uuid::Uuid,
-    ) -> Arc<dyn ExecutionPlan> {
+    ) -> sqe_core::Result<Arc<dyn ExecutionPlan>> {
         // 1. Check if we have a worker registry (distributed mode)
-        let registry = match self.worker_registry {
-            Some(ref r) => r,
-            None => return plan,
+        let Some(registry) = self.worker_registry.as_ref() else {
+            self.record_scheduler_decision("local", "single_node");
+            return Ok(plan);
         };
 
-        // 2. Get healthy workers — if none, fall back to local
+        // 2. Get healthy workers -- if none, the policy answer is local
         let healthy = registry.healthy_workers().await;
         if let Some(ref metrics) = self.metrics {
             metrics.healthy_workers.set(healthy.len() as i64);
         }
         if healthy.is_empty() {
             debug!("No healthy workers available, executing locally");
-            return plan;
+            self.record_scheduler_decision("local", "no_healthy_workers");
+            return Ok(plan);
         }
 
         // 3. A Hive external table scan is a different node; try it first.
@@ -3911,41 +3936,121 @@ impl QueryHandler {
                 .await;
         }
 
-        // 4. Find IcebergScanExec node in the plan tree
-        let scan_node = match find_iceberg_scan(&plan) {
-            Some(node) => node,
-            None => {
-                debug!("No IcebergScanExec found in plan, executing locally");
-                return plan;
+        // 4. Decide (policy), then act (infrastructure).
+        let candidate = match self
+            .decide_iceberg_distribution(&plan, &healthy, query_id)
+            .await
+        {
+            Ok(DistributionDecision::Distribute(candidate)) => candidate,
+            Ok(DistributionDecision::Local { reason, scan_node }) => {
+                self.record_scheduler_decision("local", reason);
+                return match scan_node {
+                    // Say so in the plan, the way the Hive path does.
+                    Some(node) => {
+                        let marked: Arc<dyn ExecutionPlan> = Arc::new(
+                            crate::distributed_scan::CoordinatorLocalScanExec::new(
+                                Arc::clone(&node),
+                                reason,
+                            ),
+                        );
+                        Ok(replace_scan_in_plan(&plan, &node, marked)?)
+                    }
+                    None => Ok(plan),
+                };
             }
+            Err(e) => return self.distribution_failed(plan, e, query_id),
         };
 
-        let iceberg_scan = match scan_node.downcast_ref::<IcebergScanExec>() {
-            Some(s) => s,
-            None => {
-                tracing::warn!(
-                    "find_iceberg_scan returned unexpected node type, falling back to local"
+        match self
+            .distribute_iceberg_scan(&plan, candidate, &healthy, registry, session, query_id)
+            .await
+        {
+            Ok(distributed) => {
+                self.record_scheduler_decision("distributed", "distributed");
+                Ok(distributed)
+            }
+            Err(e) => self.distribution_failed(plan, e, query_id),
+        }
+    }
+
+    /// Apply `query.distribution_fallback` to an infrastructure failure of
+    /// the distribution action (finding 402).
+    fn distribution_failed(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        error: SqeError,
+        query_id: &uuid::Uuid,
+    ) -> sqe_core::Result<Arc<dyn ExecutionPlan>> {
+        match self.config.query.distribution_fallback {
+            sqe_core::config::DistributionFallback::Error => {
+                self.record_scheduler_decision("failed", "infrastructure_error");
+                tracing::error!(
+                    query_id = %query_id,
+                    error = %error,
+                    "Distributing the scan failed; query.distribution_fallback = \"error\" \
+                     fails the query rather than running an N-worker scan on the coordinator"
                 );
-                return plan;
+                Err(error)
             }
+            sqe_core::config::DistributionFallback::Local => {
+                self.record_scheduler_decision("local", "infrastructure_error");
+                warn!(
+                    query_id = %query_id,
+                    error = %error,
+                    "Distributing the scan failed; query.distribution_fallback = \"local\" \
+                     runs it on the coordinator"
+                );
+                Ok(plan)
+            }
+        }
+    }
+
+    /// The policy half of [`Self::try_distribute`]: should this Iceberg scan
+    /// go to workers? Only infrastructure failures (the manifest listing) are
+    /// `Err`; every policy skip is `Local(reason)`.
+    async fn decide_iceberg_distribution(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+        healthy: &[String],
+        query_id: &uuid::Uuid,
+    ) -> sqe_core::Result<DistributionDecision> {
+        // Find the IcebergScanExec node in the plan tree
+        let Some(scan_node) = find_iceberg_scan(plan) else {
+            debug!("No IcebergScanExec found in plan, executing locally");
+            return Ok(DistributionDecision::Local {
+                reason: "no_iceberg_scan",
+                scan_node: None,
+            });
         };
 
-        // 4. Get data file paths and sizes from the scan manifest metadata
-        let file_info = match iceberg_scan.data_file_info().await {
-            Ok(info) => info,
-            Err(e) => {
-                warn!(error = %e, "Failed to list data files for distribution, executing locally");
-                return plan;
-            }
-        };
+        let iceberg_scan = scan_node
+            .downcast_ref::<IcebergScanExec>()
+            .ok_or_else(|| {
+                SqeError::with_code(
+                    SqeErrorCode::InternalError,
+                    "find_iceberg_scan returned a node that is not an IcebergScanExec",
+                )
+            })?;
+
+        // Get data file paths and sizes from the scan manifest metadata. This
+        // is infrastructure (catalog / object store), not policy.
+        let file_info = iceberg_scan.data_file_info().await.map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::CatalogError,
+                format!("listing data files for distribution failed: {e}"),
+            )
+        })?;
 
         let total_files = file_info.len();
         if total_files == 0 {
             debug!("No data files to distribute, executing locally");
-            return plan;
+            return Ok(DistributionDecision::Local {
+                reason: "no_data_files",
+                scan_node: Some(scan_node),
+            });
         }
 
-        // 5. Check if the scan is large enough to benefit from distribution.
+        // Check if the scan is large enough to benefit from distribution.
         // Use the configured file-count threshold as a fast proxy (no file size
         // metadata needed at this point).
         let file_threshold = self.config.query.distribution_file_threshold;
@@ -3955,13 +4060,10 @@ impl QueryHandler {
                 threshold = file_threshold,
                 "Scan below distribution file threshold — executing locally"
             );
-            if let Some(ref metrics) = self.metrics {
-                metrics
-                    .scheduler_decisions
-                    .with_label_values(&["local"])
-                    .inc();
-            }
-            return plan;
+            return Ok(DistributionDecision::Local {
+                reason: "below_file_threshold",
+                scan_node: Some(scan_node),
+            });
         }
 
         // Also check the byte-size threshold using real sizes from the manifest.
@@ -3969,31 +4071,25 @@ impl QueryHandler {
             sqe_core::parse_memory_limit(&self.config.query.distribution_threshold)
                 .unwrap_or(128 * 1024 * 1024);
 
-        if distribution_threshold > 0 {
-            let total_bytes: u64 = file_info.iter().map(|(_, size)| size).sum();
-            if total_bytes < distribution_threshold as u64 {
-                debug!(
-                    total_bytes,
-                    threshold = distribution_threshold,
-                    total_files,
-                    "Scan below distribution byte threshold — executing locally"
-                );
-                if let Some(ref metrics) = self.metrics {
-                    metrics
-                        .scheduler_decisions
-                        .with_label_values(&["local"])
-                        .inc();
-                }
-                return plan;
-            }
+        let total_bytes: u64 = file_info.iter().map(|(_, size)| size).sum();
+        if distribution_threshold > 0 && total_bytes < distribution_threshold as u64 {
+            debug!(
+                total_bytes,
+                threshold = distribution_threshold,
+                total_files,
+                "Scan below distribution byte threshold — executing locally"
+            );
+            return Ok(DistributionDecision::Local {
+                reason: "below_byte_threshold",
+                scan_node: Some(scan_node),
+            });
         }
 
-        // 6. Check if there is enough work to justify distribution.
+        // Check if there is enough work to justify distribution.
         // Phase 2: fewer files than workers is OK when total bytes can be
         // morsel-split across workers (one multi-GB file → many morsels).
         let num_workers = healthy.len();
         if total_files < num_workers {
-            let total_bytes: u64 = file_info.iter().map(|(_, size)| size).sum();
             let min_split_bytes = sqe_planner::DEFAULT_MORSEL_TARGET_BYTES;
             if total_bytes < min_split_bytes {
                 debug!(
@@ -4002,13 +4098,10 @@ impl QueryHandler {
                     total_bytes,
                     "Fewer files than workers and too small to morsel-split — local"
                 );
-                if let Some(ref metrics) = self.metrics {
-                    metrics
-                        .scheduler_decisions
-                        .with_label_values(&["local"])
-                        .inc();
-                }
-                return plan;
+                return Ok(DistributionDecision::Local {
+                    reason: "too_small_to_split",
+                    scan_node: Some(scan_node),
+                });
             }
             debug!(
                 total_files,
@@ -4018,7 +4111,60 @@ impl QueryHandler {
             );
         }
 
+        // Finding 401: pick the credential source once per query; `None` means
+        // the configured mode cannot be satisfied for this table. That is a
+        // deliberate configuration outcome, not an outage, so it stays a
+        // policy skip.
+        let Some(credentials) = crate::ticket_credentials::select_scan_credentials(
+            self.config.coordinator.distributed_credentials,
+            &self.config.storage,
+            iceberg_scan.table(),
+        ) else {
+            warn!(
+                query_id = %query_id,
+                mode = ?self.config.coordinator.distributed_credentials,
+                "distributed_credentials mode cannot be satisfied for this table; executing locally"
+            );
+            return Ok(DistributionDecision::Local {
+                reason: "credentials_unavailable",
+                scan_node: Some(scan_node),
+            });
+        };
+
         info!(total_files, num_workers, "Distributing scan across workers");
+        Ok(DistributionDecision::Distribute(DistributionCandidate {
+            scan_node,
+            file_info,
+            credentials,
+        }))
+    }
+
+    /// The action half of [`Self::try_distribute`]: build the scan tasks,
+    /// schedule them and splice a `DistributedScanExec` into the plan. Every
+    /// failure is `Err`; the caller applies `query.distribution_fallback`.
+    async fn distribute_iceberg_scan(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+        candidate: DistributionCandidate,
+        healthy: &[String],
+        registry: &Arc<crate::worker_registry::WorkerRegistry>,
+        session: &Session,
+        query_id: &uuid::Uuid,
+    ) -> sqe_core::Result<Arc<dyn ExecutionPlan>> {
+        let DistributionCandidate {
+            scan_node,
+            file_info,
+            credentials,
+        } = candidate;
+        let iceberg_scan = scan_node
+            .downcast_ref::<IcebergScanExec>()
+            .ok_or_else(|| {
+                SqeError::with_code(
+                    SqeErrorCode::InternalError,
+                    "distribution candidate is not an IcebergScanExec",
+                )
+            })?;
+        let num_workers = healthy.len();
 
         // 6. Get projected columns + Iceberg field IDs from the scan. Field
         // IDs (#43) let the worker project by the parquet PARQUET:field_id
@@ -4055,7 +4201,7 @@ impl QueryHandler {
             if self.config.query.distributed_scan_pushdown {
                 let pred =
                     crate::scan_pushdown::serialize_scan_predicate(iceberg_scan.df_filters());
-                let lim = crate::scan_pushdown::extract_pushable_limit(&plan, &scan_node);
+                let lim = crate::scan_pushdown::extract_pushable_limit(plan, &scan_node);
                 if pred.is_some() || lim.is_some() {
                     debug!(
                         has_predicate = pred.is_some(),
@@ -4131,27 +4277,20 @@ impl QueryHandler {
         // (each morsel is already sized); when packing grouped multiple small
         // whole-file morsels, emit multi-file tasks without ranges.
         let storage = &self.config.storage;
-        // Finding 401: pick the credential source once per query; `None` means
-        // the configured mode cannot be satisfied and the scan runs locally.
-        let credentials = match crate::ticket_credentials::select_scan_credentials(
-            self.config.coordinator.distributed_credentials,
-            storage,
-            iceberg_scan.table(),
-        ) {
-            Some(c) => c,
-            None => {
-                warn!(
-                    query_id = %query_id,
-                    mode = ?self.config.coordinator.distributed_credentials,
-                    "distributed_credentials mode cannot be satisfied for this table; executing locally"
-                );
-                return plan;
-            }
-        };
+        // Finding 401: the credential source was picked once per query in the
+        // decision; finding 109: every task goes through the builder so its
+        // version is derived from the fields it carries, never hand-set.
         let credential_source = credentials.source();
         let credential_expiry = credentials
             .expires_at()
             .and_then(|s| chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0));
+        let scan_storage = sqe_planner::ScanStorage {
+            s3_endpoint: storage.s3_endpoint.clone(),
+            s3_region: storage.s3_region.clone(),
+            s3_path_style: storage.s3_path_style,
+            s3_allow_http: storage.s3_endpoint.starts_with("http://"),
+            credentials,
+        };
         let scan_tasks: Vec<sqe_planner::ScanTask> = morsel_groups
             .into_iter()
             .filter(|group| !group.is_empty())
@@ -4175,60 +4314,37 @@ impl QueryHandler {
                         group_morsels.iter().map(|m| m.file_path.clone()).collect();
                     let file_sizes_bytes: Vec<u64> =
                         group_morsels.iter().map(|m| m.file_size_bytes).collect();
-                    vec![sqe_planner::ScanTask {
-                        hive: None,
-                        version: sqe_planner::SCAN_TASK_VERSION_V1,
-                        morsel_id: None,
-                        row_group_start: None,
-                        row_group_end: None,
-                        start_byte: None,
-                        end_byte: None,
-                        fragment_id: uuid::Uuid::now_v7().to_string(),
+                    vec![sqe_planner::ScanTask::builder(
+                        uuid::Uuid::now_v7().to_string(),
                         data_file_paths,
-                        file_sizes_bytes,
-                        projected_columns: projected_cols.clone(),
-                        projected_field_ids: projected_field_ids.clone(),
-                        s3_endpoint: storage.s3_endpoint.clone(),
-                        s3_region: storage.s3_region.clone(),
-                        credentials: credentials.clone(),
-
-                        audience: String::new(),
-
-                        expires_at: 0,
-                        s3_path_style: storage.s3_path_style,
-                        s3_allow_http: storage.s3_endpoint.starts_with("http://"),
-                        predicate_proto: predicate_proto.clone(),
-                        limit: scan_limit,
-                    }]
+                        scan_storage.clone(),
+                    )
+                    .with_file_sizes(file_sizes_bytes)
+                    .with_projection(projected_cols.clone(), projected_field_ids.clone())
+                    .with_predicate_proto(predicate_proto.clone())
+                    .with_limit(scan_limit)
+                    .build()]
                 } else {
                     // Byte-range morsels: one ScanTask per morsel (single file
-                    // + range). Version 2 so workers apply range resolution.
+                    // + range). The builder derives v2 from the range fields so
+                    // workers apply range resolution.
                     group_morsels
                         .into_iter()
-                        .map(|m| sqe_planner::ScanTask {
-                            hive: None,
-                            version: sqe_planner::SCAN_TASK_VERSION_V2,
-                            morsel_id: Some(m.morsel_id.clone()),
-                            row_group_start: None,
-                            row_group_end: None,
-                            start_byte: m.start_byte,
-                            end_byte: m.end_byte,
-                            fragment_id: uuid::Uuid::now_v7().to_string(),
-                            data_file_paths: vec![m.file_path.clone()],
-                            file_sizes_bytes: vec![m.file_size_bytes],
-                            projected_columns: projected_cols.clone(),
-                            projected_field_ids: projected_field_ids.clone(),
-                            s3_endpoint: storage.s3_endpoint.clone(),
-                            s3_region: storage.s3_region.clone(),
-                            credentials: credentials.clone(),
-
-                            audience: String::new(),
-
-                            expires_at: 0,
-                            s3_path_style: storage.s3_path_style,
-                            s3_allow_http: storage.s3_endpoint.starts_with("http://"),
-                            predicate_proto: predicate_proto.clone(),
-                            limit: scan_limit,
+                        .map(|m| {
+                            let mut builder = sqe_planner::ScanTask::builder(
+                                uuid::Uuid::now_v7().to_string(),
+                                vec![m.file_path.clone()],
+                                scan_storage.clone(),
+                            )
+                            .with_morsel_id(m.morsel_id.clone())
+                            .with_file_sizes(vec![m.file_size_bytes])
+                            .with_projection(projected_cols.clone(), projected_field_ids.clone())
+                            .with_predicate_proto(predicate_proto.clone())
+                            .with_limit(scan_limit);
+                            if let (Some(start), Some(end)) = (m.start_byte, m.end_byte) {
+                                builder = builder.with_byte_range(start, end);
+                            }
+                            builder.build()
                         })
                         .collect()
                 }
@@ -4236,21 +4352,18 @@ impl QueryHandler {
             .collect();
 
         if scan_tasks.is_empty() {
-            debug!("No non-empty scan tasks after splitting, executing locally");
-            if let Some(ref metrics) = self.metrics {
-                metrics
-                    .scheduler_decisions
-                    .with_label_values(&["local"])
-                    .inc();
-            }
-            return plan;
+            // `file_info` was non-empty, so morsel planning produced nothing
+            // from something: a planner bug, not a policy skip.
+            return Err(SqeError::with_code(
+                SqeErrorCode::InternalError,
+                format!(
+                    "morsel planning produced no scan tasks from {} data files",
+                    file_info.len()
+                ),
+            ));
         }
 
         if let Some(ref metrics) = self.metrics {
-            metrics
-                .scheduler_decisions
-                .with_label_values(&["distributed"])
-                .inc();
             metrics
                 .scheduler_task_count
                 .observe(scan_tasks.len() as f64);
@@ -4272,17 +4385,16 @@ impl QueryHandler {
             .collect();
 
         let scheduler = crate::scheduler::WeightedScheduler::new();
-        let assignments = match crate::scheduler::FragmentScheduler::assign(
-            &scheduler,
-            &scan_tasks,
-            &worker_infos,
-        ) {
-            Ok(a) => a,
-            Err(e) => {
-                warn!(error = %e, "Scheduling failed, executing locally");
-                return plan;
-            }
-        };
+        // `NoHealthyWorkers` here is the race with the health checker between
+        // reading `healthy` above and now: infrastructure, so `Err` (402).
+        let assignments =
+            crate::scheduler::FragmentScheduler::assign(&scheduler, &scan_tasks, &worker_infos)
+                .map_err(|e| {
+                    SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!("scheduling {} scan tasks failed: {e}", scan_tasks.len()),
+                    )
+                })?;
 
         let worker_urls: Vec<String> = assignments.iter().map(|a| a.worker_url.clone()).collect();
 
@@ -4316,18 +4428,35 @@ impl QueryHandler {
         let reservations_cb = reservations.clone();
         let callback: crate::distributed_scan::FragmentCallback =
             Arc::new(move |task_id, outcome, elapsed_ms, rows| {
-                // Finding 408: released on every outcome, including a stream
-                // dropped before EOF (LIMIT / cancel), so the worker's reserved
-                // load does not linger until the plan Arc drops.
-                let _ = reservations_cb.remove(task_id);
                 use crate::distributed_scan::FragmentOutcome;
+                // Finding 602: every failed attempt is counted by fault kind,
+                // whether or not the fragment is retried afterwards.
+                if let FragmentOutcome::Failed(fault) | FragmentOutcome::Retrying(fault) = outcome
+                {
+                    if let Some(ref metrics) = callback_metrics {
+                        metrics
+                            .worker_fragment_failures_total
+                            .with_label_values(&[fault.metric_label()])
+                            .inc();
+                    }
+                }
+                // A retried attempt is not terminal: the fragment is still
+                // running (on another worker), so its reservation and tracker
+                // row stay as they are.
+                if let FragmentOutcome::Retrying(_) = outcome {
+                    return;
+                }
+                // Finding 408: released on every terminal outcome, including a
+                // stream dropped before EOF (LIMIT / cancel), so the worker's
+                // reserved load does not linger until the plan Arc drops.
+                let _ = reservations_cb.remove(task_id);
                 let state = match outcome {
                     FragmentOutcome::Finished => FragmentState::Finished,
-                    FragmentOutcome::Failed => FragmentState::Failed,
+                    FragmentOutcome::Failed(_) => FragmentState::Failed,
                     // No `FragmentState::Cancelled` yet; leave the tracker row
                     // as it was (previously Drop never reported at all) rather
                     // than mislabel a clean stop as Failed.
-                    FragmentOutcome::Cancelled => return,
+                    FragmentOutcome::Cancelled | FragmentOutcome::Retrying(_) => return,
                 };
                 tracker.update_fragment(&qid, task_id, state, elapsed_ms, rows);
 
@@ -4402,8 +4531,13 @@ impl QueryHandler {
         exec = exec.with_worker_registry(Arc::clone(registry));
         if let Some(expiry) = credential_expiry {
             // Finding 401: vended credentials expire; let the refresh tracker
-            // push renewed ones before the worker hits the wall.
+            // push renewed ones before the worker hits the wall. The tracker
+            // is what the refresh loop and the 609 instance-change purge read,
+            // so register the fragments with it.
             exec = exec.with_credential_expiry(expiry);
+            if let Some(tracker) = &self.credential_tracker {
+                exec = exec.with_credential_tracker(Arc::clone(tracker));
+            }
         }
         info!(
             query_id = %query_id,
@@ -4421,16 +4555,19 @@ impl QueryHandler {
         let dist_scan: Arc<dyn ExecutionPlan> = Arc::new(exec);
 
         // Replace the IcebergScanExec leaf within the plan tree, keeping
-        // all parent nodes (filter, aggregate, sort, projection) intact.
-        replace_scan_in_plan(&plan, &scan_node, dist_scan)
+        // all parent nodes (filter, aggregate, sort, projection) intact. A
+        // parent that refuses the rebuild is an error, not a silent local scan
+        // (finding 402).
+        Ok(replace_scan_in_plan(plan, &scan_node, dist_scan)?)
     }
 
     /// Distribute a Hive external table scan, or say why it did not.
     ///
-    /// Never fails a query: every negative path returns a runnable plan. When
-    /// the scan cannot distribute the plan is wrapped in `HiveLocalScanExec` so
-    /// EXPLAIN carries the reason -- a silent fallback is indistinguishable
-    /// from success, and the only symptom would be an idle cluster.
+    /// Never fails a query on a POLICY ground: every negative path returns a
+    /// runnable plan wrapped in `HiveLocalScanExec` so EXPLAIN carries the
+    /// reason -- a silent fallback is indistinguishable from success, and the
+    /// only symptom would be an idle cluster. Only a plan that cannot be
+    /// rebuilt around the marker is `Err` (finding 402).
     async fn try_distribute_hive(
         &self,
         plan: Arc<dyn ExecutionPlan>,
@@ -4439,20 +4576,28 @@ impl QueryHandler {
         registry: &Arc<crate::worker_registry::WorkerRegistry>,
         session: &Session,
         query_id: &uuid::Uuid,
-    ) -> Arc<dyn ExecutionPlan> {
+    ) -> sqe_core::Result<Arc<dyn ExecutionPlan>> {
         use sqe_catalog::hive::scan_exec::HiveScanExec;
         use sqe_catalog::hive::scan_mode::HiveLocalScanExec;
         use sqe_catalog::hive::worker_scan::{servability, Unservable};
 
-        let local = |p: &Arc<dyn ExecutionPlan>, node: &Arc<dyn ExecutionPlan>, reason: String| {
+        let local = |p: &Arc<dyn ExecutionPlan>,
+                     node: &Arc<dyn ExecutionPlan>,
+                     metric_reason: &str,
+                     reason: String|
+         -> sqe_core::Result<Arc<dyn ExecutionPlan>> {
+            self.record_scheduler_decision("local", metric_reason);
             let marked: Arc<dyn ExecutionPlan> =
                 Arc::new(HiveLocalScanExec::new(Arc::clone(node), reason));
-            replace_scan_in_plan(p, node, marked)
+            Ok(replace_scan_in_plan(p, node, marked)?)
         };
 
         let scan = match hive_node.downcast_ref::<HiveScanExec>() {
             Some(s) => s,
-            None => return plan,
+            None => {
+                self.record_scheduler_decision("local", "hive_not_a_scan");
+                return Ok(plan);
+            }
         };
         let spec = scan.spec();
 
@@ -4464,17 +4609,23 @@ impl QueryHandler {
             // `Disabled` is the default state, and marking every Hive scan in a
             // non-distributed deployment would be noise rather than signal.
             if matches!(reason, Unservable::Disabled) {
-                return plan;
+                self.record_scheduler_decision("local", "hive_disabled");
+                return Ok(plan);
             }
             debug!(reason = %reason.reason(), "hive scan not distributable");
-            return local(&plan, &hive_node, reason.reason());
+            return local(&plan, &hive_node, "hive_unservable", reason.reason());
         }
 
         let partitions = match scan.partition_files().await {
             Ok(p) => p,
             Err(e) => {
                 warn!(error = %e, "listing hive partitions failed; executing locally");
-                return local(&plan, &hive_node, format!("listing partitions failed: {e}"));
+                return local(
+                    &plan,
+                    &hive_node,
+                    "hive_listing_failed",
+                    format!("listing partitions failed: {e}"),
+                );
             }
         };
 
@@ -4490,12 +4641,18 @@ impl QueryHandler {
                 return local(
                     &plan,
                     &hive_node,
+                    "hive_no_files",
                     "no partition listed any files".to_string(),
                 )
             }
             Err(e) => {
                 warn!(error = %e, "building hive scan tasks failed; executing locally");
-                return local(&plan, &hive_node, format!("building tasks failed: {e}"));
+                return local(
+                    &plan,
+                    &hive_node,
+                    "hive_task_build_failed",
+                    format!("building tasks failed: {e}"),
+                );
             }
         };
 
@@ -4532,10 +4689,16 @@ impl QueryHandler {
             Ok(d) => d,
             Err(e) => {
                 warn!(error = %e, "narrowing the distributed hive scan failed; executing locally");
-                return local(&plan, &hive_node, format!("schema alignment failed: {e}"));
+                return local(
+                    &plan,
+                    &hive_node,
+                    "hive_schema_alignment_failed",
+                    format!("schema alignment failed: {e}"),
+                );
             }
         };
-        replace_scan_in_plan(&plan, &hive_node, dist)
+        self.record_scheduler_decision("distributed", "distributed");
+        Ok(replace_scan_in_plan(&plan, &hive_node, dist)?)
     }
 
     /// Create a DataFusion SessionContext with the user's Polaris catalog registered.
@@ -7606,12 +7769,42 @@ fn find_iceberg_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionP
     scans.into_iter().max_by_key(size_of)
 }
 
+/// Finding 402: the outcome of deciding whether an Iceberg scan distributes.
+///
+/// Policy skips are `Local(reason)`; the reason is the
+/// `sqe_scheduler_decisions_total{reason}` label and, when the scan node is
+/// known, the text a `CoordinatorLocalScanExec` carries in the plan.
+/// Infrastructure failures are not a variant: they are `Err` on the
+/// surrounding `Result`, and `query.distribution_fallback` decides.
+pub(crate) enum DistributionDecision {
+    /// Fan the scan out to workers.
+    Distribute(DistributionCandidate),
+    /// Run on the coordinator.
+    Local {
+        reason: &'static str,
+        /// The Iceberg scan node, when there is one to mark.
+        scan_node: Option<Arc<dyn ExecutionPlan>>,
+    },
+}
+
+/// What the decision established and the action reuses, so the manifest is
+/// listed once and the credential choice is made once per query.
+pub(crate) struct DistributionCandidate {
+    scan_node: Arc<dyn ExecutionPlan>,
+    file_info: Vec<(String, u64)>,
+    credentials: sqe_planner::ScanCredentials,
+}
+
 /// Replace a specific scan node in a physical plan tree with a new node,
 /// keeping all parent nodes (filter, aggregate, sort, projection) intact.
 ///
 /// Walks the tree recursively. When the target node is found (by Arc pointer
 /// equality), it's replaced with the replacement. All ancestor nodes are
-/// rebuilt via `with_new_children()` to incorporate the change.
+/// rebuilt via `replace_children()` to incorporate the change.
+///
+/// A parent that refuses the rebuild is `Err` (finding 402). The previous
+/// `unwrap_or_else(|_| plan)` dropped the freshly built `DistributedScanExec`
+/// on the floor and ran the original scan on the coordinator with no log line.
 ///
 /// Public so the Hive differential tests can run the real substitution rather
 /// than a re-implementation of it. The parents are the reason: they index their
@@ -7621,23 +7814,23 @@ pub fn replace_scan_in_plan(
     plan: &Arc<dyn ExecutionPlan>,
     target: &Arc<dyn ExecutionPlan>,
     replacement: Arc<dyn ExecutionPlan>,
-) -> Arc<dyn ExecutionPlan> {
+) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
     // Check if this node IS the target (pointer equality)
     if Arc::ptr_eq(plan, target) {
-        return replacement;
+        return Ok(replacement);
     }
 
     let children = plan.children();
     if children.is_empty() {
         // Leaf node that isn't the target — return as-is
-        return Arc::clone(plan);
+        return Ok(Arc::clone(plan));
     }
 
     // Recurse into children and rebuild if any changed
     let new_children: Vec<Arc<dyn ExecutionPlan>> = children
         .iter()
         .map(|child| replace_scan_in_plan(child, target, Arc::clone(&replacement)))
-        .collect();
+        .collect::<datafusion::error::Result<Vec<_>>>()?;
 
     // Check if any child actually changed (avoid unnecessary cloning)
     let changed = new_children
@@ -7646,14 +7839,12 @@ pub fn replace_scan_in_plan(
         .any(|(new, old)| !Arc::ptr_eq(new, old));
 
     if changed {
-        plan.clone()
-            .replace_children(
-                new_children,
-                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
-            )
-            .unwrap_or_else(|_| Arc::clone(plan))
+        plan.clone().replace_children(
+            new_children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     } else {
-        Arc::clone(plan)
+        Ok(Arc::clone(plan))
     }
 }
 
@@ -8571,6 +8762,97 @@ mod tests {
     use super::*;
     use sqe_core::config::QueryConfig;
     use sqe_core::session::Session;
+
+    /// A parent node that refuses every rebuild, standing in for an operator
+    /// whose `replace_children` validates its child and fails.
+    #[derive(Debug)]
+    struct RefusingParent {
+        input: Arc<dyn ExecutionPlan>,
+    }
+
+    impl datafusion::physical_plan::DisplayAs for RefusingParent {
+        fn fmt_as(
+            &self,
+            _t: datafusion::physical_plan::DisplayFormatType,
+            f: &mut std::fmt::Formatter,
+        ) -> std::fmt::Result {
+            write!(f, "RefusingParent")
+        }
+    }
+
+    impl ExecutionPlan for RefusingParent {
+        fn name(&self) -> &str {
+            "RefusingParent"
+        }
+        fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> {
+            self.input.properties()
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.input]
+        }
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+        #[allow(deprecated)]
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            self.replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+        }
+        fn replace_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+            _options: ReplaceChildrenOptions,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            Err(datafusion::error::DataFusionError::Plan(
+                "RefusingParent cannot take a new child".to_string(),
+            ))
+        }
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<datafusion::execution::TaskContext>,
+        ) -> datafusion::error::Result<SendableRecordBatchStream> {
+            self.input.execute(partition, context)
+        }
+    }
+
+    /// 402 acceptance: a parent whose rebuild errors makes
+    /// `replace_scan_in_plan` return `Err`, not the original plan. The old
+    /// `unwrap_or_else(|_| plan)` silently dropped the distributed scan.
+    #[test]
+    fn replace_scan_in_plan_propagates_parent_rebuild_error() {
+        use datafusion::physical_plan::empty::EmptyExec;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let target: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let replacement: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(RefusingParent {
+            input: Arc::clone(&target),
+        });
+
+        let err = replace_scan_in_plan(&plan, &target, Arc::clone(&replacement))
+            .expect_err("a refused rebuild must surface, not fall back to the original plan");
+        assert!(err.to_string().contains("RefusingParent cannot take a new child"), "{err}");
+
+        // The happy paths are unchanged: the target itself is replaced, and a
+        // tree without the target is returned as-is.
+        let direct = replace_scan_in_plan(&target, &target, Arc::clone(&replacement)).unwrap();
+        assert!(Arc::ptr_eq(&direct, &replacement));
+        let other: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let untouched = replace_scan_in_plan(&plan, &other, replacement).unwrap();
+        assert!(Arc::ptr_eq(&untouched, &plan));
+    }
 
     #[test]
     fn max_sql_bytes_rejects_oversize_string() {

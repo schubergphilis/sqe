@@ -75,3 +75,5 @@ pub use rest_catalog::{
 pub use system_catalog::{SystemCatalogEntry, SystemCatalogProvider};
 
 mod scoped_table;
+#[cfg(test)]
+pub(crate) mod test_fixtures;

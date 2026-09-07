@@ -23,6 +23,7 @@ fn region() -> Option<String> {
         .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
 }
 
+/// last verified: never in this tree
 #[tokio::test]
 #[ignore = "needs live AWS credentials and a populated Glue catalog"]
 async fn lists_every_database_in_the_region() {
@@ -36,6 +37,7 @@ async fn lists_every_database_in_the_region() {
     println!("{} databases", dbs.len());
 }
 
+/// last verified: never in this tree
 #[tokio::test]
 #[ignore = "needs live AWS credentials and a populated Glue catalog"]
 async fn a_table_maps_onto_a_manifest_the_provider_can_read() {
@@ -105,6 +107,7 @@ async fn a_table_maps_onto_a_manifest_the_provider_can_read() {
 /// A projected table carries its `projection.*` properties through, which is
 /// the only reason it is readable: 192 of the surveyed catalog's projected
 /// tables have no partitions registered in Glue at all.
+/// last verified: never in this tree
 #[tokio::test]
 #[ignore = "needs live AWS credentials and a populated Glue catalog"]
 async fn projection_properties_survive_the_mapping() {
@@ -126,6 +129,7 @@ async fn projection_properties_survive_the_mapping() {
     );
 }
 
+/// last verified: never in this tree
 #[tokio::test]
 #[ignore = "needs live AWS credentials and a populated Glue catalog"]
 async fn an_absent_table_is_not_found_rather_than_a_transport_error() {

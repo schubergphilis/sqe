@@ -3,6 +3,7 @@
 pub mod classify;
 
 use crate::client::BenchClient;
+use crate::query::QualifyTables;
 use crate::report::{CompareStatusReport, ComparisonReport, ComparisonSummary, QueryComparison};
 use classify::{canonical_rows, classify_status, is_transport_error, load_expected_rows};
 use std::time::Instant;
@@ -19,6 +20,7 @@ pub async fn run_comparison(
     trino_endpoint: &str,
     query_filter: Option<&str>,
     output_dir: &str,
+    qualify: QualifyTables,
 ) -> anyhow::Result<ComparisonReport> {
     // Load query files
     let query_dir = format!("benchmarks/queries/{}", benchmark);
@@ -53,17 +55,27 @@ pub async fn run_comparison(
             .to_string();
         let raw_sql = std::fs::read_to_string(entry.path())?;
 
-        // Qualify bare table names with the benchmark namespace.
-        // TPC-BB uses TPC-DS namespace (same as sqe-bench test).
-        let namespace = if benchmark == "tpcbb" {
-            crate::bench_namespace("tpcds", scale)
-        } else {
-            crate::bench_namespace(benchmark, scale)
-        };
-        let sql = crate::query::prefix_tables(&raw_sql, &namespace, benchmark);
+        // Each engine gets the committed text unless it cannot carry a
+        // default schema on the connection (review 707). TPC-BB reads the
+        // TPC-DS namespace (same as sqe-bench test).
+        let namespace = crate::suite_namespace(benchmark, scale, None);
         // Strip trailing semicolons -- Trino HTTP protocol rejects them.
         // Trim whitespace first (files end with \n after ;)
-        let sql = sql.trim().trim_end_matches(';').trim().to_string();
+        let strip = |s: String| s.trim().trim_end_matches(';').trim().to_string();
+        let sql = strip(crate::query::sql_for_client(
+            &raw_sql,
+            &namespace,
+            benchmark,
+            qualify,
+            sqe_client.default_schema(),
+        )?);
+        let trino_sql = strip(crate::query::sql_for_client(
+            &raw_sql,
+            &namespace,
+            benchmark,
+            qualify,
+            trino_client.default_schema(),
+        )?);
 
         // Skip DML queries (UPDATE, DELETE, INSERT, MERGE) in comparison mode.
         // Both engines would modify the same table, causing data corruption.
@@ -106,7 +118,7 @@ pub async fn run_comparison(
 
         // Run against Trino
         let trino_start = Instant::now();
-        let trino_result = trino_client.execute(&sql).await;
+        let trino_result = trino_client.execute(&trino_sql).await;
         let trino_elapsed = trino_start.elapsed();
 
         let sqe_rows = sqe_result

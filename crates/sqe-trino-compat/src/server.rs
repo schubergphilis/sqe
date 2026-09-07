@@ -29,7 +29,8 @@ use crate::explain_compat;
 use crate::info_schema_compat;
 use crate::prepared;
 use crate::protocol::{
-    self, NodeVersion, ServerInfo, TrinoColumn, TrinoError, TrinoResponse, TrinoStats,
+    self, NodeVersion, ServerInfo, TrinoColumn, TrinoError, TrinoErrorExt, TrinoResponse,
+    TrinoStats,
 };
 use crate::session_props;
 

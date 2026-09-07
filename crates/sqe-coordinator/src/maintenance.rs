@@ -3225,8 +3225,9 @@ fn parse_sort_spec(
 
 /// Collect the live data files of the current snapshot. Mirrors the helper
 /// in `WriteHandler` but does not need access to the compression config, so
-/// it stays in this module.
-async fn collect_live_data_files(
+/// it stays in this module. `pub(crate)` for the shared sqlite test rig
+/// (`test_support::sqlite_rig::SqliteRig::live_files`, review 513).
+pub(crate) async fn collect_live_data_files(
     table: &IcebergTable,
 ) -> sqe_core::Result<Vec<iceberg::spec::DataFile>> {
     use futures::{StreamExt, TryStreamExt};
@@ -3861,29 +3862,13 @@ mod tests {
     #[cfg(feature = "test-sqlite")]
     mod concurrent_delete_race {
         use super::*;
+        use crate::test_support::sqlite_rig::SqliteRig;
         use arrow_array::Array;
         use iceberg::spec::Schema as IcebergSchema;
         use iceberg::TableCreation;
 
-        async fn race_sqlite_catalog(dir: &tempfile::TempDir) -> Arc<dyn Catalog> {
-            let location = dir.path().to_str().expect("tempdir path is UTF-8");
-            sqe_catalog::mount::build_catalog(
-                location,
-                sqe_sql::CatalogKind::Sqlite,
-                &std::collections::BTreeMap::new(),
-                &sqe_core::SecretStore::new(),
-            )
-            .await
-            .expect("sqlite catalog builds")
-        }
-
         fn race_one_col_arrow_schema() -> Arc<Schema> {
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
-        }
-
-        fn race_test_config() -> SqeConfig {
-            toml::from_str("[coordinator]\n[auth]\n[catalog]\ncatalog_url = \"\"\n")
-                .expect("minimal SqeConfig parses")
         }
 
         /// Reload the table and read every live data file's `id` column back
@@ -3922,13 +3907,9 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn concurrent_position_delete_during_local_rewrite_does_not_resurrect_rows() {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let catalog = race_sqlite_catalog(&dir).await;
+            let rig = SqliteRig::new().await;
+            let catalog = rig.catalog.clone();
             let ns = NamespaceIdent::new("default".to_string());
-            catalog
-                .create_namespace(&ns, std::collections::HashMap::new())
-                .await
-                .expect("create namespace");
 
             let iceberg_schema: IcebergSchema =
                 iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&race_one_col_arrow_schema())
@@ -3977,7 +3958,7 @@ mod tests {
             // Race machinery: attempt 1 pauses right before its commit.
             let seam = Arc::new(RewriteRaceSeam::new());
             let handler =
-                MaintenanceHandler::new(race_test_config()).with_test_race_seam(seam.clone());
+                MaintenanceHandler::new(rig.config.clone()).with_test_race_seam(seam.clone());
 
             let table_ref = TableRef::parse("default.race_test").expect("parse table ref");
             let catalog_for_task = catalog.clone();
@@ -4044,7 +4025,7 @@ mod tests {
             // handler with no seam re-runs `rewrite_data_files_once`,
             // reloading the table -- now at S1, with the position delete
             // live -- and re-planning against it.
-            let retry_handler = MaintenanceHandler::new(race_test_config());
+            let retry_handler = MaintenanceHandler::new(rig.config.clone());
             let outcome = retry_handler
                 .rewrite_data_files_once(
                     &catalog,
@@ -4085,30 +4066,12 @@ mod tests {
     #[cfg(feature = "test-sqlite")]
     mod puffin_carry_forward {
         use super::*;
-        use iceberg::spec::Schema as IcebergSchema;
-        use iceberg::TableCreation;
+        use crate::test_support::sqlite_rig::SqliteRig;
         use sqe_catalog::puffin_stats::{
             build_theta_sketches, parse_ndv_properties, read_ndv_blobs,
             write_puffin_sidecar_from_sketches, PROP_CARRIED_FROM, PROP_NDV_UPPER_BOUND,
             PROP_PUFFIN_STATS,
         };
-
-        async fn sqlite_catalog(dir: &tempfile::TempDir) -> Arc<dyn Catalog> {
-            let location = dir.path().to_str().expect("tempdir path is UTF-8");
-            sqe_catalog::mount::build_catalog(
-                location,
-                sqe_sql::CatalogKind::Sqlite,
-                &std::collections::BTreeMap::new(),
-                &sqe_core::SecretStore::new(),
-            )
-            .await
-            .expect("sqlite catalog builds")
-        }
-
-        fn test_config() -> SqeConfig {
-            toml::from_str("[coordinator]\n[auth]\n[catalog]\ncatalog_url = \"\"\n")
-                .expect("minimal SqeConfig parses")
-        }
 
         fn id_schema() -> Arc<Schema> {
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
@@ -4126,58 +4089,29 @@ mod tests {
         /// each in a single fast-append. Returns the ident and the table as
         /// committed.
         async fn seeded_table(
-            catalog: &Arc<dyn Catalog>,
+            rig: &SqliteRig,
             name: &str,
             batches: Vec<RecordBatch>,
         ) -> (TableIdent, IcebergTable) {
-            let ns = NamespaceIdent::new("default".to_string());
-            catalog
-                .create_namespace(&ns, std::collections::HashMap::new())
-                .await
-                .expect("create namespace");
-            let iceberg_schema: IcebergSchema =
-                iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&id_schema())
-                    .expect("arrow schema converts");
-            let creation = TableCreation::builder()
-                .name(name.to_string())
-                .schema(iceberg_schema)
-                .properties(std::collections::HashMap::from([(
-                    PROP_PUFFIN_STATS.to_string(),
-                    "true".to_string(),
-                )]))
-                .build();
-            catalog
-                .create_table(&ns, creation)
-                .await
-                .expect("create table");
-            let ident = TableIdent::new(ns, name.to_string());
-            let table = catalog.load_table(&ident).await.expect("load table");
-
-            let compression = parse_parquet_compression("zstd");
-            let mut files = Vec::new();
-            for batch in batches {
-                let written = crate::writer::write_data_files(
-                    &table,
-                    vec![batch],
-                    "seed",
-                    compression,
-                    new_upload_tracker(),
+            let table = rig
+                .local_fs_table_with_properties(
+                    name,
+                    &id_schema(),
+                    None,
+                    std::collections::HashMap::from([(
+                        PROP_PUFFIN_STATS.to_string(),
+                        "true".to_string(),
+                    )]),
                 )
-                .await
-                .expect("write seed data file");
-                files.extend(written);
-            }
-            let tx = Transaction::new(&table);
-            let action = tx.fast_append().add_data_files(files);
-            let tx = action.apply(tx).expect("apply fast_append");
-            let committed = tx.commit(catalog.as_ref()).await.expect("commit seed");
-            (ident, committed)
+                .await;
+            let committed = rig.commit_rows(&table, batches).await;
+            (rig.ident(name), committed)
         }
 
-        async fn rewrite_all(catalog: &Arc<dyn Catalog>, name: &str) -> RewriteOutcome {
-            MaintenanceHandler::new(test_config())
+        async fn rewrite_all(rig: &SqliteRig, name: &str) -> RewriteOutcome {
+            MaintenanceHandler::new(rig.config.clone())
                 .rewrite_data_files_once(
-                    catalog,
+                    &rig.catalog,
                     &TableRef::parse(&format!("default.{name}")).expect("parse table ref"),
                     None,
                     Some(1),
@@ -4194,12 +4128,12 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn rewrite_data_files_carries_statistics_onto_the_new_snapshot() {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let catalog = sqlite_catalog(&dir).await;
+            let rig = SqliteRig::new().await;
+            let catalog = rig.catalog.clone();
             let batch_a = id_batch(0..100);
             let batch_b = id_batch(100..150);
             let (ident, seeded) = seeded_table(
-                &catalog,
+                &rig,
                 "stats_carry",
                 vec![batch_a.clone(), batch_b.clone()],
             )
@@ -4239,7 +4173,7 @@ mod tests {
             );
             assert_eq!(seed_ndv.get(&1), Some(&150), "setup: 150 distinct ids");
 
-            let outcome = rewrite_all(&catalog, "stats_carry").await;
+            let outcome = rewrite_all(&rig, "stats_carry").await;
             assert!(
                 outcome.skipped_reason.is_none(),
                 "compaction must run: {outcome:?}"
@@ -4298,17 +4232,17 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn rewrite_without_previous_statistics_registers_nothing() {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let catalog = sqlite_catalog(&dir).await;
+            let rig = SqliteRig::new().await;
+            let catalog = rig.catalog.clone();
             let (ident, seeded) = seeded_table(
-                &catalog,
+                &rig,
                 "no_stats",
                 vec![id_batch(0..10), id_batch(10..20)],
             )
             .await;
             assert_eq!(seeded.metadata().statistics_iter().len(), 0);
 
-            let outcome = rewrite_all(&catalog, "no_stats").await;
+            let outcome = rewrite_all(&rig, "no_stats").await;
             assert!(outcome.skipped_reason.is_none());
 
             let after = catalog.load_table(&ident).await.expect("reload");
@@ -4346,21 +4280,9 @@ mod tests {
     #[cfg(feature = "test-sqlite")]
     mod partial_progress_batching {
         use super::*;
+        use crate::test_support::sqlite_rig::SqliteRig;
         use iceberg::spec::{DataFileBuilder, DataFileFormat, Struct};
         use iceberg::TableCreation;
-        use tempfile::TempDir;
-
-        async fn sqlite_catalog(dir: &TempDir) -> Arc<dyn Catalog> {
-            let location = dir.path().to_str().expect("tempdir path is UTF-8");
-            sqe_catalog::mount::build_catalog(
-                location,
-                sqe_sql::CatalogKind::Sqlite,
-                &std::collections::BTreeMap::new(),
-                &sqe_core::SecretStore::new(),
-            )
-            .await
-            .expect("sqlite catalog builds")
-        }
 
         fn minimal_schema() -> iceberg::spec::Schema {
             iceberg::spec::Schema::builder()
@@ -4414,18 +4336,13 @@ mod tests {
             String,
             i64,
         ) {
-            let dir = tempfile::tempdir().expect("tempdir");
-            // Leak the TempDir so it outlives this function (the sqlite
+            // Leak the rig so its tempdir outlives this function (the sqlite
             // catalog's backing file must stay on disk for the rest of the
             // test); acceptable in a test process that exits promptly.
-            let dir: &'static TempDir = Box::leak(Box::new(dir));
-            let catalog = sqlite_catalog(dir).await;
+            let rig: &'static SqliteRig = Box::leak(Box::new(SqliteRig::new().await));
+            let catalog = rig.catalog.clone();
 
             let ns = NamespaceIdent::new("default".to_string());
-            catalog
-                .create_namespace(&ns, std::collections::HashMap::new())
-                .await
-                .expect("create namespace");
             let creation = TableCreation::builder()
                 .name(table_name.to_string())
                 .schema(minimal_schema())

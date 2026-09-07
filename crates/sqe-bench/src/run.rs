@@ -5,6 +5,7 @@
 //! Read-path only. Every suite here is treated as a golden read suite. Write
 //! suites (reset/copy) are a separate follow-up.
 
+use crate::query::QualifyTables;
 use crate::{client, profile, report, status, suite};
 
 /// Golden catalog alias attached coordinator-wide for the run.
@@ -24,6 +25,8 @@ pub struct RunArgs {
     pub golden_token: String,
     /// Trino endpoint for `--compare-trino` (e.g. `localhost:18080`).
     pub trino_endpoint: Option<String>,
+    /// How bare table names reach each engine (review 707).
+    pub qualify_tables: QualifyTables,
 }
 
 pub async fn run(args: RunArgs) -> anyhow::Result<()> {
@@ -67,22 +70,20 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
         }
     }
 
-    // Build the Trino client ONCE (compare mode) so each query's single SQE run
-    // is paired with a single Trino run inside the one `run_suite` pass. The
-    // `admin` user header is required (Trino rejects query submit with 401
-    // otherwise) and `iceberg` matches the properties filename benchmark.sh
-    // writes for the compare Trino (iceberg.properties -> catalog `iceberg`).
-    // Mirrors the standalone `compare` verb defaults. Guard the missing endpoint
-    // here so `--compare-trino` without BENCH_TRINO_ENDPOINT still fails fast.
-    let trino_client: Option<Box<dyn client::BenchClient>> = if args.compare_trino {
-        let trino_ep = args
-            .trino_endpoint
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--compare-trino needs BENCH_TRINO_ENDPOINT"))?;
-        Some(Box::new(
-            client::trino::TrinoBenchClient::new(trino_ep, Some("admin"), None)
-                .with_catalog("iceberg"),
-        ))
+    // Compare mode needs a Trino endpoint. The `admin` user header is required
+    // (Trino rejects query submit with 401 otherwise) and `iceberg` matches the
+    // properties filename benchmark.sh writes for the compare Trino
+    // (iceberg.properties -> catalog `iceberg`). Mirrors the standalone
+    // `compare` verb defaults. Guard the missing endpoint here so
+    // `--compare-trino` without BENCH_TRINO_ENDPOINT still fails fast. The
+    // client itself is built per suite below: its default schema
+    // (`X-Trino-Schema`) is the suite namespace (review 707).
+    let trino_endpoint: Option<&str> = if args.compare_trino {
+        Some(
+            args.trino_endpoint
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--compare-trino needs BENCH_TRINO_ENDPOINT"))?,
+        )
     } else {
         None
     };
@@ -107,6 +108,17 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
     for suite in &args.suites {
         println!("\n=== {suite} (sf{}) via golden ===", args.scale);
 
+        // One Trino client per suite so `X-Trino-Schema` names that suite's
+        // namespace and the committed query text runs unmodified.
+        let trino_client: Option<Box<dyn client::BenchClient>> = match trino_endpoint {
+            Some(trino_ep) => Some(Box::new(
+                client::trino::TrinoBenchClient::new(trino_ep, Some("admin"), None)?
+                    .with_catalog("iceberg")
+                    .with_schema(&crate::suite_namespace(suite, args.scale, None)),
+            )),
+            None => None,
+        };
+
         // Single pass: SQE runs each query once (and Trino once, in compare
         // mode). The report results and the optional comparison both come from
         // this one sweep -- no separate compare re-execution of SQE.
@@ -120,6 +132,7 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
             None,
             &endpoint,
             args.trino_endpoint.as_deref(),
+            args.qualify_tables,
         )
         .await?;
 

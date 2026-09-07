@@ -13,7 +13,21 @@ repository.workspace = true
 # required it, so every workspace build carried it anyway), which makes the
 # backend part of this feature a no-op; it stays as the switch that compiles
 # the `#[cfg(feature = "test-sqlite")]` tests in.
-test-sqlite = ["sqe-catalog/sql-sqlite"]
+#
+# Architecture review 513: the feature also compiles the shared in-process
+# write rig (`src/test_support/sqlite_rig.rs`). That rig drives the REAL
+# `WriteHandler` commit paths through a `SessionCatalog`, and the only
+# non-REST `SessionCatalog` constructor that reaches a sqlite file is
+# `CatalogBackend::Jdbc` (`sqlite://...`), whose arm in
+# `SessionCatalog::build_backend_catalog` exists only under
+# `sqe-catalog/sql-postgres` (the sqlx `any` driver set). CI's
+# `cargo test --workspace --all-features` carries that feature already; the
+# local `--features test-sqlite` build now carries it too, so the first such
+# build after this change recompiles sqe-catalog and its dependents once.
+# `tempfile` backs the rig's per-test warehouse directory and is a normal
+# (optional) dependency here because the rig is `pub` library code under the
+# feature, not only `cfg(test)` code.
+test-sqlite = ["sqe-catalog/sql-sqlite", "sqe-catalog/sql-postgres", "dep:tempfile"]
 # `[[hive.roots]] kind = "glue"`: read table metadata from the AWS Glue Data
 # Catalog. Off by default because the Glue client is the heavyweight AWS SDK
 # dependency the slim build exists to avoid.
@@ -91,6 +105,10 @@ sqe-worker = { path = "../sqe-worker" }
 opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
+# Enabled only by the `test-sqlite` feature (see above): the in-process write
+# rig's per-test warehouse directory. Also a dev-dependency below for the
+# plain `cargo test` build.
+tempfile = { workspace = true, optional = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]

@@ -386,7 +386,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Protocol::Http => {
                 let url = format!("{scheme}://{}:{}", cli.host, cli.port);
-                Box::new(http::HttpClient::with_bearer(&url, token, cli.insecure))
+                Box::new(http::HttpClient::with_bearer(&url, token, cli.insecure)?)
             }
         }
     } else {
@@ -427,7 +427,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &username,
                     &password,
                     cli.insecure,
-                ))
+                )?)
             }
         }
     };

@@ -28,6 +28,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# Shared coordinator/worker protocol types (review findings 109 / 602 / 609):
+# `WorkerFault` encodes into a tonic `Status`, classifies `object_store`
+# errors, and `WorkerHello` carries a per-process `Uuid`. All three are
+# already in every workspace build via `workspace-hack`.
+tonic = { workspace = true }
+object_store = { workspace = true }
+uuid = { workspace = true, features = ["serde"] }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]

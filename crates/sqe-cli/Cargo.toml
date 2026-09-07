@@ -30,7 +30,10 @@ sqe-core = { path = "../sqe-core" }
 sqe-catalog = { path = "../sqe-catalog", default-features = false, features = ["rest", "rest-sigv4", "sql-sqlite", "hadoop", "hive-external"] }
 sqe-sql = { path = "../sqe-sql" }
 sqe-trino-functions = { path = "../sqe-trino-functions" }
-sqe-trino-compat = { path = "../sqe-trino-compat" }
+# Shared Trino HTTP + Flight SQL clients (review 705). Replaces the
+# hand-rolled `http.rs` / `flight.rs` clients and the dependency on the
+# whole `sqe-trino-compat` server crate that they carried for two structs.
+sqe-trino-protocol = { path = "../sqe-trino-protocol", features = ["client", "flight"] }
 sqe-policy = { path = "../sqe-policy" }
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
@@ -55,12 +58,9 @@ bytes = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-base64 = { workspace = true }
 clap = { workspace = true }
 rustyline = "18"
 rpassword = "7"
-reqwest = { workspace = true }
-url = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 # Hive external-table DDL in embedded mode (Task 9): destructuring

@@ -1,0 +1,48 @@
+[package]
+name = "sqe-trino-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+description = "Trino wire types and the shared Trino HTTP / Flight SQL clients used by sqe-cli, sqe-bench and sqe-trino-compat"
+
+[features]
+# The wire types alone need only serde. The three client surfaces are opt-in so
+# the Trino-compat *server* crate does not pull reqwest or arrow-flight through
+# this crate (review 705: the binaries used to pull the whole server crate for
+# two structs; the inverse must not happen either).
+default = []
+# `client::TrinoHttpClient` (reqwest, unbounded pagination, same-origin nextUri,
+# DELETE-on-drop cancel).
+client = ["dep:reqwest", "dep:url", "dep:tokio"]
+# `decode`: Trino JSON pages -> Arrow `RecordBatch` with faithful types
+# (decimal(p,s) -> Decimal128(p,s), integer widths, timestamps).
+arrow = ["dep:arrow-array", "dep:arrow-schema", "dep:arrow-buffer", "dep:chrono", "dep:chrono-tz", "dep:base64"]
+# `flight::FlightSqlClient` over `arrow_flight::sql::client::FlightSqlServiceClient`.
+flight = ["dep:arrow-flight", "dep:arrow-array", "dep:arrow-schema", "dep:tonic", "dep:futures"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+arrow-array = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+arrow-buffer = { workspace = true, optional = true }
+arrow-flight = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+chrono-tz = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+tokio = { workspace = true }
+wiremock = { workspace = true }
+
+[lints]
+workspace = true
