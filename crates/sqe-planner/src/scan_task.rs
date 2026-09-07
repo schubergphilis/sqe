@@ -218,8 +218,15 @@ impl ScanCredentials {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ScanTask {
     /// Ticket encoding version. `1` = whole-file (pre-morsel); `2` = optional
-    /// row-group / byte-range morsel fields. Workers reject unsupported
-    /// versions. Missing field deserializes as v1 for old coordinators.
+    /// row-group / byte-range morsel fields; `3` = `hive`. Workers reject
+    /// unsupported versions. Missing field deserializes as v1 for old
+    /// coordinators.
+    ///
+    /// Finding 109: do not hand-set this. Build tasks with
+    /// [`ScanTask::builder`], which derives it from the fields present
+    /// ([`ScanTask::required_version`]); [`ScanTask::to_bytes`] refuses a task
+    /// that declares less than its fields need. Still `pub` so existing struct
+    /// literals compile while they migrate to the builder.
     #[serde(default = "default_scan_task_version")]
     pub version: u32,
     /// Unique identifier for this fragment.
@@ -376,6 +383,109 @@ fn default_scan_task_version() -> u32 {
     SCAN_TASK_VERSION_V1
 }
 
+/// Storage connection parameters a scan ticket carries (finding 109).
+///
+/// Groups the fields every task needs to open its files so the builder takes
+/// one argument instead of five. Credentials default to
+/// [`ScanCredentials::WorkerDefault`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScanStorage {
+    pub s3_endpoint: String,
+    pub s3_region: String,
+    pub s3_path_style: bool,
+    pub s3_allow_http: bool,
+    pub credentials: ScanCredentials,
+}
+
+/// Builder for [`ScanTask`] (finding 109 / #552).
+///
+/// The point of the builder is that `version` is DERIVED from the fields
+/// present, never hand-set: [`ScanTaskBuilder::build`] computes it as the
+/// maximum version any populated field requires
+/// ([`ScanTask::required_version`]). A producer therefore cannot fill a
+/// byte-range morsel field and leave `version: 1`, which is the mixed-fleet
+/// case where an old worker silently scans the whole file per morsel.
+///
+/// The struct-literal surface of `ScanTask` stays public for now so existing
+/// construction sites keep compiling; [`ScanTask::to_bytes`] runs
+/// [`ScanTask::validate_payload`] so a literal that under-declares its
+/// version fails at encode time rather than on the worker.
+#[derive(Clone, Debug)]
+pub struct ScanTaskBuilder {
+    task: ScanTask,
+}
+
+impl ScanTaskBuilder {
+    /// Row-group sub-range of the first file: `start` inclusive, `end`
+    /// exclusive (`None` = through the last group). Requires v2.
+    pub fn with_row_groups(mut self, start: u32, end: Option<u32>) -> Self {
+        self.task.row_group_start = Some(start);
+        self.task.row_group_end = end;
+        self
+    }
+
+    /// Compressed byte sub-range of the first file: `start` inclusive, `end`
+    /// exclusive. Requires v2.
+    pub fn with_byte_range(mut self, start: u64, end: u64) -> Self {
+        self.task.start_byte = Some(start);
+        self.task.end_byte = Some(end);
+        self
+    }
+
+    /// Stable morsel id for retry / dedup. Requires v2.
+    pub fn with_morsel_id(mut self, morsel_id: impl Into<String>) -> Self {
+        self.task.morsel_id = Some(morsel_id.into());
+        self
+    }
+
+    /// Hive external-table descriptor. Requires v3.
+    pub fn with_hive(mut self, desc: HiveScanDescriptor) -> Self {
+        self.task.hive = Some(desc);
+        self
+    }
+
+    /// Per-file sizes, parallel to the file list. Empty = unknown.
+    pub fn with_file_sizes(mut self, sizes: Vec<u64>) -> Self {
+        self.task.file_sizes_bytes = sizes;
+        self
+    }
+
+    /// Column projection by name and, when known, by Iceberg field id
+    /// (parallel vectors; an empty `field_ids` means name-based fallback).
+    pub fn with_projection(mut self, columns: Vec<String>, field_ids: Vec<i32>) -> Self {
+        self.task.projected_columns = columns;
+        self.task.projected_field_ids = field_ids;
+        self
+    }
+
+    /// Pushed-down predicate as datafusion-proto `Expr` bytes (#233).
+    pub fn with_predicate_proto(mut self, predicate: Option<Vec<u8>>) -> Self {
+        self.task.predicate_proto = predicate;
+        self
+    }
+
+    /// Per-fragment row LIMIT hint (#233).
+    pub fn with_limit(mut self, limit: Option<usize>) -> Self {
+        self.task.limit = limit;
+        self
+    }
+
+    /// Ticket audience and expiry (finding 601). Both are part of the signed
+    /// bytes; the signer normally fills them, so this is for tests and for
+    /// producers that sign inline.
+    pub fn with_audience(mut self, audience: impl Into<String>, expires_at: i64) -> Self {
+        self.task.audience = audience.into();
+        self.task.expires_at = expires_at;
+        self
+    }
+
+    /// Finish the task, deriving `version` from the fields present.
+    pub fn build(mut self) -> ScanTask {
+        self.task.version = self.task.required_version();
+        self.task
+    }
+}
+
 impl std::fmt::Debug for ScanTask {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let total_bytes: u64 = self.file_sizes_bytes.iter().sum();
@@ -402,9 +512,191 @@ impl std::fmt::Debug for ScanTask {
     }
 }
 
+/// Wire key the pre-#432 predicate rode under. It is a serde `alias`, so it
+/// never appears in re-serialised output and must be whitelisted by the
+/// unknown-field check.
+const LEGACY_PREDICATE_KEY: &str = "predicate_proto";
+
 impl ScanTask {
+    /// Start building a task. `version` is derived at [`ScanTaskBuilder::build`].
+    pub fn builder(
+        fragment_id: impl Into<String>,
+        data_file_paths: Vec<String>,
+        storage: ScanStorage,
+    ) -> ScanTaskBuilder {
+        ScanTaskBuilder {
+            task: ScanTask {
+                version: SCAN_TASK_VERSION_V1,
+                fragment_id: fragment_id.into(),
+                morsel_id: None,
+                data_file_paths,
+                file_sizes_bytes: Vec::new(),
+                row_group_start: None,
+                row_group_end: None,
+                start_byte: None,
+                end_byte: None,
+                projected_columns: Vec::new(),
+                projected_field_ids: Vec::new(),
+                s3_endpoint: storage.s3_endpoint,
+                s3_region: storage.s3_region,
+                credentials: storage.credentials,
+                audience: String::new(),
+                expires_at: 0,
+                s3_path_style: storage.s3_path_style,
+                s3_allow_http: storage.s3_allow_http,
+                predicate_proto: None,
+                limit: None,
+                hive: None,
+            },
+        }
+    }
+
+    /// The lowest ticket version a worker must understand to honour every
+    /// field this task populates. This is the single source of truth the
+    /// builder and both validators share:
+    ///
+    /// - v2: any morsel field (`morsel_id`, `row_group_*`, `start_byte`,
+    ///   `end_byte`);
+    /// - v3: `hive`.
+    ///
+    /// `predicate_proto`, `limit`, `projected_field_ids`, `credentials`,
+    /// `audience` and `expires_at` do not raise the version: an old worker
+    /// that ignores them still returns correct rows (the coordinator keeps the
+    /// authoritative Filter/Limit) or fails loudly (signature / credentials),
+    /// never silently wrong data.
+    pub fn required_version(&self) -> u32 {
+        let mut required = SCAN_TASK_VERSION_V1;
+        if self.is_morsel() {
+            required = required.max(SCAN_TASK_VERSION_V2);
+        }
+        if self.hive.is_some() {
+            required = required.max(SCAN_TASK_VERSION_V3);
+        }
+        required
+    }
+
+    /// Producer-side invariant: `version` must be at least what the populated
+    /// fields require. Called from [`ScanTask::to_bytes`] so a hand-built
+    /// literal that under-declares fails at encode time on the coordinator.
+    pub fn validate_payload(&self) -> Result<(), String> {
+        let required = self.required_version();
+        if self.version < required {
+            let fields = self.fields_requiring_version(required);
+            return Err(format!(
+                "ScanTask {} declares version {} but carries v{required} fields [{}]; \
+                 build it with ScanTask::builder so the version is derived",
+                self.fragment_id,
+                self.version,
+                fields.join(", ")
+            ));
+        }
+        Ok(())
+    }
+
+    /// Names of the populated fields that need `version >= required`.
+    fn fields_requiring_version(&self, required: u32) -> Vec<&'static str> {
+        let mut fields = Vec::new();
+        if required >= SCAN_TASK_VERSION_V2 {
+            if self.morsel_id.is_some() {
+                fields.push("morsel_id");
+            }
+            if self.row_group_start.is_some() {
+                fields.push("row_group_start");
+            }
+            if self.row_group_end.is_some() {
+                fields.push("row_group_end");
+            }
+            if self.start_byte.is_some() {
+                fields.push("start_byte");
+            }
+            if self.end_byte.is_some() {
+                fields.push("end_byte");
+            }
+        }
+        if required >= SCAN_TASK_VERSION_V3 && self.hive.is_some() {
+            fields.push("hive");
+        }
+        fields
+    }
+
+    /// Consumer-side check a worker runs after decoding, given the newest
+    /// version it implements (normally [`SCAN_TASK_VERSION_CURRENT`]).
+    ///
+    /// Rejects, in order: a version above `supported_max` (a newer
+    /// coordinator; `validate_version` semantics), a version below v1, and a
+    /// payload whose fields need a higher version than declared (a producer
+    /// that hand-set `version`, which on an OLDER worker would have meant
+    /// silently duplicated rows). `unknown_fields` are keys serde dropped on
+    /// decode ([`ScanTask::from_bytes_with_unknown`]); any present means the
+    /// coordinator filled fields this build does not know, so the task is
+    /// refused rather than executed with data missing.
+    pub fn validate_for_worker(
+        &self,
+        supported_max: u32,
+        unknown_fields: &[String],
+    ) -> Result<(), String> {
+        if self.version > supported_max || self.version < SCAN_TASK_VERSION_V1 {
+            return Err(format!(
+                "unsupported ScanTask version {}; this worker supports \
+                 {SCAN_TASK_VERSION_V1}..={supported_max}",
+                self.version
+            ));
+        }
+        self.validate_payload()?;
+        if !unknown_fields.is_empty() {
+            return Err(format!(
+                "ScanTask {} (version {}) carries fields this worker does not know [{}]; \
+                 refusing rather than scanning with them dropped",
+                self.fragment_id,
+                self.version,
+                unknown_fields.join(", ")
+            ));
+        }
+        Ok(())
+    }
+
+    /// Decode and report the keys serde silently dropped.
+    ///
+    /// Design choice (finding 109 option 3): `ScanTask` cannot grow a
+    /// `#[serde(flatten)]` catch-all field without breaking every struct
+    /// literal in the coordinator and worker, and `deny_unknown_fields` is a
+    /// static attribute that cannot sit behind a runtime flag. So the check
+    /// is done outside the struct: the input's top-level keys minus the keys
+    /// of the re-serialised task (plus the legacy `predicate_proto` alias) are
+    /// the ones no field consumed. Re-serialising is cheap relative to a scan
+    /// and cannot drift from the struct definition the way a static key list
+    /// would.
+    pub fn from_bytes_with_unknown(bytes: &[u8]) -> serde_json::Result<(Self, Vec<String>)> {
+        let task: Self = serde_json::from_slice(bytes)?;
+        let input: serde_json::Value = serde_json::from_slice(bytes)?;
+        let known = serde_json::to_value(&task)?;
+        let unknown = match (input.as_object(), known.as_object()) {
+            (Some(input), Some(known)) => input
+                .keys()
+                .filter(|k| !known.contains_key(*k) && k.as_str() != LEGACY_PREDICATE_KEY)
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        };
+        Ok((task, unknown))
+    }
+
+    /// One-call worker entry point: decode, detect dropped keys, and run
+    /// [`ScanTask::validate_for_worker`] against `supported_max`.
+    pub fn decode_for_worker(bytes: &[u8], supported_max: u32) -> Result<Self, String> {
+        let (task, unknown) = Self::from_bytes_with_unknown(bytes)
+            .map_err(|e| format!("Invalid ScanTask ticket: {e}"))?;
+        task.validate_for_worker(supported_max, &unknown)?;
+        Ok(task)
+    }
+
     /// Serialize to JSON bytes for Flight Ticket body.
+    ///
+    /// Runs [`ScanTask::validate_payload`] first: a task whose fields need a
+    /// higher version than it declares is refused here, on the producer.
     pub fn to_bytes(&self) -> serde_json::Result<Vec<u8>> {
+        self.validate_payload()
+            .map_err(<serde_json::Error as serde::ser::Error>::custom)?;
         serde_json::to_vec(self)
     }
 
@@ -531,6 +823,228 @@ mod tests {
             task.validate_version().is_err(),
             "an unknown version must be refused, not read as the newest known one"
         );
+    }
+
+    fn storage() -> ScanStorage {
+        ScanStorage {
+            s3_endpoint: "http://localhost:9000".to_string(),
+            s3_region: "us-east-1".to_string(),
+            s3_path_style: true,
+            s3_allow_http: true,
+            credentials: ScanCredentials::static_keys("key", "secret", ""),
+        }
+    }
+
+    fn built(builder: ScanTaskBuilder) -> ScanTask {
+        builder.build()
+    }
+
+    // ---- finding 109: version is derived, not set ----
+
+    #[test]
+    fn builder_whole_file_task_is_v1() {
+        let task = built(ScanTask::builder(
+            "f",
+            vec!["s3://b/f.parquet".to_string()],
+            storage(),
+        ));
+        assert_eq!(task.version, SCAN_TASK_VERSION_V1);
+        assert_eq!(task.required_version(), SCAN_TASK_VERSION_V1);
+        assert!(task.validate_payload().is_ok());
+        assert_eq!(task.s3_endpoint, "http://localhost:9000");
+        assert!(task.s3_path_style);
+    }
+
+    #[test]
+    fn builder_byte_range_reports_v2() {
+        let task = built(
+            ScanTask::builder("f", vec!["s3://b/f.parquet".to_string()], storage())
+                .with_byte_range(0, 4096),
+        );
+        assert_eq!(task.version, SCAN_TASK_VERSION_V2);
+        assert_eq!(task.start_byte, Some(0));
+        assert_eq!(task.end_byte, Some(4096));
+        assert!(task.validate_payload().is_ok());
+    }
+
+    #[test]
+    fn builder_row_groups_and_morsel_id_report_v2() {
+        let rg = built(
+            ScanTask::builder("f", vec!["s3://b/f.parquet".to_string()], storage())
+                .with_row_groups(2, None),
+        );
+        assert_eq!(rg.version, SCAN_TASK_VERSION_V2);
+        let id = built(
+            ScanTask::builder("f", vec!["s3://b/f.parquet".to_string()], storage())
+                .with_morsel_id("m-1"),
+        );
+        assert_eq!(id.version, SCAN_TASK_VERSION_V2);
+    }
+
+    #[test]
+    fn builder_hive_reports_v3_even_with_morsel_fields() {
+        let task = built(
+            ScanTask::builder("f", vec!["s3://b/f.csv".to_string()], storage())
+                .with_byte_range(0, 10)
+                .with_hive(hive_descriptor()),
+        );
+        assert_eq!(task.version, SCAN_TASK_VERSION_V3);
+        assert!(task.validate_payload().is_ok());
+    }
+
+    /// Optional fields that an old worker can ignore without returning wrong
+    /// rows must not raise the version, or every Iceberg ticket would stop
+    /// being accepted by v1 workers for no correctness gain.
+    #[test]
+    fn builder_predicate_limit_and_field_ids_stay_v1() {
+        let task = built(
+            ScanTask::builder("f", vec!["s3://b/f.parquet".to_string()], storage())
+                .with_projection(vec!["id".to_string()], vec![1])
+                .with_predicate_proto(Some(vec![1, 2, 3]))
+                .with_limit(Some(10))
+                .with_file_sizes(vec![1024])
+                .with_audience("http://w1:50052", 1_700_000_000),
+        );
+        assert_eq!(task.version, SCAN_TASK_VERSION_V1);
+        assert_eq!(task.projected_field_ids, vec![1]);
+        assert_eq!(task.limit, Some(10));
+        assert_eq!(task.audience, "http://w1:50052");
+    }
+
+    /// The acceptance criterion from the review: a hand-set `version: 1`
+    /// with a byte range is exactly the mixed-fleet duplicate-rows case.
+    #[test]
+    fn hand_set_v1_with_byte_range_fails_validate_payload_and_to_bytes() {
+        let mut task = task_with_predicate(None);
+        task.version = SCAN_TASK_VERSION_V1;
+        task.start_byte = Some(0);
+        let err = task
+            .validate_payload()
+            .expect_err("v1 with start_byte must fail");
+        assert!(
+            err.contains("start_byte"),
+            "names the offending field: {err}"
+        );
+        assert!(
+            err.contains("version 1"),
+            "names the declared version: {err}"
+        );
+        assert!(
+            task.to_bytes().is_err(),
+            "to_bytes must refuse to encode an under-declared task"
+        );
+    }
+
+    #[test]
+    fn hand_set_v2_with_hive_fails_validate_payload() {
+        let mut task = task_with_predicate(None);
+        task.version = SCAN_TASK_VERSION_V2;
+        task.hive = Some(hive_descriptor());
+        let err = task.validate_payload().expect_err("v2 with hive must fail");
+        assert!(err.contains("hive"), "{err}");
+        task.version = SCAN_TASK_VERSION_V3;
+        assert!(task.validate_payload().is_ok());
+    }
+
+    /// Over-declaring is fine: a v2 ticket with no morsel fields is what
+    /// today's coordinator sends for whole-file scans on the morsel path.
+    #[test]
+    fn over_declared_version_is_accepted() {
+        let task = task_with_predicate(None);
+        assert_eq!(task.version, SCAN_TASK_VERSION_V2);
+        assert_eq!(task.required_version(), SCAN_TASK_VERSION_V1);
+        assert!(task.validate_payload().is_ok());
+        assert!(task
+            .validate_for_worker(SCAN_TASK_VERSION_CURRENT, &[])
+            .is_ok());
+    }
+
+    // ---- finding 109: consumer side ----
+
+    #[test]
+    fn worker_rejects_under_declared_ticket_from_the_wire() {
+        // Bypass to_bytes (which would refuse) to forge what a buggy or older
+        // coordinator puts on the wire.
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&task_with_predicate(None).to_bytes().unwrap()).unwrap();
+        value["version"] = serde_json::json!(1);
+        value["start_byte"] = serde_json::json!(0);
+        value["end_byte"] = serde_json::json!(100);
+        let wire = serde_json::to_vec(&value).unwrap();
+
+        let err = ScanTask::decode_for_worker(&wire, SCAN_TASK_VERSION_CURRENT)
+            .expect_err("worker must refuse a v1 ticket carrying byte-range fields");
+        assert!(err.contains("start_byte"), "{err}");
+    }
+
+    #[test]
+    fn worker_rejects_version_above_its_supported_max() {
+        let task = task_with_predicate(None); // v2
+        let err = task
+            .validate_for_worker(SCAN_TASK_VERSION_V1, &[])
+            .expect_err("a v1-only worker must refuse a v2 ticket");
+        assert!(err.contains("unsupported ScanTask version 2"), "{err}");
+        assert!(err.contains("1..=1"), "{err}");
+    }
+
+    #[test]
+    fn worker_rejects_version_zero() {
+        let mut task = task_with_predicate(None);
+        task.version = 0;
+        assert!(task
+            .validate_for_worker(SCAN_TASK_VERSION_CURRENT, &[])
+            .is_err());
+    }
+
+    #[test]
+    fn unknown_keys_are_reported_and_refused_by_the_worker() {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&task_with_predicate(None).to_bytes().unwrap()).unwrap();
+        value["future_field"] = serde_json::json!({"x": 1});
+        let wire = serde_json::to_vec(&value).unwrap();
+
+        let (task, unknown) = ScanTask::from_bytes_with_unknown(&wire).unwrap();
+        assert_eq!(unknown, vec!["future_field".to_string()]);
+        assert_eq!(task.fragment_id, "frag-b64");
+
+        let err = ScanTask::decode_for_worker(&wire, SCAN_TASK_VERSION_CURRENT)
+            .expect_err("unknown keys mean the coordinator is newer; refuse");
+        assert!(err.contains("future_field"), "{err}");
+    }
+
+    /// Keys that a field consumed under a different wire name (the legacy
+    /// `predicate_proto` alias) and keys omitted by `skip_serializing_if`
+    /// when present must not be reported as unknown.
+    #[test]
+    fn known_aliases_and_optional_keys_are_not_unknown() {
+        let mut task = task_with_predicate(Some(vec![1, 2]));
+        task.version = SCAN_TASK_VERSION_V3;
+        task.hive = Some(hive_descriptor());
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&task.to_bytes().unwrap()).unwrap();
+        // Rewrite the predicate to the legacy array form under the alias key.
+        value.as_object_mut().unwrap().remove("predicate_proto_b64");
+        value["predicate_proto"] = serde_json::json!([1, 2]);
+        let wire = serde_json::to_vec(&value).unwrap();
+
+        let (decoded, unknown) = ScanTask::from_bytes_with_unknown(&wire).unwrap();
+        assert!(unknown.is_empty(), "got unknown keys: {unknown:?}");
+        assert_eq!(decoded.predicate_proto, Some(vec![1, 2]));
+        assert!(decoded.hive.is_some());
+        assert!(ScanTask::decode_for_worker(&wire, SCAN_TASK_VERSION_CURRENT).is_ok());
+    }
+
+    #[test]
+    fn decode_for_worker_accepts_a_builder_task_round_trip() {
+        let task = built(
+            ScanTask::builder("f", vec!["s3://b/f.parquet".to_string()], storage())
+                .with_byte_range(0, 4096)
+                .with_morsel_id("m-1"),
+        );
+        let wire = task.to_bytes().unwrap();
+        let back = ScanTask::decode_for_worker(&wire, SCAN_TASK_VERSION_CURRENT).unwrap();
+        assert_eq!(back.version, SCAN_TASK_VERSION_V2);
+        assert_eq!(back.morsel_id.as_deref(), Some("m-1"));
     }
 
     /// A v2 ticket from an older coordinator has no `hive` key at all. It must

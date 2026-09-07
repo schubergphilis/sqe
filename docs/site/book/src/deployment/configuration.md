@@ -218,6 +218,12 @@ slow_query_threshold_secs = 30  # WARN-log threshold for slow queries
 distribution_threshold = "128MB" # Min scan size to distribute to workers
 distribution_file_threshold = 4 # Min file count to distribute
 target_task_size = "256MB"      # Target scan task size for bin-packing
+distribution_fallback = "error" # "error" (default) fails a query whose scan could not be
+                                # distributed (manifest listing, scheduling, plan rebuild);
+                                # "local" logs it and runs the scan on the coordinator.
+                                # Policy skips (below threshold, no workers) always run
+                                # locally and are counted in
+                                # sqe_scheduler_decisions_total{decision="local",reason=...}
 sort_mode = "adaptive"          # "adaptive", "partition_only", or "strict"
 
 # Write-path memory safety (see Features -> Write Path)

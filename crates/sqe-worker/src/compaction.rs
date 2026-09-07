@@ -554,8 +554,9 @@ pub async fn run_group_rewrite(ctx: GroupRewriteCtx) -> SqeResult<CompactGroupRe
 
 /// Convenience entry point for callers that do not supervise the rewrite:
 /// builds the `FileIO`, a fresh tracker and an un-cancelled token, then runs
-/// [`run_group_rewrite`]. Used by the manual S3 integration test below; the
-/// Flight handler builds its own [`GroupRewriteCtx`] so it can supervise.
+/// [`run_group_rewrite`]. Used by the live S3 test in
+/// `tests/protocol/compaction_live.rs`; the Flight handler builds its own
+/// [`GroupRewriteCtx`] so it can supervise.
 pub async fn compact_file_group(
     session_ctx: &SessionContext,
     request: &CompactGroupRequest,
@@ -987,90 +988,7 @@ mod tests {
         assert_eq!(decoded[0].file_size_in_bytes(), 2048);
     }
 
-    // ---- Full end-to-end (ignored: needs a live S3-compatible endpoint) --
-
-    /// Manual run against the docker quickstart stack: point at a real
-    /// Iceberg table's metadata.json and RustFS/MinIO credentials, and
-    /// confirm `compact_file_group` returns a `Done`-worthy
-    /// `CompactGroupResponse` whose `new_data_files_avro` decodes via
-    /// `read_data_files_from_avro`.
-    ///
-    /// Not runnable in this environment (no live S3). To exercise it
-    /// manually:
-    ///
-    /// ```text
-    /// SQE_IT_METADATA_LOCATION=s3://warehouse/ns/tbl/metadata/00002-....metadata.json \
-    /// SQE_IT_SNAPSHOT_ID=<current-snapshot-id-from-that-metadata.json> \
-    /// SQE_IT_GROUP_FILE_PATH=s3://warehouse/ns/tbl/data/<some-existing-file>.parquet \
-    /// SQE_IT_S3_ENDPOINT=http://localhost:9000 \
-    /// SQE_IT_S3_ACCESS_KEY=... SQE_IT_S3_SECRET_KEY=... \
-    ///   cargo test -p sqe-worker --lib compact_file_group_against_live_s3 -- --ignored
-    /// ```
-    #[tokio::test]
-    #[ignore = "requires a live S3-compatible endpoint + a real Iceberg table; run manually"]
-    async fn compact_file_group_against_live_s3() {
-        let metadata_location = std::env::var("SQE_IT_METADATA_LOCATION")
-            .expect("SQE_IT_METADATA_LOCATION must be set for this manual integration test");
-        let snapshot_id: i64 = std::env::var("SQE_IT_SNAPSHOT_ID")
-            .expect("SQE_IT_SNAPSHOT_ID must be set")
-            .parse()
-            .expect("SQE_IT_SNAPSHOT_ID must be an i64");
-        let group_file_path =
-            std::env::var("SQE_IT_GROUP_FILE_PATH").expect("SQE_IT_GROUP_FILE_PATH must be set");
-
-        let request = CompactGroupRequest {
-            job_id: "manual-it".to_string(),
-            group_id: 0,
-            table_ident: "manual.it.table".to_string(),
-            metadata_location,
-            snapshot_id,
-            group_file_paths: vec![group_file_path],
-            target_file_size_bytes: 128 * 1024 * 1024,
-            compression: "zstd".to_string(),
-            sort: None,
-            s3: sqe_compaction::wire::S3Conn {
-                endpoint: std::env::var("SQE_IT_S3_ENDPOINT").unwrap_or_default(),
-                region: std::env::var("SQE_IT_S3_REGION").unwrap_or_default(),
-                access_key: std::env::var("SQE_IT_S3_ACCESS_KEY").unwrap_or_default(),
-                secret_key: std::env::var("SQE_IT_S3_SECRET_KEY").unwrap_or_default(),
-                session_token: std::env::var("SQE_IT_S3_SESSION_TOKEN").unwrap_or_default(),
-                path_style: true,
-                allow_http: true,
-            },
-        };
-
-        let ctx = SessionContext::new();
-        let response = compact_file_group(&ctx, &request, None)
-            .await
-            .expect("compaction failed");
-
-        // Schema/partition_type here are placeholders: a real manual run
-        // should load them from the same table's metadata.json used above
-        // (`table.metadata().current_schema()` /
-        // `table.metadata().default_partition_type()`) so the decode
-        // exercises the actual table shape.
-        let schema = iceberg::spec::Schema::builder()
-            .with_schema_id(0)
-            .with_fields(vec![NestedField::required(
-                1,
-                "id",
-                iceberg::spec::Type::Primitive(PrimitiveType::Long),
-            )
-            .into()])
-            .build()
-            .unwrap();
-        let partition_type = iceberg::spec::StructType::new(vec![]);
-        let decoded = iceberg::spec::read_data_files_from_avro(
-            &mut response.new_data_files_avro.as_slice(),
-            &schema,
-            0,
-            &partition_type,
-            FormatVersion::V2,
-        )
-        .expect("avro decode of returned data files must round-trip");
-        assert!(
-            !decoded.is_empty(),
-            "expected at least one rewritten data file"
-        );
-    }
+    // The live end-to-end rewrite against a real S3 endpoint and Iceberg
+    // table lives in `tests/protocol/compaction_live.rs` (finding 611 item 5,
+    // finding 807 item 5): production code reads no integration-env variables.
 }

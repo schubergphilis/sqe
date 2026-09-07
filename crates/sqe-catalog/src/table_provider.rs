@@ -658,3 +658,176 @@ mod snapshot_schema_tests {
         assert_eq!(column_names(&provider), ["y"]);
     }
 }
+
+/// `scan_impl` attaches manifest-derived statistics to the scan node
+/// (architecture review 313), against real manifests from
+/// `crate::test_fixtures::fake_iceberg_table`.
+#[cfg(test)]
+mod scan_statistics_tests {
+    use std::sync::Arc;
+
+    use datafusion::common::stats::Precision;
+    use datafusion::common::{Column, ScalarValue, Statistics};
+    use datafusion::datasource::TableProvider;
+    use datafusion::logical_expr::statistics::StatisticsRequest;
+    use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::prelude::{col, lit, SessionContext};
+
+    use super::SqeTableProvider;
+    use crate::iceberg_scan::IcebergScanExec;
+    use crate::test_fixtures::{
+        fake_iceberg_table, fake_snapshotless_table, FAKE_NAME_NULLS, FAKE_TOTAL_BYTES,
+        FAKE_TOTAL_ROWS,
+    };
+
+    /// The statistics DataFusion's planner would see for the scan node,
+    /// through the same `StatisticsContext` entry point the optimizer uses.
+    fn statistics(plan: &Arc<dyn ExecutionPlan>) -> Arc<Statistics> {
+        let exec = plan
+            .as_ref()
+            .downcast_ref::<IcebergScanExec>()
+            .expect("scan returns an IcebergScanExec");
+        StatisticsContext::new()
+            .compute(exec, &StatisticsArgs::new())
+            .expect("statistics")
+    }
+
+    /// An unfiltered, unprojected scan reports the exact row count, the byte
+    /// size and per-column bounds the manifests carry.
+    #[tokio::test]
+    async fn scan_attaches_manifest_statistics_to_the_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = SqeTableProvider::try_new(fake_iceberg_table(dir.path(), false).await)
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+
+        let plan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let stats = statistics(&plan);
+
+        assert_eq!(stats.num_rows, Precision::Exact(FAKE_TOTAL_ROWS));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(FAKE_TOTAL_BYTES));
+        assert_eq!(stats.column_statistics.len(), 2);
+        assert_eq!(
+            stats.column_statistics[0].min_value,
+            Precision::Inexact(ScalarValue::Int64(Some(1)))
+        );
+        assert_eq!(
+            stats.column_statistics[0].max_value,
+            Precision::Inexact(ScalarValue::Int64(Some(60)))
+        );
+        assert_eq!(
+            stats.column_statistics[1].null_count,
+            Precision::Inexact(FAKE_NAME_NULLS)
+        );
+    }
+
+    /// The attached statistics are indexed by the projected schema.
+    #[tokio::test]
+    async fn projected_scan_statistics_follow_the_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = SqeTableProvider::try_new(fake_iceberg_table(dir.path(), false).await)
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+
+        let plan = provider
+            .scan(&ctx.state(), Some(&vec![1]), &[], None)
+            .await
+            .unwrap();
+        assert_eq!(plan.schema().fields().len(), 1);
+        assert_eq!(plan.schema().field(0).name(), "name");
+        let stats = statistics(&plan);
+
+        assert_eq!(stats.column_statistics.len(), 1);
+        assert_eq!(
+            stats.column_statistics[0].null_count,
+            Precision::Inexact(FAKE_NAME_NULLS)
+        );
+        assert_eq!(stats.num_rows, Precision::Exact(FAKE_TOTAL_ROWS));
+    }
+
+    /// A row-reducing filter turns the snapshot-wide row count inexact so
+    /// `COUNT(*)` can never be answered from the unfiltered total.
+    #[tokio::test]
+    async fn filtered_scan_degrades_the_row_count_to_inexact() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = SqeTableProvider::try_new(fake_iceberg_table(dir.path(), false).await)
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+
+        let plan = provider
+            .scan(&ctx.state(), None, &[col("id").gt(lit(40i64))], None)
+            .await
+            .unwrap();
+        let stats = statistics(&plan);
+
+        assert_eq!(stats.num_rows, Precision::Inexact(FAKE_TOTAL_ROWS));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(FAKE_TOTAL_BYTES));
+    }
+
+    /// A `DistinctCount` request on a table without Puffin sketches leaves
+    /// the NDV absent and everything else untouched.
+    #[tokio::test]
+    async fn distinct_count_request_without_puffin_leaves_ndv_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = SqeTableProvider::try_new(fake_iceberg_table(dir.path(), false).await)
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        let requests = [StatisticsRequest::DistinctCount(Arc::new(
+            Column::from_name("id"),
+        ))];
+
+        let plan = provider
+            .scan_impl(&ctx.state(), None, &[], None, &requests)
+            .await
+            .unwrap();
+        let stats = statistics(&plan);
+
+        assert_eq!(stats.num_rows, Precision::Exact(FAKE_TOTAL_ROWS));
+        assert_eq!(stats.column_statistics[0].distinct_count, Precision::Absent);
+    }
+
+    /// The manifest walk is observed once as `ok` on the first scan and as
+    /// `cache_hit` on the second scan of the same snapshot.
+    #[tokio::test]
+    async fn manifest_walk_is_observed_in_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let metrics = Arc::new(sqe_metrics::MetricsRegistry::new().unwrap());
+        let provider = SqeTableProvider::try_new(fake_iceberg_table(dir.path(), false).await)
+            .await
+            .unwrap()
+            .with_metrics(Arc::clone(&metrics));
+        let ctx = SessionContext::new();
+
+        provider.scan(&ctx.state(), None, &[], None).await.unwrap();
+        provider.scan(&ctx.state(), None, &[], None).await.unwrap();
+
+        let walks = &metrics.catalog_manifest_walk_seconds;
+        assert_eq!(walks.with_label_values(&["ok"]).get_sample_count(), 1);
+        assert_eq!(
+            walks.with_label_values(&["cache_hit"]).get_sample_count(),
+            1
+        );
+        assert_eq!(walks.with_label_values(&["err"]).get_sample_count(), 0);
+    }
+
+    /// A table without a snapshot scans with unknown statistics rather than
+    /// failing planning.
+    #[tokio::test]
+    async fn snapshotless_table_scans_with_unknown_statistics() {
+        let provider = SqeTableProvider::try_new(fake_snapshotless_table())
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+
+        let plan = provider.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let stats = statistics(&plan);
+
+        assert_eq!(stats.num_rows, Precision::Absent);
+        assert_eq!(stats.column_statistics.len(), 2);
+    }
+}

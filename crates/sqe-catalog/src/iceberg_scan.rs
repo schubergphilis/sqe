@@ -3430,3 +3430,183 @@ mod projection_evolution_tests {
         assert_eq!(resolved, vec![Some(0), Some(1)]);
     }
 }
+
+/// Manifest-driven statistics and pruning against real manifest bytes
+/// (architecture review 313). The fixture writes a manifest list and two
+/// data manifests into a temp dir; nothing here is mocked.
+#[cfg(test)]
+mod manifest_statistics_tests {
+    use std::collections::HashSet;
+
+    use datafusion::common::stats::Precision;
+    use datafusion::common::ScalarValue;
+    use datafusion::prelude::{col, lit};
+
+    use super::{collect_data_files_for_pruning, compute_table_statistics, IcebergScanExec};
+    use crate::test_fixtures::{
+        fake_file_path, fake_iceberg_table, fake_snapshotless_table, FAKE_FILES, FAKE_NAME_NULLS,
+        FAKE_SNAPSHOT_ID, FAKE_TOTAL_BYTES, FAKE_TOTAL_ROWS,
+    };
+
+    fn arrow_schema(table: &iceberg::table::Table) -> arrow::datatypes::Schema {
+        iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).unwrap()
+    }
+
+    /// Row count, byte size and per-column min/max/null counts are summed
+    /// across both manifests, and the row count is exact because the
+    /// snapshot carries no delete files.
+    #[tokio::test]
+    async fn compute_table_statistics_aggregates_across_two_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = fake_iceberg_table(dir.path(), false).await;
+        let schema = arrow_schema(&table);
+
+        let stats = compute_table_statistics(&table, None, &schema, 4)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.num_rows, Precision::Exact(FAKE_TOTAL_ROWS));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(FAKE_TOTAL_BYTES));
+        assert_eq!(stats.column_statistics.len(), 2);
+        let id = &stats.column_statistics[0];
+        assert_eq!(
+            id.min_value,
+            Precision::Inexact(ScalarValue::Int64(Some(1)))
+        );
+        assert_eq!(
+            id.max_value,
+            Precision::Inexact(ScalarValue::Int64(Some(60)))
+        );
+        assert_eq!(id.null_count, Precision::Inexact(0));
+        let name = &stats.column_statistics[1];
+        assert_eq!(name.null_count, Precision::Inexact(FAKE_NAME_NULLS));
+        assert_eq!(
+            name.min_value,
+            Precision::Inexact(ScalarValue::Utf8(Some("a".into())))
+        );
+        assert_eq!(name.distinct_count, Precision::Absent);
+    }
+
+    /// The column statistics follow the projected Arrow schema, not the
+    /// table schema: projecting `name` alone yields one entry, for `name`.
+    #[tokio::test]
+    async fn compute_table_statistics_follows_the_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = fake_iceberg_table(dir.path(), false).await;
+        let full = arrow_schema(&table);
+        let projected = full.project(&[1]).unwrap();
+
+        let stats = compute_table_statistics(&table, Some(FAKE_SNAPSHOT_ID), &projected, 4)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.column_statistics.len(), 1);
+        assert_eq!(
+            stats.column_statistics[0].null_count,
+            Precision::Inexact(FAKE_NAME_NULLS)
+        );
+        assert_eq!(stats.num_rows, Precision::Exact(FAKE_TOTAL_ROWS));
+    }
+
+    /// A live position-delete manifest makes the manifest record counts an
+    /// overcount, so the row count must not be exact.
+    #[tokio::test]
+    async fn live_delete_files_make_the_row_count_inexact() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = fake_iceberg_table(dir.path(), true).await;
+        let schema = arrow_schema(&table);
+
+        let stats = compute_table_statistics(&table, None, &schema, 4)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.num_rows, Precision::Inexact(FAKE_TOTAL_ROWS));
+        assert_eq!(stats.total_byte_size, Precision::Inexact(FAKE_TOTAL_BYTES));
+    }
+
+    /// No snapshot: unknown statistics, no error, no manifest read.
+    #[tokio::test]
+    async fn snapshotless_table_yields_unknown_statistics() {
+        let table = fake_snapshotless_table();
+        let schema = arrow_schema(&table);
+
+        let stats = compute_table_statistics(&table, None, &schema, 4)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.num_rows, Precision::Absent);
+        assert_eq!(stats.column_statistics.len(), 2);
+        assert_eq!(stats.column_statistics[0].min_value, Precision::Absent);
+    }
+
+    /// Only the planned paths come back, each with the bounds the pruning
+    /// predicate needs.
+    #[tokio::test]
+    async fn collect_data_files_for_pruning_returns_only_the_planned_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = fake_iceberg_table(dir.path(), false).await;
+        let wanted: HashSet<String> = [&FAKE_FILES[0], &FAKE_FILES[2]]
+            .iter()
+            .map(|f| fake_file_path(&table, f))
+            .collect();
+
+        let files = collect_data_files_for_pruning(&table, None, &wanted, 4)
+            .await
+            .unwrap();
+
+        let mut paths: Vec<String> = files.iter().map(|f| f.file_path().to_string()).collect();
+        paths.sort();
+        let mut expected: Vec<String> = wanted.into_iter().collect();
+        expected.sort();
+        assert_eq!(paths, expected);
+        for file in &files {
+            assert!(file.lower_bounds().contains_key(&1));
+            assert!(file.upper_bounds().contains_key(&1));
+        }
+    }
+
+    /// A snapshot id the metadata does not know resolves to nothing rather
+    /// than to the current snapshot's files.
+    #[tokio::test]
+    async fn collect_data_files_for_pruning_on_unknown_snapshot_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = fake_iceberg_table(dir.path(), false).await;
+        let wanted: HashSet<String> = FAKE_FILES
+            .iter()
+            .map(|f| fake_file_path(&table, f))
+            .collect();
+
+        let files = collect_data_files_for_pruning(&table, Some(999), &wanted, 4)
+            .await
+            .unwrap();
+        assert!(files.is_empty());
+    }
+
+    /// The manifest bounds drive file-level pruning: `id > 40` keeps only the
+    /// file whose `id` range reaches past 40.
+    #[tokio::test]
+    async fn manifest_bounds_prune_files_outside_the_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = fake_iceberg_table(dir.path(), false).await;
+        let schema = std::sync::Arc::new(arrow_schema(&table));
+        let wanted: HashSet<String> = FAKE_FILES
+            .iter()
+            .map(|f| fake_file_path(&table, f))
+            .collect();
+        let files = collect_data_files_for_pruning(&table, None, &wanted, 4)
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 3);
+
+        let (kept, pruned) = IcebergScanExec::prune_data_files(
+            files,
+            &[col("id").gt(lit(40i64))],
+            &schema,
+            table.metadata().current_schema(),
+        );
+
+        assert_eq!(pruned, 2);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].file_path(), fake_file_path(&table, &FAKE_FILES[2]));
+    }
+}

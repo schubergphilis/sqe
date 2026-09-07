@@ -2651,12 +2651,14 @@ impl FlightSqlService for SqeFlightSqlService {
                     }
                 }
 
-                // Finding 408: the body is a JSON `HeartbeatPayload` (worker
-                // URL + sqe.proto.version + DataFusion version); a bare URL is
-                // the legacy shape and parses as version 0.
-                let heartbeat = sqe_planner::HeartbeatPayload::parse(&action.body)
-                    .map_err(Status::invalid_argument)?;
-                let worker_url = heartbeat.worker_url.as_str();
+                // Finding 609: the body is a JSON `WorkerHello` (url,
+                // instance_id, build, ScanTask/proto/DataFusion versions,
+                // capacity, failures_since_last). Older workers send the 408
+                // `HeartbeatPayload` or a bare URL; `parse` accepts all three
+                // and reports the older two as legacy (`v == 0`).
+                let hello =
+                    sqe_planner::WorkerHello::parse(&action.body).map_err(Status::invalid_argument)?;
+                let worker_url = hello.url.as_str();
 
                 if worker_url.is_empty() {
                     return Err(Status::invalid_argument(
@@ -2669,7 +2671,7 @@ impl FlightSqlService for SqeFlightSqlService {
                 // mid-query. A versionless heartbeat is refused only under
                 // production_mode; otherwise it is accepted with a warning.
                 if let Err(err) = crate::worker_registry::check_worker_protocol(
-                    &heartbeat,
+                    &hello.heartbeat_payload(),
                     self.config.coordinator.production_mode,
                 ) {
                     return Err(Status::failed_precondition(format!(
@@ -2712,29 +2714,45 @@ impl FlightSqlService for SqeFlightSqlService {
                     }
                 }
 
-                if let Some(ref registry) = self.worker_registry {
-                    debug!(worker = %worker_url, "Received heartbeat from worker");
-                    let newly_discovered = !registry.is_known(worker_url).await;
-                    if let Err(err) = registry.register_heartbeat(worker_url).await {
-                        use crate::worker_registry::RegistrationError;
-                        let msg = format!("worker heartbeat rejected: {err}");
-                        return Err(match err {
-                            // A bad advertise URL is the worker's fault, not a
-                            // coordinator capacity problem: invalid_argument.
-                            RegistrationError::InvalidAdvertiseUrl { .. } => {
-                                Status::invalid_argument(msg)
+                let ticket_public_key = self.query_handler.ticket_signer().public_key_b64();
+                let cluster_id = coordinator_cluster_id(ticket_public_key);
+
+                let reply = if let Some(ref registry) = self.worker_registry {
+                    debug!(
+                        worker = %worker_url,
+                        instance_id = %hello.instance_id,
+                        legacy = hello.is_legacy(),
+                        "Received heartbeat from worker"
+                    );
+                    // Finding 609: the registry checks version compatibility,
+                    // detects a restarted process (new instance id) and applies
+                    // the re-admission policy; it reports what it saw.
+                    let outcome = match registry.register_hello(&hello).await {
+                        Ok(outcome) => outcome,
+                        Err(err) => {
+                            // A mismatched worker heartbeats every interval;
+                            // say it once per (worker, reason).
+                            if let crate::worker_registry::RegistrationError::HelloMismatch {
+                                reason,
+                                ..
+                            } = &err
+                            {
+                                if registry.note_hello_rejected(worker_url, reason) {
+                                    warn!(
+                                        worker = %worker_url,
+                                        build = %hello.build,
+                                        reason = %reason,
+                                        "Rejected worker hello: version mismatch \
+                                         (logged once per worker until it changes)"
+                                    );
+                                } else {
+                                    debug!(worker = %worker_url, reason = %reason, "Rejected worker hello again");
+                                }
                             }
-                            RegistrationError::CapacityExceeded { .. } => {
-                                Status::resource_exhausted(msg)
-                            }
-                            // Checked above via check_worker_protocol; kept
-                            // exhaustive for the enum.
-                            RegistrationError::ProtocolMismatch { .. } => {
-                                Status::failed_precondition(msg)
-                            }
-                        });
-                    }
-                    if newly_discovered {
+                            return Err(registration_error_status(&err));
+                        }
+                    };
+                    if outcome.newly_discovered {
                         // Finding 601: registry changes are security-relevant; audit them.
                         self.emit_auth_event(
                             sqe_metrics::audit::Outcome::Success,
@@ -2749,7 +2767,71 @@ impl FlightSqlService for SqeFlightSqlService {
                             None,
                         );
                     }
+                    if outcome.instance_changed {
+                        // Finding 609: same URL, new process. Everything the
+                        // coordinator remembered per fragment about the old
+                        // process is gone; drop it rather than push credential
+                        // refreshes at fragment ids the new process never saw.
+                        let dropped = purge_restarted_worker_state(
+                            self.query_handler.credential_tracker(),
+                            worker_url,
+                        )
+                        .await;
+                        info!(
+                            worker = %worker_url,
+                            previous_instance = ?outcome.previous_instance,
+                            instance_id = %hello.instance_id,
+                            build = %hello.build,
+                            dropped_fragment_entries = dropped,
+                            "Worker restarted; fragment-scoped state dropped"
+                        );
+                        self.emit_auth_event(
+                            sqe_metrics::audit::Outcome::Success,
+                            sqe_metrics::audit::Actor::from_parts(
+                                format!("worker:{worker_url}"),
+                                None,
+                                None,
+                                vec![],
+                                vec![],
+                            ),
+                            peer.map(|p| p.ip().to_string()),
+                            None,
+                        );
+                    }
+                    // Finding 609: the reported load vector, for the scheduler
+                    // (via the registry) and for operators (gauges).
+                    if let Some(ref metrics) = self.metrics {
+                        let cap = hello.capacity;
+                        metrics
+                            .worker_reported_memory_limit_bytes
+                            .with_label_values(&[worker_url])
+                            .set(cap.memory_limit_bytes.min(i64::MAX as u64) as i64);
+                        metrics
+                            .worker_reported_scan_budget_free_bytes
+                            .with_label_values(&[worker_url])
+                            .set(cap.scan_budget_free_bytes.min(i64::MAX as u64) as i64);
+                        metrics
+                            .worker_reported_spill_free_bytes
+                            .with_label_values(&[worker_url])
+                            .set(cap.spill_free_bytes.min(i64::MAX as u64) as i64);
+                        metrics
+                            .worker_reported_inflight_scans
+                            .with_label_values(&[worker_url])
+                            .set(i64::from(cap.inflight_scans));
+                    }
+                    sqe_planner::CoordinatorHello::accepted(cluster_id, COORDINATOR_BUILD)
                 } else {
+                    // No registry: still refuse a mismatched build loudly, and
+                    // tell a compatible one it has NOT joined a cluster instead
+                    // of the old bare `ok` (finding 609).
+                    if let sqe_planner::HelloCompat::Mismatch(reason) =
+                        hello.check_compat(&sqe_planner::CoordinatorVersions::current())
+                    {
+                        warn!(worker = %worker_url, reason = %reason, "Rejected worker hello: version mismatch");
+                        return Err(Status::failed_precondition(format!(
+                            "worker hello rejected: {reason}"
+                        )));
+                    }
                     warn!(
                         worker = %worker_url,
                         "Received a worker heartbeat but the worker registry is not \
@@ -2757,17 +2839,20 @@ impl FlightSqlService for SqeFlightSqlService {
                          IGNORING this worker. Set coordinator.worker_secret (or \
                          coordinator.worker_urls) to enable dynamic discovery."
                     );
-                }
+                    sqe_planner::CoordinatorHello::rejected(
+                        cluster_id,
+                        COORDINATOR_BUILD,
+                        "coordinator has no worker registry (single-node mode); set \
+                         coordinator.worker_secret or coordinator.worker_urls",
+                    )
+                };
 
                 // Finding 601: hand the worker the public half of the ticket-signing
                 // key over this secret-authenticated channel so it can verify
-                // tickets without ever holding a signing key. Old workers ignore
-                // the body.
-                let body = serde_json::json!({
-                    "status": "ok",
-                    "ticket_public_key": self.query_handler.ticket_signer().public_key_b64(),
-                })
-                .to_string();
+                // tickets without ever holding a signing key. The reply keeps
+                // `status` and `ticket_public_key` as top-level keys so a
+                // pre-609 worker's pin logic still finds them.
+                let body = reply.with_ticket_public_key(ticket_public_key).encode();
                 let result = arrow_flight::Result {
                     body: bytes::Bytes::from(body),
                 };
@@ -2781,6 +2866,51 @@ impl FlightSqlService for SqeFlightSqlService {
     }
 
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
+}
+
+/// Build identifier the coordinator reports in its hello (finding 609).
+const COORDINATOR_BUILD: &str = env!("CARGO_PKG_VERSION");
+
+/// Finding 609: a stable identity for "the cluster this coordinator fronts".
+///
+/// Derived from the ticket-signing public key: workers already pin that key
+/// (finding 601), it is stable across restarts when
+/// `coordinator.ticket_signing_key_file` is set, and two coordinators with
+/// different keys are, for a worker, different clusters. A worker pointed at
+/// the wrong coordinator sees a different id instead of a bare `ok`.
+fn coordinator_cluster_id(ticket_public_key_b64: &str) -> String {
+    let prefix: String = ticket_public_key_b64.chars().take(12).collect();
+    format!("sqe-{prefix}")
+}
+
+/// Finding 609: the gRPC status a refused registration produces.
+fn registration_error_status(err: &crate::worker_registry::RegistrationError) -> Status {
+    use crate::worker_registry::RegistrationError;
+    let msg = format!("worker heartbeat rejected: {err}");
+    match err {
+        // A bad advertise URL is the worker's fault, not a coordinator
+        // capacity problem: invalid_argument.
+        RegistrationError::InvalidAdvertiseUrl { .. } => Status::invalid_argument(msg),
+        RegistrationError::CapacityExceeded { .. } => Status::resource_exhausted(msg),
+        // Version skew of either generation: the worker must not receive
+        // tickets it cannot honour.
+        RegistrationError::ProtocolMismatch { .. } | RegistrationError::HelloMismatch { .. } => {
+            Status::failed_precondition(msg)
+        }
+    }
+}
+
+/// Finding 609: drop the fragment-scoped bookkeeping the coordinator holds for
+/// a worker URL whose process restarted. Today that is the credential-refresh
+/// tracker; returns how many entries were dropped.
+async fn purge_restarted_worker_state(
+    credential_tracker: Option<&Arc<crate::credential_refresh::CredentialRefreshTracker>>,
+    worker_url: &str,
+) -> usize {
+    match credential_tracker {
+        Some(tracker) => tracker.unregister_worker(worker_url).await,
+        None => 0,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4006,5 +4136,146 @@ catalog_url = ""
             .await
             .expect_err("raw SQL handle must be rejected");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 609: heartbeat hello handling
+    // -----------------------------------------------------------------------
+
+    /// 609 acceptance: a worker whose hello reports a `ScanTask` version the
+    /// coordinator does not plan for is refused by the registry, the refusal
+    /// maps to `FailedPrecondition`, and the worker is never registered (so it
+    /// can never be handed a ticket).
+    #[tokio::test]
+    async fn heartbeat_hello_version_mismatch_is_failed_precondition_and_unregistered() {
+        let registry = crate::worker_registry::WorkerRegistry::new(vec![]);
+        let mut hello = sqe_planner::WorkerHello::current(
+            "http://w1:50052",
+            uuid::Uuid::new_v4(),
+            "other-build",
+            datafusion::DATAFUSION_VERSION,
+        );
+        hello.scan_task_version = sqe_planner::SCAN_TASK_VERSION_CURRENT - 1;
+
+        let err = registry
+            .register_hello(&hello)
+            .await
+            .expect_err("skewed hello must be refused");
+        let status = super::registration_error_status(&err);
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("ScanTask version"), "{status}");
+        assert_eq!(registry.total_workers().await, 0);
+        assert!(registry.healthy_workers().await.is_empty());
+        // Logged once: the first sighting is loud, the repeat is not.
+        assert!(registry.note_hello_rejected("http://w1:50052", status.message()));
+        assert!(!registry.note_hello_rejected("http://w1:50052", status.message()));
+    }
+
+    /// 609 acceptance: the same URL reporting a new `instance_id` clears the
+    /// credential-refresh entries registered against that worker, and only
+    /// those.
+    #[tokio::test]
+    async fn heartbeat_new_instance_id_clears_credential_refresh_state() {
+        use crate::credential_refresh::CredentialRefreshTracker;
+
+        let registry = crate::worker_registry::WorkerRegistry::new(vec![]);
+        let tracker = Arc::new(CredentialRefreshTracker::new());
+        tracker
+            .register("frag-a".into(), "http://w1:50052".into(), None)
+            .await;
+        tracker
+            .register("frag-b".into(), "http://w1:50052".into(), None)
+            .await;
+        tracker
+            .register("frag-c".into(), "http://w2:50052".into(), None)
+            .await;
+
+        let first = uuid::Uuid::new_v4();
+        let hello = |instance| {
+            sqe_planner::WorkerHello::current(
+                "http://w1:50052",
+                instance,
+                "build",
+                datafusion::DATAFUSION_VERSION,
+            )
+        };
+        let outcome = registry.register_hello(&hello(first)).await.unwrap();
+        assert!(!outcome.instance_changed);
+
+        let outcome = registry
+            .register_hello(&hello(uuid::Uuid::new_v4()))
+            .await
+            .unwrap();
+        assert!(outcome.instance_changed);
+        assert_eq!(outcome.previous_instance, Some(first));
+
+        let dropped = super::purge_restarted_worker_state(Some(&tracker), "http://w1:50052").await;
+        assert_eq!(dropped, 2);
+        assert_eq!(
+            tracker.active_count().await,
+            1,
+            "the other worker's fragment must survive"
+        );
+        assert_eq!(
+            super::purge_restarted_worker_state(None, "http://w1:50052").await,
+            0
+        );
+    }
+
+    /// The reply is a `CoordinatorHello` that a pre-609 worker's pin logic can
+    /// still read: `status == "ok"` and a top-level `ticket_public_key`.
+    #[test]
+    fn heartbeat_reply_keeps_legacy_status_and_ticket_public_key() {
+        let body = sqe_planner::CoordinatorHello::accepted(
+            super::coordinator_cluster_id("AbCdEfGhIjKlMnOp"),
+            super::COORDINATOR_BUILD,
+        )
+        .with_ticket_public_key("pk-b64")
+        .encode();
+
+        let raw: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(raw["status"], "ok", "legacy pin logic reads status");
+        assert_eq!(raw["ticket_public_key"], "pk-b64");
+
+        let hello = sqe_planner::CoordinatorHello::parse(&body).expect("new workers decode it");
+        assert!(hello.accepted);
+        assert_eq!(hello.cluster_id, "sqe-AbCdEfGhIjKl");
+        assert_eq!(hello.build, super::COORDINATOR_BUILD);
+        assert_eq!(hello.ticket_public_key.as_deref(), Some("pk-b64"));
+
+        let rejected = sqe_planner::CoordinatorHello::rejected("sqe-x", "b", "single-node")
+            .with_ticket_public_key("pk")
+            .encode();
+        let hello = sqe_planner::CoordinatorHello::parse(&rejected).unwrap();
+        assert!(!hello.accepted);
+        assert_eq!(hello.reason.as_deref(), Some("single-node"));
+    }
+
+    /// Legacy bodies keep registering: a bare URL and a 408 `HeartbeatPayload`
+    /// both parse as a legacy hello with the right URL and are admitted.
+    #[tokio::test]
+    async fn heartbeat_legacy_bodies_still_register() {
+        let registry = crate::worker_registry::WorkerRegistry::new(vec![]);
+
+        let bare = sqe_planner::WorkerHello::parse(b"http://w1:50052").unwrap();
+        assert!(bare.is_legacy());
+        assert_eq!(bare.url, "http://w1:50052");
+        registry.register_hello(&bare).await.unwrap();
+
+        let payload = sqe_planner::HeartbeatPayload::current(
+            "http://w2:50052",
+            datafusion::DATAFUSION_VERSION,
+        )
+        .to_json();
+        let hello = sqe_planner::WorkerHello::parse(payload.as_bytes()).unwrap();
+        assert!(hello.is_legacy());
+        assert_eq!(hello.url, "http://w2:50052");
+        crate::worker_registry::check_worker_protocol(&hello.heartbeat_payload(), true)
+            .expect("408 payload carries matching versions");
+        registry.register_hello(&hello).await.unwrap();
+
+        let mut healthy = registry.healthy_workers().await;
+        healthy.sort();
+        assert_eq!(healthy, vec!["http://w1:50052", "http://w2:50052"]);
     }
 }

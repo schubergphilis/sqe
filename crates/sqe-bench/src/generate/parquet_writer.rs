@@ -1,8 +1,6 @@
 // The streaming writer is the primary API; `write_parquet_files` remains
 // as a thin wrapper so generators that haven't been migrated to iterators
-// yet can still call in. Allow `dead_code` on helpers that the still-in-flux
-// generator modules may not be consuming yet.
-#![allow(dead_code)]
+// yet can still call in.
 
 use std::fs;
 

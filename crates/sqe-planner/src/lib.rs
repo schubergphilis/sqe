@@ -23,6 +23,7 @@ pub mod splitter;
 pub mod stage_planner;
 pub mod star_schema_reorder;
 pub mod stats;
+pub mod worker_fault;
 pub mod worker_protocol;
 
 pub use distributed_aggregate::{
@@ -58,7 +59,11 @@ pub use scan_morsel::{
     ScanMorsel, DEFAULT_MORSEL_MAX_BYTES, DEFAULT_MORSEL_TARGET_BYTES, SCAN_TASK_VERSION_CURRENT,
     SCAN_TASK_VERSION_V1, SCAN_TASK_VERSION_V2,
 };
-pub use scan_task::{HiveScanDescriptor, HiveScanFormat, ScanTask, ScanCredentials, TicketSecret};
+pub use scan_morsel::SCAN_TASK_VERSION_V3;
+pub use scan_task::{
+    HiveScanDescriptor, HiveScanFormat, ScanCredentials, ScanStorage, ScanTask, ScanTaskBuilder,
+    TicketSecret,
+};
 #[cfg(feature = "shuffle-planning")]
 pub use shuffle_exec::{ShufflePartitioning, ShuffleReaderExec, ShuffleWriterExec};
 pub use single_distinct_count::SingleDistinctCountCompanionRule;
@@ -69,6 +74,13 @@ pub use sort_memory_rule::SortMemoryRule;
 pub use splitter::bin_pack_files;
 pub use splitter::split_files;
 pub use stage_planner::{compute_waves, decompose_plan, QueryStage, ShuffleType};
-pub use worker_protocol::{HeartbeatPayload, PROTO_VERSION, PROTO_VERSION_UNKNOWN};
+pub use worker_fault::{
+    classify_anyhow_error, classify_datafusion_error, classify_error_chain, classify_message,
+    classify_object_store_error, WorkerFault, FAULT_METADATA_KEY,
+};
+pub use worker_protocol::{
+    CoordinatorHello, CoordinatorVersions, HeartbeatPayload, HelloCompat, WorkerCapacity,
+    WorkerHello, HELLO_VERSION, HELLO_VERSION_LEGACY, PROTO_VERSION, PROTO_VERSION_UNKNOWN,
+};
 pub use star_schema_reorder::{StarSchemaReorderRule, DEFAULT_MIN_RATIO};
 pub use stats::PuffinStatisticsRequestRule;

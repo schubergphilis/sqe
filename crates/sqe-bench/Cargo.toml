@@ -15,7 +15,13 @@ name = "sqe-bench"
 path = "src/main.rs"
 
 [dependencies]
-sqe-trino-compat = { path = "../sqe-trino-compat" }
+# Shared Trino HTTP client (with faithful Arrow decoding) and Flight SQL
+# client (review 705). The bench used to link the whole `sqe-trino-compat`
+# server crate for `TrinoResponse`/`TrinoColumn`.
+sqe-trino-protocol = { path = "../sqe-trino-protocol", features = ["client", "arrow", "flight"] }
+# Tokenizer-based table qualification for `--qualify-tables` (review 707):
+# aliases and literals are tokens, not substrings, so they are never touched.
+sqlparser = { workspace = true }
 clap = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }

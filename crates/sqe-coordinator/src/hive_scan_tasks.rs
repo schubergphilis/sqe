@@ -124,45 +124,40 @@ pub fn build_hive_scan_tasks(
             continue;
         }
         let (paths, sizes): (Vec<String>, Vec<u64>) = part.files.iter().cloned().unzip();
-        tasks.push(ScanTask {
-            version: sqe_planner::scan_morsel::SCAN_TASK_VERSION_V3,
-            fragment_id: format!("{fragment_prefix}-hive-{i}"),
-            morsel_id: None,
-            data_file_paths: paths,
-            file_sizes_bytes: sizes,
-            row_group_start: None,
-            row_group_end: None,
-            start_byte: None,
-            end_byte: None,
-            projected_columns: projected_columns.to_vec(),
-            // A Hive table has no Iceberg field IDs. Left empty on purpose:
-            // `projected_columns` is already the documented fallback, and
-            // sending a bogus id would make the worker project by it.
-            projected_field_ids: Vec::new(),
+        let storage = sqe_planner::ScanStorage {
             s3_endpoint: s3.endpoint.clone(),
             s3_region: s3.region.clone(),
+            s3_path_style: s3.path_style,
+            s3_allow_http: s3.allow_http,
             credentials: sqe_planner::ScanCredentials::static_keys(
                 s3.access_key.clone(),
                 s3.secret_key.clone(),
                 s3.session_token.clone(),
             ),
-            audience: String::new(),
-            expires_at: 0,
-            s3_path_style: s3.path_style,
-            s3_allow_http: s3.allow_http,
-            predicate_proto: predicate_proto.clone(),
-            limit,
-            hive: Some(HiveScanDescriptor {
-                format: read.format,
-                delimiter: read.delimiter,
-                quote: read.quote,
-                escape: read.escape,
-                has_header: read.has_header,
-                partition_values: part.values.clone(),
-                partition_columns: partition_columns.to_vec(),
-                full_schema_json: full_schema_json.clone(),
-            }),
-        });
+        };
+        // Finding 109: the builder derives v3 from `with_hive`; nothing here
+        // sets the version by hand.
+        tasks.push(
+            ScanTask::builder(format!("{fragment_prefix}-hive-{i}"), paths, storage)
+                .with_file_sizes(sizes)
+                // A Hive table has no Iceberg field IDs. Left empty on purpose:
+                // `projected_columns` is already the documented fallback, and
+                // sending a bogus id would make the worker project by it.
+                .with_projection(projected_columns.to_vec(), Vec::new())
+                .with_predicate_proto(predicate_proto.clone())
+                .with_limit(limit)
+                .with_hive(HiveScanDescriptor {
+                    format: read.format,
+                    delimiter: read.delimiter,
+                    quote: read.quote,
+                    escape: read.escape,
+                    has_header: read.has_header,
+                    partition_values: part.values.clone(),
+                    partition_columns: partition_columns.to_vec(),
+                    full_schema_json: full_schema_json.clone(),
+                })
+                .build(),
+        );
     }
     Ok(tasks)
 }

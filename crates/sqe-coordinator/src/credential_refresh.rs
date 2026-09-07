@@ -152,6 +152,27 @@ impl CredentialRefreshTracker {
         }
     }
 
+    /// Finding 609: drop every fragment registered against `worker_url`.
+    ///
+    /// Called when a known worker URL heartbeats with a new `instance_id`: the
+    /// process that subscribed those fragments' credential channels is gone,
+    /// so a refresh push would land on a fragment id the new process never
+    /// saw. Returns how many entries were dropped.
+    pub async fn unregister_worker(&self, worker_url: &str) -> usize {
+        let mut fragments = self.fragments.write().await;
+        let before = fragments.len();
+        fragments.retain(|_, f| f.worker_url != worker_url);
+        let dropped = before - fragments.len();
+        if dropped > 0 {
+            debug!(
+                worker_url = %worker_url,
+                dropped,
+                "Dropped fragment credential state for a restarted worker"
+            );
+        }
+        dropped
+    }
+
     /// Return fragments whose credentials are approaching expiry.
     ///
     /// A fragment is "approaching expiry" if its credential expiry is within

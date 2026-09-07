@@ -208,29 +208,19 @@ mod tests {
             "{dbg}"
         );
         assert!(dbg.contains("[REDACTED]"), "{dbg}");
-        let task = sqe_planner::ScanTask {
-            hive: None,
-            version: sqe_planner::SCAN_TASK_VERSION_V1,
-            morsel_id: None,
-            row_group_start: None,
-            row_group_end: None,
-            start_byte: None,
-            end_byte: None,
-            fragment_id: "f".to_string(),
-            data_file_paths: vec!["s3://b/k".to_string()],
-            file_sizes_bytes: vec![1],
-            projected_columns: vec![],
-            projected_field_ids: vec![],
-            s3_endpoint: String::new(),
-            s3_region: String::new(),
-            credentials: c,
-            audience: "http://w1:50052".to_string(),
-            expires_at: 1,
-            s3_path_style: true,
-            s3_allow_http: true,
-            predicate_proto: None,
-            limit: None,
-        };
+        let task = sqe_planner::ScanTask::builder(
+            "f",
+            vec!["s3://b/k".to_string()],
+            sqe_planner::ScanStorage {
+                s3_path_style: true,
+                s3_allow_http: true,
+                credentials: c,
+                ..Default::default()
+            },
+        )
+        .with_file_sizes(vec![1])
+        .with_audience("http://w1:50052", 1)
+        .build();
         let dbg = format!("{task:?}");
         assert!(!dbg.contains("vended-secret"), "{dbg}");
         let json = String::from_utf8(task.to_bytes().unwrap()).unwrap();

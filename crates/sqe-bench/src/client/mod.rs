@@ -1,6 +1,5 @@
-// Client implementations are used by the `test` and `load` commands which are
-// not yet wired into the CLI; suppress dead_code warnings until they are.
-#![allow(dead_code)]
+//! Bench clients: one trait, two transports, both over the shared
+//! `sqe-trino-protocol` clients (review 705).
 
 pub mod flight;
 pub mod trino;
@@ -18,34 +17,57 @@ pub trait BenchClient: Send + Sync {
 
     /// Protocol name for reporting.
     fn protocol_name(&self) -> &str;
+
+    /// The default schema this connection carries for unqualified table
+    /// names, when the protocol can express one (Trino: `X-Trino-Schema`).
+    /// `None` means the query text must qualify its tables itself
+    /// (`query::QualifyTables::Auto` does that for such clients).
+    fn default_schema(&self) -> Option<&str> {
+        None
+    }
 }
 
-pub async fn create_client(
-    protocol: &str,
-    host: &str,
-    username: Option<&str>,
-    password: Option<&str>,
-    token_endpoint: Option<&str>,
-    client_id: Option<&str>,
-    client_secret: Option<&str>,
-) -> anyhow::Result<Box<dyn BenchClient>> {
-    match protocol {
+/// Everything needed to open a bench connection.
+pub struct ConnectArgs<'a> {
+    /// `"flight"` or `"trino"`.
+    pub protocol: &'a str,
+    pub endpoint: &'a str,
+    pub username: Option<&'a str>,
+    pub password: Option<&'a str>,
+    pub token_endpoint: Option<&'a str>,
+    pub client_id: Option<&'a str>,
+    pub client_secret: Option<&'a str>,
+    /// Default catalog (Trino protocol only: `X-Trino-Catalog`).
+    pub catalog: Option<&'a str>,
+    /// Default schema (Trino protocol only: `X-Trino-Schema`).
+    pub schema: Option<&'a str>,
+}
+
+pub async fn create_client(args: &ConnectArgs<'_>) -> anyhow::Result<Box<dyn BenchClient>> {
+    match args.protocol {
         "flight" => {
             let client = flight::FlightSqlBenchClient::connect(
-                host,
-                username,
-                password,
-                token_endpoint,
-                client_id,
-                client_secret,
+                args.endpoint,
+                args.username,
+                args.password,
+                args.token_endpoint,
+                args.client_id,
+                args.client_secret,
             )
             .await?;
             Ok(Box::new(client))
         }
         "trino" => {
-            let client = trino::TrinoBenchClient::new(host, username, password);
+            let mut client =
+                trino::TrinoBenchClient::new(args.endpoint, args.username, args.password)?;
+            if let Some(c) = args.catalog {
+                client = client.with_catalog(c);
+            }
+            if let Some(s) = args.schema {
+                client = client.with_schema(s);
+            }
             Ok(Box::new(client))
         }
-        _ => anyhow::bail!("Unknown protocol: {protocol}. Supported: flight, trino"),
+        other => anyhow::bail!("Unknown protocol: {other}. Supported: flight, trino"),
     }
 }
