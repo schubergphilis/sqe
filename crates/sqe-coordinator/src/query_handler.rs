@@ -347,7 +347,8 @@ impl QueryHandler {
             &config.coordinator,
         ));
         let catalog_ops = CatalogOps::new(config.clone());
-        let mut write_handler = WriteHandler::new(config.clone());
+        let mut write_handler = WriteHandler::new(config.clone())
+            .with_catalog_discovery(Arc::new(crate::session_context::PolarisCatalogDiscovery));
         if let Some(ref m) = metrics {
             write_handler = write_handler.with_metrics(Arc::clone(m));
         }
@@ -6725,7 +6726,7 @@ impl QueryHandler {
         stmt: &Statement,
         session_catalog: &Arc<SessionCatalog>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
-        use crate::catalog_ops::resolve_table_ident;
+        use crate::ident::resolve_table_ident;
         use sqlparser::ast::CommentObject;
 
         let (object_type, object_name, comment_text) = match stmt {

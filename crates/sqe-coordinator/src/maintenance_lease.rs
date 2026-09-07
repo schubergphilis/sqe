@@ -110,11 +110,11 @@ use uuid::Uuid;
 
 use sqe_core::{SqeError, SqeErrorCode};
 
+use crate::commit::is_conflict_message;
 use crate::maintenance_log::{
     collect_live_data_files, field_id, read_batches, resolve_state_table_ident,
     row_to_record_batch, string_bounds, MaintenanceLogRow,
 };
-use crate::write_handler::is_conflict_message;
 use crate::writer::{
     new_upload_tracker, parse_parquet_compression, write_data_files, WriteCleanupGuard,
 };
