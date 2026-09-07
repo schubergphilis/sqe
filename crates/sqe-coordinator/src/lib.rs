@@ -4,7 +4,6 @@ pub mod audit_tag_adapter;
 pub mod auth_session;
 pub mod catalog_ops;
 pub mod channel_pool;
-pub mod commit;
 pub mod compaction_dispatch;
 pub mod credential_refresh;
 pub mod ticket_credentials;
@@ -16,16 +15,12 @@ pub mod flight_sql_helpers;
 pub mod hive_ddl_handler;
 pub mod hive_tag_source;
 pub mod hive_scan_tasks;
-pub mod hive_write;
-pub mod ident;
 pub mod maintenance;
 pub mod maintenance_lease;
 pub mod maintenance_log;
 pub mod maintenance_principal;
 pub mod maintenance_scheduler;
 pub mod memory;
-pub mod merge_sql;
-pub mod merge_target_provider;
 pub mod metrics_history;
 pub mod mode;
 pub mod parallel_probe_scan;
@@ -33,7 +28,6 @@ pub mod parallel_scan;
 pub mod policy_wiring;
 pub mod post_planning;
 pub mod prepared_statements;
-pub mod puffin_carry;
 pub mod quack_executor;
 pub mod mcp_server;
 pub mod query_cache;
@@ -55,14 +49,23 @@ pub mod transport;
 pub mod web_auth;
 pub mod web_ui;
 pub mod worker_registry;
-pub mod write_handler;
-pub mod writer;
 
-/// In-process test rigs (architecture review 513). Compiled for this crate's
-/// own unit tests and, as public library code, for `tests/*.rs` under
-/// `--features test-sqlite`; never part of a production build.
-#[cfg(any(test, feature = "test-sqlite"))]
-pub mod test_support;
+/// The write path lives in `sqe-write` since 2026-09-07 (build-time item C2,
+/// `docs/internal/plans/2026-09-07-coordinator-crate-split.md`). Re-exported
+/// under the old module paths so `crate::write_handler::…` inside this crate
+/// and `sqe_coordinator::writer::…` in its integration tests compile
+/// unchanged; new code should import from `sqe_write` directly.
+pub use sqe_write::{
+    commit, hive_write, ident, merge_sql, merge_target_provider, puffin_carry, write_handler,
+    writer,
+};
+
+/// In-process test rigs (architecture review 513), owned by `sqe-write` since
+/// the split. Every consumer in this crate sits under
+/// `#[cfg(feature = "test-sqlite")]`, which forwards to `sqe-write/test-sqlite`;
+/// never part of a production build.
+#[cfg(feature = "test-sqlite")]
+pub use sqe_write::test_support;
 
 /// `write_memory` (pool-tracked write buffers) moved to `sqe-compaction` so
 /// the worker-side compaction/write path can reuse it without depending on
