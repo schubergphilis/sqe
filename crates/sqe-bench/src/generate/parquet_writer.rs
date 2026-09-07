@@ -199,6 +199,7 @@ mod tests {
     }
 
     fn tempdir_for(tag: &str) -> std::path::PathBuf {
+        // nosemgrep: opt.aikido.semgrep-rules.rust.lang.security.temp-dir -- test-only scratch dir for synthetic parquet output, pid suffixed
         let dir = std::env::temp_dir().join(format!(
             "sqe-bench-parquet-writer-{tag}-{}",
             std::process::id()

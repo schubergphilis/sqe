@@ -860,6 +860,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// PKCS#1 PEM-encoded RSA private key for test JWT signing.
+    // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.private-key -- throwaway test-only keypair, never used outside cfg(test)
     const TEST_RSA_PRIVATE_KEY_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----
 MIIEowIBAAKCAQEAvX0NLGQkeecTCMwoDPx6Qkutsf0PWBEjZnNm4vkmTTvHD1F0
 NE1XHFBwxxm3eZYaEI59au96PkH5RZS0A7XivkKOj9xcmG4MtZLa4f0UKW6hWXBB

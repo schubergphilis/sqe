@@ -214,6 +214,7 @@ start_golden_coordinator() {
     s3://*)
       ENDPOINT_HOST=$(python3 -c "from urllib.parse import urlparse; import sys; print(urlparse(sys.argv[1]).hostname or '')" "$BENCH_S3_ENDPOINT")
       if [ -z "$ENDPOINT_HOST" ]; then
+        # nosemgrep: opt.aikido.semgrep-rules.ai.ai-best-practices.hooks-dns-exfiltration.hooks-dns-exfiltration-generic
         echo "ERROR: could not parse host from BENCH_S3_ENDPOINT=$BENCH_S3_ENDPOINT" >&2
         exit 1
       fi

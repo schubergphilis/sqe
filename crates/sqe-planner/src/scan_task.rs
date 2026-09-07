@@ -712,6 +712,7 @@ mod tests {
             projected_field_ids: vec![],
             s3_endpoint: "http://localhost:9000".to_string(),
             s3_region: "us-east-1".to_string(),
+            // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS's documented example key, test fixture
             credentials: ScanCredentials::static_keys("AKIAIOSFODNN7EXAMPLE".to_string(), "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(), "session-token-value".to_string()),
             audience: String::new(),
             expires_at: 0,
@@ -722,6 +723,7 @@ mod tests {
             hive: None,
         };
         let debug_output = format!("{task:?}");
+        // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS's documented example key, asserting it is redacted
         assert!(!debug_output.contains("AKIAIOSFODNN7EXAMPLE"));
         assert!(!debug_output.contains("wJalrXUtnFEMI"));
         assert!(!debug_output.contains("session-token-value"));

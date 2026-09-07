@@ -260,10 +260,10 @@ if ! $SKIP_LOAD; then
         "$BENCH_BIN" generate "$SUITE" --scale "$SCALE" --output "$DATA_DIR" 2>&1 | tail -3
 
         echo "  ── Loading $SUITE SF${SCALE}..."
-        "$BENCH_BIN" load "$SUITE" \
+        # nosemgrep: opt.aikido.semgrep-rules.ai.ai-best-practices.hooks-dns-exfiltration.hooks-dns-exfiltration-generic
+        "$BENCH_BIN" load "$SUITE" --host "$SINGLE_HOST" \
             --scale "$SCALE" \
             --data "$DATA_DIR" \
-            --host "$SINGLE_HOST" \
             --port "$SINGLE_PORT" \
             --username "$SINGLE_USER" \
             --password "$SINGLE_PASS" \
@@ -392,9 +392,9 @@ run_single_config() {
         local METRICS_DELTA="${METRICS_DIR}/${SUITE}-sf${SCALE}-${CONFIG_NAME}-${TIMESTAMP}-delta.txt"
         capture_metrics 19090 "$METRICS_BEFORE"
 
-        OUTPUT=$("$BENCH_BIN" test "$SUITE" \
+        # nosemgrep: opt.aikido.semgrep-rules.ai.ai-best-practices.hooks-dns-exfiltration.hooks-dns-exfiltration-generic
+        OUTPUT=$("$BENCH_BIN" test "$SUITE" --host "$SINGLE_HOST" \
             --scale "$SCALE" \
-            --host "$SINGLE_HOST" \
             --port "$SINGLE_PORT" \
             --username "$SINGLE_USER" \
             --password "$SINGLE_PASS" \
@@ -501,9 +501,9 @@ run_distributed_config() {
         local METRICS_DELTA="${METRICS_DIR}/${SUITE}-sf${SCALE}-${CONFIG_NAME}-${TIMESTAMP}-delta.txt"
         capture_metrics "$DIST_METRICS_PORT" "$METRICS_BEFORE"
 
-        OUTPUT=$("$BENCH_BIN" test "$SUITE" \
+        # nosemgrep: opt.aikido.semgrep-rules.ai.ai-best-practices.hooks-dns-exfiltration.hooks-dns-exfiltration-generic
+        OUTPUT=$("$BENCH_BIN" test "$SUITE" --host "$DIST_HOST" \
             --scale "$SCALE" \
-            --host "$DIST_HOST" \
             --port "$DIST_PORT" \
             --username "$DIST_USER" \
             --password "$DIST_PASS" \

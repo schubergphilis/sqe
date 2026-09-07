@@ -20,6 +20,7 @@ fn tmpdir(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    // nosemgrep: opt.aikido.semgrep-rules.rust.lang.security.temp-dir -- test-only scratch dir for synthetic benchmark data, pid+nanos suffixed
     let dir = std::env::temp_dir().join(format!("sqe-bench-generate-parallel-{tag}-{pid}-{ts}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();

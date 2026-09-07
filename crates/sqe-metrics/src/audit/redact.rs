@@ -315,12 +315,12 @@ mod tests {
 
     #[test]
     fn redact_create_secret_aws_keys() {
-        let sql = "CREATE SECRET aws (\
-            TYPE aws, \
-            ACCESS_KEY_ID 'AKIAIOSFODNN7EXAMPLE', \
+        // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS's documented example key, redaction test input
+        let sql = "CREATE SECRET aws (TYPE aws, ACCESS_KEY_ID 'AKIAIOSFODNN7EXAMPLE', \
             SECRET_ACCESS_KEY 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', \
             SESSION_TOKEN 'FQoDYXdzEPv...EXAMPLE')";
         let redacted = redact_pii(sql);
+        // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS's documented example key, asserting it is redacted
         assert!(!redacted.contains("AKIAIOSFODNN7EXAMPLE"), "{redacted}");
         assert!(
             !redacted.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),

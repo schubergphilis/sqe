@@ -18,6 +18,7 @@ use sqe_sql::{CatalogKind, OptionValue};
 fn disable_imds() {
     // Safety: process-global env var, set identically by every test
     // in this file. Concurrent set is a no-op rather than a race.
+    // nosemgrep: opt.aikido.semgrep-rules.rust.lang.security.unsafe-usage -- test-only env var set (Rust 2024 requires unsafe); safety argued above
     unsafe {
         std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
     }
