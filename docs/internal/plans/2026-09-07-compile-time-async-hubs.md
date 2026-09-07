@@ -113,6 +113,28 @@ integration tests (8 passed).
   the attribution table, box the top roots, re-measure. Stop when
   `evaluate_obligation` is under a quarter of the compile.
 
+## sqe-catalog: one cut, then diminishing returns
+
+`HiveTableProvider` held `Arc<ListingTable>`; every `TableProvider` method
+re-walked `ListingOptions -> SortExpr -> Expr -> LogicalPlan` for the
+`Self: Sync` proof (3.5 s each). As `Arc<dyn TableProvider>` (plus the local
+`ListingTable` held across the scan `.await`) the library goes 56 s -> 43 s,
+type_check_crate 13.8 s -> 6.5 s.
+
+What remains (40 s) is spread over ten `scan`/`table`/`delete_from` methods
+at 1.2 to 2.2 s each in `check_coroutine_obligations` and again in
+`optimized_mir`, and it is a different shape: not one deep type reached
+through a struct, but hundreds of flat, individually cheap obligations, one
+per component of each coroutine witness (`Vec<Expr>`, `Expr`, `Alias`,
+`ScalarValue`, `SessionState`, `Analyzer`, `Optimizer`, ...). Those are the
+DataFusion parameter and argument types every `TableProvider` method takes
+(`filters: &[Expr]`, `state: &dyn Session`) or passes on, and they are live
+across the awaits by construction. Even a one-line delegating
+`delete_from` on a `dyn` inner pays 2.4 s. There is nothing local to erase
+without changing DataFusion's trait signatures, so the catalog stops here at
+43 s; the next lever for it is the C1 dependency edge (it waits 22 s for
+`sqe-policy` before it can start).
+
 ## Progress log
 
 - 2026-09-07: measured, fixed, documented (this file); chain 173 s -> 131 s.
