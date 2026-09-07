@@ -28,13 +28,13 @@ use uuid::Uuid;
 ///
 /// Backoff: exponential with jitter, capped at ~1s base. After `max_attempts`
 /// the last error propagates unchanged so the caller's error-mapping still runs.
-/// `pub(crate)` so `maintenance_log::append_row` can reuse it too: the
+/// `pub` so the coordinator's `maintenance_log::append_row` can reuse it too: the
 /// ledger table is also the multi-coordinator lease table
 /// (`MaintenanceSchedulerConfig::lease = Catalog`), so append commits need
 /// the same retry-on-conflict behavior as any other writer, not a
 /// single-shot commit.
 #[tracing::instrument(skip(catalog, build_and_commit), fields(table = %table_ident, op = %op), name = "sqe.write_commit")]
-pub(crate) async fn commit_with_retry<F, Fut>(
+pub async fn commit_with_retry<F, Fut>(
     catalog: &dyn Catalog,
     table_ident: &TableIdent,
     op: &str,
@@ -90,13 +90,13 @@ where
     }))
 }
 
-/// `pub(crate)` so `maintenance_lease.rs` can classify a losing claim commit
+/// `pub` so the coordinator's `maintenance_lease.rs` can classify a losing claim commit
 /// with the exact same transient-conflict heuristic `commit_with_retry` uses
 /// (a real conflict, e.g. the SQL catalog's optimistic-concurrency CAS loss,
 /// warrants a bounded retry; the `ErrorKind::DataInvalid` from a lost
 /// `check_file_existence` lease race does not match this heuristic and must
 /// be classified separately -- see `lease_cas_spike_test.rs` / Task 1).
-pub(crate) fn is_conflict_message(msg: &str) -> bool {
+pub fn is_conflict_message(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     lower.contains("commitconflict")
         || lower.contains("commit conflict")

@@ -263,7 +263,7 @@ pub(crate) fn data_file_record_count(files: &[DataFile]) -> usize {
 /// reported different numbers depending on which early return it hit (514).
 /// The `Result` return is already `#[must_use]`, so a dropped call stands out
 /// in review; only DDL (CREATE TABLE / CTAS) legitimately returns no rows at all.
-pub(crate) fn affected_rows_batch(count: u64) -> sqe_core::Result<Vec<RecordBatch>> {
+pub fn affected_rows_batch(count: u64) -> sqe_core::Result<Vec<RecordBatch>> {
     use arrow_array::Int64Array;
     use arrow_schema::{DataType, Field};
     let n = i64::try_from(count).map_err(|_| {
@@ -377,7 +377,7 @@ fn build_lineage_insert_plan(
 /// Extract the target table `ObjectName` from a `Statement::Delete`. Centralises
 /// the FromTable + TableFactor matching so a future sqlparser variant change only
 /// needs to be patched once.
-pub(crate) fn delete_target_object_name(stmt: &Statement) -> sqe_core::Result<&ObjectName> {
+pub fn delete_target_object_name(stmt: &Statement) -> sqe_core::Result<&ObjectName> {
     let delete = match stmt {
         Statement::Delete(d) => d,
         other => {
@@ -421,7 +421,7 @@ fn try_resolve_delete_target_ident(stmt: &Statement, session: &Session) -> Optio
 }
 
 /// Extract the target table `ObjectName` from a `Statement::Update`.
-pub(crate) fn update_target_object_name(stmt: &Statement) -> sqe_core::Result<&ObjectName> {
+pub fn update_target_object_name(stmt: &Statement) -> sqe_core::Result<&ObjectName> {
     let table_factor = match stmt {
         Statement::Update(update) => &update.table,
         other => {
@@ -6696,7 +6696,7 @@ fn compound_ident_parts(expr: &sqlparser::ast::Expr) -> Option<(String, String)>
 }
 
 /// Convert a sqlparser SQL data type to an Arrow DataType.
-pub(crate) fn sql_type_to_arrow(
+pub fn sql_type_to_arrow(
     sql_type: &sqlparser::ast::DataType,
 ) -> sqe_core::Result<arrow_schema::DataType> {
     use arrow_schema::DataType;
@@ -7085,7 +7085,7 @@ pub(crate) fn create_table_arrow_fields(
         .collect()
 }
 
-pub(crate) fn arrow_schema_to_iceberg_with_defaults(
+pub fn arrow_schema_to_iceberg_with_defaults(
     arrow_schema: &ArrowSchema,
     column_defs: &[sqlparser::ast::ColumnDef],
 ) -> sqe_core::Result<IcebergSchema> {
@@ -7168,7 +7168,7 @@ pub(crate) fn arrow_schema_to_iceberg_with_defaults(
 /// that is a hard error or a silent NULL). Returns `Err` when the literal
 /// is structurally compatible but out of range for the target type, so the
 /// user sees the failure instead of a silently wrapped value. Issue #77.
-pub(crate) fn default_to_iceberg_literal(
+pub fn default_to_iceberg_literal(
     sql_literal: &sqe_sql::DefaultLiteral,
     target: &iceberg::spec::Type,
 ) -> Result<Option<iceberg::spec::Literal>, String> {
@@ -7226,7 +7226,7 @@ pub(crate) fn default_to_iceberg_literal(
 ///
 /// Triggers V3 when any column uses a V3-only SQL type (nanosec timestamps)
 /// or when any column carries a write-default through the Iceberg schema.
-pub(crate) fn requires_v3_features(
+pub fn requires_v3_features(
     column_defs: &[sqlparser::ast::ColumnDef],
     iceberg_schema: &IcebergSchema,
 ) -> bool {
@@ -7472,7 +7472,7 @@ pub(crate) fn build_partition_spec(
 /// Used by the partition-evolution handler (ALTER TABLE ADD/DROP/REPLACE
 /// PARTITION FIELD) so it can share the exact same transform vocabulary as
 /// CREATE TABLE's `PARTITIONED BY` clause.
-pub(crate) fn parse_partition_transform_sql(
+pub fn parse_partition_transform_sql(
     transform_sql: &str,
 ) -> sqe_core::Result<(String, String, iceberg::spec::Transform)> {
     use sqlparser::dialect::GenericDialect;

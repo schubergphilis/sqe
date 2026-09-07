@@ -585,7 +585,14 @@ fn nullify_default_partition_columns(
 /// literal sentinel into a real NULL in `scan()`'s physical output so
 /// `SELECT dt` and `WHERE dt IS NULL` agree on what the value is.
 struct HiveTableProvider {
-    inner: Arc<ListingTable>,
+    /// The wrapped `ListingTable`, held as a trait object on purpose. Every
+    /// `async_trait` method below proves `HiveTableProvider: Sync` for its own
+    /// `Send` future, and with a concrete `ListingTable` here that proof
+    /// walked DataFusion's whole plan and expression type graph
+    /// (`ListingOptions` -> `SortExpr` -> `Expr` -> `LogicalPlan`) once per
+    /// method, about 3.5 s each (`-Zself-profile`, 2026-09-07). `dyn
+    /// TableProvider` is `Send + Sync` by declaration, so the walk stops here.
+    inner: Arc<dyn TableProvider>,
     schema: SchemaRef,
     statistics: Statistics,
     partition_columns: Vec<String>,
@@ -714,7 +721,10 @@ impl HiveTableProvider {
             let config = ListingTableConfig::new(url)
                 .with_listing_options(options)
                 .with_schema(Arc::clone(&self.file_schema));
-            let listing = ListingTable::try_new(config)?;
+            // As a trait object for the same compile-time reason as
+            // `HiveTableProvider::inner`: this future holds it across the
+            // `.await`, and `dyn TableProvider::scan` is an opaque `BoxFuture`.
+            let listing: Arc<dyn TableProvider> = Arc::new(ListingTable::try_new(config)?);
             let plan = listing
                 .scan(state, file_proj.as_ref(), &data_filters, limit)
                 .await?;

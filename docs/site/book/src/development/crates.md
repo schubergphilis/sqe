@@ -12,6 +12,7 @@ graph TB
     SERVER --> COORD["sqe-coordinator"]
     SERVER --> WORKER["sqe-worker"]
 
+    COORD --> WRITE["sqe-write"]
     COORD --> AUTH["sqe-auth"]
     COORD --> CAT["sqe-catalog"]
     COORD --> SQL["sqe-sql"]
@@ -25,6 +26,11 @@ graph TB
     WORKER --> PLANNER
     WORKER --> METRICS
     WORKER --> CORE
+
+    WRITE --> CAT
+    WRITE --> SQL
+    WRITE --> POLICY
+    WRITE --> CORE
 
     AUTH --> CORE
     CAT --> POLICYAPI["sqe-policy-api"]
@@ -124,9 +130,26 @@ Distributed query planning.
 | `scan_task.rs` | `ScanTask`: serializable message from coordinator to worker |
 | `splitter.rs` | `split_files()`: divide data files across workers |
 
+### sqe-write
+
+The write path, split out of the coordinator so it compiles in parallel with
+the distribution and maintenance code. It depends on the shared tier only;
+the coordinator reaches back in through the `CatalogDiscovery` trait and
+re-exports every module here under its old `sqe_coordinator::` path.
+
+| Module | Contents |
+|---|---|
+| `write_handler.rs` | `WriteHandler`: CTAS, INSERT, INSERT OVERWRITE, UPDATE, DELETE, MERGE; schema mapping and Iceberg commits |
+| `writer.rs` | Parquet data and position-delete file writing, upload tracking, fanout caps |
+| `merge_sql.rs`, `merge_target_provider.rs` | MERGE clause classification and SQL rewriting |
+| `puffin_carry.rs` | Puffin statistics carry-forward across commits |
+| `hive_write.rs` | Hive external-table CTAS and INSERT |
+| `ident.rs`, `commit.rs` | Identifier folding and resolution; commit-with-retry and conflict classification |
+| `test_support/sqlite_rig.rs` | In-process SQLite-backed write rig (feature `test-sqlite`) |
+
 ### sqe-coordinator
 
-The coordinator: SQL routing, session management, write handling.
+The coordinator: SQL routing, session management, maintenance, distribution.
 
 | Module | Contents |
 |---|---|
@@ -134,9 +157,8 @@ The coordinator: SQL routing, session management, write handling.
 | `query_handler.rs` | `QueryHandler`: central query routing and execution (596 lines) |
 | `session_manager.rs` | `SessionManager`: session lifecycle, token refresh integration |
 | `worker_registry.rs` | `WorkerRegistry`: worker discovery, health checking |
-| `catalog_ops.rs` | DDL operations (DROP TABLE, CREATE/DROP SCHEMA) |
-| `write_handler.rs` | CTAS and INSERT INTO handling |
-| `writer.rs` | Parquet file writing to S3 |
+| `catalog_ops.rs` | DDL operations (DROP TABLE, CREATE/DROP SCHEMA, ALTER TABLE) |
+| `maintenance*.rs` | Maintenance procedures, scheduler, ledger and lease |
 | `distributed_scan.rs` | Distributed scan coordination |
 | `mcp_server.rs` | MCP wiring: router mount, dedicated-listener mode, and the executor that runs tool SQL through `QueryHandler` under the existing auth and query rate limiters |
 | `mode.rs` | `Mode` enum, `resolve_mode()` for sqe-server |
