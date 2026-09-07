@@ -27,9 +27,13 @@ graph TB
     WORKER --> CORE
 
     AUTH --> CORE
+    CAT --> POLICYAPI["sqe-policy-api"]
     CAT --> CORE
     SQL --> CORE
+    POLICY --> POLICYAPI
     POLICY --> CORE
+    POLICYAPI --> SQL
+    POLICYAPI --> CORE
     PLANNER --> CORE
     METRICS --> CORE
     TRINO --> CORE
@@ -88,13 +92,28 @@ SQL parsing and statement classification.
 |---|---|
 | `classifier.rs` | `parse_and_classify(sql)` to `StatementKind`, routes all SQL statement types |
 
+### sqe-policy-api
+
+The interfaces the catalog needs from the policy layer, and nothing else, so
+the two crates compile side by side instead of the catalog waiting for the
+policy engine. `sqe-policy` re-exports all of it under its old paths.
+
+| Module | Contents |
+|---|---|
+| `lib.rs` | `PolicyStore` trait; `ResolvedPolicy`, `MaskType`, `TagMaskSpec`, `MaskPolicyInfo` |
+| `grants.rs` | `GrantBackend` trait; `GrantStatement`, `RevokeStatement`, `Grantee`, `GrantFilter`, `AccessCheck`, `GrantEntry`, `AccessCheckResult` |
+| `hive_catalogs.rs` | `HiveCatalogs`: the live set of catalogs holding Hive external tables |
+
 ### sqe-policy
 
 Policy enforcement framework (pluggable backend).
 
 | Module | Contents |
 |---|---|
-| `lib.rs` | `PolicyEnforcer` trait, `PassthroughEnforcer` (default no-op) |
+| `lib.rs` | `PolicyEnforcer` trait, `PassthroughEnforcer` (default no-op); re-exports of `sqe-policy-api` |
+| `plan_rewriter.rs` | `PolicyPlanRewriter`: row filters, column masks and restrictions injected above `TableScan` |
+| `ranger_store.rs`, `policy_store.rs` | `RangerStore` and `InMemoryPolicyStore` implementations of `PolicyStore` |
+| `grants/` | `PolarisGrantBackend`, Ranger grant backend, profile-based grants |
 
 ### sqe-planner
 

@@ -5,6 +5,7 @@ members = [
     "crates/sqe-auth",
     "crates/sqe-catalog",
     "crates/sqe-sql",
+    "crates/sqe-policy-api",
     "crates/sqe-policy",
     "crates/sqe-planner",
     "crates/sqe-trino-functions",
