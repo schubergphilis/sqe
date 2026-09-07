@@ -50,7 +50,7 @@ pub struct PreparedStatement {
     /// The plan built once at prepare time, still carrying placeholders.
     /// `None` for statements the streaming path does not run (DML, DDL,
     /// SHOW, ...), which execute through the buffered text path instead.
-    pub plan: Option<LogicalPlan>,
+    pub plan: Option<StoredPlan>,
     /// Inferred type of each positional parameter; `None` where DataFusion
     /// had no context to infer one (accepts any bind).
     pub param_types: Vec<Option<DataType>>,
@@ -58,6 +58,45 @@ pub struct PreparedStatement {
     pub dataset_schema: SchemaRef,
     /// The current bind, kept until `Close`, a re-bind, or eviction.
     params: RwLock<Option<Vec<ScalarValue>>>,
+}
+
+/// A [`LogicalPlan`] behind a trait object, so that the auto-trait solver
+/// stops here.
+///
+/// This exists for compile time, not behaviour. `PreparedStatement` sits in a
+/// moka cache inside `SqeFlightSqlService`, and every `async_trait` method of
+/// that service (20-odd of them) has to prove `SqeFlightSqlService: Sync` for
+/// its own `Send` future. With a bare `LogicalPlan` field that proof walked
+/// DataFusion's entire plan and expression type graph once per method, about
+/// 1.1 s each (`-Zself-profile`, 2026-09-07). `dyn PlanHolder` is `Send +
+/// Sync` by declaration, so the walk ends at this field.
+#[derive(Clone)]
+pub struct StoredPlan(Arc<dyn PlanHolder>);
+
+trait PlanHolder: Send + Sync + 'static {
+    fn plan(&self) -> &LogicalPlan;
+}
+
+impl PlanHolder for LogicalPlan {
+    fn plan(&self) -> &LogicalPlan {
+        self
+    }
+}
+
+impl StoredPlan {
+    pub fn new(plan: LogicalPlan) -> Self {
+        Self(Arc::new(plan))
+    }
+
+    pub fn plan(&self) -> &LogicalPlan {
+        self.0.plan()
+    }
+}
+
+impl std::fmt::Debug for StoredPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StoredPlan(..)")
+    }
 }
 
 impl std::fmt::Debug for PreparedStatement {
@@ -82,7 +121,7 @@ impl PreparedStatement {
         Self {
             sql,
             numbered_sql,
-            plan,
+            plan: plan.map(StoredPlan::new),
             param_types,
             dataset_schema,
             params: RwLock::new(None),
@@ -175,7 +214,8 @@ impl PreparedStatement {
     pub fn bound_plan(&self) -> Result<LogicalPlan, String> {
         let plan = self
             .plan
-            .clone()
+            .as_ref()
+            .map(|p| p.plan().clone())
             .ok_or_else(|| "prepared statement has no plan (not a query)".to_string())?;
         if self.param_types.is_empty() {
             return Ok(plan);

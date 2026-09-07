@@ -36,7 +36,7 @@
 //! # Running
 //!
 //! ```text
-//! RUST_MIN_STACK=33554432 cargo test -p sqe-coordinator --features test-sqlite -- write_handler::
+//! RUST_MIN_STACK=33554432 cargo test -p sqe-write --features test-sqlite -- write_handler::
 //! RUST_MIN_STACK=33554432 cargo test -p sqe-coordinator --features test-sqlite -- maintenance::
 //! ```
 //!

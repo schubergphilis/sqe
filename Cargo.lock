@@ -6651,6 +6651,7 @@ dependencies = [
  "sqe-trino-compat",
  "sqe-trino-functions",
  "sqe-worker",
+ "sqe-write",
  "sqlparser",
  "subtle",
  "tempfile",
@@ -7053,6 +7054,37 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
+ "uuid",
+ "workspace-hack",
+]
+
+[[package]]
+name = "sqe-write"
+version = "0.37.0"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "datafusion",
+ "futures",
+ "iceberg",
+ "parquet",
+ "serde_json",
+ "sqe-catalog",
+ "sqe-compaction",
+ "sqe-core",
+ "sqe-lineage",
+ "sqe-metrics",
+ "sqe-policy",
+ "sqe-sql",
+ "sqlparser",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
  "uuid",
  "workspace-hack",
 ]

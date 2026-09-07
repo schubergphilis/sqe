@@ -27,7 +27,10 @@ repository.workspace = true
 # `tempfile` backs the rig's per-test warehouse directory and is a normal
 # (optional) dependency here because the rig is `pub` library code under the
 # feature, not only `cfg(test)` code.
-test-sqlite = ["sqe-catalog/sql-sqlite", "sqe-catalog/sql-postgres", "dep:tempfile"]
+#
+# Since the write path moved to `sqe-write` (2026-09-07) the rig lives there;
+# this feature forwards so `sqe_coordinator::test_support` keeps resolving.
+test-sqlite = ["sqe-write/test-sqlite", "sqe-catalog/sql-sqlite", "sqe-catalog/sql-postgres", "dep:tempfile"]
 # `[[hive.roots]] kind = "glue"`: read table metadata from the AWS Glue Data
 # Catalog. Off by default because the Glue client is the heavyweight AWS SDK
 # dependency the slim build exists to avoid.
@@ -46,6 +49,7 @@ sqe-core = { path = "../sqe-core" }
 sqe-auth = { path = "../sqe-auth" }
 sqe-catalog = { path = "../sqe-catalog" }
 sqe-compaction = { path = "../sqe-compaction" }
+sqe-write = { path = "../sqe-write" }
 sqe-sql = { path = "../sqe-sql" }
 sqe-policy = { path = "../sqe-policy" }
 sqe-planner = { path = "../sqe-planner" }
