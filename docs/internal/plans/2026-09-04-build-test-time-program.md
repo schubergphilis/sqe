@@ -207,7 +207,8 @@ and are to be re-measured, not assumed.
 | # | Change | Expected effect | Risk |
 |---|---|---|---|
 | C1 | Break the serial chain: move the three `sqe-policy` items that `sqe-catalog` needs (the `PolicyStore` trait, `HiveCatalogs`, grants types) into `sqe-core` or a tiny `sqe-policy-api` crate; extract the six `sqe-worker` items the coordinator uses into a `sqe-worker-api` crate. | policy and catalog compile in parallel, worker and coordinator compile in parallel: about 75 s off the cold critical path, more on incremental touches to policy. | Trait moves touch many files once. |
-| C2 | Split `sqe-coordinator` (64K lines, 67 s lib + 43 s bin + 16 test binaries). The write path extraction plan already exists (`2026-07-13-sqe-write-crate-extraction.md`); hive and maintenance are the next candidates. | Coordinator lib compile roughly halves; touches to write code stop rebuilding the whole coordinator. | Large refactor; do after B1 and B2 so the gain is measurable. |
+| C2 | Split `sqe-coordinator` (64K lines, 67 s lib + 43 s bin + 16 test binaries). The write path extraction plan already exists (`2026-07-13-sqe-write-crate-extraction.md`); hive and maintenance are the next candidates. **Measured 2026-09-07: no compile-time gain (the cost is async `Send` proofs, not lines; see C4).** Structural item for #636 only. | Touches to write code get a 3 s test loop; coordinator compile unchanged. | Large refactor. |
+| C4 | **Box the async hubs.** Per crate: `scripts/compile-profile.sh <crate>`, box the futures the attribution table names (`BoxFuture` at the definition), type-erase deep types held in service structs. Coordinator done on `perf/compile-time-async-hubs` (68 s -> 18 s); `sqe-catalog` next (43 of 47 s is the same shape). | Coordinator library 50 s off every build; catalog likely 30 s more on the critical path. | One allocation per boxed call; no behaviour change. |
 | C3 | Runner capacity: a dedicated runner with a persistent `target/` on local disk, or a larger shared class. Runner 2433 (`docker_socket`) already exists and would also let `make test-integration` return to CI. | The GitLab-based precedent for this shape went from 20 min to under 5. | Platform team ownership; not in this repo. |
 
 ### Progress log
@@ -244,6 +245,23 @@ and are to be re-measured, not assumed.
   43.5 min (28 thin-LTO link), `target/` 37 GiB. Open: lifecycle rule on
   the bucket (tenant admin), read-only key, reachability of the acc
   endpoint from the production runners.
+- 2026-09-07, C4 found and done for the coordinator
+  (`2026-09-07-compile-time-async-hubs.md`). A first crate-split re-plan
+  measured with a warm incremental cache (154 s chain, coordinator 96 s) is
+  withdrawn. With `CARGO_INCREMENTAL=0` the chain is 173 s on main and 177 s
+  with the write path in its own crate (`refactor/extract-sqe-write`, held):
+  `sqe-write` compiles in 2.8 s and the coordinator library stays at 68 s.
+  `-Zself-profile` shows 58 of those 68 s are `evaluate_obligation`, the
+  `Send`/`Sync` proofs rooted in the Flight SQL `async_trait` methods (each
+  re-walking DataFusion's `LogicalPlan` type graph through the
+  prepared-statement cache), the Quack and MCP executors awaiting
+  `QueryHandler::execute`, and the session-cache invalidation future. Boxing
+  four hub futures and type-erasing the stored plan: coordinator library
+  68 s -> 18 s on `perf/compile-time-async-hubs`. C2 is a structural item
+  (#636) from here on; C1 is back on the table because with incremental off
+  the critical path is policy 22 s -> catalog 47 s -> coordinator -> binary,
+  and `sqe-catalog` shows the same profile (43 of 47 s), so it gets the same
+  treatment before any dependency surgery.
 
 ## 4. Expected end state
 
@@ -265,13 +283,20 @@ and are to be re-measured, not assumed.
 
 ## 6. Measurement protocol
 
-Run before and after each MR in this program:
+Run before and after each MR in this program. Always with
+`CARGO_INCREMENTAL=0`: an incremental cache in an unknown state made the
+2026-09-07 crate-split baseline (154 s, coordinator 96 s) unrepeatable, and a
+warm one turns the same touch into a 25 s build that measures nothing. CI
+runs with incremental off, so that is the number that matters anyway.
 
 ```
+export CARGO_INCREMENTAL=0
 # cold build of all test binaries with a timings report
 cargo clean && cargo test --workspace --no-run --timings
 # incremental fan-out
 touch crates/sqe-core/src/lib.rs && time cargo test --workspace --no-run
+# where ONE crate's compile goes (passes, hot queries, functions to box)
+scripts/compile-profile.sh sqe-coordinator
 touch crates/sqe-coordinator/src/lib.rs && time cargo test -p sqe-coordinator --no-run
 # feature-set drift between selections (should collapse to one hash after B1)
 for s in "--workspace" "-p sqe-coordinator" "-p sqe-bench -p sqe-coordinator"; do

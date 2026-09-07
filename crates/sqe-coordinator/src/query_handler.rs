@@ -954,6 +954,24 @@ impl QueryHandler {
         }
     }
 
+    /// Execute one SQL statement for `session` and collect the result.
+    ///
+    /// Returns a boxed future on purpose. The body below is a ~2,000-line
+    /// `async fn`; its state machine type is enormous, and every caller that
+    /// awaited it inside another `Send` future (the Flight SQL, Quack and MCP
+    /// executors, all `async_trait` methods) made rustc re-prove `Send` over
+    /// the whole thing. Measured with `-Zself-profile` on 2026-09-07: those
+    /// proofs were 30 of the coordinator library's 68 s compile. Boxing here
+    /// proves `Send` once and hands callers an opaque `dyn Future`.
+    pub fn execute<'a>(
+        &'a self,
+        session: &'a Session,
+        sql: &'a str,
+        client_ip: Option<String>,
+    ) -> futures::future::BoxFuture<'a, sqe_core::Result<Vec<RecordBatch>>> {
+        Box::pin(self.execute_inner(session, sql, client_ip))
+    }
+
     #[tracing::instrument(
         skip(self, session, sql),
         fields(
@@ -966,7 +984,7 @@ impl QueryHandler {
         ),
         name = "execute",
     )]
-    pub async fn execute(
+    async fn execute_inner(
         &self,
         session: &Session,
         sql: &str,
@@ -3013,15 +3031,19 @@ impl QueryHandler {
     /// and puts it in the ticket, so the id the client holds and the id the
     /// [`QueryTracker`] records are the same one; `CancelQuery` can then
     /// reach the running stream. `None` mints a fresh id (all other callers).
-    pub async fn execute_stream_with_id(
-        &self,
-        session: &Session,
-        sql: &str,
+    ///
+    /// Boxed for the same reason as [`Self::execute`]: the streaming state
+    /// machine is as large as the buffered one, and the Quack and Flight SQL
+    /// executors await it inside `Send` futures.
+    pub fn execute_stream_with_id<'a>(
+        &'a self,
+        session: &'a Session,
+        sql: &'a str,
         client_ip: Option<String>,
         query_id: Option<uuid::Uuid>,
-    ) -> sqe_core::Result<(SchemaRef, SendableRecordBatchStream)> {
-        self.execute_stream_inner(session, sql, None, client_ip, query_id)
-            .await
+    ) -> futures::future::BoxFuture<'a, sqe_core::Result<(SchemaRef, SendableRecordBatchStream)>>
+    {
+        Box::pin(self.execute_stream_inner(session, sql, None, client_ip, query_id))
     }
 
     /// [`Self::execute_stream_with_id`] for a plan that was already built.
