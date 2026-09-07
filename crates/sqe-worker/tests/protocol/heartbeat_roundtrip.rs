@@ -52,6 +52,11 @@ struct Seen {
     last: Instant,
     count: u32,
     hello: WorkerHello,
+    /// `failures_since_last` of every hello received, in arrival order. The
+    /// snapshot only keeps the latest hello, and two hellos can land between
+    /// two polls of the test, so assertions about a transient value read
+    /// this history instead of the snapshot.
+    failures_history: Vec<u32>,
 }
 
 #[derive(Clone)]
@@ -82,6 +87,16 @@ impl StubCoordinator {
         self.snapshot(url)
             .is_some_and(|(last, _, _)| last.elapsed() < HEALTH_TTL)
     }
+
+    /// `failures_since_last` of every hello received from `url`, oldest first.
+    fn failures_history(&self, url: &str) -> Vec<u32> {
+        self.registry
+            .lock()
+            .unwrap()
+            .get(url)
+            .map(|s| s.failures_history.clone())
+            .unwrap_or_default()
+    }
 }
 
 type Boxed<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -111,9 +126,11 @@ impl FlightService for StubCoordinator {
                 last: Instant::now(),
                 count: 0,
                 hello: hello.clone(),
+                failures_history: Vec::new(),
             });
             entry.last = Instant::now();
             entry.count += 1;
+            entry.failures_history.push(hello.failures_since_last);
             entry.hello = hello;
         }
         let body = match self.mode {
@@ -254,22 +271,31 @@ async fn heartbeat_roundtrip() {
 
     // A worker fault is reported on the next hello and acknowledged after
     // it; a user fault is never reported.
+    //
+    // Read the arrival history rather than the latest snapshot: on a loaded
+    // runner two hellos can land between two polls, so the hello carrying
+    // the failure may already have been superseded by its acknowledgement.
+    let history_before = rig.coordinator.failures_history(WORKER_URL).len();
     rig.status.record_fault(WorkerFault::WorkerInternal);
     rig.status.record_fault(WorkerFault::PrincipalDenied);
-    let (_, count_with_failure, _) = wait_for(3 * INTERVAL, || {
-        rig.coordinator
-            .snapshot(WORKER_URL)
-            .filter(|(_, _, h)| h.failures_since_last == 1)
+    let history = wait_for(6 * INTERVAL, || {
+        let history = rig.coordinator.failures_history(WORKER_URL);
+        let new = &history[history_before.min(history.len())..];
+        let failure_at = new.iter().position(|n| *n == 1)?;
+        new[failure_at + 1..].contains(&0).then_some(history)
     })
     .await
-    .expect("hello carrying the failure");
-    wait_for(3 * INTERVAL, || {
-        rig.coordinator
-            .snapshot(WORKER_URL)
-            .filter(|(_, count, h)| *count > count_with_failure && h.failures_since_last == 0)
-    })
-    .await
-    .expect("failure acknowledged on the following hello");
+    .expect("one hello carries the failure and a later hello acknowledges it");
+    let new = &history[history_before..];
+    assert_eq!(
+        new.iter().filter(|n| **n == 1).count(),
+        1,
+        "the worker fault is reported exactly once: {new:?}"
+    );
+    assert!(
+        new.iter().all(|n| *n <= 1),
+        "the user fault is never reported: {new:?}"
+    );
     assert_eq!(rig.status.failures_since_last(), 0);
 
     // Stop heartbeating: the registry entry ages out.
