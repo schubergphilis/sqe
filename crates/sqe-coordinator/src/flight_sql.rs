@@ -833,7 +833,19 @@ impl SqeFlightSqlService {
     /// 1. SQE session ID (from do_handshake) — looked up in session manager
     /// 2. Raw JWT (from backend BFF pass-through) — validated via the auth
     ///    provider chain (JWKS signature check) and converted into a session
-    async fn get_session_from_request<T: Send + Sync>(
+    ///
+    /// Boxed for compile time, not behaviour: every `FlightSqlService` method
+    /// awaits this inside its own `async_trait` (`Send`) future, and rustc
+    /// re-proved `Send` over the auth chain's state machine once per method
+    /// (about 1.3 s each, 20-odd methods, `-Zself-profile` 2026-09-07).
+    fn get_session_from_request<'a, T: Send + Sync>(
+        &'a self,
+        request: &'a Request<T>,
+    ) -> futures::future::BoxFuture<'a, Result<Arc<sqe_core::Session>, Status>> {
+        Box::pin(self.get_session_from_request_inner(request))
+    }
+
+    async fn get_session_from_request_inner<T: Send + Sync>(
         &self,
         request: &Request<T>,
     ) -> Result<Arc<sqe_core::Session>, Status> {
