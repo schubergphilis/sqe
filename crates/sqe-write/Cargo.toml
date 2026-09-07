@@ -1,0 +1,52 @@
+[package]
+name = "sqe-write"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+description = "SQE write path: CTAS/INSERT/UPDATE/DELETE/MERGE handling, Parquet data and delete file writers, Puffin statistics carry-forward, Hive external-table writes"
+
+[features]
+# Compiles the in-process SQLite-backed write rig (`test_support::sqlite_rig`)
+# and the `#[cfg(feature = "test-sqlite")]` tests that drive the real
+# `WriteHandler` commit paths through a `SessionCatalog`. Same contract as
+# `sqe-coordinator/test-sqlite`, which forwards to this feature; see that
+# crate's Cargo.toml for why `sql-postgres` is part of it.
+test-sqlite = ["sqe-catalog/sql-sqlite", "sqe-catalog/sql-postgres", "dep:tempfile"]
+
+[lib]
+name = "sqe_write"
+path = "src/lib.rs"
+
+[dependencies]
+sqe-core = { path = "../sqe-core" }
+sqe-catalog = { path = "../sqe-catalog" }
+sqe-compaction = { path = "../sqe-compaction" }
+sqe-sql = { path = "../sqe-sql" }
+sqe-policy = { path = "../sqe-policy" }
+sqe-metrics = { path = "../sqe-metrics" }
+sqe-lineage = { path = "../sqe-lineage" }
+datafusion = { workspace = true }
+arrow = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-array = { workspace = true }
+parquet = { workspace = true }
+iceberg = { workspace = true }
+sqlparser = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+# Enabled only by the `test-sqlite` feature: the rig's per-test warehouse
+# directory. Also a dev-dependency for the plain `cargo test` build.
+tempfile = { workspace = true, optional = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+toml = { workspace = true }
