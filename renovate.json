@@ -28,7 +28,8 @@
       "description": "Fold routine Rust minor/patch bumps into one PR; majors stay separate for individual review.",
       "matchManagers": ["cargo"],
       "matchUpdateTypes": ["minor", "patch"],
-      "groupName": "rust minor and patch"
+      "groupName": "rust minor and patch",
+      "minimumReleaseAge": "7 days"
     },
     {
       "description": [
@@ -44,7 +45,8 @@
       "matchUpdateTypes": ["minor"],
       "groupName": "rust 0.x breaking (pre-1.0 minor)",
       "labels": ["dependencies", "breaking-0x"],
-      "automerge": false
+      "automerge": false,
+      "minimumReleaseAge": "7 days"
     },
     {
       "description": "DataFusion/Arrow/Parquet are API-coupled and pinned in lockstep with the vendored iceberg-rust fork. Group into one reviewed PR (overrides the rule above); a version skew here breaks the build, and a bump usually means re-checking the vendor rebase.",
@@ -60,7 +62,8 @@
       ],
       "groupName": "datafusion/arrow stack",
       "labels": ["dependencies", "datafusion-stack"],
-      "automerge": false
+      "automerge": false,
+      "minimumReleaseAge": "7 days"
     },
     {
       "description": [
@@ -69,24 +72,28 @@
       ],
       "matchManagers": ["cargo"],
       "matchPackageNames": ["object_store"],
-      "allowedVersions": "<0.14"
+      "allowedVersions": "<0.14",
+      "minimumReleaseAge": "7 days"
     },
     {
       "description": "Container images in the quickstart/test docker-compose stacks (Polaris, MinIO/RustFS, Keycloak, etc.). Non-automerged: a bumped image can silently break a quickstart's assumptions.",
       "matchManagers": ["docker-compose", "dockerfile"],
       "groupName": "container images",
-      "automerge": false
+      "automerge": false,
+      "minimumReleaseAge": "7 days"
     },
     {
       "description": "AWS CDK deps live only in the quickstart demo projects; examples, not shipped code, so lower urgency.",
       "matchManagers": ["npm"],
       "matchFileNames": ["quickstart/**"],
-      "groupName": "aws cdk quickstart deps"
+      "groupName": "aws cdk quickstart deps",
+      "minimumReleaseAge": "7 days"
     },
     {
       "description": "Aikido CI platform includes (ci/templates/*.yml @ ref); keeping the guardrails/test/deploy templates current warrants a dedicated PR.",
       "matchManagers": ["gitlabci", "gitlabci-include"],
-      "groupName": "aikido ci templates"
+      "groupName": "aikido ci templates",
+      "minimumReleaseAge": "7 days"
     },
     {
       "description": [
@@ -99,7 +106,8 @@
       ],
       "matchManagers": ["cargo"],
       "matchPackageNames": ["jsonwebtoken"],
-      "allowedVersions": "<10"
+      "allowedVersions": "<10",
+      "minimumReleaseAge": "7 days"
     },
     {
       "description": [
@@ -130,7 +138,8 @@
       ],
       "matchManagers": ["docker-compose"],
       "matchPackageNames": ["apache/ranger"],
-      "allowedVersions": "<2.9"
+      "allowedVersions": "<2.9",
+      "minimumReleaseAge": "7 days"
     },
     {
       "description": [
@@ -146,7 +155,8 @@
       ],
       "matchManagers": ["docker-compose"],
       "matchPackageNames": ["postgres"],
-      "allowedVersions": "<14"
+      "allowedVersions": "<14",
+      "minimumReleaseAge": "7 days"
     }
   ]
 }

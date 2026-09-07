@@ -236,7 +236,7 @@ SELECT * FROM read_parquet(
 -- 2. Inline service-account JSON
 SELECT * FROM read_csv(
     'gs://my-bucket/data.csv',
-    gcs_service_account_key => '{"type":"service_account",...}'
+    gcs_service_account_key => '<contents of gcs-sa.json>'
 );
 
 -- 3. Application Default Credentials (gcloud config / GCE metadata / GKE Workload Identity)

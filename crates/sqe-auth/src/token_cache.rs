@@ -126,6 +126,7 @@ mod tests {
     #[test]
     fn debug_does_not_leak_token_material() {
         let token = make_token(
+            // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.security.detected-jwt-token -- fake JWT-shaped fixture, header only, no signature
             "eyJhbGciOiJSUzI1NiJ9.super-secret-access",
             Some("super-secret-refresh"),
             Utc::now() + Duration::hours(1),

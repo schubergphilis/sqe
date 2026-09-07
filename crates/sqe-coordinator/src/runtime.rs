@@ -197,6 +197,7 @@ mod tests {
 
     #[test]
     fn test_spill_enabled_creates_dir_and_enables_disk_manager() {
+        // nosemgrep: opt.aikido.semgrep-rules.rust.lang.security.temp-dir -- test-only spill dir; production spill_dir is operator-configured
         let tmpdir = std::env::temp_dir().join("sqe-test-coordinator-spill-enabled");
         // Clean up from previous test runs
         let _ = std::fs::remove_dir_all(&tmpdir);

@@ -45,6 +45,7 @@ def duck(db: str, sql: str, readonly: bool = True) -> list[list[str]]:
     if readonly:
         cmd.append("-readonly")
     cmd += [db, "-csv", "-noheader", "-c", sql]
+    # nosemgrep: opt.aikido.semgrep-rules.python.lang.security.audit.dangerous-subprocess-use-audit -- argv list, no shell
     out = subprocess.run(cmd, capture_output=True, text=True)
     if out.returncode != 0:
         raise RuntimeError(f"duckdb failed: {out.stderr.strip()[:300]}\nSQL: {sql[:200]}")

@@ -75,7 +75,7 @@ pub struct AwsIamProviderConfig {
     /// Example:
     /// ```toml
     /// [auth.providers.key_mappings]
-    /// "AKIAIOSFODNN7EXAMPLE" = { arn = "arn:aws:iam::123456789012:user/dbt-prod", roles = ["writer"] }
+    /// "AKIA...EXAMPLE" = { arn = "arn:aws:iam::123456789012:user/dbt-prod", roles = ["writer"] }
     /// ```
     pub key_mappings: HashMap<String, KeyMapping>,
 }
@@ -479,11 +479,13 @@ mod tests {
 
     #[test]
     fn is_aws_access_key_accepts_akia_prefix() {
+        // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS's documented example key, test fixture
         assert!(AwsIamProvider::is_aws_access_key("AKIAIOSFODNN7EXAMPLE"));
     }
 
     #[test]
     fn is_aws_access_key_accepts_asia_prefix() {
+        // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- synthetic EXAMPLE key id, test fixture
         assert!(AwsIamProvider::is_aws_access_key("ASIAJEXAMPLEEXAMPLEA"));
     }
 
@@ -552,6 +554,7 @@ mod tests {
         let provider = AwsIamProvider::new(AwsIamProviderConfig::default());
 
         let creds = FlightCredentials {
+            // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS's documented example key, test fixture
             username: Some("AKIAIOSFODNN7EXAMPLE".to_string()),
             password: None,
             ..Default::default()
@@ -573,6 +576,7 @@ mod tests {
     async fn config_only_known_key_returns_identity() {
         let mut key_mappings = HashMap::new();
         key_mappings.insert(
+            // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS's documented example key, test fixture
             "AKIAIOSFODNN7EXAMPLE".to_string(),
             KeyMapping {
                 arn: "arn:aws:iam::123456789012:user/Alice".to_string(),
@@ -587,6 +591,7 @@ mod tests {
         });
 
         let creds = FlightCredentials {
+            // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS's documented example key, test fixture
             username: Some("AKIAIOSFODNN7EXAMPLE".to_string()),
             password: Some(sqe_core::SecretString::new(
                 "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
@@ -614,6 +619,7 @@ mod tests {
         });
 
         let creds = FlightCredentials {
+            // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS's documented example key, test fixture
             username: Some("AKIAIOSFODNN7EXAMPLE".to_string()),
             password: Some(sqe_core::SecretString::new("secret".to_string())),
             ..Default::default()

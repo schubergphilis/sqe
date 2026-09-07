@@ -241,6 +241,7 @@ access_key  = "${AZURE_STORAGE_KEY}"
 type = "gcs"
 bucket = "my-gcs-bucket"
 [storage.credentials]
+# nosemgrep: opt.aikido.semgrep-rules.generic.secrets.security.detected-google-gcm-service-account -- config example, not a key
 type                     = "service_account"
 service_account_key_file = "/etc/sqe/gcs-sa.json"
 # or: "workload_identity" for GKE

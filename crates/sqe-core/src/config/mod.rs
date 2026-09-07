@@ -6271,6 +6271,7 @@ mod tests {
         let cc = AuthProviderConfig::ClientCredentials {
             token_endpoint: "https://idp/token".to_string(),
             client_id: "sqe".to_string(),
+            // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.generic-api-key -- placeholder secret, asserting Debug redacts it
             client_secret: "cc-secret-xyz".to_string(),
         };
         assert!(!format!("{cc:?}").contains("cc-secret-xyz"));
