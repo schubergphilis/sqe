@@ -229,6 +229,21 @@ and are to be re-measured, not assumed.
   lines pinned by hand; and first-party crates are outside hakari's reach,
   so a member that another member enables extra features on (sqe-cli on
   sqe-catalog) has to carry those features in its default set.
+- 2026-09-07, A2 (aikido !158 released as v0.12.1; sqlengine MR from
+  `ci/sccache-compiler-cache`): option (a). The 5 GiB is the S3 single-PUT
+  limit behind the runner's presigned upload, so option (b) was dropped for
+  good. The platform template gained `.aikido_rust_build_env` (sccache to
+  S3, off until `AIKIDO_SCCACHE_BUCKET` is set; protected read-write and
+  unprotected read-only key pairs pick the mode; credentials reach only the
+  sccache server; `dev`/`test` debuginfo `line-tables-only` by default;
+  `after_script` prints stats and a `/cache` persistence probe). sqlengine
+  points at bucket `sqe-cargocache` (StorageGRID acc) through project CI
+  variables and adds the block to `release-binaries`. Measured before, main
+  pipeline 1606171: test job 27 min (7.5 setup, 12 compile, 2 tests, 3.8
+  clippy), extra job 21.5 min (4.4 zipping the registry), release binaries
+  43.5 min (28 thin-LTO link), `target/` 37 GiB. Open: lifecycle rule on
+  the bucket (tenant admin), read-only key, reachability of the acc
+  endpoint from the production runners.
 
 ## 4. Expected end state
 

@@ -44,16 +44,16 @@ default:
 # do not merge the release MR until it has.
 include:
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.12.0'
+    ref: 'v0.12.1'
     file: '/ci/templates/guardrails.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.12.0'
+    ref: 'v0.12.1'
     file: '/ci/templates/test-rust.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.12.0'
+    ref: 'v0.12.1'
     file: '/ci/templates/deploy.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.12.0'
+    ref: 'v0.12.1'
     file: '/ci/templates/release.yml'
   # GitLab's own Security/Secret-Detection template was included here too. It
   # duplicated aikido-secret-scan (same gitleaks-class scan, a second image
@@ -70,6 +70,18 @@ variables:
   # thread stack (the write e2e tests need this too). 32 MiB; the platform default
   # is 8 MiB, which is not enough here. Carried over from the local cargo-gate.
   AIKIDO_RUST_MIN_STACK: "33554432"
+  # Compiler cache. The platform's .aikido_rust_build_env (test-rust.yml) runs
+  # sccache against an S3 bucket when AIKIDO_SCCACHE_BUCKET is set; it replaces
+  # the target/ cache that never fit the 5 GiB single-PUT limit (see the
+  # release-binaries comment below). The four AIKIDO_SCCACHE_* settings and the
+  # bucket credentials live in this project's CI variables, not here:
+  #   AIKIDO_SCCACHE_BUCKET=sqe-cargocache, _ENDPOINT (StorageGRID acc),
+  #   _REGION=us-east-1, and the protected+masked AIKIDO_SCCACHE_ACCESS_KEY_ID /
+  #   AIKIDO_SCCACHE_SECRET_ACCESS_KEY (read-write; protected = main and tags only,
+  #   so merge requests compile cold until a read-only key pair is added as
+  #   AIKIDO_SCCACHE_READ_*). Objects expire by a 30-day bucket lifecycle rule.
+  # Each Rust job's log ends with `sccache --show-stats`; a warm main run below
+  # ~70% hits means a CARGO_HOME/prefix/feature mismatch between jobs.
   # Live policy/scripts until aikido-tools image is rebuilt with CDLA + r-efi
   # exception + SQE reviewed_evidence (aikido!51). After tools image digest
   # updates, this override can be removed and AIKIDO_HOME from the image used.
@@ -112,6 +124,10 @@ release-binaries:
       - .cargo-home/registry/
   before_script:
     - apt-get update -qq && apt-get install -y -qq --no-install-recommends clang mold cmake curl protobuf-compiler libprotobuf-dev libssl-dev pkg-config binutils >/dev/null
+    # Same sccache setup as the platform's Rust jobs (RUSTC_WRAPPER only when the
+    # server reached the bucket). The release/dev-release profiles keep their own
+    # debuginfo settings; the debuginfo knob only touches dev/test.
+    - !reference [.aikido_rust_build_env, before_script]
   script:
     - |
       set -euo pipefail
