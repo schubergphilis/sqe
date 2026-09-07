@@ -16,7 +16,7 @@ use sqe_core::{Session, SqeError, SqeErrorCode};
 /// query-side identifier normalization (`to_lowercase`), so a column stored
 /// from unquoted DDL resolves against an unquoted (folded) query, and a
 /// double-quoted column keeps its case and must be quoted to reference (#337).
-pub(crate) fn fold_unquoted_ident(ident: &sqlparser::ast::Ident) -> String {
+pub fn fold_unquoted_ident(ident: &sqlparser::ast::Ident) -> String {
     if ident.quote_style.is_some() {
         ident.value.clone()
     } else {
@@ -32,7 +32,7 @@ pub(crate) fn fold_unquoted_ident(ident: &sqlparser::ast::Ident) -> String {
 /// - 1 part  -> namespace = "default", table = name
 /// - 2 parts -> namespace = parts[0], table = parts[1]
 /// - 3 parts -> ignore catalog prefix, namespace = parts[1], table = parts[2]
-pub(crate) fn parse_table_ref(name: &ObjectName) -> sqe_core::Result<TableIdent> {
+pub fn parse_table_ref(name: &ObjectName) -> sqe_core::Result<TableIdent> {
     let parts: Vec<String> = name
         .0
         .iter()
@@ -69,7 +69,7 @@ pub(crate) fn parse_table_ref(name: &ObjectName) -> sqe_core::Result<TableIdent>
 /// `X-Trino-Schema: tpch_demo` targets `tpch_demo.t`, not `default.t` (#357).
 /// A 2- or 3-part name already names its namespace and is returned unchanged;
 /// when the session schema is unset or empty we fall back to `default`.
-pub(crate) fn resolve_table_ident(
+pub fn resolve_table_ident(
     name: &ObjectName,
     session: &Session,
 ) -> sqe_core::Result<TableIdent> {
@@ -95,7 +95,7 @@ pub(crate) fn resolve_table_ident(
 /// the *target* catalog instead of the configured default warehouse. Mirrors
 /// the read path's `sqe_sql::extract_catalog_qualifiers` access (`.value`, no
 /// quote/case normalisation) so reads and writes resolve the same catalog name.
-pub(crate) fn catalog_qualifier(name: &ObjectName) -> Option<String> {
+pub fn catalog_qualifier(name: &ObjectName) -> Option<String> {
     let parts: Vec<&str> = name
         .0
         .iter()
@@ -113,7 +113,7 @@ pub(crate) fn catalog_qualifier(name: &ObjectName) -> Option<String> {
 /// default warehouse). This is the schema-DDL analogue of [`catalog_qualifier`]:
 /// `CREATE/DROP SCHEMA catalog.schema` is two parts (catalog + namespace),
 /// whereas a table reference is three (catalog + namespace + table).
-pub(crate) fn schema_catalog_qualifier(name: &ObjectName) -> Option<String> {
+pub fn schema_catalog_qualifier(name: &ObjectName) -> Option<String> {
     let parts: Vec<&str> = name
         .0
         .iter()
