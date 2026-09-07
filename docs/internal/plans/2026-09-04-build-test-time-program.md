@@ -206,7 +206,7 @@ and are to be re-measured, not assumed.
 
 | # | Change | Expected effect | Risk |
 |---|---|---|---|
-| C1 | Break the serial chain: move the three `sqe-policy` items that `sqe-catalog` needs (the `PolicyStore` trait, `HiveCatalogs`, grants types) into `sqe-core` or a tiny `sqe-policy-api` crate; extract the six `sqe-worker` items the coordinator uses into a `sqe-worker-api` crate. | policy and catalog compile in parallel, worker and coordinator compile in parallel: about 75 s off the cold critical path, more on incremental touches to policy. | Trait moves touch many files once. |
+| C1 | Break the serial chain: move the three `sqe-policy` items that `sqe-catalog` needs (the `PolicyStore` trait, `HiveCatalogs`, grants types) into `sqe-core` or a tiny `sqe-policy-api` crate; extract the six `sqe-worker` items the coordinator uses into a `sqe-worker-api` crate. **Policy half done 2026-09-07 (#662, `perf/policy-api-crate`): `sqe-policy-api` holds exactly those items, `sqe-policy` re-exports them, `sqe-catalog` depends on the api crate only.** Worker half not needed today: the worker (13 s) compiles alongside the catalog and is off the critical path. | policy and catalog compile in parallel: the catalog starts at ~6 s instead of ~28 s. | Trait moves touch many files once. |
 | C2 | Split `sqe-coordinator` (64K lines, 67 s lib + 43 s bin + 16 test binaries). The write path extraction plan already exists (`2026-07-13-sqe-write-crate-extraction.md`); hive and maintenance are the next candidates. **Measured 2026-09-07: no compile-time gain (the cost is async `Send` proofs, not lines; see C4).** Structural item for #636 only. | Touches to write code get a 3 s test loop; coordinator compile unchanged. | Large refactor. |
 | C4 | **Box the async hubs.** Per crate: `scripts/compile-profile.sh <crate>`, box the futures the attribution table names (`BoxFuture` at the definition), type-erase deep types held in service structs. Coordinator done on `perf/compile-time-async-hubs` (68 s -> 18 s); `sqe-catalog` next (43 of 47 s is the same shape). | Coordinator library 50 s off every build; catalog likely 30 s more on the critical path. | One allocation per boxed call; no behaviour change. |
 | C3 | Runner capacity: a dedicated runner with a persistent `target/` on local disk, or a larger shared class. Runner 2433 (`docker_socket`) already exists and would also let `make test-integration` return to CI. | The GitLab-based precedent for this shape went from 20 min to under 5. | Platform team ownership; not in this repo. |
@@ -271,6 +271,16 @@ and are to be re-measured, not assumed.
   the critical path is policy 22 s -> catalog 47 s -> coordinator -> binary,
   and `sqe-catalog` shows the same profile (43 of 47 s), so it gets the same
   treatment before any dependency surgery.
+- 2026-09-07, C1 policy half done (#662, `perf/policy-api-crate`). The
+  catalog took five items from `sqe-policy` (`PolicyStore` and its result
+  types, `GrantBackend` and its statement types, `HiveCatalogs`); they now
+  live in `sqe-policy-api` (0.3 s to compile; depends on sqe-core, sqe-sql,
+  datafusion), `sqe-policy` re-exports them, `sqe-catalog` depends on the
+  api crate and on `sqe-policy` only as a dev-dependency. `CARGO_INCREMENTAL=0`,
+  `touch sqe-core`, main base: catalog starts at 10.6 s instead of 28 s,
+  chain 173 s -> 164 s, coordinator starts 12 s earlier. Gate: workspace
+  check and clippy, hakari no diff, 1198 tests across the three crates.
+  Worker half parked (worker off the critical path).
 
 ## 4. Expected end state
 
