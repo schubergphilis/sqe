@@ -4,6 +4,7 @@ pub mod oauth2;
 pub mod prepared;
 pub mod protocol;
 pub mod server;
+pub mod session_props;
 pub mod types;
 
 pub use protocol::{

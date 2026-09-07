@@ -7,16 +7,14 @@ use std::sync::{Arc, LazyLock};
 
 use serde_json;
 
-use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray,
-};
-use arrow::datatypes::DataType;
+use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
+use arrow::datatypes::{DataType, Field, FieldRef};
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use datafusion::common::Result as DFResult;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
-    Volatility,
+    ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+    TypeSignature, Volatility,
 };
 use datafusion::scalar::ScalarValue;
 
@@ -85,7 +83,16 @@ pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionConte
 // Helpers
 // ═══════════════════════════════════════════════════════════════════
 
-use crate::helpers::{str_transform, str_transform_2};
+use crate::helpers::{
+    arg, lift1, lift2, micros_to_local_naive, str_transform, str_transform_2, tag_timezone,
+    unexpected_parameters, AnyArg, DateArg, DateDays, F64Arg, FromColumnar, I64Arg, RowArg, StrArg,
+    TsArg, TsMicros, Zone,
+};
+
+/// Epoch day zero, shared by the date helpers below.
+fn epoch_date() -> NaiveDate {
+    NaiveDate::from_ymd_opt(1970, 1, 1).expect("1970-01-01 is a valid date")
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // TRIVIAL ALIASES
@@ -114,24 +121,8 @@ impl ScalarUDFImpl for Millisecond {
         Ok(DataType::Int64)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        use arrow::array::TimestampMicrosecondArray;
-        match &args.args[0] {
-            ColumnarValue::Array(arr) => {
-                if let Some(ts_arr) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-                    let result: Int64Array = ts_arr
-                        .iter()
-                        .map(|opt| opt.map(|us| (us / 1000) % 1000))
-                        .collect();
-                    Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
-                } else {
-                    Ok(ColumnarValue::Scalar(ScalarValue::Int64(None)))
-                }
-            }
-            ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(Some(us), _)) => Ok(
-                ColumnarValue::Scalar(ScalarValue::Int64(Some((us / 1000) % 1000))),
-            ),
-            _ => Ok(ColumnarValue::Scalar(ScalarValue::Int64(None))),
-        }
+        let ts: TsArg = arg("millisecond", "timestamp", &args.args, 0)?;
+        lift1(&ts, |us| Ok(Some(us.div_euclid(1000).rem_euclid(1000))))
     }
 }
 
@@ -196,32 +187,14 @@ impl ScalarUDFImpl for IsJsonScalar {
         Ok(DataType::Boolean)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        match &args.args[0] {
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => {
-                let is_scalar = serde_json::from_str::<serde_json::Value>(s)
+        let json: StrArg = arg("is_json_scalar", "json", &args.args, 0)?;
+        lift1(&json, |s| {
+            Ok(Some(
+                serde_json::from_str::<serde_json::Value>(s)
                     .map(|v| !v.is_object() && !v.is_array())
-                    .unwrap_or(false);
-                Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(is_scalar))))
-            }
-            ColumnarValue::Array(arr) => {
-                let str_arr = arr
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| DataFusionError::Plan("Expected StringArray".into()))?;
-                let result: BooleanArray = str_arr
-                    .iter()
-                    .map(|opt| {
-                        opt.map(|s| {
-                            serde_json::from_str::<serde_json::Value>(s)
-                                .map(|v| !v.is_object() && !v.is_array())
-                                .unwrap_or(false)
-                        })
-                    })
-                    .collect();
-                Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
-            }
-            _ => Ok(ColumnarValue::Scalar(ScalarValue::Boolean(None))),
-        }
+                    .unwrap_or(false),
+            ))
+        })
     }
 }
 
@@ -242,24 +215,33 @@ impl ScalarUDFImpl for JsonArrayContains {
         Ok(DataType::Boolean)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        match (&args.args[0], &args.args[1]) {
-            (ColumnarValue::Scalar(ScalarValue::Utf8(Some(json))), val) => {
-                let val_str = scalar_to_json_comparable(val);
-                let contains = check_json_array_contains(json, &val_str);
-                Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(contains))))
-            }
-            _ => Ok(ColumnarValue::Scalar(ScalarValue::Boolean(None))),
-        }
+        const EXPECTED: &str = "json, varchar | bigint | double | boolean";
+        let json: StrArg = arg("json_array_contains", EXPECTED, &args.args, 0)?;
+        let val: AnyArg = arg("json_array_contains", EXPECTED, &args.args, 1)?;
+        lift2(&json, &val, |json, v| {
+            let needle = scalar_to_json_comparable(&v).ok_or_else(|| {
+                unexpected_parameters("json_array_contains", &args.args, EXPECTED)
+            })?;
+            Ok(Some(check_json_array_contains(json, &needle)))
+        })
     }
 }
 
-fn scalar_to_json_comparable(val: &ColumnarValue) -> String {
+/// Render a search value as JSON text for `json_array_contains`. `None` for
+/// types Trino does not accept as the search value.
+fn scalar_to_json_comparable(val: &ScalarValue) -> Option<String> {
     match val {
-        ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => format!("\"{}\"", s),
-        ColumnarValue::Scalar(ScalarValue::Int64(Some(n))) => n.to_string(),
-        ColumnarValue::Scalar(ScalarValue::Float64(Some(f))) => f.to_string(),
-        ColumnarValue::Scalar(ScalarValue::Boolean(Some(b))) => b.to_string(),
-        _ => "null".to_string(),
+        ScalarValue::Utf8(Some(s))
+        | ScalarValue::LargeUtf8(Some(s))
+        | ScalarValue::Utf8View(Some(s)) => serde_json::to_string(s).ok(),
+        ScalarValue::Int8(Some(n)) => Some(n.to_string()),
+        ScalarValue::Int16(Some(n)) => Some(n.to_string()),
+        ScalarValue::Int32(Some(n)) => Some(n.to_string()),
+        ScalarValue::Int64(Some(n)) => Some(n.to_string()),
+        ScalarValue::Float32(Some(f)) => Some(f.to_string()),
+        ScalarValue::Float64(Some(f)) => Some(f.to_string()),
+        ScalarValue::Boolean(Some(b)) => Some(b.to_string()),
+        _ => None,
     }
 }
 
@@ -294,7 +276,7 @@ impl ScalarUDFImpl for Soundex {
         Ok(DataType::Utf8)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        str_transform(&args.args[0], |s| Some(compute_soundex(s)))
+        str_transform("soundex", &args.args[0], |s| Some(compute_soundex(s)))
     }
 }
 
@@ -354,21 +336,28 @@ impl ScalarUDFImpl for HammingDistance {
         Ok(DataType::Int64)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        match (&args.args[0], &args.args[1]) {
-            (
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(s1))),
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(s2))),
-            ) => {
-                if s1.len() != s2.len() {
-                    return Err(DataFusionError::Execution(
-                        "Strings must have equal length for hamming_distance".into(),
-                    ));
+        const EXPECTED: &str = "varchar, varchar";
+        let s1: StrArg = arg("hamming_distance", EXPECTED, &args.args, 0)?;
+        let s2: StrArg = arg("hamming_distance", EXPECTED, &args.args, 1)?;
+        lift2(&s1, &s2, |a, b| {
+            // Trino compares code points, not bytes.
+            let (mut ia, mut ib) = (a.chars(), b.chars());
+            let mut dist = 0i64;
+            loop {
+                match (ia.next(), ib.next()) {
+                    (Some(x), Some(y)) => {
+                        if x != y {
+                            dist += 1;
+                        }
+                    }
+                    (None, None) => return Ok(Some(dist)),
+                    _ => return Err(DataFusionError::Execution(
+                        "The input strings to hamming_distance function must have the same length"
+                            .into(),
+                    )),
                 }
-                let dist = s1.bytes().zip(s2.bytes()).filter(|(a, b)| a != b).count() as i64;
-                Ok(ColumnarValue::Scalar(ScalarValue::Int64(Some(dist))))
             }
-            _ => Ok(ColumnarValue::Scalar(ScalarValue::Int64(None))),
-        }
+        })
     }
 }
 
@@ -406,19 +395,15 @@ impl ScalarUDFImpl for FromBase {
         Ok(DataType::Int64)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        match (&args.args[0], &args.args[1]) {
-            (ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))), ColumnarValue::Scalar(v)) => {
-                let radix_raw = match v {
-                    ScalarValue::Int64(Some(r)) => *r,
-                    ScalarValue::Int32(Some(r)) => *r as i64,
-                    _ => return Ok(ColumnarValue::Scalar(ScalarValue::Int64(None))),
-                };
-                let radix = validate_radix(radix_raw)?;
-                let result = i64::from_str_radix(s, radix).ok();
-                Ok(ColumnarValue::Scalar(ScalarValue::Int64(result)))
-            }
-            _ => Ok(ColumnarValue::Scalar(ScalarValue::Int64(None))),
-        }
+        const EXPECTED: &str = "varchar, bigint";
+        let s: StrArg = arg("from_base", EXPECTED, &args.args, 0)?;
+        let radix: I64Arg = arg("from_base", EXPECTED, &args.args, 1)?;
+        lift2(&s, &radix, |s, radix| {
+            let radix = validate_radix(radix)?;
+            i64::from_str_radix(s, radix).map(Some).map_err(|_| {
+                DataFusionError::Execution(format!("Not a valid base-{radix} number: {s}"))
+            })
+        })
     }
 }
 
@@ -439,44 +424,34 @@ impl ScalarUDFImpl for ToBase {
         Ok(DataType::Utf8)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        match (&args.args[0], &args.args[1]) {
-            (ColumnarValue::Scalar(ScalarValue::Int64(Some(n))), ColumnarValue::Scalar(v)) => {
-                let radix_raw = match v {
-                    ScalarValue::Int64(Some(r)) => *r,
-                    ScalarValue::Int32(Some(r)) => *r as i64,
-                    _ => return Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None))),
-                };
-                let radix = validate_radix(radix_raw)?;
-                let result = match radix {
-                    2 => Some(format!("{:b}", n)),
-                    8 => Some(format!("{:o}", n)),
-                    10 => Some(n.to_string()),
-                    16 => Some(format!("{:x}", n)),
-                    _ => {
-                        let mut num = if *n < 0 { (-*n) as u64 } else { *n as u64 };
-                        if num == 0 {
-                            return Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
-                                "0".to_string(),
-                            ))));
-                        }
-                        let digits = "0123456789abcdefghijklmnopqrstuvwxyz";
-                        let mut s = String::new();
-                        while num > 0 {
-                            let d = (num % radix as u64) as usize;
-                            s.push(digits.as_bytes()[d] as char);
-                            num /= radix as u64;
-                        }
-                        if *n < 0 {
-                            s.push('-');
-                        }
-                        Some(s.chars().rev().collect())
-                    }
-                };
-                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(result)))
-            }
-            _ => Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None))),
-        }
+        const EXPECTED: &str = "bigint, bigint";
+        let n: I64Arg = arg("to_base", EXPECTED, &args.args, 0)?;
+        let radix: I64Arg = arg("to_base", EXPECTED, &args.args, 1)?;
+        lift2(&n, &radix, |n, radix| {
+            let radix = validate_radix(radix)?;
+            Ok(Some(format_radix(n, radix)))
+        })
     }
+}
+
+/// Render `n` in base `radix` (2..=36, lowercase digits, `-` prefix for
+/// negatives), matching Trino's `to_base`.
+fn format_radix(n: i64, radix: u32) -> String {
+    let mut num = n.unsigned_abs();
+    if num == 0 {
+        return "0".to_string();
+    }
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut s = Vec::new();
+    while num > 0 {
+        s.push(DIGITS[(num % radix as u64) as usize]);
+        num /= radix as u64;
+    }
+    if n < 0 {
+        s.push(b'-');
+    }
+    s.reverse();
+    String::from_utf8(s).expect("radix digits are ASCII")
 }
 
 /// from_iso8601_date(s) → DATE
@@ -496,31 +471,12 @@ impl ScalarUDFImpl for FromIso8601Date {
         Ok(DataType::Date32)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-        match &args.args[0] {
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => {
-                let date = parse_iso_date(s);
-                let days = date.map(|d| d.signed_duration_since(epoch).num_days() as i32);
-                Ok(ColumnarValue::Scalar(ScalarValue::Date32(days)))
-            }
-            ColumnarValue::Array(arr) => {
-                let str_arr = arr
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| DataFusionError::Plan("Expected StringArray".into()))?;
-                let result: Date32Array = str_arr
-                    .iter()
-                    .map(|opt| {
-                        opt.and_then(|s| {
-                            parse_iso_date(s)
-                                .map(|d| d.signed_duration_since(epoch).num_days() as i32)
-                        })
-                    })
-                    .collect();
-                Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
-            }
-            _ => Ok(ColumnarValue::Scalar(ScalarValue::Date32(None))),
-        }
+        let epoch = epoch_date();
+        let s: StrArg = arg("from_iso8601_date", "varchar", &args.args, 0)?;
+        lift1(&s, |s| {
+            Ok(parse_iso_date(s)
+                .map(|d| DateDays(d.signed_duration_since(epoch).num_days() as i32)))
+        })
     }
 }
 
@@ -550,17 +506,8 @@ impl ScalarUDFImpl for FromIso8601Timestamp {
         ))
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        match &args.args[0] {
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => {
-                let ts = parse_iso_timestamp(s);
-                Ok(ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(
-                    ts, None,
-                )))
-            }
-            _ => Ok(ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(
-                None, None,
-            ))),
-        }
+        let s: StrArg = arg("from_iso8601_timestamp", "varchar", &args.args, 0)?;
+        lift1(&s, |s| Ok(parse_iso_timestamp(s).map(TsMicros)))
     }
 }
 
@@ -590,20 +537,39 @@ impl ScalarUDFImpl for ToIso8601 {
         Ok(DataType::Utf8)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        match &args.args[0] {
-            ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(Some(us), _)) => {
-                let dt = chrono::DateTime::from_timestamp_micros(*us)
-                    .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string());
-                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(dt)))
+        const EXPECTED: &str = "timestamp | date";
+        match args.args[0].data_type() {
+            DataType::Date32 | DataType::Date64 => {
+                let epoch = epoch_date();
+                let d: DateArg = arg("to_iso8601", EXPECTED, &args.args, 0)?;
+                lift1(&d, |days| {
+                    Ok(epoch
+                        .checked_add_signed(chrono::Duration::days(days as i64))
+                        .map(|date| date.format("%Y-%m-%d").to_string()))
+                })
             }
-            ColumnarValue::Scalar(ScalarValue::Date32(Some(days))) => {
-                let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                let date = epoch + chrono::Duration::days(*days as i64);
-                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
-                    date.format("%Y-%m-%d").to_string(),
-                ))))
+            DataType::Timestamp(_, _) | DataType::Null => {
+                let ts: TsArg = arg("to_iso8601", EXPECTED, &args.args, 0)?;
+                // Zoned input renders the local wall clock with its offset
+                // (Trino: `2024-03-15T15:30:45.123+01:00`); naive input is
+                // rendered as UTC with a `Z` suffix.
+                let zone = ts.tz.as_deref().map(Zone::parse).transpose()?;
+                lift1(&ts, |us| {
+                    let utc = chrono::DateTime::from_timestamp_micros(us);
+                    Ok(utc.map(|utc| match &zone {
+                        None => utc.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+                        Some(Zone::Named(tz)) => utc
+                            .with_timezone(tz)
+                            .format("%Y-%m-%dT%H:%M:%S%.3f%:z")
+                            .to_string(),
+                        Some(Zone::Fixed(off)) => utc
+                            .with_timezone(off)
+                            .format("%Y-%m-%dT%H:%M:%S%.3f%:z")
+                            .to_string(),
+                    }))
+                })
             }
-            _ => Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None))),
+            _ => Err(unexpected_parameters("to_iso8601", &args.args, EXPECTED)),
         }
     }
 }
@@ -648,29 +614,8 @@ impl ScalarUDFImpl for HumanReadableSeconds {
         Ok(DataType::Utf8)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let secs = match &args.args[0] {
-            ColumnarValue::Scalar(ScalarValue::Float64(Some(f))) => Some(*f),
-            ColumnarValue::Scalar(ScalarValue::Int64(Some(n))) => Some(*n as f64),
-            ColumnarValue::Array(arr) => {
-                // For arrays: process element-wise
-                if let Some(f_arr) = arr.as_any().downcast_ref::<Float64Array>() {
-                    let result: StringArray =
-                        f_arr.iter().map(|opt| opt.map(format_seconds)).collect();
-                    return Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef));
-                } else if let Some(i_arr) = arr.as_any().downcast_ref::<Int64Array>() {
-                    let result: StringArray = i_arr
-                        .iter()
-                        .map(|opt| opt.map(|n| format_seconds(n as f64)))
-                        .collect();
-                    return Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef));
-                }
-                None
-            }
-            _ => None,
-        };
-        Ok(ColumnarValue::Scalar(ScalarValue::Utf8(
-            secs.map(format_seconds),
-        )))
+        let secs: F64Arg = arg("human_readable_seconds", "double", &args.args, 0)?;
+        lift1(&secs, |s| Ok(Some(format_seconds(s))))
     }
 }
 
@@ -708,33 +653,31 @@ impl ScalarUDFImpl for LastDayOfMonth {
         Ok(DataType::Date32)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-        match &args.args[0] {
-            ColumnarValue::Scalar(ScalarValue::Date32(Some(days))) => {
-                let date = epoch + chrono::Duration::days(*days as i64);
-                let last = last_day_of_month(date);
-                Ok(ColumnarValue::Scalar(ScalarValue::Date32(Some(
-                    last.signed_duration_since(epoch).num_days() as i32,
-                ))))
+        const EXPECTED: &str = "date | timestamp";
+        let epoch = epoch_date();
+        let to_days = |date: NaiveDate| {
+            DateDays(
+                last_day_of_month(date)
+                    .signed_duration_since(epoch)
+                    .num_days() as i32,
+            )
+        };
+        match args.args[0].data_type() {
+            DataType::Timestamp(_, _) => {
+                let ts: TsArg = arg("last_day_of_month", EXPECTED, &args.args, 0)?;
+                let tz = ts.tz.clone();
+                lift1(&ts, |us| {
+                    Ok(micros_to_local_naive(us, tz.as_deref()).map(|dt| to_days(dt.date())))
+                })
             }
-            ColumnarValue::Array(arr) => {
-                let date_arr = arr
-                    .as_any()
-                    .downcast_ref::<Date32Array>()
-                    .ok_or_else(|| DataFusionError::Plan("Expected Date32Array".into()))?;
-                let result: Date32Array = date_arr
-                    .iter()
-                    .map(|opt| {
-                        opt.map(|days| {
-                            let date = epoch + chrono::Duration::days(days as i64);
-                            let last = last_day_of_month(date);
-                            last.signed_duration_since(epoch).num_days() as i32
-                        })
-                    })
-                    .collect();
-                Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
+            _ => {
+                let d: DateArg = arg("last_day_of_month", EXPECTED, &args.args, 0)?;
+                lift1(&d, |days| {
+                    Ok(epoch
+                        .checked_add_signed(chrono::Duration::days(days as i64))
+                        .map(to_days))
+                })
             }
-            _ => Ok(ColumnarValue::Scalar(ScalarValue::Date32(None))),
         }
     }
 }
@@ -810,12 +753,12 @@ impl ScalarUDFImpl for RegexpExtract {
             let re = build_regex(pattern).map_err(|e| {
                 DataFusionError::Plan(format!("regexp_extract: invalid regex pattern: {e}"))
             })?;
-            return str_transform(&args.args[0], |s| extract(&re, s));
+            return str_transform("regexp_extract", &args.args[0], |s| extract(&re, s));
         }
 
         // General path: pattern varies per row (rare); compile per distinct
         // call but still cap the compiled program size.
-        str_transform_2(&args.args, |s, pattern| {
+        str_transform_2("regexp_extract", &args.args, |s, pattern| {
             let re = build_regex(pattern).ok()?;
             extract(&re, s)
         })
@@ -919,16 +862,21 @@ fn column_strings(
                 n_rows.max(1),
             )))
         }
+        ColumnarValue::Scalar(ScalarValue::Utf8View(opt)) => {
+            let v = opt.clone();
+            Ok(StringArray::from_iter(std::iter::repeat_n(
+                v.as_deref(),
+                n_rows.max(1),
+            )))
+        }
         ColumnarValue::Array(arr) => {
             if let Some(s) = arr.as_any().downcast_ref::<StringArray>() {
                 Ok(s.clone())
-            } else if let Some(s) = arr
-                .as_any()
-                .downcast_ref::<arrow::array::LargeStringArray>()
-            {
-                let conv = arrow::compute::cast(s, &DataType::Utf8).map_err(|e| {
+            } else if matches!(arr.data_type(), DataType::LargeUtf8 | DataType::Utf8View) {
+                let conv = arrow::compute::cast(arr, &DataType::Utf8).map_err(|e| {
                     DataFusionError::Execution(format!(
-                        "{fn_name}: cannot convert LargeUtf8 to Utf8: {e}"
+                        "{fn_name}: cannot convert {} to Utf8: {e}",
+                        arr.data_type()
                     ))
                 })?;
                 Ok(conv
@@ -1018,7 +966,7 @@ impl ScalarUDFImpl for Normalize {
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         use unicode_normalization::UnicodeNormalization;
-        str_transform_2(&args.args, |s, form| {
+        str_transform_2("normalize", &args.args, |s, form| {
             let result = match form.to_uppercase().as_str() {
                 "NFC" => s.nfc().collect::<String>(),
                 "NFD" => s.nfd().collect::<String>(),
@@ -1031,7 +979,76 @@ impl ScalarUDFImpl for Normalize {
     }
 }
 
-/// with_timezone(ts, tz) → TIMESTAMP WITH TIME ZONE — attaches the given timezone to the timestamp
+/// Resolve the constant time-zone argument of `with_timezone` / `at_timezone`.
+///
+/// Trino requires the zone to be a constant because it is part of the result
+/// *type* (`timestamp(6) with time zone` carries the zone). Arrow has the same
+/// shape: the zone lives in `DataType::Timestamp(_, Some(tz))`, so a per-row
+/// zone cannot be represented and is rejected at plan time.
+fn constant_zone(fn_name: &str, tz: Option<&ScalarValue>) -> DFResult<String> {
+    match tz {
+        Some(
+            ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) | ScalarValue::Utf8View(Some(s)),
+        ) => {
+            Zone::parse(s)?;
+            Ok(s.clone())
+        }
+        Some(other) if other.is_null() => Err(DataFusionError::Plan(format!(
+            "{fn_name}: time zone must not be null"
+        ))),
+        Some(other) => Err(DataFusionError::Plan(format!(
+            "Unexpected parameters (timestamp, {}) for function {fn_name}. Expected: {fn_name}(timestamp, varchar)",
+            crate::helpers::trino_type_name(&other.data_type())
+        ))),
+        None => Err(DataFusionError::Plan(format!(
+            "{fn_name}: time zone must be a constant expression"
+        ))),
+    }
+}
+
+/// `return_field_from_args` shared by the two zone functions: the result is
+/// `Timestamp(Microsecond, Some(zone))` with the zone taken from the literal.
+fn zoned_return_field(fn_name: &str, args: ReturnFieldArgs) -> DFResult<FieldRef> {
+    if args.arg_fields.len() != 2 {
+        return Err(DataFusionError::Plan(format!(
+            "{fn_name}: expected 2 arguments, got {}",
+            args.arg_fields.len()
+        )));
+    }
+    match args.arg_fields[0].data_type() {
+        DataType::Timestamp(_, _) | DataType::Date32 | DataType::Date64 | DataType::Null => {}
+        other => {
+            return Err(DataFusionError::Plan(format!(
+                "Unexpected parameters ({}, varchar) for function {fn_name}. Expected: {fn_name}(timestamp, varchar)",
+                crate::helpers::trino_type_name(other)
+            )))
+        }
+    }
+    let tz = constant_zone(fn_name, args.scalar_arguments[1])?;
+    Ok(Arc::new(Field::new(
+        fn_name,
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some(tz.into())),
+        true,
+    )))
+}
+
+/// Runtime half of the zone functions: read the constant zone from the
+/// evaluated arguments (it is a scalar by construction; see
+/// [`zoned_return_field`]).
+fn runtime_zone(fn_name: &str, args: &[ColumnarValue]) -> DFResult<String> {
+    match args.get(1) {
+        Some(ColumnarValue::Scalar(sv)) => constant_zone(fn_name, Some(sv)),
+        _ => constant_zone(fn_name, None),
+    }
+}
+
+/// with_timezone(ts, tz) → TIMESTAMP WITH TIME ZONE
+///
+/// Interprets a naive timestamp as a wall-clock time in `tz` and returns the
+/// corresponding instant tagged with `tz`. Arrow stores zoned timestamps as
+/// UTC epoch values plus a display zone, so the stored value shifts by the
+/// zone offset while the rendered wall clock stays what the caller passed
+/// in — exactly Trino's `with_timezone` semantics.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct WithTimezone;
 
@@ -1045,35 +1062,33 @@ impl ScalarUDFImpl for WithTimezone {
         &SIG
     }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Microsecond,
-            Some("UTC".into()),
+        Err(DataFusionError::Internal(
+            "with_timezone: return_field_from_args should be called instead".into(),
         ))
     }
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> DFResult<FieldRef> {
+        zoned_return_field("with_timezone", args)
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        match (&args.args[0], &args.args[1]) {
-            (
-                ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(Some(us), _)),
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(tz_str))),
-            ) => {
-                use chrono_tz::Tz;
-                let _tz: Tz = tz_str.parse().map_err(|_| {
-                    DataFusionError::Execution(format!("Invalid timezone: {}", tz_str))
-                })?;
-                // Return same micros, but tagged with the timezone name
-                Ok(ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(
-                    Some(*us),
-                    Some(tz_str.clone().into()),
-                )))
-            }
-            _ => Ok(ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(
-                None, None,
-            ))),
-        }
+        let tz_name = runtime_zone("with_timezone", &args.args)?;
+        let zone = Zone::parse(&tz_name)?;
+        let ts: TsArg = arg("with_timezone", "timestamp, varchar", &args.args, 0)?;
+        // If the input already carries a zone, its wall clock in that zone is
+        // what gets re-interpreted (Trino only accepts naive input; this is
+        // the natural extension).
+        let in_tz = ts.tz.clone();
+        let out = lift1(&ts, |us| {
+            let local = micros_to_local_naive(us, in_tz.as_deref());
+            Ok(local.and_then(|l| zone.utc_micros(l)).map(TsMicros))
+        })?;
+        tag_timezone(out, &tz_name)
     }
 }
 
-/// at_timezone(ts, tz) → TIMESTAMP — converts UTC timestamp to the given timezone offset
+/// at_timezone(ts, tz) → TIMESTAMP WITH TIME ZONE
+///
+/// Same instant, displayed in `tz`. The stored UTC epoch value is unchanged;
+/// only the zone tag on the Arrow type changes (Trino's `at_timezone`).
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct AtTimezone;
 
@@ -1087,39 +1102,18 @@ impl ScalarUDFImpl for AtTimezone {
         &SIG
     }
     fn return_type(&self, _: &[DataType]) -> DFResult<DataType> {
-        Ok(DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Microsecond,
-            None,
+        Err(DataFusionError::Internal(
+            "at_timezone: return_field_from_args should be called instead".into(),
         ))
     }
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> DFResult<FieldRef> {
+        zoned_return_field("at_timezone", args)
+    }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        match (&args.args[0], &args.args[1]) {
-            (
-                ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(Some(us), _)),
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(tz_str))),
-            ) => {
-                use chrono::TimeZone;
-                use chrono_tz::Tz;
-                let tz: Tz = tz_str.parse().map_err(|_| {
-                    DataFusionError::Execution(format!("Invalid timezone: {}", tz_str))
-                })?;
-                let utc_dt = chrono::DateTime::from_timestamp_micros(*us)
-                    .ok_or_else(|| DataFusionError::Execution("Invalid timestamp".into()))?;
-                // Convert UTC → local timezone
-                let local_dt = utc_dt.with_timezone(&tz);
-                // Represent the local wall-clock time as UTC micros (for display purposes)
-                let local_naive = local_dt.naive_local();
-                let as_utc = chrono::Utc.from_utc_datetime(&local_naive);
-                let us_out = as_utc.timestamp_micros();
-                Ok(ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(
-                    Some(us_out),
-                    Some(tz_str.clone().into()),
-                )))
-            }
-            _ => Ok(ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(
-                None, None,
-            ))),
-        }
+        let tz_name = runtime_zone("at_timezone", &args.args)?;
+        let ts: TsArg = arg("at_timezone", "timestamp, varchar", &args.args, 0)?;
+        let out = lift1(&ts, |us| Ok(Some(TsMicros(us))))?;
+        tag_timezone(out, &tz_name)
     }
 }
 
@@ -1144,18 +1138,20 @@ impl ScalarUDFImpl for FormatDatetime {
         Ok(DataType::Utf8)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        match (&args.args[0], &args.args[1]) {
-            (
-                ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(Some(us), _)),
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(joda_fmt))),
-            ) => {
-                let chrono_fmt = joda_to_chrono(joda_fmt);
-                let dt = chrono::DateTime::from_timestamp_micros(*us)
-                    .map(|dt| dt.format(&chrono_fmt).to_string());
-                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(dt)))
-            }
-            _ => Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None))),
-        }
+        const EXPECTED: &str = "timestamp, varchar";
+        let ts: TsArg = arg("format_datetime", EXPECTED, &args.args, 0)?;
+        let fmt: StrArg = arg("format_datetime", EXPECTED, &args.args, 1)?;
+        let tz = ts.tz.clone();
+        // Translate the Joda pattern once when it is constant; per row otherwise.
+        let const_fmt = const_str_scalar(&args.args[1]).map(joda_to_chrono);
+        lift2(&ts, &fmt, |us, joda_fmt| {
+            let chrono_fmt: std::borrow::Cow<str> = match &const_fmt {
+                Some(f) => std::borrow::Cow::Borrowed(f),
+                None => std::borrow::Cow::Owned(joda_to_chrono(joda_fmt)),
+            };
+            Ok(micros_to_local_naive(us, tz.as_deref())
+                .map(|dt| dt.format(&chrono_fmt).to_string()))
+        })
     }
 }
 
@@ -1179,32 +1175,29 @@ impl ScalarUDFImpl for ParseDatetime {
         ))
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        match (&args.args[0], &args.args[1]) {
-            (
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))),
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(joda_fmt))),
-            ) => {
-                let chrono_fmt = joda_to_chrono(joda_fmt);
-                // Try full datetime first; fall back to a date-only pattern.
-                // chrono's NaiveDateTime parse requires a time component, but
-                // Trino's parse_datetime accepts date-only patterns and returns
-                // midnight (e.g. parse_datetime('2020-01-02','yyyy-MM-dd')).
-                let ts = NaiveDateTime::parse_from_str(s, &chrono_fmt)
-                    .ok()
-                    .or_else(|| {
-                        NaiveDate::parse_from_str(s, &chrono_fmt)
-                            .ok()
-                            .and_then(|d| d.and_hms_opt(0, 0, 0))
-                    })
-                    .map(|dt| dt.and_utc().timestamp_micros());
-                Ok(ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(
-                    ts, None,
-                )))
-            }
-            _ => Ok(ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(
-                None, None,
-            ))),
-        }
+        const EXPECTED: &str = "varchar, varchar";
+        let s: StrArg = arg("parse_datetime", EXPECTED, &args.args, 0)?;
+        let fmt: StrArg = arg("parse_datetime", EXPECTED, &args.args, 1)?;
+        let const_fmt = const_str_scalar(&args.args[1]).map(joda_to_chrono);
+        lift2(&s, &fmt, |s, joda_fmt| {
+            let chrono_fmt: std::borrow::Cow<str> = match &const_fmt {
+                Some(f) => std::borrow::Cow::Borrowed(f),
+                None => std::borrow::Cow::Owned(joda_to_chrono(joda_fmt)),
+            };
+            // Try full datetime first; fall back to a date-only pattern.
+            // chrono's NaiveDateTime parse requires a time component, but
+            // Trino's parse_datetime accepts date-only patterns and returns
+            // midnight (e.g. parse_datetime('2020-01-02','yyyy-MM-dd')).
+            let ts = NaiveDateTime::parse_from_str(s, &chrono_fmt)
+                .ok()
+                .or_else(|| {
+                    NaiveDate::parse_from_str(s, &chrono_fmt)
+                        .ok()
+                        .and_then(|d| d.and_hms_opt(0, 0, 0))
+                })
+                .map(|dt| TsMicros(dt.and_utc().timestamp_micros()));
+            Ok(ts)
+        })
     }
 }
 
@@ -1296,9 +1289,11 @@ impl ScalarUDFImpl for WordStem {
         match args.args.len() {
             1 => {
                 let stemmer = Stemmer::create(Algorithm::English);
-                str_transform(&args.args[0], |s| Some(stemmer.stem(s).into_owned()))
+                str_transform("word_stem", &args.args[0], |s| {
+                    Some(stemmer.stem(s).into_owned())
+                })
             }
-            2 => str_transform_2(&args.args, |s, lang| {
+            2 => str_transform_2("word_stem", &args.args, |s, lang| {
                 let algo = match lang.to_lowercase().as_str() {
                     "en" | "english" => Algorithm::English,
                     "fr" | "french" => Algorithm::French,
@@ -1510,16 +1505,10 @@ impl ScalarUDFImpl for JsonSize {
         Ok(DataType::Int64)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        match (&args.args[0], &args.args[1]) {
-            (
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(json))),
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(path))),
-            ) => {
-                let size = json_size_at_path(json, path);
-                Ok(ColumnarValue::Scalar(ScalarValue::Int64(size)))
-            }
-            _ => Ok(ColumnarValue::Scalar(ScalarValue::Int64(None))),
-        }
+        const EXPECTED: &str = "json, varchar";
+        let json: StrArg = arg("json_size", EXPECTED, &args.args, 0)?;
+        let path: StrArg = arg("json_size", EXPECTED, &args.args, 1)?;
+        lift2(&json, &path, |json, path| Ok(json_size_at_path(json, path)))
     }
 }
 
@@ -1558,21 +1547,10 @@ impl ScalarUDFImpl for JsonArrayGet {
         Ok(DataType::Utf8)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
-        match (&args.args[0], &args.args[1]) {
-            (
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(json))),
-                ColumnarValue::Scalar(idx_val),
-            ) => {
-                let idx = match idx_val {
-                    ScalarValue::Int64(Some(i)) => *i,
-                    ScalarValue::Int32(Some(i)) => *i as i64,
-                    _ => return Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None))),
-                };
-                let result = json_array_get_impl(json, idx);
-                Ok(ColumnarValue::Scalar(ScalarValue::Utf8(result)))
-            }
-            _ => Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None))),
-        }
+        const EXPECTED: &str = "json, bigint";
+        let json: StrArg = arg("json_array_get", EXPECTED, &args.args, 0)?;
+        let idx: I64Arg = arg("json_array_get", EXPECTED, &args.args, 1)?;
+        lift2(&json, &idx, |json, idx| Ok(json_array_get_impl(json, idx)))
     }
 }
 
@@ -1660,26 +1638,45 @@ impl ScalarUDFImpl for Format {
             ));
         }
 
-        let fmt_str = match &args.args[0] {
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => s.clone(),
-            _ => {
-                return Err(DataFusionError::Execution(
-                    "format() first argument must be a string literal".into(),
-                ))
-            }
+        let fmt: StrArg = arg("format", "varchar, ...", &args.args, 0)?;
+        let values: Vec<AnyArg> = args.args[1..]
+            .iter()
+            .map(|cv| AnyArg::from_columnar(cv).map(|v| v.expect("AnyArg accepts every type")))
+            .collect::<DFResult<_>>()?;
+
+        // Row count: the widest array among all arguments, else scalar.
+        let n_rows = std::iter::once(fmt.array_len())
+            .chain(values.iter().map(RowArg::array_len))
+            .flatten()
+            .max();
+
+        let render = |i: usize| -> DFResult<Option<String>> {
+            let Some(fmt_str) = fmt.get(i) else {
+                return Ok(None);
+            };
+            // Trino renders a NULL argument as the string "null".
+            let arg_strs: Vec<String> = values
+                .iter()
+                .map(|v| match v.get(i) {
+                    Some(sv) => format_scalar_value(&sv),
+                    None => "null".to_string(),
+                })
+                .collect();
+            apply_format(fmt_str, &arg_strs).map(Some)
         };
 
-        // Collect remaining args as strings for substitution
-        let arg_strs: Vec<String> = args.args[1..]
-            .iter()
-            .map(|a| match a {
-                ColumnarValue::Scalar(v) => format_scalar_value(v),
-                ColumnarValue::Array(_) => "?".to_string(),
-            })
-            .collect();
-
-        let result = apply_format(&fmt_str, &arg_strs)?;
-        Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(result))))
+        match n_rows {
+            None => Ok(ColumnarValue::Scalar(ScalarValue::Utf8(render(0)?))),
+            Some(n) => {
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    out.push(render(i)?);
+                }
+                Ok(ColumnarValue::Array(
+                    Arc::new(StringArray::from(out)) as ArrayRef
+                ))
+            }
+        }
     }
 }
 
@@ -1736,16 +1733,22 @@ fn apply_format(fmt: &str, args: &[String]) -> DFResult<String> {
             Some('d') => {
                 chars.next();
                 if arg_idx < args.len() {
-                    let val = args[arg_idx].parse::<i64>().unwrap_or(0);
-                    result.push_str(&val.to_string());
+                    // A non-numeric argument (notably the "null" rendering of
+                    // a NULL row) is echoed as-is, as Java's String.format does.
+                    match args[arg_idx].parse::<i64>() {
+                        Ok(val) => result.push_str(&val.to_string()),
+                        Err(_) => result.push_str(&args[arg_idx]),
+                    }
                     arg_idx += 1;
                 }
             }
             Some('f') => {
                 chars.next();
                 if arg_idx < args.len() {
-                    let val = args[arg_idx].parse::<f64>().unwrap_or(0.0);
-                    result.push_str(&format!("{val:.6}"));
+                    match args[arg_idx].parse::<f64>() {
+                        Ok(val) => result.push_str(&format!("{val:.6}")),
+                        Err(_) => result.push_str(&args[arg_idx]),
+                    }
                     arg_idx += 1;
                 }
             }

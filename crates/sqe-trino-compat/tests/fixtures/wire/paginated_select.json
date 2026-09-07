@@ -1,0 +1,198 @@
+[
+  {
+    "body": {
+      "columns": [
+        {
+          "name": "id",
+          "type": "bigint",
+          "typeSignature": {
+            "arguments": [],
+            "rawType": "bigint"
+          }
+        },
+        {
+          "name": "name",
+          "type": "varchar",
+          "typeSignature": {
+            "arguments": [
+              {
+                "kind": "LONG",
+                "value": 2147483647
+              }
+            ],
+            "rawType": "varchar"
+          }
+        }
+      ],
+      "data": "<1000 rows>",
+      "id": "<query-id>",
+      "infoUri": "http://<host>/v1/query/<query-id>",
+      "nextUri": "http://<host>/v1/statement/<query-id>/<poll-token>/1",
+      "stats": {
+        "completedSplits": 1,
+        "cpuTimeMillis": 0,
+        "elapsedTimeMillis": 0,
+        "nodes": 1,
+        "peakMemoryBytes": 0,
+        "physicalInputBytes": 0,
+        "processedBytes": 0,
+        "processedRows": 1000,
+        "queued": false,
+        "queuedSplits": 0,
+        "queuedTimeMillis": 0,
+        "rootStage": null,
+        "runningSplits": 1,
+        "scheduled": true,
+        "spilledBytes": 0,
+        "state": "RUNNING",
+        "totalSplits": 2,
+        "wallTimeMillis": 0
+      },
+      "warnings": []
+    },
+    "status": 200,
+    "step": "post"
+  },
+  {
+    "body": {
+      "columns": [
+        {
+          "name": "id",
+          "type": "bigint",
+          "typeSignature": {
+            "arguments": [],
+            "rawType": "bigint"
+          }
+        },
+        {
+          "name": "name",
+          "type": "varchar",
+          "typeSignature": {
+            "arguments": [
+              {
+                "kind": "LONG",
+                "value": 2147483647
+              }
+            ],
+            "rawType": "varchar"
+          }
+        }
+      ],
+      "data": "<1000 rows>",
+      "id": "<query-id>",
+      "infoUri": "http://<host>/v1/query/<query-id>",
+      "nextUri": "http://<host>/v1/statement/<query-id>/<poll-token>/2",
+      "stats": {
+        "completedSplits": 2,
+        "cpuTimeMillis": 0,
+        "elapsedTimeMillis": 0,
+        "nodes": 1,
+        "peakMemoryBytes": 0,
+        "physicalInputBytes": 0,
+        "processedBytes": 0,
+        "processedRows": 2000,
+        "queued": false,
+        "queuedSplits": 0,
+        "queuedTimeMillis": 0,
+        "rootStage": null,
+        "runningSplits": 1,
+        "scheduled": true,
+        "spilledBytes": 0,
+        "state": "RUNNING",
+        "totalSplits": 3,
+        "wallTimeMillis": 0
+      },
+      "warnings": []
+    },
+    "status": 200,
+    "step": "page-1"
+  },
+  {
+    "body": {
+      "error": {
+        "errorCode": 1,
+        "errorName": "USER_ERROR",
+        "errorType": "USER_ERROR",
+        "message": "Page token 7 out of range: pages are served in order and only the last page (1) may be re-requested"
+      },
+      "id": "<query-id>",
+      "infoUri": "http://<host>/v1/query/<query-id>",
+      "stats": {
+        "completedSplits": 0,
+        "cpuTimeMillis": 0,
+        "elapsedTimeMillis": 0,
+        "nodes": 1,
+        "peakMemoryBytes": 0,
+        "physicalInputBytes": 0,
+        "processedBytes": 0,
+        "processedRows": 0,
+        "queued": false,
+        "queuedSplits": 0,
+        "queuedTimeMillis": 0,
+        "rootStage": null,
+        "runningSplits": 0,
+        "scheduled": true,
+        "spilledBytes": 0,
+        "state": "FAILED",
+        "totalSplits": 1,
+        "wallTimeMillis": 0
+      },
+      "warnings": []
+    },
+    "status": 404,
+    "step": "page-7-out-of-range"
+  },
+  {
+    "body": {
+      "columns": [
+        {
+          "name": "id",
+          "type": "bigint",
+          "typeSignature": {
+            "arguments": [],
+            "rawType": "bigint"
+          }
+        },
+        {
+          "name": "name",
+          "type": "varchar",
+          "typeSignature": {
+            "arguments": [
+              {
+                "kind": "LONG",
+                "value": 2147483647
+              }
+            ],
+            "rawType": "varchar"
+          }
+        }
+      ],
+      "data": "<500 rows>",
+      "id": "<query-id>",
+      "infoUri": "http://<host>/v1/query/<query-id>",
+      "stats": {
+        "completedSplits": 1,
+        "cpuTimeMillis": 0,
+        "elapsedTimeMillis": 0,
+        "nodes": 1,
+        "peakMemoryBytes": 0,
+        "physicalInputBytes": 0,
+        "processedBytes": 0,
+        "processedRows": 2500,
+        "queued": false,
+        "queuedSplits": 0,
+        "queuedTimeMillis": 0,
+        "rootStage": null,
+        "runningSplits": 0,
+        "scheduled": true,
+        "spilledBytes": 0,
+        "state": "FINISHED",
+        "totalSplits": 1,
+        "wallTimeMillis": 0
+      },
+      "warnings": []
+    },
+    "status": 200,
+    "step": "page-2"
+  }
+]

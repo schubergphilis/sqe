@@ -5,10 +5,18 @@
 # SQE (Trino HTTP endpoint) and Trino, compare outputs.
 #
 # Requirements:
-#   - SQE running on port 8080 (Trino HTTP) with Keycloak auth
+#   - SQE running on port 28080 (Trino HTTP) against the test stack
 #   - Trino running on port 38080 with same Polaris catalog
 #   - trino-cli installed
 #   - curl, python3
+#
+# Credentials (all overridable; defaults match docker-compose.test.yml's
+# POLARIS_BOOTSTRAP_CREDENTIALS "POLARIS,root,s3cr3t" and bootstrap-test.sh):
+#   POLARIS_URL            Polaris base URL          (default http://localhost:18181)
+#   POLARIS_CLIENT_ID      OAuth client id           (default root)
+#   POLARIS_CLIENT_SECRET  OAuth client secret       (default s3cr3t)
+#   SQE_USER / SQE_PASS    Basic-auth pair for SQE   (default root / $POLARIS_CLIENT_SECRET)
+#   SQE_TOKEN              Pre-fetched token; skips the Polaris token call entirely
 #
 # Usage:
 #   ./scripts/trino-compat-test.sh                    # run all tests
@@ -26,6 +34,14 @@ TRINO_HOST="${TRINO_HOST:-http://localhost:38080}"
 TRINO_USER="${TRINO_USER:-admin}"
 TRINO_CATALOG="${TRINO_CATALOG:-iceberg}"
 SCHEMA="${SCHEMA:-default}"
+
+# Test-stack Polaris credentials. Never hard-code the secret below; a
+# non-default stack sets these in the environment.
+POLARIS_URL="${POLARIS_URL:-http://localhost:18181}"
+POLARIS_CLIENT_ID="${POLARIS_CLIENT_ID:-root}"
+POLARIS_CLIENT_SECRET="${POLARIS_CLIENT_SECRET:-s3cr3t}"
+SQE_USER="${SQE_USER:-$POLARIS_CLIENT_ID}"
+SQE_PASS="${SQE_PASS:-$POLARIS_CLIENT_SECRET}"
 
 # Colors
 RED='\033[0;31m'
@@ -46,9 +62,13 @@ get_sqe_token() {
     if [ -n "${SQE_TOKEN:-}" ]; then return; fi
 
     echo -n "Getting SQE auth token... "
-    # Try test stack Polaris OAuth (simple, no Keycloak)
-    SQE_TOKEN=$(curl -sf -X POST "http://localhost:18181/api/catalog/v1/oauth/tokens" \
-        -d "grant_type=client_credentials&client_id=root&client_secret=s3cr3t&scope=PRINCIPAL_ROLE:ALL" \
+    # Try test stack Polaris OAuth (simple, no Keycloak). The secret travels
+    # in the POST body via --data-urlencode, never on the command line.
+    SQE_TOKEN=$(curl -sf -X POST "$POLARIS_URL/api/catalog/v1/oauth/tokens" \
+        --data-urlencode "grant_type=client_credentials" \
+        --data-urlencode "client_id=$POLARIS_CLIENT_ID" \
+        --data-urlencode "client_secret=$POLARIS_CLIENT_SECRET" \
+        --data-urlencode "scope=PRINCIPAL_ROLE:ALL" \
         | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])" 2>/dev/null)
 
     if [ -z "$SQE_TOKEN" ]; then
@@ -68,8 +88,8 @@ get_sqe_token() {
 sqe_query() {
     local sql="$1"
     local result=$(curl -s -X POST "$SQE_HOST/v1/statement" \
-        -u "${SQE_USER:-root}:${SQE_PASS:-s3cr3t}" \
-        -H "X-Trino-User: ${SQE_USER:-root}" \
+        -u "$SQE_USER:$SQE_PASS" \
+        -H "X-Trino-User: $SQE_USER" \
         -H "X-Trino-Catalog: $SQE_CATALOG" \
         -H "Content-Type: text/plain" \
         -d "$sql" 2>&1)

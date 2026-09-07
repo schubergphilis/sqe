@@ -441,4 +441,172 @@ mod tests {
         let chars: Vec<char> = "(a, (b, c), d)x".chars().collect();
         assert_eq!(matching_paren(&chars, 0), Some(13));
     }
+
+    // ── Adversarial inputs: comments, quoted identifiers, literals (#630) ──
+
+    const NESTED: &str = "CAST(row(1, row(10)) AS row(a int, b row(x int)))";
+
+    #[test]
+    fn leading_line_comment_is_preserved_and_rewrite_still_fires() {
+        let sql = format!("-- leading ) comment\nSELECT {NESTED}");
+        let out = rewrite_nested_row_cast(&sql);
+        assert!(out.starts_with("-- leading ) comment\n"), "{out}");
+        assert!(parses(&out), "did not parse: {out}");
+        assert_eq!(out.matches("named_struct(").count(), 2, "{out}");
+    }
+
+    #[test]
+    fn leading_block_comment_is_preserved_and_rewrite_still_fires() {
+        let sql = format!("/* lead ) */ SELECT {NESTED}");
+        let out = rewrite_nested_row_cast(&sql);
+        assert!(out.starts_with("/* lead ) */ "), "{out}");
+        assert!(parses(&out), "did not parse: {out}");
+    }
+
+    #[test]
+    fn cast_and_row_keywords_inside_a_literal_are_untouched() {
+        // Parses as-is, so the gate returns it byte-identical.
+        let sql = "SELECT 'cast(row(1) as row(a int))' AS s";
+        assert_eq!(rewrite_nested_row_cast(sql), sql);
+    }
+
+    #[test]
+    fn trailing_comment_with_close_paren_does_not_disturb_the_span() {
+        let sql = format!("SELECT {NESTED} AS c -- )");
+        let out = rewrite_nested_row_cast(&sql);
+        assert!(out.ends_with("-- )"), "{out}");
+        assert!(parses(&out), "did not parse: {out}");
+    }
+
+    /// `matching_paren` tracks single quotes but not comments, so a `)` in a
+    /// block comment inside the CAST span closes the scan early; the rewrite
+    /// silently does not fire and the client gets the raw parse error.
+    #[test]
+    #[ignore = "rewriter bug (#630): `)` inside a block comment within the CAST span mis-balances matching_paren; enable once the scanner skips comments"]
+    fn close_paren_inside_comment_within_span_is_not_a_paren() {
+        let sql = "SELECT CAST(row(1, /* ) */ row(10)) AS row(a int, b row(x int)))";
+        let out = rewrite_nested_row_cast(sql);
+        assert!(parses(&out), "rewrite did not fire: {out}");
+        assert!(out.contains("/* ) */"), "comment bytes changed: {out}");
+    }
+
+    /// Same scan, double-quoted identifier: `"a)b"` is one identifier to the
+    /// tokenizer but a close paren to the character scanner.
+    #[test]
+    #[ignore = "rewriter bug (#630): `)` inside a quoted identifier within the CAST span mis-balances matching_paren; enable once the scanner skips quoted identifiers"]
+    fn close_paren_inside_quoted_identifier_within_span_is_not_a_paren() {
+        let sql = "SELECT CAST(row(\"a)b\", row(10)) AS row(a int, b row(x int))) FROM t";
+        let out = rewrite_nested_row_cast(sql);
+        assert!(parses(&out), "rewrite did not fire: {out}");
+        assert!(out.contains("\"a)b\""), "identifier bytes changed: {out}");
+    }
+
+    /// `matching_paren` skips single-quoted literals but `split_top_level_as`
+    /// and `split_top_level_commas` do not, so a `)` or `,` inside a literal
+    /// field value defeats the split and the rewrite does not fire.
+    #[test]
+    #[ignore = "rewriter bug (#630): `)` inside a string literal within the CAST span defeats split_top_level_as (no quote tracking); enable once the splitters skip literals"]
+    fn close_paren_inside_literal_within_span_is_not_a_paren() {
+        let sql = "SELECT CAST(row('a)b', row(10)) AS row(a varchar, b row(x int)))";
+        let out = rewrite_nested_row_cast(sql);
+        assert!(parses(&out), "rewrite did not fire: {out}");
+        assert!(out.contains("'a)b'"), "literal bytes changed: {out}");
+    }
+
+    #[test]
+    #[ignore = "rewriter bug (#630): `,` inside a string literal within the CAST span is split as a field separator by split_top_level_commas; enable once the splitters skip literals"]
+    fn comma_inside_literal_within_span_is_not_a_separator() {
+        let sql = "SELECT CAST(row('a,b', row(10)) AS row(a varchar, b row(x int)))";
+        let out = rewrite_nested_row_cast(sql);
+        assert!(parses(&out), "rewrite did not fire: {out}");
+        assert!(out.contains("'a,b'"), "literal bytes changed: {out}");
+    }
+
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Bytes that trip a character scanner: parens, commas, the keywords
+        /// this module keys on, comment openers. No quotes, so the payload
+        /// can be dropped into a literal, a quoted identifier or a comment
+        /// without further escaping (and no `*` so it cannot form `*/`).
+        fn payload() -> impl Strategy<Value = String> {
+            prop::collection::vec(
+                prop_oneof![
+                    Just(")".to_string()),
+                    Just("(".to_string()),
+                    Just(",".to_string()),
+                    Just(" cast(".to_string()),
+                    Just(" row(".to_string()),
+                    Just(" as ".to_string()),
+                    Just(" -- ".to_string()),
+                    Just(" /* ".to_string()),
+                    "[a-z0-9 ]{1,4}",
+                ],
+                1..6,
+            )
+            .prop_map(|parts| parts.concat())
+        }
+
+        fn literal() -> impl Strategy<Value = String> {
+            payload().prop_map(|p| format!("'{p}'"))
+        }
+
+        fn quoted_ident() -> impl Strategy<Value = String> {
+            payload().prop_map(|p| format!("\"{p}\""))
+        }
+
+        fn line_comment() -> impl Strategy<Value = String> {
+            payload().prop_map(|p| format!("--{p}\n"))
+        }
+
+        /// sqlparser nests block comments, so an opener inside the body would
+        /// leave the comment unterminated; defuse it.
+        fn block_comment() -> impl Strategy<Value = String> {
+            payload().prop_map(|p| format!("/*{}*/", p.replace("/*", "/ *")))
+        }
+
+        /// Statements that parse as written (so the gate must return them
+        /// unchanged), carrying the adversarial payload in every position a
+        /// BI tool would put it.
+        fn parseable_statement() -> impl Strategy<Value = String> {
+            (literal(), quoted_ident(), line_comment(), block_comment()).prop_flat_map(
+                |(l, q, lc, bc)| {
+                    prop_oneof![
+                        Just(format!("SELECT {l}, {q} FROM t {bc}")),
+                        Just(format!("{lc}SELECT CAST({l} AS VARCHAR) AS {q}")),
+                        Just(format!("SELECT CAST(ROW(1) AS ROW(x int)) {bc}, {l}")),
+                        Just(format!("INSERT INTO {q} VALUES ({l}, 1) {bc}")),
+                        Just(format!("SELECT * FROM t WHERE {q} = {l} {lc}")),
+                    ]
+                },
+            )
+        }
+
+        proptest! {
+            /// (a) Already-parseable SQL is returned byte-identical.
+            #[test]
+            fn parseable_input_is_returned_byte_identical(sql in parseable_statement()) {
+                if parses(&sql) {
+                    prop_assert_eq!(rewrite_nested_row_cast(&sql), sql);
+                }
+            }
+
+            /// (b) Literal and comment bytes outside the CAST span survive a
+            /// rewrite that fires, and the result parses.
+            #[test]
+            fn literal_and_comment_bytes_survive_the_rewrite(
+                l in literal(),
+                lc in line_comment(),
+                bc in block_comment(),
+            ) {
+                let sql = format!("{lc}SELECT {NESTED} AS c, {l} {bc}");
+                let out = rewrite_nested_row_cast(&sql);
+                prop_assert!(out.contains(&l), "literal changed: {out}");
+                prop_assert!(out.contains(&lc), "line comment changed: {out}");
+                prop_assert!(out.contains(&bc), "block comment changed: {out}");
+                prop_assert!(parses(&out), "rewrite did not fire: {out}");
+            }
+        }
+    }
 }

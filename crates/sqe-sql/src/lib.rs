@@ -5,8 +5,10 @@ pub mod catalog_qualifiers;
 pub mod classifier;
 pub mod ctas_compat;
 pub mod ddl;
+pub mod front_door;
 pub mod hive_ddl;
 pub mod hive_partitions;
+pub mod metadata;
 pub mod nested_row_cast;
 pub mod paren_less_values;
 pub mod partition;
@@ -16,6 +18,7 @@ pub mod policy_ddl;
 pub mod procedures;
 pub mod tags;
 pub mod time_travel;
+mod token_scan;
 pub mod trino_compat;
 pub mod tvf_named_args;
 pub mod v3_types;
@@ -37,6 +40,11 @@ pub use classifier::{
 };
 pub use ctas_compat::rewrite_ctas_compat;
 pub use ddl::{try_parse_ref_ddl, BranchRetention, RefDdl};
+pub use front_door::{classify_normalized, NormalizedSql, SqlFrontDoor, WireDialect};
+pub use metadata::{
+    is_metadata_query, qualify_information_schema, reads_information_schema, update_type,
+    UpdateType,
+};
 pub use nested_row_cast::rewrite_nested_row_cast;
 pub use paren_less_values::rewrite_paren_less_values;
 pub use partition::{is_create_external_table, normalize_partitioned_by};

@@ -196,6 +196,52 @@ impl TrinoError {
         Self::from_code(sqe_core::SqeErrorCode::InternalError, message, query_id)
     }
 
+    /// Build a USER_ERROR carrying one of Trino's own `StandardErrorCode`
+    /// names that has no `SqeErrorCode` counterpart (`INVALID_SESSION_PROPERTY`,
+    /// `NOT_FOUND`). Trino clients dispatch on `errorName`, so the protocol
+    /// layer's session and prepared-statement errors must use Trino's names
+    /// rather than the nearest engine code.
+    pub fn trino_user_error(
+        error_code: i32,
+        error_name: &str,
+        message: impl Into<String>,
+        query_id: Option<&str>,
+    ) -> Self {
+        let message = message.into();
+        Self {
+            message: message.clone(),
+            error_code,
+            error_name: error_name.to_string(),
+            error_type: "USER_ERROR".to_string(),
+            query_id: query_id.map(|s| s.to_string()),
+            failure_info: Some(TrinoFailureInfo {
+                r#type: "io.trino.spi.USER_ERROR".to_string(),
+                message,
+                suppressed: Vec::new(),
+                cause: None,
+                stack: Vec::new(),
+            }),
+            error_location: None,
+        }
+    }
+
+    /// `INVALID_SESSION_PROPERTY` (Trino `StandardErrorCode` 14).
+    pub fn invalid_session_property(message: impl Into<String>, query_id: Option<&str>) -> Self {
+        Self::trino_user_error(14, "INVALID_SESSION_PROPERTY", message, query_id)
+    }
+
+    /// `NOT_FOUND` (Trino `StandardErrorCode` 5): what Trino returns for
+    /// `EXECUTE`, `DEALLOCATE PREPARE` and `DESCRIBE OUTPUT|INPUT` naming a
+    /// prepared statement the session does not hold.
+    pub fn prepared_statement_not_found(name: &str, query_id: Option<&str>) -> Self {
+        Self::trino_user_error(
+            5,
+            "NOT_FOUND",
+            format!("Prepared statement not found: {name}"),
+            query_id,
+        )
+    }
+
     pub fn from_code(
         code: sqe_core::SqeErrorCode,
         message: impl Into<String>,
@@ -375,7 +421,10 @@ pub fn batches_to_rows(batches: &[RecordBatch]) -> Vec<Vec<serde_json::Value>> {
 /// Trino's wire protocol drives `USE` and `SET SESSION` by emitting
 /// `X-Trino-Set-*` / `X-Trino-Clear-*` headers on the response. Clients
 /// observe the headers and replay them on the next request to retain
-/// the new session state.
+/// the new session state. The headers go on the terminal response of the
+/// statement that caused them only (finding 708): a `USE` that fails must
+/// never switch the client's replayed schema, and a paging response never
+/// repeats them.
 #[derive(Debug, Clone, Default)]
 pub struct UpdatedSessionState {
     pub set_catalog: Option<String>,
@@ -397,169 +446,15 @@ impl UpdatedSessionState {
     }
 }
 
-/// Parse a Trino session-control statement from the leading verb.
-///
-/// Returns `None` for non-session statements; the server emits headers
-/// only when this returns `Some`. The Trino client REST API spec defines
-/// the supported verbs as USE, SET SESSION/CATALOG, RESET SESSION,
-/// PREPARE, DEALLOCATE PREPARE.
-///
 /// Which prepared-statement metadata a `DESCRIBE` requests. Trino JDBC issues
 /// `DESCRIBE OUTPUT <name>` for `PreparedStatement.getMetaData()` and
-/// `DESCRIBE INPUT <name>` for `getParameterMetaData()`.
+/// `DESCRIBE INPUT <name>` for `getParameterMetaData()`. Both are recognised by
+/// the SQL front door (`sqe_sql::StatementKind::DescribeOutput` /
+/// `DescribeInput`); nothing here parses statement text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DescribeKind {
     Output,
     Input,
-}
-
-/// Detect `DESCRIBE OUTPUT <name>` / `DESCRIBE INPUT <name>` (and the `DESC`
-/// abbreviation) and return the kind plus the prepared-statement name.
-///
-/// Returns `None` for anything else, including a plain `DESCRIBE <table>`
-/// (which sqlparser models as `ExplainTable` and the coordinator already
-/// handles). sqlparser does not model the OUTPUT/INPUT forms, so they are
-/// detected by prefix here before the SQL reaches the planner.
-pub fn parse_describe_prepared(sql: &str) -> Option<(DescribeKind, String)> {
-    let trimmed = sql.trim().trim_end_matches(';').trim();
-    let upper = trimmed.to_uppercase();
-    for (prefix, kind) in [
-        ("DESCRIBE OUTPUT ", DescribeKind::Output),
-        ("DESCRIBE INPUT ", DescribeKind::Input),
-        ("DESC OUTPUT ", DescribeKind::Output),
-        ("DESC INPUT ", DescribeKind::Input),
-    ] {
-        if upper.starts_with(prefix) {
-            let name = unquote_identifier(trimmed[prefix.len()..].trim());
-            if !name.is_empty() {
-                return Some((kind, name));
-            }
-        }
-    }
-    None
-}
-
-pub fn parse_session_statement(sql: &str) -> Option<UpdatedSessionState> {
-    let trimmed = sql.trim().trim_end_matches(';').trim();
-    let upper = trimmed.to_uppercase();
-    let mut state = UpdatedSessionState::default();
-
-    // Strip a known prefix in a case-insensitive way and return the
-    // remainder of the original (case-preserved) string.
-    fn strip_prefix_ci<'a>(s: &'a str, upper: &str, prefix: &str) -> Option<&'a str> {
-        if upper.starts_with(prefix) {
-            Some(&s[prefix.len()..])
-        } else {
-            None
-        }
-    }
-
-    if let Some(rest) = strip_prefix_ci(trimmed, &upper, "USE ") {
-        let target = rest.trim();
-        if let Some((catalog, schema)) = target.split_once('.') {
-            state.set_catalog = Some(unquote_identifier(catalog.trim()));
-            state.set_schema = Some(unquote_identifier(schema.trim()));
-        } else {
-            state.set_schema = Some(unquote_identifier(target));
-        }
-        return Some(state);
-    }
-
-    if let Some(rest) = strip_prefix_ci(trimmed, &upper, "SET CATALOG ") {
-        state.set_catalog = Some(unquote_identifier(rest.trim()));
-        return Some(state);
-    }
-
-    if let Some(rest) = strip_prefix_ci(trimmed, &upper, "SET SESSION ") {
-        if let Some((name, value)) = rest.split_once('=') {
-            state
-                .set_session
-                .push((unquote_identifier(name.trim()), value.trim().to_string()));
-            return Some(state);
-        }
-        return None;
-    }
-
-    if let Some(rest) = strip_prefix_ci(trimmed, &upper, "RESET SESSION ") {
-        state.clear_session.push(unquote_identifier(rest.trim()));
-        return Some(state);
-    }
-
-    if let Some(rest) = strip_prefix_ci(trimmed, &upper, "DEALLOCATE PREPARE ") {
-        state
-            .deallocated_prepare
-            .push(unquote_identifier(rest.trim()));
-        return Some(state);
-    }
-
-    if let Some(rest) = strip_prefix_ci(trimmed, &upper, "PREPARE ") {
-        if let Some((name_part, sql_part)) = split_prepare_body(rest.trim()) {
-            state
-                .added_prepare
-                .push((unquote_identifier(name_part), sql_part.to_string()));
-            return Some(state);
-        }
-        return None;
-    }
-
-    None
-}
-
-/// Detect `SHOW SESSION` / `SHOW SESSION LIKE '<pattern>'` and return the
-/// LIKE pattern (unquoted) if present. Returns `None` for anything that is not
-/// a `SHOW SESSION` statement.
-///
-/// sqlparser does not model `SHOW SESSION` (it collapses to a `SHOW LIKE`
-/// utility the executor rejects), so the Trino server intercepts it here and
-/// builds the result directly, the same way it does for `DESCRIBE OUTPUT`.
-pub fn parse_show_session(sql: &str) -> Option<Option<String>> {
-    let trimmed = sql.trim().trim_end_matches(';').trim();
-    let upper = trimmed.to_uppercase();
-    let rest = if upper == "SHOW SESSION" {
-        ""
-    } else {
-        upper
-            .strip_prefix("SHOW SESSION ")
-            .map(|_| trimmed["SHOW SESSION ".len()..].trim())?
-    };
-    if rest.is_empty() {
-        return Some(None);
-    }
-    // Optional `LIKE '<pattern>'`.
-    let rest_upper = rest.to_uppercase();
-    if let Some(after) = rest_upper.strip_prefix("LIKE ") {
-        let pat = rest[rest.len() - after.len()..].trim();
-        // Strip the surrounding single quotes of the SQL string literal.
-        let pat = pat
-            .strip_prefix('\'')
-            .and_then(|v| v.strip_suffix('\''))
-            .map(|v| v.replace("''", "'"))
-            .unwrap_or_else(|| pat.to_string());
-        return Some(Some(pat));
-    }
-    // `SHOW SESSION <something-else>` is not a form we model; ignore the tail
-    // and return all properties rather than failing the client.
-    Some(None)
-}
-
-fn unquote_identifier(s: &str) -> String {
-    let s = s.trim();
-    if let Some(stripped) = s.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
-        return stripped.replace("\"\"", "\"");
-    }
-    if let Some(stripped) = s.strip_prefix('`').and_then(|v| v.strip_suffix('`')) {
-        return stripped.to_string();
-    }
-    s.to_string()
-}
-
-fn split_prepare_body(s: &str) -> Option<(&str, &str)> {
-    // PREPARE <name> FROM <statement>
-    let upper = s.to_uppercase();
-    let from = upper.find(" FROM ")?;
-    let name = s[..from].trim();
-    let sql = s[from + 6..].trim();
-    Some((name, sql))
 }
 
 /// Metrics collected from one execution that feed into a `TrinoStats` row.
@@ -923,92 +818,6 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"updateType\":\"INSERT\""));
         assert!(json.contains("\"updateCount\":42"));
-    }
-
-    #[test]
-    fn test_parse_session_use_catalog_schema() {
-        let s = parse_session_statement("USE iceberg.analytics").unwrap();
-        assert_eq!(s.set_catalog.as_deref(), Some("iceberg"));
-        assert_eq!(s.set_schema.as_deref(), Some("analytics"));
-    }
-
-    #[test]
-    fn test_parse_session_use_schema_only() {
-        let s = parse_session_statement("USE analytics").unwrap();
-        assert_eq!(s.set_catalog, None);
-        assert_eq!(s.set_schema.as_deref(), Some("analytics"));
-    }
-
-    #[test]
-    fn test_parse_session_set_session_kv() {
-        let s = parse_session_statement("SET SESSION optimize_hash_generation = true").unwrap();
-        assert_eq!(s.set_session.len(), 1);
-        assert_eq!(s.set_session[0].0, "optimize_hash_generation");
-        assert_eq!(s.set_session[0].1, "true");
-    }
-
-    #[test]
-    fn test_parse_session_reset_session() {
-        let s = parse_session_statement("RESET SESSION foo").unwrap();
-        assert_eq!(s.clear_session, vec!["foo".to_string()]);
-    }
-
-    #[test]
-    fn test_parse_show_session() {
-        // Bare SHOW SESSION: all properties, no filter.
-        assert_eq!(parse_show_session("SHOW SESSION"), Some(None));
-        assert_eq!(parse_show_session("  show session ;"), Some(None));
-        // LIKE filter, quotes stripped.
-        assert_eq!(
-            parse_show_session("SHOW SESSION LIKE 'iceberg.compression_codec'"),
-            Some(Some("iceberg.compression_codec".to_string()))
-        );
-        assert_eq!(
-            parse_show_session("show session like 'iceberg.%'"),
-            Some(Some("iceberg.%".to_string()))
-        );
-        // Not a SHOW SESSION statement.
-        assert_eq!(parse_show_session("SHOW TABLES"), None);
-        assert_eq!(parse_show_session("SELECT 1"), None);
-        assert_eq!(parse_show_session("SHOW SESSIONS"), None);
-    }
-
-    #[test]
-    fn test_parse_session_prepare_and_deallocate() {
-        let s = parse_session_statement("PREPARE p1 FROM SELECT 1").unwrap();
-        assert_eq!(s.added_prepare.len(), 1);
-        assert_eq!(s.added_prepare[0].0, "p1");
-        assert_eq!(s.added_prepare[0].1, "SELECT 1");
-
-        let s = parse_session_statement("DEALLOCATE PREPARE p1").unwrap();
-        assert_eq!(s.deallocated_prepare, vec!["p1".to_string()]);
-    }
-
-    #[test]
-    fn test_parse_describe_prepared() {
-        assert_eq!(
-            parse_describe_prepared("DESCRIBE OUTPUT my_stmt"),
-            Some((DescribeKind::Output, "my_stmt".to_string()))
-        );
-        assert_eq!(
-            parse_describe_prepared("describe input \"My Stmt\";"),
-            Some((DescribeKind::Input, "My Stmt".to_string()))
-        );
-        assert_eq!(
-            parse_describe_prepared("DESC OUTPUT p1"),
-            Some((DescribeKind::Output, "p1".to_string()))
-        );
-        // Plain DESCRIBE <table> is NOT a prepared-statement describe.
-        assert_eq!(parse_describe_prepared("DESCRIBE my_table"), None);
-        assert_eq!(parse_describe_prepared("SELECT 1"), None);
-        // Missing name.
-        assert_eq!(parse_describe_prepared("DESCRIBE OUTPUT"), None);
-    }
-
-    #[test]
-    fn test_parse_session_unrelated_returns_none() {
-        assert!(parse_session_statement("SELECT 1").is_none());
-        assert!(parse_session_statement("INSERT INTO t VALUES (1)").is_none());
     }
 
     #[test]

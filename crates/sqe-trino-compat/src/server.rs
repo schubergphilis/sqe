@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use sqe_core::config::SecurityConfig;
 use sqe_core::Session;
+use sqe_sql::UpdateType;
 
 use crate::explain_compat;
 use crate::info_schema_compat;
@@ -30,6 +31,7 @@ use crate::prepared;
 use crate::protocol::{
     self, NodeVersion, ServerInfo, TrinoColumn, TrinoError, TrinoResponse, TrinoStats,
 };
+use crate::session_props;
 
 /// Default number of rows per page for result pagination.
 const DEFAULT_PAGE_SIZE: usize = 1000;
@@ -1115,28 +1117,318 @@ fn error_response(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(body)).into_response()
 }
 
-/// Classify a SQL statement against the leading keyword.
-///
-/// dbt-trino sets `rows_affected` from `updateType` + `updateCount`. Trino
-/// itself emits `INSERT`, `UPDATE`, `DELETE`, `MERGE`, plus the schema-DDL
-/// variants. We map them by the verb the user typed.
-fn classify_update_type(sql: &str) -> Option<&'static str> {
-    let token = sql
-        .trim_start()
-        .split(|c: char| c.is_whitespace() || c == '(')
-        .find(|s| !s.is_empty())?
-        .to_ascii_uppercase();
-    match token.as_str() {
-        "INSERT" => Some("INSERT"),
-        "UPDATE" => Some("UPDATE"),
-        "DELETE" => Some("DELETE"),
-        "MERGE" => Some("MERGE"),
-        "CREATE" => Some("CREATE TABLE"),
-        "DROP" => Some("DROP TABLE"),
-        "ALTER" => Some("ALTER TABLE"),
-        "TRUNCATE" => Some("TRUNCATE TABLE"),
-        _ => None,
+/// What the protocol layer knows about a statement from its AST, decided once
+/// at submit time and carried to the result cursor. Replaces the leading-word
+/// and substring tests on the SQL text (findings 704, 708): a user query with
+/// `information_schema` in a literal or comment is not a metadata query, and
+/// `CREATE VIEW` is not `CREATE TABLE`.
+#[derive(Debug, Clone, Default)]
+struct StatementFacts {
+    /// Trino `updateType` (`INSERT`, `CREATE VIEW`, `USE`, ...); `None` for
+    /// reads.
+    update_type: Option<&'static str>,
+    /// Reads `information_schema`, or is `SHOW COLUMNS` / `DESCRIBE <table>`:
+    /// the result is reshaped as catalog metadata.
+    is_metadata: bool,
+    /// `SHOW COLUMNS` / `DESCRIBE <table>`: the result is reshaped into
+    /// Trino's `DESCRIBE` column layout.
+    is_describe_or_show_columns: bool,
+    /// Any `EXPLAIN` variant: the result is collapsed to Trino's single
+    /// `Query Plan` column.
+    is_explain: bool,
+}
+
+impl StatementFacts {
+    fn from_normalized(normalized: &sqe_sql::NormalizedSql) -> Self {
+        use sqlparser::ast::{DescribeAlias, Statement};
+        let stmt = normalized.statement();
+        let is_describe_or_show_columns = matches!(
+            stmt,
+            Some(Statement::ShowColumns { .. })
+                | Some(Statement::ExplainTable {
+                    describe_alias: DescribeAlias::Describe | DescribeAlias::Desc,
+                    ..
+                })
+        );
+        Self {
+            update_type: normalized.update_type().map(UpdateType::as_trino_str),
+            is_metadata: normalized.is_metadata_query(),
+            is_describe_or_show_columns,
+            is_explain: matches!(stmt, Some(Statement::Explain { .. })),
+        }
     }
+
+    /// True when the whole result must be drained and reshaped before the
+    /// first page is served.
+    fn needs_reshape(&self) -> bool {
+        self.update_type.is_some() || self.is_metadata || self.is_explain
+    }
+}
+
+/// How a submitted statement is answered.
+#[derive(Debug)]
+enum ExecPlan {
+    /// Answered by the protocol layer alone (`SET SESSION`, `PREPARE`, ...):
+    /// an empty finished response carrying session headers, no executor.
+    Immediate,
+    /// `SHOW SESSION [LIKE ...]`: the allow-listed properties with the values
+    /// the client is carrying.
+    ShowSession { like: Option<String> },
+    /// `DESCRIBE OUTPUT|INPUT <name>` against a header-carried template.
+    DescribePrepared {
+        kind: protocol::DescribeKind,
+        template: String,
+    },
+    /// Hand the normalized (and, for `EXECUTE`, bound) SQL to the executor.
+    Sql(String),
+}
+
+/// A statement after the front door and the protocol-level dispatch.
+#[derive(Debug)]
+struct ResolvedStatement {
+    plan: ExecPlan,
+    facts: StatementFacts,
+    /// Session-state mutation to echo on the statement's terminal response.
+    session_update: Option<protocol::UpdatedSessionState>,
+}
+
+/// Run `sql` through the SQL front door and decide how to answer it.
+///
+/// This is the only place statement text is interpreted on the Trino path
+/// (finding 700): one `SqlFrontDoor::normalize` with `WireDialect::Trino`,
+/// classification from the AST it produced, and no rewrite afterwards. The
+/// session-control grammar is handled here because it never reaches the
+/// executor:
+///
+/// - `USE` goes to the executor; its `X-Trino-Set-Catalog` / `-Schema`
+///   headers are attached to the terminal response only, so a failing `USE`
+///   never switches the client.
+/// - `SET SESSION` accepts only [`session_props::SESSION_PROPERTIES`] and
+///   validates the value; anything else is `INVALID_SESSION_PROPERTY`.
+///   `RESET SESSION` and `SHOW SESSION` use the same list.
+/// - `PREPARE` has already had its body parsed by the classifier, so a
+///   malformed body fails here, at PREPARE time, with a `SYNTAX_ERROR`.
+/// - `EXECUTE` binds the parsed `USING` expressions into the header-carried
+///   template through the shared comment-aware scanner, then normalizes the
+///   bound text. `DEALLOCATE` and `DESCRIBE OUTPUT|INPUT` of an unknown name
+///   are `NOT_FOUND`, as in Trino.
+fn resolve_statement(
+    sql: &str,
+    session_catalog: Option<&str>,
+    prepared: &std::collections::HashMap<String, String>,
+    query_id: &str,
+) -> Result<ResolvedStatement, Box<TrinoError>> {
+    use sqe_sql::{classify_normalized, SqlFrontDoor, StatementKind, WireDialect};
+    use sqlparser::ast::{Expr, Statement, Use, Value};
+
+    let door = SqlFrontDoor::new(WireDialect::Trino).with_session_catalog(session_catalog);
+    let normalized = door
+        .normalize(sql)
+        .map_err(|e| TrinoError::from_sqe_error(&e, Some(query_id)))?;
+    let facts = StatementFacts::from_normalized(&normalized);
+    let exec_sql = normalized.sql().to_string();
+
+    // `EXECUTE IMMEDIATE '<sql>' [USING ...]` (Trino JDBC with
+    // explicitPrepare=false). sqlparser's Generic dialect reads it as
+    // `EXECUTE immediate '<sql>'`: a statement named IMMEDIATE with one
+    // positional string argument. Recognised from that AST shape; a prepared
+    // statement that is really called `immediate` has no positional string.
+    if let Some(Statement::Execute {
+        name: Some(name),
+        parameters,
+        has_parentheses: false,
+        immediate: false,
+        using,
+        ..
+    }) = normalized.statement()
+    {
+        if name.to_string().eq_ignore_ascii_case("immediate") {
+            if let [Expr::Value(inline)] = parameters.as_slice() {
+                if let Value::SingleQuotedString(inline_sql) = &inline.value {
+                    let params: Vec<Expr> = using.iter().map(|u| u.expr.clone()).collect();
+                    return resolve_bound_sql(&door, inline_sql, &params, query_id);
+                }
+            }
+        }
+    }
+
+    // `StatementKind::Use` carries only the printed target; keep the AST so
+    // quoted parts are unquoted the way the parser saw them.
+    let use_target = match normalized.statement() {
+        Some(Statement::Use(u)) => Some(u.clone()),
+        _ => None,
+    };
+
+    let kind = classify_normalized(normalized)
+        .map_err(|e| TrinoError::from_sqe_error(&e, Some(query_id)))?;
+    let immediate = |session_update: protocol::UpdatedSessionState| ResolvedStatement {
+        plan: ExecPlan::Immediate,
+        facts: facts.clone(),
+        session_update: Some(session_update),
+    };
+    let describe = |name: String,
+                    kind: protocol::DescribeKind|
+     -> Result<ResolvedStatement, Box<TrinoError>> {
+        let template = prepared.get(&name).ok_or_else(|| {
+            Box::new(TrinoError::prepared_statement_not_found(
+                &name,
+                Some(query_id),
+            ))
+        })?;
+        Ok(ResolvedStatement {
+            plan: ExecPlan::DescribePrepared {
+                kind,
+                template: template.clone(),
+            },
+            facts: facts.clone(),
+            session_update: None,
+        })
+    };
+
+    Ok(match kind {
+        StatementKind::Use(_) => {
+            let mut update = protocol::UpdatedSessionState::default();
+            let Some(target) = use_target else {
+                return Err(Box::new(TrinoError::internal_error(
+                    "USE classified without a parsed statement",
+                    Some(query_id),
+                )));
+            };
+            let parts = |name: &sqlparser::ast::ObjectName| -> Vec<String> {
+                name.0
+                    .iter()
+                    .map(|p| match p {
+                        sqlparser::ast::ObjectNamePart::Identifier(id) => id.value.clone(),
+                        other => other.to_string(),
+                    })
+                    .collect()
+            };
+            match &target {
+                Use::Object(name) | Use::Schema(name) | Use::Database(name) => {
+                    match parts(name).as_slice() {
+                        [schema] => update.set_schema = Some(schema.clone()),
+                        [catalog, schema] => {
+                            update.set_catalog = Some(catalog.clone());
+                            update.set_schema = Some(schema.clone());
+                        }
+                        _ => {
+                            return Err(Box::new(TrinoError::user_error(
+                                format!("Invalid USE target '{name}': expected [catalog.]schema"),
+                                Some(query_id),
+                            )))
+                        }
+                    }
+                }
+                Use::Catalog(name) => update.set_catalog = parts(name).first().cloned(),
+                other => {
+                    return Err(Box::new(TrinoError::user_error(
+                        format!("Unsupported USE form: {other}"),
+                        Some(query_id),
+                    )))
+                }
+            }
+            ResolvedStatement {
+                plan: ExecPlan::Sql(exec_sql),
+                facts,
+                session_update: Some(update),
+            }
+        }
+        StatementKind::SetCatalog(catalog) => immediate(protocol::UpdatedSessionState {
+            set_catalog: Some(catalog),
+            ..Default::default()
+        }),
+        StatementKind::SetSession { name, value } => {
+            let prop = session_props::lookup(&name).ok_or_else(|| {
+                TrinoError::invalid_session_property(
+                    session_props::unknown_property_message(&name),
+                    Some(query_id),
+                )
+            })?;
+            prop.validate(&value)
+                .map_err(|msg| TrinoError::invalid_session_property(msg, Some(query_id)))?;
+            immediate(protocol::UpdatedSessionState {
+                set_session: vec![(name, value)],
+                ..Default::default()
+            })
+        }
+        StatementKind::ResetSession(name) => {
+            if session_props::lookup(&name).is_none() {
+                return Err(Box::new(TrinoError::invalid_session_property(
+                    session_props::unknown_property_message(&name),
+                    Some(query_id),
+                )));
+            }
+            immediate(protocol::UpdatedSessionState {
+                clear_session: vec![name],
+                ..Default::default()
+            })
+        }
+        StatementKind::ShowSession { like } => ResolvedStatement {
+            plan: ExecPlan::ShowSession { like },
+            facts,
+            session_update: None,
+        },
+        StatementKind::Prepare { name, body } => immediate(protocol::UpdatedSessionState {
+            added_prepare: vec![(name, body.to_string())],
+            ..Default::default()
+        }),
+        StatementKind::Deallocate(name) => {
+            if !prepared.contains_key(&name) {
+                return Err(Box::new(TrinoError::prepared_statement_not_found(
+                    &name,
+                    Some(query_id),
+                )));
+            }
+            immediate(protocol::UpdatedSessionState {
+                deallocated_prepare: vec![name],
+                ..Default::default()
+            })
+        }
+        StatementKind::Execute { name, params } => {
+            let template = prepared
+                .get(&name)
+                .ok_or_else(|| TrinoError::prepared_statement_not_found(&name, Some(query_id)))?;
+            return resolve_bound_sql(&door, template, &params, query_id);
+        }
+        StatementKind::DescribeOutput(name) => describe(name, protocol::DescribeKind::Output)?,
+        StatementKind::DescribeInput(name) => describe(name, protocol::DescribeKind::Input)?,
+        // `EXPLAIN FULL` is SQE grammar the front door classifies without a
+        // sqlparser AST; it is still an EXPLAIN for the result reshape.
+        StatementKind::ExplainFull(_) => ResolvedStatement {
+            plan: ExecPlan::Sql(exec_sql),
+            facts: StatementFacts {
+                is_explain: true,
+                ..facts
+            },
+            session_update: None,
+        },
+        _ => ResolvedStatement {
+            plan: ExecPlan::Sql(exec_sql),
+            facts,
+            session_update: None,
+        },
+    })
+}
+
+/// Bind `params` into `template` and normalize the bound statement: the
+/// executed text of an `EXECUTE` is the template, not the `EXECUTE` itself,
+/// so the front door runs on it once here.
+fn resolve_bound_sql(
+    door: &sqe_sql::SqlFrontDoor,
+    template: &str,
+    params: &[sqlparser::ast::Expr],
+    query_id: &str,
+) -> Result<ResolvedStatement, Box<TrinoError>> {
+    let bound = prepared::bind_execute(template, params)
+        .map_err(|msg| TrinoError::user_error(msg, Some(query_id)))?;
+    let normalized = door
+        .normalize(&bound)
+        .map_err(|e| TrinoError::from_sqe_error(&e, Some(query_id)))?;
+    Ok(ResolvedStatement {
+        facts: StatementFacts::from_normalized(&normalized),
+        plan: ExecPlan::Sql(normalized.into_parts().0),
+        session_update: None,
+    })
 }
 
 /// Extract the affected-row count from a write-path response.
@@ -1304,8 +1596,10 @@ fn like_match(value: &str, pattern: &str) -> bool {
 }
 
 /// Build the `SHOW SESSION` result set in Trino's column shape
-/// (`Name, Value, Default, Type, Description`), one row per current session
-/// property, filtered by an optional `LIKE` pattern on the name. (#323)
+/// (`Name, Value, Default, Type, Description`): one row per allow-listed
+/// property ([`session_props::SESSION_PROPERTIES`]), showing the value the
+/// client is carrying in `X-Trino-Session` when it has set one, otherwise the
+/// default. Filtered by an optional `LIKE` pattern on the name. (#323, 708)
 fn build_show_session_batches(
     props: &[(String, String)],
     like: Option<&str>,
@@ -1321,27 +1615,36 @@ fn build_show_session_batches(
         Field::new("Description", DataType::Utf8, true),
     ]));
 
-    let (mut names, mut values) = (Vec::new(), Vec::new());
-    for (name, value) in props {
+    let mut names = Vec::new();
+    let mut values: Vec<Option<String>> = Vec::new();
+    let mut defaults: Vec<Option<String>> = Vec::new();
+    let mut types = Vec::new();
+    let mut descriptions = Vec::new();
+    for prop in session_props::SESSION_PROPERTIES {
         if let Some(pat) = like {
-            if !like_match(name, pat) {
+            if !like_match(prop.name, pat) {
                 continue;
             }
         }
-        names.push(name.clone());
-        values.push(value.clone());
+        let current = props
+            .iter()
+            .find(|(k, _)| k == prop.name)
+            .map(|(_, v)| v.clone());
+        names.push(prop.name.to_string());
+        values.push(current.or_else(|| prop.default.map(str::to_string)));
+        defaults.push(prop.default.map(str::to_string));
+        types.push(prop.type_name.to_string());
+        descriptions.push(prop.description.to_string());
     }
-    let row_count = names.len();
-    let empty: Vec<Option<String>> = vec![None; row_count];
 
     let batch = arrow_array::RecordBatch::try_new(
         schema,
         vec![
             Arc::new(StringArray::from(names)),
             Arc::new(StringArray::from(values)),
-            Arc::new(StringArray::from(empty.clone())),
-            Arc::new(StringArray::from(empty.clone())),
-            Arc::new(StringArray::from(empty)),
+            Arc::new(StringArray::from(defaults)),
+            Arc::new(StringArray::from(types)),
+            Arc::new(StringArray::from(descriptions)),
         ],
     );
     match batch {
@@ -1671,34 +1974,25 @@ async fn serve_page(handle: &QueryHandle, base_url: &str, id: &str, token: usize
 
 // ── Handlers ──────────────────────────────────────────────────
 
-/// Dispatch a resolved statement to the right executor path: DESCRIBE
-/// prepared, SHOW SESSION, or a normal `execute`. Mirrors the interception
-/// order in `submit_query` so async execution behaves identically.
+/// Run a resolved statement: DESCRIBE of a prepared template, SHOW SESSION
+/// from local state, or the executor. `Immediate` plans never get here; they
+/// are answered on the POST.
 async fn run_statement<Q: TrinoQueryExecutor>(
     handler: &Q,
     session: &Session,
-    exec_sql: &str,
-    prepared: &std::collections::HashMap<String, String>,
+    plan: &ExecPlan,
     show_session_props: &[(String, String)],
 ) -> Result<TrinoResultStream, sqe_core::SqeError> {
-    if let Some((kind, name)) = protocol::parse_describe_prepared(exec_sql) {
-        match prepared.get(&name) {
-            Some(prepared_sql) => handler
-                .describe_prepared(session, prepared_sql, kind)
-                .await
-                .map(TrinoResultStream::from_batches),
-            None => Err(sqe_core::SqeError::with_code(
-                sqe_core::SqeErrorCode::ExecutionFailed,
-                format!("Prepared statement not found: {name}"),
-            )),
-        }
-    } else if let Some(like) = protocol::parse_show_session(exec_sql) {
-        Ok(TrinoResultStream::from_batches(build_show_session_batches(
-            show_session_props,
-            like.as_deref(),
-        )))
-    } else {
-        handler.execute(session, exec_sql).await
+    match plan {
+        ExecPlan::Immediate => Ok(TrinoResultStream::from_batches(vec![])),
+        ExecPlan::DescribePrepared { kind, template } => handler
+            .describe_prepared(session, template, *kind)
+            .await
+            .map(TrinoResultStream::from_batches),
+        ExecPlan::ShowSession { like } => Ok(TrinoResultStream::from_batches(
+            build_show_session_batches(show_session_props, like.as_deref()),
+        )),
+        ExecPlan::Sql(sql) => handler.execute(session, sql).await,
     }
 }
 
@@ -1707,18 +2001,16 @@ async fn run_statement<Q: TrinoQueryExecutor>(
 /// Plain queries stream straight through. The shape-rewritten statement
 /// classes (DDL/DML counts, `information_schema`, `DESCRIBE`, `EXPLAIN`)
 /// need the whole result to rewrite it, so those are drained first; they are
-/// catalog-sized by construction.
+/// catalog-sized by construction. Which class a statement is in was decided
+/// from its AST at submit time ([`StatementFacts`]), never from the text.
 async fn open_cursor(
     result: TrinoResultStream,
-    exec_sql: &str,
+    facts: &StatementFacts,
     session_catalog: Option<&str>,
     page_size: usize,
     reservation: Option<MemoryReservation>,
 ) -> Result<ResultCursor, sqe_core::SqeError> {
-    let update_type = classify_update_type(exec_sql).map(str::to_string);
-    let is_metadata = info_schema_compat::is_metadata_query(exec_sql);
-    let is_explain = explain_compat::is_explain(exec_sql);
-    if update_type.is_none() && !is_metadata && !is_explain {
+    if !facts.needs_reshape() {
         return Ok(ResultCursor::new(
             result,
             page_size,
@@ -1729,14 +2021,14 @@ async fn open_cursor(
     }
 
     let batches = result.collect().await?;
-    let update_count = if update_type.is_some() {
+    let update_count = if facts.update_type.is_some() {
         extract_update_count(&batches).or(Some(0))
     } else {
         None
     };
-    let batches = if is_metadata {
+    let batches = if facts.is_metadata {
         let batches = info_schema_compat::apply_info_schema_compat(batches, session_catalog);
-        if info_schema_compat::is_describe_or_show_columns(exec_sql) {
+        if facts.is_describe_or_show_columns {
             info_schema_compat::reshape_describe_to_trino(batches)
         } else {
             batches
@@ -1744,7 +2036,7 @@ async fn open_cursor(
     } else {
         batches
     };
-    let batches = if is_explain {
+    let batches = if facts.is_explain {
         explain_compat::reshape_explain_to_trino(batches)
     } else {
         batches
@@ -1753,7 +2045,7 @@ async fn open_cursor(
         TrinoResultStream::from_batches(batches),
         page_size,
         reservation,
-        update_type,
+        facts.update_type.map(str::to_string),
         update_count,
     ))
 }
@@ -1855,59 +2147,10 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         let query_id = Uuid::new_v4().to_string();
         let base_url = extract_base_url(&headers, state.port);
 
-        let session_update = protocol::parse_session_statement(sql);
-
-        // Session-control statements with no result set are driven purely by
-        // response headers and must NOT be sent to the executor (the SQL parser
-        // rejects them):
-        //   - PREPARE / DEALLOCATE PREPARE register/forget prepared SQL via
-        //     x-trino-added-prepare / x-trino-deallocated-prepare. This is the
-        //     Metabase/JDBC connect gate: the driver issues PREPARE before any
-        //     query. (#1)
-        //   - SET SESSION / RESET SESSION set/clear catalog session properties via
-        //     x-trino-set-session / x-trino-clear-session. SQE has no tunable
-        //     session-property registry, so these are accept-and-echo: the client's
-        //     value round-trips in X-Trino-Session and surfaces in SHOW SESSION,
-        //     and the executor (which would reject "SET SESSION ...") is bypassed.
-        //     (#323)
-        // USE / SET CATALOG (set_catalog / set_schema only) are left to fall
-        // through: the executor handles them and the headers are applied after.
-        if let Some(ref update) = session_update {
-            let update_type = if !update.added_prepare.is_empty() {
-                Some("PREPARE")
-            } else if !update.deallocated_prepare.is_empty() {
-                Some("DEALLOCATE")
-            } else if !update.set_session.is_empty() {
-                Some("SET SESSION")
-            } else if !update.clear_session.is_empty() {
-                Some("RESET SESSION")
-            } else {
-                None
-            };
-            if let Some(update_type) = update_type {
-                let response = TrinoResponse {
-                    id: query_id.clone(),
-                    info_uri: Some(info_uri(&base_url, &query_id)),
-                    stats: TrinoStats::finished(),
-                    // Non-null (empty) columns: the field is skip_serializing_if
-                    // None, so omitting it makes the JDBC driver see `columns: null`
-                    // and getColumns() throws. Real Trino returns [] for these
-                    // non-query statements, so the driver builds a 0-column
-                    // ResultSet and (with updateType set) treats it as a completed
-                    // update rather than waiting for a result set.
-                    columns: Some(vec![]),
-                    update_type: Some(update_type.to_string()),
-                    ..Default::default()
-                };
-                let mut resp = (StatusCode::OK, Json(response)).into_response();
-                apply_session_headers(resp.headers_mut(), update);
-                return resp;
-            }
-        }
-
         // Trino prepared statements are stateless: the client carries the prepared
         // SQL in X-Trino-Prepared-Statement headers and submits `EXECUTE <name>
-        // USING ...`. Resolve such a body into concrete SQL before execution.
+        // USING ...`; `DEALLOCATE` and `DESCRIBE OUTPUT|INPUT` resolve against
+        // the same map.
         let prepared = {
             let values: Vec<String> = headers
                 .get_all("x-trino-prepared-statement")
@@ -1916,56 +2159,69 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 .collect();
             prepared::parse_prepared_statements(&values)
         };
-        let effective_sql = match prepared::rewrite_execute(sql, &prepared) {
-            Ok(Some(rewritten)) => rewritten,
-            Ok(None) => sql.to_string(),
-            Err(msg) => {
+
+        // The one SQL front door for the Trino wire (finding 700): normalize
+        // and classify once, from the AST. Session-control statements are
+        // decided here and never reach the executor; everything else is handed
+        // over as the normalized text with no further rewriting.
+        let ResolvedStatement {
+            plan,
+            facts,
+            session_update,
+        } = match resolve_statement(
+            sql,
+            session.default_catalog.as_deref(),
+            &prepared,
+            &query_id,
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => {
                 let response = TrinoResponse {
                     id: query_id.clone(),
                     info_uri: Some(info_uri(&base_url, &query_id)),
                     stats: TrinoStats::failed(),
-                    error: Some(TrinoError::user_error(msg, Some(&query_id))),
+                    error: Some(*error),
                     ..Default::default()
                 };
                 return (StatusCode::OK, Json(response)).into_response();
             }
         };
-        // #9: wrap parenthesis-less `VALUES` rows (`INSERT INTO t VALUES 1`,
-        // `VALUES 1, 2`) that Trino accepts but sqlparser rejects. Runs before
-        // classification and planning so both see the normalized form; a no-op for
-        // SQL that already parses (including a column named `values`). See #315.
-        let effective_sql = sqe_sql::rewrite_paren_less_values(&effective_sql);
-        // #351c: expand a leading bare `TABLE <name>` into `SELECT * FROM <name>`
-        // (Trino/SQL-standard shorthand) that sqlparser rejects. Runs before
-        // classification and planning so both see the normalized form; a no-op for
-        // SQL that already parses (CREATE/DROP/SHOW CREATE TABLE, a column named
-        // `table`). See #351c.
-        let effective_sql = sqe_sql::rewrite_bare_table(&effective_sql);
-        // #335: expand a nested / parameterized ROW-typed CAST target
-        // (`CAST(row(1, row(10)) AS row(a int, b row(x int)))`) into nested
-        // `named_struct(...)`. sqlparser rejects the nested ROW type outright, so
-        // the AST-level rewriter never sees it; this source-level rewrite runs
-        // first and yields parseable SQL. A no-op for the single-level ROW cast
-        // (which parses and is handled by the AST rewriter) and for any SQL that
-        // already parses. See #335.
-        let effective_sql = sqe_sql::rewrite_nested_row_cast(&effective_sql);
-        // #2: qualify an unqualified `information_schema` reference with the session
-        // catalog so it resolves to (and, under polaris-auto, discovers) that
-        // catalog instead of the engine default. Only metadata queries are touched.
-        let effective_sql = match session.default_catalog.as_deref() {
-            Some(cat) if info_schema_compat::is_metadata_query(&effective_sql) => {
-                info_schema_compat::qualify_information_schema(&effective_sql, cat)
+
+        // Statements the protocol layer answers by itself (PREPARE, DEALLOCATE
+        // PREPARE, SET SESSION, RESET SESSION, SET CATALOG) have no result set
+        // and are driven purely by response headers:
+        //   - PREPARE / DEALLOCATE PREPARE register/forget prepared SQL via
+        //     x-trino-added-prepare / x-trino-deallocated-prepare. This is the
+        //     Metabase/JDBC connect gate: the driver issues PREPARE before any
+        //     query. (#1)
+        //   - SET SESSION / RESET SESSION set/clear the allow-listed session
+        //     properties via x-trino-set-session / x-trino-clear-session; the
+        //     client replays them in X-Trino-Session. (#323, #628)
+        // This response is the statement's terminal response, so the headers
+        // belong on it. USE goes to the executor and gets its headers on its
+        // own terminal response below.
+        if matches!(plan, ExecPlan::Immediate) {
+            let response = TrinoResponse {
+                id: query_id.clone(),
+                info_uri: Some(info_uri(&base_url, &query_id)),
+                stats: TrinoStats::finished(),
+                // Non-null (empty) columns: the field is skip_serializing_if
+                // None, so omitting it makes the JDBC driver see `columns: null`
+                // and getColumns() throws. Real Trino returns [] for these
+                // non-query statements, so the driver builds a 0-column
+                // ResultSet and (with updateType set) treats it as a completed
+                // update rather than waiting for a result set.
+                columns: Some(vec![]),
+                update_type: facts.update_type.map(str::to_string),
+                ..Default::default()
+            };
+            let mut resp = (StatusCode::OK, Json(response)).into_response();
+            if let Some(ref update) = session_update {
+                apply_session_headers(resp.headers_mut(), update);
             }
-            _ => effective_sql,
-        };
-        // #8: name unaliased expression columns _col0, _col1, ... the way Trino
-        // does, instead of DataFusion's expression-text column names (e.g.
-        // `Int64(1) + Int64(1)`), which JDBC/BI clients display verbatim. Scoped
-        // to the Trino wire path: native Flight SQL clients keep DataFusion names.
-        // A no-op for non-SELECT statements (DESCRIBE, SHOW, DDL) and for
-        // projections containing a wildcard, so it is safe to run unconditionally
-        // here, before the DESCRIBE-prepared interception below.
-        let effective_sql = sqe_sql::alias_anonymous_select_columns(&effective_sql);
+            return resp;
+        }
+
         // Mint the poll token once, here: the same value goes on the handle, on
         // the finished result, and into every `nextUri` this query ever emits, so
         // a client that follows the protocol never presents a credential again.
@@ -1985,8 +2241,8 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         let task_handle = handle.clone();
         let task_query_id = query_id.clone();
         let task_session = session.clone();
-        let task_sql = effective_sql.clone();
-        let task_prepared = prepared.clone();
+        let task_plan = plan;
+        let task_facts = facts;
         let task_props = show_session_props;
         let task_catalog = session.default_catalog.clone();
         let page_size = state.page_size;
@@ -2029,8 +2285,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 let result = run_statement(
                     task_handler.as_ref(),
                     &task_session,
-                    &task_sql,
-                    &task_prepared,
+                    &task_plan,
                     &task_props,
                 )
                 .await;
@@ -2042,7 +2297,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                         });
                         open_cursor(
                             stream,
-                            &task_sql,
+                            &task_facts,
                             task_catalog.as_deref(),
                             page_size,
                             reservation,
@@ -2102,8 +2357,11 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             }
         }
 
-        // Still running: hand the client to the queued poll route.
-        let mut resp = (
+        // Still running: hand the client to the queued poll route. No session
+        // headers here: the statement has not finished, so a `USE` that fails
+        // after this point must not have switched the client already (708).
+        // `get_queued_results` attaches them on the terminal `Finished` hop.
+        (
             StatusCode::OK,
             Json(build_started_response(
                 &base_url,
@@ -2111,11 +2369,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                 &owner.poll_token,
             )),
         )
-            .into_response();
-        if let Some(ref update) = session_update {
-            apply_session_headers(resp.headers_mut(), update);
-        }
-        resp
+            .into_response()
     }
     .instrument(span)
     .await
@@ -2315,10 +2569,12 @@ async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
                     )),
                 )
                     .into_response();
-                // Echo any session-state mutation (USE / SET CATALOG) on the
-                // redirect hop. Normally applied inline on the POST because such
-                // statements finish in <1s; this covers the rare case where the
-                // task finishes only after the POST's bounded wait elapsed.
+                // Echo the session-state mutation of a `USE` on this terminal
+                // hop. Normally applied inline on the POST because such
+                // statements finish in <1s; this covers the case where the task
+                // finishes only after the POST's bounded wait elapsed. The
+                // started response deliberately carried nothing (708), and the
+                // results route that follows never repeats it.
                 if let Some(ref update) = handle.session_update {
                     apply_session_headers(resp.headers_mut(), update);
                 }
@@ -3341,7 +3597,9 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
-        assert_eq!(hdr, "iceberg.compression_codec='ZSTD'");
+        // The value is the evaluated literal, as Trino emits it, not the
+        // quoted source text.
+        assert_eq!(hdr, "iceberg.compression_codec=ZSTD");
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -3475,10 +3733,13 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let state = recording_state(seen.clone());
 
+        // The client carries the statement it is deallocating.
+        let mut headers = basic_auth_header("alice", "pw");
+        headers.insert("x-trino-prepared-statement", "ps=SELECT+1".parse().unwrap());
         let resp = submit_query::<MockAuthOk, RecordingQuery>(
             State(state),
             test_peer(),
-            basic_auth_header("alice", "pw"),
+            headers,
             "DEALLOCATE PREPARE ps".to_string(),
         )
         .await
@@ -3489,13 +3750,438 @@ mod tests {
             seen.lock().is_empty(),
             "DEALLOCATE must not be sent to the executor"
         );
-        assert!(resp.headers().get("x-trino-deallocated-prepare").is_some());
+        assert_eq!(
+            resp.headers()
+                .get("x-trino-deallocated-prepare")
+                .and_then(|v| v.to_str().ok()),
+            Some("ps")
+        );
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let tr: TrinoResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(tr.update_type.as_deref(), Some("DEALLOCATE"));
         assert_eq!(tr.columns.map(|c| c.len()), Some(0));
+    }
+
+    /// Finding 708: `DEALLOCATE PREPARE` of a name the session does not hold
+    /// is Trino's `NOT_FOUND`, not a silent success with a header.
+    #[tokio::test]
+    async fn submit_deallocate_unknown_name_is_not_found() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let state = recording_state(seen.clone());
+
+        let resp = submit_query::<MockAuthOk, RecordingQuery>(
+            State(state),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            "DEALLOCATE PREPARE nobody".to_string(),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(seen.lock().is_empty());
+        assert!(resp.headers().get("x-trino-deallocated-prepare").is_none());
+        let tr = body_json(resp).await;
+        assert_eq!(tr.stats.state, "FAILED");
+        let err = tr.error.expect("error body");
+        assert_eq!(err.error_name, "NOT_FOUND");
+        assert_eq!(err.error_type, "USER_ERROR");
+        assert_eq!(err.message, "Prepared statement not found: nobody");
+    }
+
+    /// Finding 708: the PREPARE body is validated at PREPARE time. A malformed
+    /// body is a `SYNTAX_ERROR` on the POST and nothing is registered.
+    #[tokio::test]
+    async fn submit_prepare_with_malformed_body_is_a_syntax_error() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let state = recording_state(seen.clone());
+
+        let resp = submit_query::<MockAuthOk, RecordingQuery>(
+            State(state),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            "PREPARE p FROM SELEC 1".to_string(),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(seen.lock().is_empty());
+        assert!(
+            resp.headers().get("x-trino-added-prepare").is_none(),
+            "a rejected PREPARE must not be echoed to the client"
+        );
+        let tr = body_json(resp).await;
+        assert_eq!(tr.stats.state, "FAILED");
+        let err = tr.error.expect("error body");
+        assert_eq!(err.error_name, "SYNTAX_ERROR");
+        assert!(err.message.contains("SELEC"), "{}", err.message);
+    }
+
+    /// Finding 708: `EXECUTE` binds the parsed `USING` expressions through the
+    /// shared comment-aware scanner; a `?` inside a comment is not a
+    /// placeholder. `EXECUTE IMMEDIATE` carries the template inline.
+    #[tokio::test]
+    async fn submit_execute_binds_parameters_comment_aware() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let state = recording_state(seen.clone());
+
+        let mut headers = basic_auth_header("alice", "pw");
+        // q = "SELECT ? AS v /* why? */"
+        headers.insert(
+            "x-trino-prepared-statement",
+            "q=SELECT+%3F+AS+v+%2F%2A+why%3F+%2A%2F".parse().unwrap(),
+        );
+        let resp = submit_query::<MockAuthOk, RecordingQuery>(
+            State(state.clone()),
+            test_peer(),
+            headers,
+            "EXECUTE q USING 1".to_string(),
+        )
+        .await
+        .into_response();
+        assert_eq!(body_json(resp).await.stats.state, "FINISHED");
+
+        let resp = submit_query::<MockAuthOk, RecordingQuery>(
+            State(state),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            "EXECUTE IMMEDIATE 'SELECT ? AS a, ? AS b' USING 42, 'x'".to_string(),
+        )
+        .await
+        .into_response();
+        assert_eq!(body_json(resp).await.stats.state, "FINISHED");
+
+        let seen = seen.lock();
+        assert_eq!(
+            *seen,
+            vec![
+                "SELECT 1 AS v /* why? */".to_string(),
+                "SELECT 42 AS a, 'x' AS b".to_string(),
+            ]
+        );
+    }
+
+    /// Finding 708: `SET SESSION` accepts only allow-listed properties with a
+    /// valid value; anything else is `INVALID_SESSION_PROPERTY` and nothing is
+    /// echoed for the client to replay. `RESET SESSION` uses the same list.
+    #[tokio::test]
+    async fn submit_set_session_rejects_unknown_property_and_bad_value() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let state = recording_state(seen.clone());
+
+        for (sql, needle) in [
+            (
+                "SET SESSION bogus = 1",
+                "Session property 'bogus' does not exist",
+            ),
+            ("SET SESSION query_max_memory = '1GB'", "query_max_memory"),
+            (
+                "SET SESSION iceberg.compression_codec = 'gzip'",
+                "Invalid value 'gzip'",
+            ),
+            (
+                "RESET SESSION bogus",
+                "Session property 'bogus' does not exist",
+            ),
+        ] {
+            let resp = submit_query::<MockAuthOk, RecordingQuery>(
+                State(state.clone()),
+                test_peer(),
+                basic_auth_header("alice", "pw"),
+                sql.to_string(),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::OK, "{sql}");
+            assert!(resp.headers().get("x-trino-set-session").is_none(), "{sql}");
+            assert!(
+                resp.headers().get("x-trino-clear-session").is_none(),
+                "{sql}"
+            );
+            let tr = body_json(resp).await;
+            assert_eq!(tr.stats.state, "FAILED", "{sql}");
+            let err = tr.error.expect("error body");
+            assert_eq!(err.error_name, "INVALID_SESSION_PROPERTY", "{sql}");
+            assert_eq!(err.error_code, 14, "{sql}");
+            assert_eq!(err.error_type, "USER_ERROR", "{sql}");
+            assert!(err.message.contains(needle), "{sql}: {}", err.message);
+        }
+        assert!(seen.lock().is_empty(), "session statements never execute");
+
+        // A known property resets with the clear header, on this terminal
+        // response.
+        let resp = submit_query::<MockAuthOk, RecordingQuery>(
+            State(state),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            "RESET SESSION iceberg.compression_codec".to_string(),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            resp.headers()
+                .get("x-trino-clear-session")
+                .and_then(|v| v.to_str().ok()),
+            Some("iceberg.compression_codec")
+        );
+        let tr = body_json(resp).await;
+        assert_eq!(tr.update_type.as_deref(), Some("RESET SESSION"));
+    }
+
+    /// `SHOW SESSION` lists the allow-list: every property SQE honours, with
+    /// the value the client is carrying when it set one, else the default.
+    #[tokio::test]
+    async fn submit_show_session_lists_the_allow_list() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let state = recording_state(seen.clone());
+
+        let resp = submit_query::<MockAuthOk, RecordingQuery>(
+            State(state.clone()),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            "SHOW SESSION".to_string(),
+        )
+        .await
+        .into_response();
+        let tr = body_json(resp).await;
+        let data = tr.data.expect("data");
+        assert_eq!(data.len(), session_props::SESSION_PROPERTIES.len());
+        assert_eq!(data[0][0], serde_json::json!("iceberg.compression_codec"));
+        assert_eq!(data[0][1], serde_json::Value::Null, "unset: default (NULL)");
+        assert_eq!(data[0][3], serde_json::json!("varchar"));
+
+        // A property the client replays but SQE does not honour is not listed.
+        let mut headers = basic_auth_header("alice", "pw");
+        headers.insert(
+            "x-trino-session",
+            "iceberg.compression_codec=LZ4, query_max_run_time=1h"
+                .parse()
+                .unwrap(),
+        );
+        let resp = submit_query::<MockAuthOk, RecordingQuery>(
+            State(state),
+            test_peer(),
+            headers,
+            "SHOW SESSION LIKE '%'".to_string(),
+        )
+        .await
+        .into_response();
+        let data = body_json(resp).await.data.expect("data");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0][1], serde_json::json!("LZ4"));
+        assert!(seen.lock().is_empty());
+    }
+
+    /// Finding 708: `SET CATALOG` and `USE` update the session through
+    /// headers; `USE` is recognised behind a leading comment (prefix matching
+    /// used to miss it) and gets its headers on its terminal response.
+    #[tokio::test]
+    async fn submit_use_and_set_catalog_update_the_session() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let state = recording_state(seen.clone());
+
+        let resp = submit_query::<MockAuthOk, RecordingQuery>(
+            State(state.clone()),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            "SET CATALOG lake".to_string(),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            resp.headers()
+                .get("x-trino-set-catalog")
+                .and_then(|v| v.to_str().ok()),
+            Some("lake")
+        );
+        assert!(seen.lock().is_empty(), "SET CATALOG never executes");
+        assert_eq!(body_json(resp).await.update_type.as_deref(), Some("USE"));
+
+        let resp = submit_query::<MockAuthOk, RecordingQuery>(
+            State(state),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            "-- switch\nUSE \"My Lake\".gold".to_string(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-trino-set-catalog")
+                .and_then(|v| v.to_str().ok()),
+            Some("My Lake")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-trino-set-schema")
+                .and_then(|v| v.to_str().ok()),
+            Some("gold")
+        );
+        let tr = body_json(resp).await;
+        assert_eq!(tr.stats.state, "FINISHED");
+        assert_eq!(tr.update_type.as_deref(), Some("USE"));
+        assert_eq!(seen.lock().len(), 1, "USE reaches the executor once");
+    }
+
+    /// Executor that fails after the POST's bounded wait has elapsed, so the
+    /// failure is only visible to a later poll.
+    struct LateFailingQuery;
+    #[async_trait::async_trait]
+    impl TrinoQueryExecutor for LateFailingQuery {
+        async fn execute(
+            &self,
+            _: &Session,
+            _: &str,
+        ) -> Result<TrinoResultStream, sqe_core::SqeError> {
+            tokio::time::sleep(DEFAULT_MAX_WAIT + std::time::Duration::from_millis(300)).await;
+            Err(sqe_core::SqeError::with_code(
+                sqe_core::SqeErrorCode::SchemaNotFound,
+                "Schema 'missing' does not exist",
+            ))
+        }
+    }
+
+    /// Finding 708 acceptance: a `USE` that fails after the bounded wait never
+    /// emits `X-Trino-Set-Schema`, neither on the started response nor on the
+    /// terminal poll.
+    #[tokio::test]
+    async fn late_failing_use_never_switches_the_client() {
+        let state = state_with(Arc::new(MockAuthOk), Arc::new(LateFailingQuery), None);
+
+        let resp = submit_query::<MockAuthOk, LateFailingQuery>(
+            State(state.clone()),
+            test_peer(),
+            basic_auth_header("alice", "pw"),
+            "USE missing".to_string(),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get("x-trino-set-schema").is_none(),
+            "the started response must not carry session headers"
+        );
+        let started = body_json(resp).await;
+        let next = started.next_uri.expect("started response has nextUri");
+        assert!(next.contains("/v1/statement/queued/"), "{next}");
+        let (id, slug) = split_queued_uri(&next);
+
+        // Poll until terminal (the poll itself waits up to maxWait).
+        let mut terminal = None;
+        for _ in 0..10 {
+            let resp = get_queued_results::<MockAuthOk, LateFailingQuery>(
+                State(state.clone()),
+                test_peer(),
+                HeaderMap::new(),
+                Path((id.clone(), slug.clone(), "1".to_string())),
+                axum::extract::RawQuery(Some("maxWait=1s".to_string())),
+            )
+            .await;
+            let has_schema_header = resp.headers().get("x-trino-set-schema").is_some();
+            let tr = body_json(resp).await;
+            assert!(!has_schema_header, "poll leaked X-Trino-Set-Schema");
+            if tr.stats.state == "FAILED" {
+                terminal = Some(tr);
+                break;
+            }
+        }
+        let failed = terminal.expect("USE failed within the polling budget");
+        assert_eq!(
+            failed.error.map(|e| e.error_name),
+            Some("SCHEMA_NOT_FOUND".to_string())
+        );
+    }
+
+    /// Finding 704 acceptance: `updateType` comes from the parsed statement.
+    /// `CREATE VIEW` is `CREATE VIEW`, not `CREATE TABLE`.
+    #[tokio::test]
+    async fn submit_reports_update_type_from_the_ast() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let state = recording_state(seen.clone());
+
+        for (sql, expected) in [
+            ("CREATE VIEW v AS SELECT 1", Some("CREATE VIEW")),
+            ("CREATE SCHEMA s", Some("CREATE SCHEMA")),
+            ("INSERT INTO t VALUES 1", Some("INSERT")),
+            ("DROP VIEW v", Some("DROP VIEW")),
+            ("SELECT 1 AS one", None),
+        ] {
+            let resp = submit_query::<MockAuthOk, RecordingQuery>(
+                State(state.clone()),
+                test_peer(),
+                basic_auth_header("alice", "pw"),
+                sql.to_string(),
+            )
+            .await
+            .into_response();
+            let tr = body_json(resp).await;
+            assert_eq!(tr.stats.state, "FINISHED", "{sql}");
+            assert_eq!(tr.update_type.as_deref(), expected, "{sql}");
+        }
+        // The paren-less VALUES reached the executor normalized.
+        assert!(
+            seen.lock().iter().any(|s| s == "INSERT INTO t VALUES (1)"),
+            "{:?}",
+            seen.lock()
+        );
+    }
+
+    /// Finding 704 acceptance: a user table with `table_catalog` and
+    /// `data_type` columns, queried with `information_schema` in a literal and
+    /// in a comment, keeps every row and its original `data_type` values.
+    #[tokio::test]
+    async fn submit_user_query_mentioning_information_schema_is_not_reshaped() {
+        struct AuditQuery;
+        #[async_trait::async_trait]
+        impl TrinoQueryExecutor for AuditQuery {
+            async fn execute(
+                &self,
+                _: &Session,
+                _: &str,
+            ) -> Result<TrinoResultStream, sqe_core::SqeError> {
+                use arrow_array::StringArray;
+                use arrow_schema::{DataType, Field, Schema};
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("table_catalog", DataType::Utf8, false),
+                    Field::new("data_type", DataType::Utf8, false),
+                ]));
+                let batch = arrow_array::RecordBatch::try_new(
+                    schema,
+                    vec![
+                        Arc::new(StringArray::from(vec!["iceberg", "system"])),
+                        Arc::new(StringArray::from(vec!["Int64", "Utf8"])),
+                    ],
+                )
+                .unwrap();
+                Ok(TrinoResultStream::from_batches(vec![batch]))
+            }
+        }
+        let state = state_with(Arc::new(MockAuthOk), Arc::new(AuditQuery), None);
+
+        for sql in [
+            "SELECT table_catalog, data_type FROM audit.events WHERE note LIKE '%information_schema%'",
+            "SELECT table_catalog, data_type FROM audit.events -- information_schema.tables",
+        ] {
+            let mut headers = basic_auth_header("alice", "pw");
+            headers.insert("x-trino-catalog", "iceberg".parse().unwrap());
+            let resp = submit_query::<MockAuthOk, AuditQuery>(
+                State(state.clone()),
+                test_peer(),
+                headers,
+                sql.to_string(),
+            )
+            .await
+            .into_response();
+            let tr = body_json(resp).await;
+            let data = tr.data.expect("data rows");
+            assert_eq!(data.len(), 2, "{sql}: no row may be scoped out");
+            assert_eq!(data[1][0], serde_json::json!("system"), "{sql}");
+            assert_eq!(data[0][1], serde_json::json!("Int64"), "{sql}: data_type verbatim");
+        }
     }
 
     #[tokio::test]

@@ -7,17 +7,15 @@
 //! column, and BI/JDBC tools string-match that exact column name. This layer
 //! collapses SQE's shape into that single column on the HTTP result boundary
 //! only -- native Flight SQL clients keep the structured table.
+//!
+//! The server gates the reshape on the parsed statement being an `EXPLAIN`
+//! (`sqlparser::ast::Statement::Explain` or the SQE `EXPLAIN FULL` kind), so a
+//! user query that happens to alias a column to `plan` is never touched and no
+//! text prefix is inspected here (finding 704).
 
 use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch, StringArray};
-
-/// True when `sql` is any `EXPLAIN` variant (`EXPLAIN`, `EXPLAIN ANALYZE`,
-/// `EXPLAIN FULL`). Gates the reshape so a user query that happens to alias a
-/// column to `plan` is never touched.
-pub fn is_explain(sql: &str) -> bool {
-    sql.trim_start().to_ascii_uppercase().starts_with("EXPLAIN")
-}
 
 /// Reshape an EXPLAIN result into Trino's single `Query Plan` varchar column.
 ///
@@ -106,15 +104,6 @@ mod tests {
     use super::*;
     use arrow_array::{Float64Array, Int32Array, Int64Array};
     use arrow_schema::{DataType, Field, Schema};
-
-    #[test]
-    fn detects_explain_variants() {
-        assert!(is_explain("EXPLAIN SELECT 1"));
-        assert!(is_explain("  explain analyze select 1"));
-        assert!(is_explain("EXPLAIN FULL SELECT 1"));
-        assert!(!is_explain("SELECT 1"));
-        assert!(!is_explain("SELECT plan FROM t"));
-    }
 
     fn plan_value(b: &RecordBatch, row: usize) -> String {
         b.column(0)
@@ -205,8 +194,8 @@ mod tests {
 
     #[test]
     fn any_non_plan_table_renders_via_the_metrics_path() {
-        // The is_explain gate guarantees the helper only ever sees EXPLAIN
-        // output, so a batch lacking the plan_type/plan columns must be one of
+        // The server's AST-level EXPLAIN gate guarantees the helper only ever
+        // sees EXPLAIN output, so a batch lacking the plan_type/plan columns must be one of
         // the metrics variants. Confirm such a batch renders rather than panics.
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         let b = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
