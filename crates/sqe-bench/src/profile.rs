@@ -4,8 +4,6 @@
 //! never stored here; they resolve at runtime from env vars or a named AWS
 //! credentials profile (see `resolve_s3_credentials`).
 
-#![allow(dead_code)]
-
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]

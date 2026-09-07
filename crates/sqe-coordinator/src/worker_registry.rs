@@ -4,8 +4,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use sqe_planner::{CoordinatorVersions, HelloCompat, WorkerCapacity, WorkerHello};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use crate::channel_pool::ChannelPool;
 
@@ -132,6 +134,13 @@ pub struct WorkerRegistry {
     channel_pool: Arc<ChannelPool>,
     max_workers: usize,
     max_consecutive_failures: u32,
+    /// Finding 609: how long after the last eviction a heartbeat that still
+    /// reports worker-attributable failures is refused re-admission.
+    recovery_quiet_period: Duration,
+    /// Finding 609: hello rejections already logged, by URL -> reason, so a
+    /// mismatched worker heartbeating every few seconds produces one warning
+    /// per (worker, reason) rather than one per interval.
+    logged_hello_rejections: Arc<DashMap<String, String>>,
 }
 
 #[derive(Debug)]
@@ -144,10 +153,59 @@ struct WorkerState {
     healthy: bool,
     consecutive_failures: u32,
     last_healthy: Option<Instant>,
+    /// Finding 609: when this worker was last removed from the healthy set by
+    /// an execution failure or the health checker. Gates re-admission.
+    last_unhealthy_at: Option<Instant>,
+    /// Finding 609: process identity from the hello; `nil` until the worker
+    /// sends one (legacy body).
+    instance_id: Uuid,
+    /// Build identifier from the hello, for diagnostics.
+    build: String,
+    /// Newest `ScanTask` version the worker said it implements; `0` unknown.
+    scan_task_version: u32,
+    /// Load vector from the most recent hello.
+    capacity: WorkerCapacity,
+}
+
+impl WorkerState {
+    fn unknown() -> Self {
+        Self {
+            healthy: false,
+            consecutive_failures: 0,
+            last_healthy: None,
+            last_unhealthy_at: None,
+            instance_id: Uuid::nil(),
+            build: String::new(),
+            scan_task_version: 0,
+            capacity: WorkerCapacity::default(),
+        }
+    }
+}
+
+/// What [`WorkerRegistry::register_hello`] observed (finding 609). The
+/// heartbeat handler uses it to decide what to audit and what to purge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HelloOutcome {
+    /// The URL was not in the registry before this hello.
+    pub newly_discovered: bool,
+    /// A known URL reported a different `instance_id`: the worker process
+    /// restarted and every fragment-scoped thing the coordinator remembered
+    /// about it (credential channels, in-flight scans) is gone.
+    pub instance_changed: bool,
+    /// The instance id the registry held before, when `instance_changed`.
+    pub previous_instance: Option<Uuid>,
+    /// The worker was unhealthy and this hello returned it to the pool.
+    pub readmitted: bool,
+    /// The worker was unhealthy and this hello did NOT return it: it still
+    /// reports failures and the quiet period has not elapsed.
+    pub held_unhealthy: bool,
 }
 
 const DEFAULT_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const DEFAULT_MAX_WORKERS: usize = 1024;
+/// Finding 609: a worker that keeps failing scans while heartbeating fine
+/// stays out of the pool for at least this long after its last eviction.
+const DEFAULT_RECOVERY_QUIET_PERIOD: Duration = Duration::from_secs(30);
 
 /// Reason a [`WorkerRegistry::register_heartbeat`] call was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,11 +229,19 @@ pub enum RegistrationError {
         worker_datafusion: String,
         coordinator_datafusion: String,
     },
+    /// Finding 609: the hello's `check_compat` found a skew (`ScanTask`
+    /// version, protocol, DataFusion). `reason` names each mismatch.
+    HelloMismatch { url: String, reason: String },
 }
 
 impl std::fmt::Display for RegistrationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::HelloMismatch { url, reason } => write!(
+                f,
+                "worker {url} version mismatch: {reason}. Deploy the same SQE build on both \
+                 sides; the worker is not admitted to the pool."
+            ),
             Self::CapacityExceeded { cap } => write!(
                 f,
                 "worker registry at max_workers cap ({cap}); refusing to track additional workers"
@@ -337,14 +403,7 @@ impl WorkerRegistry {
     ) -> Self {
         let workers: HashMap<String, WorkerState> = worker_urls
             .into_iter()
-            .map(|url| {
-                let state = WorkerState {
-                    healthy: false,
-                    consecutive_failures: 0,
-                    last_healthy: None,
-                };
-                (url, state)
-            })
+            .map(|url| (url, WorkerState::unknown()))
             .collect();
 
         // Honour the configured cap but never refuse seed URLs already in config.
@@ -361,11 +420,68 @@ impl WorkerRegistry {
             channel_pool,
             max_workers: effective_cap,
             max_consecutive_failures,
+            recovery_quiet_period: DEFAULT_RECOVERY_QUIET_PERIOD,
+            logged_hello_rejections: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Finding 609: set how long an evicted worker that still reports
+    /// failures stays out of the pool. `Duration::ZERO` restores the
+    /// pre-609 "any heartbeat re-admits" behaviour.
+    #[must_use = "with_recovery_quiet_period consumes self; bind the returned registry"]
+    pub fn with_recovery_quiet_period(mut self, quiet_period: Duration) -> Self {
+        self.recovery_quiet_period = quiet_period;
+        self
     }
 
     pub fn channel_pool(&self) -> Arc<ChannelPool> {
         self.channel_pool.clone()
+    }
+
+    /// Finding 609: the load vector `url` last reported, if it is known.
+    pub async fn worker_capacity(&self, url: &str) -> Option<WorkerCapacity> {
+        self.inner.read().await.workers.get(url).map(|w| w.capacity)
+    }
+
+    /// Finding 609: the process instance id `url` last reported. `Some(nil)`
+    /// for a known worker that has only ever sent legacy bodies.
+    pub async fn worker_instance(&self, url: &str) -> Option<Uuid> {
+        self.inner
+            .read()
+            .await
+            .workers
+            .get(url)
+            .map(|w| w.instance_id)
+    }
+
+    /// Finding 609: `(build, scan_task_version)` `url` last reported.
+    pub async fn worker_build(&self, url: &str) -> Option<(String, u32)> {
+        self.inner
+            .read()
+            .await
+            .workers
+            .get(url)
+            .map(|w| (w.build.clone(), w.scan_task_version))
+    }
+
+    /// Finding 609: log-once bookkeeping for hello rejections. Returns `true`
+    /// the first time `reason` is seen for `url` (the caller should log at
+    /// `warn!`), `false` on every repeat (the caller should stay quiet or log
+    /// at `debug!`). A later successful hello clears the entry so a worker
+    /// that is fixed and then breaks again is reported again.
+    pub fn note_hello_rejected(&self, url: &str, reason: &str) -> bool {
+        // Drop the read guard before inserting: a DashMap `get` guard held
+        // across an `insert` on the same shard deadlocks.
+        let already_logged = self
+            .logged_hello_rejections
+            .get(url)
+            .is_some_and(|prev| prev.value() == reason);
+        if already_logged {
+            return false;
+        }
+        self.logged_hello_rejections
+            .insert(url.to_string(), reason.to_string());
+        true
     }
 
     pub async fn healthy_workers(&self) -> Vec<String> {
@@ -397,12 +513,46 @@ impl WorkerRegistry {
 
     /// Register a worker (if not already known) and mark it healthy.
     ///
-    /// Called when the coordinator receives a heartbeat from a worker.
+    /// Legacy entry point: a bare URL with no hello fields. Equivalent to
+    /// [`Self::register_hello`] with a pre-609 body, so it always re-admits
+    /// (a legacy worker reports `failures_since_last == 0`).
+    pub async fn register_heartbeat(&self, url: &str) -> Result<(), RegistrationError> {
+        let hello = WorkerHello {
+            url: url.to_string(),
+            ..WorkerHello::default()
+        };
+        self.register_hello(&hello).await.map(|_| ())
+    }
+
+    /// Register a worker from its heartbeat hello (finding 609).
+    ///
     /// Workers that were not in the initial config list are dynamically added,
     /// bounded by `max_workers`. Heartbeats from previously-unknown URLs are
     /// rejected with `Err` once the cap is reached so a buggy or malicious
     /// worker reporting rotating URLs cannot grow the registry without limit.
-    pub async fn register_heartbeat(&self, url: &str) -> Result<(), RegistrationError> {
+    ///
+    /// Beyond the URL, the hello drives three things:
+    ///
+    /// - **version skew** (`check_compat`): a mismatch is refused with
+    ///   [`RegistrationError::HelloMismatch`] and, if the URL was known, the
+    ///   worker is evicted so an upgraded-but-mismatched process does not keep
+    ///   receiving tickets on the strength of its old registration;
+    /// - **instance change**: a known URL with a new `instance_id` is reported
+    ///   in [`HelloOutcome::instance_changed`] so the caller can drop
+    ///   fragment-scoped bookkeeping;
+    /// - **re-admission**: an unhealthy worker returns to the pool only when
+    ///   it reports `failures_since_last == 0` or the recovery quiet period
+    ///   has elapsed since its eviction. A worker that fails every scan but
+    ///   heartbeats fine no longer flaps back every interval.
+    ///
+    /// Legacy bodies (bare URL, `HeartbeatPayload`) carry no versions and no
+    /// failure count, so they are compat-neutral and always re-admit; the
+    /// strict/lenient legacy policy lives in [`check_worker_protocol`].
+    pub async fn register_hello(
+        &self,
+        hello: &WorkerHello,
+    ) -> Result<HelloOutcome, RegistrationError> {
+        let url = hello.url.as_str();
         // Reject unroutable advertise URLs before touching the registry.
         // A worker that advertises 0.0.0.0 (the old bug) would otherwise
         // make every worker collide on one bogus loopback entry that the
@@ -411,6 +561,30 @@ impl WorkerRegistry {
             warn!(worker = url, "Rejected heartbeat: unroutable advertise URL");
             return Err(RegistrationError::InvalidAdvertiseUrl {
                 url: url.to_string(),
+            });
+        }
+        if let HelloCompat::Mismatch(reason) = hello.check_compat(&CoordinatorVersions::current())
+        {
+            // A worker that was in the pool before it was upgraded must not
+            // stay there on the strength of its old registration.
+            let mut inner = self.inner.write().await;
+            if let Some(state) = inner.workers.get_mut(url) {
+                if state.healthy {
+                    warn!(
+                        worker = url,
+                        reason = %reason,
+                        "Evicting known worker: its hello no longer matches this coordinator"
+                    );
+                }
+                state.healthy = false;
+                state.consecutive_failures = self.max_consecutive_failures;
+                state.last_unhealthy_at = Some(Instant::now());
+                state.build = hello.build.clone();
+                state.scan_task_version = hello.scan_task_version;
+            }
+            return Err(RegistrationError::HelloMismatch {
+                url: url.to_string(),
+                reason,
             });
         }
         let mut inner = self.inner.write().await;
@@ -425,21 +599,71 @@ impl WorkerRegistry {
                 cap: self.max_workers,
             });
         }
+        let mut outcome = HelloOutcome::default();
         let state = inner.workers.entry(url.to_string()).or_insert_with(|| {
-            info!(worker = url, "Discovered new worker via heartbeat");
-            WorkerState {
-                healthy: false,
-                consecutive_failures: 0,
-                last_healthy: None,
-            }
+            info!(
+                worker = url,
+                instance_id = %hello.instance_id,
+                build = %hello.build,
+                "Discovered new worker via heartbeat"
+            );
+            outcome.newly_discovered = true;
+            WorkerState::unknown()
         });
-        if !state.healthy {
-            info!(worker = url, "Worker became healthy");
+        let now = Instant::now();
+
+        // Instance change: same URL, new process.
+        if !hello.instance_id.is_nil() {
+            if !state.instance_id.is_nil() && state.instance_id != hello.instance_id {
+                warn!(
+                    worker = url,
+                    previous_instance = %state.instance_id,
+                    instance_id = %hello.instance_id,
+                    build = %hello.build,
+                    "Worker restarted: same URL, new instance id; fragment-scoped state is gone"
+                );
+                outcome.instance_changed = true;
+                outcome.previous_instance = Some(state.instance_id);
+            }
+            state.instance_id = hello.instance_id;
         }
-        state.healthy = true;
-        state.consecutive_failures = 0;
-        state.last_healthy = Some(Instant::now());
-        Ok(())
+        if !hello.is_legacy() {
+            state.build = hello.build.clone();
+            state.scan_task_version = hello.scan_task_version;
+        }
+        state.capacity = hello.capacity;
+
+        if state.healthy {
+            state.last_healthy = Some(now);
+        } else {
+            let quiet_elapsed = state
+                .last_unhealthy_at
+                .is_none_or(|t| now.duration_since(t) >= self.recovery_quiet_period);
+            if hello.failures_since_last == 0 || quiet_elapsed {
+                info!(
+                    worker = url,
+                    failures_since_last = hello.failures_since_last,
+                    "Worker became healthy"
+                );
+                state.healthy = true;
+                state.consecutive_failures = 0;
+                state.last_healthy = Some(now);
+                outcome.readmitted = true;
+            } else {
+                debug!(
+                    worker = url,
+                    failures_since_last = hello.failures_since_last,
+                    quiet_period_secs = self.recovery_quiet_period.as_secs(),
+                    "Worker heartbeat received but it still reports scan failures; \
+                     holding it out of the pool until the quiet period elapses"
+                );
+                outcome.held_unhealthy = true;
+            }
+        }
+        drop(inner);
+        // A hello that got this far is compatible; a later mismatch is news.
+        self.logged_hello_rejections.remove(url);
+        Ok(outcome)
     }
 
     /// True when `url` is already in the registry (configured or discovered).
@@ -465,6 +689,7 @@ impl WorkerRegistry {
             }
             state.healthy = false;
             state.consecutive_failures = self.max_consecutive_failures;
+            state.last_unhealthy_at = Some(Instant::now());
         }
     }
 
@@ -483,6 +708,7 @@ impl WorkerRegistry {
                     );
                 }
                 state.healthy = false;
+                state.last_unhealthy_at = Some(Instant::now());
             } else {
                 debug!(
                     worker = url,
@@ -997,6 +1223,173 @@ mod tests {
         assert!(!advertise_url_is_routable("http://0.0.0.0:50052"));
         assert!(!advertise_url_is_routable("0.0.0.0:50052"));
         assert!(!advertise_url_is_routable("http://[::]:50052"));
+    }
+
+    // ---- Finding 609: hello-driven registration ----
+
+    fn current_hello(url: &str, instance: Uuid) -> WorkerHello {
+        WorkerHello::current(url, instance, "test-build", datafusion::DATAFUSION_VERSION)
+    }
+
+    /// 609 acceptance: a worker whose hello reports a `ScanTask` version the
+    /// coordinator does not plan for is refused with `HelloMismatch`, is not
+    /// registered, and so can never be scheduled a ticket.
+    #[tokio::test]
+    async fn hello_scan_task_version_mismatch_is_rejected_and_never_registered() {
+        let registry = WorkerRegistry::new(vec![]);
+        let mut hello = current_hello("http://w1:50052", Uuid::new_v4());
+        // Older than the coordinator: it would accept only part of what the
+        // coordinator sends (finding 109's rolling-upgrade hazard).
+        hello.scan_task_version = sqe_planner::SCAN_TASK_VERSION_CURRENT - 1;
+
+        let err = registry
+            .register_hello(&hello)
+            .await
+            .expect_err("version skew must be refused");
+        assert!(
+            matches!(err, RegistrationError::HelloMismatch { .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("ScanTask version"), "{err}");
+        assert_eq!(registry.total_workers().await, 0);
+        assert!(registry.healthy_workers().await.is_empty());
+
+        // Log-once bookkeeping: first sighting is loud, repeats are quiet, a
+        // different reason is loud again.
+        assert!(registry.note_hello_rejected("http://w1:50052", "a"));
+        assert!(!registry.note_hello_rejected("http://w1:50052", "a"));
+        assert!(registry.note_hello_rejected("http://w1:50052", "b"));
+    }
+
+    /// A worker that was healthy and then comes back with a mismatched hello
+    /// (upgraded on one side only) is evicted, not left in the pool.
+    #[tokio::test]
+    async fn hello_mismatch_evicts_a_known_healthy_worker() {
+        let registry = WorkerRegistry::new(vec![]);
+        let instance = Uuid::new_v4();
+        registry
+            .register_hello(&current_hello("http://w1:50052", instance))
+            .await
+            .unwrap();
+        assert_eq!(registry.healthy_workers().await.len(), 1);
+
+        let mut skewed = current_hello("http://w1:50052", instance);
+        skewed.datafusion_version = "0.0.1".to_string();
+        assert!(registry.register_hello(&skewed).await.is_err());
+        assert!(
+            registry.healthy_workers().await.is_empty(),
+            "mismatched worker must leave the pool"
+        );
+        assert_eq!(registry.total_workers().await, 1, "still known, for diagnostics");
+    }
+
+    /// 609 acceptance: the same URL with a new `instance_id` is reported as an
+    /// instance change, with the previous id, so the caller can purge
+    /// fragment-scoped state. Capacity and build are stored.
+    #[tokio::test]
+    async fn hello_new_instance_id_is_reported_and_capacity_stored() {
+        let registry = WorkerRegistry::new(vec![]);
+        let first = Uuid::new_v4();
+        let outcome = registry
+            .register_hello(&current_hello("http://w1:50052", first))
+            .await
+            .unwrap();
+        assert!(outcome.newly_discovered);
+        assert!(!outcome.instance_changed);
+        assert_eq!(registry.worker_instance("http://w1:50052").await, Some(first));
+
+        let second = Uuid::new_v4();
+        let hello = current_hello("http://w1:50052", second).with_capacity(WorkerCapacity {
+            memory_limit_bytes: 8 << 30,
+            scan_budget_free_bytes: 1 << 30,
+            spill_free_bytes: 100 << 30,
+            inflight_scans: 3,
+        });
+        let outcome = registry.register_hello(&hello).await.unwrap();
+        assert!(!outcome.newly_discovered);
+        assert!(outcome.instance_changed);
+        assert_eq!(outcome.previous_instance, Some(first));
+        assert_eq!(registry.worker_instance("http://w1:50052").await, Some(second));
+        assert_eq!(
+            registry.worker_capacity("http://w1:50052").await,
+            Some(hello.capacity)
+        );
+        assert_eq!(
+            registry.worker_build("http://w1:50052").await,
+            Some(("test-build".to_string(), sqe_planner::SCAN_TASK_VERSION_CURRENT))
+        );
+
+        // Same instance again: no change reported.
+        let outcome = registry
+            .register_hello(&current_hello("http://w1:50052", second))
+            .await
+            .unwrap();
+        assert!(!outcome.instance_changed);
+    }
+
+    /// A legacy body (nil instance id) never counts as an instance change, so a
+    /// mixed fleet does not purge state on every heartbeat.
+    #[tokio::test]
+    async fn legacy_hello_never_reports_instance_change() {
+        let registry = WorkerRegistry::new(vec![]);
+        registry
+            .register_hello(&current_hello("http://w1:50052", Uuid::new_v4()))
+            .await
+            .unwrap();
+        let legacy = WorkerHello::parse(b"http://w1:50052").unwrap();
+        let outcome = registry.register_hello(&legacy).await.unwrap();
+        assert!(!outcome.instance_changed);
+        assert!(!outcome.newly_discovered);
+    }
+
+    /// 609: an evicted worker whose hello still reports worker-attributable
+    /// failures is held out of the pool inside the quiet period, and re-admitted
+    /// once it reports a clean interval.
+    #[tokio::test]
+    async fn hello_with_failures_does_not_readmit_inside_quiet_period() {
+        let registry = WorkerRegistry::new(vec![])
+            .with_recovery_quiet_period(Duration::from_secs(3600));
+        let instance = Uuid::new_v4();
+        registry
+            .register_hello(&current_hello("http://w1:50052", instance))
+            .await
+            .unwrap();
+        registry.mark_unhealthy("http://w1:50052").await;
+        assert!(registry.healthy_workers().await.is_empty());
+
+        let still_failing =
+            current_hello("http://w1:50052", instance).with_failures_since_last(2);
+        let outcome = registry.register_hello(&still_failing).await.unwrap();
+        assert!(outcome.held_unhealthy);
+        assert!(!outcome.readmitted);
+        assert!(
+            registry.healthy_workers().await.is_empty(),
+            "a worker still failing scans must not flap back on a heartbeat"
+        );
+
+        let clean = current_hello("http://w1:50052", instance);
+        let outcome = registry.register_hello(&clean).await.unwrap();
+        assert!(outcome.readmitted);
+        assert_eq!(registry.healthy_workers().await.len(), 1);
+    }
+
+    /// 609: after the quiet period a heartbeat re-admits even if the worker
+    /// still reports failures, so a bad stretch is not a permanent eviction.
+    #[tokio::test]
+    async fn hello_with_failures_readmits_after_quiet_period() {
+        let registry = WorkerRegistry::new(vec![]).with_recovery_quiet_period(Duration::ZERO);
+        let instance = Uuid::new_v4();
+        registry
+            .register_hello(&current_hello("http://w1:50052", instance))
+            .await
+            .unwrap();
+        registry.mark_unhealthy("http://w1:50052").await;
+
+        let still_failing =
+            current_hello("http://w1:50052", instance).with_failures_since_last(5);
+        let outcome = registry.register_hello(&still_failing).await.unwrap();
+        assert!(outcome.readmitted);
+        assert_eq!(registry.healthy_workers().await.len(), 1);
     }
 }
 

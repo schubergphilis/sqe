@@ -10,7 +10,7 @@ pub mod server;
 
 use prometheus::{
     Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter,
-    IntCounterVec, IntGauge, Opts, Registry,
+    IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
 };
 
 fn register_counter(
@@ -101,6 +101,17 @@ fn register_int_gauge(
     Ok(m)
 }
 
+fn register_int_gauge_vec(
+    registry: &Registry,
+    name: &str,
+    help: &str,
+    labels: &[&str],
+) -> Result<IntGaugeVec, prometheus::Error> {
+    let m = IntGaugeVec::new(Opts::new(name, help), labels)?;
+    registry.register(Box::new(m.clone()))?;
+    Ok(m)
+}
+
 /// Trait for types that expose a Prometheus [`Registry`] for metrics serving.
 pub trait HasRegistry: Send + Sync + 'static {
     fn prometheus_registry(&self) -> &Registry;
@@ -126,10 +137,28 @@ pub struct MetricsRegistry {
     pub cache_size_bytes: Gauge,
     pub cache_entries: Gauge,
     // Scheduler metrics
+    /// `sqe_scheduler_decisions_total{decision, reason}` (finding 402). Every
+    /// scan that reaches the distribution decision increments exactly one
+    /// series, so `sum(decision="local") + sum(decision="distributed")` is
+    /// the number of decisions taken. `reason` names the policy skip
+    /// (`below_file_threshold`, `no_healthy_workers`, ...) or is
+    /// `distributed`.
     pub scheduler_decisions: IntCounterVec,
     pub scheduler_task_count: Histogram,
     pub scheduler_task_size_mb: Histogram,
     pub scheduler_stragglers: IntCounter,
+    /// `sqe_worker_fragment_failures_total{fault}` (finding 602): scan
+    /// fragments that ended in an error, by `sqe_planner::WorkerFault` label
+    /// (`principal_denied`, `worker_internal`, ...; `transport` for a dead
+    /// connection, `unknown` when the error carried no fault).
+    pub worker_fragment_failures_total: IntCounterVec,
+    /// `sqe_worker_reported_*{worker}` (finding 609): the capacity vector a
+    /// worker reports in its heartbeat hello. Zero means the worker did not
+    /// report the field, not that it is full.
+    pub worker_reported_memory_limit_bytes: IntGaugeVec,
+    pub worker_reported_scan_budget_free_bytes: IntGaugeVec,
+    pub worker_reported_spill_free_bytes: IntGaugeVec,
+    pub worker_reported_inflight_scans: IntGaugeVec,
     // Footer cache metrics
     pub footer_cache_hits: Counter,
     pub footer_cache_misses: Counter,
@@ -358,8 +387,40 @@ impl MetricsRegistry {
         let scheduler_decisions = register_int_counter_vec(
             &registry,
             "sqe_scheduler_decisions_total",
-            "Scheduling decisions by type",
-            &["decision"],
+            "Scheduling decisions by type and reason (local + distributed = decisions taken)",
+            &["decision", "reason"],
+        )?;
+
+        let worker_fragment_failures_total = register_int_counter_vec(
+            &registry,
+            "sqe_worker_fragment_failures_total",
+            "Distributed scan fragments that failed, by worker fault kind",
+            &["fault"],
+        )?;
+
+        let worker_reported_memory_limit_bytes = register_int_gauge_vec(
+            &registry,
+            "sqe_worker_reported_memory_limit_bytes",
+            "Memory pool limit a worker reported in its heartbeat",
+            &["worker"],
+        )?;
+        let worker_reported_scan_budget_free_bytes = register_int_gauge_vec(
+            &registry,
+            "sqe_worker_reported_scan_budget_free_bytes",
+            "Scan admission budget a worker reported as free in its heartbeat",
+            &["worker"],
+        )?;
+        let worker_reported_spill_free_bytes = register_int_gauge_vec(
+            &registry,
+            "sqe_worker_reported_spill_free_bytes",
+            "Free spill volume bytes a worker reported in its heartbeat",
+            &["worker"],
+        )?;
+        let worker_reported_inflight_scans = register_int_gauge_vec(
+            &registry,
+            "sqe_worker_reported_inflight_scans",
+            "Scans a worker reported as executing in its heartbeat",
+            &["worker"],
         )?;
 
         let scheduler_task_count = register_histogram(
@@ -848,6 +909,11 @@ impl MetricsRegistry {
             scheduler_task_count,
             scheduler_task_size_mb,
             scheduler_stragglers,
+            worker_fragment_failures_total,
+            worker_reported_memory_limit_bytes,
+            worker_reported_scan_budget_free_bytes,
+            worker_reported_spill_free_bytes,
+            worker_reported_inflight_scans,
             footer_cache_hits,
             footer_cache_misses,
             footer_cache_size_bytes,
@@ -1142,8 +1208,16 @@ mod tests {
         metrics.cache_entries.set(0.0);
         metrics
             .scheduler_decisions
-            .with_label_values(&["local"])
+            .with_label_values(&["local", "below_file_threshold"])
             .inc_by(0);
+        metrics
+            .worker_fragment_failures_total
+            .with_label_values(&["worker_internal"])
+            .inc_by(0);
+        metrics
+            .worker_reported_memory_limit_bytes
+            .with_label_values(&["http://w1:50052"])
+            .set(0);
         metrics.scheduler_task_count.observe(0.0);
         metrics.scheduler_task_size_mb.observe(0.0);
         metrics.scheduler_stragglers.inc_by(0);

@@ -4,7 +4,7 @@
 
 SELECT
     b.b_name                         AS broker_name,
-    tt.tt_name                       AS tt_name,
+    tt.tt_name                       AS trade_type,
     COUNT(t.t_id)                    AS trade_count,
     SUM(t.t_qty)                     AS total_qty,
     SUM(t.t_comm)                    AS total_commission,
@@ -21,4 +21,4 @@ GROUP BY
 ORDER BY
     total_commission DESC,
     broker_name,
-    tt_name;
+    trade_type;

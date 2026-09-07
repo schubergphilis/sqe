@@ -200,13 +200,21 @@ pub fn build_worker_service_with_hot_reload(
         let client_tls = sqe_core::tls::tonic_client(&worker_tls, None).map_err(|e| {
             anyhow::anyhow!("cannot build worker client TLS for the heartbeat: {e}")
         })?;
-        heartbeat::start_heartbeat_task(
+        // Finding 609: the hello carries this process's identity, load vector
+        // and worker-attributable failures. The probe is installed here, once
+        // the service knows its pool and budgets.
+        let status = Arc::clone(service.status());
+        status.set_capacity_probe(service.capacity_probe());
+        // Detached on purpose, like the config-reload watcher: the heartbeat
+        // runs for the life of the process.
+        let _heartbeat_task = heartbeat::start_heartbeat_task(
             config.worker.coordinator_url.clone(),
             advertise_url,
             interval,
             config.worker.worker_secret.clone(),
             Some(client_tls),
             Some(Arc::clone(&ticket_pin)),
+            status,
         );
     } else {
         // A worker_secret with no coordinator_url is inert: nothing to

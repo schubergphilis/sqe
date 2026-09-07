@@ -1,10 +1,12 @@
 use std::fmt;
+use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
 use arrow_flight::decode::FlightRecordBatchStream;
+use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Ticket;
 use arrow_schema::SchemaRef;
@@ -30,18 +32,18 @@ use datafusion::physical_plan::{
 };
 use datafusion_proto::bytes::Serializeable;
 use futures::{Stream, StreamExt, TryStreamExt};
-use tracing::{error, info, info_span, warn, Instrument};
+use tracing::{debug, error, info, info_span, warn, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use sqe_core::SqeError;
 use sqe_metrics::propagation::inject_trace_context;
-use sqe_planner::ScanTask;
+use sqe_planner::{ScanTask, WorkerFault};
 
 use crate::channel_pool::ChannelPool;
 use crate::credential_refresh::CredentialRefreshTracker;
 use crate::worker_registry::WorkerRegistry;
 
-/// Default maximum number of retry attempts per fragment before giving up
-/// or falling back to local execution.
+/// Default maximum number of retry attempts per fragment before giving up.
 const DEFAULT_MAX_RETRIES: u32 = 2;
 
 /// Fallback inbound gRPC message ceiling when no config was plumbed in.
@@ -115,11 +117,25 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// fragment so the coordinator's background refresh loop can push new
 /// credentials before they expire.
 ///
-/// If a worker fails, the executor will:
-/// 1. Mark the worker as unhealthy in the registry.
-/// 2. Re-assign the fragment to another healthy worker (up to `max_retries` times).
-/// 3. If no healthy workers remain, fall back to local execution via
-///    the coordinator's DataFusion `TaskContext`.
+/// When an attempt fails -- at dispatch, or mid-stream before any batch has
+/// reached the consumer -- the executor consults the worker fault (finding
+/// 602, [`WorkerFault`]) and either:
+/// 1. marks the worker unhealthy and re-dispatches the (idempotent) fragment
+///    to another healthy worker, up to `max_retries` times (worker faults,
+///    transport errors);
+/// 2. backs off and retries the same worker (`SourceThrottled`);
+/// 3. fails the fragment immediately and leaves the registry alone
+///    (`TaskInvalid`, `PrincipalDenied`, `SourceMissing`, `Cancelled`): no
+///    other worker would do better, and the worker did nothing wrong.
+///
+/// A mid-stream error AFTER batches were yielded cannot be retried (the
+/// consumer already holds a prefix), so the fragment fails; the worker is
+/// still marked unhealthy under the same fault policy (finding 402).
+///
+/// There is no per-fragment local fallback. Running one fragment of an
+/// N-worker scan on the coordinator hid worker outages behind a slow query;
+/// the plan-level `query.distribution_fallback` setting is the deliberate
+/// replacement.
 #[derive(Debug)]
 pub struct DistributedScanExec {
     scan_tasks: Vec<ScanTask>,
@@ -134,10 +150,9 @@ pub struct DistributedScanExec {
     worker_registry: Option<Arc<WorkerRegistry>>,
     /// Maximum number of retry attempts per fragment.
     max_retries: u32,
-    /// Optional local execution callback for fallback.
-    /// When set, fragments that cannot be executed on any worker
-    /// will be executed locally using the coordinator's DataFusion runtime.
-    local_executor: Option<Arc<dyn LocalExecutor>>,
+    /// How a fragment stream is obtained from a worker. `None` means the
+    /// production Flight `do_get` path; tests script outcomes per worker.
+    dispatcher: Option<Arc<dyn FragmentDispatcher>>,
     /// Optional callback fired when each fragment completes or fails.
     fragment_callback: FragmentCallbackOpt,
     /// Shared secret attached to every outbound `do_get` so the worker
@@ -172,22 +187,80 @@ pub struct DistributedScanExec {
     pushed_down_filters: Vec<Arc<dyn PhysicalExpr>>,
 }
 
-/// Trait for local execution fallback.
-///
-/// Implemented by the coordinator to execute scan tasks locally when all
-/// workers are unavailable.
-pub trait LocalExecutor: Send + Sync + std::fmt::Debug {
-    /// Execute a scan task locally and return a record batch stream.
-    fn execute_local(
-        &self,
-        task: &ScanTask,
-        schema: SchemaRef,
-    ) -> DFResult<SendableRecordBatchStream>;
+/// A fragment's batches as they arrive from a worker, before reassembly to
+/// the plan's schema.
+pub(crate) type WorkerStream =
+    Pin<Box<dyn Stream<Item = Result<RecordBatch, FlightError>> + Send>>;
+
+/// Why one dispatch attempt failed, kept typed so the retry loop can consult
+/// the fault policy (finding 602) instead of guessing from a message.
+#[derive(Debug)]
+pub(crate) enum DispatchError {
+    /// The coordinator could not build the ticket or its headers. No worker
+    /// can fix that; the producer has a bug.
+    Ticket(DataFusionError),
+    /// Connect failure, rpc timeout, dead channel: no `Status` reached us.
+    Transport(String),
+    /// The worker (or tonic on its behalf) answered with a gRPC `Status`.
+    Status(tonic::Status),
 }
 
-/// Callback invoked when a fragment stream completes or fails.
-/// Args: (fragment_id, success: bool, elapsed_ms, output_rows)
+/// Single choke point for "get this fragment's stream from that worker", and
+/// the seam the retry tests script through. Production uses
+/// [`FlightDispatcher`] (`do_get` over the channel pool).
+pub(crate) trait FragmentDispatcher: Send + Sync + fmt::Debug {
+    fn dispatch(
+        &self,
+        task: ScanTask,
+        worker_url: String,
+    ) -> Pin<Box<dyn Future<Output = Result<WorkerStream, DispatchError>> + Send>>;
+}
+
+/// Callback invoked when a fragment stream completes, fails, or is
+/// re-dispatched. Args: (fragment_id, outcome, elapsed_ms, output_rows)
 pub type FragmentCallback = Arc<dyn Fn(&str, FragmentOutcome, u64, usize) + Send + Sync>;
+
+/// What went wrong with a fragment attempt, as reported to the
+/// [`FragmentCallback`] and used as the `fault` label of
+/// `sqe_worker_fragment_failures_total` (finding 602).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FragmentFault {
+    /// The worker classified the failure ([`WorkerFault`]), or the bare gRPC
+    /// code mapped to one.
+    Worker(WorkerFault),
+    /// The connection died or timed out; no classifiable `Status` arrived.
+    Transport,
+    /// A coordinator-side failure with no worker fault behind it (ticket
+    /// encoding, Flight decode, batch reassembly).
+    Unknown,
+}
+
+impl FragmentFault {
+    /// Stable label for metrics. `WorkerFault` labels are reused verbatim.
+    pub fn metric_label(self) -> &'static str {
+        match self {
+            FragmentFault::Worker(f) => f.metric_label(),
+            FragmentFault::Transport => "transport",
+            FragmentFault::Unknown => "unknown",
+        }
+    }
+
+    /// The [`sqe_core::SqeErrorCode`] the query surfaces for this fault.
+    pub fn sqe_error_code(self) -> sqe_core::SqeErrorCode {
+        match self {
+            FragmentFault::Worker(f) => f.sqe_error_code(),
+            FragmentFault::Transport | FragmentFault::Unknown => {
+                sqe_core::SqeErrorCode::ExecutionFailed
+            }
+        }
+    }
+}
+
+impl fmt::Display for FragmentFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.metric_label())
+    }
+}
 
 /// How a fragment stream ended, as reported to the [`FragmentCallback`].
 ///
@@ -196,12 +269,19 @@ pub type FragmentCallback = Arc<dyn Fn(&str, FragmentOutcome, u64, usize) + Send
 /// (`LIMIT`-terminated or cancelled query) without mislabelling a clean stop
 /// as a failure. Before this the reservation lived until the plan `Arc`
 /// dropped.
+///
+/// Finding 402/602: `Retrying` is NOT terminal. It reports one failed attempt
+/// whose fragment is being re-dispatched, so the failure is counted by fault
+/// without the query tracker marking the fragment finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FragmentOutcome {
     /// The stream reached EOF.
     Finished,
-    /// The stream yielded an error, or a dispatch attempt failed.
-    Failed,
+    /// The fragment failed for good: retries exhausted, a fault that must not
+    /// be retried, or an error after batches had already been yielded.
+    Failed(FragmentFault),
+    /// One attempt failed and the fragment is being dispatched again.
+    Retrying(FragmentFault),
     /// The stream was dropped before EOF or error.
     Cancelled,
 }
@@ -252,7 +332,7 @@ impl DistributedScanExec {
             credential_tracker: None,
             worker_registry: None,
             max_retries: DEFAULT_MAX_RETRIES,
-            local_executor: None,
+            dispatcher: None,
             fragment_callback: FragmentCallbackOpt(None),
             worker_secret: String::new(),
             ticket_signer: None,
@@ -277,7 +357,7 @@ impl DistributedScanExec {
             credential_tracker: self.credential_tracker.clone(),
             worker_registry: self.worker_registry.clone(),
             max_retries: self.max_retries,
-            local_executor: self.local_executor.clone(),
+            dispatcher: self.dispatcher.clone(),
             fragment_callback: FragmentCallbackOpt(self.fragment_callback.0.clone()),
             worker_secret: self.worker_secret.clone(),
             ticket_signer: self.ticket_signer.clone(),
@@ -359,10 +439,12 @@ impl DistributedScanExec {
         self
     }
 
-    /// Set the local executor for fallback when all workers are down.
-    #[must_use = "with_local_executor consumes self; bind the returned scan"]
-    pub fn with_local_executor(mut self, executor: Arc<dyn LocalExecutor>) -> Self {
-        self.local_executor = Some(executor);
+    /// Replace the Flight `do_get` dispatch with a scripted one. Test seam
+    /// for the retry / fault-policy tests; production never sets it.
+    #[cfg(test)]
+    #[must_use = "with_dispatcher consumes self; bind the returned scan"]
+    pub(crate) fn with_dispatcher(mut self, dispatcher: Arc<dyn FragmentDispatcher>) -> Self {
+        self.dispatcher = Some(dispatcher);
         self
     }
 
@@ -568,11 +650,7 @@ impl ExecutionPlan for DistributedScanExec {
         let max_retries = self.max_retries;
         let worker_registry = self.worker_registry.clone();
         let channel_pool = self.worker_registry.as_ref().map(|r| r.channel_pool());
-        let local_executor = self.local_executor.clone();
         let fragment_callback = self.fragment_callback.0.clone();
-        let worker_secret = self.worker_secret.clone();
-        let ticket_signer = self.ticket_signer.clone();
-        let ticket_ttl = self.ticket_ttl;
         let dispatch_limits = DispatchLimits {
             connect_timeout: self.worker_connect_timeout,
             rpc_timeout: self.worker_rpc_timeout,
@@ -595,11 +673,26 @@ impl ExecutionPlan for DistributedScanExec {
         // Capture the current OTel context so it can be propagated to the worker
         let parent_cx = dispatch_span.context();
 
-        // Phase 1: resolve which stream to use (retry across workers, then local fallback).
-        // Phase 2: stream batches from the resolved source.
+        let dispatcher: Arc<dyn FragmentDispatcher> = match &self.dispatcher {
+            Some(scripted) => Arc::clone(scripted),
+            None => Arc::new(FlightDispatcher {
+                pool: channel_pool.clone(),
+                parent_cx,
+                worker_secret: self.worker_secret.clone(),
+                ticket_signer: self.ticket_signer.clone(),
+                ticket_ttl: self.ticket_ttl,
+                limits: dispatch_limits,
+                ticket_predicate_dropped,
+            }),
+        };
+
+        // Phase 1: finalise the ticket (dynamic filters) and register it.
+        // Phase 2: drive the fragment: dispatch, stream, and on failure consult
+        // the fault policy to re-dispatch or fail (finding 402 / 602).
         //
-        // We split these into two phases because the retry loop is async and
-        // must complete before we know which inner stream to poll.
+        // Phase 1 is a future rather than inline because the dynamic-filter
+        // snapshot must run on the stream's first poll, after the join build
+        // side has materialised its bounds.
         let resolve_future = async move {
             // Path B-2 for distributed scans: snapshot the dynamic join
             // filters NOW — this future runs on the stream's first poll,
@@ -748,185 +841,45 @@ impl ExecutionPlan for DistributedScanExec {
             }
 
             let start = std::time::Instant::now();
-            let mut last_error: Option<DataFusionError> = None;
-            let mut current_worker_url = initial_worker_url;
-            let mut failed_workers: Vec<String> = Vec::new();
+            let fragment_id = task.fragment_id.clone();
+            let last_fault: Arc<Mutex<Option<FragmentFault>>> = Arc::new(Mutex::new(None));
 
-            // Attempt the initial worker + up to max_retries reassignments
-            for attempt in 0..=max_retries {
-                if attempt > 0 {
-                    let delay = std::time::Duration::from_millis(50 * (1 << attempt.min(4)));
-                    tokio::time::sleep(delay).await;
-
-                    warn!(
-                        fragment_id = %task.fragment_id,
-                        attempt = attempt,
-                        max_retries = max_retries,
-                        worker = %current_worker_url,
-                        "Retrying fragment on different worker"
-                    );
-                }
-
-                match dispatch_to_worker(
-                    &task,
-                    &current_worker_url,
-                    channel_pool.as_deref(),
-                    &parent_cx,
-                    &worker_secret,
-                    ticket_signer.as_deref(),
-                    ticket_ttl,
-                    &dispatch_limits,
-                    &ticket_predicate_dropped,
-                )
-                .await
-                {
-                    Ok(flight_stream) => {
-                        // Project received batches to match the expected schema.
-                        // Workers return full table columns, but the plan may expect
-                        // fewer columns (e.g., COUNT(*) expects 0 columns).
-                        let expected_schema = schema.clone();
-                        let inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
-                            Box::pin(
-                                flight_stream
-                                    .map_err(|e| DataFusionError::External(Box::new(e)))
-                                    .map(move |batch_result| {
-                                        reassemble_worker_batch(batch_result?, &expected_schema)
-                                    }),
-                            );
-                        // Terminate the fragment stream on the first mid-stream
-                        // error so downstream operators do not see Ok batches
-                        // arriving after an Err from this fragment.
-                        let terminated: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
-                            Box::pin(TerminateOnErrorStream::new(inner, task.fragment_id.clone()));
-                        // Wrap the stream so the callback fires when it
-                        // completes and the credential-tracker entry is
-                        // released on completion (COORD-02). Wrap whenever
-                        // either a callback or a tracker is present.
-                        let wrapped: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
-                            if fragment_callback.is_some() || credential_tracker.is_some() {
-                                Box::pin(CallbackStream::new(
-                                    terminated,
-                                    task.fragment_id.clone(),
-                                    fragment_callback.clone(),
-                                    start,
-                                    credential_tracker.clone(),
-                                ))
-                            } else {
-                                terminated
-                            };
-                        return Ok(wrapped);
-                    }
-                    Err(e) => {
-                        warn!(
-                            fragment_id = %task.fragment_id,
-                            worker = %current_worker_url,
-                            error = %e,
-                            attempt = attempt,
-                            "Worker execution failed"
-                        );
-
-                        // Fire callback with failure for each failed attempt
-                        if let Some(ref cb) = fragment_callback {
-                            cb(
-                                &task.fragment_id,
-                                FragmentOutcome::Failed,
-                                start.elapsed().as_millis() as u64,
-                                0,
-                            );
-                        }
-
-                        // Mark the worker as unhealthy in the registry
-                        if let Some(ref registry) = worker_registry {
-                            registry.mark_unhealthy(&current_worker_url).await;
-                        }
-
-                        failed_workers.push(current_worker_url.clone());
-                        last_error = Some(e);
-
-                        // Try to find another healthy worker for next attempt
-                        if attempt < max_retries {
-                            if let Some(ref registry) = worker_registry {
-                                let healthy = registry.healthy_workers().await;
-                                if let Some(next_worker) =
-                                    healthy.into_iter().find(|w| !failed_workers.contains(w))
-                                {
-                                    current_worker_url = next_worker;
-                                    continue;
-                                }
-                            }
-                            // No healthy workers available for retry
-                            warn!(
-                                fragment_id = %task.fragment_id,
-                                "No healthy workers available for retry"
-                            );
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // COORD-02: all remote attempts exhausted. The credential-tracker
-            // entry is released by the local-fallback stream's CallbackStream
-            // (on completion) or, when there is no fallback, by the explicit
-            // unregister on the error path below. No early unregister here so
-            // the local-fallback stream still tracks its own credentials.
-
-            // Try local fallback
-            if let Some(ref executor) = local_executor {
-                warn!(
-                    fragment_id = %task.fragment_id,
-                    failed_workers = ?failed_workers,
-                    "All workers failed, falling back to local execution"
-                );
-                let local_stream = match executor.execute_local(&task, schema) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        // Local fallback failed to start: no stream is created,
-                        // so release the tracker entry here (COORD-02).
-                        if let Some(ref tracker) = credential_tracker {
-                            tracker.unregister(&task.fragment_id).await;
-                        }
-                        return Err(e);
-                    }
-                };
-                let inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
-                    Box::pin(local_stream);
-                let terminated: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
-                    Box::pin(TerminateOnErrorStream::new(inner, task.fragment_id.clone()));
-                // Wrap the fallback stream so the callback fires on completion
-                // and the credential-tracker entry is released (COORD-02).
-                let wrapped: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
-                    if fragment_callback.is_some() || credential_tracker.is_some() {
-                        Box::pin(CallbackStream::new(
-                            terminated,
-                            task.fragment_id.clone(),
-                            fragment_callback,
-                            start,
-                            credential_tracker,
-                        ))
-                    } else {
-                        terminated
-                    };
-                return Ok(wrapped);
-            }
-
-            // No local fallback available — release the tracker entry
-            // (COORD-02: no stream is returned on this path), fire callback with
-            // failure, and propagate the last error.
-            if let Some(ref tracker) = credential_tracker {
-                tracker.unregister(&task.fragment_id).await;
-            }
-            let err = last_error.unwrap_or_else(|| {
-                DataFusionError::Execution(
-                    "All workers failed and no local fallback configured".to_string(),
-                )
+            let run = Arc::new(FragmentRun {
+                task,
+                schema,
+                dispatcher,
+                registry: worker_registry,
+                channel_pool,
+                callback: fragment_callback.clone(),
+                start,
+                max_retries,
+                last_fault: Arc::clone(&last_fault),
             });
-            error!(
-                fragment_id = %task.fragment_id,
-                failed_workers = ?failed_workers,
-                "Fragment execution failed after all retries with no local fallback"
-            );
-            Err(err)
+            let driven: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
+                Box::pin(run.drive(initial_worker_url));
+
+            // The driver already stops after its terminal error; the wrapper
+            // keeps the "clean prefix, then exactly one terminal event"
+            // guarantee (#50) independent of the driver's internals.
+            let terminated: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
+                Box::pin(TerminateOnErrorStream::new(driven, fragment_id.clone()));
+            // Wrap the stream so the callback fires when it completes and the
+            // credential-tracker entry is released on completion (COORD-02).
+            // Wrap whenever either a callback or a tracker is present.
+            let wrapped: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
+                if fragment_callback.is_some() || credential_tracker.is_some() {
+                    Box::pin(CallbackStream::new(
+                        terminated,
+                        fragment_id,
+                        fragment_callback,
+                        start,
+                        credential_tracker,
+                        last_fault,
+                    ))
+                } else {
+                    terminated
+                };
+            Ok::<_, DataFusionError>(wrapped)
         }
         .instrument(dispatch_span.clone());
 
@@ -943,12 +896,443 @@ impl ExecutionPlan for DistributedScanExec {
     }
 }
 
+/// What the retry loop does with one failed attempt (finding 602).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptPolicy {
+    /// Evict the worker and re-dispatch the fragment to another healthy one.
+    RetryElsewhere,
+    /// Back off and retry on the same worker; the registry is untouched.
+    RetrySameWorker,
+    /// Fail the fragment now; the registry is untouched.
+    FailFast,
+}
+
+/// One classified attempt failure: the fault for metrics and the callback,
+/// the policy for the loop, and the error the consumer sees if it is final.
+struct AttemptFailure {
+    fault: FragmentFault,
+    policy: AttemptPolicy,
+    error: DataFusionError,
+}
+
+/// Map a decoded [`WorkerFault`] to the retry policy. This is the whole 602
+/// table in one place:
+///
+/// | fault                     | registry        | action                 |
+/// |---------------------------|-----------------|------------------------|
+/// | `WorkerResourceExhausted` | mark unhealthy  | retry on another worker|
+/// | `WorkerInternal`          | mark unhealthy  | retry on another worker|
+/// | transport (no fault)      | mark unhealthy  | retry on another worker|
+/// | `SourceThrottled`         | untouched       | back off, same worker  |
+/// | `TaskInvalid`             | untouched       | fail now               |
+/// | `PrincipalDenied`         | untouched       | fail now               |
+/// | `SourceMissing`           | untouched       | fail now               |
+/// | `Cancelled`               | untouched       | fail now               |
+fn policy_for(fault: WorkerFault) -> AttemptPolicy {
+    if fault.is_retryable_on_other_worker() {
+        AttemptPolicy::RetryElsewhere
+    } else if fault.is_retryable_same_worker() {
+        AttemptPolicy::RetrySameWorker
+    } else {
+        AttemptPolicy::FailFast
+    }
+}
+
+/// Classify a gRPC `Status` from a worker, at dispatch or mid-stream.
+///
+/// `Unavailable` / `DeadlineExceeded` / `Unknown` decode to no fault: tonic's
+/// transport layer produces those for a dead connection, so they take the
+/// transport path (evict, retry elsewhere) rather than being mistaken for a
+/// worker-reported throttle.
+fn classify_status(status: &tonic::Status, worker_url: &str, phase: &str) -> AttemptFailure {
+    match WorkerFault::from_status(status) {
+        Some(fault) => AttemptFailure {
+            fault: FragmentFault::Worker(fault),
+            policy: policy_for(fault),
+            error: DataFusionError::External(Box::new(SqeError::with_code(
+                fault.sqe_error_code(),
+                format!(
+                    "Worker {worker_url} {phase} failed ({fault}): {}",
+                    status.message()
+                ),
+            ))),
+        },
+        None => AttemptFailure {
+            fault: FragmentFault::Transport,
+            policy: AttemptPolicy::RetryElsewhere,
+            error: DataFusionError::Execution(format!(
+                "Worker {worker_url} {phase} failed: {status}"
+            )),
+        },
+    }
+}
+
+fn classify_dispatch_error(err: DispatchError, worker_url: &str) -> AttemptFailure {
+    match err {
+        DispatchError::Status(status) => classify_status(&status, worker_url, "do_get"),
+        DispatchError::Transport(msg) => AttemptFailure {
+            fault: FragmentFault::Transport,
+            policy: AttemptPolicy::RetryElsewhere,
+            error: DataFusionError::Execution(msg),
+        },
+        // The coordinator built a ticket it cannot encode: retrying it on any
+        // worker asks the same question. Producer bug; fail loudly.
+        DispatchError::Ticket(e) => AttemptFailure {
+            fault: FragmentFault::Worker(WorkerFault::TaskInvalid),
+            policy: AttemptPolicy::FailFast,
+            error: e,
+        },
+    }
+}
+
+fn classify_stream_error(err: FlightError, worker_url: &str) -> AttemptFailure {
+    match err {
+        FlightError::Tonic(status) => classify_status(&status, worker_url, "stream"),
+        // Flight decode / protocol errors: the worker shipped something this
+        // coordinator could not read. Another worker may not; the fault is
+        // not classifiable, so it is counted as `unknown`.
+        other => AttemptFailure {
+            fault: FragmentFault::Unknown,
+            policy: AttemptPolicy::RetryElsewhere,
+            error: DataFusionError::Execution(format!(
+                "Worker {worker_url} stream failed: {other}"
+            )),
+        },
+    }
+}
+
+/// Exponential backoff before attempt `attempt` (1-based for retries).
+fn retry_backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(50 * (1 << attempt.min(4)))
+}
+
+/// Where the fragment driver is in its attempt sequence.
+enum Phase {
+    /// About to (re)dispatch to `worker`; `attempt` is 0 for the first try.
+    Dispatch { worker: String, attempt: u32 },
+    /// Streaming batches from `worker`.
+    Streaming {
+        worker: String,
+        inner: WorkerStream,
+        attempt: u32,
+    },
+    /// Terminal: EOF or a final error has been yielded.
+    Done,
+}
+
+/// Mutable state threaded through the driver's `unfold`.
+struct RunState {
+    phase: Phase,
+    /// Workers this fragment has already failed on; never retried.
+    failed_workers: Vec<String>,
+    /// Batches handed downstream so far. Once non-zero a mid-stream error
+    /// cannot be retried: the consumer already holds a prefix.
+    yielded_batches: usize,
+}
+
+/// Everything one fragment's attempts share (finding 402).
+///
+/// The retry loop used to live in a "resolve the stream" future, so it could
+/// only retry `do_get`; once a stream was returned, a mid-stream loss ended
+/// the query. [`FragmentRun::drive`] is a stream that owns the attempt loop,
+/// so a worker lost before the first batch is retried like a dispatch
+/// failure.
+struct FragmentRun {
+    task: ScanTask,
+    schema: SchemaRef,
+    dispatcher: Arc<dyn FragmentDispatcher>,
+    registry: Option<Arc<WorkerRegistry>>,
+    channel_pool: Option<Arc<ChannelPool>>,
+    callback: Option<FragmentCallback>,
+    start: std::time::Instant,
+    max_retries: u32,
+    /// The fault behind the terminal error, read by [`CallbackStream`] so the
+    /// `Failed` outcome carries it.
+    last_fault: Arc<Mutex<Option<FragmentFault>>>,
+}
+
+impl FragmentRun {
+    fn set_fault(&self, fault: FragmentFault) {
+        if let Ok(mut slot) = self.last_fault.lock() {
+            *slot = Some(fault);
+        }
+    }
+
+    /// Apply the registry side of the policy: evict the worker (and drop its
+    /// pooled channel on a transport failure) for `RetryElsewhere`; leave it
+    /// alone otherwise. User-caused faults never count against the worker.
+    async fn penalise(&self, worker: &str, failure: &AttemptFailure) {
+        if failure.policy != AttemptPolicy::RetryElsewhere {
+            return;
+        }
+        if let Some(registry) = &self.registry {
+            registry.mark_unhealthy(worker).await;
+        }
+        if failure.fault == FragmentFault::Transport {
+            if let Some(pool) = &self.channel_pool {
+                pool.invalidate(worker);
+            }
+        }
+    }
+
+    /// Decide what follows a failed attempt that has not yielded batches:
+    /// `Ok(next phase)` to retry, `Err(error)` to fail the fragment.
+    async fn after_failure(
+        &self,
+        state: &mut RunState,
+        worker: String,
+        attempt: u32,
+        failure: AttemptFailure,
+    ) -> Result<Phase, DataFusionError> {
+        warn!(
+            fragment_id = %self.task.fragment_id,
+            worker = %worker,
+            fault = %failure.fault,
+            policy = ?failure.policy,
+            attempt,
+            max_retries = self.max_retries,
+            error = %failure.error,
+            "Fragment attempt failed"
+        );
+        self.penalise(&worker, &failure).await;
+
+        if failure.policy == AttemptPolicy::FailFast {
+            self.set_fault(failure.fault);
+            return Err(failure.error);
+        }
+        if attempt >= self.max_retries {
+            error!(
+                fragment_id = %self.task.fragment_id,
+                failed_workers = ?state.failed_workers,
+                fault = %failure.fault,
+                "Fragment failed after all retries"
+            );
+            self.set_fault(failure.fault);
+            return Err(failure.error);
+        }
+
+        let next_worker = match failure.policy {
+            AttemptPolicy::RetrySameWorker => Some(worker),
+            AttemptPolicy::RetryElsewhere => {
+                state.failed_workers.push(worker);
+                match &self.registry {
+                    Some(registry) => registry
+                        .healthy_workers()
+                        .await
+                        .into_iter()
+                        .find(|w| !state.failed_workers.contains(w)),
+                    None => None,
+                }
+            }
+            AttemptPolicy::FailFast => unreachable!("handled above"),
+        };
+        let Some(next_worker) = next_worker else {
+            warn!(
+                fragment_id = %self.task.fragment_id,
+                failed_workers = ?state.failed_workers,
+                "No healthy workers available for retry"
+            );
+            self.set_fault(failure.fault);
+            return Err(failure.error);
+        };
+
+        if let Some(cb) = &self.callback {
+            cb(
+                &self.task.fragment_id,
+                FragmentOutcome::Retrying(failure.fault),
+                self.start.elapsed().as_millis() as u64,
+                0,
+            );
+        }
+        Ok(Phase::Dispatch {
+            worker: next_worker,
+            attempt: attempt + 1,
+        })
+    }
+
+    /// The fragment as a stream: dispatch, stream, and on failure consult the
+    /// fault policy. Ends after EOF or exactly one terminal error.
+    fn drive(
+        self: Arc<Self>,
+        initial_worker: String,
+    ) -> impl Stream<Item = DFResult<RecordBatch>> + Send {
+        let state = RunState {
+            phase: Phase::Dispatch {
+                worker: initial_worker,
+                attempt: 0,
+            },
+            failed_workers: Vec::new(),
+            yielded_batches: 0,
+        };
+        futures::stream::unfold(state, move |mut state| {
+            let run = Arc::clone(&self);
+            async move {
+                loop {
+                    match std::mem::replace(&mut state.phase, Phase::Done) {
+                        Phase::Done => return None,
+                        Phase::Dispatch { worker, attempt } => {
+                            if attempt > 0 {
+                                tokio::time::sleep(retry_backoff(attempt)).await;
+                                warn!(
+                                    fragment_id = %run.task.fragment_id,
+                                    attempt,
+                                    max_retries = run.max_retries,
+                                    worker = %worker,
+                                    "Retrying fragment"
+                                );
+                            }
+                            match run
+                                .dispatcher
+                                .dispatch(run.task.clone(), worker.clone())
+                                .await
+                            {
+                                Ok(inner) => {
+                                    state.phase = Phase::Streaming {
+                                        worker,
+                                        inner,
+                                        attempt,
+                                    };
+                                }
+                                Err(e) => {
+                                    let failure = classify_dispatch_error(e, &worker);
+                                    match run
+                                        .after_failure(&mut state, worker, attempt, failure)
+                                        .await
+                                    {
+                                        Ok(next) => state.phase = next,
+                                        Err(err) => return Some((Err(err), state)),
+                                    }
+                                }
+                            }
+                        }
+                        Phase::Streaming {
+                            worker,
+                            mut inner,
+                            attempt,
+                        } => match inner.next().await {
+                            None => return None,
+                            Some(Ok(batch)) => {
+                                match reassemble_worker_batch(batch, &run.schema) {
+                                    Ok(batch) => {
+                                        state.yielded_batches += 1;
+                                        state.phase = Phase::Streaming {
+                                            worker,
+                                            inner,
+                                            attempt,
+                                        };
+                                        return Some((Ok(batch), state));
+                                    }
+                                    Err(e) => {
+                                        // Contract mismatch between what the
+                                        // worker shipped and what the plan
+                                        // expects; another worker would ship
+                                        // the same thing.
+                                        run.set_fault(FragmentFault::Unknown);
+                                        return Some((Err(e), state));
+                                    }
+                                }
+                            }
+                            Some(Err(e)) => {
+                                let failure = classify_stream_error(e, &worker);
+                                if state.yielded_batches > 0 {
+                                    // Downstream already consumed a prefix of
+                                    // this fragment; re-dispatching would
+                                    // duplicate rows. The query fails, but the
+                                    // worker is still judged by the fault
+                                    // policy (finding 402).
+                                    error!(
+                                        fragment_id = %run.task.fragment_id,
+                                        worker = %worker,
+                                        fault = %failure.fault,
+                                        yielded_batches = state.yielded_batches,
+                                        error = %failure.error,
+                                        "Mid-stream worker failure after batches were yielded; \
+                                         cannot retry"
+                                    );
+                                    run.penalise(&worker, &failure).await;
+                                    run.set_fault(failure.fault);
+                                    return Some((Err(failure.error), state));
+                                }
+                                debug!(
+                                    fragment_id = %run.task.fragment_id,
+                                    worker = %worker,
+                                    "Mid-stream failure before any batch; treating as a dispatch failure"
+                                );
+                                match run
+                                    .after_failure(&mut state, worker, attempt, failure)
+                                    .await
+                                {
+                                    Ok(next) => state.phase = next,
+                                    Err(err) => return Some((Err(err), state)),
+                                }
+                            }
+                        },
+                    }
+                }
+            }
+        })
+    }
+}
+
+/// Production [`FragmentDispatcher`]: Arrow Flight `do_get` against the
+/// worker, over the channel pool when there is one.
+struct FlightDispatcher {
+    pool: Option<Arc<ChannelPool>>,
+    parent_cx: opentelemetry::Context,
+    worker_secret: String,
+    ticket_signer: Option<Arc<sqe_core::ticket_signing::TicketSigner>>,
+    ticket_ttl: std::time::Duration,
+    limits: DispatchLimits,
+    ticket_predicate_dropped: datafusion::physical_plan::metrics::Count,
+}
+
+impl fmt::Debug for FlightDispatcher {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FlightDispatcher")
+            .field("pooled", &self.pool.is_some())
+            .field("signed", &self.ticket_signer.is_some())
+            .finish()
+    }
+}
+
+impl FragmentDispatcher for FlightDispatcher {
+    fn dispatch(
+        &self,
+        task: ScanTask,
+        worker_url: String,
+    ) -> Pin<Box<dyn Future<Output = Result<WorkerStream, DispatchError>> + Send>> {
+        let pool = self.pool.clone();
+        let parent_cx = self.parent_cx.clone();
+        let worker_secret = self.worker_secret.clone();
+        let ticket_signer = self.ticket_signer.clone();
+        let ticket_ttl = self.ticket_ttl;
+        let limits = self.limits;
+        let dropped = self.ticket_predicate_dropped.clone();
+        Box::pin(async move {
+            let flight_stream = dispatch_to_worker(
+                &task,
+                &worker_url,
+                pool.as_deref(),
+                &parent_cx,
+                &worker_secret,
+                ticket_signer.as_deref(),
+                ticket_ttl,
+                &limits,
+                &dropped,
+            )
+            .await?;
+            let boxed: WorkerStream = Box::pin(flight_stream);
+            Ok(boxed)
+        })
+    }
+}
+
 /// Dispatch a scan task to a single worker via Arrow Flight `do_get`.
 ///
-/// Returns the `FlightRecordBatchStream` on success, or a `DataFusionError`
-/// on connection/transport failure. When `pool` is provided, the channel
-/// is fetched (or built once and cached) from it; otherwise a fresh
-/// connect runs per call bounded by `connect_timeout`.
+/// Returns the `FlightRecordBatchStream` on success, or a typed
+/// [`DispatchError`] otherwise. When `pool` is provided, the channel is
+/// fetched (or built once and cached) from it; otherwise a fresh connect runs
+/// per call bounded by `connect_timeout`.
 ///
 /// The `rpc_timeout` bounds the `do_get` round-trip itself. A kernel-paused
 /// worker that accepts the TCP connection but never replies on the gRPC
@@ -957,6 +1341,7 @@ impl ExecutionPlan for DistributedScanExec {
 /// gRPC settings for dispatching one fragment, identical across retries.
 /// Bundled so `dispatch_to_worker` stays inside clippy's argument budget as
 /// the message ceiling joins the two timeouts (#432).
+#[derive(Debug, Clone, Copy)]
 struct DispatchLimits {
     /// Caps TCP+TLS+HTTP/2 handshake. Issue #29.
     connect_timeout: std::time::Duration,
@@ -1024,7 +1409,7 @@ async fn dispatch_to_worker(
     ticket_ttl: std::time::Duration,
     limits: &DispatchLimits,
     ticket_predicate_dropped: &datafusion::physical_plan::metrics::Count,
-) -> Result<FlightRecordBatchStream, DataFusionError> {
+) -> Result<FlightRecordBatchStream, DispatchError> {
     // Finding 601: bind the ticket to this worker and to a deadline before
     // signing, so a captured ticket cannot be replayed elsewhere or later.
     let mut task = task.clone();
@@ -1036,12 +1421,13 @@ async fn dispatch_to_worker(
         worker_url,
         limits.max_message_bytes,
         ticket_predicate_dropped,
-    )?;
+    )
+    .map_err(DispatchError::Ticket)?;
 
     let channel = match pool {
         Some(pool) => pool.get(worker_url).await.map_err(|e| {
             pool.invalidate(worker_url);
-            DataFusionError::Execution(format!("Failed to connect to worker {worker_url}: {e}"))
+            DispatchError::Transport(format!("Failed to connect to worker {worker_url}: {e}"))
         })?,
         // No pool: build a one-off channel. The HTTP/2 windows come from
         // `GrpcTransportConfig::default()` rather than the deployment's
@@ -1050,19 +1436,19 @@ async fn dispatch_to_worker(
         // values, never tonic's 64 KB.
         None => crate::transport::apply_grpc_transport_endpoint(
             tonic::transport::Endpoint::new(worker_url.to_string()).map_err(|e| {
-                DataFusionError::Execution(format!(
+                DispatchError::Transport(format!(
                     "Failed to create endpoint for worker {worker_url}: {e}"
                 ))
             })?,
             &sqe_core::config::GrpcTransportConfig::default(),
         )
         .connect_timeout(limits.connect_timeout)
-            .timeout(limits.rpc_timeout)
-            .connect()
-            .await
-            .map_err(|e| {
-                DataFusionError::Execution(format!("Failed to connect to worker {worker_url}: {e}"))
-            })?,
+        .timeout(limits.rpc_timeout)
+        .connect()
+        .await
+        .map_err(|e| {
+            DispatchError::Transport(format!("Failed to connect to worker {worker_url}: {e}"))
+        })?,
     };
     // Match the worker's own inbound ceiling on the response direction: a
     // large Flight batch coming back must not die on tonic's 4 MiB default.
@@ -1083,17 +1469,17 @@ async fn dispatch_to_worker(
 
     if !worker_secret.is_empty() {
         let value = worker_secret.parse().map_err(|e| {
-            DataFusionError::Execution(format!(
+            DispatchError::Ticket(DataFusionError::Execution(format!(
                 "worker_secret cannot be encoded as a metadata header value: {e}"
-            ))
+            )))
         })?;
         request.metadata_mut().insert(WORKER_SECRET_HEADER, value);
 
         if let Some(sig) = scan_signature {
             let sig_value = sig.parse().map_err(|e| {
-                DataFusionError::Execution(format!(
+                DispatchError::Ticket(DataFusionError::Execution(format!(
                     "scan signature cannot be encoded as a metadata header value: {e}"
-                ))
+                )))
             })?;
             request
                 .metadata_mut()
@@ -1118,12 +1504,15 @@ async fn dispatch_to_worker(
             if let Some(pool) = pool {
                 pool.invalidate(worker_url);
             }
-            DataFusionError::Execution(format!(
+            DispatchError::Transport(format!(
                 "Worker {worker_url} do_get exceeded {}s rpc timeout",
                 limits.rpc_timeout.as_secs()
             ))
         })?
         .map_err(|e| {
+            // Transport-shaped codes drop the pooled channel; the Status
+            // itself travels on so the retry loop can decode the fault
+            // (finding 602) instead of reading a message.
             if let Some(pool) = pool {
                 if matches!(
                     e.code(),
@@ -1132,7 +1521,7 @@ async fn dispatch_to_worker(
                     pool.invalidate(worker_url);
                 }
             }
-            DataFusionError::Execution(format!("Worker {worker_url} do_get failed: {e}"))
+            DispatchError::Status(e)
         })?;
 
     let flight_stream = FlightRecordBatchStream::new_from_flight_data(
@@ -1200,8 +1589,11 @@ struct CallbackStream {
     /// (register on dispatch, unregister only on the all-attempts-failed path),
     /// growing the tracker map for the life of the process. Firing the
     /// unregister here -- on the same exactly-once teardown that fires the
-    /// callback -- covers success, error, and local-fallback completions.
+    /// callback -- covers success and error completions.
     credential_tracker: Option<Arc<CredentialRefreshTracker>>,
+    /// Finding 602: the fault behind the terminal error, written by the
+    /// fragment driver before it yields that error, so `Failed` carries it.
+    last_fault: Arc<Mutex<Option<FragmentFault>>>,
 }
 
 impl CallbackStream {
@@ -1211,6 +1603,7 @@ impl CallbackStream {
         callback: Option<FragmentCallback>,
         start: std::time::Instant,
         credential_tracker: Option<Arc<CredentialRefreshTracker>>,
+        last_fault: Arc<Mutex<Option<FragmentFault>>>,
     ) -> Self {
         Self {
             inner,
@@ -1220,7 +1613,18 @@ impl CallbackStream {
             output_rows: 0,
             fired: std::sync::atomic::AtomicBool::new(false),
             credential_tracker,
+            last_fault,
         }
+    }
+
+    /// The fault the driver recorded for the terminal error, `Unknown` when
+    /// the error did not come through the driver.
+    fn terminal_fault(&self) -> FragmentFault {
+        self.last_fault
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+            .unwrap_or(FragmentFault::Unknown)
     }
 
     /// Claim the exactly-once teardown. Returns `true` for the first caller
@@ -1335,9 +1739,11 @@ impl Stream for CallbackStream {
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(e))) => {
-                // Stream produced an error: callback with Failed, release the
-                // credential-tracker entry (COORD-02).
-                self.finish(FragmentOutcome::Failed);
+                // Stream produced an error: callback with Failed (carrying the
+                // driver's fault, finding 602), release the credential-tracker
+                // entry (COORD-02).
+                let fault = self.terminal_fault();
+                self.finish(FragmentOutcome::Failed(fault));
                 Poll::Ready(Some(Err(e)))
             }
             Poll::Ready(Some(Ok(batch))) => {
@@ -1367,6 +1773,117 @@ impl Drop for CallbackStream {
     /// report a second outcome (double-release) from `Drop`.
     fn drop(&mut self) {
         self.finish(FragmentOutcome::Cancelled);
+    }
+}
+
+/// Pass-through node recording that an Iceberg scan did NOT distribute, and
+/// why (finding 402).
+///
+/// The Hive path has had this since cycle 5 (`HiveLocalScanExec`): a silent
+/// fallback is indistinguishable from success, so the policy decision that
+/// kept a scan on the coordinator becomes a plan node whose `Display` carries
+/// the reason. It changes nothing about the data: `execute` delegates to the
+/// wrapped scan and the properties are the scan's own. Only used when a worker
+/// registry exists; a single-node coordinator has nothing to explain.
+#[derive(Debug)]
+pub struct CoordinatorLocalScanExec {
+    input: Arc<dyn ExecutionPlan>,
+    reason: String,
+}
+
+impl CoordinatorLocalScanExec {
+    pub fn new(input: Arc<dyn ExecutionPlan>, reason: impl Into<String>) -> Self {
+        Self {
+            input,
+            reason: reason.into(),
+        }
+    }
+
+    /// Why the scan stayed on the coordinator (the `scheduler_decisions`
+    /// `reason` label value).
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl DisplayAs for CoordinatorLocalScanExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        match t {
+            // The reason belongs in the DEFAULT format: someone asking why the
+            // cluster is idle runs plain EXPLAIN.
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(
+                    f,
+                    "CoordinatorLocalScanExec: coordinator-local, reason={}",
+                    self.reason
+                )
+            }
+            DisplayFormatType::TreeRender => write!(f, "CoordinatorLocalScanExec"),
+        }
+    }
+}
+
+impl ExecutionPlan for CoordinatorLocalScanExec {
+    fn name(&self) -> &str {
+        "CoordinatorLocalScanExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.input.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    /// Owns no expressions; the wrapped scan is a child and is visited in its
+    /// own right.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    #[allow(deprecated)]
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Keep the reason across a rebuild; dropping it would make the marker
+        // vanish the first time a rule rebuilt the plan.
+        let child = children.into_iter().next().ok_or_else(|| {
+            DataFusionError::Internal(
+                "CoordinatorLocalScanExec requires exactly one child".to_string(),
+            )
+        })?;
+        Ok(Arc::new(CoordinatorLocalScanExec::new(
+            child,
+            self.reason.clone(),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        self.input.execute(partition, context)
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        self.input.metrics()
     }
 }
 
@@ -1588,29 +2105,15 @@ mod tests {
     }
 
     fn make_task(id: &str) -> ScanTask {
-        ScanTask {
-            hive: None,
-            version: 1,
-            morsel_id: None,
-            row_group_start: None,
-            row_group_end: None,
-            start_byte: None,
-            end_byte: None,
-            fragment_id: id.to_string(),
-            data_file_paths: vec![],
-            file_sizes_bytes: vec![],
-            projected_columns: vec![],
-            projected_field_ids: vec![],
-            s3_endpoint: String::new(),
-            s3_region: String::new(),
-            credentials: sqe_planner::ScanCredentials::default(),
-            audience: String::new(),
-            expires_at: 0,
-            s3_path_style: false,
-            s3_allow_http: true,
-            predicate_proto: None,
-            limit: None,
-        }
+        ScanTask::builder(
+            id,
+            vec![],
+            sqe_planner::ScanStorage {
+                s3_allow_http: true,
+                ..Default::default()
+            },
+        )
+        .build()
     }
 
     /// An oversized ticket must lose its predicate, not its fragment. The
@@ -1685,29 +2188,15 @@ mod tests {
     #[test]
     fn test_distributed_scan_exec_properties() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let task = ScanTask {
-            hive: None,
-            version: 1,
-            morsel_id: None,
-            row_group_start: None,
-            row_group_end: None,
-            start_byte: None,
-            end_byte: None,
-            fragment_id: "frag-001".to_string(),
-            data_file_paths: vec!["s3://bucket/file.parquet".to_string()],
-            file_sizes_bytes: vec![],
-            projected_columns: vec![],
-            projected_field_ids: vec![],
-            s3_endpoint: String::new(),
-            s3_region: String::new(),
-            credentials: sqe_planner::ScanCredentials::default(),
-            audience: String::new(),
-            expires_at: 0,
-            s3_path_style: false,
-            s3_allow_http: true,
-            predicate_proto: None,
-            limit: None,
-        };
+        let task = ScanTask::builder(
+            "frag-001",
+            vec!["s3://bucket/file.parquet".to_string()],
+            sqe_planner::ScanStorage {
+                s3_allow_http: true,
+                ..Default::default()
+            },
+        )
+        .build();
 
         let exec: Arc<dyn ExecutionPlan> = Arc::new(DistributedScanExec::new(
             vec![task],
@@ -1806,6 +2295,7 @@ mod tests {
             None, // no fragment callback; tracker teardown must still fire
             std::time::Instant::now(),
             Some(Arc::clone(&tracker)),
+            Arc::new(Mutex::new(None)),
         );
 
         // Drain to EOF; this fires the teardown which spawns the unregister.
@@ -1846,6 +2336,7 @@ mod tests {
             None,
             std::time::Instant::now(),
             Some(Arc::clone(&tracker)),
+            Arc::new(Mutex::new(None)),
         );
 
         assert!(stream.next().await.unwrap().is_err(), "error surfaced");
@@ -1886,6 +2377,7 @@ mod tests {
             None,
             std::time::Instant::now(),
             Some(Arc::clone(&tracker)),
+            Arc::new(Mutex::new(None)),
         );
         drop(stream);
 
@@ -1936,6 +2428,7 @@ mod tests {
             Some(cb),
             std::time::Instant::now(),
             None,
+            Arc::new(Mutex::new(None)),
         );
         drop(stream);
 
@@ -1973,6 +2466,7 @@ mod tests {
             Some(cb),
             std::time::Instant::now(),
             None,
+            Arc::new(Mutex::new(None)),
         );
         assert!(stream.next().await.is_none());
         drop(stream);
@@ -2043,64 +2537,435 @@ mod tests {
         }
     }
 
-    // ---- Retry / fallback integration tests ----
+    // ---- Retry / fault-policy tests (findings 402 and 602) ----
 
     use arrow_array::Int64Array;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::collections::{HashMap, VecDeque};
 
-    /// A test local executor that returns a single batch with a marker value.
+    /// What one scripted dispatch does.
     #[derive(Debug)]
-    struct TestLocalExecutor {
-        call_count: AtomicU32,
+    enum Scripted {
+        /// `do_get` itself fails.
+        Refuse(DispatchError),
+        /// `do_get` succeeds and the stream yields these items in order.
+        Stream(Vec<Result<RecordBatch, FlightError>>),
     }
 
-    impl TestLocalExecutor {
-        fn new() -> Self {
-            Self {
-                call_count: AtomicU32::new(0),
-            }
+    /// The mock worker: a per-URL queue of outcomes, consumed one per
+    /// dispatch, plus the order in which workers were asked.
+    #[derive(Debug, Default)]
+    struct ScriptedDispatcher {
+        scripts: Mutex<HashMap<String, VecDeque<Scripted>>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl ScriptedDispatcher {
+        fn script(self, worker: &str, outcome: Scripted) -> Self {
+            self.scripts
+                .lock()
+                .unwrap()
+                .entry(worker.to_string())
+                .or_default()
+                .push_back(outcome);
+            self
         }
 
-        fn calls(&self) -> u32 {
-            self.call_count.load(Ordering::SeqCst)
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
         }
     }
 
-    impl LocalExecutor for TestLocalExecutor {
-        fn execute_local(
+    impl FragmentDispatcher for ScriptedDispatcher {
+        fn dispatch(
             &self,
-            _task: &ScanTask,
-            schema: SchemaRef,
-        ) -> DFResult<SendableRecordBatchStream> {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(Int64Array::from(vec![42])) as _],
-            )?;
-            Ok(Box::pin(TestRecordBatchStream {
-                schema,
-                inner: Box::pin(futures::stream::iter(vec![Ok(batch)])),
-            }))
+            _task: ScanTask,
+            worker_url: String,
+        ) -> Pin<Box<dyn Future<Output = Result<WorkerStream, DispatchError>> + Send>> {
+            self.calls.lock().unwrap().push(worker_url.clone());
+            let next = self
+                .scripts
+                .lock()
+                .unwrap()
+                .get_mut(&worker_url)
+                .and_then(|q| q.pop_front());
+            Box::pin(async move {
+                match next {
+                    Some(Scripted::Refuse(e)) => Err(e),
+                    Some(Scripted::Stream(items)) => {
+                        let s: WorkerStream = Box::pin(futures::stream::iter(items));
+                        Ok(s)
+                    }
+                    None => Err(DispatchError::Transport(format!(
+                        "no scripted outcome left for {worker_url}"
+                    ))),
+                }
+            })
         }
     }
 
-    /// Minimal `RecordBatchStream` for test use.
-    struct TestRecordBatchStream {
-        schema: SchemaRef,
-        inner: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>>,
+    fn id_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
     }
 
-    impl Stream for TestRecordBatchStream {
-        type Item = DFResult<RecordBatch>;
-        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            self.inner.as_mut().poll_next(cx)
+    fn one_row(v: i64) -> RecordBatch {
+        RecordBatch::try_new(id_schema(), vec![Arc::new(Int64Array::from(vec![v]))]).unwrap()
+    }
+
+    fn tonic_err(status: tonic::Status) -> Result<RecordBatch, FlightError> {
+        Err(FlightError::Tonic(Box::new(status)))
+    }
+
+    async fn two_healthy_workers() -> Arc<WorkerRegistry> {
+        let registry = Arc::new(WorkerRegistry::new(vec![
+            "http://w1:50052".to_string(),
+            "http://w2:50052".to_string(),
+        ]));
+        registry.mark_healthy("http://w1:50052").await;
+        registry.mark_healthy("http://w2:50052").await;
+        registry
+    }
+
+    /// Build a one-partition exec targeting w1 with the scripted mock worker
+    /// and a callback recorder.
+    fn scripted_exec(
+        registry: &Arc<WorkerRegistry>,
+        dispatcher: &Arc<ScriptedDispatcher>,
+        max_retries: u32,
+        outcomes: &Arc<Mutex<Vec<FragmentOutcome>>>,
+    ) -> DistributedScanExec {
+        let cb: FragmentCallback = {
+            let outcomes = Arc::clone(outcomes);
+            Arc::new(move |_id, outcome, _ms, _rows| outcomes.lock().unwrap().push(outcome))
+        };
+        DistributedScanExec::new(
+            vec![make_task("f1")],
+            vec!["http://w1:50052".to_string()],
+            id_schema(),
+        )
+        .with_worker_registry(Arc::clone(registry))
+        .with_max_retries(max_retries)
+        .with_dispatcher(Arc::clone(dispatcher) as Arc<dyn FragmentDispatcher>)
+        .with_fragment_callback(cb)
+    }
+
+    async fn collect(exec: &DistributedScanExec) -> Vec<DFResult<RecordBatch>> {
+        exec.execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .collect()
+            .await
+    }
+
+    fn sqe_code(err: &DataFusionError) -> sqe_core::SqeErrorCode {
+        // Same conversion the query path applies before auditing.
+        let cloned = DataFusionError::Execution(err.to_string());
+        match err {
+            DataFusionError::External(inner) => inner
+                .downcast_ref::<SqeError>()
+                .map(|e| e.error_code())
+                .unwrap_or_else(|| SqeError::from(cloned).error_code()),
+            _ => SqeError::from(cloned).error_code(),
         }
     }
 
-    impl datafusion::physical_plan::RecordBatchStream for TestRecordBatchStream {
-        fn schema(&self) -> SchemaRef {
-            self.schema.clone()
-        }
+    /// 402 acceptance: a stream that errors after ZERO batches is re-dispatched
+    /// to a second healthy worker and the query succeeds; the first worker is
+    /// marked unhealthy (the fault was `worker_internal`).
+    #[tokio::test]
+    async fn midstream_error_before_first_batch_retries_on_second_worker() {
+        let registry = two_healthy_workers().await;
+        let dispatcher = Arc::new(
+            ScriptedDispatcher::default()
+                .script(
+                    "http://w1:50052",
+                    Scripted::Stream(vec![tonic_err(tonic::Status::internal("pod evicted"))]),
+                )
+                .script("http://w2:50052", Scripted::Stream(vec![Ok(one_row(7))])),
+        );
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        let exec = scripted_exec(&registry, &dispatcher, 1, &outcomes);
+
+        let results = collect(&exec).await;
+        assert_eq!(results.len(), 1, "{results:?}");
+        let batch = results[0].as_ref().expect("retry on w2 must succeed");
+        assert_eq!(
+            batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0),
+            7
+        );
+        assert_eq!(dispatcher.calls(), vec!["http://w1:50052", "http://w2:50052"]);
+        assert_eq!(
+            registry.healthy_workers().await,
+            vec!["http://w2:50052"],
+            "w1 evicted, w2 kept"
+        );
+        assert_eq!(
+            *outcomes.lock().unwrap(),
+            vec![
+                FragmentOutcome::Retrying(FragmentFault::Worker(WorkerFault::WorkerInternal)),
+                FragmentOutcome::Finished,
+            ]
+        );
+    }
+
+    /// 402 acceptance: a stream that errors after ONE batch cannot be retried
+    /// (the consumer holds a prefix): the query fails, the worker is still
+    /// marked unhealthy, and the callback fires `Failed` with the fault.
+    #[tokio::test]
+    async fn midstream_error_after_one_batch_fails_query_and_marks_worker_unhealthy() {
+        let registry = two_healthy_workers().await;
+        let dispatcher = Arc::new(
+            ScriptedDispatcher::default()
+                .script(
+                    "http://w1:50052",
+                    Scripted::Stream(vec![
+                        Ok(one_row(1)),
+                        tonic_err(tonic::Status::internal("pod evicted")),
+                    ]),
+                )
+                .script("http://w2:50052", Scripted::Stream(vec![Ok(one_row(2))])),
+        );
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        let exec = scripted_exec(&registry, &dispatcher, 2, &outcomes);
+
+        let results = collect(&exec).await;
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert!(results[0].is_ok());
+        assert!(results[1].is_err(), "query must fail, not retry with a prefix out");
+        assert_eq!(
+            dispatcher.calls(),
+            vec!["http://w1:50052"],
+            "no re-dispatch after batches were yielded"
+        );
+        assert_eq!(registry.healthy_workers().await, vec!["http://w2:50052"]);
+        assert_eq!(
+            *outcomes.lock().unwrap(),
+            vec![FragmentOutcome::Failed(FragmentFault::Worker(
+                WorkerFault::WorkerInternal
+            ))]
+        );
+    }
+
+    /// 602 acceptance: `PermissionDenied` is the user's problem. The registry
+    /// is untouched, nothing is retried, and the error carries
+    /// `SqeErrorCode::AccessDenied`.
+    #[tokio::test]
+    async fn permission_denied_leaves_registry_unchanged_and_yields_access_denied() {
+        let registry = two_healthy_workers().await;
+        let dispatcher = Arc::new(
+            ScriptedDispatcher::default()
+                .script(
+                    "http://w1:50052",
+                    Scripted::Refuse(DispatchError::Status(tonic::Status::permission_denied(
+                        "S3 AccessDenied: token expired",
+                    ))),
+                )
+                .script("http://w2:50052", Scripted::Stream(vec![Ok(one_row(2))])),
+        );
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        let exec = scripted_exec(&registry, &dispatcher, 2, &outcomes);
+
+        let results = collect(&exec).await;
+        assert_eq!(results.len(), 1);
+        let err = results[0].as_ref().expect_err("must fail");
+        assert_eq!(sqe_code(err), sqe_core::SqeErrorCode::AccessDenied, "{err}");
+        assert_eq!(
+            SqeError::from(DataFusionError::External(Box::new(SqeError::with_code(
+                sqe_core::SqeErrorCode::AccessDenied,
+                "x"
+            ))))
+            .error_code(),
+            sqe_core::SqeErrorCode::AccessDenied,
+            "the query path's From<DataFusionError> must keep the fault code for the audit record"
+        );
+        assert_eq!(dispatcher.calls(), vec!["http://w1:50052"], "no retry");
+        let mut healthy = registry.healthy_workers().await;
+        healthy.sort();
+        assert_eq!(
+            healthy,
+            vec!["http://w1:50052", "http://w2:50052"],
+            "a user fault must not evict a worker"
+        );
+        assert_eq!(
+            *outcomes.lock().unwrap(),
+            vec![FragmentOutcome::Failed(FragmentFault::Worker(
+                WorkerFault::PrincipalDenied
+            ))]
+        );
+    }
+
+    /// 602 acceptance: `ResourceExhausted` from w1 retries on w2 and marks w1
+    /// unhealthy. Uses the lossless `x-sqe-fault` header encoding.
+    #[tokio::test]
+    async fn resource_exhausted_retries_elsewhere_and_marks_worker_unhealthy() {
+        let registry = two_healthy_workers().await;
+        let dispatcher = Arc::new(
+            ScriptedDispatcher::default()
+                .script(
+                    "http://w1:50052",
+                    Scripted::Refuse(DispatchError::Status(
+                        WorkerFault::WorkerResourceExhausted.into_status("memory pool full"),
+                    )),
+                )
+                .script("http://w2:50052", Scripted::Stream(vec![Ok(one_row(2))])),
+        );
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        let exec = scripted_exec(&registry, &dispatcher, 1, &outcomes);
+
+        let results = collect(&exec).await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok(), "{results:?}");
+        assert_eq!(dispatcher.calls(), vec!["http://w1:50052", "http://w2:50052"]);
+        assert_eq!(registry.healthy_workers().await, vec!["http://w2:50052"]);
+        assert_eq!(
+            outcomes.lock().unwrap()[0],
+            FragmentOutcome::Retrying(FragmentFault::Worker(
+                WorkerFault::WorkerResourceExhausted
+            ))
+        );
+    }
+
+    /// 602: `SourceThrottled` backs off and retries the SAME worker; moving it
+    /// would only move the pressure. Registry untouched.
+    #[tokio::test]
+    async fn source_throttled_retries_same_worker_without_touching_registry() {
+        let registry = two_healthy_workers().await;
+        let dispatcher = Arc::new(
+            ScriptedDispatcher::default()
+                .script(
+                    "http://w1:50052",
+                    Scripted::Refuse(DispatchError::Status(
+                        WorkerFault::SourceThrottled.into_status("SlowDown"),
+                    )),
+                )
+                .script("http://w1:50052", Scripted::Stream(vec![Ok(one_row(1))])),
+        );
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        let exec = scripted_exec(&registry, &dispatcher, 1, &outcomes);
+
+        let results = collect(&exec).await;
+        assert!(results.len() == 1 && results[0].is_ok(), "{results:?}");
+        assert_eq!(dispatcher.calls(), vec!["http://w1:50052", "http://w1:50052"]);
+        assert_eq!(registry.healthy_workers().await.len(), 2);
+    }
+
+    /// 602: `TaskInvalid` (bad ticket) fails fast: no retry, no eviction, the
+    /// error is `InvalidArguments`.
+    #[tokio::test]
+    async fn task_invalid_fails_fast_without_retry() {
+        let registry = two_healthy_workers().await;
+        let dispatcher = Arc::new(
+            ScriptedDispatcher::default()
+                .script(
+                    "http://w1:50052",
+                    Scripted::Refuse(DispatchError::Status(tonic::Status::invalid_argument(
+                        "unsupported ScanTask version 9",
+                    ))),
+                )
+                .script("http://w2:50052", Scripted::Stream(vec![Ok(one_row(2))])),
+        );
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        let exec = scripted_exec(&registry, &dispatcher, 2, &outcomes);
+
+        let results = collect(&exec).await;
+        let err = results[0].as_ref().expect_err("must fail");
+        assert_eq!(sqe_code(err), sqe_core::SqeErrorCode::InvalidArguments);
+        assert_eq!(dispatcher.calls(), vec!["http://w1:50052"]);
+        assert_eq!(registry.healthy_workers().await.len(), 2);
+    }
+
+    /// Retries exhausted on worker faults: the last error surfaces, both
+    /// workers are evicted, and the callback reports `Retrying` then `Failed`.
+    #[tokio::test]
+    async fn retries_exhausted_surfaces_error_and_callback_reports_failed() {
+        let registry = two_healthy_workers().await;
+        let dispatcher = Arc::new(
+            ScriptedDispatcher::default()
+                .script(
+                    "http://w1:50052",
+                    Scripted::Refuse(DispatchError::Transport("connection refused".into())),
+                )
+                .script(
+                    "http://w2:50052",
+                    Scripted::Refuse(DispatchError::Transport("connection refused".into())),
+                ),
+        );
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        let exec = scripted_exec(&registry, &dispatcher, 1, &outcomes);
+
+        let results = collect(&exec).await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_err());
+        assert!(registry.healthy_workers().await.is_empty());
+        assert_eq!(
+            *outcomes.lock().unwrap(),
+            vec![
+                FragmentOutcome::Retrying(FragmentFault::Transport),
+                FragmentOutcome::Failed(FragmentFault::Transport),
+            ]
+        );
+    }
+
+    /// The transport fallback: `Unavailable` decodes to no fault and takes the
+    /// evict-and-retry path (a dead connection is not a throttle).
+    #[tokio::test]
+    async fn unavailable_status_is_transport_not_throttle() {
+        let registry = two_healthy_workers().await;
+        let dispatcher = Arc::new(
+            ScriptedDispatcher::default()
+                .script(
+                    "http://w1:50052",
+                    Scripted::Refuse(DispatchError::Status(tonic::Status::unavailable(
+                        "transport error",
+                    ))),
+                )
+                .script("http://w2:50052", Scripted::Stream(vec![Ok(one_row(2))])),
+        );
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        let exec = scripted_exec(&registry, &dispatcher, 1, &outcomes);
+
+        let results = collect(&exec).await;
+        assert!(results[0].is_ok(), "{results:?}");
+        assert_eq!(dispatcher.calls(), vec!["http://w1:50052", "http://w2:50052"]);
+        assert_eq!(registry.healthy_workers().await, vec!["http://w2:50052"]);
+    }
+
+    /// 402: the local-reason marker prints its reason in the default EXPLAIN
+    /// format and delegates everything else to the wrapped scan.
+    #[test]
+    fn coordinator_local_scan_exec_displays_reason() {
+        use datafusion::physical_plan::displayable;
+        let inner: Arc<dyn ExecutionPlan> = Arc::new(DistributedScanExec::new(
+            vec![make_task("f1")],
+            vec!["http://w1:50052".to_string()],
+            id_schema(),
+        ));
+        let marked: Arc<dyn ExecutionPlan> = Arc::new(CoordinatorLocalScanExec::new(
+            Arc::clone(&inner),
+            "below_file_threshold",
+        ));
+        let text = format!("{}", displayable(marked.as_ref()).indent(true));
+        assert!(
+            text.contains("CoordinatorLocalScanExec: coordinator-local, reason=below_file_threshold"),
+            "{text}"
+        );
+        assert_eq!(marked.children().len(), 1);
+        assert_eq!(
+            marked.output_partitioning().partition_count(),
+            inner.output_partitioning().partition_count()
+        );
+        let rebuilt = Arc::clone(&marked)
+            .replace_children(
+                vec![inner],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .unwrap();
+        assert_eq!(
+            rebuilt
+                .downcast_ref::<CoordinatorLocalScanExec>()
+                .unwrap()
+                .reason(),
+            "below_file_threshold",
+            "reason survives a rebuild"
+        );
     }
 
     #[tokio::test]
@@ -2135,75 +3000,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_local_fallback_when_all_workers_fail() {
-        let registry = Arc::new(WorkerRegistry::new(vec!["http://w1:50052".to_string()]));
-        registry.mark_healthy("http://w1:50052").await;
-
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let local_exec = Arc::new(TestLocalExecutor::new());
-
-        let exec = DistributedScanExec::new(
-            vec![make_task("f1")],
-            vec!["http://w1:50052".to_string()],
-            schema,
-        )
-        .with_worker_registry(registry.clone())
-        .with_max_retries(0)
-        .with_local_executor(Arc::new(LocalExecutorWrapper(local_exec.clone())));
-
-        let context = Arc::new(TaskContext::default());
-        let stream = exec.execute(0, context).unwrap();
-
-        use futures::StreamExt;
-        let results: Vec<_> = stream.collect().await;
-
-        assert_eq!(
-            local_exec.calls(),
-            1,
-            "Local executor should be called once"
-        );
-        assert_eq!(results.len(), 1);
-        let batch = results[0].as_ref().unwrap();
-        assert_eq!(batch.num_rows(), 1);
-
-        let col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(
-            col.value(0),
-            42,
-            "Should get marker value from local executor"
-        );
-    }
-
-    #[tokio::test]
     async fn metrics_populated_after_execution() {
-        // Drive a partition through the local-fallback path (worker is
-        // unreachable) and assert the exec's metrics carry the rows that
-        // flowed through the stream, so passive profiles and EXPLAIN
-        // ANALYZE show real numbers on the DistributedScanExec row.
-        let registry = Arc::new(WorkerRegistry::new(vec!["http://w1:50052".to_string()]));
-        registry.mark_healthy("http://w1:50052").await;
+        // Drive a partition through a scripted worker that ships one row and
+        // assert the exec's metrics carry the rows that flowed through the
+        // stream, so passive profiles and EXPLAIN ANALYZE show real numbers
+        // on the DistributedScanExec row.
+        let registry = two_healthy_workers().await;
+        let dispatcher = Arc::new(
+            ScriptedDispatcher::default()
+                .script("http://w1:50052", Scripted::Stream(vec![Ok(one_row(42))])),
+        );
+        let outcomes = Arc::new(Mutex::new(Vec::new()));
+        let exec = scripted_exec(&registry, &dispatcher, 0, &outcomes);
 
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let local_exec = Arc::new(TestLocalExecutor::new());
-
-        let exec = DistributedScanExec::new(
-            vec![make_task("f1")],
-            vec!["http://w1:50052".to_string()],
-            schema,
-        )
-        .with_worker_registry(registry)
-        .with_max_retries(0)
-        .with_local_executor(Arc::new(LocalExecutorWrapper(local_exec)));
-
-        let context = Arc::new(TaskContext::default());
-        let stream = exec.execute(0, context).unwrap();
-
-        use futures::StreamExt;
-        let results: Vec<_> = stream.collect().await;
+        let results = collect(&exec).await;
         assert_eq!(results.len(), 1);
         assert!(results[0].is_ok());
 
@@ -2213,12 +3023,13 @@ mod tests {
         assert_eq!(
             metrics.output_rows(),
             Some(1),
-            "baseline metrics must record the one fallback row"
+            "baseline metrics must record the one row"
         );
         assert!(
             metrics.elapsed_compute().is_some(),
             "elapsed_compute must be recorded"
         );
+        assert_eq!(*outcomes.lock().unwrap(), vec![FragmentOutcome::Finished]);
     }
 
     #[tokio::test]
@@ -2279,164 +3090,42 @@ mod tests {
         );
     }
 
+    /// Two partitions failing at once each surface their own error; there is
+    /// no per-fragment local fallback to paper over a dead cluster.
     #[tokio::test]
-    async fn test_local_fallback_after_retries_exhausted() {
-        let registry = Arc::new(WorkerRegistry::new(vec![
-            "http://w1:50052".to_string(),
-            "http://w2:50052".to_string(),
-        ]));
-        registry.mark_healthy("http://w1:50052").await;
-        registry.mark_healthy("http://w2:50052").await;
-
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let local_exec = Arc::new(TestLocalExecutor::new());
-
-        let exec = DistributedScanExec::new(
-            vec![make_task("f1")],
-            vec!["http://w1:50052".to_string()],
-            schema,
-        )
-        .with_worker_registry(registry.clone())
-        .with_max_retries(1)
-        .with_local_executor(Arc::new(LocalExecutorWrapper(local_exec.clone())));
-
-        let context = Arc::new(TaskContext::default());
-        let stream = exec.execute(0, context).unwrap();
-
-        use futures::StreamExt;
-        let results: Vec<_> = stream.collect().await;
-
-        assert_eq!(local_exec.calls(), 1);
-        assert_eq!(results.len(), 1);
-        assert!(results[0].is_ok());
-    }
-
-    /// Wrapper to make `Arc<TestLocalExecutor>` implement `LocalExecutor`.
-    #[derive(Debug)]
-    struct LocalExecutorWrapper(Arc<TestLocalExecutor>);
-
-    impl LocalExecutor for LocalExecutorWrapper {
-        fn execute_local(
-            &self,
-            task: &ScanTask,
-            schema: SchemaRef,
-        ) -> DFResult<SendableRecordBatchStream> {
-            self.0.execute_local(task, schema)
-        }
-    }
-
-    #[tokio::test]
-    async fn test_concurrent_retry_two_partitions_fail_simultaneously() {
-        // Two partitions fail simultaneously, both should retry on different workers
-        // and ultimately fall back to local execution.
-        let registry = Arc::new(WorkerRegistry::new(vec![
-            "http://w1:50052".to_string(),
-            "http://w2:50052".to_string(),
-        ]));
-        registry.mark_healthy("http://w1:50052").await;
-        registry.mark_healthy("http://w2:50052").await;
-
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let local_exec = Arc::new(TestLocalExecutor::new());
-
+    async fn test_concurrent_two_partitions_fail_independently() {
+        let registry = two_healthy_workers().await;
+        let refuse = || {
+            Scripted::Refuse(DispatchError::Transport(
+                "connection refused".to_string(),
+            ))
+        };
+        let dispatcher = Arc::new(
+            ScriptedDispatcher::default()
+                .script("http://w1:50052", refuse())
+                .script("http://w1:50052", refuse())
+                .script("http://w2:50052", refuse())
+                .script("http://w2:50052", refuse()),
+        );
         let exec = Arc::new(
             DistributedScanExec::new(
                 vec![make_task("f1"), make_task("f2")],
                 vec!["http://w1:50052".to_string(), "http://w2:50052".to_string()],
-                schema,
+                id_schema(),
             )
             .with_worker_registry(registry.clone())
             .with_max_retries(1)
-            .with_local_executor(Arc::new(LocalExecutorWrapper(local_exec.clone()))),
+            .with_dispatcher(Arc::clone(&dispatcher) as Arc<dyn FragmentDispatcher>),
         );
-
         let context = Arc::new(TaskContext::default());
-
-        // Execute both partitions concurrently
-        let exec0 = exec.clone();
-        let ctx0 = context.clone();
-        let exec1 = exec.clone();
-        let ctx1 = context.clone();
-
+        let (exec0, ctx0, exec1, ctx1) = (exec.clone(), context.clone(), exec.clone(), context);
         let (res0, res1) = tokio::join!(
-            async move {
-                use futures::StreamExt;
-                let stream = exec0.execute(0, ctx0).unwrap();
-                stream.collect::<Vec<_>>().await
-            },
-            async move {
-                use futures::StreamExt;
-                let stream = exec1.execute(1, ctx1).unwrap();
-                stream.collect::<Vec<_>>().await
-            }
+            async move { exec0.execute(0, ctx0).unwrap().collect::<Vec<_>>().await },
+            async move { exec1.execute(1, ctx1).unwrap().collect::<Vec<_>>().await }
         );
-
-        // Both partitions should have fallen back to local execution
-        // (workers are unreachable), so the local executor should be called twice
-        assert_eq!(
-            local_exec.calls(),
-            2,
-            "Local executor should be called for each failed partition"
-        );
-        assert_eq!(res0.len(), 1, "partition 0 should produce one batch");
-        assert_eq!(res1.len(), 1, "partition 1 should produce one batch");
-        assert!(res0[0].is_ok(), "partition 0 batch should be Ok");
-        assert!(res1[0].is_ok(), "partition 1 batch should be Ok");
-    }
-
-    #[tokio::test]
-    async fn test_fallback_after_all_workers_fail() {
-        // When all workers in the registry are marked unhealthy,
-        // verify the fallback executor is called.
-        let registry = Arc::new(WorkerRegistry::new(vec![
-            "http://w1:50052".to_string(),
-            "http://w2:50052".to_string(),
-            "http://w3:50052".to_string(),
-        ]));
-        registry.mark_healthy("http://w1:50052").await;
-        registry.mark_healthy("http://w2:50052").await;
-        registry.mark_healthy("http://w3:50052").await;
-
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let local_exec = Arc::new(TestLocalExecutor::new());
-
-        let exec = DistributedScanExec::new(
-            vec![make_task("f1")],
-            vec!["http://w1:50052".to_string()],
-            schema,
-        )
-        .with_worker_registry(registry.clone())
-        .with_max_retries(2) // allow retries across workers
-        .with_local_executor(Arc::new(LocalExecutorWrapper(local_exec.clone())));
-
-        let context = Arc::new(TaskContext::default());
-        let stream = exec.execute(0, context).unwrap();
-
-        use futures::StreamExt;
-        let results: Vec<_> = stream.collect().await;
-
-        // All workers are unreachable, so after exhausting retries the fallback
-        // should have been invoked.
-        assert_eq!(
-            local_exec.calls(),
-            1,
-            "Local executor should be called when all workers fail"
-        );
-        assert_eq!(results.len(), 1);
-        let batch = results[0].as_ref().unwrap();
-        let col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(col.value(0), 42, "Should get marker value from fallback");
-
-        // Verify the workers got marked unhealthy
-        assert!(
-            registry.healthy_workers().await.is_empty()
-                || registry.healthy_workers().await.len() < 3,
-            "At least the attempted workers should be marked unhealthy"
-        );
+        assert!(res0.len() == 1 && res0[0].is_err(), "{res0:?}");
+        assert!(res1.len() == 1 && res1[0].is_err(), "{res1:?}");
+        assert!(registry.healthy_workers().await.is_empty());
     }
 
     #[tokio::test]

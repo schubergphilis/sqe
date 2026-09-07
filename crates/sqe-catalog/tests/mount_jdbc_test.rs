@@ -130,6 +130,8 @@ async fn an_unknown_secret_reference_is_refused() {
 
 /// The ATTACH surface end to end against a real database: prefix stripping, the
 /// spliced secret, and a namespace round-trip proving the handle actually works.
+///
+/// last verified: never in this tree
 #[tokio::test]
 #[ignore = "requires live Postgres; docker compose -f docker-compose.test.yml up -d postgres"]
 async fn jdbc_attach_roundtrip_against_live_postgres() {

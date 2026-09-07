@@ -56,6 +56,12 @@ pub mod worker_registry;
 pub mod write_handler;
 pub mod writer;
 
+/// In-process test rigs (architecture review 513). Compiled for this crate's
+/// own unit tests and, as public library code, for `tests/*.rs` under
+/// `--features test-sqlite`; never part of a production build.
+#[cfg(any(test, feature = "test-sqlite"))]
+pub mod test_support;
+
 /// `write_memory` (pool-tracked write buffers) moved to `sqe-compaction` so
 /// the worker-side compaction/write path can reuse it without depending on
 /// this crate. Re-exported under its original path so

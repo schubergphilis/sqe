@@ -645,49 +645,559 @@ fn iceberg_to_sql_type_info(t: &iceberg::spec::Type) -> SqlTypeInfo {
     }
 }
 
+/// `InformationSchemaProvider` driven against a wiremock Polaris
+/// (architecture review 313): rows and catalog call counts per table.
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::Arc;
 
-    #[test]
-    fn test_table_names() {
-        let names = vec!["tables", "columns", "schemata"];
-        for name in &names {
-            assert!(matches!(name, &"tables" | &"columns" | &"schemata"));
+    use arrow_array::{Array, Int32Array, StringArray};
+    use datafusion::physical_plan::collect;
+    use datafusion::prelude::{col, lit, SessionContext};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::rest_catalog::TableMetadataCache;
+
+    const WAREHOUSE: &str = "test-warehouse";
+    const NAMESPACES_PATH: &str = "/v1/test-warehouse/namespaces";
+
+    fn tables_path(ns: &str) -> String {
+        format!("/v1/test-warehouse/namespaces/{ns}/tables")
+    }
+
+    fn table_path(ns: &str, table: &str) -> String {
+        format!("/v1/test-warehouse/namespaces/{ns}/tables/{table}")
+    }
+
+    /// `loadTable` body: `id` (required int) and `data` (optional string).
+    fn load_table_body(table: &str) -> serde_json::Value {
+        serde_json::json!({
+            "metadata-location": format!("s3://warehouse/{table}/metadata/00001.metadata.json"),
+            "metadata": {
+                "format-version": 2,
+                "table-uuid": uuid::Uuid::new_v4().to_string(),
+                "location": format!("s3://warehouse/{table}"),
+                "last-sequence-number": 0,
+                "last-updated-ms": 1_700_000_000_000_i64,
+                "last-column-id": 2,
+                "current-schema-id": 0,
+                "schemas": [{
+                    "type": "struct",
+                    "schema-id": 0,
+                    "fields": [
+                        {"id": 1, "name": "id", "required": true, "type": "int"},
+                        {"id": 2, "name": "data", "required": false, "type": "string"}
+                    ]
+                }],
+                "default-spec-id": 0,
+                "partition-specs": [{"spec-id": 0, "fields": []}],
+                "last-partition-id": 999,
+                "default-sort-order-id": 0,
+                "sort-orders": [{"order-id": 0, "fields": []}],
+                "properties": {},
+                "current-snapshot-id": -1,
+                "snapshots": [],
+                "snapshot-log": [],
+                "metadata-log": []
+            },
+            "config": {}
+        })
+    }
+
+    fn identifiers(ns: &str, names: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "identifiers": names
+                .iter()
+                .map(|n| serde_json::json!({"namespace": [ns], "name": n}))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    fn forbidden() -> ResponseTemplate {
+        ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error": {"message": "not authorized", "type": "NotAuthorizedException", "code": 403}
+        }))
+    }
+
+    fn unavailable() -> ResponseTemplate {
+        ResponseTemplate::new(503).set_body_json(serde_json::json!({
+            "error": {"message": "backend down", "type": "ServiceUnavailable", "code": 503}
+        }))
+    }
+
+    async fn mount_json(server: &MockServer, url: &str, body: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path(url))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    /// Two namespaces, three tables, every table loadable: `sales.orders`,
+    /// `sales.customers`, `hr.employees`.
+    async fn polaris(server: &MockServer) {
+        mount_json(
+            server,
+            "/v1/config",
+            serde_json::json!({"overrides": {"prefix": WAREHOUSE}, "defaults": {}}),
+        )
+        .await;
+        mount_json(
+            server,
+            NAMESPACES_PATH,
+            serde_json::json!({"namespaces": [["sales"], ["hr"]]}),
+        )
+        .await;
+        mount_json(
+            server,
+            &tables_path("sales"),
+            identifiers("sales", &["orders", "customers"]),
+        )
+        .await;
+        mount_json(
+            server,
+            &tables_path("hr"),
+            identifiers("hr", &["employees"]),
+        )
+        .await;
+        for (ns, table) in [
+            ("sales", "orders"),
+            ("sales", "customers"),
+            ("hr", "employees"),
+        ] {
+            mount_json(server, &table_path(ns, table), load_table_body(table)).await;
+        }
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(server)
+            .await;
+    }
+
+    async fn session(
+        server: &MockServer,
+        token: &str,
+        cache: TableMetadataCache,
+    ) -> Arc<SessionCatalog> {
+        Arc::new(
+            SessionCatalog::new(
+                &server.uri(),
+                WAREHOUSE,
+                token,
+                &sqe_core::config::StorageConfig::default(),
+                Some(cache),
+                None,
+                None,
+                false,
+            )
+            .await
+            .expect("construct session catalog"),
+        )
+    }
+
+    async fn provider_for(server: &MockServer, token: &str) -> InformationSchemaProvider {
+        let catalog = session(server, token, TableMetadataCache::new(0)).await;
+        InformationSchemaProvider::new(catalog, WAREHOUSE.to_string(), None, None)
+    }
+
+    /// Scan `table` of `provider` with `filters` and collect every row.
+    async fn scan_rows(
+        provider: &InformationSchemaProvider,
+        table: &str,
+        filters: &[Expr],
+    ) -> DFResult<Vec<RecordBatch>> {
+        let ctx = SessionContext::new();
+        let table = provider
+            .table(table)
+            .await?
+            .expect("information_schema table exists");
+        let plan = table.scan(&ctx.state(), None, filters, None).await?;
+        collect(plan, ctx.task_ctx()).await
+    }
+
+    fn strings(batches: &[RecordBatch], column: &str) -> Vec<String> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let array = b
+                    .column_by_name(column)
+                    .expect("column present")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("utf8 column");
+                (0..array.len())
+                    .map(|i| array.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn ints(batches: &[RecordBatch], column: &str) -> Vec<Option<i32>> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let array = b
+                    .column_by_name(column)
+                    .expect("column present")
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("int32 column");
+                (0..array.len())
+                    .map(|i| array.is_valid(i).then(|| array.value(i)))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn row_count(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(RecordBatch::num_rows).sum()
+    }
+
+    /// Requests the mock saw for `method_name` on `url_path`.
+    async fn calls(server: &MockServer, method_name: &str, url_path: &str) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.method.as_str() == method_name && r.url.path() == url_path)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn provider_exposes_exactly_the_three_tables() {
+        let server = MockServer::start().await;
+        polaris(&server).await;
+        let provider = provider_for(&server, "info-schema-names").await;
+
+        assert_eq!(provider.table_names(), ["tables", "columns", "schemata"]);
+        for name in ["tables", "columns", "schemata"] {
+            assert!(provider.table_exist(name));
+            assert!(provider.table(name).await.unwrap().is_some());
+        }
+        assert!(!provider.table_exist("routines"));
+        assert!(provider.table("routines").await.unwrap().is_none());
+        assert_eq!(calls(&server, "GET", NAMESPACES_PATH).await, 2);
+    }
+
+    /// `schemata`: one row per namespace, one `listNamespaces` call, and no
+    /// call at all when the provider carries a pre-resolved list.
+    #[tokio::test]
+    async fn schemata_lists_every_namespace_once() {
+        let server = MockServer::start().await;
+        polaris(&server).await;
+        let provider = provider_for(&server, "info-schema-schemata").await;
+
+        let batches = scan_rows(&provider, "schemata", &[]).await.unwrap();
+        assert_eq!(row_count(&batches), 2);
+        assert_eq!(strings(&batches, "schema_name"), ["sales", "hr"]);
+        assert_eq!(strings(&batches, "catalog_name"), [WAREHOUSE, WAREHOUSE]);
+        assert_eq!(batches[0].schema().fields().len(), 2);
+        assert_eq!(calls(&server, "GET", NAMESPACES_PATH).await, 1);
+
+        let cached = provider.with_cached_namespaces(vec!["only_this".to_string()]);
+        let batches = scan_rows(&cached, "schemata", &[]).await.unwrap();
+        assert_eq!(strings(&batches, "schema_name"), ["only_this"]);
+        assert_eq!(
+            calls(&server, "GET", NAMESPACES_PATH).await,
+            1,
+            "a cached namespace list must not re-list"
+        );
+    }
+
+    /// `tables`: one row per table across every namespace, one `listTables`
+    /// per namespace, no `loadTable`.
+    #[tokio::test]
+    async fn tables_lists_one_row_per_table_with_one_list_call_per_namespace() {
+        let server = MockServer::start().await;
+        polaris(&server).await;
+        let provider = provider_for(&server, "info-schema-tables").await;
+
+        let batches = scan_rows(&provider, "tables", &[]).await.unwrap();
+
+        assert_eq!(row_count(&batches), 3);
+        assert_eq!(batches[0].schema().fields().len(), 4);
+        assert_eq!(
+            strings(&batches, "table_name"),
+            ["orders", "customers", "employees"]
+        );
+        assert_eq!(strings(&batches, "table_schema"), ["sales", "sales", "hr"]);
+        assert!(strings(&batches, "table_type")
+            .iter()
+            .all(|t| t == "BASE TABLE"));
+        assert_eq!(calls(&server, "GET", NAMESPACES_PATH).await, 1);
+        assert_eq!(calls(&server, "GET", &tables_path("sales")).await, 1);
+        assert_eq!(calls(&server, "GET", &tables_path("hr")).await, 1);
+        assert_eq!(
+            calls(&server, "GET", &table_path("sales", "orders")).await,
+            0
+        );
+    }
+
+    /// `tables`: a namespace the principal may not list is skipped; an
+    /// outage on one namespace fails the whole table as `CatalogUnavailable`.
+    /// (wiremock serves the first matching mount, so the override goes in
+    /// before the baseline fixture.)
+    #[tokio::test]
+    async fn tables_skips_forbidden_namespaces_and_fails_on_outages() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(tables_path("hr")))
+            .respond_with(forbidden())
+            .mount(&server)
+            .await;
+        polaris(&server).await;
+        let provider = provider_for(&server, "info-schema-tables-403").await;
+
+        let batches = scan_rows(&provider, "tables", &[]).await.unwrap();
+        assert_eq!(strings(&batches, "table_name"), ["orders", "customers"]);
+
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path(tables_path("hr")))
+            .respond_with(unavailable())
+            .mount(&server)
+            .await;
+        polaris(&server).await;
+        let provider = provider_for(&server, "info-schema-tables-503").await;
+
+        let err = scan_rows(&provider, "tables", &[])
+            .await
+            .expect_err("an outage is not an empty schema");
+        let DataFusionError::External(inner) = err else {
+            panic!("expected External, got {err:?}");
+        };
+        assert_eq!(
+            inner
+                .downcast_ref::<sqe_core::SqeError>()
+                .expect("SqeError")
+                .error_code(),
+            sqe_core::SqeErrorCode::CatalogUnavailable
+        );
+    }
+
+    /// `columns`: every column of every table with SQL-standard types, one
+    /// `loadTable` per table (the metadata cache is disabled here).
+    #[tokio::test]
+    async fn columns_lists_every_column_and_loads_each_table_once() {
+        let server = MockServer::start().await;
+        polaris(&server).await;
+        let provider = provider_for(&server, "info-schema-columns").await;
+
+        let batches = scan_rows(&provider, "columns", &[]).await.unwrap();
+
+        assert_eq!(row_count(&batches), 6);
+        assert_eq!(batches[0].schema().fields().len(), 13);
+        assert_eq!(
+            strings(&batches, "table_name"),
+            [
+                "orders",
+                "orders",
+                "customers",
+                "customers",
+                "employees",
+                "employees"
+            ]
+        );
+        assert_eq!(
+            strings(&batches, "column_name"),
+            ["id", "data", "id", "data", "id", "data"]
+        );
+        assert_eq!(
+            ints(&batches, "ordinal_position"),
+            [Some(1), Some(2), Some(1), Some(2), Some(1), Some(2)]
+        );
+        assert_eq!(
+            strings(&batches, "is_nullable"),
+            ["NO", "YES", "NO", "YES", "NO", "YES"]
+        );
+        assert_eq!(
+            strings(&batches, "data_type"),
+            ["integer", "varchar", "integer", "varchar", "integer", "varchar"]
+        );
+        assert_eq!(ints(&batches, "numeric_precision")[..2], [Some(32), None]);
+        assert_eq!(
+            ints(&batches, "character_maximum_length")[..2],
+            [None, Some(i32::MAX)]
+        );
+        for (ns, table) in [
+            ("sales", "orders"),
+            ("sales", "customers"),
+            ("hr", "employees"),
+        ] {
+            assert_eq!(calls(&server, "GET", &table_path(ns, table)).await, 1);
         }
     }
 
-    #[test]
-    fn test_tables_schema() {
-        let schema = Schema::new(vec![
-            Field::new("table_catalog", DataType::Utf8, false),
-            Field::new("table_schema", DataType::Utf8, false),
-            Field::new("table_name", DataType::Utf8, false),
-            Field::new("table_type", DataType::Utf8, false),
-        ]);
-        assert_eq!(schema.fields().len(), 4);
+    /// Review 307: `WHERE table_schema = 'hr'` lists only that namespace,
+    /// so `listTables` and `loadTable` run for `hr` alone.
+    #[tokio::test]
+    async fn columns_with_table_schema_filter_lists_one_namespace() {
+        let server = MockServer::start().await;
+        polaris(&server).await;
+        let provider = provider_for(&server, "info-schema-columns-filter").await;
+
+        let batches = scan_rows(&provider, "columns", &[col("table_schema").eq(lit("hr"))])
+            .await
+            .unwrap();
+
+        assert_eq!(row_count(&batches), 2);
+        assert_eq!(strings(&batches, "table_schema"), ["hr", "hr"]);
+        assert_eq!(calls(&server, "GET", &tables_path("hr")).await, 1);
+        assert_eq!(calls(&server, "GET", &tables_path("sales")).await, 0);
+        assert_eq!(
+            calls(&server, "GET", &table_path("sales", "orders")).await,
+            0
+        );
+        assert_eq!(
+            calls(&server, "GET", &table_path("hr", "employees")).await,
+            1
+        );
     }
 
-    #[test]
-    fn test_columns_schema() {
-        // 7 base columns plus 6 extension columns required by dbt-trino
-        // and SQL-conforming JDBC drivers (issue #99).
-        let schema = Schema::new(vec![
-            Field::new("table_catalog", DataType::Utf8, false),
-            Field::new("table_schema", DataType::Utf8, false),
-            Field::new("table_name", DataType::Utf8, false),
-            Field::new("column_name", DataType::Utf8, false),
-            Field::new("ordinal_position", DataType::Int32, false),
-            Field::new("is_nullable", DataType::Utf8, false),
-            Field::new("data_type", DataType::Utf8, false),
-            Field::new("character_maximum_length", DataType::Int32, true),
-            Field::new("numeric_precision", DataType::Int32, true),
-            Field::new("numeric_scale", DataType::Int32, true),
-            Field::new("datetime_precision", DataType::Int32, true),
-            Field::new("column_default", DataType::Utf8, true),
-            Field::new("udt_name", DataType::Utf8, true),
-        ]);
-        assert_eq!(schema.fields().len(), 13);
+    /// Review 307: with a shared metadata cache inside the authorization
+    /// recheck window, a second `columns` build costs zero `loadTable` GETs.
+    #[tokio::test]
+    async fn warm_cache_columns_build_costs_no_load_table_round_trips() {
+        let server = MockServer::start().await;
+        polaris(&server).await;
+        let cache = TableMetadataCache::new(300).with_authorization_recheck(300);
+        let catalog = session(&server, "info-schema-columns-warm", cache).await;
+        let provider = InformationSchemaProvider::new(catalog, WAREHOUSE.to_string(), None, None);
+
+        scan_rows(&provider, "columns", &[]).await.unwrap();
+        let cold = calls(&server, "GET", &table_path("sales", "orders")).await;
+        assert_eq!(cold, 1);
+
+        let batches = scan_rows(&provider, "columns", &[]).await.unwrap();
+        assert_eq!(row_count(&batches), 6);
+        assert_eq!(
+            calls(&server, "GET", &table_path("sales", "orders")).await,
+            cold
+        );
+        assert_eq!(
+            calls(&server, "GET", &table_path("hr", "employees")).await,
+            1
+        );
+    }
+
+    /// `columns`: a table whose `loadTable` fails is omitted; the others are
+    /// still listed.
+    #[tokio::test]
+    async fn columns_omits_a_table_whose_load_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(table_path("sales", "customers")))
+            .respond_with(unavailable())
+            .mount(&server)
+            .await;
+        polaris(&server).await;
+        let provider = provider_for(&server, "info-schema-columns-load-fail").await;
+
+        let batches = scan_rows(&provider, "columns", &[]).await.unwrap();
+
+        assert_eq!(
+            strings(&batches, "table_name"),
+            ["orders", "orders", "employees", "employees"]
+        );
+    }
+
+    /// `columns` with a policy store: restricted columns are invisible and
+    /// the ordinal positions close the gap, so a denied user cannot infer
+    /// that a column exists.
+    #[tokio::test]
+    async fn columns_hides_policy_restricted_columns() {
+        let server = MockServer::start().await;
+        polaris(&server).await;
+        let store = sqe_policy::policy_store::InMemoryPolicyStore::new();
+        store
+            .add_table_policy(
+                "sales",
+                "orders",
+                sqe_policy::ResolvedPolicy {
+                    restricted_columns: vec!["id".to_string()],
+                    ..Default::default()
+                },
+            )
+            .await;
+        let user = SessionUser {
+            username: "alice".to_string(),
+            roles: Vec::new(),
+            subject: None,
+            email: None,
+            groups: Vec::new(),
+        };
+        let catalog = session(
+            &server,
+            "info-schema-columns-policy",
+            TableMetadataCache::new(0),
+        )
+        .await;
+        let provider = InformationSchemaProvider::new(
+            catalog,
+            WAREHOUSE.to_string(),
+            Some(Arc::new(store)),
+            Some(user),
+        );
+
+        let batches = scan_rows(
+            &provider,
+            "columns",
+            &[col("table_schema").eq(lit("sales"))],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            strings(&batches, "table_name"),
+            ["orders", "customers", "customers"]
+        );
+        assert_eq!(strings(&batches, "column_name"), ["data", "id", "data"]);
+        assert_eq!(
+            ints(&batches, "ordinal_position"),
+            [Some(1), Some(1), Some(2)]
+        );
+    }
+
+    /// A catalog that cannot list namespaces contributes no rows to any of
+    /// the three tables instead of failing them.
+    #[tokio::test]
+    async fn unlistable_catalog_contributes_no_rows() {
+        let server = MockServer::start().await;
+        mount_json(
+            &server,
+            "/v1/config",
+            serde_json::json!({"overrides": {"prefix": WAREHOUSE}, "defaults": {}}),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path(NAMESPACES_PATH))
+            .respond_with(unavailable())
+            .mount(&server)
+            .await;
+        let provider = provider_for(&server, "info-schema-unlistable").await;
+
+        for table in ["schemata", "tables", "columns"] {
+            let batches = scan_rows(&provider, table, &[]).await.unwrap();
+            assert_eq!(row_count(&batches), 0, "{table}");
+        }
+
+        server.reset().await;
+        mount_json(
+            &server,
+            "/v1/config",
+            serde_json::json!({"overrides": {"prefix": WAREHOUSE}, "defaults": {}}),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path(NAMESPACES_PATH))
+            .respond_with(forbidden())
+            .mount(&server)
+            .await;
+        let provider = provider_for(&server, "info-schema-forbidden").await;
+        let batches = scan_rows(&provider, "schemata", &[]).await.unwrap();
+        assert_eq!(row_count(&batches), 0);
     }
 
     #[test]
@@ -772,14 +1282,5 @@ mod tests {
             .downcast_ref::<sqe_core::SqeError>()
             .expect("SqeError");
         assert_eq!(sqe.error_code(), sqe_core::SqeErrorCode::CatalogUnavailable);
-    }
-
-    #[test]
-    fn test_schemata_schema() {
-        let schema = Schema::new(vec![
-            Field::new("catalog_name", DataType::Utf8, false),
-            Field::new("schema_name", DataType::Utf8, false),
-        ]);
-        assert_eq!(schema.fields().len(), 2);
     }
 }

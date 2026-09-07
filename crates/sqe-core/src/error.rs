@@ -367,6 +367,12 @@ fn datafusion_error_code(e: &DataFusionError) -> SqeErrorCode {
                 if let Some(df) = inner.downcast_ref::<DataFusionError>() {
                     return datafusion_error_code(df);
                 }
+                // A typed SqeError smuggled through DataFusion (the
+                // distributed scan wraps worker faults this way, finding 602)
+                // keeps its code instead of collapsing to ExecutionFailed.
+                if let Some(sqe) = inner.downcast_ref::<SqeError>() {
+                    return sqe.error_code();
+                }
             }
             SqeErrorCode::ExecutionFailed
         }

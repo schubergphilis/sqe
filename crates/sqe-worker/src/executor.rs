@@ -35,9 +35,111 @@ pub fn configure_row_group_pruning(enabled: bool) {
 
 use sqe_catalog::FooterCache;
 use sqe_metrics::{MetricsRegistry, WorkerMetricsRegistry};
-use sqe_planner::ScanTask;
+use sqe_planner::{classify_anyhow_error, ScanTask, WorkerFault};
 
 use crate::credential_channel::RefreshableCredentials;
+
+/// A scan error classified while it was still typed (review finding 602).
+///
+/// The producer loop turns every failure into `anyhow::Error` before it
+/// crosses the mpsc channel, and the Flight service used to stringify that
+/// into `Status::internal`. By then a user's expired S3 token and a worker OOM
+/// looked identical. `ScanFault` is attached at each emission point, where the
+/// `object_store` / parquet / budget error is still a concrete type, so the
+/// Flight boundary only has to read [`scan_fault`].
+///
+/// `Display` shows the wrapped error's own message and `source()` continues
+/// its chain, so `{err:#}` on the enclosing `anyhow::Error` prints the same
+/// text it did before the tag existed.
+#[derive(Debug)]
+pub struct ScanFault {
+    fault: WorkerFault,
+    source: anyhow::Error,
+}
+
+impl ScanFault {
+    /// Wrap `source` with an explicit classification.
+    pub fn tag(fault: WorkerFault, source: anyhow::Error) -> anyhow::Error {
+        anyhow::Error::new(Self { fault, source })
+    }
+
+    /// Wrap `source` with the classification its typed chain implies. An
+    /// error that already carries a tag is returned unchanged.
+    pub fn classify(source: anyhow::Error) -> anyhow::Error {
+        if tagged_fault(&source).is_some() {
+            return source;
+        }
+        let fault = classify_anyhow_error(&source);
+        Self::tag(fault, source)
+    }
+
+    /// The classification.
+    pub fn fault(&self) -> WorkerFault {
+        self.fault
+    }
+}
+
+impl std::fmt::Display for ScanFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
+impl std::error::Error for ScanFault {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // `Display` already printed the wrapped error's outermost message;
+        // continue from its first cause so `{:#}` does not repeat it.
+        self.source.chain().nth(1)
+    }
+}
+
+fn tagged_fault(err: &anyhow::Error) -> Option<WorkerFault> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<ScanFault>().map(ScanFault::fault))
+}
+
+/// The [`WorkerFault`] of a scan error: the tag the producer attached, or a
+/// best-effort classification of the chain for errors that bypassed it.
+pub fn scan_fault(err: &anyhow::Error) -> WorkerFault {
+    tagged_fault(err).unwrap_or_else(|| classify_anyhow_error(err))
+}
+
+/// Builds the [`ObjectStore`] a scan reads through.
+///
+/// Called once at setup with `None` (use the ticket's own credentials) and
+/// again on every credential refresh with the pushed credentials. Production
+/// uses [`s3_object_store_factory`]; the protocol tests install a recording
+/// stub so the refresh path is observable without S3.
+pub type ObjectStoreFactory = Arc<
+    dyn Fn(&ScanTask, Option<&RefreshableCredentials>) -> anyhow::Result<Arc<dyn ObjectStore>>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// The production factory: an `AmazonS3` store from the ticket's endpoint,
+/// region and credentials (or the refreshed ones).
+pub fn s3_object_store_factory() -> ObjectStoreFactory {
+    Arc::new(
+        |task: &ScanTask, refreshed: Option<&RefreshableCredentials>| {
+            let store: Arc<dyn ObjectStore> = match refreshed {
+                None => Arc::new(build_object_store_with_creds(
+                    task,
+                    task.credentials.access_key(),
+                    task.credentials.secret_key(),
+                    task.credentials.session_token(),
+                )?),
+                Some(creds) => Arc::new(build_object_store_with_creds(
+                    task,
+                    &creds.access_key_id,
+                    &creds.secret_access_key,
+                    &creds.session_token,
+                )?),
+            };
+            Ok(store)
+        },
+    )
+}
 
 /// A decoded batch that carries its scan-budget permit until the consumer
 /// (Flight encoder or test drain) drops it.
@@ -403,17 +505,52 @@ pub async fn execute_scan_streaming(
     footer_cache: Option<Arc<FooterCache>>,
     coordinator_metrics: Option<Arc<MetricsRegistry>>,
 ) -> anyhow::Result<(SchemaRef, ScanBatchStream)> {
+    execute_scan_streaming_with_factory(
+        task,
+        metrics,
+        session_ctx,
+        credential_rx,
+        footer_cache,
+        coordinator_metrics,
+        s3_object_store_factory(),
+        None,
+    )
+    .await
+}
+
+/// Like [`execute_scan_streaming`], with the [`ObjectStoreFactory`] that
+/// builds the initial store and every refreshed one, and an optional
+/// worker-wide scan [`ByteBudget`] (`None` derives one from the session pool).
+///
+/// This is the seam the Flight service and the protocol tests share: the
+/// service passes the production S3 factory, the tests pass a stub that
+/// records which credentials each `get` used.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_scan_streaming_with_factory(
+    task: ScanTask,
+    metrics: Option<Arc<WorkerMetricsRegistry>>,
+    session_ctx: SessionContext,
+    credential_rx: Option<watch::Receiver<Option<RefreshableCredentials>>>,
+    footer_cache: Option<Arc<FooterCache>>,
+    coordinator_metrics: Option<Arc<MetricsRegistry>>,
+    store_factory: ObjectStoreFactory,
+    scan_budget: Option<ByteBudget>,
+) -> anyhow::Result<(SchemaRef, ScanBatchStream)> {
     if task.data_file_paths.is_empty() {
-        anyhow::bail!("ScanTask has no data files");
+        return Err(ScanFault::tag(
+            WorkerFault::TaskInvalid,
+            anyhow::anyhow!("ScanTask has no data files"),
+        ));
     }
-    let store: Arc<dyn ObjectStore> = Arc::new(build_object_store_with_creds(
-        &task,
-        task.credentials.access_key(),
-        task.credentials.secret_key(),
-        task.credentials.session_token(),
-    )?);
-    let scan_budget = default_scan_budget(&session_ctx);
-    execute_scan_streaming_with_store(
+    // A store that cannot even be built from the ticket (bad endpoint, no
+    // region) is the coordinator's mistake, not this worker's.
+    let store = store_factory(&task, None).map_err(|e| {
+        ScanFault::tag(
+            WorkerFault::TaskInvalid,
+            e.context("building the object store from the scan ticket"),
+        )
+    })?;
+    scan_streaming_inner(
         task,
         metrics,
         session_ctx,
@@ -421,8 +558,8 @@ pub async fn execute_scan_streaming(
         credential_rx,
         footer_cache,
         coordinator_metrics,
-        true,
-        Some(scan_budget),
+        Some(store_factory),
+        scan_budget,
     )
     .await
 }
@@ -432,7 +569,8 @@ pub async fn execute_scan_streaming(
 ///
 /// When `scan_budget` is `None`, a default budget is derived from the session
 /// pool (half the finite limit). When `allow_credential_refresh` is `false`,
-/// the store is fixed for the lifetime of the scan.
+/// the store is fixed for the lifetime of the scan; when `true`, refreshed
+/// credentials rebuild it through [`s3_object_store_factory`].
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_scan_streaming_with_store(
     task: ScanTask,
@@ -445,8 +583,77 @@ pub async fn execute_scan_streaming_with_store(
     allow_credential_refresh: bool,
     scan_budget: Option<ByteBudget>,
 ) -> anyhow::Result<(SchemaRef, ScanBatchStream)> {
+    let store_factory = allow_credential_refresh.then(s3_object_store_factory);
+    scan_streaming_inner(
+        task,
+        metrics,
+        session_ctx,
+        initial_store,
+        credential_rx,
+        footer_cache,
+        coordinator_metrics,
+        store_factory,
+        scan_budget,
+    )
+    .await
+}
+
+/// Rebuild `store` when refreshed credentials arrived since the last check.
+///
+/// Runs before EVERY file open after the first, including the depth-1
+/// prefetch of file two. The check used to live only inside the per-file
+/// loop, after that first prefetch had already been issued with the original
+/// store, so credentials refreshed during file one were not applied until
+/// file three (finding 611, `credential_refresh_mid_scan`).
+fn apply_refreshed_credentials(
+    task: &ScanTask,
+    credential_rx: Option<&mut watch::Receiver<Option<RefreshableCredentials>>>,
+    store_factory: Option<&ObjectStoreFactory>,
+    store: &mut Arc<dyn ObjectStore>,
+) {
+    let (Some(rx), Some(factory)) = (credential_rx, store_factory) else {
+        return;
+    };
+    if !rx.has_changed().unwrap_or(false) {
+        return;
+    }
+    let Some(creds) = rx.borrow_and_update().clone() else {
+        return;
+    };
+    info!(
+        fragment_id = %task.fragment_id,
+        expiry = %creds.expiry,
+        "Applying refreshed credentials for next file read"
+    );
+    match factory(task, Some(&creds)) {
+        Ok(s) => *store = s,
+        Err(e) => warn!(
+            fragment_id = %task.fragment_id,
+            error = %e,
+            "Failed to rebuild object store with refreshed credentials"
+        ),
+    }
+}
+
+/// Shared body of the streaming entry points. `store_factory == None` fixes
+/// the store for the life of the scan (no credential refresh).
+#[allow(clippy::too_many_arguments)]
+async fn scan_streaming_inner(
+    task: ScanTask,
+    metrics: Option<Arc<WorkerMetricsRegistry>>,
+    session_ctx: SessionContext,
+    initial_store: Arc<dyn ObjectStore>,
+    credential_rx: Option<watch::Receiver<Option<RefreshableCredentials>>>,
+    footer_cache: Option<Arc<FooterCache>>,
+    coordinator_metrics: Option<Arc<MetricsRegistry>>,
+    store_factory: Option<ObjectStoreFactory>,
+    scan_budget: Option<ByteBudget>,
+) -> anyhow::Result<(SchemaRef, ScanBatchStream)> {
     if task.data_file_paths.is_empty() {
-        anyhow::bail!("ScanTask has no data files");
+        return Err(ScanFault::tag(
+            WorkerFault::TaskInvalid,
+            anyhow::anyhow!("ScanTask has no data files"),
+        ));
     }
 
     // A Hive task's format decides which reader opens its files. All three
@@ -467,7 +674,8 @@ pub async fn execute_scan_streaming_with_store(
                 | sqe_planner::HiveScanFormat::Csv
                 | sqe_planner::HiveScanFormat::Json => {}
             }
-            let full = crate::hive_partition::full_schema_of(d).map_err(|e| anyhow::anyhow!(e))?;
+            let full = crate::hive_partition::full_schema_of(d)
+                .map_err(|e| ScanFault::tag(WorkerFault::TaskInvalid, anyhow::anyhow!(e)))?;
             Some(Arc::new((d.clone(), full)))
         }
     };
@@ -491,7 +699,8 @@ pub async fn execute_scan_streaming_with_store(
         coordinator_metrics.as_deref(),
         hive_ctx.as_ref(),
     )
-    .await?;
+    .await
+    .map_err(ScanFault::classify)?;
 
     // A Hive scan's output carries the partition columns too, so the schema
     // reported to the caller is the full one, not the data file's. Taken here,
@@ -608,7 +817,7 @@ pub async fn execute_scan_streaming_with_store(
                     match crate::hive_partition::append_partition_columns(&batch, desc, full) {
                         Ok(b) => b,
                         Err(e) => {
-                            let _ = tx.send(Err(anyhow::anyhow!(e))).await;
+                            let _ = tx.send(Err(ScanFault::classify(anyhow::anyhow!(e)))).await;
                             return false;
                         }
                     }
@@ -618,7 +827,14 @@ pub async fn execute_scan_streaming_with_store(
             let permit = match scan_budget.acquire(batch_bytes).await {
                 Ok(p) => p,
                 Err(e) => {
-                    let _ = tx.send(Err(anyhow::anyhow!(e))).await;
+                    // Scan budget refused the batch: this worker's memory, not
+                    // the user's data. Another worker may have room.
+                    let _ = tx
+                        .send(Err(ScanFault::tag(
+                            WorkerFault::WorkerResourceExhausted,
+                            anyhow::anyhow!(e),
+                        )))
+                        .await;
                     return false;
                 }
             };
@@ -673,7 +889,7 @@ pub async fn execute_scan_streaming_with_store(
                     }
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(e)).await;
+                    let _ = tx.send(Err(ScanFault::classify(e))).await;
                     return;
                 }
             }
@@ -697,7 +913,7 @@ pub async fn execute_scan_streaming_with_store(
         debug!(file = %first_path, rows = first_file_bytes, "first-file batches drained");
 
         let mut store: Arc<dyn ObjectStore> = initial_store;
-        let mut credential_rx = if allow_credential_refresh {
+        let mut credential_rx = if store_factory.is_some() {
             credential_rx
         } else {
             None
@@ -741,6 +957,12 @@ pub async fn execute_scan_streaming_with_store(
             if !wait_queue_below(&queue_bytes, &queue_space, watermark, &tx).await {
                 return;
             }
+            apply_refreshed_credentials(
+                &task,
+                credential_rx.as_mut(),
+                store_factory.as_ref(),
+                &mut store,
+            );
             let fut = start_next_open(idx, store.clone());
             idx += 1;
             Some(fut)
@@ -752,7 +974,7 @@ pub async fn execute_scan_streaming_with_store(
             let (mut file_stream, _schema, bytes) = match open_fut.await {
                 Ok(t) => t,
                 Err(e) => {
-                    let _ = tx.send(Err(e)).await;
+                    let _ = tx.send(Err(ScanFault::classify(e))).await;
                     return;
                 }
             };
@@ -770,7 +992,12 @@ pub async fn execute_scan_streaming_with_store(
             fetch_permit = match scan_budget.acquire(fetch_charge).await {
                 Ok(p) => Some(p),
                 Err(e) => {
-                    let _ = tx.send(Err(anyhow::anyhow!(e))).await;
+                    let _ = tx
+                        .send(Err(ScanFault::tag(
+                            WorkerFault::WorkerResourceExhausted,
+                            anyhow::anyhow!(e),
+                        )))
+                        .await;
                     return;
                 }
             };
@@ -802,7 +1029,7 @@ pub async fn execute_scan_streaming_with_store(
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(e)).await;
+                        let _ = tx.send(Err(ScanFault::classify(e))).await;
                         return;
                     }
                 }
@@ -834,31 +1061,12 @@ pub async fn execute_scan_streaming_with_store(
                 if !wait_queue_below(&queue_bytes, &queue_space, watermark, &tx).await {
                     return;
                 }
-                if let Some(ref mut rx) = credential_rx {
-                    if rx.has_changed().unwrap_or(false) {
-                        let new_creds = rx.borrow_and_update().clone();
-                        if let Some(creds) = new_creds {
-                            info!(
-                                fragment_id = %task.fragment_id,
-                                expiry = %creds.expiry,
-                                "Applying refreshed credentials for next file read"
-                            );
-                            match build_object_store_with_creds(
-                                &task,
-                                &creds.access_key_id,
-                                &creds.secret_access_key,
-                                &creds.session_token,
-                            ) {
-                                Ok(s) => store = Arc::new(s),
-                                Err(e) => warn!(
-                                    fragment_id = %task.fragment_id,
-                                    error = %e,
-                                    "Failed to rebuild object store with refreshed credentials"
-                                ),
-                            }
-                        }
-                    }
-                }
+                apply_refreshed_credentials(
+                    &task,
+                    credential_rx.as_mut(),
+                    store_factory.as_ref(),
+                    &mut store,
+                );
                 pending = Some(start_next_open(idx, store.clone()));
                 idx += 1;
             }

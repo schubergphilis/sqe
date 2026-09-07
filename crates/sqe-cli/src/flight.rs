@@ -1,13 +1,14 @@
+//! Flight SQL backend for the CLI, over the shared
+//! `sqe_trino_protocol::flight::FlightSqlClient` (review 705).
+
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use arrow_array::RecordBatch;
-use arrow_flight::sql::client::FlightSqlServiceClient;
-use futures::TryStreamExt;
-use tonic::transport::{Channel, ClientTlsConfig};
+use sqe_trino_protocol::flight::{ChannelOptions, FlightSqlClient};
 
 use crate::client::{QueryResult, SqlClient};
 
 pub struct FlightClient {
-    inner: FlightSqlServiceClient<Channel>,
+    inner: FlightSqlClient,
 }
 
 impl FlightClient {
@@ -16,16 +17,13 @@ impl FlightClient {
         username: &str,
         password: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let channel = build_channel(url).await?;
-        let mut inner = FlightSqlServiceClient::new(channel);
-
-        let token = inner
-            .handshake(username, password)
-            .await
-            .map_err(|e| format!("Authentication failed: {e}"))?;
-
-        inner.set_token(String::from_utf8(token.to_vec())?);
-
+        let inner = FlightSqlClient::connect_with_handshake(
+            url,
+            username,
+            password,
+            &ChannelOptions::default(),
+        )
+        .await?;
         Ok(Self { inner })
     }
 
@@ -33,50 +31,17 @@ impl FlightClient {
         url: &str,
         token: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let channel = build_channel(url).await?;
-        let mut inner = FlightSqlServiceClient::new(channel);
-        inner.set_token(token.to_string());
+        let inner =
+            FlightSqlClient::connect_with_token(url, token, &ChannelOptions::default()).await?;
         Ok(Self { inner })
     }
-}
-
-async fn build_channel(url: &str) -> Result<Channel, Box<dyn std::error::Error>> {
-    let mut endpoint = Channel::from_shared(url.to_string())?;
-    if url.starts_with("https://") {
-        endpoint = endpoint.tls_config(ClientTlsConfig::new())?;
-    }
-    let channel = endpoint
-        .connect()
-        .await
-        .map_err(|e| format!("Failed to connect to {url}: {e}"))?;
-    Ok(channel)
 }
 
 #[async_trait::async_trait]
 impl SqlClient for FlightClient {
     async fn execute(&mut self, sql: &str) -> Result<QueryResult, Box<dyn std::error::Error>> {
-        let info = self
-            .inner
-            .execute(sql.to_string(), None)
-            .await
-            .map_err(|e| format!("Query failed: {e}"))?;
-
-        let mut all_batches: Vec<RecordBatch> = Vec::new();
-
-        for endpoint in info.endpoint {
-            if let Some(ticket) = endpoint.ticket {
-                let stream = self
-                    .inner
-                    .do_get(ticket)
-                    .await
-                    .map_err(|e| format!("Failed to fetch results: {e}"))?;
-
-                let batches: Vec<RecordBatch> = stream.try_collect().await?;
-                all_batches.extend(batches);
-            }
-        }
-
-        batches_to_result(&all_batches)
+        let batches = self.inner.execute_collect(sql).await?;
+        batches_to_result(&batches)
     }
 }
 

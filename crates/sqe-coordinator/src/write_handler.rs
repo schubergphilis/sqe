@@ -796,7 +796,10 @@ impl WriteHandler {
                 action = action.delete_files(remove);
             }
             let commit_result = match action.apply(tx) {
-                Ok(tx) => tx.commit(catalog).await,
+                Ok(tx) => {
+                    self.before_commit_seam().await;
+                    tx.commit(catalog).await
+                }
                 Err(e) => Err(e),
             };
 
@@ -1096,6 +1099,17 @@ impl DeleteAwareReadPlan {
     }
 }
 
+/// TEST-ONLY seam: a future the handler awaits right before each Iceberg
+/// commit it makes (architecture review 513). Lets an in-process test land a
+/// concurrent commit deterministically inside the window between "read the
+/// snapshot and compute the rewrite" and "commit it", which is the only place
+/// an optimistic-concurrency conflict can arise and which wall-clock timing
+/// cannot hit reliably. Compiled only for this crate's tests and under the
+/// `test-sqlite` feature; production builds have no field, no builder and an
+/// empty `before_commit_seam`.
+#[cfg(any(test, feature = "test-sqlite"))]
+pub type CommitRaceHook = Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
 pub struct WriteHandler {
     config: SqeConfig,
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
@@ -1107,6 +1121,9 @@ pub struct WriteHandler {
     /// filters and column masks but the write path would let masked or
     /// filtered-out rows be copied verbatim into a sink table.
     policy_enforcer: Option<Arc<dyn sqe_policy::PolicyEnforcer>>,
+    /// See [`CommitRaceHook`].
+    #[cfg(any(test, feature = "test-sqlite"))]
+    commit_race_hook: Option<CommitRaceHook>,
 }
 
 impl WriteHandler {
@@ -1116,6 +1133,26 @@ impl WriteHandler {
             metrics: None,
             table_cache: None,
             policy_enforcer: None,
+            #[cfg(any(test, feature = "test-sqlite"))]
+            commit_race_hook: None,
+        }
+    }
+
+    /// TEST-ONLY: install a [`CommitRaceHook`]. See its doc comment.
+    #[cfg(any(test, feature = "test-sqlite"))]
+    #[must_use = "with_test_commit_race_hook consumes self; bind the returned handler"]
+    pub fn with_test_commit_race_hook(mut self, hook: CommitRaceHook) -> Self {
+        self.commit_race_hook = Some(hook);
+        self
+    }
+
+    /// Await the test-only [`CommitRaceHook`], if one is installed. Called
+    /// immediately before `tx.commit(..)` on the retrying commit paths. A
+    /// no-op in production builds.
+    async fn before_commit_seam(&self) {
+        #[cfg(any(test, feature = "test-sqlite"))]
+        if let Some(hook) = &self.commit_race_hook {
+            hook().await;
         }
     }
 
@@ -2773,6 +2810,7 @@ impl WriteHandler {
                     let tx = Transaction::new(&fresh_table);
                     let action = tx.fast_append().add_data_files(files);
                     let tx = action.apply(tx)?;
+                    self.before_commit_seam().await;
                     tx.commit(cat.as_catalog().as_ref()).await
                 }
             },
@@ -10355,5 +10393,695 @@ s3_path_style = true
             Some(&different),
             &iceberg
         ));
+    }
+
+    // -------------------------------------------------------------------------
+    // 513: the committing write paths, in process.
+    //
+    // Every test below drives a production `WriteHandler` (built from the
+    // rig's config, so `resolve_session_catalog` yields a real
+    // `SessionCatalog` over sqlite) through the same entry points
+    // `query_handler` calls, commits real Parquet to a tempdir warehouse, and
+    // reads the result back through the Iceberg table scan (delete-aware) or
+    // a DataFusion `SELECT` over `SqeTableProvider`.
+    //
+    // Run with:
+    //   RUST_MIN_STACK=33554432 cargo test -p sqe-coordinator \
+    //       --features test-sqlite -- write_handler::
+    //
+    // CI: `aikido-test-rust` runs `cargo test --workspace --all-features`
+    // under the same RUST_MIN_STACK, which enables `test-sqlite`, so these run
+    // on every MR. Rig details: `crate::test_support::sqlite_rig`.
+    // -------------------------------------------------------------------------
+    #[cfg(feature = "test-sqlite")]
+    mod committing {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        use super::*;
+        use crate::test_support::sqlite_rig::{
+            append_rows, ctas_select_sql, id_v_batch, id_v_pairs, id_v_schema, identity_spec,
+            insert_select_sql, parse_one, rows_affected, SqliteRig,
+        };
+        use arrow_schema::{DataType, Field};
+
+        fn handler(rig: &SqliteRig) -> WriteHandler {
+            WriteHandler::new(rig.config.clone())
+        }
+
+        fn snapshot_count(table: &IcebergTable) -> usize {
+            table.metadata().snapshots().count()
+        }
+
+        /// `CREATE TABLE ...` through `handle_create_table`.
+        async fn run_create(h: &WriteHandler, rig: &SqliteRig, sql: &str) {
+            h.handle_create_table(&rig.session(), &parse_one(sql))
+                .await
+                .expect("CREATE TABLE");
+        }
+
+        /// `INSERT ...` the way `query_handler` issues it; returns
+        /// `rows_affected`.
+        async fn run_insert(h: &WriteHandler, rig: &SqliteRig, sql: &str) -> sqe_core::Result<i64> {
+            let stmt = parse_one(sql);
+            let select_sql = insert_select_sql(&stmt);
+            let ctx = DFSessionContext::new();
+            let out = h
+                .handle_insert_streaming(
+                    &rig.session(),
+                    &stmt,
+                    &ctx,
+                    &select_sql,
+                    &mut None,
+                    &mut None,
+                )
+                .await?;
+            Ok(rows_affected(&out))
+        }
+
+        /// `CREATE [OR REPLACE] TABLE ... AS SELECT` through
+        /// `handle_ctas_streaming`.
+        async fn run_ctas(h: &WriteHandler, rig: &SqliteRig, sql: &str) -> Vec<RecordBatch> {
+            let stmt = parse_one(sql);
+            let select_sql = ctas_select_sql(&stmt);
+            let ctx = DFSessionContext::new();
+            h.handle_ctas_streaming(
+                &rig.session(),
+                &stmt,
+                &ctx,
+                &select_sql,
+                &mut None,
+                &mut None,
+            )
+            .await
+            .expect("CTAS")
+        }
+
+        /// `DELETE ...` through the CoW/MoR dispatcher; returns
+        /// `rows_affected`.
+        async fn run_delete(h: &WriteHandler, rig: &SqliteRig, sql: &str) -> sqe_core::Result<i64> {
+            let ctx = DFSessionContext::new();
+            let out = h
+                .handle_delete_dispatch(
+                    &rig.session(),
+                    &parse_one(sql),
+                    rig.session_catalog().await,
+                    &ctx,
+                    &mut None,
+                    &mut None,
+                )
+                .await?;
+            Ok(rows_affected(&out))
+        }
+
+        /// `UPDATE ...` through the dispatcher; returns `rows_affected`.
+        async fn run_update(h: &WriteHandler, rig: &SqliteRig, sql: &str) -> sqe_core::Result<i64> {
+            let ctx = DFSessionContext::new();
+            let out = h
+                .handle_update_dispatch(
+                    &rig.session(),
+                    &parse_one(sql),
+                    rig.session_catalog().await,
+                    &ctx,
+                    &mut None,
+                    &mut None,
+                )
+                .await?;
+            Ok(rows_affected(&out))
+        }
+
+        /// `MERGE ...` through the dispatcher with pre-executed source
+        /// batches (the caller runs the source query in production); returns
+        /// `rows_affected`.
+        async fn run_merge(
+            h: &WriteHandler,
+            rig: &SqliteRig,
+            sql: &str,
+            source: Vec<RecordBatch>,
+            source_schema_hint: Option<arrow_schema::SchemaRef>,
+        ) -> sqe_core::Result<i64> {
+            let ctx = DFSessionContext::new();
+            let out = h
+                .handle_merge_dispatch(
+                    &rig.session(),
+                    &parse_one(sql),
+                    source,
+                    source_schema_hint,
+                    rig.session_catalog().await,
+                    &ctx,
+                    None,
+                    &mut None,
+                    &mut None,
+                )
+                .await?;
+            Ok(rows_affected(&out))
+        }
+
+        /// A seeded `(id, v)` table `default.<name>` with rows 1..=3.
+        async fn seeded_id_v(rig: &SqliteRig, name: &str) -> TableIdent {
+            seeded_id_v_with(rig, name, std::collections::HashMap::new()).await
+        }
+
+        async fn seeded_id_v_with(
+            rig: &SqliteRig,
+            name: &str,
+            props: std::collections::HashMap<String, String>,
+        ) -> TableIdent {
+            let table = rig
+                .local_fs_table_with_properties(name, &id_v_schema(), None, props)
+                .await;
+            rig.commit_rows(&table, vec![id_v_batch(&[(1, "a"), (2, "b"), (3, "c")])])
+                .await;
+            rig.ident(name)
+        }
+
+        /// A hook that lands ONE concurrent append of `(99, "late")` on
+        /// `ident` the first time a commit is about to happen, then stays
+        /// quiet so the retry can succeed.
+        fn late_append_hook(
+            rig: &SqliteRig,
+            ident: &TableIdent,
+        ) -> (CommitRaceHook, Arc<AtomicBool>) {
+            let fired = Arc::new(AtomicBool::new(false));
+            let catalog = rig.catalog.clone();
+            let ident = ident.clone();
+            let fired_for_hook = fired.clone();
+            let hook: CommitRaceHook = Arc::new(move || {
+                let fired = fired_for_hook.clone();
+                let catalog = catalog.clone();
+                let ident = ident.clone();
+                Box::pin(async move {
+                    if fired.swap(true, AtomicOrdering::SeqCst) {
+                        return;
+                    }
+                    append_rows(&catalog, &ident, vec![id_v_batch(&[(99, "late")])]).await;
+                })
+            });
+            (hook, fired)
+        }
+
+        fn s(v: &str) -> Option<String> {
+            Some(v.to_string())
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn insert_then_select_round_trip() {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+            run_create(
+                &h,
+                &rig,
+                "CREATE TABLE default.rt (id BIGINT NOT NULL, v VARCHAR)",
+            )
+            .await;
+
+            let n = run_insert(
+                &h,
+                &rig,
+                "INSERT INTO default.rt SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) AS s(id, v)",
+            )
+            .await
+            .expect("INSERT");
+            assert_eq!(n, 3, "rows_affected reports the written rows");
+
+            // SELECT through DataFusion over the committed table.
+            let table = rig.load(&rig.ident("rt")).await;
+            assert_eq!(snapshot_count(&table), 1);
+            let provider = sqe_catalog::table_provider::SqeTableProvider::try_new(table)
+                .await
+                .expect("table provider");
+            let ctx = DFSessionContext::new();
+            ctx.register_table("rt", Arc::new(provider))
+                .expect("register");
+            let batches = ctx
+                .sql("SELECT id, v FROM rt ORDER BY id")
+                .await
+                .expect("plan")
+                .collect()
+                .await
+                .expect("execute");
+            assert_eq!(
+                id_v_pairs(&batches),
+                vec![(1, s("a")), (2, s("b")), (3, s("c"))]
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn insert_overwrite_replaces_only_touched_partitions() {
+            let rig = SqliteRig::new().await;
+            let schema = ArrowSchema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("part", DataType::Utf8, false),
+            ]);
+            rig.local_fs_table("ow", &schema, Some(identity_spec(&schema, &["part"])))
+                .await;
+            let h = handler(&rig);
+
+            let n = run_insert(
+                &h,
+                &rig,
+                "INSERT INTO default.ow SELECT * FROM (VALUES (1, 'a'), (2, 'a'), (3, 'b')) AS s(id, part)",
+            )
+            .await
+            .expect("INSERT");
+            assert_eq!(n, 3);
+
+            // Dynamic overwrite: only partition `a` is touched; `b` survives.
+            let n = run_insert(
+                &h,
+                &rig,
+                "INSERT OVERWRITE default.ow SELECT * FROM (VALUES (10, 'a')) AS s(id, part)",
+            )
+            .await
+            .expect("INSERT OVERWRITE");
+            assert_eq!(n, 1);
+
+            let ident = rig.ident("ow");
+            assert_eq!(rig.scan_i64(&ident, "id").await, vec![3, 10]);
+            let files = rig.live_files(&ident).await;
+            assert_eq!(files.len(), 2, "one file per live partition: {files:?}");
+            let rows: u64 = files.iter().map(|f| f.record_count()).sum();
+            assert_eq!(rows, 2);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn cow_delete_retries_after_concurrent_append() {
+            let rig = SqliteRig::new().await;
+            let ident = seeded_id_v(&rig, "cow").await;
+            let metrics = Arc::new(sqe_metrics::MetricsRegistry::new().expect("metrics"));
+            let (hook, fired) = late_append_hook(&rig, &ident);
+            let h = handler(&rig)
+                .with_metrics(metrics.clone())
+                .with_test_commit_race_hook(hook);
+
+            let n = run_delete(&h, &rig, "DELETE FROM default.cow WHERE id = 2")
+                .await
+                .expect("CoW DELETE survives the lost race");
+
+            assert!(fired.load(AtomicOrdering::SeqCst), "the race was exercised");
+            assert_eq!(n, 1, "rows_affected counts the deleted row once");
+            assert_eq!(
+                rig.scan_i64(&ident, "id").await,
+                vec![1, 3, 99],
+                "deleted row gone, concurrently appended row kept"
+            );
+            // Snapshot order proves the append landed first and the DELETE
+            // committed on top of it: seed, late append, then the rewrite.
+            let table = rig.load(&ident).await;
+            assert_eq!(snapshot_count(&table), 3, "seed + late append + rewrite");
+            // The rewrite carries `RefSnapshotIdMatch`, so its first commit
+            // against the pre-append snapshot is a retryable conflict. The
+            // vendored `Transaction::commit` absorbs retryable conflicts with
+            // its own reload-and-reapply loop before `commit_rewrite_with_retry`
+            // sees them, so the handler-level counter only counts conflicts
+            // that escape that loop: zero here, never more than one.
+            assert!(
+                metrics
+                    .write_commit_retries_total
+                    .with_label_values(&["delete-cow"])
+                    .get()
+                    <= 1
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn mor_delete_retries_after_concurrent_append() {
+            let rig = SqliteRig::new().await;
+            let ident = seeded_id_v_with(
+                &rig,
+                "mor",
+                std::collections::HashMap::from([(
+                    sqe_core::table_properties::WRITE_DELETE_MODE.to_string(),
+                    "merge-on-read".to_string(),
+                )]),
+            )
+            .await;
+            let (hook, fired) = late_append_hook(&rig, &ident);
+            let h = handler(&rig).with_test_commit_race_hook(hook);
+
+            let n = run_delete(&h, &rig, "DELETE FROM default.mor WHERE id = 2")
+                .await
+                .expect("MoR DELETE survives the lost race");
+
+            assert!(fired.load(AtomicOrdering::SeqCst), "the race was exercised");
+            assert_eq!(n, 1);
+            // Logical view applies the position delete; the physical data
+            // file is untouched (MoR) and the late append is a second file.
+            assert_eq!(rig.scan_i64(&ident, "id").await, vec![1, 3, 99]);
+            let data_files = rig.live_files(&ident).await;
+            assert_eq!(
+                data_files.len(),
+                2,
+                "seed file kept + late file: {data_files:?}"
+            );
+            let table = rig.load(&ident).await;
+            let deletes = sqe_compaction::collect_live_delete_files(&table)
+                .await
+                .expect("live delete files");
+            assert_eq!(deletes.len(), 1, "one position-delete file committed");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn merge_matched_update_and_not_matched_insert() {
+            let rig = SqliteRig::new().await;
+            let ident = seeded_id_v(&rig, "m1").await;
+            let h = handler(&rig);
+            let n = run_merge(
+                &h,
+                &rig,
+                "MERGE INTO default.m1 AS t USING src AS s ON t.id = s.id \
+                 WHEN MATCHED THEN UPDATE SET v = s.v \
+                 WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
+                vec![id_v_batch(&[(2, "B"), (4, "d")])],
+                None,
+            )
+            .await
+            .expect("MERGE");
+            // CoW MERGE reports the rows it WROTE (the rewritten target: 3
+            // seed rows, one of them updated, plus the insert), not the rows
+            // the clauses touched; only the empty-source BY SOURCE path (501)
+            // counts claimed rows instead.
+            assert_eq!(n, 4, "rows written by the rewrite");
+            assert_eq!(
+                rig.scan_id_v(&ident).await,
+                vec![(1, s("a")), (2, s("B")), (3, s("c")), (4, s("d"))]
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn merge_matched_delete() {
+            let rig = SqliteRig::new().await;
+            let ident = seeded_id_v(&rig, "m2").await;
+            let h = handler(&rig);
+            let n = run_merge(
+                &h,
+                &rig,
+                "MERGE INTO default.m2 AS t USING src AS s ON t.id = s.id \
+                 WHEN MATCHED THEN DELETE",
+                vec![id_v_batch(&[(1, "x")])],
+                None,
+            )
+            .await
+            .expect("MERGE");
+            assert_eq!(n, 2, "rows written: the two survivors");
+            assert_eq!(rig.scan_id_v(&ident).await, vec![(2, s("b")), (3, s("c"))]);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn merge_not_matched_by_source_delete() {
+            let rig = SqliteRig::new().await;
+            let ident = seeded_id_v(&rig, "m3").await;
+            let h = handler(&rig);
+            let n = run_merge(
+                &h,
+                &rig,
+                "MERGE INTO default.m3 AS t USING src AS s ON t.id = s.id \
+                 WHEN MATCHED THEN UPDATE SET v = s.v \
+                 WHEN NOT MATCHED BY SOURCE THEN DELETE",
+                vec![id_v_batch(&[(1, "A")])],
+                None,
+            )
+            .await
+            .expect("MERGE");
+            assert_eq!(n, 1, "rows written: the one updated survivor");
+            assert_eq!(rig.scan_id_v(&ident).await, vec![(1, s("A"))]);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn merge_not_matched_by_source_update() {
+            let rig = SqliteRig::new().await;
+            let ident = seeded_id_v(&rig, "m4").await;
+            let h = handler(&rig);
+            let n = run_merge(
+                &h,
+                &rig,
+                "MERGE INTO default.m4 AS t USING src AS s ON t.id = s.id \
+                 WHEN NOT MATCHED BY SOURCE THEN UPDATE SET v = 'gone'",
+                vec![id_v_batch(&[(1, "a")])],
+                None,
+            )
+            .await
+            .expect("MERGE");
+            assert_eq!(n, 3, "rows written: all three target rows");
+            assert_eq!(
+                rig.scan_id_v(&ident).await,
+                vec![(1, s("a")), (2, s("gone")), (3, s("gone"))]
+            );
+        }
+
+        /// 501: an empty source is not a shortcut when a BY SOURCE clause
+        /// exists; every target row is unmatched-by-source.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn merge_empty_source_still_runs_not_matched_by_source() {
+            let rig = SqliteRig::new().await;
+            let ident = seeded_id_v(&rig, "m5").await;
+            let h = handler(&rig);
+            let n = run_merge(
+                &h,
+                &rig,
+                "MERGE INTO default.m5 AS t USING src AS s ON t.id = s.id \
+                 WHEN MATCHED THEN DELETE \
+                 WHEN NOT MATCHED BY SOURCE THEN DELETE",
+                vec![],
+                Some(id_v_schema()),
+            )
+            .await
+            .expect("MERGE");
+            assert_eq!(n, 3, "all target rows were unmatched by source");
+            assert!(rig.scan_id_v(&ident).await.is_empty());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn merge_empty_source_without_by_source_clause_is_a_noop() {
+            let rig = SqliteRig::new().await;
+            let ident = seeded_id_v(&rig, "m6").await;
+            let before = snapshot_count(&rig.load(&ident).await);
+            let h = handler(&rig);
+            let n = run_merge(
+                &h,
+                &rig,
+                "MERGE INTO default.m6 AS t USING src AS s ON t.id = s.id \
+                 WHEN MATCHED THEN UPDATE SET v = s.v \
+                 WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)",
+                vec![],
+                Some(id_v_schema()),
+            )
+            .await
+            .expect("MERGE");
+            assert_eq!(n, 0);
+            assert_eq!(
+                rig.scan_id_v(&ident).await,
+                vec![(1, s("a")), (2, s("b")), (3, s("c"))]
+            );
+            assert_eq!(snapshot_count(&rig.load(&ident).await), before, "no commit");
+        }
+
+        /// 500: same schema and partitioning -> the contents are swapped in
+        /// with one rewrite commit; the table keeps its UUID and history.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn create_or_replace_in_place_keeps_table_identity() {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+            run_ctas(
+                &h,
+                &rig,
+                "CREATE TABLE default.cr AS SELECT * FROM (VALUES (1, 'a')) AS s(id, v)",
+            )
+            .await;
+            let ident = rig.ident("cr");
+            let before = rig.load(&ident).await;
+            let uuid_before = before.metadata().uuid();
+            assert_eq!(rig.scan_id_v(&ident).await, vec![(1, s("a"))]);
+
+            let out = run_ctas(
+                &h,
+                &rig,
+                "CREATE OR REPLACE TABLE default.cr AS SELECT * FROM (VALUES (7, 'z'), (8, 'y')) AS s(id, v)",
+            )
+            .await;
+            assert_eq!(rows_affected(&out), 2);
+
+            let after = rig.load(&ident).await;
+            assert_eq!(after.metadata().uuid(), uuid_before, "same table");
+            assert!(
+                snapshot_count(&after) > snapshot_count(&before),
+                "history kept and extended"
+            );
+            assert_eq!(rig.scan_id_v(&ident).await, vec![(7, s("z")), (8, s("y"))]);
+        }
+
+        /// 500: a different column set cannot be written into the live table,
+        /// so the replacement is staged under a temporary name and swapped in
+        /// with DROP + RENAME, leaving no staging table behind.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn create_or_replace_with_new_schema_swaps_tables() {
+            let rig = SqliteRig::new().await;
+            let h = handler(&rig);
+            run_ctas(
+                &h,
+                &rig,
+                "CREATE TABLE default.cs AS SELECT * FROM (VALUES (1, 'a')) AS s(id, v)",
+            )
+            .await;
+            let ident = rig.ident("cs");
+            let uuid_before = rig.load(&ident).await.metadata().uuid();
+
+            run_ctas(
+                &h,
+                &rig,
+                "CREATE OR REPLACE TABLE default.cs AS SELECT * FROM (VALUES (5, 'q', 2.5)) AS s(id, v, w)",
+            )
+            .await;
+
+            let after = rig.load(&ident).await;
+            assert_ne!(
+                after.metadata().uuid(),
+                uuid_before,
+                "a new table took the name"
+            );
+            assert_eq!(
+                after.metadata().current_schema().as_struct().fields().len(),
+                3
+            );
+            assert_eq!(rig.scan_i64(&ident, "id").await, vec![5]);
+            let tables = rig
+                .catalog
+                .list_tables(&NamespaceIdent::new("default".to_string()))
+                .await
+                .expect("list tables");
+            assert_eq!(
+                tables
+                    .iter()
+                    .map(|t| t.name().to_string())
+                    .collect::<Vec<_>>(),
+                vec!["cs".to_string()],
+                "no staging table left behind"
+            );
+        }
+
+        /// 502: files written under an older partition spec are still
+        /// candidates for a DELETE whose predicate names the NEW partition
+        /// column. Spec 0 partitions by `country`; after evolving to `region`,
+        /// `DELETE ... WHERE region = 'EU'` must reach the EU rows inside the
+        /// `country`-partitioned legacy files too.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn partition_evolution_then_delete_reaches_legacy_spec_files() {
+            let rig = SqliteRig::new().await;
+            let schema = ArrowSchema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("country", DataType::Utf8, false),
+                Field::new("region", DataType::Utf8, false),
+            ]);
+            rig.local_fs_table("evo", &schema, Some(identity_spec(&schema, &["country"])))
+                .await;
+            let ident = rig.ident("evo");
+            let h = handler(&rig);
+
+            let n = run_insert(
+                &h,
+                &rig,
+                "INSERT INTO default.evo SELECT * FROM (VALUES \
+                 (1, 'US', 'EU'), (2, 'DE', 'EU'), (3, 'US', 'NA')) AS s(id, country, region)",
+            )
+            .await
+            .expect("INSERT under spec 0");
+            assert_eq!(n, 3);
+            let legacy_files = rig.live_files(&ident).await;
+            assert_eq!(legacy_files.len(), 2, "US and DE partitions");
+
+            rig.evolve_partition_spec(&ident, identity_spec(&schema, &["region"]))
+                .await;
+            let evolved = rig.load(&ident).await;
+            assert_eq!(evolved.metadata().default_partition_spec().spec_id(), 1);
+
+            let n = run_insert(
+                &h,
+                &rig,
+                "INSERT INTO default.evo SELECT * FROM (VALUES (4, 'FR', 'EU')) AS s(id, country, region)",
+            )
+            .await
+            .expect("INSERT under spec 1");
+            assert_eq!(n, 1);
+            let spec_ids: std::collections::BTreeSet<i32> = rig
+                .live_files(&ident)
+                .await
+                .iter()
+                .map(|f| f.partition_spec_id())
+                .collect();
+            assert_eq!(
+                spec_ids,
+                [0, 1].into_iter().collect(),
+                "both spec generations live"
+            );
+
+            let n = run_delete(&h, &rig, "DELETE FROM default.evo WHERE region = 'EU'")
+                .await
+                .expect("DELETE across spec generations");
+            assert_eq!(n, 3, "EU rows in legacy files (1, 2) and the new file (4)");
+            assert_eq!(rig.scan_i64(&ident, "id").await, vec![3]);
+        }
+
+        /// 505: a mis-shaped INSERT fails at planning time, before any file is
+        /// written or committed.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn insert_with_wider_arity_is_a_planning_error() {
+            let rig = SqliteRig::new().await;
+            rig.local_fs_table("ar", &id_v_schema(), None).await;
+            let ident = rig.ident("ar");
+            let h = handler(&rig);
+
+            let err = run_insert(
+                &h,
+                &rig,
+                "INSERT INTO default.ar SELECT * FROM (VALUES (1, 'a', 2)) AS s(id, v, w)",
+            )
+            .await
+            .expect_err("three source columns into a two-column table");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("INSERT has 3 columns but target has 2"),
+                "planning-time arity error, got: {msg}"
+            );
+
+            let table = rig.load(&ident).await;
+            assert_eq!(snapshot_count(&table), 0, "nothing was committed");
+            assert!(rig.live_files(&ident).await.is_empty());
+            let data_dir = format!(
+                "{}/data",
+                table.metadata().location().trim_start_matches("file://")
+            );
+            let stray = std::fs::read_dir(&data_dir)
+                .map(|d| d.filter_map(Result::ok).count())
+                .unwrap_or(0);
+            assert_eq!(stray, 0, "no parquet part was written");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn update_reports_rows_affected() {
+            let rig = SqliteRig::new().await;
+            let ident = seeded_id_v(&rig, "up").await;
+            let h = handler(&rig);
+            let n = run_update(&h, &rig, "UPDATE default.up SET v = 'z' WHERE id >= 2")
+                .await
+                .expect("UPDATE");
+            assert_eq!(n, 2);
+            assert_eq!(
+                rig.scan_id_v(&ident).await,
+                vec![(1, s("a")), (2, s("z")), (3, s("z"))]
+            );
+        }
+
+        /// 514: a truncate reports the manifest row count, not "unknown".
+        #[tokio::test(flavor = "multi_thread")]
+        async fn delete_without_where_truncates_and_reports_rows_affected() {
+            let rig = SqliteRig::new().await;
+            let ident = seeded_id_v(&rig, "tr").await;
+            let h = handler(&rig);
+            let n = run_delete(&h, &rig, "DELETE FROM default.tr")
+                .await
+                .expect("truncate");
+            assert_eq!(n, 3);
+            assert!(rig.scan_id_v(&ident).await.is_empty());
+            assert!(rig.live_files(&ident).await.is_empty());
+        }
     }
 }

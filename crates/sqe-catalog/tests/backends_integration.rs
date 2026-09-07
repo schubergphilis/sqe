@@ -43,6 +43,8 @@ mod glue {
     /// is not set; that's the signal that the operator opted out of the
     /// live AWS path. Glue databases are regional and need a real S3
     /// bucket to exist for the LocationUri.
+    ///
+    /// last verified: never in this tree
     #[tokio::test]
     #[ignore = "requires AWS credentials + a pre-created S3 bucket; run with --ignored"]
     async fn live_glue_namespace_round_trip() {
@@ -148,6 +150,8 @@ mod hms {
     /// The test uses a unique namespace name per run (`sqe_hms_ci_<uuid>`)
     /// so concurrent runs don't collide, and cleans up on success.
     /// Failure leaves the namespace behind for inspection.
+    ///
+    /// last verified: never in this tree
     #[tokio::test]
     #[ignore = "requires docker-compose HMS stack; run with --ignored"]
     async fn hms_namespace_round_trip() {
@@ -305,6 +309,8 @@ mod sql_postgres {
     ///
     /// Default `SQE_TEST_PG_URL` matches the docker-compose service:
     /// `postgres://iceberg:iceberg@localhost:15432/iceberg_catalog`.
+    ///
+    /// last verified: never in this tree
     #[tokio::test]
     #[ignore = "requires live Postgres; run with --ignored against docker-compose postgres"]
     async fn jdbc_postgres_namespace_roundtrip() {
@@ -374,6 +380,8 @@ mod sql_postgres {
     /// Closes the engine-wiring caveat on `sqe:jdbc-catalog:v2`. The
     /// existing `jdbc_postgres_namespace_roundtrip` proves the
     /// library layer; this proves the SQE engine dispatcher.
+    ///
+    /// last verified: never in this tree
     #[tokio::test]
     #[ignore = "requires live Postgres; run with --ignored against docker-compose postgres"]
     async fn for_session_dispatches_through_jdbc_backend() {
@@ -490,6 +498,8 @@ warehouse = "{warehouse}"
     /// SQLite, PostgreSQL, and MySQL all accept V3 metadata. We pick
     /// PostgreSQL because the docker-compose stack already runs it for
     /// the V2 round-trip, so this test rides the same infrastructure.
+    ///
+    /// last verified: never in this tree
     #[tokio::test]
     #[ignore = "requires live Postgres; run with --ignored against docker-compose postgres"]
     async fn jdbc_postgres_v3_table_format_version_roundtrip() {
@@ -622,6 +632,9 @@ mod hadoop {
         assert_eq!(orders.namespace, vec!["sales".to_string()]);
     }
 
+    /// Hadoop warehouse discovery against a live MinIO.
+    ///
+    /// last verified: never in this tree
     #[tokio::test]
     #[ignore = "requires MinIO-backed warehouse; run with --ignored and SQE_TEST_MINIO_URL set"]
     async fn hadoop_backend_minio_integration() {
@@ -662,6 +675,8 @@ mod nessie {
     /// upstream `RestCatalog` client reads it from the config response
     /// and prepends it to subsequent paths automatically; we don't have
     /// to thread it through.
+    ///
+    /// last verified: never in this tree
     #[tokio::test]
     #[ignore = "requires docker-compose Nessie stack; run with --ignored"]
     async fn nessie_namespace_round_trip() {
@@ -751,6 +766,8 @@ mod s3_tables {
     /// AWS path. The warehouse format is the value AWS returns from
     /// the `/v1/config` `prefix` override:
     /// `<account-id>:s3tablescatalog/<bucket-name>`.
+    ///
+    /// last verified: never in this tree
     #[tokio::test]
     #[ignore = "requires AWS credentials + a pre-existing S3 Tables bucket; run with --ignored"]
     async fn list_namespaces_via_glue_rest() {
@@ -847,6 +864,8 @@ mod unity_catalog {
     /// uses against a Databricks-hosted Unity Catalog with bearer auth
     /// turned on. Independent of the read-only Iceberg REST smoke
     /// below.
+    ///
+    /// last verified: never in this tree
     #[tokio::test]
     #[ignore = "requires Unity Catalog M2M credentials; run with --ignored"]
     async fn unity_catalog_m2m_auth_obtains_token() {
@@ -885,6 +904,8 @@ mod unity_catalog {
     /// REST client connects without a bearer token. The bearer-auth
     /// path against a Databricks-hosted Unity is exercised separately
     /// by `unity_catalog_m2m_auth_obtains_token`.
+    ///
+    /// last verified: never in this tree
     #[tokio::test]
     #[ignore = "requires docker-compose Unity stack; run with --ignored"]
     async fn list_via_unity_rest() {
