@@ -137,8 +137,8 @@ use uuid::Uuid;
 use sqe_core::{SqeError, SqeErrorCode};
 
 use crate::catalog_ops::is_namespace_not_found;
+use crate::commit::commit_with_retry;
 use crate::table_health::TableHealth;
-use crate::write_handler::commit_with_retry;
 use crate::writer::{
     new_upload_tracker, parse_parquet_compression, write_data_files, WriteCleanupGuard,
 };

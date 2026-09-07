@@ -53,7 +53,7 @@ use sqe_catalog::puffin_stats::{
 use sqe_metrics::MetricsRegistry;
 use tracing::{debug, info, warn};
 
-use crate::write_handler::commit_with_retry;
+use crate::commit::commit_with_retry;
 
 /// Nominal entry count `k` of the writer's sketches: `ThetaSketch::builder()`
 /// defaults to `lg_k = 12`. A union that retains more than this many hashes
