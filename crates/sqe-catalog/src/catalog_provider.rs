@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 
 use sqe_core::config::StorageConfig;
 use sqe_core::SessionUser;
-use sqe_policy::PolicyStore;
+use sqe_policy_api::PolicyStore;
 
 use crate::rest_catalog::SessionCatalog;
 use crate::schema_provider::SqeSchemaProvider;
