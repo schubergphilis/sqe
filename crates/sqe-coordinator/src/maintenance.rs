@@ -19,7 +19,7 @@ use std::sync::Arc;
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
-use iceberg::spec::{DataContentType, DataFile, ManifestStatus};
+use iceberg::spec::{DataContentType, DataFile};
 use iceberg::table::Table as IcebergTable;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
@@ -31,6 +31,10 @@ use tracing::{info, warn};
 use crate::worker_registry::{WorkerLoadTracker, WorkerRegistry};
 use crate::writer::{new_upload_tracker, parse_parquet_compression, WriteCleanupGuard};
 
+/// Lives in `writer.rs` since MR A of the coordinator crate split (the sqlite
+/// test rig that moves with the write path needs it); re-exported here so the
+/// procedures keep calling `collect_live_data_files` unqualified.
+pub(crate) use crate::writer::collect_live_data_files;
 pub(crate) use sqe_compaction::{
     collect_live_delete_files, covered_position_deletes, delete_heavy_files,
     pack_file_groups_partition_aware,
@@ -3221,57 +3225,6 @@ fn parse_sort_spec(
         }
     }
     Ok(Some(spec))
-}
-
-/// Collect the live data files of the current snapshot. Mirrors the helper
-/// in `WriteHandler` but does not need access to the compression config, so
-/// it stays in this module. `pub(crate)` for the shared sqlite test rig
-/// (`test_support::sqlite_rig::SqliteRig::live_files`, review 513).
-pub(crate) async fn collect_live_data_files(
-    table: &IcebergTable,
-) -> sqe_core::Result<Vec<iceberg::spec::DataFile>> {
-    use futures::{StreamExt, TryStreamExt};
-
-    let metadata_ref = table.metadata_ref();
-    let snapshot = match metadata_ref.current_snapshot() {
-        Some(s) => s,
-        None => return Ok(vec![]),
-    };
-
-    let cache = table.object_cache();
-    let manifest_list = cache
-        .get_manifest_list(snapshot, &metadata_ref)
-        .await
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to load manifest list: {e}")))?;
-
-    const CONCURRENCY: usize = 8;
-    let manifests: Vec<Arc<iceberg::spec::Manifest>> =
-        futures::stream::iter(manifest_list.entries().iter().cloned())
-            .map(|mf| {
-                let cache = cache.clone();
-                async move { cache.get_manifest(&mf).await }
-            })
-            .buffer_unordered(CONCURRENCY)
-            .try_collect()
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to load manifest: {e}")))?;
-
-    let data_files = manifests
-        .into_iter()
-        .flat_map(|manifest| {
-            manifest
-                .entries()
-                .iter()
-                .filter(|entry| {
-                    entry.status() != ManifestStatus::Deleted
-                        && entry.data_file().content_type() == DataContentType::Data
-                })
-                .map(|entry| entry.data_file().clone())
-                .collect::<Vec<_>>()
-        })
-        .collect();
-
-    Ok(data_files)
 }
 
 /// Build a single-row `RecordBatch` describing the procedure's effect.

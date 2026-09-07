@@ -4,7 +4,7 @@ use arrow::compute::cast;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use iceberg::arrow::schema_to_arrow_schema;
-use iceberg::spec::{DataFile, Schema as IcebergSchema};
+use iceberg::spec::{DataContentType, DataFile, ManifestStatus, Schema as IcebergSchema};
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::base_writer::equality_delete_writer::{
@@ -31,8 +31,8 @@ use uuid::Uuid;
 
 /// The streaming-writer bridge (`write_data_files_streaming` and its direct
 /// helpers) moved to `sqe-compaction` (Phase 4c Task 1) so the compaction
-/// rewrite path (`crate::maintenance::rewrite_group`, itself now in
-/// `sqe-compaction::rewrite`) and, later, the worker-side `compact_file_group`
+/// rewrite path (`sqe_compaction::rewrite::rewrite_group`, reached from
+/// `maintenance.rs`) and, later, the worker-side `compact_file_group`
 /// action can share it without depending on this crate. Re-exported under
 /// their original paths so every existing `crate::writer::X` call site
 /// (`maintenance.rs`, `maintenance_log.rs`, `write_handler.rs`, and the
@@ -41,6 +41,66 @@ pub use sqe_compaction::writer::{
     auto_fanout_caps, new_upload_tracker, parse_parquet_compression, write_data_files_streaming,
     FanoutLimits, TrackingLocationGenerator, UploadedPaths, WriteCleanupGuard,
 };
+
+/// Collect the live data files of the current snapshot. Mirrors the helper
+/// in `WriteHandler` but does not need access to the compression config.
+/// `pub(crate)` for the maintenance procedures (re-exported from
+/// `maintenance.rs`) and the shared sqlite test rig
+/// (`test_support::sqlite_rig::SqliteRig::live_files`, review 513).
+pub(crate) async fn collect_live_data_files(table: &Table) -> sqe_core::Result<Vec<DataFile>> {
+    use futures::{StreamExt, TryStreamExt};
+
+    let metadata_ref = table.metadata_ref();
+    let snapshot = match metadata_ref.current_snapshot() {
+        Some(s) => s,
+        None => return Ok(vec![]),
+    };
+
+    let cache = table.object_cache();
+    let manifest_list = cache
+        .get_manifest_list(snapshot, &metadata_ref)
+        .await
+        .map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("Failed to load manifest list: {e}"),
+            )
+        })?;
+
+    const CONCURRENCY: usize = 8;
+    let manifests: Vec<Arc<iceberg::spec::Manifest>> =
+        futures::stream::iter(manifest_list.entries().iter().cloned())
+            .map(|mf| {
+                let cache = cache.clone();
+                async move { cache.get_manifest(&mf).await }
+            })
+            .buffer_unordered(CONCURRENCY)
+            .try_collect()
+            .await
+            .map_err(|e| {
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Failed to load manifest: {e}"),
+                )
+            })?;
+
+    let data_files = manifests
+        .into_iter()
+        .flat_map(|manifest| {
+            manifest
+                .entries()
+                .iter()
+                .filter(|entry| {
+                    entry.status() != ManifestStatus::Deleted
+                        && entry.data_file().content_type() == DataContentType::Data
+                })
+                .map(|entry| entry.data_file().clone())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    Ok(data_files)
+}
 // Internal-only helper: never referenced outside this module either before or
 // after the move, so a plain (non-`pub`) import is enough.
 use sqe_compaction::writer::unpartitioned_spec_key;

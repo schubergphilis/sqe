@@ -29,13 +29,14 @@ use sqe_core::table_properties::{
 use sqe_core::{Session, SqeConfig, SqeError, SqeErrorCode};
 use tracing::instrument;
 
-use crate::catalog_ops::{catalog_qualifier, fold_unquoted_ident, parse_table_ref};
-use crate::write_memory::{TrackedBatchBuffer, WriteReservation};
+use crate::commit::{commit_with_retry, is_conflict_message};
+use crate::ident::{catalog_qualifier, fold_unquoted_ident, parse_table_ref};
 use crate::writer::{
     new_upload_tracker, project_to_identifier_columns, resolve_write_compression,
     write_data_files_streaming_with_metrics, write_data_files_with_metrics,
     write_equality_delete_key_files, FanoutLimits, PositionDeleteWriter, WriteCleanupGuard,
 };
+use sqe_compaction::write_memory::{TrackedBatchBuffer, WriteReservation};
 
 /// Check an INSERT's projected columns against the target table's schema
 /// before execution starts (architecture review 505).
@@ -614,85 +615,6 @@ async fn rollback_ctas_partial_create(
     }
 }
 
-/// Bounded retry around an Iceberg commit that may lose an optimistic-concurrency
-/// race against another writer.
-///
-/// iceberg-rust's vendored catalogs (SQL, in-memory, our REST bridge) tag conflict
-/// errors with `retryable = true`. Polaris and HMS surface the same condition as
-/// `CatalogCommitConflicts`. The fix for #47 wraps every commit site that builds
-/// a Transaction so a conflict reloads the table and rebuilds the action against
-/// the new base snapshot. Without the reload the next attempt commits over the
-/// same stale metadata-location and the conflict repeats.
-///
-/// `build_and_commit` runs once per attempt; it receives a freshly-loaded
-/// IcebergTable and is expected to build a `Transaction`, apply its action, and
-/// call `tx.commit(catalog).await`. The closure clones data files / delete files
-/// it captures so each attempt operates on its own action graph.
-///
-/// Backoff: exponential with jitter, capped at ~1s base. After `max_attempts`
-/// the last error propagates unchanged so the caller's error-mapping still runs.
-/// `pub(crate)` so `maintenance_log::append_row` can reuse it too: the
-/// ledger table is also the multi-coordinator lease table
-/// (`MaintenanceSchedulerConfig::lease = Catalog`), so append commits need
-/// the same retry-on-conflict behavior as any other writer, not a
-/// single-shot commit.
-#[tracing::instrument(skip(catalog, build_and_commit), fields(table = %table_ident, op = %op), name = "sqe.write_commit")]
-pub(crate) async fn commit_with_retry<F, Fut>(
-    catalog: &dyn Catalog,
-    table_ident: &TableIdent,
-    op: &str,
-    mut build_and_commit: F,
-) -> std::result::Result<IcebergTable, iceberg::Error>
-where
-    F: FnMut(IcebergTable) -> Fut,
-    Fut: std::future::Future<Output = std::result::Result<IcebergTable, iceberg::Error>>,
-{
-    const MAX_ATTEMPTS: u32 = 4;
-    let mut last_err: Option<iceberg::Error> = None;
-    for attempt in 1..=MAX_ATTEMPTS {
-        let table = catalog.load_table(table_ident).await?;
-        match build_and_commit(table).await {
-            Ok(t) => {
-                if attempt > 1 {
-                    info!(
-                        table = %table_ident,
-                        op,
-                        attempts = attempt,
-                        "commit succeeded after retry"
-                    );
-                }
-                return Ok(t);
-            }
-            Err(e) => {
-                let retryable = e.retryable() || is_conflict_message(&e.to_string());
-                if !retryable || attempt == MAX_ATTEMPTS {
-                    last_err = Some(e);
-                    break;
-                }
-                let base_ms: u64 = 50_u64.saturating_mul(1_u64 << (attempt - 1));
-                let jitter_ms: u64 = (Uuid::new_v4().as_u128() as u64) % 50;
-                let sleep_ms = base_ms.saturating_add(jitter_ms).min(1000);
-                warn!(
-                    table = %table_ident,
-                    op,
-                    attempt,
-                    backoff_ms = sleep_ms,
-                    error = %e,
-                    "commit conflict; reloading table and retrying"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-                last_err = Some(e);
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| {
-        iceberg::Error::new(
-            iceberg::ErrorKind::Unexpected,
-            "commit_with_retry exhausted attempts without capturing an error",
-        )
-    }))
-}
-
 /// Backoff (exponential + jitter, capped ~1s) for retrying a CoW UPDATE/DELETE
 /// after an optimistic-concurrency conflict. Mirrors `commit_with_retry`'s
 /// schedule. CoW cannot use `commit_with_retry` directly because the rewritten
@@ -706,21 +628,6 @@ fn cow_conflict_backoff_ms(attempt: u32) -> u64 {
 
 /// Max attempts for a CoW UPDATE/DELETE that loses an optimistic-concurrency race.
 const COW_MAX_ATTEMPTS: u32 = 4;
-
-/// `pub(crate)` so `maintenance_lease.rs` can classify a losing claim commit
-/// with the exact same transient-conflict heuristic `commit_with_retry` uses
-/// (a real conflict, e.g. the SQL catalog's optimistic-concurrency CAS loss,
-/// warrants a bounded retry; the `ErrorKind::DataInvalid` from a lost
-/// `check_file_existence` lease race does not match this heuristic and must
-/// be classified separately -- see `lease_cas_spike_test.rs` / Task 1).
-pub(crate) fn is_conflict_message(msg: &str) -> bool {
-    let lower = msg.to_lowercase();
-    lower.contains("commitconflict")
-        || lower.contains("commit conflict")
-        || lower.contains("stale snapshot")
-        || lower.contains("rowdelta conflict")
-        || lower.contains("retryable")
-}
 
 /// One attempt of a copy-on-write rewrite, produced by the closure
 /// [`WriteHandler::commit_rewrite_with_retry`] runs against a freshly loaded
@@ -939,9 +846,34 @@ impl WriteHandler {
         catalog: &dyn TableCacheInvalidator,
         table_ident: &TableIdent,
     ) {
-        crate::session_context::invalidate_session_cache(&session.user.username).await;
+        if let Some(discovery) = &self.catalog_discovery {
+            discovery
+                .invalidate_session_cache(&session.user.username)
+                .await;
+        }
         catalog.invalidate_table_all_tokens(table_ident).await;
     }
+}
+
+/// What the write handler needs from the coordinator's session layer, as a
+/// trait so the write path does not depend on `session_context` (the moka
+/// session cache and per-catalog bearer resolution are coordinator state).
+/// The coordinator implements it as `session_context::PolarisCatalogDiscovery`.
+#[async_trait::async_trait]
+pub trait CatalogDiscovery: Send + Sync {
+    /// Resolve a non-default `warehouse` for `session` via Polaris discovery,
+    /// or `None` when it is not resolvable (nonexistent or not authorized).
+    async fn discover_session_catalog(
+        &self,
+        warehouse: &str,
+        config: &SqeConfig,
+        session: &Session,
+        table_cache: Option<&TableMetadataCache>,
+    ) -> Option<Arc<SessionCatalog>>;
+
+    /// Drop every cached session context of `username` after a commit so the
+    /// next query sees the new schema state.
+    async fn invalidate_session_cache(&self, username: &str);
 }
 
 /// The one thing `after_commit` needs from a catalog, extracted as a trait so
@@ -1121,6 +1053,10 @@ pub struct WriteHandler {
     /// filters and column masks but the write path would let masked or
     /// filtered-out rows be copied verbatim into a sink table.
     policy_enforcer: Option<Arc<dyn sqe_policy::PolicyEnforcer>>,
+    /// The coordinator's session-cache and catalog-discovery hooks; see
+    /// [`CatalogDiscovery`]. `None` in unit tests and in any embedding that
+    /// has no per-user session cache to invalidate.
+    catalog_discovery: Option<Arc<dyn CatalogDiscovery>>,
     /// See [`CommitRaceHook`].
     #[cfg(any(test, feature = "test-sqlite"))]
     commit_race_hook: Option<CommitRaceHook>,
@@ -1133,9 +1069,19 @@ impl WriteHandler {
             metrics: None,
             table_cache: None,
             policy_enforcer: None,
+            catalog_discovery: None,
             #[cfg(any(test, feature = "test-sqlite"))]
             commit_race_hook: None,
         }
+    }
+
+    /// Install the coordinator's [`CatalogDiscovery`] hooks. Without them a
+    /// 3-part target naming a non-default catalog is an "unknown catalog"
+    /// error and commits do not invalidate any session cache.
+    #[must_use = "with_catalog_discovery consumes self; bind the returned handler"]
+    pub fn with_catalog_discovery(mut self, discovery: Arc<dyn CatalogDiscovery>) -> Self {
+        self.catalog_discovery = Some(discovery);
+        self
     }
 
     /// TEST-ONLY: install a [`CommitRaceHook`]. See its doc comment.
@@ -5289,8 +5235,8 @@ impl WriteHandler {
             .iter()
             .map(|d| d.file_path().to_string())
             .collect();
-        let live_deletes = crate::maintenance::collect_live_delete_files(table).await?;
-        let covered = crate::maintenance::covered_position_deletes(&removed_paths, &live_deletes);
+        let live_deletes = sqe_compaction::collect_live_delete_files(table).await?;
+        let covered = sqe_compaction::covered_position_deletes(&removed_paths, &live_deletes);
         Ok(removed_data.into_iter().chain(covered).collect())
     }
 
@@ -6154,14 +6100,20 @@ impl WriteHandler {
                     && self.config.query.catalog_discovery
                         == sqe_core::config::CatalogDiscovery::PolarisAuto =>
             {
-                crate::session_context::discover_session_catalog(
-                    warehouse,
-                    &self.config,
-                    session,
-                    self.table_cache.as_ref(),
-                )
-                .await
-                .ok_or_else(|| {
+                let discovered = match &self.catalog_discovery {
+                    Some(discovery) => {
+                        discovery
+                            .discover_session_catalog(
+                                warehouse,
+                                &self.config,
+                                session,
+                                self.table_cache.as_ref(),
+                            )
+                            .await
+                    }
+                    None => None,
+                };
+                discovered.ok_or_else(|| {
                     SqeError::Catalog(format!(
                         "Unknown catalog '{warehouse}': not resolvable via Polaris \
                          (nonexistent or not authorized for this user)"
