@@ -1027,6 +1027,30 @@ pub(crate) async fn configured_session_catalog(
     }
 }
 
+/// The coordinator's implementation of the write path's
+/// [`CatalogDiscovery`](crate::write_handler::CatalogDiscovery) hooks: Polaris
+/// discovery through this module's per-catalog bearer resolution, and
+/// invalidation of the moka session-context cache after a commit.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PolarisCatalogDiscovery;
+
+#[async_trait::async_trait]
+impl crate::write_handler::CatalogDiscovery for PolarisCatalogDiscovery {
+    async fn discover_session_catalog(
+        &self,
+        warehouse: &str,
+        config: &SqeConfig,
+        session: &Session,
+        table_cache: Option<&TableMetadataCache>,
+    ) -> Option<Arc<SessionCatalog>> {
+        discover_session_catalog(warehouse, config, session, table_cache).await
+    }
+
+    async fn invalidate_session_cache(&self, username: &str) {
+        invalidate_session_cache(username).await
+    }
+}
+
 pub(crate) async fn discover_session_catalog(
     warehouse: &str,
     config: &SqeConfig,

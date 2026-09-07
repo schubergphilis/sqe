@@ -633,6 +633,27 @@ fn classify_catalog_status(status: u16) -> SqeErrorCode {
     }
 }
 
+/// True when `code` (an HTTP status such as `"401"`) occurs in `lower` as a
+/// whole token: bounded on both sides by a non-alphanumeric byte or the end
+/// of the string. `"status: 401 unauthorized"` and `"http 401"` match;
+/// `"127.0.0.1:39401"`, `"snapshot 8401223"` and `"401k"` do not.
+fn has_status_token(lower: &str, code: &str) -> bool {
+    let bytes = lower.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = lower[from..].find(code) {
+        let start = from + pos;
+        let end = start + code.len();
+        let bounded_before = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let bounded_after = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        if bounded_before && bounded_after {
+            return true;
+        }
+        // `code` is ASCII, so `start + 1` is a char boundary.
+        from = start + 1;
+    }
+    false
+}
+
 /// Classify a [`SqeError::Catalog`] message into a specific error code.
 fn classify_catalog_error(msg: &str) -> SqeErrorCode {
     let lower = msg.to_lowercase();
@@ -644,11 +665,19 @@ fn classify_catalog_error(msg: &str) -> SqeErrorCode {
     // breaker message was opaque. That sent users hunting for tables
     // that exist when the actual cause was an Authorization header
     // that did not reach the catalog. Surface the real cause.
-    if lower.contains("401") || lower.contains("unauthorized") || lower.contains("www-authenticate")
+    //
+    // The bare codes are matched as whole tokens, not substrings: a message
+    // that quotes the request URL carries the peer's port ("127.0.0.1:39401"),
+    // and snapshot ids, row counts and file sizes contain every three-digit
+    // sequence eventually. `contains("401")` turned a request timeout against
+    // a mock catalog on port 39401 into AuthenticationFailed (CI, 2026-09-07).
+    if has_status_token(&lower, "401")
+        || lower.contains("unauthorized")
+        || lower.contains("www-authenticate")
     {
         return SqeErrorCode::AuthenticationFailed;
     }
-    if lower.contains("403") || lower.contains("forbidden") {
+    if has_status_token(&lower, "403") || lower.contains("forbidden") {
         return SqeErrorCode::AccessDenied;
     }
     // Transient catalog failures: surface as `Unavailable` so retry logic
@@ -659,11 +688,11 @@ fn classify_catalog_error(msg: &str) -> SqeErrorCode {
     if lower.contains("circuit breaker") || lower.contains("circuit open") {
         return SqeErrorCode::CircuitBreakerOpen;
     }
-    if lower.contains("502")
+    if has_status_token(&lower, "502")
         || lower.contains("bad gateway")
-        || lower.contains("503")
+        || has_status_token(&lower, "503")
         || lower.contains("service unavailable")
-        || lower.contains("504")
+        || has_status_token(&lower, "504")
         || lower.contains("gateway timeout")
         || lower.contains("500 internal server error")
     {
@@ -1290,6 +1319,38 @@ mod tests {
         let err = SqeError::Catalog("AccessDenied: unauthorized request".to_string());
         let code = err.error_code();
         assert_eq!(code, SqeErrorCode::AuthenticationFailed);
+    }
+
+    /// CI 2026-09-07: a request timeout against a wiremock catalog on port
+    /// 39401 classified as AuthenticationFailed because the URL in the
+    /// message contains the digits "401". Status codes match as whole tokens.
+    #[test]
+    fn error_code_catalog_port_containing_401_is_not_an_auth_failure() {
+        let err = SqeError::Catalog(
+            "Failed to authorize table sales.orders: error sending request for url \
+             (http://127.0.0.1:39401/v1/test-warehouse/namespaces/sales/tables/orders)"
+                .to_string(),
+        );
+        assert_eq!(err.error_code(), SqeErrorCode::CatalogError);
+
+        let err = SqeError::Catalog(
+            "Failed to load table: snapshot 8403122 not found: connection reset by peer"
+                .to_string(),
+        );
+        assert_eq!(err.error_code(), SqeErrorCode::CatalogUnavailable);
+    }
+
+    #[test]
+    fn has_status_token_matches_whole_tokens_only() {
+        assert!(super::has_status_token("http 401", "401"));
+        assert!(super::has_status_token("401 unauthorized", "401"));
+        assert!(super::has_status_token("{ status: 401, body: x }", "401"));
+        assert!(super::has_status_token("status=503;retry", "503"));
+        assert!(!super::has_status_token("127.0.0.1:39401/v1", "401"));
+        assert!(!super::has_status_token("4013 rows", "401"));
+        assert!(!super::has_status_token("plan 401k", "401"));
+        // Second occurrence is the bounded one.
+        assert!(super::has_status_token("port 39401, status 401", "401"));
     }
 
     #[test]

@@ -209,7 +209,7 @@ impl HiveDdlHandler {
     /// Only the catalog component matters for the answer this returns
     /// (`is_hive_root` inspects nothing else), so a `Bare` reference is
     /// promoted with a placeholder `"default"` schema -- consistent with
-    /// `catalog_ops::parse_table_ref`'s own fallback for a one-part name --
+    /// `ident::parse_table_ref`'s own fallback for a one-part name --
     /// rather than threading the session's default schema through for a
     /// value this method never uses.
     pub fn resolve_table_kind_for_session(
