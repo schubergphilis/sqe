@@ -1,12 +1,21 @@
-use arrow_array::RecordBatch;
-use arrow_flight::sql::client::FlightSqlServiceClient;
-use futures::TryStreamExt;
-use tonic::transport::Channel;
+//! Flight SQL benchmark client over the shared
+//! `sqe_trino_protocol::flight::FlightSqlClient` (review 705).
+//!
+//! Creates a fresh gRPC connection per query to avoid HTTP/2 stream
+//! accumulation issues on long-running benchmark sessions.
+//!
+//! No default schema: the coordinator's Flight path never populates
+//! `Session::default_schema` and treats `USE` as a logged no-op
+//! (`query_handler.rs`, `StatementKind::Use`), so `default_schema()` reports
+//! `None` and `query::QualifyTables::Auto` qualifies table names for this
+//! client. When the coordinator honours a Flight session schema, return it
+//! here and the rewrite switches itself off.
 
-/// Flight SQL benchmark client.
-///
-/// Creates a fresh gRPC connection per query to avoid HTTP/2 stream
-/// accumulation issues on long-running benchmark sessions.
+use std::time::Duration;
+
+use arrow_array::RecordBatch;
+use sqe_trino_protocol::flight::{ChannelOptions, FlightSqlClient};
+
 pub struct FlightSqlBenchClient {
     host: String,
     token: Option<String>,
@@ -27,16 +36,10 @@ impl FlightSqlBenchClient {
         {
             Some(fetch_client_credentials_token(endpoint, cid, secret).await?)
         } else if let (Some(user), Some(pass)) = (username, password) {
-            let channel = build_channel(host).await?;
-            let mut client = FlightSqlServiceClient::new(channel);
-            let handshake_token = client
-                .handshake(user, pass)
-                .await
-                .map_err(|e| anyhow::anyhow!("Authentication failed: {e}"))?;
-            Some(
-                String::from_utf8(handshake_token.to_vec())
-                    .map_err(|e| anyhow::anyhow!("Token is not valid UTF-8: {e}"))?,
-            )
+            let client =
+                FlightSqlClient::connect_with_handshake(host, user, pass, &channel_options())
+                    .await?;
+            client.token().map(str::to_string)
         } else {
             None
         };
@@ -58,14 +61,32 @@ impl FlightSqlBenchClient {
         }
     }
 
-    /// Create a fresh FlightSqlServiceClient with the stored token.
-    async fn new_client(&self) -> anyhow::Result<FlightSqlServiceClient<Channel>> {
-        let channel = build_channel(&self.host).await?;
-        let mut client = FlightSqlServiceClient::new(channel);
-        if let Some(ref token) = self.token {
-            client.set_token(token.clone());
-        }
-        Ok(client)
+    /// Open a fresh connection carrying the stored token.
+    async fn new_client(&self) -> anyhow::Result<FlightSqlClient> {
+        let opts = channel_options();
+        Ok(match &self.token {
+            Some(token) => FlightSqlClient::connect_with_token(&self.host, token, &opts).await?,
+            None => FlightSqlClient::connect(&self.host, &opts).await?,
+        })
+    }
+}
+
+/// Bench channel tuning. Per-request timeout: long CTAS loads (e.g. TPC-H
+/// SF100 lineitem = 28 GiB / 600M rows) can take well over the old 5-minute
+/// hard-coded value. Override via `BENCH_CLIENT_TIMEOUT_SECS` when running at
+/// large scale factors; the default of 1800 s (30 min) covers SF100 on a
+/// modest box without artificially capping SF1000 runs either.
+fn channel_options() -> ChannelOptions {
+    let timeout_secs: u64 = std::env::var("BENCH_CLIENT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1800);
+    ChannelOptions {
+        timeout: Some(Duration::from_secs(timeout_secs)),
+        connect_timeout: Some(Duration::from_secs(10)),
+        http2_keep_alive_interval: Some(Duration::from_secs(10)),
+        keep_alive_timeout: Some(Duration::from_secs(20)),
+        keep_alive_while_idle: true,
     }
 }
 
@@ -105,38 +126,6 @@ async fn fetch_client_credentials_token(
         .ok_or_else(|| anyhow::anyhow!("No access_token in token response"))
 }
 
-async fn build_channel(host: &str) -> anyhow::Result<Channel> {
-    use std::time::Duration;
-
-    let url = if host.starts_with("http://") || host.starts_with("https://") {
-        host.to_string()
-    } else {
-        format!("http://{host}")
-    };
-    // Per-request timeout. Long CTAS loads (e.g. TPC-H SF100 lineitem =
-    // 28 GiB / 600M rows) can take well over the old 5-minute hard-coded
-    // value. Override via `BENCH_CLIENT_TIMEOUT_SECS` when running at
-    // large scale factors; the default of 1800 s (30 min) covers SF100
-    // on a modest box without artificially capping SF1000 runs either.
-    let timeout_secs: u64 = std::env::var("BENCH_CLIENT_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1800);
-
-    let channel = Channel::from_shared(url.clone())
-        .map_err(|e| anyhow::anyhow!("Invalid endpoint URI '{url}': {e}"))?
-        .keep_alive_while_idle(true)
-        .http2_keep_alive_interval(Duration::from_secs(10))
-        .keep_alive_timeout(Duration::from_secs(20))
-        .timeout(Duration::from_secs(timeout_secs))
-        .connect_timeout(Duration::from_secs(10))
-        .connect()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to '{url}': {e}"))?;
-
-    Ok(channel)
-}
-
 #[async_trait::async_trait]
 impl super::BenchClient for FlightSqlBenchClient {
     async fn execute(&self, sql: &str) -> anyhow::Result<Vec<RecordBatch>> {
@@ -145,49 +134,12 @@ impl super::BenchClient for FlightSqlBenchClient {
 
         let debug = std::env::var("BENCH_DEBUG").is_ok();
         if debug {
-            eprintln!("[flight] get_flight_info...");
+            eprintln!("[flight] execute + do_get...");
         }
-        let flight_info = client
-            .execute(sql.to_string(), None)
-            .await
-            .map_err(|e| anyhow::anyhow!("Query failed: {e}"))?;
+        let batches = client.execute_collect(sql).await?;
         if debug {
-            eprintln!("[flight] got {} endpoints", flight_info.endpoint.len());
+            eprintln!("[flight] got {} batches", batches.len());
         }
-
-        let mut batches = Vec::new();
-
-        for (i, endpoint) in flight_info.endpoint.iter().enumerate() {
-            let ticket = endpoint
-                .ticket
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("Flight endpoint returned no ticket"))?;
-
-            if debug {
-                eprintln!("[flight] do_get endpoint {i}...");
-            }
-            let stream = client
-                .do_get(ticket)
-                .await
-                .map_err(|e| anyhow::anyhow!("do_get failed: {e}"))?;
-
-            if debug {
-                eprintln!("[flight] collecting batches from endpoint {i}...");
-            }
-            let endpoint_batches: Vec<RecordBatch> = stream
-                .try_collect()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to collect record batches: {e}"))?;
-
-            if debug {
-                eprintln!(
-                    "[flight] got {} batches from endpoint {i}",
-                    endpoint_batches.len()
-                );
-            }
-            batches.extend(endpoint_batches);
-        }
-
         Ok(batches)
     }
 

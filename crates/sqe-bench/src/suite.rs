@@ -10,6 +10,7 @@
 
 use crate::client::BenchClient;
 use crate::comparison::classify;
+use crate::query::QualifyTables;
 use crate::report::{
     CompareStatusReport, ComparisonReport, ComparisonSummary, QueryComparison, QueryResult,
 };
@@ -35,6 +36,7 @@ pub async fn run_suite(
     namespace_override: Option<&str>,
     sqe_endpoint: &str,
     trino_endpoint: Option<&str>,
+    qualify: QualifyTables,
 ) -> anyhow::Result<SuiteOutcome> {
     let queries = crate::query::load_query_files(benchmark)?;
     run_suite_with_queries(
@@ -48,6 +50,7 @@ pub async fn run_suite(
         namespace_override,
         sqe_endpoint,
         trino_endpoint,
+        qualify,
     )
     .await
 }
@@ -67,14 +70,11 @@ async fn run_suite_with_queries(
     namespace_override: Option<&str>,
     sqe_endpoint: &str,
     trino_endpoint: Option<&str>,
+    qualify: QualifyTables,
 ) -> anyhow::Result<SuiteOutcome> {
-    // Namespace: mirror `test::run_benchmark_test` exactly (override wins;
-    // tpcbb reads the tpcds namespace; then apply the catalog prefix).
-    let ns_base = match namespace_override {
-        Some(ns) => ns.to_string(),
-        None if benchmark == "tpcbb" => crate::bench_namespace("tpcds", scale),
-        None => crate::bench_namespace(benchmark, scale),
-    };
+    // Namespace: override wins; tpcbb reads the tpcds namespace; then apply
+    // the catalog prefix. Only used when a client needs qualified names.
+    let ns_base = crate::suite_namespace(benchmark, scale, namespace_override);
     let namespace = match catalog {
         Some(cat) => format!("{cat}.{ns_base}"),
         None => ns_base,
@@ -108,9 +108,15 @@ async fn run_suite_with_queries(
             continue;
         }
 
-        // Qualify bare table names with the benchmark namespace. This is the
-        // SQL sent to SQE, byte-identical to the test path.
-        let sql = crate::query::prefix_tables(&query.sql, &namespace, benchmark);
+        // The SQL sent to SQE: the committed text when the connection carries
+        // a default schema, else qualified with the namespace (review 707).
+        let sql = crate::query::sql_for_client(
+            &query.sql,
+            &namespace,
+            benchmark,
+            qualify,
+            sqe.default_schema(),
+        )?;
         let timeout = crate::execute::resolve_timeout(query.timeout_secs);
 
         // The ONE SQE execution. Its `QueryRun` feeds BOTH the report outcome
@@ -149,9 +155,16 @@ async fn run_suite_with_queries(
         if let Some(trino_client) = trino {
             // Trino's HTTP protocol rejects trailing semicolons, so strip them
             // (and surrounding whitespace) for the Trino call and the DML check.
-            // SQE keeps the un-stripped SQL above; the strip is inert for SQE,
-            // so its rows/time are unchanged vs the old compare path.
-            let trino_sql = sql.trim().trim_end_matches(';').trim().to_string();
+            // Trino resolves the schema from `X-Trino-Schema`, so its text is
+            // the committed query unless `--qualify-tables always`.
+            let trino_sql = crate::query::sql_for_client(
+                &query.sql,
+                &namespace,
+                benchmark,
+                qualify,
+                trino_client.default_schema(),
+            )?;
+            let trino_sql = trino_sql.trim().trim_end_matches(';').trim().to_string();
 
             // Skip DML in comparison mode: running it against both engines would
             // mutate the one shared table. DML correctness is checked by SQE
@@ -369,6 +382,7 @@ mod tests {
             None,
             "sqe://test",
             Some("trino://test"),
+            QualifyTables::Auto,
         )
         .await
         .unwrap();

@@ -10,13 +10,13 @@ use tracing::warn;
 const DEFAULT_EXPECTED_ROWS_PATH: &str = "benchmarks/expected/canonical_rows_duckdb.json";
 
 /// Canonical-row manifest: { benchmark -> { query_name -> { "sf{N}_official_rows": count } } }.
-pub(crate) type ExpectedRows = HashMap<String, HashMap<String, HashMap<String, i64>>>;
+pub type ExpectedRows = HashMap<String, HashMap<String, HashMap<String, i64>>>;
 
 /// Load the canonical-row manifest. Path comes from `BENCH_EXPECTED_ROWS`, or
 /// defaults to `benchmarks/expected/canonical_rows_duckdb.json`. Returns `None`
 /// if the file is absent (existing runs keep working) or unparseable (with a
 /// warning), so the assertion gracefully no-ops.
-pub(crate) fn load_expected_rows() -> Option<ExpectedRows> {
+pub fn load_expected_rows() -> Option<ExpectedRows> {
     let path = std::env::var("BENCH_EXPECTED_ROWS")
         .unwrap_or_else(|_| DEFAULT_EXPECTED_ROWS_PATH.to_string());
     if !std::path::Path::new(&path).exists() {
@@ -41,7 +41,7 @@ pub(crate) fn load_expected_rows() -> Option<ExpectedRows> {
 /// Returns `None` when there is no manifest, no entry, or no count for this
 /// scale (e.g. SF10, which is not in the manifest yet). The scale key is built
 /// from `format_scale` so it is forward-compatible: scale 1.0 -> `sf1_official_rows`.
-pub(crate) fn canonical_rows(
+pub fn canonical_rows(
     manifest: Option<&ExpectedRows>,
     benchmark: &str,
     query_name: &str,
@@ -60,7 +60,7 @@ pub(crate) fn canonical_rows(
 /// `None` when unknown. The vacuous (0-rows-on-both) arm splits on `canonical`:
 /// unknown -> `Vacuous`, `Some(0)` -> `ExpectedEmpty` (pass), `Some(n>0)` ->
 /// `VacuousBug` (fail). All other arms are unchanged.
-pub(crate) fn classify_status(
+pub fn classify_status(
     sqe_error: &Option<String>,
     trino_error: &Option<String>,
     sqe_rows: usize,
@@ -95,7 +95,7 @@ pub(crate) fn classify_status(
 /// regular sqe-bench test, not by compare. Moved verbatim from
 /// `run_comparison`'s inline block so the single-pass `suite::run_suite` driver
 /// and `run_comparison` share one detector.
-pub(crate) fn is_dml(sql: &str) -> bool {
+pub fn is_dml(sql: &str) -> bool {
     let sql_upper = sql.trim().to_uppercase();
     let is_dml = sql_upper.starts_with("UPDATE ")
         || sql_upper.starts_with("DELETE ")
@@ -118,7 +118,7 @@ pub(crate) fn is_dml(sql: &str) -> bool {
 /// Connection/transport-level failure, as opposed to a query-level error.
 /// These are safe to retry once: the query never reached execution, or the
 /// stream died for reasons unrelated to the SQL.
-pub(crate) fn is_transport_error(msg: &str) -> bool {
+pub fn is_transport_error(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     m.contains("h2 protocol error")
         || m.contains("transport error")

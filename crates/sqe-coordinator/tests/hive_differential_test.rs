@@ -185,7 +185,8 @@ async fn substituting_the_full_schema_scan_keeps_the_query_correct() {
 
         let (full_schema, dist_batches) = distributed_rows(&scan).await;
         let stand_in = hive_diff::stand_in_for_distributed(&scan, full_schema, dist_batches);
-        let swapped = sqe_coordinator::query_handler::replace_scan_in_plan(&plan, &scan, stand_in);
+        let swapped = sqe_coordinator::query_handler::replace_scan_in_plan(&plan, &scan, stand_in)
+            .expect("the parents must accept the stand-in (finding 402: a refusal is an error)");
         assert!(
             find_hive_scan(&swapped).is_none(),
             "{sql}: the substitution must actually have replaced the scan:\n{}",

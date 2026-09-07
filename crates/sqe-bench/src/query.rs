@@ -1,3 +1,21 @@
+//! Benchmark query files and (opt-in) table qualification.
+//!
+//! Review 707: the harness used to rewrite every benchmark query with string
+//! heuristics to prefix bare table names, and the committed TPC text had been
+//! edited to dodge the rewriter's false positives. The default is now to send
+//! the file text as committed and let the connection carry the schema
+//! (`X-Trino-Schema` on the Trino protocol). Qualification survives only as
+//! [`QualifyTables`] for connections that cannot express a default schema
+//! (today: the coordinator's Flight path, see `client::flight`), and it is
+//! implemented on `sqlparser`'s tokenizer so aliases, string literals and
+//! comments are tokens that are never touched.
+
+use std::collections::HashSet;
+
+use sqlparser::dialect::GenericDialect;
+use sqlparser::keywords::Keyword;
+use sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer};
+
 // ---------------------------------------------------------------------------
 // Data types
 // ---------------------------------------------------------------------------
@@ -5,13 +23,51 @@
 pub struct QueryFile {
     pub id: String,
     /// Human-readable name from `-- name:` header comment.
-    #[allow(dead_code)]
     pub name: String,
     pub sql: String,
     pub requires: Vec<String>,
-    /// Per-query timeout from `-- timeout:` header comment (future use).
-    #[allow(dead_code)]
+    /// Per-query timeout from `-- timeout:` header comment.
     pub timeout_secs: u64,
+}
+
+/// How bare table names in a query file reach the engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum QualifyTables {
+    /// Send the text untouched when the client carries a default schema
+    /// (`BenchClient::default_schema()` is `Some`); qualify otherwise.
+    #[default]
+    Auto,
+    /// Always qualify bare table names with the namespace.
+    Always,
+    /// Never rewrite; the engine must resolve bare names itself.
+    Never,
+}
+
+impl QualifyTables {
+    /// Whether a client with `default_schema` needs qualified table names.
+    pub fn applies(self, default_schema: Option<&str>) -> bool {
+        match self {
+            QualifyTables::Always => true,
+            QualifyTables::Never => false,
+            QualifyTables::Auto => default_schema.is_none(),
+        }
+    }
+}
+
+/// The SQL to send to a client for a benchmark query: the committed text, or
+/// the tokenizer-qualified text when [`QualifyTables::applies`] says so.
+pub fn sql_for_client(
+    sql: &str,
+    namespace: &str,
+    benchmark: &str,
+    mode: QualifyTables,
+    default_schema: Option<&str>,
+) -> anyhow::Result<String> {
+    if mode.applies(default_schema) {
+        prefix_tables(sql, namespace, benchmark)
+    } else {
+        Ok(sql.to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -127,191 +183,313 @@ pub fn normalize_query_id(id: &str) -> String {
     }
 }
 
-/// Strip SQL line comments (`-- ...` to end-of-line, preserving the newline).
-///
-/// The prefixer's "inside a quoted string" heuristic counts apostrophes to
-/// detect string literals, but apostrophes inside comments (e.g.
-/// `-- credit the customer's balance`) trip it up. Comments have no runtime
-/// effect, so we remove them before scanning. Block comments (`/* ... */`)
-/// are rare in the bench queries and left untouched.
-fn strip_line_comments(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' if !in_double => {
-                in_single = !in_single;
-                out.push(c);
+/// Table names of a benchmark suite (TPC-BB queries also reference the
+/// TPC-DS tables they are loaded next to).
+pub fn suite_tables(benchmark: &str) -> anyhow::Result<Vec<String>> {
+    let gen = crate::generate::get_generator(benchmark)?;
+    let mut tables: Vec<String> = gen.tables().into_iter().map(|t| t.name).collect();
+    if benchmark == "tpcbb" {
+        let tpcds = crate::generate::get_generator("tpcds")?;
+        tables.extend(tpcds.tables().into_iter().map(|t| t.name));
+    }
+    Ok(tables)
+}
+
+/// Qualify the bare table names of `benchmark` in `sql` with `namespace`.
+/// Unknown benchmarks pass the text through unchanged (there is no table
+/// list to match against).
+pub fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> anyhow::Result<String> {
+    let tables = match suite_tables(benchmark) {
+        Ok(t) => t,
+        Err(_) => return Ok(sql.to_string()),
+    };
+    qualify_tables(sql, namespace, &tables)
+}
+
+/// Per-parenthesis-depth parser state for [`qualify_tables`].
+#[derive(Default, Clone, Copy)]
+struct Scope {
+    /// The next identifier is a table reference (right after FROM/JOIN/INTO/
+    /// UPDATE/TABLE/USING, or after a comma inside an active FROM clause).
+    expect_table: bool,
+    /// Inside a FROM clause: a comma at this depth introduces another table.
+    from_active: bool,
+    /// Inside a function-call argument list: `FROM` here is `EXTRACT(x FROM
+    /// y)` / `SUBSTRING(... FROM ...)`, not a table introducer.
+    function_args: bool,
+}
+
+/// Qualify bare table references in `sql` with `namespace`, using
+/// `sqlparser`'s tokenizer so only identifier tokens in table position are
+/// touched. Column aliases, string literals, comments, quoted identifiers
+/// that are not tables, CTE names and already-qualified names are left as
+/// they are. The output is the input text with `namespace.` spliced in front
+/// of each qualified table token; nothing else is re-rendered.
+pub fn qualify_tables(sql: &str, namespace: &str, tables: &[String]) -> anyhow::Result<String> {
+    let dialect = GenericDialect {};
+    let tokens = Tokenizer::new(&dialect, sql)
+        .tokenize_with_location()
+        .map_err(|e| anyhow::anyhow!("cannot tokenize query for table qualification: {e}"))?;
+
+    let table_set: HashSet<String> = tables.iter().map(|t| t.to_ascii_lowercase()).collect();
+    let cte_names = collect_cte_names(&tokens);
+
+    // Significant (non-whitespace) tokens, by index into `tokens`.
+    let sig: Vec<usize> = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !matches!(t.token, Token::Whitespace(_)))
+        .map(|(i, _)| i)
+        .collect();
+
+    let mut stack: Vec<Scope> = vec![Scope::default()];
+    let mut insert_at: Vec<Location> = Vec::new();
+
+    for (k, &i) in sig.iter().enumerate() {
+        let tok = &tokens[i].token;
+        let prev = k.checked_sub(1).map(|p| &tokens[sig[p]].token);
+        let next = sig.get(k + 1).map(|&n| &tokens[n].token);
+        let depth = stack.len() - 1;
+        let scope = &mut stack[depth];
+
+        match tok {
+            Token::LParen => {
+                // `FROM (`, `JOIN (`, `USING (` open a derived table; the
+                // parent keeps its FROM clause active for what follows `)`.
+                let derived = scope.expect_table;
+                scope.expect_table = false;
+                if derived {
+                    scope.from_active = true;
+                }
+                let function_args = match prev {
+                    // `IN (`, `EXISTS (`, `AS (`, `FROM (`, `= (`, `, (` ...
+                    // open a subquery or grouping, not a call.
+                    Some(Token::Word(w)) if w.quote_style.is_none() => {
+                        !is_paren_opener_keyword(w.keyword)
+                    }
+                    Some(Token::Word(_)) => true,
+                    _ => false,
+                };
+                stack.push(Scope {
+                    function_args,
+                    ..Scope::default()
+                });
             }
-            '"' if !in_single => {
-                in_double = !in_double;
-                out.push(c);
+            Token::RParen => {
+                if stack.len() > 1 {
+                    stack.pop();
+                }
             }
-            '-' if !in_single && !in_double && chars.peek() == Some(&'-') => {
-                // Consume the second '-' and the rest of the line.
-                chars.next();
-                for nc in chars.by_ref() {
-                    if nc == '\n' {
-                        out.push('\n');
-                        break;
+            Token::Comma => {
+                if scope.from_active {
+                    scope.expect_table = true;
+                }
+            }
+            Token::SemiColon => {
+                stack.clear();
+                stack.push(Scope::default());
+            }
+            Token::Word(w) => {
+                if w.quote_style.is_none() && !scope.function_args {
+                    match w.keyword {
+                        Keyword::FROM
+                        | Keyword::JOIN
+                        | Keyword::INTO
+                        | Keyword::UPDATE
+                        | Keyword::TABLE
+                        | Keyword::USING => {
+                            scope.expect_table = true;
+                            scope.from_active = true;
+                            continue;
+                        }
+                        // `DROP TABLE IF EXISTS t`, `FROM ONLY t`, `JOIN LATERAL (`.
+                        Keyword::IF
+                        | Keyword::EXISTS
+                        | Keyword::NOT
+                        | Keyword::ONLY
+                        | Keyword::LATERAL
+                            if scope.expect_table =>
+                        {
+                            continue;
+                        }
+                        // Clause boundaries: the FROM list is over.
+                        Keyword::WHERE
+                        | Keyword::GROUP
+                        | Keyword::HAVING
+                        | Keyword::ORDER
+                        | Keyword::LIMIT
+                        | Keyword::OFFSET
+                        | Keyword::FETCH
+                        | Keyword::UNION
+                        | Keyword::EXCEPT
+                        | Keyword::INTERSECT
+                        | Keyword::WINDOW
+                        | Keyword::QUALIFY
+                        | Keyword::SET
+                        | Keyword::RETURNING
+                        | Keyword::SELECT
+                        | Keyword::VALUES
+                        | Keyword::WITH => {
+                            scope.expect_table = false;
+                            scope.from_active = false;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                if scope.expect_table {
+                    // This identifier fills the table slot whether or not we
+                    // qualify it (an alias, a CTE, a qualified name, or a
+                    // function-table such as `read_parquet(...)`).
+                    scope.expect_table = false;
+                    let preceded_by_period = matches!(prev, Some(Token::Period));
+                    let followed_by_period = matches!(next, Some(Token::Period));
+                    let name = w.value.to_ascii_lowercase();
+                    if !preceded_by_period
+                        && !followed_by_period
+                        && table_set.contains(&name)
+                        && !cte_names.contains(&name)
+                    {
+                        insert_at.push(tokens[i].span.start);
                     }
                 }
             }
-            _ => out.push(c),
+            _ => {
+                // A literal or operator in table position: nothing to qualify.
+                scope.expect_table = false;
+            }
         }
     }
-    out
+
+    if insert_at.is_empty() {
+        return Ok(sql.to_string());
+    }
+
+    let mut offsets: Vec<usize> = insert_at
+        .iter()
+        .map(|loc| {
+            byte_offset(sql, *loc).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "tokenizer location {}:{} is outside the query text",
+                    loc.line,
+                    loc.column
+                )
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
+    offsets.sort_unstable();
+    offsets.dedup();
+
+    let prefix = format!("{namespace}.");
+    let mut out = String::with_capacity(sql.len() + offsets.len() * prefix.len());
+    let mut last = 0usize;
+    for off in offsets {
+        out.push_str(&sql[last..off]);
+        out.push_str(&prefix);
+        last = off;
+    }
+    out.push_str(&sql[last..]);
+    Ok(out)
 }
 
-/// Replace unqualified table names in the query SQL with
-/// `<namespace>.<table>` qualified names.
-///
-/// Uses word-boundary matching: a table name is qualified when it appears
-/// as a standalone word (not preceded/followed by `_` or `.`).
-/// Tables are processed longest-name-first to avoid partial replacements.
-pub fn prefix_tables(sql: &str, namespace: &str, benchmark: &str) -> String {
-    let gen = match crate::generate::get_generator(benchmark) {
-        Ok(g) => g,
-        Err(_) => return sql.to_string(),
-    };
+/// Keywords after which `(` opens a subquery / grouping rather than a
+/// function-call argument list.
+fn is_paren_opener_keyword(k: Keyword) -> bool {
+    matches!(
+        k,
+        Keyword::IN
+            | Keyword::EXISTS
+            | Keyword::AS
+            | Keyword::FROM
+            | Keyword::JOIN
+            | Keyword::ON
+            | Keyword::AND
+            | Keyword::OR
+            | Keyword::NOT
+            | Keyword::SELECT
+            | Keyword::WHERE
+            | Keyword::USING
+            | Keyword::VALUES
+            | Keyword::THEN
+            | Keyword::ELSE
+            | Keyword::WHEN
+            | Keyword::BY
+            | Keyword::UNION
+            | Keyword::ALL
+            | Keyword::ANY
+            | Keyword::SOME
+            | Keyword::LATERAL
+            | Keyword::HAVING
+            | Keyword::RETURNING
+            | Keyword::WITH
+            | Keyword::INTERSECT
+            | Keyword::EXCEPT
+            | Keyword::CASE
+            | Keyword::DISTINCT
+    )
+}
 
-    let mut tables: Vec<String> = gen.tables().into_iter().map(|t| t.name).collect();
-
-    // TPC-BB queries reference TPC-DS tables — include them for qualification
-    if benchmark == "tpcbb" {
-        if let Ok(tpcds_gen) = crate::generate::get_generator("tpcds") {
-            tables.extend(tpcds_gen.tables().into_iter().map(|t| t.name));
-        }
+/// Names bound by `WITH name [(cols)] AS (...) [, name2 AS (...)]` at any
+/// depth. A CTE named like a base table must not be qualified.
+fn collect_cte_names(tokens: &[TokenWithSpan]) -> HashSet<String> {
+    #[derive(PartialEq)]
+    enum Mode {
+        Off,
+        /// Expecting the next CTE name at `depth`.
+        ExpectName(usize),
+        /// Inside/after a CTE body at `depth`; a comma there starts another.
+        InList(usize),
     }
-    // Longest first to prevent "part" matching inside "partsupp"
-    tables.sort_by_key(|t| std::cmp::Reverse(t.len()));
-
-    // Strip line comments up front so apostrophes in prose like "customer's"
-    // don't unbalance the string-literal quote check below.
-    let mut result = strip_line_comments(sql);
-
-    for table in &tables {
-        let qualified = format!("{namespace}.{table}");
-        let mut output = String::with_capacity(result.len() + 256);
-        let mut remaining = result.as_str();
-
-        while let Some(pos) = remaining.find(table.as_str()) {
-            // Check character before the match (word boundary)
-            let before_ok = if pos == 0 {
-                true
-            } else {
-                let before = remaining.as_bytes()[pos - 1];
-                // Not preceded by alphanumeric, underscore, or dot
-                !before.is_ascii_alphanumeric() && before != b'_' && before != b'.'
-            };
-
-            // Check character after the match
-            let end = pos + table.len();
-            let after_char = if end < remaining.len() {
-                Some(remaining.as_bytes()[end])
-            } else {
-                None
-            };
-            let after_ok = match after_char {
-                None => true,
-                Some(c) if c.is_ascii_alphanumeric() || c == b'_' => false, // Part of longer identifier
-                _ => true,
-            };
-            // If followed by '.', this is a column reference (store.item_sk).
-            // Only qualify if in FROM/JOIN context (table definition), not in expression context.
-            let is_column_ref = after_char == Some(b'.');
-
-            if before_ok && after_ok {
-                let before_str = &remaining[..pos];
-                let trimmed_before = before_str.trim_end();
-                let upper_before = trimmed_before.to_uppercase();
-
-                // Skip if preceded by "AS " (this is an alias, not a table ref)
-                if upper_before.ends_with(" AS") {
-                    output.push_str(&remaining[..end]);
-                    remaining = &remaining[end..];
-                    continue;
+    let mut names = HashSet::new();
+    let mut depth = 0usize;
+    let mut mode = Mode::Off;
+    for t in tokens {
+        match &t.token {
+            Token::Whitespace(_) => {}
+            Token::LParen => depth += 1,
+            Token::RParen => depth = depth.saturating_sub(1),
+            Token::Word(w) if w.quote_style.is_none() && w.keyword == Keyword::WITH => {
+                mode = Mode::ExpectName(depth);
+            }
+            Token::Word(w) => match mode {
+                Mode::ExpectName(d) if d == depth => {
+                    names.insert(w.value.to_ascii_lowercase());
+                    mode = Mode::InList(d);
                 }
-
-                // Only qualify if preceded by a table-introducing context:
-                // FROM, JOIN, TABLE, INTO, UPDATE, or a comma within a FROM/JOIN clause.
-                //
-                // To determine if a trailing comma is in FROM/JOIN context (vs SELECT/ORDER BY),
-                // scan the full text so far (output + current segment) for the last SQL clause keyword.
-                let in_table_context = upper_before.ends_with(" FROM")
-                    || upper_before.ends_with(" JOIN")
-                    || upper_before.ends_with(" TABLE")
-                    || upper_before.ends_with(" INTO")
-                    || upper_before.ends_with(" UPDATE")
-                    || upper_before.ends_with("\nUPDATE")
-                    || upper_before.ends_with(" EXISTS")
-                    // Trailing comma means continuation of a table list
-                    // (handles "FROM t1, t2", "FROM t1 a1,\n t2 a2", etc.)
-                    // Note: this can over-qualify column aliases that share names with tables.
-                    // Such queries are fixed by renaming the conflicting aliases in the query files.
-                    || trimmed_before.ends_with(',')
-                    // Also handle newline after FROM/JOIN (table on next line)
-                    || {
-                        let words: Vec<&str> = trimmed_before.split_whitespace().collect();
-                        words.last().map(|w| {
-                            let u = w.to_uppercase();
-                            u == "FROM" || u == "JOIN" || u == "TABLE" || u == "INTO"
-                        }).unwrap_or(false)
-                    };
-
-                // If followed by '.', this is a column reference (store.item_sk)
-                // or alias reference (store.cume_sales). Never qualify these --
-                // they reference an alias or already-qualified table, not a bare table.
-                if is_column_ref {
-                    output.push_str(&remaining[..end]);
-                    remaining = &remaining[end..];
-                    continue;
+                Mode::InList(d) if d == depth && w.keyword != Keyword::AS => {
+                    // `WITH x AS (...) SELECT` -- the list is over.
+                    mode = Mode::Off;
                 }
-
-                if !in_table_context {
-                    output.push_str(&remaining[..end]);
-                    remaining = &remaining[end..];
-                    continue;
-                }
-
-                // Check it's not inside a quoted string (heuristic:
-                // count unescaped quotes before this position — odd means inside quotes).
-                // Check both single quotes (SQL string literals) and double quotes (identifiers).
-                //
-                // Must count across `output + remaining[..pos]`, not just
-                // `remaining[..pos]`. When an earlier occurrence of the same
-                // bare table name was consumed (e.g. the `news_item` inside a
-                // string literal `'news_item'`), its opening quote now lives in
-                // `output` while the closing quote stays in `remaining`. Scoping
-                // the count to `remaining[..pos]` alone yields an odd number and
-                // wrongly flags the real FROM-context match as inside a string.
-                let single_quotes_before =
-                    output.matches('\'').count() + remaining[..pos].matches('\'').count();
-                let double_quotes_before =
-                    output.matches('"').count() + remaining[..pos].matches('"').count();
-                // `is_multiple_of` is stable only from 1.87; workspace MSRV is 1.85.
-                let inside_string = single_quotes_before % 2 != 0;
-                let inside_identifier = double_quotes_before % 2 != 0;
-                if !inside_string && !inside_identifier {
-                    output.push_str(&remaining[..pos]);
-                    output.push_str(&qualified);
-                    remaining = &remaining[end..];
-                    continue;
+                _ => {}
+            },
+            Token::Comma => {
+                if let Mode::InList(d) = mode {
+                    if d == depth {
+                        mode = Mode::ExpectName(d);
+                    }
                 }
             }
-
-            // Not a match — copy up to and including the found text, continue searching
-            output.push_str(&remaining[..end]);
-            remaining = &remaining[end..];
+            _ => {}
         }
-
-        output.push_str(remaining);
-        result = output;
     }
+    names
+}
 
-    result
+/// Byte offset of a 1-based tokenizer `(line, column)`; columns count chars.
+fn byte_offset(sql: &str, loc: Location) -> Option<usize> {
+    let line_idx = usize::try_from(loc.line).ok()?.checked_sub(1)?;
+    let col_idx = usize::try_from(loc.column).ok()?.checked_sub(1)?;
+    let mut line_start = 0usize;
+    for (n, line) in sql.split_inclusive('\n').enumerate() {
+        if n == line_idx {
+            return line
+                .char_indices()
+                .nth(col_idx)
+                .map(|(b, _)| line_start + b);
+        }
+        line_start += line.len();
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -362,164 +540,28 @@ mod tests {
     }
 
     #[test]
-    fn prefix_tables_qualifies_tpch_tables() {
-        let sql = "SELECT * FROM lineitem WHERE l_shipdate > DATE '1998-01-01'";
-        let result = prefix_tables(sql, "tpch_sf1", "tpch");
-        assert!(
-            result.contains("tpch_sf1.lineitem"),
-            "expected qualified table in: {result}"
-        );
+    fn qualify_mode_applies() {
+        assert!(QualifyTables::Auto.applies(None));
+        assert!(!QualifyTables::Auto.applies(Some("tpch_sf1")));
+        assert!(QualifyTables::Always.applies(Some("tpch_sf1")));
+        assert!(!QualifyTables::Never.applies(None));
     }
 
     #[test]
-    fn prefix_tables_longest_first_no_partial() {
-        // "partsupp" must be prefixed before "part" to avoid partial match
-        let sql = "SELECT * FROM partsupp, part WHERE ps_partkey = p_partkey";
-        let result = prefix_tables(sql, "tpch_sf1", "tpch");
-        assert!(
-            result.contains("tpch_sf1.partsupp"),
-            "partsupp not qualified: {result}"
-        );
-        // "part" should also be qualified (appears after comma + space)
-        assert!(
-            result.contains("tpch_sf1.part"),
-            "part not qualified: {result}"
-        );
-        // Should not have double-qualification
-        assert!(
-            !result.contains("tpch_sf1.tpch_sf1"),
-            "double-qualified: {result}"
-        );
-    }
-
-    #[test]
-    fn prefix_tables_does_not_qualify_aliases() {
-        let sql = "SELECT cc_call_center_id AS call_center FROM call_center WHERE 1=1";
-        let result = prefix_tables(sql, "tpcds_sf1", "tpcds");
-        assert!(
-            result.contains("FROM tpcds_sf1.call_center"),
-            "FROM table should be qualified: {result}"
-        );
-        assert!(
-            result.contains("AS call_center"),
-            "alias should not be qualified: {result}"
-        );
-    }
-
-    #[test]
-    fn prefix_tables_comma_list() {
-        let sql = "FROM catalog_returns, call_center, customer WHERE 1=1";
-        let result = prefix_tables(sql, "tpcds_sf1", "tpcds");
-        assert!(
-            result.contains("tpcds_sf1.catalog_returns"),
-            "catalog_returns: {result}"
-        );
-        assert!(
-            result.contains("tpcds_sf1.call_center"),
-            "call_center: {result}"
-        );
-        assert!(result.contains("tpcds_sf1.customer"), "customer: {result}");
-    }
-
-    #[test]
-    fn prefix_tables_survives_apostrophe_in_comment() {
-        // Regression: a possessive apostrophe inside a line comment (e.g.
-        // `customer's balance`) used to leave a phantom open quote in the
-        // quote-balance heuristic and disabled qualification for the rest
-        // of the query.
-        let sql = "\
--- Debit the customer's balance\n\
-UPDATE customer SET c_balance = c_balance - 1 WHERE c_id = 1;";
-        let result = prefix_tables(sql, "tpcc_sf1", "tpcc");
-        assert!(
-            result.contains("UPDATE tpcc_sf1.customer"),
-            "expected UPDATE target qualified:\n{result}"
-        );
-    }
-
-    #[test]
-    fn prefix_tables_survives_string_literal_shadowing_table_name() {
-        // Regression: a SELECT that uses a string literal equal to a table
-        // name (`'news_item'` in TPC-E data_maintenance) used to leave a
-        // phantom open quote after the prefixer advanced past the `news_item`
-        // inside the literal, blocking the real FROM-clause qualification.
-        let sql = "\
-SELECT 'news_item' AS target FROM news_item WHERE 1=1;";
-        let result = prefix_tables(sql, "tpce_sf1", "tpce");
-        assert!(
-            result.contains("FROM tpce_sf1.news_item"),
-            "expected FROM qualified:\n{result}"
-        );
-        assert!(
-            result.contains("'news_item'"),
-            "string literal must not be rewritten:\n{result}"
-        );
-    }
-
-    #[test]
-    fn prefix_tables_qualifies_multiline_from_with_aliases() {
-        // Regression: order_status-style query — multi-line FROM with
-        // bare-name joins plus a correlated subquery in WHERE.
-        let sql = "\
--- Look up a customer's most recent order\n\
-SELECT c.c_id FROM\n\
-    customer c\n\
-    JOIN orders o ON o.o_c_id = c.c_id\n\
-    JOIN order_line ol ON ol.ol_o_id = o.o_id\n\
-WHERE o.o_id = (\n\
-    SELECT MAX(o2.o_id) FROM orders o2 WHERE o2.o_c_id = c.c_id\n\
-);";
-        let result = prefix_tables(sql, "tpcc_sf1", "tpcc");
-        assert!(
-            result.contains("tpcc_sf1.customer"),
-            "customer must be qualified:\n{result}"
-        );
-        assert!(
-            result.contains("tpcc_sf1.order_line"),
-            "order_line must be qualified:\n{result}"
-        );
-        // `orders` appears twice (outer FROM and inner subquery); both qualified.
-        assert_eq!(
-            result.matches("tpcc_sf1.orders").count(),
-            2,
-            "both `orders` occurrences must be qualified:\n{result}"
-        );
-    }
-
-    #[test]
-    fn prefix_tables_q16_partsupp_part() {
-        // q16: FROM partsupp, part (same line) + subquery FROM supplier
-        let sql = "FROM\n    partsupp,\n    part\nWHERE 1=1 AND ps_suppkey NOT IN (\n    SELECT s_suppkey FROM supplier\n)";
-        let result = prefix_tables(sql, "tpch_sf1", "tpch");
-        assert!(result.contains("tpch_sf1.partsupp"), "partsupp: {result}");
-        assert!(
-            result.contains("tpch_sf1.part"),
-            "part not qualified: {result}"
-        );
-        assert!(
-            result.contains("FROM tpch_sf1.supplier"),
-            "supplier: {result}"
-        );
-    }
-
-    #[test]
-    fn prefix_tables_aliased_tables() {
-        // q07: nation n1, nation n2 — table with alias
-        let sql = "FROM\n    supplier,\n    lineitem,\n    orders,\n    customer,\n    nation n1,\n    nation n2\nWHERE 1=1";
-        let result = prefix_tables(sql, "tpch_sf1", "tpch");
-        assert!(result.contains("tpch_sf1.nation n1"), "nation n1: {result}");
-        assert!(result.contains("tpch_sf1.nation n2"), "nation n2: {result}");
-    }
-
-    #[test]
-    fn prefix_tables_multiline_comma_list() {
-        // TPC-H q02 style: FROM with each table on its own line
-        let sql = "SELECT * FROM\n    part,\n    supplier,\n    partsupp,\n    nation,\n    region\nWHERE 1=1";
-        let result = prefix_tables(sql, "tpch_sf1", "tpch");
-        assert!(result.contains("tpch_sf1.part"), "part: {result}");
-        assert!(result.contains("tpch_sf1.supplier"), "supplier: {result}");
-        assert!(result.contains("tpch_sf1.partsupp"), "partsupp: {result}");
-        assert!(result.contains("tpch_sf1.nation"), "nation: {result}");
-        assert!(result.contains("tpch_sf1.region"), "region: {result}");
+    fn byte_offset_handles_multibyte_and_lines() {
+        let sql = "SELECT 'é' FROM t\nJOIN u";
+        // 'J' of JOIN is line 2, column 1.
+        let off = byte_offset(sql, Location { line: 2, column: 1 }).unwrap();
+        assert_eq!(&sql[off..off + 4], "JOIN");
+        // 't' on line 1: after "SELECT 'é' FROM " = 16 chars, so column 17.
+        let off = byte_offset(
+            sql,
+            Location {
+                line: 1,
+                column: 17,
+            },
+        )
+        .unwrap();
+        assert_eq!(&sql[off..off + 1], "t");
     }
 }

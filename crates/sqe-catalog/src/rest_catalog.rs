@@ -601,6 +601,18 @@ impl TableMetadataCache {
         self
     }
 
+    /// Override the soft TTL with a sub-second value. Test seam only: the
+    /// freshness clock is `std::time::Instant`, which `tokio::time::pause()`
+    /// does not advance, so a state-machine test that must cross the soft TTL
+    /// either sleeps for real or shortens the TTL. Production reads
+    /// `catalog.metadata_cache_ttl_secs` through [`Self::new`].
+    #[doc(hidden)]
+    #[must_use = "with_soft_ttl consumes self; bind the returned cache"]
+    pub fn with_soft_ttl(mut self, soft_ttl: std::time::Duration) -> Self {
+        self.soft_ttl = soft_ttl;
+        self
+    }
+
     /// True when `key` was authorized less than `authorization_recheck` ago.
     /// Always false when the recheck window is zero.
     pub async fn authorization_fresh(&self, key: &str) -> bool {
@@ -1514,7 +1526,31 @@ impl SessionCatalog {
         backend: &sqe_core::config::CatalogBackend,
     ) -> sqe_core::Result<Self> {
         let inner: Arc<dyn iceberg::Catalog> = Self::build_backend_catalog(backend).await?;
+        Ok(Self::from_backend_catalog(
+            inner,
+            catalog,
+            storage,
+            bearer_token,
+            table_cache,
+            backend,
+        ))
+    }
 
+    /// Wrap an already-built non-REST `iceberg::Catalog` as a session catalog.
+    ///
+    /// The tail of [`Self::for_session_other_backend_with`] after the backend
+    /// is constructed, split out so the `CatalogHandle::Other` dispatch arms
+    /// can be driven by an in-process `iceberg::Catalog` mock under plain
+    /// `cargo test` (architecture review 313). The live backends stay behind
+    /// [`Self::build_backend_catalog`].
+    pub(crate) fn from_backend_catalog(
+        inner: Arc<dyn iceberg::Catalog>,
+        catalog: &sqe_core::config::CatalogConfig,
+        storage: &sqe_core::config::StorageConfig,
+        bearer_token: &str,
+        table_cache: TableMetadataCache,
+        backend: &sqe_core::config::CatalogBackend,
+    ) -> Self {
         let token_fingerprint = rest_catalog_token_fingerprint(bearer_token);
 
         info!(
@@ -1536,7 +1572,7 @@ impl SessionCatalog {
         warn_shared_backend_identity_once(backend);
 
         let circuit_breaker = user_circuit_breaker(&token_fingerprint, &catalog.warehouse);
-        Ok(Self {
+        Self {
             inner: CatalogHandle::Other(inner),
             catalog_url: String::new(),
             warehouse: catalog.warehouse.clone(),
@@ -1547,7 +1583,7 @@ impl SessionCatalog {
             circuit_breaker,
             require_vended_credentials: catalog.require_vended_credentials,
             table_cache,
-        })
+        }
     }
 
     // (helper defined as a free function below `impl`; see
@@ -4403,6 +4439,368 @@ mod invalidation_tests {
 
 /// Architecture review 311: view version/dialect selection, percent-encoded
 /// REST paths, and the shared `rest_request` plumbing (breaker + metrics).
+/// The `CatalogHandle::Other` arms of `dispatch_catalog!` and the non-REST
+/// session constructor, driven by an in-process `iceberg::Catalog` mock
+/// (architecture review 313). The live Glue / HMS / JDBC / S3 Tables tests in
+/// `tests/backends_integration.rs` stay `#[ignore]`d; this is the coverage
+/// that runs under plain `cargo test`.
+#[cfg(test)]
+mod other_backend_tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
+
+    use super::cache_capacity_tests::test_table;
+    use super::{rest_catalog_token_fingerprint, SessionCatalog, TableMetadataCache};
+    use sqe_core::config::{CatalogBackend, CatalogConfig, StorageConfig};
+
+    const BEARER: &str = "other-backend-bearer";
+
+    fn sales() -> NamespaceIdent {
+        NamespaceIdent::new("sales".to_string())
+    }
+
+    fn orders() -> TableIdent {
+        TableIdent::new(sales(), "orders".to_string())
+    }
+
+    fn hms_config() -> CatalogConfig {
+        let mut config: CatalogConfig = toml::from_str("warehouse = \"hms-warehouse\"").unwrap();
+        config.backend = CatalogBackend::Hms {
+            uri: "metastore:9083".to_string(),
+            warehouse: "s3://hms-warehouse".to_string(),
+        };
+        config
+    }
+
+    /// Records every trait method the session dispatches into it.
+    #[derive(Debug, Default)]
+    struct RecordingCatalog {
+        calls: Mutex<Vec<&'static str>>,
+    }
+
+    impl RecordingCatalog {
+        fn record(&self, call: &'static str) {
+            self.calls.lock().unwrap().push(call);
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Catalog for RecordingCatalog {
+        async fn list_namespaces(
+            &self,
+            _parent: Option<&NamespaceIdent>,
+        ) -> iceberg::Result<Vec<NamespaceIdent>> {
+            self.record("list_namespaces");
+            Ok(vec![sales()])
+        }
+
+        async fn create_namespace(
+            &self,
+            namespace: &NamespaceIdent,
+            properties: HashMap<String, String>,
+        ) -> iceberg::Result<iceberg::Namespace> {
+            self.record("create_namespace");
+            Ok(iceberg::Namespace::with_properties(
+                namespace.clone(),
+                properties,
+            ))
+        }
+
+        async fn get_namespace(
+            &self,
+            namespace: &NamespaceIdent,
+        ) -> iceberg::Result<iceberg::Namespace> {
+            self.record("get_namespace");
+            Ok(iceberg::Namespace::new(namespace.clone()))
+        }
+
+        async fn namespace_exists(&self, _namespace: &NamespaceIdent) -> iceberg::Result<bool> {
+            self.record("namespace_exists");
+            Ok(true)
+        }
+
+        async fn update_namespace(
+            &self,
+            _namespace: &NamespaceIdent,
+            _properties: HashMap<String, String>,
+        ) -> iceberg::Result<()> {
+            self.record("update_namespace");
+            Ok(())
+        }
+
+        async fn drop_namespace(&self, _namespace: &NamespaceIdent) -> iceberg::Result<()> {
+            self.record("drop_namespace");
+            Ok(())
+        }
+
+        async fn list_tables(
+            &self,
+            _namespace: &NamespaceIdent,
+        ) -> iceberg::Result<Vec<TableIdent>> {
+            self.record("list_tables");
+            Ok(vec![orders()])
+        }
+
+        async fn create_table(
+            &self,
+            _namespace: &NamespaceIdent,
+            _creation: TableCreation,
+        ) -> iceberg::Result<iceberg::table::Table> {
+            self.record("create_table");
+            Ok(test_table())
+        }
+
+        async fn load_table(&self, _table: &TableIdent) -> iceberg::Result<iceberg::table::Table> {
+            self.record("load_table");
+            Ok(test_table())
+        }
+
+        async fn drop_table(&self, _table: &TableIdent) -> iceberg::Result<()> {
+            self.record("drop_table");
+            Ok(())
+        }
+
+        async fn table_exists(&self, _table: &TableIdent) -> iceberg::Result<bool> {
+            self.record("table_exists");
+            Ok(true)
+        }
+
+        async fn rename_table(&self, _src: &TableIdent, _dest: &TableIdent) -> iceberg::Result<()> {
+            self.record("rename_table");
+            Ok(())
+        }
+
+        async fn register_table(
+            &self,
+            _table: &TableIdent,
+            _metadata_location: String,
+        ) -> iceberg::Result<iceberg::table::Table> {
+            self.record("register_table");
+            Ok(test_table())
+        }
+
+        async fn update_table(
+            &self,
+            _commit: iceberg::TableCommit,
+        ) -> iceberg::Result<iceberg::table::Table> {
+            self.record("update_table");
+            Ok(test_table())
+        }
+    }
+
+    fn session_over(backend: Arc<RecordingCatalog>, cache: TableMetadataCache) -> SessionCatalog {
+        let config = hms_config();
+        SessionCatalog::from_backend_catalog(
+            backend,
+            &config,
+            &StorageConfig::default(),
+            BEARER,
+            cache,
+            &config.backend.clone(),
+        )
+    }
+
+    /// The non-REST constructor produces an `Other` handle keyed by the
+    /// bearer fingerprint, with no REST URL and the configured warehouse.
+    #[test]
+    fn from_backend_catalog_builds_an_other_handle() {
+        let backend = Arc::new(RecordingCatalog::default());
+        let session = session_over(backend.clone(), TableMetadataCache::new(0));
+
+        assert!(!session.is_rest_backend());
+        assert_eq!(session.catalog_url(), "");
+        assert_eq!(session.warehouse(), "hms-warehouse");
+        assert_eq!(
+            session.token_fingerprint(),
+            rest_catalog_token_fingerprint(BEARER)
+        );
+        assert!(
+            backend.calls().is_empty(),
+            "construction makes no catalog call"
+        );
+    }
+
+    /// Every read-side `SessionCatalog` method reaches the trait object
+    /// through the `Other` arm, and a cached `load_table` is served without
+    /// a second backend call or any HTTP authorization probe.
+    #[tokio::test]
+    async fn other_handle_dispatches_reads_through_the_trait_object() {
+        let backend = Arc::new(RecordingCatalog::default());
+        let session = session_over(
+            backend.clone(),
+            TableMetadataCache::new(300).with_authorization_recheck(300),
+        );
+
+        assert_eq!(session.list_namespaces().await.unwrap(), vec![sales()]);
+        assert_eq!(
+            session.get_namespace(&sales()).await.unwrap().name(),
+            &sales()
+        );
+        assert!(session.namespace_visible(&sales()).await.unwrap());
+        assert_eq!(session.list_tables(&sales()).await.unwrap(), vec![orders()]);
+        assert!(session.table_exists(&orders()).await.unwrap());
+        // No per-user catalog authorization exists on a shared-identity
+        // backend: the probe is a no-op, not an HTTP call to an empty URL.
+        session.authorize_table_access(&orders()).await.unwrap();
+
+        let first = session.load_table(&orders()).await.unwrap();
+        let second = session.load_table(&orders()).await.unwrap();
+        assert_eq!(first.metadata().uuid(), second.metadata().uuid());
+
+        assert_eq!(
+            backend.calls(),
+            [
+                "list_namespaces",
+                "get_namespace",
+                "get_namespace",
+                "list_tables",
+                "table_exists",
+                "load_table",
+            ],
+            "the second load_table is a cache hit"
+        );
+    }
+
+    /// With the cache disabled every `load_table` goes to the backend.
+    #[tokio::test]
+    async fn other_handle_reloads_when_the_cache_is_disabled() {
+        let backend = Arc::new(RecordingCatalog::default());
+        let session = session_over(backend.clone(), TableMetadataCache::new(0));
+
+        session.load_table(&orders()).await.unwrap();
+        session.load_table(&orders()).await.unwrap();
+
+        assert_eq!(backend.calls(), ["load_table", "load_table"]);
+    }
+
+    /// REST-only surfaces refuse with a typed error naming the backend and
+    /// never touch the trait object.
+    #[tokio::test]
+    async fn other_handle_rejects_rest_only_operations() {
+        let backend = Arc::new(RecordingCatalog::default());
+        let session = session_over(backend.clone(), TableMetadataCache::new(0));
+        let schema = serde_json::json!({"type": "struct", "fields": []});
+        let props = HashMap::new();
+
+        let errors = [
+            session
+                .create_view(&sales(), "v", "SELECT 1", &schema, &props)
+                .await
+                .err(),
+            session
+                .create_or_replace_view(&sales(), "v", "SELECT 1", &schema, &props)
+                .await
+                .err(),
+            session.list_views(&sales()).await.err(),
+            session.load_view_sql(&sales(), "v").await.err(),
+            session.drop_view(&sales(), "v").await.err(),
+            session
+                .commit_schema_update(&orders(), Vec::new(), Vec::new())
+                .await
+                .err(),
+        ];
+        for err in errors {
+            let err = err.expect("REST-only operation must fail on an Other handle");
+            let text = err.to_string();
+            assert!(text.contains("requires the REST catalog backend"), "{text}");
+            assert!(text.contains("Other"), "{text}");
+        }
+        assert!(backend.calls().is_empty());
+    }
+
+    /// The `SessionCatalogBridge` forwards every namespace and table
+    /// mutation into the `Other` arm as well.
+    #[tokio::test]
+    async fn bridge_over_other_handle_dispatches_every_mutation() {
+        let backend = Arc::new(RecordingCatalog::default());
+        let session = Arc::new(session_over(backend.clone(), TableMetadataCache::new(300)));
+        let bridge = session.as_catalog();
+
+        bridge
+            .create_namespace(&sales(), HashMap::new())
+            .await
+            .unwrap();
+        assert!(bridge.namespace_exists(&sales()).await.unwrap());
+        bridge
+            .update_namespace(&sales(), HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(bridge.list_namespaces(None).await.unwrap(), vec![sales()]);
+        assert_eq!(bridge.list_tables(&sales()).await.unwrap(), vec![orders()]);
+        let creation = TableCreation::builder()
+            .name("orders".to_string())
+            .schema(test_table().metadata().current_schema().as_ref().clone())
+            .build();
+        bridge.create_table(&sales(), creation).await.unwrap();
+        bridge.load_table(&orders()).await.unwrap();
+        assert!(bridge.table_exists(&orders()).await.unwrap());
+        bridge
+            .rename_table(
+                &orders(),
+                &TableIdent::new(sales(), "orders_v2".to_string()),
+            )
+            .await
+            .unwrap();
+        bridge
+            .register_table(&orders(), "s3://bucket/meta.json".to_string())
+            .await
+            .unwrap();
+        bridge.drop_table(&orders()).await.unwrap();
+        bridge.drop_namespace(&sales()).await.unwrap();
+
+        assert_eq!(
+            backend.calls(),
+            [
+                "create_namespace",
+                "namespace_exists",
+                "update_namespace",
+                "list_namespaces",
+                "list_tables",
+                "create_table",
+                "load_table",
+                "table_exists",
+                "rename_table",
+                "register_table",
+                "drop_table",
+                "drop_namespace",
+            ]
+        );
+    }
+
+    /// `for_session_with` on a non-REST backend the build did not compile in
+    /// is a typed configuration error naming the missing cargo feature.
+    #[cfg(not(feature = "hms"))]
+    #[tokio::test]
+    async fn for_session_with_hms_without_the_feature_names_the_feature() {
+        let err = SessionCatalog::for_session_with(
+            &hms_config(),
+            &StorageConfig::default(),
+            None,
+            BEARER,
+        )
+        .await
+        .expect_err("HMS is not compiled in");
+        let text = err.to_string();
+        assert!(text.contains("`hms` cargo feature"), "{text}");
+    }
+
+    /// `build_backend_catalog` refuses the REST variant: REST sessions are
+    /// built by `for_session`, never through the loader.
+    #[tokio::test]
+    async fn build_backend_catalog_rejects_rest() {
+        let err = SessionCatalog::build_backend_catalog(&CatalogBackend::Rest)
+            .await
+            .expect_err("REST is not a loader backend");
+        assert!(err.to_string().contains("non-REST"), "{err}");
+    }
+}
+
 #[cfg(test)]
 mod view_rest_tests {
     use std::collections::HashMap;

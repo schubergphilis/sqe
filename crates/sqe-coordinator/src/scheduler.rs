@@ -240,60 +240,35 @@ mod tests {
 
     const MB: u64 = 1024 * 1024;
 
-    fn make_task(id: &str, file_count: usize, file_size_mb: u64) -> ScanTask {
-        ScanTask {
-            hive: None,
-            version: 1,
-            morsel_id: None,
-            row_group_start: None,
-            row_group_end: None,
-            start_byte: None,
-            end_byte: None,
-            fragment_id: id.to_string(),
-            data_file_paths: (0..file_count)
-                .map(|i| format!("s3://bucket/file{i}.parquet"))
-                .collect(),
-            file_sizes_bytes: (0..file_count).map(|_| file_size_mb * MB).collect(),
-            projected_columns: vec![],
-            projected_field_ids: vec![],
-            s3_endpoint: String::new(),
-            s3_region: String::new(),
-            credentials: sqe_planner::ScanCredentials::default(),
-            audience: String::new(),
-            expires_at: 0,
-            s3_path_style: false,
+    fn storage() -> sqe_planner::ScanStorage {
+        sqe_planner::ScanStorage {
             s3_allow_http: true,
-            predicate_proto: None,
-            limit: None,
+            ..Default::default()
         }
     }
 
-    fn make_task_with_sizes(id: &str, sizes: &[u64]) -> ScanTask {
-        ScanTask {
-            hive: None,
-            version: 1,
-            morsel_id: None,
-            row_group_start: None,
-            row_group_end: None,
-            start_byte: None,
-            end_byte: None,
-            fragment_id: id.to_string(),
-            data_file_paths: (0..sizes.len())
+    fn make_task(id: &str, file_count: usize, file_size_mb: u64) -> ScanTask {
+        ScanTask::builder(
+            id,
+            (0..file_count)
                 .map(|i| format!("s3://bucket/file{i}.parquet"))
                 .collect(),
-            file_sizes_bytes: sizes.to_vec(),
-            projected_columns: vec![],
-            projected_field_ids: vec![],
-            s3_endpoint: String::new(),
-            s3_region: String::new(),
-            credentials: sqe_planner::ScanCredentials::default(),
-            audience: String::new(),
-            expires_at: 0,
-            s3_path_style: false,
-            s3_allow_http: true,
-            predicate_proto: None,
-            limit: None,
-        }
+            storage(),
+        )
+        .with_file_sizes((0..file_count).map(|_| file_size_mb * MB).collect())
+        .build()
+    }
+
+    fn make_task_with_sizes(id: &str, sizes: &[u64]) -> ScanTask {
+        ScanTask::builder(
+            id,
+            (0..sizes.len())
+                .map(|i| format!("s3://bucket/file{i}.parquet"))
+                .collect(),
+            storage(),
+        )
+        .with_file_sizes(sizes.to_vec())
+        .build()
     }
 
     fn make_worker(url: &str, healthy: bool, in_flight_load: u64) -> WorkerInfo {
@@ -778,52 +753,12 @@ mod tests {
         let scheduler = WeightedScheduler::new();
         let file_path = "s3://bucket/dashboard/metrics.parquet".to_string();
 
-        let task1 = ScanTask {
-            hive: None,
-            version: 1,
-            morsel_id: None,
-            row_group_start: None,
-            row_group_end: None,
-            start_byte: None,
-            end_byte: None,
-            fragment_id: "q1_scan".to_string(),
-            data_file_paths: vec![file_path.clone()],
-            file_sizes_bytes: vec![100 * MB],
-            projected_columns: vec![],
-            projected_field_ids: vec![],
-            s3_endpoint: String::new(),
-            s3_region: String::new(),
-            credentials: sqe_planner::ScanCredentials::default(),
-            audience: String::new(),
-            expires_at: 0,
-            s3_path_style: false,
-            s3_allow_http: true,
-            predicate_proto: None,
-            limit: None,
-        };
-        let task2 = ScanTask {
-            hive: None,
-            version: 1,
-            morsel_id: None,
-            row_group_start: None,
-            row_group_end: None,
-            start_byte: None,
-            end_byte: None,
-            fragment_id: "q2_scan".to_string(),
-            data_file_paths: vec![file_path.clone()],
-            file_sizes_bytes: vec![100 * MB],
-            projected_columns: vec![],
-            projected_field_ids: vec![],
-            s3_endpoint: String::new(),
-            s3_region: String::new(),
-            credentials: sqe_planner::ScanCredentials::default(),
-            audience: String::new(),
-            expires_at: 0,
-            s3_path_style: false,
-            s3_allow_http: true,
-            predicate_proto: None,
-            limit: None,
-        };
+        let task1 = ScanTask::builder("q1_scan", vec![file_path.clone()], storage())
+            .with_file_sizes(vec![100 * MB])
+            .build();
+        let task2 = ScanTask::builder("q2_scan", vec![file_path.clone()], storage())
+            .with_file_sizes(vec![100 * MB])
+            .build();
 
         let workers = vec![
             make_worker("http://w1:50052", true, 0),

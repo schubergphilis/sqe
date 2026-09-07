@@ -1,4 +1,5 @@
 use crate::client::BenchClient;
+use crate::query::QualifyTables;
 use crate::report::QueryResult;
 
 // ---------------------------------------------------------------------------
@@ -19,6 +20,7 @@ pub async fn run_benchmark_test(
     query_filter: Option<&str>,
     catalog: Option<&str>,
     namespace_override: Option<&str>,
+    qualify: QualifyTables,
 ) -> anyhow::Result<Vec<QueryResult>> {
     let out = crate::suite::run_suite(
         client,
@@ -30,6 +32,7 @@ pub async fn run_benchmark_test(
         namespace_override,
         "",
         None,
+        qualify,
     )
     .await?;
     Ok(out.results)

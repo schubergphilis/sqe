@@ -20,4 +20,5 @@ pub mod shuffle;
 /// `worker-shuffle` for the same reason as [`shuffle`].
 #[cfg(feature = "worker-shuffle")]
 pub mod spill_buffer;
+pub mod status;
 pub mod ticket_pin;

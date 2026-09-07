@@ -22,6 +22,8 @@ publish = false
 ahash = { version = "0.8", features = ["serde"] }
 arrow = { version = "59", features = ["canonical_extension_types", "chrono-tz", "ipc_compression", "prettyprint"] }
 arrow-array = { version = "59", default-features = false, features = ["chrono-tz"] }
+arrow-cast = { version = "59", default-features = false, features = ["prettyprint"] }
+arrow-ipc = { version = "59", features = ["lz4", "zstd"] }
 arrow-schema = { version = "59", default-features = false, features = ["canonical_extension_types", "serde"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-smithy-http-client = { version = "1", default-features = false, features = ["rustls-aws-lc", "rustls-ring"] }
@@ -49,6 +51,7 @@ digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["m
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid"] }
 either = { version = "1", features = ["use_std"] }
 event-listener-strategy = { version = "0.5" }
+fastrand = { version = "2" }
 foldhash = { version = "0.2" }
 form_urlencoded = { version = "1" }
 futures-channel = { version = "0.3", features = ["sink"] }
@@ -60,7 +63,8 @@ futures-task = { version = "0.3" }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std", "wasm_js"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
-hashbrown = { version = "0.17" }
+hashbrown-582f2526e08bb6a0 = { package = "hashbrown", version = "0.14", default-features = false, features = ["raw"] }
+hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 httparse = { version = "1" }
 hyper = { version = "1", features = ["full"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12"] }
@@ -88,6 +92,7 @@ parquet = { version = "59", features = ["object_store", "variant_experimental"] 
 percent-encoding = { version = "2" }
 portable-atomic = { version = "1", features = ["require-cas"] }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
+prost-types = { version = "0.14" }
 rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
 rand-93f6ce9d446188ac = { package = "rand", version = "0.10" }
 rand_chacha = { version = "0.9", default-features = false, features = ["std"] }
@@ -126,6 +131,7 @@ tracing-futures = { version = "0.2", features = ["futures-03"] }
 tracing-log = { version = "0.2", default-features = false, features = ["log-tracer", "std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 twox-hash = { version = "2", default-features = false, features = ["xxhash32", "xxhash64"] }
+typenum = { version = "1", default-features = false, features = ["const-generics"] }
 uuid = { version = "1", features = ["js", "serde", "v4", "v7"] }
 winnow = { version = "1" }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
@@ -138,7 +144,7 @@ cc = { version = "1", default-features = false, features = ["parallel"] }
 either = { version = "1", features = ["use_std"] }
 foldhash = { version = "0.2" }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
-hashbrown = { version = "0.17" }
+hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 indexmap = { version = "2" }
 memchr = { version = "2" }
 once_cell = { version = "1" }
