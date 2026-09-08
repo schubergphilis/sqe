@@ -353,7 +353,7 @@ struct Report {
 }
 
 #[test]
-#[ignore]
+#[ignore = "bench; writes benchmarks/results/hive-cycle2-partition-index-scale.json"]
 fn hive_cycle2_scale_bench() {
     block_on_prod_stack(async {
         let mut cases = Vec::new();
@@ -380,7 +380,7 @@ fn hive_cycle2_scale_bench() {
 /// copied locally. Default slice: 2009 + 2024 Q1 under
 /// `HIVE_BTC_DATA` (default `/tmp/sqe-btc-hive/data`).
 #[test]
-#[ignore]
+#[ignore = "bench; writes benchmarks/results/hive-cycle2-partition-index-scale.json"]
 fn hive_btc_public_slice_bench() {
     let data_dir = std::env::var("HIVE_BTC_DATA")
         .unwrap_or_else(|_| "/tmp/sqe-btc-hive/data".to_string());

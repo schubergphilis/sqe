@@ -115,7 +115,7 @@ fn summary_count(summary: &HashMap<String, String>, key: &str) -> i64 {
 
 // 1 + 2: no silent append, full replace, new snapshot, prior snapshot retained.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 async fn overwrite_replaces_unpartitioned_and_retains_history() {
     let (session, handler) = crate::common::setup_handler().await;
     let (ns, name) = ("default", "iow_full_378");
@@ -168,7 +168,7 @@ async fn overwrite_replaces_unpartitioned_and_retains_history() {
 
 // 3: idempotency.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 async fn overwrite_is_idempotent() {
     let (session, handler) = crate::common::setup_handler().await;
     let (ns, name) = ("default", "iow_idem_378");
@@ -206,7 +206,7 @@ async fn overwrite_is_idempotent() {
 
 // 4: dynamic partition overwrite - touched replaced, untouched preserved.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 async fn overwrite_dynamic_preserves_untouched_partitions() {
     let (session, handler) = crate::common::setup_handler().await;
     let (ns, name) = ("default", "iow_dyn_378");
@@ -268,7 +268,7 @@ async fn overwrite_dynamic_preserves_untouched_partitions() {
 
 // 5: zero-row unpartitioned overwrite = truncate.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 async fn overwrite_empty_select_truncates_unpartitioned() {
     let (session, handler) = crate::common::setup_handler().await;
     let (ns, name) = ("default", "iow_trunc_378");
@@ -311,7 +311,7 @@ async fn overwrite_empty_select_truncates_unpartitioned() {
 // INSERTs, giving three live data files that a plain DELETE turns into a
 // position-delete file rather than a rewrite.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 async fn overwrite_drops_covered_position_deletes() {
     let (session, handler) = crate::common::setup_handler().await;
     let (ns, name) = ("default", "iow_mor_cleanup_378");
@@ -398,7 +398,7 @@ async fn overwrite_drops_covered_position_deletes() {
 
 // 7: self-overwrite.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 async fn overwrite_from_self() {
     let (session, handler) = crate::common::setup_handler().await;
     let (ns, name) = ("default", "iow_self_378");
@@ -437,7 +437,7 @@ async fn overwrite_from_self() {
 
 // 8: static PARTITION clause errors loudly (no stack needed, but kept here).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 async fn overwrite_static_partition_errors() {
     let (session, handler) = crate::common::setup_handler().await;
     let (ns, name) = ("default", "iow_static_378");

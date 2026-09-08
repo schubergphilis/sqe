@@ -152,7 +152,7 @@ fn unknown_procedure_falls_through_to_call_error() {
 /// The strong-form compaction test below exercises the actual re-encoding
 /// path against many small files.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn rewrite_data_files_returns_summary() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -217,7 +217,7 @@ async fn rewrite_data_files_returns_summary() {
 /// in MR !96; it surfaces the regression if anyone reverts to the old
 /// manifest-only path.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn rewrite_data_files_actually_compacts_parquet() {
     use datafusion::arrow::array::{Array, Int64Array};
 
@@ -354,7 +354,7 @@ fn extract_count(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> i6
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn expire_snapshots_retain_last_commits() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -394,7 +394,7 @@ async fn expire_snapshots_retain_last_commits() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn remove_orphan_files_respects_default_threshold() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -443,7 +443,7 @@ async fn remove_orphan_files_respects_default_threshold() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn rewrite_manifests_commits_and_returns_summary() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -496,7 +496,7 @@ async fn rewrite_manifests_commits_and_returns_summary() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn read_only_user_rejected_with_audit() {
     // This test needs a read-only session. The default test root is admin,
     // so we synthesise a session with the readonly role to exercise the
@@ -562,7 +562,7 @@ fn snapshot_rows(
 /// earlier state. This is the load-bearing test: it asserts the READ path
 /// (COUNT after rollback), not just that the commit returned a summary.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn rollback_to_snapshot_reverts_data() {
     let (session, handler) = crate::common::setup_handler().await;
     let table = "default.maint_rollback_test";
@@ -644,7 +644,7 @@ async fn rollback_to_snapshot_reverts_data() {
 /// descendant (not an ancestor), so rollback_to_snapshot(S2) must be rejected
 /// while set_current_snapshot(S2) succeeds and moves forward.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn rollback_rejects_non_ancestor_but_set_current_allows() {
     let (session, handler) = crate::common::setup_handler().await;
     let table = "default.maint_ancestry_test";

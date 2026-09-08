@@ -482,7 +482,7 @@ mod tests {
     /// block comment inside the CAST span closes the scan early; the rewrite
     /// silently does not fire and the client gets the raw parse error.
     #[test]
-    #[ignore = "rewriter bug (#630): `)` inside a block comment within the CAST span mis-balances matching_paren; enable once the scanner skips comments"]
+    #[ignore = "bug:#630; `)` inside a block comment within the CAST span mis-balances matching_paren; enable once the scanner skips comments"]
     fn close_paren_inside_comment_within_span_is_not_a_paren() {
         let sql = "SELECT CAST(row(1, /* ) */ row(10)) AS row(a int, b row(x int)))";
         let out = rewrite_nested_row_cast(sql);
@@ -493,7 +493,7 @@ mod tests {
     /// Same scan, double-quoted identifier: `"a)b"` is one identifier to the
     /// tokenizer but a close paren to the character scanner.
     #[test]
-    #[ignore = "rewriter bug (#630): `)` inside a quoted identifier within the CAST span mis-balances matching_paren; enable once the scanner skips quoted identifiers"]
+    #[ignore = "bug:#630; `)` inside a quoted identifier within the CAST span mis-balances matching_paren; enable once the scanner skips quoted identifiers"]
     fn close_paren_inside_quoted_identifier_within_span_is_not_a_paren() {
         let sql = "SELECT CAST(row(\"a)b\", row(10)) AS row(a int, b row(x int))) FROM t";
         let out = rewrite_nested_row_cast(sql);
@@ -505,7 +505,7 @@ mod tests {
     /// and `split_top_level_commas` do not, so a `)` or `,` inside a literal
     /// field value defeats the split and the rewrite does not fire.
     #[test]
-    #[ignore = "rewriter bug (#630): `)` inside a string literal within the CAST span defeats split_top_level_as (no quote tracking); enable once the splitters skip literals"]
+    #[ignore = "bug:#630; `)` inside a string literal within the CAST span defeats split_top_level_as (no quote tracking); enable once the splitters skip literals"]
     fn close_paren_inside_literal_within_span_is_not_a_paren() {
         let sql = "SELECT CAST(row('a)b', row(10)) AS row(a varchar, b row(x int)))";
         let out = rewrite_nested_row_cast(sql);
@@ -514,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "rewriter bug (#630): `,` inside a string literal within the CAST span is split as a field separator by split_top_level_commas; enable once the splitters skip literals"]
+    #[ignore = "bug:#630; `,` inside a string literal within the CAST span is split as a field separator by split_top_level_commas; enable once the splitters skip literals"]
     fn comma_inside_literal_within_span_is_not_a_separator() {
         let sql = "SELECT CAST(row('a,b', row(10)) AS row(a varchar, b row(x int)))";
         let out = rewrite_nested_row_cast(sql);

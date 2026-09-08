@@ -57,7 +57,7 @@ async fn reset_table(
 // INSERT and verify the new spec is in effect by reading the row back.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn add_identity_partition_field_to_unpartitioned_table() {
     let (session, handler) = crate::common::setup_handler().await;
     let fq = "default.pe_add_identity";
@@ -103,7 +103,7 @@ async fn add_identity_partition_field_to_unpartitioned_table() {
 // a successful round-trip on the new spec.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn add_day_partition_field_with_transform() {
     let (session, handler) = crate::common::setup_handler().await;
     let fq = "default.pe_add_day";
@@ -153,7 +153,7 @@ async fn add_day_partition_field_with_transform() {
 // and verify INSERT works with the now-empty spec.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn drop_partition_field_from_partitioned_table() {
     let (session, handler) = crate::common::setup_handler().await;
     let fq = "default.pe_drop";
@@ -212,7 +212,7 @@ async fn drop_partition_field_from_partitioned_table() {
 // rows written before the REPLACE.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn replace_partition_field_identity_to_bucket() {
     let (session, handler) = crate::common::setup_handler().await;
     let fq = "default.pe_replace";
@@ -269,7 +269,7 @@ async fn replace_partition_field_identity_to_bucket() {
 // Confirm partition evolution works against a V3 table with nanosec ts.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn add_partition_field_on_v3_table() {
     let (session, handler) = crate::common::setup_handler().await;
     let fq = "default.pe_v3_add";
@@ -316,7 +316,7 @@ async fn add_partition_field_on_v3_table() {
 // Negative: DROP PARTITION FIELD that does not exist returns a clear error.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn drop_unknown_partition_field_returns_error() {
     let (session, handler) = crate::common::setup_handler().await;
     let fq = "default.pe_drop_unknown";
@@ -353,7 +353,7 @@ async fn drop_unknown_partition_field_returns_error() {
 // Negative: ADD PARTITION FIELD on a column that does not exist.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn add_partition_field_on_unknown_column_returns_error() {
     let (session, handler) = crate::common::setup_handler().await;
     let fq = "default.pe_add_unknown";

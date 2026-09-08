@@ -48,7 +48,7 @@ fn analyze_qualified_with_properties_classifies_as_analyze() {
 
 /// ANALYZE on an existing table succeeds (no-op stats) and returns no rows.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn analyze_existing_table_succeeds() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -79,7 +79,7 @@ async fn analyze_existing_table_succeeds() {
 
 /// ANALYZE on a missing table errors (table-not-found), not a silent no-op.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn analyze_missing_table_errors() {
     let (session, handler) = crate::common::setup_handler().await;
 
