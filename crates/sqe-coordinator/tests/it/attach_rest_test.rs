@@ -43,9 +43,12 @@ fn dummy_session() -> Session {
 }
 
 fn session_with_roles(roles: Vec<String>) -> Session {
+    // Token unique per call: `SESSION_CONTEXT_CACHE` is process-wide and
+    // keyed on `username:token_hash:catalog:schema`; a fixed token would hand
+    // one test another's cached context, pointing at a dropped mock server.
     Session::new(
         "tester".to_string(),
-        sqe_core::SecretString::new("tok".to_string()),
+        sqe_core::SecretString::new(format!("tok-{}", uuid::Uuid::new_v4())),
         None,
         chrono::Utc::now() + chrono::Duration::hours(1),
         roles,
@@ -127,7 +130,7 @@ async fn mount_rest_fixture_requires_auth(server: &MockServer) {
 
 #[tokio::test]
 async fn attach_rest_catalog_succeeds() {
-    let server = MockServer::start().await;
+    let server = crate::common::mock_server().await;
     mount_rest_fixture(&server).await;
 
     let handler = make_handler(SecretStore::new(), RuntimeCatalogRegistry::new());
@@ -145,7 +148,7 @@ async fn attach_rest_catalog_succeeds() {
 
 #[tokio::test]
 async fn attach_rest_duplicate_name_errors() {
-    let server = MockServer::start().await;
+    let server = crate::common::mock_server().await;
     mount_rest_fixture(&server).await;
 
     let handler = make_handler(SecretStore::new(), RuntimeCatalogRegistry::new());
@@ -171,7 +174,7 @@ async fn attach_rest_duplicate_name_errors() {
 
 #[tokio::test]
 async fn attach_then_detach_then_reattach() {
-    let server = MockServer::start().await;
+    let server = crate::common::mock_server().await;
     mount_rest_fixture(&server).await;
 
     let handler = make_handler(SecretStore::new(), RuntimeCatalogRegistry::new());
@@ -217,7 +220,7 @@ async fn detach_unknown_catalog_errors() {
 
 #[tokio::test]
 async fn attach_with_bearer_secret_ref() {
-    let server = MockServer::start().await;
+    let server = crate::common::mock_server().await;
 
     // This fixture verifies the bearer is forwarded: every GET endpoint
     // is guarded by header_exists("Authorization"); requests without auth
@@ -248,7 +251,7 @@ async fn attach_with_bearer_secret_ref() {
 
 #[tokio::test]
 async fn drop_secret_blocked_while_catalog_attached() {
-    let server = MockServer::start().await;
+    let server = crate::common::mock_server().await;
     mount_rest_fixture(&server).await;
 
     let handler = make_handler(SecretStore::new(), RuntimeCatalogRegistry::new());
@@ -294,7 +297,7 @@ async fn drop_secret_blocked_while_catalog_attached() {
 
 #[tokio::test]
 async fn drop_secret_succeeds_after_detach() {
-    let server = MockServer::start().await;
+    let server = crate::common::mock_server().await;
     mount_rest_fixture(&server).await;
 
     let handler = make_handler(SecretStore::new(), RuntimeCatalogRegistry::new());
@@ -347,7 +350,7 @@ async fn drop_secret_succeeds_after_detach() {
 
 #[tokio::test]
 async fn attach_rejected_without_admin_role() {
-    let server = MockServer::start().await;
+    let server = crate::common::mock_server().await;
     mount_rest_fixture(&server).await;
 
     let handler = make_handler(SecretStore::new(), RuntimeCatalogRegistry::new());
@@ -367,7 +370,7 @@ async fn attach_rejected_without_admin_role() {
 
 #[tokio::test]
 async fn detach_rejected_without_admin_role() {
-    let server = MockServer::start().await;
+    let server = crate::common::mock_server().await;
     mount_rest_fixture(&server).await;
 
     let handler = make_handler(SecretStore::new(), RuntimeCatalogRegistry::new());

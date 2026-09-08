@@ -18,7 +18,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 async fn mount_empty_polaris() -> MockServer {
-    let server = MockServer::start().await;
+    let server = crate::common::mock_server().await;
     Mock::given(method("GET"))
         .and(path("/v1/config"))
         .respond_with(
@@ -63,10 +63,15 @@ fn handler(catalog_url: &str) -> sqe_coordinator::QueryHandler {
     .expect("QueryHandler::new")
 }
 
+/// Token unique per call: `SESSION_CONTEXT_CACHE` is process-wide and keyed
+/// on `username:token_hash:catalog:schema`, and every test here builds its
+/// own handler against its own mock URL. A fixed token would hand one test
+/// another's cached `SessionContext`, pointing at a mock server that has
+/// since been dropped (connection refused on `/v1/namespaces`).
 fn session() -> Session {
     Session::new(
         "describer".to_string(),
-        sqe_core::SecretString::new("tok".to_string()),
+        sqe_core::SecretString::new(format!("tok-{}", uuid::Uuid::new_v4())),
         None,
         Utc::now() + Duration::hours(1),
         vec![],
