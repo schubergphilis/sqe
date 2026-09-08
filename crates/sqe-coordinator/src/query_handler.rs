@@ -6992,6 +6992,53 @@ impl QueryHandler {
             .iter()
             .map(|f| f.name.clone())
             .collect();
+
+        // Architecture review 205 (#558): SHOW STATS is governed like
+        // `information_schema.columns`, which `SHOW COLUMNS`, `DESCRIBE` and
+        // `SHOW CREATE TABLE` read from. The same policy the plan rewriter
+        // applies to a scan decides what this statement may say: restricted
+        // columns are not listed (denied columns are invisible, not errors),
+        // a row filter makes the snapshot's total row count someone else's
+        // number so it is reported NULL, and a deny-all policy answers with
+        // no rows at all. When per-column statistics land here (Puffin NDV,
+        // min/max), they must come from the enforced plan or stay NULL for
+        // masked and restricted columns; a raw min/max of a masked column is
+        // the value leak this gate exists to prevent. The MCP
+        // `get_table_stats` tool is a thin wrapper over this statement.
+        let (column_names, row_count) = match self.policy_store.as_deref() {
+            None => (column_names, row_count),
+            Some(store) => {
+                // Malformed tags are UNKNOWN, not empty: the rewriter fails
+                // closed on them and so does this.
+                let col_tags = crate::tag_source_impl::parse_column_tags(metadata.properties())
+                    .map_err(|e| {
+                        SqeError::with_code(
+                            SqeErrorCode::ExecutionFailed,
+                            format!("SHOW STATS: malformed sqe.column-tags on {table_name}: {e}"),
+                        )
+                    })?;
+                let default_hive = sqe_policy::plan_rewriter::HiveCatalogs::new();
+                let hive_catalogs = self.hive_catalogs.as_deref().unwrap_or(&default_hive);
+                let (policy_ns, policy_table) =
+                    sqe_policy::plan_rewriter::resolve_policy_key_for_ident(
+                        Some(session_catalog.warehouse()),
+                        table_ident.namespace().as_ref(),
+                        table_ident.name(),
+                        hive_catalogs,
+                    )
+                    .unwrap_or_else(|| (namespace.to_string(), bare_table.to_string()));
+                let policy = sqe_policy::plan_rewriter::resolve_effective_policy(
+                    store,
+                    &session.user,
+                    &policy_table,
+                    &policy_ns,
+                    &col_tags,
+                    self.config.policy.mask_precedence,
+                )
+                .await;
+                governed_show_stats(&policy, column_names, row_count)
+            }
+        };
         build_show_stats_batch(&column_names, row_count)
     }
 
@@ -8497,6 +8544,33 @@ impl QueryHandler {
 /// (column_name NULL, row_count from the snapshot, or NULL when never
 /// written). Columns: column_name, data_size, distinct_values_count,
 /// nulls_fraction, row_count, low_value, high_value. (#6)
+/// What `SHOW STATS` may say under `policy` (architecture review 205): the
+/// column list without the restricted columns, and the row count only when
+/// no row filter applies (the snapshot total is then not the caller's
+/// count). A deny-all policy yields no columns and no count. Masked columns
+/// stay listed: their names are visible through `information_schema` too,
+/// and their per-column statistics are NULL here. Pure so the rule is
+/// unit-tested without a catalog.
+fn governed_show_stats(
+    policy: &sqe_policy::ResolvedPolicy,
+    column_names: Vec<String>,
+    row_count: Option<f64>,
+) -> (Vec<String>, Option<f64>) {
+    if sqe_policy::plan_rewriter::policy_denies_all(policy) {
+        return (Vec::new(), None);
+    }
+    let columns = column_names
+        .into_iter()
+        .filter(|c| !policy.restricted_columns.iter().any(|r| r == c))
+        .collect();
+    let row_count = if policy.row_filters.is_empty() {
+        row_count
+    } else {
+        None
+    };
+    (columns, row_count)
+}
+
 fn build_show_stats_batch(
     column_names: &[String],
     row_count: Option<f64>,
@@ -8923,6 +8997,68 @@ fn merge_source_sql(source: &TableFactor) -> Result<String, SqeError> {
         other => Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
             "Unsupported MERGE source: {other}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod show_stats_policy_tests {
+    use super::governed_show_stats;
+    use datafusion::logical_expr::{col, lit};
+    use sqe_policy::ResolvedPolicy;
+
+    fn cols(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Denied columns are invisible, not errors: the row for a restricted
+    /// column is simply absent, exactly as `information_schema.columns`.
+    #[test]
+    fn restricted_columns_are_not_listed() {
+        let policy = ResolvedPolicy {
+            restricted_columns: cols(&["ssn"]),
+            ..Default::default()
+        };
+        let (columns, rows) = governed_show_stats(&policy, cols(&["id", "ssn", "name"]), Some(10.0));
+        assert_eq!(columns, cols(&["id", "name"]));
+        assert_eq!(rows, Some(10.0), "no row filter: the snapshot count is the caller's count");
+    }
+
+    /// The snapshot's total-records is the whole table; under a row filter it
+    /// is a number the caller must not learn.
+    #[test]
+    fn a_row_filter_hides_the_total_row_count() {
+        let policy = ResolvedPolicy {
+            row_filters: vec![col("region").eq(lit("eu"))],
+            ..Default::default()
+        };
+        let (columns, rows) = governed_show_stats(&policy, cols(&["id", "region"]), Some(10.0));
+        assert_eq!(columns, cols(&["id", "region"]));
+        assert_eq!(rows, None);
+    }
+
+    /// The rewriter's deny-all sentinel answers with nothing at all.
+    #[test]
+    fn a_deny_all_policy_yields_no_rows() {
+        let policy = ResolvedPolicy {
+            row_filters: vec![lit(false)],
+            ..Default::default()
+        };
+        let (columns, rows) = governed_show_stats(&policy, cols(&["id"]), Some(10.0));
+        assert!(columns.is_empty());
+        assert_eq!(rows, None);
+    }
+
+    /// Masked columns stay listed: their names are visible everywhere else
+    /// and their per-column statistics are NULL in this statement.
+    #[test]
+    fn masked_columns_stay_listed_and_an_unrestricted_policy_changes_nothing() {
+        let mut policy = ResolvedPolicy::default();
+        policy
+            .column_masks
+            .insert("email".to_string(), sqe_policy::MaskType::Nullify);
+        let (columns, rows) = governed_show_stats(&policy, cols(&["id", "email"]), Some(3.0));
+        assert_eq!(columns, cols(&["id", "email"]));
+        assert_eq!(rows, Some(3.0));
     }
 }
 
