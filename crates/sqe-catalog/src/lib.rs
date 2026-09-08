@@ -7,6 +7,7 @@ pub mod catalog_provider;
 pub mod circuit_breaker;
 pub mod expr_to_predicate;
 pub mod file_tvf_common;
+pub mod file_tvf_prepare;
 pub mod footer_cache;
 pub mod grant_chameleon;
 pub mod hf_tree_cache;

@@ -52,6 +52,7 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion_expr::Expr;
 use tracing::debug;
 
+use futures::future::BoxFuture;
 use sqe_core::config::{StorageConfig, TvfCaller};
 
 use crate::file_tvf_common::{
@@ -59,6 +60,7 @@ use crate::file_tvf_common::{
     register_http_store_if_needed, register_s3_store_if_needed, rewrite_hf_path_in_place,
     FileTvfArgs,
 };
+use crate::file_tvf_prepare::{PreparableTableFunction, PreparedProviders};
 
 const FN_NAME: &str = "read_csv";
 
@@ -170,6 +172,9 @@ pub struct ReadCsvFunction {
     /// The executing session's runtime environment; see
     /// [`crate::read_parquet::ReadParquetFunction::with_runtime_env`].
     runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
+    /// Providers built by [`PreparableTableFunction::prepare`] ahead of
+    /// planning; `call` only looks them up (architecture review 806).
+    prepared: PreparedProviders,
 }
 
 impl ReadCsvFunction {
@@ -178,6 +183,7 @@ impl ReadCsvFunction {
             storage,
             caller: TvfCaller::default(),
             runtime_env: None,
+            prepared: PreparedProviders::default(),
         }
     }
 
@@ -187,22 +193,13 @@ impl ReadCsvFunction {
             storage,
             caller,
             runtime_env: None,
+            prepared: PreparedProviders::default(),
         }
     }
 
-    /// Bind the executing session's runtime environment so inline-credential
-    /// object stores are visible to the scan, not just to schema inference.
-    pub fn with_runtime_env(
-        mut self,
-        env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
-    ) -> Self {
-        self.runtime_env = Some(env);
-        self
-    }
-}
-
-impl TableFunctionImpl for ReadCsvFunction {
-    fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
+    /// Parse the arguments and run the path policy: the synchronous part of
+    /// a call, shared by `prepare` and `call`.
+    fn checked_args(&self, exprs: &[Expr]) -> DFResult<(FileTvfArgs, CsvOpts)> {
         let mut csv_opts = CsvOpts::default();
         let mut parse_err: Option<DataFusionError> = None;
 
@@ -260,13 +257,49 @@ impl TableFunctionImpl for ReadCsvFunction {
             &self.storage,
             &self.caller,
         )?;
+        Ok((args, csv_opts))
+    }
+}
 
-        let storage = self.storage.clone();
-        let runtime_env = self.runtime_env.clone();
-        crate::runtime_bridge::block_on_compat(async move {
-            build_csv_listing_table(&args, &csv_opts, &storage, runtime_env.as_deref()).await
+impl PreparableTableFunction for ReadCsvFunction {
+    fn prepare<'a>(&'a self, exprs: &'a [Expr]) -> BoxFuture<'a, DFResult<()>> {
+        Box::pin(async move {
+            let (args, csv_opts) = self.checked_args(exprs)?;
+            let provider = build_csv_listing_table(
+                &args,
+                &csv_opts,
+                &self.storage,
+                self.runtime_env.as_deref(),
+            )
+            .await
+            .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: {e}")))?;
+            self.prepared.insert(exprs, provider);
+            Ok(())
         })
-        .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: {e}")))?
+    }
+}
+
+impl ReadCsvFunction {
+    /// Bind the executing session's runtime environment so inline-credential
+    /// object stores are visible to the scan, not just to schema inference.
+    pub fn with_runtime_env(
+        mut self,
+        env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> Self {
+        self.runtime_env = Some(env);
+        self
+    }
+}
+
+impl TableFunctionImpl for ReadCsvFunction {
+    // Synchronous and called from inside the planner, so it never touches
+    // storage: `prepare` built the provider on the async path and this only
+    // re-checks the policy and looks it up (architecture review 806).
+    fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
+        self.checked_args(exprs)?;
+        self.prepared
+            .get(exprs)
+            .ok_or_else(|| PreparedProviders::not_prepared(FN_NAME, exprs))
     }
 }
 
