@@ -53,27 +53,50 @@ impl TableProvider for ScopedTable {
     ) -> Result<Vec<TableProviderFilterPushDown>> {
         self.inner.supports_filters_pushdown(filters)
     }
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
+    // `async_trait`'s desugared form (compile time, see
+    // docs/internal/plans/2026-09-07-compile-time-async-hubs.md): the block
+    // must own the scoped `SessionState` the inner scan borrows and needs
+    // the `&[Expr]`, and proving either `Send` walks DataFusion's whole type
+    // graph under this method's parameter environment (2.5 s). Both are
+    // held as `SendErased`, which states the fact once. The downcast and the
+    // state build stay synchronous, before the block, as before.
+    fn scan<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+        &'life0 self,
+        state: &'life1 dyn Session,
+        projection: Option<&'life2 Vec<usize>>,
+        filters: &'life3 [Expr],
         limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let state = state
-            .as_any()
-            .downcast_ref::<SessionState>()
-            .ok_or_else(|| {
-                DataFusionError::Internal("File reader requires a SessionState".into())
-            })?;
-        let scoped = SessionStateBuilder::new_from_existing(state.clone())
-            .with_runtime_env(Arc::clone(&self.runtime))
-            .build();
-        let inner = self.inner.scan(&scoped, projection, filters, limit).await?;
-        Ok(Arc::new(ScopedExec {
-            inner,
-            runtime: Arc::clone(&self.runtime),
-        }))
+    ) -> futures::future::BoxFuture<'async_trait, Result<Arc<dyn ExecutionPlan>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        Self: 'async_trait,
+    {
+        let Some(state) = state.as_any().downcast_ref::<SessionState>() else {
+            return Box::pin(async {
+                Err(DataFusionError::Internal(
+                    "File reader requires a SessionState".into(),
+                ))
+            });
+        };
+        let scoped = crate::send_erased::SendErased::new(
+            SessionStateBuilder::new_from_existing(state.clone())
+                .with_runtime_env(Arc::clone(&self.runtime))
+                .build(),
+        );
+        let filters = crate::send_erased::SendErased::new(filters);
+        Box::pin(async move {
+            let inner = self
+                .inner
+                .scan(scoped.get(), projection, filters.get(), limit)
+                .await?;
+            Ok(Arc::new(ScopedExec {
+                inner,
+                runtime: Arc::clone(&self.runtime),
+            }) as Arc<dyn ExecutionPlan>)
+        })
     }
 }
 #[derive(Debug)]
