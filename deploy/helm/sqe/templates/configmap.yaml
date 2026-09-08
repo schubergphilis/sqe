@@ -64,6 +64,31 @@ data:
 
     [policy]
     engine = {{ .Values.config.policy.engine | quote }}
+    {{- if eq .Values.config.policy.engine "ranger" }}
+    # policy.ranger.admin-password arrives as the SQE_POLICY__RANGER__ADMIN_PASSWORD
+    # env override, never through this ConfigMap.
+
+    [policy.ranger]
+    url = {{ .Values.config.policy.ranger.url | quote }}
+    service-name = {{ .Values.config.policy.ranger.service_name | quote }}
+    project-tags = {{ .Values.config.policy.ranger.project_tags }}
+    {{- end }}
+
+    [access_control]
+    backend = {{ .Values.config.access_control.backend | quote }}
+    {{- if eq .Values.config.access_control.backend "ranger" }}
+    # Grants go to the same Ranger Admin the policy engine reads from.
+
+    [access_control.ranger]
+    url = {{ .Values.config.policy.ranger.url | quote }}
+    service-name = {{ .Values.config.policy.ranger.service_name | quote }}
+    {{- end }}
+
+    # Architecture review 212: production_mode refuses policy.engine =
+    # passthrough and access_control.backend = none unless acknowledged here.
+    [security]
+    allow_no_policy_engine = {{ .Values.config.security.allow_no_policy_engine }}
+    allow_no_grant_backend = {{ .Values.config.security.allow_no_grant_backend }}
 
     [rate_limit]
     enabled = {{ .Values.config.rate_limit.enabled }}

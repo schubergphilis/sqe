@@ -169,8 +169,24 @@ config:
     s3_path_style: true
     # s3_access_key / s3_secret_key: set via secret or env override
 
+  # Dev default: no policy engine, no grant backend. production_mode refuses
+  # both defaults unless the matching security.allow_* flag acknowledges
+  # the choice (architecture review 212); values-production.yaml picks the
+  # Ranger pairing. Rendered into [policy], [policy.ranger] (engine=ranger
+  # only), [access_control] and [security] by templates/configmap.yaml.
   policy:
     engine: "passthrough"
+    ranger:
+      url: ""
+      service_name: "sqe"
+      # SET TAG must be visible to Spark/Kyuubi too; production_mode refuses
+      # false without security.allow_unprojected_tags.
+      project_tags: true
+  access_control:
+    backend: "none"
+  security:
+    allow_no_policy_engine: false
+    allow_no_grant_backend: false
 
   metrics:
     prometheus_port: 9090
