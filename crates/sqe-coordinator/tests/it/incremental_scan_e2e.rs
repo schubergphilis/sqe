@@ -158,7 +158,7 @@ fn incremental_provider_builds_with_empty_plan() {
 /// 4. INSERT 20 rows, capture snapshot s3.
 /// 5. `SELECT count(*) FROM t FOR INCREMENTAL BETWEEN SNAPSHOT s0 AND SNAPSHOT s3` == 45.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn incremental_scan_three_snapshots_returns_45_rows() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -279,7 +279,7 @@ async fn incremental_scan_three_snapshots_returns_45_rows() {
 /// an incremental range materialises the three meta columns with the correct
 /// values (insert kind, a positive ordinal, and a known snapshot id).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn incremental_scan_meta_columns_are_populated() {
     let (session, handler) = crate::common::setup_handler().await;
 

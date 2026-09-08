@@ -380,7 +380,7 @@ async fn not_in_with_null_subquery_returns_non_matches() {
 //     stress_one_million_row_keyset -- --ignored --nocapture
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris; 1M-row keyset stress"]
 async fn stress_one_million_row_keyset() {
     const N: usize = 1_000_000;
     let ctx = SessionContext::new();

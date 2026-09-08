@@ -40,7 +40,7 @@ macro_rules! ac_gate {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn ranger_wiring_smoke_carol_can_query() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -62,7 +62,7 @@ async fn ranger_wiring_smoke_carol_can_query() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn fixture_round_trip_creates_services_and_policies() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -374,7 +374,7 @@ async fn assert_denied_but_valid(ctx: &AcCtx, denied: &Session, sql: &str) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn cross_user_insert_then_delete_sees_the_committed_snapshot() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -434,7 +434,7 @@ async fn cross_user_insert_then_delete_sees_the_committed_snapshot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn denied_before_any_grant() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -459,7 +459,7 @@ async fn denied_before_any_grant() {
 /// from the outside. That ambiguity is what made the original failure read as
 /// latency and burn a 120-second budget.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn setup_removes_grants_the_suite_wrote_through_sql() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -519,7 +519,7 @@ async fn setup_removes_grants_the_suite_wrote_through_sql() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn grant_select_to_role_enables_exact_rows() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -558,7 +558,7 @@ async fn grant_select_to_role_enables_exact_rows() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn role_grant_and_user_grant_both_apply() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -620,7 +620,7 @@ async fn role_grant_and_user_grant_both_apply() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn write_privileges_are_separate_from_read() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -751,7 +751,7 @@ async fn add_deny_item_to_audit_policy(ctx: &AcCtx) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn ranger_deny_overrides_allow() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -818,7 +818,7 @@ async fn ranger_deny_overrides_allow() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn revoke_disables_access() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -948,7 +948,7 @@ pub(crate) fn hive_rowfilter_policy(name: &str, filter: &str) -> serde_json::Val
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn resource_column_masks_apply_to_engineer_only() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -1012,7 +1012,7 @@ async fn resource_column_masks_apply_to_engineer_only() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn hash_mask_is_keyed_hmac() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -1056,7 +1056,7 @@ async fn hash_mask_is_keyed_hmac() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn resource_row_filter_restricts_rows() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -1152,7 +1152,7 @@ async fn set_column_tag(ctx: &AcCtx, column: &str, tag: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn tag_column_mask_applies_from_iceberg_property() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -1213,7 +1213,7 @@ async fn tag_column_mask_applies_from_iceberg_property() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn tag_row_filter_restricts_rows() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -1266,7 +1266,7 @@ async fn tag_row_filter_restricts_rows() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn unmappable_tag_mask_fails_closed() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -1375,7 +1375,7 @@ fn all_cells(batches: &[RecordBatch]) -> Vec<String> {
 /// for firstName=carol lastName=sqe, so the assertion matches the first token
 /// rather than pinning the whole string.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn show_grants_reports_who_granted_and_when() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -1424,7 +1424,7 @@ async fn show_grants_reports_who_granted_and_when() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn show_grants_lists_both_roles() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -1472,7 +1472,7 @@ async fn show_grants_lists_both_roles() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn check_access_reflects_user_grants() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -1523,7 +1523,7 @@ async fn check_access_reflects_user_grants() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn capture_live_tag_bundle() {
     ac_gate!();
     if std::env::var("SQE_AC_CAPTURE").as_deref() != Ok("1") {
@@ -1607,7 +1607,7 @@ async fn capture_live_tag_bundle() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn unknown_tag_state_denies() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -1672,7 +1672,7 @@ async fn unknown_tag_state_denies() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn ranger_outage_fails_closed() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -1810,7 +1810,7 @@ async fn ranger_outage_fails_closed() {
 /// under test. A GRANT or REVOKE would instead route through Polaris's coarse
 /// gate and its own plugin poll, and the result would measure that timer.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn cache_ttl_bounds_policy_staleness() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -1960,7 +1960,7 @@ async fn cache_ttl_bounds_policy_staleness() {
 /// than of one policy, so it needs its own case with explicit priorities. It
 /// stays unit-tested and the matrix says so.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn remaining_mask_types_apply_live() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -2073,7 +2073,7 @@ async fn remaining_mask_types_apply_live() {
 /// covered in-process by `contested_column_uses_the_resource_mask_when_configured`
 /// in `sqe-policy`, which does not need a live stack to be conclusive.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn tag_mask_beats_resource_mask_live() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -2130,7 +2130,7 @@ async fn tag_mask_beats_resource_mask_live() {
 /// nothing on any table. This proves the read actually works, on two tables, one
 /// of which is created AFTER the grant.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn all_tables_in_schema_grant_covers_the_namespace() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -2233,7 +2233,7 @@ async fn all_tables_in_schema_grant_covers_the_namespace() {
 /// rather than by `assert_denied_but_valid`, whose admin control would itself
 /// insert one and move the row count this test asserts on.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn revoking_write_leaves_an_independent_read_grant_intact() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -2470,7 +2470,7 @@ async fn polaris_access_types_inner(
 /// that access type at exactly that resource, and the research note pins that the
 /// access type is what unblocks the read.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn one_table_grant_writes_the_namespace_it_needs() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -2675,7 +2675,7 @@ async fn one_table_grant_writes_the_namespace_it_needs() {
 /// The discriminator is a namespace each catalog has and the other does not, so
 /// this cannot pass by returning the union or the wrong catalog.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn show_schemas_describes_the_catalog_it_names() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -2792,7 +2792,7 @@ async fn show_schemas_describes_the_catalog_it_names() {
 /// on residue rather than on behaviour, which is exactly what the first version of
 /// this assertion did.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn insert_does_not_confer_storage_relocation() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -2896,7 +2896,7 @@ async fn insert_does_not_confer_storage_relocation() {
 /// Also pins the two properties that make SQL `DENY` usable rather than a one-way
 /// door: it is idempotent, and `REVOKE` clears it.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn sql_deny_blocks_a_granted_read_and_revoke_clears_it() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -3046,7 +3046,7 @@ async fn sql_deny_blocks_a_granted_read_and_revoke_clears_it() {
 /// indistinguishable from an invalid statement, which is how a broken parser reads
 /// as a working authz gate.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn a_non_admin_cannot_grant_under_the_default_gate() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -3096,7 +3096,7 @@ async fn a_non_admin_cannot_grant_under_the_default_gate() {
 /// own tables from then on. Documented, not hidden -- an unseeded grantee gets an
 /// error naming the level and the statement that fixes it.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn a_delegated_owner_grants_on_their_own_table_without_an_admin_role() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -3236,7 +3236,7 @@ async fn a_delegated_owner_grants_on_their_own_table_without_an_admin_role() {
 /// to, so standing the role gate down would leave the write unauthorized rather
 /// than authorized more finely.
 #[tokio::test]
-#[ignore]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn deny_still_requires_an_admin_role_under_ranger_delegate() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -3320,7 +3320,7 @@ async fn deny_still_requires_an_admin_role_under_ranger_delegate() {
 
 /// CONTROL for `adding_a_column_to_a_masked_table_breaks_the_query_in_sqe`.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn control_add_column_with_no_policy_at_all() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -3376,7 +3376,7 @@ async fn control_add_column_with_no_policy_at_all() {
 
 /// CONTROL for `renaming_a_tagged_column_breaks_differently_in_each_engine`.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn control_rename_column_with_no_policy_at_all() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -3443,7 +3443,7 @@ async fn control_rename_column_with_no_policy_at_all() {
 /// one projects `id` alongside the renamed column, so the index list is non-empty
 /// and this branch is never reached.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn a_projection_matching_no_file_column_never_returns_another_column() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -3500,7 +3500,7 @@ async fn a_projection_matching_no_file_column_never_returns_another_column() {
 /// without the statement working at all, which is the shape that already let one
 /// guard test through in this suite.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn show_masking_policies_lists_what_ranger_holds() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -3587,7 +3587,7 @@ async fn show_masking_policies_lists_what_ranger_holds() {
 /// The listing is a map of where the sensitive columns are. Someone who cannot read
 /// `orders.ssn` must not learn that `orders.ssn` is the column worth masking.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn show_masking_policies_is_refused_for_a_non_admin() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -3618,7 +3618,7 @@ async fn show_masking_policies_is_refused_for_a_non_admin() {
 /// policy name to its tag actually reaches the tag store, writes the association,
 /// and makes the mask fire. That is the whole chain and it needs a real Ranger.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn set_masking_policy_attaches_a_named_tag_policy() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -3707,7 +3707,7 @@ async fn set_masking_policy_attaches_a_named_tag_policy() {
 /// rather than the refusal living only in a function nothing calls, and that the
 /// column is left alone.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn set_masking_policy_refuses_a_resource_policy() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -3780,7 +3780,7 @@ async fn set_masking_policy_refuses_a_resource_policy() {
 /// panic: a surprising mask is much harder to explain than a missing one, and the
 /// operator has no statement that would show them why it is happening.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
 async fn a_dropped_column_does_not_bequeath_its_tags_to_a_new_one() {
     ac_gate!();
     let _guard = crate::common::serial().lock().await;

@@ -579,7 +579,7 @@ async fn partition_record_counts(
 /// Position-delete parity: distributed rewrite of an N-group table on >= 2
 /// workers matches a coordinator-local rewrite of the same fixture.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris + 2 live sqe-worker processes"]
+#[ignore = "needs:polaris+workers"]
 async fn position_delete_parity() {
     let (session, handler) = crate::common::setup_handler_with_workers(&worker_urls()).await;
     let namespace = "default";
@@ -683,7 +683,7 @@ async fn position_delete_parity() {
 /// Equality-delete parity: same properties as [`position_delete_parity`],
 /// exercised on the equality-delete taxonomy (MoR `UPDATE`) instead.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris + 2 live sqe-worker processes"]
+#[ignore = "needs:polaris+workers"]
 async fn equality_delete_parity() {
     let (session, handler) = crate::common::setup_handler_with_workers(&worker_urls()).await;
     let namespace = "default";
@@ -791,7 +791,7 @@ async fn equality_delete_parity() {
 /// `partition_spec_id` before committing -- exactly the path the two
 /// unpartitioned fixtures above never touch.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris + 2 live sqe-worker processes"]
+#[ignore = "needs:polaris+workers"]
 async fn partitioned_with_deletes_parity() {
     let (session, handler) = crate::common::setup_handler_with_workers(&worker_urls()).await;
     let namespace = "default";

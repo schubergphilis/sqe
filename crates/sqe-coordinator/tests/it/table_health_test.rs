@@ -81,7 +81,7 @@ async fn seed_mor_table(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 async fn table_health_reports_small_and_delete_files_without_write_privilege() {
     let (session, handler) = crate::common::setup_handler().await;
     let namespace = "default";

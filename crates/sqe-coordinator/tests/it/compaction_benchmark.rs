@@ -71,7 +71,7 @@ async fn timed_filter_query(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris; run with --nocapture"]
+#[ignore = "needs:polaris; run with --nocapture"]
 async fn compaction_sort_benchmark() {
     let (session, handler) = crate::common::setup_handler().await;
     let namespace = "default";

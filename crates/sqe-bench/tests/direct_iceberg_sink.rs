@@ -115,9 +115,8 @@ async fn current_snapshot_id(
 ///   SQE_TEST_ICEBERG_S3_REGION     (default us-east-1)
 ///   SQE_TEST_ICEBERG_SCALE         (default 0.01)
 #[tokio::test]
-#[ignore = "requires a live Iceberg REST catalog + S3-compatible store; run with --ignored \
-            (see SQE_TEST_ICEBERG_* env vars in this file's doc comment; defaults match \
-            quickstart/benchmark's Nessie/RustFS compose stack)"]
+#[ignore = "needs:nessie; a live Iceberg REST catalog + S3-compatible store (SQE_TEST_ICEBERG_* env \
+            vars in this file's doc comment; defaults match quickstart/benchmark's Nessie/RustFS stack)"]
 async fn tpch_direct_sink_writes_and_resumes() {
     let target = test_target();
     let scale = test_scale();

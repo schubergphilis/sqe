@@ -128,7 +128,7 @@ fn merge_mor_clause_shapes() {
 /// Task 9.5 acceptance: UPDATE MoR writes equality delete + new data
 /// file; no existing data files are rewritten.
 #[test]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 fn mor_update_writes_data_plus_equality_delete() {
     // 1. CREATE TABLE ns.t (id int, v int) WITH IDENTIFIER FIELDS (id)
     //    TBLPROPERTIES ('write.update.mode' = 'merge-on-read').
@@ -142,7 +142,7 @@ fn mor_update_writes_data_plus_equality_delete() {
 /// Task 9.8 acceptance: MERGE MoR commits data files + equality deletes
 /// in one snapshot via RowDeltaAction.
 #[test]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 fn mor_merge_commits_all_files_in_one_snapshot() {
     // 1. CREATE target ns.t (id int, v int) WITH IDENTIFIER FIELDS (id)
     //    TBLPROPERTIES ('write.merge.mode' = 'merge-on-read').
@@ -161,7 +161,7 @@ fn mor_merge_commits_all_files_in_one_snapshot() {
 /// path. Validates the equality-delete file format is portable across
 /// engines.
 #[test]
-#[ignore = "needs docker-compose.spark.yml + iceberg-spark-runtime"]
+#[ignore = "needs:spark"]
 fn spark_reads_sqe_mor_updated_table() {
     // Same setup as `mor_update_writes_data_plus_equality_delete`, then
     // query the table from Spark 4.1 and assert row counts and values
@@ -171,7 +171,7 @@ fn spark_reads_sqe_mor_updated_table() {
 /// Task 9.13: Trino 465 reads tables that SQE wrote via the MoR UPDATE
 /// path.
 #[test]
-#[ignore = "needs docker-compose.trino.yml + trino-iceberg-connector"]
+#[ignore = "needs:trino"]
 fn trino_reads_sqe_mor_updated_table() {
     // Same setup; query through the Trino HTTP layer and assert parity.
 }
