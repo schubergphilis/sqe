@@ -34,7 +34,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -60,7 +60,7 @@ use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use futures::TryStreamExt;
 use moka::sync::Cache as SyncCache;
 use object_store::{ObjectMeta, ObjectStore};
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use super::manifest::{HiveManifest, PartitionIndex, PartitionIndexEntry};
 use super::partition::{
@@ -72,13 +72,115 @@ use super::stats::{analyzed_statistics, row_width_hint, size_only_from_index, si
 use super::source::HiveMetadataSource;
 use super::store::HiveManifestStore;
 use super::HiveError;
+use crate::schema_provider::{merge_listing, NamespaceListing};
 
-/// TTL-independent capacity bound for a schema's `table_names()` cache and a
-/// catalog's `schema()`-issued caches (they share one moka instance; see
-/// [`HiveCatalogProvider::new`]). Generous: a warehouse with more than this
-/// many distinct databases across one session is not the case this cache is
-/// sized for, and a miss just costs one more listing.
+/// Capacity bound for a catalog's per-database table-name snapshots
+/// ([`HiveListings::tables`]). Generous: a warehouse with more than this
+/// many distinct databases referenced by one session is not the case this
+/// is sized for, and an evicted snapshot just costs one more listing on the
+/// next pre-plan refresh.
 const TABLE_NAMES_CACHE_CAPACITY: u64 = 1024;
+
+/// Last known database and table listings of one Hive catalog (architecture
+/// review 806).
+///
+/// DataFusion's `CatalogProvider::schema_names()` and
+/// `SchemaProvider::table_names()` are synchronous and have no error channel.
+/// They used to bridge onto the metastore from inside the hook and turn a
+/// listing failure into "this catalog has no databases" (finding P1-7). They
+/// now serve these snapshots and never touch the network; the snapshots are
+/// filled by [`HiveCatalogProvider::refresh_referenced`] from the
+/// coordinator's (and the embedded CLI's) async pre-plan path. A failed
+/// refresh keeps the previous names and records why in
+/// [`NamespaceListing::stale_error`], so readers can tell "empty" from
+/// "unavailable".
+///
+/// Shared by the catalog provider and every [`HiveSchemaProvider`] it
+/// issues, so a listing refreshed for one query's planning serves the next
+/// one within `ttl`. Per provider, not process-global like the Iceberg
+/// snapshots: a Hive listing is not principal-filtered, and the provider is
+/// itself session-scoped, so there is no cross-session sharing to gain.
+pub struct HiveListings {
+    /// How long a snapshot is served without being re-listed. A snapshot
+    /// older than this is still served (last known) until the next refresh
+    /// replaces it.
+    ttl: Duration,
+    databases: RwLock<Option<Arc<NamespaceListing>>>,
+    tables: SyncCache<String, Arc<NamespaceListing>>,
+}
+
+impl HiveListings {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            databases: RwLock::new(None),
+            tables: SyncCache::builder()
+                .max_capacity(TABLE_NAMES_CACHE_CAPACITY)
+                .time_to_idle(Duration::from_secs(3600))
+                .build(),
+        }
+    }
+
+    /// The database snapshot, if a refresh has run.
+    pub fn databases(&self) -> Option<Arc<NamespaceListing>> {
+        self.databases
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The table snapshot of `database`, if a refresh has run for it.
+    pub fn tables(&self, database: &str) -> Option<Arc<NamespaceListing>> {
+        self.tables.get(database)
+    }
+
+    fn is_fresh(&self, listing: Option<&Arc<NamespaceListing>>) -> bool {
+        listing.is_some_and(|l| l.checked_at.elapsed() < self.ttl)
+    }
+
+    fn databases_fresh(&self) -> bool {
+        self.is_fresh(self.databases().as_ref())
+    }
+
+    fn tables_fresh(&self, database: &str) -> bool {
+        self.is_fresh(self.tables.get(database).as_ref())
+    }
+
+    fn store_databases(&self, outcome: Result<Vec<String>, (String, bool)>) -> Arc<NamespaceListing> {
+        let mut slot = self.databases.write().unwrap_or_else(PoisonError::into_inner);
+        let merged = Arc::new(merge_listing(slot.as_deref(), outcome));
+        *slot = Some(Arc::clone(&merged));
+        merged
+    }
+
+    fn store_tables(
+        &self,
+        database: &str,
+        outcome: Result<Vec<String>, (String, bool)>,
+    ) -> Arc<NamespaceListing> {
+        let previous = self.tables.get(database);
+        let merged = Arc::new(merge_listing(previous.as_deref(), outcome));
+        self.tables.insert(database.to_string(), Arc::clone(&merged));
+        merged
+    }
+}
+
+impl fmt::Debug for HiveListings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HiveListings")
+            .field("ttl", &self.ttl)
+            .field("databases", &self.databases().map(|l| l.names.len()))
+            .field("tables", &self.tables.entry_count())
+            .finish()
+    }
+}
+
+/// Turn a listing failure into the `(message, denied)` pair the snapshot
+/// records. A `Forbidden` is a legitimate (empty) answer for this caller;
+/// anything else means the metastore could not be listed.
+fn listing_failure(e: &HiveError) -> (String, bool) {
+    (e.to_string(), matches!(e, HiveError::Forbidden(_)))
+}
 
 /// Default capacity for [`HiveMetadataCache`]. Process-wide and long-lived,
 /// so sized for "every Hive table this deployment has ever queried since
@@ -1017,11 +1119,10 @@ pub struct HiveCatalogProvider {
     data_store_factory: Arc<dyn HiveDataStoreFactory>,
     runtime: Arc<RuntimeEnv>,
     manifest_cache: Arc<HiveMetadataCache>,
-    /// `"<database>"` -> table names, shared with every `HiveSchemaProvider`
-    /// this catalog issues via `schema()` (`moka::sync::Cache` clones cheaply
-    /// and share their backing map), so a listing done for one query's
-    /// planning is not repeated for the next one within `cache_ttl`.
-    table_names_cache: SyncCache<String, Arc<Vec<String>>>,
+    /// Database and per-database table-name snapshots, shared with every
+    /// `HiveSchemaProvider` this catalog issues via `schema()`; see
+    /// [`HiveListings`].
+    listings: Arc<HiveListings>,
 }
 
 impl fmt::Debug for HiveCatalogProvider {
@@ -1054,10 +1155,6 @@ impl HiveCatalogProvider {
         manifest_cache: Arc<HiveMetadataCache>,
         cache_ttl: Duration,
     ) -> Self {
-        let table_names_cache = SyncCache::builder()
-            .max_capacity(TABLE_NAMES_CACHE_CAPACITY)
-            .time_to_live(cache_ttl)
-            .build();
         Self {
             name,
             source: Arc::clone(&store) as Arc<dyn HiveMetadataSource>,
@@ -1065,7 +1162,7 @@ impl HiveCatalogProvider {
             data_store_factory,
             runtime,
             manifest_cache,
-            table_names_cache,
+            listings: Arc::new(HiveListings::new(cache_ttl)),
         }
     }
 
@@ -1079,10 +1176,6 @@ impl HiveCatalogProvider {
         manifest_cache: Arc<HiveMetadataCache>,
         cache_ttl: Duration,
     ) -> Self {
-        let table_names_cache = SyncCache::builder()
-            .max_capacity(TABLE_NAMES_CACHE_CAPACITY)
-            .time_to_live(cache_ttl)
-            .build();
         Self {
             name,
             source,
@@ -1090,7 +1183,123 @@ impl HiveCatalogProvider {
             data_store_factory,
             runtime,
             manifest_cache,
-            table_names_cache,
+            listings: Arc::new(HiveListings::new(cache_ttl)),
+        }
+    }
+
+    /// The catalog's name as registered with DataFusion.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The listing snapshots this provider and its schema providers serve.
+    pub fn listings(&self) -> &Arc<HiveListings> {
+        &self.listings
+    }
+
+    /// List the databases from the metastore and store the result as the
+    /// catalog's snapshot. On failure the previous names are kept and the
+    /// error recorded, then returned so an async caller can surface it.
+    pub async fn refresh_databases(&self) -> Result<Arc<NamespaceListing>, HiveError> {
+        match self.source.list_databases().await {
+            Ok(mut names) => {
+                names.sort();
+                Ok(self.listings.store_databases(Ok(names)))
+            }
+            Err(e) => {
+                let kept = self.listings.store_databases(Err(listing_failure(&e)));
+                error!(catalog = %self.name, error = %e, kept = kept.names.len(), "hive_external: failed to list databases; keeping previous snapshot");
+                Err(e)
+            }
+        }
+    }
+
+    /// List the tables of `database` and store the result as its snapshot;
+    /// same failure contract as [`Self::refresh_databases`].
+    pub async fn refresh_tables(&self, database: &str) -> Result<Arc<NamespaceListing>, HiveError> {
+        match self.source.list_tables(database).await {
+            Ok(mut names) => {
+                names.sort();
+                Ok(self.listings.store_tables(database, Ok(names)))
+            }
+            Err(e) => {
+                let kept = self.listings.store_tables(database, Err(listing_failure(&e)));
+                error!(catalog = %self.name, database, error = %e, kept = kept.names.len(), "hive_external: failed to list tables; keeping previous snapshot");
+                Err(e)
+            }
+        }
+    }
+
+    /// Refresh the snapshots a statement is about to plan against, off the
+    /// async path (review 806): the database list, plus the tables of every
+    /// database the statement references in this catalog (`cat.db.t`, and
+    /// `db.t` / the session schema when this catalog is `default_catalog`).
+    /// A statement that reads `information_schema` enumerates every
+    /// database, so it refreshes them all. Snapshots younger than the TTL
+    /// are skipped, so the steady-state cost is one listing per database
+    /// per window, not per query. Failures are recorded in the snapshot,
+    /// never propagated: planning proceeds on the last known names and
+    /// `table()` reports the precise error for the table it actually needs.
+    pub async fn refresh_referenced(
+        &self,
+        sql: &str,
+        default_catalog: Option<&str>,
+        default_schema: Option<&str>,
+    ) {
+        let is_default = default_catalog.is_some_and(|c| c.eq_ignore_ascii_case(&self.name));
+        let mut databases: Vec<String> = Vec::new();
+        if is_default {
+            if let Some(schema) = default_schema {
+                databases.push(schema.to_string());
+            }
+        }
+        for (catalog, schema) in sqe_sql::extract_schema_qualifiers_from_sql(sql) {
+            let ours = match catalog {
+                Some(c) => c.eq_ignore_ascii_case(&self.name),
+                None => is_default,
+            };
+            // `information_schema` is DataFusion's own virtual schema, not a
+            // Hive database to list.
+            if ours
+                && !schema.eq_ignore_ascii_case("information_schema")
+                && !databases.iter().any(|d| d.eq_ignore_ascii_case(&schema))
+            {
+                databases.push(schema);
+            }
+        }
+
+        if !self.listings.databases_fresh() {
+            // Errors are already folded into the snapshot with their reason.
+            let _ = self.refresh_databases().await;
+        }
+
+        if sql_reads_information_schema(sql) {
+            if let Some(listing) = self.listings.databases() {
+                for db in &listing.names {
+                    if !databases.iter().any(|d| d.eq_ignore_ascii_case(db)) {
+                        databases.push(db.clone());
+                    }
+                }
+            }
+        }
+
+        for db in databases {
+            if self.listings.tables_fresh(&db) {
+                continue;
+            }
+            let _ = self.refresh_tables(&db).await;
+        }
+    }
+
+    /// Refresh the database list and every database's tables, regardless of
+    /// age. For callers that will enumerate the whole catalog next (tests,
+    /// tooling); a query path should use [`Self::refresh_referenced`].
+    pub async fn refresh_all(&self) {
+        let Ok(databases) = self.refresh_databases().await else {
+            return;
+        };
+        for db in &databases.names {
+            let _ = self.refresh_tables(db).await;
         }
     }
 
@@ -1111,33 +1320,62 @@ impl HiveCatalogProvider {
         self.sidecar.clone()
     }
 
-    /// Drop any cached `table_names()` result for `database`. Call after DDL
-    /// that creates or drops a table so the next `SHOW TABLES` / planning
-    /// lookup sees the change without waiting for the cache TTL. Mirrors
+    /// Drop the table-name snapshot of `database` (and the database list,
+    /// since the first table of a new database creates it) so the next
+    /// pre-plan refresh re-lists instead of waiting out the TTL. Call after
+    /// DDL that creates or drops a table. Mirrors
     /// `SqeSchemaProvider::invalidate_table_names` (`schema_provider.rs`).
     ///
     /// `HiveSchemaProvider::table()` itself needs no matching invalidation:
     /// it calls `store.get()` unconditionally on every lookup (see its own
     /// doc comment on cache-before-build ordering) rather than reading
     /// through `manifest_cache` first, so a manifest write or delete is
-    /// visible to the next `table()` call with no cache to invalidate.
-    /// `table_names_cache` is the only stale-listing risk.
+    /// visible to the next `table()` call with no cache to invalidate. The
+    /// listing snapshots are the only stale-listing risk.
     pub fn invalidate_table_names(&self, database: &str) {
-        self.table_names_cache.invalidate(database);
+        self.listings.tables.invalidate(database);
+        *self
+            .listings
+            .databases
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = None;
     }
 }
 
+/// True when `sql` reads `information_schema`, whose `schemata` / `tables` /
+/// `columns` views enumerate every schema of every catalog and so need every
+/// database's table snapshot, not just the referenced ones.
+fn sql_reads_information_schema(sql: &str) -> bool {
+    sql.to_ascii_lowercase().contains("information_schema")
+}
+
 impl CatalogProvider for HiveCatalogProvider {
+    // Synchronous and without an error channel, so it serves the last known
+    // database snapshot and never touches the metastore (review 806); the
+    // snapshot is refreshed by `refresh_referenced` on the async pre-plan
+    // path. A stale snapshot is served with a warning, an absent one as an
+    // empty list with a debug line, so a listing outage cannot masquerade
+    // as an empty catalog in the logs even though DataFusion sees a list.
     fn schema_names(&self) -> Vec<String> {
-        let store = Arc::clone(&self.source);
-        match crate::runtime_bridge::block_on_compat(async move { store.list_databases().await }) {
-            Ok(Ok(names)) => names,
-            Ok(Err(e)) => {
-                error!(catalog = %self.name, error = %e, "hive_external: failed to list databases");
-                Vec::new()
+        match self.listings.databases() {
+            Some(listing) => {
+                if let Some(err) = &listing.stale_error {
+                    warn!(
+                        catalog = %self.name,
+                        error = %err,
+                        denied = listing.denied,
+                        age_secs = listing.checked_at.elapsed().as_secs(),
+                        known = listing.names.len(),
+                        "hive_external: serving last known database list; metastore listing is stale"
+                    );
+                }
+                listing.names.clone()
             }
-            Err(bridge) => {
-                error!(catalog = %self.name, error = %bridge, "hive_external: could not list databases");
+            None => {
+                debug!(
+                    catalog = %self.name,
+                    "hive_external: no database snapshot yet; refresh_referenced has not run for this catalog"
+                );
                 Vec::new()
             }
         }
@@ -1157,7 +1395,7 @@ impl CatalogProvider for HiveCatalogProvider {
             data_store_factory: Arc::clone(&self.data_store_factory),
             runtime: Arc::clone(&self.runtime),
             cache: Arc::clone(&self.manifest_cache),
-            table_names_cache: self.table_names_cache.clone(),
+            listings: Arc::clone(&self.listings),
         }))
     }
 }
@@ -1170,7 +1408,7 @@ pub struct HiveSchemaProvider {
     data_store_factory: Arc<dyn HiveDataStoreFactory>,
     runtime: Arc<RuntimeEnv>,
     cache: Arc<HiveMetadataCache>,
-    table_names_cache: SyncCache<String, Arc<Vec<String>>>,
+    listings: Arc<HiveListings>,
 }
 
 impl fmt::Debug for HiveSchemaProvider {
@@ -1185,38 +1423,46 @@ impl fmt::Debug for HiveSchemaProvider {
 impl SchemaProvider for HiveSchemaProvider {
     // DataFusion's `SchemaProvider::table_names()` is synchronous while the
     // manifest store is async, exactly the constraint `SqeSchemaProvider`
-    // documents at `schema_provider.rs:184`. This uses the identical bridge
-    // (`crate::runtime_bridge::block_on_compat`, itself `block_in_place` +
-    // `Handle::block_on` on a multi-thread runtime, a dedicated thread with a
-    // hard deadline on a current-thread one) rather than a second style.
+    // documents in `schema_provider.rs`. Same answer as there (review 806):
+    // serve the database's last known snapshot and never touch the network;
+    // `HiveCatalogProvider::refresh_referenced` fills it on the async
+    // pre-plan path. A stale snapshot is served with a warning.
     fn table_names(&self) -> Vec<String> {
-        if let Some(cached) = self.table_names_cache.get(&self.database) {
-            return (*cached).clone();
+        match self.listings.tables(&self.database) {
+            Some(listing) => {
+                if let Some(err) = &listing.stale_error {
+                    warn!(
+                        database = %self.database,
+                        error = %err,
+                        denied = listing.denied,
+                        age_secs = listing.checked_at.elapsed().as_secs(),
+                        known = listing.names.len(),
+                        "hive_external: serving last known table list; metastore listing is stale"
+                    );
+                }
+                listing.names.clone()
+            }
+            None => {
+                debug!(
+                    database = %self.database,
+                    "hive_external: no table-name snapshot yet; refresh_referenced has not run for this database"
+                );
+                Vec::new()
+            }
         }
-
-        let store = Arc::clone(&self.source);
-        let database = self.database.clone();
-        let names = match crate::runtime_bridge::block_on_compat(async move {
-            store.list_tables(&database).await
-        }) {
-            Ok(Ok(names)) => names,
-            Ok(Err(e)) => {
-                error!(database = %self.database, error = %e, "hive_external: failed to list tables");
-                Vec::new()
-            }
-            Err(bridge) => {
-                error!(database = %self.database, error = %bridge, "hive_external: could not list tables");
-                Vec::new()
-            }
-        };
-
-        self.table_names_cache
-            .insert(self.database.clone(), Arc::new(names.clone()));
-        names
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        self.table_names().iter().any(|n| n == name)
+        match self.listings.tables(&self.database) {
+            Some(listing) if listing.stale_error.is_none() => {
+                listing.names.iter().any(|n| n == name)
+            }
+            // No usable snapshot must not read as "table does not exist": a
+            // `DROP TABLE IF EXISTS` would silently no-op. Unknown is
+            // answered as present so the caller reaches `table()`, which asks
+            // the source and reports the real answer or the real error.
+            _ => true,
+        }
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
@@ -1563,5 +1809,233 @@ mod tests {
             );
         assert!(err.contains("sales.a"), "{err}");
         assert!(err.contains("sales.b_old_secret"), "{err}");
+    }
+}
+
+/// The listing snapshots behind `schema_names()` / `table_names()` (review
+/// 806): what the synchronous hooks serve before, after and across a failed
+/// refresh, and which databases `refresh_referenced` lists for a statement.
+#[cfg(test)]
+mod listing_tests {
+    use super::*;
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+
+    /// A metastore whose listings are canned and whose failure is a switch,
+    /// recording every `list_tables` call so a test can pin what a statement
+    /// caused to be listed.
+    struct ScriptedSource {
+        databases: Vec<String>,
+        tables: HashMap<String, Vec<String>>,
+        fail_with: Mutex<Option<HiveError>>,
+        list_tables_calls: Mutex<Vec<String>>,
+        limits: super::super::manifest::ManifestLimits,
+    }
+
+    impl ScriptedSource {
+        fn new(tables: &[(&str, &[&str])]) -> Arc<Self> {
+            let mut databases: Vec<String> = tables.iter().map(|(d, _)| d.to_string()).collect();
+            databases.sort();
+            Arc::new(Self {
+                databases,
+                tables: tables
+                    .iter()
+                    .map(|(d, t)| (d.to_string(), t.iter().map(|s| s.to_string()).collect()))
+                    .collect(),
+                fail_with: Mutex::new(None),
+                list_tables_calls: Mutex::new(Vec::new()),
+                limits: Default::default(),
+            })
+        }
+
+        fn fail_with(&self, e: Option<HiveError>) {
+            *self.fail_with.lock().unwrap() = e;
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.list_tables_calls.lock().unwrap().clone()
+        }
+
+        fn failure(&self) -> Result<(), HiveError> {
+            match &*self.fail_with.lock().unwrap() {
+                Some(HiveError::Store(m)) => Err(HiveError::Store(m.clone())),
+                Some(HiveError::Forbidden(m)) => Err(HiveError::Forbidden(m.clone())),
+                Some(other) => Err(HiveError::Validation(other.to_string())),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl HiveMetadataSource for ScriptedSource {
+        async fn list_databases(&self) -> Result<Vec<String>, HiveError> {
+            self.failure()?;
+            Ok(self.databases.clone())
+        }
+
+        async fn list_tables(&self, database: &str) -> Result<Vec<String>, HiveError> {
+            self.list_tables_calls.lock().unwrap().push(database.to_string());
+            self.failure()?;
+            Ok(self.tables.get(database).cloned().unwrap_or_default())
+        }
+
+        async fn get(&self, _database: &str, table: &str) -> Result<HiveManifest, HiveError> {
+            Err(HiveError::NotFound(table.to_string()))
+        }
+
+        async fn etag(&self, _database: &str, _table: &str) -> Result<Option<String>, HiveError> {
+            Ok(None)
+        }
+
+        fn limits(&self) -> &super::super::manifest::ManifestLimits {
+            &self.limits
+        }
+    }
+
+    #[derive(Debug)]
+    struct UnusedFactory;
+
+    impl HiveDataStoreFactory for UnusedFactory {
+        fn store_for(
+            &self,
+            _location: &str,
+            _secret: Option<&str>,
+        ) -> Result<Arc<dyn ObjectStore>, HiveError> {
+            unreachable!("listing tests never scan")
+        }
+    }
+
+    fn provider(source: Arc<ScriptedSource>, ttl: Duration) -> HiveCatalogProvider {
+        HiveCatalogProvider::with_source(
+            "lake".to_string(),
+            source,
+            Arc::new(UnusedFactory),
+            RuntimeEnvBuilder::new().build_arc().expect("runtime"),
+            Arc::new(HiveMetadataCache::new()),
+            ttl,
+        )
+    }
+
+    #[tokio::test]
+    async fn sync_hooks_serve_nothing_until_a_refresh_runs_and_unknown_is_not_absent() {
+        let source = ScriptedSource::new(&[("sales", &["orders"])]);
+        let p = provider(source, Duration::from_secs(60));
+
+        assert!(p.schema_names().is_empty(), "no snapshot yet: no databases");
+        let schema = p.schema("sales").expect("schemas are lazy");
+        assert!(schema.table_names().is_empty(), "no snapshot yet: no tables");
+        assert!(
+            schema.table_exist("orders") && schema.table_exist("nope"),
+            "without a snapshot existence is unknown, and unknown must not read as absent"
+        );
+
+        p.refresh_all().await;
+        assert_eq!(p.schema_names(), vec!["sales".to_string()]);
+        assert_eq!(schema.table_names(), vec!["orders".to_string()]);
+        assert!(schema.table_exist("orders"));
+        assert!(!schema.table_exist("nope"), "a fresh snapshot answers absence for real");
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_keeps_the_previous_names_and_marks_the_snapshot_stale() {
+        let source = ScriptedSource::new(&[("sales", &["orders"])]);
+        let p = provider(Arc::clone(&source), Duration::from_secs(60));
+        p.refresh_all().await;
+
+        source.fail_with(Some(HiveError::Store("bucket unreachable".into())));
+        p.refresh_tables("sales").await.expect_err("the failure must reach the async caller");
+        p.refresh_databases().await.expect_err("the failure must reach the async caller");
+
+        let schema = p.schema("sales").expect("schema");
+        assert_eq!(
+            schema.table_names(),
+            vec!["orders".to_string()],
+            "the last known names are served, not an empty list"
+        );
+        assert_eq!(p.schema_names(), vec!["sales".to_string()]);
+        let tables = p.listings().tables("sales").expect("snapshot");
+        assert!(tables.unavailable(), "an outage is recorded as unavailable, not denied");
+        assert!(tables.stale_error.as_deref().is_some_and(|e| e.contains("bucket unreachable")));
+        assert!(
+            schema.table_exist("nope"),
+            "a stale snapshot cannot vouch for absence; unknown reads as present"
+        );
+
+        source.fail_with(Some(HiveError::Forbidden("not yours".into())));
+        let _ = p.refresh_tables("sales").await;
+        let tables = p.listings().tables("sales").expect("snapshot");
+        assert!(tables.denied && !tables.unavailable(), "a denial is a legitimate answer");
+    }
+
+    #[tokio::test]
+    async fn refresh_referenced_lists_only_this_catalogs_referenced_databases() {
+        let source = ScriptedSource::new(&[("sales", &["orders"]), ("hr", &["people"])]);
+        let p = provider(Arc::clone(&source), Duration::from_secs(60));
+
+        // `lake.sales.orders` is ours; `other.x.y` belongs to another
+        // catalog and `bare.t` resolves against the default catalog, which
+        // is not this root.
+        p.refresh_referenced(
+            "SELECT * FROM lake.sales.orders o JOIN other.x.y ON true JOIN bare.t ON true",
+            Some("main_warehouse"),
+            Some("gold"),
+        )
+        .await;
+        assert_eq!(source.calls(), vec!["sales".to_string()]);
+        assert_eq!(p.schema_names(), vec!["hr".to_string(), "sales".to_string()]);
+        assert!(p.listings().tables("hr").is_none(), "hr was not referenced");
+
+        // Within the TTL the same statement costs nothing.
+        p.refresh_referenced("SELECT * FROM lake.sales.orders", Some("main_warehouse"), None)
+            .await;
+        assert_eq!(source.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn two_part_names_and_the_session_schema_count_when_this_root_is_the_default_catalog() {
+        let source = ScriptedSource::new(&[("sales", &["orders"]), ("hr", &["people"])]);
+        let p = provider(Arc::clone(&source), Duration::from_secs(60));
+
+        p.refresh_referenced("SELECT * FROM sales.orders", Some("LAKE"), Some("hr"))
+            .await;
+        let mut calls = source.calls();
+        calls.sort();
+        assert_eq!(calls, vec!["hr".to_string(), "sales".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_information_schema_read_refreshes_every_database() {
+        let source = ScriptedSource::new(&[("sales", &["orders"]), ("hr", &["people"])]);
+        let p = provider(Arc::clone(&source), Duration::from_secs(60));
+
+        p.refresh_referenced(
+            "SELECT table_name FROM lake.information_schema.tables",
+            Some("main_warehouse"),
+            None,
+        )
+        .await;
+        let mut calls = source.calls();
+        calls.sort();
+        assert_eq!(calls, vec!["hr".to_string(), "sales".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn invalidation_and_ttl_expiry_force_a_relist() {
+        let source = ScriptedSource::new(&[("sales", &["orders"])]);
+        let p = provider(Arc::clone(&source), Duration::from_millis(0));
+        p.refresh_referenced("SELECT * FROM lake.sales.orders", None, None).await;
+        assert_eq!(source.calls().len(), 1);
+
+        // A zero TTL means every pre-plan refresh re-lists.
+        p.refresh_referenced("SELECT * FROM lake.sales.orders", None, None).await;
+        assert_eq!(source.calls().len(), 2);
+
+        // DDL invalidation drops both the table and the database snapshot so
+        // the next refresh cannot serve a stale answer even within the TTL.
+        let p = provider(Arc::clone(&source), Duration::from_secs(60));
+        p.refresh_all().await;
+        p.invalidate_table_names("sales");
+        assert!(p.listings().tables("sales").is_none());
+        assert!(p.listings().databases().is_none());
+        assert!(p.schema_names().is_empty());
     }
 }

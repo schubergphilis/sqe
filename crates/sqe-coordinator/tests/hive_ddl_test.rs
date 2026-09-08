@@ -800,7 +800,8 @@ async fn drop_table_removes_the_manifest_and_leaves_the_data() {
 // (bypassing `SESSION_CONTEXT_CACHE` entirely), and `DESCRIBE`'s column
 // lookup does too: `HiveSchemaProvider::table()` (`provider.rs`) always
 // calls `store.get(&database, name)` fresh, never consulting the
-// per-provider `table_names_cache` that backs `table_names()`/`table_exist()`.
+// per-provider listing snapshots that back `table_names()`/`table_exist()`
+// (`HiveListings`, review 806).
 // A `DESCRIBE`-before/after-drop test was written and looked plausible, but
 // a mutation check (commenting out the DROP arm's `invalidate_session_cache`
 // call) proved it passed identically either way -- it was measuring
