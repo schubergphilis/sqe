@@ -34,7 +34,7 @@ use sqe_policy::PassthroughEnforcer;
 use tempfile::TempDir;
 use tonic::Request;
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, ResponseTemplate};
 
 const MINIMAL_TOML: &str = r#"
 [coordinator]
@@ -54,9 +54,13 @@ fn admin_session() -> Session {
 }
 
 fn session_with_roles(roles: Vec<String>) -> Session {
+    // Token unique per call: `SESSION_CONTEXT_CACHE` is process-wide and
+    // keyed on `username:token_hash:catalog:schema`; a fixed token would hand
+    // one test another's cached context, pointing at a dropped mock server.
+    // The username stays fixed because the audit events assert on it.
     Session::new(
         "auditor".to_string(),
-        sqe_core::SecretString::new("tok".to_string()),
+        sqe_core::SecretString::new(format!("tok-{}", uuid::Uuid::new_v4())),
         None,
         chrono::Utc::now() + chrono::Duration::hours(1),
         roles,
@@ -235,7 +239,7 @@ async fn audit_logs_failed_create_with_error_status() {
 
 #[tokio::test]
 async fn audit_logs_attach_and_detach_against_mock_rest() {
-    let server = MockServer::start().await;
+    let server = crate::common::mock_server().await;
     Mock::given(method("GET"))
         .and(path("/v1/config"))
         .respond_with(
@@ -297,7 +301,7 @@ async fn audit_logs_attach_and_detach_against_mock_rest() {
 /// is populated (enabling a non-empty `resources` list).
 #[tokio::test]
 async fn audit_select_query_emits_canonical_event_and_redacts_pii() {
-    let server = MockServer::start().await;
+    let server = crate::common::mock_server().await;
     Mock::given(method("GET"))
         .and(path("/v1/config"))
         .respond_with(
@@ -1108,7 +1112,7 @@ async fn create_secret_stays_redacted_legacy_after_ddl_migration() {
 /// GREEN: after the param is accepted and threaded to the audit event.
 #[tokio::test]
 async fn execute_threads_client_ip_into_query_audit_event() {
-    let server = MockServer::start().await;
+    let server = crate::common::mock_server().await;
     Mock::given(method("GET"))
         .and(path("/v1/config"))
         .respond_with(
