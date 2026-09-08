@@ -164,7 +164,7 @@ async fn seed_three_files(
 // DELETE: merge-on-read via CTAS property -> position deletes, no rewrite
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 async fn ctas_delete_mode_mor_writes_position_deletes() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -219,7 +219,7 @@ async fn ctas_delete_mode_mor_writes_position_deletes() {
 // DELETE: property absent -> documented default is copy-on-write
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 async fn ctas_delete_mode_default_is_cow() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -265,7 +265,7 @@ async fn ctas_delete_mode_default_is_cow() {
 // correct results, no delete files.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 async fn ctas_update_mode_mor_without_pk_falls_back_to_cow() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -319,7 +319,7 @@ async fn ctas_update_mode_mor_without_pk_falls_back_to_cow() {
 // MERGE: merge-on-read via CTAS property, same no-PK fallback contract.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 async fn ctas_merge_mode_mor_without_pk_falls_back_to_cow() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -388,7 +388,7 @@ async fn ctas_merge_mode_mor_without_pk_falls_back_to_cow() {
 // metadata and surface through SHOW CREATE TABLE (the !557 fix itself).
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 async fn ctas_write_mode_properties_survive_to_metadata() {
     let (session, handler) = crate::common::setup_handler().await;
     let fq = "default.ctas_props_371";
@@ -438,7 +438,7 @@ async fn ctas_write_mode_properties_survive_to_metadata() {
 // the deletes into the rewrite instead of resurrecting or dropping rows.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 async fn mor_delete_then_cow_update_round_trip() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -527,7 +527,7 @@ async fn mor_delete_then_cow_update_round_trip() {
 // delete-manifest entries accumulating per CoW commit on MoR-touched tables.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 async fn cow_rewrite_drops_superseded_position_deletes_376() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";

@@ -51,7 +51,7 @@ async fn reset_table(
 // the catalog and the writer routes records into the right partition.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn create_table_partitioned_by_identity() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -98,7 +98,7 @@ async fn create_table_partitioned_by_identity() {
 // Cell: sqe:hidden-partitioning:v2 (day transform on TIMESTAMP)
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn create_table_partitioned_by_day_transform() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -142,7 +142,7 @@ async fn create_table_partitioned_by_day_transform() {
 // Cell: sqe:hidden-partitioning:v2 (bucket transform with N=16)
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn create_table_partitioned_by_bucket_transform() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -181,7 +181,7 @@ async fn create_table_partitioned_by_bucket_transform() {
 // Cell: sqe:hidden-partitioning:v2 (truncate transform on STRING)
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn create_table_partitioned_by_truncate_transform() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -223,7 +223,7 @@ async fn create_table_partitioned_by_truncate_transform() {
 // Cell: sqe:hidden-partitioning:v2 (composite multi-column spec)
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn create_table_partitioned_by_multiple_transforms() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -267,7 +267,7 @@ async fn create_table_partitioned_by_multiple_transforms() {
 // Cell: sqe:hidden-partitioning:v3 (V3 + nanosec timestamp partitioning)
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn create_table_partitioned_by_day_on_v3_table() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -311,7 +311,7 @@ async fn create_table_partitioned_by_day_on_v3_table() {
 // supported list.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn unsupported_partition_transform_returns_error() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -345,7 +345,7 @@ async fn unsupported_partition_transform_returns_error() {
 // Negative: PARTITIONED BY column that doesn't exist in the schema.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn unknown_partition_column_returns_error() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";

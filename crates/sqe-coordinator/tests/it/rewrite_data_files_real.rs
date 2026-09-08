@@ -52,7 +52,7 @@ async fn live_data_file_count(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn rewrite_merges_small_files_preserves_rows() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -195,7 +195,7 @@ fn status_col(summary: &[arrow_array::RecordBatch]) -> String {
 
 /// Sort-strategy compaction physically orders the rewritten rows.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn rewrite_sort_strategy_orders_rows() {
     let (session, handler) = crate::common::setup_handler().await;
     let namespace = "default";
@@ -286,7 +286,7 @@ async fn rewrite_sort_strategy_orders_rows() {
 /// Z-order-strategy compaction runs and preserves the row set (physical
 /// clustering is a benchmark concern; correctness is that no rows are lost).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn rewrite_zorder_strategy_preserves_rows() {
     let (session, handler) = crate::common::setup_handler().await;
     let namespace = "default";
@@ -426,7 +426,7 @@ fn parse_bound(json: &str, field_id: i32) -> Option<i64> {
 /// several output files; those must come out with non-overlapping, ordered id
 /// ranges.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 async fn rewrite_sort_produces_disjoint_file_ranges() {
     let (session, handler) = crate::common::setup_handler().await;
     let namespace = "default";
@@ -541,7 +541,7 @@ async fn rewrite_sort_produces_disjoint_file_ranges() {
 /// stay gone, the surviving rows must be complete, and the multi-file output
 /// must still come out with disjoint id ranges.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 async fn rewrite_sort_applies_deletes_and_keeps_disjoint_ranges() {
     let (session, handler) = crate::common::setup_handler().await;
     let namespace = "default";
@@ -658,7 +658,7 @@ async fn rewrite_sort_applies_deletes_and_keeps_disjoint_ranges() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn rewrite_skips_below_min_input_files() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -724,7 +724,7 @@ async fn rewrite_skips_below_min_input_files() {
 /// default rewrite (and one with a high min_input) and consolidates with
 /// `rewrite_all`.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 async fn rewrite_all_forces_below_min_input() {
     let (session, handler) = crate::common::setup_handler().await;
     let namespace = "default";

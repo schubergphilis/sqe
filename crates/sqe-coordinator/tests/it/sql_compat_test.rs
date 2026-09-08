@@ -241,31 +241,31 @@ async fn run_sql_file(filename: &str) {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: ./scripts/integration-test.sh
+#[ignore = "needs:polaris"] // Requires: ./scripts/integration-test.sh
 async fn test_sql_compat_01_basic_select() {
     run_sql_file("01_basic_select.sql").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_sql_compat_02_null_handling() {
     run_sql_file("02_null_handling.sql").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_sql_compat_03_cte_queries() {
     run_sql_file("03_cte_queries.sql").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_sql_compat_04_string_functions() {
     run_sql_file("04_string_functions.sql").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_sql_compat_05_aggregations() {
     run_sql_file("05_aggregations.sql").await;
 }
@@ -275,7 +275,7 @@ async fn test_sql_compat_05_aggregations() {
 // SQL planner (verified on the DataFusion 54 build; the planner is unchanged from
 // 53.1, so this is a stale-doc correction, not a DF 54 capability change).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_sql_compat_06_qualify() {
     run_sql_file("06_qualify.sql").await;
 }

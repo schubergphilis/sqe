@@ -239,8 +239,23 @@ test:
 #                                                     endpoint, output diffed against goldens
 #                                                     (needs `trino` or `trino-cli` on PATH,
 #                                                     or TRINO_CLI=/path; skips otherwise)
+#   make test-integration GROUP=polaris                only the tests that declare
+#                                                     `#[ignore = "needs:polaris"]`
+#                                                     (cargo xtask test-groups lists
+#                                                     the groups and their counts)
 #   make test-distributed                             coordinator + 2 workers
+#   make test-distributed GROUP=polaris+workers        only the tests that need workers
 #   make test-integration-down                        tear the stack back down
+#
+# Every `#[ignore]` in the workspace names the stack it needs (finding 807);
+# `cargo xtask test-groups --check` in CI rejects a bare one. GROUP is matched
+# by exact test name, so a group runs the same set on every machine.
+#
+# Distributed failure paths (finding 411) are part of the default suite:
+# tests/it/distributed_failure_e2e.rs drives in-process chaos workers, so
+# `make test-integration` (or FILTER=distributed_failure_e2e) is the gate for
+# changes under distributed_scan.rs, scheduler.rs, worker_registry.rs and
+# streaming.rs. No external worker process is needed for those six cases.
 #
 # RUST_MIN_STACK is 32 MiB here, deliberately NOT the 8 MiB the script defaults
 # to (which mirrors production WORKER_STACK_BYTES). An unfiltered run passes
@@ -248,16 +263,17 @@ test:
 # 32 MiB. 32 MiB is what every other coordinator suite in the repo uses.
 IT_RUST_MIN_STACK ?= 33554432
 FILTER            ?=
+GROUP             ?=
 
 test-integration:
 	@echo "==> Integration suite (stack: docker-compose.test.yml)"
 	@scripts/integration-preflight.sh
-	@RUST_MIN_STACK=$(IT_RUST_MIN_STACK) scripts/integration-test.sh $(FILTER)
+	@GROUP=$(GROUP) RUST_MIN_STACK=$(IT_RUST_MIN_STACK) scripts/integration-test.sh $(FILTER)
 
 test-distributed:
 	@echo "==> Distributed suite (stack: test.yml + distributed.yml overlay)"
 	@scripts/integration-preflight.sh --distributed
-	@DISTRIBUTED=1 RUST_MIN_STACK=$(IT_RUST_MIN_STACK) scripts/integration-test.sh $(FILTER)
+	@GROUP=$(GROUP) DISTRIBUTED=1 RUST_MIN_STACK=$(IT_RUST_MIN_STACK) scripts/integration-test.sh $(FILTER)
 
 # The suites leave their stack up on purpose: bootstrap is idempotent, so a
 # rerun skips the 30-60s bring-up. Add `-v` by hand for a volume-clean slate.

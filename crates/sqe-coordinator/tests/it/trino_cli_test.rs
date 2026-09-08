@@ -300,7 +300,7 @@ fn golden_path() -> PathBuf {
 // ── The test ─────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris; plus trino-cli on PATH or TRINO_CLI=/path"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn trino_cli_golden() {
     crate::common::init_tracing();
 

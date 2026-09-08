@@ -73,9 +73,30 @@ if [ "$#" -eq 0 ] && [ "$DISTRIBUTED" != "1" ]; then
     SKIP_ARGS+=(--skip rewrite_data_files_distributed_parity)
     SKIP_ARGS+=(--skip compaction_distributed_benchmark)
 fi
+# GROUP=<stack> runs only the ignored tests that declare that stack
+# (`#[ignore = "needs:<stack>"]`, finding 807), by exact name. The list comes
+# from `cargo xtask test-groups --names`, so it cannot drift from the
+# attributes. Without GROUP the run is what it always was: every ignored test
+# in the crate minus the skips above.
+GROUP_ARGS=()
+if [ -n "${GROUP:-}" ]; then
+    echo "Selecting ignored tests in group '$GROUP' (cargo xtask test-groups --names $GROUP)..."
+    # `while read`, not `mapfile`: macOS ships bash 3.2 and `#!/usr/bin/env bash`
+    # may resolve to it.
+    GROUP_NAMES=()
+    while IFS= read -r name; do
+        [ -n "$name" ] && GROUP_NAMES+=("$name")
+    done < <(cargo xtask test-groups --names "$GROUP")
+    if [ "${#GROUP_NAMES[@]}" -eq 0 ]; then
+        echo "no ignored tests declare needs:$GROUP" >&2
+        exit 2
+    fi
+    echo "  ${#GROUP_NAMES[@]} tests"
+    GROUP_ARGS=(--exact "${GROUP_NAMES[@]}")
+fi
 RUST_LOG="${RUST_LOG:-sqe_coordinator=info,sqe_catalog=info,sqe_auth=info,warn}" \
 RUST_MIN_STACK="${RUST_MIN_STACK:-8388608}" \
-    cargo test -p sqe-coordinator -- --ignored --test-threads=1 --nocapture "${SKIP_ARGS[@]}" "$@" 2>&1 \
+    cargo test -p sqe-coordinator -- --ignored --test-threads=1 --nocapture "${SKIP_ARGS[@]}" "${GROUP_ARGS[@]}" "$@" 2>&1 \
     | tee "$SQE_LOG_FILE"
 EXIT_CODE=${PIPESTATUS[0]}
 
