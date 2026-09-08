@@ -4255,6 +4255,25 @@ pub struct SecurityConfig {
     /// diffs. Dev (non-production) still WARNs and starts.
     #[serde(default)]
     pub allow_unkeyed_hash_masks: bool,
+    /// Opt-in escape hatch for `policy.engine = passthrough` under
+    /// `production_mode` (architecture review 212, issue #565). Passthrough
+    /// enforces nothing: every user sees every row and column the catalog
+    /// lets them read, with no row filters, masks or column restrictions.
+    /// Leaving this `false` (the default) makes `production_mode` refuse to
+    /// start without a real policy engine (`ranger`, or `in_memory` for
+    /// tests). Set `true` only for a deployment that deliberately relies on
+    /// catalog-level authorization alone; the choice is then visible in
+    /// config diffs, and startup still logs the disabled enforcement.
+    #[serde(default)]
+    pub allow_no_policy_engine: bool,
+    /// Opt-in escape hatch for `access_control.backend = none` under
+    /// `production_mode` (architecture review 212, issue #565). Without a
+    /// grant backend `GRANT` / `REVOKE` are rejected at execution and
+    /// privileges can only be managed outside SQE. Set `true` when that is
+    /// the intended operating model; the choice is then visible in config
+    /// diffs.
+    #[serde(default)]
+    pub allow_no_grant_backend: bool,
     /// Opt-in escape hatch for Ranger without `policy.ranger.project-tags`
     /// (issue #397). Leaving this `false` (the default) makes
     /// `production_mode` refuse to start when `policy.engine = ranger` and
@@ -5816,6 +5835,35 @@ impl SqeConfig {
                  [storage] S3 keys after LOAD_TABLE and Polaris table-data-read \
                  is not the data gate). Set it on [catalog] and every REST \
                  [catalogs.*] block."
+                    .to_string(),
+            );
+        }
+
+        // Architecture review 212 (#565): the default engine enforces nothing.
+        // Every other dev-only default is refused here or sits behind an
+        // `allow_*` flag; this one used to start silently.
+        if self.policy.engine == PolicyEngine::Passthrough
+            && !self.security.allow_no_policy_engine
+        {
+            errors.push(
+                "production_mode: policy.engine is passthrough (no row filters, masks or \
+                 column restrictions; only catalog-level authorization applies). Set \
+                 policy.engine = \"ranger\" (or \"in_memory\" for tests), or set \
+                 security.allow_no_policy_engine = true to acknowledge running without \
+                 a policy engine."
+                    .to_string(),
+            );
+        }
+
+        if self.access_control.backend == AccessControlBackend::None
+            && !self.security.allow_no_grant_backend
+        {
+            errors.push(
+                "production_mode: access_control.backend is none (GRANT / REVOKE are \
+                 rejected; privileges can only be managed outside SQE). Set \
+                 access_control.backend to chameleon, polaris or ranger, or set \
+                 security.allow_no_grant_backend = true to acknowledge managing \
+                 grants elsewhere."
                     .to_string(),
             );
         }
@@ -7535,7 +7583,49 @@ s3_secret_key = "configured-secret"
         config.security.allow_insecure_transport = false;
         config.auth.providers = vec![oidc_provider_for_validate()];
         config.catalog.require_vended_credentials = true;
+        // Review 212: a real policy engine and a grant backend are part of a
+        // hardened config; the tests below flip each back to its default.
+        config.policy.engine = PolicyEngine::InMemory;
+        config.access_control.backend = AccessControlBackend::Polaris;
         config
+    }
+
+    #[test]
+    fn validate_production_rejects_passthrough_policy_engine() {
+        let mut config = valid_production_config();
+        config.policy.engine = PolicyEngine::Passthrough;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(
+            err.contains("policy.engine is passthrough") && err.contains("allow_no_policy_engine"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_production_accepts_passthrough_policy_engine_when_opted_in() {
+        let mut config = valid_production_config();
+        config.policy.engine = PolicyEngine::Passthrough;
+        config.security.allow_no_policy_engine = true;
+        assert!(config.validate_production().is_ok());
+    }
+
+    #[test]
+    fn validate_production_rejects_missing_grant_backend() {
+        let mut config = valid_production_config();
+        config.access_control.backend = AccessControlBackend::None;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(
+            err.contains("access_control.backend is none") && err.contains("allow_no_grant_backend"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_production_accepts_missing_grant_backend_when_opted_in() {
+        let mut config = valid_production_config();
+        config.access_control.backend = AccessControlBackend::None;
+        config.security.allow_no_grant_backend = true;
+        assert!(config.validate_production().is_ok());
     }
 
     #[test]
