@@ -6511,6 +6511,7 @@ dependencies = [
  "sqe-core",
  "sqe-metrics",
  "sqe-policy",
+ "sqe-policy-api",
  "sqe-sql",
  "sqlparser",
  "sqlx",
@@ -6814,10 +6815,23 @@ dependencies = [
  "sha2 0.11.0",
  "sqe-core",
  "sqe-metrics",
+ "sqe-policy-api",
  "sqe-sql",
  "tokio",
  "tracing",
  "wiremock",
+ "workspace-hack",
+]
+
+[[package]]
+name = "sqe-policy-api"
+version = "0.37.0"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "serde",
+ "sqe-core",
+ "sqe-sql",
  "workspace-hack",
 ]
 

@@ -15,7 +15,7 @@ use iceberg::NamespaceIdent;
 use tracing::{debug, warn};
 
 use sqe_core::SessionUser;
-use sqe_policy::PolicyStore;
+use sqe_policy_api::PolicyStore;
 
 use crate::rest_catalog::{listing_error_is_forbidden, SessionCatalog};
 

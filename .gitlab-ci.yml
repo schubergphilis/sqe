@@ -44,16 +44,16 @@ default:
 # do not merge the release MR until it has.
 include:
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.12.1'
+    ref: 'v0.12.2'
     file: '/ci/templates/guardrails.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.12.1'
+    ref: 'v0.12.2'
     file: '/ci/templates/test-rust.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.12.1'
+    ref: 'v0.12.2'
     file: '/ci/templates/deploy.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.12.1'
+    ref: 'v0.12.2'
     file: '/ci/templates/release.yml'
   # GitLab's own Security/Secret-Detection template was included here too. It
   # duplicated aikido-secret-scan (same gitleaks-class scan, a second image
@@ -107,15 +107,18 @@ variables:
 # validation artifact: same opt-level, no LTO, so the link is minutes not tens
 # of minutes. `strip` keeps the MR artifact small.
 #
-# Same native deps as the platform test job: .cargo/config.toml pins clang +
-# mold for x86_64 Linux, protobuf-compiler is needed by datafusion-substrait's
-# build script. `--locked` and `--no-default-features` match ./Dockerfile.
-# The rust image tag follows rust-toolchain.toml (1.98.0); ./Dockerfile still
-# says 1.97.1, tracked as item A7 of the build-time plan.
+# Runs in the platform's Rust image (aikido images/aikido-rust, pinned by digest
+# in the included template as AIKIDO_RUST_IMAGE): rust 1.98.0 matching
+# rust-toolchain.toml, clang + mold (what .cargo/config.toml pins for x86_64
+# Linux), protobuf for datafusion-substrait's build script, binutils for
+# `strip`, and sccache. Before this the job spent minutes on apt-get and a
+# rustup toolchain download on every run. `--locked` and
+# `--no-default-features` match ./Dockerfile, which still says rust 1.97.1
+# (item A7 of the build-time plan).
 release-binaries:
   stage: test
   needs: []
-  image: rust:1.98.0-slim-bookworm
+  image: "$AIKIDO_RUST_IMAGE"
   timeout: 90m
   variables:
     CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
@@ -126,7 +129,6 @@ release-binaries:
     paths:
       - .cargo-home/registry/
   before_script:
-    - apt-get update -qq && apt-get install -y -qq --no-install-recommends clang mold cmake curl protobuf-compiler libprotobuf-dev libssl-dev pkg-config binutils >/dev/null
     # Same sccache setup as the platform's Rust jobs (RUSTC_WRAPPER only when the
     # server reached the bucket). The release/dev-release profiles keep their own
     # debuginfo settings; the debuginfo knob only touches dev/test.
