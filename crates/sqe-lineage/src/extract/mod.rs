@@ -9,6 +9,8 @@
 pub mod columns;
 pub mod datasets;
 
+use crate::event::LineageQualityFacet;
+
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::{DmlStatement, TableScan};
 
@@ -63,8 +65,34 @@ pub fn extract_lineage(
     plan: &LogicalPlan,
     lookup: &CatalogLookup,
 ) -> (Vec<InputDataset>, Vec<OutputDataset>) {
+    let extracted = extract_lineage_governed(plan, lookup, &[]);
+    (extracted.inputs, extracted.outputs)
+}
+
+/// [`extract_lineage`] with what the policy enforcer did to the plan
+/// (architecture review 610).
+///
+/// `masked_fields` is the enforcer's `(table, column)` list of masked and
+/// restricted scan columns, `table` spelled as the scan's `TableReference`
+/// (`catalog.ns.t`, `ns.t` or `t`). Every column-lineage dependency on one of
+/// them is reported with the `MASKED` transformation instead of identity
+/// passthrough: the target holds hashes, `***` or NULL, not the value, so a
+/// consumer must neither propagate the source column's tags nor conclude the
+/// raw value was copied. The enforcer's projection sits between the scan and
+/// the user's query, so this is decided from the enforcer's own record rather
+/// than by guessing at expression shapes; `sqe-lineage` stays free of a
+/// policy-crate dependency.
+///
+/// `quality` reports the plan node kinds the column tracer has no rule for;
+/// when non-empty the emitter attaches the `sqe_lineageQuality` run facet.
+pub fn extract_lineage_governed(
+    plan: &LogicalPlan,
+    lookup: &CatalogLookup,
+    masked_fields: &[(String, String)],
+) -> Extracted {
     let inputs = datasets::extract_inputs(plan, lookup);
     let mut outputs = datasets::extract_outputs(plan, lookup);
+    let mut untraced = Vec::new();
 
     // For DML/DDL writes, attach the projected target schema and column
     // lineage by tracing the source plan. The source plan's output
@@ -84,14 +112,54 @@ pub fn extract_lineage(
                     })
                     .collect(),
             });
-            let trace = columns::trace_plan(source_plan);
+            let (mut trace, missing) = columns::trace_plan_reporting(source_plan);
+            untraced = missing;
+            mark_masked(&mut trace, masked_fields);
             let target_fields = output_field_names(source_plan);
             out.facets.columnLineage =
                 Some(build_column_lineage_facet(&target_fields, &trace, lookup));
         }
     }
 
-    (inputs, outputs)
+    Extracted {
+        inputs,
+        outputs,
+        quality: LineageQualityFacet {
+            complete: untraced.is_empty(),
+            untraced,
+        },
+    }
+}
+
+/// Result of [`extract_lineage_governed`].
+pub struct Extracted {
+    pub inputs: Vec<InputDataset>,
+    pub outputs: Vec<OutputDataset>,
+    pub quality: LineageQualityFacet,
+}
+
+/// Rewrite the transformation of every dependency on a masked or restricted
+/// scan column to `MASKED`. The enforcer's table key is parsed with the same
+/// rule the tracer applies to a scan's `table_name`, so `ns.t` and
+/// `catalog.ns.t` compare the way the planner spelled them.
+fn mark_masked(trace: &mut columns::ColumnTrace, masked_fields: &[(String, String)]) {
+    if masked_fields.is_empty() {
+        return;
+    }
+    let masked: Vec<((String, String, String), &str)> = masked_fields
+        .iter()
+        .map(|(table, column)| (columns::parse_table_ref(table), column.as_str()))
+        .collect();
+    for deps in trace.iter_mut() {
+        for dep in deps.iter_mut() {
+            let hit = masked.iter().any(|((_, schema, table), column)| {
+                schema == &dep.schema && table == &dep.table && *column == dep.field
+            });
+            if hit {
+                dep.transformation = columns::masked();
+            }
+        }
+    }
 }
 
 /// For a write plan, return the source `LogicalPlan` whose columns feed the

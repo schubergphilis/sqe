@@ -60,6 +60,11 @@ pub struct QueryCompleteCtx {
     pub statement_kind: String,
     pub rows_returned: usize,
     pub plan: Option<PlanOrHint>,
+    /// Masked and restricted scan columns as the policy enforcer recorded
+    /// them, `(table, column)` with `table` the scan's `TableReference`
+    /// display; column lineage reports them as `MASKED` (review 610). Empty
+    /// when no policy engine is wired or nothing was masked.
+    pub masked_fields: Vec<(String, String)>,
 }
 
 pub struct QueryFailCtx {
@@ -74,6 +79,11 @@ pub struct QueryFailCtx {
     pub statement_kind: String,
     pub error_message: String,
     pub plan: Option<PlanOrHint>,
+    /// Masked and restricted scan columns as the policy enforcer recorded
+    /// them, `(table, column)` with `table` the scan's `TableReference`
+    /// display; column lineage reports them as `MASKED` (review 610). Empty
+    /// when no policy engine is wired or nothing was masked.
+    pub masked_fields: Vec<(String, String)>,
 }
 
 /// Test helper. Constructs a minimally-valid context for unit tests in this
@@ -114,6 +124,7 @@ impl QueryCompleteCtx {
             statement_kind: "query".into(),
             rows_returned: 0,
             plan: None,
+            masked_fields: Vec::new(),
         }
     }
 }
@@ -137,6 +148,7 @@ impl QueryFailCtx {
             statement_kind: "query".into(),
             error_message: "boom".into(),
             plan: None,
+            masked_fields: Vec::new(),
         }
     }
 }

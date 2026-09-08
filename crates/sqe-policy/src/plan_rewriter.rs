@@ -507,9 +507,10 @@ fn summarise_policies(table_policies: &HashMap<String, ResolvedPolicy>) -> Polic
     let mut row_filters_applied = 0usize;
     let mut masked: HashSet<String> = HashSet::new();
     let mut restricted: HashSet<String> = HashSet::new();
+    let mut masked_fields: HashSet<(String, String)> = HashSet::new();
     let mut denied = false;
 
-    for policy in table_policies.values() {
+    for (table, policy) in table_policies {
         for f in &policy.row_filters {
             if is_deny_all_expr(f) {
                 denied = true;
@@ -519,9 +520,11 @@ fn summarise_policies(table_policies: &HashMap<String, ResolvedPolicy>) -> Polic
         }
         for col in policy.column_masks.keys() {
             masked.insert(col.clone());
+            masked_fields.insert((table.clone(), col.clone()));
         }
         for col in &policy.restricted_columns {
             restricted.insert(col.clone());
+            masked_fields.insert((table.clone(), col.clone()));
         }
     }
 
@@ -529,12 +532,15 @@ fn summarise_policies(table_policies: &HashMap<String, ResolvedPolicy>) -> Polic
     columns_masked.sort();
     let mut columns_restricted: Vec<String> = restricted.into_iter().collect();
     columns_restricted.sort();
+    let mut masked_fields: Vec<(String, String)> = masked_fields.into_iter().collect();
+    masked_fields.sort();
 
     PolicySummary {
         row_filters_applied,
         columns_masked,
         columns_restricted,
         denied,
+        masked_fields,
     }
 }
 
@@ -1068,6 +1074,16 @@ mod tests {
         );
         assert_eq!(s.columns_restricted, vec!["notes".to_string()]);
         assert!(!s.denied, "a real row filter is not a deny");
+        // Review 610: lineage needs the scan each mask applied to, and a
+        // restricted column counts as masked (its value is NULL, not copied).
+        assert_eq!(
+            s.masked_fields,
+            vec![
+                ("sales.orders".to_string(), "notes".to_string()),
+                ("sales.orders".to_string(), "salary".to_string()),
+                ("sales.orders".to_string(), "ssn".to_string()),
+            ]
+        );
     }
 
     #[test]
