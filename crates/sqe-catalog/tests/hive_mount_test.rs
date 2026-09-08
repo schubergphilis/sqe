@@ -183,6 +183,10 @@ async fn session_hive_catalog_resolves_a_table_written_through_the_shared_root()
         Duration::from_secs(60),
     );
 
+    // The sync hooks serve snapshots that only the async refresh fills
+    // (review 806): before it, the catalog reports no databases at all.
+    assert!(provider.schema_names().is_empty());
+    provider.refresh_all().await;
     assert_eq!(provider.schema_names(), vec!["sales".to_string()]);
     let schema = provider.schema("sales").expect("schema");
     let tables = schema.table_names();

@@ -865,6 +865,14 @@ impl SqlClient for EmbeddedClient {
         // DataFusion version shim, not dialect normalization, which is why it
         // sits outside the front door.
         let rewritten = sqe_sql::rewrite_named_tvf_args(rewritten.as_ref());
+        // Review 806: fill the Hive listing snapshots DataFusion's synchronous
+        // `schema_names()` / `table_names()` hooks serve while planning, the
+        // same way the coordinator's `refresh_listing_snapshots` does. A Hive
+        // table is always 3-part in `--embedded` (no session default catalog
+        // points at a root), so only `cat.db.t` references count.
+        for provider in self.hive_roots.values() {
+            provider.refresh_referenced(&rewritten, None, None).await;
+        }
         let df = self.ctx.sql(&rewritten).await?;
         // Snapshot the DataFrame schema before collecting so we still
         // emit column names when the query produces zero batches (an
