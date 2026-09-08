@@ -263,10 +263,26 @@ impl SqeTableProvider {
             .collect())
     }
 
-    async fn scan_impl(
+    /// Boxed at the definition (compile time, see
+    /// docs/internal/plans/2026-09-07-compile-time-async-hubs.md): the
+    /// coroutine below holds `&[Expr]` across its awaits, and proving it
+    /// `Send` walks DataFusion's whole `Expr` type graph. Done once here;
+    /// `scan` hands this future through without a coroutine of its own.
+    fn scan_impl<'a>(
+        &'a self,
+        state: &'a dyn Session,
+        projection: Option<&'a [usize]>,
+        filters: &'a [Expr],
+        limit: Option<usize>,
+        statistics_requests: &'a [StatisticsRequest],
+    ) -> futures::future::BoxFuture<'a, DFResult<Arc<dyn ExecutionPlan>>> {
+        Box::pin(self.scan_impl_inner(state, projection, filters, limit, statistics_requests))
+    }
+
+    async fn scan_impl_inner(
         &self,
         state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         _limit: Option<usize>,
         statistics_requests: &[StatisticsRequest],
@@ -488,32 +504,51 @@ impl TableProvider for SqeTableProvider {
         self.supports_filters_pushdown_impl(filters)
     }
 
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
+    // `async_trait`'s desugared form: no coroutine of its own, the boxed
+    // `scan_impl` future is handed straight through (compile time; see the
+    // note on `scan_impl`).
+    fn scan<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+        &'life0 self,
+        state: &'life1 dyn Session,
+        projection: Option<&'life2 Vec<usize>>,
+        filters: &'life3 [Expr],
         limit: Option<usize>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.scan_impl(state, projection, filters, limit, &[]).await
+    ) -> futures::future::BoxFuture<'async_trait, DFResult<Arc<dyn ExecutionPlan>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.scan_impl(state, projection.map(Vec::as_slice), filters, limit, &[])
     }
 
-    async fn scan_with_args<'a>(
-        &self,
-        state: &dyn Session,
+    // Same desugared form as `scan`: `ScanArgs` hands out its borrows with
+    // the outer `'a`, so the boxed `scan_impl` future can be built here and
+    // mapped, with no coroutine that would hold the `&[Expr]` again.
+    fn scan_with_args<'a, 'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        state: &'life1 dyn Session,
         args: ScanArgs<'a>,
-    ) -> DFResult<ScanResult> {
-        let projection = args.projection().map(<[_]>::to_vec);
-        let plan = self
-            .scan_impl(
+    ) -> futures::future::BoxFuture<'async_trait, DFResult<ScanResult>>
+    where
+        'a: 'async_trait,
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        use futures::TryFutureExt;
+        Box::pin(
+            self.scan_impl(
                 state,
-                projection.as_ref(),
+                args.projection(),
                 args.filters().unwrap_or(&[]),
                 args.limit(),
                 args.statistics_requests(),
             )
-            .await?;
-        Ok(ScanResult::new(plan))
+            .map_ok(ScanResult::new),
+        )
     }
 }
 
