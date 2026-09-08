@@ -108,83 +108,93 @@ impl CatalogProvider for WritableIcebergCatalog {
     /// fresh `IcebergSchemaProvider` (via the upstream constructor
     /// path) and cache it so subsequent `CREATE TABLE` / `SELECT`
     /// resolve against the same handle.
+    // `CREATE SCHEMA` through DataFusion's own DDL executor lands here. The
+    // hook is synchronous and the Iceberg catalog is async; it used to
+    // bridge with `runtime_bridge::block_on_compat` from inside the planner
+    // (architecture review 806). SQE's statement paths (the coordinator's
+    // `catalog_ops`, the embedded CLI's DDL interceptor) call
+    // [`WritableIcebergCatalog::create_namespace`] on the async path
+    // instead, so reaching this hook means a planner entry point handed
+    // the statement to DataFusion unintercepted; say so rather than block.
     fn register_schema(
         &self,
         name: &str,
         _provider: Arc<dyn SchemaProvider>,
     ) -> DFResult<Option<Arc<dyn SchemaProvider>>> {
-        // Reject duplicates explicitly; the trait contract says we
-        // could replace, but the iceberg::Catalog will fail-loud on
-        // create-after-create and surfacing that error verbatim is
-        // more useful than silently swapping cache entries.
-        if self.schemas.contains_key(name) {
-            return Err(DataFusionError::Execution(format!(
-                "schema {name} already exists"
-            )));
-        }
-
-        let catalog = self.catalog.clone();
-        let ns_name = name.to_string();
-        // The CatalogProvider trait method is sync; iceberg::Catalog is
-        // async. crate::runtime_bridge::block_on_compat picks
-        // block_in_place on multi-thread runtimes and an off-thread
-        // block_on on current-thread. The earlier
-        // spawn_blocking + futures::executor::block_on(join) pattern
-        // could stall a worker waiting on the join future (issue #81).
-        let ns_name_for_err = ns_name.clone();
-        let provider = crate::runtime_bridge::block_on_compat(async move {
-            let ns = NamespaceIdent::new(ns_name.clone());
-            catalog
-                .create_namespace(&ns, std::collections::HashMap::new())
-                .await
-                .map_err(|e| anyhow::anyhow!("create_namespace({ns_name}): {e}"))?;
-            let upstream_catalog =
-                iceberg_datafusion::IcebergCatalogProvider::try_new(catalog.clone())
-                    .await
-                    .map_err(|e| anyhow::anyhow!("rebuild after create_namespace: {e}"))?;
-            upstream_catalog.schema(&ns_name).ok_or_else(|| {
-                anyhow::anyhow!("schema {ns_name} disappeared between create and read")
-            })
-        })
-        .map_err(|e| {
-            DataFusionError::Execution(format!("register_schema({ns_name_for_err}): {e}"))
-        })?
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-        self.schemas.insert(name.to_string(), provider);
-        Ok(None)
+        Err(DataFusionError::Plan(format!(
+            "CREATE SCHEMA {name}: this Iceberg catalog cannot be written through \
+             DataFusion's synchronous register_schema hook; route the statement to \
+             WritableIcebergCatalog::create_namespace on the async path (review 806)"
+        )))
     }
 
     fn deregister_schema(
         &self,
         name: &str,
-        cascade: bool,
+        _cascade: bool,
     ) -> DFResult<Option<Arc<dyn SchemaProvider>>> {
+        Err(DataFusionError::Plan(format!(
+            "DROP SCHEMA {name}: this Iceberg catalog cannot be written through \
+             DataFusion's synchronous deregister_schema hook; route the statement to \
+             WritableIcebergCatalog::drop_namespace on the async path (review 806)"
+        )))
+    }
+}
+
+impl WritableIcebergCatalog {
+    /// `CREATE SCHEMA [IF NOT EXISTS] <name>` on this catalog, on the async
+    /// path. After the namespace exists a fresh `IcebergSchemaProvider` is
+    /// built (via the upstream constructor path) and cached so subsequent
+    /// `CREATE TABLE` / `SELECT` resolve against the same handle. Duplicates
+    /// are rejected explicitly unless `if_not_exists`: the iceberg catalog
+    /// fails loud on create-after-create, and surfacing that as an error is
+    /// more useful than silently swapping cache entries.
+    pub async fn create_namespace(&self, name: &str, if_not_exists: bool) -> anyhow::Result<()> {
+        if self.schemas.contains_key(name) {
+            if if_not_exists {
+                return Ok(());
+            }
+            anyhow::bail!("schema {name} already exists");
+        }
+        let ns = NamespaceIdent::new(name.to_string());
+        self.catalog
+            .create_namespace(&ns, std::collections::HashMap::new())
+            .await
+            .map_err(|e| anyhow::anyhow!("create_namespace({name}): {e}"))?;
+        let upstream = IcebergCatalogProvider::try_new(self.catalog.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("rebuild after create_namespace: {e}"))?;
+        let provider = upstream
+            .schema(name)
+            .ok_or_else(|| anyhow::anyhow!("schema {name} disappeared between create and read"))?;
+        self.schemas.insert(name.to_string(), provider);
+        Ok(())
+    }
+
+    /// `DROP SCHEMA [IF EXISTS] <name>` on this catalog, on the async path.
+    /// `CASCADE` is not implemented: the iceberg catalog refuses to drop a
+    /// non-empty namespace and SQE does not delete tables on its behalf.
+    pub async fn drop_namespace(
+        &self,
+        name: &str,
+        if_exists: bool,
+        cascade: bool,
+    ) -> anyhow::Result<()> {
         if cascade {
-            return Err(DataFusionError::NotImplemented(
-                "DROP SCHEMA ... CASCADE is not implemented for embedded iceberg catalogs"
-                    .to_string(),
-            ));
+            anyhow::bail!("DROP SCHEMA ... CASCADE is not implemented for embedded iceberg catalogs");
         }
         if !self.schemas.contains_key(name) {
-            // None signals "not present" per the trait doc.
-            return Ok(None);
+            if if_exists {
+                return Ok(());
+            }
+            anyhow::bail!("schema {name} does not exist");
         }
-
-        let catalog = self.catalog.clone();
-        let ns_name = name.to_string();
-        let ns_name_for_err = ns_name.clone();
-        crate::runtime_bridge::block_on_compat(async move {
-            let ns = NamespaceIdent::new(ns_name.clone());
-            catalog
-                .drop_namespace(&ns)
-                .await
-                .map_err(|e| anyhow::anyhow!("drop_namespace({ns_name}): {e}"))
-        })
-        .map_err(|e| {
-            DataFusionError::Execution(format!("deregister_schema({ns_name_for_err}): {e}"))
-        })?
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-
-        Ok(self.schemas.remove(name).map(|(_, v)| v))
+        let ns = NamespaceIdent::new(name.to_string());
+        self.catalog
+            .drop_namespace(&ns)
+            .await
+            .map_err(|e| anyhow::anyhow!("drop_namespace({name}): {e}"))?;
+        self.schemas.remove(name);
+        Ok(())
     }
 }

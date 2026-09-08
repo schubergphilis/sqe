@@ -3700,18 +3700,58 @@ impl QueryHandler {
         )
         .await;
 
+        // `session.default_catalog` fills the missing catalog of `db.t`
+        // references, for the Iceberg providers below and for a Hive root
+        // when it is the default.
+        let default_catalog = session
+            .default_catalog
+            .clone()
+            .unwrap_or_else(|| self.config.resolve_default_catalog());
+
+        // Iceberg: the namespace list itself. `SqeCatalogProvider::schema()`
+        // used to re-list the catalog from inside the synchronous hook when
+        // a name was missing from its snapshot (#368, an externally created
+        // namespace). The miss is resolved here instead: every schema the
+        // statement names gets `refresh_namespace`, which re-lists
+        // (cooldown-gated) when the name is unknown and refreshes the
+        // table-name snapshot when stale. Any catalog whose provider is an
+        // `SqeCatalogProvider` (the session warehouse, discovered
+        // workspaces, `[catalogs.*]` entries) is covered.
+        let mut referenced: Vec<(String, String)> = Vec::new();
+        if let Some(schema) = session.default_schema.as_deref() {
+            referenced.push((default_catalog.clone(), schema.to_string()));
+        }
+        for (catalog, schema) in sqe_sql::extract_schema_qualifiers_from_sql(sql) {
+            let catalog = catalog.unwrap_or_else(|| default_catalog.clone());
+            if !referenced.iter().any(|(c, s)| c == &catalog && s == &schema) {
+                referenced.push((catalog, schema));
+            }
+        }
+        for (catalog, schema) in &referenced {
+            if schema.eq_ignore_ascii_case("information_schema") {
+                continue;
+            }
+            let Some(provider) = ctx.catalog(catalog) else {
+                continue;
+            };
+            let any: &dyn std::any::Any = provider.as_ref();
+            let Some(sqe) = any.downcast_ref::<sqe_catalog::catalog_provider::SqeCatalogProvider>()
+            else {
+                continue;
+            };
+            if let Err(e) = sqe.refresh_namespace(schema).await {
+                // Folded into the snapshots with its reason; the table
+                // lookup reports the precise error for what it needs.
+                debug!(catalog = %catalog, schema = %schema, error = %e, "namespace refresh failed before planning");
+            }
+        }
+
         let Ok(roots) = self.runtime_catalogs.hive_roots() else {
             return;
         };
         if roots.is_empty() {
             return;
         }
-        // `session.default_catalog` fills the missing catalog of `db.t`
-        // references; a Hive root only sees those when it is the default.
-        let default_catalog = session
-            .default_catalog
-            .clone()
-            .unwrap_or_else(|| self.config.resolve_default_catalog());
         for (name, _) in roots {
             // The session-scoped provider `create_session_context` registered
             // for this root; `CatalogProvider: Any`, so the downcast is the
