@@ -46,7 +46,7 @@ mod glue {
     ///
     /// last verified: never in this tree
     #[tokio::test]
-    #[ignore = "requires AWS credentials + a pre-created S3 bucket; run with --ignored"]
+    #[ignore = "needs:aws; pre-created S3 bucket"]
     async fn live_glue_namespace_round_trip() {
         let warehouse = std::env::var("SQE_TEST_GLUE_WAREHOUSE").expect(
             "SQE_TEST_GLUE_WAREHOUSE must be set to a pre-created \
@@ -153,7 +153,7 @@ mod hms {
     ///
     /// last verified: never in this tree
     #[tokio::test]
-    #[ignore = "requires docker-compose HMS stack; run with --ignored"]
+    #[ignore = "needs:hms"]
     async fn hms_namespace_round_trip() {
         // Upstream HmsCatalog calls `to_socket_addrs()` directly on the
         // configured address, so it wants `host:port` (no scheme prefix).
@@ -312,7 +312,7 @@ mod sql_postgres {
     ///
     /// last verified: never in this tree
     #[tokio::test]
-    #[ignore = "requires live Postgres; run with --ignored against docker-compose postgres"]
+    #[ignore = "needs:postgres"]
     async fn jdbc_postgres_namespace_roundtrip() {
         let url = std::env::var("SQE_TEST_PG_URL").unwrap_or_else(|_| {
             "postgres://iceberg:iceberg@localhost:15432/iceberg_catalog".to_string()
@@ -383,7 +383,7 @@ mod sql_postgres {
     ///
     /// last verified: never in this tree
     #[tokio::test]
-    #[ignore = "requires live Postgres; run with --ignored against docker-compose postgres"]
+    #[ignore = "needs:postgres"]
     async fn for_session_dispatches_through_jdbc_backend() {
         use std::sync::Arc;
 
@@ -501,7 +501,7 @@ warehouse = "{warehouse}"
     ///
     /// last verified: never in this tree
     #[tokio::test]
-    #[ignore = "requires live Postgres; run with --ignored against docker-compose postgres"]
+    #[ignore = "needs:postgres"]
     async fn jdbc_postgres_v3_table_format_version_roundtrip() {
         use iceberg::spec::{
             NestedField, PrimitiveType, Schema as IcebergSchema, Type as IcebergType,
@@ -636,7 +636,7 @@ mod hadoop {
     ///
     /// last verified: never in this tree
     #[tokio::test]
-    #[ignore = "requires MinIO-backed warehouse; run with --ignored and SQE_TEST_MINIO_URL set"]
+    #[ignore = "needs:minio; SQE_TEST_MINIO_URL"]
     async fn hadoop_backend_minio_integration() {
         // Future: wire to a running MinIO instance and discover real tables.
         unimplemented!("MinIO integration arrives with task 2.16");
@@ -678,7 +678,7 @@ mod nessie {
     ///
     /// last verified: never in this tree
     #[tokio::test]
-    #[ignore = "requires docker-compose Nessie stack; run with --ignored"]
+    #[ignore = "needs:nessie"]
     async fn nessie_namespace_round_trip() {
         // `/iceberg/` is the Iceberg REST mount point Nessie reports
         // back via the config response. Trailing slash matters: the
@@ -769,7 +769,7 @@ mod s3_tables {
     ///
     /// last verified: never in this tree
     #[tokio::test]
-    #[ignore = "requires AWS credentials + a pre-existing S3 Tables bucket; run with --ignored"]
+    #[ignore = "needs:aws; pre-existing S3 Tables bucket"]
     async fn list_namespaces_via_glue_rest() {
         let warehouse = std::env::var("SQE_TEST_S3TABLES_WAREHOUSE").expect(
             "SQE_TEST_S3TABLES_WAREHOUSE must be set, e.g. \
@@ -867,7 +867,7 @@ mod unity_catalog {
     ///
     /// last verified: never in this tree
     #[tokio::test]
-    #[ignore = "requires Unity Catalog M2M credentials; run with --ignored"]
+    #[ignore = "needs:unity; M2M credentials"]
     async fn unity_catalog_m2m_auth_obtains_token() {
         let endpoint = std::env::var("SQE_TEST_UC_TOKEN_ENDPOINT")
             .expect("SQE_TEST_UC_TOKEN_ENDPOINT must be set");
@@ -907,7 +907,7 @@ mod unity_catalog {
     ///
     /// last verified: never in this tree
     #[tokio::test]
-    #[ignore = "requires docker-compose Unity stack; run with --ignored"]
+    #[ignore = "needs:unity; docker-compose stack"]
     async fn list_via_unity_rest() {
         // Unity exposes its Iceberg REST surface under
         // /api/2.1/unity-catalog/iceberg/. The trailing slash is

@@ -158,7 +158,7 @@ async fn reset_table(
 // can be re-loaded without raising "unsupported format-version" errors.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn create_v3_table_with_nanosec_timestamp_round_trips_through_polaris() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -195,7 +195,7 @@ async fn create_v3_table_with_nanosec_timestamp_round_trips_through_polaris() {
 // scan time and DataFusion materialises Timestamp(Nanosecond, _).
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn insert_then_select_round_trips_v3_table() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -252,7 +252,7 @@ async fn insert_then_select_round_trips_v3_table() {
 // schema-evolution write path.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn alter_add_column_with_default_on_v3_table() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -317,7 +317,7 @@ async fn alter_add_column_with_default_on_v3_table() {
 // count must drop to one (rewritten file).
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn delete_cow_on_v3_table_drops_row() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -371,7 +371,7 @@ async fn delete_cow_on_v3_table_drops_row() {
 // focused on V3 + write-path.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn position_deletes_on_v3_table() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -439,7 +439,7 @@ async fn position_deletes_on_v3_table() {
 // in one RowDeltaAction commit.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn equality_delete_update_on_v3_table() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -514,7 +514,7 @@ async fn equality_delete_update_on_v3_table() {
 // metadata, complementing the existing UPDATE and DELETE coverage.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn merge_into_on_v3_table() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -600,7 +600,7 @@ async fn merge_into_on_v3_table() {
 // in the snapshot machinery.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn time_travel_on_v3_table() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -663,7 +663,7 @@ async fn time_travel_on_v3_table() {
 // dedicated bloom test suite (Phase F).
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn bloom_filter_property_round_trips_on_v3_table() {
     use arrow_array::StringArray;
 
@@ -726,7 +726,7 @@ async fn bloom_filter_property_round_trips_on_v3_table() {
 // confirm the maintenance code path does not bail out on V3 metadata.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn rewrite_data_files_on_v3_table() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -792,7 +792,7 @@ async fn rewrite_data_files_on_v3_table() {
 // rewrites the SQL to reference it.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn for_version_as_of_on_v3_table() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -881,7 +881,7 @@ async fn for_version_as_of_on_v3_table() {
 // committed in the chosen range with the right `_change_type` column.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn cdc_incremental_scan_on_v3_table() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -981,7 +981,7 @@ async fn cdc_incremental_scan_on_v3_table() {
 // commits a schema change that surfaces through information_schema.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn type_promotion_int_to_bigint_on_v3_table() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -1039,7 +1039,7 @@ async fn type_promotion_int_to_bigint_on_v3_table() {
 // Basic statistics surface (COUNT, file count) work on a V3 table.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn statistics_on_v3_table() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
