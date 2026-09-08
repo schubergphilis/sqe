@@ -60,6 +60,7 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion_expr::Expr;
 use tracing::debug;
 
+use futures::future::BoxFuture;
 use sqe_core::config::{StorageConfig, TvfCaller};
 
 use crate::file_tvf_common::{
@@ -67,6 +68,7 @@ use crate::file_tvf_common::{
     register_http_store_if_needed, register_s3_store_if_needed, rewrite_hf_path_in_place,
     FileTvfArgs,
 };
+use crate::file_tvf_prepare::{PreparableTableFunction, PreparedProviders};
 
 const FN_NAME: &str = "read_json";
 
@@ -190,6 +192,9 @@ pub struct ReadJsonFunction {
     /// The executing session's runtime environment; see
     /// [`crate::read_parquet::ReadParquetFunction::with_runtime_env`].
     runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
+    /// Providers built by [`PreparableTableFunction::prepare`] ahead of
+    /// planning; `call` only looks them up (architecture review 806).
+    prepared: PreparedProviders,
 }
 
 impl ReadJsonFunction {
@@ -198,6 +203,7 @@ impl ReadJsonFunction {
             storage,
             caller: TvfCaller::default(),
             runtime_env: None,
+            prepared: PreparedProviders::default(),
         }
     }
 
@@ -207,22 +213,13 @@ impl ReadJsonFunction {
             storage,
             caller,
             runtime_env: None,
+            prepared: PreparedProviders::default(),
         }
     }
 
-    /// Bind the executing session's runtime environment so inline-credential
-    /// object stores are visible to the scan, not just to schema inference.
-    pub fn with_runtime_env(
-        mut self,
-        env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
-    ) -> Self {
-        self.runtime_env = Some(env);
-        self
-    }
-}
-
-impl TableFunctionImpl for ReadJsonFunction {
-    fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
+    /// Parse the arguments and run the path policy: the synchronous part of
+    /// a call, shared by `prepare` and `call`.
+    fn checked_args(&self, exprs: &[Expr]) -> DFResult<(FileTvfArgs, JsonOpts)> {
         let mut json_opts = JsonOpts::default();
         let mut parse_err: Option<DataFusionError> = None;
 
@@ -260,51 +257,76 @@ impl TableFunctionImpl for ReadJsonFunction {
             &self.storage,
             &self.caller,
         )?;
+        Ok((args, json_opts))
+    }
+}
 
-        let framing = json_opts.framing.unwrap_or(JsonFraming::Auto);
-        let compression = json_opts
-            .compression
-            .unwrap_or_else(|| compression_from_extension(&args.path));
+impl PreparableTableFunction for ReadJsonFunction {
+    fn prepare<'a>(&'a self, exprs: &'a [Expr]) -> BoxFuture<'a, DFResult<()>> {
+        Box::pin(async move {
+            let (args, json_opts) = self.checked_args(exprs)?;
 
-        // Router: a top-level array (explicit `format => 'array'`) or a zip
-        // archive cannot be served by DataFusion's streaming JSON listing
-        // table, so both route to the buffer path (whole-object fetch +
-        // decode). Everything else streams. Both branches run only after
-        // `enforce_tvf_path_policy` above.
-        let use_buffer =
-            matches!(framing, JsonFraming::Array) || matches!(compression, JsonCompression::Zip);
+            let framing = json_opts.framing.unwrap_or(JsonFraming::Auto);
+            let compression = json_opts
+                .compression
+                .unwrap_or_else(|| compression_from_extension(&args.path));
 
-        let storage = self.storage.clone();
-        let runtime_env = self.runtime_env.clone();
+            // Router: a top-level array (explicit `format => 'array'`) or a
+            // zip archive cannot be served by DataFusion's streaming JSON
+            // listing table, so both route to the buffer path (whole-object
+            // fetch + decode). Everything else streams. Both branches run
+            // only after `enforce_tvf_path_policy` in `checked_args`.
+            let use_buffer = matches!(framing, JsonFraming::Array)
+                || matches!(compression, JsonCompression::Zip);
 
-        if use_buffer {
-            let max_bytes = DEFAULT_MAX_BUFFER_BYTES;
-            crate::runtime_bridge::block_on_compat(async move {
+            let provider = if use_buffer {
                 crate::read_json_buffer::build_buffer_table(
                     &args,
                     framing,
                     compression,
-                    max_bytes,
-                    &storage,
-                    runtime_env.as_deref(),
+                    DEFAULT_MAX_BUFFER_BYTES,
+                    &self.storage,
+                    self.runtime_env.as_deref(),
                 )
                 .await
-            })
-            .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: {e}")))?
-        } else {
-            let df_compression = streaming_compression(compression);
-            crate::runtime_bridge::block_on_compat(async move {
+            } else {
                 build_json_listing_table(
                     &args,
                     &json_opts,
-                    df_compression,
-                    &storage,
-                    runtime_env.as_deref(),
+                    streaming_compression(compression),
+                    &self.storage,
+                    self.runtime_env.as_deref(),
                 )
                 .await
-            })
-            .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: {e}")))?
-        }
+            }
+            .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: {e}")))?;
+            self.prepared.insert(exprs, provider);
+            Ok(())
+        })
+    }
+}
+
+impl ReadJsonFunction {
+    /// Bind the executing session's runtime environment so inline-credential
+    /// object stores are visible to the scan, not just to schema inference.
+    pub fn with_runtime_env(
+        mut self,
+        env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> Self {
+        self.runtime_env = Some(env);
+        self
+    }
+}
+
+impl TableFunctionImpl for ReadJsonFunction {
+    // Synchronous and called from inside the planner, so it never touches
+    // storage: `prepare` built the provider on the async path and this only
+    // re-checks the policy and looks it up (architecture review 806).
+    fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
+        self.checked_args(exprs)?;
+        self.prepared
+            .get(exprs)
+            .ok_or_else(|| PreparedProviders::not_prepared(FN_NAME, exprs))
     }
 }
 
@@ -502,6 +524,26 @@ mod tests {
         ));
     }
 
+    /// Register `read_json` the way the engine does (through the file
+    /// table-function registry, review 806), so `plan` can prepare it.
+    fn register_json(ctx: &datafusion::prelude::SessionContext, storage: StorageConfig) {
+        crate::file_tvf_prepare::FileTableFunctions::register(
+            ctx,
+            "read_json",
+            Arc::new(ReadJsonFunction::new(storage)),
+        );
+    }
+
+    /// What every production entry point does: build the file table
+    /// functions' providers on the async path, then plan.
+    async fn plan(
+        ctx: &datafusion::prelude::SessionContext,
+        sql: &str,
+    ) -> DFResult<datafusion::dataframe::DataFrame> {
+        crate::file_tvf_prepare::prepare_statement(ctx, sql).await?;
+        ctx.sql(sql).await
+    }
+
     #[tokio::test]
     async fn reads_plain_ndjson_local() {
         use datafusion::prelude::SessionContext;
@@ -517,9 +559,8 @@ mod tests {
             ..StorageConfig::default()
         };
         let ctx = SessionContext::new();
-        ctx.register_udtf("read_json", Arc::new(ReadJsonFunction::new(storage)));
-        let df = ctx
-            .sql(&format!(
+        register_json(&ctx, storage);
+        let df = plan(&ctx, &format!(
                 "SELECT count(*) AS n FROM read_json('{}')",
                 path.display()
             ))
@@ -551,9 +592,8 @@ mod tests {
             ..StorageConfig::default()
         };
         let ctx = SessionContext::new();
-        ctx.register_udtf("read_json", Arc::new(ReadJsonFunction::new(storage)));
-        let df = ctx
-            .sql(&format!(
+        register_json(&ctx, storage);
+        let df = plan(&ctx, &format!(
                 "SELECT count(*) AS n FROM read_json('{}', 'format=array')",
                 path.display()
             ))
@@ -572,10 +612,7 @@ mod tests {
     async fn buffer_path_rejects_local_secret() {
         use datafusion::prelude::SessionContext;
         let ctx = SessionContext::new();
-        ctx.register_udtf(
-            "read_json",
-            Arc::new(ReadJsonFunction::new(StorageConfig::default())),
-        );
+        register_json(&ctx, StorageConfig::default());
         // Anonymous caller + a sensitive absolute path must be denied by
         // policy, BEFORE any object-store fetch. format=array forces the
         // buffer path (the streaming path would also be denied the same
@@ -590,9 +627,7 @@ mod tests {
         // reaches this TVF's `call()`, so `format => 'array'` here would
         // fail on an unrelated parser error instead of exercising the
         // policy gate.
-        let res = ctx
-            .sql("SELECT * FROM read_json('/etc/shadow', 'format=array')")
-            .await;
+        let res = plan(&ctx, "SELECT * FROM read_json('/etc/shadow', 'format=array')").await;
         // Either plan-time or collect-time error; assert it errors and never reads.
         let err = match res {
             Err(e) => e.to_string(),
@@ -610,22 +645,19 @@ mod tests {
     async fn buffer_path_rejects_imds_url() {
         use datafusion::prelude::SessionContext;
         let ctx = SessionContext::new();
-        ctx.register_udtf(
-            "read_json",
-            Arc::new(ReadJsonFunction::new(StorageConfig::default())),
-        );
+        register_json(&ctx, StorageConfig::default());
         // Anonymous caller + an IMDS/SSRF-style URL must be denied by
         // policy, BEFORE any object-store fetch. format=array forces the
         // buffer path (same positional-arg rationale as
         // `buffer_path_rejects_local_secret` above: a raw `SessionContext`
         // hasn't gone through `rewrite_named_tvf_args`, so `format=array`
         // must be passed positionally rather than as `format => 'array'`).
-        let res = ctx
-            .sql(
-                "SELECT * FROM read_json('http://169.254.169.254/latest/meta-data/', \
-                 'format=array')",
-            )
-            .await;
+        let res = plan(
+            &ctx,
+            "SELECT * FROM read_json('http://169.254.169.254/latest/meta-data/', \
+             'format=array')",
+        )
+        .await;
         let err = match res {
             Err(e) => e.to_string(),
             Ok(df) => format!("{:?}", df.collect().await.err()),
@@ -656,13 +688,12 @@ mod tests {
             ..StorageConfig::default()
         };
         let ctx = SessionContext::new();
-        ctx.register_udtf("read_json", Arc::new(ReadJsonFunction::new(storage)));
+        register_json(&ctx, storage);
         // No `format` arg: plain NDJSON with a `.gz` suffix stays on the
         // streaming path (`build_json_listing_table` +
         // `FileCompressionType::GZIP`), unlike `reads_gzipped_array` below
         // which forces the buffer path via `format => 'array'`.
-        let n = ctx
-            .sql(&format!(
+        let n = plan(&ctx, &format!(
                 "SELECT count(*) AS n FROM read_json('{}')",
                 path.display()
             ))
@@ -699,14 +730,13 @@ mod tests {
             ..StorageConfig::default()
         };
         let ctx = SessionContext::new();
-        ctx.register_udtf("read_json", Arc::new(ReadJsonFunction::new(storage)));
+        register_json(&ctx, storage);
         // .gz auto-detects gzip; format=array forces the buffer path (array
         // can't stream). Positional 'format=array' (not `format => 'array'`)
         // because this raw SessionContext hasn't gone through the
         // coordinator's named-TVF-arg rewrite; see
         // `buffer_path_rejects_local_secret` above for the full rationale.
-        let n = ctx
-            .sql(&format!(
+        let n = plan(&ctx, &format!(
                 "SELECT count(*) AS n FROM read_json('{}', 'format=array')",
                 path.display()
             ))
@@ -748,11 +778,10 @@ mod tests {
             ..StorageConfig::default()
         };
         let ctx = SessionContext::new();
-        ctx.register_udtf("read_json", Arc::new(ReadJsonFunction::new(storage)));
+        register_json(&ctx, storage);
         // Zip always routes to the buffer path regardless of `format`, so no
         // positional arg is needed here (unlike the array case above).
-        let n = ctx
-            .sql(&format!(
+        let n = plan(&ctx, &format!(
                 "SELECT count(*) AS n FROM read_json('{}')",
                 path.display()
             ))
@@ -784,11 +813,10 @@ mod tests {
             ..StorageConfig::default()
         };
         let ctx = SessionContext::new();
-        ctx.register_udtf("read_json", Arc::new(ReadJsonFunction::new(storage)));
+        register_json(&ctx, storage);
         // `newline_delimited=false` is the legacy alias for `format=array`;
         // this locks the newline_delimited => framing::Array => buffer route.
-        let df = ctx
-            .sql(&format!(
+        let df = plan(&ctx, &format!(
                 "SELECT count(*) AS n FROM read_json('{}', 'newline_delimited=false')",
                 path.display()
             ))

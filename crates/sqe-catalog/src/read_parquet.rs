@@ -34,10 +34,13 @@ use datafusion::error::Result as DFResult;
 #[cfg(test)]
 use datafusion::execution::context::SessionContext;
 use datafusion_expr::Expr;
+use futures::future::BoxFuture;
 use object_store::aws::AmazonS3Builder;
 use tracing::debug;
 
 use sqe_core::config::{StorageConfig, TvfCaller};
+
+use crate::file_tvf_prepare::{PreparableTableFunction, PreparedProviders};
 
 /// Named keyword arguments accepted by `read_parquet()`.
 #[derive(Debug, Clone, Default)]
@@ -138,6 +141,9 @@ pub struct ReadParquetFunction {
     /// registration and execution falls back to the engine's `[storage]`
     /// config — correct only when the inline endpoint matches it.
     runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
+    /// Providers built by [`PreparableTableFunction::prepare`] ahead of
+    /// planning; `call` only looks them up (architecture review 806).
+    prepared: PreparedProviders,
 }
 
 impl ReadParquetFunction {
@@ -149,6 +155,7 @@ impl ReadParquetFunction {
             storage,
             caller: TvfCaller::default(),
             runtime_env: None,
+            prepared: PreparedProviders::default(),
         }
     }
 
@@ -158,22 +165,13 @@ impl ReadParquetFunction {
             storage,
             caller,
             runtime_env: None,
+            prepared: PreparedProviders::default(),
         }
     }
 
-    /// Bind the executing session's runtime environment so inline-credential
-    /// object stores are visible to the scan, not just to schema inference.
-    pub fn with_runtime_env(
-        mut self,
-        env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
-    ) -> Self {
-        self.runtime_env = Some(env);
-        self
-    }
-}
-
-impl TableFunctionImpl for ReadParquetFunction {
-    fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
+    /// Parse the arguments and run the path policy: the part of a call that
+    /// is synchronous and runs both in `prepare` and in `call`.
+    fn checked_args(&self, exprs: &[Expr]) -> DFResult<ReadParquetArgs> {
         let args = parse_args(exprs)?;
         // Issue #10: reject local-path and arbitrary HTTP-host arguments
         // BEFORE constructing the object store. Without this guard,
@@ -188,16 +186,44 @@ impl TableFunctionImpl for ReadParquetFunction {
             &self.storage,
             &self.caller,
         )?;
-        let storage = self.storage.clone();
-        let runtime_env = self.runtime_env.clone();
+        Ok(args)
+    }
+}
 
-        // `TableFunctionImpl::call` is sync; schema inference is async.
-        // block_on_compat drives the future on multi-thread (block_in_place)
-        // or current-thread (off-thread) runtimes (issue #83).
-        crate::runtime_bridge::block_on_compat(async move {
-            build_listing_table(&args, &storage, runtime_env.as_deref()).await
+impl PreparableTableFunction for ReadParquetFunction {
+    fn prepare<'a>(&'a self, exprs: &'a [Expr]) -> BoxFuture<'a, DFResult<()>> {
+        Box::pin(async move {
+            let args = self.checked_args(exprs)?;
+            let provider = build_listing_table(&args, &self.storage, self.runtime_env.as_deref())
+                .await
+                .map_err(|e| datafusion::error::DataFusionError::Plan(format!("read_parquet: {e}")))?;
+            self.prepared.insert(exprs, provider);
+            Ok(())
         })
-        .map_err(|e| datafusion::error::DataFusionError::Plan(format!("read_parquet: {e}")))?
+    }
+}
+
+impl ReadParquetFunction {
+    /// Bind the executing session's runtime environment so inline-credential
+    /// object stores are visible to the scan, not just to schema inference.
+    pub fn with_runtime_env(
+        mut self,
+        env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> Self {
+        self.runtime_env = Some(env);
+        self
+    }
+}
+
+impl TableFunctionImpl for ReadParquetFunction {
+    // Synchronous and called from inside the planner, so it never touches
+    // storage: `prepare` built the provider on the async path and this only
+    // re-checks the policy and looks it up (architecture review 806).
+    fn call(&self, exprs: &[Expr]) -> DFResult<Arc<dyn TableProvider>> {
+        self.checked_args(exprs)?;
+        self.prepared
+            .get(exprs)
+            .ok_or_else(|| PreparedProviders::not_prepared("read_parquet", exprs))
     }
 }
 
