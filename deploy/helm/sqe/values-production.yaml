@@ -26,6 +26,30 @@ config:
   # REST catalog (issue #395).
   catalog:
     require_vended_credentials: true
+  # production_mode refuses the default policy engine (passthrough enforces
+  # no row filters, masks or column restrictions) and the default grant
+  # backend (none) unless the matching security.allow_* flag acknowledges
+  # the choice (architecture review 212). Pick the real engines for your
+  # platform; the values below are the Ranger pairing from the
+  # polaris-ranger-keycloak quickstart.
+  policy:
+    engine: ranger
+    ranger:
+      # Required: the engine refuses to start with engine=ranger and an
+      # empty url. The Ranger admin password arrives as the
+      # SQE_POLICY__RANGER__ADMIN_PASSWORD env override, never in values.
+      url: ""
+      service_name: "sqe"
+      project_tags: true
+  access_control:
+    # Rendered with the same Ranger Admin as [access_control.ranger].
+    backend: ranger
+  # To run WITHOUT a policy engine or grant backend on purpose, say so
+  # explicitly instead; production_mode then starts and logs the disabled
+  # enforcement at warn level:
+  # security:
+  #   allow_no_policy_engine: true
+  #   allow_no_grant_backend: true
 
 # ── Durable audit log ───────────────────────────────────────
 # Mounts a ReadWriteOnce PVC at audit.path so records survive reschedule.
