@@ -15,9 +15,20 @@
 > harness; verified against the binary's own `--list --ignored`). Rules and
 > the open item (a docker-capable CI runner for the `polaris` group) in
 > `docs/internal/process/test-groups.md`.
-> **NEXT:** finding 411 (#591): the chaos worker and six failure cases behind
-> `make test-distributed`; then 806 (#638), 205/212 (#653), 610 (#657), 627,
-> #659 partials.
+> Finding 411 (#591) landed on the same branch: `tests/it/common/chaos_worker.rs`
+> wraps a production `WorkerFlightService` in-process and cuts, hangs or slows
+> its `do_get` stream; `tests/it/distributed_failure_e2e.rs` runs the six cases
+> (refused connection, loss mid-stream, hang, `CancelQuery`, query deadline,
+> straggler) against the real registry, scheduler, retry loop, tracker and
+> streaming deadline. They need only the Polaris stack (`needs:polaris`), so
+> every `make test-integration` is now the gate for `distributed_scan.rs`,
+> `scheduler.rs`, `worker_registry.rs` and `streaming.rs`. Two test-side
+> lessons: the planner bin-packs small files into one fragment up to
+> `query.target_task_size`, so a spread over workers needs that knob low; and
+> `distribution_threshold` / `distribution_file_threshold` keep small tables
+> local unless zeroed.
+> **NEXT:** 806 (#638), 205/212 (#653), 610 (#657), 627, #659 partials; the
+> docker-capable CI runner for the `polaris` group (807 item 3).
 
 > **STATUS 2026-09-07 (night): coordinator compile 68 s -> 18 s by boxing four async hubs, on `perf/compile-time-async-hubs`; the crate split is demoted to a structural item.**
 >

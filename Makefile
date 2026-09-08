@@ -251,6 +251,12 @@ test:
 # `cargo xtask test-groups --check` in CI rejects a bare one. GROUP is matched
 # by exact test name, so a group runs the same set on every machine.
 #
+# Distributed failure paths (finding 411) are part of the default suite:
+# tests/it/distributed_failure_e2e.rs drives in-process chaos workers, so
+# `make test-integration` (or FILTER=distributed_failure_e2e) is the gate for
+# changes under distributed_scan.rs, scheduler.rs, worker_registry.rs and
+# streaming.rs. No external worker process is needed for those six cases.
+#
 # RUST_MIN_STACK is 32 MiB here, deliberately NOT the 8 MiB the script defaults
 # to (which mirrors production WORKER_STACK_BYTES). An unfiltered run passes
 # `--ignored`, which force-runs the write e2e suites, and those SIGABRT below
