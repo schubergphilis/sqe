@@ -48,6 +48,18 @@ set of tests on every machine and does not drift from the attributes.
 The `#[cfg_attr(debug_assertions, ignore = "release-only")]` form is read the
 same way; the reason goes inside the `cfg_attr`.
 
+## Distributed failure paths (finding 411)
+
+`crates/sqe-coordinator/tests/it/distributed_failure_e2e.rs` runs the six
+worker-failure cases (refused connection, loss mid-stream, hang, `CancelQuery`,
+query deadline, straggler) against in-process chaos workers from
+`tests/it/common/chaos_worker.rs`: a production `WorkerFlightService` whose
+`do_get` response is cut, hung or slowed. They need only the Polaris stack, so
+they are `needs:polaris` and run in every `make test-integration`, which makes
+that target the gate for changes under `distributed_scan.rs`, `scheduler.rs`,
+`worker_registry.rs`, `streaming.rs` and `flight_sql.rs`'s cancel path. One
+file, one filter: `make test-integration FILTER=distributed_failure_e2e`.
+
 ## Still open from finding 807
 
 - A mandatory CI job that runs `GROUP=polaris` against the compose stack. It
@@ -55,5 +67,3 @@ same way; the reason goes inside the `cfg_attr`.
   in the fleet; the shared runners are `docker` executors without a socket).
   Until then the gate for the write path, distributed dispatch and access
   control is `make test-integration` on a laptop, as CLAUDE.md says.
-- Finding 411 (#591): the six distributed failure cases behind
-  `make test-distributed`.
