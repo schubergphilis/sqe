@@ -63,6 +63,50 @@ pub fn test_config_path() -> String {
         .to_string()
 }
 
+/// Like [`setup_handler`], but with policy enforcement wired to `store`:
+/// the same `PolicyPlanRewriter` production builds for a configured engine,
+/// and the store handed to the handler so the metadata paths
+/// (`information_schema`, `SHOW STATS`, `SHOW EFFECTIVE POLICY`) resolve
+/// policies too. Tests register policies on `store` before running SQL.
+pub async fn setup_handler_with_policy_store(
+    store: Arc<sqe_policy::policy_store::InMemoryPolicyStore>,
+) -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
+    init_tracing();
+    let config =
+        sqe_core::SqeConfig::load(&test_config_path()).expect("Failed to load test config");
+    let authenticator = sqe_auth::Authenticator::new(&config.auth)
+        .await
+        .expect("Failed to create authenticator");
+    let session = authenticator
+        .authenticate("root", "")
+        .await
+        .expect("Auth failed for root");
+    let store: Arc<dyn sqe_policy::PolicyStore> = store;
+    let policy: Arc<dyn sqe_policy::PolicyEnforcer> = Arc::new(
+        sqe_policy::plan_rewriter::PolicyPlanRewriter::new(Arc::clone(&store)),
+    );
+    let query_tracker = Arc::new(sqe_coordinator::query_tracker::QueryTracker::new(
+        &config.query_history,
+    ));
+    let handler = sqe_coordinator::QueryHandler::new(
+        policy,
+        Some(store),
+        config,
+        None,
+        None,
+        None,
+        None,
+        query_tracker,
+        None,
+        None, // grant_backend
+        None, // lineage observer
+        sqe_coordinator::RuntimeCatalogRegistry::default(),
+        sqe_core::SecretStore::default(),
+    )
+    .expect("Failed to create QueryHandler");
+    (session, handler)
+}
+
 /// Authenticate as root and return (session, handler).
 pub async fn setup_handler() -> (sqe_core::Session, sqe_coordinator::QueryHandler) {
     init_tracing();
