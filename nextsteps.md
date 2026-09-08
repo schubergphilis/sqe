@@ -43,6 +43,11 @@
 > Also today: MR A of the split (!959, write-path decoupling) is up; its red
 > pipeline was a latent classifier bug (bare `contains("401")` matched a
 > wiremock port), fixed in !960 and merged into the branch.
+> Later the same night: the platform side of the 7.5-minute install prelude
+> landed as aikido v0.12.2 (aikido !161): a prebaked `aikido-rust` image with
+> the toolchain, clang/mold/protobuf and the supply-chain tools, pinned by
+> digest as `AIKIDO_RUST_IMAGE`; `ci/aikido-rust-image` moves this repo to
+> that release and runs `release-binaries` in the same image.
 > **NEXT:** merge !960, !959 (harmless, and it carries the split plan doc),
 > and this branch; then the same profile-and-box pass on `sqe-catalog` (43
 > of its 47 s, `hive::provider` 17 s), which sits on the critical path
