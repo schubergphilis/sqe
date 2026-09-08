@@ -122,7 +122,10 @@ hive-external = ["dep:thiserror"]
 [dependencies]
 sqe-core = { path = "../sqe-core" }
 sqe-sql = { path = "../sqe-sql" }
-sqe-policy = { path = "../sqe-policy" }
+# Only the interfaces (PolicyStore, GrantBackend, HiveCatalogs), not the
+# policy engine: build-time item C1. With the full `sqe-policy` here the
+# 22 s policy compile sat in front of this crate's on every cold build.
+sqe-policy-api = { path = "../sqe-policy-api" }
 sqe-metrics = { path = "../sqe-metrics" }
 thiserror = { workspace = true, optional = true }
 datafusion = { workspace = true }
@@ -202,6 +205,8 @@ aws-credential-types = { version = "1.3", optional = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
+# Tests build an InMemoryPolicyStore; production code needs only sqe-policy-api.
+sqe-policy = { path = "../sqe-policy" }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 sqlparser = { workspace = true }
