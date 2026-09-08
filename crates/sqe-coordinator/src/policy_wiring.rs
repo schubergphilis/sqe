@@ -47,7 +47,19 @@ pub fn build_policy_enforcer(
     };
 
     let store: Option<Arc<dyn PolicyStore>> = match config.engine {
-        PolicyEngine::Passthrough => None,
+        PolicyEngine::Passthrough => {
+            // Architecture review 212 (#565): the same startup signal the
+            // anonymous and bearer-passthrough auth providers emit.
+            // `production_mode` refuses this engine unless
+            // `security.allow_no_policy_engine` is set; dev starts with the
+            // warning.
+            tracing::warn!(
+                "policy enforcement DISABLED (policy.engine = passthrough): every user \
+                 sees every row and column the catalog allows; no row filters, masks or \
+                 column restrictions apply. Set policy.engine = \"ranger\" for enforcement."
+            );
+            None
+        }
         PolicyEngine::InMemory => Some(Arc::new(
             sqe_policy::policy_store::InMemoryPolicyStore::new(),
         )),
