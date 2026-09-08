@@ -62,6 +62,22 @@ pub struct RunFacets {
     pub parent: Option<Box<ParentRunFacet>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub errorMessage: Option<ErrorMessageFacet>,
+    /// SQE-specific: present only when the column-lineage extractor could not
+    /// trace part of the plan, so a consumer can tell "this column has no
+    /// source" from "the extractor gave up" (architecture review 610).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sqe_lineageQuality: Option<LineageQualityFacet>,
+}
+
+/// Custom run facet `sqe_lineageQuality`. `complete` is false when at least
+/// one `LogicalPlan` node kind had no column-trace rule; `untraced` lists
+/// those kinds (deduplicated, in plan order), e.g. `["Unnest"]`. Output
+/// columns that depend on such a node are absent from `columnLineage`, not
+/// wrong, and this facet is how a consumer learns that.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LineageQualityFacet {
+    pub complete: bool,
+    pub untraced: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

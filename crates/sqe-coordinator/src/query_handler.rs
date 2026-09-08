@@ -1310,6 +1310,7 @@ impl QueryHandler {
                                 statement_kind: kind_name.clone(),
                                 rows_returned: rows,
                                 plan: None,
+                                masked_fields: Vec::new(),
                             });
                         }
                     }
@@ -2686,6 +2687,13 @@ impl QueryHandler {
                             statement_kind: kind_name.clone(),
                             rows_returned: rows,
                             plan: captured_plan.take(),
+                            // Review 610: the enforcer's masked/restricted
+                            // scan columns, so column lineage reports them as
+                            // MASKED rather than identity passthrough.
+                            masked_fields: policy_summary
+                                .as_ref()
+                                .map(|s| s.masked_fields.clone())
+                                .unwrap_or_default(),
                         });
                     }
                     Err(e) => {
@@ -2713,6 +2721,10 @@ impl QueryHandler {
                             // query_tracker.rs:214.
                             error_message: e.client_message(),
                             plan: captured_plan.take(),
+                            masked_fields: policy_summary
+                                .as_ref()
+                                .map(|s| s.masked_fields.clone())
+                                .unwrap_or_default(),
                         });
                     }
                 }
