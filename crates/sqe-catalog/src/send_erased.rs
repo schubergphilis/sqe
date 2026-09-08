@@ -23,9 +23,13 @@ use datafusion::execution::session_state::SessionState;
 use datafusion::logical_expr::Expr;
 
 /// Types whose `Send + Sync`-ness this crate asserts by hand for
-/// [`SendErased`]. Implementing it is `unsafe`: the implementor promises the
-/// type is `Send + Sync`; `known_types_are_send_and_sync` below checks every
-/// implementation the ordinary way in the test build.
+/// [`SendErased`].
+///
+/// # Safety
+///
+/// The implementor promises the type is `Send + Sync`. Every implementation
+/// is checked the ordinary way by `known_types_are_send_and_sync` in the
+/// test build; add the new type there when adding an `impl`.
 pub(crate) unsafe trait KnownSend {}
 
 unsafe impl KnownSend for Vec<Expr> {}
