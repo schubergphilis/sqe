@@ -10,6 +10,27 @@ pub mod spark_runner;
 
 use std::sync::Arc;
 
+/// A wiremock server on a listener of its own, never one from wiremock's
+/// server pool.
+///
+/// `MockServer::start()` hands out pooled servers: when a test drops its
+/// server, the same `host:port` is recycled to the next test that starts
+/// one. The coordinator's catalog HTTP clients are process-wide
+/// (`SHARED_HTTP_CLIENTS` in `sqe_catalog::rest_catalog`) and keep idle
+/// connections pooled per `host:port`, and each `#[tokio::test]` is its own
+/// runtime, so the hyper task driving an idle connection dies with the test
+/// that opened it. The next test to be handed that port then reuses a
+/// connection whose driver is gone: `error sending request for url`, or a
+/// silently failed catalog discovery, in a test that did nothing wrong.
+/// This bit `trino_session_catalog_test` whenever `trino_describe_test`
+/// happened to run alongside it (first seen on the aikido-rust CI image,
+/// where the scheduling made the overlap deterministic). A fresh ephemeral
+/// listener per server means no port is ever reused within the process.
+pub async fn mock_server() -> wiremock::MockServer {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+    wiremock::MockServer::builder().listener(listener).start().await
+}
+
 /// Initialize the tracing subscriber once for the entire test binary.
 pub fn init_tracing() {
     static TRACING_INIT: std::sync::Once = std::sync::Once::new();

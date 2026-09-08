@@ -27,6 +27,23 @@
 > `query.target_task_size`, so a spread over workers needs that knob low; and
 > `distribution_threshold` / `distribution_file_threshold` keep small tables
 > local unless zeroed.
+>
+> Harness cross-talk fixed on the way (the MR's first CI run on the
+> aikido-rust image failed `trino_session_catalog_test` twice, deterministic,
+> passing locally): wiremock's `MockServer::start()` recycles pooled servers,
+> so a later test inherits an earlier test's `host:port`, and the
+> coordinator's process-wide catalog HTTP clients then reuse an idle
+> connection whose hyper driver died with the earlier `#[tokio::test]`
+> runtime ("error sending request", or a silently unresolved discovery).
+> Underneath, `trino_describe_test`, `audit_e2e_test` and `attach_rest_test`
+> used one fixed token for every test, so `SESSION_CONTEXT_CACHE`
+> (`username:token_hash:catalog:schema`) handed tests each other's contexts,
+> which the recycled ports had been masking. Fix: `common::mock_server()`
+> binds a fresh listener (no pool) at all 16 sites, and the three files use a
+> per-call token. Bisected with the 1.98 toolchain in a second target dir; the
+> toolchain was not the cause, the pairing `trino_session + trino_describe`
+> fails 6/6 on 1.97.1 too, and the full harness now passes 9/9 at 2, 4 and 8
+> threads.
 > **NEXT:** 806 (#638), 205/212 (#653), 610 (#657), 627, #659 partials; the
 > docker-capable CI runner for the `polaris` group (807 item 3).
 > **STATUS 2026-09-07 (late): build-time item C1, policy half, on `perf/policy-api-crate` (#662): `sqe-catalog` no longer waits for `sqe-policy`.**

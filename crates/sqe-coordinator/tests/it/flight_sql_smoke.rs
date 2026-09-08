@@ -51,7 +51,7 @@ fn smoke_config(catalog_url: &str) -> SqeConfig {
 async fn mount_empty_polaris() -> wiremock::MockServer {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
-    let server = wiremock::MockServer::start().await;
+    let server = crate::common::mock_server().await;
     Mock::given(method("GET"))
         .and(path("/v1/config"))
         .respond_with(

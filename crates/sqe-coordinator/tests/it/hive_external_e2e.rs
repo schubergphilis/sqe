@@ -203,7 +203,7 @@ fn ndjson_bytes(rows: &[(i64, f64)]) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 async fn mock_polaris() -> wiremock::MockServer {
-    let server = wiremock::MockServer::start().await;
+    let server = crate::common::mock_server().await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path("/v1/config"))
         .respond_with(
