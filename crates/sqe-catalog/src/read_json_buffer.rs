@@ -119,14 +119,29 @@ impl TableProvider for ReservedMemTable {
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
         self.inner.supports_filters_pushdown(filters)
     }
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
+    // Written in `async_trait`'s desugared form on purpose (compile time,
+    // see docs/internal/plans/2026-09-07-compile-time-async-hubs.md): an
+    // `async fn` here would own a coroutine that captures `filters: &[Expr]`,
+    // and proving that coroutine `Send` walks DataFusion's whole `Expr` /
+    // `LogicalPlan` type graph once more under this method's own parameter
+    // environment (about 4 s of the crate's build). Handing the inner
+    // table's already-boxed future straight through owns no coroutine at
+    // all, and the behaviour is identical.
+    fn scan<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+        &'life0 self,
+        state: &'life1 dyn Session,
+        projection: Option<&'life2 Vec<usize>>,
+        filters: &'life3 [Expr],
         limit: Option<usize>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.scan(state, projection, filters, limit).await
+    ) -> futures::future::BoxFuture<'async_trait, DFResult<Arc<dyn ExecutionPlan>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.inner.scan(state, projection, filters, limit)
     }
 }
 

@@ -567,7 +567,25 @@ impl SqeSchemaProvider {
     /// single `list_namespaces` call. Sibling warehouses named by the view
     /// body are registered lazily, only when planning fails to resolve a
     /// reference.
-    async fn plan_view(&self, name: &str, sql: String) -> DFResult<Option<Arc<dyn TableProvider>>> {
+    ///
+    /// Boxed at the definition (compile time, see
+    /// docs/internal/plans/2026-09-07-compile-time-async-hubs.md): the
+    /// coroutine holds a `DataFrame` (a `LogicalPlan`) across its awaits, and
+    /// proving that `Send` walks DataFusion's whole plan graph. Done once
+    /// here instead of again inside `SchemaProvider::table`.
+    fn plan_view<'a>(
+        &'a self,
+        name: &'a str,
+        sql: String,
+    ) -> futures::future::BoxFuture<'a, DFResult<Option<Arc<dyn TableProvider>>>> {
+        Box::pin(self.plan_view_inner(name, sql))
+    }
+
+    async fn plan_view_inner(
+        &self,
+        name: &str,
+        sql: String,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
         let catalog_name = &self.warehouse;
 
         let mini_ctx = SessionContext::new_with_config(

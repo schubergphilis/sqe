@@ -57,6 +57,7 @@ use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
+use futures::future::BoxFuture;
 use futures::TryStreamExt;
 use moka::sync::Cache as SyncCache;
 use object_store::{ObjectMeta, ObjectStore};
@@ -1074,34 +1075,64 @@ impl TableProvider for HiveTableProvider {
         Some(self.statistics.clone())
     }
 
-    async fn insert_into(
-        &self,
-        state: &dyn Session,
+    // The four DML hooks below are written in `async_trait`'s desugared form
+    // on purpose (compile time, see
+    // docs/internal/plans/2026-09-07-compile-time-async-hubs.md): an
+    // `async fn` wrapper owns a coroutine capturing `Vec<Expr>`, and proving
+    // it `Send` walks DataFusion's whole `Expr` graph once more under this
+    // method's parameter environment (2 s apiece). The inner table's future
+    // is already boxed, so it is handed straight through.
+    fn insert_into<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        state: &'life1 dyn Session,
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.insert_into(state, input, insert_op).await
+    ) -> BoxFuture<'async_trait, DFResult<Arc<dyn ExecutionPlan>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.inner.insert_into(state, input, insert_op)
     }
 
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
+    fn delete_from<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        state: &'life1 dyn Session,
         filters: Vec<Expr>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.delete_from(state, filters).await
+    ) -> BoxFuture<'async_trait, DFResult<Arc<dyn ExecutionPlan>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.inner.delete_from(state, filters)
     }
 
-    async fn update(
-        &self,
-        state: &dyn Session,
+    fn update<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        state: &'life1 dyn Session,
         assignments: Vec<(String, Expr)>,
         filters: Vec<Expr>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.update(state, assignments, filters).await
+    ) -> BoxFuture<'async_trait, DFResult<Arc<dyn ExecutionPlan>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.inner.update(state, assignments, filters)
     }
 
-    async fn truncate(&self, state: &dyn Session) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.truncate(state).await
+    fn truncate<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        state: &'life1 dyn Session,
+    ) -> BoxFuture<'async_trait, DFResult<Arc<dyn ExecutionPlan>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.inner.truncate(state)
     }
 }
 
@@ -1582,6 +1613,45 @@ impl SchemaProvider for HiveSchemaProvider {
             resolved.compression =
                 detect_compression(&data_store, url.prefix(), resolved.compression).await;
         }
+        let projection_cfg =
+            parse_projection(&manifest.parameters, &manifest.partition_keys).map_err(to_df)?;
+        let index = manifest.sqe.partition_index.clone();
+        let partition_types: Vec<(String, String)> = manifest
+            .partition_keys
+            .iter()
+            .map(|k| (k.name.clone(), k.r#type.clone()))
+            .collect();
+
+        // The one remaining await of this method runs BEFORE the
+        // `ListingTable` exists (compile time, see
+        // docs/internal/plans/2026-09-07-compile-time-async-hubs.md): its
+        // `ListingOptions` carry `Expr`s (`file_sort_order`), and a coroutine
+        // that holds them across an await pays a `Send` proof over
+        // DataFusion's whole expression graph. Listing the files first keeps
+        // every later step synchronous.
+        let needs_listing = manifest.hive_statistics().is_none()
+            && index.is_none()
+            && !projection_cfg.as_ref().map(|p| p.enabled).unwrap_or(false);
+        let listed_files: Option<Vec<ObjectMeta>> = if needs_listing {
+            match data_store
+                .list(Some(url.prefix()))
+                .try_collect::<Vec<ObjectMeta>>()
+                .await
+            {
+                Ok(files) => Some(files),
+                Err(e) => {
+                    warn!(
+                        database = %self.database, table = %name, error = %e,
+                        "hive_external: could not list files for size-only statistics; \
+                         table remains queryable with unknown statistics"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let options = listing_options(&resolved, partition_cols).map_err(to_df)?;
 
         let file_schema_ref = Arc::new(file_schema);
@@ -1592,15 +1662,6 @@ impl SchemaProvider for HiveSchemaProvider {
         let listing_table = ListingTable::try_new(config)?;
         let full_schema = listing_table.schema();
 
-        let projection_cfg =
-            parse_projection(&manifest.parameters, &manifest.partition_keys).map_err(to_df)?;
-        let index = manifest.sqe.partition_index.clone();
-        let partition_types: Vec<(String, String)> = manifest
-            .partition_keys
-            .iter()
-            .map(|k| (k.name.clone(), k.r#type.clone()))
-            .collect();
-
         let statistics = if let Some(hs) = manifest.hive_statistics() {
             let bytes = index
                 .as_ref()
@@ -1609,23 +1670,10 @@ impl SchemaProvider for HiveSchemaProvider {
         } else if let Some(idx) = &index {
             let bytes: u64 = idx.entries.iter().map(|e| e.total_bytes).sum();
             size_only_from_index(bytes, width_hint, &full_schema)
-        } else if projection_cfg.as_ref().map(|p| p.enabled).unwrap_or(false) {
-            Statistics::new_unknown(&full_schema)
         } else {
-            match data_store
-                .list(Some(url.prefix()))
-                .try_collect::<Vec<ObjectMeta>>()
-                .await
-            {
-                Ok(files) => size_only_statistics(&files, width_hint, &full_schema),
-                Err(e) => {
-                    warn!(
-                        database = %self.database, table = %name, error = %e,
-                        "hive_external: could not list files for size-only statistics; \
-                         table remains queryable with unknown statistics"
-                    );
-                    Statistics::new_unknown(&full_schema)
-                }
+            match listed_files {
+                Some(files) => size_only_statistics(&files, width_hint, &full_schema),
+                None => Statistics::new_unknown(&full_schema),
             }
         };
 
