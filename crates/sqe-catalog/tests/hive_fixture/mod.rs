@@ -220,6 +220,11 @@ pub async fn register_hive_root(ctx: &SessionContext, f: &Fixture) -> Arc<HiveCa
         Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new()),
         Duration::from_secs(60),
     ));
+    // The synchronous `schema_names()` / `table_names()` hooks serve
+    // snapshots that only an async refresh fills (review 806); the
+    // coordinator does this before planning, a raw `SessionContext` does not,
+    // so `information_schema` / `SHOW TABLES` on this context need it here.
+    provider.refresh_all().await;
     ctx.register_catalog("lake", provider.clone());
     provider
 }
