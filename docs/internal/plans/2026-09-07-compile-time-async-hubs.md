@@ -173,12 +173,22 @@ DataFusion trait:
    `table()` method now lists files for statistics *before* it builds the
    `ListingTable`, so its last await holds none (3.9 s -> 2.3 s).
 
-Per-crate `evaluate_obligation`: 39.5 s -> 13.9 s; the profiled crate build
-42 s -> 25 s. What remains: `HiveTableProvider::scan` / `scan_with_args`
-(4.5 s, they must own the rewritten `Vec<Expr>` the inner scan borrows),
-`ScopedTable::scan` (2.4 s, holds a `SessionState` across the await), the
-Hive `table()` residue (2.3 s). Each would need an owned-argument variant of
-the DataFusion trait method to disappear.
+4. **State the fact once when the block must own the value.** Three methods
+   have no choice: `HiveTableProvider::scan` / `scan_with_args` must own the
+   rewritten `Vec<Expr>` the inner scan borrows, `ScopedTable::scan` must own
+   the scoped `SessionState` (and needs the `&[Expr]`). Both types are
+   `Send + Sync`; only the proof is expensive. `crate::send_erased::SendErased`
+   is a newtype with an `unsafe impl Send + Sync` gated on an `unsafe` marker
+   trait implemented for exactly those types, and a unit test that proves
+   the marker's claim the ordinary way. The coroutine holds the wrapper and
+   the proof stops there: 4.5 s + 2.4 s -> 0. DataFusion is not vendored in
+   this repo (only iceberg-rust is), so an owned-argument trait variant was
+   never on the table; this is the substitute.
+
+Per-crate `evaluate_obligation`: 39.5 s -> 7.2 s; the profiled crate build
+42 s -> 19 s. What remains: the Hive `table()` tail (2.3 s) and 1.2 s on
+`ReservedMemTable::scan` that the pass-through did not remove, plus the long
+tail of `SessionCatalog` methods at 0.2 to 0.4 s each.
 
 The predicate aggregation is a two-line addition to the attribution script's
 input and is worth running first next time: it tells you *what type* is being
@@ -189,4 +199,4 @@ walked, which is what decides between the three shapes above.
 - 2026-09-07: measured, fixed, documented (this file); chain 173 s -> 131 s.
 - 2026-09-08: C1 policy half (!963) and C4 coordinator (!961) on main: chain
   108.8 s. sqe-catalog C4 on `perf/catalog-async-hubs`: obligations
-  39.5 s -> 13.9 s (section above).
+  39.5 s -> 7.2 s (section above).
