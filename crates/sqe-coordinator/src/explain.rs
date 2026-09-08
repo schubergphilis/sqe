@@ -65,6 +65,7 @@ impl ExplainHandler {
         inner_sql: &str,
         ctx: &SessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        crate::query_handler::prepare_file_tvfs(ctx, inner_sql).await?;
         let df = ctx
             .sql(inner_sql)
             .await
@@ -122,6 +123,7 @@ impl ExplainHandler {
         let total_start = std::time::Instant::now();
 
         let parse_start = std::time::Instant::now();
+        crate::query_handler::prepare_file_tvfs(ctx, inner_sql).await?;
         let df = ctx
             .sql(inner_sql)
             .await
@@ -261,6 +263,7 @@ impl ExplainHandler {
         let total_start = std::time::Instant::now();
 
         let parse_start = std::time::Instant::now();
+        crate::query_handler::prepare_file_tvfs(ctx, inner_sql).await?;
         let df = ctx
             .sql(inner_sql)
             .await
