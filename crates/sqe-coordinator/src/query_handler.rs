@@ -3476,6 +3476,8 @@ impl QueryHandler {
         sql: &str,
         query_id: Option<&uuid::Uuid>,
     ) -> sqe_core::Result<(LogicalPlan, TimeTravelCleanup)> {
+        self.refresh_listing_snapshots(ctx, session_catalog, session, sql)
+            .await;
         let (sql, incremental_identities) =
             self.handle_incremental(sql, ctx, session_catalog).await?;
         let (sql, tt_cleanup) = self
@@ -3537,6 +3539,8 @@ impl QueryHandler {
                 self.preflight_resolve_catalogs(stmt, session).await?;
             }
             let (ctx, session_catalog) = self.create_session_context(session).await?;
+            self.refresh_listing_snapshots(&ctx, &session_catalog, session, sql)
+                .await;
             // Register incremental providers so the planner can resolve the
             // tables with their augmented schemas. The FOR INCREMENTAL clause
             // must be stripped before handle_time_travel sees it because that
@@ -3635,6 +3639,65 @@ impl QueryHandler {
             .collect())
     }
 
+    /// Review 806: refresh, on the async path, the listing snapshots that
+    /// DataFusion's synchronous `schema_names()` / `table_names()` hooks will
+    /// serve while planning `sql`, so no hook ever bridges onto the network.
+    /// Iceberg: the table-name snapshots of the namespaces the statement
+    /// references in the session warehouse. Hive: the database list and the
+    /// referenced databases' tables of every attached root. Snapshots
+    /// younger than their TTL are skipped; failures are recorded in the
+    /// snapshot (served as last known, with a warning) and the table lookup
+    /// itself reports the precise error. Called by every path that plans
+    /// through `ctx.sql`: execute, the Flight stream planner and
+    /// `get_schema`.
+    async fn refresh_listing_snapshots(
+        &self,
+        ctx: &SessionContext,
+        session_catalog: &Arc<SessionCatalog>,
+        session: &Session,
+        sql: &str,
+    ) {
+        sqe_catalog::schema_provider::refresh_referenced_namespaces(
+            session_catalog,
+            session_catalog.warehouse(),
+            sql,
+            session.default_schema.as_deref(),
+        )
+        .await;
+
+        let Ok(roots) = self.runtime_catalogs.hive_roots() else {
+            return;
+        };
+        if roots.is_empty() {
+            return;
+        }
+        // `session.default_catalog` fills the missing catalog of `db.t`
+        // references; a Hive root only sees those when it is the default.
+        let default_catalog = session
+            .default_catalog
+            .clone()
+            .unwrap_or_else(|| self.config.resolve_default_catalog());
+        for (name, _) in roots {
+            // The session-scoped provider `create_session_context` registered
+            // for this root; `CatalogProvider: Any`, so the downcast is the
+            // supported way to reach it.
+            let Some(provider) = ctx.catalog(&name) else {
+                continue;
+            };
+            let any: &dyn std::any::Any = provider.as_ref();
+            let Some(hive) = any.downcast_ref::<sqe_catalog::hive::provider::HiveCatalogProvider>()
+            else {
+                continue;
+            };
+            hive.refresh_referenced(
+                sql,
+                Some(default_catalog.as_str()),
+                session.default_schema.as_deref(),
+            )
+            .await;
+        }
+    }
+
     /// Execute a SELECT query through DataFusion with the user's catalog.
     ///
     /// After policy enforcement and physical planning, this method attempts to
@@ -3659,19 +3722,8 @@ impl QueryHandler {
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
 
-        // Review 806: refresh the table-name snapshots of the namespaces this
-        // statement references here, on the async path, so DataFusion's
-        // synchronous `SchemaProvider::table_names()` never bridges onto the
-        // network. Snapshots younger than the TTL are skipped; failures are
-        // recorded in the snapshot (served as last-known + warning) and the
-        // table lookup itself reports the precise error.
-        sqe_catalog::schema_provider::refresh_referenced_namespaces(
-            &session_catalog,
-            session_catalog.warehouse(),
-            sql,
-            session.default_schema.as_deref(),
-        )
-        .await;
+        self.refresh_listing_snapshots(&ctx, &session_catalog, session, sql)
+            .await;
 
         // Pre-process incremental (CDC) first. The FOR INCREMENTAL BETWEEN
         // clause is not modelled by sqlparser-rs, so the downstream
@@ -5130,7 +5182,13 @@ impl QueryHandler {
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let col_sql = info_schema_columns_query(table_name);
 
-        let (ctx, _) = self.create_session_context(session).await?;
+        let (ctx, session_catalog) = self.create_session_context(session).await?;
+        // `information_schema.columns` enumerates every catalog's schemas and
+        // tables through the synchronous listing hooks, which only serve
+        // snapshots (review 806); fill them first or a Hive table's columns
+        // come back empty.
+        self.refresh_listing_snapshots(&ctx, &session_catalog, session, &col_sql)
+            .await;
         let df = ctx.sql(&col_sql).await.map_err(|e| {
             SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("failed to query information_schema.columns: {e}"))
         })?;
