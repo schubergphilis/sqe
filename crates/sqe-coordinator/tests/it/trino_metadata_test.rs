@@ -47,7 +47,7 @@ fn print_str_cols(label: &str, batches: &[arrow_array::RecordBatch]) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn information_schema_reveals_provider_and_catalog() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -159,7 +159,7 @@ async fn information_schema_reveals_provider_and_catalog() {
 // #4: DESCRIBE <table> must be supported (aliased to SHOW COLUMNS) instead of
 // failing with "Statement type not supported". Returns the same projection.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn describe_table_aliases_to_show_columns() {
     let (session, handler) = crate::common::setup_handler().await;
     let ns = "default";
@@ -209,7 +209,7 @@ async fn describe_table_aliases_to_show_columns() {
 // escaping, `WHERE table_name = 'weird'name'` is a SQL error (or injection);
 // with escaping it is a valid query that simply matches no table.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn describe_with_quote_in_name_is_escaped_not_injected() {
     let (session, handler) = crate::common::setup_handler().await;
     let r = handler

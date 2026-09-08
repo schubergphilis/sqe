@@ -321,7 +321,7 @@ async fn count_of(handler: &QueryHandler, session: &Session, sql: &str) -> i64 {
 ///   provider-reuse window (see `hive_ddl_test.rs`'s comment on why a
 ///   SQL-level post-DROP read was removed as non-discriminating there).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the local Polaris + RustFS stack"]
+#[ignore = "needs:polaris"]
 async fn hive_external_table_round_trips_on_object_storage() {
     let store = s3_store();
     reset_prefix(store.as_ref(), "hive-t11-wh/sales/orders").await;
@@ -468,7 +468,7 @@ async fn hive_external_table_round_trips_on_object_storage() {
 /// column order would also fail it, since the assertion is keyed by `id`
 /// found via `WHERE`, not by position.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the local Polaris + RustFS stack"]
+#[ignore = "needs:polaris"]
 async fn parquet_and_json_tables_read_on_object_storage() {
     let store = s3_store();
     reset_prefix(store.as_ref(), "hive-t11-wh/sales/orders_parquet").await;
@@ -582,7 +582,7 @@ async fn parquet_and_json_tables_read_on_object_storage() {
 /// session B's read succeed, since nothing would re-validate the location
 /// on load. This test fails exactly that mutation.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the local Polaris + RustFS stack"]
+#[ignore = "needs:polaris"]
 async fn hive_load_denied_when_location_fails_the_storage_allowlist() {
     let store = s3_store();
     reset_prefix(store.as_ref(), "hive-t11-wh/sales/guarded").await;

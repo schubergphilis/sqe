@@ -1,5 +1,24 @@
 # SQE — Next Steps
 
+> **STATUS 2026-09-07 (late night): finding 807, items 1 and 2, on `test/ignore-groups-807`: every `#[ignore]` names its stack; `make test-integration GROUP=<stack>` runs one stack's worth.**
+>
+> 250 `#[ignore]` attributes now carry a reason whose first token is a fixed
+> vocabulary (`needs:polaris`, `needs:polaris+workers`, `needs:ranger`,
+> `needs:ranger+spark`, `needs:spark`, `needs:trino`, `needs:postgres`,
+> `needs:hms`, `needs:nessie`, `needs:unity`, `needs:minio`, `needs:aws`,
+> `bug:#n`, `bench`, `deferred`, `release-only`); 136 were bare before. New
+> `cargo xtask test-groups` lists the groups (polaris 158, ranger 43,
+> ranger+spark 19, aws 6, polaris+workers 5, ...), `--check` fails on a bare or
+> unknown reason and runs in `ci/aikido-rust-extra.sh`, `--names <group>`
+> feeds `scripts/integration-test.sh` so `make test-integration GROUP=polaris`
+> runs exactly those tests by libtest name (module-qualified for the `it`
+> harness; verified against the binary's own `--list --ignored`). Rules and
+> the open item (a docker-capable CI runner for the `polaris` group) in
+> `docs/internal/process/test-groups.md`.
+> **NEXT:** finding 411 (#591): the chaos worker and six failure cases behind
+> `make test-distributed`; then 806 (#638), 205/212 (#653), 610 (#657), 627,
+> #659 partials.
+
 > **STATUS 2026-09-07 (night): coordinator compile 68 s -> 18 s by boxing four async hubs, on `perf/compile-time-async-hubs`; the crate split is demoted to a structural item.**
 >
 > The crate-split plan rested on a warm-incremental measurement. Repeated

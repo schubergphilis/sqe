@@ -363,7 +363,7 @@ async fn seed_discovery_warehouse() {
 /// in `[catalogs.*]`. With `catalog_discovery = "static"` the warehouse must
 /// NOT be discovered -- "unknown catalog" is returned immediately.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn static_mode_rejects_undeclared_warehouse() {
     let _live = LIVE_STACK_LOCK.lock().await;
     crate::common::init_tracing();
@@ -404,7 +404,7 @@ async fn static_mode_rejects_undeclared_warehouse() {
 /// and the SELECT returns the seeded row from the DISCOVERED warehouse (not the
 /// default `test_warehouse`).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn polaris_auto_lazy_hit() {
     let _live = LIVE_STACK_LOCK.lock().await;
     crate::common::init_tracing();
@@ -452,7 +452,7 @@ async fn polaris_auto_lazy_hit() {
 /// loading the target failed with "table does not exist" even though
 /// INSERT/SELECT/CTAS resolved the same table.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn polaris_auto_mutations_on_discovered_catalog() {
     let _live = LIVE_STACK_LOCK.lock().await;
     crate::common::init_tracing();
@@ -567,7 +567,7 @@ async fn polaris_auto_mutations_on_discovered_catalog() {
 /// found". This is the schema-planning twin of `polaris_auto_lazy_hit` and the
 /// exact path `get_flight_info_statement` takes before `do_get` ever runs.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn polaris_auto_get_schema_lazy_hit() {
     let _live = LIVE_STACK_LOCK.lock().await;
     crate::common::init_tracing();
@@ -599,7 +599,7 @@ async fn polaris_auto_get_schema_lazy_hit() {
 /// returns None, and the pre-flight check produces "unknown catalog" with no
 /// Polaris HTTP details leaked to the caller.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn polaris_auto_nonexistent_warehouse_returns_unknown_catalog() {
     let _live = LIVE_STACK_LOCK.lock().await;
     crate::common::init_tracing();
@@ -636,7 +636,7 @@ async fn polaris_auto_nonexistent_warehouse_returns_unknown_catalog() {
 /// session succeeds both times. The second reference reuses the provider
 /// registered into the session context by the first discovery.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn polaris_auto_in_session_reuse() {
     let _live = LIVE_STACK_LOCK.lock().await;
     crate::common::init_tracing();
@@ -683,7 +683,7 @@ async fn polaris_auto_in_session_reuse() {
 /// the DISCOVERED `discovery_test_wh`, not the default. Before the write-path
 /// fix this failed because `create_catalog_bridge` always used `config.catalog`.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn polaris_auto_insert_lands_in_discovered_warehouse() {
     let _live = LIVE_STACK_LOCK.lock().await;
     crate::common::init_tracing();
@@ -723,7 +723,7 @@ async fn polaris_auto_insert_lands_in_discovered_warehouse() {
 /// the default warehouse, so `CREATE SCHEMA ws.x` landed in the default and
 /// `DROP TABLE ws.x.t` reported "table does not exist".
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn polaris_auto_ddl_resolves_discovered_warehouse() {
     let _live = LIVE_STACK_LOCK.lock().await;
     crate::common::init_tracing();

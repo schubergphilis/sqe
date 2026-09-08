@@ -12,6 +12,10 @@ cargo check -p sqe-catalog --no-default-features --features rest,sql-sqlite
 cargo check -p sqe-catalog --no-default-features
 cargo xtask matrix-report --min-percent 50
 
+# Every #[ignore] must name the stack it needs (finding 807): a bare #[ignore]
+# or a reason outside the vocabulary in xtask/src/test_groups.rs fails here.
+cargo xtask test-groups --check
+
 # The workspace-hack crate must match the dependency graph, or per-crate builds
 # silently fall back to their own feature resolution and the 38-copies problem
 # returns without anyone noticing. `generate --diff` exits non-zero on drift.

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 // Test: Authenticate via client_credentials against Polaris built-in OAuth
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_authentication() {
     let config = sqe_core::SqeConfig::load(&crate::common::test_config_path())
         .expect("Failed to load test config");
@@ -27,7 +27,7 @@ async fn test_authentication() {
 
 // Test: Token fingerprint is stable for the same principal
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_token_fingerprint() {
     let config = sqe_core::SqeConfig::load(&crate::common::test_config_path())
         .expect("Failed to load test config");
@@ -49,7 +49,7 @@ async fn test_token_fingerprint() {
 
 // Test: Query handler executes SELECT 1
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_simple_select() {
     let config = sqe_core::SqeConfig::load(&crate::common::test_config_path())
         .expect("Failed to load test config");
@@ -122,7 +122,7 @@ fn test_sql_classification() {
 
 // Test: CTAS roundtrip — create a table, select from it, verify, cleanup
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_ctas_roundtrip() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -177,7 +177,7 @@ async fn test_ctas_roundtrip() {
 
 // Test: INSERT INTO — create a table, insert a second row, verify both rows
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_insert_into() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -224,7 +224,7 @@ async fn test_insert_into() {
 
 // Test: DROP TABLE — create a table, drop it, verify it no longer appears
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_drop_table() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -261,7 +261,7 @@ async fn test_drop_table() {
 
 // Test: DROP TABLE IF EXISTS on a non-existent table should not error
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_drop_table_if_exists_no_error() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -322,7 +322,7 @@ fn test_worker_registry_no_workers() {
 
 // Test: Coordinator with no workers falls back to local execution
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_local_fallback_without_workers() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -381,7 +381,7 @@ fn test_scan_task_roundtrip() {
 // fall-back path must be a deliberate, named test that asserts the result
 // shape WITHOUT a worker registry.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + bootstrap-test.sh"]
+#[ignore = "needs:polaris"]
 async fn test_local_fallback_select() {
     let config = sqe_core::SqeConfig::load(&crate::common::test_config_path())
         .expect("Failed to load test config");
@@ -455,7 +455,7 @@ async fn test_local_fallback_select() {
 // Wired into CI via scripts/integration-test.sh (DISTRIBUTED=1) +
 // dedicated distributed-smoke job in .gitlab-ci.yml (Q-05).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.distributed.yml + a worker on :50052"]
+#[ignore = "needs:polaris+workers; a worker on :50052"]
 async fn test_distributed_select() {
     let config = sqe_core::SqeConfig::load(&crate::common::test_config_path())
         .expect("Failed to load test config");
@@ -650,7 +650,7 @@ fn test_trino_batches_to_json() {
 
 // Test: information_schema.tables is queryable
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_information_schema_tables() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -702,7 +702,7 @@ fn write_test_parquet(dir: &std::path::Path) -> std::path::PathBuf {
 
 // Test: read_parquet() TVF — CTAS from a local Parquet file, verify round-trip
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_read_parquet_local_file() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -845,7 +845,7 @@ fn assert_three_known_rows(batches: &[arrow_array::RecordBatch]) {
 
 // Test: read_csv() TVF — CTAS from a local CSV file, verify round-trip.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_read_csv_local_file() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -882,7 +882,7 @@ async fn test_read_csv_local_file() {
 
 // Test: read_json() TVF — CTAS from a local NDJSON file, verify round-trip.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_read_json_local_file() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -919,7 +919,7 @@ async fn test_read_json_local_file() {
 
 // Test: information_schema.schemata is queryable
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_information_schema_schemata() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -1011,7 +1011,7 @@ async fn teardown_join_fixture(
 
 // Test: CREATE VIEW registers the view in Polaris; DROP VIEW removes it
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_create_and_drop_view() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1075,7 +1075,7 @@ async fn test_create_and_drop_view() {
 
 // Test: View with aggregation — high earners per department
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_view_with_aggregation() {
     let (session, handler) = setup_join_fixture().await;
     let _ = handler
@@ -1123,7 +1123,7 @@ async fn test_view_with_aggregation() {
 
 // Test: INNER JOIN — only employees that have a matching department
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_inner_join() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1159,7 +1159,7 @@ async fn test_inner_join() {
 
 // Test: LEFT JOIN — all employees, NULL dept_name for those without a department
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_left_join() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1189,7 +1189,7 @@ async fn test_left_join() {
 
 // Test: RIGHT JOIN — all departments including HR which has no employees
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_right_join() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1214,7 +1214,7 @@ async fn test_right_join() {
 
 // Test: FULL OUTER JOIN — all employees AND all departments
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_full_outer_join() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1239,7 +1239,7 @@ async fn test_full_outer_join() {
 
 // Test: CROSS JOIN — cartesian product (small tables only!)
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_cross_join() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -1292,7 +1292,7 @@ async fn test_cross_join() {
 
 // Test: Self-join — manager hierarchy (employee referencing employee)
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_self_join() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -1343,7 +1343,7 @@ async fn test_self_join() {
 
 // Test: GROUP BY with COUNT, SUM, AVG, MIN, MAX
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_aggregation_basic() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1382,7 +1382,7 @@ async fn test_aggregation_basic() {
 
 // Test: HAVING clause — only departments with avg salary > 75000
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_having_clause() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1410,7 +1410,7 @@ async fn test_having_clause() {
 
 // Test: JOIN + GROUP BY together — department summary with headcount and avg
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_join_with_aggregation() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1435,7 +1435,7 @@ async fn test_join_with_aggregation() {
 
 // Test: CTE (WITH clause) + JOIN
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_cte_join() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1462,7 +1462,7 @@ async fn test_cte_join() {
 
 // Test: Subquery in WHERE clause
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_subquery_where() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1498,7 +1498,7 @@ async fn test_subquery_where() {
 
 // Test: Scalar subquery in SELECT
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_scalar_subquery_select() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1521,7 +1521,7 @@ async fn test_scalar_subquery_select() {
 
 // Test: UNION ALL across tables
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_union_all() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -1578,7 +1578,7 @@ async fn test_union_all() {
 
 // Test: ORDER BY, LIMIT, OFFSET
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_order_limit_offset() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1609,7 +1609,7 @@ async fn test_order_limit_offset() {
 
 // Test: WHERE with multiple conditions (AND, OR, NOT)
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_where_conditions() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1637,7 +1637,7 @@ async fn test_where_conditions() {
 
 // Test: CASE expression
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_case_expression() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1675,7 +1675,7 @@ async fn test_case_expression() {
 
 // Test: String functions (UPPER, LOWER, LENGTH, CONCAT)
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_string_functions() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1716,7 +1716,7 @@ async fn test_string_functions() {
 
 // Test: Math functions and expressions
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_math_expressions() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1740,7 +1740,7 @@ async fn test_math_expressions() {
 
 // Test: Multiple CTEs chained
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_multiple_ctes() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1775,7 +1775,7 @@ async fn test_multiple_ctes() {
 
 // Test: Three-way JOIN — employees + departments + a project table
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_three_way_join() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1825,7 +1825,7 @@ async fn test_three_way_join() {
 
 // Test: IN and NOT IN subquery
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_in_subquery() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1850,7 +1850,7 @@ async fn test_in_subquery() {
 
 // Test: EXISTS correlated subquery
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_exists_subquery() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1876,7 +1876,7 @@ async fn test_exists_subquery() {
 
 // Test: Window functions — ROW_NUMBER, RANK, dense_rank
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_window_functions() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1902,7 +1902,7 @@ async fn test_window_functions() {
 
 // Test: Running total and lead/lag with window
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_window_running_total() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1928,7 +1928,7 @@ async fn test_window_running_total() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_explain_plan() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -1978,7 +1978,7 @@ async fn test_explain_plan() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_explain_analyze() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -2018,7 +2018,7 @@ async fn test_explain_analyze() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_explain_full() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -2070,7 +2070,7 @@ async fn test_explain_full() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_explain_policy_aware() {
     let (session, handler) = setup_join_fixture().await;
 
@@ -2120,7 +2120,7 @@ fn keycloak_config() -> Option<sqe_core::SqeConfig> {
 
 // Test: Authenticate against Keycloak with test users (task 2.6)
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: SQE quickstart with Keycloak running + SQE_TEST_KEYCLOAK_URL set
+#[ignore = "needs:polaris"] // Requires: SQE quickstart with Keycloak running + SQE_TEST_KEYCLOAK_URL set
 async fn test_keycloak_auth_with_test_users() {
     crate::common::init_tracing();
     let config = match keycloak_config() {
@@ -2181,7 +2181,7 @@ async fn test_keycloak_auth_with_test_users() {
 
 // Test: Token refresh via Keycloak (task 2.6)
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: SQE quickstart with Keycloak running + SQE_TEST_KEYCLOAK_URL set
+#[ignore = "needs:polaris"] // Requires: SQE quickstart with Keycloak running + SQE_TEST_KEYCLOAK_URL set
 async fn test_keycloak_token_refresh() {
     crate::common::init_tracing();
     let config = match keycloak_config() {
@@ -2219,7 +2219,7 @@ async fn test_keycloak_token_refresh() {
 
 // Test: Different users see different catalog visibility (task 7.13)
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: SQE quickstart with Keycloak + Polaris running + SQE_TEST_KEYCLOAK_URL set
+#[ignore = "needs:polaris"] // Requires: SQE quickstart with Keycloak + Polaris running + SQE_TEST_KEYCLOAK_URL set
 async fn test_different_user_catalog_visibility() {
     crate::common::init_tracing();
     let config = match keycloak_config() {
@@ -2328,7 +2328,7 @@ impl sqe_trino_compat::server::TrinoQueryExecutor for TestTrinoQuery {
 
 // Test: Trino /v1/statement endpoint handles a query via HTTP
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_trino_http_query() {
     crate::common::init_tracing();
 
@@ -2451,7 +2451,7 @@ async fn test_trino_http_query() {
 /// - SELECT from non-existent table
 /// - Double CREATE (should fail)
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_table_lifecycle_edge_cases() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -2760,7 +2760,7 @@ async fn test_table_lifecycle_edge_cases() {
 
 /// Probe: function compatibility and type mismatch error quality.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "needs:polaris"]
 async fn test_function_compat_and_type_errors() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -2829,7 +2829,7 @@ async fn test_function_compat_and_type_errors() {
 /// on data file names. This reproduces the bug where a 2000-row INSERT via dbt
 /// failed with "Cannot add files that are already referenced by table".
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_large_insert_multi_batch() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -2922,7 +2922,7 @@ async fn test_large_insert_multi_batch() {
 /// Test that error codes are properly classified — not generic INTERNAL_ERROR.
 /// Each error scenario should produce a specific SqeErrorCode, not ExecutionFailed.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_error_classification_live() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -3042,7 +3042,7 @@ async fn test_error_classification_live() {
 
 // Test: DELETE FROM with WHERE clause — removes matching rows
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_delete_with_where() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -3124,7 +3124,7 @@ async fn test_delete_with_where() {
 
 // Test: DELETE FROM without WHERE (truncate) — removes all rows
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_delete_all() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -3188,7 +3188,7 @@ async fn test_delete_all() {
 
 // Test: UPDATE with WHERE clause — modifies matching rows
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_update_with_where() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -3273,7 +3273,7 @@ async fn test_update_with_where() {
 
 // Test: UPDATE all rows — modifies every row without WHERE clause
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_update_all_rows() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -3361,7 +3361,7 @@ async fn test_update_all_rows() {
 
 // Test: MERGE INTO with UPDATE on matched rows and INSERT on unmatched rows
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_merge_insert_and_update() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -3470,7 +3470,7 @@ async fn test_merge_insert_and_update() {
 
 // Test: MERGE INTO with WHEN MATCHED THEN DELETE
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_merge_delete_matched() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -3576,7 +3576,7 @@ async fn test_merge_delete_matched() {
 
 // Test: DELETE on a larger dataset (1000 rows, delete ~333 where id % 3 = 0)
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_delete_larger_dataset() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -3685,7 +3685,7 @@ async fn test_delete_larger_dataset() {
 
 // Test: UPDATE on a larger dataset (100 rows, update 21 rows)
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_update_larger_dataset() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -3788,7 +3788,7 @@ async fn test_update_larger_dataset() {
 
 // Test: DELETE across multiple data files (created by multiple INSERT operations)
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_delete_multiple_data_files() {
     let (session, handler) = crate::common::setup_handler().await;
 
@@ -3906,7 +3906,7 @@ async fn test_delete_multiple_data_files() {
 
 // Test: UPDATE across multiple data files (created by multiple INSERT operations)
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn test_update_multiple_data_files() {
     let (session, handler) = crate::common::setup_handler().await;
 

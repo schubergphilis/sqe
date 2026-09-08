@@ -119,7 +119,7 @@ async fn spark_eventually_ok(ctx: &AcCtx, who: &str, sql: &str) -> Vec<Vec<Strin
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+#[ignore = "needs:ranger+spark; run scripts/spark-access-control-test.sh"]
 async fn spark_denied_before_any_grant() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -143,7 +143,7 @@ async fn spark_denied_before_any_grant() {
 /// decides, and that is what this proves: with the item in place and no Polaris
 /// grant, the read is still refused, BY POLARIS.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+#[ignore = "needs:ranger+spark; run scripts/spark-access-control-test.sh"]
 async fn object_denial_survives_the_frontend_defer_policy() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -186,7 +186,7 @@ async fn object_denial_survives_the_frontend_defer_policy() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+#[ignore = "needs:ranger+spark; run scripts/spark-access-control-test.sh"]
 async fn spark_grant_select_to_role_enables_exact_rows() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -226,7 +226,7 @@ async fn spark_grant_select_to_role_enables_exact_rows() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+#[ignore = "needs:ranger+spark; run scripts/spark-access-control-test.sh"]
 async fn spark_role_grant_and_user_grant_both_apply() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -259,7 +259,7 @@ async fn spark_role_grant_and_user_grant_both_apply() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+#[ignore = "needs:ranger+spark; run scripts/spark-access-control-test.sh"]
 async fn spark_revoke_disables_access() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -312,7 +312,7 @@ async fn row_count_via_sqe(ctx: &AcCtx) -> usize {
 /// row count is therefore asserted as well: authorization is only real if nothing
 /// landed.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+#[ignore = "needs:ranger+spark; run scripts/spark-access-control-test.sh"]
 async fn spark_write_privileges_are_separate_from_read() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -394,7 +394,7 @@ async fn spark_write_privileges_are_separate_from_read() {
 /// split means running Spark behind a Kyuubi server with real authentication,
 /// which is separate work.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+#[ignore = "needs:ranger+spark; run scripts/spark-access-control-test.sh"]
 async fn mismatched_identity_reveals_the_two_tier_trust_split() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -492,7 +492,7 @@ async fn add_deny_item_to_orders_policy(ctx: &AcCtx) {
 /// access while alice (analyst only) keeps it, which is what proves the deny is
 /// precedence rather than the grant having failed.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+#[ignore = "needs:ranger+spark; run scripts/spark-access-control-test.sh"]
 async fn spark_ranger_deny_overrides_allow() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -544,7 +544,7 @@ async fn spark_ranger_deny_overrides_allow() {
 /// The wildcard is what makes one grant cover tables created later, so a Spark path
 /// that only honored explicitly named tables would silently under-grant.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+#[ignore = "needs:ranger+spark; run scripts/spark-access-control-test.sh"]
 async fn spark_all_tables_in_schema_grant_covers_the_namespace() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -608,7 +608,7 @@ async fn spark_all_tables_in_schema_grant_covers_the_namespace() {
 /// `spark-defaults.conf` and the escalation is open again. `parity-test.sh` carries
 /// the same check for the demo path.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+#[ignore = "needs:ranger+spark; run scripts/spark-access-control-test.sh"]
 async fn no_service_account_catalog_can_defeat_per_user_identity() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
