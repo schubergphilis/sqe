@@ -33,7 +33,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 /// matchers ignore the `?warehouse=` query, so the same mock serves both the
 /// config catalog and any discovered warehouse.
 async fn mount_empty_polaris() -> MockServer {
-    let server = MockServer::start().await;
+    let server = crate::common::mock_server().await;
     Mock::given(method("GET"))
         .and(path("/v1/config"))
         .respond_with(
@@ -54,7 +54,7 @@ async fn mount_empty_polaris() -> MockServer {
 /// `?warehouse=` query, so every warehouse (config + discovered) sees the same
 /// content.
 async fn mount_polaris_with_table() -> MockServer {
-    let server = MockServer::start().await;
+    let server = crate::common::mock_server().await;
     Mock::given(method("GET"))
         .and(path("/v1/config"))
         .respond_with(
