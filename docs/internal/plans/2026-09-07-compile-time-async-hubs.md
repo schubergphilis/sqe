@@ -199,4 +199,5 @@ walked, which is what decides between the three shapes above.
 - 2026-09-07: measured, fixed, documented (this file); chain 173 s -> 131 s.
 - 2026-09-08: C1 policy half (!963) and C4 coordinator (!961) on main: chain
   108.8 s. sqe-catalog C4 on `perf/catalog-async-hubs`: obligations
-  39.5 s -> 7.2 s (section above).
+  39.5 s -> 7.2 s (section above); chain 108.8 s -> 84.9 s
+  (`CARGO_BUILD_JOBS=4`, `touch sqe-core`, `CARGO_INCREMENTAL=0`).

@@ -1135,6 +1135,7 @@ mod tests {
             columns_masked: vec!["ssn".to_string()],
             columns_restricted: vec!["notes".to_string()],
             denied: false,
+            masked_fields: Vec::new(),
         };
         let qid = fin.query_id;
         tracker.start(

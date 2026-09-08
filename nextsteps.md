@@ -1,6 +1,6 @@
 # SQE — Next Steps
 
-> **STATUS 2026-09-08 (late): build-time C4 for `sqe-catalog` on `perf/catalog-async-hubs`: trait solving 39.5 s -> 13.9 s; cold chain 108.8 s (main) -> 93.8 s.**
+> **STATUS 2026-09-08 (late): build-time C4 for `sqe-catalog` on `perf/catalog-async-hubs`: trait solving 39.5 s -> 7.2 s; cold chain 108.8 s (main) -> 84.9 s.**
 >
 > Re-measured main first (`touch sqe-core`, `CARGO_INCREMENTAL=0`): 108.8 s,
 > down from 173 s at the start of the program (!961 + !963). Then profiled the
@@ -16,17 +16,49 @@
 > erasing what a block holds across an await (`MemTable` carries `Expr` in its
 > column defaults, so `Arc<dyn TableProvider>` first; `ListingOptions` carries
 > `Expr`, so the Hive `table()` lists files before it builds the
-> `ListingTable`). Residue 9 s: `HiveTableProvider::scan`/`scan_with_args`
-> (must own the rewritten `Vec<Expr>` the inner scan borrows),
-> `ScopedTable::scan` (holds a `SessionState`), the Hive `table()` tail. Plan:
+> `ListingTable`). The residue (`HiveTableProvider::scan`/`scan_with_args`
+> must own the rewritten `Vec<Expr>` the inner scan borrows; `ScopedTable::scan`
+> holds a `SessionState`) is a fourth shape: `send_erased::SendErased<T>`
+> wraps the value in a type whose `Send + Sync` is stated once (unsafe impls
+> for `Vec<Expr>`, `&[Expr]`, `SessionState`, each checked structurally by a
+> unit test), so the coroutine proof never descends into DataFusion. That
+> took obligations 13.9 s -> 7.2 s and the chain 93.8 s -> 84.9 s. Plan:
 > docs/internal/plans/2026-09-07-compile-time-async-hubs.md, "second look".
-> Gates: sqe-catalog all test binaries 845, `it` 150, clippy clean. Behaviour
+> Gates: sqe-catalog all test binaries 846, `it` 150, live Hive e2e 5, clippy
+> clean. Behaviour
 > unchanged; the metadata TVF scan stops forwarding `filters` to its
 > `MemTable`, which never received any (default pushdown is unsupported).
 > **NEXT:** the Flight `USE` / default-schema gap (closes #627), #659 partials,
 > the docker-capable CI runner (807 item 3). Parked, not in this repo: A2
 > sccache bucket on object02 prd (lifecycle rule + RO key, then the five CI
 > variables); C3 runner with a persistent target dir (platform team).
+> **STATUS 2026-09-08 (night): finding 610 (#617) on `fix/lineage-masked-and-untraced-610`: column lineage reports masked source columns as MASKED and says when a trace is incomplete.**
+>
+> `PolicySummary` gains `masked_fields: Vec<(table, column)>`, the scan
+> `TableReference` display plus column for every masked or restricted column
+> (a restricted column holds NULL, so it counts as masked); `summarise_policies`
+> fills it and `merge` folds it. The coordinator passes it into the lineage
+> `QueryCompleteCtx` / `QueryFailCtx` (new `masked_fields`), and the new
+> `extract::extract_lineage_governed` rewrites every column-lineage dependency
+> on one of those scan columns to `{DIRECT, MASKED, masking: true}`. The
+> decision comes from the enforcer's own record rather than from guessing at
+> projection shapes, and `sqe-lineage` stays free of a policy-crate dependency
+> (plain string tuples cross the boundary). Completeness: `trace_plan_reporting`
+> collects the plan node kinds the tracer has no rule for (`Unnest`,
+> `RecursiveQuery`, `Values`, multi-input extensions, ...) through a
+> thread-local active only during a reporting walk; when non-empty the run
+> carries the custom facet `sqe_lineageQuality: {complete: false, untraced:
+> [...]}`. The old `extract_lineage` entry point and every existing extract
+> test are unchanged. Book: operations/openlineage.md, new section "Policy and
+> completeness in column lineage". Tests: `extract_governed_test.rs` (masked vs
+> identity, namespace-only table key, `Unnest` facet, plain entry point
+> unchanged), summary test extended. Gates: sqe-lineage all binaries green,
+> sqe-policy 282, coordinator streaming tests, clippy clean. Not done from the
+> proposal: the `sqe_lineage_incomplete_total` counter (the emitter has no
+> metrics registry handle beyond the dropped counter; add when a lineage
+> metrics block exists).
+> **NEXT:** 627, #659 partials; the docker-capable CI runner for the
+> `polaris` group (807 item 3).
 
 > **STATUS 2026-09-08 (evening): finding 205 (#558) on `fix/show-stats-restricted-columns-205`: `SHOW STATS` is governed by the same effective policy as a scan.**
 >
