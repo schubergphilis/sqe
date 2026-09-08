@@ -94,6 +94,13 @@ spool_path = "/var/spool/sqe-ol"
 
 **`sqe_lineage_sink_errors_total{sink="http"}` increments.** Same: collector unreachable. With `spool_path` configured, events still reach disk.
 
+## Policy and completeness in column lineage
+
+Two properties of the `columnLineage` facet matter to a governance tool that propagates tags or plans deletions from it:
+
+- **Masked and restricted source columns are reported as `MASKED`, not identity.** When the caller's policy masks or restricts a column of a scanned table, every target column that derives from it carries the transformation `{type: "DIRECT", subtype: "MASKED", masking: true}` instead of `IDENTITY` or `TRANSFORMATION`. The target holds hashes, `***` or NULL, so the source column's tags must not be propagated onto it and the raw value was not copied. The decision comes from the policy enforcer's own record of what it applied to the plan, not from guessing at expression shapes.
+- **An incomplete trace says so.** The column tracer has rules for scans, projections, filters, aggregates, joins, unions, sorts, limits, distinct, aliases, windows and single-input extensions. A plan node outside that set (`Unnest`, `RecursiveQuery`, `Values`, a multi-input extension, ...) contributes no dependencies, and the affected target columns are then absent from `columnLineage`. Whenever that happens the run carries the custom facet `sqe_lineageQuality: {complete: false, untraced: ["Unnest"]}`, so a consumer can tell "this column has no source" from "the extractor gave up". Complete traces carry no facet.
+
 ## v1 limitations
 
 - No mTLS to the collector. Bearer auth only.

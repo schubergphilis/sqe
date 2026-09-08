@@ -91,7 +91,7 @@ fn make(kind: &str, subtype: &str, masking: bool) -> Transformation {
 
 /// Parse a (possibly quoted) qualified table name into (catalog, schema, table)
 /// applying the same fallback rules as `extract::datasets::parse_table_ref`.
-fn parse_table_ref(name: &str) -> (String, String, String) {
+pub(crate) fn parse_table_ref(name: &str) -> (String, String, String) {
     let parts: Vec<String> = name
         .split('.')
         .map(|s| s.trim_matches('"').to_string())
@@ -464,7 +464,60 @@ fn trace_extension(e: &datafusion::logical_expr::Extension) -> ColumnTrace {
     if inputs.len() == 1 {
         return trace_plan(inputs[0]);
     }
+    record_untraced(format!("Extension({})", e.node.name()));
     Vec::new()
+}
+
+thread_local! {
+    /// Node kinds the current `trace_plan_reporting` walk gave up on. A
+    /// thread-local rather than a parameter threaded through every rule: the
+    /// walk is synchronous and single-threaded, and the rules call each other
+    /// through `trace_plan` in a dozen places. `None` outside a reporting walk
+    /// (plain `trace_plan` callers, tests) so recording is a no-op there.
+    static UNTRACED: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn record_untraced(kind: String) {
+    UNTRACED.with(|u| {
+        if let Some(list) = u.borrow_mut().as_mut() {
+            if !list.contains(&kind) {
+                list.push(kind);
+            }
+        }
+    });
+}
+
+/// The variant name of a plan node this extractor has no rule for.
+fn untraced_kind(plan: &LogicalPlan) -> String {
+    use LogicalPlan::*;
+    match plan {
+        Unnest(_) => "Unnest",
+        RecursiveQuery(_) => "RecursiveQuery",
+        Values(_) => "Values",
+        EmptyRelation(_) => "EmptyRelation",
+        Subquery(_) => "Subquery",
+        Repartition(_) => "Repartition",
+        Statement(_) => "Statement",
+        Explain(_) => "Explain",
+        Analyze(_) => "Analyze",
+        Dml(_) => "Dml",
+        Ddl(_) => "Ddl",
+        Copy(_) => "Copy",
+        DescribeTable(_) => "DescribeTable",
+        other => return format!("{}", other.display()),
+    }
+    .to_string()
+}
+
+/// [`trace_plan`] plus the list of node kinds it could not trace (architecture
+/// review 610). An output column that depends on such a node is absent from
+/// the trace rather than wrong; the caller turns a non-empty list into the
+/// `sqe_lineageQuality` run facet so a consumer can tell the two apart.
+pub fn trace_plan_reporting(plan: &LogicalPlan) -> (ColumnTrace, Vec<String>) {
+    UNTRACED.with(|u| *u.borrow_mut() = Some(Vec::new()));
+    let trace = trace_plan(plan);
+    let untraced = UNTRACED.with(|u| u.borrow_mut().take().unwrap_or_default());
+    (trace, untraced)
 }
 
 /// Walk a `LogicalPlan` bottom-up and emit per-output-column lineage
@@ -499,8 +552,13 @@ pub fn trace_plan(plan: &LogicalPlan) -> ColumnTrace {
             trace_window(w, child)
         }
         LogicalPlan::Extension(e) => trace_extension(e),
-        // Unknown nodes -> empty trace.
-        _ => Vec::new(),
+        // No rule for this node kind: empty trace, and the kind is recorded
+        // for the `sqe_lineageQuality` facet (review 610) so the consumer
+        // sees "untraced", not "no source".
+        other => {
+            record_untraced(untraced_kind(other));
+            Vec::new()
+        }
     }
 }
 
