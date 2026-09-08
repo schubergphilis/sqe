@@ -45,25 +45,43 @@ fn build_start(c: &QueryStartCtx, cfg: &EmitterConfig) -> RunEvent {
         eventTime: c.started_at.to_rfc3339(),
         producer: cfg.producer.clone(),
         schemaURL: SCHEMA_URL.into(),
-        run: build_run(c.run_id, c.started_at, &c.session_id, None),
+        run: build_run(c.run_id, c.started_at, &c.session_id, None, None),
         job: build_job(&cfg.job_namespace, &c.statement_kind, &c.sql),
         inputs: vec![],
         outputs: vec![],
     }
 }
 
+/// Datasets plus the lineage-quality facet for a plan or hint. Hints carry
+/// no column lineage, so their quality is trivially complete (no facet).
+fn extract_for(
+    plan: &Option<PlanOrHint>,
+    masked_fields: &[(String, String)],
+    cfg: &EmitterConfig,
+) -> (Vec<InputDataset>, Vec<OutputDataset>, Option<LineageQualityFacet>) {
+    match plan {
+        Some(PlanOrHint::Plan(p)) => {
+            let extracted =
+                extract::extract_lineage_governed(p.as_ref(), &cfg.catalog_lookup, masked_fields);
+            let quality = (!extracted.quality.complete).then_some(extracted.quality);
+            (extracted.inputs, extracted.outputs, quality)
+        }
+        Some(PlanOrHint::Hint(h)) => {
+            let (i, o) = extract::extract_from_hint(h, &cfg.catalog_lookup);
+            (i, o, None)
+        }
+        None => (vec![], vec![], None),
+    }
+}
+
 fn build_complete(c: &QueryCompleteCtx, cfg: &EmitterConfig) -> RunEvent {
-    let (inputs, outputs) = match &c.plan {
-        Some(PlanOrHint::Plan(p)) => extract::extract_lineage(p.as_ref(), &cfg.catalog_lookup),
-        Some(PlanOrHint::Hint(h)) => extract::extract_from_hint(h, &cfg.catalog_lookup),
-        None => (vec![], vec![]),
-    };
+    let (inputs, outputs, quality) = extract_for(&c.plan, &c.masked_fields, cfg);
     RunEvent {
         eventType: EventType::Complete,
         eventTime: c.ended_at.to_rfc3339(),
         producer: cfg.producer.clone(),
         schemaURL: SCHEMA_URL.into(),
-        run: build_run(c.run_id, c.started_at, &c.session_id, None),
+        run: build_run(c.run_id, c.started_at, &c.session_id, None, quality),
         job: build_job(&cfg.job_namespace, &c.statement_kind, &c.sql),
         inputs,
         outputs,
@@ -71,11 +89,7 @@ fn build_complete(c: &QueryCompleteCtx, cfg: &EmitterConfig) -> RunEvent {
 }
 
 fn build_fail(c: &QueryFailCtx, cfg: &EmitterConfig) -> RunEvent {
-    let (inputs, outputs) = match &c.plan {
-        Some(PlanOrHint::Plan(p)) => extract::extract_lineage(p.as_ref(), &cfg.catalog_lookup),
-        Some(PlanOrHint::Hint(h)) => extract::extract_from_hint(h, &cfg.catalog_lookup),
-        None => (vec![], vec![]),
-    };
+    let (inputs, outputs, quality) = extract_for(&c.plan, &c.masked_fields, cfg);
     RunEvent {
         eventType: EventType::Fail,
         eventTime: c.ended_at.to_rfc3339(),
@@ -86,6 +100,7 @@ fn build_fail(c: &QueryFailCtx, cfg: &EmitterConfig) -> RunEvent {
             c.started_at,
             &c.session_id,
             Some(&c.error_message),
+            quality,
         ),
         job: build_job(&cfg.job_namespace, &c.statement_kind, &c.sql),
         inputs,
@@ -98,6 +113,7 @@ fn build_run(
     started: chrono::DateTime<chrono::Utc>,
     session_id: &str,
     error: Option<&str>,
+    quality: Option<LineageQualityFacet>,
 ) -> Run {
     let parent = parse_session_uuid(session_id).map(|sess_uuid| {
         Box::new(ParentRunFacet {
@@ -121,6 +137,7 @@ fn build_run(
                 message: m.to_string(),
                 programmingLanguage: "sql".into(),
             }),
+            sqe_lineageQuality: quality,
         },
     }
 }

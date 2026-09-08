@@ -38,6 +38,13 @@ pub struct PolicySummary {
     /// filter was injected: resolve failure, breaker-open, unknown-tag state,
     /// or fully-restricted table).
     pub denied: bool,
+    /// Every masked or restricted column with the scan it was applied to, as
+    /// `(table, column)` where `table` is the scan's `TableReference` display
+    /// (`catalog.ns.t`, `ns.t` or `t`, exactly as the planner spells it).
+    /// Sorted, deduplicated. Column lineage uses it to report those source
+    /// columns as MASKED instead of identity passthrough (architecture review
+    /// 610); the bare name lists above stay for the audit entry.
+    pub masked_fields: Vec<(String, String)>,
 }
 
 impl PolicySummary {
@@ -54,6 +61,10 @@ impl PolicySummary {
         self.columns_restricted.sort();
         self.columns_restricted.dedup();
         self.denied |= other.denied;
+        self.masked_fields
+            .extend(other.masked_fields.iter().cloned());
+        self.masked_fields.sort();
+        self.masked_fields.dedup();
     }
 }
 
