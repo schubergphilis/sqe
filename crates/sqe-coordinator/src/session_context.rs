@@ -797,7 +797,16 @@ pub async fn create_session_context(
                 session.user.username.clone(),
                 session.user.roles.clone(),
             );
-            ctx.register_udtf(
+            // Registered through `FileTableFunctions::register`, not
+            // `ctx.register_udtf`: the file readers build their provider on
+            // the async path (`prepare_statement`, called by every planner
+            // entry point before `ctx.sql`) and their synchronous `call`
+            // only looks it up (architecture review 806). The registry it
+            // keeps in the session config is how `prepare_statement` finds
+            // them.
+            use sqe_catalog::file_tvf_prepare::FileTableFunctions;
+            FileTableFunctions::register(
+                &ctx,
                 "read_parquet",
                 Arc::new(
                     sqe_catalog::read_parquet::ReadParquetFunction::with_caller(
@@ -814,7 +823,8 @@ pub async fn create_session_context(
             // comment, null_regex, file_extension. JSON-specific args:
             // newline_delimited, file_extension. S3 credentials + endpoint
             // overrides flow through the shared file_tvf_common helpers.
-            ctx.register_udtf(
+            FileTableFunctions::register(
+                &ctx,
                 "read_csv",
                 Arc::new(
                     sqe_catalog::read_csv::ReadCsvFunction::with_caller(
@@ -824,7 +834,8 @@ pub async fn create_session_context(
                     .with_runtime_env(ctx.runtime_env()),
                 ),
             );
-            ctx.register_udtf(
+            FileTableFunctions::register(
+                &ctx,
                 "read_json",
                 Arc::new(
                     sqe_catalog::read_json::ReadJsonFunction::with_caller(

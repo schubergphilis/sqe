@@ -363,7 +363,13 @@ pub fn build_embedded_context_with_mask(
     // not, so every `read_csv('s3://…')` in embedded mode failed this way,
     // inline credentials or not.
     let tvf_runtime = ctx.runtime_env();
-    ctx.register_udtf(
+    // `FileTableFunctions::register`, not `ctx.register_udtf`: the readers
+    // build their provider on the async path (`prepare_statement` in
+    // `execute`, right before `ctx.sql`) and their synchronous `call` only
+    // looks it up (architecture review 806).
+    use sqe_catalog::file_tvf_prepare::FileTableFunctions;
+    FileTableFunctions::register(
+        &ctx,
         "read_parquet",
         Arc::new(
             sqe_catalog::read_parquet::ReadParquetFunction::with_caller(
@@ -373,7 +379,8 @@ pub fn build_embedded_context_with_mask(
             .with_runtime_env(Arc::clone(&tvf_runtime)),
         ),
     );
-    ctx.register_udtf(
+    FileTableFunctions::register(
+        &ctx,
         "read_csv",
         Arc::new(
             sqe_catalog::read_csv::ReadCsvFunction::with_caller(
@@ -383,7 +390,8 @@ pub fn build_embedded_context_with_mask(
             .with_runtime_env(Arc::clone(&tvf_runtime)),
         ),
     );
-    ctx.register_udtf(
+    FileTableFunctions::register(
+        &ctx,
         "read_json",
         Arc::new(
             sqe_catalog::read_json::ReadJsonFunction::with_caller(
@@ -888,6 +896,10 @@ impl SqlClient for EmbeddedClient {
         for provider in self.hive_roots.values() {
             provider.refresh_referenced(&rewritten, None, None).await;
         }
+        // Same review: build the file table functions' providers (schema
+        // inference over object storage) here, before DataFusion's
+        // synchronous `call` asks for them.
+        sqe_catalog::file_tvf_prepare::prepare_statement(&self.ctx, &rewritten).await?;
         let df = self.ctx.sql(&rewritten).await?;
         // Snapshot the DataFrame schema before collecting so we still
         // emit column names when the query produces zero batches (an
