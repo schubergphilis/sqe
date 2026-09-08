@@ -460,9 +460,13 @@ pub async fn build_embedded_context_with_warehouse(
     Ok((ctx, iceberg_catalogs))
 }
 
-/// Map of iceberg catalogs keyed by user-facing name, available to
-/// the DDL interceptor for write operations.
-pub type IcebergCatalogMap = HashMap<String, Arc<dyn iceberg::Catalog>>;
+/// The writable Iceberg catalogs of this process keyed by user-facing name:
+/// the `--catalog` SQLite warehouses and every `ATTACH`ed Iceberg catalog.
+/// The DDL interceptor routes `CREATE SCHEMA` / `DROP SCHEMA` through these
+/// handles (review 806): `SessionContext::catalog` hands back DataFusion's
+/// `DynamicFileCatalogProvider` wrapper once URL tables are enabled, so the
+/// provider cannot be recovered from the context by downcasting.
+pub type IcebergCatalogMap = HashMap<String, Arc<WritableIcebergCatalog>>;
 
 /// Initialise `<path>/sqe.db` as the Iceberg metadata store and
 /// `<path>/iceberg/` as the data file root, then register the result
@@ -477,7 +481,7 @@ async fn attach_sqlite_catalog(
     ctx: &SessionContext,
     name: &str,
     path: &Path,
-) -> anyhow::Result<Arc<dyn iceberg::Catalog>> {
+) -> anyhow::Result<Arc<WritableIcebergCatalog>> {
     std::fs::create_dir_all(path)
         .map_err(|e| anyhow::anyhow!("failed to create warehouse dir {}: {e}", path.display()))?;
     let data_root = path.join("iceberg");
@@ -520,10 +524,10 @@ async fn attach_sqlite_catalog(
             .map_err(|e| anyhow::anyhow!("SQLite catalog open failed: {e}"))?,
     );
 
-    let provider = WritableIcebergCatalog::try_new(catalog.clone()).await?;
+    let provider = Arc::new(WritableIcebergCatalog::try_new(catalog).await?);
 
-    ctx.register_catalog(name, Arc::new(provider));
-    Ok(catalog)
+    ctx.register_catalog(name, Arc::clone(&provider) as Arc<dyn datafusion::catalog::CatalogProvider>);
+    Ok(provider)
 }
 
 /// Build an embedded context with a non-REST cloud catalog (Glue or
@@ -558,15 +562,13 @@ pub async fn build_embedded_context_with_backend(
 ///
 /// Mirrors the network clients (`flight.rs`, `http.rs`) so the CLI's
 /// REPL and one-shot paths don't need to special-case embedded mode.
-/// The `iceberg_catalogs` map keeps strong references to the
-/// catalog handles even though `WritableIcebergCatalog` already
-/// holds its own clone — this stays around so a future CTAS path
-/// can reach the iceberg API for the Parquet-write + commit step
-/// without going through `Arc::downgrade` gymnastics on the
-/// CatalogProvider trait object.
+/// The `iceberg_catalogs` map holds the `WritableIcebergCatalog` of every
+/// writable Iceberg catalog registered with `ctx`, so `CREATE SCHEMA` /
+/// `DROP SCHEMA` reach their async namespace methods without going through
+/// the CatalogProvider trait object DataFusion holds (see
+/// [`IcebergCatalogMap`]).
 pub struct EmbeddedClient {
     ctx: SessionContext,
-    #[allow(dead_code)]
     iceberg_catalogs: IcebergCatalogMap,
     /// In-memory secret store for `CREATE SECRET` / `DROP SECRET` / `SHOW SECRETS`.
     secrets: SecretStore,
@@ -821,6 +823,19 @@ impl SqlClient for EmbeddedClient {
                     if let Some(result) = self.embedded_handle_drop_hive_table(stmt).await? {
                         return Ok(result);
                     }
+                    if let Some(result) = self.embedded_handle_iceberg_schema_ddl(stmt).await? {
+                        return Ok(result);
+                    }
+                }
+                // CREATE SCHEMA / DROP SCHEMA on a `WritableIcebergCatalog`
+                // go to its async namespace methods; DataFusion's own
+                // synchronous `register_schema` hook refuses them (review
+                // 806). Any other catalog falls through to `ctx.sql`.
+                sqe_sql::StatementKind::CreateSchema(ref stmt)
+                | sqe_sql::StatementKind::DropSchema(ref stmt) => {
+                    if let Some(result) = self.embedded_handle_iceberg_schema_ddl(stmt).await? {
+                        return Ok(result);
+                    }
                 }
                 sqe_sql::StatementKind::ShowCreateTable(ref stmt) => {
                     if let Some(result) = self.embedded_handle_show_create_hive_table(stmt).await? {
@@ -905,13 +920,19 @@ impl EmbeddedClient {
         .await
         .map_err(|e| format!("ATTACH failed: {e}"))?;
 
-        let provider =
+        let provider = Arc::new(
             sqe_catalog::writable_iceberg_catalog::WritableIcebergCatalog::try_new(catalog.clone())
                 .await
-                .map_err(|e| format!("ATTACH: failed to wrap catalog '{}': {e}", stmt.name))?;
+                .map_err(|e| format!("ATTACH: failed to wrap catalog '{}': {e}", stmt.name))?,
+        );
 
-        self.ctx
-            .register_catalog(stmt.name.clone(), Arc::new(provider));
+        self.ctx.register_catalog(
+            stmt.name.clone(),
+            Arc::clone(&provider) as Arc<dyn datafusion::catalog::CatalogProvider>,
+        );
+        // So CREATE SCHEMA / DROP SCHEMA on this catalog reach its async
+        // namespace methods (review 806); removed again on DETACH.
+        self.iceberg_catalogs.insert(stmt.name.clone(), provider);
 
         let secret_ref = stmt
             .options
@@ -930,6 +951,9 @@ impl EmbeddedClient {
         &mut self,
         stmt: &sqe_sql::DetachStatement,
     ) -> Result<QueryResult, Box<dyn std::error::Error>> {
+        if self.attached_catalogs.contains_key(&stmt.name) {
+            self.iceberg_catalogs.remove(&stmt.name);
+        }
         if self.attached_catalogs.remove(&stmt.name).is_none() {
             return Err(format!("catalog '{}' is not attached", stmt.name).into());
         }
@@ -1062,6 +1086,78 @@ impl EmbeddedClient {
             columns: vec![],
             rows: vec![],
         })
+    }
+
+    /// `CREATE SCHEMA <cat>.<ns>` / `DROP SCHEMA <cat>.<ns>` where `<cat>` is
+    /// a `WritableIcebergCatalog` (a `--catalog` SQLite warehouse or an
+    /// attached Iceberg catalog): routed to its async namespace methods, the
+    /// way the coordinator's `catalog_ops` does, instead of DataFusion's
+    /// synchronous `register_schema` hook, which would have to block the
+    /// planner on the catalog and now refuses (architecture review 806).
+    /// `Ok(None)` means "not ours": a bare name, a catalog that is not
+    /// registered, or one of another kind, all fall through to `ctx.sql`.
+    async fn embedded_handle_iceberg_schema_ddl(
+        &self,
+        stmt: &datafusion::sql::sqlparser::ast::Statement,
+    ) -> Result<Option<QueryResult>, Box<dyn std::error::Error>> {
+        use datafusion::sql::sqlparser::ast::{ObjectType, SchemaName, Statement};
+
+        enum Ddl<'a> {
+            Create { name: &'a datafusion::sql::sqlparser::ast::ObjectName, if_not_exists: bool },
+            Drop { name: &'a datafusion::sql::sqlparser::ast::ObjectName, if_exists: bool, cascade: bool },
+        }
+        let ddl = match stmt {
+            Statement::CreateSchema {
+                schema_name: SchemaName::Simple(name),
+                if_not_exists,
+                ..
+            } => Ddl::Create {
+                name,
+                if_not_exists: *if_not_exists,
+            },
+            Statement::Drop {
+                object_type: ObjectType::Schema,
+                names,
+                if_exists,
+                cascade,
+                ..
+            } if names.len() == 1 => Ddl::Drop {
+                name: &names[0],
+                if_exists: *if_exists,
+                cascade: *cascade,
+            },
+            _ => return Ok(None),
+        };
+
+        let parts: Vec<String> = match &ddl {
+            Ddl::Create { name, .. } | Ddl::Drop { name, .. } => name
+                .0
+                .iter()
+                .filter_map(|p| p.as_ident().map(|i| i.value.clone()))
+                .collect(),
+        };
+        let [catalog_name, schema_name] = parts.as_slice() else {
+            return Ok(None);
+        };
+        // Not through `self.ctx.catalog(..)`: with URL tables enabled
+        // DataFusion hands back its `DynamicFileCatalogProvider` wrapper, so
+        // the registered provider cannot be recovered by downcasting.
+        let Some(catalog) = self.iceberg_catalogs.get(catalog_name.as_str()) else {
+            return Ok(None);
+        };
+
+        match ddl {
+            Ddl::Create { if_not_exists, .. } => {
+                catalog.create_namespace(schema_name, if_not_exists).await?
+            }
+            Ddl::Drop {
+                if_exists, cascade, ..
+            } => catalog.drop_namespace(schema_name, if_exists, cascade).await?,
+        }
+        Ok(Some(QueryResult {
+            columns: vec![],
+            rows: vec![],
+        }))
     }
 
     /// `DROP TABLE` against a Hive root: delete the manifest, never the
