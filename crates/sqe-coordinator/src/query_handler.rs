@@ -143,6 +143,16 @@ fn normalize_for_planning(session: &Session, sql: &str) -> sqe_core::Result<Stri
     Ok(sqe_sql::rewrite_named_tvf_args(normalized.sql()))
 }
 
+/// Build the providers of the file table functions `sql` calls, on the async
+/// path, before DataFusion's synchronous `TableFunctionImpl::call` asks for
+/// them (architecture review 806). Must run on the final text handed to
+/// `ctx.sql`; every planner entry point in this crate calls it.
+pub(crate) async fn prepare_file_tvfs(ctx: &SessionContext, sql: &str) -> sqe_core::Result<()> {
+    sqe_catalog::file_tvf_prepare::prepare_statement(ctx, sql)
+        .await
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))
+}
+
 fn refuse_if_audit_closed(
     audit: Option<&Arc<sqe_metrics::audit::AuditLogger>>,
 ) -> sqe_core::Result<()> {
@@ -1113,6 +1123,27 @@ impl QueryHandler {
             self.preflight_resolve_catalogs(stmt, session).await?;
         }
 
+        // Review 806: the write branches below (CTAS, INSERT ... SELECT,
+        // MERGE, UPDATE, DELETE) hand the session context to the write
+        // handler, which plans the statement's SELECT parts through
+        // `ctx.sql` several times over. Their file table functions
+        // (`read_parquet('...')` and friends) are prepared here, once, on
+        // the async path, with the user's statement text: the handler's
+        // derived sub-statements repeat the same calls with the same
+        // literal arguments, and the prepared providers are keyed by those
+        // arguments on the functions inside this session's context. The
+        // read path prepares again right before its own `ctx.sql` with the
+        // normalized text (`execute_query`, `plan_sql_for_stream`), which is
+        // idempotent. Gated on the statement text naming a file function so
+        // a statement that cannot need it never builds a session context
+        // it would not otherwise have built.
+        if kind.statement().is_some()
+            && sqe_catalog::file_tvf_prepare::mentions_file_function(sql)
+        {
+            let (ctx, _) = self.create_session_context(session).await?;
+            prepare_file_tvfs(&ctx, sql).await?;
+        }
+
         let span = Span::current();
         span.record("statement_type", kind_name.as_str());
         span.record("db.operation.name", kind_name.as_str());
@@ -1782,6 +1813,7 @@ impl QueryHandler {
                             // Plan the SELECT for its schema only. The column
                             // list and the partition-key types both come from
                             // the query, because a CTAS need not declare them.
+                            prepare_file_tvfs(&ctx, &select_sql).await?;
                             let schema = ctx
                                 .sql(&select_sql)
                                 .await
@@ -3508,6 +3540,7 @@ impl QueryHandler {
             "sqe.plan",
             query_id = query_id.map(|q| q.to_string()).unwrap_or_default()
         );
+        prepare_file_tvfs(ctx, sql).await?;
         let df = ctx.sql(sql).instrument(plan_span).await.map_err(|e| {
             SqeError::with_code(
                 SqeErrorCode::ExecutionFailed,
@@ -3568,6 +3601,7 @@ impl QueryHandler {
                     incremental_identities,
                 )
                 .await?;
+            prepare_file_tvfs(&ctx, &sql_for_plan).await?;
             let df = ctx
                 .sql(&sql_for_plan)
                 .await
@@ -3638,6 +3672,7 @@ impl QueryHandler {
             self.preflight_resolve_catalogs(stmt, session).await?;
         }
         let (ctx, _session_catalog) = self.create_session_context(session).await?;
+        prepare_file_tvfs(&ctx, numbered_sql).await?;
         let df = ctx
             .sql(numbered_sql)
             .await
@@ -3767,6 +3802,7 @@ impl QueryHandler {
 
         // Plan the query via DataFusion's SQL planner
         let plan_span = tracing::info_span!("sqe.plan", query_id = %query_id);
+        prepare_file_tvfs(&ctx, sql).await?;
         let df = ctx
             .sql(sql)
             .instrument(plan_span)
