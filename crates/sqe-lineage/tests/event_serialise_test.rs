@@ -38,6 +38,7 @@ fn sample_run() -> Run {
             }),
             parent: None,
             errorMessage: None,
+            sqe_lineageQuality: None,
         },
     }
 }
@@ -151,6 +152,7 @@ fn snapshot_query_fail() {
                     message: "table not found: missing_table".into(),
                     programmingLanguage: "sql".into(),
                 }),
+                sqe_lineageQuality: None,
             },
         },
         job: sample_job("query:err"),
