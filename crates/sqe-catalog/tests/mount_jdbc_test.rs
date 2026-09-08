@@ -133,7 +133,7 @@ async fn an_unknown_secret_reference_is_refused() {
 ///
 /// last verified: never in this tree
 #[tokio::test]
-#[ignore = "requires live Postgres; docker compose -f docker-compose.test.yml up -d postgres"]
+#[ignore = "needs:postgres"]
 async fn jdbc_attach_roundtrip_against_live_postgres() {
     // `Catalog` itself is not imported: build_catalog returns `Arc<dyn Catalog>`,
     // so the trait methods are already reachable through the trait object.

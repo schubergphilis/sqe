@@ -131,7 +131,7 @@ async fn seed_mor_table(
 /// so the deleted rows stay gone, AND it consolidates the small files (proving
 /// it ran rather than skipping like the Phase 1 guard did).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 async fn rewrite_applies_position_deletes_and_consolidates() {
     let (session, handler) = crate::common::setup_handler().await;
     let namespace = "default";
@@ -184,7 +184,7 @@ async fn rewrite_applies_position_deletes_and_consolidates() {
 /// Larger table, same property, exercised at a different delete count to guard
 /// against off-by-one in the delete-accounting cross-check.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 async fn rewrite_preserves_deletes() {
     let (session, handler) = crate::common::setup_handler().await;
     let namespace = "default";
@@ -229,7 +229,7 @@ async fn rewrite_preserves_deletes() {
 /// `min_input_files`) and would otherwise be skipped. Proven by contrast: the
 /// same table skips without the threshold and runs with it.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 async fn rewrite_delete_file_threshold_triggers_on_delete_heavy_file() {
     let (session, handler) = crate::common::setup_handler().await;
     let namespace = "default";
@@ -335,7 +335,7 @@ async fn rewrite_delete_file_threshold_triggers_on_delete_heavy_file() {
 /// consolidate. The seq pin keeps the compacted output above the equality
 /// delete so it is not re-applied to the fresh value.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 async fn rewrite_applies_equality_deletes() {
     let (session, handler) = crate::common::setup_handler().await;
     let namespace = "default";

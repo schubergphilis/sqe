@@ -842,7 +842,7 @@ mod tests {
     //    `sqe_compaction::dispatch::decode_group_response` against the same
     //    table's schema/partition type/spec id/format version.
     #[tokio::test]
-    #[ignore = "requires a live worker Flight service; run manually against the quickstart stack"]
+    #[ignore = "needs:polaris+workers; live worker Flight service"]
     async fn dispatch_and_collect_groups_against_a_live_worker() {
         // Intentionally left as documentation: see the comment above for the
         // manual procedure. A synthetic in-process FlightService could

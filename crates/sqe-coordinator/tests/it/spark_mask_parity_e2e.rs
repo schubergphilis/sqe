@@ -138,7 +138,7 @@ async fn agreed_rows(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+#[ignore = "needs:ranger+spark; run scripts/spark-access-control-test.sh"]
 async fn column_mask_is_byte_identical_across_engines() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -185,7 +185,7 @@ async fn column_mask_is_byte_identical_across_engines() {
 /// alice is an analyst and NOT an engineer, so the same policy must leave her
 /// unmasked. Without this, a mask applied to everyone would pass the parity test.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+#[ignore = "needs:ranger+spark; run scripts/spark-access-control-test.sh"]
 async fn an_unmasked_role_is_unmasked_in_both_engines() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -228,7 +228,7 @@ async fn an_unmasked_role_is_unmasked_in_both_engines() {
 /// than a parity result. The runner classifies that separately for exactly this
 /// reason.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+#[ignore = "needs:ranger+spark; run scripts/spark-access-control-test.sh"]
 async fn row_filter_returns_identical_rows_across_engines() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -277,7 +277,7 @@ async fn row_filter_returns_identical_rows_across_engines() {
 /// Kyuubi started honoring the transformer, which is good news: drop this test and
 /// update the access-control matrix, because named types would then be portable.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+#[ignore = "needs:ranger+spark; run scripts/spark-access-control-test.sh"]
 async fn a_named_mask_type_is_not_byte_portable() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -389,7 +389,7 @@ impl sqe_policy::tag_projector::TagProjector for AlwaysFailingProjector {
 /// which is exactly the fail-open the projection exists to close, and it would be
 /// invisible because the statement reported success.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak; run scripts/spark-access-control-test.sh"]
+#[ignore = "needs:ranger; run scripts/spark-access-control-test.sh"]
 async fn a_failed_projection_rolls_back_the_tag() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -467,7 +467,7 @@ fn tag_mask_policy_portable(name: &str, tag: &str) -> serde_json::Value {
 /// from the projection, and the two render identically. Before the projector, this
 /// column was masked in SQE and RAW in Spark.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+#[ignore = "needs:ranger+spark; run scripts/spark-access-control-test.sh"]
 async fn tag_column_mask_is_byte_identical_across_engines() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -524,7 +524,7 @@ async fn tag_column_mask_is_byte_identical_across_engines() {
 /// two engines disagreeing about the same table, which is what this suite exists to
 /// prevent.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+#[ignore = "needs:ranger+spark; run scripts/spark-access-control-test.sh"]
 async fn unset_tag_stops_masking_in_both_engines() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -600,7 +600,7 @@ async fn unset_tag_stops_masking_in_both_engines() {
 /// Both masks hide the raw value, so this was never a leak in either direction.
 /// The assertion still checks that much first.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+#[ignore = "needs:ranger+spark; run scripts/spark-access-control-test.sh"]
 async fn resource_and_tag_mask_precedence_agrees_across_engines() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -694,7 +694,7 @@ async fn resource_and_tag_mask_precedence_agrees_across_engines() {
 /// routine schema change. Asserted as current behaviour so the defect is recorded and
 /// a fix trips this test.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+#[ignore = "needs:ranger+spark; run scripts/spark-access-control-test.sh"]
 async fn adding_a_column_to_a_masked_table_keeps_it_queryable() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;
@@ -842,7 +842,7 @@ async fn adding_a_column_to_a_masked_table_keeps_it_queryable() {
 /// the same assumption, so they agreed, and agreement is what the suite was built to
 /// look for. Agreement is not correctness.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs quickstart/polaris-ranger-keycloak plus spark; run scripts/spark-access-control-test.sh"]
+#[ignore = "needs:ranger+spark; run scripts/spark-access-control-test.sh"]
 async fn a_renamed_column_keeps_its_mask_in_both_engines() {
     spark_gate!();
     let _guard = crate::common::serial().lock().await;

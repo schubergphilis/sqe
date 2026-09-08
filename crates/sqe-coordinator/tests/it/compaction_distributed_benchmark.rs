@@ -192,7 +192,7 @@ async fn run_rewrite_timed(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "informational benchmark; not a CI gate; see module doc for real-scale usage"]
+#[ignore = "bench; see module doc for real-scale usage"]
 async fn distributed_rewrite_wall_clock_ratio() {
     let workers = worker_urls();
     let (session, handler) = crate::common::setup_handler_with_workers(&workers).await;

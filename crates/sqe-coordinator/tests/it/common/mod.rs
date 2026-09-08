@@ -2,6 +2,8 @@
 //! Each file in tests/ is its own binary; include this via `mod common;`.
 #![allow(dead_code)]
 
+/// In-process chaos worker for `distributed_failure_e2e` (finding 411).
+pub mod chaos_worker;
 /// Ranger Admin REST fixtures for `access_control_e2e`.
 pub mod ranger_fixture;
 pub mod spark_runner;

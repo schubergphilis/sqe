@@ -234,7 +234,7 @@ fn spark_reads_sqe_equality_delete_file() {
 /// Task 6.10: commit conflict when a concurrent writer advances the
 /// snapshot before the RowDelta commits.
 #[test]
-#[ignore = "needs two concurrent sessions against live Polaris"]
+#[ignore = "needs:polaris; two concurrent sessions"]
 fn concurrent_writer_produces_retryable_commit_conflict() {
     // Implementation tracked alongside the spec scenario
     // "Conflict detection on concurrent commits".
@@ -249,7 +249,7 @@ fn concurrent_writer_produces_retryable_commit_conflict() {
 /// guarded by iceberg-rust's `validate_data_file_changes` at commit, so a
 /// conflict fails cleanly rather than corrupting data.
 #[test]
-#[ignore = "needs two concurrent sessions against live Polaris"]
+#[ignore = "needs:polaris; two concurrent sessions"]
 fn cow_update_delete_retries_on_concurrency_conflict() {
     // Implementation tracked alongside the spec scenario
     // "Partition-aware CoW writes retry on commit conflict".
@@ -261,7 +261,7 @@ fn cow_update_delete_retries_on_concurrency_conflict() {
 /// delete file, rewrites zero data files, and subsequent reads exclude
 /// the deleted rows.
 #[test]
-#[ignore = "needs docker-compose.test.yml + Polaris"]
+#[ignore = "needs:polaris"]
 fn mor_delete_writes_one_equality_delete_file() {
     // Implementation tracked alongside the spec scenario
     // "DELETE by primary key writes equality delete".

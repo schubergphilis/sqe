@@ -134,7 +134,7 @@ async fn slow_consumer_wide_rows_stays_within_budget() {
 
 /// Future: pausing 30s must stop further S3 GETs once budgets are full.
 #[tokio::test]
-#[ignore = "phase-1 stretch: assert no further GETs during 30s pause once budgets full"]
+#[ignore = "deferred; phase-1 stretch: assert no further GETs during 30s pause once budgets full"]
 async fn slow_consumer_caps_bytes_when_client_pauses() {
     panic!(
         "Wire a CountingStore and assert GET count freezes for 30s while the \

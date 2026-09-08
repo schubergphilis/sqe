@@ -51,7 +51,7 @@ impl AuthProvider for FixedIdentityProvider {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
+#[ignore = "needs:polaris"] // Requires: docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh
 async fn quack_select_one_round_trip() {
     crate::common::init_tracing();
 
