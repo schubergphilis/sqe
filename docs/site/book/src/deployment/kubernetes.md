@@ -53,6 +53,8 @@ Workers are **disabled by default**. The coordinator runs queries locally.
 
 `values.yaml` is the easy dev path (`production_mode: false`). For production, overlay `values-production.yaml`: it turns on `production_mode`, rate limiting, `catalog.require_vended_credentials`, a durable audit PVC, and ServiceMonitor. You must still supply existing Secrets, TLS/ingress, and `workerSecret` when workers are on. Templating fails if `production_mode` and `worker.enabled` are both true with an empty worker secret. The engine also refuses to start if a REST catalog still has `require_vended_credentials = false`.
 
+`production_mode` also refuses the two governance defaults: `policy.engine = passthrough` (no row filters, masks or column restrictions; only catalog-level authorization applies) and `access_control.backend = none` (GRANT and REVOKE rejected). The overlay selects the Ranger pairing for both; fill in `config.policy.ranger.url` and provide the admin password as the `SQE_POLICY__RANGER__ADMIN_PASSWORD` environment override. A deployment that deliberately runs without a policy engine or grant backend says so with `config.security.allow_no_policy_engine` / `config.security.allow_no_grant_backend`; the choice is then visible in the values diff, and the coordinator logs the disabled enforcement at warn level on every start.
+
 ```bash
 helm install sqe deploy/helm/sqe/ \
   -f deploy/helm/sqe/values-production.yaml \
