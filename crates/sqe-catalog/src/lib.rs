@@ -30,6 +30,7 @@ pub mod read_csv;
 #[cfg(feature = "rest")]
 pub mod rest_catalog;
 pub mod runtime_bridge;
+mod send_erased;
 pub mod session_tuning;
 pub use session_tuning::engine_session_config;
 #[cfg(feature = "rest")]

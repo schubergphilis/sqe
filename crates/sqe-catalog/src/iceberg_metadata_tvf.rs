@@ -105,33 +105,52 @@ impl TableProvider for IcebergMetadataProvider {
         TableType::Base
     }
 
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
+    // `async_trait`'s desugared form (compile time, see
+    // docs/internal/plans/2026-09-07-compile-time-async-hubs.md): the async
+    // block captures no `Expr`, so its `Send` proof does not walk DataFusion's
+    // expression graph. `filters` is not forwarded to the `MemTable`: this
+    // provider keeps the default `supports_filters_pushdown` (unsupported),
+    // so DataFusion never hands it any, and the `MemTable` ignores them.
+    fn scan<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+        &'life0 self,
+        state: &'life1 dyn Session,
+        projection: Option<&'life2 Vec<usize>>,
+        _filters: &'life3 [Expr],
         limit: Option<usize>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let fn_name = self.kind.fn_name();
-        let table = self.catalog.load_table(&self.ident).await.map_err(|e| {
-            DataFusionError::Plan(format!(
-                "{fn_name}: failed to load table '{}.{}': {e}",
-                self.ident.namespace().as_ref().join("."),
-                self.ident.name()
-            ))
-        })?;
+    ) -> futures::future::BoxFuture<'async_trait, DFResult<Arc<dyn ExecutionPlan>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let fn_name = self.kind.fn_name();
+            let table = self.catalog.load_table(&self.ident).await.map_err(|e| {
+                DataFusionError::Plan(format!(
+                    "{fn_name}: failed to load table '{}.{}': {e}",
+                    self.ident.namespace().as_ref().join("."),
+                    self.ident.name()
+                ))
+            })?;
 
-        let batch = match self.kind {
-            MetadataKind::Snapshots => build_snapshots_batch(&table, &self.schema)?,
-            MetadataKind::Manifests => build_manifests_batch(&table, &self.schema).await?,
-            MetadataKind::History => build_history_batch(&table, &self.schema)?,
-            MetadataKind::Files => build_files_batch(&table, &self.schema).await?,
-            MetadataKind::Partitions => build_partitions_batch(&table, &self.schema).await?,
-            MetadataKind::Refs => build_refs_batch(&table, &self.schema)?,
-        };
+            let batch = match self.kind {
+                MetadataKind::Snapshots => build_snapshots_batch(&table, &self.schema)?,
+                MetadataKind::Manifests => build_manifests_batch(&table, &self.schema).await?,
+                MetadataKind::History => build_history_batch(&table, &self.schema)?,
+                MetadataKind::Files => build_files_batch(&table, &self.schema).await?,
+                MetadataKind::Partitions => build_partitions_batch(&table, &self.schema).await?,
+                MetadataKind::Refs => build_refs_batch(&table, &self.schema)?,
+            };
 
-        let mem = MemTable::try_new(self.schema.clone(), vec![vec![batch]])?;
-        mem.scan(state, projection, filters, limit).await
+            // Type-erased before the await: a `MemTable` carries `Expr`
+            // (column defaults), and holding one across `scan` would put
+            // the expression graph back into this coroutine's `Send` proof.
+            let mem: Arc<dyn TableProvider> =
+                Arc::new(MemTable::try_new(self.schema.clone(), vec![vec![batch]])?);
+            mem.scan(state, projection, &[], limit).await
+        })
     }
 }
 

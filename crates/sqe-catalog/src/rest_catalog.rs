@@ -2028,8 +2028,22 @@ impl SessionCatalog {
     /// cached metadata is reused without re-downloading.
     ///
     /// Use [`invalidate_table`] to evict an entry after DDL/DML.
+    ///
+    /// Returns a boxed future on purpose (compile time, see
+    /// docs/internal/plans/2026-09-07-compile-time-async-hubs.md): this is
+    /// the catalog's busiest async hub, awaited from a dozen `async_trait`
+    /// methods (`SchemaProvider::table`, `information_schema`, the metadata
+    /// TVFs), and each of those re-proved the concrete future `Send` under
+    /// its own parameter environment. Boxing here proves it once.
+    pub fn load_table<'a>(
+        &'a self,
+        table_ident: &'a TableIdent,
+    ) -> futures::future::BoxFuture<'a, sqe_core::Result<Table>> {
+        Box::pin(self.load_table_inner(table_ident))
+    }
+
     #[instrument(name = "sqe.catalog", skip(self), fields(op = "load_table", table = %table_ident, warehouse = %self.warehouse))]
-    pub async fn load_table(&self, table_ident: &TableIdent) -> sqe_core::Result<Table> {
+    async fn load_table_inner(&self, table_ident: &TableIdent) -> sqe_core::Result<Table> {
         let cache_key = self.table_cache_key(table_ident);
         // Snapshot the invalidation generations BEFORE any fetch below. Every
         // insert on this path is fenced with it, so a commit by another session

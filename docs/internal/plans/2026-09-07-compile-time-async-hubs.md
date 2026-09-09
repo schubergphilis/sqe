@@ -135,6 +135,69 @@ without changing DataFusion's trait signatures, so the catalog stops here at
 43 s; the next lever for it is the C1 dependency edge (it waits 22 s for
 `sqe-policy` before it can start).
 
+## sqe-catalog, second look (2026-09-08): the coroutine, not the trait
+
+The paragraph above was wrong about "nothing local to erase". Aggregating
+the profile by *predicate* (the `arg0` of every `evaluate_obligation` event
+in `chrome_profiler.json`) showed the 39.5 s as thousands of small
+`<datafusion_expr::... as Send/Sync>` proofs, each solved about 26 times: once
+per async method, because every method has its own parameter environment and
+rustc does not share auto-trait results across them. The cost is therefore
+per *coroutine that captures an `Expr`-bearing value*, and `async_trait`
+makes every `async fn` in a trait impl such a coroutine: it moves all the
+arguments (`filters: &[Expr]`, a `Vec<Expr>`) into the boxed `async move`
+block whether the body uses them across an await or not.
+
+Three shapes remove the coroutine or its `Expr` capture without touching the
+DataFusion trait:
+
+1. **Pass-through wrappers** written in `async_trait`'s desugared form
+   (`fn scan<'life0, ..., 'async_trait>(...) -> BoxFuture<'async_trait, _>`
+   with the `'lifeN: 'async_trait` bounds) that return the inner `dyn`
+   provider's already-boxed future directly. No coroutine at all.
+   `ReservedMemTable::scan` 4.1 s -> 1.1 s; `HiveTableProvider`'s
+   `insert_into` / `delete_from` / `update` / `truncate` 2.2 s -> 0.
+2. **Hubs boxed at the definition** (the coordinator recipe):
+   `SessionCatalog::load_table`, `SqeTableProvider::scan_impl`,
+   `InformationSchemaProvider::build_columns_batch`,
+   `SqeSchemaProvider::plan_view`. Their callers then await a `BoxFuture`
+   and own no `Expr`/`LogicalPlan`. `SqeSchemaProvider::table` 3.8 s -> 0.3 s;
+   `SqeTableProvider::scan` 2.7 s -> 0, `scan_with_args` 2.6 s -> 0 (`ScanArgs`
+   hands out its borrows with the outer lifetime, so the boxed future can be
+   built and `map_ok`'d without a coroutine).
+3. **Erase what the block holds across an await.** A `MemTable` carries
+   `Expr` (column defaults); holding one while awaiting its `scan` puts the
+   whole graph back in. `Arc<dyn TableProvider>` before the await:
+   `information_schema.columns` scan 4.7 s -> 0, the metadata TVF scan
+   4.4 s -> 0. `ListingOptions` carries `Expr` (`file_sort_order`); the Hive
+   `table()` method now lists files for statistics *before* it builds the
+   `ListingTable`, so its last await holds none (3.9 s -> 2.3 s).
+
+4. **State the fact once when the block must own the value.** Three methods
+   have no choice: `HiveTableProvider::scan` / `scan_with_args` must own the
+   rewritten `Vec<Expr>` the inner scan borrows, `ScopedTable::scan` must own
+   the scoped `SessionState` (and needs the `&[Expr]`). Both types are
+   `Send + Sync`; only the proof is expensive. `crate::send_erased::SendErased`
+   is a newtype with an `unsafe impl Send + Sync` gated on an `unsafe` marker
+   trait implemented for exactly those types, and a unit test that proves
+   the marker's claim the ordinary way. The coroutine holds the wrapper and
+   the proof stops there: 4.5 s + 2.4 s -> 0. DataFusion is not vendored in
+   this repo (only iceberg-rust is), so an owned-argument trait variant was
+   never on the table; this is the substitute.
+
+Per-crate `evaluate_obligation`: 39.5 s -> 7.2 s; the profiled crate build
+42 s -> 19 s. What remains: the Hive `table()` tail (2.3 s) and 1.2 s on
+`ReservedMemTable::scan` that the pass-through did not remove, plus the long
+tail of `SessionCatalog` methods at 0.2 to 0.4 s each.
+
+The predicate aggregation is a two-line addition to the attribution script's
+input and is worth running first next time: it tells you *what type* is being
+walked, which is what decides between the three shapes above.
+
 ## Progress log
 
 - 2026-09-07: measured, fixed, documented (this file); chain 173 s -> 131 s.
+- 2026-09-08: C1 policy half (!963) and C4 coordinator (!961) on main: chain
+  108.8 s. sqe-catalog C4 on `perf/catalog-async-hubs`: obligations
+  39.5 s -> 7.2 s (section above); chain 108.8 s -> 84.9 s
+  (`CARGO_BUILD_JOBS=4`, `touch sqe-core`, `CARGO_INCREMENTAL=0`).

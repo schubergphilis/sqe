@@ -57,6 +57,7 @@ use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
+use futures::future::BoxFuture;
 use futures::TryStreamExt;
 use moka::sync::Cache as SyncCache;
 use object_store::{ObjectMeta, ObjectStore};
@@ -73,6 +74,7 @@ use super::source::HiveMetadataSource;
 use super::store::HiveManifestStore;
 use super::HiveError;
 use crate::schema_provider::{merge_listing, NamespaceListing};
+use crate::send_erased::SendErased;
 
 /// Capacity bound for a catalog's per-database table-name snapshots
 /// ([`HiveListings::tables`]). Generous: a warehouse with more than this
@@ -788,7 +790,24 @@ impl HiveTableProvider {
         Ok(Vec::new())
     }
 
-    async fn scan_from_entries(
+    /// Boxed at the definition (compile time, see
+    /// docs/internal/plans/2026-09-07-compile-time-async-hubs.md): the
+    /// coroutine owns `filters: Vec<Expr>`, so its `Send` proof walks
+    /// DataFusion's expression graph; done once here rather than again in
+    /// each `scan` variant that awaits it. Heap-allocating it is also what
+    /// keeps the per-partition `ListingTable` scans off a 2 MB tokio worker
+    /// stack during SELECT.
+    fn scan_from_entries<'a>(
+        &'a self,
+        state: &'a dyn Session,
+        projection: Option<&'a [usize]>,
+        filters: Vec<Expr>,
+        limit: Option<usize>,
+    ) -> BoxFuture<'a, DFResult<Arc<dyn ExecutionPlan>>> {
+        Box::pin(self.scan_from_entries_inner(state, projection, filters, limit))
+    }
+
+    async fn scan_from_entries_inner(
         &self,
         state: &dyn Session,
         projection: Option<&[usize]>,
@@ -1001,66 +1020,89 @@ impl TableProvider for HiveTableProvider {
         self.inner.get_column_default(column)
     }
 
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
+    // `scan` and `scan_with_args` are written in `async_trait`'s desugared
+    // form (compile time, see
+    // docs/internal/plans/2026-09-07-compile-time-async-hubs.md). The
+    // rewritten filters must outlive the inner scan that borrows them, so
+    // the async block has to own the `Vec<Expr>`; it holds it as a
+    // `SendErased`, which states the (true) `Send` fact once instead of
+    // making rustc re-prove it over DataFusion's whole expression graph for
+    // this method's parameter environment (2 s apiece). The filter rewrite
+    // itself runs synchronously before the block, so a bad filter still
+    // fails before any I/O, as it did.
+    fn scan<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+        &'life0 self,
+        state: &'life1 dyn Session,
+        projection: Option<&'life2 Vec<usize>>,
+        filters: &'life3 [Expr],
         limit: Option<usize>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let rewritten = normalize_default_partition_filters(filters, &self.partition_columns)?;
-        if self.uses_index_scan() {
-            // Heap-allocate the indexed path: its future (per-partition
-            // ListingTable scans) is large enough that constructing it in
-            // this already-boxed async_trait method overflowed a 2 MB
-            // tokio worker during SELECT.
-            let proj = projection.cloned();
-            return Box::pin(self.scan_from_entries(
-                state,
-                proj.as_deref(),
-                rewritten,
-                limit,
-            ))
-            .await;
-        }
-        let plan = self
-            .inner
-            .scan(state, projection, &rewritten, limit)
-            .await?;
-        nullify_default_partition_columns(plan, &self.partition_columns)
-    }
-
-    async fn scan_with_args<'a>(
-        &self,
-        state: &dyn Session,
-        args: ScanArgs<'a>,
-    ) -> DFResult<ScanResult> {
-        let rewritten = match args.filters() {
-            Some(f) => Some(normalize_default_partition_filters(
-                f,
-                &self.partition_columns,
-            )?),
-            None => None,
+    ) -> BoxFuture<'async_trait, DFResult<Arc<dyn ExecutionPlan>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        Self: 'async_trait,
+    {
+        let rewritten = match normalize_default_partition_filters(filters, &self.partition_columns)
+        {
+            Ok(r) => r,
+            Err(e) => return Box::pin(async move { Err(e) }),
         };
         if self.uses_index_scan() {
-            let filters = rewritten.unwrap_or_default();
-            let proj = args.projection().map(|s| s.to_vec());
-            let plan = Box::pin(self.scan_from_entries(
-                state,
-                proj.as_deref(),
-                filters,
-                args.limit(),
-            ))
-            .await?;
-            return Ok(ScanResult::new(plan));
+            return self.scan_from_entries(state, projection.map(Vec::as_slice), rewritten, limit);
         }
-        let mut new_args = ScanArgs::default()
-            .with_projection(args.projection())
-            .with_limit(args.limit());
-        new_args = new_args.with_filters(rewritten.as_deref());
-        let result = self.inner.scan_with_args(state, new_args).await?;
-        let plan = nullify_default_partition_columns(result.into_inner(), &self.partition_columns)?;
-        Ok(ScanResult::new(plan))
+        let held = SendErased::new(rewritten);
+        Box::pin(async move {
+            let plan = self
+                .inner
+                .scan(state, projection, held.get(), limit)
+                .await?;
+            nullify_default_partition_columns(plan, &self.partition_columns)
+        })
+    }
+
+    fn scan_with_args<'a, 'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        state: &'life1 dyn Session,
+        args: ScanArgs<'a>,
+    ) -> BoxFuture<'async_trait, DFResult<ScanResult>>
+    where
+        'a: 'async_trait,
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        let rewritten = match args.filters() {
+            Some(f) => match normalize_default_partition_filters(f, &self.partition_columns) {
+                Ok(r) => Some(r),
+                Err(e) => return Box::pin(async move { Err(e) }),
+            },
+            None => None,
+        };
+        let projection = args.projection();
+        let limit = args.limit();
+        if self.uses_index_scan() {
+            use futures::TryFutureExt;
+            return Box::pin(
+                self.scan_from_entries(state, projection, rewritten.unwrap_or_default(), limit)
+                    .map_ok(ScanResult::new),
+            );
+        }
+        let held = SendErased::new(rewritten.unwrap_or_default());
+        let has_filters = args.filters().is_some();
+        Box::pin(async move {
+            let mut new_args = ScanArgs::default()
+                .with_projection(projection)
+                .with_limit(limit);
+            if has_filters {
+                new_args = new_args.with_filters(Some(held.get().as_slice()));
+            }
+            let result = self.inner.scan_with_args(state, new_args).await?;
+            let plan =
+                nullify_default_partition_columns(result.into_inner(), &self.partition_columns)?;
+            Ok(ScanResult::new(plan))
+        })
     }
 
     fn supports_filters_pushdown(
@@ -1074,34 +1116,64 @@ impl TableProvider for HiveTableProvider {
         Some(self.statistics.clone())
     }
 
-    async fn insert_into(
-        &self,
-        state: &dyn Session,
+    // The four DML hooks below are written in `async_trait`'s desugared form
+    // on purpose (compile time, see
+    // docs/internal/plans/2026-09-07-compile-time-async-hubs.md): an
+    // `async fn` wrapper owns a coroutine capturing `Vec<Expr>`, and proving
+    // it `Send` walks DataFusion's whole `Expr` graph once more under this
+    // method's parameter environment (2 s apiece). The inner table's future
+    // is already boxed, so it is handed straight through.
+    fn insert_into<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        state: &'life1 dyn Session,
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.insert_into(state, input, insert_op).await
+    ) -> BoxFuture<'async_trait, DFResult<Arc<dyn ExecutionPlan>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.inner.insert_into(state, input, insert_op)
     }
 
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
+    fn delete_from<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        state: &'life1 dyn Session,
         filters: Vec<Expr>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.delete_from(state, filters).await
+    ) -> BoxFuture<'async_trait, DFResult<Arc<dyn ExecutionPlan>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.inner.delete_from(state, filters)
     }
 
-    async fn update(
-        &self,
-        state: &dyn Session,
+    fn update<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        state: &'life1 dyn Session,
         assignments: Vec<(String, Expr)>,
         filters: Vec<Expr>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.update(state, assignments, filters).await
+    ) -> BoxFuture<'async_trait, DFResult<Arc<dyn ExecutionPlan>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.inner.update(state, assignments, filters)
     }
 
-    async fn truncate(&self, state: &dyn Session) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.inner.truncate(state).await
+    fn truncate<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        state: &'life1 dyn Session,
+    ) -> BoxFuture<'async_trait, DFResult<Arc<dyn ExecutionPlan>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.inner.truncate(state)
     }
 }
 
@@ -1582,6 +1654,45 @@ impl SchemaProvider for HiveSchemaProvider {
             resolved.compression =
                 detect_compression(&data_store, url.prefix(), resolved.compression).await;
         }
+        let projection_cfg =
+            parse_projection(&manifest.parameters, &manifest.partition_keys).map_err(to_df)?;
+        let index = manifest.sqe.partition_index.clone();
+        let partition_types: Vec<(String, String)> = manifest
+            .partition_keys
+            .iter()
+            .map(|k| (k.name.clone(), k.r#type.clone()))
+            .collect();
+
+        // The one remaining await of this method runs BEFORE the
+        // `ListingTable` exists (compile time, see
+        // docs/internal/plans/2026-09-07-compile-time-async-hubs.md): its
+        // `ListingOptions` carry `Expr`s (`file_sort_order`), and a coroutine
+        // that holds them across an await pays a `Send` proof over
+        // DataFusion's whole expression graph. Listing the files first keeps
+        // every later step synchronous.
+        let needs_listing = manifest.hive_statistics().is_none()
+            && index.is_none()
+            && !projection_cfg.as_ref().map(|p| p.enabled).unwrap_or(false);
+        let listed_files: Option<Vec<ObjectMeta>> = if needs_listing {
+            match data_store
+                .list(Some(url.prefix()))
+                .try_collect::<Vec<ObjectMeta>>()
+                .await
+            {
+                Ok(files) => Some(files),
+                Err(e) => {
+                    warn!(
+                        database = %self.database, table = %name, error = %e,
+                        "hive_external: could not list files for size-only statistics; \
+                         table remains queryable with unknown statistics"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let options = listing_options(&resolved, partition_cols).map_err(to_df)?;
 
         let file_schema_ref = Arc::new(file_schema);
@@ -1592,15 +1703,6 @@ impl SchemaProvider for HiveSchemaProvider {
         let listing_table = ListingTable::try_new(config)?;
         let full_schema = listing_table.schema();
 
-        let projection_cfg =
-            parse_projection(&manifest.parameters, &manifest.partition_keys).map_err(to_df)?;
-        let index = manifest.sqe.partition_index.clone();
-        let partition_types: Vec<(String, String)> = manifest
-            .partition_keys
-            .iter()
-            .map(|k| (k.name.clone(), k.r#type.clone()))
-            .collect();
-
         let statistics = if let Some(hs) = manifest.hive_statistics() {
             let bytes = index
                 .as_ref()
@@ -1609,23 +1711,10 @@ impl SchemaProvider for HiveSchemaProvider {
         } else if let Some(idx) = &index {
             let bytes: u64 = idx.entries.iter().map(|e| e.total_bytes).sum();
             size_only_from_index(bytes, width_hint, &full_schema)
-        } else if projection_cfg.as_ref().map(|p| p.enabled).unwrap_or(false) {
-            Statistics::new_unknown(&full_schema)
         } else {
-            match data_store
-                .list(Some(url.prefix()))
-                .try_collect::<Vec<ObjectMeta>>()
-                .await
-            {
-                Ok(files) => size_only_statistics(&files, width_hint, &full_schema),
-                Err(e) => {
-                    warn!(
-                        database = %self.database, table = %name, error = %e,
-                        "hive_external: could not list files for size-only statistics; \
-                         table remains queryable with unknown statistics"
-                    );
-                    Statistics::new_unknown(&full_schema)
-                }
+            match listed_files {
+                Some(files) => size_only_statistics(&files, width_hint, &full_schema),
+                None => Statistics::new_unknown(&full_schema),
             }
         };
 
