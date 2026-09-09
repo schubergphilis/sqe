@@ -2063,13 +2063,39 @@ impl QueryHandler {
                     Ok(vec![])
                 }
 
-                // USE catalog.schema — session context switching stub.
-                // The actual session mutation happens in the Trino HTTP layer via
-                // X-Trino-Set-Catalog / X-Trino-Set-Schema response headers.
+                // USE [catalog.]schema — session scope switch (review 707).
+                // The Trino HTTP layer is stateless and carries the scope back
+                // to the client as X-Trino-Set-Catalog / -Schema headers; the
+                // Flight path has no such channel, so the stored session is
+                // mutated here and every later request on the same token
+                // resolves unqualified names in the new scope. The same
+                // copy-and-reinsert shape as SET WRITE_BRANCH above.
                 StatementKind::Use(ref target) => {
-                    tracing::info!(
-                        "USE {target} — session catalog/schema switch (no-op at engine level)"
-                    );
+                    let (catalog, schema) = parse_use_target(target)?;
+                    if let Some(ref manager) = self.session_manager {
+                        let updated = manager.set_default_scope(
+                            &session.id,
+                            catalog.clone(),
+                            schema.clone(),
+                        );
+                        if !updated {
+                            return Err(SqeError::with_code(
+                                SqeErrorCode::ExecutionFailed,
+                                "USE: session not found in manager".to_string(),
+                            ));
+                        }
+                        tracing::info!(
+                            username = %session.user.username,
+                            catalog = ?catalog,
+                            schema = %schema,
+                            "USE applied to the session"
+                        );
+                    } else {
+                        tracing::debug!(
+                            "USE {target} requested but session manager is not wired; \
+                             the scope is carried by the protocol layer in this mode"
+                        );
+                    }
                     Ok(vec![])
                 }
 
@@ -8928,6 +8954,31 @@ fn namespaces_or_empty_on_denial(
     }
 }
 
+/// `USE` target as the classifier renders it (`schema`, `catalog.schema`,
+/// quotes preserved) into `(catalog, schema)`. Mirrors the Trino layer's
+/// reading of the same statement: one part is a schema, two parts are
+/// catalog and schema, anything else is a user error.
+fn parse_use_target(target: &str) -> sqe_core::Result<(Option<String>, String)> {
+    let unquote = |part: &str| -> String {
+        let p = part.trim();
+        p.strip_prefix('"')
+            .and_then(|p| p.strip_suffix('"'))
+            .map(|p| p.replace("\"\"", "\""))
+            .unwrap_or_else(|| p.to_string())
+    };
+    let parts: Vec<String> = target.split('.').map(unquote).collect();
+    match parts.as_slice() {
+        [schema] if !schema.is_empty() => Ok((None, schema.clone())),
+        [catalog, schema] if !catalog.is_empty() && !schema.is_empty() => {
+            Ok((Some(catalog.clone()), schema.clone()))
+        }
+        _ => Err(SqeError::with_code(
+            SqeErrorCode::SyntaxError,
+            format!("Invalid USE target '{target}': expected [catalog.]schema"),
+        )),
+    }
+}
+
 fn parse_show_tables_namespace(filter: &str) -> Option<String> {
     let raw = filter.trim();
     if raw.is_empty() {
@@ -9757,6 +9808,27 @@ mod tests {
         ];
         let out = namespaces_or_empty_on_denial(Ok(ns.clone())).expect("ok passes through");
         assert_eq!(out, ns);
+    }
+
+    #[test]
+    fn parse_use_target_reads_schema_and_catalog_schema_forms() {
+        assert_eq!(
+            parse_use_target("analytics").unwrap(),
+            (None, "analytics".to_string())
+        );
+        assert_eq!(
+            parse_use_target("lake.sales").unwrap(),
+            (Some("lake".to_string()), "sales".to_string())
+        );
+        assert_eq!(
+            parse_use_target("\"Lake\".\"Sales Q1\"").unwrap(),
+            (Some("Lake".to_string()), "Sales Q1".to_string()),
+            "quoted identifiers are unquoted, case and spaces kept"
+        );
+        for bad in ["", "a.b.c", "a.", ".b"] {
+            let err = parse_use_target(bad).expect_err(bad);
+            assert_eq!(err.error_code(), SqeErrorCode::SyntaxError, "{bad}");
+        }
     }
 
     #[test]

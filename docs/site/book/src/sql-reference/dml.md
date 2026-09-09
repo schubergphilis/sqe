@@ -182,8 +182,8 @@ SET WRITE_BRANCH = DEFAULT;
 
 | Statement | Origin | Notes |
 |---|---|---|
-| `USE catalog.schema` | `sqe-sql/classifier.rs` | Switch active catalog and schema. Subsequent unqualified table references use this scope. |
-| `USE schema` | `sqe-sql/classifier.rs` | Switch schema only. |
+| `USE catalog.schema` | `sqe-sql/classifier.rs` | Switch active catalog and schema. Subsequent unqualified table references use this scope. Over the Trino protocol the scope travels back as `X-Trino-Set-Catalog` / `X-Trino-Set-Schema` and the client echoes it; over Flight SQL it is stored on the session behind the bearer token, so every later request on that token, on any connection, resolves in the new scope. `current_schema()` reports it. |
+| `USE schema` | `sqe-sql/classifier.rs` | Switch schema only; the catalog stays as it was. |
 | `SET <variable> = <value>` | `sqlparser-rs` (DataFusion) | DataFusion session config. See `EXPLAIN ANALYZE` documentation for valid keys. |
 | `BEGIN` / `COMMIT` / `ROLLBACK` | `sqe-sql/classifier.rs` | No-op stubs for JDBC compatibility. SQE does not implement multi-statement transactions; each commit is single-statement. |
 

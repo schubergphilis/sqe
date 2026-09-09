@@ -153,6 +153,15 @@ impl Session {
         self.write_branch = branch;
     }
 
+    /// `USE [catalog.]schema`: set the scope unqualified table references
+    /// resolve in. `catalog` `None` keeps the current default catalog.
+    pub fn set_default_scope(&mut self, catalog: Option<String>, schema: String) {
+        if catalog.is_some() {
+            self.default_catalog = catalog;
+        }
+        self.default_schema = Some(schema);
+    }
+
     /// Returns a new session with the given default catalog.
     #[must_use = "with_catalog consumes self; bind the returned Session"]
     pub fn with_catalog(mut self, catalog: Option<String>) -> Self {
