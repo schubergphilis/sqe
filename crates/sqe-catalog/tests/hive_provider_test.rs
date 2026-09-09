@@ -1184,3 +1184,321 @@ async fn composite_indexed_scan_prunes_on_one_key() {
     );
     assert_eq!(n, 1);
 }
+
+// ---------------------------------------------------------------------------
+// Table-load round trips: the manifest recheck window and cached data facts.
+// ---------------------------------------------------------------------------
+
+mod counting {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use futures::stream::BoxStream;
+    use object_store::path::Path as ObjectPath;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
+
+    use sqe_catalog::hive::manifest::{HiveManifest, ManifestLimits};
+    use sqe_catalog::hive::provider::HiveDataStoreFactory;
+    use sqe_catalog::hive::source::HiveMetadataSource;
+    use sqe_catalog::hive::store::HiveManifestStore;
+    use sqe_catalog::hive::HiveError;
+
+    /// Counts metastore round trips; every call is answered by the fixture's
+    /// manifest store. `etags = false` behaves like Glue, which has no change
+    /// token.
+    pub struct CountingSource {
+        inner: HiveManifestStore,
+        etags: bool,
+        pub etag_calls: AtomicUsize,
+        pub get_calls: AtomicUsize,
+    }
+
+    impl CountingSource {
+        pub fn new(inner: HiveManifestStore, etags: bool) -> Self {
+            Self {
+                inner,
+                etags,
+                etag_calls: AtomicUsize::new(0),
+                get_calls: AtomicUsize::new(0),
+            }
+        }
+        pub fn etags(&self) -> usize {
+            self.etag_calls.load(Ordering::SeqCst)
+        }
+        pub fn gets(&self) -> usize {
+            self.get_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HiveMetadataSource for CountingSource {
+        async fn list_databases(&self) -> Result<Vec<String>, HiveError> {
+            self.inner.list_databases().await
+        }
+        async fn list_tables(&self, database: &str) -> Result<Vec<String>, HiveError> {
+            self.inner.list_tables(database).await
+        }
+        async fn get(&self, database: &str, table: &str) -> Result<HiveManifest, HiveError> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(database, table).await
+        }
+        async fn etag(&self, database: &str, table: &str) -> Result<Option<String>, HiveError> {
+            self.etag_calls.fetch_add(1, Ordering::SeqCst);
+            if !self.etags {
+                // Still confirm the table exists, as Glue's `etag` path does
+                // not: the store's answer is what tells the provider about a
+                // dropped table.
+                return self.inner.manifest_etag(database, table).await.map(|_| None);
+            }
+            self.inner.manifest_etag(database, table).await
+        }
+        fn limits(&self) -> &ManifestLimits {
+            self.inner.limits()
+        }
+    }
+
+    /// Counts data-prefix listings on the way to the local filesystem.
+    #[derive(Debug)]
+    pub struct CountingStore {
+        inner: Arc<dyn ObjectStore>,
+        pub list_calls: AtomicUsize,
+    }
+
+    impl CountingStore {
+        pub fn local() -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::new(object_store::local::LocalFileSystem::new()),
+                list_calls: AtomicUsize::new(0),
+            })
+        }
+        pub fn lists(&self) -> usize {
+            self.list_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CountingStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<ListResult> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            opts: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct CountingFactory(pub Arc<CountingStore>);
+
+    impl HiveDataStoreFactory for CountingFactory {
+        fn store_for(
+            &self,
+            _location: &str,
+            _secret: Option<&str>,
+        ) -> Result<Arc<dyn ObjectStore>, HiveError> {
+            Ok(Arc::clone(&self.0) as Arc<dyn ObjectStore>)
+        }
+    }
+}
+
+/// A `lake` catalog over the fixture whose metastore and data store count
+/// their round trips.
+async fn counting_root(
+    f: &hive_fixture::Fixture,
+    ctx: &SessionContext,
+    cache: HiveMetadataCache,
+    etags: bool,
+) -> (
+    Arc<HiveCatalogProvider>,
+    Arc<counting::CountingSource>,
+    Arc<counting::CountingStore>,
+) {
+    let source = Arc::new(counting::CountingSource::new(fixture_store(&f.root), etags));
+    let store = counting::CountingStore::local();
+    let provider = Arc::new(HiveCatalogProvider::with_source(
+        "lake".to_string(),
+        Arc::clone(&source) as Arc<dyn sqe_catalog::hive::source::HiveMetadataSource>,
+        Arc::new(counting::CountingFactory(Arc::clone(&store))),
+        ctx.runtime_env(),
+        Arc::new(cache),
+        Duration::from_secs(60),
+    ));
+    provider.refresh_all().await;
+    (provider, source, store)
+}
+
+async fn load_orders(
+    provider: &HiveCatalogProvider,
+) -> Arc<dyn datafusion::datasource::TableProvider> {
+    use datafusion::catalog::CatalogProvider;
+    provider
+        .schema("sales")
+        .expect("sales")
+        .table("orders")
+        .await
+        .expect("table()")
+        .expect("orders")
+}
+
+/// A statement resolves the same table several times (DataFusion's resolver,
+/// `information_schema`, the tag source); inside the recheck window those
+/// cost one metadata round trip in total, and the CSV codec probe and the
+/// size-statistics listing run once per manifest version, not per lookup.
+#[tokio::test]
+async fn repeated_lookups_inside_the_recheck_window_pay_one_round_trip() {
+    use datafusion::common::stats::Precision;
+
+    let f = partitioned_csv_root().await;
+    let ctx = SessionContext::new();
+    let (provider, source, store) =
+        counting_root(&f, &ctx, HiveMetadataCache::new(), true).await;
+
+    let first = load_orders(&provider).await;
+    let first_size = first.statistics().expect("size stats").total_byte_size;
+    assert!(
+        matches!(first_size, Precision::Exact(n) if n > 0),
+        "size-only statistics come from the listing: {first_size:?}"
+    );
+    assert_eq!(source.etags(), 1);
+    assert_eq!(source.gets(), 1);
+    assert_eq!(
+        store.lists(),
+        2,
+        "one listing for the CSV codec, one for size statistics"
+    );
+
+    for _ in 0..3 {
+        let again = load_orders(&provider).await;
+        assert_eq!(
+            again.statistics().expect("size stats").total_byte_size,
+            first_size,
+            "cached facts must yield the same statistics"
+        );
+    }
+    assert_eq!(source.etags(), 1, "no HEAD inside the recheck window");
+    assert_eq!(source.gets(), 1);
+    assert_eq!(store.lists(), 2, "no relisting inside the TTL");
+}
+
+/// `metadata_recheck_secs = 0` restores a HEAD per lookup; the data facts
+/// still belong to the manifest version and are not re-listed while the
+/// ETag matches.
+#[tokio::test]
+async fn a_zero_recheck_window_heads_every_lookup_but_keeps_the_listings() {
+    let f = partitioned_csv_root().await;
+    let ctx = SessionContext::new();
+    let cache = HiveMetadataCache::new().with_recheck(Duration::ZERO);
+    let (provider, source, store) = counting_root(&f, &ctx, cache, true).await;
+
+    for _ in 0..3 {
+        load_orders(&provider).await;
+    }
+    assert_eq!(source.etags(), 3, "every lookup compares the ETag");
+    assert_eq!(source.gets(), 1, "an unchanged ETag never reloads");
+    assert_eq!(store.lists(), 2, "facts follow the manifest version");
+}
+
+/// DDL and writes call `invalidate`; the next lookup must go back to the
+/// source for everything, including the data facts, because a new manifest
+/// version may point at a different location or codec.
+#[tokio::test]
+async fn invalidating_the_manifest_reloads_it_and_relists_the_data() {
+    let f = partitioned_csv_root().await;
+    let ctx = SessionContext::new();
+    let cache = Arc::new(HiveMetadataCache::new());
+    let source = Arc::new(counting::CountingSource::new(fixture_store(&f.root), true));
+    let store = counting::CountingStore::local();
+    let provider = Arc::new(HiveCatalogProvider::with_source(
+        "lake".to_string(),
+        Arc::clone(&source) as Arc<dyn sqe_catalog::hive::source::HiveMetadataSource>,
+        Arc::new(counting::CountingFactory(Arc::clone(&store))),
+        ctx.runtime_env(),
+        Arc::clone(&cache),
+        Duration::from_secs(60),
+    ));
+    provider.refresh_all().await;
+
+    load_orders(&provider).await;
+    cache.invalidate("sales", "orders");
+    load_orders(&provider).await;
+
+    assert_eq!(source.etags(), 2);
+    assert_eq!(source.gets(), 2, "an invalidated entry is reloaded");
+    assert_eq!(store.lists(), 4, "facts were dropped with the entry");
+}
+
+/// A source without change tokens (Glue) refreshes on the cache TTL. Serving
+/// from the cache must not extend that TTL: the previous implementation
+/// re-inserted the entry on every hit, so a table queried continuously never
+/// picked up a changed manifest.
+#[tokio::test]
+async fn an_etag_less_source_reloads_once_the_ttl_has_lapsed() {
+    let f = partitioned_csv_root().await;
+    let ctx = SessionContext::new();
+    let cache = HiveMetadataCache::with_ttl(Duration::from_millis(300));
+    let (provider, source, _store) = counting_root(&f, &ctx, cache, false).await;
+
+    load_orders(&provider).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    load_orders(&provider).await;
+    assert_eq!(source.gets(), 1, "inside the TTL the entry is served");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    load_orders(&provider).await;
+    assert_eq!(
+        source.gets(),
+        2,
+        "400 ms after the load a 300 ms TTL has lapsed, whatever was served in between"
+    );
+}

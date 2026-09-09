@@ -23,6 +23,7 @@ ATTACH 's3://bucket/wh/' AS lake (TYPE hive_external);
 manifest_max_bytes = 1048576
 manifest_max_columns = 4096
 manifest_max_partition_keys = 32
+metadata_recheck_secs = 10   # serve a cached manifest this long before asking the metastore again
 
 [[hive.roots]]
 name     = "lake"
@@ -253,6 +254,12 @@ An object store makes a `PUT` visible whole or not at all, so no reader ever see
 But a write that produces several files has no commit that makes them appear together, and there is nothing SQE can do about that: a Hive external table has no metadata pointer to swap. Its content is whatever is in the directory, which is exactly the property that lets other engines read it.
 
 So a concurrent reader may see a subset of an in-progress write, and an interrupted write leaves the files it had already landed. Those files hold real rows, not corruption. **If you need snapshot isolation on write, use an Iceberg table.**
+
+### One metadata round trip per table, not one per lookup
+
+Planning a statement resolves every table reference it names through the catalog, `information_schema` resolves every table in a database, and the policy layer reads the same manifest to find column tags. Before this, each of those lookups cost a `HEAD` on the manifest to compare its ETag, and for CSV and JSON tables a listing of the data prefix to read the compression codec off a file name, and for tables with neither `ANALYZE` statistics nor a partition index a second listing to size the table for the planner. A twelve-table dbt step paid all of that twelve times over.
+
+Now a manifest that the metastore confirmed less than `metadata_recheck_secs` ago (default 10) is served as is, and what the two listings learned is kept on the manifest's cache entry until the manifest reloads or the 60 s cache TTL expires. Every `CREATE`, `ALTER`, `DROP`, `MSCK REPAIR` and `INSERT` in the coordinator drops the entry for the table it changed, so your own writes are visible immediately. The window only delays what another engine wrote to the same manifest; set `metadata_recheck_secs = 0` to check on every lookup. Glue-backed roots have no change token and already refreshed on the TTL alone; they now honour that TTL under continuous querying, where the previous release kept extending it.
 
 ### The partition index is refreshed for you
 
