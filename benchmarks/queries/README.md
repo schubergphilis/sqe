@@ -2,10 +2,12 @@
 
 `sqe-bench` sends these files as committed. It no longer rewrites table names
 in the SQL (review 707, issue #627): the default schema rides on the
-connection instead (`X-Trino-Schema` on the Trino protocol). The one
+connection instead (`X-Trino-Schema` on the Trino protocol; one
+`USE [catalog.]schema` on the session behind the bearer token on Flight SQL,
+which the coordinator stores so the per-query connections share it). The one
 exception is `--qualify-tables always|auto`, a tokenizer-based qualifier
-for connections that cannot carry a default schema; see
-`crates/sqe-bench/src/query.rs`. Because the text is no longer rewritten, an
+for connections that cannot carry a default schema (a Flight client without a
+bearer token has no session to scope); see `crates/sqe-bench/src/query.rs`. Because the text is no longer rewritten, an
 alias that happens to share a table's name is fine again, and three files
 that had been edited to dodge the old string rewriter were restored (below).
 

@@ -84,6 +84,15 @@ impl FlightServer {
         let polaris = mount_empty_polaris().await;
         let config = smoke_config(&polaris.uri());
         let tracker = Arc::new(QueryTracker::new(&config.query_history));
+
+        // Any credentials authenticate. The subject here is the transport, not
+        // the identity provider, which has its own tests.
+        let provider = Arc::new(AnonymousProvider::new(AnonymousProviderConfig::default()));
+        let session_manager = Arc::new(SessionManager::with_provider(provider));
+
+        // The handler holds the same manager the service authenticates with,
+        // as `sqe-server` wires it: `USE` mutates the stored session through it
+        // (review 707), and a handler without one would log and ignore it.
         let handler = QueryHandler::new(
             Arc::new(PassthroughEnforcer),
             None, // policy_store
@@ -99,12 +108,8 @@ impl FlightServer {
             RuntimeCatalogRegistry::new(),
             SecretStore::new(),
         )
-        .expect("QueryHandler::new");
-
-        // Any credentials authenticate. The subject here is the transport, not
-        // the identity provider, which has its own tests.
-        let provider = Arc::new(AnonymousProvider::new(AnonymousProviderConfig::default()));
-        let session_manager = Arc::new(SessionManager::with_provider(provider));
+        .expect("QueryHandler::new")
+        .with_session_manager(Arc::clone(&session_manager));
         let service = SqeFlightSqlService::new(session_manager, Arc::new(handler), config);
 
         // Port 0 plus `serve_with_incoming`: the OS picks a free port and the
@@ -206,6 +211,63 @@ async fn handshake_then_statement_returns_rows_over_grpc() {
         .downcast_ref::<arrow_array::Int64Array>()
         .expect("1 + 1 is an Int64");
     assert_eq!(values.value(0), 2);
+}
+
+/// Review 707: `USE` over Flight scopes the session, not just the statement.
+/// The Trino protocol hands the scope back as response headers the client
+/// echoes; Flight has no such channel, so the coordinator mutates the stored
+/// session and every later request on the same token sees it. `current_schema()`
+/// is the session UDF that reads `Session::default_schema`, so it is the
+/// observable; a second client with its own handshake must not inherit it.
+#[tokio::test(flavor = "multi_thread")]
+async fn use_over_flight_scopes_later_statements_on_the_same_token() {
+    let server = FlightServer::start().await;
+    let mut client = FlightSqlServiceClient::new(server.channel().await);
+    let token = client.handshake("scoped", "scoped").await.expect("handshake");
+    client.set_token(String::from_utf8(token.to_vec()).expect("token is utf-8"));
+
+    let schema_of = |batches: Vec<arrow_array::RecordBatch>| -> String {
+        let batch = batches
+            .into_iter()
+            .find(|b| b.num_rows() > 0)
+            .expect("one row");
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .expect("current_schema() is Utf8")
+            .value(0)
+            .to_string()
+    };
+
+    let before = query(&mut client, "SELECT current_schema() AS s").await.expect("query");
+    assert_eq!(schema_of(before), "default", "the engine default before USE");
+
+    let use_result = query(&mut client, "USE analytics").await.expect("USE executes");
+    let rows: usize = use_result.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 0, "USE returns no rows");
+
+    // A fresh channel, same token: the scope lives on the session, not the
+    // connection, which is what lets a per-query-connection client rely on it.
+    let mut again = FlightSqlServiceClient::new(server.channel().await);
+    again.set_token(String::from_utf8(token.to_vec()).expect("token is utf-8"));
+    let after = query(&mut again, "SELECT current_schema() AS s").await.expect("query");
+    assert_eq!(schema_of(after), "analytics");
+
+    let two_part = query(&mut again, "USE lake.sales").await;
+    two_part.expect("catalog.schema form executes");
+    let after_two = query(&mut again, "SELECT current_schema() AS s").await.expect("query");
+    assert_eq!(schema_of(after_two), "sales");
+
+    let bad = query(&mut again, "USE a.b.c").await;
+    assert!(bad.is_err(), "a three-part USE target is refused");
+
+    // Another session (own handshake) is untouched.
+    let mut other = FlightSqlServiceClient::new(server.channel().await);
+    let other_token = other.handshake("other", "other").await.expect("handshake");
+    other.set_token(String::from_utf8(other_token.to_vec()).expect("token is utf-8"));
+    let other_schema = query(&mut other, "SELECT current_schema() AS s").await.expect("query");
+    assert_eq!(schema_of(other_schema), "default", "USE is per session");
 }
 
 /// Finding 403: the ADBC/JDBC cancel sequence over the wire. `GetFlightInfo`
