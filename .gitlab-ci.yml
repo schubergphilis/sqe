@@ -44,16 +44,16 @@ default:
 # do not merge the release MR until it has.
 include:
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.12.2'
+    ref: 'v0.12.3'
     file: '/ci/templates/guardrails.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.12.2'
+    ref: 'v0.12.3'
     file: '/ci/templates/test-rust.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.12.2'
+    ref: 'v0.12.3'
     file: '/ci/templates/deploy.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.12.2'
+    ref: 'v0.12.3'
     file: '/ci/templates/release.yml'
   # GitLab's own Security/Secret-Detection template was included here too. It
   # duplicated aikido-secret-scan (same gitleaks-class scan, a second image
@@ -70,6 +70,11 @@ variables:
   # thread stack (the write e2e tests need this too). 32 MiB; the platform default
   # is 8 MiB, which is not enough here. Carried over from the local cargo-gate.
   AIKIDO_RUST_MIN_STACK: "33554432"
+  # Clippy in its own job (aikido-clippy-rust, aikido !166 / v0.12.3), parallel
+  # to the gate, which then skips its clippy phase. Clippy shares no artifacts
+  # with the test build, so serial placement was pure wall clock: 5m06 of the
+  # 21m test job on pipeline 1609830. Still advisory.
+  AIKIDO_CARGO_CLIPPY_JOB: "1"
   # Compiler cache. The platform's .aikido_rust_build_env (test-rust.yml) runs
   # sccache against an S3 bucket when AIKIDO_SCCACHE_BUCKET is set; it replaces
   # the target/ cache that never fit the 5 GiB single-PUT limit (see the
