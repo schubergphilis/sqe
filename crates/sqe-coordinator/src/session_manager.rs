@@ -387,15 +387,40 @@ impl SessionManager {
     /// The session is copied (because `Session` is behind an `Arc` and cannot
     /// be mutated in place), mutated, and re-inserted atomically.
     pub fn set_write_branch(&self, session_id: &str, branch: Option<String>) -> bool {
-        let Some(session) = self.sessions.get(session_id) else {
+        self.update_session(session_id, |s| s.set_write_branch(branch))
+    }
+
+    /// Copy the stored session, apply `mutate`, re-insert. The read guard is
+    /// dropped BEFORE the insert: `DashMap::insert` on a shard whose read
+    /// guard the same thread still holds deadlocks (the first test of
+    /// `set_default_scope` hung exactly there; `set_write_branch` had the
+    /// same shape and no test).
+    fn update_session(&self, session_id: &str, mutate: impl FnOnce(&mut Session)) -> bool {
+        let Some(mut updated) = self
+            .sessions
+            .get(session_id)
+            .map(|entry| (**entry.value()).clone())
+        else {
             return false;
         };
-        let mut updated = (*session.value().clone()).clone();
-        updated.set_write_branch(branch);
+        mutate(&mut updated);
         self.sessions
             .insert(session_id.to_string(), Arc::new(updated));
         self.record_activity(session_id);
         true
+    }
+
+    /// `USE [catalog.]schema` for a stored session (review 707): the Flight
+    /// path has no per-request header to carry the default scope, so the
+    /// statement mutates the session every later request resolves through.
+    /// Same copy-and-reinsert shape as [`Self::set_write_branch`].
+    pub fn set_default_scope(
+        &self,
+        session_id: &str,
+        catalog: Option<String>,
+        schema: String,
+    ) -> bool {
+        self.update_session(session_id, |s| s.set_default_scope(catalog, schema))
     }
 
     /// Save current sessions to a JSON file for crash recovery.
@@ -633,6 +658,57 @@ mod tests {
 
         assert_eq!(retrieved.id, id, "Retrieved session ID must match");
         assert_eq!(retrieved.user.username, "alice");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: USE mutates the stored session (review 707, Flight path)
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn set_default_scope_updates_the_stored_session() {
+        let auth = make_authenticator().await;
+        let manager = SessionManager::new(auth);
+        let session = Arc::new(make_session("carol"));
+        let id = session.id.clone();
+        manager.sessions.insert(id.clone(), session);
+
+        assert!(manager.set_default_scope(&id, None, "analytics".into()));
+        let after_schema = manager.get_session(&id).expect("session");
+        assert_eq!(after_schema.default_schema.as_deref(), Some("analytics"));
+        assert!(
+            after_schema.default_catalog.is_none(),
+            "USE schema alone keeps the catalog"
+        );
+
+        assert!(manager.set_default_scope(&id, Some("lake".into()), "sales".into()));
+        let after_both = manager.get_session(&id).expect("session");
+        assert_eq!(after_both.default_catalog.as_deref(), Some("lake"));
+        assert_eq!(after_both.default_schema.as_deref(), Some("sales"));
+
+        assert!(manager.set_default_scope(&id, None, "hr".into()));
+        let after_schema_only = manager.get_session(&id).expect("session");
+        assert_eq!(
+            after_schema_only.default_catalog.as_deref(),
+            Some("lake"),
+            "USE schema keeps the catalog a previous USE set"
+        );
+        assert_eq!(after_schema_only.default_schema.as_deref(), Some("hr"));
+
+        assert!(
+            !manager.set_default_scope("no-such-session", None, "x".into()),
+            "an unknown session reports false so the caller can error"
+        );
+
+        // Same copy-and-reinsert path as SET WRITE_BRANCH, which had no test
+        // and deadlocked on the DashMap shard until `update_session` dropped
+        // the read guard before inserting.
+        assert!(manager.set_write_branch(&id, Some("audit".into())));
+        let with_branch = manager.get_session(&id).expect("session");
+        assert_eq!(with_branch.write_branch.as_deref(), Some("audit"));
+        assert_eq!(
+            with_branch.default_schema.as_deref(),
+            Some("hr"),
+            "one setter does not clobber the other"
+        );
     }
 
     // -----------------------------------------------------------------------

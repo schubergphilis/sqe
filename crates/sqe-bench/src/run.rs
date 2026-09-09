@@ -119,11 +119,26 @@ pub async fn run(args: RunArgs) -> anyhow::Result<()> {
             None => None,
         };
 
+        // One Flight client per suite as well, scoped with `USE` to the
+        // namespace this suite reads (the same `[catalog.]ns` `run_suite`
+        // derives), so the committed query text runs unmodified on SQE too
+        // (review 707). The scope lives on the token's session, which the
+        // per-query connections share.
+        let ns_base = crate::suite_namespace(suite, args.scale, None);
+        let sqe_scope = match catalog {
+            Some(cat) => format!("{cat}.{ns_base}"),
+            None => ns_base,
+        };
+        let suite_client: Box<dyn client::BenchClient> = Box::new(
+            client::flight::FlightSqlBenchClient::with_token(&endpoint, &args.golden_token)
+                .with_schema(&sqe_scope),
+        );
+
         // Single pass: SQE runs each query once (and Trino once, in compare
         // mode). The report results and the optional comparison both come from
         // this one sweep -- no separate compare re-execution of SQE.
         let out = suite::run_suite(
-            bench_client.as_ref(),
+            suite_client.as_ref(),
             trino_client.as_deref(),
             suite,
             args.scale,

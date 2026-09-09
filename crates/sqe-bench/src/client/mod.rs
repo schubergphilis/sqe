@@ -55,6 +55,19 @@ pub async fn create_client(args: &ConnectArgs<'_>) -> anyhow::Result<Box<dyn Ben
                 args.client_secret,
             )
             .await?;
+            // The coordinator scopes `USE [catalog.]schema` on the token's
+            // session (review 707), so the Flight client carries a default
+            // schema the same way the Trino client carries `X-Trino-Schema`.
+            let client = match args.schema {
+                Some(schema) => {
+                    let scope = match args.catalog {
+                        Some(catalog) => format!("{catalog}.{schema}"),
+                        None => schema.to_string(),
+                    };
+                    client.with_schema(&scope)
+                }
+                None => client,
+            };
             Ok(Box::new(client))
         }
         "trino" => {

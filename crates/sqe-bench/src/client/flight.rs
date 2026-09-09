@@ -4,24 +4,63 @@
 //! Creates a fresh gRPC connection per query to avoid HTTP/2 stream
 //! accumulation issues on long-running benchmark sessions.
 //!
-//! No default schema: the coordinator's Flight path never populates
-//! `Session::default_schema` and treats `USE` as a logged no-op
-//! (`query_handler.rs`, `StatementKind::Use`), so `default_schema()` reports
-//! `None` and `query::QualifyTables::Auto` qualifies table names for this
-//! client. When the coordinator honours a Flight session schema, return it
-//! here and the rewrite switches itself off.
+//! Default schema (review 707): the coordinator keys its session on the
+//! bearer token and `USE [catalog.]schema` mutates that stored session
+//! (`query_handler.rs`, `StatementKind::Use`), so one `USE` sent on the
+//! first query scopes every later connection carrying the same token.
+//! `with_schema` arms it; `default_schema()` then reports the schema and
+//! `query::QualifyTables::Auto` sends the committed query text untouched.
 
 use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use sqe_trino_protocol::flight::{ChannelOptions, FlightSqlClient};
+use tokio::sync::OnceCell;
 
 pub struct FlightSqlBenchClient {
     host: String,
     token: Option<String>,
+    /// `[catalog.]schema` to `USE` once before the first query.
+    schema: Option<String>,
+    scoped: OnceCell<()>,
 }
 
 impl FlightSqlBenchClient {
+    /// Scope unqualified table names to `schema` (`[catalog.]schema`) for the
+    /// session behind this client's token. Applied lazily, once, by the first
+    /// `execute`. A client without a token has no server-side session for the
+    /// scope to live on, so the schema is not recorded: `default_schema()`
+    /// stays `None` and the caller's `QualifyTables::Auto` qualifies names.
+    pub fn with_schema(mut self, schema: &str) -> Self {
+        if self.token.is_some() {
+            self.schema = Some(schema.to_string());
+        } else {
+            eprintln!(
+                "[flight] no bearer token, so no session to scope with USE {schema}; \
+                 table names will be qualified in the query text instead"
+            );
+        }
+        self
+    }
+
+    /// Send the `USE` exactly once per client. Later connections carry the
+    /// same token, so the coordinator serves them the scoped session.
+    async fn ensure_scoped(&self) -> anyhow::Result<()> {
+        let Some(schema) = &self.schema else {
+            return Ok(());
+        };
+        self.scoped
+            .get_or_try_init(|| async {
+                let mut client = self.new_client().await?;
+                client
+                    .execute_collect(&format!("USE {schema}"))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("USE {schema} over Flight failed: {e}"))?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        Ok(())
+    }
     /// Connect to a Flight SQL server and obtain auth credentials.
     pub async fn connect(
         host: &str,
@@ -47,6 +86,8 @@ impl FlightSqlBenchClient {
         Ok(Self {
             host: host.to_string(),
             token,
+            schema: None,
+            scoped: OnceCell::new(),
         })
     }
 
@@ -58,6 +99,8 @@ impl FlightSqlBenchClient {
         Self {
             host: host.to_string(),
             token: Some(token.to_string()),
+            schema: None,
+            scoped: OnceCell::new(),
         }
     }
 
@@ -129,6 +172,7 @@ async fn fetch_client_credentials_token(
 #[async_trait::async_trait]
 impl super::BenchClient for FlightSqlBenchClient {
     async fn execute(&self, sql: &str) -> anyhow::Result<Vec<RecordBatch>> {
+        self.ensure_scoped().await?;
         // Fresh connection per query — avoids HTTP/2 stream accumulation
         let mut client = self.new_client().await?;
 
@@ -150,5 +194,9 @@ impl super::BenchClient for FlightSqlBenchClient {
 
     fn protocol_name(&self) -> &str {
         "flight"
+    }
+
+    fn default_schema(&self) -> Option<&str> {
+        self.schema.as_deref()
     }
 }
