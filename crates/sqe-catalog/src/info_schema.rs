@@ -177,7 +177,22 @@ impl InformationSchemaProvider {
     /// a fresh metadata-cache hit without a round trip inside the
     /// authorization recheck window, so a warm catalog costs zero REST calls
     /// and a cold one costs one `load_table` per miss (review 307).
-    async fn build_columns_batch(&self, namespace_filter: Option<&str>) -> DFResult<RecordBatch> {
+    ///
+    /// Boxed at the definition (compile time, see
+    /// docs/internal/plans/2026-09-07-compile-time-async-hubs.md) so the
+    /// `TableProvider::scan` that awaits it owns no coroutine over
+    /// DataFusion's `Expr` graph.
+    fn build_columns_batch<'a>(
+        &'a self,
+        namespace_filter: Option<&'a str>,
+    ) -> futures::future::BoxFuture<'a, DFResult<RecordBatch>> {
+        Box::pin(self.build_columns_batch_inner(namespace_filter))
+    }
+
+    async fn build_columns_batch_inner(
+        &self,
+        namespace_filter: Option<&str>,
+    ) -> DFResult<RecordBatch> {
         let schema = Self::columns_schema();
 
         let namespaces: Vec<String> = match namespace_filter {
@@ -445,20 +460,39 @@ impl TableProvider for InformationSchemaColumns {
             .collect())
     }
 
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
+    // `async_trait`'s desugared form (compile time, see
+    // docs/internal/plans/2026-09-07-compile-time-async-hubs.md): the
+    // namespace filter is extracted synchronously, so the async block below
+    // captures no `Expr` and its `Send` proof does not walk DataFusion's
+    // expression graph. Behaviour is unchanged.
+    fn scan<'life0, 'life1, 'life2, 'life3, 'async_trait>(
+        &'life0 self,
+        state: &'life1 dyn Session,
+        projection: Option<&'life2 Vec<usize>>,
+        filters: &'life3 [Expr],
         limit: Option<usize>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+    ) -> futures::future::BoxFuture<'async_trait, DFResult<Arc<dyn ExecutionPlan>>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        Self: 'async_trait,
+    {
         let ns = namespace_filter(filters);
         if let Some(ns) = &ns {
             debug!(namespace = %ns, "information_schema.columns: namespace filter pushed down");
         }
-        let batch = self.inner.build_columns_batch(ns.as_deref()).await?;
-        let mem = MemTable::try_new(self.schema(), vec![vec![batch]])?;
-        mem.scan(state, projection, &[], limit).await
+        let schema = self.schema();
+        Box::pin(async move {
+            let batch = self.inner.build_columns_batch(ns.as_deref()).await?;
+            // Type-erased before the await: a `MemTable` carries `Expr`
+            // (column defaults), and holding one across `scan` would put
+            // the expression graph back into this coroutine's `Send` proof.
+            let mem: Arc<dyn TableProvider> =
+                Arc::new(MemTable::try_new(schema, vec![vec![batch]])?);
+            mem.scan(state, projection, &[], limit).await
+        })
     }
 }
 
