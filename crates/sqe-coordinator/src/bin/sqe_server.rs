@@ -1518,7 +1518,11 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     // `main.rs`. Both Arcs must be the same instance every other Hive
     // consumer receives (Task 8+).
     let hive_catalogs = Arc::new(sqe_policy::plan_rewriter::HiveCatalogs::new());
-    let hive_manifest_cache = Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new());
+    let hive_manifest_cache = Arc::new(
+        sqe_catalog::hive::provider::HiveMetadataCache::new().with_recheck(
+            std::time::Duration::from_secs(config.hive.metadata_recheck_secs),
+        ),
+    );
 
     // Attach every `[[hive.roots]]` configured root before the first
     // session context is ever built; see the matching comment in `main.rs`.

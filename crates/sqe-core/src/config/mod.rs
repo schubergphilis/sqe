@@ -2891,6 +2891,10 @@ fn default_hive_manifest_max_partition_index_entries() -> usize {
     100_000
 }
 
+fn default_hive_metadata_recheck_secs() -> u64 {
+    10
+}
+
 /// `[hive]`: warehouse roots to attach at coordinator startup, plus the
 /// manifest size/shape caps enforced on every root. The four caps default
 /// to the exact values `hive::manifest::ManifestLimits::default()` uses
@@ -2909,6 +2913,14 @@ pub struct HiveConfig {
     pub manifest_max_partition_keys: usize,
     #[serde(default = "default_hive_manifest_max_partition_index_entries")]
     pub manifest_max_partition_index_entries: usize,
+    /// How long a Hive table's cached manifest is served without asking the
+    /// metastore whether it changed (one HEAD per table per lookup
+    /// otherwise). Every DDL and write in this process invalidates the
+    /// entry directly, so the window only delays what another writer
+    /// changed. `0` checks on every lookup. Default 10, matching
+    /// `[catalog] authorization_recheck_secs`.
+    #[serde(default = "default_hive_metadata_recheck_secs")]
+    pub metadata_recheck_secs: u64,
 }
 
 impl Default for HiveConfig {
@@ -2920,6 +2932,7 @@ impl Default for HiveConfig {
             manifest_max_partition_keys: default_hive_manifest_max_partition_keys(),
             manifest_max_partition_index_entries: default_hive_manifest_max_partition_index_entries(
             ),
+            metadata_recheck_secs: default_hive_metadata_recheck_secs(),
         }
     }
 }

@@ -42,6 +42,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::{CatalogProvider, ScanArgs, ScanResult, SchemaProvider, Session};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{Constraints, ScalarValue, Statistics};
+use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
 use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -69,7 +70,7 @@ use super::partition::{
 };
 use super::scan_exec::{HiveScanExec, HiveScanSpec};
 use super::serde_map::{arrow_type, listing_options, resolve_format, ResolvedFormat};
-use super::stats::{analyzed_statistics, row_width_hint, size_only_from_index, size_only_statistics};
+use super::stats::{analyzed_statistics, row_width_hint, size_only_from_index};
 use super::source::HiveMetadataSource;
 use super::store::HiveManifestStore;
 use super::HiveError;
@@ -188,6 +189,9 @@ fn listing_failure(e: &HiveError) -> (String, bool) {
 /// so sized for "every Hive table this deployment has ever queried since
 /// boot," not one session.
 const MANIFEST_CACHE_CAPACITY: u64 = 16_384;
+/// Default for `[hive] metadata_recheck_secs`; mirrors the Iceberg side's
+/// `catalog.authorization_recheck_secs`.
+pub const DEFAULT_METADATA_RECHECK: Duration = Duration::from_secs(10);
 
 /// The directory name Hive itself writes for a NULL partition value.
 ///
@@ -219,7 +223,8 @@ pub use super::manifest::HIVE_DEFAULT_PARTITION;
 /// Glue has no trustworthy field for this: `compressionType` is absent on
 /// most tables and reads "none" on every table that carries it, gzipped
 /// ones included. So the key suffix is the only signal, and one listing per
-/// manifest-cache miss is what it costs.
+/// [`HiveTableFacts`] refresh (manifest reload or cache TTL) is what it costs;
+/// `HiveSchemaProvider::table` keeps the answer on the manifest's cache entry.
 ///
 /// Falls back to `current` when the prefix is empty, unreachable, or the
 /// first object names no codec. A listing failure is not fatal here: the
@@ -227,8 +232,8 @@ pub use super::manifest::HIVE_DEFAULT_PARTITION;
 async fn detect_compression(
     store: &Arc<dyn ObjectStore>,
     prefix: &object_store::path::Path,
-    current: datafusion::datasource::file_format::file_compression_type::FileCompressionType,
-) -> datafusion::datasource::file_format::file_compression_type::FileCompressionType {
+    current: FileCompressionType,
+) -> FileCompressionType {
     let mut stream = store.list(Some(prefix));
     loop {
         match stream.try_next().await {
@@ -261,17 +266,6 @@ pub trait HiveDataStoreFactory: Send + Sync + fmt::Debug {
     ) -> Result<Arc<dyn ObjectStore>, HiveError>;
 }
 
-/// A shared, process-wide cache of loaded manifests, keyed by
-/// `"<database>.<table>"`.
-///
-/// One instance is built at coordinator startup and injected into every
-/// per-session [`HiveCatalogProvider`]. It holds no credentials and grants no
-/// access by itself: reading it only tells a caller what a table's columns
-/// and tags are, and the policy layer still decides per user whether to mask
-/// or deny based on that. There is deliberately no invalidation here beyond
-/// the moka TTL/capacity eviction; a manifest change (e.g. `ALTER TABLE`)
-/// self-heals the next time `HiveSchemaProvider::table` reloads it, which is
-/// on every uncached call.
 /// Who currently owns a bucket-level object-store registration: the table
 /// that last (successfully) claimed it, and the `sqe.secret` name it read
 /// under (`None` for engine-default credentials).
@@ -280,16 +274,57 @@ struct ObjectStoreOwner {
     secret: Option<String>,
 }
 
+/// What `HiveSchemaProvider::table` learned about a table's data files the
+/// last time it looked: facts that cost a listing of the data prefix and
+/// that the manifest itself does not record. They live on the manifest's
+/// cache entry, so a manifest reload (new ETag, DDL, `invalidate`) drops
+/// them with it, and they expire on the cache TTL on their own because data
+/// files change without the manifest changing.
+#[derive(Clone)]
+pub struct HiveTableFacts {
+    /// Codec read off the first data object's key, for the text formats
+    /// (`None` for formats that carry their own framing).
+    pub compression: Option<FileCompressionType>,
+    /// Total bytes under the data prefix, for size-only statistics when the
+    /// table has neither `ANALYZE` statistics nor a partition index.
+    pub listed_bytes: Option<u64>,
+    pub listed_at: Instant,
+}
+
 #[derive(Clone)]
 struct CachedManifest {
     manifest: HiveManifest,
     etag: Option<String>,
     loaded_at: Instant,
+    /// When the source last confirmed this entry is current: at load, and
+    /// on every ETag match after that. `get_if_recently_verified` serves
+    /// the entry without a round trip inside `recheck` of this instant.
+    verified_at: Instant,
+    facts: Option<HiveTableFacts>,
 }
 
+/// A shared, process-wide cache of loaded manifests, keyed by
+/// `"<database>.<table>"`.
+///
+/// One instance is built at coordinator startup and injected into every
+/// per-session [`HiveCatalogProvider`]. It holds no credentials and grants no
+/// access by itself: reading it only tells a caller what a table's columns
+/// and tags are, and the policy layer still decides per user whether to mask
+/// or deny based on that.
+///
+/// Freshness has two clocks. Within `recheck` (default 10 s) of the last
+/// successful check an entry is served as is, so the many lookups one query
+/// or one dbt step makes for the same table pay one metadata round trip,
+/// not one each. Past that, `HiveSchemaProvider::table` asks the source for
+/// the manifest's ETag: a match extends the entry, a change reloads it, and
+/// a source without ETags (Glue) reloads when `ttl` (default 60 s) has
+/// elapsed since the load. Every DDL and write path in this process calls
+/// `invalidate` on the tables it changes, so the window only delays what
+/// another process wrote. Set `recheck` to zero to check on every lookup.
 pub struct HiveMetadataCache {
     inner: SyncCache<String, CachedManifest>,
     ttl: Duration,
+    recheck: Duration,
     /// Guards against the collision `register_object_store` cannot see on
     /// its own: DataFusion's `ObjectStoreRegistry` keys purely on
     /// `scheme://host:port` (see `object_store_bucket_key`), discarding the
@@ -319,6 +354,7 @@ impl Default for HiveMetadataCache {
 }
 
 impl HiveMetadataCache {
+    /// 60 s TTL for ETag-less sources, 10 s recheck window.
     pub fn new() -> Self {
         Self::with_ttl(Duration::from_secs(60))
     }
@@ -329,8 +365,18 @@ impl HiveMetadataCache {
                 .max_capacity(MANIFEST_CACHE_CAPACITY)
                 .build(),
             ttl,
+            recheck: DEFAULT_METADATA_RECHECK,
             object_store_owners: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// How long a confirmed entry is served without asking the source
+    /// again. Sourced from `[hive] metadata_recheck_secs`; zero means every
+    /// lookup checks.
+    #[must_use = "with_recheck consumes self; bind the returned cache"]
+    pub fn with_recheck(mut self, recheck: Duration) -> Self {
+        self.recheck = recheck;
+        self
     }
 
     fn key(database: &str, table: &str) -> String {
@@ -354,41 +400,74 @@ impl HiveMetadataCache {
         m: HiveManifest,
         etag: Option<String>,
     ) {
+        let now = Instant::now();
         self.inner.insert(
             Self::key(database, table),
             CachedManifest {
                 manifest: m,
                 etag,
-                loaded_at: Instant::now(),
+                loaded_at: now,
+                verified_at: now,
+                facts: None,
             },
         );
     }
 
     /// Use the cached manifest when the store's current ETag matches, or
     /// when the store has no ETag and the TTL has not elapsed. A changed
-    /// ETag returns `None` so the caller reloads.
+    /// ETag returns `None` so the caller reloads. A hit counts as a
+    /// verification: the entry is served without a round trip for the next
+    /// `recheck` (see [`Self::get_if_recently_verified`]).
     pub fn get_if_fresh(
         &self,
         database: &str,
         table: &str,
         etag: Option<&str>,
     ) -> Option<HiveManifest> {
+        let key = Self::key(database, table);
+        let mut cached = self.inner.get(&key)?;
+        let fresh = match etag {
+            Some(now) => cached.etag.as_deref() == Some(now),
+            None => cached.loaded_at.elapsed() < self.ttl,
+        };
+        if !fresh {
+            return None;
+        }
+        cached.verified_at = Instant::now();
+        let manifest = cached.manifest.clone();
+        self.inner.insert(key, cached);
+        Some(manifest)
+    }
+
+    /// The cached manifest when the source confirmed it (load or ETag
+    /// match) less than `recheck` ago, so the caller skips the round trip.
+    /// An ETag-less entry additionally has to be inside its TTL.
+    pub fn get_if_recently_verified(&self, database: &str, table: &str) -> Option<HiveManifest> {
+        if self.recheck.is_zero() {
+            return None;
+        }
         let cached = self.inner.get(&Self::key(database, table))?;
-        match etag {
-            Some(now) => {
-                if cached.etag.as_deref() == Some(now) {
-                    Some(cached.manifest)
-                } else {
-                    None
-                }
-            }
-            None => {
-                if cached.loaded_at.elapsed() < self.ttl {
-                    Some(cached.manifest)
-                } else {
-                    None
-                }
-            }
+        let within_ttl = cached.etag.is_some() || cached.loaded_at.elapsed() < self.ttl;
+        (within_ttl && cached.verified_at.elapsed() < self.recheck).then_some(cached.manifest)
+    }
+
+    /// Data-file facts recorded for the current entry, when they are
+    /// younger than the TTL. `None` when the entry is missing, was reloaded
+    /// since, or the facts have aged out.
+    pub fn facts(&self, database: &str, table: &str) -> Option<HiveTableFacts> {
+        let cached = self.inner.get(&Self::key(database, table))?;
+        let facts = cached.facts?;
+        (facts.listed_at.elapsed() < self.ttl).then_some(facts)
+    }
+
+    /// Attach data-file facts to the current entry. A no-op when the entry
+    /// is gone (evicted or invalidated meanwhile): facts belong to a
+    /// manifest version, not to a table name.
+    pub fn record_facts(&self, database: &str, table: &str, facts: HiveTableFacts) {
+        let key = Self::key(database, table);
+        if let Some(mut cached) = self.inner.get(&key) {
+            cached.facts = Some(facts);
+            self.inner.insert(key, cached);
         }
     }
 
@@ -1538,40 +1617,56 @@ impl SchemaProvider for HiveSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        let etag = match self.source.etag(&self.database, name).await {
-            Ok(e) => e,
-            Err(HiveError::NotFound(_)) => return Ok(None),
-            Err(e) => return Err(to_df(e)),
-        };
-        let manifest = if let Some(cached) =
-            self.cache
-                .get_if_fresh(&self.database, name, etag.as_deref())
-        {
-            cached
-        } else {
-            match self.source.get(&self.database, name).await {
-                Ok(m) => m,
-                Err(HiveError::NotFound(_)) => return Ok(None),
-                Err(e) => return Err(to_df(e)),
+        // Three tiers, cheapest first. DataFusion resolves every table
+        // reference of a statement through here, `information_schema` calls
+        // it per table, and the policy layer's tag source reads the same
+        // cache, so a table touched by one query is looked up several times
+        // in a few milliseconds: those pay no round trip at all. Past the
+        // recheck window one HEAD (the manifest ETag) decides between
+        // serving the entry and reloading it.
+        let manifest = match self.cache.get_if_recently_verified(&self.database, name) {
+            Some(recent) => recent,
+            None => {
+                let etag = match self.source.etag(&self.database, name).await {
+                    Ok(e) => e,
+                    Err(HiveError::NotFound(_)) => return Ok(None),
+                    Err(e) => return Err(to_df(e)),
+                };
+                match self
+                    .cache
+                    .get_if_fresh(&self.database, name, etag.as_deref())
+                {
+                    Some(cached) => cached,
+                    None => {
+                        let loaded = match self.source.get(&self.database, name).await {
+                            Ok(m) => m,
+                            Err(HiveError::NotFound(_)) => return Ok(None),
+                            Err(e) => return Err(to_df(e)),
+                        };
+                        // Cache BEFORE building the table. The policy layer's
+                        // `TagSource` is synchronous and can only answer from
+                        // this cache, and plan rewriting runs after the
+                        // `LogicalPlan` is built, which is after this call
+                        // returns. If the insert moved below the table build
+                        // and the build failed partway, a later retry could
+                        // rewrite against an empty cache and deny rather than
+                        // mask.
+                        //
+                        // `a_failed_table_build_still_leaves_the_manifest_cached`
+                        // (see hive_provider_test.rs) pins this ordering:
+                        // moving this insert to just before the final `Ok`
+                        // return, as a mutation check, makes that test fail
+                        // while leaving every happy-path test (including
+                        // `loading_a_table_populates_the_metadata_cache_before_returning`)
+                        // green, which is exactly why the happy-path test
+                        // alone was not enough.
+                        self.cache
+                            .insert_versioned(&self.database, name, loaded.clone(), etag);
+                        loaded
+                    }
+                }
             }
         };
-
-        // Cache BEFORE building the table. The policy layer's `TagSource` is
-        // synchronous and can only answer from this cache, and plan
-        // rewriting runs after the `LogicalPlan` is built, which is after
-        // this call returns. If the insert moved below the table build and
-        // the build failed partway, a later retry could rewrite against an
-        // empty cache and deny rather than mask.
-        //
-        // `a_failed_table_build_still_leaves_the_manifest_cached` (see
-        // hive_provider_test.rs) pins this ordering: moving this insert to
-        // just before the final `Ok` return, as a mutation check, makes that
-        // test fail while leaving every happy-path test (including
-        // `loading_a_table_populates_the_metadata_cache_before_returning`)
-        // green, which is exactly why the happy-path test alone was not
-        // enough.
-        self.cache
-            .insert_versioned(&self.database, name, manifest.clone(), etag);
 
         // A table this release cannot read is invisible, not fatal. Glue
         // holds formats SQE has no reader for (ORC, Avro) and types it
@@ -1643,16 +1738,25 @@ impl SchemaProvider for HiveSchemaProvider {
         // Compression has to come from a real object key: Glue records
         // nothing usable (`compressionType` is absent on most tables and
         // says "none" on every table carrying it, gzipped ones included).
-        // One listing per manifest-cache miss, and only for the text
-        // formats, where guessing wrong feeds gzip bytes to a parser and
-        // fails as `Encountered unexpected ''` rather than as a codec
-        // problem.
+        // One listing per facts refresh (manifest reload or cache TTL), and
+        // only for the text formats, where guessing wrong feeds gzip bytes
+        // to a parser and fails as `Encountered unexpected ''` rather than
+        // as a codec problem.
+        let facts = self.cache.facts(&self.database, name);
+        let mut detected_compression = None;
         if matches!(
             resolved.kind,
             super::serde_map::HiveFileFormat::Json | super::serde_map::HiveFileFormat::Csv
         ) {
-            resolved.compression =
-                detect_compression(&data_store, url.prefix(), resolved.compression).await;
+            resolved.compression = match facts.as_ref().and_then(|f| f.compression) {
+                Some(known) => known,
+                None => {
+                    let detected =
+                        detect_compression(&data_store, url.prefix(), resolved.compression).await;
+                    detected_compression = Some(detected);
+                    detected
+                }
+            };
         }
         let projection_cfg =
             parse_projection(&manifest.parameters, &manifest.partition_keys).map_err(to_df)?;
@@ -1673,13 +1777,20 @@ impl SchemaProvider for HiveSchemaProvider {
         let needs_listing = manifest.hive_statistics().is_none()
             && index.is_none()
             && !projection_cfg.as_ref().map(|p| p.enabled).unwrap_or(false);
-        let listed_files: Option<Vec<ObjectMeta>> = if needs_listing {
+        let known_bytes = facts.as_ref().and_then(|f| f.listed_bytes);
+        let mut listed_now = false;
+        let listed_bytes: Option<u64> = if !needs_listing {
+            None
+        } else if known_bytes.is_some() {
+            known_bytes
+        } else {
+            listed_now = true;
             match data_store
                 .list(Some(url.prefix()))
                 .try_collect::<Vec<ObjectMeta>>()
                 .await
             {
-                Ok(files) => Some(files),
+                Ok(files) => Some(files.iter().map(|f| f.size).sum()),
                 Err(e) => {
                     warn!(
                         database = %self.database, table = %name, error = %e,
@@ -1689,9 +1800,23 @@ impl SchemaProvider for HiveSchemaProvider {
                     None
                 }
             }
-        } else {
-            None
         };
+        // Remember what this call paid for, so the next lookup of this
+        // manifest version inside the TTL pays nothing. A failed listing
+        // leaves `listed_bytes` unknown and is retried on the next lookup,
+        // as before; the warning above says why each time.
+        if detected_compression.is_some() || listed_now {
+            self.cache.record_facts(
+                &self.database,
+                name,
+                HiveTableFacts {
+                    compression: detected_compression
+                        .or_else(|| facts.as_ref().and_then(|f| f.compression)),
+                    listed_bytes: if listed_now { listed_bytes } else { known_bytes },
+                    listed_at: Instant::now(),
+                },
+            );
+        }
 
         let options = listing_options(&resolved, partition_cols).map_err(to_df)?;
 
@@ -1712,8 +1837,8 @@ impl SchemaProvider for HiveSchemaProvider {
             let bytes: u64 = idx.entries.iter().map(|e| e.total_bytes).sum();
             size_only_from_index(bytes, width_hint, &full_schema)
         } else {
-            match listed_files {
-                Some(files) => size_only_statistics(&files, width_hint, &full_schema),
+            match listed_bytes {
+                Some(bytes) => size_only_from_index(bytes, width_hint, &full_schema),
                 None => Statistics::new_unknown(&full_schema),
             }
         };
