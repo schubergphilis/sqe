@@ -183,10 +183,11 @@ version = "0.9"
 default-features = false
 features = ["any", "runtime-tokio", "sqlite"]
 
-# rusqlite (sqe-catalog `sql`, reached only through sqe-cli in the workspace
-# build) turns on bundled-build features of the sqlite C crate that
-# sqlx-sqlite alone does not. Pin the workspace union so the C library is
-# compiled once, not once per selection.
+# This is the one place that asks for the bundled build of the sqlite C
+# crate. rusqlite used to request it too (sqe-catalog `sql`, zero call
+# sites) and was dropped 2026-09-10; `sqlx/sqlite` implies `bundled` on
+# sqlx-sqlite, and this line keeps the union stable so the C library is
+# compiled once, not once per feature selection.
 [dependencies.libsqlite3-sys]
 version = "0.37"
 features = ["bundled", "bundled_bindings", "cc", "min_sqlite_version_3_34_1", "pkg-config", "unlock_notify", "vcpkg"]
