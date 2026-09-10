@@ -161,33 +161,19 @@ winnow = { version = "1" }
 
 # Managed by hand, outside the hakari section. `iceberg-catalog-loader` is in
 # .config/hakari.toml's final-excludes because its `all` feature set drags the
-# optional glue/hms/s3tables backends into every build. But the default
-# workspace build already enables `rest` (sqe-catalog default) and `sql`
-# (sqe-cli asks for `sql-sqlite`), and without this line a `-p sqe-coordinator`
-# build resolves the loader with `rest` only, which is a different loader,
+# optional glue/hms/s3tables backends into every build. The default workspace
+# build enables `rest` (sqe-catalog default); without this line a per-crate
+# build could resolve the loader differently, which is a different loader,
 # hence a different sqe-catalog, sqe-worker and sqe-coordinator. Pin the
 # default union here so every selection shares one build. Keep it in step
 # with sqe-cli's sqe-catalog features.
+#
+# 2026-09-10: `sql` left this pin, and the hand pins on `sqlx` (with
+# `sqlite`) and `libsqlite3-sys` (`bundled`) below it are gone. sqe-cli's
+# embedded catalog runs on the pure-Rust `sqe-catalog/sql-sqlite-rs`, so no
+# default build reaches sqlx or the C library any more; both stay opt-in
+# behind `sql-postgres` / `sql-sqlite` and are unified by cargo on demand.
 [dependencies.iceberg-catalog-loader]
 path = "../../vendor/iceberg-rust/crates/catalog/loader"
 default-features = false
-features = ["rest", "sql"]
-
-# Same reasoning as the loader above: sqe-cli's `sql-sqlite` gives the
-# workspace build sqlx with `sqlite` + `runtime-tokio`; a per-crate build got
-# sqlx with neither, so sqlx, sqlx-core and everything above them
-# (iceberg-catalog-sql, the loader, sqe-catalog, worker, coordinator) were
-# built twice. Pin the workspace union. The postgres backend stays opt-in.
-[dependencies.sqlx]
-version = "0.9"
-default-features = false
-features = ["any", "runtime-tokio", "sqlite"]
-
-# This is the one place that asks for the bundled build of the sqlite C
-# crate. rusqlite used to request it too (sqe-catalog `sql`, zero call
-# sites) and was dropped 2026-09-10; `sqlx/sqlite` implies `bundled` on
-# sqlx-sqlite, and this line keeps the union stable so the C library is
-# compiled once, not once per feature selection.
-[dependencies.libsqlite3-sys]
-version = "0.37"
-features = ["bundled", "bundled_bindings", "cc", "min_sqlite_version_3_34_1", "pkg-config", "unlock_notify", "vcpkg"]
+features = ["rest"]

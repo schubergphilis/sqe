@@ -20,7 +20,7 @@ repository.workspace = true
 # ~10-15 MB; glue ~50-80 MB (aws-sdk-glue is the heavyweight); s3tables
 # adds ~5-10 MB on top of glue's AWS SDK runtime.
 #
-# `hadoop` and `sql-sqlite` are in the default set for one reason: sqe-cli
+# `hadoop` and `sql-sqlite-rs` are in the default set for one reason: sqe-cli
 # requires them, and under resolver 2 every `cargo test --workspace` therefore
 # already builds this crate with them on. A `cargo test -p sqe-coordinator`
 # did not, so the same crate came out with a different feature set and
@@ -30,7 +30,12 @@ repository.workspace = true
 # sqe-cli in the same cargo invocation, so it carried both already. Keep this
 # list equal to what sqe-cli asks for; the workspace-hack crate pins the
 # third-party side of the same problem.
-default = ["rest", "rest-sigv4", "hive-external", "hadoop", "sql-sqlite"]
+#
+# 2026-09-10: `sql-sqlite` (sqlx + the bundled C libsqlite3) left this set in
+# favour of `sql-sqlite-rs` (pure-Rust sqlite-rs, vendor/sqlite-rs). Both
+# engines read and write the same `sqe.db`; the sqlx SQLite driver is now
+# opt-in and no default build links libsqlite3.
+default = ["rest", "rest-sigv4", "hive-external", "hadoop", "sql-sqlite-rs"]
 # Umbrella for the legacy default: every supported backend compiled in.
 # Use when packaging an image that needs to dispatch to Polaris, Glue,
 # S3 Tables, Hive Metastore, Hadoop warehouses, and Postgres-backed SQL

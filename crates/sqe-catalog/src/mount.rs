@@ -535,7 +535,7 @@ async fn build_sqlite(
 /// `sqlite:abs/path/db`. The query string (sqlx open options) is dropped;
 /// the pure-Rust engine always opens read-write-create.
 #[cfg(feature = "sql-sqlite-rs")]
-fn sqlite_url_to_path(url: &str) -> Result<std::path::PathBuf, String> {
+pub(crate) fn sqlite_url_to_path(url: &str) -> Result<std::path::PathBuf, String> {
     let rest = url
         .strip_prefix("sqlite://")
         .or_else(|| url.strip_prefix("sqlite:"))
@@ -1128,19 +1128,22 @@ async fn build_hms(
 /// Spec form is `jdbc:postgresql://...` (the JDBC syntax familiar from Java);
 /// sqlx expects `postgresql://...` without the prefix. The `jdbc:` prefix is
 /// stripped when present so either form works in SQL.
-#[cfg(any(feature = "sql", feature = "sql-postgres", feature = "sql-sqlite"))]
+///
+/// A `sqlite:` URL is served by the pure-Rust engine when `sql-sqlite-rs` is
+/// compiled in (same row scope name as the sqlx path, so a file attached
+/// under either engine shows the same tables); every other scheme goes to
+/// sqlx.
+#[cfg(any(
+    feature = "sql",
+    feature = "sql-postgres",
+    feature = "sql-sqlite",
+    feature = "sql-sqlite-rs"
+))]
 async fn build_jdbc(
     location: &str,
     options: &BTreeMap<String, OptionValue>,
     secrets: &SecretStore,
 ) -> Result<Arc<dyn iceberg::Catalog>, String> {
-    use std::collections::HashMap;
-
-    use iceberg::CatalogBuilder;
-    use iceberg_catalog_sql::{
-        SqlCatalogBuilder, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE,
-    };
-
     let trimmed = location.trim();
     if trimmed.is_empty() {
         return Err("location must not be empty for TYPE jdbc".to_string());
@@ -1151,6 +1154,47 @@ async fn build_jdbc(
         .get("WAREHOUSE")
         .and_then(OptionValue::as_str)
         .ok_or_else(|| "option `WAREHOUSE` is required for TYPE jdbc".to_string())?;
+
+    #[cfg(feature = "sql-sqlite-rs")]
+    if url_form.starts_with("sqlite:") {
+        use crate::sqlite_rs_catalog::SqliteRsCatalog;
+        let db_path = sqlite_url_to_path(url_form)?;
+        let catalog = SqliteRsCatalog::open("sqe-attached-jdbc", db_path, warehouse)
+            .await
+            .map_err(|e| format!("JDBC SQL catalog open failed: {e}"))?;
+        return Ok(Arc::new(catalog));
+    }
+
+    build_jdbc_sqlx(url_form, warehouse, options, secrets).await
+}
+
+#[cfg(not(any(feature = "sql", feature = "sql-postgres", feature = "sql-sqlite")))]
+async fn build_jdbc_sqlx(
+    url_form: &str,
+    _warehouse: &str,
+    _options: &BTreeMap<String, OptionValue>,
+    _secrets: &SecretStore,
+) -> Result<Arc<dyn iceberg::Catalog>, String> {
+    let scheme = url_form.split(':').next().unwrap_or(url_form);
+    Err(format!(
+        "TYPE jdbc with a `{scheme}:` URL requires the `sql-postgres` cargo feature on \
+         sqe-catalog; this build serves `sqlite:` URLs only"
+    ))
+}
+
+#[cfg(any(feature = "sql", feature = "sql-postgres", feature = "sql-sqlite"))]
+async fn build_jdbc_sqlx(
+    url_form: &str,
+    warehouse: &str,
+    options: &BTreeMap<String, OptionValue>,
+    secrets: &SecretStore,
+) -> Result<Arc<dyn iceberg::Catalog>, String> {
+    use std::collections::HashMap;
+
+    use iceberg::CatalogBuilder;
+    use iceberg_catalog_sql::{
+        SqlCatalogBuilder, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE,
+    };
 
     let final_url =
         if let Some(secret_ref) = options.get("SECRET").and_then(OptionValue::as_secret_ref) {
@@ -1185,15 +1229,20 @@ async fn build_jdbc(
     Ok(Arc::new(catalog))
 }
 
-#[cfg(not(any(feature = "sql", feature = "sql-postgres", feature = "sql-sqlite")))]
+#[cfg(not(any(
+    feature = "sql",
+    feature = "sql-postgres",
+    feature = "sql-sqlite",
+    feature = "sql-sqlite-rs"
+)))]
 async fn build_jdbc(
     _location: &str,
     _options: &BTreeMap<String, OptionValue>,
     _secrets: &SecretStore,
 ) -> Result<Arc<dyn iceberg::Catalog>, String> {
     Err(
-        "TYPE jdbc requires the `sql`, `sql-postgres`, or `sql-sqlite` cargo feature \
-         on sqe-catalog"
+        "TYPE jdbc requires the `sql-sqlite-rs` (sqlite URLs) or `sql-postgres` cargo \
+         feature on sqe-catalog"
             .to_string(),
     )
 }
