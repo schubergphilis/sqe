@@ -51,5 +51,4 @@ third-party = [
     { name = "sqlx-postgres" },
     { name = "sqlx-sqlite" },
     { name = "sqlx-core" },
-    { name = "rusqlite" },
 ]
