@@ -1750,22 +1750,27 @@ mod tests {
     /// aborted at the idle deadline — the guard extends instead.
     #[tokio::test]
     async fn idle_timeout_extends_while_operator_metrics_advance() {
-        let (mut stream, rows, _tracker, _qid) = idle_test_stream(Duration::from_millis(50)).await;
+        // 400 ms idle window, ticker every 20 ms: the ticker has twenty
+        // chances per window to be scheduled. The 50 ms / 10 ms version
+        // still aborted on a loaded CI runner (!983 test job) even with the
+        // seed below, because a starved runner can hold a task for more
+        // than 50 ms at a stretch.
+        let idle = Duration::from_millis(400);
+        let (mut stream, rows, _tracker, _qid) = idle_test_stream(idle).await;
 
-        // Seed one increment before polling. On a loaded CI runner the
-        // ticker task can lose the first 50ms slice, the idle guard
-        // fires, and the test fails with "no results for 0s".
+        // Seed one increment before polling so the first window is never
+        // empty even if the ticker task starts late.
         rows.add(1);
         let ticker = tokio::spawn(async move {
             loop {
                 rows.add(1);
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         });
 
-        // Six idle windows: without progress-aware extension the stream
-        // aborts at ~50ms; with it, it must still be pending at 300ms.
-        let polled = tokio::time::timeout(Duration::from_millis(300), stream.next()).await;
+        // Three idle windows: without progress-aware extension the stream
+        // aborts at ~400 ms; with it, it must still be pending at 1.2 s.
+        let polled = tokio::time::timeout(idle * 3, stream.next()).await;
         ticker.abort();
         assert!(
             polled.is_err(),
