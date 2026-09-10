@@ -45,3 +45,36 @@ ignore = [
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
 ]
+
+# Without this section cargo-deny 0.20 rejects EVERY license as "not explicitly
+# allowed": about 600 `error[rejected]` lines per CI job and `licenses FAILED`
+# (non-blocking, so it went unnoticed), which buried any real finding. The
+# allow list is the intersection of the platform's license policy
+# (aikido `policy/license-policy.json` `allowed`, the same list the blocking
+# `aikido-license-policy` SBOM job enforces) with what the dependency graph
+# actually carries (`cargo deny --all-features list -l license`). A crate
+# whose expression is an OR passes when one branch is allowed, which is how
+# `r-efi` (MIT OR Apache-2.0 OR LGPL-2.1-or-later) is fine without allowing
+# LGPL here. Adding a license means adding it to the platform policy first.
+[licenses]
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    # Apache-2.0 with the LLVM exception is Apache-2.0 for the policy's
+    # purposes (rustix, linux-raw-sys, blake3, wasi); cargo-deny needs the
+    # exact SPDX expression.
+    "Apache-2.0 WITH LLVM-exception",
+    "0BSD",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "bzip2-1.0.6",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
