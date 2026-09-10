@@ -57,10 +57,11 @@ rest = [
 # it; without the feature the sigv4 catalog properties are ignored by
 # the vendored REST client.
 rest-sigv4 = ["rest", "iceberg-catalog-rest/aws-sigv4"]
-# JDBC-style SQL catalog. SQLite via rusqlite (existing helper) plus the
-# upstream iceberg-catalog-sql crate which uses sqlx::any for runtime
-# dispatch to SQLite/PostgreSQL/MySQL.
-sql = ["dep:rusqlite", "dep:iceberg-catalog-sql", "dep:sqlx", "iceberg-catalog-loader/sql"]
+# JDBC-style SQL catalog: the upstream iceberg-catalog-sql crate, which uses
+# sqlx::any for runtime dispatch to SQLite/PostgreSQL/MySQL. rusqlite used to
+# ride along here with zero call sites; it was only the lever that turned on
+# libsqlite3-sys `bundled`, and workspace-hack now requests that directly.
+sql = ["dep:iceberg-catalog-sql", "dep:sqlx", "iceberg-catalog-loader/sql"]
 # Add-on for `sql`: enable PostgreSQL via sqlx. Kept separate so the base
 # `sql` feature does not pull tls-rustls + tokio-runtime + postgres driver
 # into builds that only want SQLite.
@@ -181,11 +182,6 @@ zip = { workspace = true }
 flate2 = { workspace = true }
 # Optional backend dependencies — gated by the corresponding cargo feature
 # above. None of these are pulled into a default `cargo build`.
-# 0.39 is the newest rusqlite compatible with sqlx 0.9: rusqlite 0.40 needs
-# libsqlite3-sys ^0.38, while sqlx 0.9 pins libsqlite3-sys ">=0.30.1, <0.38".
-# Both declare `links = "sqlite3"`, so cargo permits only one in the graph.
-# Bump to 0.40 once sqlx widens that bound.
-rusqlite = { version = "0.39", features = ["bundled"], optional = true }
 iceberg-catalog-hms = { workspace = true, optional = true }
 iceberg-catalog-glue = { workspace = true, optional = true }
 iceberg-catalog-sql = { workspace = true, optional = true }
