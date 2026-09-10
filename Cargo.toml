@@ -193,7 +193,7 @@ csv = "1"
 # (!857). A 0.10 data set is a new draw, not comparable to 0.8 baselines
 # in benchmarks/results/ without a fresh generate + compare-trino.
 # API: gen_range -> random_range, gen_bool -> random_bool, gen -> random,
-# thread_rng -> rng, Rng -> RngExt. rusqlite stays on 0.39 (#389).
+# thread_rng -> rng, Rng -> RngExt.
 rand = "0.10"
 ring = "0.17"
 
