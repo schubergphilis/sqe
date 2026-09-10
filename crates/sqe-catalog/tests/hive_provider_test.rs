@@ -1487,18 +1487,30 @@ async fn invalidating_the_manifest_reloads_it_and_relists_the_data() {
 async fn an_etag_less_source_reloads_once_the_ttl_has_lapsed() {
     let f = partitioned_csv_root().await;
     let ctx = SessionContext::new();
-    let cache = HiveMetadataCache::with_ttl(Duration::from_millis(300));
+    // Generous margins on both sides of the TTL: a loaded CI runner spent
+    // more than the 100 ms this test used to leave between "load again"
+    // and "TTL lapses" (the 300 ms / 200 ms version failed on !980 with an
+    // extra reload), so the in-TTL probe now sits 1.5 s clear of the edge
+    // and the post-TTL probe 0.5 s past it.
+    let ttl = Duration::from_millis(2_000);
+    let cache = HiveMetadataCache::with_ttl(ttl);
     let (provider, source, _store) = counting_root(&f, &ctx, cache, false).await;
 
+    let loaded_at = std::time::Instant::now();
     load_orders(&provider).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     load_orders(&provider).await;
+    assert!(
+        loaded_at.elapsed() < ttl,
+        "test rig too slow to probe inside the TTL; nothing to conclude"
+    );
     assert_eq!(source.gets(), 1, "inside the TTL the entry is served");
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let past_ttl = (ttl + Duration::from_millis(500)).saturating_sub(loaded_at.elapsed());
+    tokio::time::sleep(past_ttl).await;
     load_orders(&provider).await;
     assert_eq!(
         source.gets(),
         2,
-        "400 ms after the load a 300 ms TTL has lapsed, whatever was served in between"
+        "past the TTL the entry is reloaded, whatever was served in between"
     );
 }
