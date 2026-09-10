@@ -28,7 +28,7 @@ members = [
     "xtask",
 ]
 # Exclude vendored trees. They are referenced via path / [patch], not members.
-exclude = ["vendor/iceberg-rust", "vendor/jiter", "vendor/datafusion-functions-json"]
+exclude = ["vendor/iceberg-rust", "vendor/jiter", "vendor/datafusion-functions-json", "vendor/sqlite-rs"]
 
 [workspace.package]
 version = "0.37.0"
@@ -90,6 +90,10 @@ iceberg-datafusion = { path = "vendor/iceberg-rust/crates/integrations/datafusio
 iceberg-catalog-hms = { path = "vendor/iceberg-rust/crates/catalog/hms" }
 iceberg-catalog-glue = { path = "vendor/iceberg-rust/crates/catalog/glue" }
 iceberg-catalog-sql = { path = "vendor/iceberg-rust/crates/catalog/sql" }
+# Pure-Rust SQLite (Lab271/sqlite-rs, facade branch snapshot). Library only,
+# zero dependencies; gated by sqe-catalog `sql-sqlite-rs`. See
+# vendor/sqlite-rs/README.md for provenance and the refresh recipe.
+sqlite-rs = { path = "vendor/sqlite-rs" }
 # AWS S3 Tables (managed Iceberg). Vendored from risingwavelabs fork
 # main; gated by sqe-catalog `s3tables` feature.
 iceberg-catalog-s3tables = { path = "vendor/iceberg-rust/crates/catalog/s3tables" }
