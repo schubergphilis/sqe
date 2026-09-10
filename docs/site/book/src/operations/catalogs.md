@@ -153,8 +153,9 @@ secret meaningful. Characters that would otherwise break a URL, such as `@`,
 `:`, and `/`, are percent-encoded on the way in, so a password does not need
 pre-escaping.
 
-Requires one of the `sql`, `sql-postgres`, or `sql-sqlite` cargo features. A
-binary built without them reports which feature is missing.
+A `sqlite:` URL is served by the pure-Rust SQLite engine (`sql-sqlite-rs`,
+in the default build); every other scheme needs `sql-postgres` (sqlx). A
+binary built without the matching feature reports which one is missing.
 
 ## SHOW CATALOGS and SHOW SECRETS
 

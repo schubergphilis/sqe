@@ -477,10 +477,13 @@ pub type IcebergCatalogMap = HashMap<String, Arc<WritableIcebergCatalog>>;
 /// Open the embedded SQLite catalog at `db_path` (created if absent) with
 /// `warehouse_uri` as the data root, under the fixed `sqe-embedded` scope.
 ///
-/// Pure-Rust engine (`sqe_catalog::sqlite_rs_catalog`) when sqe-cli is built
-/// with the `sqlite-rs` feature; sqlx + libsqlite3 otherwise. Both engines
-/// read and write the same file, so a warehouse survives switching.
-#[cfg(feature = "sqlite-rs")]
+/// Pure-Rust engine (`sqe_catalog::sqlite_rs_catalog`, always compiled in)
+/// unless sqe-cli is built with the `sqlite-c` feature, which selects the
+/// sqlx + libsqlite3 engine instead. Not gated on a default feature: the
+/// release job, the Dockerfile and the Makefile build sqe-cli with
+/// `--no-default-features`. Both engines read and write the same file, so a
+/// warehouse survives switching.
+#[cfg(not(feature = "sqlite-c"))]
 async fn open_embedded_sqlite_catalog(
     db_path: &Path,
     warehouse_uri: &str,
@@ -492,7 +495,7 @@ async fn open_embedded_sqlite_catalog(
     Ok(Arc::new(catalog))
 }
 
-#[cfg(not(feature = "sqlite-rs"))]
+#[cfg(feature = "sqlite-c")]
 async fn open_embedded_sqlite_catalog(
     db_path: &Path,
     warehouse_uri: &str,

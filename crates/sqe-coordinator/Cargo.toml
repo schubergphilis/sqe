@@ -8,29 +8,27 @@ repository.workspace = true
 
 [features]
 # Opt-in for integration tests that spin up a SQLite-backed Iceberg
-# catalog: `cargo test -p sqe-coordinator --features test-sqlite`. Since
-# 2026-09-04 `sql-sqlite` is in sqe-catalog's default set (sqe-cli always
-# required it, so every workspace build carried it anyway), which makes the
-# backend part of this feature a no-op; it stays as the switch that compiles
-# the `#[cfg(feature = "test-sqlite")]` tests in.
+# catalog: `cargo test -p sqe-coordinator --features test-sqlite`. The
+# SQLite engine (`sqe-catalog/sql-sqlite-rs`, pure Rust) is in sqe-catalog's
+# default set, which makes the backend part of this feature a no-op; it
+# stays as the switch that compiles the `#[cfg(feature = "test-sqlite")]`
+# tests in.
 #
 # Architecture review 513: the feature also compiles the shared in-process
 # write rig (`src/test_support/sqlite_rig.rs`). That rig drives the REAL
 # `WriteHandler` commit paths through a `SessionCatalog`, and the only
 # non-REST `SessionCatalog` constructor that reaches a sqlite file is
-# `CatalogBackend::Jdbc` (`sqlite://...`), whose arm in
-# `SessionCatalog::build_backend_catalog` exists only under
-# `sqe-catalog/sql-postgres` (the sqlx `any` driver set). CI's
-# `cargo test --workspace --all-features` carries that feature already; the
-# local `--features test-sqlite` build now carries it too, so the first such
-# build after this change recompiles sqe-catalog and its dependents once.
+# `CatalogBackend::Jdbc` (`sqlite://...`). Since 2026-09-10 that arm is
+# served by `sqe-catalog/sql-sqlite-rs`; it no longer needs
+# `sqe-catalog/sql-postgres` (the sqlx `any` driver set), so a
+# `--features test-sqlite` build carries no sqlx and no libsqlite3.
 # `tempfile` backs the rig's per-test warehouse directory and is a normal
 # (optional) dependency here because the rig is `pub` library code under the
 # feature, not only `cfg(test)` code.
 #
 # Since the write path moved to `sqe-write` (2026-09-07) the rig lives there;
 # this feature forwards so `sqe_coordinator::test_support` keeps resolving.
-test-sqlite = ["sqe-write/test-sqlite", "sqe-catalog/sql-sqlite", "sqe-catalog/sql-postgres", "dep:tempfile"]
+test-sqlite = ["sqe-write/test-sqlite", "sqe-catalog/sql-sqlite-rs", "dep:tempfile"]
 # `[[hive.roots]] kind = "glue"`: read table metadata from the AWS Glue Data
 # Catalog. Off by default because the Glue client is the heavyweight AWS SDK
 # dependency the slim build exists to avoid.
