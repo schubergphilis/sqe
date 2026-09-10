@@ -344,3 +344,97 @@ async fn a_file_written_by_the_sqlx_path_roundtrips_through_sqlite_rs() {
     names.sort();
     assert_eq!(names, vec!["customers", "orders"]);
 }
+
+/// Many tasks, one connection. The facade's worker serialises statements but
+/// not transactions, so without the catalog's per-connection gate two
+/// concurrent commits interleave their `BEGIN`s ("cannot start a transaction
+/// within a transaction", coordinator `maintenance_lease_test` on CI) and an
+/// autocommit statement from a third task lands inside someone else's
+/// transaction. Eight concurrent property commits from the same base plus
+/// eight concurrent namespace creations with properties: every call must
+/// return a real outcome (success or the retryable conflict), never an
+/// engine error, and the end state must be consistent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_commits_and_writes_on_one_connection_never_nest_transactions() {
+    let dir = TempDir::new().unwrap();
+    let catalog = open(dir.path()).await;
+    let ns = NamespaceIdent::new("sales".to_string());
+    catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+    let table = catalog.create_table(&ns, creation("orders")).await.unwrap();
+    let ident = table.identifier().clone();
+
+    let mut commits = Vec::new();
+    for i in 0..8 {
+        let catalog = catalog.clone();
+        let ident = ident.clone();
+        commits.push(tokio::spawn(async move {
+            let t = catalog.load_table(&ident).await.unwrap();
+            let tx = Transaction::new(&t);
+            let tx = tx
+                .update_table_properties()
+                .set(format!("writer-{i}"), "x".to_string())
+                .apply(tx)
+                .unwrap();
+            tx.commit(&catalog).await
+        }));
+    }
+    let mut namespaces = Vec::new();
+    for i in 0..8 {
+        let catalog = catalog.clone();
+        namespaces.push(tokio::spawn(async move {
+            catalog
+                .create_namespace(
+                    &NamespaceIdent::new(format!("ns{i}")),
+                    HashMap::from([
+                        ("owner".to_string(), format!("team-{i}")),
+                        ("tier".to_string(), "gold".to_string()),
+                    ]),
+                )
+                .await
+        }));
+    }
+
+    let mut ok = 0;
+    for c in commits {
+        match c.await.unwrap() {
+            Ok(_) => ok += 1,
+            Err(e) => {
+                assert_eq!(
+                    e.kind(),
+                    iceberg::ErrorKind::CatalogCommitConflicts,
+                    "a concurrent commit may only fail with the retryable conflict: {e}"
+                );
+                assert!(e.retryable());
+            }
+        }
+    }
+    assert!(ok >= 1, "at least one commit must land");
+    for n in namespaces {
+        n.await.unwrap().unwrap();
+    }
+
+    // Consistent end state: one row per table, every namespace present with
+    // both properties, the file valid to stock sqlite3.
+    let final_table = catalog.load_table(&ident).await.unwrap();
+    let landed = (0..8)
+        .filter(|i| {
+            final_table
+                .metadata()
+                .properties()
+                .contains_key(&format!("writer-{i}"))
+        })
+        .count();
+    assert_eq!(landed, ok, "every successful commit is visible, no more");
+    for i in 0..8 {
+        let got = catalog
+            .get_namespace(&NamespaceIdent::new(format!("ns{i}")))
+            .await
+            .unwrap();
+        assert_eq!(got.properties().get("owner").unwrap(), &format!("team-{i}"));
+        assert_eq!(got.properties().get("tier").unwrap(), "gold");
+    }
+    if let Some(count) = oracle(&db(dir.path()), "SELECT count(*) FROM iceberg_tables;") {
+        assert_eq!(count, "1");
+    }
+    assert_oracle_ok(&db(dir.path()));
+}
