@@ -1,0 +1,38 @@
+[package]
+name = "sqlite-rs"
+version = "0.18.10"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "A binary-compatible Rust replication of SQLite (SQE vendored snapshot)"
+repository = "https://github.com/Lab271/sqlite-rs"
+
+# SQE vendored snapshot: library only. The upstream manifest declares the
+# `sqlite-rs` CLI, two test-helper binaries, ~60 `[[test]]` targets, benches
+# and dev-dependencies (proptest, criterion, rusqlite, md-5). None of that is
+# shipped here -- `src/bin/` is removed from the snapshot and target
+# auto-discovery is off so cargo does not go looking for the rest. See
+# README.md in this directory for the snapshot's provenance and refresh recipe.
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+[lints.rust]
+# Upstream's crate-wide default (ADR-0031): `src/sys/{fcntl,termios}.rs`
+# are the only `#![allow(unsafe_code)]` carve-outs.
+unsafe_code = "deny"
+
+[lints.clippy]
+let_underscore_must_use = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
+arithmetic_side_effects = "deny"
+mod_module_files = "deny"

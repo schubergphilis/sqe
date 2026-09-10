@@ -44,8 +44,6 @@ use async_trait::async_trait;
 use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::SessionContext;
-use iceberg::CatalogBuilder;
-use iceberg_catalog_sql::{SqlCatalogBuilder, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE};
 use sqe_core::config::StorageConfig;
 
 use crate::writable_iceberg_catalog::WritableIcebergCatalog;
@@ -476,6 +474,52 @@ pub async fn build_embedded_context_with_warehouse(
 /// provider cannot be recovered from the context by downcasting.
 pub type IcebergCatalogMap = HashMap<String, Arc<WritableIcebergCatalog>>;
 
+/// Open the embedded SQLite catalog at `db_path` (created if absent) with
+/// `warehouse_uri` as the data root, under the fixed `sqe-embedded` scope.
+///
+/// Pure-Rust engine (`sqe_catalog::sqlite_rs_catalog`) when sqe-cli is built
+/// with the `sqlite-rs` feature; sqlx + libsqlite3 otherwise. Both engines
+/// read and write the same file, so a warehouse survives switching.
+#[cfg(feature = "sqlite-rs")]
+async fn open_embedded_sqlite_catalog(
+    db_path: &Path,
+    warehouse_uri: &str,
+) -> anyhow::Result<Arc<dyn iceberg::Catalog>> {
+    use sqe_catalog::sqlite_rs_catalog::SqliteRsCatalog;
+    let catalog = SqliteRsCatalog::open("sqe-embedded", db_path, warehouse_uri)
+        .await
+        .map_err(|e| anyhow::anyhow!("SQLite catalog open failed: {e}"))?;
+    Ok(Arc::new(catalog))
+}
+
+#[cfg(not(feature = "sqlite-rs"))]
+async fn open_embedded_sqlite_catalog(
+    db_path: &Path,
+    warehouse_uri: &str,
+) -> anyhow::Result<Arc<dyn iceberg::Catalog>> {
+    use iceberg::CatalogBuilder;
+    use iceberg_catalog_sql::{
+        SqlCatalogBuilder, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE,
+    };
+    // `mode=rwc` tells SQLite to create the file if missing; without it
+    // sqlx fails with "unable to open database file" on the first run
+    // because SQLite defaults to read-write without create.
+    let mut props = HashMap::new();
+    props.insert(
+        SQL_CATALOG_PROP_URI.to_string(),
+        format!("sqlite://{}?mode=rwc", db_path.display()),
+    );
+    props.insert(
+        SQL_CATALOG_PROP_WAREHOUSE.to_string(),
+        warehouse_uri.to_string(),
+    );
+    let catalog = SqlCatalogBuilder::default()
+        .load("sqe-embedded".to_string(), props)
+        .await
+        .map_err(|e| anyhow::anyhow!("SQLite catalog open failed: {e}"))?;
+    Ok(Arc::new(catalog))
+}
+
 /// Initialise `<path>/sqe.db` as the Iceberg metadata store and
 /// `<path>/iceberg/` as the data file root, then register the result
 /// with `ctx` under the given catalog `name`.
@@ -509,15 +553,10 @@ async fn attach_sqlite_catalog(
     // `mode=rwc` tells SQLite to create the file if missing; without it
     // sqlx fails with "unable to open database file" on the first run
     // because SQLite defaults to read-write without create.
-    let uri = format!("sqlite://{}?mode=rwc", db_path.display());
     let warehouse_uri = format!("file://{}", abs.join("iceberg").display());
 
-    let mut props = HashMap::new();
-    props.insert(SQL_CATALOG_PROP_URI.to_string(), uri);
-    props.insert(SQL_CATALOG_PROP_WAREHOUSE.to_string(), warehouse_uri);
-
-    // The builder's `name` parameter is NOT just diagnostic — it
-    // becomes the `catalog_name` row key inside the SQLite
+    // The catalog's `name` is NOT just diagnostic — it becomes the
+    // `catalog_name` row key inside the SQLite
     // `iceberg_namespace_properties` and `iceberg_tables` tables, so
     // namespaces and tables are scoped per-name. We deliberately keep
     // the same fixed name across every embedded warehouse so each
@@ -525,12 +564,7 @@ async fn attach_sqlite_catalog(
     // for the user comes from each catalog living in its own SQLite
     // file (separate `path`); the user-facing identifier is set by
     // `ctx.register_catalog(name, ...)` below.
-    let catalog: Arc<dyn iceberg::Catalog> = Arc::new(
-        SqlCatalogBuilder::default()
-            .load("sqe-embedded".to_string(), props)
-            .await
-            .map_err(|e| anyhow::anyhow!("SQLite catalog open failed: {e}"))?,
-    );
+    let catalog = open_embedded_sqlite_catalog(&db_path, &warehouse_uri).await?;
 
     let provider = Arc::new(WritableIcebergCatalog::try_new(catalog).await?);
 
@@ -1721,7 +1755,7 @@ mod tests {
     #[tokio::test]
     async fn two_catalogs_both_visible() {
         use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
-        use iceberg::{Catalog, NamespaceIdent, TableCreation};
+        use iceberg::{NamespaceIdent, TableCreation};
 
         let tmp_a = tempfile::tempdir().expect("tempdir a");
         let tmp_b = tempfile::tempdir().expect("tempdir b");
@@ -1730,23 +1764,15 @@ mod tests {
         for (name, dir) in &[("a", tmp_a.path()), ("b", tmp_b.path())] {
             std::fs::create_dir_all(dir.join("iceberg")).expect("data dir");
             let abs = dir.canonicalize().expect("canonicalize");
-            let mut props = HashMap::new();
-            props.insert(
-                SQL_CATALOG_PROP_URI.to_string(),
-                format!("sqlite://{}?mode=rwc", abs.join("sqe.db").display()),
-            );
-            props.insert(
-                SQL_CATALOG_PROP_WAREHOUSE.to_string(),
-                format!("file://{}", abs.join("iceberg").display()),
-            );
-            // Use the same fixed name as production code so the
-            // bootstrap writes into the same `catalog_name` scope
-            // the attach path reads. See the comment in
-            // `attach_sqlite_catalog`.
-            let cat = SqlCatalogBuilder::default()
-                .load("sqe-embedded".to_string(), props)
-                .await
-                .expect("bootstrap catalog");
+            // Bootstrap through the same opener production uses, so the
+            // rows land in the same `catalog_name` scope the attach path
+            // reads and the same engine (sqlx or sqlite-rs) writes them.
+            let cat = open_embedded_sqlite_catalog(
+                &abs.join("sqe.db"),
+                &format!("file://{}", abs.join("iceberg").display()),
+            )
+            .await
+            .expect("bootstrap catalog");
             let ns = NamespaceIdent::new(format!("ns_{name}"));
             cat.create_namespace(&ns, HashMap::new())
                 .await
