@@ -18,16 +18,18 @@ path = "src/main.rs"
 # `cargo test` at the repo root, even though coordinator and worker
 # never ask for them. Opt in with `cargo install sqe-cli --features aws`
 # or `cargo build -p sqe-cli --features aws`.
-default = ["sqlite-rs"]
+default = []
 aws = ["sqe-catalog/glue", "sqe-catalog/s3tables"]
-# `sqlite-rs` (default since 2026-09-10) runs the embedded catalog on the
-# vendored pure-Rust sqlite-rs (`sqe-catalog/sql-sqlite-rs`): no libsqlite3,
-# no C toolchain on that path. `sqlite-c` is the previous engine, sqlx + the
-# bundled C library, kept as an opt-in fallback: `cargo build -p sqe-cli
-# --no-default-features --features sqlite-c`. Same file layout either way,
-# so an existing `~/.sqe/warehouse/sqe.db` opens under both; with both
-# features on, sqlite-rs wins. Exactly one of them must be enabled.
-sqlite-rs = ["sqe-catalog/sql-sqlite-rs"]
+# The embedded catalog's SQLite engine is the vendored pure-Rust sqlite-rs
+# (`sqe-catalog/sql-sqlite-rs`, always on via the dependency line below): no
+# libsqlite3, no C toolchain on that path. It is NOT a default feature on
+# purpose: the release job, the Dockerfile and the Makefile all build sqe-cli
+# with `--no-default-features`, so anything the binary needs has to be
+# unconditional. `sqlite-c` is the previous engine, sqlx + the bundled C
+# library, kept as an opt-in fallback: `cargo build -p sqe-cli --features
+# sqlite-c`. Same file layout either way, so an existing
+# `~/.sqe/warehouse/sqe.db` opens under both; with `sqlite-c` on, sqlx
+# serves the embedded catalog.
 sqlite-c = ["sqe-catalog/sql-sqlite", "dep:iceberg-catalog-sql"]
 # DEP-07: the `delta` feature (read_delta() TVF) is REMOVED for the DataFusion 54
 # bump. deltalake-core has no DF 54 release yet. Restore this line and the
@@ -36,7 +38,7 @@ sqlite-c = ["sqe-catalog/sql-sqlite", "dep:iceberg-catalog-sql"]
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }
-sqe-catalog = { path = "../sqe-catalog", default-features = false, features = ["rest", "rest-sigv4", "hadoop", "hive-external"] }
+sqe-catalog = { path = "../sqe-catalog", default-features = false, features = ["rest", "rest-sigv4", "hadoop", "hive-external", "sql-sqlite-rs"] }
 sqe-sql = { path = "../sqe-sql" }
 sqe-trino-functions = { path = "../sqe-trino-functions" }
 # Shared Trino HTTP + Flight SQL clients (review 705). Replaces the

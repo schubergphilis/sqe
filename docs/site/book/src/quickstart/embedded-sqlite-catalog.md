@@ -28,8 +28,8 @@ Two engines can serve `sqe.db`, selected at build time:
 
 | Build | Engine | Notes |
 |---|---|---|
-| `cargo build -p sqe-cli` (default) | [Lab271/sqlite-rs](https://github.com/Lab271/sqlite-rs), a pure-Rust SQLite, vendored under `vendor/sqlite-rs` | No `libsqlite3` and no C toolchain anywhere in the default binary. |
-| `cargo build -p sqe-cli --no-default-features --features sqlite-c` | `sqlx` + the bundled C `libsqlite3` | The engine releases before 2026-09 shipped; kept as a fallback. |
+| `cargo build -p sqe-cli` (any feature set, including `--no-default-features`) | [Lab271/sqlite-rs](https://github.com/Lab271/sqlite-rs), a pure-Rust SQLite, vendored under `vendor/sqlite-rs` | Always compiled in. No `libsqlite3` in the binary. |
+| `cargo build -p sqe-cli --features sqlite-c` | `sqlx` + the bundled C `libsqlite3` | The engine releases before 2026-09 shipped; kept as an opt-in fallback. |
 
 Both engines read and write the same file. A warehouse created by one opens
 under the other, in either direction: the pure-Rust engine maintains the

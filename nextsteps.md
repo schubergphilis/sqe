@@ -50,9 +50,12 @@
 > in sqe-catalog's `sql` feature is the only text this touches there.
 > **STATUS 2026-09-10 (c): sqlite-rs is the default SQLite engine; no default build links libsqlite3 or sqlx (`feat/sqlite-rs-default`, on top of !981).**
 >
-> `sql-sqlite-rs` replaces `sql-sqlite` in sqe-catalog's default set and in
-> sqe-cli (feature `sqlite-rs`, now default; `sqlite-c` = the sqlx + C
-> engine as an opt-in fallback, exactly one required). `sqlite:` URLs on
+> `sql-sqlite-rs` replaces `sql-sqlite` in sqe-catalog's default set and is
+> unconditional on sqe-cli's sqe-catalog dependency (`sqlite-c` = the sqlx
+> + C engine as an opt-in fallback). It is deliberately not a sqe-cli
+> default feature: the first version gated it on one and the release job,
+> which builds with `--no-default-features` like the Dockerfile and the
+> Makefile, hit the `compile_error!` (pipeline 1611344). `sqlite:` URLs on
 > the JDBC paths go to `SqliteRsCatalog` too: `TYPE jdbc` in `mount.rs`
 > (`build_jdbc` splits into a sqlite-rs branch and `build_jdbc_sqlx`) and
 > `CatalogBackend::Jdbc` in `build_backend_catalog` (guarded arm, same
