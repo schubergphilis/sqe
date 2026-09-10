@@ -25,8 +25,6 @@ arrow-array = { version = "59", default-features = false, features = ["chrono-tz
 arrow-cast = { version = "59", default-features = false, features = ["prettyprint"] }
 arrow-ipc = { version = "59", features = ["lz4", "zstd"] }
 arrow-schema = { version = "59", default-features = false, features = ["canonical_extension_types", "serde"] }
-aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-smithy-http-client = { version = "1", default-features = false, features = ["rustls-aws-lc", "rustls-ring"] }
 aws-smithy-types = { version = "1", default-features = false, features = ["byte-stream-poll-next", "http-body-0-4-x", "http-body-1-x", "rt-tokio", "test-util"] }
 axum = { version = "0.8" }
 axum-core = { version = "0.5", default-features = false, features = ["tracing"] }
@@ -100,12 +98,11 @@ regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-lite = { version = "0.1" }
 regex-syntax = { version = "0.8" }
-reqwest-594e8ee84c453af0 = { package = "reqwest", version = "0.13", default-features = false, features = ["blocking", "form", "gzip", "http2", "json", "query", "rustls"] }
+reqwest-594e8ee84c453af0 = { package = "reqwest", version = "0.13", default-features = false, features = ["blocking", "form", "gzip", "http2", "json", "query", "rustls-no-provider"] }
 reqwest-5ef9efb8ec2df382 = { package = "reqwest", version = "0.12", default-features = false, features = ["http2", "json", "rustls-tls", "rustls-tls-native-roots", "stream"] }
 ring = { version = "0.17", features = ["std"] }
-rustls = { version = "0.23", features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 rustls-pki-types = { version = "1", features = ["std"] }
-rustls-webpki = { version = "0.103", default-features = false, features = ["aws-lc-rs", "ring", "std"] }
 scopeguard = { version = "1" }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }

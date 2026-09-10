@@ -115,6 +115,10 @@ impl QuackClient {
     ) -> Result<Self, ClientError> {
         let endpoint = parse_quack_uri(uri)?;
         policy.check_destination(&endpoint)?;
+        // reqwest is `rustls-no-provider` (no aws-lc C build) and panics at
+        // construction without a process default provider; this crate does
+        // not link sqe-core's pre-main install, so install ring here.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let http = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(60))
             .redirect(reqwest::redirect::Policy::none())

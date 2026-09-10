@@ -15,7 +15,7 @@ description = "Trino wire types and the shared Trino HTTP / Flight SQL clients u
 default = []
 # `client::TrinoHttpClient` (reqwest, unbounded pagination, same-origin nextUri,
 # DELETE-on-drop cancel).
-client = ["dep:reqwest", "dep:url", "dep:tokio"]
+client = ["dep:reqwest", "dep:url", "dep:tokio", "dep:rustls"]
 # `decode`: Trino JSON pages -> Arrow `RecordBatch` with faithful types
 # (decimal(p,s) -> Decimal128(p,s), integer widths, timestamps).
 arrow = ["dep:arrow-array", "dep:arrow-schema", "dep:arrow-buffer", "dep:chrono", "dep:chrono-tz", "dep:base64"]
@@ -27,6 +27,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 reqwest = { workspace = true, optional = true }
+# reqwest is built with `rustls-no-provider` workspace-wide (no aws-lc C
+# build), so a client crate that does not link sqe-core installs the ring
+# provider itself before building a `reqwest::Client` (client.rs).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
 url = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 arrow-array = { workspace = true, optional = true }

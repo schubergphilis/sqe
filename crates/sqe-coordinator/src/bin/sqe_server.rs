@@ -799,6 +799,10 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
 // stream, and absorb large plans instead. An 8 MiB worker stack gives us ~4x
 // the headroom at zero runtime cost.
 fn main() -> anyhow::Result<()> {
+    // ring is the process TLS provider (installed pre-main by sqe-core; this
+    // makes it explicit and logs which case happened). The later call on the
+    // TLS listener path stays as the finding-210 check.
+    sqe_coordinator::tls::ensure_crypto_provider();
     let cli = Cli::parse();
     let config_path = cli
         .config
