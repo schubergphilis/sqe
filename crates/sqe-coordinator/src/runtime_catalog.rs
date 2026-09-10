@@ -501,8 +501,8 @@ mod hive_lane_tests {
     }
 
     /// Minimal `iceberg::Catalog` stub so the cross-lane collision test below
-    /// can populate the Iceberg lane without a real backend (no `sql-sqlite`
-    /// feature, no network). Every method is unreachable: the test only
+    /// can populate the Iceberg lane without a real backend (no SQLite
+    /// engine feature, no network). Every method is unreachable: the test only
     /// exercises registry bookkeeping, never catalog behavior.
     #[derive(Debug)]
     struct UnreachableCatalog;
@@ -593,7 +593,8 @@ mod hive_lane_tests {
     /// registration loop runs last, which a later refactor could silently
     /// reverse.
     ///
-    /// `TYPE sqlite` needs the `sql-sqlite` feature to actually build a
+    /// `TYPE sqlite` needs a SQLite engine feature (`sql-sqlite-rs` or
+    /// `sql-sqlite`) to actually build a
     /// catalog, but the collision check runs before `build_catalog` is
     /// ever called, so this test does not need that feature: it proves the
     /// check fires, not that a sqlite catalog can be built.
@@ -627,7 +628,7 @@ mod hive_lane_tests {
     ///
     /// Populates the Iceberg lane directly (module-private field access)
     /// rather than through `attach()`, which would need a real backend
-    /// (`sql-sqlite` feature, or network for a REST/Glue/HMS catalog) --
+    /// (a SQLite engine feature, or network for a REST/Glue/HMS catalog) --
     /// this test cares about the name-collision check, not catalog
     /// construction.
     #[tokio::test]

@@ -11,9 +11,10 @@ description = "SQE write path: CTAS/INSERT/UPDATE/DELETE/MERGE handling, Parquet
 # Compiles the in-process SQLite-backed write rig (`test_support::sqlite_rig`)
 # and the `#[cfg(feature = "test-sqlite")]` tests that drive the real
 # `WriteHandler` commit paths through a `SessionCatalog`. Same contract as
-# `sqe-coordinator/test-sqlite`, which forwards to this feature; see that
-# crate's Cargo.toml for why `sql-postgres` is part of it.
-test-sqlite = ["sqe-catalog/sql-sqlite", "sqe-catalog/sql-postgres", "dep:tempfile"]
+# `sqe-coordinator/test-sqlite`, which forwards to this feature. The rig's
+# `CatalogBackend::Jdbc { url: "sqlite://..." }` is served by the pure-Rust
+# `sql-sqlite-rs` engine since 2026-09-10, so no sqlx is needed here.
+test-sqlite = ["sqe-catalog/sql-sqlite-rs", "dep:tempfile"]
 
 [lib]
 name = "sqe_write"

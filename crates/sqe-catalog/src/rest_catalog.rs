@@ -1654,6 +1654,21 @@ impl SessionCatalog {
                 ));
             }
 
+            // A `sqlite:` URL is served by the pure-Rust engine, with the
+            // same row-scope name the sqlx path used, so a file created
+            // under either engine reads the same under the other.
+            #[cfg(feature = "sql-sqlite-rs")]
+            CatalogBackend::Jdbc { url, warehouse } if url.trim().starts_with("sqlite:") => {
+                use crate::sqlite_rs_catalog::SqliteRsCatalog;
+                let db_path =
+                    crate::mount::sqlite_url_to_path(url.trim()).map_err(SqeError::Catalog)?;
+                let catalog = SqliteRsCatalog::open("sqe-jdbc-session", db_path, warehouse)
+                    .await
+                    .map_err(|e| {
+                        SqeError::catalog_src(format!("SQLite catalog build failed: {e}"), e)
+                    })?;
+                return Ok(Arc::new(catalog));
+            }
             #[cfg(feature = "sql-postgres")]
             CatalogBackend::Jdbc { url, warehouse } => {
                 use iceberg_catalog_sql::{SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE};
@@ -1665,7 +1680,8 @@ impl SessionCatalog {
             #[cfg(not(feature = "sql-postgres"))]
             CatalogBackend::Jdbc { .. } => {
                 return Err(SqeError::Catalog(
-                    "JDBC backend requires the `sql-postgres` cargo feature on sqe-catalog"
+                    "JDBC backend with a non-sqlite URL requires the `sql-postgres` cargo \
+                     feature on sqe-catalog (`sqlite:` URLs need `sql-sqlite-rs`)"
                         .to_string(),
                 ));
             }

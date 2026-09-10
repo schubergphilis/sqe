@@ -18,16 +18,17 @@ path = "src/main.rs"
 # `cargo test` at the repo root, even though coordinator and worker
 # never ask for them. Opt in with `cargo install sqe-cli --features aws`
 # or `cargo build -p sqe-cli --features aws`.
-default = []
+default = ["sqlite-rs"]
 aws = ["sqe-catalog/glue", "sqe-catalog/s3tables"]
-# `sqlite-rs` swaps the embedded catalog's SQLite engine for the vendored
-# pure-Rust sqlite-rs (`sqe-catalog/sql-sqlite-rs`): no libsqlite3, no C
-# toolchain on that path. Same file layout as the sqlx engine, so an
-# existing `~/.sqe/warehouse/sqe.db` opens under either. Default-OFF while
-# the upstream facade (Lab271/sqlite-rs PR #705) is unreleased; opt in with
-# `cargo build -p sqe-cli --features sqlite-rs`. The sqlx engine stays
-# linked as the `TYPE jdbc` fallback.
+# `sqlite-rs` (default since 2026-09-10) runs the embedded catalog on the
+# vendored pure-Rust sqlite-rs (`sqe-catalog/sql-sqlite-rs`): no libsqlite3,
+# no C toolchain on that path. `sqlite-c` is the previous engine, sqlx + the
+# bundled C library, kept as an opt-in fallback: `cargo build -p sqe-cli
+# --no-default-features --features sqlite-c`. Same file layout either way,
+# so an existing `~/.sqe/warehouse/sqe.db` opens under both; with both
+# features on, sqlite-rs wins. Exactly one of them must be enabled.
 sqlite-rs = ["sqe-catalog/sql-sqlite-rs"]
+sqlite-c = ["sqe-catalog/sql-sqlite", "dep:iceberg-catalog-sql"]
 # DEP-07: the `delta` feature (read_delta() TVF) is REMOVED for the DataFusion 54
 # bump. deltalake-core has no DF 54 release yet. Restore this line and the
 # sqe-catalog `delta` feature once delta-rs ships DF 54 support.
@@ -35,7 +36,7 @@ sqlite-rs = ["sqe-catalog/sql-sqlite-rs"]
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }
-sqe-catalog = { path = "../sqe-catalog", default-features = false, features = ["rest", "rest-sigv4", "sql-sqlite", "hadoop", "hive-external"] }
+sqe-catalog = { path = "../sqe-catalog", default-features = false, features = ["rest", "rest-sigv4", "hadoop", "hive-external"] }
 sqe-sql = { path = "../sqe-sql" }
 sqe-trino-functions = { path = "../sqe-trino-functions" }
 # Shared Trino HTTP + Flight SQL clients (review 705). Replaces the
@@ -49,11 +50,11 @@ arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
 datafusion = { workspace = true }
 datafusion-functions-json = { workspace = true }
-# Embedded persistent catalog: SQLite via iceberg-catalog-sql, exposed
-# to DataFusion via iceberg-datafusion. Both ride along the same
-# vendored iceberg-rust workspace the cluster already uses.
+# Embedded persistent catalog, exposed to DataFusion via iceberg-datafusion.
+# iceberg-catalog-sql is only needed by the `sqlite-c` fallback engine; the
+# default `sqlite-rs` engine lives in sqe-catalog.
 iceberg = { workspace = true }
-iceberg-catalog-sql = { workspace = true }
+iceberg-catalog-sql = { workspace = true, optional = true }
 iceberg-datafusion = { workspace = true }
 # DashMap powers the writable catalog's per-name schema cache; same
 # concurrency-friendly map iceberg-datafusion uses for its own
