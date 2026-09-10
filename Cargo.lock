@@ -6513,6 +6513,7 @@ dependencies = [
  "sqe-policy",
  "sqe-policy-api",
  "sqe-sql",
+ "sqlite-rs",
  "sqlparser",
  "sqlx",
  "tempfile",
@@ -7088,6 +7089,10 @@ dependencies = [
  "uuid",
  "workspace-hack",
 ]
+
+[[package]]
+name = "sqlite-rs"
+version = "0.18.10"
 
 [[package]]
 name = "sqlite-wasm-rs"

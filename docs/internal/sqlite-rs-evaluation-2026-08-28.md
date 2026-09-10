@@ -259,6 +259,44 @@ it never writes. It is now the safest part of the work.
    not enumerate them), and whether a non-POSIX VFS is in scope, since
    `UnixVfs` and the `src/sys` carve-out are POSIX-only.
 
+## 2026-09-10: ported, and what the port found
+
+Stage 2 is built, on the facade branch rather than a release: Lab271's
+`feat/013-api-facade` (PR #705, commit `e788241`) is vendored library-only
+under `vendor/sqlite-rs/` and `crates/sqe-catalog/src/sqlite_rs_catalog.rs`
+implements `iceberg::Catalog` over `sqlite_rs::api::Connection`, behind the
+`sql-sqlite-rs` feature (sqe-cli: `sqlite-rs`). The sqlx engine stays the
+fallback. Design rules and their reasons are in that module's header; the
+adoption direction is proven by a test that has the sqlx engine write a file,
+sqlite-rs read and extend it, and sqlx read it back, with stock `sqlite3`
+reporting `integrity_check` = `ok` at every step.
+
+Two earlier statements in this document are now stale:
+
+- "The rusqlite dependency is not dead weight" stopped being true once
+  workspace-hack requested `bundled` directly; the pin was dropped in !980.
+- "The Rust engine must treat any catalog carrying an `sqlite_autoindex_*` as
+  read-only" was superseded by upstream #685, which recovers and maintains
+  those indexes. Adoption is a reopen, not a migration. #687 (creating the
+  autoindex) still stands, so fresh files get named `UNIQUE` indexes instead.
+
+Running the catalog's real statements through the facade, not the CLI, found
+four engine defects the oracle corpus had not, all pinned by tests in the
+module and reported to Lab271:
+
+| # | Defect at `e788241` | SQE workaround |
+|---|---|---|
+| 1 | `UPDATE` binds only its first parameter: `SET v = ? WHERE k = ?` changes 0 rows, silently; one parameter in either clause works; prepared path identical | every update is `DELETE` + `INSERT` of the key under `BEGIN IMMEDIATE` (`replace_row`), including the commit compare-and-swap |
+| 2 | covering-index `SELECT` on an autoindexed table miscounts parameters ("wants 1 parameter(s) but 2 were bound"); projecting one non-indexed column fixes it | `list_tables` projects `metadata_location` it never reads |
+| 3 | `rowid` is not selectable (`unknown column "rowid"`) | none needed once (1) is delete + insert |
+| 4 | `sqlite_master` is not queryable | schema presence via `Connection::table_names()` |
+
+Defect 1 is the one that matters for their Requirement 1: a rows-affected
+count of zero is the conflict signal, and here it was also the *success*
+signal for a statement that did nothing. Their Requirement 7 workload test
+(the join of facade and verbatim catalog statements) would have caught it;
+this port is that test until theirs exists.
+
 ## Sources
 
 SQE side: `crates/sqe-catalog/Cargo.toml:52,62,164`,

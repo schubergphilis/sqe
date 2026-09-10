@@ -71,6 +71,13 @@ sql-postgres = ["sql", "sqlx/postgres", "sqlx/runtime-tokio", "sqlx/tls-rustls"]
 # sqlx::any needs. Embedded mode picks this; cluster builds typically
 # want `sql-postgres` instead.
 sql-sqlite = ["sql", "sqlx/sqlite", "sqlx/runtime-tokio"]
+# Pure-Rust SQLite catalog: `SqliteRsCatalog` over the vendored Lab271
+# sqlite-rs embedding API (vendor/sqlite-rs). Speaks the same two-table
+# schema as `sql-sqlite`, so an existing `sqe.db` opens under either. Does
+# not depend on `sql`: no sqlx, no libsqlite3-sys, no C toolchain. When both
+# this and `sql-sqlite` are on, the embedded and `TYPE sqlite` mount paths
+# pick this one and sqlx stays the fallback for `TYPE jdbc` URLs.
+sql-sqlite-rs = ["dep:sqlite-rs"]
 # Hadoop storage-only backend. No extra dependency — the backend scans a
 # warehouse path via `object_store`, which is already linked. Hadoop has
 # no upstream loader counterpart; SQE's hadoop dispatch stays in
@@ -182,6 +189,7 @@ rusqlite = { version = "0.39", features = ["bundled"], optional = true }
 iceberg-catalog-hms = { workspace = true, optional = true }
 iceberg-catalog-glue = { workspace = true, optional = true }
 iceberg-catalog-sql = { workspace = true, optional = true }
+sqlite-rs = { workspace = true, optional = true }
 iceberg-catalog-s3tables = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 # deltalake-core REMOVED for the DataFusion 54 bump (see the `delta` feature note
