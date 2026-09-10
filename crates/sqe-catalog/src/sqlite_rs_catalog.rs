@@ -90,9 +90,49 @@ pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct SqliteRsCatalog {
     name: String,
     db_path: PathBuf,
-    conn: Arc<Connection>,
+    shared: Arc<SharedConn>,
     warehouse_location: String,
     fileio: FileIO,
+}
+
+/// The one `Connection` per catalog file, plus the lock that makes it
+/// usable from many tasks.
+///
+/// The facade's worker serialises *statements*, not *transactions*: a
+/// `BEGIN` from task A followed by a `BEGIN` from task B on the same
+/// connection is "cannot start a transaction within a transaction" (seen
+/// on two concurrent `update_table` commits, coordinator
+/// `maintenance_lease_test`), and any autocommit statement task B runs
+/// while A's transaction is open executes *inside* it, committed or rolled
+/// back with it. So every catalog call, single statement or transaction,
+/// holds `gate` for its whole run on the blocking thread. Throughput is not
+/// a concern for a pointer store; correctness of the compare-and-swap is.
+#[derive(Debug)]
+struct SharedConn {
+    conn: Connection,
+    gate: Mutex<()>,
+}
+
+impl SharedConn {
+    /// Run `f` on a blocking thread with exclusive use of the connection.
+    async fn run<T, F>(self: &Arc<Self>, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+    {
+        let shared = Arc::clone(self);
+        run_blocking(move || {
+            // A poisoned gate means a panic mid-statement on another thread;
+            // the connection's own state is still consistent (the facade
+            // rolls back a dropped Transaction), so keep serving.
+            let _exclusive = shared
+                .gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            f(&shared.conn)
+        })
+        .await
+    }
 }
 
 impl SqliteRsCatalog {
@@ -125,16 +165,13 @@ impl SqliteRsCatalog {
         let fileio = FileIOBuilder::new(scheme).build()?;
 
         let db_path = canonical_db_path(db_path.as_ref())?;
-        let conn = shared_connection(&db_path).await?;
-        {
-            let conn = Arc::clone(&conn);
-            run_blocking(move || ensure_schema(&conn)).await?;
-        }
+        let shared = shared_connection(&db_path).await?;
+        shared.run(ensure_schema).await?;
 
         Ok(Self {
             name,
             db_path,
-            conn,
+            shared,
             warehouse_location,
             fileio,
         })
@@ -148,22 +185,23 @@ impl SqliteRsCatalog {
     /// True when `other` runs on the same `Connection` (same worker thread).
     /// The process-wide one-connection-per-file rule is observable here.
     pub fn shares_connection_with(&self, other: &SqliteRsCatalog) -> bool {
-        Arc::ptr_eq(&self.conn, &other.conn)
+        Arc::ptr_eq(&self.shared, &other.shared)
     }
 
     async fn fetch_rows(&self, sql: String, args: Vec<String>) -> Result<Vec<Row>> {
-        let conn = Arc::clone(&self.conn);
-        run_blocking(move || {
-            conn.query_all_with(&sql, params(args))
-                .map_err(from_sqlite_error)
-        })
-        .await
+        self.shared
+            .run(move |conn| {
+                conn.query_all_with(&sql, params(args))
+                    .map_err(from_sqlite_error)
+            })
+            .await
     }
 
     /// Run one write statement in autocommit; returns rows changed.
     async fn execute(&self, sql: String, args: Vec<String>) -> Result<u64> {
-        let conn = Arc::clone(&self.conn);
-        run_blocking(move || conn.execute_with(&sql, params(args)).map_err(from_sqlite_error)).await
+        self.shared
+            .run(move |conn| conn.execute_with(&sql, params(args)).map_err(from_sqlite_error))
+            .await
     }
 
     /// The `UPDATE` stand-in (module docs, defect 1): inside one
@@ -189,8 +227,7 @@ impl SqliteRsCatalog {
     where
         D: FnOnce(Option<&Row>) -> Result<Option<Vec<Value>>> + Send + 'static,
     {
-        let conn = Arc::clone(&self.conn);
-        run_blocking(move || {
+        self.shared.run(move |conn| {
             let tx = conn
                 .transaction_with(TransactionBehavior::Immediate)
                 .map_err(from_sqlite_error)?;
@@ -312,12 +349,12 @@ fn canonical_db_path(path: &Path) -> Result<PathBuf> {
 ///
 /// Holds `Weak` so the worker thread stops when the last catalog on that
 /// path drops, and a later open starts a fresh one.
-fn registry() -> &'static Mutex<HashMap<PathBuf, Weak<Connection>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<Connection>>>> = OnceLock::new();
+fn registry() -> &'static Mutex<HashMap<PathBuf, Weak<SharedConn>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<SharedConn>>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-async fn shared_connection(db_path: &Path) -> Result<Arc<Connection>> {
+async fn shared_connection(db_path: &Path) -> Result<Arc<SharedConn>> {
     // Fast path: a live connection already serves this file.
     if let Some(existing) = lock_registry().get(db_path).and_then(Weak::upgrade) {
         return Ok(existing);
@@ -328,7 +365,10 @@ async fn shared_connection(db_path: &Path) -> Result<Arc<Connection>> {
         let conn = Connection::open(&path).map_err(from_sqlite_error)?;
         conn.set_busy_timeout(DEFAULT_BUSY_TIMEOUT)
             .map_err(from_sqlite_error)?;
-        Ok(Arc::new(conn))
+        Ok(Arc::new(SharedConn {
+            conn,
+            gate: Mutex::new(()),
+        }))
     })
     .await?;
     // Re-check under the lock: another task may have opened the same file
@@ -343,7 +383,7 @@ async fn shared_connection(db_path: &Path) -> Result<Arc<Connection>> {
     Ok(opened)
 }
 
-fn lock_registry() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Weak<Connection>>> {
+fn lock_registry() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Weak<SharedConn>>> {
     // A poisoned registry only means a panic while holding the map; the
     // map itself holds nothing that can be half-written.
     registry()
@@ -493,13 +533,12 @@ impl Catalog for SqliteRsCatalog {
         // One statement per property, inside one transaction: sqlite-rs
         // rejects multi-row VALUES lists less predictably than one row at a
         // time, and a transaction keeps the namespace all-or-nothing.
-        let conn = Arc::clone(&self.conn);
         let name = self.name.clone();
         let rows: Vec<(String, String)> = insert_properties
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        run_blocking(move || {
+        self.shared.run(move |conn| {
             let tx = conn.transaction().map_err(from_sqlite_error)?;
             for (key, value) in rows {
                 tx.execute_with(
@@ -599,9 +638,8 @@ impl Catalog for SqliteRsCatalog {
             "INSERT INTO {NAMESPACE_PROPERTIES} (catalog_name, namespace, property_key, property_value)
              VALUES (?, ?, ?, ?)"
         );
-        let conn = Arc::clone(&self.conn);
         let name = self.name.clone();
-        run_blocking(move || {
+        self.shared.run(move |conn| {
             let tx = conn
                 .transaction_with(TransactionBehavior::Immediate)
                 .map_err(from_sqlite_error)?;
