@@ -492,7 +492,12 @@ async fn open_embedded_sqlite_catalog(
     Ok(Arc::new(catalog))
 }
 
-#[cfg(not(feature = "sqlite-rs"))]
+#[cfg(not(any(feature = "sqlite-rs", feature = "sqlite-c")))]
+compile_error!(
+    "sqe-cli needs a SQLite engine for the embedded catalog: enable `sqlite-rs` (default) or `sqlite-c`"
+);
+
+#[cfg(all(not(feature = "sqlite-rs"), feature = "sqlite-c"))]
 async fn open_embedded_sqlite_catalog(
     db_path: &Path,
     warehouse_uri: &str,

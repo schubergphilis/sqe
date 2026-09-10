@@ -96,16 +96,16 @@ pub struct MaintenanceHandler {
     /// carry-forward path (architecture review 512). `None` in tests and in
     /// handlers built without a registry; the carry-forward still runs.
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
-    /// TEST-ONLY synchronization seam (`#[cfg(test)]`, so it compiles only
+    /// TEST-ONLY synchronization seam (`#[cfg(all(test, feature = "test-sqlite"))]`, so it compiles only
     /// for this crate's own unit test binary -- never for a release build or
     /// an external integration test). See `RewriteRaceSeam`'s doc comment and
-    /// the `#[cfg(test)] mod tests` test
+    /// the `#[cfg(all(test, feature = "test-sqlite"))] mod tests` test
     /// `concurrent_position_delete_during_local_rewrite_does_not_resurrect_rows`
     /// for how it is used to land a concurrent commit deterministically
     /// inside `rewrite_data_files_once`'s conflict window, instead of racing
     /// wall-clock timing. Always `None` unless a test opts in via
     /// `with_test_race_seam`; `MaintenanceHandler::new` never sets it.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-sqlite"))]
     race_seam: Option<Arc<RewriteRaceSeam>>,
 }
 
@@ -120,7 +120,7 @@ impl MaintenanceHandler {
             worker_registry: None,
             worker_load: Arc::new(WorkerLoadTracker::new()),
             metrics: None,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "test-sqlite"))]
             race_seam: None,
         }
     }
@@ -136,7 +136,7 @@ impl MaintenanceHandler {
     /// TEST-ONLY: attach a [`RewriteRaceSeam`] so the first attempt of
     /// `rewrite_data_files_once` pauses right before its final commit. See
     /// the field doc comment on `race_seam` above.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-sqlite"))]
     #[must_use = "with_test_race_seam consumes self; bind the returned handler"]
     fn with_test_race_seam(mut self, seam: Arc<RewriteRaceSeam>) -> Self {
         self.race_seam = Some(seam);
@@ -1300,8 +1300,8 @@ impl MaintenanceHandler {
         // window `set_validate_from_snapshot_id` guards. `fired` makes this
         // one-shot: a retry (a fresh call to this method after a rejected
         // first attempt) runs straight through, matching real retry behavior.
-        // Compiled only under `#[cfg(test)]`; always a no-op in production.
-        #[cfg(test)]
+        // Compiled only under `#[cfg(all(test, feature = "test-sqlite"))]`; always a no-op in production.
+        #[cfg(all(test, feature = "test-sqlite"))]
         if let Some(seam) = self.race_seam.as_ref() {
             if !seam.fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 seam.ready.notify_one();
@@ -3320,7 +3320,7 @@ pub(crate) fn session_is_explicitly_read_only(session: &Session) -> bool {
     has_read_only && !has_write_like
 }
 
-/// TEST-ONLY (`#[cfg(test)]`) two-way handshake used by
+/// TEST-ONLY (`#[cfg(all(test, feature = "test-sqlite"))]`) two-way handshake used by
 /// `rewrite_data_files_once` (see the `race_seam` field on
 /// [`MaintenanceHandler`]) to pause the first attempt right before its final
 /// commit and let a test land a concurrent write deterministically inside
@@ -3341,14 +3341,14 @@ pub(crate) fn session_is_explicitly_read_only(session: &Session) -> bool {
 /// through without pausing again, matching real retry behavior (only the
 /// first attempt races the concurrent writer; the retry re-reads and re-plans
 /// against the table the concurrent write already landed on).
-#[cfg(test)]
+#[cfg(all(test, feature = "test-sqlite"))]
 struct RewriteRaceSeam {
     ready: tokio::sync::Notify,
     go: tokio::sync::Notify,
     fired: std::sync::atomic::AtomicBool,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-sqlite"))]
 impl RewriteRaceSeam {
     fn new() -> Self {
         Self {
@@ -3359,7 +3359,7 @@ impl RewriteRaceSeam {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-sqlite"))]
 mod tests {
     use super::*;
     use chrono::Duration;

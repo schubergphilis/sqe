@@ -30,8 +30,9 @@
 //! `WriteHandler::new(rig.config.clone())` is a production handler pointed at
 //! the rig.
 //!
-//! The Jdbc arm compiles only under `sqe-catalog/sql-postgres`, which the
-//! `test-sqlite` feature of this crate enables (see `Cargo.toml`).
+//! The `sqlite:` Jdbc arm is served by the pure-Rust `sqe-catalog/sql-sqlite-rs`
+//! engine, which the `test-sqlite` feature of this crate enables (see
+//! `Cargo.toml`); no sqlx and no libsqlite3 are involved.
 //!
 //! # Running
 //!
@@ -107,7 +108,7 @@ impl SqliteRig {
         };
         let catalog = SessionCatalog::build_backend_catalog(&backend)
             .await
-            .expect("sqlite (jdbc) catalog builds; needs sqe-catalog/sql-postgres");
+            .expect("sqlite (jdbc) catalog builds; needs sqe-catalog/sql-sqlite-rs");
 
         let config = rig_config(&db_url, &warehouse);
 

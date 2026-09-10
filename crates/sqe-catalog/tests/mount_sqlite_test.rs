@@ -3,13 +3,12 @@
 //!
 //! These tests construct an actual SQLite-backed Iceberg catalog over
 //! a tempdir warehouse and verify the resulting handle can run
-//! `list_namespaces`. The test crate must enable the `sql-sqlite`
-//! feature so the embedded SQLite driver is wired through `sqlx::any`;
-//! the default SQE build only enables `sql-postgres`, so this test
-//! file is gated to keep the standard `cargo test -p sqe-catalog`
-//! pass without requiring a Postgres stack.
+//! `list_namespaces`. Either SQLite engine serves `TYPE sqlite`: the
+//! pure-Rust `sql-sqlite-rs` (default) or sqlx's driver behind
+//! `sql-sqlite`; the file is gated on having one of them so a build with
+//! neither still passes `cargo test -p sqe-catalog`.
 
-#![cfg(feature = "sql-sqlite")]
+#![cfg(any(feature = "sql-sqlite", feature = "sql-sqlite-rs"))]
 
 use std::collections::BTreeMap;
 
