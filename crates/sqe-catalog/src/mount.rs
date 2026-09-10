@@ -508,18 +508,86 @@ fn store_for_secret(
 /// directory. Required for the URL-shape; optional for bare paths.
 ///
 /// Mirrors `attach_sqlite_catalog` in `crates/sqe-cli/src/embedded.rs`.
-#[cfg(feature = "sql-sqlite")]
+///
+/// Two engines can serve this: the pure-Rust `sqlite_rs_catalog` when the
+/// `sql-sqlite-rs` feature is on (preferred whenever compiled in), else the
+/// sqlx + libsqlite3 path behind `sql-sqlite`. Both read and write the same
+/// file layout, so a warehouse created under one opens under the other.
+#[cfg(feature = "sql-sqlite-rs")]
+async fn build_sqlite(
+    location: &str,
+    options: &BTreeMap<String, OptionValue>,
+) -> Result<Arc<dyn iceberg::Catalog>, String> {
+    use crate::sqlite_rs_catalog::SqliteRsCatalog;
+
+    let (db_url, warehouse) = resolve_sqlite_location(location, options)?;
+    let db_path = sqlite_url_to_path(&db_url)?;
+    // Same fixed row-scope name as the sqlx path, so a file attached under
+    // either engine shows the same namespaces and tables.
+    let catalog = SqliteRsCatalog::open("sqe-attached", db_path, warehouse)
+        .await
+        .map_err(|e| format!("SQLite catalog open failed: {e}"))?;
+    Ok(Arc::new(catalog))
+}
+
+/// The file path inside a `sqlite:` URL as the sqlx path spells it:
+/// `sqlite:///abs/path/db?mode=rwc`, `sqlite://abs/path/db`, or
+/// `sqlite:abs/path/db`. The query string (sqlx open options) is dropped;
+/// the pure-Rust engine always opens read-write-create.
+#[cfg(feature = "sql-sqlite-rs")]
+fn sqlite_url_to_path(url: &str) -> Result<std::path::PathBuf, String> {
+    let rest = url
+        .strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("sqlite:"))
+        .ok_or_else(|| format!("not a sqlite URL: {url}"))?;
+    let path = rest.split('?').next().unwrap_or(rest);
+    if path.is_empty() || path == ":memory:" {
+        return Err(
+            "TYPE sqlite needs a file path; in-memory databases are not attachable".to_string(),
+        );
+    }
+    Ok(std::path::PathBuf::from(path))
+}
+
+#[cfg(all(feature = "sql-sqlite", not(feature = "sql-sqlite-rs")))]
 async fn build_sqlite(
     location: &str,
     options: &BTreeMap<String, OptionValue>,
 ) -> Result<Arc<dyn iceberg::Catalog>, String> {
     use std::collections::HashMap;
-    use std::path::PathBuf;
 
     use iceberg::CatalogBuilder;
     use iceberg_catalog_sql::{
         SqlCatalogBuilder, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE,
     };
+
+    let (db_url, warehouse) = resolve_sqlite_location(location, options)?;
+
+    let mut props = HashMap::new();
+    props.insert(SQL_CATALOG_PROP_URI.to_string(), db_url);
+    props.insert(SQL_CATALOG_PROP_WAREHOUSE.to_string(), warehouse);
+
+    // The builder's `name` is recorded as the row scope inside the
+    // SQLite metadata tables. Embedded mode uses a fixed name so
+    // every db file holds a single coherent scope; mirror that here.
+    // The user-facing catalog identifier comes from
+    // `register_catalog(name, ...)` at the coordinator level.
+    let catalog = SqlCatalogBuilder::default()
+        .load("sqe-attached".to_string(), props)
+        .await
+        .map_err(|e| format!("SQLite catalog open failed: {e}"))?;
+
+    Ok(Arc::new(catalog))
+}
+
+/// Resolve `TYPE sqlite`'s location and options into the database URL and
+/// the warehouse URI, shared by both SQLite engines.
+#[cfg(any(feature = "sql-sqlite", feature = "sql-sqlite-rs"))]
+fn resolve_sqlite_location(
+    location: &str,
+    options: &BTreeMap<String, OptionValue>,
+) -> Result<(String, String), String> {
+    use std::path::PathBuf;
 
     let trimmed = location.trim();
     if trimmed.is_empty() {
@@ -569,30 +637,16 @@ async fn build_sqlite(
         })?,
     };
 
-    let mut props = HashMap::new();
-    props.insert(SQL_CATALOG_PROP_URI.to_string(), db_url);
-    props.insert(SQL_CATALOG_PROP_WAREHOUSE.to_string(), warehouse);
-
-    // The builder's `name` is recorded as the row scope inside the
-    // SQLite metadata tables. Embedded mode uses a fixed name so
-    // every db file holds a single coherent scope; mirror that here.
-    // The user-facing catalog identifier comes from
-    // `register_catalog(name, ...)` at the coordinator level.
-    let catalog = SqlCatalogBuilder::default()
-        .load("sqe-attached".to_string(), props)
-        .await
-        .map_err(|e| format!("SQLite catalog open failed: {e}"))?;
-
-    Ok(Arc::new(catalog))
+    Ok((db_url, warehouse))
 }
 
-#[cfg(not(feature = "sql-sqlite"))]
+#[cfg(not(any(feature = "sql-sqlite", feature = "sql-sqlite-rs")))]
 async fn build_sqlite(
     _location: &str,
     _options: &BTreeMap<String, OptionValue>,
 ) -> Result<Arc<dyn iceberg::Catalog>, String> {
     Err(
-        "TYPE sqlite requires the `sql-sqlite` cargo feature on sqe-catalog \
+        "TYPE sqlite requires the `sql-sqlite-rs` or `sql-sqlite` cargo feature on sqe-catalog \
          (or `sql-postgres` for `TYPE jdbc`)"
             .to_string(),
     )
