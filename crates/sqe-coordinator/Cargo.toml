@@ -64,7 +64,8 @@ tonic = { workspace = true, features = ["tls-ring"] }
 # avoids pulling rustls/aws-lc-rs; we install the ring provider explicitly so
 # the Quack endpoint uses the same crypto backend as the tonic Flight path.
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
-rustls = { version = "0.23", features = ["ring"] }
+# Same shape as sqe-core: no rustls defaults, or `aws_lc_rs` comes back in.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

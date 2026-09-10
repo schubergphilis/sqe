@@ -123,7 +123,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 
 # HTTP
 axum = "0.8"
-reqwest = { version = "0.13", features = ["json", "rustls", "form", "query"], default-features = false }
+# `rustls-no-provider`, not `rustls`: reqwest 0.13's `rustls` feature hardwires
+# the aws-lc provider (`__rustls-aws-lc-rs`), which is the C build every SQE
+# binary was paying for. With ring the only provider feature in the graph,
+# rustls selects it automatically for every client reqwest builds.
+reqwest = { version = "0.13", features = ["json", "rustls-no-provider", "form", "query"], default-features = false }
 # The vendored iceberg-catalog-rest still builds on reqwest 0.12, so its
 # `RestCatalogBuilder::with_client` needs a 0.12 `Client`. sqe-catalog builds
 # one with the same `[catalog]` deadlines (review 300). No features: the

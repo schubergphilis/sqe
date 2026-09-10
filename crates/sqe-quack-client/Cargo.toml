@@ -15,6 +15,9 @@ async-trait = { workspace = true }
 datafusion = { workspace = true }
 datafusion-expr = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
+# reqwest is `rustls-no-provider` workspace-wide; this crate does not link
+# sqe-core, so it installs the ring provider itself (client.rs).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 url = { workspace = true }

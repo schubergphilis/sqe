@@ -243,6 +243,9 @@ impl OutputFormat {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // ring is the process TLS provider (installed pre-main by sqe-core; this
+    // makes it explicit and logs which case happened).
+    sqe_core::tls::ensure_crypto_provider();
     let cli = Cli::parse();
     error_render::set_raw_errors(cli.raw_errors);
 
