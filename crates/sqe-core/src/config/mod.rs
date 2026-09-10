@@ -10143,6 +10143,13 @@ warehouse = "wh"
 
     #[test]
     fn shipped_operator_tomls_load() {
+        // `SqeConfig::load` applies `SQE_*` environment overrides, and the
+        // tests above set deliberately invalid ones (for example
+        // `SQE_QUERY__MAX_CONCURRENT_PER_USR`) under `ENV_LOCK`. Without
+        // holding the same lock this test could load a shipped TOML while
+        // one of those variables was set and fail on "unknown field", which
+        // it did intermittently in CI (!977, !980).
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let files = [
             "tests/sqe-test.toml",
