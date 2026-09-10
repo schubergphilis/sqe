@@ -9,6 +9,8 @@ cargo check -p sqe-catalog --no-default-features --features rest,glue,s3tables
 cargo check -p sqe-catalog --no-default-features --features rest,hms
 cargo check -p sqe-catalog --no-default-features --features rest,sql-postgres
 cargo check -p sqe-catalog --no-default-features --features rest,sql-sqlite
+cargo check -p sqe-catalog --no-default-features --features rest,sql-sqlite-rs
+cargo check -p sqe-catalog --no-default-features --features rest,sql-sqlite-rs,sql-postgres
 cargo check -p sqe-catalog --no-default-features
 cargo xtask matrix-report --min-percent 50
 
