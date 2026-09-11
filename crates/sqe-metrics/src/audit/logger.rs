@@ -403,6 +403,7 @@ fn audit_resume_event(reason: &str) -> AuditEvent {
             email: None,
             roles: Vec::new(),
             groups: Vec::new(),
+            app_name: None,
         },
         outcome: Outcome::Failure {
             error_type: Some("audit_resume".into()),

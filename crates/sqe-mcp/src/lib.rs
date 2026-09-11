@@ -5,7 +5,12 @@
 //! same token in the query `Session`, preserving user -> MCP -> SQE -> source
 //! identity and authorization.
 
-use std::{collections::BTreeSet, net::SocketAddr, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
@@ -34,8 +39,26 @@ pub trait QueryExecutor: Send + Sync + 'static {
 }
 
 pub trait AuthRateLimiter: Send + Sync + 'static {
-    fn allow(&self, peer_ip: &str) -> bool;
+    /// `credential` is a non-secret label for the presented credential (a
+    /// SHA-256 fingerprint prefix of the bearer, or `no-bearer`), so the
+    /// per-tuple budget is spent per token, not per address. Behind a proxy
+    /// every agent shares one peer IP; without this key one garbage-bearer
+    /// loop would exhaust the budget for all of them, and one attacker could
+    /// rotate tokens for free.
+    fn allow(&self, peer_ip: &str, credential: &str) -> bool;
 }
+
+/// The `Mcp-Session-Id` header (MCP Streamable HTTP, 2025-11-25).
+pub const SESSION_ID_HEADER: &str = "mcp-session-id";
+
+/// Longest client label kept from `clientInfo` or `User-Agent`.
+const CLIENT_LABEL_MAX: usize = 64;
+/// Client sessions the registry keeps before evicting the least recently
+/// seen one. Each entry is a few dozen bytes; this is a bound, not a budget.
+const CLIENT_SESSIONS_MAX: usize = 4096;
+/// A client session that has been quiet this long is dropped on the next
+/// eviction pass. Agents that keep talking are refreshed on every call.
+const CLIENT_SESSION_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone)]
 pub struct McpServerState {
@@ -49,6 +72,109 @@ pub struct McpServerState {
     /// (fail closed) and logged; config validation refuses that case at
     /// startup, so the server path never sees it.
     principals: Arc<Vec<StaticPrincipal>>,
+    /// `Mcp-Session-Id` -> the client that introduced itself on `initialize`.
+    /// Advisory only: an unknown or missing id never fails a request, it just
+    /// leaves the audit label at the `User-Agent` fallback. Every other part
+    /// of the server stays stateless.
+    clients: Arc<ClientRegistry>,
+}
+
+/// What a client said about itself on `initialize`, bound to the identity that
+/// said it. The binding stops one caller from relabelling another caller's
+/// audit trail by replaying a session id it observed.
+struct ClientSession {
+    user: String,
+    label: String,
+    seen: Instant,
+}
+
+#[derive(Default)]
+struct ClientRegistry {
+    inner: Mutex<HashMap<String, ClientSession>>,
+}
+
+impl ClientRegistry {
+    fn insert(&self, user: &str, label: String) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.len() >= CLIENT_SESSIONS_MAX {
+            let now = Instant::now();
+            inner.retain(|_, session| now.duration_since(session.seen) < CLIENT_SESSION_IDLE);
+            if inner.len() >= CLIENT_SESSIONS_MAX {
+                if let Some(oldest) = inner
+                    .iter()
+                    .min_by_key(|(_, session)| session.seen)
+                    .map(|(id, _)| id.clone())
+                {
+                    inner.remove(&oldest);
+                }
+            }
+        }
+        inner.insert(
+            id.clone(),
+            ClientSession {
+                user: user.to_string(),
+                label,
+                seen: Instant::now(),
+            },
+        );
+        id
+    }
+
+    /// The label for `id`, only if `user` is the identity that registered it.
+    fn label(&self, id: &str, user: &str) -> Option<String> {
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session = inner.get_mut(id)?;
+        if session.user != user {
+            return None;
+        }
+        session.seen = Instant::now();
+        Some(session.label.clone())
+    }
+
+    fn remove(&self, id: &str, user: &str) {
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.get(id).is_some_and(|session| session.user == user) {
+            inner.remove(id);
+        }
+    }
+}
+
+/// Reduce a client-supplied string to something safe to put in a log line and
+/// an audit record: printable ASCII minus quotes and backslashes, at most
+/// [`CLIENT_LABEL_MAX`] bytes, or `None` when nothing survives.
+fn sanitize_label(raw: &str) -> Option<String> {
+    let label: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .filter(|c| !matches!(c, '"' | '\'' | '\\'))
+        .take(CLIENT_LABEL_MAX)
+        .collect();
+    let label = label.trim().to_string();
+    (!label.is_empty()).then_some(label)
+}
+
+/// `name/version` from an `initialize` request's `clientInfo`, sanitized.
+fn client_label_from_client_info(params: &Value) -> Option<String> {
+    let info = params.get("clientInfo")?;
+    let name = info.get("name").and_then(Value::as_str)?;
+    let version = info.get("version").and_then(Value::as_str);
+    let raw = match version {
+        Some(version) if !version.trim().is_empty() => format!("{name}/{version}"),
+        _ => name.to_string(),
+    };
+    sanitize_label(&raw)
+}
+
+/// The `Session.source` value for one tool call: `mcp:<tool>` plus the client
+/// label when one is known. This is what the audit trail and `system.runtime`
+/// show as the initiating application, so an operator can tell an AI agent's
+/// queries from a JDBC client's, and one agent from another.
+fn source_label(tool: &str, client: Option<&str>) -> String {
+    match client {
+        Some(client) => format!("mcp:{tool}:{client}"),
+        None => format!("mcp:{tool}"),
+    }
 }
 
 /// One static-mode principal: an opaque bearer plus the identity it grants.
@@ -99,6 +225,7 @@ impl McpServerState {
             auth_rate_limiter: None,
             config,
             principals,
+            clients: Arc::new(ClientRegistry::default()),
         }
     }
 
@@ -175,9 +302,36 @@ async fn mcp_delete(
         return StatusCode::FORBIDDEN.into_response();
     }
     match authenticate(&state, &headers, peer.ip().to_string()).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(auth) => {
+            if let Some(id) = session_id(&headers) {
+                state.clients.remove(id, &auth.session.user.username);
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(response) => response,
     }
+}
+
+fn session_id(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(SESSION_ID_HEADER)?
+        .to_str()
+        .ok()
+        .filter(|id| !id.is_empty())
+}
+
+/// The client label for this request: what the client said on `initialize`
+/// if it echoes the `Mcp-Session-Id` we issued and is still the same identity,
+/// else the sanitized `User-Agent`, else nothing.
+fn client_label(state: &McpServerState, headers: &HeaderMap, user: &str) -> Option<String> {
+    session_id(headers)
+        .and_then(|id| state.clients.label(id, user))
+        .or_else(|| {
+            headers
+                .get(header::USER_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .and_then(sanitize_label)
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,23 +387,44 @@ async fn mcp_post(
         );
     }
     let id = request.id.clone();
+    let user = auth.session.user.username.as_str();
+    let mut issued_session_id = None;
     let result = match request.method.as_str() {
-        "initialize" => Ok(json!({
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": { "tools": { "listChanged": false } },
-            "serverInfo": { "name": "sqe", "version": sqe_core::VERSION },
-            "instructions": "Governed SQL access. Prefer read-only metadata and query tools. The change tool is separately gated by OAuth scope, SQE role, and source-data authorization."
-        })),
+        "initialize" => {
+            // Remember who is talking so every later call can be attributed
+            // to this client in the audit trail. Nothing else hangs off the id.
+            let label = client_label_from_client_info(&request.params)
+                .or_else(|| client_label(&state, &headers, user))
+                .unwrap_or_else(|| "unknown".to_string());
+            tracing::info!(user, client = %label, "MCP client initialized");
+            issued_session_id = Some(state.clients.insert(user, label));
+            Ok(json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": { "tools": { "listChanged": false } },
+                "serverInfo": { "name": "sqe", "version": sqe_core::VERSION },
+                "instructions": "Governed SQL access. Prefer read-only metadata and query tools. The change tool is separately gated by OAuth scope, SQE role, and source-data authorization."
+            }))
+        }
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tools(&state.config) })),
-        "tools/call" => call_tool(&state, &auth, &request.params).await,
+        "tools/call" => {
+            let client = client_label(&state, &headers, user);
+            call_tool(&state, &auth, client.as_deref(), &request.params).await
+        }
         "notifications/initialized" => return StatusCode::ACCEPTED.into_response(),
         _ => Err((-32601, format!("Method not found: {}", request.method))),
     };
-    match result {
+    let mut response = match result {
         Ok(value) => rpc_result(id, value),
         Err((code, message)) => rpc_error(id, code, message),
+    };
+    if let Some(value) = issued_session_id
+        .as_deref()
+        .and_then(|id| HeaderValue::from_str(id).ok())
+    {
+        response.headers_mut().insert(SESSION_ID_HEADER, value);
     }
+    response
 }
 
 fn origin_allowed(config: &McpConfig, headers: &HeaderMap) -> bool {
@@ -273,10 +448,15 @@ async fn authenticate(
     headers: &HeaderMap,
     peer_ip: String,
 ) -> Result<AuthContext, Response> {
+    // The credential half of the rate-limit key is a fingerprint of the
+    // bearer, never the bearer: the limiter stores its keys.
+    let credential = bearer(headers)
+        .map(sqe_trino_compat::server::bearer_fingerprint)
+        .unwrap_or_else(|| "no-bearer".to_string());
     if state
         .auth_rate_limiter
         .as_ref()
-        .is_some_and(|limiter| !limiter.allow(&peer_ip))
+        .is_some_and(|limiter| !limiter.allow(&peer_ip, &credential))
     {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
@@ -525,6 +705,7 @@ fn three_string_schema() -> Value {
 async fn call_tool(
     state: &McpServerState,
     auth: &AuthContext,
+    client: Option<&str>,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
     let name = params
@@ -543,6 +724,7 @@ async fn call_tool(
             "email": auth.session.user.email,
             "groups": auth.session.user.groups,
             "oauth_scopes": auth.scopes,
+            "client": client,
         })));
     }
     let sql = match name {
@@ -574,7 +756,13 @@ async fn call_tool(
         }
         _ => return Err((-32602, format!("Unknown tool: {name}"))),
     };
-    match state.executor.execute(&auth.session, &sql).await {
+    // Tag the session with the tool and client so the audit trail and
+    // `system.runtime` show WHICH agent ran WHAT through MCP, not just the user.
+    let session = auth
+        .session
+        .clone()
+        .with_source(Some(source_label(name, client)));
+    match state.executor.execute(&session, &sql).await {
         Ok(batches) => Ok(tool_success(batches_json(
             &batches,
             state.config.max_result_rows,
@@ -793,8 +981,14 @@ mod tests {
         }
     }
 
+    /// Records, per call: the catalog token, `(username, roles)`, and the
+    /// `Session.source` label the tool call stamped.
     #[derive(Default)]
-    struct RecordingExecutor(Mutex<Option<String>>, Mutex<Option<(String, Vec<String>)>>);
+    struct RecordingExecutor(
+        Mutex<Option<String>>,
+        Mutex<Option<(String, Vec<String>)>>,
+        Mutex<Option<String>>,
+    );
 
     #[async_trait]
     impl QueryExecutor for RecordingExecutor {
@@ -808,6 +1002,7 @@ mod tests {
                 session.user.username.clone(),
                 session.user.roles.clone(),
             ));
+            *self.2.lock().unwrap() = session.source.clone();
             Ok(vec![])
         }
     }
@@ -1059,6 +1254,232 @@ mod tests {
         app.oneshot(request.body(Body::from(body)).unwrap())
             .await
             .unwrap()
+    }
+
+    /// A request against a shared router, with arbitrary extra headers, so
+    /// two calls can share the server-side client registry.
+    async fn send(
+        app: &Router,
+        bearer: &str,
+        extra_headers: &[(&str, &str)],
+        body: String,
+    ) -> Response<Body> {
+        let mut request = Request::post("/mcp")
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+        for (name, value) in extra_headers {
+            request = request.header(*name, *value);
+        }
+        app.clone()
+            .oneshot(request.body(Body::from(body)).unwrap())
+            .await
+            .unwrap()
+    }
+
+    fn initialize(client_name: &str, client_version: &str) -> String {
+        json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": client_name, "version": client_version}
+            }
+        })
+        .to_string()
+    }
+
+    fn session_id_of(response: &Response<Body>) -> String {
+        response
+            .headers()
+            .get(SESSION_ID_HEADER)
+            .expect("initialize issues an Mcp-Session-Id")
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn tool_calls_stamp_tool_and_client_into_the_session_source() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let app = router(McpServerState::new(
+            Arc::new(MockAuth),
+            executor.clone(),
+            static_config(false),
+        ));
+        let init = send(&app, READ_TOKEN, &[], initialize("claude-code", "2.1.0")).await;
+        assert_eq!(init.status(), StatusCode::OK);
+        let session_id = session_id_of(&init);
+
+        // The session id wins over User-Agent: clientInfo is the client's own
+        // name for itself, the UA is whatever HTTP library it happens to use.
+        let call = send(
+            &app,
+            READ_TOKEN,
+            &[(SESSION_ID_HEADER, &session_id), ("user-agent", "node")],
+            tool_call("execute_sql_readonly"),
+        )
+        .await;
+        assert_eq!(call.status(), StatusCode::OK);
+        assert_eq!(
+            executor.2.lock().unwrap().as_deref(),
+            Some("mcp:execute_sql_readonly:claude-code/2.1.0")
+        );
+
+        // DELETE ends the client session; the label falls back afterwards.
+        let delete = app
+            .clone()
+            .oneshot(
+                Request::delete("/mcp")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
+                    .header(header::AUTHORIZATION, format!("Bearer {READ_TOKEN}"))
+                    .header(SESSION_ID_HEADER, &session_id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+        send(
+            &app,
+            READ_TOKEN,
+            &[(SESSION_ID_HEADER, &session_id)],
+            tool_call("execute_sql_readonly"),
+        )
+        .await;
+        assert_eq!(
+            executor.2.lock().unwrap().as_deref(),
+            Some("mcp:execute_sql_readonly")
+        );
+    }
+
+    #[tokio::test]
+    async fn another_principal_cannot_relabel_its_calls_with_a_borrowed_session_id() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let app = router(McpServerState::new(
+            Arc::new(MockAuth),
+            executor.clone(),
+            static_config(true),
+        ));
+        let init = send(&app, READ_TOKEN, &[], initialize("claude-code", "2.1.0")).await;
+        let readers_session_id = session_id_of(&init);
+
+        // The writer replays the reader's id. The binding to the identity that
+        // registered it means the label is not applied; the writer's own
+        // User-Agent is used instead, so its audit trail stays its own.
+        let call = send(
+            &app,
+            WRITE_TOKEN,
+            &[
+                (SESSION_ID_HEADER, &readers_session_id),
+                ("user-agent", "codex-cli/1.2"),
+            ],
+            tool_call("execute_sql_readonly"),
+        )
+        .await;
+        assert_eq!(call.status(), StatusCode::OK);
+        assert_eq!(
+            executor.2.lock().unwrap().as_deref(),
+            Some("mcp:execute_sql_readonly:codex-cli/1.2")
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_session_id_and_no_user_agent_leave_the_bare_tool_label() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let app = router(McpServerState::new(
+            Arc::new(MockAuth),
+            executor.clone(),
+            static_config(false),
+        ));
+        // An id this server never issued (or one from before a restart) is
+        // ignored, never an error: the id is advisory.
+        let call = send(
+            &app,
+            READ_TOKEN,
+            &[(SESSION_ID_HEADER, "not-issued-by-this-server")],
+            tool_call("execute_sql_readonly"),
+        )
+        .await;
+        assert_eq!(call.status(), StatusCode::OK);
+        assert_eq!(
+            executor.2.lock().unwrap().as_deref(),
+            Some("mcp:execute_sql_readonly")
+        );
+    }
+
+    #[test]
+    fn client_labels_are_printable_ascii_and_bounded() {
+        // Newlines and quotes cannot reach a log line or an audit record.
+        assert_eq!(
+            sanitize_label("claude-code/2.1\n\"; DROP").as_deref(),
+            Some("claude-code/2.1; DROP")
+        );
+        assert_eq!(sanitize_label("\t\n\u{1b}"), None);
+        assert_eq!(
+            sanitize_label(&"a".repeat(500)).map(|s| s.len()),
+            Some(CLIENT_LABEL_MAX)
+        );
+        // clientInfo without a version is just the name; without a name it is
+        // nothing, not "unknown/1.0".
+        assert_eq!(
+            client_label_from_client_info(&json!({"clientInfo":{"name":"codex","version":""}}))
+                .as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            client_label_from_client_info(&json!({"clientInfo":{"version":"1.0"}})),
+            None
+        );
+        assert_eq!(source_label("list_tables", None), "mcp:list_tables");
+        assert_eq!(
+            source_label("list_tables", Some("codex/1.0")),
+            "mcp:list_tables:codex/1.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_rate_limit_is_keyed_by_bearer_fingerprint_not_peer_ip_alone() {
+        struct RecordingLimiter(Mutex<Vec<(String, String)>>);
+        impl AuthRateLimiter for RecordingLimiter {
+            fn allow(&self, peer_ip: &str, credential: &str) -> bool {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((peer_ip.to_string(), credential.to_string()));
+                true
+            }
+        }
+        let limiter = Arc::new(RecordingLimiter(Mutex::new(Vec::new())));
+        let app = router(
+            McpServerState::new(
+                Arc::new(MockAuth),
+                Arc::new(RecordingExecutor::default()),
+                static_config(true),
+            )
+            .with_auth_rate_limiter(limiter.clone()),
+        );
+        send(&app, READ_TOKEN, &[], tool_call("execute_sql_readonly")).await;
+        send(&app, WRITE_TOKEN, &[], tool_call("execute_sql_readonly")).await;
+        let no_bearer = Request::post("/mcp")
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(tool_call("execute_sql_readonly")))
+            .unwrap();
+        app.clone().oneshot(no_bearer).await.unwrap();
+
+        let keys = limiter.0.lock().unwrap();
+        assert_eq!(keys.len(), 3);
+        // Same peer, two credentials, two buckets.
+        assert_eq!(keys[0].0, keys[1].0);
+        assert!(keys[0].1.starts_with("bearer:"));
+        assert!(keys[1].1.starts_with("bearer:"));
+        assert_ne!(keys[0].1, keys[1].1);
+        assert_eq!(keys[2].1, "no-bearer");
+        // The key is a fingerprint: the limiter never sees the token itself.
+        assert!(keys.iter().all(|(_, key)| !key.contains(READ_TOKEN) && !key.contains(WRITE_TOKEN)));
     }
 
     #[tokio::test]

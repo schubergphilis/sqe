@@ -13,13 +13,30 @@ MCP_BASE=${MCP_URL%/mcp}
 EXPECT_WRITES=${EXPECT_WRITES:-false}
 
 rpc() {
-  local token=$1 payload=$2
+  local token=$1 payload=$2 session=${3:-}
+  local -a session_header=()
+  if [ -n "$session" ]; then
+    session_header=(-H "Mcp-Session-Id: $session")
+  fi
   curl -fsS "$MCP_URL" \
     -H "Authorization: Bearer $token" \
     -H 'Content-Type: application/json' \
     -H 'Accept: application/json' \
     -H 'MCP-Protocol-Version: 2025-11-25' \
+    "${session_header[@]}" \
     --data "$payload"
+}
+
+# The Mcp-Session-Id header SQE issues on initialize; the body is discarded.
+init_session_id() {
+  local token=$1 payload=$2
+  curl -fsS -o /dev/null -D - "$MCP_URL" \
+    -H "Authorization: Bearer $token" \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json' \
+    -H 'MCP-Protocol-Version: 2025-11-25' \
+    --data "$payload" \
+    | tr -d '\r' | awk 'tolower($1)=="mcp-session-id:" {print $2}'
 }
 
 step "checking OAuth protected-resource metadata"
@@ -52,6 +69,12 @@ assert_contains "metadata tools" "$tool_names" "describe_table"
 step "checking per-user identity and governed reads"
 who=$(rpc "$SQE_MCP_TOKEN" '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"whoami","arguments":{}}}')
 assert_eq "admin identity reaches MCP" "$(jq -r .result.structuredContent.user <<<"$who")" "adminuser"
+
+step "checking audit attribution of the calling client"
+session_id=$(init_session_id "$SQE_MCP_TOKEN" '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"quickstart","version":"1"}}}')
+assert_not_empty "initialize issues an Mcp-Session-Id" "$session_id"
+who=$(rpc "$SQE_MCP_TOKEN" '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"whoami","arguments":{}}}' "$session_id")
+assert_eq "calls carry the client from clientInfo" "$(jq -r .result.structuredContent.client <<<"$who")" "quickstart/1"
 read_result=$(rpc "$SQE_MCP_TOKEN" '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"execute_sql_readonly","arguments":{"sql":"SELECT COUNT(*) AS row_count FROM quickstart.demo.events"}}}')
 assert_eq "source data read through SQE" "$(jq -r '.result.structuredContent.rows[0].row_count' <<<"$read_result")" "4"
 blocked=$(rpc "$SQE_MCP_TOKEN" '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"execute_sql_readonly","arguments":{"sql":"DROP TABLE quickstart.demo.events"}}}')

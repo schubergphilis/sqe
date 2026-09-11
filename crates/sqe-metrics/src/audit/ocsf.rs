@@ -30,6 +30,10 @@ pub fn to_ocsf(event: &AuditEvent) -> Value {
     if !event.actor.roles.is_empty() {
         user["roles"] = json!(event.actor.roles);
     }
+    let mut actor = json!({ "user": user });
+    if let Some(app_name) = &event.actor.app_name {
+        actor["app_name"] = json!(app_name);
+    }
 
     let mut unmapped = serde_json::Map::new();
     if let Some(q) = &event.query {
@@ -68,7 +72,7 @@ pub fn to_ocsf(event: &AuditEvent) -> Value {
             "uid": event.integrity.hash,
             "sequence": event.integrity.seq,
         },
-        "actor": { "user": user },
+        "actor": actor,
         "unmapped": Value::Object(unmapped),
     });
 
@@ -120,6 +124,7 @@ mod tests {
                 email: Some("a@x.io".into()),
                 roles: vec!["analyst".into()],
                 groups: vec!["hr".into()],
+                app_name: Some("mcp:execute_sql_readonly:claude-code/2.1".into()),
             },
             outcome: Outcome::Success,
             resources: vec![Resource {
@@ -166,6 +171,8 @@ mod tests {
         assert_eq!(v["actor"]["user"]["uid"], "u1");
         assert_eq!(v["actor"]["user"]["email_addr"], "a@x.io");
         assert_eq!(v["actor"]["user"]["groups"][0]["name"], "hr");
+        // The initiating client lands on OCSF's own field for it, not unmapped.
+        assert_eq!(v["actor"]["app_name"], "mcp:execute_sql_readonly:claude-code/2.1");
         assert_eq!(v["metadata"]["product"]["name"], "SQE");
         // SQE-specific stats live under enrichments/unmapped, not core fields.
         assert_eq!(v["unmapped"]["bytes_scanned"], 2048);
@@ -206,6 +213,7 @@ mod tests {
                 email: None,
                 roles: vec![],
                 groups: vec![],
+                app_name: None,
             },
             outcome: Outcome::Success,
             resources: vec![],
@@ -219,6 +227,8 @@ mod tests {
             query_id: None,
             integrity: Integrity::default(),
         };
+        // No client label: the key is absent, not null.
+        assert!(to_ocsf(&base(AuditKind::Auth))["actor"].get("app_name").is_none());
         assert_eq!(to_ocsf(&base(AuditKind::Auth))["class_uid"], 3002);
         assert_eq!(to_ocsf(&base(AuditKind::Session))["class_uid"], 3003);
         assert_eq!(to_ocsf(&base(AuditKind::Grant))["class_uid"], 3001);
