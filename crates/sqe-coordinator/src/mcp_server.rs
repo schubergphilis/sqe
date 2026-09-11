@@ -30,12 +30,21 @@ struct CoordinatorMcpExecutor {
     rate_limiter: Arc<QueryRateLimiter>,
 }
 
+/// The `[[hive.roots]]` catalog names, which the MCP change tool treats as
+/// engine-credential targets (see `McpConfig::write_catalogs`). Session
+/// `ATTACH`ed Hive catalogs cannot exist over MCP: a session there lives for
+/// one request.
+pub fn hive_root_names(config: &sqe_core::config::SqeConfig) -> Vec<String> {
+    config.hive.roots.iter().map(|root| root.name.clone()).collect()
+}
+
 pub fn mcp_router(
     auth: Arc<dyn AuthProvider>,
     handler: Arc<QueryHandler>,
     rate_limiter: Arc<QueryRateLimiter>,
     auth_rate_limiter: Arc<AuthRateLimiter>,
     config: McpConfig,
+    hive_roots: Vec<String>,
 ) -> axum::Router {
     let executor: Arc<dyn sqe_mcp::QueryExecutor> = Arc::new(CoordinatorMcpExecutor {
         handler,
@@ -43,7 +52,9 @@ pub fn mcp_router(
     });
     let auth_limiter: Arc<dyn sqe_mcp::AuthRateLimiter> = auth_rate_limiter;
     sqe_mcp::router(
-        sqe_mcp::McpServerState::new(auth, executor, config).with_auth_rate_limiter(auth_limiter),
+        sqe_mcp::McpServerState::new(auth, executor, config)
+            .with_auth_rate_limiter(auth_limiter)
+            .with_hive_roots(hive_roots),
     )
 }
 
@@ -65,10 +76,18 @@ pub async fn start_mcp_server(
     rate_limiter: Arc<QueryRateLimiter>,
     auth_rate_limiter: Arc<AuthRateLimiter>,
     config: McpConfig,
+    hive_roots: Vec<String>,
     tls: &TlsConfig,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    let app = mcp_router(auth, handler, rate_limiter, auth_rate_limiter, config);
+    let app = mcp_router(
+        auth,
+        handler,
+        rate_limiter,
+        auth_rate_limiter,
+        config,
+        hive_roots,
+    );
 
     if tls.is_enabled() {
         // Checked, not discarded: the old `let _ = ...install_default()`
