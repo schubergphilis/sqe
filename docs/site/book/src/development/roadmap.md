@@ -331,6 +331,7 @@ An MCP Streamable HTTP endpoint (protocol revision 2025-11-25) served from the c
 - Runnable end-to-end stack with Codex and Claude Code templates: `quickstart/mcp/` (14/14 checks, 2026-08-28)
 - `[mcp.auth] mode`: `oauth` (default), `static` principals with env/base64 bearer tokens, `anonymous` for a no-IdP deployment; anonymous refused when an IdP is configured, under `production_mode`, or with writes on
 - Documented at [Model Context Protocol](../deployment/mcp.md) and [MCP with Codex and Claude](../quickstart/mcp.md)
+- Audit attribution: every tool call carries `mcp:<tool>:<client>/<version>` as the session's client label (OCSF `actor.app_name`, the `source` column of `system.runtime.queries`), from the `clientInfo` sent on `initialize` and echoed through an advisory `Mcp-Session-Id`; the auth rate limit is keyed per `(peer IP, bearer fingerprint)` like the Trino path
 
 Open: no dynamic client registration on SQE's side (the authorization server owns registration), no MCP resources or prompts (tools only), no streamed partial results, and no mode-2 arm in the quickstart (that stack is Keycloak-based).
 
