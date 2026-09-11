@@ -30,11 +30,16 @@
 //! Every engine call runs on `tokio::task::spawn_blocking`; the facade blocks
 //! on a channel to its worker and must not sit on a runtime thread.
 //!
-//! ## Engine defects this module codes around (snapshot `e788241`)
+//! ## Engine defects this module codes around (snapshot `0ef830d`)
 //!
 //! Found 2026-09-10 by running this catalog's statements through the facade;
 //! each is pinned by a test here and reported upstream. Remove the workaround
-//! when the corresponding fix lands in the vendored snapshot.
+//! when the corresponding fix lands in the vendored snapshot. Upstream's
+//! diagnosis of (1) and (2) is one bug: bare `?` indices were assigned during
+//! code generation, so they depended on visit order and plan shape (the
+//! `UPDATE` values are swapped, not dropped). The fix (their ADR-0044) is on
+//! `fix/bare-param-numbering-text-order`, which has not met the facade
+//! branch yet; see `vendor/sqlite-rs/README.md`.
 //!
 //! 1. **`UPDATE` binds only its first parameter.** `UPDATE t SET v = ? WHERE
 //!    k = ?` changes zero rows and reports zero; with one parameter in either
@@ -107,6 +112,12 @@ pub struct SqliteRsCatalog {
 /// back with it. So every catalog call, single statement or transaction,
 /// holds `gate` for its whole run on the blocking thread. Throughput is not
 /// a concern for a pointer store; correctness of the compare-and-swap is.
+///
+/// Since snapshot `0ef830d` the facade's `transaction()` takes that
+/// exclusion itself for the `Transaction`'s lifetime (upstream ADR-0045), so
+/// the two locks overlap. `gate` stays one cycle as the belt over a new
+/// upstream lock; dropping it is a deliberate change validated by
+/// `concurrent_commits_and_writes_on_one_connection_never_nest_transactions`.
 #[derive(Debug)]
 struct SharedConn {
     conn: Connection,
