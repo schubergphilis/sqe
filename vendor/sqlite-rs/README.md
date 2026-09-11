@@ -11,7 +11,7 @@ writes the stock on-disk format. SQE uses it as the metadata store behind the
 | | |
 |---|---|
 | Branch | `feat/013-api-facade` (PR #705, the spec-013 embedding API) |
-| Commit | `e788241` (2026-09-09) |
+| Commit | `0ef830d` (2026-09-11; previously `e788241`, 2026-09-09) |
 | Crate version | 0.18.10 |
 | Runtime dependencies | none |
 | Snapshot contents | `src/` minus `src/bin/`, `LICENSE` |
@@ -35,10 +35,34 @@ optional git dependencies at resolve time even when the feature that needs
 them is off. A path dependency is the same pattern SQE already uses for
 `vendor/iceberg-rust`.
 
+## Snapshot history
+
+- `0ef830d` (2026-09-11): `Connection::transaction()` now holds the
+  connection for the `Transaction`'s lifetime; other threads' calls wait
+  instead of nesting, and a second `transaction()` on the owning thread is
+  `Error::TransactionActive` (upstream ADR-0045, spec 013 Requirement 4). A
+  raw `execute("BEGIN")` is still unguarded. `SqliteRsCatalog` keeps its own
+  per-connection mutex on top for one cycle.
+- `e788241` (2026-09-09): first snapshot, the facade as merged into PR #705.
+
+Not in this snapshot: the bare-`?` parameter-numbering fix (upstream ADR-0044,
+branch `fix/bare-param-numbering-text-order`). It branches from `main`, has
+no `src/api.rs`, and conflicts with the facade branch in
+`src/codegen/expr/value.rs`, so it cannot be vendored until Lab271 lands one
+on the other. Defects 1 and 2 below stay worked around until then.
+
 ## Known upstream gaps SQE codes around
 
 These are tracked upstream; `SqliteRsCatalog` avoids them rather than waiting.
 
+- **Bare `?` parameter numbering** (fixed upstream on a branch, see above):
+  `UPDATE t SET v = ? WHERE k = ?` swaps its two values, and a covering-index
+  `SELECT` over an autoindex restarts the parameter counter mid-statement.
+  The catalog does every update as `DELETE` + `INSERT` under `BEGIN IMMEDIATE`
+  and projects one non-indexed column in `list_tables`.
+- **#707** `sqlite_master` is not reachable from `SELECT` (schema presence
+  goes through `Connection::table_names()`); **#708** `rowid` is not
+  selectable.
 - **#697** `CREATE TABLE IF NOT EXISTS` ignores its guard and corrupts the
   file on the second run. The catalog reads `Connection::table_names()` and
   only issues a plain `CREATE TABLE` when the table is absent
@@ -57,10 +81,12 @@ These are tracked upstream; `SqliteRsCatalog` avoids them rather than waiting.
 
 ```bash
 cd /path/to/sqlite-rs && git fetch origin
+rm -rf /path/to/sqlengine/vendor/sqlite-rs/{src,LICENSE}
 git archive --format=tar origin/feat/013-api-facade src LICENSE \
   | tar -x -C /path/to/sqlengine/vendor/sqlite-rs
 rm -rf /path/to/sqlengine/vendor/sqlite-rs/src/bin
 # keep SQE's Cargo.toml and this README; update the commit in the table above
+# and compare [package]/[lints] in upstream's Cargo.toml against ours
 cargo check -p sqlite-rs && cargo test -p sqe-catalog --features sql-sqlite-rs
 ```
 

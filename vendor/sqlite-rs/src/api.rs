@@ -39,9 +39,10 @@
 //! phases; the protocol below is shaped to take them.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
 use crate::header::{DatabaseHeader, DEFAULT_PAGE_SIZE};
@@ -247,6 +248,18 @@ pub enum Error {
     /// two ways: the connection was closed, or the worker panicked (which
     /// would be a bug in this crate).
     ConnectionClosed,
+    /// This thread already holds a transaction on this connection.
+    ///
+    /// Requirement 4's exclusion makes another holder of the same
+    /// connection *wait* for an open transaction rather than interleave
+    /// with it. Waiting is wrong for the thread that already owns it: that
+    /// is a nesting bug, and blocking would hide it as a hang. `SAVEPOINT`
+    /// is out of scope, so there is nothing legitimate to nest.
+    ///
+    /// Re-entry from a *different* thread of the same async task cannot be
+    /// distinguished from genuine contention and blocks, which is what a
+    /// mutex would do.
+    TransactionActive,
     /// A column was read as a type its value cannot convert to.
     TypeMismatch {
         /// The column, named if the statement has usable names, else its
@@ -313,6 +326,7 @@ impl Error {
             Error::ColumnNotFound { .. } => code::ERROR,
             Error::MultipleStatements { .. }
             | Error::ConnectionClosed
+            | Error::TransactionActive
             | Error::StatementFinalized => code::MISUSE,
             Error::Sqlite { code, .. } => *code,
             Error::Busy { .. } => code::BUSY,
@@ -375,6 +389,10 @@ impl std::fmt::Display for Error {
             Error::Corrupt { message } => write!(f, "database image is malformed: {message}"),
             Error::Io { message } => write!(f, "I/O error: {message}"),
             Error::ConnectionClosed => write!(f, "connection is closed"),
+            Error::TransactionActive => write!(
+                f,
+                "this thread already holds a transaction on this connection"
+            ),
             Error::StatementFinalized => write!(f, "statement has been finalized"),
             Error::TypeMismatch {
                 column,
@@ -404,6 +422,14 @@ impl std::error::Error for Error {}
 #[derive(Debug, Clone)]
 pub struct Connection {
     inner: Arc<Shared>,
+    /// The transaction this handle speaks inside, if any.
+    ///
+    /// `None` for every handle a caller obtains from [`Connection::open`]
+    /// and friends. [`Connection::transaction`] builds one clone with the
+    /// token set and gives it to the [`Transaction`], which is how the
+    /// transaction's own statements pass the gate in [`Connection::send`]
+    /// while other holders of the same connection wait.
+    txn: Option<u64>,
 }
 
 /// The shared half of a [`Connection`], so clones address one worker.
@@ -423,6 +449,38 @@ struct Shared {
     /// `JoinHandle` has to be owned to be joined, and because `Shared` is
     /// reachable from several threads until the last clone goes.
     worker: Mutex<Option<JoinHandle<()>>>,
+    /// Which transaction, if any, currently owns this connection.
+    ///
+    /// Requirement 4's serialization is per *statement* — the worker runs
+    /// one request at a time. A transaction is several statements, and
+    /// without this slot two holders of one connection could interleave
+    /// them: one task's `BEGIN` landing inside another's open transaction,
+    /// and worse, an autocommit write from a third task running inside
+    /// whichever transaction happened to be open and being committed or
+    /// rolled back with it. That last case loses a write that reported
+    /// success, which is why this is a lock rather than a documented
+    /// caveat.
+    txn: Mutex<Option<TxnOwner>>,
+    /// Signalled when [`Shared::txn`] goes back to `None`.
+    txn_free: Condvar,
+    /// Hands out transaction tokens. Monotonic so a token is never reused
+    /// and a stale handle cannot be mistaken for the current owner.
+    next_txn: AtomicU64,
+}
+
+/// Who holds the transaction slot on a [`Shared`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TxnOwner {
+    token: u64,
+    /// Recorded so re-entry from the same thread is an error rather than a
+    /// deadlock. A thread that already holds the transaction and asks for
+    /// another one has a bug, and blocking it forever would hide the bug
+    /// behind a hang; other threads genuinely should wait.
+    ///
+    /// This does not catch re-entry from a different thread of the same
+    /// async task, which no API can see. That case blocks, which is the
+    /// same thing a `Mutex` would do.
+    thread: ThreadId,
 }
 
 impl Drop for Shared {
@@ -668,7 +726,11 @@ impl Connection {
                 inner: Arc::new(Shared {
                     requests: Some(request_tx),
                     worker: Mutex::new(Some(handle)),
+                    txn: Mutex::new(None),
+                    txn_free: Condvar::new(),
+                    next_txn: AtomicU64::new(1),
                 }),
+                txn: None,
             }),
             Ok(Err(e)) => {
                 // The worker returns straight after reporting a failure;
@@ -838,9 +900,22 @@ impl Connection {
 
     /// Begins a transaction with the given locking behaviour.
     pub fn transaction_with(&self, behavior: TransactionBehavior) -> Result<Transaction, Error> {
-        self.execute(behavior.statement())?;
+        // The slot is taken *before* `BEGIN`, not after: between the two
+        // there must be no window in which another holder's statement can
+        // reach the worker, or that statement lands inside this
+        // transaction.
+        let token = self.claim_transaction()?;
+        let conn = Connection {
+            inner: Arc::clone(&self.inner),
+            txn: Some(token),
+        };
+        if let Err(e) = conn.execute(behavior.statement()) {
+            self.release_transaction(token);
+            return Err(e);
+        }
         Ok(Transaction {
-            conn: self.clone(),
+            conn,
+            token,
             done: false,
         })
     }
@@ -911,12 +986,105 @@ impl Connection {
 
     /// Hands `request` to the worker, or reports the worker is gone.
     fn send(&self, request: Request) -> Result<(), Error> {
+        self.await_turn();
         self.inner
             .requests
             .as_ref()
             .ok_or(Error::ConnectionClosed)?
             .send(request)
             .map_err(|_| Error::ConnectionClosed)
+    }
+
+    /// Blocks until this handle may speak to the worker.
+    ///
+    /// Free when no transaction is open, or when the open one is this
+    /// handle's own. Everyone else waits, which is what makes a
+    /// [`Transaction`] a unit rather than a sequence other holders of the
+    /// connection can interleave with.
+    ///
+    /// A poisoned lock is recovered rather than propagated: the state it
+    /// guards is a single `Option`, a panicking holder cannot leave it
+    /// torn, and turning every subsequent statement into an error because
+    /// one unrelated caller panicked would be a worse failure than
+    /// continuing.
+    fn await_turn(&self) {
+        let mut slot = self
+            .inner
+            .txn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let me = std::thread::current().id();
+        loop {
+            match *slot {
+                None => return,
+                // This handle *is* the transaction.
+                Some(owner) if Some(owner.token) == self.txn => return,
+                // The thread that opened the transaction, speaking through
+                // the original handle rather than the guard. Letting it
+                // through preserves what a single-threaded caller has
+                // always been able to do — hold a `Transaction` and keep
+                // using `conn` — and matches SQLite, where any statement on
+                // a connection with an open transaction runs inside it.
+                //
+                // Blocking here instead would not be exclusion, it would be
+                // a deadlock against oneself, and a worse bug than the one
+                // this slot exists to fix.
+                Some(owner) if owner.thread == me => return,
+                Some(_) => {
+                    slot = self
+                        .inner
+                        .txn_free
+                        .wait(slot)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            }
+        }
+    }
+
+    /// Takes the transaction slot, waiting for another thread's transaction
+    /// to finish, and returns the token that identifies this one.
+    fn claim_transaction(&self) -> Result<u64, Error> {
+        let me = std::thread::current().id();
+        let mut slot = self
+            .inner
+            .txn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            match *slot {
+                Some(owner) if owner.thread == me => return Err(Error::TransactionActive),
+                Some(_) => {
+                    slot = self
+                        .inner
+                        .txn_free
+                        .wait(slot)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                None => {
+                    let token = self.inner.next_txn.fetch_add(1, Ordering::Relaxed);
+                    *slot = Some(TxnOwner { token, thread: me });
+                    return Ok(token);
+                }
+            }
+        }
+    }
+
+    /// Releases the transaction slot and wakes whoever is waiting.
+    fn release_transaction(&self, token: u64) {
+        let mut slot = self
+            .inner
+            .txn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.map(|owner| owner.token) == Some(token) {
+            *slot = None;
+            // `notify_all` rather than `notify_one`: the waiters are not
+            // interchangeable. Some want the slot (`claim_transaction`) and
+            // some only want it empty (`await_turn`), and waking a single
+            // arbitrary one can wake a claimer while autocommit callers
+            // keep waiting behind it for no reason.
+            self.inner.txn_free.notify_all();
+        }
     }
 
     /// Waits for the worker's answer, or reports the worker is gone.
@@ -1230,6 +1398,7 @@ fn storage_class(value: &Value) -> &'static str {
 #[derive(Debug)]
 pub struct Transaction {
     conn: Connection,
+    token: u64,
     done: bool,
 }
 
@@ -1237,7 +1406,13 @@ impl Transaction {
     /// Commits the transaction.
     pub fn commit(mut self) -> Result<(), Error> {
         self.done = true;
-        self.conn.execute("COMMIT").map(drop)
+        let result = self.conn.execute("COMMIT").map(drop);
+        // Released whether or not `COMMIT` succeeded. A failed commit
+        // leaves the engine's transaction state to the engine; what must
+        // not happen is the slot staying held by a `Transaction` that is
+        // being dropped, because nothing would ever free it.
+        self.conn.release_transaction(self.token);
+        result
     }
 
     /// Rolls the transaction back.
@@ -1246,7 +1421,9 @@ impl Transaction {
     /// reported rather than discarded.
     pub fn rollback(mut self) -> Result<(), Error> {
         self.done = true;
-        self.conn.execute("ROLLBACK").map(drop)
+        let result = self.conn.execute("ROLLBACK").map(drop);
+        self.conn.release_transaction(self.token);
+        result
     }
 
     /// The connection this transaction runs on.
@@ -1274,6 +1451,7 @@ impl Drop for Transaction {
         // on disk is unchanged — which is the outcome a rollback wanted.
         // A caller who needs to see the error calls `rollback()`.
         self.conn.execute("ROLLBACK").ok();
+        self.conn.release_transaction(self.token);
     }
 }
 
@@ -2029,8 +2207,26 @@ impl Engine {
             return self.compile_select(sql);
         }
         let (schemas, views) = self.catalog()?;
-        crate::codegen::compile_statement(sql, schemas, views).map_err(|e| Error::Compile {
-            message: e.to_string(),
+        crate::codegen::compile_statement(sql, schemas, views).map_err(|e| {
+            // `PRAGMA <name> = <value>` compiles; the introspection
+            // pragmas do not, and a consumer meeting one deserves to be
+            // told where they live rather than reading a parser message
+            // about an unsupported pragma name. The catalogue and its
+            // tiers are plan.md's V7 (ADR-0029 put the nine introspection
+            // pragmas in the CLI); spec 013's non-goals say this API
+            // covers only what a pool sets and what durability requires.
+            if is_pragma(sql) {
+                return Error::Compile {
+                    message: format!(
+                        "{e} — this API supports only `PRAGMA <name> = <value>` \
+                         (see Connection::pragma); the introspection pragmas are \
+                         plan.md V7 and are available through the sqlite-rs CLI"
+                    ),
+                };
+            }
+            Error::Compile {
+                message: e.to_string(),
+            }
         })
     }
 
@@ -2090,6 +2286,11 @@ fn is_select(sql: &str) -> bool {
     ["SELECT", "VALUES", "WITH"]
         .iter()
         .any(|kw| starts_with_keyword(head, kw))
+}
+
+/// Whether `sql` is a `PRAGMA` statement.
+fn is_pragma(sql: &str) -> bool {
+    starts_with_keyword(sql.trim_start(), "PRAGMA")
 }
 
 /// Whether `sql` can change the `sqlite_master` catalog.
