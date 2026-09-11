@@ -117,25 +117,13 @@ pub(crate) async fn build_catalog_provider(
     if let Some(m) = prom_metrics {
         catalog_provider = catalog_provider.with_metrics(Arc::clone(m));
     }
-    let small_file_threshold_bytes = cat_cfg.small_file_threshold_mb.saturating_mul(1024 * 1024);
-    catalog_provider = catalog_provider.with_small_file_threshold(small_file_threshold_bytes);
-    catalog_provider = catalog_provider.with_manifest_concurrency(cat_cfg.manifest_concurrency);
-    catalog_provider = catalog_provider.with_prefetch_concurrency(prefetch_concurrency);
-    // Issue #132: Tier-1 dynamic-filter clustering gate (default off).
-    catalog_provider = catalog_provider.with_runtime_filter_clustering(
-        cat_cfg.runtime_filters.clustering_skip_enabled,
-        cat_cfg.runtime_filters.uniform_threshold,
+    // The nine scan knobs (#132 clustering gate, #369 bloom probing, the
+    // fetch pipeline depth, ...) travel as one struct from here to
+    // `IcebergScanExec` (#575); `ScanTuning::from_config` is the only copy
+    // out of the operator's config.
+    catalog_provider = catalog_provider.with_tuning(
+        sqe_catalog::iceberg_scan::ScanTuning::from_config(cat_cfg, prefetch_concurrency),
     );
-    catalog_provider =
-        catalog_provider.with_runtime_filter_wait_ms(cat_cfg.runtime_filters.wait_ms);
-    // Issue #369: bloom-filter row-group probing of sealed runtime filters.
-    catalog_provider = catalog_provider.with_runtime_filter_bloom(
-        cat_cfg.runtime_filters.bloom_probe,
-        cat_cfg.runtime_filters.bloom_max_values,
-    );
-    // sqe#scan-fetch-pipeline: fetch/decode pipelining depth for the scan's subtask fetch
-    // stage. Unset keeps the scan default (3x cores); 0 disables staging.
-    catalog_provider = catalog_provider.with_scan_fetch_ahead(cat_cfg.scan_fetch_ahead);
 
     Ok((catalog_provider, session_catalog))
 }

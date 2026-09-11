@@ -6,6 +6,24 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Catalog: the nine scan tuning knobs travel as one `ScanTuning` struct (#575)
+
+    `small_file_threshold_bytes`, `manifest_concurrency`,
+    `prefetch_concurrency`, the two clustering-gate values, the runtime
+    filter wait, the two bloom-probe values and `scan_fetch_ahead` were
+    nine fields with nine setters on four types, forwarded field by field at
+    each hop, with the literal defaults repeated in five places. A hop that
+    forgot one silently kept a default, and `SqeCatalogProvider::with_namespaces`
+    had done exactly that. Now `sqe_catalog::iceberg_scan::ScanTuning` holds
+    them with `Default` as the one source of defaults and `from_config` as
+    the one copy out of `[catalog]` / `[storage]`; the catalog, schema and
+    table providers carry one `tuning` and hand it down with `with_tuning`,
+    and `IcebergScanExec::with_tuning` applies it. The coordinator's copy
+    is one line. `with_prefetch_concurrency` stays on the providers for the
+    two coordinator call sites that adjust it alone; the other per-knob
+    provider setters are gone. A unit test threads a non-default tuning
+    from the table provider into the scan node and reads it back.
+
 - Build: one dependency build for every cargo selection (cargo-hakari)
 
     `crates/workspace-hack` is a cargo-hakari managed crate that every member

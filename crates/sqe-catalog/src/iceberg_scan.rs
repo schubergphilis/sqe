@@ -107,6 +107,88 @@ pub const DEFAULT_SCAN_FETCH_AHEAD_MULTIPLIER: usize = 3;
 /// been updated.
 pub const DEFAULT_TARGET_PARTITIONS: usize = 1;
 
+/// The scan tuning knobs, defined once (review finding 309, #575).
+///
+/// `SqeCatalogProvider`, `SqeSchemaProvider` and `SqeTableProvider` each hold
+/// one of these and hand it down unchanged; `IcebergScanExec::with_tuning`
+/// applies it. [`Default`] is the single source of the defaults and
+/// [`ScanTuning::from_config`] the single copy out of the operator's config,
+/// so a knob cannot reach the scan with a stale default because one hop
+/// forgot to forward it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScanTuning {
+    /// Files below this size take the direct-read fast path (one GET, parsed
+    /// from memory). `0` disables it.
+    pub small_file_threshold_bytes: u64,
+    /// Concurrency for direct manifest walks during pruning. Never below 1.
+    pub manifest_concurrency: usize,
+    /// In-flight GETs on the direct-read fast path (`[storage]
+    /// prefetch_concurrency`). Never below 1.
+    pub prefetch_concurrency: usize,
+    /// Issue #132: skip Tier-1 dynamic-predicate registration on scans whose
+    /// files are uniform on every filter column.
+    pub runtime_filter_clustering_skip: bool,
+    /// Issue #132: per-file bounds-spread fraction above which a column
+    /// counts as uniform.
+    pub runtime_filter_uniform_threshold: f64,
+    /// Bounded wait (ms) at stream open for pending dynamic filters. `0`
+    /// disables the wait.
+    pub runtime_filter_wait_ms: u64,
+    /// Issue #369: probe parquet bloom filters with sealed runtime filters.
+    pub runtime_filter_bloom_probe: bool,
+    /// Issue #369: cap on keys per membership conjunct for bloom probing.
+    pub runtime_filter_bloom_max_values: usize,
+    /// Fetch/decode pipelining depth. `None` keeps the scan default
+    /// (3x cores); `Some(0)` disables staging; `Some(n)` is an absolute depth.
+    pub scan_fetch_ahead: Option<usize>,
+}
+
+impl Default for ScanTuning {
+    fn default() -> Self {
+        Self {
+            small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
+            manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY,
+            prefetch_concurrency: DEFAULT_DIRECT_READ_CONCURRENCY,
+            runtime_filter_clustering_skip: false,
+            runtime_filter_uniform_threshold: 0.8,
+            runtime_filter_wait_ms: DEFAULT_RUNTIME_FILTER_WAIT_MS,
+            runtime_filter_bloom_probe: true,
+            runtime_filter_bloom_max_values: 65536,
+            scan_fetch_ahead: None,
+        }
+    }
+}
+
+impl ScanTuning {
+    /// The tuning an operator configured: `[catalog]` for everything but
+    /// `prefetch_concurrency`, which the caller reads from `[storage]`.
+    pub fn from_config(
+        catalog: &sqe_core::config::CatalogConfig,
+        prefetch_concurrency: usize,
+    ) -> Self {
+        Self {
+            small_file_threshold_bytes: catalog.small_file_threshold_mb.saturating_mul(1024 * 1024),
+            manifest_concurrency: catalog.manifest_concurrency,
+            prefetch_concurrency,
+            runtime_filter_clustering_skip: catalog.runtime_filters.clustering_skip_enabled,
+            runtime_filter_uniform_threshold: catalog.runtime_filters.uniform_threshold,
+            runtime_filter_wait_ms: catalog.runtime_filters.wait_ms,
+            runtime_filter_bloom_probe: catalog.runtime_filters.bloom_probe,
+            runtime_filter_bloom_max_values: catalog.runtime_filters.bloom_max_values,
+            scan_fetch_ahead: catalog.scan_fetch_ahead,
+        }
+        .normalized()
+    }
+
+    /// Clamp the two concurrencies to at least 1: a zero-width
+    /// `buffer_unordered` stalls forever.
+    pub fn normalized(mut self) -> Self {
+        self.manifest_concurrency = self.manifest_concurrency.max(1);
+        self.prefetch_concurrency = self.prefetch_concurrency.max(1);
+        self
+    }
+}
+
 // Clone is derived so physical optimizer rules (e.g. the probe-side scan
 // parallelization rule, issue #235) can rebuild a scan node with a different
 // `target_partitions` from a shared reference; `with_target_partitions`
@@ -338,6 +420,7 @@ impl IcebergScanExec {
                 .map(|n| n.get())
                 .unwrap_or(8);
         let fetch_permits = Arc::new(tokio::sync::Semaphore::new(scan_fetch_ahead));
+        let tuning = ScanTuning::default();
         Self {
             table,
             projected_schema,
@@ -348,20 +431,59 @@ impl IcebergScanExec {
             metrics: ExecutionPlanMetricsSet::new(),
             snapshot_id: None,
             trust_sort_order: false,
-            small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
+            small_file_threshold_bytes: tuning.small_file_threshold_bytes,
             pushed_down_filters: vec![],
-            manifest_concurrency: DEFAULT_MANIFEST_CONCURRENCY,
-            direct_read_concurrency: DEFAULT_DIRECT_READ_CONCURRENCY,
+            manifest_concurrency: tuning.manifest_concurrency,
+            direct_read_concurrency: tuning.prefetch_concurrency,
             target_partitions: DEFAULT_TARGET_PARTITIONS,
             cached_statistics: None,
-            runtime_filter_clustering_skip: false,
-            runtime_filter_uniform_threshold: 0.8,
-            runtime_filter_wait_ms: DEFAULT_RUNTIME_FILTER_WAIT_MS,
-            runtime_filter_bloom_probe: true,
-            runtime_filter_bloom_max_values: 65536,
+            runtime_filter_clustering_skip: tuning.runtime_filter_clustering_skip,
+            runtime_filter_uniform_threshold: tuning.runtime_filter_uniform_threshold,
+            runtime_filter_wait_ms: tuning.runtime_filter_wait_ms,
+            runtime_filter_bloom_probe: tuning.runtime_filter_bloom_probe,
+            runtime_filter_bloom_max_values: tuning.runtime_filter_bloom_max_values,
             decode_permits,
             scan_fetch_ahead,
             fetch_permits,
+        }
+    }
+
+    /// Apply every scan tuning knob at once (#575). `None` for
+    /// `scan_fetch_ahead` keeps the depth chosen in [`Self::new`].
+    #[must_use = "with_tuning consumes self; bind the returned scan"]
+    pub fn with_tuning(self, tuning: &ScanTuning) -> Self {
+        let mut exec = self
+            .with_small_file_threshold(tuning.small_file_threshold_bytes)
+            .with_manifest_concurrency(tuning.manifest_concurrency)
+            .with_direct_read_concurrency(tuning.prefetch_concurrency)
+            .with_runtime_filter_clustering(
+                tuning.runtime_filter_clustering_skip,
+                tuning.runtime_filter_uniform_threshold,
+            )
+            .with_runtime_filter_wait_ms(tuning.runtime_filter_wait_ms)
+            .with_runtime_filter_bloom(
+                tuning.runtime_filter_bloom_probe,
+                tuning.runtime_filter_bloom_max_values,
+            );
+        if let Some(fetch_ahead) = tuning.scan_fetch_ahead {
+            exec = exec.with_scan_fetch_ahead(fetch_ahead);
+        }
+        exec
+    }
+
+    /// The tuning this scan runs with. `scan_fetch_ahead` is the resolved
+    /// depth, so it is always `Some`.
+    pub fn tuning(&self) -> ScanTuning {
+        ScanTuning {
+            small_file_threshold_bytes: self.small_file_threshold_bytes,
+            manifest_concurrency: self.manifest_concurrency,
+            prefetch_concurrency: self.direct_read_concurrency,
+            runtime_filter_clustering_skip: self.runtime_filter_clustering_skip,
+            runtime_filter_uniform_threshold: self.runtime_filter_uniform_threshold,
+            runtime_filter_wait_ms: self.runtime_filter_wait_ms,
+            runtime_filter_bloom_probe: self.runtime_filter_bloom_probe,
+            runtime_filter_bloom_max_values: self.runtime_filter_bloom_max_values,
+            scan_fetch_ahead: Some(self.scan_fetch_ahead),
         }
     }
 
