@@ -271,6 +271,16 @@ adoption direction is proven by a test that has the sqlx engine write a file,
 sqlite-rs read and extend it, and sqlx read it back, with stock `sqlite3`
 reporting `integrity_check` = `ok` at every step.
 
+*2026-09-11:* the snapshot moved to the facade tip `0ef830d`. Lab271 traced
+defects 1 and 2 to one cause, bare-`?` indices assigned at code generation
+rather than parse time (their ADR-0044; the `UPDATE` values were swapped, not
+dropped, harmless only because the swapped `WHERE` never matched). That fix
+lives on `fix/bare-param-numbering-text-order`, which has not been merged with
+the facade branch and conflicts with it, so it is not in the snapshot and the
+workarounds stand. What did land is our transaction addendum: `transaction()`
+now holds the connection for the guard's lifetime (ADR-0045). Defect 3 is
+upstream #708, defect 4 is #707.
+
 Two earlier statements in this document are now stale:
 
 - "The rusqlite dependency is not dead weight" stopped being true once

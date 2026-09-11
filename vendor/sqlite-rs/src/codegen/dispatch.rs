@@ -112,8 +112,27 @@ fn canonical(word: &str) -> &'static str {
         .unwrap_or("")
 }
 
-fn parse_error<T: std::fmt::Debug>(other: ParseOutcome<T>) -> DispatchError {
-    DispatchError::ParseFailed(format!("{other:?}"))
+/// Renders a rejected parse as prose.
+///
+/// This used to be `format!("{other:?}")`, which put Rust struct syntax —
+/// `Unsupported { message: "...", span: Span { line: 1, .. } }` — into a
+/// message an embedding consumer sees verbatim. The parse outcome already
+/// carries a human message and a position; use them.
+fn parse_error<T>(other: ParseOutcome<T>) -> DispatchError {
+    match other {
+        ParseOutcome::Unsupported { message, span } | ParseOutcome::Invalid { message, span } => {
+            DispatchError::ParseFailed(format!(
+                "{message} (line {}, column {})",
+                span.line, span.column
+            ))
+        }
+        // Not reachable through the dispatcher, which only calls this on a
+        // rejection, but the match has to be total and a panic here would
+        // be a worse answer than a plain sentence.
+        ParseOutcome::Accepted(_) => {
+            DispatchError::ParseFailed("statement was accepted but not dispatched".to_string())
+        }
+    }
 }
 
 /// Parses `sql`, picks the compiler for its leading keyword(s), and
