@@ -140,10 +140,13 @@ run on the coordinator, and workers never exchange data with each other. There
 is no shuffle on any query path today. The `DoExchange` shuffle intake and its
 spillable partition buffers still exist in the tree, kept for the stage-based
 execution roadmap, but they are compiled out by default: they live behind the
-`worker-shuffle` cargo feature in sqe-worker, with `shuffle-planning` in
-sqe-planner and `exchange` in sqe-spill as the planner and manifest halves. In
-a default build the worker answers `DoExchange` with `Unimplemented` and holds
-no state keyed by a caller-supplied query or stage id. Read any description of
+`worker-shuffle` cargo feature in sqe-worker, with `exchange` in sqe-spill as
+the manifest half. In a default build the worker answers `DoExchange` with
+`Unimplemented` and holds no state keyed by a caller-supplied query or stage
+id. The planner side (stage decomposition, shuffle writer and reader nodes,
+range-partitioned distributed sort, distributed aggregate, broadcast and
+shuffle-hash join rules) had no caller in any binary and was removed from
+sqe-planner; git history before 2026-09-11 keeps it. Read any description of
 stage-based MPP in this repository as roadmap, not as running code.
 
 **Scaling model:**

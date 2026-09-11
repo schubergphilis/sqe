@@ -6,7 +6,6 @@ use crate::scan_morsel::{
     SCAN_TASK_VERSION_CURRENT, SCAN_TASK_VERSION_V1, SCAN_TASK_VERSION_V2, SCAN_TASK_VERSION_V3,
 };
 
-
 /// File format of a Hive external table's data files.
 ///
 /// Deliberately a wire-local enum rather than a re-export of
@@ -175,14 +174,18 @@ impl ScanCredentials {
     pub fn access_key(&self) -> &str {
         match self {
             Self::WorkerDefault => "",
-            Self::Vended { access_key, .. } | Self::Static { access_key, .. } => access_key.expose(),
+            Self::Vended { access_key, .. } | Self::Static { access_key, .. } => {
+                access_key.expose()
+            }
         }
     }
 
     pub fn secret_key(&self) -> &str {
         match self {
             Self::WorkerDefault => "",
-            Self::Vended { secret_key, .. } | Self::Static { secret_key, .. } => secret_key.expose(),
+            Self::Vended { secret_key, .. } | Self::Static { secret_key, .. } => {
+                secret_key.expose()
+            }
         }
     }
 
@@ -372,7 +375,10 @@ mod predicate_wire {
 
         match Option::<Wire>::deserialize(deserializer)? {
             None => Ok(None),
-            Some(Wire::B64(text)) => B64.decode(text.as_bytes()).map(Some).map_err(de::Error::custom),
+            Some(Wire::B64(text)) => B64
+                .decode(text.as_bytes())
+                .map(Some)
+                .map_err(de::Error::custom),
             Some(Wire::Raw(bytes)) => Ok(Some(bytes)),
         }
     }
@@ -746,7 +752,11 @@ mod tests {
             projected_field_ids: vec![1],
             s3_endpoint: "http://localhost:9000".to_string(),
             s3_region: "us-east-1".to_string(),
-            credentials: ScanCredentials::static_keys("key".to_string(), "secret".to_string(), String::new()),
+            credentials: ScanCredentials::static_keys(
+                "key".to_string(),
+                "secret".to_string(),
+                String::new(),
+            ),
             audience: String::new(),
             expires_at: 0,
             s3_path_style: true,
@@ -814,7 +824,11 @@ mod tests {
     #[test]
     fn version_three_is_accepted_and_four_is_not() {
         let mut task = task_with_predicate(None);
-        for v in [SCAN_TASK_VERSION_V1, SCAN_TASK_VERSION_V2, SCAN_TASK_VERSION_V3] {
+        for v in [
+            SCAN_TASK_VERSION_V1,
+            SCAN_TASK_VERSION_V2,
+            SCAN_TASK_VERSION_V3,
+        ] {
             task.version = v;
             assert!(task.validate_version().is_ok(), "v{v} must be accepted");
         }
@@ -1111,7 +1125,10 @@ mod tests {
         let bytes = task_with_predicate(None).to_bytes().unwrap();
         let json = String::from_utf8(bytes.clone()).unwrap();
         assert!(!json.contains("predicate_proto"));
-        assert!(ScanTask::from_bytes(&bytes).unwrap().predicate_proto.is_none());
+        assert!(ScanTask::from_bytes(&bytes)
+            .unwrap()
+            .predicate_proto
+            .is_none());
     }
 
     #[test]
@@ -1133,7 +1150,11 @@ mod tests {
             projected_field_ids: vec![1, 2],
             s3_endpoint: "http://localhost:9000".to_string(),
             s3_region: "us-east-1".to_string(),
-            credentials: ScanCredentials::static_keys("testadmin".to_string(), "testadmin".to_string(), String::new()),
+            credentials: ScanCredentials::static_keys(
+                "testadmin".to_string(),
+                "testadmin".to_string(),
+                String::new(),
+            ),
             audience: String::new(),
             expires_at: 0,
             s3_path_style: true,
@@ -1227,7 +1248,11 @@ mod tests {
             s3_endpoint: "http://localhost:9000".to_string(),
             s3_region: "us-east-1".to_string(),
             // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS's documented example key, test fixture
-            credentials: ScanCredentials::static_keys("AKIAIOSFODNN7EXAMPLE".to_string(), "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(), "session-token-value".to_string()),
+            credentials: ScanCredentials::static_keys(
+                "AKIAIOSFODNN7EXAMPLE".to_string(),
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+                "session-token-value".to_string(),
+            ),
             audience: String::new(),
             expires_at: 0,
             s3_path_style: true,

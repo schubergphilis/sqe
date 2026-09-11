@@ -14,7 +14,6 @@
 
 use std::sync::Arc;
 
-use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -28,6 +27,7 @@ use datafusion::physical_plan::joins::utils::JoinFilter;
 use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use tracing::{debug, trace};
 
@@ -212,7 +212,8 @@ fn estimate_build_side_size(hash_join: &HashJoinExec) -> BuildSizeEstimate {
     // In DataFusion's HashJoinExec, the left side is the build side.
     let build_side = hash_join.left();
 
-    let stats = match StatisticsContext::new().compute(build_side.as_ref(), &StatisticsArgs::new()) {
+    let stats = match StatisticsContext::new().compute(build_side.as_ref(), &StatisticsArgs::new())
+    {
         Ok(stats) => stats,
         Err(_) => return BuildSizeEstimate::Unknown,
     };

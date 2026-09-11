@@ -23,7 +23,6 @@
 
 use std::sync::Arc;
 
-use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::Result;
 use datafusion::config::ConfigOptions;
@@ -32,6 +31,7 @@ use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::joins::utils::JoinFilter;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::physical_plan::ExecutionPlan;
 use tracing::{debug, info, trace};
 

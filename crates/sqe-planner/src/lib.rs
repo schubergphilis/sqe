@@ -1,45 +1,42 @@
-pub mod distributed_aggregate;
-/// Broadcast / shuffle-hash join planning. Gated behind `shuffle-planning`:
-/// these rules build [`shuffle_exec::ShuffleWriterExec`] trees that no
-/// coordinator module plans today (review finding 600).
-#[cfg(feature = "shuffle-planning")]
-pub mod distributed_join;
-pub mod distributed_sort;
+//! Planning for SQE's distributed scan.
+//!
+//! The live surface is small and this crate's public API describes it, not
+//! the roadmap (review finding 108):
+//!
+//! - the scan-task model workers execute: [`ScanTask`], [`HiveScanDescriptor`],
+//!   [`ScanCredentials`], [`ScanStorage`] and the ticket versions;
+//! - morsel planning over files and row groups ([`plan_scan_morsels`],
+//!   [`bin_pack_files`]);
+//! - the coordinator's physical optimizer rules: [`JoinStrategyRule`],
+//!   [`StarSchemaReorderRule`], [`SortMemoryRule`],
+//!   [`SingleDistinctCountCompanionRule`] and [`PuffinStatisticsRequestRule`];
+//! - the coordinator/worker protocol types ([`WorkerHello`], [`WorkerFault`]).
+//!
+//! Every join, aggregate and sort runs on the coordinator; workers scan and
+//! stream Arrow back. The stage planner, shuffle nodes, range-partitioned
+//! distributed sort, distributed aggregate and broadcast/shuffle-hash join
+//! rules that used to live here had no caller in any binary and were
+//! deleted on 2026-09-11 (issue #551); git history before that date keeps
+//! them. Three modules stay because a dated plan wires them in:
+//! [`external_aggregate`] and [`grace_hash_join`] (bounded-memory plan
+//! Phase 5, `docs/superpowers/plans/2026-07-25-bounded-memory-spill-execution.md`)
+//! and [`predicate_transfer`] (lakehouse performance roadmap).
+
 pub mod external_aggregate;
 pub mod grace_hash_join;
 pub mod join_strategy;
 pub mod predicate_transfer;
 pub mod scan_morsel;
 pub mod scan_task;
-/// Shuffle writer/reader physical nodes. Gated behind `shuffle-planning`: the
-/// writer drops its input and returns an empty stream because the producer
-/// side was never written, and nothing plans it (review finding 600).
-#[cfg(feature = "shuffle-planning")]
-pub mod shuffle_exec;
 pub mod single_distinct_count;
 pub mod sort_memory;
 pub mod sort_memory_rule;
 pub mod splitter;
-pub mod stage_planner;
 pub mod star_schema_reorder;
 pub mod stats;
 pub mod worker_fault;
 pub mod worker_protocol;
 
-pub use distributed_aggregate::{
-    AggregateStrategy, DistributedAggregateRule, FinalAggregateExec, PartialAggregateExec,
-    DEFAULT_DISTRIBUTED_AGGREGATE_THRESHOLD, DEFAULT_HIGH_CARDINALITY_THRESHOLD,
-    MIN_EXECUTORS_FOR_DISTRIBUTED_AGGREGATE,
-};
-#[cfg(feature = "shuffle-planning")]
-pub use distributed_join::{
-    BroadcastJoinPlan, BroadcastJoinRule, BroadcastSide, JoinStrategy, PreSortedJoinRule,
-    ShuffleHashJoinPlan, DEFAULT_BROADCAST_THRESHOLD,
-};
-pub use distributed_sort::{
-    compute_range_boundaries, needs_sampling, sample_based_boundaries, DistributedSortExec,
-    DistributedSortRule, DEFAULT_DISTRIBUTED_SORT_THRESHOLD, MIN_EXECUTORS_FOR_DISTRIBUTED_SORT,
-};
 pub use external_aggregate::{
     ensure_decomposable, external_hash_aggregate, AggregateConsumer, DecomposableAgg,
     DfAggregateSpillCase, DfAggregateSpillGateReport, ExternalAggregateConfig,
@@ -54,26 +51,22 @@ pub use predicate_transfer::{
     build_predicate_transfer, extract_distinct_from_batches, extract_distinct_values,
     PredicateTransfer, MAX_PREDICATE_TRANSFER_VALUES,
 };
+pub use scan_morsel::SCAN_TASK_VERSION_V3;
 pub use scan_morsel::{
     group_row_groups_into_morsels, plan_file_byte_morsels, plan_scan_morsels, RowGroupSlice,
     ScanMorsel, DEFAULT_MORSEL_MAX_BYTES, DEFAULT_MORSEL_TARGET_BYTES, SCAN_TASK_VERSION_CURRENT,
     SCAN_TASK_VERSION_V1, SCAN_TASK_VERSION_V2,
 };
-pub use scan_morsel::SCAN_TASK_VERSION_V3;
 pub use scan_task::{
     HiveScanDescriptor, HiveScanFormat, ScanCredentials, ScanStorage, ScanTask, ScanTaskBuilder,
     TicketSecret,
 };
-#[cfg(feature = "shuffle-planning")]
-pub use shuffle_exec::{ShufflePartitioning, ShuffleReaderExec, ShuffleWriterExec};
 pub use single_distinct_count::SingleDistinctCountCompanionRule;
-pub use sort_memory::{
-    SortAdmissionError, SortConsumer, SortMemoryPolicy, DEFAULT_SORT_MERGE_FANIN,
-};
+pub use sort_memory::{SortAdmissionError, SortMemoryPolicy, DEFAULT_SORT_MERGE_FANIN};
 pub use sort_memory_rule::SortMemoryRule;
 pub use splitter::bin_pack_files;
-pub use splitter::split_files;
-pub use stage_planner::{compute_waves, decompose_plan, QueryStage, ShuffleType};
+pub use star_schema_reorder::{StarSchemaReorderRule, DEFAULT_MIN_RATIO};
+pub use stats::PuffinStatisticsRequestRule;
 pub use worker_fault::{
     classify_anyhow_error, classify_datafusion_error, classify_error_chain, classify_message,
     classify_object_store_error, WorkerFault, FAULT_METADATA_KEY,
@@ -82,5 +75,3 @@ pub use worker_protocol::{
     CoordinatorHello, CoordinatorVersions, HeartbeatPayload, HelloCompat, WorkerCapacity,
     WorkerHello, HELLO_VERSION, HELLO_VERSION_LEGACY, PROTO_VERSION, PROTO_VERSION_UNKNOWN,
 };
-pub use star_schema_reorder::{StarSchemaReorderRule, DEFAULT_MIN_RATIO};
-pub use stats::PuffinStatisticsRequestRule;
