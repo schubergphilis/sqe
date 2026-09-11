@@ -1664,6 +1664,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             Arc::clone(&rate_limiter),
             Arc::clone(&auth_rate_limiter),
             config.mcp.clone(),
+            sqe_coordinator::mcp_server::hive_root_names(&config),
         ))
     } else {
         if config.mcp.port > 0 {
@@ -1673,6 +1674,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
                 Arc::clone(&rate_limiter),
                 Arc::clone(&auth_rate_limiter),
                 config.mcp.clone(),
+                sqe_coordinator::mcp_server::hive_root_names(&config),
                 &config.coordinator.tls,
             )
             .await?;

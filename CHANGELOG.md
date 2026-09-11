@@ -77,6 +77,26 @@ All notable changes to SQE are documented in this file.
     Trino path spends; agents behind one proxy address get separate budgets
     and a token-rotating attacker does not.
 
+- MCP: catalog scoping for agents (`write_catalogs`, default catalog and schema)
+
+    `[mcp] write_catalogs` is an allowlist for the change tool: the
+    statement's parser-visible target (the table of INSERT, UPDATE, DELETE,
+    MERGE, CREATE TABLE [AS], ALTER TABLE, DROP, TRUNCATE, COMMENT; the view of
+    CREATE VIEW; the schema of CREATE/DROP SCHEMA) must resolve to a listed
+    catalog. Sources are reads and stay with policy enforcement. While the
+    gate is active an unresolvable target, or a kind with no target (CALL,
+    grants, policy DDL), is refused rather than guessed. `[[hive.roots]]`
+    catalogs need the explicit entry even with an empty list: Hive has no
+    per-user storage credentials, so an agent writing there acts as the
+    engine, and the config logs that choice at startup. `[mcp]
+    default_catalog` / `default_schema`, overridable per static principal,
+    are set on every MCP session so agents can use two-part names and one
+    agent can be pinned to one warehouse. MCP now classifies SQL through the
+    engine's `SqlFrontDoor` (`WireDialect::Mcp`), so an agent's statement is
+    parsed exactly as a Flight or Trino client's. Hive over MCP is documented:
+    only configured roots are reachable (ATTACH is per-session), and
+    `get_table_stats` is Iceberg-only.
+
 - Experimental Puffin NDV statistics consumer (`query.puffin_statistics`)
 
     Tables that opted in to `write.puffin.stats = 'true'` already carried a

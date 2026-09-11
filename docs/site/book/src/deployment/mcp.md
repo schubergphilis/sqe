@@ -39,6 +39,9 @@ read_scope = "sqe:mcp:read"
 write_scope = "sqe:mcp:write"
 allow_writes = false
 write_roles = ["data_writer"]
+# write_catalogs = ["iceberg"] # catalogs the change tool may target; see "Catalog scoping"
+# default_catalog = "iceberg"  # lets agents use two-part names
+# default_schema = "analytics"
 max_result_rows = 1000
 max_response_bytes = 2097152
 
@@ -108,6 +111,8 @@ user      = "mcp-writer"
 roles     = ["data_writer"]
 # nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.generic-api-key -- placeholder value
 token_b64 = "c3FlLXdyaXRlci10b2tlbi0x"
+default_catalog = "iceberg"           # this principal's sessions resolve two-part names here
+default_schema  = "staging"
 ```
 
 A caller presents `Authorization: Bearer <token>`; SQE matches it against the
@@ -218,6 +223,55 @@ roles where operational isolation is required.
 Results are structured JSON and text content. `max_result_rows` and
 `max_response_bytes` bound model context consumption; `truncated` reports when
 the result was cut. Prefer aggregation and explicit `LIMIT` clauses.
+
+## Catalog scoping
+
+Two settings decide which catalogs an agent works in.
+
+`default_catalog` and `default_schema` are set on every MCP session, so agents
+can write `SELECT * FROM orders` or `staging.orders` instead of qualifying
+every name. In static mode a principal's own `default_catalog` and
+`default_schema` win over the endpoint-wide values, which pins one agent to
+one warehouse. The same defaults drive `information_schema` qualification and
+the write gate below. A `default_schema` without a catalog to resolve in is a
+startup error.
+
+`write_catalogs` is the allowlist for `execute_sql_change`. When set, the
+statement's target must resolve to a listed catalog, compared without regard
+to case. Targets are what the parser exposes: the table of an `INSERT`,
+`UPDATE`, `DELETE`, `MERGE`, `CREATE TABLE`, `CREATE TABLE AS`, `ALTER TABLE`,
+`DROP`, `TRUNCATE` or `COMMENT`, the view of `CREATE VIEW`, the schema of
+`CREATE SCHEMA` or `DROP SCHEMA`. Sources are reads, so an
+`INSERT INTO iceberg.t SELECT * FROM lake.raw` is a write to `iceberg` only;
+policy enforcement covers the read side as it does everywhere. An unqualified
+target resolves through the session default catalog. While the gate is active,
+a target that cannot be resolved is refused, and so is a statement kind with no
+parser-visible target: `CALL` procedures, grants, policy DDL. Run those over
+Flight SQL or Trino, as the user, not from an agent.
+
+Hive external tables (`[[hive.roots]]`) get one extra rule, whether or not
+`write_catalogs` is set. Iceberg writes are authorised twice: SQE's policy, and
+Polaris vending credentials for that user. A Hive root has no per-user
+credentials; SQE reads and writes it with its own storage credentials, so an
+agent writing there acts as the engine. That needs an explicit opt-in: the
+Hive root's catalog name must appear in `write_catalogs`, and SQE logs a
+warning at startup when it does. With no `write_catalogs` and no Hive roots,
+the change tool behaves as before.
+
+## Hive tables over MCP
+
+Hive external tables are visible through every read tool, with the same
+row filters and column masks as over Flight SQL: the manifest's policy key is
+`<root>.<database>`, and the read tools go through the same query handler.
+Two things differ from an interactive session.
+
+- Only `[[hive.roots]]` catalogs are reachable. `ATTACH ... TYPE hive_external`
+  is a session statement, and an MCP session lives for one request, so an
+  attached catalog is gone before the next call. Configure roots in the server
+  config instead.
+- `get_table_stats` reads Iceberg snapshot metadata and returns a tool error
+  for a Hive table. `describe_table`, `get_table_ddl` and `execute_sql_readonly`
+  work on both.
 
 ## Audit attribution
 
