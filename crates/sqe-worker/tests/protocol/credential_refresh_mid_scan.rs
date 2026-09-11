@@ -6,8 +6,8 @@ use std::time::Duration;
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::Action;
 use futures::StreamExt;
-use sqe_spill::ByteBudget;
 use sqe_worker::credential_channel::RefreshableCredentials;
+use sqe_worker::executor::ScanBudget;
 use tonic::Request;
 
 use super::fixtures::{do_get, worker_service, StubBucket, NEW_KEY, OLD_KEY};
@@ -24,10 +24,11 @@ const ROWS: usize = 1024;
 /// Timing is made deterministic by the scan budget rather than by sleeps.
 /// The producer checks for refreshed credentials immediately before opening
 /// each file after the first. File one has eight row groups (eight batches of
-/// at least one unit each) against a five-unit budget, so the producer cannot
-/// finish file one -- let alone reach that check -- until the consumer starts
-/// draining. A refresh published before the first frame is consumed is
-/// therefore guaranteed to precede the open of file two.
+/// at least one unit each) against a five-unit budget (four of them the
+/// decode lane), so the producer cannot finish file one -- let alone reach
+/// that check -- until the consumer starts draining. A refresh published
+/// before the first frame is consumed is therefore guaranteed to precede the
+/// open of file two.
 #[tokio::test]
 async fn credential_refresh_mid_scan() {
     let mut bucket = StubBucket::new();
@@ -35,7 +36,7 @@ async fn credential_refresh_mid_scan() {
     bucket.put_parquet("data/f2.parquet", &[ROWS]).await;
     bucket.put_parquet("data/f3.parquet", &[ROWS]).await;
 
-    let scan_budget = ByteBudget::with_granularity("scan", 5 * UNIT, UNIT, None);
+    let scan_budget = ScanBudget::with_granularity(5 * UNIT, UNIT, None);
     let svc = worker_service(bucket.factory(), Some(scan_budget.clone()), None);
     let task = bucket.scan_task("frag-refresh");
 

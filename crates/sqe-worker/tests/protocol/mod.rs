@@ -7,3 +7,4 @@ mod compaction_live;
 mod credential_refresh_mid_scan;
 mod error_classification;
 mod heartbeat_roundtrip;
+mod shared_scan_budget;

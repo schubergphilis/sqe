@@ -28,7 +28,7 @@ use parquet::arrow::ArrowWriter;
 use sqe_metrics::WorkerMetricsRegistry;
 use sqe_planner::{ScanCredentials, ScanStorage, ScanTask};
 use sqe_spill::ByteBudget;
-use sqe_worker::executor::ObjectStoreFactory;
+use sqe_worker::executor::{ObjectStoreFactory, ScanBudget};
 use sqe_worker::flight_service::WorkerFlightService;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -247,12 +247,27 @@ impl StubBucket {
     /// A v1 whole-file ticket over every object, with sizes so the executor
     /// never issues HEAD.
     pub fn scan_task(&self, fragment_id: &str) -> ScanTask {
-        let paths = self
-            .objects
+        let keys: Vec<&str> = self.objects.iter().map(|(k, _)| k.as_str()).collect();
+        self.scan_task_over(fragment_id, &keys)
+    }
+
+    /// A v1 whole-file ticket over just `keys` (each must have been put), so
+    /// one bucket can serve several concurrent single-file scans.
+    pub fn scan_task_over(&self, fragment_id: &str, keys: &[&str]) -> ScanTask {
+        let objects: Vec<&(String, u64)> = keys
+            .iter()
+            .map(|key| {
+                self.objects
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .unwrap_or_else(|| panic!("no object {key} in the stub bucket"))
+            })
+            .collect();
+        let paths = objects
             .iter()
             .map(|(k, _)| format!("s3://{BUCKET}/{k}"))
             .collect();
-        let sizes = self.objects.iter().map(|(_, s)| *s).collect();
+        let sizes = objects.iter().map(|(_, s)| *s).collect();
         ScanTask::builder(
             fragment_id,
             paths,
@@ -290,7 +305,7 @@ impl Default for StubBucket {
 /// `factory`, with optional shared scan and flight budgets.
 pub fn worker_service(
     factory: ObjectStoreFactory,
-    scan_budget: Option<ByteBudget>,
+    scan_budget: Option<ScanBudget>,
     flight_budget: Option<ByteBudget>,
 ) -> WorkerFlightService {
     let metrics = Arc::new(WorkerMetricsRegistry::new().expect("metrics"));
