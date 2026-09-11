@@ -38,6 +38,7 @@ mod incremental_scan_e2e;
 mod insert_overwrite_e2e;
 mod integration_test;
 mod maintenance_procedures_test;
+mod mcp_access_control_e2e;
 mod mor_update_merge_integration;
 mod multi_catalog_routing_test;
 mod partition_e2e;

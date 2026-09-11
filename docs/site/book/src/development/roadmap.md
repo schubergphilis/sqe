@@ -326,13 +326,14 @@ An MCP Streamable HTTP endpoint (protocol revision 2025-11-25) served from the c
 
 - `sqe-mcp` crate: Streamable HTTP transport, RFC 9728 protected-resource metadata, bearer challenges, tool dispatch, response bounding
 - `McpConfig` in `sqe-core` with startup validation; mounts on the existing web listener or a dedicated port
-- Nine read tools behind `read_scope`; `execute_sql_readonly` gated by SQE's SQL parser and statement classifier as an allow-list (one statement; query and `SHOW` kinds only, everything else refused by default)
+- Eleven read tools behind `read_scope` (incl. `search_tables`, a server-side LIKE over `SHOW SCHEMAS` + `SHOW TABLES`, and `sample_rows`, `SELECT * LIMIT n` as the caller, capped at 100); `execute_sql_readonly` gated by SQE's SQL parser and statement classifier as an allow-list (one statement; query and `SHOW` kinds only, everything else refused by default)
 - `execute_sql_change` hidden unless `allow_writes = true`, then gated on the write scope, an SQE role in `write_roles`, and source authorization
 - Runnable end-to-end stack with Codex and Claude Code templates: `quickstart/mcp/` (14/14 checks, 2026-08-28)
 - `[mcp.auth] mode`: `oauth` (default), `static` principals with env/base64 bearer tokens, `anonymous` for a no-IdP deployment; anonymous refused when an IdP is configured, under `production_mode`, or with writes on
 - Documented at [Model Context Protocol](../deployment/mcp.md) and [MCP with Codex and Claude](../quickstart/mcp.md)
 - Audit attribution: every tool call carries `mcp:<tool>:<client>/<version>` as the session's client label (OCSF `actor.app_name`, the `source` column of `system.runtime.queries`), from the `clientInfo` sent on `initialize` and echoed through an advisory `Mcp-Session-Id`; the auth rate limit is keyed per `(peer IP, bearer fingerprint)` like the Trino path
 - Catalog scoping: `write_catalogs` allowlist on the change tool resolved from the statement's parser-visible target (fail closed on unresolvable targets and target-less kinds); `[[hive.roots]]` need the explicit entry because Hive writes run on engine credentials; `default_catalog` / `default_schema` per endpoint and per static principal; classification through `SqlFrontDoor` with `WireDialect::Mcp`
+- Access-control end-to-end over `/mcp` (`tests/it/mcp_access_control_e2e.rs`, runs under `scripts/access-control-test.sh`): denied-but-valid reads, `list_tables` parity with `SHOW TABLES`, Ranger masks and row filters through `execute_sql_readonly` and `sample_rows`, the change tool's role, catalog and source gates against a live Polaris grant, `search_tables` literal safety
 
 Open: no dynamic client registration on SQE's side (the authorization server owns registration), no MCP resources or prompts (tools only), no streamed partial results, and no mode-2 arm in the quickstart (that stack is Keycloak-based).
 
