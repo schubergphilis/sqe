@@ -126,6 +126,9 @@ pub fn resolve_memory_budgets(config: &SqeConfig) -> anyhow::Result<ResolvedMemo
         // to zero capacity, and `ByteBudget` then rejects every frame with
         // ItemTooLarge, silently turning the charge off (issue #407).
         flight_budget_bytes: resolved.flight_budget.max(64 * 1024),
+        // Two units at least: `ScanBudget` splits this into a fetch lane and
+        // a decode lane, and below two units the fetch lane is empty.
+        scan_budget_bytes: resolved.scan_budget.max(128 * 1024),
         budget_granularity_bytes: resolved.budget_granularity,
         process_headroom_bytes: resolved.process_headroom,
         configured_need_bytes: configured_need,
@@ -140,6 +143,9 @@ pub struct ResolvedMemoryBudgets {
     pub shuffle_budget_bytes: usize,
     /// Capacity for the encoded-Flight-frame budget (issue #407).
     pub flight_budget_bytes: usize,
+    /// Capacity for the worker-wide scan budget (`[worker.memory]
+    /// scan_budget`), both lanes together (issue #407).
+    pub scan_budget_bytes: usize,
     /// Accounting unit for the byte budgets built from these values.
     pub budget_granularity_bytes: usize,
     pub process_headroom_bytes: usize,
@@ -512,6 +518,22 @@ prometheus_port = {prometheus_port}
         );
     }
 
+    /// Same shape as the flight budget, found the same way: `[worker.memory]
+    /// scan_budget` was counted in `configured_need_bytes` and reached no
+    /// `ByteBudget`, so every `do_get` derived a private half-pool budget and
+    /// N scans held N budgets (issue #407).
+    #[test]
+    fn resolve_forwards_the_scan_budget() {
+        let cfg = minimal_cfg(50052, 9090);
+        let budgets = resolve_memory_budgets(&cfg).expect("resolve");
+        // Default is a fifth of the worker memory limit.
+        assert_eq!(
+            budgets.scan_budget_bytes,
+            budgets.memory_limit_bytes / 5,
+            "scan budget must be resolved from worker.memory, not dropped"
+        );
+    }
+
     #[test]
     fn port_change_warns_and_does_not_mutate_boot_listen_identity() {
         let boot_cfg = minimal_cfg(50052, 9090);
@@ -551,6 +573,7 @@ prometheus_port = {prometheus_port}
             governor_pool_bytes: 250 * 1024 * 1024,
             shuffle_budget_bytes: 80 * 1024 * 1024,
             flight_budget_bytes: 40 * 1024 * 1024,
+            scan_budget_bytes: 80 * 1024 * 1024,
             budget_granularity_bytes: 64 * 1024,
             process_headroom_bytes: 256 * 1024 * 1024,
             configured_need_bytes: 400 * 1024 * 1024 + 256 * 1024 * 1024,
@@ -594,6 +617,7 @@ prometheus_port = {prometheus_port}
             governor_pool_bytes: 32 * 1024 * 1024,
             shuffle_budget_bytes: 8 * 1024 * 1024,
             flight_budget_bytes: 4 * 1024 * 1024,
+            scan_budget_bytes: 8 * 1024 * 1024,
             budget_granularity_bytes: 64 * 1024,
             process_headroom_bytes: 1024 * 1024,
             configured_need_bytes: 17 * 1024 * 1024,

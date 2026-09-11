@@ -105,8 +105,21 @@ pub fn build_worker_service_with_hot_reload(
         crate::ticket_pin::TicketKeyPin::from_config(&config.worker)
             .map_err(|e| anyhow::anyhow!("worker.ticket_public_key: {e}"))?,
     );
+    // The scan budget reserves against the session pool: decoded batches ARE
+    // Arrow allocations, and operators must see their residency. Cloned before
+    // `session_ctx` moves into the service.
+    let session_pool = session_ctx.runtime_env().memory_pool.clone();
     let mut service = WorkerFlightService::new(metrics, session_ctx)
         .with_ticket_pin(Arc::clone(&ticket_pin))
+        // #407: `[worker.memory] scan_budget` was parsed and counted in
+        // `configured_need_bytes` but reached no code; every `do_get` derived
+        // its own half-pool budget, so N scans held N budgets. One budget,
+        // worker-wide, is what makes the wait on it backpressure.
+        .with_scan_budget(crate::executor::ScanBudget::with_granularity(
+            budgets.scan_budget_bytes,
+            budgets.budget_granularity_bytes,
+            Some(session_pool),
+        ))
         .with_accept_hmac_tickets(config.worker.accept_hmac_tickets)
         .with_scan_timeout(config.worker.scan_timeout_secs)
         // Finding 608: worker-side ceiling on one compact_file_group rewrite.

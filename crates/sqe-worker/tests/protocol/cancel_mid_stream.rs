@@ -7,6 +7,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use sqe_spill::ByteBudget;
 use sqe_worker::credential_channel::RefreshableCredentials;
+use sqe_worker::executor::ScanBudget;
 
 use super::fixtures::{do_get, wait_for, worker_service, StubBucket, NEW_KEY};
 
@@ -20,7 +21,7 @@ async fn cancel_mid_stream() {
         .await;
     bucket.put_parquet("data/tail.parquet", &[512]).await;
 
-    let scan_budget = ByteBudget::with_granularity("scan", 64 * 1024, 4096, None);
+    let scan_budget = ScanBudget::with_granularity(64 * 1024, 4096, None);
     let flight_budget = ByteBudget::with_granularity("flight", 64 * 1024, 1024, None);
     let svc = worker_service(
         bucket.factory(),

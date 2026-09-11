@@ -125,6 +125,16 @@ Coordinator: **greedy** pool. Workers: **fair** pool (hardcoded in `sqe-worker`)
 
 Set `SQE_MEMORY_LIMIT` in Kubernetes so the process cap matches the pod limit. A documented 64 GB default on a 31 GB node caused kernel OOM in benchmark runs.
 
+#### Worker scan budget
+
+A worker splits `worker.memory_limit` into sub-budgets under `[worker.memory]`. The one that decides how many concurrent scans a worker can hold in RAM is `scan_budget`, a fifth of the limit by default. It is one budget per worker, shared by every scan the coordinator sends, so a worker with forty inbound scans admits decoded batches from all forty against the same capacity and parks the rest until the coordinator drains. A quarter of it is the fetch lane that charges each open parquet file while it streams; the rest admits decoded batches. When the coordinator's `sqe_worker_reported_scan_budget_free_bytes` sits at zero while the coordinator is busy elsewhere, the worker is waiting on the coordinator, not the other way round. Raise `scan_budget` only together with `memory_limit`: the sub-budgets must fit inside it.
+
+```toml
+[worker.memory]
+scan_budget = "6GB"     # default: memory_limit / 5
+flight_budget = "3GB"   # encoded frames awaiting shipment, default: memory_limit / 10
+```
+
 ### Branches to merge before heavy SF10 load
 
 These are reliability fixes, not optional optimizations:
@@ -328,4 +338,3 @@ Route audit logs and traces through an OpenTelemetry Collector when possible. Au
 - Production config validator, DML audit, observability wiring, and CI for write/distributed have seen substantial progress via prior and current MRs.
 
 Refer to the full audit for the prioritized plan. Keep `sqe.toml.example` and this guide in sync as more items land.
-

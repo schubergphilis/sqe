@@ -16,14 +16,17 @@ use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
+#[cfg(feature = "worker-shuffle")]
 use sqe_spill::ByteBudget;
-use sqe_worker::executor::{execute_scan_streaming_with_store, SCAN_CHANNEL_ITEM_CAPACITY};
+use sqe_worker::executor::{
+    execute_scan_streaming_with_store, ScanBudget, SCAN_CHANNEL_ITEM_CAPACITY,
+};
 #[cfg(feature = "worker-shuffle")]
 use sqe_worker::shuffle::{ShuffleReceiver, DEFAULT_CHANNEL_CAPACITY};
 
 use common::*;
 
-fn session_and_scan_budget(memory_limit: usize) -> (SessionContext, ByteBudget) {
+fn session_and_scan_budget(memory_limit: usize) -> (SessionContext, ScanBudget) {
     let pool = Arc::new(FairSpillPool::new(memory_limit));
     let runtime = Arc::new(
         RuntimeEnvBuilder::new()
@@ -34,7 +37,7 @@ fn session_and_scan_budget(memory_limit: usize) -> (SessionContext, ByteBudget) 
     let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
     // Scan budget = full worker limit so a pure-scan workload can use it all;
     // ownership accounting keeps residency bounded by live permits only.
-    let scan_budget = ByteBudget::new("scan", memory_limit, Some(pool));
+    let scan_budget = ScanBudget::new(memory_limit, Some(pool));
     (ctx, scan_budget)
 }
 
