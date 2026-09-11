@@ -35,6 +35,9 @@ fn parse_config_path() -> String {
 }
 
 fn main() -> anyhow::Result<()> {
+    // ring is the process TLS provider (installed pre-main by sqe-core; this
+    // makes it explicit and logs which case happened).
+    sqe_core::tls::ensure_crypto_provider();
     let config_path = parse_config_path();
     let config = SqeConfig::load(&config_path)?;
     config.validate()?;

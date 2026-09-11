@@ -335,6 +335,27 @@ pub fn https_peers_need_trust_root(
     ))
 }
 
+/// Install ring as the rustls process default before `main` runs.
+///
+/// Why pre-main and not in each `main`: reqwest 0.13 is built with
+/// `rustls-no-provider` (its `rustls` feature hardwires the aws-lc provider
+/// and with it the aws-lc-sys C build, see the workspace `Cargo.toml`), and
+/// under that feature reqwest panics at `Client` construction unless a
+/// process default provider exists. Clients are built in about 25 places
+/// across a dozen crates and in their test binaries. Every one of those
+/// links this crate, so this is the one place that guarantees the provider
+/// is there first. The binaries additionally call
+/// [`ensure_crypto_provider`] from `main`, which then finds it installed and
+/// says so at debug level.
+///
+/// No logging here: this runs before any subscriber exists. A failed install
+/// can only mean another pre-main initialiser won the race, in which case
+/// the provider that is installed is the one rustls will use.
+#[ctor::ctor]
+fn install_ring_before_main() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Install the ring crypto provider as the rustls process default, once.
 ///
 /// The old call sites did `let _ = rustls::crypto::ring::default_provider()
@@ -342,7 +363,8 @@ pub fn https_peers_need_trust_root(
 /// provider first. This reports which case happened. Paths that build their
 /// config through [`ServerTlsMaterial`] do not depend on the process default
 /// at all; this exists for the ones that still call rustls helpers which do
-/// (for example `RustlsConfig::reload_from_pem_file`).
+/// (for example `RustlsConfig::reload_from_pem_file`). Since the pre-main
+/// install above, the usual outcome is the first branch.
 pub fn ensure_crypto_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_some() {
         tracing::debug!("rustls crypto provider already installed; keeping the existing one");

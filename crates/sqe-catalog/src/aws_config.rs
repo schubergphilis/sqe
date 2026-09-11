@@ -45,7 +45,17 @@ pub async fn build_aws_config(
     options: &BTreeMap<String, OptionValue>,
     secrets: &SecretStore,
 ) -> Result<aws_config::SdkConfig, String> {
-    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+    // Explicit rustls (ring) HTTPS client: the `aws-config` dependency has
+    // `default-https-client` off because that feature hardcodes the aws-lc
+    // provider and its C build into every binary. Same client the vendored
+    // Glue and S3 Tables crates build (SQE #133).
+    let http_client = aws_smithy_http_client::Builder::new()
+        .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+            aws_smithy_http_client::tls::rustls_provider::CryptoMode::Ring,
+        ))
+        .build_https();
+    let mut loader =
+        aws_config::defaults(aws_config::BehaviorVersion::latest()).http_client(http_client);
 
     // 1. Apply the explicit AWS secret first if present. The
     //    `credentials_provider` setter overrides the default chain, so

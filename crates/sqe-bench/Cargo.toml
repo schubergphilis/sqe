@@ -33,6 +33,10 @@ parquet = { workspace = true }
 object_store = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
+# reqwest is `rustls-no-provider` workspace-wide; sqe-bench does not link
+# sqe-core, so main.rs installs the ring provider before anything builds a
+# client (the Flight client's OIDC exchange in client/flight.rs).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
