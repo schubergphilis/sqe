@@ -579,7 +579,9 @@ mod tests {
         let g = TpcbbGenerator;
         let cfg = GenerateConfig::default();
         let t = g.tables()[0].name.clone();
-        let src = g.generate_batches(&t, 1.0, &cfg).unwrap();
+        // Row-count identity, scale-independent; SF1 cost 7 s of debug-mode
+        // generation per run (CI test phase, 2026-09-09).
+        let src = g.generate_batches(&t, 0.01, &cfg).unwrap();
         let expected_total = src.total_rows;
         let rows: usize = src
             .shards
