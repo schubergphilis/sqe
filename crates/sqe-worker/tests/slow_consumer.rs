@@ -12,8 +12,7 @@ use datafusion::execution::memory_pool::{FairSpillPool, MemoryPool};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
-use sqe_spill::ByteBudget;
-use sqe_worker::executor::execute_scan_streaming_with_store;
+use sqe_worker::executor::{execute_scan_streaming_with_store, ScanBudget};
 
 use common::*;
 
@@ -39,7 +38,7 @@ async fn slow_consumer_wide_rows_stays_within_budget() {
             .expect("runtime"),
     );
     let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
-    let scan_budget = ByteBudget::new("scan", WORKER_MEMORY_LIMIT_BYTES, Some(pool.clone()));
+    let scan_budget = ScanBudget::new(WORKER_MEMORY_LIMIT_BYTES, Some(pool.clone()));
     let metrics = worker_metrics();
     let store = local_store(tmp.path());
     let task = local_scan_task(

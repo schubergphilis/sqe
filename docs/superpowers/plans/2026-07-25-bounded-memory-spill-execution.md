@@ -490,6 +490,14 @@ while keeping resident scan and Flight buffers within configured budgets.
 - [x] Charge fetched compressed bytes only while the fetch buffer is resident.
 - [x] Charge decoded Arrow batches by `get_array_memory_size()` while owned by
       the worker pipeline.
+      (Both charged, against a budget that was PER SCAN. `[worker.memory]
+      scan_budget` parsed, resolved and counted in `configured_need_bytes`
+      but reached no `ByteBudget`; `do_get` derived a half-pool budget for
+      each stream, so N scans held N budgets and only the pool's `try_grow`
+      ever said no, as a failed query. Same shape as the flight budget
+      below, found by the same audit (#407), fixed 2026-09-11: one
+      `ScanBudget` per worker, split into a fetch lane and a decode lane
+      because a shared single lane deadlocks when fetch charges fill it.)
 - [x] Replace `mpsc<RecordBatch>(16)` with a byte-admitted
       `mpsc<Accounted<RecordBatch>>`; keep a small item cap only as a secondary
       scheduling guard.

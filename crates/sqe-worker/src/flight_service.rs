@@ -340,10 +340,12 @@ pub struct WorkerFlightService {
     /// The protocol tests install stubs so faults, refresh and cancellation
     /// are observable without S3.
     store_factory: ObjectStoreFactory,
-    /// Worker-wide scan byte budget shared by every `do_get`. `None` (the
-    /// default, and what bootstrap wires today) derives one budget per scan
-    /// from the session pool, as before.
-    scan_budget: Option<ByteBudget>,
+    /// Worker-wide scan byte budget shared by every `do_get`. Bootstrap wires
+    /// `[worker.memory] scan_budget`; a service built without it shares ONE
+    /// pool-derived default across scans. It is never per-scan: a budget
+    /// derived inside `do_get` bounds one stream and lets N streams hold N
+    /// budgets, which is the term that exhausted the worker pool (#407).
+    scan_budget: executor::ScanBudget,
     /// TEST-ONLY (`#[cfg(test)]`, so it compiles only for this crate's own
     /// unit test binary) replacement for the real rewrite, plus the `FileIO`
     /// the orphan cleanup runs against. Lets the finding-608 tests drive the
@@ -642,41 +644,7 @@ impl Drop for CompactionRpcGuard {
 
 impl WorkerFlightService {
     pub fn new(metrics: Arc<WorkerMetricsRegistry>, session_ctx: SessionContext) -> Self {
-        Self {
-            metrics,
-            credential_store: CredentialStore::new(),
-            session_ctx,
-            footer_cache: None,
-            #[cfg(feature = "worker-shuffle")]
-            shuffle_manager: ShuffleManager::new(),
-            scan_timeout: std::time::Duration::from_secs(600),
-            flight_compression: FlightCompression::Zstd,
-            #[cfg(feature = "worker-shuffle")]
-            shuffle_compression: FlightCompression::Zstd,
-            worker_secret: String::new(),
-            ticket_pin: None,
-            advertise_url: String::new(),
-            accept_hmac_tickets: false,
-            spill_manager: None,
-            flight_budget: None,
-            #[cfg(feature = "worker-shuffle")]
-            shuffle_memory_budget: Arc::new(std::sync::atomic::AtomicUsize::new(
-                DEFAULT_SHUFFLE_MEMORY_BUDGET,
-            )),
-            scan_timeout_secs: Arc::new(std::sync::atomic::AtomicU64::new(600)),
-            memory_governor: None,
-            live_consumers: Arc::new(LiveConsumerRegistry::new()),
-            #[cfg(feature = "worker-shuffle")]
-            exchange_store: Arc::new(ExchangeAttemptStore::new()),
-            compaction_timeout: Some(std::time::Duration::from_secs(
-                DEFAULT_COMPACTION_TIMEOUT_SECS,
-            )),
-            status: WorkerStatus::new(),
-            store_factory: executor::s3_object_store_factory(),
-            scan_budget: None,
-            #[cfg(test)]
-            compaction_seam: None,
-        }
+        Self::with_credential_store(metrics, session_ctx, CredentialStore::new())
     }
 
     /// Create a new service with an externally provided credential store.
@@ -688,6 +656,7 @@ impl WorkerFlightService {
         session_ctx: SessionContext,
         credential_store: CredentialStore,
     ) -> Self {
+        let scan_budget = executor::default_scan_budget(&session_ctx);
         Self {
             metrics,
             credential_store,
@@ -719,7 +688,7 @@ impl WorkerFlightService {
             )),
             status: WorkerStatus::new(),
             store_factory: executor::s3_object_store_factory(),
-            scan_budget: None,
+            scan_budget,
             #[cfg(test)]
             compaction_seam: None,
         }
@@ -954,12 +923,17 @@ impl WorkerFlightService {
         self
     }
 
-    /// Share one scan byte budget across every `do_get` instead of deriving
-    /// one per scan from the session pool.
+    /// Replace the pool-derived default scan budget with the configured one
+    /// (`[worker.memory] scan_budget`). Shared by every `do_get`.
     #[must_use = "with_scan_budget consumes self; bind the returned service"]
-    pub fn with_scan_budget(mut self, budget: ByteBudget) -> Self {
-        self.scan_budget = Some(budget);
+    pub fn with_scan_budget(mut self, budget: executor::ScanBudget) -> Self {
+        self.scan_budget = budget;
         self
+    }
+
+    /// The scan budget every `do_get` admits against.
+    pub fn scan_budget(&self) -> &executor::ScanBudget {
+        &self.scan_budget
     }
 
     /// Share a [`WorkerStatus`] created elsewhere (the heartbeat task reads
@@ -978,8 +952,8 @@ impl WorkerFlightService {
     /// Current load vector for the heartbeat hello.
     ///
     /// `memory_limit_bytes` is the session pool limit (0 when unbounded).
-    /// `scan_budget_free_bytes` is what the shared scan budget would still
-    /// admit, or, without one, what the pool would (limit minus reserved).
+    /// `scan_budget_free_bytes` is what the shared scan budget's decode lane
+    /// would still admit.
     /// `spill_free_bytes` is 0 = unknown: the `SegmentStore` trait exposes
     /// used bytes only, not the volume's free space. `inflight_scans` comes
     /// from [`WorkerStatus`].
@@ -996,19 +970,13 @@ impl WorkerFlightService {
         let pool = self.session_ctx.runtime_env().memory_pool.clone();
         let scan_budget = self.scan_budget.clone();
         Arc::new(move || {
-            let (limit, free) = match pool.memory_limit() {
-                MemoryLimit::Finite(limit) => {
-                    (limit as u64, limit.saturating_sub(pool.reserved()) as u64)
-                }
-                _ => (0, 0),
-            };
-            let scan_budget_free_bytes = match &scan_budget {
-                Some(budget) => budget.free_bytes() as u64,
-                None => free,
+            let limit = match pool.memory_limit() {
+                MemoryLimit::Finite(limit) => limit as u64,
+                _ => 0,
             };
             WorkerCapacity {
                 memory_limit_bytes: limit,
-                scan_budget_free_bytes,
+                scan_budget_free_bytes: scan_budget.free_bytes() as u64,
                 spill_free_bytes: 0,
                 inflight_scans: 0,
             }
@@ -1676,7 +1644,7 @@ impl FlightService for WorkerFlightService {
                 footer_cache.clone(),
                 None, // Coordinator metrics (workers don't have coordinator registry)
                 store_factory,
-                scan_budget,
+                Some(scan_budget),
             );
 
             let (schema, batch_stream) = if scan_timeout.is_zero() {

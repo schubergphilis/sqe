@@ -253,6 +253,29 @@ All notable changes to SQE are documented in this file.
 
 ### Bug Fixes
 
+- Worker: the scan byte budget is one budget per worker, not one per scan (#407)
+
+    `[worker.memory] scan_budget` was parsed, resolved and counted in the
+    startup headroom check while reaching no code. Every `DoGet` derived a
+    private budget of half the pool, so N concurrent scans held N budgets
+    and the only thing that stopped them was the pool refusing a
+    reservation, which fails the query instead of slowing the scan. That is
+    the term behind the SF10 TPC-DS inventory OOMs on a 4 GB worker.
+
+    Bootstrap now builds one `ScanBudget` from `scan_budget` (default a
+    fifth of `worker.memory_limit`) and every `DoGet` admits against it; a
+    service built without the setting shares one pool-derived default.
+    The budget has two lanes. Decoded batches are admitted on the decode
+    lane and released as the coordinator drains them. An open file's
+    compressed bytes are charged on a fetch lane (a quarter of the budget,
+    one file capped at half of it) and released when the file is drained.
+    One shared lane for both deadlocks: eight scans each holding a fetch
+    charge fill it and then all wait for a batch admission that can never
+    be granted. Each scan also reserves its previous batch's size before
+    decoding the next, so a full lane stops the parquet reader instead of
+    decoding into RAM first and waiting afterwards. The heartbeat's
+    `scan_budget_free_bytes` now reports the decode lane.
+
 - Flight SQL accepts JWT bearer tokens via the configured provider chain
 
     Before this fix the coordinator built `SessionManager::new(authenticator)`
