@@ -145,6 +145,9 @@ Standard OCSF fields used:
 - `actor.user.email_addr`: email claim, when present.
 - `actor.user.groups`: array of group objects `{"name": "..."}`.
 - `actor.user.roles`: roles array.
+- `actor.app_name`: the initiating client, when the protocol reports one:
+  `X-Trino-Source` on Trino HTTP, `mcp:<tool>:<client>` on the MCP endpoint.
+  Absent for Flight SQL and for system events.
 - `resources`: array of `{"name": "catalog.namespace.table", "type": "Table"|"View"}`.
 - `src_endpoint.ip`: client IP, when present.
 - `metadata.product.name`: `"SQE"`.

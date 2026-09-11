@@ -16,8 +16,12 @@ use crate::{
 };
 
 impl sqe_mcp::AuthRateLimiter for AuthRateLimiter {
-    fn allow(&self, peer_ip: &str) -> bool {
-        self.check(peer_ip, "mcp-bearer").is_ok()
+    /// Same `(peer_ip, credential)` tuple the Trino and Basic paths spend
+    /// their budget on; `credential` is the bearer's fingerprint, so agents
+    /// behind one proxy address get separate budgets and a token-rotating
+    /// attacker does not.
+    fn allow(&self, peer_ip: &str, credential: &str) -> bool {
+        self.check(peer_ip, credential).is_ok()
     }
 }
 

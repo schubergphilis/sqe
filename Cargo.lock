@@ -6693,6 +6693,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "uuid",
  "workspace-hack",
 ]
 

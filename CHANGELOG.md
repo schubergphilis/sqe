@@ -59,6 +59,24 @@ All notable changes to SQE are documented in this file.
 
 ### Added
 
+- MCP: audit attribution of the calling agent, and a per-credential auth rate limit
+
+    Every MCP tool call now stamps the session's client label with
+    `mcp:<tool>:<client name>/<client version>`, the field Trino HTTP fills
+    from `X-Trino-Source`. The client name and version come from the
+    `clientInfo` sent on `initialize`; SQE answers with an `Mcp-Session-Id`
+    header and applies the label to every later call that echoes it under
+    the same identity. The id is advisory: an unknown one, one from before a
+    restart, or one issued to another identity falls back to the sanitized
+    `User-Agent`, then to `mcp:<tool>`. The audit `Actor` gains an optional
+    `app_name` carrying this label for every protocol (OCSF `actor.app_name`),
+    so an OCSF event for an AI agent's query is no longer indistinguishable
+    from a Flight SQL client's, and `whoami` reports the resolved `client`.
+    The MCP authentication rate limit is keyed on `(peer IP, bearer
+    fingerprint)` instead of `(peer IP, "mcp-bearer")`, the same tuple the
+    Trino path spends; agents behind one proxy address get separate budgets
+    and a token-rotating attacker does not.
+
 - Experimental Puffin NDV statistics consumer (`query.puffin_statistics`)
 
     Tables that opted in to `write.puffin.stats = 'true'` already carried a
