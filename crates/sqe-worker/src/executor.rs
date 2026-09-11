@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::common::DFSchema;
-use datafusion::execution::memory_pool::{MemoryConsumer, MemoryLimit};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryLimit, MemoryPool};
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::create_physical_expr;
@@ -181,7 +181,7 @@ struct QueueTrackedScanStream {
     queue_bytes: Arc<AtomicUsize>,
     space: Arc<Notify>,
     metrics: Option<Arc<WorkerMetricsRegistry>>,
-    scan_budget: ByteBudget,
+    scan_budget: ScanBudget,
 }
 
 impl Stream for QueueTrackedScanStream {
@@ -200,9 +200,9 @@ impl Stream for QueueTrackedScanStream {
                 if let Some(ref m) = self.metrics {
                     m.scan_queue_resident_bytes
                         .set(self.queue_bytes.load(Ordering::Relaxed) as f64);
-                    // Decode residency = live scan-budget charge (ownership, not history).
+                    // Decode residency = live decode-lane charge (ownership, not history).
                     m.scan_decode_resident_bytes
-                        .set(self.scan_budget.used_bytes() as f64);
+                        .set(self.scan_budget.decode().used_bytes() as f64);
                 }
                 Poll::Ready(Some(Ok(batch)))
             }
@@ -211,9 +211,106 @@ impl Stream for QueueTrackedScanStream {
     }
 }
 
+/// Share of a [`ScanBudget`] reserved for the fetch lane: one accounting unit
+/// in four. The rest admits decoded batches.
+const SCAN_FETCH_LANE_DEN: usize = 4;
+
+/// The worker-wide scan byte budget, in two lanes.
+///
+/// `[worker.memory] scan_budget` is ONE number, but it pays for two kinds of
+/// residency with different release rules. Decoded Arrow batches are released
+/// as the Flight consumer drains them. The fetch charge for an open parquet
+/// file (its compressed row groups in the reader) is released only when the
+/// file is fully drained, which itself needs batch admissions. Charging both
+/// against one budget deadlocks the moment the budget is shared across
+/// scans: eight concurrent DoGets each holding a `capacity / 8` fetch permit
+/// fill the budget, every one of them then waits in `acquire` for its first
+/// batch, and nothing can ever release. The per-scan budget that
+/// `do_get` used to derive hid that, because no two scans shared a budget
+/// (issue #407).
+///
+/// Splitting the capacity into a fetch lane and a decode lane keeps the
+/// invariant that a fetch permit can never occupy decode capacity: a scan
+/// holding a fetch permit always gets its batches admitted once the
+/// consumer drains, so the wait is backpressure, not a cycle.
+#[derive(Clone, Debug)]
+pub struct ScanBudget {
+    decode: ByteBudget,
+    fetch: ByteBudget,
+}
+
+impl ScanBudget {
+    /// A scan budget of `capacity_bytes` with the default 64 KiB unit.
+    pub fn new(capacity_bytes: usize, pool: Option<Arc<dyn MemoryPool>>) -> Self {
+        Self::with_granularity(capacity_bytes, sqe_spill::DEFAULT_BUDGET_GRANULARITY, pool)
+    }
+
+    /// A scan budget split in whole accounting units so the two lanes sum
+    /// to `capacity_bytes` rounded UP to one unit, never more. Below two
+    /// units the fetch lane is empty and fetch charges are skipped.
+    pub fn with_granularity(
+        capacity_bytes: usize,
+        unit_bytes: usize,
+        pool: Option<Arc<dyn MemoryPool>>,
+    ) -> Self {
+        let unit = unit_bytes.max(1);
+        let units = capacity_bytes.div_ceil(unit).max(1);
+        let fetch_units = if units >= 2 {
+            (units / SCAN_FETCH_LANE_DEN).max(1)
+        } else {
+            0
+        };
+        let decode_units = units - fetch_units;
+        Self {
+            decode: ByteBudget::with_granularity("scan", decode_units * unit, unit, pool.clone()),
+            fetch: ByteBudget::with_granularity("scan-fetch", fetch_units * unit, unit, pool),
+        }
+    }
+
+    /// Lane that admits decoded batches.
+    pub fn decode(&self) -> &ByteBudget {
+        &self.decode
+    }
+
+    /// Lane that charges an open file's compressed bytes while it streams.
+    pub fn fetch(&self) -> &ByteBudget {
+        &self.fetch
+    }
+
+    /// Both lanes together, aligned to whole units.
+    pub fn capacity_bytes(&self) -> usize {
+        self.decode.capacity_bytes() + self.fetch.capacity_bytes()
+    }
+
+    /// Bytes charged across both lanes.
+    pub fn used_bytes(&self) -> usize {
+        self.decode.used_bytes() + self.fetch.used_bytes()
+    }
+
+    /// Decode capacity still free: what this worker would admit for the next
+    /// batch, which is the number the coordinator schedules on.
+    pub fn free_bytes(&self) -> usize {
+        self.decode.free_bytes()
+    }
+
+    /// Accounting unit shared by both lanes.
+    pub fn unit_bytes(&self) -> usize {
+        self.decode.unit_bytes()
+    }
+
+    /// Fetch charge for a file of `file_bytes`: capped at half the fetch lane
+    /// so one multi-GB file cannot hold every other scan's open at the door,
+    /// and at least one byte so the charge is never a no-op.
+    fn fetch_charge(&self, file_bytes: u64) -> usize {
+        (file_bytes as usize)
+            .min(self.fetch.capacity_bytes() / 2)
+            .max(1)
+    }
+}
+
 /// Build a default scan budget from the session pool when the caller did not
 /// supply one (standalone tests / legacy call sites).
-fn default_scan_budget(session_ctx: &SessionContext) -> ByteBudget {
+pub(crate) fn default_scan_budget(session_ctx: &SessionContext) -> ScanBudget {
     let pool = session_ctx.runtime_env().memory_pool.clone();
     let limit = match pool.memory_limit() {
         MemoryLimit::Finite(n) => n,
@@ -223,7 +320,41 @@ fn default_scan_budget(session_ctx: &SessionContext) -> ByteBudget {
     };
     // 50% of the pool for scan so operators/Flight retain headroom when no
     // explicit [worker.memory] config is wired.
-    ByteBudget::new("scan", limit / 2, Some(pool))
+    ScanBudget::new(limit / 2, Some(pool))
+}
+
+/// Admit `batch_bytes` against the decode lane, reusing the pre-decode
+/// permit when it already covers the batch. Otherwise the pre-permit is
+/// dropped BEFORE the real acquire: holding it while waiting would be a
+/// hold-and-wait on the same lane, which deadlocks once every scan does it.
+async fn admit_decoded(
+    decode: &ByteBudget,
+    pre: Option<sqe_spill::BytePermit>,
+    batch_bytes: usize,
+) -> sqe_spill::Result<sqe_spill::BytePermit> {
+    if let Some(p) = pre {
+        if p.charged_bytes() >= batch_bytes {
+            return Ok(p);
+        }
+        drop(p);
+    }
+    decode.acquire(batch_bytes).await
+}
+
+/// Reserve decode capacity BEFORE the next batch is decoded, sized from the
+/// previous batch of the same scan (batches of one file are alike). Zero
+/// means no estimate yet, so nothing is reserved and the first batch pays
+/// after decode as before. Issue #407's "acquire before decode": a scan
+/// whose budget lane is full stops pulling from the parquet reader instead
+/// of decoding into RAM and then waiting with the batch resident.
+async fn pre_admit(
+    decode: &ByteBudget,
+    estimate_bytes: usize,
+) -> sqe_spill::Result<Option<sqe_spill::BytePermit>> {
+    if estimate_bytes == 0 {
+        return Ok(None);
+    }
+    decode.acquire(estimate_bytes).await.map(Some)
 }
 
 /// Decode the coordinator's pushed-down predicate (#233) from its serialized
@@ -494,7 +625,7 @@ fn build_physical_predicate(
 /// without materialising the full scan in memory.
 ///
 /// Builds an S3 [`ObjectStore`] from the task's credentials and a default
-/// scan [`ByteBudget`] from the session pool. Prefer
+/// [`ScanBudget`] from the session pool. Prefer
 /// [`execute_scan_streaming_with_store`] for local fixtures or an explicit
 /// budget from `[worker.memory]`.
 pub async fn execute_scan_streaming(
@@ -520,7 +651,7 @@ pub async fn execute_scan_streaming(
 
 /// Like [`execute_scan_streaming`], with the [`ObjectStoreFactory`] that
 /// builds the initial store and every refreshed one, and an optional
-/// worker-wide scan [`ByteBudget`] (`None` derives one from the session pool).
+/// worker-wide [`ScanBudget`] (`None` derives one from the session pool).
 ///
 /// This is the seam the Flight service and the protocol tests share: the
 /// service passes the production S3 factory, the tests pass a stub that
@@ -534,7 +665,7 @@ pub async fn execute_scan_streaming_with_factory(
     footer_cache: Option<Arc<FooterCache>>,
     coordinator_metrics: Option<Arc<MetricsRegistry>>,
     store_factory: ObjectStoreFactory,
-    scan_budget: Option<ByteBudget>,
+    scan_budget: Option<ScanBudget>,
 ) -> anyhow::Result<(SchemaRef, ScanBatchStream)> {
     if task.data_file_paths.is_empty() {
         return Err(ScanFault::tag(
@@ -565,7 +696,7 @@ pub async fn execute_scan_streaming_with_factory(
 }
 
 /// Like [`execute_scan_streaming`], but uses a caller-supplied [`ObjectStore`]
-/// and optional scan [`ByteBudget`].
+/// and optional [`ScanBudget`].
 ///
 /// When `scan_budget` is `None`, a default budget is derived from the session
 /// pool (half the finite limit). When `allow_credential_refresh` is `false`,
@@ -581,7 +712,7 @@ pub async fn execute_scan_streaming_with_store(
     footer_cache: Option<Arc<FooterCache>>,
     coordinator_metrics: Option<Arc<MetricsRegistry>>,
     allow_credential_refresh: bool,
-    scan_budget: Option<ByteBudget>,
+    scan_budget: Option<ScanBudget>,
 ) -> anyhow::Result<(SchemaRef, ScanBatchStream)> {
     let store_factory = allow_credential_refresh.then(s3_object_store_factory);
     scan_streaming_inner(
@@ -647,7 +778,7 @@ async fn scan_streaming_inner(
     footer_cache: Option<Arc<FooterCache>>,
     coordinator_metrics: Option<Arc<MetricsRegistry>>,
     store_factory: Option<ObjectStoreFactory>,
-    scan_budget: Option<ByteBudget>,
+    scan_budget: Option<ScanBudget>,
 ) -> anyhow::Result<(SchemaRef, ScanBatchStream)> {
     if task.data_file_paths.is_empty() {
         return Err(ScanFault::tag(
@@ -710,30 +841,6 @@ async fn scan_streaming_inner(
         None => Arc::clone(&first_schema),
     };
 
-    // Fetch-resident: charge a capped estimate of the open file's compressed
-    // size against the scan budget while the file streams. Dropped when the
-    // file's batches are fully drained (or the producer exits).
-    let fetch_charge = (first_bytes as usize)
-        .min(scan_budget.capacity_bytes() / 8)
-        .max(1);
-    let initial_fetch_permit = match scan_budget.try_acquire(fetch_charge) {
-        Ok(p) => Some(p),
-        Err(e) => {
-            // Non-fatal: proceed without fetch charge if the budget is already
-            // tight; decode admission still protects RAM.
-            debug!(error = %e, "scan fetch budget admit skipped");
-            None
-        }
-    };
-    if let Some(ref m) = metrics {
-        m.scan_fetch_resident_bytes.set(
-            initial_fetch_permit
-                .as_ref()
-                .map(|p| p.charged_bytes())
-                .unwrap_or(0) as f64,
-        );
-    }
-
     let (tx, rx) = mpsc::channel::<anyhow::Result<AccountedBatch>>(SCAN_CHANNEL_ITEM_CAPACITY);
     let queue_bytes = Arc::new(AtomicUsize::new(0));
     let queue_space = Arc::new(Notify::new());
@@ -763,7 +870,50 @@ async fn scan_streaming_inner(
         let initial_store: Arc<dyn ObjectStore> = initial_store;
         let mut total_rows: usize = 0;
         let mut total_bytes: u64 = first_bytes;
-        let mut fetch_permit = initial_fetch_permit;
+        // Charged decode bytes of the last batch this scan emitted: the
+        // pre-decode estimate for the next one. Zero until the first batch.
+        let mut estimate: usize = 0;
+
+        /// Send a budget refusal. This worker's memory, not the user's data;
+        /// another worker may have room.
+        async fn send_exhausted(
+            tx: &mpsc::Sender<anyhow::Result<AccountedBatch>>,
+            e: sqe_spill::BudgetError,
+        ) {
+            let _ = tx
+                .send(Err(ScanFault::tag(
+                    WorkerFault::WorkerResourceExhausted,
+                    anyhow::anyhow!(e),
+                )))
+                .await;
+        }
+
+        /// Charge an open file's compressed bytes against the fetch lane
+        /// while it streams. Waits for lane capacity (issue #407: a try_acquire
+        /// that skipped the charge let parquet decode run unbounded), which is
+        /// safe because the lane is never occupied by batch permits. An empty
+        /// lane (budget below two units) skips the charge. `Err` is fatal.
+        async fn acquire_fetch(
+            scan_budget: &ScanBudget,
+            file_bytes: u64,
+            metrics: &Option<Arc<WorkerMetricsRegistry>>,
+        ) -> sqe_spill::Result<Option<sqe_spill::BytePermit>> {
+            let permit = if scan_budget.fetch().capacity_bytes() == 0 {
+                None
+            } else {
+                Some(
+                    scan_budget
+                        .fetch()
+                        .acquire(scan_budget.fetch_charge(file_bytes))
+                        .await?,
+                )
+            };
+            if let Some(m) = metrics {
+                m.scan_fetch_resident_bytes
+                    .set(permit.as_ref().map(|p| p.charged_bytes()).unwrap_or(0) as f64);
+            }
+            Ok(permit)
+        }
 
         /// Wait until the outbound queue is at or below `watermark`, or the
         /// Flight consumer is gone. Registers on `space` before the load so
@@ -794,18 +944,21 @@ async fn scan_streaming_inner(
             }
         }
 
-        /// Admit one decoded batch against the scan budget (waits for capacity),
-        /// wrap it in [`Accounted`], and send it. Returns `false` on fatal error
-        /// or consumer disconnect.
+        /// Admit one decoded batch against the decode lane (reusing `pre`
+        /// when it covers the batch, waiting for capacity otherwise), wrap it
+        /// in [`Accounted`], and send it. Returns the charged bytes, or `None`
+        /// on fatal error or consumer disconnect.
+        #[allow(clippy::too_many_arguments)]
         async fn emit_batch(
             tx: &mpsc::Sender<anyhow::Result<AccountedBatch>>,
-            scan_budget: &ByteBudget,
+            scan_budget: &ScanBudget,
             queue_bytes: &AtomicUsize,
             queue_space: &Notify,
             metrics: &Option<Arc<WorkerMetricsRegistry>>,
+            pre: Option<sqe_spill::BytePermit>,
             batch: RecordBatch,
             hive: Option<&Arc<(sqe_planner::HiveScanDescriptor, SchemaRef)>>,
-        ) -> bool {
+        ) -> Option<usize> {
             // Materialize Hive partition columns BEFORE sizing. Doing it after
             // the permit is acquired would leave the worker holding more memory
             // than it reserved: a partition column allocates one value per row,
@@ -818,29 +971,22 @@ async fn scan_streaming_inner(
                         Ok(b) => b,
                         Err(e) => {
                             let _ = tx.send(Err(ScanFault::classify(anyhow::anyhow!(e)))).await;
-                            return false;
+                            return None;
                         }
                     }
                 }
             };
             let batch_bytes = batch.get_array_memory_size();
-            let permit = match scan_budget.acquire(batch_bytes).await {
+            let permit = match admit_decoded(scan_budget.decode(), pre, batch_bytes).await {
                 Ok(p) => p,
                 Err(e) => {
-                    // Scan budget refused the batch: this worker's memory, not
-                    // the user's data. Another worker may have room.
-                    let _ = tx
-                        .send(Err(ScanFault::tag(
-                            WorkerFault::WorkerResourceExhausted,
-                            anyhow::anyhow!(e),
-                        )))
-                        .await;
-                    return false;
+                    send_exhausted(tx, e).await;
+                    return None;
                 }
             };
             if let Some(m) = metrics {
                 m.scan_decode_resident_bytes
-                    .set(scan_budget.used_bytes() as f64);
+                    .set(scan_budget.decode().used_bytes() as f64);
             }
             let charged = permit.charged_bytes();
             queue_bytes.fetch_add(charged, Ordering::Relaxed);
@@ -860,57 +1006,127 @@ async fn scan_streaming_inner(
                     m.scan_queue_resident_bytes
                         .set(queue_bytes.load(Ordering::Relaxed) as f64);
                     m.scan_decode_resident_bytes
-                        .set(scan_budget.used_bytes() as f64);
+                        .set(scan_budget.decode().used_bytes() as f64);
                 }
-                return false;
+                return None;
             }
-            true
+            Some(charged)
         }
 
-        // Drain the first file's batches.
-        let mut first_file_bytes: usize = 0;
-        while let Some(batch_res) = first_stream.next().await {
-            match batch_res {
-                Ok(batch) => {
-                    total_rows += batch.num_rows();
-                    first_file_bytes += batch.get_array_memory_size();
-                    if !emit_batch(
-                        &tx,
-                        &scan_budget,
-                        &queue_bytes,
-                        &queue_space,
-                        &metrics,
-                        batch,
-                        hive_ctx.as_ref(),
-                    )
-                    .await
-                    {
-                        return;
+        /// Outcome of draining one file's batch stream.
+        enum Drained {
+            /// Every batch was emitted.
+            All,
+            /// The per-fragment row limit was reached mid-file.
+            LimitReached,
+            /// Fatal error or consumer disconnect; the error (if any) was sent.
+            Stop,
+        }
+
+        /// Decode and emit every batch of one file. Before each decode the
+        /// previous batch's charge is reserved on the decode lane, so a full
+        /// lane stops the parquet reader instead of the batch landing in RAM
+        /// first and waiting afterwards.
+        #[allow(clippy::too_many_arguments)]
+        async fn drain_file(
+            file_stream: &mut FileBatchStream,
+            tx: &mpsc::Sender<anyhow::Result<AccountedBatch>>,
+            scan_budget: &ScanBudget,
+            queue_bytes: &AtomicUsize,
+            queue_space: &Notify,
+            metrics: &Option<Arc<WorkerMetricsRegistry>>,
+            hive: Option<&Arc<(sqe_planner::HiveScanDescriptor, SchemaRef)>>,
+            estimate: &mut usize,
+            total_rows: &mut usize,
+            row_limit: Option<usize>,
+            fragment_id: &str,
+        ) -> Drained {
+            loop {
+                let pre = match pre_admit(scan_budget.decode(), *estimate).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        send_exhausted(tx, e).await;
+                        return Drained::Stop;
+                    }
+                };
+                let Some(batch_res) = file_stream.next().await else {
+                    return Drained::All;
+                };
+                match batch_res {
+                    Ok(batch) => {
+                        *total_rows += batch.num_rows();
+                        match emit_batch(
+                            tx,
+                            scan_budget,
+                            queue_bytes,
+                            queue_space,
+                            metrics,
+                            pre,
+                            batch,
+                            hive,
+                        )
+                        .await
+                        {
+                            Some(charged) => *estimate = charged,
+                            None => return Drained::Stop,
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(ScanFault::classify(e))).await;
+                        return Drained::Stop;
                     }
                 }
-                Err(e) => {
-                    let _ = tx.send(Err(ScanFault::classify(e))).await;
-                    return;
+                if let Some(limit) = row_limit {
+                    if *total_rows >= limit {
+                        debug!(
+                            fragment_id = %fragment_id,
+                            total_rows = *total_rows,
+                            limit,
+                            "Per-fragment limit reached; stopping scan early"
+                        );
+                        return Drained::LimitReached;
+                    }
                 }
             }
-            if let Some(limit) = row_limit {
-                if total_rows >= limit {
-                    debug!(
-                        fragment_id = %task.fragment_id,
-                        total_rows,
-                        limit,
-                        "Per-fragment limit reached; stopping scan early"
-                    );
-                    return;
-                }
+        }
+
+        // Fetch-resident: charge the open file's compressed size against the
+        // fetch lane while it streams. Taken here, inside the producer, so
+        // `do_get` returns its stream at once and a full lane holds the scan
+        // BEFORE its first decode rather than timing out the setup.
+        let mut fetch_permit = match acquire_fetch(&scan_budget, first_bytes, &metrics).await {
+            Ok(p) => p,
+            Err(e) => {
+                send_exhausted(&tx, e).await;
+                return;
             }
+        };
+
+        // Drain the first file's batches.
+        match drain_file(
+            &mut first_stream,
+            &tx,
+            &scan_budget,
+            &queue_bytes,
+            &queue_space,
+            &metrics,
+            hive_ctx.as_ref(),
+            &mut estimate,
+            &mut total_rows,
+            row_limit,
+            &task.fragment_id,
+        )
+        .await
+        {
+            Drained::All => {}
+            Drained::LimitReached | Drained::Stop => return,
         }
         // File fully drained: release fetch charge.
         drop(fetch_permit.take());
         if let Some(ref m) = metrics {
             m.scan_fetch_resident_bytes.set(0.0);
         }
-        debug!(file = %first_path, rows = first_file_bytes, "first-file batches drained");
+        debug!(file = %first_path, rows = total_rows, "first-file batches drained");
 
         let mut store: Arc<dyn ObjectStore> = initial_store;
         let mut credential_rx = if store_factory.is_some() {
@@ -953,7 +1169,7 @@ async fn scan_streaming_inner(
         let mut pending = if idx < task.data_file_paths.len() {
             // After the first file is decoded, the queue may still be full.
             // Wait for the consumer before opening the next parquet file.
-            let watermark = scan_budget.capacity_bytes().saturating_div(2);
+            let watermark = scan_budget.decode().capacity_bytes().saturating_div(2);
             if !wait_queue_below(&queue_bytes, &queue_space, watermark, &tx).await {
                 return;
             }
@@ -980,76 +1196,41 @@ async fn scan_streaming_inner(
             };
             total_bytes += bytes;
 
-            // Cap fetch charge so a multi-GB file cannot monopolise the scan budget.
-            // Wait for capacity before decoding batches (issue #407): try_acquire
-            // used to skip the charge and let parquet decode run unbounded.
-            let fetch_charge = (bytes as usize)
-                .min(scan_budget.capacity_bytes() / 8)
-                .max(1);
             // Drop the previous permit before acquire so the file boundary
-            // never holds 2 x (capacity/8) against the scan budget.
+            // never holds two fetch charges against the lane.
             drop(fetch_permit.take());
-            fetch_permit = match scan_budget.acquire(fetch_charge).await {
-                Ok(p) => Some(p),
+            fetch_permit = match acquire_fetch(&scan_budget, bytes, &metrics).await {
+                Ok(p) => p,
                 Err(e) => {
-                    let _ = tx
-                        .send(Err(ScanFault::tag(
-                            WorkerFault::WorkerResourceExhausted,
-                            anyhow::anyhow!(e),
-                        )))
-                        .await;
+                    send_exhausted(&tx, e).await;
                     return;
                 }
             };
-            if let Some(ref m) = metrics {
-                m.scan_fetch_resident_bytes.set(
-                    fetch_permit
-                        .as_ref()
-                        .map(|p| p.charged_bytes())
-                        .unwrap_or(0) as f64,
-                );
-            }
 
-            while let Some(batch_res) = file_stream.next().await {
-                match batch_res {
-                    Ok(batch) => {
-                        total_rows += batch.num_rows();
-                        if !emit_batch(
-                            &tx,
-                            &scan_budget,
-                            &queue_bytes,
-                            &queue_space,
-                            &metrics,
-                            batch,
-                            hive_ctx.as_ref(),
-                        )
-                        .await
-                        {
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(ScanFault::classify(e))).await;
-                        return;
-                    }
-                }
-            }
+            let drained = drain_file(
+                &mut file_stream,
+                &tx,
+                &scan_budget,
+                &queue_bytes,
+                &queue_space,
+                &metrics,
+                hive_ctx.as_ref(),
+                &mut estimate,
+                &mut total_rows,
+                row_limit,
+                &task.fragment_id,
+            )
+            .await;
 
             drop(fetch_permit.take());
             if let Some(ref m) = metrics {
                 m.scan_fetch_resident_bytes.set(0.0);
             }
 
-            if let Some(limit) = row_limit {
-                if total_rows >= limit {
-                    debug!(
-                        fragment_id = %task.fragment_id,
-                        total_rows,
-                        limit,
-                        "Per-fragment limit reached; stopping scan early"
-                    );
-                    break 'files;
-                }
+            match drained {
+                Drained::All => {}
+                Drained::LimitReached => break 'files,
+                Drained::Stop => return,
             }
 
             // Issue #407: open the next file only after this one is drained
@@ -1057,7 +1238,7 @@ async fn scan_streaming_inner(
             // scan budget. Prefetching the next parquet decode while the
             // outbound channel is full is what OOM'd SF10 inventory queries.
             if idx < task.data_file_paths.len() {
-                let watermark = scan_budget.capacity_bytes().saturating_div(2);
+                let watermark = scan_budget.decode().capacity_bytes().saturating_div(2);
                 if !wait_queue_below(&queue_bytes, &queue_space, watermark, &tx).await {
                     return;
                 }
@@ -1966,6 +2147,83 @@ fn resolve_scan_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two lanes sum to the capacity rounded up to whole units, and the
+    /// fetch lane is a quarter of the units, at least one once there are two.
+    #[test]
+    fn scan_budget_splits_in_whole_units() {
+        let b = ScanBudget::with_granularity(8 * 1024, 1024, None);
+        assert_eq!(b.fetch().capacity_bytes(), 2 * 1024);
+        assert_eq!(b.decode().capacity_bytes(), 6 * 1024);
+        assert_eq!(b.capacity_bytes(), 8 * 1024);
+
+        // Five units: one for fetch, four for decode; never six units total.
+        let five = ScanBudget::with_granularity(5 * 1024, 1024, None);
+        assert_eq!(five.fetch().capacity_bytes(), 1024);
+        assert_eq!(five.decode().capacity_bytes(), 4 * 1024);
+
+        // Two units is the smallest split that leaves both lanes usable.
+        let two = ScanBudget::with_granularity(2 * 1024, 1024, None);
+        assert_eq!(two.fetch().capacity_bytes(), 1024);
+        assert_eq!(two.decode().capacity_bytes(), 1024);
+
+        // Below that the fetch lane is empty and fetch charges are skipped.
+        let one = ScanBudget::with_granularity(100, 1024, None);
+        assert_eq!(one.fetch().capacity_bytes(), 0);
+        assert_eq!(one.decode().capacity_bytes(), 1024);
+    }
+
+    /// One multi-GB file cannot hold the whole fetch lane: the charge is
+    /// capped at half of it so a second scan can always open a file.
+    #[test]
+    fn scan_budget_fetch_charge_is_capped_at_half_the_lane() {
+        let b = ScanBudget::with_granularity(8 * 1024, 1024, None);
+        assert_eq!(b.fetch_charge(100), 100);
+        assert_eq!(b.fetch_charge(u64::MAX), 1024);
+        assert_eq!(b.fetch_charge(0), 1);
+    }
+
+    /// A pre-decode permit that already covers the batch IS the batch's
+    /// permit: no second acquire, no double charge.
+    #[tokio::test]
+    async fn admit_decoded_reuses_a_covering_pre_permit() {
+        let b = ScanBudget::with_granularity(8 * 1024, 1024, None);
+        let pre = pre_admit(b.decode(), 2048).await.unwrap();
+        assert_eq!(b.decode().used_bytes(), 2048);
+        let permit = admit_decoded(b.decode(), pre, 1500).await.unwrap();
+        assert_eq!(permit.charged_bytes(), 2048);
+        assert_eq!(b.decode().used_bytes(), 2048);
+        drop(permit);
+        assert_eq!(b.decode().used_bytes(), 0);
+    }
+
+    /// A batch larger than its estimate releases the estimate BEFORE the real
+    /// acquire, so peak charge is the batch, never estimate plus batch.
+    #[tokio::test]
+    async fn admit_decoded_releases_a_short_pre_permit_before_acquiring() {
+        // Decode lane: 3 units of 1 KiB. Estimate 1 KiB, batch 3 KiB: holding
+        // the estimate while acquiring 3 KiB would wait forever.
+        let b = ScanBudget::with_granularity(4 * 1024, 1024, None);
+        let pre = pre_admit(b.decode(), 1024).await.unwrap();
+        let permit = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            admit_decoded(b.decode(), pre, 3 * 1024),
+        )
+        .await
+        .expect("must not hold-and-wait on its own lane")
+        .unwrap();
+        assert_eq!(permit.charged_bytes(), 3 * 1024);
+        assert_eq!(b.decode().used_bytes(), 3 * 1024);
+    }
+
+    /// No estimate, no reservation: the first batch of a scan pays after
+    /// decode exactly as before.
+    #[tokio::test]
+    async fn pre_admit_skips_without_an_estimate() {
+        let b = ScanBudget::with_granularity(4 * 1024, 1024, None);
+        assert!(pre_admit(b.decode(), 0).await.unwrap().is_none());
+        assert_eq!(b.used_bytes(), 0);
+    }
 
     #[test]
     fn test_s3_url_to_bucket() {

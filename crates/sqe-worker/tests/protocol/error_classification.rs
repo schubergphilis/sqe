@@ -9,7 +9,7 @@
 
 use futures::StreamExt;
 use sqe_planner::WorkerFault;
-use sqe_spill::ByteBudget;
+use sqe_worker::executor::ScanBudget;
 use tonic::{Code, Request, Status};
 
 use super::fixtures::{
@@ -93,9 +93,10 @@ async fn mid_stream_fault_is_classified_in_the_stream() {
 #[tokio::test]
 async fn budget_exhaustion_is_a_worker_fault_and_counts() {
     let mut bucket = StubBucket::new();
-    // One 1024-row Int64 group: an 8 KiB batch against a 4 KiB budget.
+    // One 1024-row Int64 group: an 8 KiB batch against a 4 KiB budget (a
+    // 3 KiB decode lane once the fetch lane takes its unit).
     bucket.put_parquet("data/big.parquet", &[1024]).await;
-    let scan_budget = ByteBudget::with_granularity("scan", 4096, 1024, None);
+    let scan_budget = ScanBudget::with_granularity(4096, 1024, None);
     let svc = worker_service(bucket.factory(), Some(scan_budget.clone()), None);
     let task = bucket.scan_task("frag-oom");
 
