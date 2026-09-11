@@ -231,6 +231,20 @@ All notable changes to SQE are documented in this file.
 
 ### Removed
 
+- sqe-planner: the stage and shuffle planner that no binary called (#551)
+
+    `stage_planner.rs`, `shuffle_exec.rs`, `distributed_join.rs`,
+    `distributed_sort.rs`, `distributed_aggregate.rs`, `split_files` and
+    `SortConsumer`: about 5,000 lines of `ExecutionPlan` and
+    `PhysicalOptimizerRule` implementations, 148 unit tests, and the
+    `shuffle-planning` cargo feature. The executed topology is a distributed
+    scan with every join, aggregate and sort on the coordinator; these
+    modules were Ballista-era scaffolding for a stage-based MPP that the
+    roadmap still describes but nothing plans, and each DataFusion upgrade
+    was paying to migrate operators that never ran. `external_aggregate`,
+    `grace_hash_join` and `predicate_transfer` stay: dated plans wire them
+    in. The crate-level doc now describes the live surface.
+
 - Wind down the Apache Ballista distributed-execution integration
 
     Ballista 53 was evaluated as an opt-in distributed engine behind a

@@ -6733,7 +6733,6 @@ dependencies = [
  "arrow-schema",
  "base64 0.23.1",
  "datafusion",
- "futures",
  "object_store",
  "serde",
  "serde_json",
