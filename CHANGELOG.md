@@ -97,6 +97,28 @@ All notable changes to SQE are documented in this file.
     only configured roots are reachable (ATTACH is per-session), and
     `get_table_stats` is Iceberg-only.
 
+- MCP: `search_tables` and `sample_rows` tools; access-control end-to-end suite over `/mcp`
+
+    `search_tables(pattern, [catalog])` walks `SHOW SCHEMAS` and `SHOW TABLES`
+    for one catalog and matches a LIKE pattern in the server (a bare word is
+    a case-insensitive substring match; the catalog defaults to the
+    session's; a schema the caller may not list is skipped). Not
+    `information_schema.tables`: a catalog-qualified
+    `<catalog>.information_schema.tables` is answered by DataFusion's
+    built-in listing, which knows the system schemas and already-loaded
+    tables only (measured against the Ranger stack: 40 system rows, no
+    fixture table). `sample_rows(catalog, schema, table, [limit])` is
+    `SELECT * LIMIT n` as the caller, default 10, capped at 100, so row
+    filters and masks apply. `tests/it/mcp_access_control_e2e.rs` drives the
+    MCP router in-process over a Ranger-wired `QueryHandler` with the
+    personas' real Keycloak sessions: denied-but-valid reads, `list_tables`
+    parity with `SHOW TABLES`, MASK_NULL / MASK_SHOW_LAST_4 and a row filter
+    through `execute_sql_readonly` and `sample_rows`, the change tool's role,
+    catalog and source gates against a live Polaris INSERT grant. Runs under
+    `scripts/access-control-test.sh` (the `access_control_e2e` filter matches
+    the module name). Before this, masking through MCP was reasoned from
+    "same QueryHandler", not measured.
+
 - Experimental Puffin NDV statistics consumer (`query.puffin_statistics`)
 
     Tables that opted in to `write.puffin.stats = 'true'` already carried a

@@ -2,9 +2,10 @@
 # Run the access-control e2e suite against the Polaris + Ranger + Keycloak
 # quickstart stack.
 #
-#   scripts/access-control-test.sh                  # whole suite
-#   scripts/access-control-test.sh tag_column_mask  # one test by substring
-#   scripts/access-control-test.sh --down           # tear the stack down
+#   scripts/access-control-test.sh                          # whole suite (every *access_control_e2e module)
+#   scripts/access-control-test.sh tag_column_mask          # one access_control_e2e test by substring
+#   scripts/access-control-test.sh mcp_access_control_e2e   # a whole sibling module (name carries the suite suffix)
+#   scripts/access-control-test.sh --down                   # tear the stack down
 #
 # Only the services the suite needs are started. `sqe`, `data-seed`, and `spark`
 # are NOT in any of those dependency chains, so no SQE image is built and the
@@ -118,7 +119,15 @@ echo "  config: $RESOLVED_CONFIG (ranger=$RANGER_URL polaris=$POLARIS_URL keyclo
 # and force-run them against this stack, which is not the one they need.
 FILTER="access_control_e2e"
 if [ "$#" -gt 0 ]; then
-    FILTER="access_control_e2e::$1"
+    case "$1" in
+        # A filter that already names a suite module (mcp_access_control_e2e,
+        # access_control_e2e::foo) is passed through. Prefixing it would build
+        # `access_control_e2e::mcp_access_control_e2e`, which matches nothing
+        # and reports "0 passed" as success. Observed once; a green that never
+        # ran is the failure mode this suite exists to avoid.
+        *access_control_e2e*) FILTER="$1" ;;
+        *) FILTER="access_control_e2e::$1" ;;
+    esac
 fi
 
 # `spark_access_control_e2e` CONTAINS `access_control_e2e`, so the filter above also
