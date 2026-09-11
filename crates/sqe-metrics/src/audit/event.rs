@@ -39,6 +39,13 @@ pub struct Actor {
     pub roles: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<String>,
+    /// The client application that initiated the activity, as the wire
+    /// protocol reported it: `X-Trino-Source` on Trino HTTP, and
+    /// `mcp:<tool>:<client>` on the MCP endpoint. Maps to OCSF
+    /// `actor.app_name`. `None` when the protocol carries no such label
+    /// (Flight SQL) or the event has no client (maintenance, system).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,7 +201,16 @@ impl Actor {
             email,
             roles,
             groups,
+            app_name: None,
         }
+    }
+
+    /// Attach the client application label (`Session.source`). Chained after
+    /// [`Actor::from_parts`] wherever a session is at hand.
+    #[must_use = "with_app_name consumes self; bind the returned Actor"]
+    pub fn with_app_name(mut self, app_name: Option<String>) -> Self {
+        self.app_name = app_name;
+        self
     }
 }
 
@@ -211,6 +227,7 @@ pub(crate) fn sample_query_event() -> AuditEvent {
             email: Some("alice@corp.example".into()),
             roles: vec!["analyst".into()],
             groups: vec!["hr".into()],
+            app_name: None,
         },
         outcome: Outcome::Success,
         resources: vec![Resource {
@@ -262,6 +279,7 @@ mod tests {
                 email: Some("alice@corp.example".into()),
                 roles: vec!["analyst".into()],
                 groups: vec!["hr".into()],
+                app_name: None,
             },
             outcome: Outcome::Success,
             resources: vec![Resource {

@@ -2803,7 +2803,8 @@ impl QueryHandler {
                     session.user.email.clone(),
                     session.user.roles.clone(),
                     session.user.groups.clone(),
-                );
+                )
+                .with_app_name(session.source.clone());
 
                 let event = sqe_metrics::audit::AuditEvent {
                     time: chrono::Utc::now(),
@@ -2889,7 +2890,8 @@ impl QueryHandler {
                     session.user.email.clone(),
                     session.user.roles.clone(),
                     session.user.groups.clone(),
-                );
+                )
+                .with_app_name(session.source.clone());
 
                 let grant_event = sqe_metrics::audit::AuditEvent {
                     time: chrono::Utc::now(),
@@ -2981,7 +2983,8 @@ impl QueryHandler {
                     session.user.email.clone(),
                     session.user.roles.clone(),
                     session.user.groups.clone(),
-                );
+                )
+                .with_app_name(session.source.clone());
 
                 let is_dml = matches!(
                     &kind,
@@ -3365,7 +3368,8 @@ impl QueryHandler {
                     session.user.email.clone(),
                     session.user.roles.clone(),
                     session.user.groups.clone(),
-                );
+                )
+                .with_app_name(session.source.clone());
                 let finalizer = crate::streaming::StreamFinalizer {
                     tracker: Arc::clone(&self.query_tracker),
                     metrics: self.metrics.clone(),

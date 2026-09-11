@@ -219,6 +219,33 @@ Results are structured JSON and text content. `max_result_rows` and
 `max_response_bytes` bound model context consumption; `truncated` reports when
 the result was cut. Prefer aggregation and explicit `LIMIT` clauses.
 
+## Audit attribution
+
+Every tool call runs as the authenticated user, and the audit record says so
+in `actor.user`. It also says which agent asked. The session's client label,
+the same field Trino HTTP fills from `X-Trino-Source`, is set to:
+
+```text
+mcp:<tool>:<client name>/<client version>
+```
+
+The client name and version come from the `clientInfo` the MCP client sends on
+`initialize`. SQE answers `initialize` with an `Mcp-Session-Id` header; a
+client that echoes it on later requests gets that label on every call. The id
+is advisory. An unknown id, one from before a restart, or one issued to a
+different identity is ignored, never rejected, and the label falls back to the
+request's `User-Agent`, then to the bare `mcp:<tool>` form. Labels are reduced
+to printable ASCII and cut at 64 bytes before they reach a log line.
+
+In the OCSF export the label is `actor.app_name`; in `system.runtime.queries`
+and the dashboard it is the `source` column. `whoami` returns the label the
+server resolved for the current request as `client`.
+
+The authentication rate limit is spent per `(peer IP, credential)` tuple, the
+same tuple the Trino and Basic paths use. The credential half is a SHA-256
+fingerprint of the bearer, so agents behind one proxy address get separate
+budgets and a token-rotating attacker does not.
+
 ## Design references
 
 The design follows the MCP 2025-11-25 authorization requirements (OAuth 2.1,

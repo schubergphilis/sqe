@@ -903,7 +903,10 @@ enum AuthFailure {
 /// token. Bearers are attacker-supplied and unbounded in number, so the raw
 /// value must never become a map key or a log field; the digest gives the
 /// same per-credential budget passwords get without storing the secret.
-fn bearer_fingerprint(token: &str) -> String {
+///
+/// Public because the MCP endpoint keys its auth rate limit the same way;
+/// one fingerprint, one definition of "the same credential".
+pub fn bearer_fingerprint(token: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = hex::encode(Sha256::digest(token.as_bytes()));
     format!("bearer:{}", &digest[..16])
