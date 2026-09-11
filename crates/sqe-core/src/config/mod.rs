@@ -919,6 +919,22 @@ pub struct McpConfig {
     /// Maximum JSON bytes returned in one MCP tool response.
     #[serde(default = "default_mcp_max_response_bytes")]
     pub max_response_bytes: usize,
+    /// Catalogs the change/write tool may target. Empty means any catalog
+    /// EXCEPT a `[[hive.roots]]` catalog: Hive roots are reached with the
+    /// engine's own credentials, so an agent writing there acts as SQE, not
+    /// as the user, and that needs naming here explicitly. Compared
+    /// case-insensitively. A change statement whose target catalog cannot be
+    /// determined (unqualified name with no default catalog, or a statement
+    /// kind without a table target) is refused while this gate is active.
+    #[serde(default)]
+    pub write_catalogs: Vec<String>,
+    /// Default catalog for MCP sessions, so agents can use two-part names.
+    /// A static principal's own `default_catalog` wins over this one.
+    #[serde(default)]
+    pub default_catalog: Option<String>,
+    /// Default schema for MCP sessions. Only meaningful with a catalog.
+    #[serde(default)]
+    pub default_schema: Option<String>,
     /// How callers authenticate to `/mcp`. Defaults to OAuth.
     #[serde(default)]
     pub auth: McpAuthConfig,
@@ -938,6 +954,9 @@ impl Default for McpConfig {
             write_roles: default_mcp_write_roles(),
             max_result_rows: default_mcp_max_result_rows(),
             max_response_bytes: default_mcp_max_response_bytes(),
+            write_catalogs: Vec::new(),
+            default_catalog: None,
+            default_schema: None,
             auth: McpAuthConfig::default(),
         }
     }
@@ -1017,6 +1036,15 @@ pub struct McpPrincipalConfig {
     /// Base64-encoded bearer token. Obfuscation only.
     #[serde(default)]
     pub token_b64: String,
+    /// Default catalog for this principal's sessions; wins over
+    /// `mcp.default_catalog`. Pins an agent to one warehouse without it
+    /// having to qualify every name.
+    #[serde(default)]
+    pub default_catalog: Option<String>,
+    /// Default schema for this principal's sessions; wins over
+    /// `mcp.default_schema`.
+    #[serde(default)]
+    pub default_schema: Option<String>,
 }
 
 /// Minimum token length. Short tokens are guessable, and a static token is the
@@ -5393,6 +5421,50 @@ impl SqeConfig {
                         .to_string(),
                 );
             }
+            if self.mcp.write_catalogs.iter().any(|c| c.trim().is_empty()) {
+                errors.push("mcp.write_catalogs must not contain an empty catalog name".to_string());
+            }
+            if !self.mcp.allow_writes && !self.mcp.write_catalogs.is_empty() {
+                errors.push(
+                    "mcp.write_catalogs is set but mcp.allow_writes is false; the change tool \
+                     is not advertised, so the allowlist gates nothing"
+                        .to_string(),
+                );
+            }
+            // A Hive root named in write_catalogs is the explicit opt-in the
+            // gate asks for. Say so at startup: the operator is choosing to
+            // let agents write on the engine's credentials.
+            let hive_roots: Vec<&str> = self.hive.roots.iter().map(|r| r.name.as_str()).collect();
+            for catalog in &self.mcp.write_catalogs {
+                if hive_roots
+                    .iter()
+                    .any(|root| root.eq_ignore_ascii_case(catalog))
+                {
+                    tracing::warn!(
+                        catalog,
+                        "mcp.write_catalogs names a [[hive.roots]] catalog: MCP change statements \
+                         there run on the engine's own storage credentials, not the caller's"
+                    );
+                }
+            }
+            if self.mcp.default_schema.is_some() && self.mcp.default_catalog.is_none() {
+                errors.push(
+                    "mcp.default_schema needs mcp.default_catalog; a schema alone does not resolve"
+                        .to_string(),
+                );
+            }
+            for principal in &self.mcp.auth.principals {
+                if principal.default_schema.is_some()
+                    && principal.default_catalog.is_none()
+                    && self.mcp.default_catalog.is_none()
+                {
+                    errors.push(format!(
+                        "mcp.auth.principals[{}] default_schema needs a default_catalog (its own \
+                         or mcp.default_catalog)",
+                        principal.user
+                    ));
+                }
+            }
         }
 
         // TLS validation: if one of cert/key is set, both must be set
@@ -7164,6 +7236,8 @@ partial_progress_batch = 5
             roles: roles.iter().map(|r| r.to_string()).collect(),
             token_env: String::new(),
             token_b64: b64(token),
+            default_catalog: None,
+            default_schema: None,
         }
     }
 
@@ -7326,6 +7400,8 @@ partial_progress_batch = 5
             roles: vec!["reader".to_string()],
             token_env: String::new(),
             token_b64: "not valid base64!!".to_string(),
+            default_catalog: None,
+            default_schema: None,
         }];
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("token_b64"), "got: {err}");
@@ -7340,6 +7416,8 @@ partial_progress_batch = 5
             roles: vec!["reader".to_string()],
             token_env: String::new(),
             token_b64: String::new(),
+            default_catalog: None,
+            default_schema: None,
         }];
         let err = config.validate().unwrap_err().to_string();
         assert!(
@@ -7357,6 +7435,8 @@ partial_progress_batch = 5
             roles: vec!["reader".to_string()],
             token_env: "SQE_MCP_TOKEN_THAT_IS_NOT_SET".to_string(),
             token_b64: String::new(),
+            default_catalog: None,
+            default_schema: None,
         }];
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("SQE_MCP_TOKEN_THAT_IS_NOT_SET"), "got: {err}");
@@ -7371,10 +7451,62 @@ partial_progress_batch = 5
             roles: vec!["reader".to_string()],
             token_env: "SQE_MCP_TEST_READ_TOKEN".to_string(),
             token_b64: b64("base64-token-is-long-too"),
+            default_catalog: None,
+            default_schema: None,
         };
         let token = principal.resolve_token().expect("resolves");
         std::env::remove_var("SQE_MCP_TEST_READ_TOKEN");
         assert_eq!(token.expose(), "env-token-is-long-enough");
+    }
+
+    #[test]
+    fn mcp_write_catalogs_without_writes_is_a_misconfiguration() {
+        let mut config = mcp_enabled_config();
+        config.mcp.authorization_servers = vec!["https://idp.example.com/realm".to_string()];
+        config.mcp.write_catalogs = vec!["iceberg".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("write_catalogs") && err.contains("allow_writes"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn mcp_write_catalogs_refuses_an_empty_name() {
+        let mut config = mcp_enabled_config();
+        config.mcp.authorization_servers = vec!["https://idp.example.com/realm".to_string()];
+        config.mcp.allow_writes = true;
+        config.mcp.write_catalogs = vec!["iceberg".to_string(), "  ".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("empty catalog name"), "got: {err}");
+    }
+
+    #[test]
+    fn mcp_default_schema_needs_a_default_catalog() {
+        let mut config = mcp_enabled_config();
+        config.mcp.authorization_servers = vec!["https://idp.example.com/realm".to_string()];
+        config.mcp.default_schema = Some("analytics".to_string());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("mcp.default_schema"), "got: {err}");
+
+        config.mcp.default_catalog = Some("iceberg".to_string());
+        config.validate().expect("catalog + schema resolves");
+
+        // A principal's schema may lean on the endpoint-wide catalog.
+        config.mcp.auth.mode = McpAuthMode::Static;
+        let mut principal =
+            static_principal("mcp-reader", &["reader"], "a-sufficiently-long-token");
+        principal.default_schema = Some("hr".to_string());
+        config.mcp.auth.principals = vec![principal];
+        config.validate().expect("principal schema over mcp.default_catalog");
+
+        config.mcp.default_catalog = None;
+        config.mcp.default_schema = None;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("mcp.auth.principals[mcp-reader] default_schema"),
+            "got: {err}"
+        );
     }
 
     #[test]
