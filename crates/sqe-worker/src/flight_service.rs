@@ -2399,17 +2399,29 @@ mod tests {
             start_byte: None,
             end_byte: None,
             fragment_id: "frag-sig".to_string(),
-            data_file_paths: vec!["s3://bucket/f.parquet".to_string()],
+            // A bucket-less URL: the downstream failure the signature tests
+            // expect arrives at store construction, before any network. The
+            // earlier `s3://bucket/...` with `WorkerDefault` credentials and no
+            // endpoint ran the worker's own credential chain, whose
+            // instance-metadata probe took 7 s to time out per test, and a
+            // closed local port still cost the S3 client's retry schedule
+            // (measured 2026-09-09; the four auth tests were 30 s of the binary).
+            data_file_paths: vec!["s3:///f.parquet".to_string()],
             file_sizes_bytes: vec![1024],
             projected_columns: vec![],
             projected_field_ids: vec![],
-            s3_endpoint: String::new(),
-            s3_region: String::new(),
-            credentials: sqe_planner::ScanCredentials::default(),
+            s3_endpoint: "http://127.0.0.1:1".to_string(),
+            s3_region: "us-east-1".to_string(),
+            credentials: sqe_planner::ScanCredentials::Vended {
+                access_key: sqe_planner::TicketSecret::new("test"),
+                secret_key: sqe_planner::TicketSecret::new("test"),
+                session_token: sqe_planner::TicketSecret::new(""),
+                expires_at: None,
+            },
             audience: String::new(),
             expires_at: 0,
-            s3_path_style: false,
-            s3_allow_http: false,
+            s3_path_style: true,
+            s3_allow_http: true,
             predicate_proto: None,
             limit: None,
         }
@@ -2919,20 +2931,28 @@ mod tests {
             job_id: "job-sig".to_string(),
             group_id: 1,
             table_ident: "catalog.ns.tbl".to_string(),
-            metadata_location: "s3://bucket/warehouse/tbl/metadata/v1.metadata.json".to_string(),
+            // A scheme the S3 FileIO cannot open: the downstream failure the
+            // auth tests expect arrives before any network (see
+            // `make_scan_task_bytes` for the 7 to 9 s this used to cost).
+            metadata_location: "nowhere://bucket/warehouse/tbl/metadata/v1.metadata.json"
+                .to_string(),
             snapshot_id: 42,
-            group_file_paths: vec!["s3://bucket/data/f1.parquet".to_string()],
+            group_file_paths: vec!["nowhere://bucket/data/f1.parquet".to_string()],
             target_file_size_bytes: 128 * 1024 * 1024,
             compression: "zstd".to_string(),
             sort: None,
+            // Static keys and a closed local port, for the same reason as
+            // `make_scan_task_bytes`: an empty S3Conn made FileIO consult the
+            // instance-metadata endpoint, 9 s per test before the expected
+            // downstream failure arrived.
             s3: sqe_compaction::wire::S3Conn {
-                endpoint: String::new(),
-                region: String::new(),
-                access_key: String::new(),
-                secret_key: String::new(),
+                endpoint: "http://127.0.0.1:1".to_string(),
+                region: "us-east-1".to_string(),
+                access_key: "test".to_string(),
+                secret_key: "test".to_string(),
                 session_token: String::new(),
-                path_style: false,
-                allow_http: false,
+                path_style: true,
+                allow_http: true,
             },
         }
         .to_bytes()
