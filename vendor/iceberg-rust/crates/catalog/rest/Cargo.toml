@@ -32,7 +32,13 @@ repository = { workspace = true }
 # SigV4 auth for AWS Iceberg REST endpoints (S3 Tables, Glue Iceberg
 # REST, Lake Formation). Off by default so a pure-OSS REST stack
 # (Polaris, Nessie, Lakekeeper) doesn't pull in the AWS SDK.
-aws-sigv4 = ["dep:aws-sigv4", "dep:aws-credential-types", "dep:aws-config", "dep:bytes"]
+aws-sigv4 = [
+    "dep:aws-sigv4",
+    "dep:aws-credential-types",
+    "dep:aws-config",
+    "dep:aws-smithy-http-client",
+    "dep:bytes",
+]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -62,9 +68,16 @@ typed-builder = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 # Optional AWS SigV4 signer for the AWS Iceberg REST endpoints. Pinned
 # to the same major as `aws-config 1.8.7` already in the workspace.
+# `default-features = false` on aws-config: its `default-https-client`
+# feature hardcodes the aws-lc rustls provider (aws-smithy-runtime
+# `default-https-client = ["aws-smithy-http-client/rustls-aws-lc"]`), which
+# drags aws-lc-sys and its C build into every SQE binary. sigv4.rs supplies
+# an explicit ring HTTPS client instead, the same way the Glue and S3
+# Tables crates do (SQE #133).
 aws-sigv4 = { version = "1", optional = true }
 aws-credential-types = { version = "1", optional = true }
-aws-config = { version = "1.8.7", optional = true }
+aws-config = { version = "1.8.7", default-features = false, features = ["rt-tokio", "credentials-process", "sso", "behavior-version-latest"], optional = true }
+aws-smithy-http-client = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 
 [dev-dependencies]

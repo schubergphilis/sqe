@@ -194,6 +194,11 @@ impl TrinoHttpClientBuilder {
                 source,
             }
         })?;
+        // reqwest is built with `rustls-no-provider` (no aws-lc C build) and
+        // panics at construction without a process default provider. This
+        // crate does not link sqe-core, whose pre-main install covers the
+        // rest of the workspace, so install ring here; a no-op if present.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let mut builder =
             reqwest::Client::builder().danger_accept_invalid_certs(self.accept_invalid_certs);
         if let Some(t) = self.timeout {

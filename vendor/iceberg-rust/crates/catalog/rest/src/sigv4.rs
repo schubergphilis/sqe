@@ -93,7 +93,19 @@ impl SigV4Signer {
         let provider = self
             .provider
             .get_or_try_init(|| async {
+                // SQE: supply an explicit rustls (ring) HTTPS client. The
+                // `aws-config` dependency has `default-https-client` off
+                // because that feature hardcodes the aws-lc provider (and
+                // its C build) into every binary; the credential chain
+                // still needs HTTP for IMDS, STS and SSO, so it gets the
+                // same ring client the vendored Glue/S3 Tables crates use.
+                let http_client = aws_smithy_http_client::Builder::new()
+                    .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+                        aws_smithy_http_client::tls::rustls_provider::CryptoMode::Ring,
+                    ))
+                    .build_https();
                 let conf = aws_config::defaults(aws_config::BehaviorVersion::v2026_01_12())
+                    .http_client(http_client)
                     .load()
                     .await;
                 conf.credentials_provider().ok_or_else(|| {

@@ -37,6 +37,18 @@ futures = { workspace = true }
 # via `workspace-hack`, so this adds no compile weight; it only lets the
 # coordinator and the worker share one implementation instead of three.
 tonic = { workspace = true }
-rustls = { version = "0.23", features = ["ring"] }
+# `default-features = false`: rustls's default set includes `aws_lc_rs` and
+# `prefer-post-quantum`, which compile aws-lc-sys (a C build) next to ring.
+# ring is the one provider SQE uses (`tls::ensure_crypto_provider`); with it
+# as the only provider feature in the graph, rustls also selects it
+# automatically for callers that never install one.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# Installs ring as the rustls process default before `main` (tls.rs). reqwest
+# 0.13 under `rustls-no-provider` panics at client construction when no
+# provider is installed, and clients are built in 25 places across a dozen
+# crates plus their tests; one pre-main install in the crate every one of
+# them links is the guarantee, the explicit `ensure_crypto_provider()` calls
+# in the binaries' `main` are the belt to this brace.
+ctor = "0.5"
 datafusion = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
