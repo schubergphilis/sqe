@@ -700,6 +700,8 @@ fn tools(config: &McpConfig) -> Vec<Value> {
         tool("describe_table", "Return columns for a table visible to the authenticated user.", three_string_schema(), true, false),
         tool("get_table_ddl", "Return SHOW CREATE TABLE output for a visible table.", three_string_schema(), true, false),
         tool("get_table_stats", "Return Iceberg table statistics visible to the authenticated user. Hive external tables have no snapshot statistics and return an error; use describe_table for them.", three_string_schema(), true, false),
+        tool("search_tables", "Find tables by name across the schemas of one catalog (SHOW SCHEMAS, then SHOW TABLES per schema, matched server-side). `pattern` is a SQL LIKE pattern (% and _ are wildcards; a bare word matches as a substring, case-insensitive). `catalog` defaults to the session's default catalog. Only tables visible to the authenticated user are returned.", json!({"type":"object","properties":{"pattern":{"type":"string"},"catalog":{"type":"string"}},"required":["pattern"],"additionalProperties":false}), true, false),
+        tool("sample_rows", "Return up to `limit` rows (default 10, at most 100) of a table, as the authenticated user: row filters and column masks apply. Prefer this over SELECT * for a first look at a table.", json!({"type":"object","properties":{"catalog":{"type":"string"},"schema":{"type":"string"},"table":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["catalog","schema","table"],"additionalProperties":false}), true, false),
         tool("explain_query", "Explain a read-only SQL query without allowing a write statement to be hidden behind EXPLAIN.", one_string_schema("sql"), true, false),
         tool("whoami", "Show the SQE identity, roles, groups, and OAuth scopes for this request; never returns tokens.", empty_schema(), true, false),
     ];
@@ -769,6 +771,13 @@ async fn call_tool(
         })));
     }
     let session_catalog = auth.session.default_catalog.as_deref();
+    if name == "search_tables" {
+        let session = auth
+            .session
+            .clone()
+            .with_source(Some(source_label(name, client)));
+        return search_tables(state, &session, &args).await.map(tool_success);
+    }
     let sql = match name {
         "execute_sql_readonly" => {
             let sql = required(&args, "sql")?;
@@ -792,6 +801,11 @@ async fn call_tool(
         "describe_table" => format!("SHOW COLUMNS FROM {}", table_ref(&args)?),
         "get_table_ddl" => format!("SHOW CREATE TABLE {}", table_ref(&args)?),
         "get_table_stats" => format!("SHOW STATS FOR {}", table_ref(&args)?),
+        "sample_rows" => format!(
+            "SELECT * FROM {} LIMIT {}",
+            table_ref(&args)?,
+            sample_limit(&args)?
+        ),
         "explain_query" => {
             let inner = required(&args, "sql")?;
             ensure_read_only(inner, session_catalog).map_err(|e| (-32602, e))?;
@@ -813,6 +827,152 @@ async fn call_tool(
         ))),
         Err(error) => Ok(tool_failure(error.to_string())),
     }
+}
+
+/// Most rows `sample_rows` returns, whatever the caller asks for.
+const SAMPLE_ROWS_MAX: u64 = 100;
+const SAMPLE_ROWS_DEFAULT: u64 = 10;
+
+/// `limit` for `sample_rows`: absent means the default, anything else is
+/// clamped to `1..=SAMPLE_ROWS_MAX`. Accepts a JSON number or a numeric
+/// string, since MCP clients differ on how they send integers.
+fn sample_limit(args: &Value) -> Result<u64, (i32, String)> {
+    let Some(value) = args.get("limit") else {
+        return Ok(SAMPLE_ROWS_DEFAULT);
+    };
+    let limit = match value {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse::<u64>().ok(),
+        Value::Null => Some(SAMPLE_ROWS_DEFAULT),
+        _ => None,
+    }
+    .ok_or_else(|| (-32602, "limit must be a positive integer".to_string()))?;
+    if limit == 0 {
+        return Err((-32602, "limit must be a positive integer".to_string()));
+    }
+    Ok(limit.min(SAMPLE_ROWS_MAX))
+}
+
+/// Most schemas `search_tables` walks in one catalog.
+const SEARCH_SCHEMAS_MAX: usize = 200;
+
+/// Case-insensitive SQL `LIKE`: `%` matches any run, `_` one character, and
+/// there is no escape. A pattern with neither wildcard matches as a
+/// substring, which is what a caller typing a word means.
+fn like_matches(pattern: &str, name: &str) -> bool {
+    fn go(p: &[char], s: &[char]) -> bool {
+        match p.split_first() {
+            None => s.is_empty(),
+            Some(('%', rest)) => (0..=s.len()).any(|i| go(rest, &s[i..])),
+            Some(('_', rest)) => !s.is_empty() && go(rest, &s[1..]),
+            Some((c, rest)) => s.first().is_some_and(|d| d == c) && go(rest, &s[1..]),
+        }
+    }
+    let pattern = pattern.to_lowercase();
+    let bare = !pattern.contains('%') && !pattern.contains('_');
+    let p: Vec<char> = if bare {
+        format!("%{pattern}%").chars().collect()
+    } else {
+        pattern.chars().collect()
+    };
+    let s: Vec<char> = name.to_lowercase().chars().collect();
+    go(&p, &s)
+}
+
+/// The first column of a `SHOW` result as strings, in row order.
+fn first_column_strings(batches: &[RecordBatch]) -> Vec<String> {
+    let mut out = Vec::new();
+    for batch in batches {
+        if batch.num_columns() == 0 {
+            continue;
+        }
+        let column = batch.column(0);
+        for row in 0..batch.num_rows() {
+            if let Some(value) =
+                sqe_trino_compat::types::arrow_value_to_json(column.as_ref(), row).as_str()
+            {
+                out.push(value.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// `search_tables`: walk `SHOW SCHEMAS` and `SHOW TABLES` for one catalog and
+/// match names in the server.
+///
+/// Not `information_schema.tables`: a catalog-qualified
+/// `<catalog>.information_schema.tables` is answered by DataFusion's built-in
+/// listing, which knows the system schemas and whatever Iceberg tables the
+/// session already loaded, and nothing else (measured against the Ranger
+/// stack: 40 `information_schema` / `runtime` rows, no `ac.orders`). The
+/// `SHOW` statements go to the catalog and through the same visibility
+/// filtering as every other metadata read, so a table the caller may not see
+/// is not in the answer. A schema the caller may not list is skipped, not an
+/// error: it is not theirs to know about.
+async fn search_tables(
+    state: &McpServerState,
+    session: &Session,
+    args: &Value,
+) -> Result<Value, (i32, String)> {
+    let pattern = required(args, "pattern")?;
+    let catalog = args
+        .get("catalog")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+        .or_else(|| session.default_catalog.clone())
+        .ok_or_else(|| {
+            (
+                -32602,
+                "search_tables needs a catalog: pass `catalog`, or configure mcp.default_catalog"
+                    .to_string(),
+            )
+        })?;
+    let schemas = state
+        .executor
+        .execute(session, &format!("SHOW SCHEMAS FROM {}", ident(&catalog)))
+        .await
+        .map_err(|e| (-32000, format!("listing schemas of {catalog}: {e}")))?;
+    let mut rows = Vec::new();
+    let mut total = 0usize;
+    for schema in first_column_strings(&schemas)
+        .into_iter()
+        .filter(|s| !s.eq_ignore_ascii_case("information_schema"))
+        .take(SEARCH_SCHEMAS_MAX)
+    {
+        let sql = format!("SHOW TABLES FROM {}.{}", ident(&catalog), ident(&schema));
+        let tables = match state.executor.execute(session, &sql).await {
+            Ok(batches) => first_column_strings(&batches),
+            Err(error) => {
+                tracing::debug!(%catalog, %schema, %error, "search_tables: schema skipped");
+                continue;
+            }
+        };
+        for table in tables.into_iter().filter(|t| like_matches(pattern, t)) {
+            total += 1;
+            if rows.len() < state.config.max_result_rows {
+                rows.push(json!({
+                    "table_catalog": catalog,
+                    "table_schema": schema,
+                    "table_name": table,
+                }));
+            }
+        }
+    }
+    let returned = rows.len();
+    Ok(json!({
+        "columns": [
+            {"name": "table_catalog", "type": "Utf8"},
+            {"name": "table_schema", "type": "Utf8"},
+            {"name": "table_name", "type": "Utf8"},
+        ],
+        "rows": rows,
+        "total_rows": total,
+        "returned_rows": returned,
+        "truncated": returned < total,
+    }))
 }
 
 fn required<'a>(args: &'a Value, name: &str) -> Result<&'a str, (i32, String)> {
@@ -1955,6 +2115,158 @@ mod tests {
         ensure_read_only("SELECT * FROM t FOR VERSION AS OF 5", None)
             .expect("SQE time-travel clause survives the pre-parse pipeline");
         assert!(ensure_read_only("SELEC 1", None).is_err());
+    }
+
+    #[test]
+    fn like_matching_is_case_insensitive_and_treats_a_bare_word_as_a_substring() {
+        assert!(like_matches("ORD", "orders"));
+        assert!(like_matches("orders", "ORDERS"));
+        assert!(!like_matches("orderz", "orders"));
+        // Explicit wildcards are the caller's own: anchored at both ends.
+        assert!(like_matches("ord%", "orders"));
+        assert!(!like_matches("rd%", "orders"));
+        assert!(like_matches("o_ders", "orders"));
+        assert!(!like_matches("o_ers", "orders"));
+        assert!(like_matches("%", ""));
+        // A quote is a character in the pattern, never syntax.
+        assert!(!like_matches("x' OR '1'='1", "orders"));
+    }
+
+    /// Answers `SHOW SCHEMAS` / `SHOW TABLES` from a fixed map, recording
+    /// every statement it was asked to run.
+    struct ScriptedExecutor {
+        answers: HashMap<&'static str, Vec<&'static str>>,
+        asked: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl QueryExecutor for ScriptedExecutor {
+        async fn execute(&self, _session: &Session, sql: &str) -> Result<Vec<RecordBatch>, SqeError> {
+            self.asked.lock().unwrap().push(sql.to_string());
+            let Some(values) = self.answers.get(sql) else {
+                return Err(SqeError::Auth(format!("not authorized: {sql}")));
+            };
+            let schema = Arc::new(Schema::new(vec![Field::new("Name", DataType::Utf8, true)]));
+            let column = StringArray::from(values.clone());
+            Ok(vec![RecordBatch::try_new(schema, vec![Arc::new(column)]).unwrap()])
+        }
+    }
+
+    #[tokio::test]
+    async fn search_tables_walks_show_statements_and_skips_unlistable_schemas() {
+        let executor = Arc::new(ScriptedExecutor {
+            answers: HashMap::from([
+                (
+                    "SHOW SCHEMAS FROM \"sales_wh\"",
+                    vec!["information_schema", "ac", "ops", "locked"],
+                ),
+                ("SHOW TABLES FROM \"sales_wh\".\"ac\"", vec!["orders", "customers"]),
+                ("SHOW TABLES FROM \"sales_wh\".\"ops\"", vec!["order_events", "audit"]),
+                // "locked" has no answer: the executor refuses it, as a catalog
+                // refuses a schema the caller may not list.
+            ]),
+            asked: Mutex::new(Vec::new()),
+        });
+        let mut config = static_config(false);
+        config.max_result_rows = 1;
+        let state = McpServerState::new(Arc::new(MockAuth), executor.clone(), config);
+        let session = local_session("mcp-reader".into(), vec![]);
+
+        let result = search_tables(
+            &state,
+            &session,
+            &json!({"pattern": "ord", "catalog": "sales_wh"}),
+        )
+        .await
+        .unwrap();
+        // Two matches across two schemas; the response cap keeps one and says so.
+        assert_eq!(result["total_rows"], 2);
+        assert_eq!(result["returned_rows"], 1);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["rows"][0]["table_schema"], "ac");
+        assert_eq!(result["rows"][0]["table_name"], "orders");
+        let asked = executor.asked.lock().unwrap().clone();
+        assert!(
+            !asked.iter().any(|s| s.contains("information_schema")),
+            "information_schema is not a schema to search: {asked:?}"
+        );
+        assert!(asked.iter().any(|s| s == "SHOW TABLES FROM \"sales_wh\".\"locked\""));
+
+        // No catalog anywhere: an argument error that says what to pass, and
+        // nothing runs.
+        let before = executor.asked.lock().unwrap().len();
+        let err = search_tables(&state, &session, &json!({"pattern": "x"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, -32602);
+        assert!(err.1.contains("needs a catalog"));
+        assert_eq!(executor.asked.lock().unwrap().len(), before);
+
+        // The session default catalog fills in.
+        let session = session.with_catalog(Some("sales_wh".into()));
+        let result = search_tables(&state, &session, &json!({"pattern": "%audit"}))
+            .await
+            .unwrap();
+        assert_eq!(result["rows"][0]["table_name"], "audit");
+    }
+
+    #[test]
+    fn sample_rows_limit_is_defaulted_and_capped() {
+        assert_eq!(sample_limit(&json!({})).unwrap(), SAMPLE_ROWS_DEFAULT);
+        assert_eq!(sample_limit(&json!({"limit": 25})).unwrap(), 25);
+        assert_eq!(sample_limit(&json!({"limit": "7"})).unwrap(), 7);
+        assert_eq!(sample_limit(&json!({"limit": 100000})).unwrap(), SAMPLE_ROWS_MAX);
+        assert!(sample_limit(&json!({"limit": 0})).is_err());
+        assert!(sample_limit(&json!({"limit": -3})).is_err());
+        assert!(sample_limit(&json!({"limit": "many"})).is_err());
+    }
+
+    #[tokio::test]
+    async fn discovery_tools_run_as_the_caller_with_the_generated_sql() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let app = router(McpServerState::new(
+            Arc::new(MockAuth),
+            executor.clone(),
+            static_config(false),
+        ));
+        let body = json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"sample_rows","arguments":{"catalog":"sales_wh","schema":"ac","table":"orders","limit":3}}
+        })
+        .to_string();
+        let response = send(&app, READ_TOKEN, &[], body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            executed(&executor).as_deref(),
+            Some("SELECT * FROM \"sales_wh\".\"ac\".\"orders\" LIMIT 3")
+        );
+        assert_eq!(
+            executor.1.lock().unwrap().clone().map(|(user, _)| user).as_deref(),
+            Some("mcp-reader"),
+            "the sample runs as the caller, so filters and masks apply"
+        );
+
+        // The writer principal defaults to catalog iceberg: search needs no
+        // catalog argument, and starts from that catalog's schemas.
+        let body = json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"search_tables","arguments":{"pattern":"ord"}}
+        })
+        .to_string();
+        send(&app, WRITE_TOKEN, &[], body).await;
+        assert_eq!(
+            executed(&executor).as_deref(),
+            Some("SHOW SCHEMAS FROM \"iceberg\"")
+        );
+        assert_eq!(
+            executor.2.lock().unwrap().as_deref(),
+            Some("mcp:search_tables"),
+            "the walk is attributed to the tool like any other call"
+        );
+        assert!(tools(&McpConfig::default())
+            .iter()
+            .filter(|t| t["name"] == "search_tables" || t["name"] == "sample_rows")
+            .all(|t| t["annotations"]["readOnlyHint"] == json!(true)));
     }
 
     #[tokio::test]

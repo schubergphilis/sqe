@@ -201,6 +201,12 @@ Read tools are always available after the `sqe:mcp:read` scope is validated:
 - `describe_table`
 - `get_table_ddl`
 - `get_table_stats`
+- `search_tables` (walks `SHOW SCHEMAS` and `SHOW TABLES` for one catalog and
+  matches a LIKE pattern server-side; a bare word is a case-insensitive
+  substring match; the catalog defaults to the session's; a schema the caller
+  may not list is skipped)
+- `sample_rows` (`SELECT * ... LIMIT n` as the caller, default 10, at most 100;
+  row filters and masks apply)
 - `explain_query`
 - `whoami` (identity metadata only; never tokens)
 
