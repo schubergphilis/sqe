@@ -59,6 +59,11 @@ pub enum WireDialect {
     Flight,
     /// `sqe-cli --embedded` and other in-process callers.
     Embedded,
+    /// The MCP endpoint (`/mcp`, Streamable HTTP). Classifies through this
+    /// door before the read-only / change gates so an agent's SQL is parsed
+    /// exactly as a Flight or Trino client's would be; the executor then runs
+    /// the engine's own door on the same text.
+    Mcp,
 }
 
 /// The one place SQL text is normalized before classification and planning.

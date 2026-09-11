@@ -77,6 +77,10 @@ pub struct McpServerState {
     /// leaves the audit label at the `User-Agent` fallback. Every other part
     /// of the server stays stateless.
     clients: Arc<ClientRegistry>,
+    /// `[[hive.roots]]` catalog names. A change statement targeting one of
+    /// these runs on the engine's storage credentials, not the caller's, so
+    /// it needs the catalog named in `write_catalogs` explicitly.
+    hive_roots: Arc<Vec<String>>,
 }
 
 /// What a client said about itself on `initialize`, bound to the identity that
@@ -182,6 +186,8 @@ struct StaticPrincipal {
     token: SecretString,
     user: String,
     roles: Vec<String>,
+    default_catalog: Option<String>,
+    default_schema: Option<String>,
 }
 
 impl StaticPrincipal {
@@ -191,6 +197,8 @@ impl StaticPrincipal {
                 token,
                 user: config.user.clone(),
                 roles: config.roles.clone(),
+                default_catalog: config.default_catalog.clone(),
+                default_schema: config.default_schema.clone(),
             }),
             Err(message) => {
                 tracing::error!(
@@ -226,6 +234,7 @@ impl McpServerState {
             config,
             principals,
             clients: Arc::new(ClientRegistry::default()),
+            hive_roots: Arc::new(Vec::new()),
         }
     }
 
@@ -233,6 +242,30 @@ impl McpServerState {
         self.auth_rate_limiter = Some(limiter);
         self
     }
+
+    /// The `[[hive.roots]]` catalog names; see `McpConfig::write_catalogs`.
+    pub fn with_hive_roots(mut self, roots: Vec<String>) -> Self {
+        self.hive_roots = Arc::new(roots);
+        self
+    }
+}
+
+/// Apply the endpoint-wide default catalog and schema, overridden per static
+/// principal. Set on the session, so the same defaults reach the engine's
+/// front door (`information_schema` qualification), name resolution, and the
+/// change tool's target check.
+fn with_defaults(
+    session: Session,
+    config: &McpConfig,
+    principal: Option<&StaticPrincipal>,
+) -> Session {
+    let catalog = principal
+        .and_then(|p| p.default_catalog.clone())
+        .or_else(|| config.default_catalog.clone());
+    let schema = principal
+        .and_then(|p| p.default_schema.clone())
+        .or_else(|| config.default_schema.clone());
+    session.with_catalog(catalog).with_schema(schema)
 }
 
 pub fn router(state: McpServerState) -> Router {
@@ -502,7 +535,11 @@ fn authenticate_static(
         ));
     };
     Ok(AuthContext {
-        session: local_session(principal.user.clone(), principal.roles.clone()),
+        session: with_defaults(
+            local_session(principal.user.clone(), principal.roles.clone()),
+            &state.config,
+            Some(principal),
+        ),
         scopes: None,
     })
 }
@@ -511,7 +548,11 @@ fn authenticate_static(
 fn authenticate_anonymous(state: &McpServerState) -> AuthContext {
     let anonymous = &state.config.auth.anonymous;
     AuthContext {
-        session: local_session(anonymous.user.clone(), anonymous.roles.clone()),
+        session: with_defaults(
+            local_session(anonymous.user.clone(), anonymous.roles.clone()),
+            &state.config,
+            None,
+        ),
         scopes: None,
     }
 }
@@ -575,7 +616,7 @@ async fn authenticate_oauth(
     }
     // Shared identity-to-session mapping (finding 204); the raw MCP bearer
     // is the catalog token when the provider vended none.
-    let session = identity.into_session(Some(token));
+    let session = with_defaults(identity.into_session(Some(token)), &state.config, None);
     Ok(AuthContext {
         session,
         scopes: Some(scopes),
@@ -658,12 +699,12 @@ fn tools(config: &McpConfig) -> Vec<Value> {
         tool("list_tables", "List tables visible to the authenticated user in a catalog and schema.", two_string_schema("catalog", "schema"), true, false),
         tool("describe_table", "Return columns for a table visible to the authenticated user.", three_string_schema(), true, false),
         tool("get_table_ddl", "Return SHOW CREATE TABLE output for a visible table.", three_string_schema(), true, false),
-        tool("get_table_stats", "Return Iceberg table statistics visible to the authenticated user.", three_string_schema(), true, false),
+        tool("get_table_stats", "Return Iceberg table statistics visible to the authenticated user. Hive external tables have no snapshot statistics and return an error; use describe_table for them.", three_string_schema(), true, false),
         tool("explain_query", "Explain a read-only SQL query without allowing a write statement to be hidden behind EXPLAIN.", one_string_schema("sql"), true, false),
         tool("whoami", "Show the SQE identity, roles, groups, and OAuth scopes for this request; never returns tokens.", empty_schema(), true, false),
     ];
     if config.allow_writes {
-        tools.push(tool("execute_sql_change", "Execute one change/write SQL statement. Requires the configured OAuth write scope and SQE writer role; source catalog and storage authorization still apply as the authenticated user.", one_string_schema("sql"), false, true));
+        tools.push(tool("execute_sql_change", "Execute one change/write SQL statement. Requires the configured OAuth write scope and SQE writer role; the target catalog must be one the operator allowed for MCP writes; source catalog and storage authorization still apply as the authenticated user.", one_string_schema("sql"), false, true));
     }
     tools
 }
@@ -727,16 +768,18 @@ async fn call_tool(
             "client": client,
         })));
     }
+    let session_catalog = auth.session.default_catalog.as_deref();
     let sql = match name {
         "execute_sql_readonly" => {
             let sql = required(&args, "sql")?;
-            ensure_read_only(sql).map_err(|e| (-32602, e))?;
+            ensure_read_only(sql, session_catalog).map_err(|e| (-32602, e))?;
             sql.to_string()
         }
         "execute_sql_change" => {
             authorize_write(state, auth)?;
             let sql = required(&args, "sql")?;
-            ensure_change(sql).map_err(|e| (-32602, e))?;
+            let kind = ensure_change(sql, session_catalog).map_err(|e| (-32602, e))?;
+            authorize_write_target(state, &auth.session, &kind)?;
             sql.to_string()
         }
         "list_catalogs" => "SHOW CATALOGS".to_string(),
@@ -751,7 +794,7 @@ async fn call_tool(
         "get_table_stats" => format!("SHOW STATS FOR {}", table_ref(&args)?),
         "explain_query" => {
             let inner = required(&args, "sql")?;
-            ensure_read_only(inner).map_err(|e| (-32602, e))?;
+            ensure_read_only(inner, session_catalog).map_err(|e| (-32602, e))?;
             format!("EXPLAIN {inner}")
         }
         _ => return Err((-32602, format!("Unknown tool: {name}"))),
@@ -791,11 +834,23 @@ fn table_ref(args: &Value) -> Result<String, (i32, String)> {
     ))
 }
 
-fn classify(sql: &str) -> Result<StatementKind, String> {
+/// Classify through the same chain the engine uses (finding 700): the
+/// pre-parse pipeline strips the SQE clauses sqlparser cannot see, the front
+/// door parses once with the source-level fallbacks and AST rewrites, and the
+/// classifier reads that AST. The `session_catalog` lets a two-part
+/// `information_schema.<table>` resolve the way it will at execution. The
+/// ORIGINAL text is what the executor gets: the engine runs its own door on it,
+/// and the pre-parse pipeline's output is classification input, not SQL to run
+/// (it has the time-travel clauses stripped).
+fn classify(sql: &str, session_catalog: Option<&str>) -> Result<StatementKind, String> {
     ensure_single_statement(sql)?;
-    let normalized =
+    let classifiable =
         sqe_sql::pre_parse_pipeline(&sqe_sql::UserSql::from(sql)).map_err(|e| e.to_string())?;
-    sqe_sql::parse_and_classify_typed(&normalized).map_err(|e| e.to_string())
+    let normalized = sqe_sql::SqlFrontDoor::new(sqe_sql::WireDialect::Mcp)
+        .with_session_catalog(session_catalog)
+        .normalize(classifiable.as_str())
+        .map_err(|e| e.to_string())?;
+    sqe_sql::classify_normalized(normalized).map_err(|e| e.to_string())
 }
 
 fn ensure_single_statement(sql: &str) -> Result<(), String> {
@@ -817,9 +872,8 @@ fn ensure_single_statement(sql: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn ensure_read_only(sql: &str) -> Result<(), String> {
-    let kind = classify(sql)?;
-    let allowed = matches!(
+fn is_read_only(kind: &StatementKind) -> bool {
+    matches!(
         kind,
         StatementKind::Query(_)
             | StatementKind::ShowCatalogs
@@ -834,21 +888,223 @@ fn ensure_read_only(sql: &str) -> Result<(), String> {
             | StatementKind::ShowCreateSchema(_)
             | StatementKind::ShowStats(_)
             | StatementKind::ShowPartitions(_)
-    );
-    if allowed {
-        Ok(())
+    )
+}
+
+/// Classify and require a read-only kind; returns the kind for the caller.
+fn ensure_read_only(sql: &str, session_catalog: Option<&str>) -> Result<StatementKind, String> {
+    let kind = classify(sql, session_catalog)?;
+    if is_read_only(&kind) {
+        Ok(kind)
     } else {
         Err(format!("Read-only tool rejected {} statement", kind.name()))
     }
 }
 
-fn ensure_change(sql: &str) -> Result<(), String> {
-    let kind = classify(sql)?;
-    if ensure_read_only(sql).is_ok() {
+/// Classify and require a change kind; returns the kind so the target gate
+/// can inspect it without parsing twice.
+fn ensure_change(sql: &str, session_catalog: Option<&str>) -> Result<StatementKind, String> {
+    let kind = classify(sql, session_catalog)?;
+    if is_read_only(&kind) {
         return Err(format!(
             "Use a read-only tool for {} statements",
             kind.name()
         ));
+    }
+    Ok(kind)
+}
+
+/// Where a change statement writes, as the parser sees it.
+enum WriteTarget {
+    /// `[catalog.][schema.]table`
+    Table(Vec<String>),
+    /// `[catalog.]schema`
+    Schema(Vec<String>),
+}
+
+fn name_parts(name: &sqlparser::ast::ObjectName) -> Vec<String> {
+    name.0
+        .iter()
+        .map(|part| {
+            part.as_ident()
+                .map(|ident| ident.value.clone())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn relation_name(factor: &sqlparser::ast::TableFactor) -> Option<Vec<String>> {
+    match factor {
+        sqlparser::ast::TableFactor::Table { name, .. } => Some(name_parts(name)),
+        _ => None,
+    }
+}
+
+/// The objects a change statement writes to. `None` when the statement kind
+/// has no table target the parser exposes (procedures, grants, session
+/// statements, policy DDL): the gate then fails closed rather than guessing.
+/// Sources (`INSERT ... SELECT FROM other.t`) are reads and are not targets;
+/// policy enforcement covers them.
+fn write_targets(kind: &StatementKind) -> Option<Vec<WriteTarget>> {
+    use sqlparser::ast::{FromTable, ObjectType, SchemaName, Statement, TableObject};
+    let table = |parts: Vec<String>| WriteTarget::Table(parts);
+    let targets = match kind {
+        StatementKind::Insert(stmt) => match stmt.as_ref() {
+            Statement::Insert(insert) => match &insert.table {
+                TableObject::TableName(name) => vec![table(name_parts(name))],
+                _ => return None,
+            },
+            _ => return None,
+        },
+        StatementKind::Ctas(stmt) | StatementKind::CreateTable(stmt) => match stmt.as_ref() {
+            Statement::CreateTable(create) => vec![table(name_parts(&create.name))],
+            _ => return None,
+        },
+        StatementKind::CreateExternalTable(spec) => {
+            let mut parts = Vec::new();
+            if let Some(catalog) = &spec.catalog {
+                parts.push(catalog.clone());
+            }
+            if let Some(database) = &spec.database {
+                parts.push(database.clone());
+            } else if spec.catalog.is_some() {
+                // A catalog without a database cannot resolve as three parts.
+                return None;
+            }
+            parts.push(spec.name.clone());
+            vec![table(parts)]
+        }
+        StatementKind::Merge(stmt) => match stmt.as_ref() {
+            Statement::Merge(merge) => vec![table(relation_name(&merge.table)?)],
+            _ => return None,
+        },
+        StatementKind::Delete(stmt) => match stmt.as_ref() {
+            Statement::Delete(delete) => {
+                if !delete.tables.is_empty() {
+                    delete.tables.iter().map(|n| table(name_parts(n))).collect()
+                } else {
+                    let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) =
+                        &delete.from;
+                    from.iter()
+                        .map(|twj| relation_name(&twj.relation).map(table))
+                        .collect::<Option<Vec<_>>>()?
+                }
+            }
+            _ => return None,
+        },
+        StatementKind::Update(stmt) => match stmt.as_ref() {
+            Statement::Update(update) => vec![table(relation_name(&update.table.relation)?)],
+            _ => return None,
+        },
+        StatementKind::Drop(stmt) | StatementKind::DropView(stmt) | StatementKind::DropSchema(stmt) => {
+            match stmt.as_ref() {
+                Statement::Drop {
+                    object_type: ObjectType::Schema,
+                    names,
+                    ..
+                } => names.iter().map(|n| WriteTarget::Schema(name_parts(n))).collect(),
+                Statement::Drop { names, .. } => names.iter().map(|n| table(name_parts(n))).collect(),
+                _ => return None,
+            }
+        }
+        StatementKind::Rename(stmt) | StatementKind::AlterTableProps(stmt) => match stmt.as_ref() {
+            Statement::AlterTable(alter) => vec![table(name_parts(&alter.name))],
+            _ => return None,
+        },
+        StatementKind::CreateView(stmt) => match stmt.as_ref() {
+            Statement::CreateView(view) => vec![table(name_parts(&view.name))],
+            _ => return None,
+        },
+        StatementKind::CreateSchema(stmt) => match stmt.as_ref() {
+            Statement::CreateSchema { schema_name, .. } => match schema_name {
+                SchemaName::Simple(name) | SchemaName::NamedAuthorization(name, _) => {
+                    vec![WriteTarget::Schema(name_parts(name))]
+                }
+                SchemaName::UnnamedAuthorization(_) => return None,
+            },
+            _ => return None,
+        },
+        StatementKind::Comment(stmt) => match stmt.as_ref() {
+            Statement::Comment { object_name, .. } => vec![table(name_parts(object_name))],
+            _ => return None,
+        },
+        StatementKind::Truncate(name) => {
+            vec![table(name.split('.').map(|p| p.trim_matches('"').to_string()).collect())]
+        }
+        _ => return None,
+    };
+    Some(targets)
+}
+
+/// The catalog a target resolves to, given the session default.
+fn target_catalog(target: &WriteTarget, default_catalog: Option<&str>) -> Option<String> {
+    let (parts, qualified_len) = match target {
+        WriteTarget::Table(parts) => (parts, 3),
+        WriteTarget::Schema(parts) => (parts, 2),
+    };
+    if parts.iter().any(String::is_empty) {
+        return None;
+    }
+    if parts.len() >= qualified_len {
+        parts.first().cloned()
+    } else {
+        default_catalog.map(str::to_string)
+    }
+}
+
+/// The catalog gate for the change tool. Inactive when nothing is configured
+/// to gate on; otherwise every target must resolve to a catalog that passes:
+/// a Hive root must be named in `write_catalogs` (the write runs on the
+/// engine's credentials), and any catalog must be named when the list is
+/// non-empty. Unresolvable targets fail closed.
+fn authorize_write_target(
+    state: &McpServerState,
+    session: &Session,
+    kind: &StatementKind,
+) -> Result<(), (i32, String)> {
+    let allow = &state.config.write_catalogs;
+    let hive = &state.hive_roots;
+    if allow.is_empty() && hive.is_empty() {
+        return Ok(());
+    }
+    let listed = |catalog: &str| allow.iter().any(|c| c.eq_ignore_ascii_case(catalog));
+    let is_hive = |catalog: &str| hive.iter().any(|c| c.eq_ignore_ascii_case(catalog));
+    let targets = write_targets(kind).ok_or_else(|| {
+        (
+            -32003,
+            format!(
+                "The MCP change tool cannot determine the target catalog of a {} statement, and \
+                 mcp.write_catalogs or [[hive.roots]] are configured; only statements with a \
+                 table or schema target are allowed here",
+                kind.name()
+            ),
+        )
+    })?;
+    for target in &targets {
+        let catalog = target_catalog(target, session.default_catalog.as_deref()).ok_or_else(|| {
+            (
+                -32003,
+                "Qualify the target with its catalog: this session has no default catalog and \
+                 mcp.write_catalogs or [[hive.roots]] are configured"
+                    .to_string(),
+            )
+        })?;
+        if is_hive(&catalog) && !listed(&catalog) {
+            return Err((
+                -32003,
+                format!(
+                    "Catalog '{catalog}' is a Hive root: MCP change statements there run on the \
+                     engine's storage credentials, not yours, and need the catalog named in \
+                     mcp.write_catalogs"
+                ),
+            ));
+        }
+        if !allow.is_empty() && !listed(&catalog) {
+            return Err((
+                -32003,
+                format!("Catalog '{catalog}' is not in mcp.write_catalogs"),
+            ));
+        }
     }
     Ok(())
 }
@@ -981,12 +1237,15 @@ mod tests {
         }
     }
 
-    /// Records, per call: the catalog token, `(username, roles)`, and the
-    /// `Session.source` label the tool call stamped.
+    /// Records, per call: the catalog token, `(username, roles)`, the
+    /// `Session.source` label the tool call stamped, the session's
+    /// `(default_catalog, default_schema)`, and the SQL text handed over.
     #[derive(Default)]
     struct RecordingExecutor(
         Mutex<Option<String>>,
         Mutex<Option<(String, Vec<String>)>>,
+        Mutex<Option<String>>,
+        Mutex<Option<(Option<String>, Option<String>)>>,
         Mutex<Option<String>>,
     );
 
@@ -995,7 +1254,7 @@ mod tests {
         async fn execute(
             &self,
             session: &Session,
-            _sql: &str,
+            sql: &str,
         ) -> Result<Vec<RecordBatch>, SqeError> {
             *self.0.lock().unwrap() = Some(session.access_token().expose().to_string());
             *self.1.lock().unwrap() = Some((
@@ -1003,6 +1262,11 @@ mod tests {
                 session.user.roles.clone(),
             ));
             *self.2.lock().unwrap() = session.source.clone();
+            *self.3.lock().unwrap() = Some((
+                session.default_catalog.clone(),
+                session.default_schema.clone(),
+            ));
+            *self.4.lock().unwrap() = Some(sql.to_string());
             Ok(vec![])
         }
     }
@@ -1030,7 +1294,7 @@ mod tests {
             "SHOW CATALOGS",
             "SHOW STATS FOR iceberg.ns.t",
         ] {
-            ensure_read_only(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            ensure_read_only(sql, None).unwrap_or_else(|e| panic!("{sql}: {e}"));
         }
         for sql in [
             "INSERT INTO t VALUES (1)",
@@ -1039,14 +1303,14 @@ mod tests {
             "DROP TABLE t",
             "CALL system.rewrite_data_files(table => 'ns.t')",
         ] {
-            assert!(ensure_read_only(sql).is_err(), "must reject: {sql}");
+            assert!(ensure_read_only(sql, None).is_err(), "must reject: {sql}");
         }
     }
 
     #[test]
     fn rejects_multiple_statements_but_not_semicolon_in_literal() {
-        assert!(ensure_read_only("SELECT 1; DROP TABLE t").is_err());
-        assert!(ensure_read_only("SELECT ';' AS value;").is_ok());
+        assert!(ensure_read_only("SELECT 1; DROP TABLE t", None).is_err());
+        assert!(ensure_read_only("SELECT ';' AS value;", None).is_ok());
     }
 
     #[test]
@@ -1199,12 +1463,16 @@ mod tests {
                         roles: vec!["reader".to_string()],
                         token_env: String::new(),
                         token_b64: b64(READ_TOKEN),
+                        default_catalog: None,
+                        default_schema: None,
                     },
                     McpPrincipalConfig {
                         user: "mcp-writer".to_string(),
                         roles: vec!["data_writer".to_string()],
                         token_env: String::new(),
                         token_b64: b64(WRITE_TOKEN),
+                        default_catalog: Some("iceberg".to_string()),
+                        default_schema: Some("ns".to_string()),
                     },
                 ],
                 ..Default::default()
@@ -1480,6 +1748,213 @@ mod tests {
         assert_eq!(keys[2].1, "no-bearer");
         // The key is a fingerprint: the limiter never sees the token itself.
         assert!(keys.iter().all(|(_, key)| !key.contains(READ_TOKEN) && !key.contains(WRITE_TOKEN)));
+    }
+
+    fn change_call(sql: &str) -> String {
+        json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"tools/call",
+            "params":{"name":"execute_sql_change","arguments":{"sql":sql}}
+        })
+        .to_string()
+    }
+
+    /// One change-tool call against a fresh server: the JSON-RPC body and
+    /// the executor, so a test can assert both the refusal and that nothing
+    /// reached the engine.
+    async fn change(
+        config: McpConfig,
+        hive_roots: &[&str],
+        token: &str,
+        sql: &str,
+    ) -> (Value, Arc<RecordingExecutor>) {
+        let executor = Arc::new(RecordingExecutor::default());
+        let app = router(
+            McpServerState::new(Arc::new(MockAuth), executor.clone(), config)
+                .with_hive_roots(hive_roots.iter().map(|s| s.to_string()).collect()),
+        );
+        let response = send(&app, token, &[], change_call(sql)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (serde_json::from_slice(&bytes).unwrap(), executor)
+    }
+
+    fn executed(executor: &RecordingExecutor) -> Option<String> {
+        executor.4.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn change_tool_refuses_a_catalog_outside_write_catalogs() {
+        let mut config = static_config(true);
+        config.write_catalogs = vec!["Iceberg".to_string()];
+
+        let (body, executor) =
+            change(config.clone(), &[], WRITE_TOKEN, "INSERT INTO iceberg.ns.t VALUES (1)").await;
+        assert!(body.get("error").is_none(), "{body}");
+        assert!(executed(&executor).is_some());
+
+        let (body, executor) =
+            change(config.clone(), &[], WRITE_TOKEN, "INSERT INTO other.ns.t VALUES (1)").await;
+        assert_eq!(body["error"]["code"], -32003, "{body}");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not in mcp.write_catalogs"));
+        assert!(executed(&executor).is_none(), "refused statements never reach the engine");
+
+        // The writer principal's default catalog is iceberg, so an unqualified
+        // target resolves there and passes.
+        let (body, executor) = change(config, &[], WRITE_TOKEN, "INSERT INTO t VALUES (1)").await;
+        assert!(body.get("error").is_none(), "{body}");
+        assert!(executed(&executor).is_some());
+    }
+
+    #[tokio::test]
+    async fn hive_roots_need_an_explicit_write_catalogs_entry() {
+        // No allowlist at all: Iceberg writes pass as before, the Hive root
+        // does not, because that write would run on the engine's credentials.
+        let config = static_config(true);
+        let (body, executor) =
+            change(config.clone(), &["lake"], WRITE_TOKEN, "INSERT INTO lake.db.t VALUES (1)").await;
+        assert_eq!(body["error"]["code"], -32003, "{body}");
+        assert!(body["error"]["message"].as_str().unwrap().contains("Hive root"));
+        assert!(executed(&executor).is_none());
+
+        let (body, _) =
+            change(config.clone(), &["lake"], WRITE_TOKEN, "INSERT INTO iceberg.ns.t VALUES (1)").await;
+        assert!(body.get("error").is_none(), "{body}");
+
+        // Naming the root is the opt-in.
+        let mut opted_in = static_config(true);
+        opted_in.write_catalogs = vec!["lake".to_string()];
+        let (body, executor) =
+            change(opted_in, &["lake"], WRITE_TOKEN, "INSERT INTO lake.db.t VALUES (1)").await;
+        assert!(body.get("error").is_none(), "{body}");
+        assert!(executed(&executor).is_some());
+    }
+
+    #[tokio::test]
+    async fn change_tool_fails_closed_on_statements_without_a_table_target() {
+        let mut config = static_config(true);
+        config.write_catalogs = vec!["iceberg".to_string()];
+        let (body, executor) = change(
+            config,
+            &[],
+            WRITE_TOKEN,
+            "CALL system.rewrite_data_files(table => 'ns.t')",
+        )
+        .await;
+        assert_eq!(body["error"]["code"], -32003, "{body}");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot determine the target catalog"));
+        assert!(executed(&executor).is_none());
+
+        // With nothing configured to gate on, the same call is unchanged.
+        let (body, executor) = change(
+            static_config(true),
+            &[],
+            WRITE_TOKEN,
+            "CALL system.rewrite_data_files(table => 'ns.t')",
+        )
+        .await;
+        assert!(body.get("error").is_none(), "{body}");
+        assert!(executed(&executor).is_some());
+    }
+
+    #[tokio::test]
+    async fn unqualified_target_without_a_default_catalog_is_refused_while_gated() {
+        let mut config = static_config(true);
+        config.write_catalogs = vec!["iceberg".to_string()];
+        // The writer principal carries defaults; strip them so resolution
+        // has nothing to fall back on.
+        for principal in &mut config.auth.principals {
+            principal.default_catalog = None;
+            principal.default_schema = None;
+        }
+        let (body, executor) = change(config, &[], WRITE_TOKEN, "INSERT INTO t VALUES (1)").await;
+        assert_eq!(body["error"]["code"], -32003, "{body}");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Qualify the target"));
+        assert!(executed(&executor).is_none());
+    }
+
+    #[test]
+    fn write_targets_resolve_the_catalog_of_each_change_kind() {
+        let catalog_of = |sql: &str| {
+            let kind = classify(sql, Some("dflt")).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let targets = write_targets(&kind).unwrap_or_else(|| panic!("{sql}: no targets"));
+            targets
+                .iter()
+                .map(|t| target_catalog(t, Some("dflt")).unwrap_or_else(|| panic!("{sql}: unresolved")))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(catalog_of("INSERT INTO a.b.t VALUES (1)"), ["a"]);
+        assert_eq!(catalog_of("INSERT INTO b.t VALUES (1)"), ["dflt"]);
+        assert_eq!(catalog_of("UPDATE a.b.t SET x = 1"), ["a"]);
+        assert_eq!(catalog_of("DELETE FROM a.b.t WHERE x = 1"), ["a"]);
+        assert_eq!(
+            catalog_of("MERGE INTO a.b.t USING a.b.s ON t.id = s.id WHEN MATCHED THEN DELETE"),
+            ["a"]
+        );
+        assert_eq!(catalog_of("CREATE TABLE a.b.t (x INT)"), ["a"]);
+        // The source is a read, not a target: only the created table counts.
+        assert_eq!(
+            catalog_of("CREATE TABLE a.b.t AS SELECT * FROM other.c.d"),
+            ["a"]
+        );
+        assert_eq!(catalog_of("DROP TABLE a.b.t"), ["a"]);
+        assert_eq!(catalog_of("DROP SCHEMA a.b"), ["a"]);
+        assert_eq!(catalog_of("CREATE SCHEMA b"), ["dflt"]);
+        assert_eq!(catalog_of("ALTER TABLE a.b.t RENAME TO u"), ["a"]);
+        assert_eq!(catalog_of("TRUNCATE TABLE a.b.t"), ["a"]);
+
+        let call = classify("CALL system.rewrite_data_files(table => 'ns.t')", None).unwrap();
+        assert!(write_targets(&call).is_none(), "procedures have no parser-visible target");
+    }
+
+    #[tokio::test]
+    async fn session_defaults_come_from_the_principal_then_the_endpoint() {
+        let mut config = static_config(true);
+        config.default_catalog = Some("warehouse".to_string());
+        config.default_schema = Some("public".to_string());
+        let executor = Arc::new(RecordingExecutor::default());
+        let app = router(McpServerState::new(
+            Arc::new(MockAuth),
+            executor.clone(),
+            config,
+        ));
+
+        send(&app, READ_TOKEN, &[], tool_call("execute_sql_readonly")).await;
+        assert_eq!(
+            executor.3.lock().unwrap().clone(),
+            Some((Some("warehouse".to_string()), Some("public".to_string())))
+        );
+
+        // The writer principal declares its own defaults, which win.
+        send(&app, WRITE_TOKEN, &[], tool_call("execute_sql_readonly")).await;
+        assert_eq!(
+            executor.3.lock().unwrap().clone(),
+            Some((Some("iceberg".to_string()), Some("ns".to_string())))
+        );
+    }
+
+    #[test]
+    fn classification_goes_through_the_engine_front_door() {
+        // The door accepts what the engine accepts; the original text is what
+        // the executor receives, so nothing here re-serializes.
+        ensure_read_only("SELECT * FROM information_schema.tables", Some("iceberg"))
+            .expect("information_schema with a session catalog");
+        ensure_read_only("SELECT 1 + 1", None).expect("anonymous column");
+        ensure_read_only("SELECT * FROM t FOR VERSION AS OF 5", None)
+            .expect("SQE time-travel clause survives the pre-parse pipeline");
+        assert!(ensure_read_only("SELEC 1", None).is_err());
     }
 
     #[tokio::test]
