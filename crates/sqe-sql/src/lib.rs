@@ -32,7 +32,7 @@ pub use attach::{
 pub use bare_table::rewrite_bare_table;
 pub use catalog_qualifiers::{
     extract_catalog_qualifiers, extract_catalog_qualifiers_from_sql,
-    extract_schema_qualifiers_from_sql,
+    extract_schema_qualifiers_from_sql, pinned_table_schema_from_sql,
 };
 pub use classifier::{
     parse_and_classify, parse_and_classify_typed, CheckAccessParams, ShowEffectivePolicyParams,
