@@ -297,6 +297,23 @@ All notable changes to SQE are documented in this file.
 
 ### Bug Fixes
 
+- S3 spill store: quota reserved atomically per writer, one PUT per segment (#382)
+
+    `reserve_quota` read the counters and the `fetch_add` happened in
+    `finish`, so N concurrent writers all passed a stale check and could
+    overshoot `max_bytes` / `max_objects` by N segments. The reservation is
+    now a compare-and-swap in `create_writer`, held by the writer, refunded
+    when the writer aborts or is dropped, and reconciled to the bytes
+    actually written in `finish`. `finish` also PUT the whole body twice
+    (a `.partial` staging copy, then the final key) and issued a DELETE, for
+    no atomicity gain: S3 PUT is atomic. It now PUTs the final key once with
+    the segment's lifecycle tags. `S3SegmentStore::from_config` warns at
+    startup that orphan reaping depends on a bucket lifecycle rule for
+    `sqe-spill=true` that SQE does not create, and that the bucket must be
+    dedicated to spill. Still open on #382: cross-checking the spill bucket
+    against the warehouse, a streaming read path, and counters that survive
+    a restart.
+
 - Dashboard: bearer tokens pass the pre-auth rate limiter before validation (#562)
 
     The operator dashboard's `require_admin_bearer` guard was the one bearer
