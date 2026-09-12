@@ -3788,6 +3788,48 @@ impl QueryHandler {
             }
         }
 
+        // #664: a statement that reads `information_schema` is answered by
+        // DataFusion's built-in provider, which enumerates EVERY catalog
+        // through the same synchronous hooks. It names no namespace, so the
+        // loop above filled nothing, and a namespace this session had not
+        // touched listed no tables (the MCP `search_tables` probe saw 40
+        // rows, all `information_schema` and `runtime`, and no `ac.orders`).
+        // Hive already refreshes every database for such a statement
+        // (`refresh_referenced` below); do the same for the Iceberg catalogs.
+        // A `WHERE table_schema = '<ns>'` conjunct (dbt's
+        // `get_columns_in_relation`, `SHOW COLUMNS`, `DESCRIBE`) pins the
+        // rows to one namespace, so only that one is refreshed, in the
+        // catalogs the statement qualifies; the rows of every other namespace
+        // would be filtered out anyway.
+        let info_schema_catalogs: Vec<&String> = referenced
+            .iter()
+            .filter(|(_, s)| s.eq_ignore_ascii_case("information_schema"))
+            .map(|(c, _)| c)
+            .collect();
+        if !info_schema_catalogs.is_empty() {
+            let pinned = sqe_sql::pinned_table_schema_from_sql(sql);
+            for name in ctx.catalog_names() {
+                let Some(provider) = ctx.catalog(&name) else {
+                    continue;
+                };
+                let any: &dyn std::any::Any = provider.as_ref();
+                let Some(sqe) =
+                    any.downcast_ref::<sqe_catalog::catalog_provider::SqeCatalogProvider>()
+                else {
+                    continue;
+                };
+                match &pinned {
+                    Some(ns) if info_schema_catalogs.iter().any(|c| **c == name) => {
+                        if let Err(e) = sqe.refresh_namespace(ns).await {
+                            debug!(catalog = %name, schema = %ns, error = %e, "pinned namespace refresh failed before an information_schema read");
+                        }
+                    }
+                    Some(_) => {}
+                    None => sqe.refresh_all_namespaces().await,
+                }
+            }
+        }
+
         let Ok(roots) = self.runtime_catalogs.hive_roots() else {
             return;
         };

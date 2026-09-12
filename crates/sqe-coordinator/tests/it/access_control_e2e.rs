@@ -2657,6 +2657,63 @@ async fn one_table_grant_writes_the_namespace_it_needs() {
         .await;
 }
 
+/// Issue #664: `information_schema.tables` lists a namespace the session has
+/// never named. DataFusion's built-in provider answers every
+/// `information_schema` reference and enumerates through the synchronous
+/// snapshot hooks; before the fix only the namespaces a statement referenced
+/// were refreshed, so a fresh session saw 40 rows of `information_schema` and
+/// `runtime` entries and no `ac.orders` (the MCP `search_tables` probe that
+/// filed the issue). Snapshots are keyed by the bearer's fingerprint and
+/// `ranger_session` logs in anew, so a second carol session is cold by
+/// construction: nothing an earlier test did can warm it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:ranger; run scripts/access-control-test.sh"]
+async fn information_schema_lists_a_namespace_a_fresh_session_never_named() {
+    ac_gate!();
+    let _guard = crate::common::serial().lock().await;
+    let ctx = ac_setup().await;
+
+    // Pinned: `table_schema = 'ac'` refreshes exactly that namespace.
+    let fresh = crate::common::ranger_session("carol").await;
+    let pinned = col_strings(
+        &exec_ok(
+            &ctx,
+            &fresh,
+            "SELECT table_name FROM sales_wh.information_schema.tables \
+             WHERE table_schema = 'ac' AND table_name = 'orders'",
+        )
+        .await,
+        "table_name",
+    );
+    assert_eq!(
+        pinned,
+        vec!["orders".to_string()],
+        "pinned information_schema read"
+    );
+
+    // Unpinned: every namespace of the catalog is refreshed. A third fresh
+    // session, so the pinned read above cannot have warmed it.
+    let fresh = crate::common::ranger_session("carol").await;
+    let batches = exec_ok(
+        &ctx,
+        &fresh,
+        "SELECT table_schema, table_name FROM sales_wh.information_schema.tables \
+         WHERE table_catalog = 'sales_wh'",
+    )
+    .await;
+    let schemas = col_strings(&batches, "table_schema");
+    let names = col_strings(&batches, "table_name");
+    let listed: Vec<(&str, &str)> = schemas
+        .iter()
+        .zip(names.iter())
+        .map(|(s, n)| (s.as_str(), n.as_str()))
+        .collect();
+    assert!(
+        listed.contains(&("ac", "orders")),
+        "unpinned information_schema read must list ac.orders; got {listed:?}"
+    );
+}
+
 /// `SHOW SCHEMAS FROM <catalog>` must describe the catalog it names.
 ///
 /// It did not. The resolver asked whether the named catalog differed from

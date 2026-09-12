@@ -131,6 +131,130 @@ impl Visitor for CatalogQualifierCollector {
     }
 }
 
+/// The namespace an `information_schema` read pins, when the statement is a
+/// single SELECT whose WHERE clause has a top-level conjunct of exactly
+/// `table_schema = '<literal>'` (either operand order, optionally qualified
+/// as `t.table_schema`). Every other shape, including a `table_schema`
+/// comparison nested under OR, returns `None`, and the caller refreshes every
+/// namespace: a wider refresh is never wrong, only slower.
+///
+/// Used by the coordinator's pre-plan step (issue #664) so `SHOW COLUMNS`,
+/// `DESCRIBE` and dbt's `get_columns_in_relation` refresh one namespace's
+/// table snapshot instead of the whole catalog's.
+pub fn pinned_table_schema_from_sql(sql: &str) -> Option<String> {
+    use sqlparser::ast::{BinaryOperator, Expr, SetExpr, Value};
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    fn conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+        match expr {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                conjuncts(left, out);
+                conjuncts(right, out);
+            }
+            Expr::Nested(inner) => conjuncts(inner, out),
+            other => out.push(other),
+        }
+    }
+
+    fn is_table_schema(expr: &Expr) -> bool {
+        match expr {
+            Expr::Identifier(id) => id.value.eq_ignore_ascii_case("table_schema"),
+            Expr::CompoundIdentifier(parts) => parts
+                .last()
+                .is_some_and(|id| id.value.eq_ignore_ascii_case("table_schema")),
+            _ => false,
+        }
+    }
+
+    fn string_literal(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Value(v) => match &v.value {
+                Value::SingleQuotedString(s) => Some(s.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    let statements = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let selection = select.selection.as_ref()?;
+    let mut parts = Vec::new();
+    conjuncts(selection, &mut parts);
+    parts.into_iter().find_map(|c| match c {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            if is_table_schema(left) {
+                string_literal(right)
+            } else if is_table_schema(right) {
+                string_literal(left)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    })
+}
+
+#[cfg(test)]
+mod pinned_table_schema_tests {
+    use super::pinned_table_schema_from_sql;
+
+    #[test]
+    fn a_top_level_equality_pins_the_namespace() {
+        assert_eq!(
+            pinned_table_schema_from_sql(
+                "SELECT column_name FROM \"cat\".information_schema.columns \
+                 WHERE table_schema = 'sales' AND table_name = 'orders'"
+            ),
+            Some("sales".to_string())
+        );
+        assert_eq!(
+            pinned_table_schema_from_sql(
+                "SELECT * FROM information_schema.tables WHERE 'hr' = c.table_schema"
+            ),
+            Some("hr".to_string())
+        );
+        assert_eq!(
+            pinned_table_schema_from_sql(
+                "SELECT * FROM information_schema.tables \
+                 WHERE (table_catalog = 'c' AND (table_schema = 'x'))"
+            ),
+            Some("x".to_string())
+        );
+    }
+
+    #[test]
+    fn anything_wider_than_one_namespace_does_not_pin() {
+        for sql in [
+            "SELECT * FROM information_schema.tables",
+            "SELECT * FROM information_schema.tables WHERE table_name = 'orders'",
+            "SELECT * FROM information_schema.tables \
+             WHERE table_schema = 'a' OR table_schema = 'b'",
+            "SELECT * FROM information_schema.tables WHERE table_schema LIKE 'a%'",
+            "SELECT * FROM information_schema.tables WHERE table_schema = table_name",
+            "SELECT * FROM information_schema.tables WHERE table_schema <> 'a'",
+            "SELECT 1; SELECT * FROM information_schema.tables WHERE table_schema = 'a'",
+            "not sql at all",
+        ] {
+            assert_eq!(pinned_table_schema_from_sql(sql), None, "{sql}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

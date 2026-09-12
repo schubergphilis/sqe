@@ -253,6 +253,27 @@ All notable changes to SQE are documented in this file.
 
 ### Bug Fixes
 
+- `information_schema.tables` lists every namespace, not only the ones the session already named (#664)
+
+    With `with_information_schema(true)` DataFusion's built-in provider
+    answers every `information_schema` reference, catalog-qualified or not,
+    and enumerates each catalog through the synchronous `schema_names()` and
+    `table_names()` hooks, which serve snapshots only. The pre-plan refresh
+    filled the snapshots of the namespaces a statement named, and an
+    `information_schema` read names none, so a session that had not touched
+    a namespace saw no tables in it: the MCP `search_tables` probe got 40
+    rows of `information_schema` and `runtime` entries and no `ac.orders`.
+    Hive catalogs already refreshed every database for such a read.
+
+    Iceberg catalogs now do the same: an `information_schema` read re-lists
+    the visible namespaces (cooldown-gated, so an externally created
+    namespace appears) and refreshes every namespace's table snapshot that is
+    older than its TTL, eight at a time. A `WHERE table_schema = '<ns>'`
+    conjunct (dbt's `get_columns_in_relation`, `SHOW COLUMNS`, `DESCRIBE`)
+    refreshes that one namespace only, in the catalogs the statement
+    qualifies. Pinned live against the Ranger stack with a fresh session,
+    whose snapshots are cold by construction.
+
 - Worker: the scan byte budget is one budget per worker, not one per scan (#407)
 
     `[worker.memory] scan_budget` was parsed, resolved and counted in the

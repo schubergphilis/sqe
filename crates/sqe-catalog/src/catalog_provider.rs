@@ -465,6 +465,60 @@ impl SqeCatalogProvider {
         Ok(())
     }
 
+    /// Async pre-plan refresh for a statement that reads `information_schema`
+    /// (issue #664). With `with_information_schema(true)` DataFusion's built-in
+    /// provider answers every `information_schema` reference, qualified or
+    /// not, and it enumerates this catalog through the synchronous
+    /// `schema_names()` / `table_names()` hooks, which only serve snapshots.
+    /// Such a statement names no namespace, so [`Self::refresh_namespace`]
+    /// filled none of them, and a namespace the session had not touched
+    /// listed no tables at all. Re-list the visible namespaces (cooldown-gated,
+    /// so an externally created namespace shows up) and refresh every
+    /// namespace's table snapshot that is older than its TTL, a bounded number
+    /// at a time. Failures are folded into the snapshots with their reason
+    /// and logged here; planning proceeds on the last known names, as on
+    /// every other pre-plan path.
+    pub async fn refresh_all_namespaces(&self) {
+        if relist_due(&self.namespace_relist_at, NAMESPACE_RELIST_COOLDOWN) {
+            match Self::list_visible_namespace_names(
+                Arc::clone(&self.session_catalog),
+                self.namespace_visibility_filter,
+            )
+            .await
+            {
+                Ok(fresh) => {
+                    *self
+                        .cached_namespaces
+                        .write()
+                        .unwrap_or_else(PoisonError::into_inner) = fresh;
+                }
+                Err(e) => debug!(
+                    warehouse = %self.warehouse,
+                    error = %e,
+                    "namespace re-list before an information_schema read failed; keeping the snapshot"
+                ),
+            }
+        }
+        let stale: Vec<Arc<SqeSchemaProvider>> = self
+            .cached_namespace_names()
+            .iter()
+            .map(|ns| self.schema_provider(ns))
+            .filter(|p| p.needs_refresh())
+            .collect();
+        let warehouse = &self.warehouse;
+        futures::stream::iter(stale)
+            .for_each_concurrent(NAMESPACE_PROBE_CONCURRENCY, |provider| async move {
+                if let Err(e) = provider.refresh_table_names().await {
+                    debug!(
+                        warehouse = %warehouse,
+                        error = %e,
+                        "table listing before an information_schema read failed; serving last known names"
+                    );
+                }
+            })
+            .await;
+    }
+
     /// The cached per-namespace schema provider, built on first use.
     fn schema_provider(&self, name: &str) -> Arc<SqeSchemaProvider> {
         if let Some(existing) = self.schema_providers.get(name) {
@@ -603,6 +657,106 @@ mod tests {
 
     fn ns(name: &str) -> NamespaceIdent {
         NamespaceIdent::new(name.to_string())
+    }
+
+    /// Issue #664: an `information_schema` read enumerates this catalog
+    /// through the synchronous hooks, which serve snapshots only. After
+    /// `refresh_all_namespaces` every namespace has a table snapshot, and a
+    /// namespace created after the provider was built (the second listing
+    /// below) is in `schema_names()` too.
+    #[tokio::test]
+    async fn refresh_all_namespaces_fills_every_snapshot_and_relists() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const WAREHOUSE: &str = "test-warehouse";
+        let server = MockServer::start().await;
+        let json = |body: serde_json::Value| ResponseTemplate::new(200).set_body_json(body);
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(json(
+                serde_json::json!({"overrides": {"prefix": WAREHOUSE}, "defaults": {}}),
+            ))
+            .mount(&server)
+            .await;
+        // First listing (provider construction): `sales` only. Every later
+        // listing: `sales` and `hr`, as if `hr` was created externally.
+        Mock::given(method("GET"))
+            .and(path("/v1/test-warehouse/namespaces"))
+            .respond_with(json(serde_json::json!({"namespaces": [["sales"]]})))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/test-warehouse/namespaces"))
+            .respond_with(json(serde_json::json!({"namespaces": [["sales"], ["hr"]]})))
+            .mount(&server)
+            .await;
+        for (namespace, table) in [("sales", "orders"), ("hr", "employees")] {
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/v1/test-warehouse/namespaces/{namespace}/tables"
+                )))
+                .respond_with(json(serde_json::json!({
+                    "identifiers": [{"namespace": [namespace], "name": table}]
+                })))
+                .mount(&server)
+                .await;
+        }
+
+        // A token no other test uses: the table-name snapshots are
+        // process-global and keyed by the bearer's fingerprint.
+        let token = format!("refresh-all-{}", uuid::Uuid::new_v4());
+        let catalog = Arc::new(
+            SessionCatalog::new(
+                &server.uri(),
+                WAREHOUSE,
+                &token,
+                &StorageConfig::default(),
+                Some(crate::rest_catalog::TableMetadataCache::new(0)),
+                None,
+                None,
+                false,
+            )
+            .await
+            .expect("session catalog"),
+        );
+        let provider = SqeCatalogProvider::try_new_with_options(
+            catalog,
+            StorageConfig::default(),
+            WAREHOUSE.to_string(),
+            None,
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect("provider");
+
+        let names = provider.schema_names();
+        assert!(names.iter().any(|n| n == "sales"));
+        assert!(!names.iter().any(|n| n == "hr"), "hr is listed later");
+        assert!(
+            provider
+                .schema("sales")
+                .expect("sales")
+                .table_names()
+                .is_empty(),
+            "no statement named `sales`, so its snapshot is cold"
+        );
+
+        provider.refresh_all_namespaces().await;
+
+        let names = provider.schema_names();
+        assert!(names.iter().any(|n| n == "hr"), "re-listed: {names:?}");
+        assert_eq!(
+            provider.schema("sales").expect("sales").table_names(),
+            vec!["orders".to_string()]
+        );
+        assert_eq!(
+            provider.schema("hr").expect("hr").table_names(),
+            vec!["employees".to_string()]
+        );
     }
 
     /// Mixed allow/deny probe results: only the allowed names survive, in
