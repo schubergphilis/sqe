@@ -90,6 +90,13 @@ pub async fn bearer_admin_identity(
 pub trait BearerAdminState: Send + Sync + 'static {
     fn bearer_provider(&self) -> Option<&Arc<dyn AuthProvider>>;
     fn auth_config(&self) -> Option<&sqe_core::config::AuthConfig>;
+    /// The pre-auth rate limiter every bearer passes before it reaches the
+    /// provider (#562). `None` (the default, for test doubles and
+    /// `run_worker`) skips the gate; the coordinator wires the same limiter
+    /// the Flight, Trino and MCP paths share.
+    fn auth_rate_limiter(&self) -> Option<&Arc<crate::rate_limiter::AuthRateLimiter>> {
+        None
+    }
     /// Returns the audit logger for emitting dashboard-access events, if wired.
     fn audit(&self) -> Option<&Arc<AuditLogger>>;
     /// Called when an anonymous (Unauthorized) denial occurs. Implementors
@@ -256,6 +263,37 @@ where
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
+
+    // #562: a bearer that is about to reach the provider spends pre-auth
+    // budget, keyed (client ip, token fingerprint) exactly like the Trino
+    // and MCP paths. Validating a garbage bearer is not free (a JWKS
+    // refetch, an IdP or STS round trip per attempt), and this was the one
+    // bearer entry point with no cap. Requests without a bearer fall through
+    // to the anonymous 401 below and never spend budget.
+    let bearer = header
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .filter(|t| !t.is_empty());
+    if let (Some(limiter), Some(token)) = (state.auth_rate_limiter(), bearer) {
+        let ip = client_ip.as_deref().unwrap_or("unknown");
+        let ip_key = ip
+            .parse::<SocketAddr>()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|_| ip.to_string());
+        let fingerprint = sqe_trino_compat::server::bearer_fingerprint(token);
+        if limiter.check(&ip_key, &fingerprint).is_err() {
+            tracing::warn!(
+                client_ip = ip,
+                "dashboard: bearer rejected by auth rate limiter"
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(axum::http::header::RETRY_AFTER, "1")],
+                "authentication rate limit",
+            )
+                .into_response();
+        }
+    }
+
     let result = bearer_admin_identity(provider, auth_cfg, header).await;
 
     // Emit an audit event for identified-principal outcomes (success or
@@ -817,6 +855,123 @@ mod tests {
             event.client_ip.is_none(),
             "client_ip must be None when not provided"
         );
+    }
+
+    /// #562: with a limiter at one attempt per minute, the second bearer from
+    /// the same peer is refused with 429 BEFORE the provider is called. The
+    /// provider counts its calls so the test fails if the gate merely
+    /// changed the status code after validation.
+    #[tokio::test]
+    async fn require_admin_bearer_rate_limits_bearers_before_the_provider() {
+        use axum::{routing::get, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt;
+
+        struct CountingProvider {
+            calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl sqe_auth::AuthProvider for CountingProvider {
+            async fn authenticate(
+                &self,
+                _creds: &sqe_auth::FlightCredentials,
+            ) -> Result<sqe_auth::Identity, sqe_auth::AuthError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(sqe_auth::Identity {
+                    user_id: "admin".into(),
+                    display_name: "admin".into(),
+                    roles: vec!["admin".into()],
+                    subject: None,
+                    email: None,
+                    groups: vec![],
+                    catalog_token: None,
+                    refresh_token: None,
+                    expires_at: None,
+                })
+            }
+        }
+
+        struct LimitedState {
+            provider: Arc<dyn sqe_auth::AuthProvider>,
+            auth_cfg: sqe_core::config::AuthConfig,
+            limiter: Arc<crate::rate_limiter::AuthRateLimiter>,
+        }
+
+        impl BearerAdminState for LimitedState {
+            fn bearer_provider(&self) -> Option<&Arc<dyn sqe_auth::AuthProvider>> {
+                Some(&self.provider)
+            }
+            fn auth_config(&self) -> Option<&sqe_core::config::AuthConfig> {
+                Some(&self.auth_cfg)
+            }
+            fn audit(&self) -> Option<&Arc<sqe_metrics::audit::AuditLogger>> {
+                None
+            }
+            fn auth_rate_limiter(&self) -> Option<&Arc<crate::rate_limiter::AuthRateLimiter>> {
+                Some(&self.limiter)
+            }
+        }
+
+        let counting = Arc::new(CountingProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let limiter = Arc::new(crate::rate_limiter::AuthRateLimiter::new(
+            &sqe_core::config::RateLimitConfig {
+                enabled: true,
+                auth_attempts_per_minute: 1,
+                ..Default::default()
+            },
+        ));
+        let state = Arc::new(LimitedState {
+            provider: Arc::clone(&counting) as Arc<dyn sqe_auth::AuthProvider>,
+            auth_cfg: auth_cfg(&["admin"]),
+            limiter,
+        });
+        let app = Router::new()
+            .route("/guarded", get(|| async { "ok" }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_admin_bearer::<LimitedState>,
+            ))
+            .with_state(state);
+
+        let request = || {
+            let peer: std::net::SocketAddr = "203.0.113.9:4000".parse().unwrap();
+            let mut req = axum::http::Request::builder()
+                .uri("/guarded")
+                .header("Authorization", "Bearer garbage-token")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            req
+        };
+
+        let first = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            second
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        assert_eq!(
+            counting.calls.load(Ordering::SeqCst),
+            1,
+            "the refused bearer must never reach the provider"
+        );
+
+        // No bearer, no budget spent: the anonymous 401 is unchanged and the
+        // limiter has not been consulted for it.
+        let anonymous = axum::http::Request::builder()
+            .uri("/guarded")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(anonymous).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// `require_admin_bearer` emits an audit event with client_ip when ConnectInfo
