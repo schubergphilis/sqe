@@ -6,6 +6,18 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Catalog: `information_schema.tables` no longer loads every table (#664 follow-up)
+
+    DataFusion's built-in `information_schema.tables` asks the schema provider
+    for each listed name's type, and the trait default answers by loading the
+    table: one `loadTable` round trip per table per metadata query, for a
+    statement dbt and every BI tool issue constantly. The namespace snapshot
+    now records which names came from the view listing, and
+    `SqeSchemaProvider::table_type` answers from it: `BASE TABLE` or `VIEW`
+    without touching the catalog. A name the snapshot does not know, or no
+    snapshot at all, still takes the loading path. The wiremock catalog test
+    asserts the type of a table and of a view with zero `loadTable` requests.
+
 - Catalog: the nine scan tuning knobs travel as one `ScanTuning` struct (#575)
 
     `small_file_threshold_bytes`, `manifest_concurrency`,
