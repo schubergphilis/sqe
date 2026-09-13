@@ -64,6 +64,7 @@ arrow-ipc = { version = "59", features = ["lz4", "zstd"] }
 # impls; it changes no behaviour for anything already using arrow-schema.
 arrow-schema = { version = "59", features = ["serde"] }
 arrow-array = "59"
+arrow-cast = "59"
 arrow-buffer = "59"
 parquet = { version = "59", features = ["async", "object_store"] }
 object_store = { version = "0.13", features = ["aws", "http", "azure", "gcp"] }
