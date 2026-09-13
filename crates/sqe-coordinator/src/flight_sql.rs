@@ -468,7 +468,6 @@ pub struct SqeFlightSqlService {
     worker_secret: sqe_core::SecretString,
     metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
     rate_limiter: Option<Arc<crate::rate_limiter::QueryRateLimiter>>,
-    auth_rate_limiter: Option<Arc<crate::rate_limiter::AuthRateLimiter>>,
     metadata_rate_limiter: Option<Arc<crate::rate_limiter::MetadataRateLimiter>>,
     /// Audit logger inherited from the `QueryHandler`. Used to emit
     /// `AuditKind::Auth` events on handshake success/failure and on
@@ -538,7 +537,6 @@ impl SqeFlightSqlService {
             worker_secret,
             metrics: None,
             rate_limiter: None,
-            auth_rate_limiter: None,
             metadata_rate_limiter: None,
             audit,
             prepared_statements: PreparedStatementStore::default(),
@@ -713,15 +711,6 @@ impl SqeFlightSqlService {
         limiter: Arc<crate::rate_limiter::QueryRateLimiter>,
     ) -> Self {
         self.rate_limiter = Some(limiter);
-        self
-    }
-
-    #[must_use = "with_auth_rate_limiter consumes self; bind the returned service"]
-    pub fn with_auth_rate_limiter(
-        mut self,
-        limiter: Arc<crate::rate_limiter::AuthRateLimiter>,
-    ) -> Self {
-        self.auth_rate_limiter = Some(limiter);
         self
     }
 
@@ -910,7 +899,11 @@ impl SqeFlightSqlService {
             // client replaying the same JWT on every RPC authenticates once
             // and reuses one session. `created` is true only on that first
             // sight, which is the only time an auth-success event belongs.
-            match self.session_manager.session_for_bearer(token).await {
+            match self
+                .session_manager
+                .session_for_bearer(token, Some(strip_port_for_key(&client_ip)))
+                .await
+            {
                 Ok((session, created)) => {
                     if !created {
                         debug!(
@@ -945,6 +938,11 @@ impl SqeFlightSqlService {
                     // interactive clients; bearer replay clients establish
                     // no handshake session.
                     return Ok(session);
+                }
+                Err(e) if e.error_code() == sqe_core::SqeErrorCode::ResourceExhausted => {
+                    // #562: the pre-auth limiter denied before any provider ran.
+                    warn!(client_ip = %client_ip, "Flight: bearer rejected by auth rate limiter");
+                    return Err(Status::resource_exhausted("authentication rate limit"));
                 }
                 Err(e) => {
                     warn!(
@@ -1289,35 +1287,17 @@ impl FlightSqlService for SqeFlightSqlService {
 
         let client_ip = self.extract_client_ip(&request);
 
-        // Pre-auth rate limit, keyed by (peer-ip, username). Without
-        // this, do_handshake forwards every attempt to the upstream
-        // IdP -- unbounded credential stuffing plus a DoS vector
-        // against the IdP itself. Issue #57.
-        if let Some(ref limiter) = self.auth_rate_limiter {
-            if limiter
-                .check(strip_port_for_key(&client_ip), username)
-                .is_err()
-            {
-                if let Some(ref metrics) = self.metrics {
-                    metrics
-                        .auth_attempts_total
-                        .with_label_values(&["oidc", "rate_limited"])
-                        .inc();
-                }
-                warn!(
-                    username = username,
-                    client_ip = %client_ip,
-                    "Handshake rejected by auth rate limiter"
-                );
-                return Err(Status::resource_exhausted("authentication rate limit"));
-            }
-        }
-
         info!(username = username, "Handshake authentication attempt");
 
+        // The pre-auth rate limit (issue #57) is no longer checked here: the
+        // provider chain is wrapped in `RateLimitedAuthProvider` (#562),
+        // which keys the budget on the peer address carried in the
+        // credentials and denies before any IdP round trip. The denial comes
+        // back as `ResourceExhausted` and is mapped below.
         let credentials = sqe_auth::FlightCredentials {
             username: Some(username.to_string()),
             password: Some(sqe_core::SecretString::new(password.to_string())),
+            peer_ip: Some(strip_port_for_key(&client_ip).to_string()),
             ..Default::default()
         };
 
@@ -1347,6 +1327,20 @@ impl FlightSqlService for SqeFlightSqlService {
                         .inc();
                 }
                 session
+            }
+            Ok(Err(e)) if e.error_code() == sqe_core::SqeErrorCode::ResourceExhausted => {
+                if let Some(ref metrics) = self.metrics {
+                    metrics
+                        .auth_attempts_total
+                        .with_label_values(&["oidc", "rate_limited"])
+                        .inc();
+                }
+                warn!(
+                    username = username,
+                    client_ip = %client_ip,
+                    "Handshake rejected by auth rate limiter"
+                );
+                return Err(Status::resource_exhausted("authentication rate limit"));
             }
             Ok(Err(e)) => {
                 if let Some(ref metrics) = self.metrics {

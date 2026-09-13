@@ -37,6 +37,9 @@ pub enum GuardReject {
     Unauthorized,
     /// Token is valid but the identity does not hold an admin role.
     Forbidden,
+    /// The `(peer, bearer)` tuple is over the pre-auth budget (#562); no
+    /// provider was consulted.
+    RateLimited,
 }
 
 /// Validate an `Authorization: Bearer <token>` header against the bearer
@@ -60,6 +63,7 @@ pub async fn bearer_admin_identity(
     provider: &Arc<dyn AuthProvider>,
     auth_cfg: &sqe_core::config::AuthConfig,
     header: Option<&str>,
+    peer_ip: Option<&str>,
 ) -> Result<Identity, (GuardReject, Option<Identity>)> {
     let token = match header.and_then(|h| h.strip_prefix("Bearer ")) {
         Some(t) if !t.is_empty() => t.to_string(),
@@ -67,12 +71,13 @@ pub async fn bearer_admin_identity(
     };
     let creds = FlightCredentials {
         bearer_token: Some(SecretString::new(token)),
+        peer_ip: peer_ip.map(str::to_string),
         ..Default::default()
     };
-    let identity = provider
-        .authenticate(&creds)
-        .await
-        .map_err(|_| (GuardReject::Unauthorized, None))?;
+    let identity = provider.authenticate(&creds).await.map_err(|e| match e {
+        sqe_auth::AuthError::RateLimited => (GuardReject::RateLimited, None),
+        _ => (GuardReject::Unauthorized, None),
+    })?;
     if auth_cfg.has_admin_role(&identity.roles) {
         Ok(identity)
     } else {
@@ -90,13 +95,6 @@ pub async fn bearer_admin_identity(
 pub trait BearerAdminState: Send + Sync + 'static {
     fn bearer_provider(&self) -> Option<&Arc<dyn AuthProvider>>;
     fn auth_config(&self) -> Option<&sqe_core::config::AuthConfig>;
-    /// The pre-auth rate limiter every bearer passes before it reaches the
-    /// provider (#562). `None` (the default, for test doubles and
-    /// `run_worker`) skips the gate; the coordinator wires the same limiter
-    /// the Flight, Trino and MCP paths share.
-    fn auth_rate_limiter(&self) -> Option<&Arc<crate::rate_limiter::AuthRateLimiter>> {
-        None
-    }
     /// Returns the audit logger for emitting dashboard-access events, if wired.
     fn audit(&self) -> Option<&Arc<AuditLogger>>;
     /// Called when an anonymous (Unauthorized) denial occurs. Implementors
@@ -160,7 +158,9 @@ pub fn dashboard_audit_event(
             (actor, Outcome::Success)
         }
         // Unauthorized: anonymous, no principal established. No audit line.
-        Err((GuardReject::Unauthorized, _)) => return None,
+        // Rate limited: refused before any principal was established, and a
+        // flood is exactly when the audit spool must not be fed per attempt.
+        Err((GuardReject::Unauthorized | GuardReject::RateLimited, _)) => return None,
         // Forbidden: valid token, wrong role. Log the actual user.
         Err((GuardReject::Forbidden, Some(identity))) => {
             let actor = Actor::from_parts(
@@ -264,37 +264,22 @@ where
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
 
-    // #562: a bearer that is about to reach the provider spends pre-auth
-    // budget, keyed (client ip, token fingerprint) exactly like the Trino
-    // and MCP paths. Validating a garbage bearer is not free (a JWKS
-    // refetch, an IdP or STS round trip per attempt), and this was the one
-    // bearer entry point with no cap. Requests without a bearer fall through
-    // to the anonymous 401 below and never spend budget.
-    let bearer = header
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .filter(|t| !t.is_empty());
-    if let (Some(limiter), Some(token)) = (state.auth_rate_limiter(), bearer) {
-        let ip = client_ip.as_deref().unwrap_or("unknown");
-        let ip_key = ip
-            .parse::<SocketAddr>()
+    // #562: the pre-auth rate limit is applied by the `RateLimitedAuthProvider`
+    // that wraps the chain, keyed on the peer address carried in the
+    // credentials. Port-stripped so one client's ephemeral ports share a
+    // budget; "unknown" when no peer address could be resolved.
+    let peer_key = client_ip.as_deref().map(|ip| {
+        ip.parse::<SocketAddr>()
             .map(|a| a.ip().to_string())
-            .unwrap_or_else(|_| ip.to_string());
-        let fingerprint = sqe_trino_compat::server::bearer_fingerprint(token);
-        if limiter.check(&ip_key, &fingerprint).is_err() {
-            tracing::warn!(
-                client_ip = ip,
-                "dashboard: bearer rejected by auth rate limiter"
-            );
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [(axum::http::header::RETRY_AFTER, "1")],
-                "authentication rate limit",
-            )
-                .into_response();
-        }
-    }
-
-    let result = bearer_admin_identity(provider, auth_cfg, header).await;
+            .unwrap_or_else(|_| ip.to_string())
+    });
+    let result = bearer_admin_identity(
+        provider,
+        auth_cfg,
+        header,
+        Some(peer_key.as_deref().unwrap_or("unknown")),
+    )
+    .await;
 
     // Emit an audit event for identified-principal outcomes (success or
     // Forbidden). Anonymous denials (Unauthorized) write NO audit line:
@@ -311,6 +296,12 @@ where
                 "dashboard: anonymous denial (no bearer token or invalid scheme)"
             );
             state.on_anonymous_denial();
+        }
+        Err((GuardReject::RateLimited, _)) => {
+            tracing::warn!(
+                client_ip = client_ip.as_deref().unwrap_or("unknown"),
+                "dashboard: bearer rejected by auth rate limiter"
+            );
         }
         Ok(identity) => {
             state.note_dashboard_success();
@@ -342,6 +333,12 @@ where
         Err((GuardReject::Forbidden, _)) => {
             (StatusCode::FORBIDDEN, "admin role required").into_response()
         }
+        Err((GuardReject::RateLimited, _)) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::RETRY_AFTER, "1")],
+            "authentication rate limit",
+        )
+            .into_response(),
     }
 }
 
@@ -397,7 +394,7 @@ mod tests {
             roles: vec![],
             ok: true,
         });
-        let r = bearer_admin_identity(&p, &auth_cfg(&["admin"]), None).await;
+        let r = bearer_admin_identity(&p, &auth_cfg(&["admin"]), None, None).await;
         assert!(matches!(r, Err((GuardReject::Unauthorized, None))));
     }
 
@@ -407,7 +404,7 @@ mod tests {
             roles: vec![],
             ok: true,
         });
-        let r = bearer_admin_identity(&p, &auth_cfg(&["admin"]), Some("Basic abc")).await;
+        let r = bearer_admin_identity(&p, &auth_cfg(&["admin"]), Some("Basic abc"), None).await;
         assert!(matches!(r, Err((GuardReject::Unauthorized, None))));
     }
 
@@ -417,7 +414,7 @@ mod tests {
             roles: vec!["analyst".into()],
             ok: true,
         });
-        let r = bearer_admin_identity(&p, &auth_cfg(&["admin"]), Some("Bearer tok")).await;
+        let r = bearer_admin_identity(&p, &auth_cfg(&["admin"]), Some("Bearer tok"), None).await;
         assert!(matches!(r, Err((GuardReject::Forbidden, Some(_)))));
     }
 
@@ -427,7 +424,7 @@ mod tests {
             roles: vec!["admin".into()],
             ok: true,
         });
-        let id = bearer_admin_identity(&p, &auth_cfg(&["admin"]), Some("Bearer tok"))
+        let id = bearer_admin_identity(&p, &auth_cfg(&["admin"]), Some("Bearer tok"), None)
             .await
             .unwrap();
         assert_eq!(id.roles, vec!["admin".to_string()]);
@@ -857,10 +854,11 @@ mod tests {
         );
     }
 
-    /// #562: with a limiter at one attempt per minute, the second bearer from
-    /// the same peer is refused with 429 BEFORE the provider is called. The
-    /// provider counts its calls so the test fails if the gate merely
-    /// changed the status code after validation.
+    /// #562: the guard hands the provider the peer address and maps the
+    /// chain-level limiter's denial to 429. The provider under test is the
+    /// real `RateLimitedAuthProvider` at one attempt per minute around a
+    /// counting stub, so the second bearer from the same peer is refused
+    /// BEFORE the inner provider runs; the count proves it.
     #[tokio::test]
     async fn require_admin_bearer_rate_limits_bearers_before_the_provider() {
         use axum::{routing::get, Router};
@@ -875,8 +873,13 @@ mod tests {
         impl sqe_auth::AuthProvider for CountingProvider {
             async fn authenticate(
                 &self,
-                _creds: &sqe_auth::FlightCredentials,
+                creds: &sqe_auth::FlightCredentials,
             ) -> Result<sqe_auth::Identity, sqe_auth::AuthError> {
+                assert_eq!(
+                    creds.peer_ip.as_deref(),
+                    Some("203.0.113.9"),
+                    "the guard must carry the port-stripped peer address"
+                );
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok(sqe_auth::Identity {
                     user_id: "admin".into(),
@@ -895,7 +898,6 @@ mod tests {
         struct LimitedState {
             provider: Arc<dyn sqe_auth::AuthProvider>,
             auth_cfg: sqe_core::config::AuthConfig,
-            limiter: Arc<crate::rate_limiter::AuthRateLimiter>,
         }
 
         impl BearerAdminState for LimitedState {
@@ -907,9 +909,6 @@ mod tests {
             }
             fn audit(&self) -> Option<&Arc<sqe_metrics::audit::AuditLogger>> {
                 None
-            }
-            fn auth_rate_limiter(&self) -> Option<&Arc<crate::rate_limiter::AuthRateLimiter>> {
-                Some(&self.limiter)
             }
         }
 
@@ -923,10 +922,14 @@ mod tests {
                 ..Default::default()
             },
         ));
+        let provider: Arc<dyn sqe_auth::AuthProvider> =
+            Arc::new(crate::rate_limiter::RateLimitedAuthProvider::new(
+                Arc::clone(&counting) as Arc<dyn sqe_auth::AuthProvider>,
+                limiter,
+            ));
         let state = Arc::new(LimitedState {
-            provider: Arc::clone(&counting) as Arc<dyn sqe_auth::AuthProvider>,
+            provider,
             auth_cfg: auth_cfg(&["admin"]),
-            limiter,
         });
         let app = Router::new()
             .route("/guarded", get(|| async { "ok" }))

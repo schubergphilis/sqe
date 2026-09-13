@@ -111,12 +111,10 @@ struct HealthState {
     node_info: Option<sqe_coordinator::web_ui::NodeInfo>,
     /// Populated in `run_coordinator`; `None` in `run_worker` and tests.
     metrics_history: Option<Arc<sqe_coordinator::metrics_history::MetricsHistory>>,
-    /// Bearer auth provider for the web_ui guard. `None` in `run_worker` and tests.
+    /// Bearer auth provider for the web_ui guard. `None` in `run_worker` and
+    /// tests. In the coordinator this is the chain wrapped in the pre-auth
+    /// rate limiter (#562), so the guard needs no limiter of its own.
     bearer_provider: Option<Arc<dyn sqe_auth::AuthProvider>>,
-    /// Pre-auth rate limiter the web_ui guard consults before a bearer reaches
-    /// the provider (#562); the same instance the Flight, Trino and MCP paths
-    /// share. `None` in `run_worker` and tests.
-    auth_rate_limiter: Option<Arc<sqe_coordinator::rate_limiter::AuthRateLimiter>>,
     /// Auth config for admin-role check in the web_ui guard. `None` in `run_worker` and tests.
     auth_cfg: Option<sqe_core::config::AuthConfig>,
     /// Security config for client-IP resolution in the web_ui guard.
@@ -149,10 +147,6 @@ impl sqe_coordinator::web_auth::BearerAdminState for HealthState {
 
     fn auth_config(&self) -> Option<&sqe_core::config::AuthConfig> {
         self.auth_cfg.as_ref()
-    }
-
-    fn auth_rate_limiter(&self) -> Option<&Arc<sqe_coordinator::rate_limiter::AuthRateLimiter>> {
-        self.auth_rate_limiter.as_ref()
     }
 
     fn audit(&self) -> Option<&Arc<sqe_metrics::audit::AuditLogger>> {
@@ -1000,13 +994,34 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     let authenticator = Arc::new(sqe_auth::Authenticator::new(&config.auth).await?);
     _task_guards.push(authenticator.start_refresh_task());
 
+    // Rate limiters, shared by the Flight SQL, Trino, MCP and dashboard paths.
+    // Built before the chain so the pre-auth limiter can wrap it (#562).
+    let rate_limiter = Arc::new(sqe_coordinator::rate_limiter::QueryRateLimiter::new(
+        &config.rate_limit,
+    ));
+    let auth_rate_limiter = Arc::new(sqe_coordinator::rate_limiter::AuthRateLimiter::new(
+        &config.rate_limit,
+    ));
+    let metadata_rate_limiter = Arc::new(sqe_coordinator::rate_limiter::MetadataRateLimiter::new(
+        &config.rate_limit,
+    ));
+
     // Build the auth provider chain from `[[auth.providers]]`. Both Flight
     // SQL (via SessionManager) and the Trino-compat HTTP path use the
     // same chain so the two endpoints accept the same set of credentials.
     // For configs without `[[auth.providers]]` the chain wraps the legacy
     // Authenticator and behaviour is unchanged.
+    //
+    // #562: the chain is wrapped in the pre-auth rate limiter ONCE, here, so
+    // every entry point that hands it a credential with a peer address
+    // (Flight, MCP, the dashboard) is gated without deciding to be. Trino
+    // and Quack still run their own check and send no peer address; they
+    // migrate next.
     let auth_chain: Arc<dyn sqe_auth::AuthProvider> =
-        Arc::new(sqe_auth::build_auth_chain(&config.auth).await?);
+        Arc::new(sqe_coordinator::rate_limiter::RateLimitedAuthProvider::new(
+            Arc::new(sqe_auth::build_auth_chain(&config.auth).await?),
+            Arc::clone(&auth_rate_limiter),
+        ));
 
     // SessionManager authenticates new Flight SQL requests through the
     // chain; the legacy Authenticator stays attached so its background
@@ -1407,19 +1422,6 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         }
     }
 
-    // Rate limiters, shared by the Flight SQL, Trino, MCP and dashboard paths.
-    // Built before the health server so the dashboard guard gets the same
-    // `AuthRateLimiter` instance as every other bearer entry point (#562).
-    let rate_limiter = Arc::new(sqe_coordinator::rate_limiter::QueryRateLimiter::new(
-        &config.rate_limit,
-    ));
-    let auth_rate_limiter = Arc::new(sqe_coordinator::rate_limiter::AuthRateLimiter::new(
-        &config.rate_limit,
-    ));
-    let metadata_rate_limiter = Arc::new(sqe_coordinator::rate_limiter::MetadataRateLimiter::new(
-        &config.rate_limit,
-    ));
-
     // Health server. Started here (after audit init) so the audit logger can be
     // threaded into HealthState and dashboard-access events are captured from
     // the first request. Probes (/healthz, /readyz) are still served immediately
@@ -1441,7 +1443,6 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         metrics_history: metrics_history.clone(),
         // auth_chain is already built above; reuse it for the web_ui guard.
         bearer_provider: Some(Arc::clone(&auth_chain) as Arc<dyn sqe_auth::AuthProvider>),
-        auth_rate_limiter: Some(Arc::clone(&auth_rate_limiter)),
         auth_cfg: Some(config.auth.clone()),
         // Thread the security config so the dashboard guard honours
         // trusted_proxies for XFF resolution, matching the Flight SQL path.
@@ -1673,7 +1674,6 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             Arc::clone(&auth_chain),
             Arc::clone(&query_handler),
             Arc::clone(&rate_limiter),
-            Arc::clone(&auth_rate_limiter),
             config.mcp.clone(),
             sqe_coordinator::mcp_server::hive_root_names(&config),
         ))
@@ -1683,7 +1683,6 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
                 Arc::clone(&auth_chain),
                 Arc::clone(&query_handler),
                 Arc::clone(&rate_limiter),
-                Arc::clone(&auth_rate_limiter),
                 config.mcp.clone(),
                 sqe_coordinator::mcp_server::hive_root_names(&config),
                 &config.coordinator.tls,
@@ -1813,7 +1812,6 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     let mut flight_service =
         SqeFlightSqlService::new(session_manager, query_handler, config.clone())
             .with_rate_limiter(rate_limiter)
-            .with_auth_rate_limiter(Arc::clone(&auth_rate_limiter))
             .with_metadata_rate_limiter(metadata_rate_limiter);
     // Hand the flight service the SAME registry the query handler reads, so
     // worker heartbeats (handled on the DoAction path) actually register
@@ -1895,7 +1893,6 @@ async fn run_worker(config: SqeConfig, config_path: String) -> anyhow::Result<()
         node_info: None,
         metrics_history: None,
         bearer_provider: None,
-        auth_rate_limiter: None,
         auth_cfg: None,
         security_cfg: None,
         audit: None,
@@ -2290,7 +2287,6 @@ mod tests {
             node_info: None,
             metrics_history: None,
             bearer_provider: None,
-            auth_rate_limiter: None,
             auth_cfg: None,
             security_cfg: None,
             audit: None,
@@ -2319,7 +2315,6 @@ mod tests {
             node_info: None,
             metrics_history: None,
             bearer_provider: None,
-            auth_rate_limiter: None,
             auth_cfg: None,
             security_cfg: None,
             audit: None,
@@ -2354,7 +2349,6 @@ mod tests {
             node_info: None,
             metrics_history: None,
             bearer_provider: None,
-            auth_rate_limiter: None,
             auth_cfg: None,
             security_cfg: None,
             audit: None,
@@ -2386,7 +2380,6 @@ mod tests {
             node_info: None,
             metrics_history: None,
             bearer_provider: None,
-            auth_rate_limiter: None,
             auth_cfg: None,
             security_cfg: None,
             audit: None,
@@ -2417,7 +2410,6 @@ mod tests {
             node_info: None,
             metrics_history: None,
             bearer_provider: None,
-            auth_rate_limiter: None,
             auth_cfg: None,
             security_cfg: None,
             audit: None,
@@ -2484,7 +2476,6 @@ mod tests {
             node_info: None,
             metrics_history: None,
             bearer_provider: None,
-            auth_rate_limiter: None,
             auth_cfg: None,
             security_cfg: None,
             audit: None,
@@ -2532,7 +2523,6 @@ mod tests {
             node_info: None,
             metrics_history: None,
             bearer_provider: None,
-            auth_rate_limiter: None,
             auth_cfg: None,
             security_cfg: None,
             audit: None,
@@ -2569,7 +2559,6 @@ mod tests {
             node_info: None,
             metrics_history: None,
             bearer_provider: None,
-            auth_rate_limiter: None,
             auth_cfg: None,
             security_cfg: None,
             audit: None,
@@ -2614,7 +2603,6 @@ mod tests {
             node_info: None,
             metrics_history: Some(hist),
             bearer_provider: None,
-            auth_rate_limiter: None,
             auth_cfg: None,
             security_cfg: None,
             audit: None,
@@ -2691,7 +2679,6 @@ mod tests {
             node_info: None,
             metrics_history: None,
             bearer_provider: None,
-            auth_rate_limiter: None,
             auth_cfg: None,
             security_cfg: None,
             audit: None,
@@ -2726,7 +2713,6 @@ mod tests {
             node_info: None,
             metrics_history: None,
             bearer_provider: None,
-            auth_rate_limiter: None,
             auth_cfg: None,
             security_cfg: None,
             audit: None,
@@ -2813,7 +2799,6 @@ mod tests {
             node_info: None,
             metrics_history: None,
             bearer_provider: Some(provider),
-            auth_rate_limiter: None,
             auth_cfg: Some(auth_cfg),
             security_cfg: None,
             audit: None,
@@ -3048,7 +3033,6 @@ mod tests {
             node_info: None,
             metrics_history: None,
             bearer_provider: None,
-            auth_rate_limiter: None,
             auth_cfg: None,
             security_cfg: None,
             audit: None,
@@ -3088,7 +3072,6 @@ mod tests {
             node_info: None,
             metrics_history: None,
             bearer_provider: None,
-            auth_rate_limiter: None,
             auth_cfg: None,
             security_cfg: None,
             audit: None,
@@ -3156,7 +3139,6 @@ mod tests {
             node_info: None,
             metrics_history: None,
             bearer_provider: None,
-            auth_rate_limiter: None,
             auth_cfg: None,
             security_cfg: None,
             audit: None,

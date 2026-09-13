@@ -146,9 +146,6 @@ async fn mcp_app(ctx: &AcCtx, write_catalogs: Vec<String>) -> Router {
         Arc::new(sqe_coordinator::rate_limiter::QueryRateLimiter::new(
             &config.rate_limit,
         )),
-        Arc::new(sqe_coordinator::rate_limiter::AuthRateLimiter::new(
-            &config.rate_limit,
-        )),
         mcp,
         Vec::new(),
     )

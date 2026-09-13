@@ -10,20 +10,7 @@ use sqe_core::{
     Session, SqeError, SqeErrorCode,
 };
 
-use crate::{
-    rate_limiter::{AuthRateLimiter, QueryRateLimiter},
-    QueryHandler,
-};
-
-impl sqe_mcp::AuthRateLimiter for AuthRateLimiter {
-    /// Same `(peer_ip, credential)` tuple the Trino and Basic paths spend
-    /// their budget on; `credential` is the bearer's fingerprint, so agents
-    /// behind one proxy address get separate budgets and a token-rotating
-    /// attacker does not.
-    fn allow(&self, peer_ip: &str, credential: &str) -> bool {
-        self.check(peer_ip, credential).is_ok()
-    }
-}
+use crate::{rate_limiter::QueryRateLimiter, QueryHandler};
 
 struct CoordinatorMcpExecutor {
     handler: Arc<QueryHandler>,
@@ -38,11 +25,13 @@ pub fn hive_root_names(config: &sqe_core::config::SqeConfig) -> Vec<String> {
     config.hive.roots.iter().map(|root| root.name.clone()).collect()
 }
 
+/// `auth` is the coordinator's provider chain, already wrapped in the
+/// pre-auth rate limiter (#562); MCP sends the peer address in the
+/// credentials and maps the denial to 429.
 pub fn mcp_router(
     auth: Arc<dyn AuthProvider>,
     handler: Arc<QueryHandler>,
     rate_limiter: Arc<QueryRateLimiter>,
-    auth_rate_limiter: Arc<AuthRateLimiter>,
     config: McpConfig,
     hive_roots: Vec<String>,
 ) -> axum::Router {
@@ -50,12 +39,7 @@ pub fn mcp_router(
         handler,
         rate_limiter,
     });
-    let auth_limiter: Arc<dyn sqe_mcp::AuthRateLimiter> = auth_rate_limiter;
-    sqe_mcp::router(
-        sqe_mcp::McpServerState::new(auth, executor, config)
-            .with_auth_rate_limiter(auth_limiter)
-            .with_hive_roots(hive_roots),
-    )
+    sqe_mcp::router(sqe_mcp::McpServerState::new(auth, executor, config).with_hive_roots(hive_roots))
 }
 
 #[async_trait]
@@ -74,20 +58,12 @@ pub async fn start_mcp_server(
     auth: Arc<dyn AuthProvider>,
     handler: Arc<QueryHandler>,
     rate_limiter: Arc<QueryRateLimiter>,
-    auth_rate_limiter: Arc<AuthRateLimiter>,
     config: McpConfig,
     hive_roots: Vec<String>,
     tls: &TlsConfig,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    let app = mcp_router(
-        auth,
-        handler,
-        rate_limiter,
-        auth_rate_limiter,
-        config,
-        hive_roots,
-    );
+    let app = mcp_router(auth, handler, rate_limiter, config, hive_roots);
 
     if tls.is_enabled() {
         // Checked, not discarded: the old `let _ = ...install_default()`

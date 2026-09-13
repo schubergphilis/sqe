@@ -23,6 +23,12 @@ pub struct FlightCredentials {
     pub password: Option<SecretString>,
     pub bearer_token: Option<SecretString>,
     pub client_cert_cn: Option<String>,
+    /// The resolved client address the credential arrived from, without the
+    /// ephemeral port (#562). The pre-auth rate limiter that wraps the
+    /// provider chain keys its budget on `(peer_ip, credential)`; an adapter
+    /// that sets this relies on that gate, an adapter that leaves it `None`
+    /// has kept its own.
+    pub peer_ip: Option<String>,
 }
 
 impl fmt::Debug for FlightCredentials {
@@ -32,6 +38,7 @@ impl fmt::Debug for FlightCredentials {
             .field("password", &self.password)
             .field("bearer_token", &self.bearer_token)
             .field("client_cert_cn", &self.client_cert_cn)
+            .field("peer_ip", &self.peer_ip)
             .finish()
     }
 }
@@ -84,6 +91,10 @@ pub enum AuthError {
     AuthFailed(String),
     /// An unexpected internal error occurred (network failure, config issue, etc.).
     Internal(anyhow::Error),
+    /// The `(peer_ip, credential)` tuple is over its pre-auth budget (#562).
+    /// No provider was consulted. Adapters map this to their protocol's
+    /// "too many requests" answer (HTTP 429, gRPC RESOURCE_EXHAUSTED).
+    RateLimited,
 }
 
 impl fmt::Display for AuthError {
@@ -92,6 +103,7 @@ impl fmt::Display for AuthError {
             AuthError::NotMyCredentials => write!(f, "credentials not handled by this provider"),
             AuthError::AuthFailed(msg) => write!(f, "authentication failed: {msg}"),
             AuthError::Internal(err) => write!(f, "internal auth error: {err}"),
+            AuthError::RateLimited => write!(f, "authentication rate limit"),
         }
     }
 }
@@ -255,6 +267,7 @@ mod tests {
             password: Some(SecretString::new("hunter2-very-private".to_string())),
             bearer_token: Some(SecretString::new("ey-bearer-private".to_string())),
             client_cert_cn: Some("cn=alice".to_string()),
+            peer_ip: Some("203.0.113.7".to_string()),
         };
         let debug = format!("{:?}", creds);
 
