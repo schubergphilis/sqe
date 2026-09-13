@@ -7,6 +7,10 @@ license = "Apache-2.0"
 repository.workspace = true
 
 [dependencies]
+# Registry types and propagation helpers live in the core crate (review 803
+# item 2) and are re-exported from `lib.rs`; this crate adds the exporters,
+# the `/metrics` server and the audit pipeline.
+sqe-metrics-core = { path = "../sqe-metrics-core", features = ["propagation"] }
 prometheus = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }

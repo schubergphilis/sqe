@@ -26,7 +26,9 @@ sqe-catalog = { path = "../sqe-catalog" }
 sqe-compaction = { path = "../sqe-compaction" }
 sqe-sql = { path = "../sqe-sql" }
 sqe-policy = { path = "../sqe-policy" }
-sqe-metrics = { path = "../sqe-metrics" }
+# `MetricsRegistry` only: the registry crate, under the name the sources use
+# (review 803 item 2). No exporters, no OTel SDK, no `/metrics` server.
+sqe-metrics = { path = "../sqe-metrics-core", package = "sqe-metrics-core" }
 sqe-lineage = { path = "../sqe-lineage" }
 datafusion = { workspace = true }
 arrow = { workspace = true }

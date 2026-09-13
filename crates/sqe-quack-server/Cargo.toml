@@ -10,7 +10,9 @@ repository.workspace = true
 sqe-quack-wire = { path = "../sqe-quack-wire" }
 sqe-auth = { path = "../sqe-auth" }
 sqe-core = { path = "../sqe-core" }
-sqe-metrics = { path = "../sqe-metrics" }
+# Trace-context propagation only: the registry crate, under the name the
+# sources use (review 803 item 2). No exporters, no OTel SDK.
+sqe-metrics = { path = "../sqe-metrics-core", package = "sqe-metrics-core", features = ["propagation"] }
 axum = { workspace = true }
 tokio = { workspace = true }
 moka = { workspace = true }
