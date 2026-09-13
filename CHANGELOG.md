@@ -6,6 +6,23 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Crates: `sqe-metrics-core` holds the registry types; the policy, catalog, compaction and write crates depend on it, not on the telemetry stack (#635)
+
+    Four library crates linked `sqe-metrics` for one type, `MetricsRegistry`
+    (the catalog also for `propagation::trace_context_http_headers`), and so
+    declared a dependency on the OTLP exporters, the OpenTelemetry SDK, the
+    tracing subscriber and the axum `/metrics` server. The registry types
+    and the propagation helpers now live in `sqe-metrics-core` (propagation
+    behind a feature); `sqe-metrics` depends on it and re-exports both, so
+    the coordinator, worker, server and lineage crates see the same API.
+    The four crates (plus `sqe-trino-compat` and `sqe-quack-server`, which
+    used propagation only) name the core crate under the dependency name
+    `sqe-metrics`, so their sources are unchanged. One caveat, measured:
+    the third-party closure of those crates barely moves, because
+    `workspace-hack` (cargo-hakari) unifies every workspace dependency into
+    every member on purpose; what changes is the crate graph and what the
+    library crates may reach for.
+
 - Crates: the `sqe-server` binary has its own crate; the coordinator library no longer depends on the worker (#635, #636, #589)
 
     `crates/sqe-coordinator/src/bin/sqe_server.rs` is now

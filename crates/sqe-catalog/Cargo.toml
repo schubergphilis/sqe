@@ -141,7 +141,9 @@ sqe-sql = { path = "../sqe-sql" }
 # policy engine: build-time item C1. With the full `sqe-policy` here the
 # 22 s policy compile sat in front of this crate's on every cold build.
 sqe-policy-api = { path = "../sqe-policy-api" }
-sqe-metrics = { path = "../sqe-metrics" }
+# `MetricsRegistry` and `propagation::trace_context_http_headers` only: the
+# registry crate, under the name the sources use (review 803 item 2).
+sqe-metrics = { path = "../sqe-metrics-core", package = "sqe-metrics-core", features = ["propagation"] }
 thiserror = { workspace = true, optional = true }
 datafusion = { workspace = true }
 datafusion-expr = { workspace = true }

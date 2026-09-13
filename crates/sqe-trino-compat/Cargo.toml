@@ -15,7 +15,9 @@ sqe-trino-protocol = { path = "../sqe-trino-protocol", features = ["arrow"] }
 sqe-core = { path = "../sqe-core" }
 sqe-auth = { path = "../sqe-auth" }
 sqe-sql = { path = "../sqe-sql" }
-sqe-metrics = { path = "../sqe-metrics" }
+# Trace-context propagation only: the registry crate, under the name the
+# sources use (review 803 item 2). No exporters, no OTel SDK.
+sqe-metrics = { path = "../sqe-metrics-core", package = "sqe-metrics-core", features = ["propagation"] }
 # Session-control and prepared-statement handling reads the AST the SQL front
 # door produced (USE targets, EXECUTE arguments) instead of the statement text.
 sqlparser = { workspace = true }

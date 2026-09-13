@@ -16,6 +16,7 @@ members = [
     "crates/sqe-worker",
     "crates/sqe-trino-protocol",
     "crates/sqe-trino-compat",
+    "crates/sqe-metrics-core",
     "crates/sqe-metrics",
     "crates/sqe-spill",
     "crates/sqe-lineage",

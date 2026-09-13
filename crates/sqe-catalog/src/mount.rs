@@ -157,8 +157,8 @@ use sqe_core::config::{StorageConfig, TvfCaller};
 /// `[storage.tvf]` allowlist via `storage.tvf.check_path`, and that a root
 /// name does not collide with an already-registered catalog is the caller's
 /// responsibility (this function has no registry to check against; see the
-/// module doc comment on `sqe_policy::plan_rewriter::HiveCatalogs` for why
-/// that check belongs where ATTACH is dispatched, not here).
+/// module doc comment on `sqe_policy_api::HiveCatalogs` for why that check
+/// belongs where ATTACH is dispatched, not here).
 ///
 /// `limits` bounds an untrusted input: a manifest is a file anyone who can
 /// write to the warehouse prefix can plant, and `max_bytes`/`max_columns`/

@@ -189,15 +189,23 @@ Interactive SQL client.
 | `http.rs` | `HttpClient`: Trino HTTP protocol client |
 | `display.rs` | Output formatting: ASCII table, CSV, JSON |
 
-### sqe-metrics
+### sqe-metrics-core
 
-Observability stack.
+The registry types and trace-context propagation, and nothing heavier. The policy, catalog, compaction and write crates depend on this crate (under the dependency name `sqe-metrics`, so their sources read `sqe_metrics::MetricsRegistry`), which keeps the OTLP exporters, the OpenTelemetry SDK, the tracing subscriber and the axum server out of their builds.
 
 | Module | Contents |
 |---|---|
-| `lib.rs` | `MetricsRegistry`: Prometheus counters, histograms, gauges |
+| `lib.rs` | `MetricsRegistry`, `WorkerMetricsRegistry`, `HasRegistry`: Prometheus counters, histograms, gauges |
+| `propagation.rs` (feature `propagation`) | W3C trace context over tonic metadata and HTTP headers, correlation ids |
+
+### sqe-metrics
+
+Observability stack; re-exports everything in `sqe-metrics-core`.
+
+| Module | Contents |
+|---|---|
 | `server.rs` | Prometheus HTTP `/metrics` endpoint (axum) |
-| `audit.rs` | `AuditLogger`: JSONL audit log writer |
+| `audit/` | `AuditLogger`: OCSF and JSONL audit pipeline, sinks, redaction |
 | `otel.rs` | OpenTelemetry init (traces, metrics, logs via OTLP/gRPC) |
 
 ### sqe-trino-protocol
