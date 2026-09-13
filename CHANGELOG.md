@@ -297,6 +297,21 @@ All notable changes to SQE are documented in this file.
 
 ### Bug Fixes
 
+- Write path: one field-id stamping implementation (#600)
+
+    Two implementations stamped Iceberg field ids onto Arrow batches and
+    disagreed: `stamp_field_ids` behind the buffered `write_data_files`
+    scanned every batch for nulls to decide nullability and cast per batch,
+    while `build_stamped_schema` / `apply_stamped_schema` behind the
+    streaming writer marked every column nullable and took types from the
+    Iceberg schema. Both ran in production (streaming CTAS and INSERT on one,
+    the CoW per-file rewrite, lease and ledger rows and the delete key files
+    on the other), so any type-mapping fix had to land twice or writes
+    diverged. The buffered writer is now a one-shot stream into
+    `write_data_files_streaming`, the equality-delete key writers use the
+    shared `stamp_batches`, and `stamp_field_ids` is gone. Same file naming,
+    same partitioned fan-out (the vendored `TaskWriter`), one stamping rule.
+
 - Coordinator: query and write planning run on a dedicated 64 MiB stack (#640)
 
     A stack overflow in Rust is a process abort. The planning phases (SQL to
