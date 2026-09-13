@@ -6,6 +6,21 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Coordinator: one audit emitter for every statement outcome (#589, #636)
+
+    `QueryHandler::execute_inner` built the statement's `AuditEvent` four
+    times over (SELECT, GRANT/REVOKE/DENY, secret-bearing statements on the
+    redacting legacy path, everything else) and the streaming finalizer
+    three more times (success, error, cancel), each copy assembling the
+    actor, outcome, timing and query block by hand. `audit_emitter.rs`
+    now holds the builders (`actor_for`, `outcome_of`, `policy_audit`,
+    `query_info`, `timing`) and `emit_statement_audit`, which routes by
+    statement kind exactly as before; the streaming finalizer has one
+    `emit_audit` that the three endings call with their outcome. Same
+    events, same fields, same redaction contract (raw SQL in `query.text`,
+    redacted by the audit worker; secret-bearing kinds stay on `log`).
+    `execute_inner` is 245 lines shorter.
+
 - Config: production mode is one rule table, mirrored in the production guide (#637)
 
     What `coordinator.production_mode = true` refuses was fifteen
