@@ -1,10 +1,18 @@
 //! S3 (or S3-compatible) spill segment backend.
 //!
 //! Uses a dedicated bucket/prefix and credential, never table-vended STS
-//! credentials or a warehouse path. Writes stage under `*.partial` then
-//! publish via copy (atomic from the reader's point of view). Objects are
-//! tagged for bucket lifecycle expiry so orphaned segments are reaped even
-//! if process cleanup fails.
+//! credentials or a warehouse path. A segment is PUT once, to its final key:
+//! S3 PUT is atomic, so a reader sees either no object or the whole one, and
+//! the staging copy this store used to write first bought nothing (#382).
+//! Objects are tagged for bucket lifecycle expiry so orphaned segments are
+//! reaped even if process cleanup fails; SQE does not create that rule, so
+//! [`S3SegmentStore::from_config`] says so at startup.
+//!
+//! Quota is reserved up front in `create_writer` with a compare-and-swap on
+//! the counters and refunded when a writer is aborted or dropped, so N
+//! concurrent writers cannot all pass a stale check and overshoot
+//! `max_bytes` by N segments (#382). `finish` reconciles the reservation to
+//! the bytes actually written.
 //!
 //! Tests inject an [`object_store::memory::InMemory`] store; production builds
 //! an AmazonS3 client from [`S3SpillConfig`].
@@ -227,8 +235,77 @@ impl S3SegmentStore {
     /// Build an AmazonS3 client from config and wrap it.
     pub fn from_config(config: &S3SpillConfig) -> Result<Self> {
         config.validate()?;
+        // Orphan reaping of segments left by a crashed worker relies on a
+        // bucket lifecycle rule SQE never creates or verifies (#382). Say so
+        // where an operator reads startup logs, once per store.
+        tracing::warn!(
+            bucket = %config.bucket,
+            prefix = %config.normalized_prefix(),
+            tag = %format!("{LIFECYCLE_TAG_KEY}={LIFECYCLE_TAG_VALUE}"),
+            "S3 spill store: orphaned segments are reaped only by a bucket lifecycle rule \
+             expiring objects with this tag; SQE does not create it. The bucket must be \
+             dedicated to spill and must not overlap any table warehouse."
+        );
         let store = build_amazon_s3(config)?;
         Self::new(store, config)
+    }
+
+    /// Reserve `need` bytes and one object against the quota, atomically.
+    ///
+    /// Compare-and-swap on both counters, so concurrent writers cannot each
+    /// pass a stale read and overshoot together (#382). The returned
+    /// [`QuotaHold`] refunds on drop until [`QuotaHold::settle`] reconciles
+    /// it to the bytes actually written.
+    fn reserve_quota(&self, need: u64) -> Result<QuotaHold> {
+        if take_fault(SpillFault::DiskFull) {
+            return Err(BudgetError::SpillDiskFull { need, available: 0 });
+        }
+        if take_fault(SpillFault::QuotaExceeded) {
+            return Err(BudgetError::SpillQuotaExceeded {
+                scope: "s3".into(),
+                need,
+                free: 0,
+                max: self.max_bytes,
+            });
+        }
+        let max_bytes = self.max_bytes;
+        if let Err(used) =
+            self.used_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                    let next = used.saturating_add(need);
+                    (next <= max_bytes).then_some(next)
+                })
+        {
+            return Err(BudgetError::SpillQuotaExceeded {
+                scope: "s3".into(),
+                need,
+                free: max_bytes.saturating_sub(used),
+                max: max_bytes,
+            });
+        }
+        let max_objects = self.max_objects;
+        if let Err(objs) =
+            self.used_objects
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |objs| {
+                    let next = objs.saturating_add(1);
+                    (next <= max_objects).then_some(next)
+                })
+        {
+            // Give the byte reservation back: nothing was written.
+            self.used_bytes.fetch_sub(need, Ordering::AcqRel);
+            return Err(BudgetError::SpillQuotaExceeded {
+                scope: "s3-objects".into(),
+                need: 1,
+                free: max_objects.saturating_sub(objs),
+                max: max_objects,
+            });
+        }
+        Ok(QuotaHold {
+            used_bytes: Arc::clone(&self.used_bytes),
+            used_objects: Arc::clone(&self.used_objects),
+            reserved_bytes: need,
+            settled: false,
+        })
     }
 
     /// Object key for a scope-relative file name.
@@ -252,38 +329,45 @@ impl S3SegmentStore {
         );
         ObjectPath::from(joined)
     }
+}
 
-    fn reserve_quota(&self, need: u64) -> Result<()> {
-        if take_fault(SpillFault::DiskFull) {
-            return Err(BudgetError::SpillDiskFull { need, available: 0 });
+/// A quota reservation held by an open writer (#382).
+///
+/// Dropping an unsettled hold (abort, error, or a writer dropped without
+/// `finish`) returns the reserved bytes and the object slot. `settle`
+/// replaces the estimate with the bytes actually written and keeps the
+/// object slot, so the counters track published segments exactly.
+struct QuotaHold {
+    used_bytes: Arc<AtomicU64>,
+    used_objects: Arc<AtomicU64>,
+    reserved_bytes: u64,
+    settled: bool,
+}
+
+impl QuotaHold {
+    fn settle(mut self, actual_bytes: u64) {
+        if actual_bytes >= self.reserved_bytes {
+            self.used_bytes
+                .fetch_add(actual_bytes - self.reserved_bytes, Ordering::AcqRel);
+        } else {
+            self.used_bytes
+                .fetch_sub(self.reserved_bytes - actual_bytes, Ordering::AcqRel);
         }
-        if take_fault(SpillFault::QuotaExceeded) {
-            return Err(BudgetError::SpillQuotaExceeded {
-                scope: "s3".into(),
-                need,
-                free: 0,
-                max: self.max_bytes,
-            });
+        self.settled = true;
+    }
+}
+
+impl Drop for QuotaHold {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.used_bytes
+                .fetch_sub(self.reserved_bytes, Ordering::AcqRel);
+            self.used_objects
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                    Some(c.saturating_sub(1))
+                })
+                .ok();
         }
-        let used = self.used_bytes.load(Ordering::Relaxed);
-        if used.saturating_add(need) > self.max_bytes {
-            return Err(BudgetError::SpillQuotaExceeded {
-                scope: "s3".into(),
-                need,
-                free: self.max_bytes.saturating_sub(used),
-                max: self.max_bytes,
-            });
-        }
-        let objs = self.used_objects.load(Ordering::Relaxed);
-        if objs.saturating_add(1) > self.max_objects {
-            return Err(BudgetError::SpillQuotaExceeded {
-                scope: "s3-objects".into(),
-                need: 1,
-                free: self.max_objects.saturating_sub(objs),
-                max: self.max_objects,
-            });
-        }
-        Ok(())
     }
 }
 
@@ -344,9 +428,8 @@ impl SegmentStore for S3SegmentStore {
                 .map_err(|_| BudgetError::Cancelled {
                     budget: "spill-write-s3".into(),
                 })?;
-        self.reserve_quota(64 * 1024)?;
+        let quota = self.reserve_quota(64 * 1024)?;
 
-        let partial_key = self.key(scope, &SpillSegment::partial_file_name(sequence));
         let final_key = self.key(scope, &SpillSegment::segment_file_name(sequence));
 
         // Buffer IPC into memory; segment_target_size bounds this in production.
@@ -364,14 +447,12 @@ impl SegmentStore for S3SegmentStore {
             scope: scope.clone(),
             sequence,
             schema,
-            partial_key,
             final_key,
             bucket: self.bucket.clone(),
             ipc: Some(ipc),
             row_count: 0,
             logical_bytes: 0,
-            used_bytes: self.used_bytes.clone(),
-            used_objects: self.used_objects.clone(),
+            quota: Some(quota),
             _write_permit: permit,
         }))
     }
@@ -557,14 +638,13 @@ struct S3SegmentWriter {
     scope: SpillScope,
     sequence: u64,
     schema: SchemaRef,
-    partial_key: ObjectPath,
     final_key: ObjectPath,
     bucket: String,
     ipc: Option<StreamWriter<Cursor<Vec<u8>>>>,
     row_count: u64,
     logical_bytes: u64,
-    used_bytes: Arc<AtomicU64>,
-    used_objects: Arc<AtomicU64>,
+    /// The up-front quota reservation; settled by `finish`, refunded on drop.
+    quota: Option<QuotaHold>,
     _write_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -573,7 +653,7 @@ impl SegmentWriter for S3SegmentWriter {
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         if take_fault(SpillFault::ShortWrite) {
             return Err(BudgetError::SpillIo {
-                path: self.partial_key.to_string(),
+                path: self.final_key.to_string(),
                 source: std::io::Error::new(std::io::ErrorKind::WriteZero, "injected short write"),
             });
         }
@@ -582,7 +662,7 @@ impl SegmentWriter for S3SegmentWriter {
             .as_mut()
             .ok_or_else(|| BudgetError::Config("writer already finished".into()))?;
         ipc.write(batch).map_err(|e| BudgetError::SpillIo {
-            path: self.partial_key.to_string(),
+            path: self.final_key.to_string(),
             source: std::io::Error::other(e.to_string()),
         })?;
         self.row_count += batch.num_rows() as u64;
@@ -596,11 +676,11 @@ impl SegmentWriter for S3SegmentWriter {
             .take()
             .ok_or_else(|| BudgetError::Config("writer already finished".into()))?;
         ipc.finish().map_err(|e| BudgetError::SpillIo {
-            path: self.partial_key.to_string(),
+            path: self.final_key.to_string(),
             source: std::io::Error::other(e.to_string()),
         })?;
         let cursor = ipc.into_inner().map_err(|e| BudgetError::SpillIo {
-            path: self.partial_key.to_string(),
+            path: self.final_key.to_string(),
             source: std::io::Error::other(e.to_string()),
         })?;
         let body = cursor.into_inner();
@@ -614,19 +694,11 @@ impl SegmentWriter for S3SegmentWriter {
             });
         }
 
-        // Stage partial with lifecycle tags (short-lived purpose).
-        let mut partial_opts = PutOptions::from(lifecycle_tags_for_partial(&self.scope));
-        partial_opts.attributes = lifecycle_attributes(&self.scope, LIFECYCLE_PURPOSE_PARTIAL);
-        self.store
-            .put_opts(
-                &self.partial_key,
-                PutPayload::from(Bytes::from(body.clone())),
-                partial_opts,
-            )
-            .await
-            .map_err(|e| map_os_err(self.partial_key.as_ref(), e))?;
-
-        // Publish: put final with segment tags (copy not always tagged on all backends).
+        // One PUT, to the final key, with the segment's lifecycle tags. S3 PUT
+        // is atomic: a reader sees no object or the complete one, so the
+        // staging copy this used to write first (a second full PUT plus a
+        // DELETE per segment) protected nothing (#382). Every error path
+        // above and here drops `quota` unsettled, which refunds it.
         let mut final_opts = PutOptions::from(lifecycle_tags_for_segment(&self.scope));
         final_opts.attributes = lifecycle_attributes(&self.scope, LIFECYCLE_PURPOSE_SEGMENT);
         self.store
@@ -638,11 +710,9 @@ impl SegmentWriter for S3SegmentWriter {
             .await
             .map_err(|e| map_os_err(self.final_key.as_ref(), e))?;
 
-        // Delete partial staging object.
-        let _ = self.store.delete(&self.partial_key).await;
-
-        self.used_bytes.fetch_add(physical_bytes, Ordering::Relaxed);
-        self.used_objects.fetch_add(1, Ordering::Relaxed);
+        if let Some(quota) = self.quota.take() {
+            quota.settle(physical_bytes);
+        }
 
         let schema_fingerprint = schema_fingerprint(&self.schema);
         let path = PathBuf::from(format!("s3://{}/{}", self.bucket, self.final_key));
@@ -660,8 +730,10 @@ impl SegmentWriter for S3SegmentWriter {
     }
 
     async fn abort(mut self: Box<Self>) -> Result<()> {
+        // Nothing was PUT before `finish`, so there is nothing to delete; the
+        // quota hold refunds itself when the writer drops.
         self.ipc = None;
-        let _ = self.store.delete(&self.partial_key).await;
+        self.quota = None;
         Ok(())
     }
 }
@@ -880,6 +952,80 @@ mod tests {
         // Second object should fail quota at create (reserve counts +1).
         let err = store.create_writer(&scope, 1, batch(1).schema()).await;
         assert!(err.is_err());
+    }
+
+    /// #382: the quota is reserved when the writer is created, atomically, so
+    /// concurrent writers cannot all pass a stale check; an abort refunds;
+    /// `finish` reconciles the estimate to the bytes actually written.
+    #[tokio::test]
+    async fn quota_is_reserved_up_front_refunded_on_abort_and_reconciled_on_finish() {
+        let _fault_guard = crate::fault::FaultSession::new(vec![]);
+        let mut cfg = test_config();
+        // Room for exactly two 64 KiB reservations.
+        cfg.max_bytes = 2 * 64 * 1024;
+        let mem: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = Arc::new(S3SegmentStore::new(mem, &cfg).unwrap());
+        let scope = SpillScope::new("q", "s", "op", 0, 0);
+        let schema = batch(1).schema();
+
+        let w1 = store
+            .create_writer(&scope, 0, schema.clone())
+            .await
+            .unwrap();
+        let w2 = store
+            .create_writer(&scope, 1, schema.clone())
+            .await
+            .unwrap();
+        assert_eq!(store.used_bytes().await.unwrap(), 2 * 64 * 1024);
+        // The third open writer is refused before any byte is written.
+        assert!(matches!(
+            store.create_writer(&scope, 2, schema.clone()).await,
+            Err(BudgetError::SpillQuotaExceeded { .. })
+        ));
+
+        // Abort gives the reservation back and the next open succeeds.
+        w2.abort().await.unwrap();
+        assert_eq!(store.used_bytes().await.unwrap(), 64 * 1024);
+        let w3 = store
+            .create_writer(&scope, 2, schema.clone())
+            .await
+            .unwrap();
+        // A writer dropped without finish or abort refunds too.
+        drop(w3);
+        assert_eq!(store.used_bytes().await.unwrap(), 64 * 1024);
+
+        // Finish replaces the estimate with the published size.
+        let mut w1 = w1;
+        w1.write_batch(&batch(1)).await.unwrap();
+        let seg = w1.finish().await.unwrap();
+        assert_eq!(store.used_bytes().await.unwrap(), seg.physical_bytes);
+    }
+
+    /// #382: one PUT to the final key, no staging object, no DELETE.
+    #[tokio::test]
+    async fn finish_puts_the_final_object_once() {
+        let _fault_guard = crate::fault::FaultSession::new(vec![]);
+        let mem = Arc::new(InMemory::new());
+        let store = Arc::new(S3SegmentStore::new(mem.clone(), &test_config()).unwrap());
+        let scope = SpillScope::new("q", "s", "op", 0, 0);
+        let mut w = store
+            .create_writer(&scope, 0, batch(1).schema())
+            .await
+            .unwrap();
+        w.write_batch(&batch(1)).await.unwrap();
+        let seg = w.finish().await.unwrap();
+
+        let mut listed = mem.list(None);
+        let mut keys = Vec::new();
+        while let Some(item) = listed.next().await {
+            keys.push(item.unwrap().location.to_string());
+        }
+        assert_eq!(keys.len(), 1, "exactly one object: {keys:?}");
+        assert!(
+            !keys[0].ends_with(".partial"),
+            "no staging object: {keys:?}"
+        );
+        assert!(seg.path.to_string_lossy().ends_with(&keys[0]));
     }
 
     #[tokio::test]

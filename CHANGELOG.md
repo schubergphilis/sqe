@@ -6,6 +6,36 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Catalog: `information_schema.tables` no longer loads every table (#664 follow-up)
+
+    DataFusion's built-in `information_schema.tables` asks the schema provider
+    for each listed name's type, and the trait default answers by loading the
+    table: one `loadTable` round trip per table per metadata query, for a
+    statement dbt and every BI tool issue constantly. The namespace snapshot
+    now records which names came from the view listing, and
+    `SqeSchemaProvider::table_type` answers from it: `BASE TABLE` or `VIEW`
+    without touching the catalog. A name the snapshot does not know, or no
+    snapshot at all, still takes the loading path. The wiremock catalog test
+    asserts the type of a table and of a view with zero `loadTable` requests.
+
+- Catalog: the nine scan tuning knobs travel as one `ScanTuning` struct (#575)
+
+    `small_file_threshold_bytes`, `manifest_concurrency`,
+    `prefetch_concurrency`, the two clustering-gate values, the runtime
+    filter wait, the two bloom-probe values and `scan_fetch_ahead` were
+    nine fields with nine setters on four types, forwarded field by field at
+    each hop, with the literal defaults repeated in five places. A hop that
+    forgot one silently kept a default, and `SqeCatalogProvider::with_namespaces`
+    had done exactly that. Now `sqe_catalog::iceberg_scan::ScanTuning` holds
+    them with `Default` as the one source of defaults and `from_config` as
+    the one copy out of `[catalog]` / `[storage]`; the catalog, schema and
+    table providers carry one `tuning` and hand it down with `with_tuning`,
+    and `IcebergScanExec::with_tuning` applies it. The coordinator's copy
+    is one line. `with_prefetch_concurrency` stays on the providers for the
+    two coordinator call sites that adjust it alone; the other per-knob
+    provider setters are gone. A unit test threads a non-default tuning
+    from the table provider into the scan node and reads it back.
+
 - Build: one dependency build for every cargo selection (cargo-hakari)
 
     `crates/workspace-hack` is a cargo-hakari managed crate that every member
@@ -266,6 +296,37 @@ All notable changes to SQE are documented in this file.
     `docs/archive/ballista-evaluation/`.
 
 ### Bug Fixes
+
+- S3 spill store: quota reserved atomically per writer, one PUT per segment (#382)
+
+    `reserve_quota` read the counters and the `fetch_add` happened in
+    `finish`, so N concurrent writers all passed a stale check and could
+    overshoot `max_bytes` / `max_objects` by N segments. The reservation is
+    now a compare-and-swap in `create_writer`, held by the writer, refunded
+    when the writer aborts or is dropped, and reconciled to the bytes
+    actually written in `finish`. `finish` also PUT the whole body twice
+    (a `.partial` staging copy, then the final key) and issued a DELETE, for
+    no atomicity gain: S3 PUT is atomic. It now PUTs the final key once with
+    the segment's lifecycle tags. `S3SegmentStore::from_config` warns at
+    startup that orphan reaping depends on a bucket lifecycle rule for
+    `sqe-spill=true` that SQE does not create, and that the bucket must be
+    dedicated to spill. Still open on #382: cross-checking the spill bucket
+    against the warehouse, a streaming read path, and counters that survive
+    a restart.
+
+- Dashboard: bearer tokens pass the pre-auth rate limiter before validation (#562)
+
+    The operator dashboard's `require_admin_bearer` guard was the one bearer
+    entry point that never consulted `AuthRateLimiter`; Flight, Trino (since
+    #622) and MCP (since !991) all do. Validating a garbage bearer is not
+    free (a JWKS refetch, an IdP or STS round trip per attempt), so anyone
+    reaching the health/web port could drive that cost without limit. The
+    guard now keys `(client ip, token fingerprint)` against the same
+    limiter instance the other paths share and answers 429 with
+    `Retry-After: 1`; a request without a bearer still gets the anonymous
+    401 and spends no budget. Remaining on #562: a single
+    `RateLimitedAuthProvider` wrapper in the auth chain, which needs the peer
+    address to travel with `FlightCredentials` first.
 
 - `information_schema.tables` lists every namespace, not only the ones the session already named (#664)
 
