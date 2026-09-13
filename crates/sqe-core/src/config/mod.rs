@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::SecretString;
 
 mod env_overlay;
+pub mod production;
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -5272,11 +5273,8 @@ impl SqeConfig {
                             && url.query().is_none()
                             && url.fragment().is_none() =>
                     {
-                        if self.coordinator.production_mode && url.scheme() != "https" {
-                            errors.push(
-                                "mcp.resource_uri must use https in production_mode".to_string(),
-                            );
-                        }
+                        // The https requirement is a production-mode rule
+                        // (`production::PRODUCTION_RULES`).
                     }
                     _ => errors.push(
                         "mcp.resource_uri must be an absolute URL with path /mcp and no query or fragment"
@@ -5294,11 +5292,8 @@ impl SqeConfig {
                 for issuer in &self.mcp.authorization_servers {
                     match url::Url::parse(issuer) {
                         Ok(url) if url.has_host() && url.fragment().is_none() => {
-                            if self.coordinator.production_mode && url.scheme() != "https" {
-                                errors.push(format!(
-                                    "mcp authorization server must use https in production_mode: {issuer}"
-                                ));
-                            }
+                            // The https requirement is a production-mode rule
+                            // (`production::PRODUCTION_RULES`).
                         }
                         _ => errors.push(format!(
                             "mcp authorization server must be an absolute URL without a fragment: {issuer}"
@@ -5399,12 +5394,8 @@ impl SqeConfig {
                              mcp.auth.mode = \"oauth\" or \"static\""
                         ));
                     }
-                    if self.coordinator.production_mode {
-                        errors.push(
-                            "mcp.auth.mode = \"anonymous\" is not allowed under production_mode"
-                                .to_string(),
-                        );
-                    }
+                    // Refused outright under production_mode
+                    // (`production::PRODUCTION_RULES`, `mcp-no-anonymous-auth`).
                     if self.mcp.allow_writes {
                         errors.push(
                             "mcp.auth.mode = \"anonymous\" cannot be combined with \
@@ -5817,180 +5808,10 @@ impl SqeConfig {
 
     /// Fail-closed production guard. Only enforced when
     /// `coordinator.production_mode` is `true` (via [`SqeConfig::validate`]).
+    /// The rules are the table in [`production::PRODUCTION_RULES`]; this
+    /// function only joins the violations.
     pub fn validate_production(&self) -> crate::error::Result<()> {
-        let mut errors = Vec::new();
-
-        if self.auth.providers.iter().any(|p| {
-            matches!(
-                p,
-                AuthProviderConfig::Anonymous { .. } | AuthProviderConfig::BearerPassthrough { .. }
-            )
-        }) {
-            errors.push(
-                "production_mode: auth.providers must not include anonymous or \
-                 bearer_passthrough providers (dev-only; accept any connection \
-                 or skip local JWT validation)"
-                    .to_string(),
-            );
-        }
-
-        if !self.rate_limit.enabled {
-            errors.push(
-                "production_mode: rate_limit.enabled must be true (disabled rate \
-                 limiting allows query and auth flooding)"
-                    .to_string(),
-            );
-        }
-
-        if self.security.allow_insecure_transport {
-            errors.push(
-                "production_mode: security.allow_insecure_transport must be false \
-                 (cleartext distributed hops expose bearer tokens, worker secrets, \
-                 and vended S3 credentials)"
-                    .to_string(),
-            );
-        }
-
-        // SEC-03: a config-held `client_credentials` grant hands one server-baked
-        // service token to every connection, collapsing all users to a single
-        // identity at Polaris/S3 and defeating per-user authorization. Two
-        // sibling paths carry this risk and must be gated with parity:
-        //   1. `[auth].providers` — the Flight user-auth `ClientCredentials`
-        //      provider (shared identity for every connecting user).
-        //   2. `[catalog.auth]` / `[catalogs.*.auth]` — a catalog whose auth
-        //      method is `ClientCredentials` fetches one token per session and
-        //      reuses it, so that catalog sees one identity for all users.
-        // The per-connection `client_credentials_passthrough` provider (own
-        // creds per connection) is NOT flagged. Reject in production unless the
-        // operator acknowledges a deliberate single-shared-identity deployment.
-        let shared_identity_flight = self
-            .auth
-            .providers
-            .iter()
-            .any(|p| matches!(p, AuthProviderConfig::ClientCredentials { .. }));
-        let shared_identity_catalog = std::iter::once(&self.catalog)
-            .chain(self.catalogs.values())
-            .any(|c| matches!(c.auth, Some(CatalogAuthConfig::ClientCredentials { .. })));
-        if !self.security.allow_shared_service_identity
-            && (shared_identity_flight || shared_identity_catalog)
-        {
-            errors.push(
-                "production_mode: a shared-service-identity auth mode is configured \
-                 (config-held client_credentials in [auth].providers and/or \
-                 [catalog(s).auth]); every connection would use one identity at \
-                 Polaris/S3, losing per-user authorization. Use oidc_password \
-                 (per-user) or client_credentials_passthrough (per-connection) for \
-                 user auth and SessionBearer for catalog auth, or set \
-                 security.allow_shared_service_identity = true to acknowledge a \
-                 deliberate single-service deployment."
-                    .to_string(),
-            );
-        }
-
-        if !self.coordinator.worker_urls.is_empty()
-            && self.coordinator.worker_secret.is_empty()
-            && self.coordinator.allow_unauthenticated_workers
-        {
-            errors.push(
-                "production_mode: coordinator.worker_urls is set with an empty \
-                 coordinator.worker_secret and coordinator.allow_unauthenticated_workers \
-                 = true (any TCP-reachable client may register as a worker)"
-                    .to_string(),
-            );
-        }
-
-        if self.query.max_sql_bytes == 0 {
-            errors.push(
-                "production_mode: query.max_sql_bytes must be > 0 \
-                 (0 disables the pre-parse statement size cap and lets a \
-                 client burn coordinator memory/CPU on an arbitrarily large \
-                 SQL string)"
-                    .to_string(),
-            );
-        }
-
-        if self.coordinator.distributed_credentials == DistributedCredentialMode::Auto
-            && !self.coordinator.worker_urls.is_empty()
-        {
-            errors.push(
-                "production_mode: coordinator.distributed_credentials must be set \
-                 explicitly (vended, static or worker_default); `auto` silently \
-                 ships the shared [storage] key pair to workers when a table has \
-                 no vended credentials (finding 401)"
-                    .to_string(),
-            );
-        }
-
-        let rest_missing_vended = |c: &CatalogConfig| {
-            matches!(c.backend, CatalogBackend::Rest) && !c.require_vended_credentials
-        };
-        if rest_missing_vended(&self.catalog) || self.catalogs.values().any(rest_missing_vended) {
-            errors.push(
-                "production_mode: catalog.require_vended_credentials must be true \
-                 on every REST catalog (otherwise FileIO falls back to the shared \
-                 [storage] S3 keys after LOAD_TABLE and Polaris table-data-read \
-                 is not the data gate). Set it on [catalog] and every REST \
-                 [catalogs.*] block."
-                    .to_string(),
-            );
-        }
-
-        // Architecture review 212 (#565): the default engine enforces nothing.
-        // Every other dev-only default is refused here or sits behind an
-        // `allow_*` flag; this one used to start silently.
-        if self.policy.engine == PolicyEngine::Passthrough
-            && !self.security.allow_no_policy_engine
-        {
-            errors.push(
-                "production_mode: policy.engine is passthrough (no row filters, masks or \
-                 column restrictions; only catalog-level authorization applies). Set \
-                 policy.engine = \"ranger\" (or \"in_memory\" for tests), or set \
-                 security.allow_no_policy_engine = true to acknowledge running without \
-                 a policy engine."
-                    .to_string(),
-            );
-        }
-
-        if self.access_control.backend == AccessControlBackend::None
-            && !self.security.allow_no_grant_backend
-        {
-            errors.push(
-                "production_mode: access_control.backend is none (GRANT / REVOKE are \
-                 rejected; privileges can only be managed outside SQE). Set \
-                 access_control.backend to chameleon, polaris or ranger, or set \
-                 security.allow_no_grant_backend = true to acknowledge managing \
-                 grants elsewhere."
-                    .to_string(),
-            );
-        }
-
-        if self.policy.engine == PolicyEngine::Ranger
-            && self.policy.mask_key.is_empty()
-            && !self.security.allow_unkeyed_hash_masks
-        {
-            errors.push(
-                "production_mode: policy.engine is ranger but policy.mask_key is empty \
-                 (Ranger MASK_HASH would fall back to unsalted SHA-256). Set \
-                 policy.mask_key (or SQE_POLICY__MASK_KEY), or set \
-                 security.allow_unkeyed_hash_masks = true to acknowledge unsalted hashes."
-                    .to_string(),
-            );
-        }
-
-        if self.policy.engine == PolicyEngine::Ranger
-            && !self.policy.ranger.project_tags
-            && !self.security.allow_unprojected_tags
-        {
-            errors.push(
-                "production_mode: policy.engine is ranger but policy.ranger.project-tags \
-                 is false (SET TAG writes Iceberg properties that Spark/Kyuubi cannot \
-                 see, so Spark returns raw columns SQE masks). Mixed SQE+Spark must set \
-                 policy.ranger.project-tags = true, or set \
-                 security.allow_unprojected_tags = true for SQE-only Ranger deploys."
-                    .to_string(),
-            );
-        }
-
+        let errors = production::violations(self);
         if errors.is_empty() {
             Ok(())
         } else {
@@ -10312,6 +10133,10 @@ audience = "polaris"
 
     #[test]
     fn unknown_toml_key_under_coordinator_fails() {
+        // `load_from_str` runs the env overlay; without the lock a sibling
+        // test's `SQE_AUTH__PROVIDERS__0__*` variable leaks in and the error
+        // this test reads is the overlay's, not the unknown-key one.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let err = SqeConfig::load_from_str(
             r#"
 [coordinator]
