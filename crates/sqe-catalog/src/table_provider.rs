@@ -14,6 +14,7 @@ use iceberg::table::Table;
 use tracing::{debug, warn};
 
 use crate::expr_to_predicate;
+use crate::iceberg_scan::ScanTuning;
 
 /// DataFusion `TableProvider` that wraps an Iceberg `Table`.
 ///
@@ -38,30 +39,9 @@ pub struct SqeTableProvider {
     snapshot_id: Option<i64>,
     /// Trust Iceberg sort order for all columns (not just partition keys).
     trust_sort_order: bool,
-    /// Small-file threshold in bytes for the direct-read fast path.
-    small_file_threshold_bytes: u64,
-    /// Concurrency for direct manifest walks during pruning.
-    manifest_concurrency: usize,
-    /// In-flight prefetch concurrency for the direct-read small-file fast path.
-    /// Wired through to `IcebergScanExec::direct_read_concurrency`.
-    prefetch_concurrency: usize,
-    /// Issue #132: Tier-1 dynamic-filter clustering gate, from
-    /// `[catalog.runtime_filters]`. When `skip` is true, scans whose files are
-    /// uniform on every filter column skip Tier-1 registration.
-    runtime_filter_clustering_skip: bool,
-    runtime_filter_uniform_threshold: f64,
-    /// Bounded wait (ms) at scan open for pending dynamic filters, from
-    /// `[catalog.runtime_filters] wait_ms`.
-    runtime_filter_wait_ms: u64,
-    /// Issue #369: bloom-filter row-group probing of sealed runtime
-    /// filters, from `[catalog.runtime_filters] bloom_probe` /
-    /// `bloom_max_values`.
-    runtime_filter_bloom_probe: bool,
-    runtime_filter_bloom_max_values: usize,
-    /// Fetch/decode pipelining depth (sqe#scan-fetch-pipeline), from `[catalog]
-    /// scan_fetch_ahead`. `None` = scan default (3x cores); `Some(0)` =
-    /// staging disabled; `Some(n)` = absolute depth.
-    scan_fetch_ahead: Option<usize>,
+    /// The scan tuning knobs, applied to every `IcebergScanExec` this
+    /// provider builds (#575).
+    tuning: ScanTuning,
 }
 
 impl SqeTableProvider {
@@ -97,16 +77,22 @@ impl SqeTableProvider {
             prom_metrics: None,
             trust_sort_order: false,
             snapshot_id,
-            small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
-            manifest_concurrency: crate::iceberg_scan::DEFAULT_MANIFEST_CONCURRENCY,
-            prefetch_concurrency: crate::iceberg_scan::DEFAULT_DIRECT_READ_CONCURRENCY,
-            runtime_filter_clustering_skip: false,
-            runtime_filter_uniform_threshold: 0.8,
-            runtime_filter_wait_ms: crate::iceberg_scan::DEFAULT_RUNTIME_FILTER_WAIT_MS,
-            runtime_filter_bloom_probe: true,
-            runtime_filter_bloom_max_values: 65536,
-            scan_fetch_ahead: None,
+            tuning: ScanTuning::default(),
         })
+    }
+
+    /// Replace every scan tuning knob at once (#575). This is the path the
+    /// catalog and schema providers use; the per-knob setters below are kept
+    /// for callers that adjust one value.
+    #[must_use = "with_tuning consumes self; bind the returned provider"]
+    pub fn with_tuning(mut self, tuning: ScanTuning) -> Self {
+        self.tuning = tuning.normalized();
+        self
+    }
+
+    /// The tuning every scan of this table runs with.
+    pub fn tuning(&self) -> &ScanTuning {
+        &self.tuning
     }
 
     /// Attach Prometheus metrics for file pruning and S3 I/O.
@@ -122,7 +108,7 @@ impl SqeTableProvider {
     /// from memory, bypassing iceberg-rust's `scan.to_arrow()` pipeline.
     #[must_use = "with_small_file_threshold consumes self; bind the returned provider"]
     pub fn with_small_file_threshold(mut self, threshold_bytes: u64) -> Self {
-        self.small_file_threshold_bytes = threshold_bytes;
+        self.tuning.small_file_threshold_bytes = threshold_bytes;
         self
     }
 
@@ -130,7 +116,7 @@ impl SqeTableProvider {
     /// column-statistics pruning.
     #[must_use = "with_manifest_concurrency consumes self; bind the returned provider"]
     pub fn with_manifest_concurrency(mut self, concurrency: usize) -> Self {
-        self.manifest_concurrency = concurrency.max(1);
+        self.tuning.manifest_concurrency = concurrency.max(1);
         self
     }
 
@@ -138,43 +124,7 @@ impl SqeTableProvider {
     /// fast path. Maps to `IcebergScanExec::direct_read_concurrency` and is
     /// fed from `[storage] prefetch_concurrency`.
     pub fn with_prefetch_concurrency(mut self, concurrency: usize) -> Self {
-        self.prefetch_concurrency = concurrency.max(1);
-        self
-    }
-
-    /// Configure the Tier-1 dynamic-filter clustering gate (issue #132) from
-    /// `[catalog.runtime_filters]`. Threads through to `IcebergScanExec`.
-    #[must_use = "with_runtime_filter_clustering consumes self; bind the returned provider"]
-    pub fn with_runtime_filter_clustering(mut self, skip: bool, uniform_threshold: f64) -> Self {
-        self.runtime_filter_clustering_skip = skip;
-        self.runtime_filter_uniform_threshold = uniform_threshold;
-        self
-    }
-
-    /// Bounded wait (ms) at scan open for pending dynamic filters, from
-    /// `[catalog.runtime_filters] wait_ms`. Threads through to `IcebergScanExec`.
-    #[must_use = "with_runtime_filter_wait_ms consumes self; bind the returned provider"]
-    pub fn with_runtime_filter_wait_ms(mut self, wait_ms: u64) -> Self {
-        self.runtime_filter_wait_ms = wait_ms;
-        self
-    }
-
-    /// Bloom-filter (SBBF) row-group probing of sealed runtime filters
-    /// (issue #369), from `[catalog.runtime_filters]`. Threads through to
-    /// `IcebergScanExec`.
-    #[must_use = "with_runtime_filter_bloom consumes self; bind the returned provider"]
-    pub fn with_runtime_filter_bloom(mut self, enabled: bool, max_values: usize) -> Self {
-        self.runtime_filter_bloom_probe = enabled;
-        self.runtime_filter_bloom_max_values = max_values;
-        self
-    }
-
-    /// Fetch/decode pipelining depth (sqe#scan-fetch-pipeline), from `[catalog]
-    /// scan_fetch_ahead`. Threads through to `IcebergScanExec`. `None`
-    /// keeps the scan's default (3x cores); `Some(0)` disables staging.
-    #[must_use = "with_scan_fetch_ahead consumes self; bind the returned provider"]
-    pub fn with_scan_fetch_ahead(mut self, fetch_ahead: Option<usize>) -> Self {
-        self.scan_fetch_ahead = fetch_ahead;
+        self.tuning.prefetch_concurrency = concurrency.max(1);
         self
     }
 
@@ -355,22 +305,7 @@ impl SqeTableProvider {
         // exchange (Doris-style Local Shuffle, or a planner rule that injects
         // `RepartitionExec(Hash, ...)` ahead of the join) is in place.
         let _ = state; // intentionally unused now; see note above
-        exec = exec
-            .with_small_file_threshold(self.small_file_threshold_bytes)
-            .with_manifest_concurrency(self.manifest_concurrency)
-            .with_direct_read_concurrency(self.prefetch_concurrency)
-            .with_runtime_filter_clustering(
-                self.runtime_filter_clustering_skip,
-                self.runtime_filter_uniform_threshold,
-            )
-            .with_runtime_filter_wait_ms(self.runtime_filter_wait_ms)
-            .with_runtime_filter_bloom(
-                self.runtime_filter_bloom_probe,
-                self.runtime_filter_bloom_max_values,
-            );
-        if let Some(fetch_ahead) = self.scan_fetch_ahead {
-            exec = exec.with_scan_fetch_ahead(fetch_ahead);
-        }
+        exec = exec.with_tuning(&self.tuning);
 
         // Pre-compute per-column min/max/null_count from manifest entries so
         // DataFusion's join-order optimizer sees real selectivity and picks
@@ -388,7 +323,7 @@ impl SqeTableProvider {
             &self.table,
             self.snapshot_id,
             projected_schema.as_ref(),
-            self.manifest_concurrency,
+            self.tuning.manifest_concurrency,
         )
         .await
         {
@@ -631,6 +566,45 @@ mod snapshot_schema_tests {
             .iter()
             .map(|f| f.name().clone())
             .collect()
+    }
+
+    /// #575: the nine scan knobs travel as one struct. A non-default value
+    /// set on the provider is what the scan node reports it runs with, and
+    /// zero concurrencies clamp to one instead of stalling a zero-width
+    /// `buffer_unordered`.
+    #[tokio::test]
+    async fn scan_tuning_reaches_the_scan_exec_unchanged() {
+        use crate::iceberg_scan::{IcebergScanExec, ScanTuning};
+
+        let tuning = ScanTuning {
+            small_file_threshold_bytes: 1,
+            manifest_concurrency: 3,
+            prefetch_concurrency: 5,
+            runtime_filter_clustering_skip: true,
+            runtime_filter_uniform_threshold: 0.42,
+            runtime_filter_wait_ms: 7,
+            runtime_filter_bloom_probe: false,
+            runtime_filter_bloom_max_values: 11,
+            scan_fetch_ahead: Some(13),
+        };
+        let provider = SqeTableProvider::try_new(evolved_table())
+            .await
+            .unwrap()
+            .with_tuning(tuning.clone());
+        assert_eq!(provider.tuning(), &tuning);
+
+        let exec = IcebergScanExec::new(evolved_table(), provider.schema.clone(), None, None)
+            .with_tuning(provider.tuning());
+        assert_eq!(exec.tuning(), tuning);
+
+        let clamped = ScanTuning {
+            manifest_concurrency: 0,
+            prefetch_concurrency: 0,
+            ..ScanTuning::default()
+        }
+        .normalized();
+        assert_eq!(clamped.manifest_concurrency, 1);
+        assert_eq!(clamped.prefetch_concurrency, 1);
     }
 
     #[tokio::test]

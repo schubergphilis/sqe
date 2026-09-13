@@ -11,6 +11,7 @@ use sqe_core::config::StorageConfig;
 use sqe_core::SessionUser;
 use sqe_policy_api::PolicyStore;
 
+use crate::iceberg_scan::ScanTuning;
 use crate::rest_catalog::SessionCatalog;
 use crate::schema_provider::SqeSchemaProvider;
 
@@ -156,28 +157,10 @@ pub struct SqeCatalogProvider {
     session_user: Option<SessionUser>,
     /// Optional Prometheus metrics propagated to schema/table providers.
     prom_metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
-    /// Small-file threshold in bytes for the direct-read fast path.
-    /// Propagated to schema and table providers.
-    small_file_threshold_bytes: u64,
-    /// Concurrency for direct manifest walks during pruning.
-    /// Propagated to schema and table providers.
-    manifest_concurrency: usize,
-    /// Prefetch concurrency for the direct-read fast path. Sourced from
-    /// `[storage] prefetch_concurrency` and propagated downstream.
-    prefetch_concurrency: usize,
-    /// Issue #132: Tier-1 dynamic-filter clustering gate, propagated downstream.
-    runtime_filter_clustering_skip: bool,
-    runtime_filter_uniform_threshold: f64,
-    /// Bounded wait (ms) at scan open for pending dynamic filters,
-    /// propagated downstream.
-    runtime_filter_wait_ms: u64,
-    /// Issue #369: bloom-filter row-group probing of sealed runtime
-    /// filters, propagated downstream.
-    runtime_filter_bloom_probe: bool,
-    runtime_filter_bloom_max_values: usize,
-    /// Fetch/decode pipelining depth (sqe#scan-fetch-pipeline); see
-    /// `SqeTableProvider::with_scan_fetch_ahead`.
-    scan_fetch_ahead: Option<usize>,
+    /// The scan tuning knobs, handed unchanged to every schema and table
+    /// provider (#575). One struct, one set of defaults, one copy from
+    /// config: a hop can no longer forget a knob.
+    tuning: ScanTuning,
     /// One `SqeSchemaProvider` per namespace for the life of this provider,
     /// so repeated `schema()` lookups during a planning pass (DataFusion
     /// resolves each table reference separately) share one instance instead
@@ -309,17 +292,26 @@ impl SqeCatalogProvider {
             policy_store,
             session_user,
             prom_metrics: None,
-            small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
-            manifest_concurrency: crate::iceberg_scan::DEFAULT_MANIFEST_CONCURRENCY,
-            prefetch_concurrency: crate::iceberg_scan::DEFAULT_DIRECT_READ_CONCURRENCY,
-            runtime_filter_clustering_skip: false,
-            runtime_filter_uniform_threshold: 0.8,
-            runtime_filter_wait_ms: crate::iceberg_scan::DEFAULT_RUNTIME_FILTER_WAIT_MS,
-            runtime_filter_bloom_probe: true,
-            runtime_filter_bloom_max_values: 65536,
-            scan_fetch_ahead: None,
+            tuning: ScanTuning::default(),
             schema_providers: DashMap::new(),
         })
+    }
+
+    /// Replace every scan tuning knob at once (#575). Handed unchanged to
+    /// every schema and table provider this catalog builds. Schema providers
+    /// are cached per namespace with the tuning they were built with, so the
+    /// cache is dropped here: a lookup after this call can never serve the
+    /// old values.
+    #[must_use = "with_tuning consumes self; bind the returned provider"]
+    pub fn with_tuning(mut self, tuning: ScanTuning) -> Self {
+        self.tuning = tuning.normalized();
+        self.schema_providers.clear();
+        self
+    }
+
+    /// The tuning every scan through this catalog runs with.
+    pub fn tuning(&self) -> &ScanTuning {
+        &self.tuning
     }
 
     /// Attach Prometheus metrics to be propagated to schema/table providers.
@@ -329,62 +321,11 @@ impl SqeCatalogProvider {
         self
     }
 
-    /// Set the small-file threshold (bytes) for the direct-read fast path.
-    /// Propagated to all schema and table providers.
-    #[must_use = "with_small_file_threshold consumes self; bind the returned provider"]
-    pub fn with_small_file_threshold(mut self, threshold_bytes: u64) -> Self {
-        self.small_file_threshold_bytes = threshold_bytes;
-        self
-    }
-
-    /// Set the per-scan concurrency used when walking manifests for
-    /// column-statistics pruning. Propagated to schema and table providers.
-    #[must_use = "with_manifest_concurrency consumes self; bind the returned provider"]
-    pub fn with_manifest_concurrency(mut self, concurrency: usize) -> Self {
-        self.manifest_concurrency = concurrency.max(1);
-        self
-    }
-
     /// Set the prefetch concurrency for the direct-read fast path.
     /// Propagated to schema and table providers. Fed from
     /// `[storage] prefetch_concurrency`.
     pub fn with_prefetch_concurrency(mut self, concurrency: usize) -> Self {
-        self.prefetch_concurrency = concurrency.max(1);
-        self
-    }
-
-    /// Configure the Tier-1 dynamic-filter clustering gate (issue #132).
-    /// Propagated to schema and table providers.
-    #[must_use = "with_runtime_filter_clustering consumes self; bind the returned provider"]
-    pub fn with_runtime_filter_clustering(mut self, skip: bool, uniform_threshold: f64) -> Self {
-        self.runtime_filter_clustering_skip = skip;
-        self.runtime_filter_uniform_threshold = uniform_threshold;
-        self
-    }
-
-    /// Bounded wait (ms) at scan open for pending dynamic filters.
-    /// Propagated to schema and table providers.
-    #[must_use = "with_runtime_filter_wait_ms consumes self; bind the returned provider"]
-    pub fn with_runtime_filter_wait_ms(mut self, wait_ms: u64) -> Self {
-        self.runtime_filter_wait_ms = wait_ms;
-        self
-    }
-
-    /// Bloom-filter (SBBF) row-group probing of sealed runtime filters
-    /// (issue #369). Propagated to schema and table providers.
-    #[must_use = "with_runtime_filter_bloom consumes self; bind the returned provider"]
-    pub fn with_runtime_filter_bloom(mut self, enabled: bool, max_values: usize) -> Self {
-        self.runtime_filter_bloom_probe = enabled;
-        self.runtime_filter_bloom_max_values = max_values;
-        self
-    }
-
-    /// Fetch/decode pipelining depth (sqe#scan-fetch-pipeline), from `[catalog]
-    /// scan_fetch_ahead`. `None` keeps the scan default (3x cores);
-    /// `Some(0)` disables staging.
-    #[must_use = "with_scan_fetch_ahead consumes self; bind the returned provider"]
-    pub fn with_scan_fetch_ahead(mut self, fetch_ahead: Option<usize>) -> Self {
-        self.scan_fetch_ahead = fetch_ahead;
+        self.tuning.prefetch_concurrency = concurrency.max(1);
         self
     }
 
@@ -406,15 +347,7 @@ impl SqeCatalogProvider {
             policy_store: None,
             session_user: None,
             prom_metrics: None,
-            small_file_threshold_bytes: crate::iceberg_scan::DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
-            manifest_concurrency: crate::iceberg_scan::DEFAULT_MANIFEST_CONCURRENCY,
-            prefetch_concurrency: crate::iceberg_scan::DEFAULT_DIRECT_READ_CONCURRENCY,
-            runtime_filter_clustering_skip: false,
-            runtime_filter_uniform_threshold: 0.8,
-            runtime_filter_wait_ms: crate::iceberg_scan::DEFAULT_RUNTIME_FILTER_WAIT_MS,
-            runtime_filter_bloom_probe: true,
-            runtime_filter_bloom_max_values: 65536,
-            scan_fetch_ahead: None,
+            tuning: ScanTuning::default(),
             schema_providers: DashMap::new(),
         }
     }
@@ -534,20 +467,7 @@ impl SqeCatalogProvider {
         if let Some(ref m) = self.prom_metrics {
             provider = provider.with_metrics(Arc::clone(m));
         }
-        provider = provider.with_small_file_threshold(self.small_file_threshold_bytes);
-        provider = provider.with_manifest_concurrency(self.manifest_concurrency);
-        provider = provider.with_prefetch_concurrency(self.prefetch_concurrency);
-        provider = provider.with_runtime_filter_clustering(
-            self.runtime_filter_clustering_skip,
-            self.runtime_filter_uniform_threshold,
-        );
-        provider = provider.with_runtime_filter_wait_ms(self.runtime_filter_wait_ms);
-        provider = provider.with_scan_fetch_ahead(self.scan_fetch_ahead);
-        provider = provider.with_runtime_filter_bloom(
-            self.runtime_filter_bloom_probe,
-            self.runtime_filter_bloom_max_values,
-        );
-        let provider = Arc::new(provider);
+        let provider = Arc::new(provider.with_tuning(self.tuning.clone()));
         Arc::clone(
             self.schema_providers
                 .entry(name.to_string())
@@ -703,6 +623,15 @@ mod tests {
                 .mount(&server)
                 .await;
         }
+        // `sales` also has a view; `hr` answers 404 for views, which the
+        // refresh degrades to tables-only.
+        Mock::given(method("GET"))
+            .and(path("/v1/test-warehouse/namespaces/sales/views"))
+            .respond_with(json(serde_json::json!({
+                "identifiers": [{"namespace": ["sales"], "name": "v_orders"}]
+            })))
+            .mount(&server)
+            .await;
 
         // A token no other test uses: the table-name snapshots are
         // process-global and keyed by the bearer's fingerprint.
@@ -749,14 +678,54 @@ mod tests {
 
         let names = provider.schema_names();
         assert!(names.iter().any(|n| n == "hr"), "re-listed: {names:?}");
+        let sales = provider.schema("sales").expect("sales");
         assert_eq!(
-            provider.schema("sales").expect("sales").table_names(),
-            vec!["orders".to_string()]
+            sales.table_names(),
+            vec!["orders".to_string(), "v_orders".to_string()]
         );
         assert_eq!(
             provider.schema("hr").expect("hr").table_names(),
             vec!["employees".to_string()]
         );
+
+        // `information_schema.tables` asks each listed name for its type.
+        // The snapshot answers: no `loadTable` round trip, and views are
+        // reported as views (dbt decides DROP VIEW vs DROP TABLE on this).
+        use datafusion::datasource::TableType;
+        assert_eq!(
+            sales.table_type("orders").await.expect("type"),
+            Some(TableType::Base)
+        );
+        assert_eq!(
+            sales.table_type("v_orders").await.expect("type"),
+            Some(TableType::View)
+        );
+        let loads = server
+            .received_requests()
+            .await
+            .expect("request log")
+            .iter()
+            .filter(|r| r.url.path().contains("/tables/") || r.url.path().contains("/views/"))
+            .count();
+        assert_eq!(loads, 0, "table_type must be answered from the snapshot");
+
+        // #575: one tuning struct reaches every schema provider, including
+        // the ones already cached before `with_tuning` ran.
+        let tuning = ScanTuning {
+            small_file_threshold_bytes: 1,
+            manifest_concurrency: 3,
+            prefetch_concurrency: 5,
+            runtime_filter_clustering_skip: true,
+            runtime_filter_uniform_threshold: 0.42,
+            runtime_filter_wait_ms: 7,
+            runtime_filter_bloom_probe: false,
+            runtime_filter_bloom_max_values: 11,
+            scan_fetch_ahead: Some(13),
+        };
+        let provider = provider.with_tuning(tuning.clone());
+        assert_eq!(provider.tuning(), &tuning);
+        assert_eq!(provider.schema_provider("hr").tuning(), &tuning);
+        assert_eq!(provider.schema_provider("sales").tuning(), &tuning);
     }
 
     /// Mixed allow/deny probe results: only the allowed names survive, in
