@@ -10,7 +10,7 @@
 //! Replaces fair division of `FairSpillPool` across every registered consumer
 //! (the TPC-DS q39 pool/N pathology) with explicit grants.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::budget::split_default_read_headroom;
@@ -70,6 +70,11 @@ pub struct GrantGuard {
     governor: Arc<MemoryGovernor>,
     query_id: String,
     name: String,
+    /// The grant this guard owns (#380). `Some` for guards the governor
+    /// issued from `try_admit_guarded`, which release exactly that grant;
+    /// `None` for guards built by hand, which fall back to releasing the
+    /// first active grant with the same `(query_id, name)`.
+    grant_id: Option<u64>,
     armed: bool,
 }
 
@@ -83,8 +88,15 @@ impl GrantGuard {
             governor,
             query_id: query_id.into(),
             name: name.into(),
+            grant_id: None,
             armed: true,
         }
+    }
+
+    /// The unique id of the grant this guard releases, when the governor
+    /// issued it.
+    pub fn grant_id(&self) -> Option<u64> {
+        self.grant_id
     }
 
     pub fn query_id(&self) -> &str {
@@ -104,7 +116,10 @@ impl GrantGuard {
 impl Drop for GrantGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.governor.release(&self.query_id, &self.name);
+            match self.grant_id {
+                Some(id) => self.governor.release_by_id(id),
+                None => self.governor.release(&self.query_id, &self.name),
+            }
         }
     }
 }
@@ -129,7 +144,13 @@ pub struct MemoryGovernor {
     state: Mutex<GovernorState>,
     admissions: AtomicUsize,
     rejections: AtomicUsize,
+    /// Reclaim passes that freed at least one byte of bookkeeping. Passes
+    /// that found nothing to shrink do not count (#380): a metric that
+    /// reports activity that never happened is worse than none.
     reclaims: AtomicUsize,
+    /// Monotonic id handed to each admitted grant, so release matches the
+    /// grant a guard owns rather than the first `(query_id, name)` twin.
+    next_grant_id: AtomicU64,
 }
 
 #[derive(Default)]
@@ -143,6 +164,8 @@ struct GovernorState {
 }
 
 struct ActiveGrant {
+    /// Unique per admission (#380).
+    id: u64,
     query_id: String,
     name: String,
     #[allow(dead_code)] // retained for weighted reclaim in later Phase 7 work
@@ -167,6 +190,7 @@ impl MemoryGovernor {
             admissions: AtomicUsize::new(0),
             rejections: AtomicUsize::new(0),
             reclaims: AtomicUsize::new(0),
+            next_grant_id: AtomicU64::new(1),
         }
     }
 
@@ -212,8 +236,10 @@ impl MemoryGovernor {
         }
         if state.granted_sum > distributable {
             let need = state.granted_sum - distributable;
-            let _ = Self::shrink_active_toward_minima(&mut state, need);
-            self.reclaims.fetch_add(1, Ordering::Relaxed);
+            let got = Self::shrink_active_toward_minima(&mut state, need);
+            if got > 0 {
+                self.reclaims.fetch_add(1, Ordering::Relaxed);
+            }
             if state.granted_sum > distributable {
                 return Err(format!(
                     "cannot resize governor to {new_pool}: granted {} still exceeds distributable {distributable} after reclaim toward minima",
@@ -255,8 +281,21 @@ impl MemoryGovernor {
     pub fn try_admit(
         &self,
         req: AdmissionRequest,
-        _consumer: &dyn ReclaimableConsumer,
+        consumer: &dyn ReclaimableConsumer,
     ) -> AdmissionDecision {
+        match self.admit_inner(req, consumer) {
+            Ok((grant, _id)) => AdmissionDecision::Granted(grant),
+            Err(rejected) => rejected,
+        }
+    }
+
+    /// The admission itself, also returning the new grant's id so
+    /// [`Self::try_admit_guarded`] can release exactly that grant.
+    fn admit_inner(
+        &self,
+        req: AdmissionRequest,
+        _consumer: &dyn ReclaimableConsumer,
+    ) -> Result<(MemoryGrant, u64), AdmissionDecision> {
         let minimum = req.minimum_bytes.max(1).min(req.desired_bytes.max(1));
         let desired = req.desired_bytes.max(minimum);
 
@@ -274,22 +313,24 @@ impl MemoryGovernor {
         let new_minima = state.minima_sum.saturating_add(minimum);
         if new_minima > distributable {
             self.rejections.fetch_add(1, Ordering::Relaxed);
-            return AdmissionDecision::Rejected {
+            return Err(AdmissionDecision::Rejected {
                 reason: format!(
                     "minima {} exceed distributable pool {} (headroom {} reserved)",
                     new_minima, distributable, headroom
                 ),
                 pool_bytes,
                 minima_sum: new_minima,
-            };
+            });
         }
 
         // Under soft watermark pressure: only hand out minima and try to free
         // residual from existing grants first.
         let pressure = state.granted_sum >= soft_limit;
         if pressure {
-            let _ = Self::shrink_active_toward_minima(&mut state, minimum);
-            self.reclaims.fetch_add(1, Ordering::Relaxed);
+            let got = Self::shrink_active_toward_minima(&mut state, minimum);
+            if got > 0 {
+                self.reclaims.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         // Fair residual: base = minimum, plus share of free residual weighted
@@ -311,16 +352,18 @@ impl MemoryGovernor {
 
         if state.granted_sum.saturating_add(grant_size) > distributable {
             self.rejections.fetch_add(1, Ordering::Relaxed);
-            return AdmissionDecision::Rejected {
+            return Err(AdmissionDecision::Rejected {
                 reason: "insufficient free capacity after fair share".into(),
                 pool_bytes,
                 minima_sum: new_minima,
-            };
+            });
         }
 
+        let id = self.next_grant_id.fetch_add(1, Ordering::Relaxed);
         state.granted_sum += grant_size;
         state.minima_sum += minimum;
         state.active.push(ActiveGrant {
+            id,
             query_id: req.query_id.clone(),
             name: req.name.clone(),
             class: req.class,
@@ -329,11 +372,14 @@ impl MemoryGovernor {
         });
         self.admissions.fetch_add(1, Ordering::Relaxed);
 
-        AdmissionDecision::Granted(MemoryGrant::with_bounds(
-            format!("{}:{}", req.query_id, req.name),
-            grant_size,
-            desired,
-            minimum,
+        Ok((
+            MemoryGrant::with_bounds(
+                format!("{}:{}", req.query_id, req.name),
+                grant_size,
+                desired,
+                minimum,
+            ),
+            id,
         ))
     }
 
@@ -347,16 +393,27 @@ impl MemoryGovernor {
     ) -> Result<(MemoryGrant, GrantGuard), AdmissionDecision> {
         let query_id = req.query_id.clone();
         let name = req.name.clone();
-        match self.try_admit(req, consumer) {
-            AdmissionDecision::Granted(grant) => {
-                let guard = GrantGuard::new(self.clone(), query_id, name);
-                Ok((grant, guard))
-            }
-            other => Err(other),
+        let (grant, id) = self.admit_inner(req, consumer)?;
+        let mut guard = GrantGuard::new(self.clone(), query_id, name);
+        guard.grant_id = Some(id);
+        Ok((grant, guard))
+    }
+
+    /// Release the grant with this id (#380). Two concurrent grants with the
+    /// same `(query_id, name)` hold different bytes; releasing by position
+    /// returned the wrong one's bytes for as long as both were live.
+    pub fn release_by_id(&self, id: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(idx) = state.active.iter().position(|g| g.id == id) {
+            let g = state.active.remove(idx);
+            state.granted_sum = state.granted_sum.saturating_sub(g.granted);
+            state.minima_sum = state.minima_sum.saturating_sub(g.minimum);
         }
     }
 
-    /// Release a previously admitted grant by query/name.
+    /// Release a previously admitted grant by query/name. Matches the first
+    /// active grant with that pair; prefer the guard from
+    /// [`Self::try_admit_guarded`], which releases by id.
     pub fn release(&self, query_id: &str, name: &str) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(idx) = state
@@ -520,6 +577,96 @@ mod tests {
             desired_bytes: desired,
             minimum_bytes: minimum,
         }
+    }
+
+    /// #380: two live grants with the same `(query_id, name)` release their
+    /// own bytes. Positional release returned the first twin's bytes for
+    /// whichever guard dropped, so the sum was wrong until both were gone.
+    #[test]
+    fn duplicate_named_grants_release_their_own_bytes() {
+        let gov = Arc::new(MemoryGovernor::new(64 * 1024 * 1024));
+        let small = Dummy {
+            name: "part",
+            desired: 1024 * 1024,
+            minimum: 1024 * 1024,
+        };
+        let big = Dummy {
+            name: "part",
+            desired: 8 * 1024 * 1024,
+            minimum: 8 * 1024 * 1024,
+        };
+        let (first, first_guard) = gov
+            .try_admit_guarded(
+                req(
+                    "q",
+                    "part",
+                    WorkloadClass::Join,
+                    small.desired,
+                    small.minimum,
+                ),
+                &small,
+            )
+            .expect("first grant");
+        let (second, second_guard) = gov
+            .try_admit_guarded(
+                req("q", "part", WorkloadClass::Join, big.desired, big.minimum),
+                &big,
+            )
+            .expect("second grant");
+        assert_ne!(first_guard.grant_id(), second_guard.grant_id());
+        let both = gov.granted_sum();
+        assert_eq!(both, first.capacity_bytes() + second.capacity_bytes());
+
+        // Dropping the SECOND guard must free the second grant's bytes.
+        drop(second_guard);
+        assert_eq!(gov.granted_sum(), first.capacity_bytes());
+        assert_eq!(gov.active_count(), 1);
+        drop(first_guard);
+        assert_eq!(gov.granted_sum(), 0);
+    }
+
+    /// #380: the reclaim counter counts passes that freed something. A
+    /// pressure pass over grants already at their minima has nothing to
+    /// shrink and must not report a reclaim.
+    #[test]
+    fn reclaims_count_only_passes_that_freed_bytes() {
+        let gov = Arc::new(MemoryGovernor::new(8 * 1024 * 1024));
+        let distributable = gov.distributable_bytes();
+        // Fill past the 85% soft watermark (four grants of 22.5%) with grants
+        // whose minimum == desired, so every grant is already at its floor.
+        let chunk = distributable / 40 * 9;
+        let mut guards = Vec::new();
+        for i in 0..4 {
+            let d = Dummy {
+                name: "floor",
+                desired: chunk,
+                minimum: chunk,
+            };
+            let (_g, guard) = gov
+                .try_admit_guarded(
+                    req(&format!("q{i}"), "floor", WorkloadClass::Join, chunk, chunk),
+                    &d,
+                )
+                .expect("grant at floor");
+            guards.push(guard);
+        }
+        assert!(
+            gov.under_pressure(),
+            "90% granted is past the 85% watermark"
+        );
+        let d = Dummy {
+            name: "late",
+            desired: 1024,
+            minimum: 1024,
+        };
+        let _ = gov.try_admit(req("late", "late", WorkloadClass::Join, 1024, 1024), &d);
+        assert_eq!(
+            gov.reclaims(),
+            0,
+            "nothing was shrinkable, so nothing was reclaimed"
+        );
+        assert_eq!(gov.reclaim_under_pressure(4096), 0);
+        assert_eq!(gov.reclaims(), 0);
     }
 
     #[test]
