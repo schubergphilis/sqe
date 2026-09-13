@@ -6,6 +6,18 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Crates: the MCP endpoint no longer links the Trino server crate (#635)
+
+    `sqe-mcp` depended on `sqe-trino-compat` for one function, the Arrow
+    cell to Trino JSON value encoder, and so compiled the whole Trino HTTP
+    server into the MCP crate. The encoder and its timestamp and interval
+    formatting helpers now live in `sqe_trino_protocol::encode` behind the
+    wire crate's `arrow` feature, next to the decoder they mirror;
+    `sqe_trino_compat::types::arrow_value_to_json` is a re-export. MCP's
+    first-party edges are `sqe-auth`, `sqe-core`, `sqe-sql` and
+    `sqe-trino-protocol`. The `sqe-bench` edge named in the same finding was
+    already gone (review 705).
+
 - Catalog: `information_schema.tables` no longer loads every table (#664 follow-up)
 
     DataFusion's built-in `information_schema.tables` asks the schema provider
@@ -296,6 +308,20 @@ All notable changes to SQE are documented in this file.
     `docs/archive/ballista-evaluation/`.
 
 ### Bug Fixes
+
+- Config: `[query]` byte sizes and the OpenLineage rules are checked at load (#637)
+
+    Six `[query]` sizes (`per_user_memory_budget`, `max_query_memory`,
+    `distribution_threshold`, `target_task_size`,
+    `runtime_filter_inlist_max_size`, `fanout_buffer_budget`) were parsed
+    where they were used: the planner read `distribution_threshold` and
+    `target_task_size` with `unwrap_or(0)`, so a typo silently turned
+    distribution off, and the handler constructor read the memory budgets,
+    so a typo failed the first query rather than the boot. They now go
+    through the same byte-size validator as every other size, and the
+    error names the field and the value. The `[metrics.openlineage]`
+    rules ran only when the coordinator built its observer; `validate()`
+    runs them for every binary when the block is enabled.
 
 - Auth: one pre-authentication rate limiter in front of the provider chain (#562)
 
