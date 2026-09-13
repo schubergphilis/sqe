@@ -2758,106 +2758,18 @@ impl QueryHandler {
         }
 
         if let Some(ref audit) = self.audit {
-            // Route SELECT/DQL (StatementKind::Query) through the canonical
-            // AuditEvent path so the event carries a fully-populated Actor,
-            // structured Resource list, and typed policy/timing/stats blocks.
-            //
-            // GRANT/REVOKE are routed through the canonical AuditKind::Grant
-            // path (Task 14). The raw SQL text in query.text carries grantee
-            // info; the worker thread's redact_pii pass sanitises it before
-            // chain stamping. No secrets travel in GRANT/REVOKE SQL so the
-            // redacted-legacy path is not required for these statement kinds.
-            //
-            // Secret-bearing kinds (CREATE/DROP/SHOW SECRET, ATTACH, DETACH)
-            // stay on the legacy log(&AuditEntry) path: it applies PII redaction
-            // before writing, which is critical for statements that carry bearer
-            // tokens or credentials in their SQL text. All other DDL/DML/admin
-            // kinds emit canonical AuditEvents via log_event (the worker thread
-            // redacts query text there too); DML maps to Query, the rest to
-            // AdminDdl.
-            if matches!(&kind, StatementKind::Query(_)) {
-                let ps = policy_summary.unwrap_or_default();
-
-                let outcome = match &result {
-                    Ok(_) => sqe_metrics::audit::Outcome::Success,
-                    Err(e) => sqe_metrics::audit::Outcome::Failure {
-                        error_type: Some(e.error_code().trino_error_type().to_string()),
-                        error_code: Some(e.error_code().name().to_string()),
-                        message: Some(e.client_message()),
-                    },
-                };
-
-                // Always emit PolicyAudit for SELECTs (even when all fields zero).
-                // This records the policy decision explicitly for SIEM/audit completeness
-                // (P0 from full audit: DML + read path policy decisions must be visible).
-                let policy = Some(sqe_metrics::audit::PolicyAudit {
-                    row_filters_applied: ps.row_filters_applied,
-                    columns_masked: ps.columns_masked,
-                    columns_restricted: ps.columns_restricted,
-                    denied: ps.denied,
-                });
-
-                let actor = sqe_metrics::audit::Actor::from_parts(
-                    session.user.username.clone(),
-                    session.user.subject.clone(),
-                    session.user.email.clone(),
-                    session.user.roles.clone(),
-                    session.user.groups.clone(),
-                )
-                .with_app_name(session.source.clone());
-
-                let event = sqe_metrics::audit::AuditEvent {
-                    time: chrono::Utc::now(),
-                    kind: sqe_metrics::audit::AuditKind::Query,
-                    actor,
-                    outcome,
-                    resources: audit_resources,
-                    policy,
-                    timing: Some(sqe_metrics::audit::Timing {
-                        duration_ms: duration.as_millis() as u64,
-                        // queued_ms and planning_ms are tracked by QueryTracker
-                        // but no per-id getter is exposed at this call site.
-                        // They default to 0 here; a follow-up can expose a
-                        // QueryTracker::timing_for(id) if needed.
-                        queued_ms: 0,
-                        planning_ms: 0,
-                        execution_ms,
-                    }),
-                    stats: Some(sqe_metrics::audit::QueryStats {
-                        rows_returned: rows,
-                        rows_written: None,
-                        bytes_scanned: pm.bytes_scanned,
-                        rows_scanned: pm.rows_scanned,
-                        spill_bytes: pm.spill_bytes,
-                        peak_memory_bytes: pm.peak_memory_bytes,
-                    }),
-                    query: Some(sqe_metrics::audit::QueryInfo {
-                        // Pass sql text directly. The worker thread always applies
-                        // redact_pii to query.text before chain stamping and writing.
-                        // When GDPR config is active, GDPR-tag masking runs additionally
-                        // via apply_gdpr_masking (which calls redact_pii internally).
-                        // Do NOT redact here: caller-side redaction would double-apply.
-                        text: Some(sql.to_string()),
-                        query_hash: sqe_metrics::audit::query_hash(sql),
-                        statement_type: kind_name,
-                    }),
-                    session_id: Some(session.id.clone()),
-                    client_ip: client_ip.clone(),
-                    trace_id,
-                    query_id: Some(query_id.to_string()),
-                    integrity: sqe_metrics::audit::Integrity::default(),
-                };
-                audit.log_event(event);
-            } else if matches!(
+            // One builder for every statement kind (`crate::audit_emitter`);
+            // the routing (canonical `log_event` for reads, writes, DDL and
+            // GRANT/REVOKE, the redacting legacy `log` for secret-bearing
+            // statements) is documented there. What only this site knows:
+            // the grant target for GRANT/REVOKE/DENY, from the parsed
+            // statement, so the resource is structured rather than parsed
+            // out of SQL text downstream.
+            let grant_resources = if matches!(
                 &kind,
                 StatementKind::Grant(_) | StatementKind::Revoke(_) | StatementKind::Deny(_)
             ) {
-                // Canonical path for GRANT/REVOKE (Task 14, OCSF Account Change 3001).
-                // Build a Resource from the parsed grant statement so the target object
-                // is structured. The raw SQL travels in query.text where the worker
-                // thread's redact_pii pass handles sanitisation.
-                let grant_resources = kind
-                    .statement()
+                kind.statement()
                     .and_then(|ast_stmt| Self::extract_grant_statement(ast_stmt).ok())
                     .map(|gs| {
                         let name = gs
@@ -2873,182 +2785,33 @@ impl QueryHandler {
                             object_type: sqe_metrics::audit::ObjectType::Table,
                         }]
                     })
-                    .unwrap_or_default();
-
-                let grant_outcome = match &result {
-                    Ok(_) => sqe_metrics::audit::Outcome::Success,
-                    Err(e) => sqe_metrics::audit::Outcome::Failure {
-                        error_type: Some(e.error_code().trino_error_type().to_string()),
-                        error_code: Some(e.error_code().name().to_string()),
-                        message: Some(e.client_message()),
-                    },
-                };
-
-                let grant_actor = sqe_metrics::audit::Actor::from_parts(
-                    session.user.username.clone(),
-                    session.user.subject.clone(),
-                    session.user.email.clone(),
-                    session.user.roles.clone(),
-                    session.user.groups.clone(),
-                )
-                .with_app_name(session.source.clone());
-
-                let grant_event = sqe_metrics::audit::AuditEvent {
-                    time: chrono::Utc::now(),
-                    kind: sqe_metrics::audit::AuditKind::Grant,
-                    actor: grant_actor,
-                    outcome: grant_outcome,
-                    resources: grant_resources,
-                    policy: None,
-                    timing: Some(sqe_metrics::audit::Timing {
-                        duration_ms: duration.as_millis() as u64,
-                        queued_ms: 0,
-                        planning_ms: 0,
-                        execution_ms: 0,
-                    }),
-                    stats: None,
-                    query: Some(sqe_metrics::audit::QueryInfo {
-                        text: Some(sql.to_string()),
-                        query_hash: sqe_metrics::audit::query_hash(sql),
-                        statement_type: kind_name,
-                    }),
-                    session_id: Some(session.id.clone()),
-                    client_ip: client_ip.clone(),
-                    trace_id: trace_id.clone(),
-                    query_id: Some(query_id.to_string()),
-                    integrity: sqe_metrics::audit::Integrity::default(),
-                };
-                audit.log_event(grant_event);
-            } else if matches!(
-                &kind,
-                StatementKind::CreateSecret(_)
-                    | StatementKind::DropSecret(_)
-                    | StatementKind::ShowSecrets
-                    | StatementKind::Attach(_)
-                    | StatementKind::Detach(_)
-            ) {
-                // Secret-bearing statements stay on the redacted legacy path.
-                // PII redaction runs inside log() before the entry is written.
-                // Never route these through log_event: the legacy path is the
-                // established redaction contract for bearer tokens and catalog
-                // credentials embedded in SQL text.
-                let ps = policy_summary.unwrap_or_default();
-                audit.log(&sqe_metrics::audit::AuditEntry {
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    username: session.user.username.clone(),
-                    session_id: Some(session.id.clone()),
-                    query_hash: sqe_metrics::audit::query_hash(sql),
-                    query_text: Some(sql.to_string()),
-                    statement_type: kind_name,
-                    duration_ms: duration.as_millis() as u64,
-                    rows_returned: rows,
-                    status: status.to_string(),
-                    client_ip: None,
-                    tables_touched: tables_touched.clone(),
-                    row_filters_applied: ps.row_filters_applied,
-                    columns_masked: ps.columns_masked,
-                    columns_restricted: ps.columns_restricted,
-                    policy_denied: ps.denied,
-                });
+                    .unwrap_or_default()
             } else {
-                // Canonical path for DDL, DML, and admin statements.
-                // Non-secret SQL travels through log_event; the worker thread
-                // applies redact_pii before chain-stamping and writing.
-                let audit_kind = if matches!(
-                    &kind,
-                    StatementKind::Insert(_)
-                        | StatementKind::Ctas(_)
-                        | StatementKind::Merge(_)
-                        | StatementKind::Delete(_)
-                        | StatementKind::Update(_)
-                        | StatementKind::Truncate(_)
-                ) {
-                    sqe_metrics::audit::AuditKind::Query
-                } else {
-                    sqe_metrics::audit::AuditKind::AdminDdl
-                };
-
-                let ddl_outcome = match &result {
-                    Ok(_) => sqe_metrics::audit::Outcome::Success,
-                    Err(e) => sqe_metrics::audit::Outcome::Failure {
-                        error_type: Some(e.error_code().trino_error_type().to_string()),
-                        error_code: Some(e.error_code().name().to_string()),
-                        message: Some(e.client_message()),
-                    },
-                };
-
-                let ddl_actor = sqe_metrics::audit::Actor::from_parts(
-                    session.user.username.clone(),
-                    session.user.subject.clone(),
-                    session.user.email.clone(),
-                    session.user.roles.clone(),
-                    session.user.groups.clone(),
-                )
-                .with_app_name(session.source.clone());
-
-                let is_dml = matches!(
-                    &kind,
-                    StatementKind::Insert(_)
-                        | StatementKind::Ctas(_)
-                        | StatementKind::Merge(_)
-                        | StatementKind::Delete(_)
-                        | StatementKind::Update(_)
-                        | StatementKind::Truncate(_)
-                );
-                let ps = policy_summary.unwrap_or_default();
-                // Always emit PolicyAudit for DML (INSERT/CTAS/MERGE/DELETE/UPDATE/...).
-                // Previously conditional on "had effect"; now unconditional so every
-                // write carries the source policy decision (row filters, masks, denies)
-                // even when zero-effect (policy engine admitted the source raw).
-                // Addresses full-audit P0 "DML policy audit on write path" and O2.
-                // Write handler already calls enforce_source_plan / compute_write_predicates
-                // and threads the summary out for all DML dispatch paths.
-                let policy = Some(sqe_metrics::audit::PolicyAudit {
-                    row_filters_applied: ps.row_filters_applied,
-                    columns_masked: ps.columns_masked,
-                    columns_restricted: ps.columns_restricted,
-                    denied: ps.denied,
-                });
-                let stats = if is_dml {
-                    Some(sqe_metrics::audit::QueryStats {
-                        rows_returned: rows,
-                        rows_written,
-                        bytes_scanned: pm.bytes_scanned,
-                        rows_scanned: pm.rows_scanned,
-                        spill_bytes: pm.spill_bytes,
-                        peak_memory_bytes: pm.peak_memory_bytes,
-                    })
-                } else {
-                    None
-                };
-
-                let ddl_event = sqe_metrics::audit::AuditEvent {
-                    time: chrono::Utc::now(),
-                    kind: audit_kind,
-                    actor: ddl_actor,
-                    outcome: ddl_outcome,
+                Vec::new()
+            };
+            crate::audit_emitter::emit_statement_audit(
+                audit,
+                crate::audit_emitter::StatementAudit {
+                    session,
+                    sql,
+                    kind: &kind,
+                    kind_name,
+                    error: result.as_ref().err(),
+                    status,
+                    duration,
+                    execution_ms,
+                    rows,
+                    rows_written,
+                    plan_metrics: &pm,
+                    policy_summary,
                     resources: audit_resources,
-                    policy,
-                    timing: Some(sqe_metrics::audit::Timing {
-                        duration_ms: duration.as_millis() as u64,
-                        queued_ms: 0,
-                        planning_ms: 0,
-                        execution_ms: if is_dml { execution_ms } else { 0 },
-                    }),
-                    stats,
-                    query: Some(sqe_metrics::audit::QueryInfo {
-                        text: Some(sql.to_string()),
-                        query_hash: sqe_metrics::audit::query_hash(sql),
-                        statement_type: kind_name,
-                    }),
-                    session_id: Some(session.id.clone()),
+                    tables_touched,
+                    grant_resources,
                     client_ip: client_ip.clone(),
                     trace_id,
-                    query_id: Some(query_id.to_string()),
-                    integrity: sqe_metrics::audit::Integrity::default(),
-                };
-                audit.log_event(ddl_event);
-            }
+                    query_id,
+                },
+            );
         }
 
         // Slow query warning
@@ -3362,14 +3125,7 @@ impl QueryHandler {
                 policy_summary,
                 audit_resources,
             )) => {
-                let actor = sqe_metrics::audit::Actor::from_parts(
-                    session.user.username.clone(),
-                    session.user.subject.clone(),
-                    session.user.email.clone(),
-                    session.user.roles.clone(),
-                    session.user.groups.clone(),
-                )
-                .with_app_name(session.source.clone());
+                let actor = crate::audit_emitter::actor_for(session);
                 let finalizer = crate::streaming::StreamFinalizer {
                     tracker: Arc::clone(&self.query_tracker),
                     metrics: self.metrics.clone(),
