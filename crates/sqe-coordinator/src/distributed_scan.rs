@@ -245,15 +245,6 @@ impl FragmentFault {
         }
     }
 
-    /// The [`sqe_core::SqeErrorCode`] the query surfaces for this fault.
-    pub fn sqe_error_code(self) -> sqe_core::SqeErrorCode {
-        match self {
-            FragmentFault::Worker(f) => f.sqe_error_code(),
-            FragmentFault::Transport | FragmentFault::Unknown => {
-                sqe_core::SqeErrorCode::ExecutionFailed
-            }
-        }
-    }
 }
 
 impl fmt::Display for FragmentFault {
@@ -305,11 +296,6 @@ impl DistributedScanExec {
     /// Returns the scan tasks for all partitions.
     pub fn scan_tasks(&self) -> &[ScanTask] {
         &self.scan_tasks
-    }
-
-    /// Returns the worker URLs corresponding to each scan task.
-    pub fn worker_urls(&self) -> &[String] {
-        &self.worker_urls
     }
 
     pub fn new(scan_tasks: Vec<ScanTask>, worker_urls: Vec<String>, schema: SchemaRef) -> Self {
@@ -432,7 +418,9 @@ impl DistributedScanExec {
         self
     }
 
-    /// Set the maximum number of retry attempts per fragment.
+    /// Set the maximum number of retry attempts per fragment. Production
+    /// runs on `DEFAULT_MAX_RETRIES`; the retry and fault-policy tests set it.
+    #[cfg(test)]
     #[must_use = "with_max_retries consumes self; bind the returned scan"]
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
@@ -1800,7 +1788,8 @@ impl CoordinatorLocalScanExec {
     }
 
     /// Why the scan stayed on the coordinator (the `scheduler_decisions`
-    /// `reason` label value).
+    /// `reason` label value). Production reads it through `DisplayAs`.
+    #[cfg(test)]
     pub fn reason(&self) -> &str {
         &self.reason
     }
