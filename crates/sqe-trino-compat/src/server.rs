@@ -123,27 +123,12 @@ pub struct TrinoState<A, Q> {
     /// Trusted-proxy allowlist used to decide whether to honour
     /// `x-forwarded-for`. Empty = ignore it. Issue #74.
     pub security: SecurityConfig,
-    /// Optional pre-auth rate limit on credentials. Issue #57.
-    pub auth_rate_limiter: Option<Arc<dyn TrinoAuthRateLimiter>>,
     /// Basic-auth sessions already validated by the provider chain, keyed on
     /// a digest of the credential. Issue #622.
     pub auth_sessions: MokaCache<String, Session>,
     /// When true, /v1/info omits the build version so unauthenticated
     /// callers cannot fingerprint the engine. Issue #40.
     pub expose_version: bool,
-}
-
-/// Trait the coordinator implements to plug an
-/// `AuthRateLimiter` into the Trino path without coupling this crate
-/// to the coordinator's concrete rate-limit module.
-#[async_trait::async_trait]
-pub trait TrinoAuthRateLimiter: Send + Sync + 'static {
-    /// Returns `Err(())` when the (peer_ip, username) tuple is over budget.
-    // Trait surface predates the `result_unit_err` lint; switching to a
-    // dedicated `RateLimitError` would touch every implementer for no
-    // wire-level benefit.
-    #[allow(clippy::result_unit_err)]
-    fn check(&self, peer_ip: &str, username: &str) -> Result<(), ()>;
 }
 
 /// Who submitted a query, and the secret that lets that same client keep
@@ -633,19 +618,29 @@ pub struct TrinoClientHeaders {
     pub compression_codec: Option<String>,
 }
 
+/// `peer_ip` on both methods is the port-stripped, proxy-resolved client
+/// address. The coordinator adapter puts it in `FlightCredentials.peer_ip`,
+/// which is what the chain-level pre-auth rate limiter keys on (#562); a
+/// denial comes back as an `SqeError` whose code is `ResourceExhausted` and
+/// the server answers 429.
 #[async_trait::async_trait]
 pub trait TrinoAuthenticator: Send + Sync + 'static {
     async fn authenticate(
         &self,
         username: &str,
         password: &str,
+        peer_ip: &str,
     ) -> Result<Session, sqe_core::SqeError>;
 
     /// Validate a raw bearer token (JWT) and return an authenticated session.
     ///
     /// The default implementation rejects all bearer tokens. Override this in
     /// the coordinator adapter to route through the JWKS-validating auth chain.
-    async fn authenticate_bearer(&self, _token: &str) -> Result<Session, sqe_core::SqeError> {
+    async fn authenticate_bearer(
+        &self,
+        _token: &str,
+        _peer_ip: &str,
+    ) -> Result<Session, sqe_core::SqeError> {
         Err(sqe_core::SqeError::Auth(
             "Bearer token authentication not configured".to_string(),
         ))
@@ -701,7 +696,6 @@ pub trait TrinoQueryExecutor: Send + Sync + 'static {
 #[derive(Default)]
 pub struct TrinoServerOptions {
     pub security: SecurityConfig,
-    pub auth_rate_limiter: Option<Arc<dyn TrinoAuthRateLimiter>>,
     /// Whether `/v1/info` may return the exact build version. Default
     /// `false` for production deployments. Issue #40.
     pub expose_version: bool,
@@ -778,7 +772,6 @@ where
         port,
         oauth2: oauth2.clone(),
         security: options.security,
-        auth_rate_limiter: options.auth_rate_limiter,
         auth_sessions: build_auth_session_cache(),
         expose_version: options.expose_version,
     });
@@ -904,8 +897,8 @@ enum AuthFailure {
 /// value must never become a map key or a log field; the digest gives the
 /// same per-credential budget passwords get without storing the secret.
 ///
-/// Public because the MCP endpoint keys its auth rate limit the same way;
-/// one fingerprint, one definition of "the same credential".
+/// Public because the coordinator's chain-level limiter (#562) keys bearers
+/// the same way; one fingerprint, one definition of "the same credential".
 pub fn bearer_fingerprint(token: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = hex::encode(Sha256::digest(token.as_bytes()));
@@ -928,27 +921,20 @@ fn basic_session_key(user: &str, pass: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Consult the pre-auth rate limiter. `principal` is a Basic username or a
-/// bearer fingerprint — never a raw credential. Returns false when the tuple
-/// is over budget.
-fn check_auth_rate<A, Q>(
-    state: &Arc<TrinoState<A, Q>>,
-    peer_host: &str,
-    principal: &str,
-    client_ip: &str,
-) -> bool {
-    let Some(limiter) = state.auth_rate_limiter.as_ref() else {
-        return true;
-    };
-    if limiter.check(peer_host, principal).is_err() {
+/// Classify a provider failure: the chain-level pre-auth limiter (#562)
+/// surfaces as `ResourceExhausted`, everything else is a rejection. The
+/// principal logged is a username or a bearer fingerprint, never a raw
+/// credential.
+fn classify_auth_error(error: &sqe_core::SqeError, principal: &str, client_ip: &str) -> AuthFailure {
+    if error.error_code() == sqe_core::SqeErrorCode::ResourceExhausted {
         warn!(
             principal = %principal,
             client_ip = %client_ip,
             "Trino auth rejected by rate limiter"
         );
-        return false;
+        return AuthFailure::RateLimited;
     }
-    true
+    AuthFailure::Rejected
 }
 
 /// The 429 every route returns when the pre-auth limiter denies a credential.
@@ -971,9 +957,10 @@ fn rate_limited_response() -> Response {
 ///    session cache. Replaying it costs the IdP nothing, so it does not spend
 ///    pre-auth budget — otherwise a legitimate client polling once a second
 ///    would exhaust a 10/min budget in its first ten seconds.
-/// 2. Everything that would reach a provider — **bearer included**, which the
-///    POST route used to skip — passes the pre-auth rate limiter first, keyed
-///    on (peer ip, username or bearer fingerprint).
+/// 2. Everything that would reach a provider, bearer included, carries the
+///    peer host to the authenticator; the chain-level pre-auth limiter keys
+///    on (peer ip, username or bearer fingerprint) and denies before any
+///    provider runs. The denial is `ResourceExhausted` and becomes 429 here.
 /// 3. Only then is the provider chain asked to validate.
 async fn authenticate_request<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     state: &Arc<TrinoState<A, Q>>,
@@ -982,14 +969,18 @@ async fn authenticate_request<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     client_ip: &str,
 ) -> Result<Session, AuthFailure> {
     if let Some(token) = extract_bearer_token(headers) {
-        if !check_auth_rate(state, peer_host, &bearer_fingerprint(&token), client_ip) {
-            return Err(AuthFailure::RateLimited);
-        }
-        return match state.authenticator.authenticate_bearer(&token).await {
+        return match state
+            .authenticator
+            .authenticate_bearer(&token, peer_host)
+            .await
+        {
             Ok(session) => Ok(session),
             Err(e) => {
-                warn!(error = %e, client_ip = %client_ip, "Trino bearer token validation failed");
-                Err(AuthFailure::Rejected)
+                let failure = classify_auth_error(&e, &bearer_fingerprint(&token), client_ip);
+                if matches!(failure, AuthFailure::Rejected) {
+                    warn!(error = %e, client_ip = %client_ip, "Trino bearer token validation failed");
+                }
+                Err(failure)
             }
         };
     }
@@ -1005,17 +996,21 @@ async fn authenticate_request<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             }
             state.auth_sessions.invalidate(&key);
         }
-        if !check_auth_rate(state, peer_host, &user, client_ip) {
-            return Err(AuthFailure::RateLimited);
-        }
-        return match state.authenticator.authenticate(&user, &pass).await {
+        return match state
+            .authenticator
+            .authenticate(&user, &pass, peer_host)
+            .await
+        {
             Ok(session) => {
                 state.auth_sessions.insert(key, session.clone());
                 Ok(session)
             }
             Err(e) => {
-                warn!(error = %e, user = %user, client_ip = %client_ip, "Trino authentication failed");
-                Err(AuthFailure::Rejected)
+                let failure = classify_auth_error(&e, &user, client_ip);
+                if matches!(failure, AuthFailure::Rejected) {
+                    warn!(error = %e, user = %user, client_ip = %client_ip, "Trino authentication failed");
+                }
+                Err(failure)
             }
         };
     }
@@ -2775,7 +2770,6 @@ mod tests {
             port: 8080,
             oauth2: None,
             security: SecurityConfig::default(),
-            auth_rate_limiter: None,
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
@@ -2806,7 +2800,6 @@ mod tests {
             port: 8080,
             oauth2: None,
             security: SecurityConfig::default(),
-            auth_rate_limiter: None,
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
@@ -2832,7 +2825,6 @@ mod tests {
             port: 8080,
             oauth2: None,
             security: SecurityConfig::default(),
-            auth_rate_limiter: None,
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
@@ -2858,7 +2850,6 @@ mod tests {
             port: 8080,
             oauth2: None,
             security: SecurityConfig::default(),
-            auth_rate_limiter: None,
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
@@ -2871,7 +2862,12 @@ mod tests {
     struct MockAuth;
     #[async_trait::async_trait]
     impl TrinoAuthenticator for MockAuth {
-        async fn authenticate(&self, _: &str, _: &str) -> Result<Session, sqe_core::SqeError> {
+        async fn authenticate(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<Session, sqe_core::SqeError> {
             Err(sqe_core::SqeError::Auth("mock".to_string()))
         }
     }
@@ -2882,7 +2878,12 @@ mod tests {
     struct MockAuthOk;
     #[async_trait::async_trait]
     impl TrinoAuthenticator for MockAuthOk {
-        async fn authenticate(&self, user: &str, _: &str) -> Result<Session, sqe_core::SqeError> {
+        async fn authenticate(
+            &self,
+            user: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<Session, sqe_core::SqeError> {
             Ok(Session::new(
                 user.to_string(),
                 sqe_core::SecretString::new("mock-token".to_string()),
@@ -2891,7 +2892,11 @@ mod tests {
                 vec![],
             ))
         }
-        async fn authenticate_bearer(&self, _: &str) -> Result<Session, sqe_core::SqeError> {
+        async fn authenticate_bearer(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Session, sqe_core::SqeError> {
             Ok(Session::new(
                 "bearer-user".to_string(),
                 sqe_core::SecretString::new("mock-token".to_string()),
@@ -2931,7 +2936,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TrinoAuthenticator for TraceRecordingAuth {
-        async fn authenticate(&self, user: &str, _: &str) -> Result<Session, sqe_core::SqeError> {
+        async fn authenticate(
+            &self,
+            user: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<Session, sqe_core::SqeError> {
             self.observed
                 .lock()
                 .push(sqe_metrics::propagation::current_trace_id());
@@ -2979,7 +2989,6 @@ mod tests {
             port: 8080,
             oauth2: None,
             security: SecurityConfig::default(),
-            auth_rate_limiter: None,
             auth_sessions: build_auth_session_cache(),
             expose_version: false,
         });
@@ -3063,7 +3072,6 @@ mod tests {
             port: 8080,
             oauth2: None,
             security: SecurityConfig::default(),
-            auth_rate_limiter: None,
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
         })
@@ -3110,7 +3118,6 @@ mod tests {
             port: 8080,
             oauth2: None,
             security: SecurityConfig::default(),
-            auth_rate_limiter: None,
             auth_sessions: build_auth_session_cache(),
             expose_version: false,
         })
@@ -3406,7 +3413,7 @@ mod tests {
     /// poisoned status mutex.
     #[tokio::test]
     async fn panicking_executor_yields_error_body_not_500() {
-        let state = state_with(Arc::new(MockAuthOk), Arc::new(PanickingQuery), None);
+        let state = state_with(Arc::new(MockAuthOk), Arc::new(PanickingQuery));
         let resp = submit_query(
             State(state.clone()),
             test_peer(),
@@ -3473,7 +3480,7 @@ mod tests {
             None,
             None,
         ));
-        let state = state_with(Arc::new(MockAuthOk), Arc::new(MockQuery), None);
+        let state = state_with(Arc::new(MockAuthOk), Arc::new(MockQuery));
         state.queries.insert("q-stream".to_string(), handle.clone());
 
         let fetch = |token: &'static str| {
@@ -4054,7 +4061,7 @@ mod tests {
     /// terminal poll.
     #[tokio::test]
     async fn late_failing_use_never_switches_the_client() {
-        let state = state_with(Arc::new(MockAuthOk), Arc::new(LateFailingQuery), None);
+        let state = state_with(Arc::new(MockAuthOk), Arc::new(LateFailingQuery));
 
         let resp = submit_query::<MockAuthOk, LateFailingQuery>(
             State(state.clone()),
@@ -4164,7 +4171,7 @@ mod tests {
                 Ok(TrinoResultStream::from_batches(vec![batch]))
             }
         }
-        let state = state_with(Arc::new(MockAuthOk), Arc::new(AuditQuery), None);
+        let state = state_with(Arc::new(MockAuthOk), Arc::new(AuditQuery));
 
         for sql in [
             "SELECT table_catalog, data_type FROM audit.events WHERE note LIKE '%information_schema%'",
@@ -4235,7 +4242,6 @@ mod tests {
             port: 8080,
             oauth2: None,
             security: SecurityConfig::default(),
-            auth_rate_limiter: None,
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
@@ -4827,7 +4833,7 @@ mod tests {
     /// fetch is told the result expired, not that the id never existed (#621).
     #[tokio::test]
     async fn expired_query_is_reported_as_expired_not_unknown() {
-        let state = state_with(Arc::new(MockAuthOk), Arc::new(MockQuery), None);
+        let state = state_with(Arc::new(MockAuthOk), Arc::new(MockQuery));
         state.expired.insert("q-old".to_string(), ());
 
         let expired = get_results(
@@ -4897,7 +4903,6 @@ mod tests {
             port: 8080,
             oauth2: None,
             security: SecurityConfig::default(),
-            auth_rate_limiter: None,
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
@@ -4934,7 +4939,6 @@ mod tests {
             port: 8080,
             oauth2: None,
             security: SecurityConfig::default(),
-            auth_rate_limiter: None,
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
@@ -4976,7 +4980,6 @@ mod tests {
             port: 8080,
             oauth2: None,
             security: SecurityConfig::default(),
-            auth_rate_limiter: None,
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
@@ -5057,7 +5060,6 @@ mod tests {
             port: 8080,
             oauth2: None,
             security: SecurityConfig::default(),
-            auth_rate_limiter: None,
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
@@ -5119,7 +5121,6 @@ mod tests {
             port: 8080,
             oauth2: None,
             security: SecurityConfig::default(),
-            auth_rate_limiter: None,
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
@@ -5159,7 +5160,6 @@ mod tests {
             port: 8080,
             oauth2: None,
             security: SecurityConfig::default(),
-            auth_rate_limiter: None,
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
@@ -5233,7 +5233,6 @@ mod tests {
             port: 8080,
             oauth2: None,
             security: SecurityConfig::default(),
-            auth_rate_limiter: None,
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
@@ -5281,7 +5280,6 @@ mod tests {
             port: 8080,
             oauth2: None,
             security: SecurityConfig::default(),
-            auth_rate_limiter: None,
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
         });
@@ -5324,7 +5322,6 @@ mod tests {
             port: 8080,
             oauth2: None,
             security: SecurityConfig::default(),
-            auth_rate_limiter: None,
             auth_sessions: build_auth_session_cache(),
             expose_version: false,
         });
@@ -5357,7 +5354,6 @@ mod tests {
             port: 8080,
             oauth2: None,
             security: SecurityConfig::default(),
-            auth_rate_limiter: None,
             auth_sessions: build_auth_session_cache(),
             expose_version: false,
         });
@@ -5369,15 +5365,18 @@ mod tests {
 
     // ── Poll-token binding and pre-auth rate limiting (#622, #562) ──
 
-    /// Fixed-budget stand-in for the coordinator's `AuthRateLimiter`: allows
-    /// `budget` checks, then denies, and records every tuple it was asked
-    /// about so a test can assert *what* was keyed as well as *whether*.
-    struct BudgetLimiter {
+    /// Stand-in for the coordinator's rate-limited provider chain (#562):
+    /// allows `budget` attempts, then answers `ResourceExhausted` the way
+    /// `RateLimitedAuthProvider` does, and records the `(peer, principal)`
+    /// it was handed so a test can assert *what* was keyed as well as
+    /// *whether*. Every attempt inside the budget is rejected, so the test
+    /// can tell a 401 (provider ran) from a 429 (budget spent).
+    struct BudgetAuth {
         remaining: std::sync::atomic::AtomicUsize,
         seen: Mutex<Vec<(String, String)>>,
     }
 
-    impl BudgetLimiter {
+    impl BudgetAuth {
         fn new(budget: usize) -> Arc<Self> {
             Arc::new(Self {
                 remaining: std::sync::atomic::AtomicUsize::new(budget),
@@ -5388,17 +5387,41 @@ mod tests {
         fn seen(&self) -> Vec<(String, String)> {
             self.seen.lock().clone()
         }
-    }
 
-    impl TrinoAuthRateLimiter for BudgetLimiter {
-        fn check(&self, peer_ip: &str, principal: &str) -> Result<(), ()> {
+        fn spend(&self, peer_ip: &str, principal: &str) -> Result<(), sqe_core::SqeError> {
             self.seen
                 .lock()
                 .push((peer_ip.to_string(), principal.to_string()));
             self.remaining
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .map(|_| ())
-                .map_err(|_| ())
+                .map_err(|_| {
+                    sqe_core::SqeError::with_code(
+                        sqe_core::SqeErrorCode::ResourceExhausted,
+                        "authentication rate limit".to_string(),
+                    )
+                })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TrinoAuthenticator for BudgetAuth {
+        async fn authenticate(
+            &self,
+            user: &str,
+            _: &str,
+            peer_ip: &str,
+        ) -> Result<Session, sqe_core::SqeError> {
+            self.spend(peer_ip, user)?;
+            Err(sqe_core::SqeError::Auth("wrong password".to_string()))
+        }
+        async fn authenticate_bearer(
+            &self,
+            token: &str,
+            peer_ip: &str,
+        ) -> Result<Session, sqe_core::SqeError> {
+            self.spend(peer_ip, &bearer_fingerprint(token))?;
+            Err(sqe_core::SqeError::Auth("bad bearer".to_string()))
         }
     }
 
@@ -5410,7 +5433,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TrinoAuthenticator for CountingAuth {
-        async fn authenticate(&self, user: &str, _: &str) -> Result<Session, sqe_core::SqeError> {
+        async fn authenticate(
+            &self,
+            user: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<Session, sqe_core::SqeError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(Session::new(
                 user.to_string(),
@@ -5423,11 +5451,10 @@ mod tests {
     }
 
     /// Handler-test state with the caches empty and everything but the
-    /// authenticator, executor and limiter at its default.
+    /// authenticator and executor at its default.
     fn state_with<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         authenticator: Arc<A>,
         query_handler: Arc<Q>,
-        auth_rate_limiter: Option<Arc<dyn TrinoAuthRateLimiter>>,
     ) -> Arc<TrinoState<A, Q>> {
         Arc::new(TrinoState {
             authenticator,
@@ -5443,7 +5470,6 @@ mod tests {
             port: 8080,
             oauth2: None,
             security: SecurityConfig::default(),
-            auth_rate_limiter,
             auth_sessions: build_auth_session_cache(),
             expose_version: false,
         })
@@ -5457,16 +5483,12 @@ mod tests {
     }
 
     /// #622: the POST route's limiter used to be trivially bypassable by
-    /// guessing credentials against a GET poll instead. Every route now
-    /// consults it before the provider chain.
+    /// guessing credentials against a GET poll instead. Every route hands
+    /// the peer host to the (rate-limited) chain and maps its denial to 429.
     #[tokio::test]
     async fn poll_with_wrong_credentials_is_rate_limited() {
-        let limiter = BudgetLimiter::new(2);
-        let state = state_with(
-            Arc::new(MockAuth), // rejects every credential
-            Arc::new(MockQuery),
-            Some(limiter.clone()),
-        );
+        let limiter = BudgetAuth::new(2);
+        let state = state_with(limiter.clone(), Arc::new(MockQuery));
 
         let poll = |attempt: usize| {
             let state = state.clone();
@@ -5506,7 +5528,6 @@ mod tests {
     #[tokio::test]
     async fn submit_plus_polls_authenticates_exactly_once() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let limiter = BudgetLimiter::new(100);
         let open = Arc::new(AtomicBool::new(false));
         let gate = Arc::new(tokio::sync::Notify::new());
         let state = state_with(
@@ -5517,7 +5538,6 @@ mod tests {
                 open,
                 gate: gate.clone(),
             }),
-            Some(limiter.clone()),
         );
 
         let submitted = submit_query(
@@ -5545,14 +5565,13 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK);
         }
 
+        // One provider call is also one pre-auth budget spend: the limiter
+        // sits inside the chain, so what the chain never sees costs nothing.
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
             "the five polls must not have re-run the password grant"
         );
-        // And they did not spend pre-auth budget either: only the POST was
-        // ever put to the limiter.
-        assert_eq!(limiter.seen().len(), 1);
 
         gate.notify_waiters();
     }
@@ -5568,7 +5587,7 @@ mod tests {
     /// and an authenticator that would reject one if there were.
     #[tokio::test]
     async fn poll_with_valid_poll_token_needs_no_credentials() {
-        let state = state_with(Arc::new(MockAuth), Arc::new(MockQuery), None);
+        let state = state_with(Arc::new(MockAuth), Arc::new(MockQuery));
         state
             .queries
             .insert("q1".to_string(), handle_with(QueryStatus::Running, "alice"));
@@ -5598,7 +5617,7 @@ mod tests {
     /// route cannot be used to enumerate query ids.
     #[tokio::test]
     async fn wrong_poll_token_without_credentials_does_not_leak_existence() {
-        let state = state_with(Arc::new(MockAuth), Arc::new(MockQuery), None);
+        let state = state_with(Arc::new(MockAuth), Arc::new(MockQuery));
         state
             .queries
             .insert("q1".to_string(), handle_with(QueryStatus::Running, "alice"));
@@ -5636,15 +5655,12 @@ mod tests {
 
     /// #562: the Bearer branch on `POST /v1/statement` used to go straight to
     /// `authenticate_bearer`, so garbage bearers could drive JWKS refetches
-    /// and IdP round trips without limit.
+    /// and IdP round trips without limit. The peer host now travels with the
+    /// bearer and the chain's denial is a 429.
     #[tokio::test]
     async fn bearer_post_past_limiter_budget_returns_429() {
-        let limiter = BudgetLimiter::new(1);
-        let state = state_with(
-            Arc::new(MockAuth), // no bearer provider -> rejects
-            Arc::new(MockQuery),
-            Some(limiter.clone()),
-        );
+        let limiter = BudgetAuth::new(1);
+        let state = state_with(limiter.clone(), Arc::new(MockQuery));
 
         let post = || {
             let state = state.clone();

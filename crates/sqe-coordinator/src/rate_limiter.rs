@@ -75,12 +75,6 @@ impl AuthRateLimiter {
     }
 }
 
-impl sqe_trino_compat::server::TrinoAuthRateLimiter for AuthRateLimiter {
-    fn check(&self, peer_ip: &str, username: &str) -> Result<(), ()> {
-        AuthRateLimiter::check(self, peer_ip, username).map_err(|_| ())
-    }
-}
-
 /// The pre-auth rate limit as an [`AuthProvider`] wrapper around the chain
 /// (#562).
 ///

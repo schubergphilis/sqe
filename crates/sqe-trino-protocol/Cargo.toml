@@ -17,8 +17,10 @@ default = []
 # DELETE-on-drop cancel).
 client = ["dep:reqwest", "dep:url", "dep:tokio", "dep:rustls"]
 # `decode`: Trino JSON pages -> Arrow `RecordBatch` with faithful types
-# (decimal(p,s) -> Decimal128(p,s), integer widths, timestamps).
-arrow = ["dep:arrow-array", "dep:arrow-schema", "dep:arrow-buffer", "dep:chrono", "dep:chrono-tz", "dep:base64"]
+# (decimal(p,s) -> Decimal128(p,s), integer widths, timestamps), and
+# `encode`: Arrow cells -> Trino JSON values (the server's and MCP's one
+# value encoding; review 803).
+arrow = ["dep:arrow-array", "dep:arrow-schema", "dep:arrow-buffer", "dep:arrow-cast", "dep:chrono", "dep:chrono-tz", "dep:base64"]
 # `flight::FlightSqlClient` over `arrow_flight::sql::client::FlightSqlServiceClient`.
 flight = ["dep:arrow-flight", "dep:arrow-array", "dep:arrow-schema", "dep:tonic", "dep:futures"]
 
@@ -36,6 +38,7 @@ tokio = { workspace = true, optional = true }
 arrow-array = { workspace = true, optional = true }
 arrow-schema = { workspace = true, optional = true }
 arrow-buffer = { workspace = true, optional = true }
+arrow-cast = { workspace = true, optional = true }
 arrow-flight = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }

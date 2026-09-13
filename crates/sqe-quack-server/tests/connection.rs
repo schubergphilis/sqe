@@ -8,7 +8,9 @@ use sqe_quack_wire::message::{
     decode_message, encode_message, ConnectionRequest, MessageHeader, MessageType, QuackMessage,
 };
 
-use support::{accept_provider, spawn_server_with, RejectProvider, SkipProvider};
+use support::{
+    accept_provider, spawn_server_with, RateLimitedProvider, RejectProvider, SkipProvider,
+};
 
 fn sample_connection_request(token: &str) -> Vec<u8> {
     let header = MessageHeader {
@@ -104,6 +106,35 @@ async fn connection_request_surfaces_auth_failed_message_from_provider() {
         }
         other => panic!("expected ErrorResponse, got {other:?}"),
     }
+}
+
+/// QUACK-08 / #562: the pre-auth rate limit lives in the provider chain.
+/// The server sends the resolved client address with the credential and
+/// turns the chain's `RateLimited` into the `SQE-RATELIMIT` error the Quack
+/// client already understands.
+#[tokio::test]
+async fn connection_request_carries_peer_ip_and_maps_rate_limit() {
+    let provider = RateLimitedProvider::new();
+    let base = spawn_server_with(provider.clone()).await;
+    let resp_bytes = post_quack(&base, sample_connection_request("some-token")).await;
+    let (_, resp_body) = decode_message(&resp_bytes).unwrap();
+    match resp_body {
+        QuackMessage::ErrorResponse(e) => {
+            assert!(
+                e.message.starts_with("SQE-RATELIMIT"),
+                "expected the rate-limit error, got: {}",
+                e.message
+            );
+        }
+        other => panic!("expected ErrorResponse, got {other:?}"),
+    }
+    let seen = provider.seen_peer_ips.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        seen[0].as_deref(),
+        Some("127.0.0.1"),
+        "the port-stripped loopback peer must travel with the credential"
+    );
 }
 
 #[tokio::test]
