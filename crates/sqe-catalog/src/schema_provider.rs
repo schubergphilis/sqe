@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use datafusion::catalog::SchemaProvider;
-use datafusion::datasource::TableProvider;
 use datafusion::datasource::ViewTable;
+use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use iceberg::NamespaceIdent;
@@ -39,6 +39,9 @@ const TABLE_NAMES_TTL_SECS: u64 = 5;
 pub struct NamespaceListing {
     /// Tables then views, as of the last successful refresh.
     pub names: Vec<String>,
+    /// The subset of `names` that are views, so `table_type` can answer
+    /// `information_schema.tables` without loading every table.
+    pub views: Vec<String>,
     /// When the last refresh (successful or not) was attempted.
     pub checked_at: Instant,
     /// Error text of the most recent failed refresh, or `None` when `names`
@@ -108,12 +111,14 @@ pub(crate) fn merge_listing(
     match outcome {
         Ok(names) => NamespaceListing {
             names,
+            views: Vec::new(),
             checked_at: Instant::now(),
             stale_error: None,
             denied: false,
         },
         Err((error, denied)) => NamespaceListing {
             names: previous.map(|p| p.names.clone()).unwrap_or_default(),
+            views: previous.map(|p| p.views.clone()).unwrap_or_default(),
             checked_at: Instant::now(),
             stale_error: Some(error),
             denied,
@@ -138,13 +143,17 @@ pub async fn refresh_namespace_listing(
     let previous = TABLE_NAMES_SNAPSHOTS.get(&key);
     let ns_ident = NamespaceIdent::new(namespace.to_string());
 
+    let mut view_names: Vec<String> = Vec::new();
     let outcome = match catalog.list_tables(&ns_ident).await {
         Ok(tables) => {
             let mut names: Vec<String> = tables.iter().map(|t| t.name().to_string()).collect();
             // Views are additive: a failed view listing degrades to
             // tables-only rather than failing the whole snapshot, as before.
             match catalog.list_views(&ns_ident).await {
-                Ok(views) => names.extend(views),
+                Ok(views) => {
+                    view_names = views.clone();
+                    names.extend(views);
+                }
                 Err(e) => {
                     warn!(namespace = %namespace, error = %e, "Failed to list views; snapshot carries tables only");
                 }
@@ -161,7 +170,11 @@ pub async fn refresh_namespace_listing(
     };
 
     let (merged, err) = match outcome {
-        Ok(names) => (merge_listing(previous.as_deref(), Ok(names)), None),
+        Ok(names) => {
+            let mut merged = merge_listing(previous.as_deref(), Ok(names));
+            merged.views = view_names;
+            (merged, None)
+        }
         Err((text, denied, e)) => (
             merge_listing(previous.as_deref(), Err((text, denied))),
             Some(e),
@@ -368,6 +381,26 @@ impl SchemaProvider for SqeSchemaProvider {
                 Vec::new()
             }
         }
+    }
+
+    /// DataFusion's `information_schema.tables` asks every listed name for its
+    /// type, and the trait default answers by loading the table: one catalog
+    /// round trip per table per metadata query, which dbt issues constantly
+    /// (#664 follow-up). The snapshot already separates views from tables,
+    /// so a name it knows is answered without the network. A name it does not
+    /// know, or no usable snapshot at all, takes the loading path so the
+    /// answer is never a guess.
+    async fn table_type(&self, name: &str) -> DFResult<Option<TableType>> {
+        if let Some(listing) = self.cached_listing() {
+            if name_exists_in(&listing.names, name) {
+                return Ok(Some(if name_exists_in(&listing.views, name) {
+                    TableType::View
+                } else {
+                    TableType::Base
+                }));
+            }
+        }
+        self.table(name).await.map(|o| o.map(|t| t.table_type()))
     }
 
     fn table_exist(&self, name: &str) -> bool {

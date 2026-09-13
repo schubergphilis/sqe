@@ -623,6 +623,15 @@ mod tests {
                 .mount(&server)
                 .await;
         }
+        // `sales` also has a view; `hr` answers 404 for views, which the
+        // refresh degrades to tables-only.
+        Mock::given(method("GET"))
+            .and(path("/v1/test-warehouse/namespaces/sales/views"))
+            .respond_with(json(serde_json::json!({
+                "identifiers": [{"namespace": ["sales"], "name": "v_orders"}]
+            })))
+            .mount(&server)
+            .await;
 
         // A token no other test uses: the table-name snapshots are
         // process-global and keyed by the bearer's fingerprint.
@@ -669,14 +678,36 @@ mod tests {
 
         let names = provider.schema_names();
         assert!(names.iter().any(|n| n == "hr"), "re-listed: {names:?}");
+        let sales = provider.schema("sales").expect("sales");
         assert_eq!(
-            provider.schema("sales").expect("sales").table_names(),
-            vec!["orders".to_string()]
+            sales.table_names(),
+            vec!["orders".to_string(), "v_orders".to_string()]
         );
         assert_eq!(
             provider.schema("hr").expect("hr").table_names(),
             vec!["employees".to_string()]
         );
+
+        // `information_schema.tables` asks each listed name for its type.
+        // The snapshot answers: no `loadTable` round trip, and views are
+        // reported as views (dbt decides DROP VIEW vs DROP TABLE on this).
+        use datafusion::datasource::TableType;
+        assert_eq!(
+            sales.table_type("orders").await.expect("type"),
+            Some(TableType::Base)
+        );
+        assert_eq!(
+            sales.table_type("v_orders").await.expect("type"),
+            Some(TableType::View)
+        );
+        let loads = server
+            .received_requests()
+            .await
+            .expect("request log")
+            .iter()
+            .filter(|r| r.url.path().contains("/tables/") || r.url.path().contains("/views/"))
+            .count();
+        assert_eq!(loads, 0, "table_type must be answered from the snapshot");
 
         // #575: one tuning struct reaches every schema provider, including
         // the ones already cached before `with_tuning` ran.
