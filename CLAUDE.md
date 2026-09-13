@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This repository contains the full engine implementation. Licensed under Apache 2.0.
 
-The shipped long-running binary is `sqe-server` (`--mode coordinator` or `--mode worker`). `sqe-worker` is the standalone worker with the same bootstrap. OPA and Cedar were the original design and were not built.
+The shipped long-running binary is `sqe-server` (`--mode coordinator` or `--mode worker`), built from `crates/sqe-server`, which is the only crate depending on both the `sqe-coordinator` and `sqe-worker` libraries. `sqe-worker` is the standalone worker with the same bootstrap. OPA and Cedar were the original design and were not built.
 
 ## Architecture
 
