@@ -3,6 +3,7 @@
 // `pub(crate)`. Widening one back to `pub` is a one-word change, so nothing
 // here is a promise of stability, only a record of who depends on what.
 pub(crate) mod adaptive_sort;
+pub(crate) mod audit_emitter;
 pub(crate) mod audit_resources;
 pub mod audit_tag_adapter;
 pub mod auth_session;

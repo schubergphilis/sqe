@@ -6,6 +6,36 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Coordinator: one admission sequence for `execute` and `execute_stream` (#589)
+
+    Both entry points carried their own copy of the admission gates
+    (memory pressure, per-user permit, global permit, per-user memory
+    reservation), and the copies had drifted: the buffered path reserved
+    memory before taking the global permit, the streaming path after, so
+    which error a client saw when two gates failed at once depended on the
+    protocol it used. `QueryHandler::admit` (in the new child module
+    `query_handler/admission.rs`, the first phase split out of the
+    handler) is the one sequence, in the streaming order; it returns an
+    `Admission` whose permits and reservation the buffered path drops on
+    return and the streaming path moves into the result-stream wrapper.
+    `try_acquire_owned` has one call site left in `query_handler.rs` (the
+    sorted-write cap, a different gate).
+
+- Coordinator: one audit emitter for every statement outcome (#589, #636)
+
+    `QueryHandler::execute_inner` built the statement's `AuditEvent` four
+    times over (SELECT, GRANT/REVOKE/DENY, secret-bearing statements on the
+    redacting legacy path, everything else) and the streaming finalizer
+    three more times (success, error, cancel), each copy assembling the
+    actor, outcome, timing and query block by hand. `audit_emitter.rs`
+    now holds the builders (`actor_for`, `outcome_of`, `policy_audit`,
+    `query_info`, `timing`) and `emit_statement_audit`, which routes by
+    statement kind exactly as before; the streaming finalizer has one
+    `emit_audit` that the three endings call with their outcome. Same
+    events, same fields, same redaction contract (raw SQL in `query.text`,
+    redacted by the audit worker; secret-bearing kinds stay on `log`).
+    `execute_inner` is 245 lines shorter.
+
 - Config: production mode is one rule table, mirrored in the production guide (#637)
 
     What `coordinator.production_mode = true` refuses was fifteen
