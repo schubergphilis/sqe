@@ -483,12 +483,16 @@ pub fn new_upload_tracker() -> UploadedPaths {
 
 /// Build a stamped Arrow schema from an Iceberg schema.
 ///
-/// Used by the streaming write path: derive the target schema once, then reuse
-/// it for every batch via [`apply_stamped_schema`]. Unlike the non-streaming
-/// `write_data_files`'s `stamp_field_ids` this function does not require all
-/// batches to be present -- it marks all columns as nullable (the safe
-/// default for Iceberg) and takes types from the Iceberg schema directly.
-fn build_stamped_schema(iceberg_schema: &IcebergSchema) -> sqe_core::Result<Arc<ArrowSchema>> {
+/// The one field-id stamping implementation (#600): derive the target schema
+/// once, then apply it to every batch via [`apply_stamped_schema`] or
+/// [`stamp_batches`]. Every column is nullable (the safe default for
+/// Iceberg, and it needs no cross-batch null scan) and types come from the
+/// Iceberg schema, so a type-mapping fix lands here once for the streaming
+/// writes, the buffered writes, the compaction rewrite and the delete key
+/// files alike.
+pub fn build_stamped_schema(
+    iceberg_schema: &IcebergSchema,
+) -> sqe_core::Result<Arc<ArrowSchema>> {
     let expected_arrow_schema = schema_to_arrow_schema(iceberg_schema)
         .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to derive expected Arrow schema: {e}")))?;
 
@@ -535,7 +539,7 @@ fn build_stamped_schema(iceberg_schema: &IcebergSchema) -> sqe_core::Result<Arc<
 /// showed a panic instead of a SQL-level message. A mismatch on either side is
 /// a user error (`INSERT INTO t2 SELECT a, b, c` against a two-column `t2`) and
 /// is reported as one.
-fn apply_stamped_schema(
+pub fn apply_stamped_schema(
     batch: RecordBatch,
     stamped_schema: &Arc<ArrowSchema>,
 ) -> sqe_core::Result<RecordBatch> {
@@ -568,6 +572,22 @@ fn apply_stamped_schema(
         .collect();
     RecordBatch::try_new(stamped_schema.clone(), new_columns?)
         .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to apply stamped schema: {e}")))
+}
+
+/// Stamp a whole batch list against `iceberg_schema` (#600): the buffered
+/// callers' form of [`apply_stamped_schema`]. An empty list is returned as is.
+pub fn stamp_batches(
+    batches: Vec<RecordBatch>,
+    iceberg_schema: &IcebergSchema,
+) -> sqe_core::Result<Vec<RecordBatch>> {
+    if batches.is_empty() {
+        return Ok(batches);
+    }
+    let stamped_schema = build_stamped_schema(iceberg_schema)?;
+    batches
+        .into_iter()
+        .map(|batch| apply_stamped_schema(batch, &stamped_schema))
+        .collect()
 }
 
 /// Resolved fanout limits for a partitioned streaming write. Both `0` means
