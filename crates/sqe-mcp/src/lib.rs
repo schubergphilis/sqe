@@ -873,7 +873,7 @@ fn first_column_strings(batches: &[RecordBatch]) -> Vec<String> {
         let column = batch.column(0);
         for row in 0..batch.num_rows() {
             if let Some(value) =
-                sqe_trino_compat::types::arrow_value_to_json(column.as_ref(), row).as_str()
+                sqe_trino_protocol::encode::arrow_value_to_json(column.as_ref(), row).as_str()
             {
                 out.push(value.to_string());
             }
@@ -1303,7 +1303,7 @@ fn batches_json(batches: &[RecordBatch], max_rows: usize, max_bytes: usize) -> V
             for (index, field) in batch.schema().fields().iter().enumerate() {
                 object.insert(
                     field.name().clone(),
-                    sqe_trino_compat::types::arrow_value_to_json(batch.column(index).as_ref(), row),
+                    sqe_trino_protocol::encode::arrow_value_to_json(batch.column(index).as_ref(), row),
                 );
             }
             rows.push(Value::Object(object));

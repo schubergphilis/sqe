@@ -10,7 +10,9 @@ repository.workspace = true
 sqe-core = { path = "../sqe-core" }
 sqe-auth = { path = "../sqe-auth" }
 sqe-sql = { path = "../sqe-sql" }
-sqe-trino-compat = { path = "../sqe-trino-compat" }
+# The Arrow-to-JSON value encoder only; the Trino server crate is not linked
+# here any more (review 803, item 3).
+sqe-trino-protocol = { path = "../sqe-trino-protocol", features = ["arrow"] }
 arrow-array = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }

@@ -15,6 +15,8 @@
 //!   `DELETE nextUri` when a query is dropped mid-flight.
 //! - [`decode`] (feature `arrow`) -- Trino JSON pages to Arrow `RecordBatch`
 //!   with faithful types.
+//! - [`encode`] (feature `arrow`) -- Arrow cells to Trino JSON values, the
+//!   inverse, shared by the Trino server and the MCP endpoint (review 803).
 //! - [`flight`] (feature `flight`) -- `FlightSqlClient` wrapping
 //!   `FlightSqlServiceClient` (channel, handshake, token, collect or stream).
 
@@ -25,6 +27,9 @@ pub mod client;
 
 #[cfg(feature = "arrow")]
 pub mod decode;
+
+#[cfg(feature = "arrow")]
+pub mod encode;
 
 #[cfg(feature = "flight")]
 pub mod flight;
