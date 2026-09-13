@@ -53,9 +53,9 @@ STAGING_DIR="/tmp/sqe-bench-attach-smoke-data"
 
 echo "==> Building sqe-bench + sqe-coordinator + sqe-cli (profile: $PROFILE)"
 if [ "$PROFILE" = "release" ]; then
-  cargo build -p sqe-bench -p sqe-coordinator -p sqe-cli --bin sqe-bench --bin sqe-server --bin sqe-cli --release 2>&1
+  cargo build -p sqe-bench -p sqe-server -p sqe-cli --bin sqe-bench --bin sqe-server --bin sqe-cli --release 2>&1
 else
-  cargo build -p sqe-bench -p sqe-coordinator -p sqe-cli --bin sqe-bench --bin sqe-server --bin sqe-cli --profile "$PROFILE" 2>&1
+  cargo build -p sqe-bench -p sqe-server -p sqe-cli --bin sqe-bench --bin sqe-server --bin sqe-cli --profile "$PROFILE" 2>&1
 fi
 BENCH_BIN="$ROOT_DIR/target/$PROFILE/sqe-bench"
 

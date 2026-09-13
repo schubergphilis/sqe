@@ -46,7 +46,7 @@ The `aws` CLI is optional. Without it, `run.sh` uses the `amazon/aws-cli` contai
 ./run.sh --clean            # stop, delete the bucket volume, ./data and ./.venv
 ```
 
-`--server` needs `sqe-server` built too: `cargo build --release -p sqe-coordinator --bin sqe-server`.
+`--server` needs `sqe-server` built too: `cargo build --release -p sqe-server`.
 
 A first run from nothing takes well under a minute at the default size. Re-runs skip generation and upload when the data already matches the requested size, so iterating on the SQL is fast.
 
@@ -54,7 +54,7 @@ A first run from nothing takes well under a minute at the default size. Re-runs 
 
 ```
 gen_data.py ──> ./data ──> s3://lake/data/<table>/<partitions>/   the data
-                                                                 
+
 sqe-cli --hive-root lake=s3://lake/wh/                            the root
    CREATE EXTERNAL TABLE ──> s3://lake/wh/demo/<table>/_sqe/table.json
 ```

@@ -89,11 +89,11 @@ echo ""
 if [ ! -x "$BENCH_BIN" ] || [ ! -x "$SQE_BIN" ]; then
     echo "Building sqe-bench + sqe-coordinator (profile: $PROFILE)..."
     if [ "$PROFILE" = "release" ]; then
-        cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-server --release
+        cargo build -p sqe-bench -p sqe-server --bin sqe-bench --bin sqe-server --release
     elif [ "$PROFILE" = "dev-release" ]; then
-        cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-server --profile dev-release
+        cargo build -p sqe-bench -p sqe-server --bin sqe-bench --bin sqe-server --profile dev-release
     else
-        cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-server
+        cargo build -p sqe-bench -p sqe-server --bin sqe-bench --bin sqe-server
     fi
 fi
 

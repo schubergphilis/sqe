@@ -6559,7 +6559,6 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "chrono",
- "clap",
  "croner",
  "dashmap",
  "datafusion",
@@ -6838,6 +6837,45 @@ dependencies = [
  "proptest",
  "reqwest 0.13.4",
  "thiserror 2.0.20",
+ "workspace-hack",
+]
+
+[[package]]
+name = "sqe-server"
+version = "0.37.0"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-flight",
+ "async-trait",
+ "axum",
+ "axum-server",
+ "clap",
+ "datafusion",
+ "futures",
+ "iceberg",
+ "moka",
+ "prometheus",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "sqe-auth",
+ "sqe-catalog",
+ "sqe-coordinator",
+ "sqe-core",
+ "sqe-lineage",
+ "sqe-metrics",
+ "sqe-policy",
+ "sqe-quack-server",
+ "sqe-sql",
+ "sqe-trino-compat",
+ "sqe-worker",
+ "tokio",
+ "toml",
+ "tonic",
+ "tower",
+ "tracing",
+ "uuid",
  "workspace-hack",
 ]
 

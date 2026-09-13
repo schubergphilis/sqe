@@ -55,8 +55,7 @@ audience = "https://sqe.example.com/mcp"
 The endpoint is `POST https://sqe.example.com/mcp`. In the main `sqe-server`
 binary, `enabled = true` with `port = 0` merges the MCP routes into the existing
 health/web listener (`metrics.prometheus_port + 1`). Set a nonzero `port` for a
-dedicated listener and independent network policy. The legacy
-`sqe-coordinator` binary supports the dedicated-listener form only.
+dedicated listener and independent network policy.
 
 SQE publishes RFC 9728
 metadata at both:

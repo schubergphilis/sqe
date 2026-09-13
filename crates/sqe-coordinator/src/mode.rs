@@ -24,8 +24,8 @@ pub enum Mode {
 /// empty `worker_urls`. In that state any TCP-reachable client can register as
 /// a worker and receive user bearer tokens.
 ///
-/// Shared between `main.rs` and `bin/sqe_server.rs` so the warning cannot
-/// drift between the two coordinator binaries.
+/// Lives in the library rather than in `crates/sqe-server/src/main.rs` so
+/// the warning text has one home that tests can reach.
 #[must_use]
 pub fn warns_unauthenticated_workers(coordinator: &CoordinatorConfig) -> bool {
     // Mirror `distributed_enabled` in bin/sqe_server.rs: discovery is live on

@@ -38,9 +38,9 @@ glue = ["sqe-catalog/glue"]
 name = "sqe_coordinator"
 path = "src/lib.rs"
 
-[[bin]]
-name = "sqe-server"
-path = "src/bin/sqe_server.rs"
+# The `sqe-server` binary lives in `crates/sqe-server` (review 803 item 4):
+# a library crate that carried the binary also carried `sqe-worker`, so a
+# worker-only change rebuilt this crate and every integration-test binary.
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }
@@ -100,11 +100,9 @@ chrono = { workspace = true }
 croner = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
-clap = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 subtle = { workspace = true }
-sqe-worker = { path = "../sqe-worker" }
 opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
@@ -115,6 +113,9 @@ tempfile = { workspace = true, optional = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
+# Test-only: the chaos worker and the Hive differential rig run a real worker
+# in-process. A dev-dependency keeps it out of the library build.
+sqe-worker = { path = "../sqe-worker" }
 opentelemetry_sdk = { workspace = true }
 # Test-only: TcpListenerStream, so the Flight SQL smoke test can serve on an
 # OS-assigned port. Both production entry points hand tonic a SocketAddr and

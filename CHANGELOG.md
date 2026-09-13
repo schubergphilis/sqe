@@ -6,6 +6,21 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Crates: the `sqe-server` binary has its own crate; the coordinator library no longer depends on the worker (#635, #636, #589)
+
+    `crates/sqe-coordinator/src/bin/sqe_server.rs` is now
+    `crates/sqe-server/src/main.rs`, a binary crate that depends on both
+    `sqe-coordinator` and `sqe-worker`. The coordinator library carried the
+    worker dependency for the embedded-worker mode of that one binary, so a
+    worker-only change rebuilt the coordinator library and everything above
+    it. `cargo tree -p sqe-coordinator -e normal` no longer lists
+    `sqe-worker` (it stays a dev-dependency for the chaos-worker and Hive
+    differential rigs). Build with `cargo build -p sqe-server` or, as before,
+    `cargo build --bin sqe-server` from the workspace root; the Dockerfile,
+    benchmark scripts and docs that named `-p sqe-coordinator` for the
+    binary are updated. The coordinator crate also drops `clap`, which only
+    the binary used.
+
 - Crates: the MCP endpoint no longer links the Trino server crate (#635)
 
     `sqe-mcp` depended on `sqe-trino-compat` for one function, the Arrow
