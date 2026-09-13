@@ -5,6 +5,7 @@
 //! reclaims excess; live consumers registered here receive `try_reclaim`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::governor::{
@@ -14,13 +15,20 @@ use crate::reclaim::{MemoryGrant, ReclaimableConsumer};
 
 /// Live consumer handle registered for reclaim callbacks.
 struct LiveConsumer {
+    query_id: String,
     consumer: Arc<dyn ReclaimableConsumer>,
 }
 
 /// Registry of live operators that can shrink under pressure.
+///
+/// Keyed by a handle unique per registration (#383): the governor tolerates
+/// two live grants named `(query_id, name)`, and keying this map by that
+/// pair let the first guard to drop evict the other, still-live consumer
+/// from reclaim.
 #[derive(Default)]
 pub struct LiveConsumerRegistry {
-    inner: Mutex<HashMap<(String, String), LiveConsumer>>,
+    inner: Mutex<HashMap<u64, LiveConsumer>>,
+    next_handle: AtomicU64,
 }
 
 impl LiveConsumerRegistry {
@@ -28,44 +36,57 @@ impl LiveConsumerRegistry {
         Self::default()
     }
 
+    /// Register a live consumer; the returned handle is what unregisters it.
     pub fn register(
         &self,
         query_id: impl Into<String>,
-        name: impl Into<String>,
         consumer: Arc<dyn ReclaimableConsumer>,
-    ) {
-        let key = (query_id.into(), name.into());
-        self.inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(key, LiveConsumer { consumer });
+    ) -> u64 {
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed) + 1;
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).insert(
+            handle,
+            LiveConsumer {
+                query_id: query_id.into(),
+                consumer,
+            },
+        );
+        handle
     }
 
-    pub fn unregister(&self, query_id: &str, name: &str) {
+    pub fn unregister(&self, handle: u64) {
         self.inner
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .remove(&(query_id.to_string(), name.to_string()));
+            .remove(&handle);
     }
 
     pub fn unregister_query(&self, query_id: &str) {
         let mut map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        map.retain(|(q, _), _| q != query_id);
+        map.retain(|_, live| live.query_id != query_id);
     }
 
     /// Ask every live consumer to free memory; returns total reclaimed.
+    ///
+    /// The consumer handles are snapshotted under the lock and the
+    /// callbacks run after it is released (#383): a spilling consumer whose
+    /// `try_reclaim` re-enters this registry would otherwise deadlock.
     pub fn reclaim_all(&self, target: usize) -> usize {
         if target == 0 {
             return 0;
         }
-        let map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if map.is_empty() {
+        let consumers: Vec<Arc<dyn ReclaimableConsumer>> = {
+            let map = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            map.values()
+                .map(|live| Arc::clone(&live.consumer))
+                .collect()
+        };
+        if consumers.is_empty() {
             return 0;
         }
-        let per = (target / map.len()).max(1);
+        let per = (target / consumers.len()).max(1);
         let mut got = 0usize;
-        for live in map.values() {
-            got = got.saturating_add(live.consumer.try_reclaim(per));
+        for consumer in consumers {
+            got = got.saturating_add(consumer.try_reclaim(per));
             if got >= target {
                 break;
             }
@@ -171,15 +192,14 @@ pub fn admit_operator(
     }
     match governor.try_admit_guarded(req, consumer.as_ref()) {
         Ok((grant, guard)) => {
-            live.register(query_id, &name, consumer.clone());
+            let live_handle = live.register(query_id, consumer.clone());
             consumer.set_current(grant.capacity_bytes());
             Ok((
                 grant,
                 OperatorGrantGuard {
                     grant_guard: guard,
                     live: live.clone(),
-                    query_id: query_id.to_string(),
-                    name,
+                    live_handle,
                 },
             ))
         }
@@ -191,13 +211,21 @@ pub fn admit_operator(
 pub struct OperatorGrantGuard {
     grant_guard: GrantGuard,
     live: Arc<LiveConsumerRegistry>,
-    query_id: String,
-    name: String,
+    /// This guard's own registration (#383), so dropping it can never evict
+    /// a same-named consumer that is still live.
+    live_handle: u64,
+}
+
+impl OperatorGrantGuard {
+    /// The governor grant id this guard releases.
+    pub fn grant_id(&self) -> Option<u64> {
+        self.grant_guard.grant_id()
+    }
 }
 
 impl Drop for OperatorGrantGuard {
     fn drop(&mut self) {
-        self.live.unregister(&self.query_id, &self.name);
+        self.live.unregister(self.live_handle);
         // grant_guard drops after this and releases the governor grant.
         let _ = &self.grant_guard;
     }
@@ -206,6 +234,69 @@ impl Drop for OperatorGrantGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #383: two live operators with the same `(query_id, name)` (two
+    /// partitions of one shuffle) keep their own registrations. Dropping one
+    /// used to remove the shared key and hide the other from reclaim.
+    #[test]
+    fn same_named_consumers_keep_their_own_registrations() {
+        let gov = Arc::new(MemoryGovernor::new(64 * 1024 * 1024));
+        let live = Arc::new(LiveConsumerRegistry::new());
+        let mk = || {
+            Arc::new(OperatorConsumer::new(
+                "part",
+                WorkloadClass::Shuffle,
+                4 * 1024 * 1024,
+                1024 * 1024,
+            ))
+        };
+        let (_g1, guard1) = admit_operator(&gov, &live, "q", mk()).expect("first");
+        let (_g2, guard2) = admit_operator(&gov, &live, "q", mk()).expect("second");
+        assert_eq!(live.len(), 2);
+        assert_ne!(guard1.grant_id(), guard2.grant_id());
+
+        drop(guard1);
+        assert_eq!(live.len(), 1, "the second consumer is still registered");
+        assert_eq!(gov.active_count(), 1);
+        drop(guard2);
+        assert!(live.is_empty());
+        assert_eq!(gov.active_count(), 0);
+    }
+
+    /// #383: `reclaim_all` runs the callbacks with the registry unlocked, so
+    /// a consumer that re-enters the registry from `try_reclaim` does not
+    /// deadlock.
+    #[test]
+    fn reclaim_all_does_not_hold_the_registry_lock_across_callbacks() {
+        struct ReEntrant {
+            live: Arc<LiveConsumerRegistry>,
+        }
+        impl ReclaimableConsumer for ReEntrant {
+            fn name(&self) -> &str {
+                "reentrant"
+            }
+            fn desired_bytes(&self) -> usize {
+                1024
+            }
+            fn minimum_bytes(&self) -> usize {
+                1024
+            }
+            fn try_reclaim(&self, _target: usize) -> usize {
+                // Would deadlock on a lock held by the caller.
+                self.live.len()
+            }
+        }
+        let live = Arc::new(LiveConsumerRegistry::new());
+        let handle = live.register(
+            "q",
+            Arc::new(ReEntrant {
+                live: Arc::clone(&live),
+            }),
+        );
+        assert_eq!(live.reclaim_all(1), 1);
+        live.unregister(handle);
+        assert!(live.is_empty());
+    }
 
     #[test]
     fn admit_join_agg_sort_and_reclaim() {

@@ -297,6 +297,24 @@ All notable changes to SQE are documented in this file.
 
 ### Bug Fixes
 
+- MemoryGovernor: grants release by unique id; the reclaim counter counts real reclaims (#380)
+
+    `release` matched the first active grant with the same `(query_id, name)`,
+    so two concurrent same-named grants (shuffle partitions of one query)
+    returned the wrong one's bytes while both were live. Every admission now
+    gets a monotonic id, the guard from `try_admit_guarded` releases exactly
+    that grant, and `reclaims` increments only when a pressure pass shrank
+    something; it used to count every pass, including ones with nothing to
+    shrink. The `LiveConsumerRegistry` had the same shape (#383): keyed by
+    `(query_id, name)`, so the first same-named guard to drop evicted the
+    other, still-live consumer from reclaim. It is keyed by a per-registration
+    handle now, and `reclaim_all` snapshots the consumers and runs the
+    callbacks with the registry unlocked, so a spilling consumer that
+    re-enters the registry cannot deadlock. Still open on #380: real
+    `try_reclaim` wiring, pool sizing to what the governor gates, and
+    advisory rather than hard rejects; on #383: manifests built from real
+    segments.
+
 - S3 spill store: quota reserved atomically per writer, one PUT per segment (#382)
 
     `reserve_quota` read the counters and the `fetch_add` happened in
