@@ -3465,56 +3465,84 @@ impl QueryHandler {
     ) -> sqe_core::Result<OpenStreamResult> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
 
-        let (plan, tt_cleanup) = match prebuilt {
-            Some(plan) => (plan, TimeTravelCleanup::new(&ctx, Vec::new())),
-            None => {
-                self.plan_sql_for_stream(&ctx, &session_catalog, session, sql, Some(query_id))
-                    .await?
-            }
-        };
-        // Streaming path: the audit entry is recorded by the
-        // TrackedRecordBatchStream finalizer (not the `execute` path), so carry
-        // the policy summary out to the caller, which stows it on the
-        // StreamFinalizer for the audit emission at stream end.
-        let (enforced_plan, policy_summary) = {
-            let _policy_span = tracing::info_span!(
-                "sqe.policy_rewrite",
-                user = %session.user.username
-            );
-            self.policy_enforcer.evaluate(&session.user, plan).await?
-        };
-        debug!("Policy-enforced plan (streaming): {:?}", enforced_plan);
-        // Compute the structured resource list from the logical plan now,
-        // before it is consumed by `execute_logical_plan`. The streaming
-        // finalizer needs these to emit a canonical `AuditEvent`; there is
-        // no opportunity to recover the logical plan later in the pipeline.
-        let effective_catalog_buf: Option<String> = if session.default_catalog.is_none() {
-            Some(self.config.resolve_default_catalog())
-        } else {
-            None
-        };
-        let default_catalog_str: Option<&str> = session
-            .default_catalog
-            .as_deref()
-            .or(effective_catalog_buf.as_deref());
-        let audit_resources =
-            crate::audit_resources::resources_from_plan(&enforced_plan, default_catalog_str);
-        let mut tables_touched = sqe_lineage::extract::extract_table_names(&enforced_plan);
-        append_metadata_tvf_targets(&enforced_plan, &mut tables_touched);
+        // Every recursive phase (SQL planning, the policy rewrite, the
+        // optimizer, physical planning, the post-planning rules) runs on the
+        // dedicated planning stack (#640): a plan deeper than the request
+        // thread's stack used to abort the coordinator. Execution below stays
+        // on the runtime threads.
+        let (final_plan, tt_cleanup, tables_touched, policy_summary, audit_resources) =
+            sqe_core::runtime::on_planning_stack(async {
+                let (plan, tt_cleanup) = match prebuilt {
+                    Some(plan) => (plan, TimeTravelCleanup::new(&ctx, Vec::new())),
+                    None => {
+                        self.plan_sql_for_stream(
+                            &ctx,
+                            &session_catalog,
+                            session,
+                            sql,
+                            Some(query_id),
+                        )
+                        .await?
+                    }
+                };
+                // Streaming path: the audit entry is recorded by the
+                // TrackedRecordBatchStream finalizer (not the `execute` path), so
+                // carry the policy summary out to the caller, which stows it on
+                // the StreamFinalizer for the audit emission at stream end.
+                let (enforced_plan, policy_summary) = {
+                    let _policy_span = tracing::info_span!(
+                        "sqe.policy_rewrite",
+                        user = %session.user.username
+                    );
+                    self.policy_enforcer.evaluate(&session.user, plan).await?
+                };
+                debug!("Policy-enforced plan (streaming): {:?}", enforced_plan);
+                // Compute the structured resource list from the logical plan
+                // now, before it is consumed by `execute_logical_plan`. The
+                // streaming finalizer needs these to emit a canonical
+                // `AuditEvent`; there is no opportunity to recover the logical
+                // plan later in the pipeline.
+                let effective_catalog_buf: Option<String> = if session.default_catalog.is_none()
+                {
+                    Some(self.config.resolve_default_catalog())
+                } else {
+                    None
+                };
+                let default_catalog_str: Option<&str> = session
+                    .default_catalog
+                    .as_deref()
+                    .or(effective_catalog_buf.as_deref());
+                let audit_resources = crate::audit_resources::resources_from_plan(
+                    &enforced_plan,
+                    default_catalog_str,
+                );
+                let mut tables_touched =
+                    sqe_lineage::extract::extract_table_names(&enforced_plan);
+                append_metadata_tvf_targets(&enforced_plan, &mut tables_touched);
 
-        let enforced_df = ctx
-            .execute_logical_plan(enforced_plan)
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to create execution plan: {e}")))?;
-        let physical_plan = enforced_df
-            .create_physical_plan()
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Physical plan creation failed: {e}")))?;
+                let enforced_df = ctx
+                    .execute_logical_plan(enforced_plan)
+                    .await
+                    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to create execution plan: {e}")))?;
+                let physical_plan = enforced_df
+                    .create_physical_plan()
+                    .await
+                    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Physical plan creation failed: {e}")))?;
 
-        // Post-planning rule pipeline + distribution. The rule order lives in
-        // `crate::post_planning`; this is the same call `execute_query` makes.
-        let final_plan = self
-            .finish_physical_plan(&ctx, session, query_id, physical_plan)
+                // Post-planning rule pipeline + distribution. The rule order
+                // lives in `crate::post_planning`; this is the same call
+                // `execute_query` makes.
+                let final_plan = self
+                    .finish_physical_plan(&ctx, session, query_id, physical_plan)
+                    .await?;
+                Ok::<_, SqeError>((
+                    final_plan,
+                    tt_cleanup,
+                    tables_touched,
+                    policy_summary,
+                    audit_resources,
+                ))
+            })
             .await?;
 
         // Planning complete — promote tracker to Running
@@ -3884,87 +3912,96 @@ impl QueryHandler {
         self.refresh_listing_snapshots(&ctx, &session_catalog, session, sql)
             .await;
 
-        // Pre-process incremental (CDC) first. The FOR INCREMENTAL BETWEEN
-        // clause is not modelled by sqlparser-rs, so the downstream
-        // handle_time_travel call (which parses SQL) would fail if we left it
-        // in place. handle_incremental strips the clause text and registers
-        // an IncrementalTableProvider per target table.
-        let (sql, incremental_identities) =
-            self.handle_incremental(sql, &ctx, &session_catalog).await?;
-        // Pre-process time travel: detect FOR SYSTEM_TIME AS OF, resolve
-        // snapshot IDs, register snapshot-specific table providers, and
-        // strip the temporal clause. `tt_cleanup` deregisters the pinned
-        // providers when this function returns, so the bare table name
-        // resolves to HEAD on the next query in the same session (#44).
-        let (sql, tt_cleanup) = self
-            .handle_time_travel(
-                &sql,
-                &ctx,
-                session,
-                &session_catalog,
-                incremental_identities,
-            )
-            .await?;
-        // The single normalization pass before planning (finding 700):
-        // Trino-compat AST rewrites (`CAST(v AS JSON)` -> `to_json(v)`, ...),
-        // `_colN` aliasing and `information_schema` qualification, through the
-        // same front door every entry point uses.
-        let sql = normalize_for_planning(session, &sql)?;
-        let sql = sql.as_str();
+        // Every recursive phase up to the final physical plan runs on the
+        // dedicated planning stack (#640); see `open_stream`. The out-params
+        // are written inside so the caller sees them whether or not planning
+        // succeeds past them.
+        let (final_plan, _tt_cleanup) = sqe_core::runtime::on_planning_stack(async {
+            // Pre-process incremental (CDC) first. The FOR INCREMENTAL BETWEEN
+            // clause is not modelled by sqlparser-rs, so the downstream
+            // handle_time_travel call (which parses SQL) would fail if we left
+            // it in place. handle_incremental strips the clause text and
+            // registers an IncrementalTableProvider per target table.
+            let (sql, incremental_identities) =
+                self.handle_incremental(sql, &ctx, &session_catalog).await?;
+            // Pre-process time travel: detect FOR SYSTEM_TIME AS OF, resolve
+            // snapshot IDs, register snapshot-specific table providers, and
+            // strip the temporal clause. `tt_cleanup` deregisters the pinned
+            // providers when this function returns, so the bare table name
+            // resolves to HEAD on the next query in the same session (#44).
+            let (sql, tt_cleanup) = self
+                .handle_time_travel(
+                    &sql,
+                    &ctx,
+                    session,
+                    &session_catalog,
+                    incremental_identities,
+                )
+                .await?;
+            // The single normalization pass before planning (finding 700):
+            // Trino-compat AST rewrites (`CAST(v AS JSON)` -> `to_json(v)`,
+            // ...), `_colN` aliasing and `information_schema` qualification,
+            // through the same front door every entry point uses.
+            let sql = normalize_for_planning(session, &sql)?;
+            let sql = sql.as_str();
 
-        // Plan the query via DataFusion's SQL planner
-        let plan_span = tracing::info_span!("sqe.plan", query_id = %query_id);
-        prepare_file_tvfs(&ctx, sql).await?;
-        let df = ctx
-            .sql(sql)
-            .instrument(plan_span)
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
+            // Plan the query via DataFusion's SQL planner
+            let plan_span = tracing::info_span!("sqe.plan", query_id = %query_id);
+            prepare_file_tvfs(&ctx, sql).await?;
+            let df = ctx
+                .sql(sql)
+                .instrument(plan_span)
+                .await
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
 
-        // Get the logical plan, give pinned scans their real identity back
-        // (400), and run policy enforcement.
-        let plan = tt_cleanup.restore_identities(df.logical_plan().clone())?;
-        let (enforced_plan, policy_summary) = {
-            let _policy_span = tracing::info_span!(
-                "sqe.policy_rewrite",
-                user = %session.user.username
-            );
-            self.policy_enforcer.evaluate(&session.user, plan).await?
-        };
+            // Get the logical plan, give pinned scans their real identity back
+            // (400), and run policy enforcement.
+            let plan = tt_cleanup.restore_identities(df.logical_plan().clone())?;
+            let (enforced_plan, policy_summary) = {
+                let _policy_span = tracing::info_span!(
+                    "sqe.policy_rewrite",
+                    user = %session.user.username
+                );
+                self.policy_enforcer.evaluate(&session.user, plan).await?
+            };
 
-        debug!("Policy-enforced plan: {:?}", enforced_plan);
+            debug!("Policy-enforced plan: {:?}", enforced_plan);
 
-        // Surface the policy summary to the audit log (out-param, same pattern as
-        // `plan_out`). The caller copies the counts/names/denied flag into the
-        // AuditEntry so a deny-all (zero rows) is distinguishable from a
-        // legitimate empty result.
-        *summary_out = Some(policy_summary);
+            // Surface the policy summary to the audit log (out-param, same
+            // pattern as `plan_out`). The caller copies the counts/names/denied
+            // flag into the AuditEntry so a deny-all (zero rows) is
+            // distinguishable from a legitimate empty result.
+            *summary_out = Some(policy_summary);
 
-        // Capture the enforced plan for OpenLineage extraction. Cloning into
-        // a Box keeps the lineage path independent of DataFusion's
-        // execute_logical_plan consumption pattern below.
-        *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(
-            enforced_plan.clone(),
-        )));
+            // Capture the enforced plan for OpenLineage extraction. Cloning
+            // into a Box keeps the lineage path independent of DataFusion's
+            // execute_logical_plan consumption pattern below.
+            *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(
+                enforced_plan.clone(),
+            )));
 
-        // Create a new DataFrame from the enforced plan
-        let enforced_df = ctx
-            .execute_logical_plan(enforced_plan)
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to create execution plan: {e}")))?;
+            // Create a new DataFrame from the enforced plan
+            let enforced_df = ctx
+                .execute_logical_plan(enforced_plan)
+                .await
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to create execution plan: {e}")))?;
 
-        // Get the physical plan
-        let physical_plan = enforced_df
-            .create_physical_plan()
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Physical plan creation failed: {e}")))?;
+            // Get the physical plan
+            let physical_plan = enforced_df
+                .create_physical_plan()
+                .await
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Physical plan creation failed: {e}")))?;
 
-        // Post-planning rule pipeline + distribution. The rule order lives in
-        // `crate::post_planning`; this is the same call `open_stream` makes,
-        // so the batch path gets the parallel-scan rules too (review 404).
-        let final_plan = self
-            .finish_physical_plan(&ctx, session, query_id, physical_plan)
-            .await?;
+            // Post-planning rule pipeline + distribution. The rule order lives
+            // in `crate::post_planning`; this is the same call `open_stream`
+            // makes, so the batch path gets the parallel-scan rules too
+            // (review 404).
+            let final_plan = self
+                .finish_physical_plan(&ctx, session, query_id, physical_plan)
+                .await?;
+            Ok::<_, SqeError>((final_plan, tt_cleanup))
+        })
+        .await?;
 
         // Execute the (possibly distributed) plan.
         //

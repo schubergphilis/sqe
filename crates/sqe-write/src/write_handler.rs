@@ -1366,23 +1366,30 @@ impl WriteHandler {
         let namespace = table_ident.namespace().clone();
         let name = table_ident.name().to_string();
 
-        // Plan the SELECT without executing it; gives us the output schema cheaply.
-        let df = ctx
-            .sql(select_sql)
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
+        // Plan the SELECT without executing it; gives us the output schema
+        // cheaply. Planning and the policy rewrite are recursive and run on
+        // the dedicated planning stack (#640); this is the CTAS + rewriter
+        // path that overflowed a request thread.
+        let (df, policy_summary) = sqe_core::runtime::on_planning_stack(async {
+            let df = ctx
+                .sql(select_sql)
+                .await
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
 
-        // Enforce policy on the source SELECT so masks and restrictions
-        // shape the target table. Without this, CTAS over a masked table
-        // creates a sink with plaintext columns.
-        let (enforced_source, policy_summary) = self
-            .enforce_source_plan(session, df.logical_plan().clone())
-            .await?;
+            // Enforce policy on the source SELECT so masks and restrictions
+            // shape the target table. Without this, CTAS over a masked table
+            // creates a sink with plaintext columns.
+            let (enforced_source, policy_summary) = self
+                .enforce_source_plan(session, df.logical_plan().clone())
+                .await?;
+            let df = ctx
+                .execute_logical_plan(enforced_source)
+                .await
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Plan execution failed: {e}")))?;
+            Ok::<_, SqeError>((df, policy_summary))
+        })
+        .await?;
         *policy_summary_out = Some(policy_summary);
-        let df = ctx
-            .execute_logical_plan(enforced_source)
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Plan execution failed: {e}")))?;
 
         let arrow_schema = Arc::new(df.schema().as_arrow().clone());
         let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema)?;
@@ -1866,32 +1873,42 @@ impl WriteHandler {
 
         // Enforce row filters, column masks, and restricted columns on the
         // source SELECT. Without this, INSERT INTO sink SELECT FROM masked
-        // would copy plaintext into sink, bypassing every policy.
+        // would copy plaintext into sink, bypassing every policy. The rewrite
+        // and the physical planning in `execute_stream` are recursive and run
+        // on the dedicated planning stack (#640); the stream itself is polled
+        // on the runtime threads.
         let source_plan = df.logical_plan().clone();
-        let (enforced_plan, policy_summary) =
-            self.enforce_source_plan(session, source_plan).await?;
-        *policy_summary_out = Some(policy_summary);
+        let (stream, policy_summary, lineage_plan) =
+            sqe_core::runtime::on_planning_stack(async {
+                let (enforced_plan, policy_summary) =
+                    self.enforce_source_plan(session, source_plan).await?;
 
-        let (lin_catalog, lin_namespace, lin_table) =
-            lineage_target_parts(&self.config, &table_ident);
-        if let Ok(wrapper) = build_lineage_insert_plan(
-            enforced_plan.clone(),
-            &lin_catalog,
-            &lin_namespace,
-            &lin_table,
-        ) {
+                let (lin_catalog, lin_namespace, lin_table) =
+                    lineage_target_parts(&self.config, &table_ident);
+                let lineage_plan = build_lineage_insert_plan(
+                    enforced_plan.clone(),
+                    &lin_catalog,
+                    &lin_namespace,
+                    &lin_table,
+                )
+                .ok();
+
+                let df = ctx
+                    .execute_logical_plan(enforced_plan)
+                    .await
+                    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Plan execution failed: {e}")))?;
+
+                let stream = df
+                    .execute_stream()
+                    .await
+                    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to start execution stream: {e}")))?;
+                Ok::<_, SqeError>((stream, policy_summary, lineage_plan))
+            })
+            .await?;
+        *policy_summary_out = Some(policy_summary);
+        if let Some(wrapper) = lineage_plan {
             *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(wrapper)));
         }
-
-        let df = ctx
-            .execute_logical_plan(enforced_plan)
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Plan execution failed: {e}")))?;
-
-        let stream = df
-            .execute_stream()
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to start execution stream: {e}")))?;
 
         let (stream, sketch_acc) = tap_stream_for_puffin_sketches(&table, stream);
 

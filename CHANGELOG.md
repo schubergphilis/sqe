@@ -297,6 +297,27 @@ All notable changes to SQE are documented in this file.
 
 ### Bug Fixes
 
+- Coordinator: query and write planning run on a dedicated 64 MiB stack (#640)
+
+    A stack overflow in Rust is a process abort. The planning phases (SQL to
+    logical plan, the policy rewrite, the optimizer, physical planning, the
+    post-planning rules) are recursive tree walks whose depth follows the
+    query, and they ran on whichever 8 MiB request thread picked up the
+    task; one deep `IN (...)` list or one MERGE with a wide policy rewrite
+    took the coordinator down with every in-flight query. Both query paths
+    (`execute_query`, `open_stream`) and both write paths (CTAS and INSERT
+    source planning) now run those phases through
+    `sqe_core::runtime::on_planning_stack`: on the multi-thread runtime the
+    worker hands its core back to the scheduler and a scoped thread with
+    64 MiB of stack drives the phase on the same runtime; on a
+    current-thread runtime (test bodies) the phase runs inline. Execution
+    stays on the runtime threads. The requirement is bounded to planning, so
+    `coordinator.runtime_stack_mib` no longer has to be sized for the
+    deepest plan anyone might send. Still open on #640: the integration
+    suites keep `RUST_MIN_STACK` because `#[tokio::test]` bodies are the
+    current-thread case, and the release-profile deep-shape guards stay
+    release-only.
+
 - MemoryGovernor: grants release by unique id; the reclaim counter counts real reclaims (#380)
 
     `release` matched the first active grant with the same `(query_id, name)`,
