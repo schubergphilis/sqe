@@ -285,6 +285,20 @@ All notable changes to SQE are documented in this file.
 
 ### Bug Fixes
 
+- Dashboard: bearer tokens pass the pre-auth rate limiter before validation (#562)
+
+    The operator dashboard's `require_admin_bearer` guard was the one bearer
+    entry point that never consulted `AuthRateLimiter`; Flight, Trino (since
+    #622) and MCP (since !991) all do. Validating a garbage bearer is not
+    free (a JWKS refetch, an IdP or STS round trip per attempt), so anyone
+    reaching the health/web port could drive that cost without limit. The
+    guard now keys `(client ip, token fingerprint)` against the same
+    limiter instance the other paths share and answers 429 with
+    `Retry-After: 1`; a request without a bearer still gets the anonymous
+    401 and spends no budget. Remaining on #562: a single
+    `RateLimitedAuthProvider` wrapper in the auth chain, which needs the peer
+    address to travel with `FlightCredentials` first.
+
 - `information_schema.tables` lists every namespace, not only the ones the session already named (#664)
 
     With `with_information_schema(true)` DataFusion's built-in provider
