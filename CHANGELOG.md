@@ -6,6 +6,21 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Coordinator: one admission sequence for `execute` and `execute_stream` (#589)
+
+    Both entry points carried their own copy of the admission gates
+    (memory pressure, per-user permit, global permit, per-user memory
+    reservation), and the copies had drifted: the buffered path reserved
+    memory before taking the global permit, the streaming path after, so
+    which error a client saw when two gates failed at once depended on the
+    protocol it used. `QueryHandler::admit` (in the new child module
+    `query_handler/admission.rs`, the first phase split out of the
+    handler) is the one sequence, in the streaming order; it returns an
+    `Admission` whose permits and reservation the buffered path drops on
+    return and the streaming path moves into the result-stream wrapper.
+    `try_acquire_owned` has one call site left in `query_handler.rs` (the
+    sorted-write cap, a different gate).
+
 - Coordinator: one audit emitter for every statement outcome (#589, #636)
 
     `QueryHandler::execute_inner` built the statement's `AuditEvent` four
