@@ -6687,7 +6687,7 @@ dependencies = [
  "sqe-auth",
  "sqe-core",
  "sqe-sql",
- "sqe-trino-compat",
+ "sqe-trino-protocol",
  "sqlparser",
  "subtle",
  "tokio",
@@ -6943,6 +6943,7 @@ version = "0.37.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
+ "arrow-cast",
  "arrow-flight",
  "arrow-schema",
  "base64 0.23.1",
