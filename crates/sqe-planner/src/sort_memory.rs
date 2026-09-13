@@ -9,7 +9,7 @@
 //! This module is the gate + policy. Wiring into DF sort construction lands
 //! when the worker governor (Phase 7) owns the FairSpillPool replacement.
 
-use sqe_spill::{split_default_read_headroom, MemoryGrant, ReclaimableConsumer};
+use sqe_spill::{split_default_read_headroom, MemoryGrant};
 
 /// Default max runs merged in one pass. Higher fan-in needs more simultaneous
 /// buffer reservations; keep this modest for laptop 64 MiB workers.
@@ -115,38 +115,6 @@ impl std::fmt::Display for SortAdmissionError {
 }
 
 impl std::error::Error for SortAdmissionError {}
-
-/// Reclaimable consumer for sort operators.
-pub struct SortConsumer {
-    name: String,
-    desired: usize,
-    minimum: usize,
-}
-
-impl SortConsumer {
-    pub fn new(name: impl Into<String>, desired: usize, minimum: usize) -> Self {
-        Self {
-            name: name.into(),
-            desired: desired.max(1),
-            minimum: minimum.max(1).min(desired.max(1)),
-        }
-    }
-}
-
-impl ReclaimableConsumer for SortConsumer {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn desired_bytes(&self) -> usize {
-        self.desired
-    }
-    fn minimum_bytes(&self) -> usize {
-        self.minimum
-    }
-    fn try_reclaim(&self, _target: usize) -> usize {
-        0
-    }
-}
 
 #[cfg(test)]
 mod tests {
