@@ -35,6 +35,11 @@ use crate::query_tracker::{FragmentState, QueryTracker};
 use crate::runtime_catalog::RuntimeCatalogRegistry;
 use crate::write_handler::WriteHandler;
 
+// Review 409: the handler is being split by phase into child modules that
+// share this module's private state. Admission is the first.
+mod admission;
+pub(crate) use admission::Admission;
+
 /// Per-query resource metrics extracted from the executed physical plan tree.
 ///
 /// `pub(crate)` so the streaming finalizer can construct and inspect
@@ -1006,97 +1011,10 @@ impl QueryHandler {
         reject_oversized_sql(&self.config.query, sql)?;
         refuse_if_audit_closed(self.audit.as_ref())?;
 
-        // Memory pressure admission control: reject new queries when the
-        // coordinator's FairSpillPool is >95% utilized (Red).
-        let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
-        if let Some(ref metrics) = self.metrics {
-            metrics.coordinator_memory_pressure.set(pressure.as_gauge());
-            metrics
-                .coordinator_memory_used_bytes
-                .set(crate::memory::used_bytes(&self.runtime.memory_pool) as f64);
-            metrics
-                .coordinator_memory_limit_bytes
-                .set(crate::memory::limit_bytes(&self.runtime.memory_pool) as f64);
-        }
-        if !pressure.admits_new_query() {
-            warn!(
-                pressure = %pressure,
-                username = %session.user.username,
-                "Rejecting query due to memory pressure"
-            );
-            let sort_cols = extract_order_by_columns(sql);
-            return Err(SqeError::Execution(
-                adaptive_sort::format_pressure_rejection(&sort_cols, pressure),
-            ));
-        }
-
-        // Backpressure: per-user gate first, then global gate. The per-user
-        // gate prevents one tenant from holding every global permit while
-        // legitimately under their submission rate limit. We acquire owned
-        // permits because the streaming path holds them for the result-
-        // stream lifetime, not the synchronous execute() call.
-        let _per_user_permit = if self.config.query.max_concurrent_per_user > 0 {
-            let username = session.user.username.clone();
-            let sem = self
-                .per_user_semaphores
-                .entry(username.clone())
-                .or_insert_with(|| {
-                    Arc::new(tokio::sync::Semaphore::new(
-                        self.config.query.max_concurrent_per_user,
-                    ))
-                })
-                .clone();
-            match sem.try_acquire_owned() {
-                Ok(permit) => Some(permit),
-                Err(_) => {
-                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                        "Too many concurrent queries for user '{}' ({} active). Please retry later.",
-                        username, self.config.query.max_concurrent_per_user
-                    )));
-                }
-            }
-        } else {
-            None
-        };
-
-        // Per-user memory reservation. Reject when this user's in-flight
-        // queries would push past their share of the global pool, before
-        // the global red-band check fires for everyone else.
-        let _per_user_mem_reservation =
-            if self.per_user_memory_budget_bytes > 0 && self.per_query_memory_bytes > 0 {
-                let username = session.user.username.clone();
-                match self.per_user_memory.try_reserve(
-                    &username,
-                    self.per_query_memory_bytes,
-                    self.per_user_memory_budget_bytes,
-                ) {
-                    Some(r) => Some(r),
-                    None => {
-                        let used = self.per_user_memory.used_bytes(&username);
-                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                            "Per-user memory budget exceeded for '{}': {} bytes reserved, \
-                         limit {} bytes. Wait for in-flight queries to complete.",
-                            username, used, self.per_user_memory_budget_bytes
-                        )));
-                    }
-                }
-            } else {
-                None
-            };
-
-        let _permit = if let Some(ref sem) = self.query_semaphore {
-            match sem.clone().try_acquire_owned() {
-                Ok(permit) => Some(permit),
-                Err(_) => {
-                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                        "Too many concurrent queries ({} active). Please retry later.",
-                        self.config.query.max_concurrent_queries
-                    )));
-                }
-            }
-        } else {
-            None
-        };
+        // Admission (pressure, per-user and global permits, per-user memory
+        // reservation): one sequence shared with the streaming path, see
+        // `query_handler::admission`. Held for the whole buffered call.
+        let _admission = self.admit(session, sql, "query")?;
 
         let start = std::time::Instant::now();
         // Pre-parse pipeline (strip FOR INCREMENTAL / FOR VERSION AS OF,
@@ -2954,93 +2872,14 @@ impl QueryHandler {
         refuse_if_audit_closed(self.audit.as_ref())?;
 
         // --- Admission control -------------------------------------------------
-        let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
-        if let Some(ref metrics) = self.metrics {
-            metrics.coordinator_memory_pressure.set(pressure.as_gauge());
-            metrics
-                .coordinator_memory_used_bytes
-                .set(crate::memory::used_bytes(&self.runtime.memory_pool) as f64);
-            metrics
-                .coordinator_memory_limit_bytes
-                .set(crate::memory::limit_bytes(&self.runtime.memory_pool) as f64);
-        }
-        if !pressure.admits_new_query() {
-            warn!(
-                pressure = %pressure,
-                username = %session.user.username,
-                "Rejecting streaming query due to memory pressure"
-            );
-            let sort_cols = extract_order_by_columns(sql);
-            return Err(SqeError::Execution(
-                adaptive_sort::format_pressure_rejection(&sort_cols, pressure),
-            ));
-        }
-
-        // Acquire owned concurrency permits so they can be moved into the
-        // stream wrapper and released when the client finishes draining.
-        // The per-user permit is acquired first; if granted, the global
-        // permit is acquired second. A user that holds N per-user permits
-        // (each tied to an open stream) still counts N times against the
-        // global ceiling.
-        let mut permits: Vec<tokio::sync::OwnedSemaphorePermit> = Vec::new();
-        if self.config.query.max_concurrent_per_user > 0 {
-            let username = session.user.username.clone();
-            let sem = self
-                .per_user_semaphores
-                .entry(username.clone())
-                .or_insert_with(|| {
-                    Arc::new(tokio::sync::Semaphore::new(
-                        self.config.query.max_concurrent_per_user,
-                    ))
-                })
-                .clone();
-            match sem.try_acquire_owned() {
-                Ok(p) => permits.push(p),
-                Err(_) => {
-                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                        "Too many concurrent queries for user '{}' ({} active). Please retry later.",
-                        username, self.config.query.max_concurrent_per_user
-                    )));
-                }
-            }
-        }
-        if let Some(ref sem) = self.query_semaphore {
-            match Arc::clone(sem).try_acquire_owned() {
-                Ok(p) => permits.push(p),
-                Err(_) => {
-                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                        "Too many concurrent queries ({} active). Please retry later.",
-                        self.config.query.max_concurrent_queries
-                    )));
-                }
-            }
-        }
-
-        // Per-user memory reservation. Carried by the streaming wrapper so
-        // it releases when the result stream drops, not when the planning
-        // call returns. Without this, large multi-second streams would
-        // appear to free their budget immediately on admission.
-        let per_user_mem_reservation =
-            if self.per_user_memory_budget_bytes > 0 && self.per_query_memory_bytes > 0 {
-                let username = session.user.username.clone();
-                match self.per_user_memory.try_reserve(
-                    &username,
-                    self.per_query_memory_bytes,
-                    self.per_user_memory_budget_bytes,
-                ) {
-                    Some(r) => Some(r),
-                    None => {
-                        let used = self.per_user_memory.used_bytes(&username);
-                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                            "Per-user memory budget exceeded for '{}': {} bytes reserved, \
-                         limit {} bytes. Wait for in-flight queries to complete.",
-                            username, used, self.per_user_memory_budget_bytes
-                        )));
-                    }
-                }
-            } else {
-                None
-            };
+        // Same sequence as execute() (`query_handler::admission`). The
+        // permits and the reservation are moved into the stream wrapper
+        // below and released when the client finishes draining, not when
+        // planning returns.
+        let Admission {
+            permits,
+            memory_reservation: per_user_mem_reservation,
+        } = self.admit(session, sql, "streaming query")?;
 
         // --- Classify ---------------------------------------------------------
         // See execute() for the pipeline rationale: pre-parse pipeline, then
