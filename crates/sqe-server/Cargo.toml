@@ -32,6 +32,7 @@ sqe-lineage = { path = "../sqe-lineage" }
 sqe-metrics = { path = "../sqe-metrics" }
 sqe-trino-compat = { path = "../sqe-trino-compat" }
 sqe-quack-server = { path = "../sqe-quack-server" }
+sqe-sql = { path = "../sqe-sql" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 arrow-array = { workspace = true }
@@ -55,7 +56,6 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 iceberg = { workspace = true }
-sqe-sql = { path = "../sqe-sql" }
 toml = { workspace = true }
 
 [lints]
