@@ -56,7 +56,7 @@ struct MockAuth;
 
 #[async_trait::async_trait]
 impl TrinoAuthenticator for MockAuth {
-    async fn authenticate(&self, user: &str, pass: &str) -> Result<Session, SqeError> {
+    async fn authenticate(&self, user: &str, pass: &str, _peer_ip: &str) -> Result<Session, SqeError> {
         if pass == BASIC_PASSWORD && matches!(user, "alice" | "bob") {
             Ok(session_for(user))
         } else {
@@ -64,7 +64,7 @@ impl TrinoAuthenticator for MockAuth {
         }
     }
 
-    async fn authenticate_bearer(&self, token: &str) -> Result<Session, SqeError> {
+    async fn authenticate_bearer(&self, token: &str, _peer_ip: &str) -> Result<Session, SqeError> {
         if token == GOOD_BEARER {
             Ok(session_for("bearer-user"))
         } else {

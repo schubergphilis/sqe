@@ -6,6 +6,18 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Crates: the MCP endpoint no longer links the Trino server crate (#635)
+
+    `sqe-mcp` depended on `sqe-trino-compat` for one function, the Arrow
+    cell to Trino JSON value encoder, and so compiled the whole Trino HTTP
+    server into the MCP crate. The encoder and its timestamp and interval
+    formatting helpers now live in `sqe_trino_protocol::encode` behind the
+    wire crate's `arrow` feature, next to the decoder they mirror;
+    `sqe_trino_compat::types::arrow_value_to_json` is a re-export. MCP's
+    first-party edges are `sqe-auth`, `sqe-core`, `sqe-sql` and
+    `sqe-trino-protocol`. The `sqe-bench` edge named in the same finding was
+    already gone (review 705).
+
 - Catalog: `information_schema.tables` no longer loads every table (#664 follow-up)
 
     DataFusion's built-in `information_schema.tables` asks the schema provider
@@ -297,6 +309,20 @@ All notable changes to SQE are documented in this file.
 
 ### Bug Fixes
 
+- Config: `[query]` byte sizes and the OpenLineage rules are checked at load (#637)
+
+    Six `[query]` sizes (`per_user_memory_budget`, `max_query_memory`,
+    `distribution_threshold`, `target_task_size`,
+    `runtime_filter_inlist_max_size`, `fanout_buffer_budget`) were parsed
+    where they were used: the planner read `distribution_threshold` and
+    `target_task_size` with `unwrap_or(0)`, so a typo silently turned
+    distribution off, and the handler constructor read the memory budgets,
+    so a typo failed the first query rather than the boot. They now go
+    through the same byte-size validator as every other size, and the
+    error names the field and the value. The `[metrics.openlineage]`
+    rules ran only when the coordinator built its observer; `validate()`
+    runs them for every binary when the block is enabled.
+
 - Auth: one pre-authentication rate limiter in front of the provider chain (#562)
 
     Every listener re-implemented the same check before calling the auth
@@ -312,9 +338,12 @@ All notable changes to SQE are documented in this file.
     entry point maps that one error to its wire form (Flight
     `RESOURCE_EXHAUSTED`, dashboard and MCP `429` with `Retry-After`). The
     peer address travels in `FlightCredentials.peer_ip`; a credential without
-    one passes the wrapper untouched, which is how Trino and Quack keep their
-    own check for now without being counted twice. Flight SQL, the
-    dashboard and MCP are migrated in this change; Trino and Quack follow.
+    one passes the wrapper untouched. All five listeners are on it: Flight
+    SQL, the dashboard, MCP, Trino (`TrinoAuthenticator` now receives the
+    peer host, `TrinoAuthRateLimiter` is gone, the denial is still a 429 on
+    every route) and Quack (its private 10 per second per-IP governor is
+    gone; the connection request is on the same per-minute budget as every
+    other bearer, with the same `SQE-RATELIMIT` error on the wire).
 
 - Write path: one field-id stamping implementation (#600)
 

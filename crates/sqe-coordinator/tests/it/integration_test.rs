@@ -2305,6 +2305,7 @@ impl sqe_trino_compat::server::TrinoAuthenticator for TestTrinoAuth {
         &self,
         username: &str,
         password: &str,
+        _peer_ip: &str,
     ) -> Result<sqe_core::Session, sqe_core::SqeError> {
         self.0.authenticate(username, password).await
     }

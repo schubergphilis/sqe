@@ -670,12 +670,26 @@ struct AuthenticatorAdapter {
     bearer_provider: Option<Arc<dyn sqe_auth::AuthProvider>>,
 }
 
+/// The chain-level pre-auth limiter (#562) refuses with `RateLimited`; the
+/// Trino server recognises `ResourceExhausted` and answers 429 instead of
+/// the 401 every other provider failure gets.
+fn trino_auth_error(e: sqe_auth::AuthError, context: &str) -> sqe_core::SqeError {
+    match e {
+        sqe_auth::AuthError::RateLimited => sqe_core::SqeError::with_code(
+            sqe_core::SqeErrorCode::ResourceExhausted,
+            "authentication rate limit".to_string(),
+        ),
+        other => sqe_core::SqeError::Auth(format!("{context}{other}")),
+    }
+}
+
 #[async_trait::async_trait]
 impl TrinoAuthenticator for AuthenticatorAdapter {
     async fn authenticate(
         &self,
         username: &str,
         password: &str,
+        peer_ip: &str,
     ) -> Result<sqe_core::Session, sqe_core::SqeError> {
         // Route Basic auth through the chain so a service principal's
         // client_id/client_secret reaches `client_credentials_passthrough` over
@@ -685,12 +699,13 @@ impl TrinoAuthenticator for AuthenticatorAdapter {
             let credentials = sqe_auth::FlightCredentials {
                 username: Some(username.to_string()),
                 password: Some(sqe_core::SecretString::new(password.to_string())),
+                peer_ip: Some(peer_ip.to_string()),
                 ..Default::default()
             };
             let identity = provider
                 .authenticate(&credentials)
                 .await
-                .map_err(|e| sqe_core::SqeError::Auth(e.to_string()))?;
+                .map_err(|e| trino_auth_error(e, ""))?;
             return Ok(sqe_coordinator::auth_session::identity_to_session(
                 identity, None,
             ));
@@ -704,6 +719,7 @@ impl TrinoAuthenticator for AuthenticatorAdapter {
     async fn authenticate_bearer(
         &self,
         token: &str,
+        peer_ip: &str,
     ) -> Result<sqe_core::Session, sqe_core::SqeError> {
         let provider = self.bearer_provider.as_ref().ok_or_else(|| {
             sqe_core::SqeError::Auth("Bearer token authentication is not configured".to_string())
@@ -711,12 +727,14 @@ impl TrinoAuthenticator for AuthenticatorAdapter {
 
         let credentials = sqe_auth::FlightCredentials {
             bearer_token: Some(sqe_core::SecretString::new(token.to_string())),
+            peer_ip: Some(peer_ip.to_string()),
             ..Default::default()
         };
 
-        let identity = provider.authenticate(&credentials).await.map_err(|e| {
-            sqe_core::SqeError::Auth(format!("Bearer token validation failed: {e}"))
-        })?;
+        let identity = provider
+            .authenticate(&credentials)
+            .await
+            .map_err(|e| trino_auth_error(e, "Bearer token validation failed: "))?;
 
         // Fall back to the raw JWT as the catalog token when the provider did
         // not supply one (passthrough to Polaris).
@@ -1704,11 +1722,11 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             handler: query_handler.clone(),
             rate_limiter: Arc::clone(&rate_limiter),
         });
-        let trino_auth_limiter: Arc<dyn sqe_trino_compat::server::TrinoAuthRateLimiter> =
-            Arc::clone(&auth_rate_limiter) as _;
+        // The pre-auth rate limit is inside `auth_chain` (#562): the adapter
+        // forwards the peer host in the credentials and the chain's denial
+        // comes back as `ResourceExhausted`, which the Trino server maps to 429.
         let trino_opts = sqe_trino_compat::server::TrinoServerOptions {
             security: config.security.clone(),
-            auth_rate_limiter: Some(trino_auth_limiter),
             expose_version: false,
         };
         sqe_trino_compat::server::start_trino_server_with_options(
@@ -1737,11 +1755,11 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         let executor: Arc<dyn sqe_quack_server::QueryExecutor> = Arc::new(
             sqe_coordinator::CoordinatorExecutor::new(query_handler.clone()),
         );
-        // QUACK-08: the Quack ConnectionRequest -> authenticate path is rate
-        // limited per client IP inside sqe-quack-server, mirroring the Flight /
-        // Trino auth limiters. We pass [security].trusted_proxies so the limiter
-        // keys on the real client IP (rightmost untrusted x-forwarded-for hop)
-        // when the peer is a trusted proxy, and on the raw TCP peer otherwise.
+        // QUACK-08 / #562: the Quack ConnectionRequest -> authenticate path is
+        // rate limited by the limiter inside `auth_chain`, keyed on the client
+        // IP the Quack server resolves. We pass [security].trusted_proxies so
+        // that IP is the real client (rightmost untrusted x-forwarded-for hop)
+        // when the peer is a trusted proxy, and the raw TCP peer otherwise.
         // Serving with connect-info hands the handler the peer SocketAddr.
         let quack_state =
             sqe_quack_server::QuackServerState::new(Arc::clone(&auth_chain), executor)
