@@ -222,7 +222,16 @@ impl SessionManager {
             .auth_provider
             .authenticate(credentials)
             .await
-            .map_err(|e| sqe_core::SqeError::Auth(e.to_string()))?;
+            .map_err(|e| match e {
+                // #562: the pre-auth limiter denied before any provider ran.
+                // Carried as ResourceExhausted so Flight answers
+                // RESOURCE_EXHAUSTED, not UNAUTHENTICATED.
+                sqe_auth::AuthError::RateLimited => sqe_core::SqeError::with_code(
+                    sqe_core::SqeErrorCode::ResourceExhausted,
+                    "authentication rate limit",
+                ),
+                other => sqe_core::SqeError::Auth(other.to_string()),
+            })?;
 
         let session = self.identity_to_session(&identity);
         let session_id = session.id.clone();
@@ -250,7 +259,11 @@ impl SessionManager {
     /// existing session (still subject to `get_session`'s expiry eviction), a
     /// miss authenticates and records the mapping. The boolean is `true` when
     /// a session was created, so callers emit auth-success events only then.
-    pub async fn session_for_bearer(&self, token: &str) -> sqe_core::Result<(Arc<Session>, bool)> {
+    pub async fn session_for_bearer(
+        &self,
+        token: &str,
+        peer_ip: Option<&str>,
+    ) -> sqe_core::Result<(Arc<Session>, bool)> {
         let fingerprint = bearer_fingerprint(token);
         if let Some(id) = self.by_token.get(&fingerprint).map(|e| e.value().clone()) {
             if let Some(session) = self.get_session(&id) {
@@ -261,8 +274,12 @@ impl SessionManager {
             self.by_token.remove(&fingerprint);
             self.token_of.remove(&id);
         }
+        // Only a token the cache did not know reaches the provider, and so
+        // the pre-auth limiter (#562): replaying a validated bearer spends no
+        // budget, the same rule the Trino Basic path applies.
         let credentials = FlightCredentials {
             bearer_token: Some(sqe_core::SecretString::new(token.to_string())),
+            peer_ip: peer_ip.map(str::to_string),
             ..Default::default()
         };
         let session = self.authenticate_credentials(&credentials).await?;
@@ -1172,10 +1189,10 @@ mod tests {
         });
         let manager = SessionManager::with_provider(provider.clone());
 
-        let (first, created) = manager.session_for_bearer("eyJ.a.b").await.unwrap();
+        let (first, created) = manager.session_for_bearer("eyJ.a.b", None).await.unwrap();
         assert!(created);
         for _ in 0..99 {
-            let (again, created) = manager.session_for_bearer("eyJ.a.b").await.unwrap();
+            let (again, created) = manager.session_for_bearer("eyJ.a.b", None).await.unwrap();
             assert!(!created);
             assert_eq!(again.id, first.id);
         }
@@ -1183,7 +1200,7 @@ mod tests {
         assert_eq!(manager.session_count(), 1);
 
         // A different token is a different principal: new session.
-        let (other, created) = manager.session_for_bearer("eyJ.c.d").await.unwrap();
+        let (other, created) = manager.session_for_bearer("eyJ.c.d", None).await.unwrap();
         assert!(created);
         assert_ne!(other.id, first.id);
         assert_eq!(manager.session_count(), 2);
@@ -1191,7 +1208,7 @@ mod tests {
         // Removing the session forgets the fingerprint, so the next replay
         // re-authenticates instead of returning a dangling id.
         manager.remove_session(&first.id);
-        let (_, created) = manager.session_for_bearer("eyJ.a.b").await.unwrap();
+        let (_, created) = manager.session_for_bearer("eyJ.a.b", None).await.unwrap();
         assert!(created);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
     }
@@ -1206,9 +1223,9 @@ mod tests {
         });
         let manager = SessionManager::with_provider(provider.clone());
 
-        let (first, created) = manager.session_for_bearer("eyJ.a.b").await.unwrap();
+        let (first, created) = manager.session_for_bearer("eyJ.a.b", None).await.unwrap();
         assert!(created);
-        let (second, created) = manager.session_for_bearer("eyJ.a.b").await.unwrap();
+        let (second, created) = manager.session_for_bearer("eyJ.a.b", None).await.unwrap();
         assert!(created, "an expired session must not be reused");
         assert_ne!(first.id, second.id);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);

@@ -85,6 +85,10 @@ impl AuthProvider for AuthChain {
                     warn!(provider_index = i, error = %e, "Provider internal error");
                     return Err(e);
                 }
+                // Only the rate-limiting wrapper produces this, and it wraps
+                // the whole chain; a provider inside the chain never returns
+                // it. Stop here regardless, never try another provider.
+                Err(e @ AuthError::RateLimited) => return Err(e),
             }
         }
 

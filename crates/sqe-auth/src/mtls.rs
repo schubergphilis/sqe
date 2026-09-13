@@ -331,6 +331,7 @@ mod tests {
             password: Some(sqe_core::SecretString::new("secret".to_string())),
             bearer_token: Some(sqe_core::SecretString::new("eyJ...".to_string())),
             client_cert_cn: Some("service-x".to_string()),
+            peer_ip: None,
         };
 
         let identity = provider.authenticate(&creds).await.expect("should succeed");
