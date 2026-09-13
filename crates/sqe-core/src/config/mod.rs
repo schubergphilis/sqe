@@ -5786,6 +5786,17 @@ impl SqeConfig {
         validate_byte_sizes(self, &mut errors);
         validate_memory_budget_invariants(self, &mut errors);
 
+        // Subsystem validators run here, not at first use (#637 item 4). The
+        // OpenLineage rules were only consulted when the coordinator built
+        // its observer, so `sqe-server --print-config` and the worker
+        // accepted a `[metrics.openlineage]` block that the coordinator would
+        // refuse a moment later.
+        if self.metrics.openlineage.enabled {
+            if let Err(e) = self.metrics.openlineage.validate() {
+                errors.push(format!("metrics.{e}"));
+            }
+        }
+
         if self.coordinator.production_mode {
             match self.validate_production() {
                 Ok(()) => {}
@@ -6159,6 +6170,30 @@ fn validate_byte_sizes(config: &SqeConfig, errors: &mut Vec<String>) {
         &config.storage.footer_cache_size,
     );
     check("storage.prefetch_buffer", &config.storage.prefetch_buffer);
+
+    // `[query]` sizes (#637 item 4). These were parsed where they are used:
+    // `distribution_threshold` and `target_task_size` with `unwrap_or(0)`
+    // in the planner, so a typo silently turned distribution off, and
+    // `max_query_memory` / `per_user_memory_budget` in the handler
+    // constructor, so a typo failed the first query rather than the boot.
+    check(
+        "query.per_user_memory_budget",
+        &config.query.per_user_memory_budget,
+    );
+    check("query.max_query_memory", &config.query.max_query_memory);
+    check(
+        "query.distribution_threshold",
+        &config.query.distribution_threshold,
+    );
+    check("query.target_task_size", &config.query.target_task_size);
+    check(
+        "query.runtime_filter_inlist_max_size",
+        &config.query.runtime_filter_inlist_max_size,
+    );
+    check(
+        "query.fanout_buffer_budget",
+        &config.query.fanout_buffer_budget,
+    );
 
     // Sub-budgets must not sum above the worker tracked limit (they share one
     // MemoryPool). Empty fields use resolve defaults.
@@ -6645,6 +6680,52 @@ partial_progress_batch = 5
         assert_eq!(d.group_heartbeat_timeout_secs, 120);
         assert!(!d.partial_progress);
         assert_eq!(d.partial_progress_batch, 10);
+    }
+
+    /// #637 item 4: the `[query]` byte sizes fail at load, naming the field,
+    /// instead of at the first query (`max_query_memory`) or silently as
+    /// zero (`distribution_threshold`, `target_task_size`).
+    #[test]
+    fn query_byte_sizes_are_validated_at_load() {
+        let mut config = valid_config();
+        config.query.distribution_threshold = "8X".to_string();
+        config.query.target_task_size = "lots".to_string();
+        config.query.max_query_memory = "256 MBs".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        for field in [
+            "query.distribution_threshold = \"8X\"",
+            "query.target_task_size = \"lots\"",
+            "query.max_query_memory = \"256 MBs\"",
+        ] {
+            assert!(err.contains(field), "expected {field} in: {err}");
+        }
+
+        let mut config = valid_config();
+        config.query.fanout_buffer_budget = "0".to_string();
+        config.query.runtime_filter_inlist_max_size = "4MB".to_string();
+        assert!(config.validate().is_ok());
+    }
+
+    /// #637 item 4: the OpenLineage rules are part of `validate()`, so a
+    /// block the coordinator would refuse when building its observer is
+    /// refused by every binary at load.
+    #[test]
+    fn openlineage_rules_run_inside_validate() {
+        let mut config = valid_config();
+        config.metrics.openlineage.enabled = true;
+        config.metrics.openlineage.file_path = String::new();
+        config.metrics.openlineage.http_endpoint = String::new();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("metrics.openlineage.enabled requires at least one of file_path or http_endpoint"),
+            "got: {err}"
+        );
+
+        // Disabled: the block is not consulted, however it is filled in.
+        let mut config = valid_config();
+        config.metrics.openlineage.enabled = false;
+        config.metrics.openlineage.auth_mode = "bearer".to_string();
+        assert!(config.validate().is_ok());
     }
 
     #[test]

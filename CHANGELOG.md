@@ -297,6 +297,20 @@ All notable changes to SQE are documented in this file.
 
 ### Bug Fixes
 
+- Config: `[query]` byte sizes and the OpenLineage rules are checked at load (#637)
+
+    Six `[query]` sizes (`per_user_memory_budget`, `max_query_memory`,
+    `distribution_threshold`, `target_task_size`,
+    `runtime_filter_inlist_max_size`, `fanout_buffer_budget`) were parsed
+    where they were used: the planner read `distribution_threshold` and
+    `target_task_size` with `unwrap_or(0)`, so a typo silently turned
+    distribution off, and the handler constructor read the memory budgets,
+    so a typo failed the first query rather than the boot. They now go
+    through the same byte-size validator as every other size, and the
+    error names the field and the value. The `[metrics.openlineage]`
+    rules ran only when the coordinator built its observer; `validate()`
+    runs them for every binary when the block is enabled.
+
 - Auth: one pre-authentication rate limiter in front of the provider chain (#562)
 
     Every listener re-implemented the same check before calling the auth
