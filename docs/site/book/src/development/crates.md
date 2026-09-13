@@ -196,15 +196,27 @@ Observability stack.
 | `audit.rs` | `AuditLogger`: JSONL audit log writer |
 | `otel.rs` | OpenTelemetry init (traces, metrics, logs via OTLP/gRPC) |
 
+### sqe-trino-protocol
+
+Trino wire types and the shared clients. serde only by default; the client, Arrow and Flight surfaces are opt-in features so a consumer links what it uses and nothing more.
+
+| Module | Contents |
+|---|---|
+| `types.rs` | `/v1/statement` JSON types and type-signature helpers |
+| `client.rs` (feature `client`) | `TrinoHttpClient`: auth, same-origin `nextUri`, bounded pagination, cancel on drop |
+| `decode.rs` (feature `arrow`) | Trino JSON pages to Arrow `RecordBatch` with faithful types |
+| `encode.rs` (feature `arrow`) | Arrow cells to Trino JSON values; the one value encoding for the Trino server and the MCP endpoint |
+| `flight.rs` (feature `flight`) | `FlightSqlClient` over `FlightSqlServiceClient` |
+
 ### sqe-trino-compat
 
-Trino wire protocol compatibility layer.
+Trino wire protocol compatibility layer (the server side).
 
 | Module | Contents |
 |---|---|
 | `server.rs` | Trino HTTP server (`/v1/statement` endpoint) |
 | `protocol.rs` | RecordBatch to Trino JSON response serialization |
-| `types.rs` | Arrow to Trino type mapping |
+| `types.rs` | Arrow to Trino type mapping; re-exports the value encoder from `sqe-trino-protocol` |
 
 ### sqe-mcp
 

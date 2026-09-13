@@ -11,7 +11,7 @@ repository.workspace = true
 # in the serde-only protocol crate so sqe-cli / sqe-bench can deserialize a
 # page without linking this server crate (review 705). Re-exported from
 # `protocol` unchanged.
-sqe-trino-protocol = { path = "../sqe-trino-protocol" }
+sqe-trino-protocol = { path = "../sqe-trino-protocol", features = ["arrow"] }
 sqe-core = { path = "../sqe-core" }
 sqe-auth = { path = "../sqe-auth" }
 sqe-sql = { path = "../sqe-sql" }
