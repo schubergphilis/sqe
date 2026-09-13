@@ -11,6 +11,7 @@ members = [
     "crates/sqe-trino-functions",
     "crates/sqe-write",
     "crates/sqe-coordinator",
+    "crates/sqe-server",
     "crates/sqe-compaction",
     "crates/sqe-worker",
     "crates/sqe-trino-protocol",

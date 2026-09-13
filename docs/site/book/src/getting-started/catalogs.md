@@ -438,13 +438,13 @@ a smaller image can opt out:
 
 ```bash
 # REST only: no AWS SDK, no Thrift, no sqlx
-cargo build --release --no-default-features --features rest -p sqe-coordinator
+cargo build --release --no-default-features --features sqe-catalog/rest -p sqe-server
 
 # REST + AWS managed Iceberg
-cargo build --release --no-default-features --features rest,glue,s3tables -p sqe-coordinator
+cargo build --release --no-default-features --features sqe-catalog/rest,sqe-catalog/glue,sqe-catalog/s3tables -p sqe-server
 
 # REST + Hive
-cargo build --release --no-default-features --features rest,hms -p sqe-coordinator
+cargo build --release --no-default-features --features sqe-catalog/rest,sqe-catalog/hms -p sqe-server
 ```
 
 Approximate cost on top of a `rest`-only build:

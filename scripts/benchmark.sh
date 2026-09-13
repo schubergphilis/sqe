@@ -74,7 +74,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> Building sqe-bench + sqe-coordinator"
-cargo build --release -p sqe-bench -p sqe-coordinator
+cargo build --release -p sqe-bench -p sqe-server
 
 if [ "$MANAGE_STACK" = 1 ]; then
     echo "==> Bringing up test stack (Polaris + RustFS)"

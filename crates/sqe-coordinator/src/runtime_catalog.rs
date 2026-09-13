@@ -341,8 +341,8 @@ impl RuntimeCatalogRegistry {
 
 /// Attach every `[[hive.roots]]` configured root at coordinator startup,
 /// mirroring the `[catalogs.*]` static-config loop for Iceberg catalogs
-/// (`create_session_context`'s `flattened` loop). Shared by both
-/// coordinator binaries (`main.rs`, `bin/sqe_server.rs`) so they cannot
+/// (`create_session_context`'s `flattened` loop). Shared with the
+/// `sqe-server` binary (`crates/sqe-server/src/main.rs`) so they cannot
 /// drift on this the way their `hive_catalogs`/`hive_manifest_cache`
 /// constructions above them are already (independently) duplicated.
 ///

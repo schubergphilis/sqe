@@ -1,0 +1,62 @@
+[package]
+name = "sqe-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+description = "The shipped SQE binary: `sqe-server --mode coordinator|worker`, wiring the coordinator and worker libraries"
+
+# Review 803 item 4 / 804 MR C: the binary used to live in `sqe-coordinator`,
+# which made the coordinator *library* depend on `sqe-worker` for the embedded
+# worker mode alone, so every worker-only change rebuilt the coordinator and
+# its integration-test binaries. Binaries may depend on both libraries; the
+# library crates now depend on neither of each other.
+
+[features]
+# `[[hive.roots]] kind = "glue"`: forwarded to the coordinator (see there).
+glue = ["sqe-coordinator/glue"]
+
+[[bin]]
+name = "sqe-server"
+path = "src/main.rs"
+
+[dependencies]
+sqe-coordinator = { path = "../sqe-coordinator" }
+sqe-worker = { path = "../sqe-worker" }
+sqe-core = { path = "../sqe-core" }
+sqe-auth = { path = "../sqe-auth" }
+sqe-catalog = { path = "../sqe-catalog" }
+sqe-policy = { path = "../sqe-policy" }
+sqe-lineage = { path = "../sqe-lineage" }
+sqe-metrics = { path = "../sqe-metrics" }
+sqe-trino-compat = { path = "../sqe-trino-compat" }
+sqe-quack-server = { path = "../sqe-quack-server" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+arrow-array = { workspace = true }
+arrow-flight = { workspace = true }
+axum = { workspace = true }
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+clap = { workspace = true }
+datafusion = { workspace = true }
+futures = { workspace = true }
+moka = { workspace = true }
+prometheus = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true, features = ["tls-ring"] }
+tower = { version = "0.5", features = ["util"] }
+tracing = { workspace = true }
+uuid = { workspace = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+iceberg = { workspace = true }
+sqe-sql = { path = "../sqe-sql" }
+toml = { workspace = true }
+
+[lints]
+workspace = true

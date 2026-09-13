@@ -7,7 +7,7 @@
 //!   checks that the resulting identity holds an admin role. Fully testable
 //!   without an HTTP stack.
 //! - `BearerAdminState` -- a small trait that the axum middleware is generic
-//!   over. `HealthState` in `bin/sqe_server.rs` implements this trait, keeping
+//!   over. `HealthState` in `crates/sqe-server/src/main.rs` implements this trait, keeping
 //!   `HealthState` and all its construction sites in the binary.
 //! - `require_admin_bearer` -- the axum `from_fn_with_state` middleware that
 //!   gates the `web_ui` route group.
@@ -89,7 +89,7 @@ pub async fn bearer_admin_identity(
 /// auth config needed by the admin guard middleware.
 ///
 /// Using a trait keeps `HealthState` and all its construction sites in
-/// `bin/sqe_server.rs` (a binary crate) while `require_admin_bearer` lives
+/// `crates/sqe-server/src/main.rs` (the binary crate) while `require_admin_bearer` lives
 /// here in the lib. Option (a) -- moving `HealthState` into the lib -- would
 /// force every field public and add cross-crate imports for all handlers.
 pub trait BearerAdminState: Send + Sync + 'static {
