@@ -72,7 +72,7 @@ RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},sharing=locked,target
     FEATURES=""; if [ -n "$CATALOG_FEATURES" ]; then FEATURES="--features ${CATALOG_FEATURES}"; fi; \
     cargo chef cook --locked --profile "${CARGO_PROFILE}" \
       --recipe-path recipe.json --no-default-features $FEATURES \
-      --package sqe-coordinator --package sqe-worker \
+      --package sqe-server --package sqe-worker \
       --package sqe-cli --package sqe-bench \
     && sccache --show-stats
 

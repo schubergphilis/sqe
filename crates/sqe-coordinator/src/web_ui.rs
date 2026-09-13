@@ -1,6 +1,6 @@
 //! Read-only web UI: serde DTOs and pure mapping functions from the
 //! coordinator's in-memory `QueryTracker` / `WorkerRegistry` snapshots into the
-//! dashboard's JSON wire format. The axum handlers in `bin/sqe_server.rs` are
+//! dashboard's JSON wire format. The axum handlers in `crates/sqe-server/src/main.rs` are
 //! thin wrappers over these functions. Ops-only, network-gated; see
 //! `docs/superpowers/specs/2026-06-01-sqe-web-ui-design.md`.
 

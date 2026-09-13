@@ -6,7 +6,7 @@ SQE is organized as a Cargo workspace of focused crates. The tables below cover 
 
 ```mermaid
 graph TB
-    SERVER["sqe-server binary<br/>(in sqe-coordinator)"]
+    SERVER["sqe-server binary<br/>(crate sqe-server)"]
     CLI["sqe-cli"]
 
     SERVER --> COORD["sqe-coordinator"]
@@ -146,6 +146,10 @@ re-exports every module here under its old `sqe_coordinator::` path.
 | `hive_write.rs` | Hive external-table CTAS and INSERT |
 | `ident.rs`, `commit.rs` | Identifier folding and resolution; commit-with-retry and conflict classification |
 | `test_support/sqlite_rig.rs` | In-process SQLite-backed write rig (feature `test-sqlite`) |
+
+### sqe-server
+
+The shipped binary, `sqe-server --mode coordinator|worker`. One file of wiring: config load and validation, the auth chain, the session manager, the Flight SQL, Trino, MCP, Quack and health listeners, the maintenance scheduler, and the embedded worker. It depends on both `sqe-coordinator` and `sqe-worker`; the two libraries do not depend on each other, so a worker-only change no longer rebuilds the coordinator and its integration-test binaries.
 
 ### sqe-coordinator
 

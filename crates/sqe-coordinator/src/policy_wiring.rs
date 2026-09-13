@@ -1,7 +1,7 @@
 //! AUTH-01: build the policy enforcer + store from `config.policy.engine`.
 //!
-//! Shared by both coordinator binaries (`main.rs`, `bin/sqe_server.rs`) so the
-//! enforcement wiring cannot drift between them. Returns the enforcer that the
+//! Used by the `sqe-server` binary (`crates/sqe-server/src/main.rs`) and the
+//! test rigs so the enforcement wiring cannot drift. Returns the enforcer that the
 //! query pipeline runs AND the same `Arc<dyn PolicyStore>` so GRANT/REVOKE can
 //! invalidate its cache.
 
@@ -143,7 +143,7 @@ pub fn build_policy_enforcer(
 
 /// Construct the GRANT/REVOKE backend from `config.access_control`.
 ///
-/// Shared by both coordinator binaries (`main.rs`, `bin/sqe_server.rs`) and by
+/// Shared by the `sqe-server` binary (`crates/sqe-server/src/main.rs`) and by
 /// the access-control e2e test, for the same reason `build_policy_enforcer` is
 /// shared: three copies of this wiring would drift.
 pub fn build_grant_backend(config: &SqeConfig) -> anyhow::Result<Option<Arc<dyn GrantBackend>>> {

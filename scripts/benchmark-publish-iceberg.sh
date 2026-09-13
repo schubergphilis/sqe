@@ -173,7 +173,7 @@ case "$PROFILE" in
 esac
 
 if [ "$NEEDS_COORDINATOR" = "1" ]; then
-  BUILD_TARGETS=(-p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-server)
+  BUILD_TARGETS=(-p sqe-bench -p sqe-server --bin sqe-bench --bin sqe-server)
 else
   BUILD_TARGETS=(-p sqe-bench --bin sqe-bench)
 fi
