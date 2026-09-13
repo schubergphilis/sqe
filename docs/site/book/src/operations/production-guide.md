@@ -292,6 +292,30 @@ Route audit logs and traces through an OpenTelemetry Collector when possible. Au
 
 ---
 
+## What production mode enforces
+
+`coordinator.production_mode = true` (or `SQE_PRODUCTION_MODE=1`) turns the following into startup errors. The table is the one in `crates/sqe-core/src/config/production.rs`; a unit test fails when the two drift. Each `security.allow_*` waiver is an explicit acknowledgement, logged at startup.
+
+| Rule | What it refuses |
+|---|---|
+| `no-dev-auth-providers` | `auth.providers` containing `anonymous` or `bearer_passthrough` (dev-only; accept any connection or skip local JWT validation). |
+| `rate-limit-enabled` | `rate_limit.enabled = false` (allows query and auth flooding). |
+| `no-insecure-transport` | `security.allow_insecure_transport = true` (cleartext distributed hops expose bearer tokens, worker secrets and vended S3 credentials). |
+| `no-shared-service-identity` | Config-held `client_credentials` in `[auth].providers` or `[catalog(s).auth]` without `security.allow_shared_service_identity = true` (one identity for every user at Polaris/S3). |
+| `worker-secret-required` | `coordinator.worker_urls` set with an empty `coordinator.worker_secret` and `allow_unauthenticated_workers = true` (any TCP-reachable client may register as a worker). |
+| `max-sql-bytes` | `query.max_sql_bytes = 0` (disables the pre-parse statement size cap). |
+| `explicit-distributed-credentials` | `coordinator.distributed_credentials = auto` with workers configured (ships the shared `[storage]` keys to workers for tables without vended credentials). |
+| `vended-credentials-required` | A REST catalog without `require_vended_credentials = true` (FileIO would fall back to the shared `[storage]` S3 keys). |
+| `policy-engine-configured` | `policy.engine = passthrough` without `security.allow_no_policy_engine = true` (no row filters, masks or column restrictions). |
+| `grant-backend-configured` | `access_control.backend = none` without `security.allow_no_grant_backend = true` (GRANT and REVOKE would be rejected). |
+| `ranger-mask-key` | `policy.engine = ranger` with an empty `policy.mask_key` and no `security.allow_unkeyed_hash_masks = true` (MASK_HASH would fall back to unsalted SHA-256). |
+| `ranger-project-tags` | `policy.engine = ranger` with `policy.ranger.project-tags = false` and no `security.allow_unprojected_tags = true` (Spark would return columns SQE masks). |
+| `mcp-https-resource-uri` | An `http://` `mcp.resource_uri` while MCP is enabled. |
+| `mcp-https-authorization-servers` | An `http://` issuer in `mcp.authorization_servers` while MCP is enabled. |
+| `mcp-no-anonymous-auth` | `mcp.auth.mode = anonymous` while MCP is enabled. |
+
+---
+
 ## Checklist summary
 
 ### Before first production traffic
