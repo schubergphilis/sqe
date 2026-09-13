@@ -6,6 +6,25 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Coordinator: 17 modules are `pub(crate)`; the dead code that hid behind `pub` is gone (#636)
+
+    Every module in the coordinator crate was `pub`, so the compiler could
+    not tell an unused function from an exported one. The 17 modules that
+    nothing outside the crate reaches (`adaptive_sort`, `audit_resources`,
+    `catalog_ops`, `compaction_dispatch`, `ticket_credentials`,
+    `dim_build_swap`, `distributed_scan`, `explain`, `flight_sql_helpers`,
+    `parallel_probe_scan`, `parallel_scan`, `post_planning`,
+    `prepared_statements`, `quack_executor`, `scan_pushdown`, `scheduler`,
+    `suggest_bloom`) are now `pub(crate)`; the 34 that the `sqe-server`
+    binary or the integration tests use stay `pub`. The lint then found:
+    `FragmentFault::sqe_error_code` and `DistributedScanExec::worker_urls`
+    had no caller (deleted); `with_max_retries` and
+    `CoordinatorLocalScanExec::reason` were test-only (now `#[cfg(test)]`);
+    `physical_filter_to_logical_lenient` was a wrapper only a test called
+    (deleted, the test uses `physical_filter_to_logical_reporting`); and
+    the per-sort `reason` string in `SortDecision` was computed and never
+    shown, so the stripped-sort warning and log line now carry it.
+
 - Crates: `sqe-metrics-core` holds the registry types; the policy, catalog, compaction and write crates depend on it, not on the telemetry stack (#635)
 
     Four library crates linked `sqe-metrics` for one type, `MetricsRegistry`
