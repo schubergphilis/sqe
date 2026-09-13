@@ -1,12 +1,9 @@
 use std::sync::Arc;
 
-use arrow::compute::cast;
 use arrow_array::RecordBatch;
-use arrow_schema::Schema as ArrowSchema;
-use iceberg::arrow::schema_to_arrow_schema;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use iceberg::spec::{DataContentType, DataFile, ManifestStatus, Schema as IcebergSchema};
 use iceberg::table::Table;
-use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::base_writer::equality_delete_writer::{
     EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
 };
@@ -38,8 +35,9 @@ use uuid::Uuid;
 /// (`maintenance.rs`, `maintenance_log.rs`, `write_handler.rs`, and the
 /// external `sqe_coordinator::writer::` integration tests) compiles unchanged.
 pub use sqe_compaction::writer::{
-    auto_fanout_caps, new_upload_tracker, parse_parquet_compression, write_data_files_streaming,
-    FanoutLimits, TrackingLocationGenerator, UploadedPaths, WriteCleanupGuard,
+    apply_stamped_schema, auto_fanout_caps, build_stamped_schema, new_upload_tracker,
+    parse_parquet_compression, stamp_batches, write_data_files_streaming, FanoutLimits,
+    TrackingLocationGenerator, UploadedPaths, WriteCleanupGuard,
 };
 
 /// Collect the live data files of the current snapshot. Mirrors the helper
@@ -101,9 +99,6 @@ pub async fn collect_live_data_files(table: &Table) -> sqe_core::Result<Vec<Data
 
     Ok(data_files)
 }
-// Internal-only helper: never referenced outside this module either before or
-// after the move, so a plain (non-`pub`) import is enough.
-use sqe_compaction::writer::unpartitioned_spec_key;
 use sqe_core::SqeErrorCode;
 
 /// Iceberg table property that lists columns to get Parquet bloom filters.
@@ -153,13 +148,21 @@ pub fn writer_props_for_table(table: &Table, compression: Compression) -> Writer
     shared_writer_props_for_table(table, compression)
 }
 
-/// Write RecordBatches as Parquet data files for an Iceberg table.
+/// Write already-materialised RecordBatches as Parquet data files for an
+/// Iceberg table.
 ///
-/// Uses iceberg-rust's writer infrastructure to produce properly formatted
-/// Iceberg data files with correct metadata (file path, size, record count, etc.)
+/// A thin adapter over [`write_data_files_streaming`] (#600): the batches
+/// become a one-shot stream and take exactly the path CTAS, INSERT and the
+/// compaction rewrite take, including its field-id stamping, its
+/// partitioned fan-out and its file naming. This used to be a second writer
+/// with its own stamping (`stamp_field_ids`) that scanned every batch for
+/// nulls to decide nullability and cast per batch; the two disagreed, and a
+/// type-mapping fix had to land twice. Callers that hold a `Vec` (the lease
+/// and ledger rows, the CoW per-file rewrite) keep this signature.
 ///
-/// `compression` controls the Parquet compression codec. Use [`parse_parquet_compression`]
-/// to convert a config string (e.g. `"zstd"`) into a [`Compression`] value.
+/// `compression` controls the Parquet compression codec. Use
+/// [`parse_parquet_compression`] to convert a config string (e.g. `"zstd"`)
+/// into a [`Compression`] value.
 ///
 /// Returns the DataFile descriptors needed for Iceberg transaction commits.
 ///
@@ -178,113 +181,34 @@ pub async fn write_data_files(
     if total_rows == 0 {
         return Ok(vec![]);
     }
+    let Some(schema) = batches.first().map(|b| b.schema()) else {
+        return Ok(vec![]);
+    };
 
     info!(
         total_rows,
         file_prefix, "Writing data files for Iceberg table"
     );
 
-    // DataFusion-produced RecordBatches have no Iceberg field-ID metadata on their
-    // Arrow fields. The Parquet writer requires "PARQUET:field_id" in each field's
-    // metadata to map columns to the Iceberg schema. Stamp the IDs from the table's
-    // current schema onto the batch schema before writing.
-    let batches = stamp_field_ids(batches, table.metadata().current_schema())?;
-
-    let inner_loc = DefaultLocationGenerator::new(table.metadata().clone())
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Location generator error: {e}")))?;
-    let location_generator = TrackingLocationGenerator::new(inner_loc, tracker);
-
-    // Generate a unique write ID for this operation. File names follow the
-    // Iceberg convention: {write_uuid}-{counter}.parquet — no operation label.
-    // This matches Spark/Trino behavior and prevents collisions across writes.
-    let _ = file_prefix; // kept for logging; not used in file names
-    let write_id = Uuid::now_v7();
-    let unique_prefix = format!("{write_id}");
-
-    let file_name_generator =
-        DefaultFileNameGenerator::new(unique_prefix, None, iceberg::spec::DataFileFormat::Parquet);
-
-    let parquet_writer_builder = ParquetWriterBuilder::new(
-        writer_props_for_table(table, compression),
-        table.metadata().current_schema().clone(),
-    );
-
-    let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
-        parquet_writer_builder,
-        table.file_io().clone(),
-        location_generator,
-        file_name_generator,
-    );
-
-    let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
-
-    let metadata = table.metadata();
-    let partition_spec = metadata.default_partition_spec().clone();
-    let data_files = if partition_spec.is_unpartitioned() {
-        // Fast path: unpartitioned tables use the data-file writer directly.
-        // Even on the unpartitioned path the data file must record the
-        // table's current default spec id. Tables that have evolved
-        // their partition spec (ALTER TABLE DROP/REPLACE PARTITION FIELD)
-        // can be unpartitioned with `spec_id != 0`, and the catalog
-        // rejects the commit with "Data file partition spec id does not
-        // match table default partition spec id" when the file is
-        // stamped with the iceberg-rust default of 0.
-        let partition_key = unpartitioned_spec_key(table, &partition_spec);
-        let mut writer = data_file_writer_builder
-            .build(partition_key)
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build data file writer: {e}")))?;
-
-        for batch in &batches {
-            if batch.num_rows() > 0 {
-                writer
-                    .write(batch.clone())
-                    .await
-                    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Write error: {e}")))?;
-            }
-        }
-
-        writer
-            .close()
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Close writer error: {e}")))?
-    } else {
-        // Partitioned path: TaskWriter routes per-row to per-partition
-        // writers, emitting one DataFile per partition with the right
-        // partition struct attached. We pass a partition splitter that
-        // COMPUTES partition values from source columns at runtime
-        // (`try_new_with_computed_values`), so callers do not need to
-        // pre-stamp a `_partition` column on the incoming RecordBatch.
-        // Fanout writer enabled so unsorted INSERTs work without a
-        // pre-clustering step.
-        use iceberg::arrow::RecordBatchPartitionSplitter;
-        use iceberg::writer::task_writer::TaskWriter;
-        let schema = metadata.current_schema().clone();
-        let splitter = RecordBatchPartitionSplitter::try_new_with_computed_values(
-            schema.clone(),
-            partition_spec.clone(),
-        )
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build partition splitter: {e}")))?;
-        let mut writer = TaskWriter::new_with_partition_splitter(
-            data_file_writer_builder,
-            true,
-            schema,
-            partition_spec,
-            Some(splitter),
-        );
-        for batch in &batches {
-            if batch.num_rows() > 0 {
-                writer
-                    .write(batch.clone())
-                    .await
-                    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Partitioned write error: {e}")))?;
-            }
-        }
-        writer
-            .close()
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Close partitioned writer error: {e}")))?
-    };
+    let stream = Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        futures::stream::iter(batches.into_iter().map(Ok)),
+    ));
+    // Unbounded fan-out keeps the partitioned path on the vendored
+    // `TaskWriter`, which is what this writer used directly before; the
+    // batches are already resident, so there is nothing for a bounded
+    // fan-out to protect.
+    let (data_files, _rows) = write_data_files_streaming(
+        table,
+        stream,
+        file_prefix,
+        compression,
+        tracker,
+        FanoutLimits::unbounded(),
+        None,
+        None,
+    )
+    .await?;
 
     info!(
         file_count = data_files.len(),
@@ -612,7 +536,7 @@ pub async fn write_equality_delete_key_files(
         "Writing equality delete files (key-projected)"
     );
 
-    let stamped = stamp_field_ids(key_batches, &key_schema)?;
+    let stamped = stamp_batches(key_batches, &key_schema)?;
 
     let location_generator =
         DefaultLocationGenerator::new(table.metadata().clone()).map_err(|e| {
@@ -717,7 +641,7 @@ pub async fn write_equality_delete_files(
 
     // Stamp field-ids on the Arrow schema so the projector inside the writer
     // can match PARQUET:field_id metadata against `resolved_ids`.
-    let stamped = stamp_field_ids(key_batches, iceberg_schema.as_ref())?;
+    let stamped = stamp_batches(key_batches, iceberg_schema.as_ref())?;
 
     let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
         .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Location generator error: {e}")))?;
@@ -772,113 +696,10 @@ pub async fn write_equality_delete_files(
     Ok(delete_files)
 }
 
-/// Add Iceberg field IDs to each Arrow field's metadata so the Parquet writer
-/// can map columns to the Iceberg schema, and cast columns to the Iceberg-expected
-/// Arrow types (e.g. Timestamp(ns) → Timestamp(µs)).
-///
-/// DataFusion produces `Timestamp(Nanosecond, None)` for CURRENT_TIMESTAMP and
-/// timestamp literals, but Iceberg stores timestamps as `Timestamp(Microsecond, None)`.
-/// The Parquet writer rejects type mismatches, so we cast here before writing.
-fn stamp_field_ids(
-    batches: Vec<RecordBatch>,
-    iceberg_schema: &IcebergSchema,
-) -> sqe_core::Result<Vec<RecordBatch>> {
-    let Some(first) = batches.first() else {
-        return Ok(batches);
-    };
-
-    // Build the canonical Arrow schema from the Iceberg schema so we know the
-    // expected Arrow data type for each column (e.g. Timestamp(µs) not Timestamp(ns)).
-    let expected_arrow_schema = schema_to_arrow_schema(iceberg_schema)
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to derive expected Arrow schema: {e}")))?;
-
-    let iceberg_fields = iceberg_schema.as_struct().fields();
-    // A batch wider than the target has no field to stamp its extra columns
-    // against. This used to fabricate a `(i + 1)` field id and an
-    // Arrow-type fallback, writing a parquet column carrying an Iceberg field
-    // id that belongs to no field (505). Reject it with the same message the
-    // streaming path uses.
-    if first.schema().fields().len() > iceberg_fields.len() {
-        return Err(SqeError::Execution(format!(
-            "INSERT has {} columns but target has {}",
-            first.schema().fields().len(),
-            iceberg_fields.len()
-        )));
-    }
-    let new_fields: Vec<Arc<arrow_schema::Field>> = first
-        .schema()
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(i, arrow_field)| {
-            let field_id = iceberg_fields.get(i).map(|f| f.id).ok_or_else(|| {
-                SqeError::Execution(format!(
-                    "internal error: batch column {i} ('{}') has no Iceberg field \
-                     (schema has {} fields)",
-                    arrow_field.name(),
-                    iceberg_fields.len()
-                ))
-            })?;
-            let mut meta = arrow_field.metadata().clone();
-            meta.insert("PARQUET:field_id".to_string(), field_id.to_string());
-            // DataFusion sometimes marks a field as non-nullable even when the column
-            // contains nulls (e.g. CAST(NULL AS T) in UNION ALL). Check across ALL batches
-            // because the null value may appear in any batch, not just the first one.
-            let has_nulls = batches.iter().any(|b| b.column(i).null_count() > 0);
-            let nullable = arrow_field.is_nullable() || has_nulls;
-            // Use the Iceberg-expected Arrow data type (may differ, e.g. Timestamp precision).
-            let target_type = expected_arrow_schema
-                .fields()
-                .get(i)
-                .map(|f| f.data_type().clone())
-                .ok_or_else(|| {
-                    SqeError::Execution(format!(
-                        "internal error: batch column {i} ('{}') has no Arrow field \
-                         in the target schema",
-                        arrow_field.name()
-                    ))
-                })?;
-            Ok(Arc::new(
-                arrow_schema::Field::new(arrow_field.name(), target_type, nullable)
-                    .with_metadata(meta),
-            ))
-        })
-        .collect::<sqe_core::Result<Vec<_>>>()?;
-
-    let new_schema = Arc::new(ArrowSchema::new(new_fields));
-
-    batches
-        .into_iter()
-        .map(|batch| {
-            // Cast any columns whose type changed (e.g. Timestamp(ns) → Timestamp(µs)).
-            let new_columns: Result<Vec<_>, _> = batch
-                .columns()
-                .iter()
-                .enumerate()
-                .map(|(i, col)| {
-                    let target = new_schema.field(i).data_type();
-                    if col.data_type() == target {
-                        Ok(col.clone())
-                    } else {
-                        cast(col, target).map_err(|e| {
-                            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                                "Failed to cast column '{}' from {:?} to {:?}: {e}",
-                                new_schema.field(i).name(),
-                                col.data_type(),
-                                target,
-                            ))
-                        })
-                    }
-                })
-                .collect();
-            RecordBatch::try_new(new_schema.clone(), new_columns?)
-                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to stamp field IDs: {e}")))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
+    use arrow_schema::Schema as ArrowSchema;
+
     // Bloom filter unit tests live next to their implementation in
     // `sqe_catalog::parquet_writer_config`. The coordinator writer is a
     // thin wrapper; end-to-end coverage runs in
