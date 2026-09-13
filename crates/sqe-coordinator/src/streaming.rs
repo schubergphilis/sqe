@@ -272,13 +272,38 @@ impl StreamFinalizer {
     /// `PolicySummary` lives in `sqe-policy`; `PolicyAudit` lives in
     /// `sqe-metrics`. They carry the same fields but the crate boundary
     /// means we convert here rather than deriving `From` across the boundary.
-    fn policy_summary_to_audit(&self) -> sqe_metrics::audit::PolicyAudit {
-        sqe_metrics::audit::PolicyAudit {
-            row_filters_applied: self.policy_summary.row_filters_applied,
-            columns_masked: self.policy_summary.columns_masked.clone(),
-            columns_restricted: self.policy_summary.columns_restricted.clone(),
-            denied: self.policy_summary.denied,
-        }
+    /// The one `AuditKind::Query` event a streaming query emits, whichever
+    /// way it ended; success, error and cancel differ only in `outcome` and
+    /// in which duration they report (review 409).
+    fn emit_audit(
+        &self,
+        audit: &sqe_metrics::audit::AuditLogger,
+        outcome: sqe_metrics::audit::Outcome,
+        duration_ms: u64,
+        rows: usize,
+    ) {
+        audit.log_event(sqe_metrics::audit::AuditEvent {
+            time: chrono::Utc::now(),
+            kind: sqe_metrics::audit::AuditKind::Query,
+            actor: self.actor.clone(),
+            outcome,
+            resources: self.resources.clone(),
+            policy: Some(crate::audit_emitter::policy_audit(&self.policy_summary)),
+            timing: Some(sqe_metrics::audit::Timing {
+                duration_ms,
+                ..Default::default()
+            }),
+            stats: Some(sqe_metrics::audit::QueryStats {
+                rows_returned: rows,
+                ..Default::default()
+            }),
+            query: Some(crate::audit_emitter::query_info(&self.sql, "query".to_string())),
+            session_id: Some(self.session_id.clone()),
+            client_ip: self.client_ip.clone(),
+            trace_id: self.trace_id.clone(),
+            query_id: Some(self.query_id.to_string()),
+            integrity: Default::default(),
+        });
     }
 
     /// Render, log, and store the per-operator profile for this query.
@@ -372,34 +397,12 @@ impl StreamFinalizer {
         self.finish_query_span("success", rows, None);
 
         if let Some(ref audit) = self.audit {
-            let policy = self.policy_summary_to_audit();
-            let event = sqe_metrics::audit::AuditEvent {
-                time: chrono::Utc::now(),
-                kind: sqe_metrics::audit::AuditKind::Query,
-                actor: self.actor.clone(),
-                outcome: sqe_metrics::audit::Outcome::Success,
-                resources: self.resources.clone(),
-                policy: Some(policy),
-                timing: Some(sqe_metrics::audit::Timing {
-                    duration_ms: execution_ms,
-                    ..Default::default()
-                }),
-                stats: Some(sqe_metrics::audit::QueryStats {
-                    rows_returned: rows,
-                    ..Default::default()
-                }),
-                query: Some(sqe_metrics::audit::QueryInfo {
-                    text: Some(self.sql.clone()),
-                    query_hash: sqe_metrics::audit::query_hash(&self.sql),
-                    statement_type: "query".to_string(),
-                }),
-                session_id: Some(self.session_id.clone()),
-                client_ip: self.client_ip.clone(),
-                trace_id: self.trace_id.clone(),
-                query_id: Some(self.query_id.to_string()),
-                integrity: Default::default(),
-            };
-            audit.log_event(event);
+            self.emit_audit(
+                audit,
+                sqe_metrics::audit::Outcome::Success,
+                execution_ms,
+                rows,
+            );
         }
 
         let elapsed_secs = duration.as_secs();
@@ -451,38 +454,12 @@ impl StreamFinalizer {
         self.finish_query_span("error", rows, Some(&err.to_string()));
 
         if let Some(ref audit) = self.audit {
-            let policy = self.policy_summary_to_audit();
-            let event = sqe_metrics::audit::AuditEvent {
-                time: chrono::Utc::now(),
-                kind: sqe_metrics::audit::AuditKind::Query,
-                actor: self.actor.clone(),
-                outcome: sqe_metrics::audit::Outcome::Failure {
-                    error_type: Some(err.error_code().trino_error_type().to_string()),
-                    error_code: Some(err.error_code().name().to_string()),
-                    message: Some(err.client_message()),
-                },
-                resources: self.resources.clone(),
-                policy: Some(policy),
-                timing: Some(sqe_metrics::audit::Timing {
-                    duration_ms: duration.as_millis() as u64,
-                    ..Default::default()
-                }),
-                stats: Some(sqe_metrics::audit::QueryStats {
-                    rows_returned: rows,
-                    ..Default::default()
-                }),
-                query: Some(sqe_metrics::audit::QueryInfo {
-                    text: Some(self.sql.clone()),
-                    query_hash: sqe_metrics::audit::query_hash(&self.sql),
-                    statement_type: "query".to_string(),
-                }),
-                session_id: Some(self.session_id.clone()),
-                client_ip: self.client_ip.clone(),
-                trace_id: self.trace_id.clone(),
-                query_id: Some(self.query_id.to_string()),
-                integrity: Default::default(),
-            };
-            audit.log_event(event);
+            self.emit_audit(
+                audit,
+                crate::audit_emitter::outcome_of(Some(err)),
+                duration.as_millis() as u64,
+                rows,
+            );
         }
 
         // Failures always profile when the feature is on at all: a failed
@@ -514,42 +491,20 @@ impl StreamFinalizer {
         }
 
         if let Some(ref audit) = self.audit {
-            let policy = self.policy_summary_to_audit();
-            let event = sqe_metrics::audit::AuditEvent {
-                time: chrono::Utc::now(),
-                kind: sqe_metrics::audit::AuditKind::Query,
-                actor: self.actor.clone(),
-                // Cancellation is a client-driven interruption, not a server
-                // error. We map it to Failure with a dedicated error code so
-                // SIEM tools can distinguish cancelled-by-client from
-                // failed-with-error. The legacy path emitted status:"cancelled".
-                outcome: sqe_metrics::audit::Outcome::Failure {
+            // Cancellation is a client-driven interruption, not a server
+            // error. It maps to Failure with a dedicated error code so SIEM
+            // tools can tell cancelled-by-client from failed-with-error. The
+            // legacy path emitted status:"cancelled".
+            self.emit_audit(
+                audit,
+                sqe_metrics::audit::Outcome::Failure {
                     error_type: None,
                     error_code: Some("QUERY_CANCELLED".to_string()),
                     message: Some("Query was cancelled by the client".to_string()),
                 },
-                resources: self.resources.clone(),
-                policy: Some(policy),
-                timing: Some(sqe_metrics::audit::Timing {
-                    duration_ms: duration.as_millis() as u64,
-                    ..Default::default()
-                }),
-                stats: Some(sqe_metrics::audit::QueryStats {
-                    rows_returned: rows,
-                    ..Default::default()
-                }),
-                query: Some(sqe_metrics::audit::QueryInfo {
-                    text: Some(self.sql.clone()),
-                    query_hash: sqe_metrics::audit::query_hash(&self.sql),
-                    statement_type: "query".to_string(),
-                }),
-                session_id: Some(self.session_id.clone()),
-                client_ip: self.client_ip.clone(),
-                trace_id: self.trace_id.clone(),
-                query_id: Some(self.query_id.to_string()),
-                integrity: Default::default(),
-            };
-            audit.log_event(event);
+                duration.as_millis() as u64,
+                rows,
+            );
         }
         self.record_scan_metrics();
         self.finish_query_span("cancelled", rows, Some("cancelled by client"));

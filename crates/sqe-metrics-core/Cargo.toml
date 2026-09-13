@@ -1,0 +1,41 @@
+[package]
+name = "sqe-metrics-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+description = "Prometheus registry types and W3C trace-context propagation helpers, without exporters or servers"
+
+# Review 803 item 2: `sqe-policy`, `sqe-catalog`, `sqe-compaction` and
+# `sqe-write` need one type, `MetricsRegistry`, and the catalog one helper,
+# `propagation::trace_context_http_headers`. Linking `sqe-metrics` for those
+# pulled the OTLP exporters, the OpenTelemetry SDK, the tracing subscriber
+# and the `/metrics` axum server into every one of them. This crate is the
+# registry and the propagation helpers alone; `sqe-metrics` depends on it and
+# re-exports both, so the coordinator, worker and server see one API.
+
+[features]
+default = []
+# W3C trace-context propagation over tonic metadata and HTTP headers. Off by
+# default so a crate that only counts things (policy, compaction, write) does
+# not link the OpenTelemetry API.
+propagation = ["dep:opentelemetry", "dep:tracing-opentelemetry", "dep:tonic", "dep:axum", "dep:tracing"]
+
+[dependencies]
+prometheus = { workspace = true }
+opentelemetry = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+opentelemetry_sdk = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

@@ -9,7 +9,9 @@ repository.workspace = true
 [dependencies]
 sqe-core = { path = "../sqe-core" }
 sqe-policy-api = { path = "../sqe-policy-api" }
-sqe-metrics = { path = "../sqe-metrics" }
+# `MetricsRegistry` only: the registry crate, under the name the sources use
+# (review 803 item 2). No exporters, no OTel SDK, no `/metrics` server.
+sqe-metrics = { path = "../sqe-metrics-core", package = "sqe-metrics-core" }
 sqe-sql = { path = "../sqe-sql" }
 datafusion = { workspace = true }
 arrow = { workspace = true }

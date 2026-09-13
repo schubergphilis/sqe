@@ -128,7 +128,7 @@ pub fn apply_adaptive_sort(
             decisions.borrow_mut().push(SortDecision {
                 sort_columns: sort_cols.clone(),
                 kept: keep,
-                reason,
+                reason: reason.clone(),
             });
 
             if keep {
@@ -155,6 +155,7 @@ pub fn apply_adaptive_sort(
                     sort_columns = ?sort_cols,
                     sort_mode = ?sort_mode,
                     pressure = %pressure,
+                    reason = %reason,
                     "ORDER BY stripped — sort keys are not partition columns. \
                      Set sort_mode = \"strict\" to force all sorts."
                 );
@@ -234,11 +235,17 @@ pub fn format_sort_warning(decisions: &[SortDecision], sort_mode: SortMode) -> O
         SortMode::Adaptive => "adaptive",
     };
 
+    // The per-decision reason names the partition columns or the pressure
+    // level that drove the strip; the user sees why, not only that.
+    let mut reasons: Vec<&str> = stripped.iter().map(|d| d.reason.as_str()).collect();
+    reasons.dedup();
+
     Some(format!(
-        "ORDER BY [{}] was removed (sort_mode={mode_str}). \
+        "ORDER BY [{}] was removed (sort_mode={mode_str}; {}). \
          Results are returned in partition order. \
          To force sorting, set sort_mode=strict or remove ORDER BY if ordering is not required.",
         all_cols.join(", "),
+        reasons.join("; "),
     ))
 }
 
