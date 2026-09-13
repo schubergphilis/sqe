@@ -6,6 +6,19 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Config: production mode is one rule table, mirrored in the production guide (#637)
+
+    What `coordinator.production_mode = true` refuses was fifteen
+    `if production_mode && ...` branches spread through `validate()` and
+    `validate_production()`, and the production guide and the Helm
+    `values-production.yaml` each repeated the list by hand. The rules are
+    now `sqe_core::config::production::PRODUCTION_RULES`, a table of
+    `(name, summary, check)`; `validate_production` iterates it and the
+    three MCP https/anonymous checks that lived in `validate()` moved into
+    it (same messages, same conditions). The production guide gained a
+    "What production mode enforces" table keyed by rule name, and a unit
+    test fails when the guide and the table name different rules.
+
 - Coordinator: 17 modules are `pub(crate)`; the dead code that hid behind `pub` is gone (#636)
 
     Every module in the coordinator crate was `pub`, so the compiler could
