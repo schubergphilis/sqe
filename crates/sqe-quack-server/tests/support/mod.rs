@@ -90,6 +90,32 @@ impl AuthProvider for SkipProvider {
     }
 }
 
+/// Stand-in for the coordinator's rate-limited chain (#562): refuses every
+/// credential as `RateLimited` and records the `peer_ip` it was handed, so a
+/// test can check that the server sends the resolved client address along.
+pub struct RateLimitedProvider {
+    pub seen_peer_ips: std::sync::Mutex<Vec<Option<String>>>,
+}
+
+impl RateLimitedProvider {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            seen_peer_ips: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[async_trait]
+impl AuthProvider for RateLimitedProvider {
+    async fn authenticate(&self, credentials: &FlightCredentials) -> Result<Identity, AuthError> {
+        self.seen_peer_ips
+            .lock()
+            .unwrap()
+            .push(credentials.peer_ip.clone());
+        Err(AuthError::RateLimited)
+    }
+}
+
 pub fn accept_provider() -> Arc<dyn AuthProvider> {
     Arc::new(AcceptProvider::new("test-user"))
 }

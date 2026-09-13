@@ -312,9 +312,12 @@ All notable changes to SQE are documented in this file.
     entry point maps that one error to its wire form (Flight
     `RESOURCE_EXHAUSTED`, dashboard and MCP `429` with `Retry-After`). The
     peer address travels in `FlightCredentials.peer_ip`; a credential without
-    one passes the wrapper untouched, which is how Trino and Quack keep their
-    own check for now without being counted twice. Flight SQL, the
-    dashboard and MCP are migrated in this change; Trino and Quack follow.
+    one passes the wrapper untouched. All five listeners are on it: Flight
+    SQL, the dashboard, MCP, Trino (`TrinoAuthenticator` now receives the
+    peer host, `TrinoAuthRateLimiter` is gone, the denial is still a 429 on
+    every route) and Quack (its private 10 per second per-IP governor is
+    gone; the connection request is on the same per-minute budget as every
+    other bearer, with the same `SQE-RATELIMIT` error on the wire).
 
 - Write path: one field-id stamping implementation (#600)
 
