@@ -6,6 +6,18 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Crates: the MCP endpoint no longer links the Trino server crate (#635)
+
+    `sqe-mcp` depended on `sqe-trino-compat` for one function, the Arrow
+    cell to Trino JSON value encoder, and so compiled the whole Trino HTTP
+    server into the MCP crate. The encoder and its timestamp and interval
+    formatting helpers now live in `sqe_trino_protocol::encode` behind the
+    wire crate's `arrow` feature, next to the decoder they mirror;
+    `sqe_trino_compat::types::arrow_value_to_json` is a re-export. MCP's
+    first-party edges are `sqe-auth`, `sqe-core`, `sqe-sql` and
+    `sqe-trino-protocol`. The `sqe-bench` edge named in the same finding was
+    already gone (review 705).
+
 - Catalog: `information_schema.tables` no longer loads every table (#664 follow-up)
 
     DataFusion's built-in `information_schema.tables` asks the schema provider
