@@ -297,6 +297,25 @@ All notable changes to SQE are documented in this file.
 
 ### Bug Fixes
 
+- Auth: one pre-authentication rate limiter in front of the provider chain (#562)
+
+    Every listener re-implemented the same check before calling the auth
+    chain: Flight SQL in its handshake, the dashboard guard, MCP and Trino
+    each with their own key derivation, and Quack with its own governor.
+    They disagreed on what counted (Flight keyed on the username, MCP on a
+    bearer fingerprint, the dashboard on nothing until recently) and the
+    audit review (#652) found bearer paths that reached the IdP uncapped.
+    `sqe_coordinator::rate_limiter::RateLimitedAuthProvider` now wraps the
+    chain that `sqe-server` builds: it keys on the peer address plus the
+    username, bearer fingerprint or client certificate CN, refuses with the
+    new `AuthError::RateLimited` before the inner provider runs, and every
+    entry point maps that one error to its wire form (Flight
+    `RESOURCE_EXHAUSTED`, dashboard and MCP `429` with `Retry-After`). The
+    peer address travels in `FlightCredentials.peer_ip`; a credential without
+    one passes the wrapper untouched, which is how Trino and Quack keep their
+    own check for now without being counted twice. Flight SQL, the
+    dashboard and MCP are migrated in this change; Trino and Quack follow.
+
 - Write path: one field-id stamping implementation (#600)
 
     Two implementations stamped Iceberg field ids onto Arrow batches and

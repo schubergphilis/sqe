@@ -38,16 +38,6 @@ pub trait QueryExecutor: Send + Sync + 'static {
     async fn execute(&self, session: &Session, sql: &str) -> Result<Vec<RecordBatch>, SqeError>;
 }
 
-pub trait AuthRateLimiter: Send + Sync + 'static {
-    /// `credential` is a non-secret label for the presented credential (a
-    /// SHA-256 fingerprint prefix of the bearer, or `no-bearer`), so the
-    /// per-tuple budget is spent per token, not per address. Behind a proxy
-    /// every agent shares one peer IP; without this key one garbage-bearer
-    /// loop would exhaust the budget for all of them, and one attacker could
-    /// rotate tokens for free.
-    fn allow(&self, peer_ip: &str, credential: &str) -> bool;
-}
-
 /// The `Mcp-Session-Id` header (MCP Streamable HTTP, 2025-11-25).
 pub const SESSION_ID_HEADER: &str = "mcp-session-id";
 
@@ -64,7 +54,6 @@ const CLIENT_SESSION_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
 pub struct McpServerState {
     auth: Arc<dyn AuthProvider>,
     executor: Arc<dyn QueryExecutor>,
-    auth_rate_limiter: Option<Arc<dyn AuthRateLimiter>>,
     config: McpConfig,
     /// Static-mode principals with their tokens already resolved from
     /// `token_env` / `token_b64`. Resolution happens once, here, rather than
@@ -230,17 +219,11 @@ impl McpServerState {
         Self {
             auth,
             executor,
-            auth_rate_limiter: None,
             config,
             principals,
             clients: Arc::new(ClientRegistry::default()),
             hive_roots: Arc::new(Vec::new()),
         }
-    }
-
-    pub fn with_auth_rate_limiter(mut self, limiter: Arc<dyn AuthRateLimiter>) -> Self {
-        self.auth_rate_limiter = Some(limiter);
-        self
     }
 
     /// The `[[hive.roots]]` catalog names; see `McpConfig::write_catalogs`.
@@ -481,24 +464,15 @@ async fn authenticate(
     headers: &HeaderMap,
     peer_ip: String,
 ) -> Result<AuthContext, Response> {
-    // The credential half of the rate-limit key is a fingerprint of the
-    // bearer, never the bearer: the limiter stores its keys.
-    let credential = bearer(headers)
-        .map(sqe_trino_compat::server::bearer_fingerprint)
-        .unwrap_or_else(|| "no-bearer".to_string());
-    if state
-        .auth_rate_limiter
-        .as_ref()
-        .is_some_and(|limiter| !limiter.allow(&peer_ip, &credential))
-    {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({"error":"rate_limited"})),
-        )
-            .into_response());
-    }
+    // The pre-auth rate limit (#562) lives in the provider chain: the
+    // coordinator wraps it in a limiter keyed on `(peer_ip, bearer
+    // fingerprint)`, so OAuth mode carries the peer address in the
+    // credentials and maps the denial to 429 below. Static and anonymous
+    // modes never reach a provider: the static compare is constant-time
+    // against a local list and costs no IdP round trip, which is what the
+    // limiter exists to cap.
     match state.config.auth.mode {
-        McpAuthMode::Oauth => authenticate_oauth(state, headers).await,
+        McpAuthMode::Oauth => authenticate_oauth(state, headers, &peer_ip).await,
         McpAuthMode::Static => authenticate_static(state, headers),
         McpAuthMode::Anonymous => Ok(authenticate_anonymous(state)),
     }
@@ -579,25 +553,35 @@ fn local_session(user: String, roles: Vec<String>) -> Session {
 async fn authenticate_oauth(
     state: &McpServerState,
     headers: &HeaderMap,
+    peer_ip: &str,
 ) -> Result<AuthContext, Response> {
     let Some(token) = bearer(headers) else {
         return Err(auth_error(&state.config, StatusCode::UNAUTHORIZED, None));
     };
     let credentials = FlightCredentials {
         bearer_token: Some(SecretString::new(token.to_string())),
+        peer_ip: Some(peer_ip.to_string()),
         ..Default::default()
     };
     let identity = state
         .auth
         .authenticate_oauth(&credentials)
         .await
-        .map_err(|error| {
-            tracing::warn!(error = %error, "MCP bearer authentication failed");
-            auth_error(
-                &state.config,
-                StatusCode::UNAUTHORIZED,
-                Some("invalid_token"),
+        .map_err(|error| match error {
+            // #562: denied by the pre-auth limiter before any provider ran.
+            sqe_auth::AuthError::RateLimited => (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error":"rate_limited"})),
             )
+                .into_response(),
+            error => {
+                tracing::warn!(error = %error, "MCP bearer authentication failed");
+                auth_error(
+                    &state.config,
+                    StatusCode::UNAUTHORIZED,
+                    Some("invalid_token"),
+                )
+            }
         })?;
     let scopes = token_scopes(token).ok_or_else(|| {
         tracing::warn!("MCP bearer has no readable OAuth scope/scp claim");
@@ -1868,46 +1852,63 @@ mod tests {
         );
     }
 
+    /// #562: OAuth mode hands the provider chain the peer address (the
+    /// chain-level limiter keys on it) and maps the limiter's denial to 429.
+    /// The provider here records what it was given and denies the second
+    /// call the way the wrapper does.
     #[tokio::test]
-    async fn auth_rate_limit_is_keyed_by_bearer_fingerprint_not_peer_ip_alone() {
-        struct RecordingLimiter(Mutex<Vec<(String, String)>>);
-        impl AuthRateLimiter for RecordingLimiter {
-            fn allow(&self, peer_ip: &str, credential: &str) -> bool {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push((peer_ip.to_string(), credential.to_string()));
-                true
+    async fn oauth_carries_the_peer_address_and_maps_rate_limit_to_429() {
+        struct PeerRecordingAuth {
+            seen: Mutex<Vec<Option<String>>>,
+        }
+        #[async_trait]
+        impl AuthProvider for PeerRecordingAuth {
+            async fn authenticate_oauth(
+                &self,
+                credentials: &FlightCredentials,
+            ) -> Result<Identity, AuthError> {
+                let calls = {
+                    let mut seen = self.seen.lock().unwrap();
+                    seen.push(credentials.peer_ip.clone());
+                    seen.len()
+                };
+                if calls > 1 {
+                    return Err(AuthError::RateLimited);
+                }
+                MockAuth.authenticate(credentials).await
+            }
+            async fn authenticate(
+                &self,
+                credentials: &FlightCredentials,
+            ) -> Result<Identity, AuthError> {
+                MockAuth.authenticate(credentials).await
             }
         }
-        let limiter = Arc::new(RecordingLimiter(Mutex::new(Vec::new())));
-        let app = router(
-            McpServerState::new(
-                Arc::new(MockAuth),
-                Arc::new(RecordingExecutor::default()),
-                static_config(true),
-            )
-            .with_auth_rate_limiter(limiter.clone()),
-        );
-        send(&app, READ_TOKEN, &[], tool_call("execute_sql_readonly")).await;
-        send(&app, WRITE_TOKEN, &[], tool_call("execute_sql_readonly")).await;
-        let no_bearer = Request::post("/mcp")
-            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(tool_call("execute_sql_readonly")))
+        let auth = Arc::new(PeerRecordingAuth {
+            seen: Mutex::new(Vec::new()),
+        });
+        let app = router(McpServerState::new(
+            auth.clone(),
+            Arc::new(RecordingExecutor::default()),
+            test_config(),
+        ));
+        let token = scoped_token("sqe:mcp:read");
+        let first = send(&app, &token, &[], tool_call("execute_sql_readonly")).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = send(&app, &token, &[], tool_call("execute_sql_readonly")).await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
             .unwrap();
-        app.clone().oneshot(no_bearer).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "rate_limited");
 
-        let keys = limiter.0.lock().unwrap();
-        assert_eq!(keys.len(), 3);
-        // Same peer, two credentials, two buckets.
-        assert_eq!(keys[0].0, keys[1].0);
-        assert!(keys[0].1.starts_with("bearer:"));
-        assert!(keys[1].1.starts_with("bearer:"));
-        assert_ne!(keys[0].1, keys[1].1);
-        assert_eq!(keys[2].1, "no-bearer");
-        // The key is a fingerprint: the limiter never sees the token itself.
-        assert!(keys.iter().all(|(_, key)| !key.contains(READ_TOKEN) && !key.contains(WRITE_TOKEN)));
+        let seen = auth.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            seen.iter().all(|p| p.as_deref() == Some("127.0.0.1")),
+            "the peer address travels with the credentials: {seen:?}"
+        );
     }
 
     fn change_call(sql: &str) -> String {
