@@ -723,6 +723,16 @@ async fn handle_connection_request(
                 "SQE-AUTH: internal authentication error".to_string(),
             );
         }
+        // Quack keeps its own per-IP gate above and sends no `peer_ip`, so the
+        // chain-level limiter (#562) does not apply here yet; the arm exists
+        // so the migration is a wiring change, not a new match.
+        Err(AuthError::RateLimited) => {
+            return error_response(
+                "",
+                request_header.client_query_id,
+                "SQE-RATELIMIT: too many connection attempts; slow down".to_string(),
+            );
+        }
     };
 
     let connection_id = Uuid::new_v4().to_string();

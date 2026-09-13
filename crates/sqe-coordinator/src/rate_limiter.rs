@@ -81,6 +81,94 @@ impl sqe_trino_compat::server::TrinoAuthRateLimiter for AuthRateLimiter {
     }
 }
 
+/// The pre-auth rate limit as an [`AuthProvider`] wrapper around the chain
+/// (#562).
+///
+/// Every credential that reaches a provider passes here first, so no entry
+/// point can forget the gate: the wrapper is installed once, where the chain
+/// is built, and Flight, MCP and the dashboard inherit it. The budget key is
+/// `(peer_ip, credential)`: the username for a password credential, the
+/// certificate CN for mTLS, a SHA-256 fingerprint prefix for a bearer (never
+/// the token itself). A denial is [`AuthError::RateLimited`], and the inner
+/// provider is not consulted, so a garbage bearer costs no JWKS refetch and
+/// no IdP or STS round trip.
+///
+/// A credential with no `peer_ip` passes through ungated, with a warning.
+/// That is the migration seam: an adapter that sets the peer address has
+/// dropped its own check and relies on this one; an adapter that has not
+/// (Trino, Quack as of this change) still counts on its own, and counting
+/// twice here would halve every budget.
+pub struct RateLimitedAuthProvider {
+    inner: Arc<dyn sqe_auth::AuthProvider>,
+    limiter: Arc<AuthRateLimiter>,
+}
+
+impl RateLimitedAuthProvider {
+    pub fn new(inner: Arc<dyn sqe_auth::AuthProvider>, limiter: Arc<AuthRateLimiter>) -> Self {
+        Self { inner, limiter }
+    }
+
+    /// The non-secret half of the budget key for `credentials`.
+    fn principal(credentials: &sqe_auth::FlightCredentials) -> String {
+        if let Some(user) = &credentials.username {
+            return user.clone();
+        }
+        if let Some(token) = &credentials.bearer_token {
+            return sqe_trino_compat::server::bearer_fingerprint(token.expose());
+        }
+        if let Some(cn) = &credentials.client_cert_cn {
+            return format!("cn:{cn}");
+        }
+        "no-credential".to_string()
+    }
+
+    fn gate(&self, credentials: &sqe_auth::FlightCredentials) -> Result<(), sqe_auth::AuthError> {
+        let Some(peer_ip) = credentials.peer_ip.as_deref() else {
+            tracing::debug!(
+                "credential reached the provider chain without a peer address; \
+                 the pre-auth limiter did not apply (the adapter keeps its own gate)"
+            );
+            return Ok(());
+        };
+        let principal = Self::principal(credentials);
+        self.limiter.check(peer_ip, &principal).map_err(|_| {
+            tracing::warn!(
+                peer_ip,
+                principal = %principal,
+                "credential rejected by the pre-auth rate limiter"
+            );
+            sqe_auth::AuthError::RateLimited
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl sqe_auth::AuthProvider for RateLimitedAuthProvider {
+    async fn authenticate(
+        &self,
+        credentials: &sqe_auth::FlightCredentials,
+    ) -> Result<sqe_auth::Identity, sqe_auth::AuthError> {
+        self.gate(credentials)?;
+        self.inner.authenticate(credentials).await
+    }
+
+    async fn authenticate_oauth(
+        &self,
+        credentials: &sqe_auth::FlightCredentials,
+    ) -> Result<sqe_auth::Identity, sqe_auth::AuthError> {
+        self.gate(credentials)?;
+        self.inner.authenticate_oauth(credentials).await
+    }
+
+    async fn refresh_catalog_token(
+        &self,
+        identity: &sqe_auth::Identity,
+    ) -> Result<Option<sqe_core::SecretString>, sqe_auth::AuthError> {
+        // A refresh is not a new credential presentation; it spends no budget.
+        self.inner.refresh_catalog_token(identity).await
+    }
+}
+
 /// Lower-budget rate limiter for catalog browse paths (Flight
 /// do_get_tables / do_get_schemas / do_get_catalogs / prepared
 /// statement schema lookup). Each call fans out N+1 Polaris REST
@@ -199,6 +287,65 @@ impl QueryRateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #562: the wrapper denies before the inner provider is called, keys on
+    /// the peer address plus a bearer fingerprint, and lets a credential
+    /// without a peer address through untouched (the adapter kept its gate).
+    #[tokio::test]
+    async fn rate_limited_provider_denies_before_the_inner_provider() {
+        use sqe_auth::AuthProvider as _;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct Counting(AtomicUsize);
+        #[async_trait::async_trait]
+        impl sqe_auth::AuthProvider for Counting {
+            async fn authenticate(
+                &self,
+                _c: &sqe_auth::FlightCredentials,
+            ) -> Result<sqe_auth::Identity, sqe_auth::AuthError> {
+                self.0.fetch_add(1, AtomicOrdering::SeqCst);
+                Err(sqe_auth::AuthError::AuthFailed("stub".into()))
+            }
+        }
+        let inner = Arc::new(Counting(AtomicUsize::new(0)));
+        let limiter = Arc::new(AuthRateLimiter::new(&RateLimitConfig {
+            enabled: true,
+            auth_attempts_per_minute: 1,
+            ..Default::default()
+        }));
+        let wrapped = RateLimitedAuthProvider::new(
+            Arc::clone(&inner) as Arc<dyn sqe_auth::AuthProvider>,
+            limiter,
+        );
+        let bearer = |peer: Option<&str>| sqe_auth::FlightCredentials {
+            bearer_token: Some(sqe_core::SecretString::new("ey.garbage.token".into())),
+            peer_ip: peer.map(str::to_string),
+            ..Default::default()
+        };
+
+        // First attempt reaches the inner provider, second is refused before it.
+        assert!(matches!(
+            wrapped.authenticate(&bearer(Some("203.0.113.5"))).await,
+            Err(sqe_auth::AuthError::AuthFailed(_))
+        ));
+        assert!(matches!(
+            wrapped.authenticate(&bearer(Some("203.0.113.5"))).await,
+            Err(sqe_auth::AuthError::RateLimited)
+        ));
+        assert_eq!(inner.0.load(AtomicOrdering::SeqCst), 1);
+
+        // A different peer has its own budget.
+        assert!(matches!(
+            wrapped.authenticate(&bearer(Some("203.0.113.6"))).await,
+            Err(sqe_auth::AuthError::AuthFailed(_))
+        ));
+        // No peer address: not migrated, passes through to the inner provider.
+        assert!(matches!(
+            wrapped.authenticate(&bearer(None)).await,
+            Err(sqe_auth::AuthError::AuthFailed(_))
+        ));
+        assert_eq!(inner.0.load(AtomicOrdering::SeqCst), 3);
+    }
 
     #[test]
     fn disabled_limiter_always_passes() {
