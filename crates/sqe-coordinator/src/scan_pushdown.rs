@@ -96,10 +96,9 @@ pub fn is_trivially_true(expr: &Arc<dyn PhysicalExpr>) -> bool {
 /// join stays authoritative); dropping inside OR/NOT would not be, which is
 /// why the split happens only at top-level ANDs and the strict converter
 /// handles everything below.
-pub fn physical_filter_to_logical_lenient(expr: &Arc<dyn PhysicalExpr>) -> Option<Expr> {
-    physical_filter_to_logical_reporting(expr).expr
-}
-
+/// The entry point is [`physical_filter_to_logical_reporting`], whose
+/// [`LenientConversion::expr`] is the converted predicate.
+///
 /// What a lenient conversion kept, and what it had to drop.
 ///
 /// Dropping a conjunct only WIDENS the pushed predicate, so the result stays
@@ -162,7 +161,8 @@ pub fn serialize_pushed_predicate(expr: &Expr, max_raw_bytes: usize) -> PushedPr
     }
 }
 
-/// [`physical_filter_to_logical_lenient`] plus a record of what it dropped.
+/// Lenient conversion (top-level AND conjuncts that do not convert are
+/// dropped, everything below them is strict) plus a record of what it dropped.
 pub fn physical_filter_to_logical_reporting(expr: &Arc<dyn PhysicalExpr>) -> LenientConversion {
     let mut dropped = Vec::new();
     let converted = lenient_walk(expr, &mut dropped);
@@ -539,7 +539,9 @@ mod tests {
             CaseExpr::try_new(None, vec![(plit(true), plit(true))], Some(plit(false))).unwrap(),
         );
         let both: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(ge, Operator::And, opaque));
-        let logical = physical_filter_to_logical_lenient(&both).expect("partial conversion");
+        let logical = physical_filter_to_logical_reporting(&both)
+            .expr
+            .expect("partial conversion");
         assert_eq!(logical, col("a").gt_eq(lit(3i64)));
         // strict conversion still refuses the same expr
         assert!(physical_filter_to_logical(&both).is_none());

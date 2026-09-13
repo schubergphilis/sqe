@@ -6,6 +6,85 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Coordinator: one admission sequence for `execute` and `execute_stream` (#589)
+
+    Both entry points carried their own copy of the admission gates
+    (memory pressure, per-user permit, global permit, per-user memory
+    reservation), and the copies had drifted: the buffered path reserved
+    memory before taking the global permit, the streaming path after, so
+    which error a client saw when two gates failed at once depended on the
+    protocol it used. `QueryHandler::admit` (in the new child module
+    `query_handler/admission.rs`, the first phase split out of the
+    handler) is the one sequence, in the streaming order; it returns an
+    `Admission` whose permits and reservation the buffered path drops on
+    return and the streaming path moves into the result-stream wrapper.
+    `try_acquire_owned` has one call site left in `query_handler.rs` (the
+    sorted-write cap, a different gate).
+
+- Coordinator: one audit emitter for every statement outcome (#589, #636)
+
+    `QueryHandler::execute_inner` built the statement's `AuditEvent` four
+    times over (SELECT, GRANT/REVOKE/DENY, secret-bearing statements on the
+    redacting legacy path, everything else) and the streaming finalizer
+    three more times (success, error, cancel), each copy assembling the
+    actor, outcome, timing and query block by hand. `audit_emitter.rs`
+    now holds the builders (`actor_for`, `outcome_of`, `policy_audit`,
+    `query_info`, `timing`) and `emit_statement_audit`, which routes by
+    statement kind exactly as before; the streaming finalizer has one
+    `emit_audit` that the three endings call with their outcome. Same
+    events, same fields, same redaction contract (raw SQL in `query.text`,
+    redacted by the audit worker; secret-bearing kinds stay on `log`).
+    `execute_inner` is 245 lines shorter.
+
+- Config: production mode is one rule table, mirrored in the production guide (#637)
+
+    What `coordinator.production_mode = true` refuses was fifteen
+    `if production_mode && ...` branches spread through `validate()` and
+    `validate_production()`, and the production guide and the Helm
+    `values-production.yaml` each repeated the list by hand. The rules are
+    now `sqe_core::config::production::PRODUCTION_RULES`, a table of
+    `(name, summary, check)`; `validate_production` iterates it and the
+    three MCP https/anonymous checks that lived in `validate()` moved into
+    it (same messages, same conditions). The production guide gained a
+    "What production mode enforces" table keyed by rule name, and a unit
+    test fails when the guide and the table name different rules.
+
+- Coordinator: 17 modules are `pub(crate)`; the dead code that hid behind `pub` is gone (#636)
+
+    Every module in the coordinator crate was `pub`, so the compiler could
+    not tell an unused function from an exported one. The 17 modules that
+    nothing outside the crate reaches (`adaptive_sort`, `audit_resources`,
+    `catalog_ops`, `compaction_dispatch`, `ticket_credentials`,
+    `dim_build_swap`, `distributed_scan`, `explain`, `flight_sql_helpers`,
+    `parallel_probe_scan`, `parallel_scan`, `post_planning`,
+    `prepared_statements`, `quack_executor`, `scan_pushdown`, `scheduler`,
+    `suggest_bloom`) are now `pub(crate)`; the 34 that the `sqe-server`
+    binary or the integration tests use stay `pub`. The lint then found:
+    `FragmentFault::sqe_error_code` and `DistributedScanExec::worker_urls`
+    had no caller (deleted); `with_max_retries` and
+    `CoordinatorLocalScanExec::reason` were test-only (now `#[cfg(test)]`);
+    `physical_filter_to_logical_lenient` was a wrapper only a test called
+    (deleted, the test uses `physical_filter_to_logical_reporting`); and
+    the per-sort `reason` string in `SortDecision` was computed and never
+    shown, so the stripped-sort warning and log line now carry it.
+
+- Crates: `sqe-metrics-core` holds the registry types; the policy, catalog, compaction and write crates depend on it, not on the telemetry stack (#635)
+
+    Four library crates linked `sqe-metrics` for one type, `MetricsRegistry`
+    (the catalog also for `propagation::trace_context_http_headers`), and so
+    declared a dependency on the OTLP exporters, the OpenTelemetry SDK, the
+    tracing subscriber and the axum `/metrics` server. The registry types
+    and the propagation helpers now live in `sqe-metrics-core` (propagation
+    behind a feature); `sqe-metrics` depends on it and re-exports both, so
+    the coordinator, worker, server and lineage crates see the same API.
+    The four crates (plus `sqe-trino-compat` and `sqe-quack-server`, which
+    used propagation only) name the core crate under the dependency name
+    `sqe-metrics`, so their sources are unchanged. One caveat, measured:
+    the third-party closure of those crates barely moves, because
+    `workspace-hack` (cargo-hakari) unifies every workspace dependency into
+    every member on purpose; what changes is the crate graph and what the
+    library crates may reach for.
+
 - Crates: the `sqe-server` binary has its own crate; the coordinator library no longer depends on the worker (#635, #636, #589)
 
     `crates/sqe-coordinator/src/bin/sqe_server.rs` is now
