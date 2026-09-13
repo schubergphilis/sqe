@@ -35,6 +35,11 @@ use crate::query_tracker::{FragmentState, QueryTracker};
 use crate::runtime_catalog::RuntimeCatalogRegistry;
 use crate::write_handler::WriteHandler;
 
+// Review 409: the handler is being split by phase into child modules that
+// share this module's private state. Admission is the first.
+mod admission;
+pub(crate) use admission::Admission;
+
 /// Per-query resource metrics extracted from the executed physical plan tree.
 ///
 /// `pub(crate)` so the streaming finalizer can construct and inspect
@@ -1006,97 +1011,10 @@ impl QueryHandler {
         reject_oversized_sql(&self.config.query, sql)?;
         refuse_if_audit_closed(self.audit.as_ref())?;
 
-        // Memory pressure admission control: reject new queries when the
-        // coordinator's FairSpillPool is >95% utilized (Red).
-        let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
-        if let Some(ref metrics) = self.metrics {
-            metrics.coordinator_memory_pressure.set(pressure.as_gauge());
-            metrics
-                .coordinator_memory_used_bytes
-                .set(crate::memory::used_bytes(&self.runtime.memory_pool) as f64);
-            metrics
-                .coordinator_memory_limit_bytes
-                .set(crate::memory::limit_bytes(&self.runtime.memory_pool) as f64);
-        }
-        if !pressure.admits_new_query() {
-            warn!(
-                pressure = %pressure,
-                username = %session.user.username,
-                "Rejecting query due to memory pressure"
-            );
-            let sort_cols = extract_order_by_columns(sql);
-            return Err(SqeError::Execution(
-                adaptive_sort::format_pressure_rejection(&sort_cols, pressure),
-            ));
-        }
-
-        // Backpressure: per-user gate first, then global gate. The per-user
-        // gate prevents one tenant from holding every global permit while
-        // legitimately under their submission rate limit. We acquire owned
-        // permits because the streaming path holds them for the result-
-        // stream lifetime, not the synchronous execute() call.
-        let _per_user_permit = if self.config.query.max_concurrent_per_user > 0 {
-            let username = session.user.username.clone();
-            let sem = self
-                .per_user_semaphores
-                .entry(username.clone())
-                .or_insert_with(|| {
-                    Arc::new(tokio::sync::Semaphore::new(
-                        self.config.query.max_concurrent_per_user,
-                    ))
-                })
-                .clone();
-            match sem.try_acquire_owned() {
-                Ok(permit) => Some(permit),
-                Err(_) => {
-                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                        "Too many concurrent queries for user '{}' ({} active). Please retry later.",
-                        username, self.config.query.max_concurrent_per_user
-                    )));
-                }
-            }
-        } else {
-            None
-        };
-
-        // Per-user memory reservation. Reject when this user's in-flight
-        // queries would push past their share of the global pool, before
-        // the global red-band check fires for everyone else.
-        let _per_user_mem_reservation =
-            if self.per_user_memory_budget_bytes > 0 && self.per_query_memory_bytes > 0 {
-                let username = session.user.username.clone();
-                match self.per_user_memory.try_reserve(
-                    &username,
-                    self.per_query_memory_bytes,
-                    self.per_user_memory_budget_bytes,
-                ) {
-                    Some(r) => Some(r),
-                    None => {
-                        let used = self.per_user_memory.used_bytes(&username);
-                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                            "Per-user memory budget exceeded for '{}': {} bytes reserved, \
-                         limit {} bytes. Wait for in-flight queries to complete.",
-                            username, used, self.per_user_memory_budget_bytes
-                        )));
-                    }
-                }
-            } else {
-                None
-            };
-
-        let _permit = if let Some(ref sem) = self.query_semaphore {
-            match sem.clone().try_acquire_owned() {
-                Ok(permit) => Some(permit),
-                Err(_) => {
-                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                        "Too many concurrent queries ({} active). Please retry later.",
-                        self.config.query.max_concurrent_queries
-                    )));
-                }
-            }
-        } else {
-            None
-        };
+        // Admission (pressure, per-user and global permits, per-user memory
+        // reservation): one sequence shared with the streaming path, see
+        // `query_handler::admission`. Held for the whole buffered call.
+        let _admission = self.admit(session, sql, "query")?;
 
         let start = std::time::Instant::now();
         // Pre-parse pipeline (strip FOR INCREMENTAL / FOR VERSION AS OF,
@@ -2758,106 +2676,18 @@ impl QueryHandler {
         }
 
         if let Some(ref audit) = self.audit {
-            // Route SELECT/DQL (StatementKind::Query) through the canonical
-            // AuditEvent path so the event carries a fully-populated Actor,
-            // structured Resource list, and typed policy/timing/stats blocks.
-            //
-            // GRANT/REVOKE are routed through the canonical AuditKind::Grant
-            // path (Task 14). The raw SQL text in query.text carries grantee
-            // info; the worker thread's redact_pii pass sanitises it before
-            // chain stamping. No secrets travel in GRANT/REVOKE SQL so the
-            // redacted-legacy path is not required for these statement kinds.
-            //
-            // Secret-bearing kinds (CREATE/DROP/SHOW SECRET, ATTACH, DETACH)
-            // stay on the legacy log(&AuditEntry) path: it applies PII redaction
-            // before writing, which is critical for statements that carry bearer
-            // tokens or credentials in their SQL text. All other DDL/DML/admin
-            // kinds emit canonical AuditEvents via log_event (the worker thread
-            // redacts query text there too); DML maps to Query, the rest to
-            // AdminDdl.
-            if matches!(&kind, StatementKind::Query(_)) {
-                let ps = policy_summary.unwrap_or_default();
-
-                let outcome = match &result {
-                    Ok(_) => sqe_metrics::audit::Outcome::Success,
-                    Err(e) => sqe_metrics::audit::Outcome::Failure {
-                        error_type: Some(e.error_code().trino_error_type().to_string()),
-                        error_code: Some(e.error_code().name().to_string()),
-                        message: Some(e.client_message()),
-                    },
-                };
-
-                // Always emit PolicyAudit for SELECTs (even when all fields zero).
-                // This records the policy decision explicitly for SIEM/audit completeness
-                // (P0 from full audit: DML + read path policy decisions must be visible).
-                let policy = Some(sqe_metrics::audit::PolicyAudit {
-                    row_filters_applied: ps.row_filters_applied,
-                    columns_masked: ps.columns_masked,
-                    columns_restricted: ps.columns_restricted,
-                    denied: ps.denied,
-                });
-
-                let actor = sqe_metrics::audit::Actor::from_parts(
-                    session.user.username.clone(),
-                    session.user.subject.clone(),
-                    session.user.email.clone(),
-                    session.user.roles.clone(),
-                    session.user.groups.clone(),
-                )
-                .with_app_name(session.source.clone());
-
-                let event = sqe_metrics::audit::AuditEvent {
-                    time: chrono::Utc::now(),
-                    kind: sqe_metrics::audit::AuditKind::Query,
-                    actor,
-                    outcome,
-                    resources: audit_resources,
-                    policy,
-                    timing: Some(sqe_metrics::audit::Timing {
-                        duration_ms: duration.as_millis() as u64,
-                        // queued_ms and planning_ms are tracked by QueryTracker
-                        // but no per-id getter is exposed at this call site.
-                        // They default to 0 here; a follow-up can expose a
-                        // QueryTracker::timing_for(id) if needed.
-                        queued_ms: 0,
-                        planning_ms: 0,
-                        execution_ms,
-                    }),
-                    stats: Some(sqe_metrics::audit::QueryStats {
-                        rows_returned: rows,
-                        rows_written: None,
-                        bytes_scanned: pm.bytes_scanned,
-                        rows_scanned: pm.rows_scanned,
-                        spill_bytes: pm.spill_bytes,
-                        peak_memory_bytes: pm.peak_memory_bytes,
-                    }),
-                    query: Some(sqe_metrics::audit::QueryInfo {
-                        // Pass sql text directly. The worker thread always applies
-                        // redact_pii to query.text before chain stamping and writing.
-                        // When GDPR config is active, GDPR-tag masking runs additionally
-                        // via apply_gdpr_masking (which calls redact_pii internally).
-                        // Do NOT redact here: caller-side redaction would double-apply.
-                        text: Some(sql.to_string()),
-                        query_hash: sqe_metrics::audit::query_hash(sql),
-                        statement_type: kind_name,
-                    }),
-                    session_id: Some(session.id.clone()),
-                    client_ip: client_ip.clone(),
-                    trace_id,
-                    query_id: Some(query_id.to_string()),
-                    integrity: sqe_metrics::audit::Integrity::default(),
-                };
-                audit.log_event(event);
-            } else if matches!(
+            // One builder for every statement kind (`crate::audit_emitter`);
+            // the routing (canonical `log_event` for reads, writes, DDL and
+            // GRANT/REVOKE, the redacting legacy `log` for secret-bearing
+            // statements) is documented there. What only this site knows:
+            // the grant target for GRANT/REVOKE/DENY, from the parsed
+            // statement, so the resource is structured rather than parsed
+            // out of SQL text downstream.
+            let grant_resources = if matches!(
                 &kind,
                 StatementKind::Grant(_) | StatementKind::Revoke(_) | StatementKind::Deny(_)
             ) {
-                // Canonical path for GRANT/REVOKE (Task 14, OCSF Account Change 3001).
-                // Build a Resource from the parsed grant statement so the target object
-                // is structured. The raw SQL travels in query.text where the worker
-                // thread's redact_pii pass handles sanitisation.
-                let grant_resources = kind
-                    .statement()
+                kind.statement()
                     .and_then(|ast_stmt| Self::extract_grant_statement(ast_stmt).ok())
                     .map(|gs| {
                         let name = gs
@@ -2873,182 +2703,33 @@ impl QueryHandler {
                             object_type: sqe_metrics::audit::ObjectType::Table,
                         }]
                     })
-                    .unwrap_or_default();
-
-                let grant_outcome = match &result {
-                    Ok(_) => sqe_metrics::audit::Outcome::Success,
-                    Err(e) => sqe_metrics::audit::Outcome::Failure {
-                        error_type: Some(e.error_code().trino_error_type().to_string()),
-                        error_code: Some(e.error_code().name().to_string()),
-                        message: Some(e.client_message()),
-                    },
-                };
-
-                let grant_actor = sqe_metrics::audit::Actor::from_parts(
-                    session.user.username.clone(),
-                    session.user.subject.clone(),
-                    session.user.email.clone(),
-                    session.user.roles.clone(),
-                    session.user.groups.clone(),
-                )
-                .with_app_name(session.source.clone());
-
-                let grant_event = sqe_metrics::audit::AuditEvent {
-                    time: chrono::Utc::now(),
-                    kind: sqe_metrics::audit::AuditKind::Grant,
-                    actor: grant_actor,
-                    outcome: grant_outcome,
-                    resources: grant_resources,
-                    policy: None,
-                    timing: Some(sqe_metrics::audit::Timing {
-                        duration_ms: duration.as_millis() as u64,
-                        queued_ms: 0,
-                        planning_ms: 0,
-                        execution_ms: 0,
-                    }),
-                    stats: None,
-                    query: Some(sqe_metrics::audit::QueryInfo {
-                        text: Some(sql.to_string()),
-                        query_hash: sqe_metrics::audit::query_hash(sql),
-                        statement_type: kind_name,
-                    }),
-                    session_id: Some(session.id.clone()),
-                    client_ip: client_ip.clone(),
-                    trace_id: trace_id.clone(),
-                    query_id: Some(query_id.to_string()),
-                    integrity: sqe_metrics::audit::Integrity::default(),
-                };
-                audit.log_event(grant_event);
-            } else if matches!(
-                &kind,
-                StatementKind::CreateSecret(_)
-                    | StatementKind::DropSecret(_)
-                    | StatementKind::ShowSecrets
-                    | StatementKind::Attach(_)
-                    | StatementKind::Detach(_)
-            ) {
-                // Secret-bearing statements stay on the redacted legacy path.
-                // PII redaction runs inside log() before the entry is written.
-                // Never route these through log_event: the legacy path is the
-                // established redaction contract for bearer tokens and catalog
-                // credentials embedded in SQL text.
-                let ps = policy_summary.unwrap_or_default();
-                audit.log(&sqe_metrics::audit::AuditEntry {
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    username: session.user.username.clone(),
-                    session_id: Some(session.id.clone()),
-                    query_hash: sqe_metrics::audit::query_hash(sql),
-                    query_text: Some(sql.to_string()),
-                    statement_type: kind_name,
-                    duration_ms: duration.as_millis() as u64,
-                    rows_returned: rows,
-                    status: status.to_string(),
-                    client_ip: None,
-                    tables_touched: tables_touched.clone(),
-                    row_filters_applied: ps.row_filters_applied,
-                    columns_masked: ps.columns_masked,
-                    columns_restricted: ps.columns_restricted,
-                    policy_denied: ps.denied,
-                });
+                    .unwrap_or_default()
             } else {
-                // Canonical path for DDL, DML, and admin statements.
-                // Non-secret SQL travels through log_event; the worker thread
-                // applies redact_pii before chain-stamping and writing.
-                let audit_kind = if matches!(
-                    &kind,
-                    StatementKind::Insert(_)
-                        | StatementKind::Ctas(_)
-                        | StatementKind::Merge(_)
-                        | StatementKind::Delete(_)
-                        | StatementKind::Update(_)
-                        | StatementKind::Truncate(_)
-                ) {
-                    sqe_metrics::audit::AuditKind::Query
-                } else {
-                    sqe_metrics::audit::AuditKind::AdminDdl
-                };
-
-                let ddl_outcome = match &result {
-                    Ok(_) => sqe_metrics::audit::Outcome::Success,
-                    Err(e) => sqe_metrics::audit::Outcome::Failure {
-                        error_type: Some(e.error_code().trino_error_type().to_string()),
-                        error_code: Some(e.error_code().name().to_string()),
-                        message: Some(e.client_message()),
-                    },
-                };
-
-                let ddl_actor = sqe_metrics::audit::Actor::from_parts(
-                    session.user.username.clone(),
-                    session.user.subject.clone(),
-                    session.user.email.clone(),
-                    session.user.roles.clone(),
-                    session.user.groups.clone(),
-                )
-                .with_app_name(session.source.clone());
-
-                let is_dml = matches!(
-                    &kind,
-                    StatementKind::Insert(_)
-                        | StatementKind::Ctas(_)
-                        | StatementKind::Merge(_)
-                        | StatementKind::Delete(_)
-                        | StatementKind::Update(_)
-                        | StatementKind::Truncate(_)
-                );
-                let ps = policy_summary.unwrap_or_default();
-                // Always emit PolicyAudit for DML (INSERT/CTAS/MERGE/DELETE/UPDATE/...).
-                // Previously conditional on "had effect"; now unconditional so every
-                // write carries the source policy decision (row filters, masks, denies)
-                // even when zero-effect (policy engine admitted the source raw).
-                // Addresses full-audit P0 "DML policy audit on write path" and O2.
-                // Write handler already calls enforce_source_plan / compute_write_predicates
-                // and threads the summary out for all DML dispatch paths.
-                let policy = Some(sqe_metrics::audit::PolicyAudit {
-                    row_filters_applied: ps.row_filters_applied,
-                    columns_masked: ps.columns_masked,
-                    columns_restricted: ps.columns_restricted,
-                    denied: ps.denied,
-                });
-                let stats = if is_dml {
-                    Some(sqe_metrics::audit::QueryStats {
-                        rows_returned: rows,
-                        rows_written,
-                        bytes_scanned: pm.bytes_scanned,
-                        rows_scanned: pm.rows_scanned,
-                        spill_bytes: pm.spill_bytes,
-                        peak_memory_bytes: pm.peak_memory_bytes,
-                    })
-                } else {
-                    None
-                };
-
-                let ddl_event = sqe_metrics::audit::AuditEvent {
-                    time: chrono::Utc::now(),
-                    kind: audit_kind,
-                    actor: ddl_actor,
-                    outcome: ddl_outcome,
+                Vec::new()
+            };
+            crate::audit_emitter::emit_statement_audit(
+                audit,
+                crate::audit_emitter::StatementAudit {
+                    session,
+                    sql,
+                    kind: &kind,
+                    kind_name,
+                    error: result.as_ref().err(),
+                    status,
+                    duration,
+                    execution_ms,
+                    rows,
+                    rows_written,
+                    plan_metrics: &pm,
+                    policy_summary,
                     resources: audit_resources,
-                    policy,
-                    timing: Some(sqe_metrics::audit::Timing {
-                        duration_ms: duration.as_millis() as u64,
-                        queued_ms: 0,
-                        planning_ms: 0,
-                        execution_ms: if is_dml { execution_ms } else { 0 },
-                    }),
-                    stats,
-                    query: Some(sqe_metrics::audit::QueryInfo {
-                        text: Some(sql.to_string()),
-                        query_hash: sqe_metrics::audit::query_hash(sql),
-                        statement_type: kind_name,
-                    }),
-                    session_id: Some(session.id.clone()),
+                    tables_touched,
+                    grant_resources,
                     client_ip: client_ip.clone(),
                     trace_id,
-                    query_id: Some(query_id.to_string()),
-                    integrity: sqe_metrics::audit::Integrity::default(),
-                };
-                audit.log_event(ddl_event);
-            }
+                    query_id,
+                },
+            );
         }
 
         // Slow query warning
@@ -3191,93 +2872,14 @@ impl QueryHandler {
         refuse_if_audit_closed(self.audit.as_ref())?;
 
         // --- Admission control -------------------------------------------------
-        let pressure = crate::memory::check_pressure(&self.runtime.memory_pool);
-        if let Some(ref metrics) = self.metrics {
-            metrics.coordinator_memory_pressure.set(pressure.as_gauge());
-            metrics
-                .coordinator_memory_used_bytes
-                .set(crate::memory::used_bytes(&self.runtime.memory_pool) as f64);
-            metrics
-                .coordinator_memory_limit_bytes
-                .set(crate::memory::limit_bytes(&self.runtime.memory_pool) as f64);
-        }
-        if !pressure.admits_new_query() {
-            warn!(
-                pressure = %pressure,
-                username = %session.user.username,
-                "Rejecting streaming query due to memory pressure"
-            );
-            let sort_cols = extract_order_by_columns(sql);
-            return Err(SqeError::Execution(
-                adaptive_sort::format_pressure_rejection(&sort_cols, pressure),
-            ));
-        }
-
-        // Acquire owned concurrency permits so they can be moved into the
-        // stream wrapper and released when the client finishes draining.
-        // The per-user permit is acquired first; if granted, the global
-        // permit is acquired second. A user that holds N per-user permits
-        // (each tied to an open stream) still counts N times against the
-        // global ceiling.
-        let mut permits: Vec<tokio::sync::OwnedSemaphorePermit> = Vec::new();
-        if self.config.query.max_concurrent_per_user > 0 {
-            let username = session.user.username.clone();
-            let sem = self
-                .per_user_semaphores
-                .entry(username.clone())
-                .or_insert_with(|| {
-                    Arc::new(tokio::sync::Semaphore::new(
-                        self.config.query.max_concurrent_per_user,
-                    ))
-                })
-                .clone();
-            match sem.try_acquire_owned() {
-                Ok(p) => permits.push(p),
-                Err(_) => {
-                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                        "Too many concurrent queries for user '{}' ({} active). Please retry later.",
-                        username, self.config.query.max_concurrent_per_user
-                    )));
-                }
-            }
-        }
-        if let Some(ref sem) = self.query_semaphore {
-            match Arc::clone(sem).try_acquire_owned() {
-                Ok(p) => permits.push(p),
-                Err(_) => {
-                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                        "Too many concurrent queries ({} active). Please retry later.",
-                        self.config.query.max_concurrent_queries
-                    )));
-                }
-            }
-        }
-
-        // Per-user memory reservation. Carried by the streaming wrapper so
-        // it releases when the result stream drops, not when the planning
-        // call returns. Without this, large multi-second streams would
-        // appear to free their budget immediately on admission.
-        let per_user_mem_reservation =
-            if self.per_user_memory_budget_bytes > 0 && self.per_query_memory_bytes > 0 {
-                let username = session.user.username.clone();
-                match self.per_user_memory.try_reserve(
-                    &username,
-                    self.per_query_memory_bytes,
-                    self.per_user_memory_budget_bytes,
-                ) {
-                    Some(r) => Some(r),
-                    None => {
-                        let used = self.per_user_memory.used_bytes(&username);
-                        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                            "Per-user memory budget exceeded for '{}': {} bytes reserved, \
-                         limit {} bytes. Wait for in-flight queries to complete.",
-                            username, used, self.per_user_memory_budget_bytes
-                        )));
-                    }
-                }
-            } else {
-                None
-            };
+        // Same sequence as execute() (`query_handler::admission`). The
+        // permits and the reservation are moved into the stream wrapper
+        // below and released when the client finishes draining, not when
+        // planning returns.
+        let Admission {
+            permits,
+            memory_reservation: per_user_mem_reservation,
+        } = self.admit(session, sql, "streaming query")?;
 
         // --- Classify ---------------------------------------------------------
         // See execute() for the pipeline rationale: pre-parse pipeline, then
@@ -3362,14 +2964,7 @@ impl QueryHandler {
                 policy_summary,
                 audit_resources,
             )) => {
-                let actor = sqe_metrics::audit::Actor::from_parts(
-                    session.user.username.clone(),
-                    session.user.subject.clone(),
-                    session.user.email.clone(),
-                    session.user.roles.clone(),
-                    session.user.groups.clone(),
-                )
-                .with_app_name(session.source.clone());
+                let actor = crate::audit_emitter::actor_for(session);
                 let finalizer = crate::streaming::StreamFinalizer {
                     tracker: Arc::clone(&self.query_tracker),
                     metrics: self.metrics.clone(),
