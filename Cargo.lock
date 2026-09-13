@@ -6814,7 +6814,6 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
- "governor",
  "moka",
  "reqwest 0.13.4",
  "sqe-auth",
