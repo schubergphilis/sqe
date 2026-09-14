@@ -5,7 +5,6 @@ use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use crate::rest_catalog::SessionCatalog;
 use crate::system_jdbc::JdbcSchemaProvider;
 use crate::system_metadata::MetadataSchemaProvider;
-use crate::system_runtime::RuntimeSchemaProvider;
 
 /// One catalog the session can reach, paired with the `SessionCatalog` used to
 /// enumerate it. `system.jdbc.*` and `system.metadata.*` iterate these so JDBC
@@ -32,12 +31,23 @@ impl std::fmt::Debug for SystemCatalogEntry {
 ///
 /// - `jdbc`     — JDBC metadata tables required by Trino JDBC drivers
 /// - `metadata` — catalog/table/schema property tables
-/// - `runtime`  — live query, node, and task information (optional)
-#[derive(Debug)]
+/// - `runtime`  — live query, node, and task information (optional). The
+///   coordinator supplies this one (`sqe_coordinator::system_runtime`): it
+///   renders coordinator state, so the catalog crate only holds the slot.
 pub struct SystemCatalogProvider {
     jdbc_schema: Arc<JdbcSchemaProvider>,
     metadata_schema: Arc<MetadataSchemaProvider>,
-    runtime_schema: Option<Arc<RuntimeSchemaProvider>>,
+    runtime_schema: Option<Arc<dyn SchemaProvider>>,
+}
+
+impl std::fmt::Debug for SystemCatalogProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SystemCatalogProvider")
+            .field("jdbc_schema", &self.jdbc_schema)
+            .field("metadata_schema", &self.metadata_schema)
+            .field("runtime_schema", &self.runtime_schema.is_some())
+            .finish()
+    }
 }
 
 impl SystemCatalogProvider {
@@ -53,9 +63,9 @@ impl SystemCatalogProvider {
         }
     }
 
-    /// Set the runtime schema provider for `system.runtime.*` virtual tables.
+    /// Set the schema provider for the `system.runtime.*` virtual tables.
     #[must_use = "with_runtime consumes self; bind the returned provider"]
-    pub fn with_runtime(mut self, runtime: Arc<RuntimeSchemaProvider>) -> Self {
+    pub fn with_runtime(mut self, runtime: Arc<dyn SchemaProvider>) -> Self {
         self.runtime_schema = Some(runtime);
         self
     }

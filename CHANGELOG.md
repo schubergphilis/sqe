@@ -40,6 +40,25 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Coordinator: the `system.runtime` schema lives in the coordinator and
+  reads the query tracker's types directly (#576)
+
+    `sqe_catalog::system_runtime` rendered `system.runtime.queries`,
+    `nodes` and `tasks` from `RuntimeQueryRecord`, `RuntimeQueryState`
+    and `RuntimeFragmentInfo`, copies of the coordinator's `QueryRecord`,
+    `QueryState` and `FragmentInfo` kept "to avoid a circular crate
+    dependency", and `session_context.rs` converted every record field
+    by field on every read. The module only ever rendered coordinator
+    state, so it is `sqe_coordinator::system_runtime` now and takes
+    `Vec<Arc<QueryRecord>>` straight from the tracker; the three mirrored
+    types are gone and the conversion closure is `tracker.records()`.
+    `SystemCatalogProvider::with_runtime` takes a `dyn SchemaProvider`,
+    so the catalog crate keeps the slot and no longer knows what fills
+    it. The tasks-table tests now scan the built table and check the
+    rows (one per fragment with the worker URL as node id; one synthetic
+    task with the coordinator id), where before they only counted the
+    schema's columns.
+
 - Worker: the deferred slow-consumer gate is a real test (#407)
 
     `slow_consumer_caps_bytes_when_client_pauses` was an `#[ignore]`d

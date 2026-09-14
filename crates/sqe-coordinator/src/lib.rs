@@ -47,6 +47,7 @@ pub mod session_context;
 pub mod session_manager;
 pub mod streaming;
 pub(crate) mod suggest_bloom;
+pub(crate) mod system_runtime;
 pub mod table_health;
 pub mod tag_source_impl;
 pub mod tls;
