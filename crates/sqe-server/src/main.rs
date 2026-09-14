@@ -1038,6 +1038,19 @@ async fn async_main() -> anyhow::Result<()> {
         });
     }
 
+    // Region fallback: if nothing set the S3 region (no [storage], no
+    // SQE_STORAGE__S3_REGION, no AWS_REGION / AWS_DEFAULT_REGION), resolve it
+    // from the AWS SDK config, which reads the active profile's `region` in
+    // ~/.aws/config. This lets `export AWS_PROFILE=...` alone give the S3 data
+    // path a region, the same profile the Glue catalog already uses.
+    #[cfg(feature = "glue")]
+    if config.storage.s3_region.trim().is_empty() {
+        if let Some(region) = sqe_catalog::aws_config::sdk_resolved_region().await {
+            tracing::info!(%region, "S3 region resolved from the AWS SDK config (profile/SSO)");
+            config.storage.s3_region = region;
+        }
+    }
+
     let config = config;
     config.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
 

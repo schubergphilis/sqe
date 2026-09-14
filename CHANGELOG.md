@@ -19,7 +19,11 @@ All notable changes to SQE are documented in this file.
     resolve for data reads exactly as they do for the catalog, and the SDK
     refreshes a rotating session mid-run. Verified live: with only
     `AWS_PROFILE` and `AWS_REGION` set, a `SELECT count(*)` on a Glue table
-    read S3 and returned rows. `--mcp-only` serves just `/mcp`: it closes the
+    read S3 and returned rows. The S3 region resolves the same chain: after
+    `SQE_STORAGE__S3_REGION`, `AWS_REGION` and `AWS_DEFAULT_REGION`, it falls
+    back to the active profile's `region` in `~/.aws/config`, so
+    `export AWS_PROFILE=...` alone supplies both credentials and region.
+    `--mcp-only` serves just `/mcp`: it closes the
     Flight SQL, Trino HTTP and Quack query ports (sets them to 0), leaving MCP
     and the ops health/metrics port, for an assistant-only deployment that
     should not expose the SQL front doors.
