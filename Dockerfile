@@ -15,7 +15,7 @@
 # Reuse the packaged cargo-chef binary without surrendering the repository's
 # pinned Rust toolchain to whichever compiler the cargo-chef image currently
 # carries.
-FROM lukemathwalker/cargo-chef:latest-rust-bookworm@sha256:b1ed45bf65418f5daa5348b39f05ec6a6f5950996e0b797dbe38326d18d42e41 AS cargo-chef-bin
+FROM lukemathwalker/cargo-chef:latest-rust-bookworm@sha256:14ac293f096e29d01296479bb2f81ec1fb0d6ff166dc2be399cf79cc79ec4906 AS cargo-chef-bin
 
 # Renovate's "container images" group bumps tag and digest together; the rust tag must match rust-toolchain.toml.
 FROM rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS chef
@@ -100,7 +100,7 @@ RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},sharing=locked,target
 
 # Digest-pinned; Renovate bumps the runtime independently of builder tooling.
 # Keep this digest in lockstep with Dockerfile.bench.
-FROM cgr.dev/chainguard/glibc-dynamic@sha256:d49aa7837ef1ef8fae33917f94369294c6d49940d2f0b225beee65a3bb6747ed AS runtime-base
+FROM cgr.dev/chainguard/glibc-dynamic@sha256:94ec8c23c45c7aad22b6ab400dc7e1b46dd36f4c71d6c7a3976c8ad4e36ca266 AS runtime-base
 
 USER 65532
 
