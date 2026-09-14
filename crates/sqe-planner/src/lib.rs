@@ -63,7 +63,7 @@ pub use scan_task::{
 };
 pub use single_distinct_count::SingleDistinctCountCompanionRule;
 pub use sort_memory::{SortAdmissionError, SortMemoryPolicy, DEFAULT_SORT_MERGE_FANIN};
-pub use sort_memory_rule::SortMemoryRule;
+pub use sort_memory_rule::{sort_grant_bytes, SortMemoryRule};
 pub use splitter::bin_pack_files;
 pub use star_schema_reorder::{StarSchemaReorderRule, DEFAULT_MIN_RATIO};
 pub use stats::PuffinStatisticsRequestRule;

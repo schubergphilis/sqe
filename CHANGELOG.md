@@ -420,6 +420,23 @@ All notable changes to SQE are documented in this file.
 
 ### Bug Fixes
 
+- Write path: sort-on-write sources run the sort admission gate; a merge that cannot fit fails at plan time, not as an OOM (#412)
+
+    A sorted SELECT is refused at plan time by `SortMemoryRule` when the
+    sort grant cannot reserve merge headroom for the plan's fan-in, because
+    DataFusion's `ExternalSorterMerge` cannot spill. The write path never
+    ran that rule: `WriteHandler` planned CTAS, INSERT ... SELECT and the
+    MERGE source and rewrite through `DataFrame::execute_stream`, so a
+    sort-on-write whose merge did not fit ran anyway and took the
+    coordinator down mid-write. Every write source now goes through
+    `execute_source_stream`, which plans, runs the same rule with the
+    session's `target_partitions` as the merge fan-in, and refuses with
+    `RESOURCE_EXHAUSTED` naming the knobs before a file is written. The
+    grant formula is one function in `sqe-planner`, shared with the read
+    path. Still open on #412: budgeting N partition merges for a
+    partitioned target; the per-partition writers themselves are bounded
+    by default since 905.
+
 - Config: `[query]` byte sizes and the OpenLineage rules are checked at load (#637)
 
     Six `[query]` sizes (`per_user_memory_budget`, `max_query_memory`,

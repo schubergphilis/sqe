@@ -7083,6 +7083,7 @@ dependencies = [
  "sqe-core",
  "sqe-lineage",
  "sqe-metrics-core",
+ "sqe-planner",
  "sqe-policy",
  "sqe-sql",
  "sqlparser",
