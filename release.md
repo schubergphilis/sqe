@@ -155,6 +155,18 @@ runs on `$CI_COMMIT_TAG`. The v0.48.0 tag predates that rule and has no
 pipeline, no image and no GitLab Release; v0.48.1 is the first tag after the
 fix. Do not move v0.48.0; the config is read from the tagged commit.
 
+## `v*` tags must be protected, or Harbor gets nothing
+
+`REGISTRY_USERNAME` / `REGISTRY_PASSWORD` are **protected** group variables.
+GitLab exposes protected variables only to pipelines on protected branches or
+tags. Until 2026-09-14 this project protected `main` but no tags, so every tag
+pipeline ran `aikido-publish-release-image` without credentials and it logged
+`skip harbor repo.sovereign-data.org/chameleon: repo or credential vars unset`
+and exited green. The image existed in the GitLab registry; Harbor `:stable`
+never moved. `v*` is a protected tag now (create: Maintainers). If the Harbor
+mirror ever logs that skip line again, check Settings > Repository >
+Protected tags first, then retry the job; no rebuild is needed.
+
 ## Binaries on the GitHub mirror
 
 `github.com/schubergphilis/sqe` is a read-only push mirror of this repo and
