@@ -14,22 +14,22 @@ use datafusion::physical_plan::ExecutionPlan;
 use iceberg::NamespaceIdent;
 use tracing::{debug, warn};
 
-use sqe_core::SessionUser;
-use sqe_policy_api::PolicyStore;
-
 use crate::rest_catalog::{listing_error_is_forbidden, SessionCatalog};
 
 /// DataFusion `SchemaProvider` for the virtual `information_schema`.
 ///
-/// When a `PolicyStore` and `SessionUser` are provided, restricted columns
-/// are filtered out of `information_schema.columns` so that users cannot
-/// discover column names they are not allowed to see.
+/// Restricted columns are NOT filtered here (#665). The plan rewriter's
+/// contract for a restricted column is "nullified in place, the column
+/// survives in the schema", so the name is visible in every query result
+/// and hiding it from `columns` would make the two surfaces disagree. An
+/// earlier version filtered anyway, but it was dead code: with
+/// `with_information_schema(true)` on every session, DataFusion's built-in
+/// provider answers `information_schema.*` and this provider is only ever
+/// listed, never queried for columns.
 #[derive(Clone)]
 pub struct InformationSchemaProvider {
     session_catalog: Arc<SessionCatalog>,
     warehouse: String,
-    policy_store: Option<Arc<dyn PolicyStore>>,
-    session_user: Option<SessionUser>,
     /// Namespace names resolved (and visibility-filtered) by the owning
     /// `SqeCatalogProvider` at construction. When present, `schemata`,
     /// `tables`, and `columns` derive from this list instead of issuing a
@@ -43,24 +43,15 @@ impl fmt::Debug for InformationSchemaProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("InformationSchemaProvider")
             .field("warehouse", &self.warehouse)
-            .field("has_policy_store", &self.policy_store.is_some())
-            .field("session_user", &self.session_user)
             .finish()
     }
 }
 
 impl InformationSchemaProvider {
-    pub fn new(
-        session_catalog: Arc<SessionCatalog>,
-        warehouse: String,
-        policy_store: Option<Arc<dyn PolicyStore>>,
-        session_user: Option<SessionUser>,
-    ) -> Self {
+    pub fn new(session_catalog: Arc<SessionCatalog>, warehouse: String) -> Self {
         Self {
             session_catalog,
             warehouse,
-            policy_store,
-            session_user,
             cached_namespaces: None,
         }
     }
@@ -243,41 +234,9 @@ impl InformationSchemaProvider {
                     }
                 };
 
-                // Resolve restricted columns for this table when policy is active.
-                // Fail closed on policy errors: skip the table entirely rather than leak
-                // the column list when the policy backend is degraded.
-                //
-                // Match plan_rewriter's policy key: the FULL dotted namespace, as the
-                // planner spells it in a TableScan's TableReference (architecture
-                // review 201). Reducing to the last component missed the policy for
-                // multi-level namespaces and listed restricted column names that the
-                // rewriter NULLs.
-                let policy_ns = ns.as_str();
-                let restricted_columns = match (&self.policy_store, &self.session_user) {
-                    (Some(store), Some(user)) => {
-                        match store.resolve(user, table_ident.name(), policy_ns).await {
-                            Ok(policy) => policy.restricted_columns,
-                            Err(e) => {
-                                warn!(
-                                    table = %table_ident.name(),
-                                    namespace = %ns,
-                                    error = %e,
-                                    "Policy resolution failed for information_schema.columns; omitting table (fail-closed)"
-                                );
-                                continue;
-                            }
-                        }
-                    }
-                    _ => Vec::new(),
-                };
-
                 let iceberg_schema = table.metadata().current_schema();
                 let mut ordinal = 0i32;
                 for field in iceberg_schema.as_struct().fields().iter() {
-                    // Filter out restricted columns so they are invisible
-                    if restricted_columns.contains(&field.name) {
-                        continue;
-                    }
                     ordinal += 1;
                     let info = iceberg_to_sql_type_info(&field.field_type);
                     cat_b.append_value(&self.warehouse);
@@ -832,7 +791,7 @@ mod tests {
 
     async fn provider_for(server: &MockServer, token: &str) -> InformationSchemaProvider {
         let catalog = session(server, token, TableMetadataCache::new(0)).await;
-        InformationSchemaProvider::new(catalog, WAREHOUSE.to_string(), None, None)
+        InformationSchemaProvider::new(catalog, WAREHOUSE.to_string())
     }
 
     /// Scan `table` of `provider` with `filters` and collect every row.
@@ -1098,7 +1057,7 @@ mod tests {
         polaris(&server).await;
         let cache = TableMetadataCache::new(300).with_authorization_recheck(300);
         let catalog = session(&server, "info-schema-columns-warm", cache).await;
-        let provider = InformationSchemaProvider::new(catalog, WAREHOUSE.to_string(), None, None);
+        let provider = InformationSchemaProvider::new(catalog, WAREHOUSE.to_string());
 
         scan_rows(&provider, "columns", &[]).await.unwrap();
         let cold = calls(&server, "GET", &table_path("sales", "orders")).await;
@@ -1134,63 +1093,6 @@ mod tests {
         assert_eq!(
             strings(&batches, "table_name"),
             ["orders", "orders", "employees", "employees"]
-        );
-    }
-
-    /// `columns` with a policy store: restricted columns are invisible and
-    /// the ordinal positions close the gap, so a denied user cannot infer
-    /// that a column exists.
-    #[tokio::test]
-    async fn columns_hides_policy_restricted_columns() {
-        let server = MockServer::start().await;
-        polaris(&server).await;
-        let store = sqe_policy::policy_store::InMemoryPolicyStore::new();
-        store
-            .add_table_policy(
-                "sales",
-                "orders",
-                sqe_policy::ResolvedPolicy {
-                    restricted_columns: vec!["id".to_string()],
-                    ..Default::default()
-                },
-            )
-            .await;
-        let user = SessionUser {
-            username: "alice".to_string(),
-            roles: Vec::new(),
-            subject: None,
-            email: None,
-            groups: Vec::new(),
-        };
-        let catalog = session(
-            &server,
-            "info-schema-columns-policy",
-            TableMetadataCache::new(0),
-        )
-        .await;
-        let provider = InformationSchemaProvider::new(
-            catalog,
-            WAREHOUSE.to_string(),
-            Some(Arc::new(store)),
-            Some(user),
-        );
-
-        let batches = scan_rows(
-            &provider,
-            "columns",
-            &[col("table_schema").eq(lit("sales"))],
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            strings(&batches, "table_name"),
-            ["orders", "customers", "customers"]
-        );
-        assert_eq!(strings(&batches, "column_name"), ["data", "id", "data"]);
-        assert_eq!(
-            ints(&batches, "ordinal_position"),
-            [Some(1), Some(1), Some(2)]
         );
     }
 

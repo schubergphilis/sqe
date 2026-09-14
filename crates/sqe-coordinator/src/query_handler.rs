@@ -198,7 +198,8 @@ fn is_sorted_write(kind: &StatementKind) -> bool {
 /// and policy enforcement for all plans.
 pub struct QueryHandler {
     policy_enforcer: Arc<dyn PolicyEnforcer>,
-    /// Optional policy store for filtering restricted columns in information_schema.
+    /// Optional policy store: `SHOW STATS` governance, the Hive DDL handler's
+    /// column checks, and the maintenance scheduler's authorization.
     policy_store: Option<Arc<dyn PolicyStore>>,
     config: SqeConfig,
     catalog_ops: CatalogOps,
@@ -918,7 +919,6 @@ impl QueryHandler {
                     &self.config,
                     session,
                     self.table_cache.as_ref(),
-                    self.policy_store.as_ref(),
                     self.metrics.as_ref(),
                 )
                 .await
@@ -6697,12 +6697,10 @@ impl QueryHandler {
             .map(|f| f.name.clone())
             .collect();
 
-        // Architecture review 205 (#558): SHOW STATS is governed like
-        // `information_schema.columns`, which `SHOW COLUMNS`, `DESCRIBE` and
-        // `SHOW CREATE TABLE` read from. The same policy the plan rewriter
+        // Architecture review 205 (#558): the same policy the plan rewriter
         // applies to a scan decides what this statement may say: restricted
-        // columns are not listed (denied columns are invisible, not errors),
-        // a row filter makes the snapshot's total row count someone else's
+        // columns are not listed here, a row filter makes the snapshot's total
+        // row count someone else's
         // number so it is reported NULL, and a deny-all policy answers with
         // no rows at all. When per-column statistics land here (Puffin NDV,
         // min/max), they must come from the enforced plan or stay NULL for
@@ -8252,9 +8250,12 @@ impl QueryHandler {
 /// column list without the restricted columns, and the row count only when
 /// no row filter applies (the snapshot total is then not the caller's
 /// count). A deny-all policy yields no columns and no count. Masked columns
-/// stay listed: their names are visible through `information_schema` too,
-/// and their per-column statistics are NULL here. Pure so the rule is
-/// unit-tested without a catalog.
+/// stay listed, and their per-column statistics are NULL here. Note the
+/// asymmetry (#665): `information_schema.columns`, `SHOW COLUMNS` and
+/// `DESCRIBE` list restricted columns, because the rewriter nullifies them
+/// in place and the name survives in every query result; this statement
+/// drops them. Two surfaces, two contracts, still to be reconciled. Pure so
+/// the rule is unit-tested without a catalog.
 fn governed_show_stats(
     policy: &sqe_policy::ResolvedPolicy,
     column_names: Vec<String>,

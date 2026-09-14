@@ -96,7 +96,6 @@ pub(crate) async fn build_catalog_provider(
     global_storage: &sqe_core::config::StorageConfig,
     prefetch_concurrency: usize,
     table_cache: Option<&TableMetadataCache>,
-    policy_store: Option<&Arc<dyn PolicyStore>>,
     prom_metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
     degrade_unresolvable: bool,
 ) -> Result<(SqeCatalogProvider, Arc<SessionCatalog>), Arc<SqeError>> {
@@ -107,8 +106,6 @@ pub(crate) async fn build_catalog_provider(
         session_catalog.clone(),
         storage.clone(),
         cat_cfg.warehouse.clone(),
-        policy_store.cloned(),
-        Some(session.user.clone()),
         cat_cfg.namespace_visibility_filter,
         degrade_unresolvable,
     )
@@ -174,11 +171,14 @@ async fn build_session_catalog(
 /// On a cache hit the `SessionContext` and `SessionCatalog` are cloned in O(1)
 /// and returned immediately, skipping all registration work.
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(skip(config, session, policy_store, query_tracker, runtime, prom_metrics, table_cache, runtime_catalogs, hive_manifest_cache, secrets), fields(username = %session.user.username))]
+#[tracing::instrument(skip(config, session, _policy_store, query_tracker, runtime, prom_metrics, table_cache, runtime_catalogs, hive_manifest_cache, secrets), fields(username = %session.user.username))]
 pub async fn create_session_context(
     config: &SqeConfig,
     session: &Session,
-    policy_store: Option<&Arc<dyn PolicyStore>>,
+    // No longer reaches the catalog providers (#665: the information_schema
+    // column filter it fed was dead code). Kept in the signature for the
+    // 29 call sites until the next session-context slice removes it.
+    _policy_store: Option<&Arc<dyn PolicyStore>>,
     query_tracker: &Arc<QueryTracker>,
     runtime: Option<&Arc<RuntimeEnv>>,
     prom_metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
@@ -288,9 +288,7 @@ pub async fn create_session_context(
                 // bearer. Register it only if Polaris resolves it for this
                 // principal; otherwise keep the config default.
                 Some(c) => {
-                    match discover_catalog_provider(
-                        c, config, session, table_cache, policy_store, prom_metrics,
-                    )
+                    match discover_catalog_provider(c, config, session, table_cache, prom_metrics)
                     .await
                     {
                         Some((provider, session_catalog)) => {
@@ -502,7 +500,6 @@ pub async fn create_session_context(
                     &global_storage,
                     config.storage.prefetch_concurrency,
                     table_cache,
-                    policy_store,
                     prom_metrics,
                     // Static anchor: never let an unresolvable warehouse abort
                     // the whole session build and take down unrelated catalogs
@@ -947,7 +944,6 @@ pub(crate) async fn discover_catalog_provider(
     config: &SqeConfig,
     session: &Session,
     table_cache: Option<&TableMetadataCache>,
-    policy_store: Option<&Arc<dyn PolicyStore>>,
     prom_metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
 ) -> Option<(SqeCatalogProvider, Arc<SessionCatalog>)> {
     if config.query.catalog_discovery != sqe_core::config::CatalogDiscovery::PolarisAuto {
@@ -962,7 +958,6 @@ pub(crate) async fn discover_catalog_provider(
         &config.storage,
         config.storage.prefetch_concurrency,
         table_cache,
-        policy_store,
         prom_metrics,
         // Discovery keeps its Err -> None -> config-default fallback: an
         // unresolvable discovered warehouse must not register as an empty

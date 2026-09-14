@@ -8,8 +8,6 @@ use iceberg::NamespaceIdent;
 use tracing::{debug, warn};
 
 use sqe_core::config::StorageConfig;
-use sqe_core::SessionUser;
-use sqe_policy_api::PolicyStore;
 
 use crate::iceberg_scan::ScanTuning;
 use crate::rest_catalog::SessionCatalog;
@@ -151,10 +149,6 @@ pub struct SqeCatalogProvider {
     namespace_visibility_filter: bool,
     /// Instant of the last miss-triggered re-list; gates the cooldown.
     namespace_relist_at: Mutex<Option<Instant>>,
-    /// Optional policy store for filtering restricted columns in information_schema.
-    policy_store: Option<Arc<dyn PolicyStore>>,
-    /// Session user identity for policy resolution.
-    session_user: Option<SessionUser>,
     /// Optional Prometheus metrics propagated to schema/table providers.
     prom_metrics: Option<Arc<sqe_metrics::MetricsRegistry>>,
     /// The scan tuning knobs, handed unchanged to every schema and table
@@ -174,8 +168,6 @@ impl std::fmt::Debug for SqeCatalogProvider {
         f.debug_struct("SqeCatalogProvider")
             .field("warehouse", &self.warehouse)
             .field("cached_namespaces", &self.cached_namespace_names())
-            .field("has_policy_store", &self.policy_store.is_some())
-            .field("session_user", &self.session_user)
             .finish()
     }
 }
@@ -185,34 +177,18 @@ impl SqeCatalogProvider {
     ///
     /// This performs an async call to list namespaces at construction time,
     /// so the synchronous `schema_names()` method can return results without blocking.
+    ///
+    /// Namespace visibility filtering defaults ON; use
+    /// [`Self::try_new_with_options`] to control it from config.
     pub async fn try_new(
         session_catalog: Arc<SessionCatalog>,
         storage_config: StorageConfig,
         warehouse: String,
     ) -> sqe_core::Result<Self> {
-        Self::try_new_with_policy(session_catalog, storage_config, warehouse, None, None).await
-    }
-
-    /// Create a new catalog provider with optional policy filtering for information_schema.
-    ///
-    /// When `policy_store` and `session_user` are provided, `information_schema.columns`
-    /// will filter out columns restricted by the policy engine.
-    ///
-    /// Namespace visibility filtering defaults ON; use
-    /// [`Self::try_new_with_options`] to control it from config.
-    pub async fn try_new_with_policy(
-        session_catalog: Arc<SessionCatalog>,
-        storage_config: StorageConfig,
-        warehouse: String,
-        policy_store: Option<Arc<dyn PolicyStore>>,
-        session_user: Option<SessionUser>,
-    ) -> sqe_core::Result<Self> {
         Self::try_new_with_options(
             session_catalog,
             storage_config,
             warehouse,
-            policy_store,
-            session_user,
             true,
             // Convenience/legacy constructor: keep the original hard-fail
             // semantics on an unresolvable catalog. Only the static-anchor loop
@@ -238,8 +214,6 @@ impl SqeCatalogProvider {
         session_catalog: Arc<SessionCatalog>,
         storage_config: StorageConfig,
         warehouse: String,
-        policy_store: Option<Arc<dyn PolicyStore>>,
-        session_user: Option<SessionUser>,
         namespace_visibility_filter: bool,
         degrade_unresolvable: bool,
     ) -> sqe_core::Result<Self> {
@@ -289,8 +263,6 @@ impl SqeCatalogProvider {
             cached_namespaces: RwLock::new(cached_namespaces),
             namespace_visibility_filter,
             namespace_relist_at: Mutex::new(None),
-            policy_store,
-            session_user,
             prom_metrics: None,
             tuning: ScanTuning::default(),
             schema_providers: DashMap::new(),
@@ -344,8 +316,6 @@ impl SqeCatalogProvider {
             cached_namespaces: RwLock::new(namespaces),
             namespace_visibility_filter: true,
             namespace_relist_at: Mutex::new(None),
-            policy_store: None,
-            session_user: None,
             prom_metrics: None,
             tuning: ScanTuning::default(),
             schema_providers: DashMap::new(),
@@ -538,8 +508,6 @@ impl CatalogProvider for SqeCatalogProvider {
                 crate::info_schema::InformationSchemaProvider::new(
                     self.session_catalog.clone(),
                     self.warehouse.clone(),
-                    self.policy_store.clone(),
-                    self.session_user.clone(),
                 )
                 // schemata/tables/columns must derive from the same
                 // (visibility-filtered) list SHOW SCHEMAS serves, not a
@@ -654,8 +622,6 @@ mod tests {
             catalog,
             StorageConfig::default(),
             WAREHOUSE.to_string(),
-            None,
-            None,
             false,
             false,
         )
