@@ -21,9 +21,14 @@
 //! either AWS feature don't link aws-config and don't compile this file.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
+use object_store::aws::{AwsCredential, AwsCredentialProvider};
+use object_store::CredentialProvider;
 use sqe_core::{Secret, SecretStore};
 use sqe_sql::OptionValue;
+use tokio::sync::OnceCell;
 
 /// The AWS SDK config loader every SQE-built SDK client must start from.
 ///
@@ -41,6 +46,78 @@ pub fn sdk_config_loader() -> aws_config::ConfigLoader {
         ))
         .build_https();
     aws_config::defaults(aws_config::BehaviorVersion::latest()).http_client(http_client)
+}
+
+/// Bridges the AWS SDK credential chain into `object_store` for S3 data I/O.
+///
+/// `object_store`'s own `AmazonS3Builder` resolves only environment keys and
+/// EC2/ECS instance roles when no static key is set: it has no SSO and no
+/// `AWS_PROFILE` support, because it is not the AWS SDK. So `aws sso login;
+/// export AWS_PROFILE=...` worked for Glue metadata (SDK path) but not for the
+/// S3 reads (object_store path), which fell through to IMDS. This adapter
+/// hands object_store the SDK's resolved credentials, so a profile, an SSO
+/// session, `credential_process`, IRSA and IMDS all work for data reads the
+/// same way they do for the catalog. Credentials resolve on each call and the
+/// SDK provider caches and refreshes them, so an SSO or STS session that
+/// rotates mid-run keeps working (unlike keys captured once into `[storage]`).
+#[derive(Debug)]
+struct SdkObjectStoreCredentials {
+    provider: OnceCell<SharedCredentialsProvider>,
+}
+
+impl SdkObjectStoreCredentials {
+    fn new() -> Self {
+        Self {
+            provider: OnceCell::new(),
+        }
+    }
+
+    async fn provider(&self) -> object_store::Result<&SharedCredentialsProvider> {
+        self.provider
+            .get_or_try_init(|| async {
+                let conf = sdk_config_loader().load().await;
+                conf.credentials_provider().ok_or_else(|| {
+                    object_store::Error::Generic {
+                        store: "S3",
+                        source: "AWS credential provider chain returned no provider \
+                                 (no profile, SSO session, env keys or instance role)"
+                            .into(),
+                    }
+                })
+            })
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl CredentialProvider for SdkObjectStoreCredentials {
+    type Credential = AwsCredential;
+
+    async fn get_credential(&self) -> object_store::Result<Arc<AwsCredential>> {
+        let creds =
+            self.provider()
+                .await?
+                .provide_credentials()
+                .await
+                .map_err(|e| object_store::Error::Generic {
+                    store: "S3",
+                    source: Box::new(e),
+                })?;
+        Ok(Arc::new(AwsCredential {
+            key_id: creds.access_key_id().to_string(),
+            secret_key: creds.secret_access_key().to_string(),
+            token: creds.session_token().map(str::to_string),
+        }))
+    }
+}
+
+/// An `object_store` credential provider backed by the AWS SDK default chain.
+/// Attach it to an `AmazonS3Builder` on the no-static-key path so S3 reads use
+/// the same identity resolution (profile, SSO, IMDS) as the SDK. The SDK
+/// config is loaded lazily on the first credential fetch, so constructing this
+/// is cheap and synchronous.
+pub fn sdk_object_store_credentials() -> AwsCredentialProvider {
+    Arc::new(SdkObjectStoreCredentials::new())
 }
 
 /// Layer ATTACH options + secret store entries on top of the AWS default

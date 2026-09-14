@@ -83,6 +83,14 @@ struct Cli {
     #[arg(long)]
     allow_all_buckets: bool,
 
+    /// Serve only the MCP endpoint. Disables the Flight SQL, Trino HTTP and
+    /// Quack query ports (sets them to 0), leaving just `/mcp` and the ops
+    /// health/metrics port. For an assistant-only deployment that should not
+    /// expose the SQL front doors. Requires MCP to be enabled
+    /// (`--mcp-anonymous`, `--mcp-port`, or `[mcp]` in a config file).
+    #[arg(long)]
+    mcp_only: bool,
+
     /// Allow reads from these S3 prefixes, repeatable. Appended to
     /// `[storage.tvf] allowed_object_store_prefixes`. Reads use the engine's
     /// own AWS credentials, so this is the access boundary: a Glue table whose
@@ -977,6 +985,24 @@ async fn async_main() -> anyhow::Result<()> {
              readable with the engine's storage credentials, bypassing the \
              prefix allowlist. Use only on a single-tenant or trusted-network \
              deployment."
+        );
+    }
+
+    // MCP-only: close the SQL front doors, keep just /mcp (and the ops
+    // health/metrics port). Applied before validate so it composes with the
+    // other flags. Requires MCP to be enabled, or the process would serve
+    // nothing.
+    if cli.mcp_only {
+        if !config.mcp.is_enabled() {
+            return Err(anyhow::anyhow!(
+                "--mcp-only needs MCP enabled: add --mcp-anonymous, --mcp-port, or an [mcp] block"
+            ));
+        }
+        config.coordinator.flight_sql_port = 0;
+        config.coordinator.trino_http_port = 0;
+        config.coordinator.quack_port = 0;
+        tracing::info!(
+            "--mcp-only: Flight SQL, Trino HTTP and Quack ports disabled; serving /mcp only"
         );
     }
 
@@ -1922,6 +1948,23 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
 
     // Mark ready
     ready.store(true, Ordering::Relaxed);
+
+    // MCP-only: Flight SQL is disabled (port 0), so it is not the process's
+    // keep-alive. The MCP and health servers are already spawned; wait for the
+    // shutdown signal here instead of serving Flight SQL. Trino and Quack were
+    // already skipped by their `> 0` guards.
+    if config.coordinator.flight_sql_port == 0 {
+        tracing::info!(
+            "Flight SQL disabled (flight_sql_port = 0); serving MCP only. \
+             Coordinator up."
+        );
+        shutdown_with_drain(ready.clone(), config.coordinator.shutdown_drain_secs).await;
+        if let Some(tx) = shipper_shutdown_tx {
+            let _ = tx.send(true);
+        }
+        tracing::info!("SQE coordinator shut down");
+        return Ok(());
+    }
 
     // Flight SQL server with graceful shutdown
     let mut flight_service =
