@@ -4861,6 +4861,13 @@ impl QueryHandler {
         if candidates.is_empty() {
             candidates.push(self.config.catalog.warehouse.clone());
         }
+        // Hive roots (`[[hive.roots]]`, `--glue-catalog`, `ATTACH ... TYPE
+        // hive_external`) are catalogs a query can name, so they are listed
+        // too; without them an MCP client's `list_catalogs` never learns the
+        // Glue catalog exists.
+        if let Ok(roots) = self.runtime_catalogs.hive_roots() {
+            candidates.extend(roots.into_iter().map(|(name, _)| name));
+        }
         let mut catalog_names: Vec<String> = Vec::new();
         for name in candidates {
             let name = if name.is_empty() {
@@ -4905,12 +4912,6 @@ impl QueryHandler {
         // the default warehouse's. Resolve the named catalog (discovered under
         // polaris-auto) so reads line up with the write path.
         let catalog = show_schemas_catalog(filter);
-        let session_catalog = self.show_catalog(session, catalog.as_deref()).await?;
-
-        // A principal that is not authorized to list this catalog's namespaces
-        // gets an empty result, not a hard error -- so JDBC schema sync and
-        // SHOW SCHEMAS skip catalogs the user can't see instead of aborting. (#5)
-        let namespaces = namespaces_or_empty_on_denial(session_catalog.list_namespaces().await)?;
 
         // Trino's `SHOW SCHEMAS` column is named `Schema`.
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -4918,8 +4919,36 @@ impl QueryHandler {
             DataType::Utf8,
             false,
         )]));
-
         let mut builder = StringBuilder::new();
+
+        // A Hive root is not an Iceberg catalog: `show_catalog` knows
+        // `[catalogs.*]` and Polaris discovery only, so a root's name would
+        // fail as "Unknown catalog" while `SHOW TABLES FROM <root>.<db>`
+        // works. Answer from the root's metadata source (Glue's databases,
+        // or the sidecar warehouse's directories) in the same shape.
+        if let Some(root) = catalog.as_deref() {
+            if self.runtime_catalogs.is_hive_root(root).unwrap_or(false) {
+                for name in self.hive_ddl_handler.list_databases(root).await? {
+                    builder.append_value(name);
+                }
+                let array: ArrayRef = Arc::new(builder.finish());
+                let batch = RecordBatch::try_new(schema, vec![array]).map_err(|e| {
+                    SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!("Failed to create result batch: {e}"),
+                    )
+                })?;
+                return Ok(vec![batch]);
+            }
+        }
+
+        let session_catalog = self.show_catalog(session, catalog.as_deref()).await?;
+
+        // A principal that is not authorized to list this catalog's namespaces
+        // gets an empty result, not a hard error -- so JDBC schema sync and
+        // SHOW SCHEMAS skip catalogs the user can't see instead of aborting. (#5)
+        let namespaces = namespaces_or_empty_on_denial(session_catalog.list_namespaces().await)?;
+
         for ns in &namespaces {
             // Namespace is a list of parts, join with "."
             let name: Vec<&str> = ns.as_ref().iter().map(|s| s.as_str()).collect();
@@ -4972,6 +5001,22 @@ impl QueryHandler {
         session: &Session,
         table_name: &str,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // A fully-qualified name under a Hive root is answered from the
+        // table's manifest. The `information_schema.columns` route below
+        // refreshes the listing snapshots of every catalog first, which
+        // against a live Glue catalog walks every database and table for one
+        // DESCRIBE (minutes, and a GetTables call per table).
+        let parts = split_qualified_identifier(table_name);
+        if let [root, database, table] = parts.as_slice() {
+            if self.runtime_catalogs.is_hive_root(root).unwrap_or(false) {
+                let columns = self
+                    .hive_ddl_handler
+                    .describe_table(&session.user, root, database, table)
+                    .await?;
+                return hive_columns_batch(&columns);
+            }
+        }
+
         let col_sql = info_schema_columns_query(table_name);
 
         let (ctx, session_catalog) = self.create_session_context(session).await?;
@@ -7988,6 +8033,42 @@ fn extract_otel_table_info(kind: &StatementKind) -> Option<(Option<String>, Opti
         }
         _ => None,
     }
+}
+
+/// Render Hive-root columns as the same `(column_name, data_type,
+/// is_nullable)` batch the `information_schema.columns` route produces, so
+/// `DESCRIBE`/`SHOW COLUMNS` against a Hive root and against an Iceberg table
+/// answer in one shape. Hive external columns are all nullable, so
+/// `is_nullable` is always `YES`.
+fn hive_columns_batch(columns: &[(String, String)]) -> sqe_core::Result<Vec<RecordBatch>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("column_name", DataType::Utf8, false),
+        Field::new("data_type", DataType::Utf8, false),
+        Field::new("is_nullable", DataType::Utf8, false),
+    ]));
+    let mut name_b = StringBuilder::new();
+    let mut type_b = StringBuilder::new();
+    let mut nullable_b = StringBuilder::new();
+    for (name, data_type) in columns {
+        name_b.append_value(name);
+        type_b.append_value(data_type);
+        nullable_b.append_value("YES");
+    }
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(name_b.finish()) as ArrayRef,
+            Arc::new(type_b.finish()) as ArrayRef,
+            Arc::new(nullable_b.finish()) as ArrayRef,
+        ],
+    )
+    .map_err(|e| {
+        SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("Failed to create result batch: {e}"),
+        )
+    })?;
+    Ok(vec![batch])
 }
 
 /// Build an `information_schema.columns` query for a (possibly qualified)
