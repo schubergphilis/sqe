@@ -6,6 +6,28 @@ All notable changes to SQE are documented in this file.
 
 ### Added
 
+- Server: S3 reads use the AWS credential chain (SSO, profile); `--mcp-only`
+
+    S3 data reads went through `object_store`, whose credential resolver
+    covers only environment keys and EC2/ECS instance roles, so `aws sso
+    login; export AWS_PROFILE=...` authenticated the Glue catalog (the AWS
+    SDK path) but not the S3 reads, which fell through to IMDS and failed on
+    a laptop with `Error performing PUT .../169.254.169.254/...`. The S3
+    object-store builders now attach the AWS SDK credential chain on the
+    no-static-key path (`sqe_catalog::aws_config::sdk_object_store_credentials`),
+    so a profile, an SSO session, `credential_process`, IRSA and IMDS all
+    resolve for data reads exactly as they do for the catalog, and the SDK
+    refreshes a rotating session mid-run. Verified live: with only
+    `AWS_PROFILE` and `AWS_REGION` set, a `SELECT count(*)` on a Glue table
+    read S3 and returned rows. The S3 region resolves the same chain: after
+    `SQE_STORAGE__S3_REGION`, `AWS_REGION` and `AWS_DEFAULT_REGION`, it falls
+    back to the active profile's `region` in `~/.aws/config`, so
+    `export AWS_PROFILE=...` alone supplies both credentials and region.
+    `--mcp-only` serves just `/mcp`: it closes the
+    Flight SQL, Trino HTTP and Quack query ports (sets them to 0), leaving MCP
+    and the ops health/metrics port, for an assistant-only deployment that
+    should not expose the SQL front doors.
+
 - Server: run flag-only, and reach a Glue catalog over MCP with no config file
 
     `sqe-server` starts from a built-in default when there is no config

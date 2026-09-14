@@ -553,6 +553,22 @@ where
 
 /// Build an [`object_store::aws::AmazonS3`] from inline TVF args with
 /// fallback to the coordinator-wide [`StorageConfig`] defaults.
+/// The AWS SDK credential provider for object_store, when an AWS feature is
+/// compiled in. `None` on a build without `glue`/`s3tables` (no `aws-config`),
+/// where object_store keeps its own env/IMDS resolution. Gated here so the
+/// S3 builders below stay feature-independent.
+#[cfg(any(feature = "glue", feature = "s3tables"))]
+pub(crate) fn sdk_object_store_credentials_or_none() -> Option<object_store::aws::AwsCredentialProvider>
+{
+    Some(crate::aws_config::sdk_object_store_credentials())
+}
+
+#[cfg(not(any(feature = "glue", feature = "s3tables")))]
+pub(crate) fn sdk_object_store_credentials_or_none() -> Option<object_store::aws::AwsCredentialProvider>
+{
+    None
+}
+
 pub fn build_s3_store(
     fn_name: &str,
     args: &FileTvfArgs,
@@ -614,6 +630,15 @@ pub fn build_s3_store(
     if !access_key.is_empty() && !session_token.is_empty() {
         builder = builder.with_token(session_token);
     }
+    // No static key: hand object_store the AWS SDK credential chain so a
+    // profile, SSO session and IMDS all resolve, the same way the Glue/S3
+    // Tables catalog path does. Without this, object_store's own resolver
+    // sees no keys and falls through to IMDS (SQE #s3-sso).
+    if access_key.is_empty() {
+        if let Some(provider) = sdk_object_store_credentials_or_none() {
+            builder = builder.with_credentials(provider);
+        }
+    }
     if !endpoint.is_empty() {
         builder = builder.with_endpoint(endpoint);
     }
@@ -661,6 +686,12 @@ pub fn build_s3_store_for_bucket(
     let session_token = storage.s3_session_token.expose();
     if !storage.s3_access_key.is_empty() && !session_token.is_empty() {
         builder = builder.with_token(session_token);
+    }
+    // No static key: resolve through the AWS SDK chain (profile, SSO, IMDS).
+    if storage.s3_access_key.is_empty() {
+        if let Some(provider) = sdk_object_store_credentials_or_none() {
+            builder = builder.with_credentials(provider);
+        }
     }
     if !storage.s3_endpoint.is_empty() {
         builder = builder.with_endpoint(storage.s3_endpoint.as_str());
