@@ -107,13 +107,6 @@ impl Step {
     }
 }
 
-/// Merge headroom granted to every remaining `SortExec` (see `SortMemoryRule`).
-fn sort_grant_bytes(query: &QueryConfig) -> usize {
-    sqe_core::parse_memory_limit(&query.max_query_memory)
-        .unwrap_or(256 * 1024 * 1024)
-        .max(8 * 1024 * 1024)
-}
-
 /// Build the ordered rule list. This is the only place that names the
 /// sequence; see the module docs for the rationale behind each position.
 pub fn post_planning_rules(
@@ -153,7 +146,7 @@ pub fn post_planning_rules(
         metrics: metrics.cloned(),
     }));
     steps.push(Step::fail(
-        sqe_planner::SortMemoryRule::new(sort_grant_bytes(query)),
+        sqe_planner::SortMemoryRule::new(sqe_planner::sort_grant_bytes(&query.max_query_memory)),
         "Sort memory admission failed",
     ));
     steps.push(Step::fallback(StripSelfJoinDynamicFiltersRule));
