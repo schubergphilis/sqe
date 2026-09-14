@@ -12,3 +12,45 @@ scope = "evidence-vouched"
 owner = "vpf-data-ai/chameleon sqlengine maintainers"
 reason = "Published find-msvc-tools 0.1.12 declares MIT OR Apache-2.0 in Cargo.toml and includes both license texts. Source: https://static.crates.io/crates/find-msvc-tools/find-msvc-tools-0.1.12.crate ; SHA-256 3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d matches Cargo.lock. This supplies missing metadata for this exact release only; it does not waive restricted licenses."
 expires = "2026-12-04"
+
+# GitHub Actions referenced by .github/workflows/release-binaries.yml. The SBOM
+# lists them as components, deps.dev has no license record for action
+# repositories, so each shows as "license evidence missing". All four are MIT:
+# the LICENSE file at the tag in each repository. They run on GitHub-hosted
+# runners on the public mirror and are not part of the shipped binaries or
+# image. Version glob because the pinned major moves with renovate.
+[[exception]]
+id = "OSS-GHA-ACTIONS-CHECKOUT-EVIDENCE-2026"
+component = "actions/checkout@*"
+licenses = ["MIT"]
+scope = "evidence-vouched"
+owner = "vpf-data-ai/chameleon sqlengine maintainers"
+reason = "actions/checkout is MIT: https://github.com/actions/checkout/blob/v4/LICENSE . CI-only step on the GitHub mirror; nothing from it is shipped."
+expires = "2027-09-14"
+
+[[exception]]
+id = "OSS-GHA-ACTIONS-UPLOAD-ARTIFACT-EVIDENCE-2026"
+component = "actions/upload-artifact@*"
+licenses = ["MIT"]
+scope = "evidence-vouched"
+owner = "vpf-data-ai/chameleon sqlengine maintainers"
+reason = "actions/upload-artifact is MIT: https://github.com/actions/upload-artifact/blob/v4/LICENSE . CI-only step on the GitHub mirror; nothing from it is shipped."
+expires = "2027-09-14"
+
+[[exception]]
+id = "OSS-GHA-ACTIONS-DOWNLOAD-ARTIFACT-EVIDENCE-2026"
+component = "actions/download-artifact@*"
+licenses = ["MIT"]
+scope = "evidence-vouched"
+owner = "vpf-data-ai/chameleon sqlengine maintainers"
+reason = "actions/download-artifact is MIT: https://github.com/actions/download-artifact/blob/v4/LICENSE . CI-only step on the GitHub mirror; nothing from it is shipped."
+expires = "2027-09-14"
+
+[[exception]]
+id = "OSS-GHA-SWATINEM-RUST-CACHE-EVIDENCE-2026"
+component = "Swatinem/rust-cache@*"
+licenses = ["MIT"]
+scope = "evidence-vouched"
+owner = "vpf-data-ai/chameleon sqlengine maintainers"
+reason = "Swatinem/rust-cache is MIT: https://github.com/Swatinem/rust-cache/blob/v2/LICENSE . CI-only cache step on the GitHub mirror; nothing from it is shipped."
+expires = "2027-09-14"

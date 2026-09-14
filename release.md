@@ -144,6 +144,27 @@ CI publishes a GitLab Release for any `v*` tag, including `-rc.N` / `-alpha.N`
 pre-releases. The automated release-branch flow only produces clean `vX.Y.Z`
 versions, so use the script for pre-releases.
 
+## Binaries on the GitHub mirror
+
+`github.com/schubergphilis/sqe` is a read-only push mirror of this repo and
+receives every `v*` tag. `.github/workflows/release-binaries.yml` runs on that
+tag push: it builds `sqe-server`, `sqe-worker`, `sqe-cli` and `sqe-bench` for
+`aarch64-apple-darwin`, `x86_64-apple-darwin` and `x86_64-unknown-linux-gnu`
+with the same `cargo build --locked --no-default-features --profile release`
+line as the GitLab `release-binaries` job, and attaches one
+`sqe-<version>-<target>.tar.gz` plus a `.sha256` per target to a GitHub Release
+named `SQE vX.Y.Z` with generated notes.
+
+Two things to know:
+
+- The workflow runs from the tree at the tagged commit, so tags cut before the
+  file existed have no run. Backfill from the Actions tab with **Run workflow**
+  and the tag name as input (v0.48.0 is the first candidate).
+- The dispatch form also takes a `profile`. Hosted macOS runners have 7 GB of
+  RAM; if the thin-LTO `release` link dies there, rerun with `dev-release`.
+
+Harbor images stay the GitLab tag pipeline's job; GitHub only gets binaries.
+
 ## What you need once (ops)
 
 All of this is aikido-owned now; the pre-aikido `RELEASE_TOKEN` is no longer read.
