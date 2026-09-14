@@ -120,3 +120,29 @@ These tags point at trees whose crates still read `0.31.4` -- the known
 drift exception. They were pushed with `-o ci.skip` so no release pipeline
 ran for them. v0.36.0 is the first normal release after the gap. Don't
 repeat this: cut a release when a feature wave merges, not a month later.
+
+## Retrospective tags, second gap (v0.38.0 .. v0.47.0)
+
+It happened again. Between 2026-06-24 (v0.37.0) and 2026-09-14 no release was
+cut while 521 MRs merged: the aikido `aikido-release` job described in
+`release.md` only dry-runs unless the project variable `AIKIDO_RELEASE` is set,
+and it never was. On 2026-09-14 the wave endpoints were tagged retrospectively:
+
+| Tag | Commit | Wave |
+|---|---|---|
+| v0.38.0 | c8b1a60b | Trino BI-wire compat, mixed Basic-auth listener, write-path pool tracking (to Jul 2) |
+| v0.39.0 | 5a26cca8 | Parallel scan on by default, stranded-LIMIT fixes, COUNT(*) fast-path (to Jul 8) |
+| v0.40.0 | 9d1e807d | Production audit remediation, MERGE SCD2 surface, bloom row-group pruning, observability (to Jul 13) |
+| v0.41.0 | 128a9117 | Compaction phases 1-4, INSERT OVERWRITE, unified bench harness, array lambdas (to Jul 22) |
+| v0.42.0 | d1e2b119 | Bounded-memory and spill program, event-driven cache invalidation, aikido CI, Renovate (to Jul 31) |
+| v0.43.0 | 590bac79 | Access-control wave: grants as caller, DENY, grant-profile v4/v5, Spark parity, masking policies (to Aug 11) |
+| v0.44.0 | 9f942a08 | Hardening batch: ATTACH jdbc, byte budgets, circuit breaker, worker row-group pruning (to Aug 19) |
+| v0.45.0 | 88af57a5 | Hive external tables cycles 1/2/4/5, DataFusion 55 / arrow 59, Rust 1.98 (to Aug 27) |
+| v0.46.0 | dda731d2 | MCP server, Glue catalog over MCP, iceberg vendored fixes, Puffin NDV, cargo-hakari (to Sep 4) |
+| v0.47.0 | f04b2b31 | Review work packages #652-#658, crate split, async-path fixes, sqlite-rs default (to Sep 10) |
+
+As before, these trees self-report `0.37.0` and were pushed with `-o ci.skip`,
+so no image or GitLab Release exists for them. v0.48.0 is the first normal
+release after this gap. To stop this from recurring, set `AIKIDO_RELEASE=1` on
+the project (see `release.md`, "What you need once") or cut with
+`scripts/release.sh` when a wave merges.

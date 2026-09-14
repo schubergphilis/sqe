@@ -72,6 +72,12 @@ for crate_toml in crates/*/Cargo.toml; do
     if ! grep -q '^version = ' "$crate_toml"; then
         continue
     fi
+    # The cargo-hakari workspace-hack crate keeps its own 0.1.x version: every
+    # first-party crate depends on it as `version = "0.1"`, so bumping it here
+    # breaks resolution ("candidate versions found which didn't match").
+    if [[ "$crate_toml" == crates/workspace-hack/Cargo.toml ]]; then
+        continue
+    fi
     perl -i -pe 's/^version = ".*"$/version = "'"$VERSION"'"/' "$crate_toml"
     echo "  $crate_toml -> $VERSION"
 done
@@ -91,7 +97,7 @@ if [[ -z "$(git status --porcelain)" ]]; then
 fi
 
 echo "==> Committing"
-git add Cargo.toml crates/*/Cargo.toml Cargo.lock
+git add Cargo.toml crates/*/Cargo.toml Cargo.lock deploy/helm/sqe/Chart.yaml
 git commit -m "chore(release): ${VERSION}
 
 Bump all workspace crate versions to ${VERSION} ahead of the v${VERSION}
