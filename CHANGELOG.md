@@ -6,6 +6,23 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Catalog: the dead restricted-column filter in `information_schema.columns` is gone (#665)
+
+    `sqe_catalog::info_schema::InformationSchemaProvider` filtered restricted
+    columns out of `columns` through a `PolicyStore`, and the catalog
+    provider and the session-context builder threaded that store and the
+    session user through for it. None of it ran: every session is built
+    with `with_information_schema(true)`, so DataFusion's built-in provider
+    answers `information_schema.*` and this provider is only ever listed.
+    The code and its plumbing are removed, along with the catalog crate's
+    dev-dependency on `sqe-policy`. The documented contract is the plan
+    rewriter's: a restricted column is nullified in place, its name stays
+    in the schema and in `information_schema`, `SHOW COLUMNS` and
+    `DESCRIBE`. `SHOW STATS` still drops restricted columns; that
+    asymmetry is now stated at both sites instead of denied by a comment.
+    `create_session_context` keeps its `policy_store` parameter, unused,
+    until its 29 call sites are cleaned up in the next slice.
+
 - Coordinator: one admission sequence for `execute` and `execute_stream` (#589)
 
     Both entry points carried their own copy of the admission gates
