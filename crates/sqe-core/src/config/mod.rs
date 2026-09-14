@@ -2558,7 +2558,20 @@ pub enum CatalogAuthConfig {
     /// `s3tables` backends and by AWS REST endpoints that engage
     /// SigV4 based on `/v1/config`. No token is fetched at the
     /// SQE level; the AWS SDK handles credentials.
-    Aws,
+    ///
+    /// AWS's own REST endpoints advertise `rest.sigv4-enabled` in their
+    /// `/v1/config`, so the two fields below stay unset for Glue and S3
+    /// Tables. A self-hosted catalog that requires SigV4 but does not
+    /// advertise it (RustFS S3 Tables signs with service name `s3` and
+    /// answers `/v1/config` with no `rest.*` keys) needs `signing_name`
+    /// set; SQE then turns SigV4 on client-side with that name and
+    /// `signing_region` (default: `[storage] s3_region`).
+    Aws {
+        #[serde(default)]
+        signing_name: Option<String>,
+        #[serde(default)]
+        signing_region: Option<String>,
+    },
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -8389,7 +8402,10 @@ type = "aws"
         ));
         assert!(matches!(
             cfg.catalogs["aws_glue"].auth,
-            Some(CatalogAuthConfig::Aws)
+            Some(CatalogAuthConfig::Aws {
+                signing_name: None,
+                signing_region: None,
+            })
         ));
     }
 
