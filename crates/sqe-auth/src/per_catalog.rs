@@ -91,7 +91,7 @@ pub async fn resolve_bearer(
         CatalogAuthConfig::SessionBearer => Ok(session_bearer.to_string()),
         CatalogAuthConfig::Static { token } => Ok(token.clone()),
         CatalogAuthConfig::Anonymous => Ok(String::new()),
-        CatalogAuthConfig::Aws => {
+        CatalogAuthConfig::Aws { .. } => {
             // AWS auth is handled by the SDK provider chain at the
             // catalog client level; SQE doesn't supply a bearer.
             Ok(String::new())
@@ -176,7 +176,10 @@ mod tests {
 
     #[tokio::test]
     async fn aws_returns_empty_for_sdk_chain() {
-        let auth = CatalogAuthConfig::Aws;
+        let auth = CatalogAuthConfig::Aws {
+            signing_name: None,
+            signing_region: None,
+        };
         let resolved = resolve_bearer(&auth, "session").await.unwrap();
         assert!(resolved.is_empty());
     }

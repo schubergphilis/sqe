@@ -77,6 +77,7 @@ validated from a clean state.
 | [`mcp`](./mcp/) | Reuses the user-token stack; authenticated SQE MCP, read/write gates, protocol tests, Codex + Claude setup | runnable harness |
 | [`polaris-ranger-keycloak`](./polaris-ranger-keycloak/) | Polaris + Apache Ranger access control: SQE writes GRANT/REVOKE to Ranger, Polaris enforces, column masks match Spark + Kyuubi byte-for-byte | test harness (`test.sh` + `parity-test.sh`) |
 | [`nessie`](./nessie/) | Project Nessie as the Iceberg REST catalog (auth-less, anonymous SQE) | **validated 2026-06-06** |
+| [`rustfs-s3tables`](./rustfs-s3tables/) | RustFS S3 Tables: the Iceberg REST catalog inside the object store; SQE signs it client-side with the S3 keys (auth-less, anonymous SQE) | **validated 2026-09-14** |
 | [`unity-oss`](./unity-oss/) | Unity Catalog OSS over Iceberg REST (read-only upstream; catalog-browse demo) | **validated 2026-06-06** |
 
 ### B. AWS managed catalogs (CDK bootstrap + teardown)

@@ -4,6 +4,40 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Catalog: client-side SigV4 for REST catalogs that do not advertise it,
+  which connects SQE to RustFS S3 Tables
+
+    RustFS 1.0.0-rc.6 serves an Iceberg REST catalog at `/iceberg` on
+    the S3 port and authenticates it like S3: SigV4 under the service
+    name `s3`, with the `x-amz-content-sha256` payload hash on every
+    request. Its `/v1/config` carries no `rest.sigv4-enabled`, so the
+    vendored client, which only signs when the server or the user
+    props say so, sent unsigned requests and got 403 "Signature is
+    required". `[catalogs.<name>.auth]` `type = "aws"` gained
+    `signing_name` and `signing_region` (the region defaults to
+    `[storage] s3_region`); setting the name turns the SigV4 props on
+    for that catalog. Three things had to change underneath. The
+    vendored signer adds the payload hash header when the service is
+    `s3` (RustFS answered 400 "missing header: x-amz-content-sha256"
+    without it). The signer takes static keys from the `s3.*`
+    properties, so the `[storage]` keys sign the catalog and the AWS
+    SDK chain is the fallback, not the only path. And SQE's own raw
+    REST calls (the HEAD authorization check, ETag revalidation, view
+    and commit endpoints), which attached the session bearer directly
+    and so sent `Authorization: Bearer ` to a bearerless catalog (400
+    "invalid header: authorization"), now sign with the same signer.
+    Catalogs that advertise SigV4 through `/v1/config` (Glue, Amazon
+    S3 Tables) are unchanged. New quickstart
+    `quickstart/rustfs-s3tables/`: RustFS, bucket creation, the
+    S3 Tables enable call, SQE; `CREATE SCHEMA`, `CREATE TABLE`,
+    `INSERT`, aggregate, CTAS and `SHOW TABLES` against it. Tests:
+    the auth block to props mapping; a wiremock rig asserting the raw
+    HEAD carries `AWS4-HMAC-SHA256` plus the payload hash, the raw
+    POST hashes the exact body it sends, and a catalog without the
+    props still sends the bearer.
+
 ### Changed
 
 - Worker: the deferred slow-consumer gate is a real test (#407)

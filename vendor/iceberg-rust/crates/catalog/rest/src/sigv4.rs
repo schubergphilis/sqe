@@ -34,9 +34,12 @@
 //! and signs the outgoing `reqwest::Request` with SigV4 instead.
 //!
 //! Credentials come from the standard AWS provider chain, resolved
-//! once and cached per `RestCatalog` instance. Token refresh is
-//! handled by the SDK's credential cache; signing itself is a pure
-//! synchronous transformation of the request.
+//! once and cached per `RestCatalog` instance, unless the catalog
+//! properties carry static `s3.access-key-id` / `s3.secret-access-key`
+//! keys (SQE: S3-compatible servers such as RustFS sign their REST
+//! catalog with the same static keys as the object store). Token
+//! refresh is handled by the SDK's credential cache; signing itself is
+//! a pure synchronous transformation of the request.
 //!
 //! Compiled in only when the `aws-sigv4` cargo feature is on, so a
 //! REST-only build (Polaris / Nessie / Lakekeeper) doesn't pull in
@@ -47,7 +50,7 @@ use std::time::SystemTime;
 use aws_credential_types::Credentials;
 use aws_credential_types::provider::ProvideCredentials;
 use aws_sigv4::http_request::{
-    SignableBody, SignableRequest, SigningSettings, sign,
+    PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings, sign,
 };
 use aws_sigv4::sign::v4;
 use bytes::Bytes;
@@ -59,9 +62,16 @@ use tokio::sync::OnceCell;
 /// Resolves AWS credentials lazily on first use. The default chain
 /// (env vars, shared config, IMDS, etc.) is what every other AWS SDK
 /// client in the same process uses, so behaviour is consistent.
-pub(crate) struct SigV4Signer {
+///
+/// Public (SQE) so an embedding engine can sign its own raw HTTP calls
+/// to the same catalog with the same identity; see
+/// [`SigV4Signer::sign_headers`].
+pub struct SigV4Signer {
     region: String,
     name: String,
+    /// Static keys from the catalog properties. When set, the SDK
+    /// provider chain is never consulted.
+    static_credentials: Option<Credentials>,
     /// Cached credentials provider. The SDK provider already does its
     /// own caching internally; we just hold the resolved chain.
     provider: OnceCell<aws_credential_types::provider::SharedCredentialsProvider>,
@@ -77,15 +87,39 @@ impl std::fmt::Debug for SigV4Signer {
 }
 
 impl SigV4Signer {
-    pub(crate) fn new(region: impl Into<String>, name: impl Into<String>) -> Self {
+    /// A signer for `name` (the SigV4 service name, e.g. `glue`,
+    /// `s3tables`, or `s3`) in `region`, resolving credentials through
+    /// the AWS SDK default provider chain.
+    pub fn new(region: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             region: region.into(),
             name: name.into(),
+            static_credentials: None,
             provider: OnceCell::new(),
         }
     }
 
+    /// Sign with fixed keys instead of the SDK provider chain.
+    pub fn with_static_credentials(
+        mut self,
+        access_key_id: impl Into<String>,
+        secret_access_key: impl Into<String>,
+        session_token: Option<String>,
+    ) -> Self {
+        self.static_credentials = Some(Credentials::new(
+            access_key_id,
+            secret_access_key,
+            session_token,
+            None,
+            "iceberg-rest-static",
+        ));
+        self
+    }
+
     async fn credentials(&self) -> Result<Credentials> {
+        if let Some(creds) = &self.static_credentials {
+            return Ok(creds.clone());
+        }
         // Lazily build the provider on first request. `load_defaults`
         // is the non-deprecated entry point in aws-config 1.x; we pin
         // a stable BehaviorVersion so SDK upgrades don't silently
@@ -137,10 +171,49 @@ impl SigV4Signer {
     /// calls `RequestBuilder::body(serde_json::to_vec(...))`), so this
     /// is safe.
     pub(crate) async fn sign(&self, req: &mut Request) -> Result<()> {
+        // `aws-sigv4` wants the body bytes as `SignableBody::Bytes(&[u8])`
+        // (so it can hash them into the canonical request). Pull the
+        // body out of the reqwest::Request; the headers are signed in place.
+        let body_bytes: Bytes = match req.body().and_then(|b| b.as_bytes()) {
+            Some(b) => Bytes::copy_from_slice(b),
+            None => Bytes::new(),
+        };
+        let url = req.url().to_string();
+        let method = req.method().as_str().to_string();
+        self.sign_headers(&method, &url, req.headers_mut(), &body_bytes)
+            .await
+    }
+
+    /// Sign one request given as its parts, adding the SigV4
+    /// `Authorization`, `x-amz-date`, `x-amz-content-sha256` (for the
+    /// `s3` service) and, when applicable, `x-amz-security-token`
+    /// headers to `headers`.
+    ///
+    /// Works on an `http::HeaderMap`, so callers on any `reqwest` major
+    /// (or none) can sign with the same identity the catalog client
+    /// uses. `body` must be the exact bytes that go on the wire.
+    pub async fn sign_headers(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &mut http::HeaderMap,
+        body: &[u8],
+    ) -> Result<()> {
         let creds = self.credentials().await?;
         let identity = creds.into();
 
-        let signing_settings = SigningSettings::default();
+        let mut signing_settings = SigningSettings::default();
+        // SQE: servers that authenticate the catalog with S3-style
+        // SigV4 (RustFS S3 Tables signs the REST catalog under the
+        // `s3` service name) reject requests without the
+        // `x-amz-content-sha256` payload hash header ("missing header:
+        // x-amz-content-sha256", HTTP 400). The AWS S3 signer always
+        // sends it, so mirror that whenever the signing name is `s3`.
+        // Glue and Amazon S3 Tables (`glue`, `s3tables`) keep the
+        // default header set.
+        if self.name == "s3" {
+            signing_settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+        }
         let signing_params = v4::SigningParams::builder()
             .identity(&identity)
             .region(&self.region)
@@ -157,29 +230,17 @@ impl SigV4Signer {
             })?
             .into();
 
-        // `aws-sigv4` wants the body bytes as `SignableBody::Bytes(&[u8])`
-        // (so it can hash them into the canonical request). Pull the
-        // body out of the reqwest::Request, reattach it after signing.
-        let body_bytes: Bytes = match req.body().and_then(|b| b.as_bytes()) {
-            Some(b) => Bytes::copy_from_slice(b),
-            None => Bytes::new(),
-        };
-
-        let url = req.url().to_string();
-        let method = req.method().as_str().to_string();
-
         // aws-sigv4 wants `(name, value)` string slices for headers.
-        let header_iter: Vec<(&str, &str)> = req
-            .headers()
+        let header_iter: Vec<(&str, &str)> = headers
             .iter()
             .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str(), v)))
             .collect();
 
         let signable = SignableRequest::new(
-            &method,
-            &url,
+            method,
+            url,
             header_iter.iter().copied(),
-            SignableBody::Bytes(&body_bytes),
+            SignableBody::Bytes(body),
         )
         .map_err(|e| {
             Error::new(
@@ -221,7 +282,7 @@ impl SigV4Signer {
                     )
                     .with_source(e)
                 })?;
-            req.headers_mut().insert(header_name, value);
+            headers.insert(header_name, value);
         }
 
         Ok(())
