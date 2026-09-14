@@ -6,6 +6,21 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Worker: the deferred slow-consumer gate is a real test (#407)
+
+    `slow_consumer_caps_bytes_when_client_pauses` was an `#[ignore]`d
+    placeholder that panicked with its own to-do. It now runs: eight
+    incompressible 2 MiB files under a 4 MiB scan budget (fetch lane 1 MiB,
+    one file capped at half of it), a client that takes two batches and
+    pauses for two seconds. While paused, the object store's GET counter
+    must not move, live scan ownership must stay inside the budget, and
+    after the pause every row arrives and more GETs happen, which proves
+    the freeze was the fetch lane refusing to open a third file rather than
+    the scan having nothing left to fetch. Both lanes release to zero.
+    The harness's `generate_wide_parquet` repeats one string and lands at
+    80 KiB per 2 MiB decoded even uncompressed, so the test writes its own
+    distinct-payload files with dictionary encoding off.
+
 - Catalog: the dead restricted-column filter in `information_schema.columns` is gone (#665)
 
     `sqe_catalog::info_schema::InformationSchemaProvider` filtered restricted
@@ -419,6 +434,57 @@ All notable changes to SQE are documented in this file.
     `docs/archive/ballista-evaluation/`.
 
 ### Bug Fixes
+
+- Config: an S3 spill bucket that is also a table-data bucket is refused at load (#382)
+
+    Spill objects are reaped only by a bucket lifecycle rule on their tag,
+    and the spill prefix check in `sqe-spill` is a four-string denylist, so
+    a spill bucket that also holds a warehouse puts table files one
+    misconfigured rule from expiry. `validate()` now compares
+    `worker.spill.s3.bucket` (when the backend is `s3` or `tiered`) with the
+    bucket of every `[[hive.roots]]` location and every `s3://` warehouse in
+    `[catalog]` / `[catalogs.*]`, and refuses a match by name. Found on
+    the way: `validate()` still refused `worker.spill.backend = "s3"` as
+    "not implemented yet" while accepting `"tiered"`, which reaches the
+    same S3 segment store; the stale refusal is gone and both backends
+    now require `worker.spill.s3.bucket` instead. The configuration
+    reference gains the `[worker.spill.s3]` block with the
+    dedicated-bucket and lifecycle-rule requirements it never documented.
+    Of the other #382 items, the quota is already reserved by
+    compare-and-swap and refunded on abort, and `finish()` already PUTs
+    once (both covered by tests); the low items (materialized reads,
+    counters reset on restart) stay open.
+
+- Planner: the sort admission gate budgets one merge buffer per input partition (#412)
+
+    `SortMemoryRule` gated every unbounded sort against a fixed fan-in of
+    eight merge buffers. With the 8 MiB grant floor (a quarter of it is
+    merge headroom) that is 32 buffers of room, so the gate could not fire
+    on any configuration and the read path has run without sort admission
+    in practice. The fan-in now defaults to the session's
+    `datafusion.execution.target_partitions`, which is how many sorted runs
+    a partitioned `SortExec` merges; `with_max_fan_in` still pins it. On
+    the default 256 MiB grant this admits up to 1,024 partitions, so
+    ordinary deployments see no change; a small `query.max_query_memory`
+    with a wide `target_partitions` is now refused at plan time instead of
+    merging past the pool.
+
+- Write path: sort-on-write sources run the sort admission gate; a merge that cannot fit fails at plan time, not as an OOM (#412)
+
+    A sorted SELECT is refused at plan time by `SortMemoryRule` when the
+    sort grant cannot reserve merge headroom for the plan's fan-in, because
+    DataFusion's `ExternalSorterMerge` cannot spill. The write path never
+    ran that rule: `WriteHandler` planned CTAS, INSERT ... SELECT and the
+    MERGE source and rewrite through `DataFrame::execute_stream`, so a
+    sort-on-write whose merge did not fit ran anyway and took the
+    coordinator down mid-write. Every write source now goes through
+    `execute_source_stream`, which plans, runs the same rule with the
+    session's `target_partitions` as the merge fan-in, and refuses with
+    `RESOURCE_EXHAUSTED` naming the knobs before a file is written. The
+    grant formula is one function in `sqe-planner`, shared with the read
+    path. Still open on #412: budgeting N partition merges for a
+    partitioned target; the per-partition writers themselves are bounded
+    by default since 905.
 
 - Config: `[query]` byte sizes and the OpenLineage rules are checked at load (#637)
 

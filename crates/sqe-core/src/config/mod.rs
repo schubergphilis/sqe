@@ -5516,6 +5516,39 @@ impl SqeConfig {
             }
         }
 
+        // #382: the S3 spill bucket must be dedicated. Spill segments are
+        // reaped by a bucket lifecycle rule keyed on an object tag, and a
+        // worker's spill prefix is a deny-list check away from table data, so
+        // a spill bucket that is also a warehouse bucket puts table files
+        // one misconfigured rule from expiry. The prefix denylist lives in
+        // `sqe-spill`; this is the cross-check against the buckets this
+        // config names for table data (Hive roots, S3 warehouses).
+        if matches!(self.worker.spill.backend.as_str(), "s3" | "tiered")
+            && !self.worker.spill.s3.bucket.trim().is_empty()
+        {
+            let spill_bucket = self.worker.spill.s3.bucket.trim();
+            let mut data_locations: Vec<(String, &str)> = self
+                .hive
+                .roots
+                .iter()
+                .map(|r| (format!("hive.roots[{}].location", r.name), r.location.as_str()))
+                .collect();
+            data_locations.push(("catalog.warehouse".to_string(), self.catalog.warehouse.as_str()));
+            for (name, c) in &self.catalogs {
+                data_locations.push((format!("catalogs.{name}.warehouse"), c.warehouse.as_str()));
+            }
+            for (field, location) in data_locations {
+                if s3_bucket_of(location) == Some(spill_bucket) {
+                    errors.push(format!(
+                        "worker.spill.s3.bucket = {spill_bucket:?} is also the bucket of \
+                         {field} = {location:?}; the spill bucket must be dedicated to spill \
+                         (its lifecycle rule expires tagged objects and its prefix check is \
+                         a denylist, neither protects table data in the same bucket)"
+                    ));
+                }
+            }
+        }
+
         // Finding 603: TLS on plus `https://` workers used to be a
         // configuration that compiled, booted, and then failed every single
         // dispatch because the coordinator had no client trust root. Refuse it
@@ -6061,15 +6094,26 @@ fn validate_byte_sizes(config: &SqeConfig, errors: &mut Vec<String>) {
                             .into(),
                     );
                 }
+                if spill.backend == "tiered" && spill.s3.bucket.trim().is_empty() {
+                    errors.push(
+                        "worker.spill.backend = \"tiered\" requires worker.spill.s3.bucket \
+                         for its S3 tier (a bucket dedicated to spill)"
+                            .into(),
+                    );
+                }
             }
             "s3" => {
-                // S3 backend lands later; fail startup until implemented so
-                // configs are not silently ignored.
-                errors.push(
-                    "worker.spill.backend = \"s3\" is not implemented yet; use \
-                     backend = \"local\" or disable spill"
-                        .into(),
-                );
+                // The S3 segment store has been wired in the worker bootstrap
+                // since !710 and `tiered` already reaches it; the "not
+                // implemented yet" refusal this arm used to carry was stale
+                // (#382). What the backend does need is a bucket.
+                if spill.s3.bucket.trim().is_empty() {
+                    errors.push(
+                        "worker.spill.backend = \"s3\" requires worker.spill.s3.bucket \
+                         (a bucket dedicated to spill; see the configuration reference)"
+                            .into(),
+                    );
+                }
             }
             other => {
                 errors.push(format!(
@@ -6105,6 +6149,17 @@ fn maintenance_provider_client_id(provider: &AuthProviderConfig) -> Option<&str>
         | AuthProviderConfig::TokenExchange { client_id, .. } => Some(client_id.as_str()),
         _ => None,
     }
+}
+
+/// The bucket of an `s3://` or `s3a://` location, `None` for anything else
+/// (a Polaris warehouse name, a local path, an empty string).
+fn s3_bucket_of(location: &str) -> Option<&str> {
+    let rest = location
+        .trim()
+        .strip_prefix("s3://")
+        .or_else(|| location.trim().strip_prefix("s3a://"))?;
+    let bucket = rest.split('/').next().unwrap_or("");
+    (!bucket.is_empty()).then_some(bucket)
 }
 
 /// Validate every URL-shaped string in the config. Empty values are
@@ -6547,6 +6602,64 @@ partial_progress_batch = 5
         config.metrics.openlineage.enabled = false;
         config.metrics.openlineage.auth_mode = "bearer".to_string();
         assert!(config.validate().is_ok());
+    }
+
+    /// #382: the S3 spill bucket may not be a bucket this config names for
+    /// table data; a dedicated bucket passes, and the local backend does not
+    /// consult the field at all.
+    #[test]
+    fn spill_bucket_may_not_be_a_table_data_bucket() {
+        let mut config = valid_config();
+        config.worker.spill.backend = "s3".to_string();
+        config.worker.spill.s3.bucket = "lake".to_string();
+        config.hive.roots.push(HiveRootConfig {
+            name: "lake".to_string(),
+            kind: HiveRootKind::Sidecar,
+            location: "s3://lake/wh/".to_string(),
+            region: None,
+            catalog_id: None,
+            secret: None,
+        });
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("worker.spill.s3.bucket = \"lake\"")
+                && err.contains("hive.roots[lake].location"),
+            "{err}"
+        );
+
+        config.worker.spill.s3.bucket = "sqe-spill".to_string();
+        let dedicated = config.validate();
+        assert!(dedicated.is_ok(), "a dedicated bucket passes: {dedicated:?}");
+
+        // The S3 backends need a bucket at all; the stale "not implemented
+        // yet" refusal of `s3` (while `tiered` reached the same store) is gone.
+        for backend in ["s3", "tiered"] {
+            config.worker.spill.backend = backend.to_string();
+            config.worker.spill.s3.bucket = String::new();
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("worker.spill.backend = \"{backend}\" requires worker.spill.s3.bucket")),
+                "{backend}: {err}"
+            );
+        }
+        config.worker.spill.backend = "s3".to_string();
+
+        config.worker.spill.s3.bucket = "lake".to_string();
+        config.worker.spill.backend = "local".to_string();
+        let local = config.validate();
+        assert!(
+            local.is_ok(),
+            "the local backend never reads the S3 block: {local:?}"
+        );
+    }
+
+    #[test]
+    fn s3_bucket_of_parses_s3_and_s3a_only() {
+        assert_eq!(s3_bucket_of("s3://lake/wh/"), Some("lake"));
+        assert_eq!(s3_bucket_of(" s3a://lake "), Some("lake"));
+        assert_eq!(s3_bucket_of("main_warehouse"), None);
+        assert_eq!(s3_bucket_of("s3://"), None);
+        assert_eq!(s3_bucket_of("/tmp/wh"), None);
     }
 
     #[test]
