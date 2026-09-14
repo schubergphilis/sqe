@@ -141,8 +141,6 @@ async fn eight_concurrent_schema_lookups_bridge_without_starving_two_workers() {
             catalog,
             StorageConfig::default(),
             WAREHOUSE.to_string(),
-            None,
-            None,
             false,
             false,
         )
