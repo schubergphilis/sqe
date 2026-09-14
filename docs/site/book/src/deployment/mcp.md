@@ -91,6 +91,17 @@ auth-less Nessie) has no such tokens: SQE runs those queries under one identity
 and the source authorizes the engine, not the person. `[mcp.auth] mode` covers
 that shape.
 
+For the simplest case, an anonymous read-only MCP endpoint over a Glue catalog,
+`sqe-server` runs flag-only with no config file at all:
+
+```bash
+sqe-server --glue-catalog glue --allow-s3-prefix s3://lake/ \
+  --mcp-anonymous --mcp-port 8098
+```
+
+See [Run SQE as an MCP server](../getting-started/mcp-server.md) for that path.
+The rest of this section is the config-file form for static and OAuth auth.
+
 ```toml
 [mcp]
 enabled      = true

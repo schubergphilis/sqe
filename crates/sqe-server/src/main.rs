@@ -68,6 +68,30 @@ struct Cli {
     #[arg(long, requires = "glue_catalog")]
     glue_region: Option<String>,
 
+    /// Restrict `--glue-catalog` to these databases. Repeatable, and each
+    /// value may be a comma-separated list. Empty (the default) exposes every
+    /// database in the catalog. For example: `--glue-database claude,afas`.
+    #[arg(long = "glue-database", requires = "glue_catalog", value_delimiter = ',')]
+    glue_database: Vec<String>,
+
+    /// Allow reads from every object-store bucket with the engine's storage
+    /// credentials, bypassing the `--allow-s3-prefix` / `[storage.tvf]`
+    /// allowlist. The explicit "allow all buckets" switch. Safe on a
+    /// single-tenant laptop or a trusted-network read gateway; dangerous on a
+    /// multi-tenant coordinator, where any caller can then read anything the
+    /// credentials reach. Startup logs a warning when it is set.
+    #[arg(long)]
+    allow_all_buckets: bool,
+
+    /// Allow reads from these S3 prefixes, repeatable. Appended to
+    /// `[storage.tvf] allowed_object_store_prefixes`. Reads use the engine's
+    /// own AWS credentials, so this is the access boundary: a Glue table whose
+    /// location is not under one of these prefixes is refused. Needed for a
+    /// flag-only `--glue-catalog` run, where there is no config file to carry
+    /// the list. For example: `--allow-s3-prefix s3://my-lake/`.
+    #[arg(long = "allow-s3-prefix", value_name = "PREFIX")]
+    allow_s3_prefix: Vec<String>,
+
     /// Print the merged, redacted configuration and exit.
     #[arg(long)]
     print_config: bool,
@@ -835,16 +859,19 @@ fn main() -> anyhow::Result<()> {
     }
 
     if cli.print_config {
-        print!(
-            "{}",
+        // The flag-only default has nothing secret to redact; a real file
+        // still goes through the redactor.
+        let toml = if std::path::Path::new(&config_path).exists() || config_path != "sqe.toml" {
             SqeConfig::load_redacted_toml(&config_path)
                 .map_err(|e| anyhow::anyhow!("Failed to load config from {config_path}: {e}"))?
-        );
+        } else {
+            DEFAULT_FLAG_ONLY_CONFIG.to_string()
+        };
+        print!("{toml}");
         return Ok(());
     }
 
-    let config = SqeConfig::load(&config_path)
-        .map_err(|e| anyhow::anyhow!("Failed to load config from {config_path}: {e}"))?;
+    let config = load_config_or_default(&config_path)?;
     sqe_coordinator::credential_refresh::configure_push_timeouts(
         config.coordinator.credential_push_connect_timeout_secs,
         config.coordinator.credential_push_request_timeout_secs,
@@ -855,18 +882,57 @@ fn main() -> anyhow::Result<()> {
     runtime.block_on(async_main())
 }
 
+/// Built-in config for the flag-only path (`sqe-server` with no config file).
+/// It satisfies `validate()` with the no-IdP `[auth]` placeholder the
+/// `glue-readonly` quickstart uses and declares no Iceberg REST catalog, so a
+/// deployment reached only through `--glue-catalog` + `--mcp-anonymous` needs
+/// nothing on disk. Anything real (a Polaris catalog, `[[auth.providers]]`,
+/// storage keys, TLS) still goes in a config file.
+const DEFAULT_FLAG_ONLY_CONFIG: &str = r#"
+[coordinator]
+
+[catalog]
+catalog_url = ""
+
+[auth]
+client_id = "unused-no-idp"
+token_endpoint = "http://127.0.0.1:1/token"
+"#;
+
+/// Load the config file at `path`, or fall back to the built-in flag-only
+/// default when `path` is the conventional `sqe.toml` and it is absent. An
+/// explicitly named file that does not exist is still an error. Shared by the
+/// runtime-building `main` and the serving `async_main` so both agree on which
+/// config the process runs.
+fn load_config_or_default(path: &str) -> anyhow::Result<SqeConfig> {
+    if std::path::Path::new(path).exists() {
+        SqeConfig::load(path).map_err(|e| anyhow::anyhow!("Failed to load config from {path}: {e}"))
+    } else if path == "sqe.toml" {
+        SqeConfig::load_from_str(DEFAULT_FLAG_ONLY_CONFIG)
+            .map_err(|e| anyhow::anyhow!("Failed to build default config: {e}"))
+    } else {
+        Err(anyhow::anyhow!("config file not found: {path}"))
+    }
+}
+
 async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let config_path = cli
+    let explicit_config = cli
         .config
         .clone()
         .or_else(|| cli.config_positional.clone())
-        .or_else(|| std::env::var("SQE_CONFIG").ok())
-        .unwrap_or_else(|| "sqe.toml".to_string());
+        .or_else(|| std::env::var("SQE_CONFIG").ok());
 
-    let mut config = SqeConfig::load(&config_path)
-        .map_err(|e| anyhow::anyhow!("Failed to load config from {config_path}: {e}"))?;
+    // No config file named, and the conventional `sqe.toml` is not in the
+    // working directory: start from the built-in default rather than erroring.
+    // This is the flag-only path -- `sqe-server --glue-catalog glue
+    // --mcp-anonymous --mcp-port 8098` with nothing on disk. The default
+    // carries the no-IdP `[auth]` placeholder that `validate()` wants and an
+    // empty `[catalog]` (no Iceberg REST catalog); the flags below fill in the
+    // rest. Env overlays (`SQE_*`, `AWS_*`) still apply on top.
+    let config_path = explicit_config.unwrap_or_else(|| "sqe.toml".to_string());
+    let mut config = load_config_or_default(&config_path)?;
 
     // CLI overrides land before `validate`, so a flag cannot talk the
     // engine past a check the TOML equivalent would have failed.
@@ -902,6 +968,36 @@ async fn async_main() -> anyhow::Result<()> {
         );
     }
 
+    // The explicit allow-all switch. Logged loud because it removes the
+    // object-store read boundary.
+    if cli.allow_all_buckets {
+        config.storage.tvf.allow_all_object_stores = true;
+        tracing::warn!(
+            "WARNING: --allow-all-buckets is set. Every object-store path is \
+             readable with the engine's storage credentials, bypassing the \
+             prefix allowlist. Use only on a single-tenant or trusted-network \
+             deployment."
+        );
+    }
+
+    // Extra read prefixes from the flag, appended before validate so a
+    // flag-only Glue run has an access boundary without a config file.
+    for prefix in &cli.allow_s3_prefix {
+        if !config
+            .storage
+            .tvf
+            .allowed_object_store_prefixes
+            .iter()
+            .any(|p| p == prefix)
+        {
+            config
+                .storage
+                .tvf
+                .allowed_object_store_prefixes
+                .push(prefix.clone());
+        }
+    }
+
     if let Some(name) = cli.glue_catalog.as_deref() {
         // Appended rather than replacing, so the flag composes with any
         // sidecar roots the config already declares.
@@ -911,6 +1007,7 @@ async fn async_main() -> anyhow::Result<()> {
             location: String::new(),
             region: cli.glue_region.clone(),
             catalog_id: None,
+            databases: cli.glue_database.clone(),
             secret: None,
         });
     }
