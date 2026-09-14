@@ -131,12 +131,230 @@ async fn slow_consumer_wide_rows_stays_within_budget() {
     );
 }
 
-/// Future: pausing 30s must stop further S3 GETs once budgets are full.
+/// `ObjectStore` wrapper that counts data GETs (every `get_opts` that is not
+/// a HEAD) and delegates everything else. `get_range` / `get_ranges` lower
+/// to `get_opts` through the trait's default methods, so a parquet reader's
+/// row-group reads land here too.
+#[derive(Debug)]
+struct CountingStore {
+    inner: Arc<dyn object_store::ObjectStore>,
+    gets: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl std::fmt::Display for CountingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CountingStore({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for CountingStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if !options.head {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.get_opts(location, options).await
+    }
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        opts: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+/// A parquet file whose bytes on disk are close to its decoded size: every
+/// payload is distinct, so neither dictionary encoding nor a codec can fold
+/// it (the harness's `generate_wide_parquet` repeats one string and lands at
+/// 80 KiB per 2 MiB decoded). Returns the file size in bytes.
+fn write_incompressible_parquet(
+    root: &std::path::Path,
+    object_key: &str,
+    num_batches: usize,
+    rows_per_batch: usize,
+    payload_len: usize,
+) -> anyhow::Result<u64> {
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use parquet::basic::Compression;
+    use parquet::file::properties::WriterProperties;
+
+    let file_path = root.join(object_key);
+    if let Some(parent) = file_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let props = WriterProperties::builder()
+        .set_compression(Compression::UNCOMPRESSED)
+        .set_dictionary_enabled(false)
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        std::fs::File::create(&file_path)?,
+        Arc::clone(&schema),
+        Some(props),
+    )?;
+    let mut next_id: i64 = 0;
+    for _ in 0..num_batches {
+        let ids: Vec<i64> = (next_id..next_id + rows_per_batch as i64).collect();
+        let payloads: Vec<String> = ids
+            .iter()
+            .map(|id| format!("{id:0>width$x}", width = payload_len))
+            .collect();
+        next_id += rows_per_batch as i64;
+        writer.write(&RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(payloads)),
+            ],
+        )?)?;
+    }
+    writer.close()?;
+    Ok(std::fs::metadata(&file_path)?.len())
+}
+
+/// #407: once the scan budget is full, a paused client must stop the worker
+/// from fetching more of the object store, not just from decoding it.
+///
+/// Eight uncompressed files of about 2 MiB each under a 4 MiB scan budget.
+/// The fetch lane is a quarter of that (1 MiB) and one file's charge is
+/// capped at half the lane, so at most two files are open at a time; the
+/// decode lane (3 MiB) holds about five of the 550 KiB batches. The client
+/// takes two batches and pauses. With the decode lane full the producer
+/// blocks in `acquire`, the open files cannot drain, their fetch permits are
+/// never released, and no third file can be opened: the GET counter must
+/// not move for the rest of the pause. Afterwards the scan drains to the end
+/// and both lanes release to zero.
 #[tokio::test]
-#[ignore = "deferred; phase-1 stretch: assert no further GETs during 30s pause once budgets full"]
 async fn slow_consumer_caps_bytes_when_client_pauses() {
-    panic!(
-        "Wire a CountingStore and assert GET count freezes for 30s while the \
-         client is paused and scan+flight budgets are full"
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut keys = Vec::new();
+    let mut sizes = Vec::new();
+    for i in 0..8 {
+        let key = format!("data/paused_{i}.parquet");
+        let size = write_incompressible_parquet(tmp.path(), &key, 4, 2048, 256)
+            .expect("generate parquet");
+        keys.push(key);
+        sizes.push(size);
+    }
+    assert!(
+        sizes.iter().all(|s| *s > 1024 * 1024),
+        "each file must exceed the per-file fetch cap so the lane admits few files: {sizes:?}"
     );
+
+    const SCAN_BUDGET: usize = 4 * 1024 * 1024;
+    let pool = Arc::new(FairSpillPool::new(WORKER_MEMORY_LIMIT_BYTES));
+    let runtime = Arc::new(
+        RuntimeEnvBuilder::new()
+            .with_memory_pool(pool.clone())
+            .build()
+            .expect("runtime"),
+    );
+    let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
+    let scan_budget = ScanBudget::new(SCAN_BUDGET, Some(pool.clone()));
+    let metrics = worker_metrics();
+    let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(CountingStore {
+        inner: local_store(tmp.path()),
+        gets: gets.clone(),
+    });
+
+    let (_schema, mut stream) = execute_scan_streaming_with_store(
+        local_scan_task(keys, sizes),
+        Some(metrics.clone()),
+        ctx,
+        store,
+        None,
+        None,
+        None,
+        false,
+        Some(scan_budget.clone()),
+    )
+    .await
+    .expect("setup");
+
+    let mut rows = 0usize;
+    for _ in 0..2 {
+        let accounted = stream
+            .next()
+            .await
+            .expect("two batches before the pause")
+            .expect("batch");
+        rows += accounted.get().num_rows();
+    }
+
+    // Let whatever was already in flight land, then freeze the counter.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let gets_at_pause = gets.load(Ordering::SeqCst);
+    assert!(gets_at_pause > 0, "the first two batches needed at least one GET");
+    let used_at_pause = scan_budget.used_bytes();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        gets.load(Ordering::SeqCst),
+        gets_at_pause,
+        "the worker fetched more of the store while the client was paused with a full budget \
+         (scan budget used at pause: {used_at_pause} of {SCAN_BUDGET})"
+    );
+    assert!(
+        scan_budget.used_bytes() <= SCAN_BUDGET + scan_budget.unit_bytes(),
+        "live scan ownership {} exceeded the budget during the pause",
+        scan_budget.used_bytes()
+    );
+
+    while let Some(item) = stream.next().await {
+        rows += item.expect("drain after the pause").get().num_rows();
+    }
+    assert_eq!(rows, 8 * 4 * 2048, "every row of every file arrives after the pause");
+    // The freeze was backpressure, not "nothing left to fetch": the files the
+    // fetch lane refused during the pause were fetched once the client drained.
+    assert!(
+        gets.load(Ordering::SeqCst) > gets_at_pause,
+        "no GETs after the pause means the lane had already admitted every file \
+         and the frozen counter proved nothing (gets at pause: {gets_at_pause})"
+    );
+    assert_eq!(scan_budget.used_bytes(), 0);
+    assert_eq!(pool.reserved(), 0);
 }
