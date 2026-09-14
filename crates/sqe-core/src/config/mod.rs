@@ -2897,6 +2897,13 @@ pub struct HiveRootConfig {
     /// caller's own account, which is what almost every deployment wants.
     #[serde(default)]
     pub catalog_id: Option<String>,
+    /// `glue` only: restrict the root to these databases. Empty (the
+    /// default) exposes every database in the catalog. When set,
+    /// `SHOW SCHEMAS` lists only these and a table in any other database is
+    /// not found, so a shared catalog can be scoped to the databases one
+    /// deployment should see.
+    #[serde(default)]
+    pub databases: Vec<String>,
     /// Optional named secret (see `CREATE SECRET`) used when a manifest
     /// under this root does not name its own `sqe.secret`. Currently
     /// unused by `build_hive_root`/`session_hive_catalog`, which resolve a
@@ -3060,6 +3067,16 @@ pub struct TvfPolicy {
     /// object-store credentials should set this `false`.
     #[serde(default = "default_true")]
     pub allow_inline_credentials: bool,
+    /// When `true`, every object-store path is readable with the engine's
+    /// storage credentials, bypassing `allowed_object_store_prefixes`
+    /// entirely. Default `false` (fail-closed). This is the explicit
+    /// "allow all buckets" switch: convenient for a single-tenant laptop or
+    /// a trusted-network read gateway where the engine's credentials already
+    /// scope what is reachable, and dangerous on a multi-tenant coordinator,
+    /// where it lets any caller read anything those credentials can. The
+    /// startup log warns when it is on.
+    #[serde(default)]
+    pub allow_all_object_stores: bool,
 }
 
 impl Default for TvfPolicy {
@@ -3076,6 +3093,7 @@ impl Default for TvfPolicy {
             allowed_object_store_prefixes: Vec::new(),
             object_store_admin_roles: Vec::new(),
             allow_inline_credentials: true,
+            allow_all_object_stores: false,
         }
     }
 }
@@ -3320,6 +3338,12 @@ impl TvfPolicy {
         inline_credentials: bool,
     ) -> Result<(), String> {
         if caller.trusted || (inline_credentials && self.allow_inline_credentials) {
+            return Ok(());
+        }
+        // Explicit allow-all: the operator has taken responsibility for the
+        // boundary (single tenant, or the engine's credentials already scope
+        // what is reachable). Startup logs a warning when this is set.
+        if self.allow_all_object_stores {
             return Ok(());
         }
         if !self.object_store_admin_roles.is_empty()
@@ -6631,6 +6655,7 @@ partial_progress_batch = 5
             location: "s3://lake/wh/".to_string(),
             region: None,
             catalog_id: None,
+            databases: Vec::new(),
             secret: None,
         });
         let err = config.validate().unwrap_err().to_string();

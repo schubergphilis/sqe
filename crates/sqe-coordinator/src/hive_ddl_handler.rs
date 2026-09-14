@@ -469,6 +469,68 @@ impl HiveDdlHandler {
         Ok(visible)
     }
 
+    /// `SHOW SCHEMAS FROM <root>`: the databases the root's metadata source
+    /// lists, sorted. No per-database policy gate exists (policies attach to
+    /// tables), so this is the source's own answer.
+    pub async fn list_databases(&self, root: &str) -> Result<Vec<String>, SqeError> {
+        let source = self.source_for(root)?;
+        let mut names = source
+            .list_databases()
+            .await
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
+        names.sort();
+        Ok(names)
+    }
+
+    /// `SHOW COLUMNS FROM <root>.<database>.<table>` answered from the
+    /// table's own manifest: `(column_name, data_type)` for the data columns
+    /// followed by the partition keys, minus the columns the caller's policy
+    /// restricts, with the Arrow type the scan would produce.
+    ///
+    /// The `information_schema.columns` route the Iceberg path takes
+    /// enumerates every schema and table of every catalog first to fill the
+    /// listing snapshots; against a live Glue catalog of a hundred databases
+    /// that is minutes of GetTables calls for one DESCRIBE.
+    pub async fn describe_table(
+        &self,
+        user: &SessionUser,
+        root: &str,
+        database: &str,
+        table: &str,
+    ) -> Result<Vec<(String, String)>, SqeError> {
+        let source = self.source_for(root)?;
+        let manifest = source
+            .get(database, table)
+            .await
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
+
+        let policy = self.resolve_policy(user, database, table, &manifest).await;
+        if policy_denies_all(&policy) {
+            // Same wording as `show_create_table`: denied reads as absent.
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
+                "hive_external: table not found: {database}.{table}"
+            )));
+        }
+
+        let mut columns = Vec::with_capacity(
+            manifest.storage_descriptor.columns.len() + manifest.partition_keys.len(),
+        );
+        for column in manifest
+            .storage_descriptor
+            .columns
+            .iter()
+            .chain(manifest.partition_keys.iter())
+        {
+            if policy.restricted_columns.contains(&column.name) {
+                continue;
+            }
+            let data_type = sqe_catalog::hive::serde_map::arrow_type(&column.r#type)
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
+            columns.push((column.name.clone(), data_type.to_string()));
+        }
+        Ok(columns)
+    }
+
     /// `ALTER TABLE ... ADD PARTITION` against a Hive root: append one
     /// index entry and rewrite the manifest. Data files are never touched.
     pub async fn add_partition(

@@ -89,6 +89,7 @@
 - [Storage backends (S3 / R2 / GCS / ADLS / HTTPS / hf://)](./getting-started/storage-backends.md)
 - [Building from Source](./getting-started/building.md)
 - [Using the CLI](./getting-started/cli.md)
+- [Run SQE as an MCP server](./getting-started/mcp-server.md)
 
 ---
 
