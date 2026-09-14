@@ -1220,14 +1220,11 @@ impl WriteHandler {
                 format!("{what}: physical planning failed: {e}"),
             )
         })?;
-        // The merge fan-in of a partitioned SortExec is the number of sorted
-        // runs it merges, one per input partition, so the gate is sized from
-        // the session's `target_partitions` rather than the rule's default.
-        let fan_in = state.config_options().execution.target_partitions.max(1);
+        // The rule budgets one merge buffer per input partition, read from
+        // the session's `target_partitions` in `optimize`.
         let gate = sqe_planner::SortMemoryRule::new(sqe_planner::sort_grant_bytes(
             &self.config.query.max_query_memory,
-        ))
-        .with_max_fan_in(fan_in);
+        ));
         // The refusal is `DataFusionError::ResourcesExhausted`; the `From`
         // conversion keeps it `ResourceExhausted` on the wire.
         let physical = gate
