@@ -69,6 +69,26 @@ type = "hms"
 uri = "metastore.example.com:9083"
 warehouse = "s3a://my-bucket/wh"
 
+# RustFS S3 Tables: the Iceberg REST catalog built into RustFS 1.0.0-rc.6.
+# It requires SigV4 (service name "s3") but does not advertise
+# `rest.sigv4-enabled` in /v1/config, so the signing name is set here and
+# SQE signs client-side. The signature uses the `[storage]` access keys
+# (the RustFS root keys); without them the AWS SDK chain
+# (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) is consulted instead.
+# RustFS vends no credentials, so `require_vended_credentials` must be
+# false and `[storage]` must point at the same RustFS endpoint.
+# Quickstart: quickstart/rustfs-s3tables/.
+[catalogs.rustfs]
+catalog_url = "http://rustfs:9000/iceberg"
+warehouse = "warehouse"            # the table bucket
+require_vended_credentials = false
+[catalogs.rustfs.backend]
+type = "rest"
+[catalogs.rustfs.auth]
+type = "aws"
+signing_name = "s3"
+signing_region = "us-east-1"
+
 [query]
 # Optional. Picks the catalog DataFusion uses for unqualified
 # names. Defaults to the first entry from `[catalogs.*]` sorted
@@ -190,6 +210,7 @@ IMDS).
 | Unity Catalog OSS | `https://unity/api/2.1/unity-catalog/iceberg` | bearer (Databricks) / anonymous (OSS) |
 | AWS Glue Iceberg REST | `https://glue.<region>.amazonaws.com/iceberg` | AWS SigV4 (auto-detected) |
 | AWS S3 Tables REST | `https://s3tables.<region>.amazonaws.com/iceberg/v1` | AWS SigV4 (auto-detected) |
+| RustFS S3 Tables 1.0.0-rc.6+ | `http://rustfs:9000/iceberg` | AWS SigV4, service `s3` (`auth.type = "aws"`, `signing_name = "s3"`) |
 
 REST is the most-tested path. Every benchmark suite (TPC-H, SSB,
 TPC-DS, TPC-C, TPC-E, TPC-BB, ClickBench) runs against the local

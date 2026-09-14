@@ -252,6 +252,133 @@ fn user_circuit_breaker(token_fingerprint: &str, catalog: &str) -> Arc<CircuitBr
     USER_CIRCUIT_BREAKERS.get_or_create(token_fingerprint, catalog)
 }
 
+/// REST catalog properties that switch the vendored client to SigV4 on the
+/// client side.
+///
+/// AWS's REST endpoints (Glue, S3 Tables) advertise `rest.sigv4-enabled`
+/// plus the signing name and region in their `/v1/config`, and the client
+/// picks that up on its own; with `auth = { type = "aws" }` and no fields
+/// set this returns nothing and that path is unchanged. A catalog that
+/// requires SigV4 without advertising it (RustFS S3 Tables answers
+/// `/v1/config` with no `rest.*` keys and rejects unsigned requests with
+/// 403 "Signature is required") needs `signing_name` in the config; the
+/// region defaults to `[storage] s3_region`, which is also what the
+/// object-store side signs with.
+pub fn client_side_sigv4_props(
+    catalog: &sqe_core::config::CatalogConfig,
+    storage: &StorageConfig,
+) -> HashMap<String, String> {
+    let mut props = HashMap::new();
+    if let Some(sqe_core::config::CatalogAuthConfig::Aws {
+        signing_name: Some(name),
+        signing_region,
+    }) = catalog.auth.as_ref()
+    {
+        let region = signing_region
+            .as_deref()
+            .filter(|r| !r.trim().is_empty())
+            .unwrap_or(storage.s3_region.as_str());
+        props.insert("rest.sigv4-enabled".to_string(), "true".to_string());
+        props.insert("rest.signing-name".to_string(), name.clone());
+        props.insert("rest.signing-region".to_string(), region.to_string());
+    }
+    props
+}
+
+/// SigV4 signer for SQE's own raw HTTP calls to the catalog (the HEAD
+/// authorization check, ETag revalidation, the view and commit endpoints).
+/// Built from the same `rest.*` and `s3.*` properties the vendored client
+/// receives, so both paths sign with one identity.
+#[cfg(feature = "rest-sigv4")]
+type RawSigner = iceberg_catalog_rest::SigV4Signer;
+
+/// Stand-in when SigV4 is compiled out. Never constructed:
+/// [`raw_sigv4_signer`] returns `None` without the feature.
+#[cfg(not(feature = "rest-sigv4"))]
+struct RawSigner;
+
+#[cfg(not(feature = "rest-sigv4"))]
+impl RawSigner {
+    async fn sign_headers(
+        &self,
+        _method: &str,
+        _url: &str,
+        _headers: &mut reqwest::header::HeaderMap,
+        _body: &[u8],
+    ) -> iceberg::Result<()> {
+        Ok(())
+    }
+}
+
+/// The raw-path signer for a catalog whose configured properties turn on
+/// client-side SigV4 (see [`client_side_sigv4_props`]). Static `s3.*` keys
+/// take precedence over the AWS SDK provider chain, mirroring the vendored
+/// client. SigV4 that a server only advertises through `/v1/config` is not
+/// visible here; those catalogs keep the bearer on the raw path as before.
+fn raw_sigv4_signer(props: &HashMap<String, String>) -> Option<Arc<RawSigner>> {
+    #[cfg(feature = "rest-sigv4")]
+    {
+        let enabled = props
+            .get("rest.sigv4-enabled")
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        if !enabled {
+            return None;
+        }
+        let name = props.get("rest.signing-name")?;
+        let region = props.get("rest.signing-region")?;
+        let signer = RawSigner::new(region.clone(), name.clone());
+        let signer = match (
+            props.get("s3.access-key-id"),
+            props.get("s3.secret-access-key"),
+        ) {
+            (Some(access_key), Some(secret_key))
+                if !access_key.is_empty() && !secret_key.is_empty() =>
+            {
+                signer.with_static_credentials(
+                    access_key.clone(),
+                    secret_key.clone(),
+                    props.get("s3.session-token").cloned(),
+                )
+            }
+            _ => signer,
+        };
+        Some(Arc::new(signer))
+    }
+    #[cfg(not(feature = "rest-sigv4"))]
+    {
+        let _ = props;
+        None
+    }
+}
+
+/// Attach SQE's catalog identity to a raw request: a SigV4 signature when
+/// the catalog is signed, otherwise the session bearer. The body must
+/// already be set, because the signature covers its bytes.
+async fn authenticate_raw_request(
+    req: reqwest::RequestBuilder,
+    sigv4: Option<&RawSigner>,
+    bearer_token: &str,
+) -> sqe_core::Result<reqwest::Request> {
+    let build_err =
+        |e: reqwest::Error| SqeError::catalog_src(format!("Failed to build catalog request: {e}"), e);
+    let Some(signer) = sigv4 else {
+        return req.bearer_auth(bearer_token).build().map_err(build_err);
+    };
+    let mut req = req.build().map_err(build_err)?;
+    let body = req
+        .body()
+        .and_then(|b| b.as_bytes())
+        .map(<[u8]>::to_vec)
+        .unwrap_or_default();
+    let url = req.url().to_string();
+    let method = req.method().as_str().to_string();
+    signer
+        .sign_headers(&method, &url, req.headers_mut(), &body)
+        .await
+        .map_err(|e| SqeError::catalog_src(format!("Failed to sign catalog request: {e}"), e))?;
+    Ok(req)
+}
+
 fn insert_s3_location_props(props: &mut HashMap<String, String>, storage: &StorageConfig) {
     if !storage.s3_endpoint.is_empty() {
         props.insert("s3.endpoint".to_string(), storage.s3_endpoint.clone());
@@ -1100,6 +1227,12 @@ pub struct SessionCatalog {
     token_fingerprint: String,
     storage_config: StorageConfig,
     http_client: reqwest::Client,
+    /// Signer for the raw REST path when the catalog is configured for
+    /// client-side SigV4; `None` means the raw path sends the bearer.
+    sigv4: Option<Arc<RawSigner>>,
+    /// Extra catalog properties this session was built with (the
+    /// client-side SigV4 set), carried over to sibling warehouses.
+    extra_props: HashMap<String, String>,
     /// Shared circuit breaker for Polaris REST calls.
     circuit_breaker: Arc<CircuitBreaker>,
     /// When true, catalog FileIO must use Polaris-vended credentials.
@@ -1420,6 +1553,8 @@ impl SessionCatalog {
             token_fingerprint: "unconfigured".to_string(),
             storage_config: storage_config.clone(),
             http_client: shared_http_client(),
+            sigv4: None,
+            extra_props: HashMap::new(),
             circuit_breaker: user_circuit_breaker("unconfigured", "unconfigured"),
             require_vended_credentials: false,
             table_cache: table_cache.unwrap_or_else(|| TableMetadataCache::new(0)),
@@ -1484,7 +1619,7 @@ impl SessionCatalog {
     ) -> sqe_core::Result<Self> {
         match &catalog.backend {
             sqe_core::config::CatalogBackend::Rest => {
-                Self::new(
+                Self::new_with_props(
                     &catalog.catalog_url,
                     &catalog.warehouse,
                     bearer_token,
@@ -1493,6 +1628,7 @@ impl SessionCatalog {
                     Some(shared_http_client_for(catalog)),
                     None,
                     catalog.require_vended_credentials,
+                    client_side_sigv4_props(catalog, storage),
                 )
                 .await
             }
@@ -1512,6 +1648,9 @@ impl SessionCatalog {
     /// Per-catalog variant. Same logic as `for_session_other_backend`
     /// but scoped to a single `CatalogConfig` so the multi-catalog
     /// path can iterate over `[catalogs.*]` entries.
+    ///
+    /// (See the free function [`client_side_sigv4_props`] for the REST
+    /// arm's SigV4 switch.)
     ///
     /// `catalog`, `storage`, `bearer_token`, and `table_cache` are consumed
     /// only when one of the optional backend features (`hms`, `glue`,
@@ -1580,6 +1719,8 @@ impl SessionCatalog {
             token_fingerprint,
             storage_config: storage.clone(),
             http_client: shared_http_client(),
+            sigv4: None,
+            extra_props: HashMap::new(),
             circuit_breaker,
             require_vended_credentials: catalog.require_vended_credentials,
             table_cache,
@@ -1757,6 +1898,8 @@ impl SessionCatalog {
             token_fingerprint: token_fingerprint.to_string(),
             storage_config: StorageConfig::default(),
             http_client: shared_http_client(),
+            sigv4: None,
+            extra_props: HashMap::new(),
             circuit_breaker: user_circuit_breaker(token_fingerprint, "http://127.0.0.1:1"),
             require_vended_credentials: false,
             table_cache,
@@ -1773,7 +1916,7 @@ impl SessionCatalog {
     /// `team_a_data.public.events`). Authorization is unchanged — the same
     /// user token is presented, so Polaris/OPA still decide access.
     pub async fn for_sibling_warehouse(&self, warehouse: &str) -> sqe_core::Result<Self> {
-        Self::new(
+        Self::new_with_props(
             &self.catalog_url,
             warehouse,
             &self.bearer_token,
@@ -1782,6 +1925,7 @@ impl SessionCatalog {
             Some(self.http_client.clone()),
             Some(self.circuit_breaker.clone()),
             self.require_vended_credentials,
+            self.extra_props.clone(),
         )
         .await
     }
@@ -1796,6 +1940,35 @@ impl SessionCatalog {
         http_client: Option<reqwest::Client>,
         circuit_breaker: Option<Arc<CircuitBreaker>>,
         require_vended_credentials: bool,
+    ) -> sqe_core::Result<Self> {
+        Self::new_with_props(
+            catalog_url,
+            warehouse,
+            bearer_token,
+            storage_config,
+            table_cache,
+            http_client,
+            circuit_breaker,
+            require_vended_credentials,
+            HashMap::new(),
+        )
+        .await
+    }
+
+    /// [`Self::new`] plus caller-supplied REST catalog properties, merged
+    /// last so they win over the derived ones. Used for the client-side
+    /// SigV4 switch (see [`client_side_sigv4_props`]).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_props(
+        catalog_url: &str,
+        warehouse: &str,
+        bearer_token: &str,
+        storage_config: &StorageConfig,
+        table_cache: Option<TableMetadataCache>,
+        http_client: Option<reqwest::Client>,
+        circuit_breaker: Option<Arc<CircuitBreaker>>,
+        require_vended_credentials: bool,
+        extra_props: HashMap<String, String>,
     ) -> sqe_core::Result<Self> {
         let token_fingerprint = rest_catalog_token_fingerprint(bearer_token);
 
@@ -1831,11 +2004,15 @@ impl SessionCatalog {
         // also disable opendal config/IMDS load so FileIO cannot fall
         // back to AWS_ACCESS_KEY_ID, ~/.aws/config, IRSA, or IMDSv2.
         insert_s3_location_props(&mut props, storage_config);
+        props.extend(extra_props.iter().map(|(k, v)| (k.clone(), v.clone())));
         if require_vended_credentials {
             insert_s3_vended_isolation_props(&mut props);
         } else {
             insert_s3_credential_props(&mut props, storage_config);
         }
+        // SQE's raw HEAD/GET/POST calls bypass the vendored client's
+        // authenticator, so they need their own signer for a SigV4 catalog.
+        let sigv4 = raw_sigv4_signer(&props);
 
         // RisingWave fork uses CatalogBuilder::load(name, props) pattern.
         // Storage factory (OpenDAL S3) is configured automatically from the s3.*
@@ -1896,6 +2073,8 @@ impl SessionCatalog {
             token_fingerprint,
             storage_config: storage_config.clone(),
             http_client,
+            sigv4,
+            extra_props,
             circuit_breaker,
             require_vended_credentials,
             table_cache,
@@ -2212,6 +2391,7 @@ impl SessionCatalog {
                     // cached, so there is no entry for an ETag to attach to.
                     if cached {
                         let http_client = self.http_client.clone();
+                        let sigv4 = self.sigv4.clone();
                         let bearer_token = self.bearer_token.clone();
                         let url = self.table_url(table_ident);
                         let table_cache = self.table_cache.clone();
@@ -2225,8 +2405,13 @@ impl SessionCatalog {
                         );
                         tokio::spawn(
                             async move {
-                                let etag =
-                                    fetch_table_etag_inner(&http_client, &bearer_token, &url).await;
+                                let etag = fetch_table_etag_inner(
+                                    &http_client,
+                                    sigv4.as_deref(),
+                                    &bearer_token,
+                                    &url,
+                                )
+                                .await;
                                 if let Some(e) = etag.as_deref() {
                                     debug!(table = %table_ident_log, etag = %e, "Captured ETag for table");
                                 }
@@ -2278,13 +2463,14 @@ impl SessionCatalog {
         let mut req = self
             .http_client
             .head(self.table_url(table_ident))
-            .bearer_auth(&self.bearer_token)
             .header("X-Request-ID", Uuid::new_v4().to_string());
         for (k, v) in trace_context_http_headers() {
             req = req.header(k, v);
         }
+        let req =
+            authenticate_raw_request(req, self.sigv4.as_deref(), &self.bearer_token).await?;
 
-        let response = req.send().await.map_err(|e| {
+        let response = self.http_client.execute(req).await.map_err(|e| {
             self.circuit_breaker.record_failure();
             SqeError::catalog_src(format!("Failed to authorize table {table_ident}: {e}"), e)
         })?;
@@ -2455,7 +2641,6 @@ impl SessionCatalog {
         let mut req = self
             .http_client
             .request(method, url)
-            .bearer_auth(&self.bearer_token)
             .header("X-Request-ID", Uuid::new_v4().to_string());
         for (k, v) in trace_context_http_headers() {
             req = req.header(k, v);
@@ -2466,8 +2651,10 @@ impl SessionCatalog {
         if let Some(body) = body {
             req = req.json(&body);
         }
+        let req =
+            authenticate_raw_request(req, self.sigv4.as_deref(), &self.bearer_token).await?;
 
-        let resp = match req.send().await {
+        let resp = match self.http_client.execute(req).await {
             Ok(resp) => resp,
             Err(e) => {
                 self.circuit_breaker.record_failure();
@@ -2660,17 +2847,24 @@ fn view_schema_from_json(
 /// HEAD-based ETag fetch usable from a background `tokio::spawn`.
 async fn fetch_table_etag_inner(
     http_client: &reqwest::Client,
+    sigv4: Option<&RawSigner>,
     bearer_token: &str,
     url: &str,
 ) -> Option<String> {
     let mut req = http_client
         .head(url)
-        .bearer_auth(bearer_token)
         .header("X-Request-ID", Uuid::new_v4().to_string());
     for (k, v) in trace_context_http_headers() {
         req = req.header(k, v);
     }
-    match req.send().await {
+    let req = match authenticate_raw_request(req, sigv4, bearer_token).await {
+        Ok(req) => req,
+        Err(e) => {
+            debug!(url = %url, error = %e, "Failed to sign ETag request (non-fatal)");
+            return None;
+        }
+    };
+    match http_client.execute(req).await {
         Ok(resp) => resp
             .headers()
             .get("etag")
@@ -3190,6 +3384,71 @@ mod cache_capacity_tests {
             s3_path_style: true,
             ..Default::default()
         }
+    }
+
+    /// Client-side SigV4 (RustFS S3 Tables): `signing_name` on the `aws`
+    /// auth block turns the switch on, the region defaults to the storage
+    /// region, and a plain `aws` block (Glue, AWS S3 Tables, which advertise
+    /// SigV4 themselves) adds nothing.
+    #[test]
+    fn client_side_sigv4_props_follow_the_aws_auth_block() {
+        let storage = storage_with_keys();
+
+        let rustfs: sqe_core::config::CatalogConfig = toml::from_str(
+            r#"
+catalog_url = "http://rustfs:9000/iceberg"
+warehouse = "warehouse"
+[auth]
+type = "aws"
+signing_name = "s3"
+"#,
+        )
+        .unwrap();
+        let props = super::client_side_sigv4_props(&rustfs, &storage);
+        assert_eq!(props.get("rest.sigv4-enabled").map(String::as_str), Some("true"));
+        assert_eq!(props.get("rest.signing-name").map(String::as_str), Some("s3"));
+        assert_eq!(
+            props.get("rest.signing-region").map(String::as_str),
+            Some("us-east-1"),
+            "region falls back to [storage] s3_region"
+        );
+
+        let explicit: sqe_core::config::CatalogConfig = toml::from_str(
+            r#"
+catalog_url = "http://rustfs:9000/iceberg"
+warehouse = "warehouse"
+[auth]
+type = "aws"
+signing_name = "s3"
+signing_region = "eu-west-1"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            super::client_side_sigv4_props(&explicit, &storage)
+                .get("rest.signing-region")
+                .map(String::as_str),
+            Some("eu-west-1")
+        );
+
+        let aws_native: sqe_core::config::CatalogConfig = toml::from_str(
+            r#"
+catalog_url = "https://glue.eu-central-1.amazonaws.com/iceberg"
+warehouse = "123456789012"
+[auth]
+type = "aws"
+"#,
+        )
+        .unwrap();
+        assert!(
+            super::client_side_sigv4_props(&aws_native, &storage).is_empty(),
+            "AWS endpoints advertise SigV4 themselves; nothing is forced client-side"
+        );
+
+        let bearer: sqe_core::config::CatalogConfig =
+            toml::from_str("catalog_url = \"http://polaris:8181/api/catalog\"\nwarehouse = \"w\"")
+                .unwrap();
+        assert!(super::client_side_sigv4_props(&bearer, &storage).is_empty());
     }
 
     #[tokio::test]
@@ -5207,5 +5466,154 @@ mod view_rest_tests {
                 .any(|r| r.method == wiremock::http::Method::DELETE),
             "replace must not drop the view"
         );
+    }
+}
+
+/// SQE's raw REST path (HEAD authorization, views, commits) bypasses the
+/// vendored client's authenticator. Against a catalog configured for
+/// client-side SigV4 (RustFS S3 Tables) it must sign those calls itself
+/// instead of sending an empty bearer, which RustFS answers with 400
+/// "invalid header: authorization".
+#[cfg(all(test, feature = "rest-sigv4"))]
+mod sigv4_raw_tests {
+    use std::collections::HashMap;
+
+    use iceberg::{NamespaceIdent, TableIdent};
+    use wiremock::matchers::{header_exists, header_regex, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::SessionCatalog;
+    use sqe_core::config::StorageConfig;
+
+    const WAREHOUSE: &str = "warehouse";
+    const TABLE_PATH: &str = "/v1/warehouse/namespaces/demo/tables/events";
+
+    fn events() -> TableIdent {
+        TableIdent::new(NamespaceIdent::new("demo".to_string()), "events".to_string())
+    }
+
+    fn rustfs_storage() -> StorageConfig {
+        StorageConfig {
+            s3_access_key: "root".to_string(),
+            s3_secret_key: "s3cr3t".to_string().into(),
+            s3_region: "us-east-1".to_string(),
+            ..StorageConfig::default()
+        }
+    }
+
+    fn sigv4_props() -> HashMap<String, String> {
+        HashMap::from([
+            ("rest.sigv4-enabled".to_string(), "true".to_string()),
+            ("rest.signing-name".to_string(), "s3".to_string()),
+            ("rest.signing-region".to_string(), "us-east-1".to_string()),
+        ])
+    }
+
+    async fn session(server: &MockServer, props: HashMap<String, String>) -> SessionCatalog {
+        SessionCatalog::new_with_props(
+            &server.uri(),
+            WAREHOUSE,
+            "",
+            &rustfs_storage(),
+            None,
+            None,
+            None,
+            false,
+            props,
+        )
+        .await
+        .expect("construct session catalog")
+    }
+
+    #[tokio::test]
+    async fn raw_head_is_sigv4_signed_with_the_payload_hash_header() {
+        let server = MockServer::start().await;
+        // Only a signed HEAD carrying the S3 payload hash is answered;
+        // anything else falls through to wiremock's 404.
+        Mock::given(method("HEAD"))
+            .and(path(TABLE_PATH))
+            .and(header_regex(
+                "authorization",
+                r"^AWS4-HMAC-SHA256 Credential=root/\d{8}/us-east-1/s3/aws4_request",
+            ))
+            .and(header_exists("x-amz-content-sha256"))
+            .and(header_exists("x-amz-date"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let session = session(&server, sigv4_props()).await;
+        session
+            .authorize_table_access(&events())
+            .await
+            .expect("signed HEAD is accepted");
+    }
+
+    #[tokio::test]
+    async fn raw_post_signs_the_json_body_it_sends() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(TABLE_PATH))
+            .and(header_regex("authorization", r"^AWS4-HMAC-SHA256 "))
+            // Hex SHA-256 of the exact body bytes; a signer that hashed an
+            // empty body would send e3b0c442... instead.
+            .and(header_regex("x-amz-content-sha256", r"^[0-9a-f]{64}$"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+
+        let session = session(&server, sigv4_props()).await;
+        session
+            .commit_schema_update(&events(), Vec::new(), Vec::new())
+            .await
+            .expect("signed commit is accepted");
+
+        let requests = server.received_requests().await.unwrap();
+        let post = requests
+            .iter()
+            .find(|r| r.method == wiremock::http::Method::POST)
+            .expect("one POST");
+        let hash = post.headers.get("x-amz-content-sha256").unwrap();
+        let expected = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(&post.body)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        assert_eq!(hash.to_str().unwrap(), expected, "payload hash covers the body");
+        assert!(
+            post.headers.get("authorization").unwrap().to_str().unwrap().starts_with("AWS4-HMAC-SHA256"),
+            "no bearer on a signed catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_sigv4_props_the_raw_path_still_sends_the_bearer() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path(TABLE_PATH))
+            .and(header_regex("authorization", r"^Bearer session-token$"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let session = SessionCatalog::new_with_props(
+            &server.uri(),
+            WAREHOUSE,
+            "session-token",
+            &rustfs_storage(),
+            None,
+            None,
+            None,
+            false,
+            HashMap::new(),
+        )
+        .await
+        .expect("construct session catalog");
+        session
+            .authorize_table_access(&events())
+            .await
+            .expect("bearer HEAD is accepted");
     }
 }

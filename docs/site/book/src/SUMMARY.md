@@ -101,6 +101,7 @@
 - [Polaris + Ranger + Keycloak (fine-grained masking + Spark parity)](./quickstart/polaris-ranger-keycloak.md)
 - [Polaris + Ranger (service principal)](./quickstart/polaris-ranger-service-principal.md)
 - [Project Nessie (Iceberg REST catalog)](./quickstart/nessie.md)
+- [RustFS S3 Tables (Iceberg REST catalog inside the object store)](./quickstart/rustfs-s3tables.md)
 - [Unity Catalog OSS (Iceberg REST, read-only)](./quickstart/unity-oss.md)
 - [AWS S3 Tables (managed Iceberg)](./quickstart/aws-s3-tables.md)
 - [AWS Glue Data Catalog](./quickstart/aws-glue.md)

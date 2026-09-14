@@ -1,0 +1,108 @@
+# SQE quickstart: RustFS S3 Tables (the Iceberg REST catalog built into RustFS).
+#
+# RustFS 1.0.0-rc.6 ships an Iceberg REST catalog at /iceberg on the S3 port.
+# There is no separate catalog service: the table bucket IS the warehouse, and
+# the catalog is authenticated with the same SigV4 keys as the S3 API (service
+# name "s3"). RustFS does not advertise `rest.sigv4-enabled` in /v1/config, so
+# SQE is told to sign client-side via `[catalogs.rustfs.auth] type = "aws"`.
+#
+# This stack has no identity provider: SQE uses its `anonymous` auth provider
+# (dev mode). The point of this quickstart is the catalog, not auth.
+#
+#   cp .env.example .env
+#   docker compose up -d --wait
+#   ./run.sh
+
+services:
+  # ── RustFS: S3 object store + S3 Tables Iceberg REST catalog ──────────
+  rustfs:
+    image: rustfs/rustfs:1.0.0-rc.6
+    environment:
+      RUSTFS_VOLUMES: /data/rustfs
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:-root}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:-s3cr3t}
+    volumes:
+      - rustfs-data:/data
+    ports:
+      - "${RUSTFS_PORT:-19100}:9000"
+      - "${RUSTFS_CONSOLE_PORT:-19101}:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  # ── bucket-init: create the table bucket ──────────────────────────────
+  bucket-init:
+    image: rustfs/rc:v0.1.31
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        rc alias set rustfs http://rustfs:9000 "$${S3_ACCESS_KEY}" "$${S3_SECRET_KEY}"
+        rc mb rustfs/warehouse || echo "bucket exists"
+        echo "bucket ready"
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-root}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-s3cr3t}
+    restart: "no"
+    depends_on:
+      rustfs:
+        condition: service_healthy
+
+  # ── s3tables-enable: turn the bucket into a table bucket ──────────────
+  # `PUT /iceberg/v1/buckets/<bucket>` is the RustFS S3 Tables management
+  # call. Signed like every other RustFS request: SigV4, service "s3", plus
+  # the S3 payload hash header (here the hash of an empty body).
+  s3tables-enable:
+    image: curlimages/curl:8.11.1
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        # The keys reach curl through a config file on stdin (-K -), not argv.
+        printf 'user = "%s:%s"\n' "$${S3_ACCESS_KEY}" "$${S3_SECRET_KEY}" | \
+        curl -K - --fail-with-body --silent --show-error \
+          --aws-sigv4 "aws:amz:us-east-1:s3" \
+          --header "x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" \
+          --request PUT "http://rustfs:9000/iceberg/v1/buckets/warehouse"
+        echo
+        echo "table bucket 'warehouse' enabled"
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-root}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-s3cr3t}
+    restart: "no"
+    depends_on:
+      bucket-init:
+        condition: service_completed_successfully
+
+  # ── SQE: the query engine ─────────────────────────────────────────────
+  sqe:
+    image: ${SQE_IMAGE:-sqe-quickstart:latest}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["--config", "/etc/sqe/sqe.toml"]
+    environment:
+      RUST_LOG: "info,sqe_catalog=debug"
+    volumes:
+      - ./sqe.toml:/etc/sqe/sqe.toml:ro
+      - ./queries.sql:/queries.sql:ro
+    ports:
+      - "${SQE_FLIGHT_PORT:-60061}:50051"
+      - "${SQE_TRINO_PORT:-18081}:8080"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9091/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    depends_on:
+      s3tables-enable:
+        condition: service_completed_successfully
+
+volumes:
+  rustfs-data:

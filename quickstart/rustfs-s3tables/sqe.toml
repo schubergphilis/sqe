@@ -1,0 +1,80 @@
+# SQE config for the RustFS S3 Tables quickstart.
+#
+# RustFS runs its Iceberg REST catalog on the S3 port under /iceberg and
+# authenticates it with SigV4 (service name "s3"), the same keys as the S3
+# API. It does not advertise `rest.sigv4-enabled` in /v1/config, so the
+# signing name is configured here and SQE signs every catalog call itself
+# with the `[storage]` keys. RustFS vends no credentials, so SQE reads and
+# writes the data files with those same keys.
+#
+# There is no identity provider in this stack: SQE uses the `anonymous`
+# auth provider. DEV ONLY (SQE logs a security warning on startup).
+
+[coordinator]
+flight_sql_port = 50051
+trino_http_port = 8080
+mode = "hybrid"
+flight_compression = "none"
+
+[worker]
+memory_limit = "4GB"
+spill_dir = "/tmp/sqe-spill"
+
+# ── Authentication ────────────────────────────────────────────────────────
+[auth]
+# Unused by the anonymous provider, but the struct expects these.
+keycloak_url = ""
+realm = ""
+client_id = ""
+client_secret = ""
+ssl_verification = false
+
+# Accept every connection as "anonymous" with full roles. DEV ONLY.
+[[auth.providers]]
+type = "anonymous"
+user = "anonymous"
+roles = ["admin"]
+
+# ── Catalog ───────────────────────────────────────────────────────────────
+# The warehouse is the table bucket. `require_vended_credentials = false`
+# because RustFS answers "credential-vending": "unsupported".
+[catalogs.rustfs]
+catalog_url = "http://rustfs:9000/iceberg"
+warehouse = "warehouse"
+require_vended_credentials = false
+metadata_cache_ttl_secs = 30
+default_table_format_version = 2
+
+# Client-side SigV4: RustFS signs the catalog under the S3 service name.
+[catalogs.rustfs.auth]
+type = "aws"
+signing_name = "s3"
+signing_region = "us-east-1"
+
+[catalog]
+catalog_url = "http://rustfs:9000/iceberg"
+warehouse = "warehouse"
+require_vended_credentials = false
+
+[catalog.auth]
+type = "aws"
+signing_name = "s3"
+signing_region = "us-east-1"
+
+# ── Storage (data files and the catalog signature share these keys) ──────
+[storage]
+s3_endpoint = "http://rustfs:9000"
+s3_region = "us-east-1"
+s3_access_key = "root"
+s3_secret_key = "s3cr3t"
+s3_path_style = true
+s3_allow_http = true
+
+[policy]
+engine = "passthrough"
+
+[session]
+idle_timeout_secs = 900
+
+[metrics]
+prometheus_port = 9090

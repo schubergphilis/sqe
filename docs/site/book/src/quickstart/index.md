@@ -22,6 +22,7 @@ how to use it.
 | [Polaris + Keycloak (user token)](./polaris-keycloak-user-token.md) | Same stack; clients bring a pre-minted Keycloak token, SQE validates + passes it through | validated |
 | [MCP with Codex and Claude](./mcp.md) | Reuses the user-token stack; MCP read/write gates, tests and client configuration | runnable harness |
 | [Project Nessie](./nessie.md) | Nessie as the Iceberg REST catalog (auth-less, anonymous SQE) | validated |
+| [RustFS S3 Tables](./rustfs-s3tables.md) | The Iceberg REST catalog inside RustFS; client-side SigV4 with the S3 keys (auth-less, anonymous SQE) | validated |
 | [Unity Catalog OSS](./unity-oss.md) | Unity Catalog OSS over Iceberg REST (read-only; catalog-browse demo) | validated |
 
 ### AWS managed catalogs (CDK bootstrap + teardown)

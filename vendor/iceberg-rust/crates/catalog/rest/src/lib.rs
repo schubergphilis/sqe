@@ -58,4 +58,6 @@ mod sigv4;
 mod types;
 
 pub use catalog::*;
+#[cfg(feature = "aws-sigv4")]
+pub use sigv4::SigV4Signer;
 pub use types::*;
