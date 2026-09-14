@@ -1838,9 +1838,13 @@ mod tests {
             (Duration::from_millis(400)..Duration::from_millis(1200)).contains(&elapsed),
             "deadline should fire at about 500ms, fired after {elapsed:?}"
         );
+        // The property is that the deadline fires WHILE batches are still
+        // flowing, not the exact count. Four 100 ms batches fit a 500 ms
+        // deadline on an idle machine; a starved CI runner delivered two
+        // (!1011 test job), which is still "batches were flowing".
         assert!(
-            (3..=5).contains(&batches),
-            "roughly four 100ms batches should pass before a 500ms deadline, got {batches}"
+            (1..=5).contains(&batches),
+            "some 100ms batches should pass before a 500ms deadline, got {batches}"
         );
         assert!(stream.next().await.is_none());
         assert_eq!(find_record(&tracker, qid).state, QueryState::Failed);
