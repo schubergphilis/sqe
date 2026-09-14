@@ -95,6 +95,18 @@ heartbeat_interval_secs = 5     # Health check interval
 memory_limit = "8GB"            # Worker memory limit (supports B/KB/MB/GB/TB)
 spill_to_disk = true            # Allow spilling large sorts/joins to disk
 spill_dir = "/tmp/sqe-spill"    # Temp directory for spilling
+
+# [worker.spill]                # Optional. backend = "local" (default), "s3", or "tiered"
+# backend = "s3"                # (local disk first, S3 behind it). s3 and tiered require
+# [worker.spill.s3]             # the bucket below.
+# bucket = "sqe-spill-prd"      # MUST be a bucket dedicated to spill. Startup refuses a
+#                               # bucket that any [[hive.roots]] location or s3:// warehouse
+#                               # in this file also names (#382): spill objects carry the
+#                               # tag sqe-spill=true and are reaped ONLY by a bucket lifecycle
+#                               # rule that expires that tag, which SQE does not create or
+#                               # verify. Provision the rule (and a shorter one for
+#                               # sqe-spill-purpose=spill-partial) before enabling this backend.
+# prefix = "sqe-spill/"         # Must not look like table data (warehouse/, iceberg/, data/, table/)
 compaction_timeout_secs = 3600  # Max wall-clock seconds for do_action("compact_file_group").
                                 # Default: 3600 (1 hour). Set to 0 to disable.
                                 # On expiry, the worker cancels the rewrite, deletes
