@@ -1,0 +1,166 @@
+# Release binaries on the GitHub mirror.
+#
+# GitLab is the canonical remote; github.com/schubergphilis/sqe is a read-only
+# push mirror that receives every branch and `v*` tag. A mirrored tag push is a
+# normal push event here, so this workflow builds the four binaries for macOS
+# (Apple Silicon and Intel) and Linux x86_64, and attaches them to a GitHub
+# Release named after the tag. Nothing here talks back to GitLab.
+#
+# The workflow only exists at commits that contain this file, so tags cut
+# before it landed (v0.48.0 and earlier) get their binaries through
+# `workflow_dispatch` with the tag name as input.
+#
+# The build line mirrors the GitLab `release-binaries` job: `--locked`,
+# `--no-default-features`, profile `release` (thin LTO, stripped). Use
+# `dev-release` (no LTO) from the dispatch form if a hosted runner runs out
+# of memory at link time.
+name: release-binaries
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing v* tag to build and publish (e.g. v0.48.0)"
+        required: true
+        type: string
+      profile:
+        description: "Cargo profile"
+        required: false
+        default: release
+        type: choice
+        options: [release, dev-release]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Resolve tag and profile
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          profile="${{ github.event.inputs.profile || 'release' }}"
+          {
+            echo "tag=$tag"
+            echo "profile=$profile"
+            echo "version=${tag#v}"
+          } >> "$GITHUB_OUTPUT"
+
+      # .cargo/config.toml pins `-fuse-ld=/opt/homebrew/bin/ld64.lld` for
+      # aarch64-apple-darwin (the developer default). Provide that linker
+      # instead of overriding the config, so the release build is the one
+      # developers run.
+      - name: Install lld (Apple Silicon)
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: brew install lld
+
+      # .cargo/config.toml pins clang + mold for x86_64-unknown-linux-gnu.
+      - name: Install clang and mold (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang mold
+
+      # rust-toolchain.toml selects the channel; rustup on the runner honours it.
+      - name: Install the pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ steps.meta.outputs.profile }}
+
+      - name: Build binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --profile "${{ steps.meta.outputs.profile }}" \
+            --no-default-features \
+            --bin sqe-server --bin sqe-worker --bin sqe-cli --bin sqe-bench
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          profile="${{ steps.meta.outputs.profile }}"
+          name="sqe-${{ steps.meta.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          for b in sqe-server sqe-worker sqe-cli sqe-bench; do
+            cp "target/$profile/$b" "dist/$name/"
+          done
+          cp LICENSE "dist/$name/" 2>/dev/null || true
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+          "dist/$name/sqe-server" --version || true
+          echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/$name.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sqe-${{ matrix.target }}
+          path: |
+            ${{ steps.pkg.outputs.archive }}
+            ${{ steps.pkg.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          ls -la dist
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* \
+              --title "SQE $tag" \
+              --generate-notes \
+              --verify-tag
+          fi
