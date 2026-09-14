@@ -6,6 +6,21 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Worker: the deferred slow-consumer gate is a real test (#407)
+
+    `slow_consumer_caps_bytes_when_client_pauses` was an `#[ignore]`d
+    placeholder that panicked with its own to-do. It now runs: eight
+    incompressible 2 MiB files under a 4 MiB scan budget (fetch lane 1 MiB,
+    one file capped at half of it), a client that takes two batches and
+    pauses for two seconds. While paused, the object store's GET counter
+    must not move, live scan ownership must stay inside the budget, and
+    after the pause every row arrives and more GETs happen, which proves
+    the freeze was the fetch lane refusing to open a third file rather than
+    the scan having nothing left to fetch. Both lanes release to zero.
+    The harness's `generate_wide_parquet` repeats one string and lands at
+    80 KiB per 2 MiB decoded even uncompressed, so the test writes its own
+    distinct-payload files with dictionary encoding off.
+
 - Catalog: the dead restricted-column filter in `information_schema.columns` is gone (#665)
 
     `sqe_catalog::info_schema::InformationSchemaProvider` filtered restricted
