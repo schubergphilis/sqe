@@ -25,6 +25,24 @@ use std::collections::BTreeMap;
 use sqe_core::{Secret, SecretStore};
 use sqe_sql::OptionValue;
 
+/// The AWS SDK config loader every SQE-built SDK client must start from.
+///
+/// It carries an explicit rustls (ring) HTTPS client. The `aws-config`
+/// dependency has `default-https-client` off because that feature hardcodes
+/// the aws-lc provider and its C build into every binary (SQE #133), and a
+/// loader without a client does not fail at load time: the first request
+/// panics inside the SDK orchestrator with "a http_client is required". The
+/// live Glue Hive root built its loader bare and took the server down at
+/// startup that way, so the loader lives here and the call sites share it.
+pub fn sdk_config_loader() -> aws_config::ConfigLoader {
+    let http_client = aws_smithy_http_client::Builder::new()
+        .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+            aws_smithy_http_client::tls::rustls_provider::CryptoMode::Ring,
+        ))
+        .build_https();
+    aws_config::defaults(aws_config::BehaviorVersion::latest()).http_client(http_client)
+}
+
 /// Layer ATTACH options + secret store entries on top of the AWS default
 /// credential chain. Returns an [`aws_config::SdkConfig`] callers can hand
 /// to `aws_sdk_*::Client::new`. The Glue and S3 Tables backends accept
@@ -45,17 +63,7 @@ pub async fn build_aws_config(
     options: &BTreeMap<String, OptionValue>,
     secrets: &SecretStore,
 ) -> Result<aws_config::SdkConfig, String> {
-    // Explicit rustls (ring) HTTPS client: the `aws-config` dependency has
-    // `default-https-client` off because that feature hardcodes the aws-lc
-    // provider and its C build into every binary. Same client the vendored
-    // Glue and S3 Tables crates build (SQE #133).
-    let http_client = aws_smithy_http_client::Builder::new()
-        .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
-            aws_smithy_http_client::tls::rustls_provider::CryptoMode::Ring,
-        ))
-        .build_https();
-    let mut loader =
-        aws_config::defaults(aws_config::BehaviorVersion::latest()).http_client(http_client);
+    let mut loader = sdk_config_loader();
 
     // 1. Apply the explicit AWS secret first if present. The
     //    `credentials_provider` setter overrides the default chain, so
