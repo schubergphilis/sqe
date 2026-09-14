@@ -34,6 +34,10 @@ pub struct GlueMetadataSource {
     /// Glue `CatalogId`, i.e. the owning account. `None` means the caller's
     /// own account, which is what almost every deployment wants.
     catalog_id: Option<String>,
+    /// When non-empty, the root is restricted to these databases: only they
+    /// are listed, and a table in any other database is not found. Empty
+    /// exposes the whole catalog.
+    databases: Vec<String>,
     limits: ManifestLimits,
 }
 
@@ -49,13 +53,21 @@ impl GlueMetadataSource {
     pub fn new(
         client: aws_sdk_glue::Client,
         catalog_id: Option<String>,
+        databases: Vec<String>,
         limits: ManifestLimits,
     ) -> Self {
         Self {
             client,
             catalog_id,
+            databases,
             limits,
         }
+    }
+
+    /// `true` when `database` is outside the configured allow-list. An empty
+    /// list allows everything.
+    fn database_blocked(&self, database: &str) -> bool {
+        !self.databases.is_empty() && !self.databases.iter().any(|d| d == database)
     }
 
     /// Build a client from the ambient AWS configuration: the same provider
@@ -65,14 +77,17 @@ impl GlueMetadataSource {
     pub async fn from_env(
         region: Option<&str>,
         catalog_id: Option<String>,
+        databases: Vec<String>,
         limits: ManifestLimits,
     ) -> Self {
-        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        // The shared loader carries the ring HTTPS client; a bare
+        // `aws_config::defaults` has none and panics on the first request.
+        let mut loader = crate::aws_config::sdk_config_loader();
         if let Some(region) = region.filter(|r| !r.is_empty()) {
             loader = loader.region(aws_config::Region::new(region.to_string()));
         }
         let conf = loader.load().await;
-        Self::new(aws_sdk_glue::Client::new(&conf), catalog_id, limits)
+        Self::new(aws_sdk_glue::Client::new(&conf), catalog_id, databases, limits)
     }
 }
 
@@ -167,6 +182,12 @@ fn glue_err(op: &str, e: impl std::fmt::Display) -> HiveError {
 #[async_trait]
 impl HiveMetadataSource for GlueMetadataSource {
     async fn list_databases(&self) -> Result<Vec<String>, HiveError> {
+        // With an allow-list, skip the catalog scan and return it directly:
+        // the databases the operator named are the answer, and a name that
+        // does not exist in Glue simply lists no tables later.
+        if !self.databases.is_empty() {
+            return Ok(self.databases.clone());
+        }
         let mut out = Vec::new();
         let mut pages = self
             .client
@@ -182,6 +203,11 @@ impl HiveMetadataSource for GlueMetadataSource {
     }
 
     async fn list_tables(&self, database: &str) -> Result<Vec<String>, HiveError> {
+        // A database outside the allow-list lists no tables, the same empty
+        // answer an unknown database gives.
+        if self.database_blocked(database) {
+            return Ok(Vec::new());
+        }
         let mut out = Vec::new();
         let mut pages = self
             .client
@@ -205,6 +231,11 @@ impl HiveMetadataSource for GlueMetadataSource {
     }
 
     async fn get(&self, database: &str, table: &str) -> Result<HiveManifest, HiveError> {
+        // A database outside the allow-list is not found, so a direct
+        // `SELECT FROM glue.other_db.t` cannot reach past the scoping.
+        if self.database_blocked(database) {
+            return Err(HiveError::NotFound(format!("{database}.{table}")));
+        }
         let resp = self
             .client
             .get_table()
