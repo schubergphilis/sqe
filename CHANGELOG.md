@@ -435,6 +435,26 @@ All notable changes to SQE are documented in this file.
 
 ### Bug Fixes
 
+- Config: an S3 spill bucket that is also a table-data bucket is refused at load (#382)
+
+    Spill objects are reaped only by a bucket lifecycle rule on their tag,
+    and the spill prefix check in `sqe-spill` is a four-string denylist, so
+    a spill bucket that also holds a warehouse puts table files one
+    misconfigured rule from expiry. `validate()` now compares
+    `worker.spill.s3.bucket` (when the backend is `s3` or `tiered`) with the
+    bucket of every `[[hive.roots]]` location and every `s3://` warehouse in
+    `[catalog]` / `[catalogs.*]`, and refuses a match by name. Found on
+    the way: `validate()` still refused `worker.spill.backend = "s3"` as
+    "not implemented yet" while accepting `"tiered"`, which reaches the
+    same S3 segment store; the stale refusal is gone and both backends
+    now require `worker.spill.s3.bucket` instead. The configuration
+    reference gains the `[worker.spill.s3]` block with the
+    dedicated-bucket and lifecycle-rule requirements it never documented.
+    Of the other #382 items, the quota is already reserved by
+    compare-and-swap and refunded on abort, and `finish()` already PUTs
+    once (both covered by tests); the low items (materialized reads,
+    counters reset on restart) stay open.
+
 - Planner: the sort admission gate budgets one merge buffer per input partition (#412)
 
     `SortMemoryRule` gated every unbounded sort against a fixed fan-in of
