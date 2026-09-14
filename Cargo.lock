@@ -6457,7 +6457,6 @@ dependencies = [
  "sqe-auth",
  "sqe-core",
  "sqe-metrics-core",
- "sqe-policy",
  "sqe-policy-api",
  "sqe-sql",
  "sqlite-rs",

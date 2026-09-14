@@ -21,7 +21,7 @@ The shipped long-running binary is `sqe-server` (`--mode coordinator` or `--mode
 
 - **Parser extension strategy**: Wrap sqlparser-rs, don't fork. Standard GRANT/REVOKE parsed normally, then post-parse transform detects `MASKED WITH`/`ROWS WHERE` extensions and converts to custom `PolicyStatement` AST nodes
 - **Plan rewriting before optimization**: Security filters injected above TableScan; DataFusion optimizer can push user predicates through row filters but not through masked columns
-- **No information leakage**: Denied columns are invisible (not errors), row filters are transparent, masked columns block predicate pushdown on raw values -- follows PostgreSQL RLS model
+- **No information leakage**: Restricted columns are nullified in place (the name stays in the schema, every value is NULL, never an error), row filters are transparent, masked columns block predicate pushdown on raw values -- follows PostgreSQL RLS model. `information_schema.columns` therefore lists restricted column names; only `SHOW STATS` drops them (#665)
 - **Write path**: Merge-on-Read with position deletes first (simpler); compaction added later
 - **dbt compatibility**: Native dbt-sqe Python adapter over ADBC Flight SQL (Path A), not Trino compat layer
 

@@ -373,12 +373,12 @@ impl HiveDdlHandler {
     /// apart from a table that never existed (the project's no-information-
     /// leakage convention; see `resolve_policy`'s doc comment). A caller with
     /// partial access sees the DDL with restricted columns silently dropped
-    /// from the column list, mirroring how `information_schema.columns`
-    /// already treats a restricted Iceberg column as invisible rather than
-    /// erroring. Column masks are NOT reflected here (masking is a data-time
-    /// rewrite, not a schema change; the Iceberg `SHOW CREATE TABLE` path
-    /// does not filter for masks either, only `information_schema.columns`
-    /// itself would, and that is a value question, not a name/type one).
+    /// from the column list, the way `SHOW STATS` does for an Iceberg table.
+    /// Note that `information_schema.columns` does NOT hide restricted
+    /// Iceberg columns (#665: the rewriter nullifies them in place, so the
+    /// name is visible in every query result); this handler is the stricter
+    /// of the two surfaces. Column masks are NOT reflected here (masking is a
+    /// data-time rewrite, not a schema change).
     pub async fn show_create_table(
         &self,
         user: &SessionUser,
