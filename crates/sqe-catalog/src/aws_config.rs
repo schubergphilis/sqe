@@ -120,6 +120,20 @@ pub fn sdk_object_store_credentials() -> AwsCredentialProvider {
     Arc::new(SdkObjectStoreCredentials::new())
 }
 
+/// The region the AWS SDK resolves: `AWS_REGION`, `AWS_DEFAULT_REGION`, or the
+/// active profile's `region` in `~/.aws/config`. Used to fill
+/// `storage.s3_region` when nothing else set it, so `export AWS_PROFILE=...`
+/// alone gives the S3 data path a region the same way it gives the Glue
+/// catalog one. `None` when the chain resolves no region. Async because it
+/// reads the profile and SSO config.
+pub async fn sdk_resolved_region() -> Option<String> {
+    sdk_config_loader()
+        .load()
+        .await
+        .region()
+        .map(|r| r.to_string())
+}
+
 /// Layer ATTACH options + secret store entries on top of the AWS default
 /// credential chain. Returns an [`aws_config::SdkConfig`] callers can hand
 /// to `aws_sdk_*::Client::new`. The Glue and S3 Tables backends accept

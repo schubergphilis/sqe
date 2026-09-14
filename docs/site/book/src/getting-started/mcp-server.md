@@ -75,6 +75,11 @@ sqe-server --glue-catalog glue --allow-all-buckets --mcp-only --mcp-anonymous --
 No `aws configure export-credentials` step is needed. The SDK refreshes the SSO
 or STS session in the background, so a long-running server keeps working after
 the initial token would have expired.
+
+The region resolves the same way: `SQE_STORAGE__S3_REGION` (or `[storage]
+s3_region`) wins, then `AWS_REGION`, then `AWS_DEFAULT_REGION`, and finally the
+active profile's `region` in `~/.aws/config`. So `export AWS_PROFILE=...` alone
+gives both the credentials and the region.
 - `--mcp-anonymous` serves `/mcp` with no auth, read-only. Every caller is one
   anonymous identity reading with the engine's credentials. For a laptop or a
   trusted network only. It is refused when an identity provider is configured
