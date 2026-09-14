@@ -24,6 +24,14 @@ ci-config-sanity:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    # Tag pipelines too. aikido's `aikido-release-image` and
+    # `aikido-publish-release-image` are the only jobs that match a vX.Y.Z tag,
+    # and both sit in the `.post` stage. GitLab does not run a pipeline whose
+    # jobs are all in `.pre`/`.post`, so without one job in a real stage a tag
+    # push creates nothing: "The resulting pipeline would have been empty".
+    # v0.48.0 (2026-09-14) hit exactly that and shipped no image. This job in
+    # `test` is the cheapest way to give the release jobs a pipeline to run in.
+    - if: '$CI_COMMIT_TAG'
 
 # Auto-cancel superseded pipelines. The project setting
 # (Settings > CI/CD > auto_cancel_pending_pipelines) is already `enabled`, but it

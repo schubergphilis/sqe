@@ -2,8 +2,8 @@ apiVersion: v2
 name: sqe
 description: Sovereign Query Engine — distributed SQL over Apache Iceberg
 type: application
-version: 0.48.0
-appVersion: "0.48.0"
+version: 0.48.1
+appVersion: "0.48.1"
 keywords:
   - sql
   - iceberg
