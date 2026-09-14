@@ -144,6 +144,17 @@ CI publishes a GitLab Release for any `v*` tag, including `-rc.N` / `-alpha.N`
 pre-releases. The automated release-branch flow only produces clean `vX.Y.Z`
 versions, so use the script for pre-releases.
 
+## Tag pipelines need one job outside `.post`
+
+Both aikido release jobs (`aikido-release-image`, `aikido-publish-release-image`)
+run in the `.post` stage. GitLab does not run a pipeline whose jobs are all in
+`.pre`/`.post`; a tag push with nothing else matching fails silently with "The
+resulting pipeline would have been empty" (visible only if you POST
+`/projects/:id/pipeline?ref=vX.Y.Z` by hand). `ci-config-sanity` therefore also
+runs on `$CI_COMMIT_TAG`. The v0.48.0 tag predates that rule and has no
+pipeline, no image and no GitLab Release; v0.48.1 is the first tag after the
+fix. Do not move v0.48.0; the config is read from the tagged commit.
+
 ## Binaries on the GitHub mirror
 
 `github.com/schubergphilis/sqe` is a read-only push mirror of this repo and
