@@ -467,6 +467,14 @@ fn store_for_secret(
     if !access.is_empty() && !token.is_empty() {
         builder = builder.with_token(token);
     }
+    // No static key: resolve through the AWS SDK chain (profile, SSO, IMDS),
+    // so a Glue-backed Hive table's data reads with the same identity the
+    // catalog metadata does (SQE #s3-sso).
+    if access.is_empty() {
+        if let Some(provider) = crate::file_tvf_common::sdk_object_store_credentials_or_none() {
+            builder = builder.with_credentials(provider);
+        }
+    }
     let reg = region
         .as_deref()
         .filter(|s| !s.is_empty())
