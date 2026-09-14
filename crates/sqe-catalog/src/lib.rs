@@ -56,7 +56,6 @@ pub mod system_catalog;
 pub mod system_jdbc;
 #[cfg(feature = "rest")]
 pub mod system_metadata;
-pub mod system_runtime;
 pub mod topk;
 pub mod writable_iceberg_catalog;
 

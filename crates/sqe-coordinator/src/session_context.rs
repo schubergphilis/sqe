@@ -566,67 +566,13 @@ pub async fn create_session_context(
             // (system.jdbc.types, system.jdbc.catalogs, system.jdbc.schemas, etc.)
             // and the system.runtime.* virtual tables for query/node/task info.
             let tracker = Arc::clone(query_tracker);
-            let records_fn: sqe_catalog::system_runtime::QueryRecordsFn = Arc::new(move || {
-                tracker
-                    .records()
-                    .into_iter()
-                    .map(|r| sqe_catalog::system_runtime::RuntimeQueryRecord {
-                        query_id: r.query_id.to_string(),
-                        state: match r.state {
-                            crate::query_tracker::QueryState::Queued => {
-                                sqe_catalog::system_runtime::RuntimeQueryState::Queued
-                            }
-                            crate::query_tracker::QueryState::Running => {
-                                sqe_catalog::system_runtime::RuntimeQueryState::Running
-                            }
-                            crate::query_tracker::QueryState::Finished => {
-                                sqe_catalog::system_runtime::RuntimeQueryState::Finished
-                            }
-                            crate::query_tracker::QueryState::Failed => {
-                                sqe_catalog::system_runtime::RuntimeQueryState::Failed
-                            }
-                            crate::query_tracker::QueryState::Canceled => {
-                                sqe_catalog::system_runtime::RuntimeQueryState::Canceled
-                            }
-                        },
-                        user: r.user.clone(),
-                        source: r.source.clone(),
-                        sql: r.sql.clone(),
-                        created: r.created,
-                        started: r.started,
-                        ended: r.ended,
-                        queued_ms: r.queued_ms,
-                        planning_ms: r.planning_ms,
-                        execution_ms: r.execution_ms,
-                        output_rows: r.output_rows,
-                        rows_written: r.rows_written,
-                        error_type: r.error_type.clone(),
-                        error_code: r.error_code.clone(),
-                        bytes_scanned: r.bytes_scanned,
-                        rows_scanned: r.rows_scanned,
-                        spill_bytes: r.spill_bytes,
-                        peak_memory_bytes: r.peak_memory_bytes,
-                        trace_id: r.trace_id.clone(),
-                        fragments: r
-                            .fragments_snapshot()
-                            .into_iter()
-                            .map(|f| sqe_catalog::system_runtime::RuntimeFragmentInfo {
-                                task_id: f.task_id.clone(),
-                                worker_url: f.worker_url.clone(),
-                                state: f.state.to_string(),
-                                elapsed_ms: f.elapsed_ms,
-                                input_rows: f.input_rows,
-                                output_rows: f.output_rows,
-                            })
-                            .collect(),
-                    })
-                    .collect()
-            });
+            let records_fn: crate::system_runtime::QueryRecordsFn =
+                Arc::new(move || tracker.records());
             let coordinator_uri = format!(
                 "http://localhost:{}",
                 config.coordinator.flight_sql_port
             );
-            let runtime_schema = Arc::new(sqe_catalog::system_runtime::RuntimeSchemaProvider::new(
+            let runtime_schema = Arc::new(crate::system_runtime::RuntimeSchemaProvider::new(
                 records_fn,
                 config.catalog.warehouse.clone(),
                 coordinator_uri,

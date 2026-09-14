@@ -1,3 +1,14 @@
+//! The virtual `system.runtime` schema (`queries`, `nodes`, `tasks`), rendered
+//! from the coordinator's own [`QueryTracker`](crate::query_tracker::QueryTracker)
+//! records.
+//!
+//! This used to live in `sqe-catalog` behind mirrored copies of
+//! `QueryRecord`, `QueryState` and `FragmentInfo` "to avoid a circular crate
+//! dependency", with the coordinator converting every record on every read.
+//! It only ever rendered coordinator state, so it lives here now and reads
+//! the tracker's types directly (#576). The catalog's `SystemCatalogProvider`
+//! keeps a `dyn SchemaProvider` slot for it.
+
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -6,88 +17,18 @@ use arrow_array::builder::{
 };
 use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::error::Result as DFResult;
 
-// ---------------------------------------------------------------------------
-// Snapshot types — lightweight mirrors of coordinator's QueryRecord / QueryState
-// so that sqe-catalog does NOT depend on sqe-coordinator.
-// ---------------------------------------------------------------------------
-
-/// Mirrors `sqe_coordinator::query_tracker::QueryState`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RuntimeQueryState {
-    Queued,
-    Running,
-    Finished,
-    Failed,
-    Canceled,
-}
-
-impl std::fmt::Display for RuntimeQueryState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Queued => write!(f, "QUEUED"),
-            Self::Running => write!(f, "RUNNING"),
-            Self::Finished => write!(f, "FINISHED"),
-            Self::Failed => write!(f, "FAILED"),
-            Self::Canceled => write!(f, "CANCELED"),
-        }
-    }
-}
-
-/// Lightweight mirror of a single fragment's execution info.
-///
-/// Mirrors `sqe_coordinator::query_tracker::FragmentInfo` without importing
-/// it directly (to avoid a circular crate dependency).
-#[derive(Debug, Clone)]
-pub struct RuntimeFragmentInfo {
-    pub task_id: String,
-    pub worker_url: String,
-    pub state: String,
-    pub elapsed_ms: u64,
-    pub input_rows: usize,
-    pub output_rows: usize,
-}
-
-/// Lightweight snapshot of a single query record.
-///
-/// Populated from `QueryTracker::records()` in the coordinator before being
-/// passed into this crate.
-#[derive(Debug, Clone)]
-pub struct RuntimeQueryRecord {
-    pub query_id: String,
-    pub state: RuntimeQueryState,
-    pub user: String,
-    pub source: Option<String>,
-    pub sql: String,
-    pub created: DateTime<Utc>,
-    pub started: Option<DateTime<Utc>>,
-    pub ended: Option<DateTime<Utc>>,
-    pub queued_ms: u64,
-    pub planning_ms: u64,
-    pub execution_ms: u64,
-    pub output_rows: usize,
-    /// Rows written/affected by a DML statement; `None` for reads.
-    pub rows_written: Option<u64>,
-    pub error_type: Option<String>,
-    pub error_code: Option<String>,
-    pub bytes_scanned: u64,
-    pub rows_scanned: u64,
-    pub spill_bytes: u64,
-    pub peak_memory_bytes: u64,
-    pub trace_id: Option<String>,
-    pub fragments: Vec<RuntimeFragmentInfo>,
-}
+use crate::query_tracker::{QueryRecord, QueryState};
 
 // ---------------------------------------------------------------------------
 // Provider
 // ---------------------------------------------------------------------------
 
-/// Callback that returns a fresh snapshot of query records.
-pub type QueryRecordsFn = Arc<dyn Fn() -> Vec<RuntimeQueryRecord> + Send + Sync>;
+/// Callback that returns a fresh snapshot of the tracker's query records.
+pub type QueryRecordsFn = Arc<dyn Fn() -> Vec<Arc<QueryRecord>> + Send + Sync>;
 
 /// DataFusion `SchemaProvider` for the virtual `system.runtime` schema.
 ///
@@ -202,7 +143,7 @@ fn u64_to_i64_saturating(v: u64) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
 }
 
-fn build_queries_table(records: &[RuntimeQueryRecord]) -> DFResult<Arc<dyn TableProvider>> {
+fn build_queries_table(records: &[Arc<QueryRecord>]) -> DFResult<Arc<dyn TableProvider>> {
     let schema = Arc::new(queries_schema());
 
     let tz: Arc<str> = Arc::from("UTC");
@@ -232,7 +173,7 @@ fn build_queries_table(records: &[RuntimeQueryRecord]) -> DFResult<Arc<dyn Table
     let mut rows_written_b = Int64Builder::new();
 
     for rec in records {
-        query_id_b.append_value(&rec.query_id);
+        query_id_b.append_value(rec.query_id.to_string());
         state_b.append_value(rec.state.to_string());
         user_b.append_value(&rec.user);
         match &rec.source {
@@ -390,7 +331,7 @@ fn tasks_schema() -> Schema {
 }
 
 fn build_tasks_table(
-    records: &[RuntimeQueryRecord],
+    records: &[Arc<QueryRecord>],
     coordinator_node_id: &str,
 ) -> DFResult<Arc<dyn TableProvider>> {
     let schema = Arc::new(tasks_schema());
@@ -404,13 +345,15 @@ fn build_tasks_table(
     let mut output_rows_b = Int64Builder::new();
 
     for rec in records {
-        if rec.state != RuntimeQueryState::Finished {
+        if rec.state != QueryState::Finished {
             continue;
         }
-        if rec.fragments.is_empty() {
+        let query_id = rec.query_id.to_string();
+        let fragments = rec.fragments_snapshot();
+        if fragments.is_empty() {
             // Local (single-node) execution — emit one synthetic task.
-            query_id_b.append_value(&rec.query_id);
-            task_id_b.append_value(format!("{}-0", rec.query_id));
+            query_id_b.append_value(&query_id);
+            task_id_b.append_value(format!("{query_id}-0"));
             node_id_b.append_value(coordinator_node_id);
             state_b.append_value("FINISHED");
             elapsed_ms_b.append_value(u64_to_i64_saturating(rec.execution_ms));
@@ -418,11 +361,11 @@ fn build_tasks_table(
             output_rows_b.append_value(u64_to_i64_saturating(rec.output_rows as u64));
         } else {
             // Distributed execution: one row per fragment with real worker URLs.
-            for frag in &rec.fragments {
-                query_id_b.append_value(&rec.query_id);
+            for frag in &fragments {
+                query_id_b.append_value(&query_id);
                 task_id_b.append_value(&frag.task_id);
                 node_id_b.append_value(&frag.worker_url);
-                state_b.append_value(&frag.state);
+                state_b.append_value(frag.state.to_string());
                 elapsed_ms_b.append_value(u64_to_i64_saturating(frag.elapsed_ms));
                 input_rows_b.append_value(u64_to_i64_saturating(frag.input_rows as u64));
                 output_rows_b.append_value(u64_to_i64_saturating(frag.output_rows as u64));
@@ -454,78 +397,70 @@ fn build_tasks_table(
 mod tests {
     use super::*;
 
-    fn sample_records() -> Vec<RuntimeQueryRecord> {
-        vec![
-            RuntimeQueryRecord {
-                query_id: "00000000-0000-0000-0000-000000000001".to_string(),
-                state: RuntimeQueryState::Finished,
-                user: "alice".to_string(),
-                source: Some("cli".to_string()),
-                sql: "SELECT 1".to_string(),
-                created: Utc::now(),
-                started: Some(Utc::now()),
-                ended: Some(Utc::now()),
-                queued_ms: 5,
-                planning_ms: 10,
-                execution_ms: 100,
-                output_rows: 1,
-                error_type: None,
-                error_code: None,
-                bytes_scanned: 1024,
-                rows_scanned: 10,
-                spill_bytes: 0,
-                peak_memory_bytes: 2048,
-                trace_id: Some("0123456789abcdef0123456789abcdef".to_string()),
-                rows_written: None,
-                fragments: vec![],
-            },
-            RuntimeQueryRecord {
-                query_id: "00000000-0000-0000-0000-000000000002".to_string(),
-                state: RuntimeQueryState::Failed,
-                user: "bob".to_string(),
-                source: None,
-                sql: "BAD SQL".to_string(),
-                created: Utc::now(),
-                started: Some(Utc::now()),
-                ended: Some(Utc::now()),
-                queued_ms: 2,
-                planning_ms: 0,
-                execution_ms: 0,
-                output_rows: 0,
-                error_type: Some("SyntaxError".to_string()),
-                error_code: Some("42000".to_string()),
-                bytes_scanned: 0,
-                rows_scanned: 0,
-                spill_bytes: 0,
-                peak_memory_bytes: 0,
-                trace_id: None,
-                rows_written: None,
-                fragments: vec![],
-            },
-            RuntimeQueryRecord {
-                query_id: "00000000-0000-0000-0000-000000000003".to_string(),
-                state: RuntimeQueryState::Running,
-                user: "carol".to_string(),
-                source: Some("dbt".to_string()),
-                sql: "SELECT * FROM orders".to_string(),
-                created: Utc::now(),
-                started: Some(Utc::now()),
-                ended: None,
-                queued_ms: 1,
-                planning_ms: 5,
-                execution_ms: 0,
-                output_rows: 0,
-                error_type: None,
-                error_code: None,
-                bytes_scanned: 0,
-                rows_scanned: 0,
-                spill_bytes: 0,
-                peak_memory_bytes: 0,
-                trace_id: None,
-                rows_written: None,
-                fragments: vec![],
-            },
-        ]
+    use std::sync::Mutex;
+
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    use crate::query_tracker::{FragmentInfo, FragmentState};
+
+    /// A tracker record in `state` for `user`, with every other field at its
+    /// idle value. Tests set what they assert on.
+    fn record(n: u128, state: QueryState, user: &str, source: Option<&str>, sql: &str) -> QueryRecord {
+        QueryRecord {
+            query_id: Uuid::from_u128(n),
+            state,
+            user: user.to_string(),
+            source: source.map(str::to_string),
+            sql: sql.to_string(),
+            session_id: "session".to_string(),
+            client_ip: None,
+            roles: Vec::new(),
+            created: Utc::now(),
+            started: Some(Utc::now()),
+            ended: None,
+            queued_ms: 0,
+            planning_ms: 0,
+            execution_ms: 0,
+            output_rows: 0,
+            rows_written: None,
+            error_type: None,
+            error_code: None,
+            error_message: None,
+            tables_touched: Vec::new(),
+            bytes_scanned: 0,
+            rows_scanned: 0,
+            spill_bytes: 0,
+            peak_memory_bytes: 0,
+            profile: None,
+            trace_id: None,
+            fragments: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn sample_records() -> Vec<Arc<QueryRecord>> {
+        let mut finished = record(1, QueryState::Finished, "alice", Some("cli"), "SELECT 1");
+        finished.ended = Some(Utc::now());
+        finished.queued_ms = 5;
+        finished.planning_ms = 10;
+        finished.execution_ms = 100;
+        finished.output_rows = 1;
+        finished.bytes_scanned = 1024;
+        finished.rows_scanned = 10;
+        finished.peak_memory_bytes = 2048;
+        finished.trace_id = Some("0123456789abcdef0123456789abcdef".to_string());
+
+        let mut failed = record(2, QueryState::Failed, "bob", None, "BAD SQL");
+        failed.ended = Some(Utc::now());
+        failed.queued_ms = 2;
+        failed.error_type = Some("SyntaxError".to_string());
+        failed.error_code = Some("42000".to_string());
+
+        let mut running = record(3, QueryState::Running, "carol", Some("dbt"), "SELECT * FROM orders");
+        running.queued_ms = 1;
+        running.planning_ms = 5;
+
+        vec![Arc::new(finished), Arc::new(failed), Arc::new(running)]
     }
 
     // -----------------------------------------------------------------------
@@ -707,86 +642,88 @@ mod tests {
         assert_eq!(table.schema().fields().len(), 7);
     }
 
-    #[test]
-    fn test_tasks_table_distributed_uses_worker_urls() {
+    #[tokio::test]
+    async fn test_tasks_table_distributed_uses_worker_urls() {
         // A finished query with two fragments should emit two task rows using
         // real worker URLs as node_id.
-        let records = vec![RuntimeQueryRecord {
-            query_id: "00000000-0000-0000-0000-000000000010".to_string(),
-            state: RuntimeQueryState::Finished,
-            user: "alice".to_string(),
-            source: None,
-            sql: "SELECT 1".to_string(),
-            created: Utc::now(),
-            started: Some(Utc::now()),
-            ended: Some(Utc::now()),
-            queued_ms: 0,
-            planning_ms: 5,
-            execution_ms: 200,
-            output_rows: 42,
-            error_type: None,
-            error_code: None,
-            bytes_scanned: 0,
-            rows_scanned: 0,
-            spill_bytes: 0,
-            peak_memory_bytes: 0,
-            trace_id: None,
-            rows_written: None,
-            fragments: vec![
-                RuntimeFragmentInfo {
-                    task_id: "frag-0".to_string(),
-                    worker_url: "http://worker-1:50052".to_string(),
-                    state: "FINISHED".to_string(),
-                    elapsed_ms: 100,
-                    input_rows: 20,
-                    output_rows: 20,
-                },
-                RuntimeFragmentInfo {
-                    task_id: "frag-1".to_string(),
-                    worker_url: "http://worker-2:50052".to_string(),
-                    state: "FINISHED".to_string(),
-                    elapsed_ms: 150,
-                    input_rows: 22,
-                    output_rows: 22,
-                },
-            ],
-        }];
+        let mut distributed = record(0x10, QueryState::Finished, "alice", None, "SELECT 1");
+        distributed.ended = Some(Utc::now());
+        distributed.planning_ms = 5;
+        distributed.execution_ms = 200;
+        distributed.output_rows = 42;
+        distributed.fragments = Arc::new(Mutex::new(vec![
+            FragmentInfo {
+                task_id: "frag-0".to_string(),
+                worker_url: "http://worker-1:50052".to_string(),
+                state: FragmentState::Finished,
+                elapsed_ms: 100,
+                input_rows: 20,
+                output_rows: 20,
+            },
+            FragmentInfo {
+                task_id: "frag-1".to_string(),
+                worker_url: "http://worker-2:50052".to_string(),
+                state: FragmentState::Finished,
+                elapsed_ms: 150,
+                input_rows: 22,
+                output_rows: 22,
+            },
+        ]));
+        let records = vec![Arc::new(distributed)];
 
-        // Schema must still have 7 columns.
         let table = build_tasks_table(&records, "my-wh").unwrap();
         assert_eq!(table.schema().fields().len(), 7);
+        let batch = table_rows(&table).await;
+        assert_eq!(batch.num_rows(), 2, "one task row per fragment");
+        let node_ids = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(node_ids.value(0), "http://worker-1:50052");
+        assert_eq!(node_ids.value(1), "http://worker-2:50052");
+        let states = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(states.value(0), "FINISHED");
     }
 
-    #[test]
-    fn test_tasks_table_local_uses_coordinator_node_id() {
+    /// Scan a one-batch `MemTable` back into its rows.
+    async fn table_rows(table: &Arc<dyn TableProvider>) -> RecordBatch {
+        let ctx = datafusion::prelude::SessionContext::new();
+        let plan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan");
+        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .expect("collect");
+        arrow::compute::concat_batches(&table.schema(), &batches).expect("concat")
+    }
+
+    #[tokio::test]
+    async fn test_tasks_table_local_uses_coordinator_node_id() {
         // A finished query with NO fragments should emit one synthetic task
         // using the coordinator node_id.
-        let records = vec![RuntimeQueryRecord {
-            query_id: "00000000-0000-0000-0000-000000000020".to_string(),
-            state: RuntimeQueryState::Finished,
-            user: "bob".to_string(),
-            source: None,
-            sql: "SELECT 1".to_string(),
-            created: Utc::now(),
-            started: Some(Utc::now()),
-            ended: Some(Utc::now()),
-            queued_ms: 0,
-            planning_ms: 3,
-            execution_ms: 50,
-            output_rows: 5,
-            error_type: None,
-            error_code: None,
-            bytes_scanned: 0,
-            rows_scanned: 0,
-            spill_bytes: 0,
-            peak_memory_bytes: 0,
-            trace_id: None,
-            rows_written: None,
-            fragments: vec![],
-        }];
+        let mut local = record(0x20, QueryState::Finished, "bob", None, "SELECT 1");
+        local.ended = Some(Utc::now());
+        local.planning_ms = 3;
+        local.execution_ms = 50;
+        local.output_rows = 5;
+        let records = vec![Arc::new(local)];
 
         let table = build_tasks_table(&records, "my-coordinator").unwrap();
         assert_eq!(table.schema().fields().len(), 7);
+        let batch = table_rows(&table).await;
+        assert_eq!(batch.num_rows(), 1, "one synthetic task");
+        let node_ids = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(node_ids.value(0), "my-coordinator");
     }
 
     // -----------------------------------------------------------------------

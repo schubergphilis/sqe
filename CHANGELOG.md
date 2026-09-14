@@ -6,6 +6,38 @@ All notable changes to SQE are documented in this file.
 
 ### Added
 
+- Server: run flag-only, and reach a Glue catalog over MCP with no config file
+
+    `sqe-server` starts from a built-in default when there is no config
+    file and none is named, so a read-only MCP endpoint over an AWS Glue
+    catalog is one command: `sqe-server --glue-catalog glue
+    --allow-s3-prefix s3://lake/ --mcp-anonymous --mcp-port 8098`. The
+    default carries the no-IdP `[auth]` placeholder `validate()` requires
+    and declares no Iceberg REST catalog; an explicitly named file that
+    does not exist is still an error. New `--allow-s3-prefix` (repeatable)
+    appends to the `[storage.tvf]` read allowlist so a flag-only Glue run
+    has its access boundary without a file (a prefix of `s3://` allows every
+    S3 bucket); `--allow-all-buckets` (config `[storage.tvf]
+    allow_all_object_stores`) removes the boundary for a single-tenant or
+    trusted-network deployment, logged loud at startup. A `--glue-database`
+    flag (repeatable, comma-separated) scopes `--glue-catalog` to named
+    databases: only they are listed, and a table in any other database is not
+    found, so a shared Glue catalog can be narrowed to what one deployment
+    should see. Three MCP catalog tools now
+    answer for a Hive root (a Glue catalog is one), where they returned
+    "Unknown catalog" or hung before: `list_catalogs` lists the Hive
+    roots, `list_schemas` lists a root's databases from its metadata
+    source, and `describe_table` reads the table's own manifest instead
+    of the `information_schema.columns` route, which walked every database
+    of a live Glue catalog for one `DESCRIBE`. Also fixed: the live Glue
+    Hive root built its AWS SDK client without an HTTP client, so the
+    first catalog call panicked with "a http_client is required"; the
+    ring HTTPS client the rest of the engine uses is now shared through
+    `sqe_catalog::aws_config::sdk_config_loader`. Verified end to end
+    against a live Glue catalog of 134 databases through an anonymous MCP
+    endpoint: list, describe, sample and aggregate all read; writes
+    refused. New guide: "Run SQE as an MCP server".
+
 - Catalog: client-side SigV4 for REST catalogs that do not advertise it,
   which connects SQE to RustFS S3 Tables
 
@@ -39,6 +71,25 @@ All notable changes to SQE are documented in this file.
     props still sends the bearer.
 
 ### Changed
+
+- Coordinator: the `system.runtime` schema lives in the coordinator and
+  reads the query tracker's types directly (#576)
+
+    `sqe_catalog::system_runtime` rendered `system.runtime.queries`,
+    `nodes` and `tasks` from `RuntimeQueryRecord`, `RuntimeQueryState`
+    and `RuntimeFragmentInfo`, copies of the coordinator's `QueryRecord`,
+    `QueryState` and `FragmentInfo` kept "to avoid a circular crate
+    dependency", and `session_context.rs` converted every record field
+    by field on every read. The module only ever rendered coordinator
+    state, so it is `sqe_coordinator::system_runtime` now and takes
+    `Vec<Arc<QueryRecord>>` straight from the tracker; the three mirrored
+    types are gone and the conversion closure is `tracker.records()`.
+    `SystemCatalogProvider::with_runtime` takes a `dyn SchemaProvider`,
+    so the catalog crate keeps the slot and no longer knows what fills
+    it. The tasks-table tests now scan the built table and check the
+    rows (one per fragment with the worker URL as node id; one synthetic
+    task with the coordinator id), where before they only counted the
+    schema's columns.
 
 - Worker: the deferred slow-consumer gate is a real test (#407)
 

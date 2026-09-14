@@ -433,6 +433,7 @@ async fn build_glue_hive_root(
     let source = sqe_catalog::mount::build_glue_root(
         root.region.as_deref(),
         root.catalog_id.clone(),
+        root.databases.clone(),
         limits,
     )
     .await;
@@ -692,6 +693,7 @@ mod hive_lane_tests {
                 kind: Default::default(),
                 region: None,
                 catalog_id: None,
+                databases: Vec::new(),
                 name: "lake".to_string(),
                 location: format!("file://{}", dir.path().display()),
                 secret: None,
@@ -724,6 +726,7 @@ mod hive_lane_tests {
                 kind: Default::default(),
                 region: None,
                 catalog_id: None,
+                databases: Vec::new(),
                 name: "lake".to_string(),
                 location: format!("file://{}", dir.path().display()),
                 secret: None,
@@ -751,6 +754,7 @@ mod hive_lane_tests {
                 kind: Default::default(),
                 region: None,
                 catalog_id: None,
+                databases: Vec::new(),
                 name: "lake".to_string(),
                 location: "/no/such/warehouse".to_string(),
                 secret: None,
