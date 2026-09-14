@@ -53,6 +53,28 @@ The flags:
   or a trusted-network gateway, where the credentials already scope what is
   reachable. Do not use it on a multi-tenant coordinator. The startup log warns
   when it is set.
+- `--mcp-only` serves just `/mcp`. It closes the Flight SQL, Trino HTTP and
+  Quack query ports, leaving MCP and the ops health/metrics port. For an
+  assistant-only deployment that should not expose the SQL front doors. It needs
+  MCP enabled, so pair it with `--mcp-anonymous` (or static/OAuth in a config
+  file).
+
+## Credentials
+
+SQE resolves AWS credentials through the standard SDK chain for both the Glue
+catalog and the S3 data reads: environment keys, `AWS_PROFILE`, an SSO session,
+`credential_process`, IRSA, and finally IMDS. So an SSO login is enough:
+
+```bash
+aws sso login --profile my-profile
+export AWS_PROFILE=my-profile
+export AWS_REGION=eu-central-1
+sqe-server --glue-catalog glue --allow-all-buckets --mcp-only --mcp-anonymous --mcp-port 8098
+```
+
+No `aws configure export-credentials` step is needed. The SDK refreshes the SSO
+or STS session in the background, so a long-running server keeps working after
+the initial token would have expired.
 - `--mcp-anonymous` serves `/mcp` with no auth, read-only. Every caller is one
   anonymous identity reading with the engine's credentials. For a laptop or a
   trusted network only. It is refused when an identity provider is configured

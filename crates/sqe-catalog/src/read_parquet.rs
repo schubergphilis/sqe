@@ -408,6 +408,12 @@ fn build_s3_store(
     if !access_key.is_empty() && !session_token.is_empty() {
         builder = builder.with_token(session_token);
     }
+    // No static key: resolve through the AWS SDK chain (profile, SSO, IMDS).
+    if access_key.is_empty() {
+        if let Some(provider) = crate::file_tvf_common::sdk_object_store_credentials_or_none() {
+            builder = builder.with_credentials(provider);
+        }
+    }
     if !endpoint.is_empty() {
         builder = builder.with_endpoint(endpoint);
     }
