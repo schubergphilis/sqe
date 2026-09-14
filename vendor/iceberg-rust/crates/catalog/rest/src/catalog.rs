@@ -368,6 +368,26 @@ impl RestCatalogConfig {
         self.props.get("rest.signing-region").cloned()
     }
 
+    /// Static keys for the SigV4 signer, taken from the same `s3.*`
+    /// properties FileIO uses. S3-compatible servers that sign their
+    /// Iceberg REST catalog (RustFS S3 Tables) authenticate the
+    /// catalog with the object-store keys, so one set of keys serves
+    /// both. `None` (no access key or no secret configured) means the
+    /// AWS SDK provider chain resolves the identity instead.
+    #[cfg(feature = "aws-sigv4")]
+    pub(crate) fn sigv4_static_credentials(&self) -> Option<(String, String, Option<String>)> {
+        let access_key_id = self.props.get("s3.access-key-id")?;
+        let secret_access_key = self.props.get("s3.secret-access-key")?;
+        if access_key_id.is_empty() || secret_access_key.is_empty() {
+            return None;
+        }
+        Some((
+            access_key_id.clone(),
+            secret_access_key.clone(),
+            self.props.get("s3.session-token").cloned(),
+        ))
+    }
+
     /// Merge the `RestCatalogConfig` with the a [`CatalogConfig`] (fetched from the REST server).
     pub(crate) fn merge_with_config(mut self, mut config: CatalogConfig) -> Self {
         if let Some(uri) = config.overrides.remove("uri") {

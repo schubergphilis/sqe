@@ -105,6 +105,31 @@ See the quickstart: [Project Nessie (Iceberg REST catalog)](../quickstart/nessie
 
 ---
 
+## RustFS S3 Tables
+
+The Iceberg REST catalog built into RustFS 1.0.0-rc.6, served at `/iceberg`
+on the S3 port. The table bucket is the warehouse. RustFS authenticates the
+catalog like an S3 call (SigV4, service name `s3`, payload hash header) but
+does not advertise it in `/v1/config`, so the catalog needs a client-side
+signing block:
+
+```toml
+[catalogs.rustfs]
+catalog_url = "http://rustfs:9000/iceberg"
+warehouse = "warehouse"
+require_vended_credentials = false
+
+[catalogs.rustfs.auth]
+type = "aws"
+signing_name = "s3"
+signing_region = "us-east-1"
+```
+
+The `[storage]` access keys sign the catalog and read and write the data
+files. See the quickstart: [RustFS S3 Tables](../quickstart/rustfs-s3tables.md).
+
+---
+
 ## Hadoop (filesystem warehouse, no catalog service)
 
 No metadata service. SQE walks the warehouse prefix for `metadata.json` files.

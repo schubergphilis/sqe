@@ -629,7 +629,13 @@ fn build_sigv4_signer(cfg: &RestCatalogConfig) -> Option<crate::sigv4::SigV4Sign
     }
     let region = cfg.signing_region()?;
     let name = cfg.signing_name()?;
-    Some(crate::sigv4::SigV4Signer::new(region, name))
+    let signer = crate::sigv4::SigV4Signer::new(region, name);
+    Some(match cfg.sigv4_static_credentials() {
+        Some((access_key_id, secret_access_key, session_token)) => {
+            signer.with_static_credentials(access_key_id, secret_access_key, session_token)
+        }
+        None => signer,
+    })
 }
 
 /// Deserializes a unexpected catalog response into an error.
