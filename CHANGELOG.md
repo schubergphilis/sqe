@@ -420,6 +420,20 @@ All notable changes to SQE are documented in this file.
 
 ### Bug Fixes
 
+- Planner: the sort admission gate budgets one merge buffer per input partition (#412)
+
+    `SortMemoryRule` gated every unbounded sort against a fixed fan-in of
+    eight merge buffers. With the 8 MiB grant floor (a quarter of it is
+    merge headroom) that is 32 buffers of room, so the gate could not fire
+    on any configuration and the read path has run without sort admission
+    in practice. The fan-in now defaults to the session's
+    `datafusion.execution.target_partitions`, which is how many sorted runs
+    a partitioned `SortExec` merges; `with_max_fan_in` still pins it. On
+    the default 256 MiB grant this admits up to 1,024 partitions, so
+    ordinary deployments see no change; a small `query.max_query_memory`
+    with a wide `target_partitions` is now refused at plan time instead of
+    merging past the pool.
+
 - Write path: sort-on-write sources run the sort admission gate; a merge that cannot fit fails at plan time, not as an OOM (#412)
 
     A sorted SELECT is refused at plan time by `SortMemoryRule` when the
