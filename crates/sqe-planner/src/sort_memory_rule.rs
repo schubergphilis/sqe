@@ -21,6 +21,17 @@ use tracing::debug;
 use crate::sort_memory::{SortAdmissionError, SortMemoryPolicy, DEFAULT_SORT_MERGE_FANIN};
 use sqe_spill::MemoryGrant;
 
+/// Merge headroom granted to every remaining `SortExec`, derived from
+/// `query.max_query_memory`. One formula for the read path
+/// (`post_planning`) and the write path (`WriteHandler`), so a sort-on-write
+/// is admitted or refused by the same rule as a sorted SELECT (#412).
+/// Unparseable or missing: 256 MiB; never below 8 MiB.
+pub fn sort_grant_bytes(max_query_memory: &str) -> usize {
+    sqe_core::parse_memory_limit(max_query_memory)
+        .unwrap_or(256 * 1024 * 1024)
+        .max(8 * 1024 * 1024)
+}
+
 /// Gate SortExec nodes against a fixed sort memory grant.
 #[derive(Debug, Clone)]
 pub struct SortMemoryRule {

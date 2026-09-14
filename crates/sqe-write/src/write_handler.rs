@@ -1193,6 +1193,54 @@ impl WriteHandler {
     /// many partitions never holds an unbounded set of open Parquet writers.
     /// `pool`, when supplied, charges the buffered fanout estimate to the
     /// shared pool so it competes with operator memory instead of growing
+    /// Plan and start a write source the way `DataFrame::execute_stream`
+    /// does, with one step in between: the same `SortMemoryRule` the read
+    /// path runs in post-planning (#412).
+    ///
+    /// DataFusion's external sort merges through `ExternalSorterMerge`,
+    /// which cannot spill. A sort-on-write source (CTAS or INSERT with ORDER
+    /// BY, a MERGE rewrite that sorts) whose merge fan-in does not fit the
+    /// sort grant used to run anyway and take the coordinator down with an
+    /// OOM mid-write, leaving half-uploaded files for the cleanup guard.
+    /// Sorted SELECTs were already refused at plan time by the rule in
+    /// `post_planning`; the write path now gets the same answer, typed
+    /// `RESOURCE_EXHAUSTED` with the knobs named, before a byte is written.
+    /// A plan without an unbounded `SortExec` passes untouched.
+    async fn execute_source_stream(
+        &self,
+        df: datafusion::dataframe::DataFrame,
+        what: &str,
+    ) -> sqe_core::Result<datafusion::execution::SendableRecordBatchStream> {
+        use datafusion::physical_optimizer::PhysicalOptimizerRule;
+
+        let (state, plan) = df.into_parts();
+        let physical = state.create_physical_plan(&plan).await.map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("{what}: physical planning failed: {e}"),
+            )
+        })?;
+        // The merge fan-in of a partitioned SortExec is the number of sorted
+        // runs it merges, one per input partition, so the gate is sized from
+        // the session's `target_partitions` rather than the rule's default.
+        let fan_in = state.config_options().execution.target_partitions.max(1);
+        let gate = sqe_planner::SortMemoryRule::new(sqe_planner::sort_grant_bytes(
+            &self.config.query.max_query_memory,
+        ))
+        .with_max_fan_in(fan_in);
+        // The refusal is `DataFusionError::ResourcesExhausted`; the `From`
+        // conversion keeps it `ResourceExhausted` on the wire.
+        let physical = gate
+            .optimize(physical, state.config_options())
+            .map_err(SqeError::from)?;
+        datafusion::physical_plan::execute_stream(physical, state.task_ctx()).map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("{what}: failed to start execution stream: {e}"),
+            )
+        })
+    }
+
     /// beside it. `write_buffer_tracking = false` is the escape hatch back to
     /// the vendored unbounded `TaskWriter` path. A malformed
     /// `fanout_buffer_budget` string warns and falls back to the auto budget.
@@ -1326,7 +1374,9 @@ impl WriteHandler {
     /// 1. Plans the SELECT via DataFusion and derives the Iceberg schema from the
     ///    DataFrame schema (before execution — no data buffered yet).
     /// 2. Creates the table in the catalog.
-    /// 3. Streams batches directly to the Parquet writer via `df.execute_stream()`.
+    /// 3. Streams batches directly to the Parquet writer via
+    ///    `execute_source_stream` (`df.execute_stream()` plus the sort
+    ///    admission gate, #412).
     /// 4. Commits the data files via a fast-append transaction.
     ///
     /// Peak memory is O(batch_size) instead of O(total_rows). Critical for large
@@ -1542,9 +1592,7 @@ impl WriteHandler {
             WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "ctas-streaming")
                 .with_metrics(self.metrics.clone());
         let post_create: sqe_core::Result<usize> = async {
-            let stream = df.execute_stream().await.map_err(|e| {
-                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to start execution stream: {e}"))
-            })?;
+            let stream = self.execute_source_stream(df, "CTAS").await?;
             // Puffin NDV sketches ride along on the stream when the table
             // opted in; the buffered path clones batches instead, which the
             // streaming path exists to avoid.
@@ -1695,10 +1743,9 @@ impl WriteHandler {
             WriteCleanupGuard::new(table.file_io().clone(), tracker.clone(), "ctas-replace")
                 .with_metrics(self.metrics.clone());
 
-        let stream = df
-            .execute_stream()
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to start execution stream: {e}")))?;
+        let stream = self
+            .execute_source_stream(df, "CREATE OR REPLACE TABLE")
+            .await?;
         let (stream, sketch_acc) = tap_stream_for_puffin_sketches(&table, stream);
         let (data_files, total_rows) = write_data_files_streaming_with_metrics(
             &table,
@@ -1898,10 +1945,7 @@ impl WriteHandler {
                     .await
                     .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Plan execution failed: {e}")))?;
 
-                let stream = df
-                    .execute_stream()
-                    .await
-                    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to start execution stream: {e}")))?;
+                let stream = self.execute_source_stream(df, "INSERT source").await?;
                 Ok::<_, SqeError>((stream, policy_summary, lineage_plan))
             })
             .await?;
@@ -4028,9 +4072,7 @@ impl WriteHandler {
                         // Rows removed by the MERGE (DELETE clauses, unclaimed source-only
                         // rows) are filtered by the keep-column WHERE inside `select_sql`, so
                         // the stream carries exactly the surviving rows.
-                        let stream = df.execute_stream().await.map_err(|e| {
-                            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to execute MERGE query: {e}"))
-                        })?;
+                        let stream = self.execute_source_stream(df, "MERGE rewrite").await?;
 
                         // Write new data files from the merged results (streaming).
                         let tracker = new_upload_tracker();
@@ -4223,10 +4265,9 @@ impl WriteHandler {
             .sql(sql)
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("MoR MERGE {label} plan failed: {e}")))?;
-        let stream = df
-            .execute_stream()
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("MoR MERGE {label} execution failed: {e}")))?;
+        let stream = self
+            .execute_source_stream(df, &format!("MoR MERGE {label}"))
+            .await?;
         let schema = stream.schema();
         let label = label.to_string();
         let counted = stream.map(move |item| match item {
@@ -4258,10 +4299,9 @@ impl WriteHandler {
             .sql(sql)
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("MoR MERGE {label} plan failed: {e}")))?;
-        let mut stream = df
-            .execute_stream()
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("MoR MERGE {label} execution failed: {e}")))?;
+        let mut stream = self
+            .execute_source_stream(df, &format!("MoR MERGE {label}"))
+            .await?;
         let mut rows = 0usize;
         while let Some(item) = stream.next().await {
             let batch = item.map_err(|e| {
@@ -7689,6 +7729,74 @@ mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, TimeUnit};
     use sqlparser::ast::{DataType as SqlType, ExactNumberInfo, TimezoneInfo};
+
+    /// #412: a write source with an unbounded sort is refused at plan time
+    /// when the sort grant cannot hold one merge buffer per input partition,
+    /// with the same typed error a sorted SELECT gets; the same plan with a
+    /// small fan-in is admitted and streams.
+    #[tokio::test]
+    async fn sorted_write_source_is_gated_by_merge_headroom() {
+        use arrow_array::Int64Array;
+        use datafusion::prelude::SessionConfig;
+
+        let mut config = write_test_config();
+        // 8 MiB is the grant floor; a quarter of it is merge headroom (2 MiB),
+        // which holds 32 merge buffers of 64 KiB and not 64.
+        config.query.max_query_memory = "8MB".to_string();
+        let handler = WriteHandler::new(config);
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+            "a",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![3, 1, 2])) as _],
+        )
+        .unwrap();
+        let source = |target_partitions: usize| {
+            let ctx = DFSessionContext::new_with_config(
+                SessionConfig::new().with_target_partitions(target_partitions),
+            );
+            ctx.register_table(
+                "t",
+                Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![batch.clone()]]).unwrap()),
+            )
+            .unwrap();
+            ctx
+        };
+
+        let refused = handler
+            .execute_source_stream(
+                source(64).sql("SELECT a FROM t ORDER BY a").await.unwrap(),
+                "test",
+            )
+            .await
+            .err()
+            .expect("64-way merge must not fit a 2 MiB headroom");
+        assert_eq!(
+            refused.error_code(),
+            SqeErrorCode::ResourceExhausted,
+            "{refused}"
+        );
+        assert!(refused.to_string().contains("sort merge admission failed"), "{refused}");
+
+        let stream = handler
+            .execute_source_stream(
+                source(2).sql("SELECT a FROM t ORDER BY a").await.unwrap(),
+                "test",
+            )
+            .await
+            .expect("2-way merge fits");
+        let rows: usize = datafusion::physical_plan::common::collect(stream)
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 3);
+    }
 
     /// 905: partitioned writes are bounded by default and charge the pool.
     #[test]
