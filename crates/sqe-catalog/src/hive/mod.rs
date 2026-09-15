@@ -6,6 +6,7 @@
 //! Glue's `TableInput`, so storing definitions in Glue or HMS later is a field
 //! mapping rather than a redesign.
 
+pub mod athena_view;
 pub mod ddl_render;
 #[cfg(feature = "glue")]
 pub mod glue_source;

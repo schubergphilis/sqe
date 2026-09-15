@@ -44,8 +44,9 @@ use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{Constraints, ScalarValue, Statistics};
 use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
 use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
-use datafusion::datasource::TableProvider;
+use datafusion::datasource::{TableProvider, ViewTable};
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{
@@ -1541,6 +1542,7 @@ impl CatalogProvider for HiveCatalogProvider {
         // returned provider answer that lazily, same as Hive's own
         // directory-based emptiness.
         Some(Arc::new(HiveSchemaProvider {
+            catalog_name: self.name.clone(),
             database: name.to_string(),
             source: Arc::clone(&self.source),
             data_store_factory: Arc::clone(&self.data_store_factory),
@@ -1554,12 +1556,115 @@ impl CatalogProvider for HiveCatalogProvider {
 /// DataFusion `SchemaProvider` over one database directory in the Hive
 /// manifest store.
 pub struct HiveSchemaProvider {
+    /// The SQL name the owning catalog is registered under. A view's SQL is
+    /// planned against a scratch catalog of the same name so its table
+    /// references resolve the way the user's own would.
+    catalog_name: String,
     database: String,
     source: Arc<dyn HiveMetadataSource>,
     data_store_factory: Arc<dyn HiveDataStoreFactory>,
     runtime: Arc<RuntimeEnv>,
     cache: Arc<HiveMetadataCache>,
     listings: Arc<HiveListings>,
+}
+
+impl HiveSchemaProvider {
+    /// Plan an Athena/Trino view (issue #667) and serve it as a `ViewTable`.
+    ///
+    /// The view's SQL is Trino dialect, so it goes through the same
+    /// `rewrite_trino_compat` pass user statements get, then is planned in a
+    /// scratch session whose default catalog and schema are this catalog and
+    /// the view's own database: that is what makes `FROM orders` and
+    /// `FROM "sales"."orders"` inside the view resolve. The scratch catalog is
+    /// a `HiveCatalogProvider` sharing this provider's source, caches and
+    /// runtime, so base tables (and views over views) load through the
+    /// ordinary path and register their object stores on the session's
+    /// runtime. Athena qualifies with `awsdatacatalog`; that name (and any
+    /// catalog the payload names) is registered as an alias of the same
+    /// provider.
+    ///
+    /// Returns `Ok(None)` with a WARN naming the reason when the payload does
+    /// not decode or the SQL does not plan, matching how an unreadable
+    /// storage table is hidden rather than fatal. Boxed like
+    /// `SqeSchemaProvider::plan_view`: the coroutine holds a `DataFrame`
+    /// across awaits and proving that `Send` walks DataFusion's whole plan
+    /// graph, better done once here than inside `SchemaProvider::table`.
+    fn plan_view<'a>(
+        &'a self,
+        name: &'a str,
+        manifest: &'a HiveManifest,
+    ) -> futures::future::BoxFuture<'a, DFResult<Option<Arc<dyn TableProvider>>>> {
+        Box::pin(self.plan_view_inner(name, manifest))
+    }
+
+    async fn plan_view_inner(
+        &self,
+        name: &str,
+        manifest: &HiveManifest,
+    ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        let hidden = |why: &str, detail: String| {
+            warn!(
+                database = %self.database, table = %name, error = %detail,
+                "hive_external: view hidden from this catalog: {why}"
+            );
+        };
+        let Some(text) = manifest.view_original_text.as_deref() else {
+            hidden(
+                "it has no view definition",
+                "VIRTUAL_VIEW without ViewOriginalText".to_string(),
+            );
+            return Ok(None);
+        };
+        let view = match super::athena_view::decode_presto_view(text) {
+            Ok(v) => v,
+            Err(e) => {
+                hidden("its definition is not readable by this release", e.to_string());
+                return Ok(None);
+            }
+        };
+
+        let default_schema = view.schema.clone().unwrap_or_else(|| self.database.clone());
+        let sql = sqe_sql::trino_compat::rewrite_trino_compat(&view.original_sql);
+
+        let planning_catalog: Arc<dyn CatalogProvider> = Arc::new(HiveCatalogProvider {
+            name: self.catalog_name.clone(),
+            source: Arc::clone(&self.source),
+            sidecar: None,
+            data_store_factory: Arc::clone(&self.data_store_factory),
+            runtime: Arc::clone(&self.runtime),
+            manifest_cache: Arc::clone(&self.cache),
+            listings: Arc::clone(&self.listings),
+        });
+        let ctx = SessionContext::new_with_config_rt(
+            SessionConfig::new()
+                .with_default_catalog_and_schema(&self.catalog_name, &default_schema),
+            Arc::clone(&self.runtime),
+        );
+        ctx.register_catalog(&self.catalog_name, Arc::clone(&planning_catalog));
+        for alias in ["awsdatacatalog"]
+            .into_iter()
+            .chain(view.catalog.as_deref())
+        {
+            if alias != self.catalog_name {
+                ctx.register_catalog(alias, Arc::clone(&planning_catalog));
+            }
+        }
+
+        let plan = match ctx.sql(&sql).await {
+            Ok(df) => match df.into_optimized_plan() {
+                Ok(p) => p,
+                Err(e) => {
+                    hidden("its SQL does not optimize", e.to_string());
+                    return Ok(None);
+                }
+            },
+            Err(e) => {
+                hidden("its SQL does not plan in this release", e.to_string());
+                return Ok(None);
+            }
+        };
+        Ok(Some(Arc::new(ViewTable::new(plan, Some(sql)))))
+    }
 }
 
 impl fmt::Debug for HiveSchemaProvider {
@@ -1667,6 +1772,14 @@ impl SchemaProvider for HiveSchemaProvider {
                 }
             }
         };
+
+        // An Athena/Trino view has no storage at all: it is a SQL body to
+        // plan, not a format to resolve (issue #667). Decided on the Glue
+        // table type, before the format check, so a view is never reported
+        // as a table with a missing storage format.
+        if manifest.table_type == super::athena_view::VIRTUAL_VIEW {
+            return self.plan_view(name, &manifest).await;
+        }
 
         // A table this release cannot read is invisible, not fatal. Glue
         // holds formats SQE has no reader for (ORC, Avro) and types it
@@ -1925,6 +2038,7 @@ mod tests {
             owner: None,
             created_at: None,
             description: None,
+            view_original_text: None,
             partition_keys: Vec::new(),
             parameters: Default::default(),
             storage_descriptor: super::super::manifest::StorageDescriptor {
