@@ -244,7 +244,7 @@ parking_lot = "0.12"
 # Puffin NDV sketches — pure-Rust Apache DataSketches theta implementation.
 # Used by `crates/sqe-catalog/src/puffin_stats.rs` to write theta sketches
 # into Puffin sidecar files for the Iceberg statistics file list.
-datasketches = { version = "0.3", features = ["theta"] }
+datasketches = { version = "0.5", features = ["theta"] }
 
 # Zip archive reading for read_json(compression => 'zip'). deflate-only
 # (no bzip2/lzma/zstd zip methods needed); default-features off to skip

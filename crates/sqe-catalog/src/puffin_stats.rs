@@ -52,7 +52,7 @@ use arrow_schema::{DataType, TimeUnit};
 /// Re-exported so downstream crates (the coordinator's carry-forward helper)
 /// can name the sketch type inside [`ColumnSketches`] without depending on
 /// `datasketches` directly.
-pub use datasketches::theta::ThetaSketch;
+pub use datasketches::theta::{ThetaSketch, ThetaSketchBuilder};
 
 use iceberg::io::FileIO;
 use iceberg::puffin::{
@@ -312,12 +312,18 @@ impl ThetaSketchAccumulator {
                         );
                         return None;
                     }
-                    Some((
-                        col_idx,
-                        *field_id,
-                        name.clone(),
-                        ThetaSketch::builder().build(),
-                    ))
+                    // datasketches 0.5: the builder is `Default` and `build`
+                    // is fallible (it validates lg_k / seed). The defaults
+                    // are valid, so an error here would be a library bug;
+                    // skip the column rather than abort the write.
+                    let sketch = match ThetaSketchBuilder::default().build() {
+                        Ok(sketch) => sketch,
+                        Err(e) => {
+                            warn!(field = %name, error = %e, "could not build theta sketch; skipping column");
+                            return None;
+                        }
+                    };
+                    Some((col_idx, *field_id, name.clone(), sketch))
                 })
                 .collect()
         });
@@ -583,8 +589,10 @@ where
 /// the upgrade path to Java-compatible encoding.
 pub fn serialise_theta_body(sketch: &ThetaSketch) -> Vec<u8> {
     let mut out = Vec::with_capacity(sketch.num_retained() * 8);
-    for hash in sketch.iter() {
-        out.extend_from_slice(&hash.to_le_bytes());
+    // datasketches 0.5 iterates `ThetaEntry` values instead of raw u64s; the
+    // wire format stays the retained 64-bit hash.
+    for entry in sketch.iter() {
+        out.extend_from_slice(&entry.hash().to_le_bytes());
     }
     out
 }
