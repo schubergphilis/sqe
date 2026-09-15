@@ -76,6 +76,20 @@
       "minimumReleaseAge": "7 days"
     },
     {
+      "description": [
+        "reqwest_legacy is the renamed reqwest 0.12 that the vendored iceberg-catalog-rest still",
+        "builds on (vendor/iceberg-rust pins reqwest 0.12.12); SQE's own reqwest is 0.13. Cargo",
+        "refuses two dependencies that resolve to the SAME crate version under different names",
+        "('depends on crate reqwest v0.13.x multiple times with different names'), so bumping the",
+        "alias to 0.13 cannot compile until the vendored fork moves to reqwest 0.13 and the alias",
+        "is deleted altogether (MR !1007 failed exactly this way). That is a vendor rebase, not a",
+        "version bump; hold the alias here until it happens."
+      ],
+      "matchManagers": ["cargo"],
+      "matchDepNames": ["reqwest_legacy"],
+      "allowedVersions": "<0.13"
+    },
+    {
       "description": "Container images in the quickstart/test docker-compose stacks (Polaris, MinIO/RustFS, Keycloak, etc.). Non-automerged: a bumped image can silently break a quickstart's assumptions.",
       "matchManagers": ["docker-compose", "dockerfile"],
       "groupName": "container images",
