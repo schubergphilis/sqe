@@ -24,6 +24,8 @@ manifest_max_bytes = 1048576
 manifest_max_columns = 4096
 manifest_max_partition_keys = 32
 metadata_recheck_secs = 10   # serve a cached manifest this long before asking the metastore again
+metadata_ttl_secs = 60       # Glue only (no change token): refetch a manifest after this long
+metadata_timeout_secs = 10   # cut a metastore call here; serve the last known manifest if there is one
 
 [[hive.roots]]
 name     = "lake"
@@ -265,7 +267,24 @@ So a concurrent reader may see a subset of an in-progress write, and an interrup
 
 Planning a statement resolves every table reference it names through the catalog, `information_schema` resolves every table in a database, and the policy layer reads the same manifest to find column tags. Before this, each of those lookups cost a `HEAD` on the manifest to compare its ETag, and for CSV and JSON tables a listing of the data prefix to read the compression codec off a file name, and for tables with neither `ANALYZE` statistics nor a partition index a second listing to size the table for the planner. A twelve-table dbt step paid all of that twelve times over.
 
-Now a manifest that the metastore confirmed less than `metadata_recheck_secs` ago (default 10) is served as is, and what the two listings learned is kept on the manifest's cache entry until the manifest reloads or the 60 s cache TTL expires. Every `CREATE`, `ALTER`, `DROP`, `MSCK REPAIR` and `INSERT` in the coordinator drops the entry for the table it changed, so your own writes are visible immediately. The window only delays what another engine wrote to the same manifest; set `metadata_recheck_secs = 0` to check on every lookup. Glue-backed roots have no change token and already refreshed on the TTL alone; they now honour that TTL under continuous querying, where the previous release kept extending it.
+Now a manifest that the metastore confirmed less than `metadata_recheck_secs` ago (default 10) is served as is, and what the two listings learned is kept on the manifest's cache entry until the manifest reloads or the cache TTL (`metadata_ttl_secs`, default 60) expires. Every `CREATE`, `ALTER`, `DROP`, `MSCK REPAIR` and `INSERT` in the coordinator drops the entry for the table it changed, so your own writes are visible immediately. The window only delays what another engine wrote to the same manifest; set `metadata_recheck_secs = 0` to check on every lookup. Glue-backed roots have no change token and already refreshed on the TTL alone; they now honour that TTL under continuous querying, where the previous release kept extending it.
+
+### Glue: one listing warms the whole database
+
+Glue's `GetTables` returns every table's full definition, so a Glue-backed root treats the listing as the fetch. The pre-plan refresh, `SHOW TABLES` and `information_schema` load a database's manifests into the cache in one paginated call, and the `SELECT` that follows finds its table already there. Before this a `SHOW TABLES` against a 618-table database made 618 `GetTable` calls to check each table's policy, which took eight seconds; now it makes the one listing it needed anyway. `information_schema.tables` also answers a table's kind from the manifest alone rather than building the table, so listing a database no longer lists every table's data prefix for size statistics.
+
+When the TTL expires and the refetched definition is unchanged, the entry keeps the file facts it had learned (codec, listed bytes), so an expiry on a quiet table costs the `GetTable` and nothing on the object store. For a read-mostly Glue catalog, raising `metadata_ttl_secs` to a few hundred seconds mostly removes those round trips.
+
+### Timeouts, and refreshing on demand
+
+Every metastore call on a root is cut at `metadata_timeout_secs` (default 10; `0` disables the bound), including the SDK's own connect and operation clocks for Glue. A table the cache has seen is then served from its last known manifest with a `serving stale metadata, refresh timed out` warning; a table it has never seen fails with a `catalog metadata timeout` error naming the call; a listing that times out keeps the previous snapshot, the way a failed listing already did. Before this, a throttled `GetTable` stalled the query in planning with nothing in the log.
+
+A longer TTL needs a way to drop an entry when a table changes outside SQE. Three paths do:
+
+- `CALL system.refresh_catalog_cache(table => 'glue.db.t')` drops that table's manifest, `schema => 'glue.db'` drops the database's; both also drop the caller's own session view, as the bare call always did. No privilege needed, and the cost is bounded by the scope named.
+- The MCP tool `refresh_metadata` is the same call with `catalog`, `schema` and `table` arguments, rate-limited per scope so a looping assistant cannot flood the metastore. A not-found answer from `list_tables`, `describe_table`, `get_table_ddl` or `sample_rows` ends with a hint to call it once.
+- `POST /api/v1/catalogs/refresh` (admin) drops every Hive manifest alongside the session and REST-catalog caches, for the out-of-band rebind case.
+
 
 ### The partition index is refreshed for you
 

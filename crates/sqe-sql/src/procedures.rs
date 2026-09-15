@@ -171,12 +171,21 @@ pub enum ProcedureCall {
     /// Self-scoped catalog cache refresh (`CALL system.refresh_catalog_cache()`).
     /// Drops the caller's own cached `SessionContext`, so the caller's next query
     /// re-enumerates catalogs and picks up a catalog created out-of-band (e.g. by
-    /// the platform) without waiting out the TTL. Table-less and scoped to the
-    /// caller only: it touches no process-global cache, needs no write privilege,
-    /// and has no cross-tenant effect. The global, admin-gated equivalent (which
-    /// also drops the shared REST-catalog cache for the rebind case) is
+    /// the platform) without waiting out the TTL. Scoped to the caller only: it
+    /// touches no process-global cache, needs no write privilege, and has no
+    /// cross-tenant effect. The global, admin-gated equivalent (which also drops
+    /// the shared REST-catalog cache for the rebind case) is
     /// `POST /api/v1/catalogs/refresh`.
-    RefreshCatalogCache,
+    ///
+    /// Optional narrowing (issue #666): `table => 'cat.db.t'` or `schema =>
+    /// 'cat.db'` additionally drops that table's, or that database's, cached
+    /// Hive manifests. Those entries are process-shared but hold no per-user
+    /// data, and the cost of dropping them is bounded by the scope named, the
+    /// same as the invalidation every DDL on the table already performs.
+    RefreshCatalogCache {
+        table: Option<TableRef>,
+        schema: Option<NamespaceRef>,
+    },
     /// Project existing Iceberg `sqe.column-tags` into Ranger's tag store
     /// for tables tagged before the projector existed (issue #421).
     /// Admin-only. Does not write Iceberg; a failed SET TAG projection is
@@ -219,7 +228,7 @@ impl ProcedureCall {
             ProcedureCall::SetCurrentSnapshot { .. } => "set_current_snapshot",
             ProcedureCall::RollbackToSnapshot { .. } => "rollback_to_snapshot",
             ProcedureCall::TableHealth { .. } => "table_health",
-            ProcedureCall::RefreshCatalogCache => "refresh_catalog_cache",
+            ProcedureCall::RefreshCatalogCache { .. } => "refresh_catalog_cache",
             ProcedureCall::ReprojectColumnTags { .. } => "reproject_column_tags",
         }
     }
@@ -242,7 +251,7 @@ impl ProcedureCall {
                 scope: ReprojectScope::Table(table),
             } => Some(table),
             ProcedureCall::PurgeOrphanLocations { .. }
-            | ProcedureCall::RefreshCatalogCache
+            | ProcedureCall::RefreshCatalogCache { .. }
             | ProcedureCall::ReprojectColumnTags { .. } => None,
         }
     }
@@ -375,12 +384,25 @@ pub fn try_parse_call(stmt: &Statement) -> sqe_core::Result<Option<ProcedureCall
         "set_current_snapshot" => parse_set_current_snapshot(args).map(Some),
         "rollback_to_snapshot" => parse_rollback_to_snapshot(args).map(Some),
         "table_health" => parse_table_health(args).map(Some),
-        // Table-less, argument-less. Any positional/named args are ignored
-        // rather than rejected so callers can pass a harmless no-op.
-        "refresh_catalog_cache" => Ok(Some(ProcedureCall::RefreshCatalogCache)),
+        "refresh_catalog_cache" => parse_refresh_catalog_cache(args).map(Some),
         "reproject_column_tags" => parse_reproject_column_tags(args).map(Some),
         _ => Ok(None),
     }
+}
+
+/// Parse `CALL system.refresh_catalog_cache()`, optionally narrowed with
+/// `table => 'cat.db.t'` or `schema => 'cat.db'`. Both may be given; any
+/// other argument is rejected by name so a typo does not silently become a
+/// session-only refresh.
+fn parse_refresh_catalog_cache(mut args: Vec<(String, Expr)>) -> sqe_core::Result<ProcedureCall> {
+    let table = take_option(&mut args, "table", |e| {
+        expect_string(e, "table").and_then(|s| TableRef::parse(&s))
+    })?;
+    let schema = take_option(&mut args, "schema", |e| {
+        expect_string(e, "schema").and_then(|s| NamespaceRef::parse(&s))
+    })?;
+    expect_no_remaining(&args, "refresh_catalog_cache")?;
+    Ok(ProcedureCall::RefreshCatalogCache { table, schema })
 }
 
 /// Parse `CALL system.register_table(table => 'ns.t', metadata_location => 's3://...')`.
@@ -390,7 +412,7 @@ fn parse_register_table(mut args: Vec<(String, Expr)>) -> sqe_core::Result<Proce
         expect_string(e, "metadata_location")
     })?
     .ok_or_else(|| {
-        SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+        SqeError::with_code(SqeErrorCode::ExecutionFailed,
             "CALL system.register_table requires `metadata_location => 's3://...'`",
         )
     })?;
@@ -417,7 +439,7 @@ fn parse_set_current_snapshot(mut args: Vec<(String, Expr)>) -> sqe_core::Result
     let table = take_table(&mut args)?;
     let snapshot_id = take_option(&mut args, "snapshot_id", |e| expect_i64(e, "snapshot_id"))?
         .ok_or_else(|| {
-            SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+            SqeError::with_code(SqeErrorCode::ExecutionFailed,
                 "CALL system.set_current_snapshot requires `snapshot_id => <id>`",
             )
         })?;
@@ -430,7 +452,7 @@ fn parse_rollback_to_snapshot(mut args: Vec<(String, Expr)>) -> sqe_core::Result
     let table = take_table(&mut args)?;
     let snapshot_id = take_option(&mut args, "snapshot_id", |e| expect_i64(e, "snapshot_id"))?
         .ok_or_else(|| {
-            SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+            SqeError::with_code(SqeErrorCode::ExecutionFailed,
                 "CALL system.rollback_to_snapshot requires `snapshot_id => <id>`",
             )
         })?;
@@ -483,7 +505,7 @@ fn take_namespace(args: &mut Vec<(String, Expr)>) -> sqe_core::Result<NamespaceR
         .iter()
         .position(|(k, _)| k.eq_ignore_ascii_case("namespace"))
         .ok_or_else(|| {
-            SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+            SqeError::with_code(SqeErrorCode::ExecutionFailed,
                 "CALL system.purge_orphan_locations requires a `namespace => 'ns'` argument",
             )
         })?;
@@ -539,7 +561,7 @@ fn extract_args(proc: &str, args: &FunctionArguments) -> sqe_core::Result<Vec<(S
         FunctionArguments::List(list) => list,
         FunctionArguments::None => return Ok(Vec::new()),
         FunctionArguments::Subquery(_) => {
-            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed,
                 "CALL system.* does not accept subquery arguments".to_string(),
             ));
         }
@@ -569,7 +591,7 @@ fn extract_args(proc: &str, args: &FunctionArguments) -> sqe_core::Result<Vec<(S
     }
 
     if !named.is_empty() && !positional.is_empty() {
-        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed,
             "Named and positional arguments cannot be mixed".to_string(),
         ));
     }
@@ -874,7 +896,7 @@ fn parse_reproject_column_tags(mut args: Vec<(String, Expr)>) -> sqe_core::Resul
         + usize::from(namespace.is_some())
         + usize::from(catalog.is_some());
     if filled != 1 {
-        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, 
+        return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed,
             "CALL system.reproject_column_tags requires exactly one of \
              `table => 'ns.t'`, `namespace => 'ns'`, or `catalog => 'cat'`",
         ));
@@ -1454,10 +1476,54 @@ mod tests {
     fn parses_refresh_catalog_cache() {
         let stmt = parse_first("CALL system.refresh_catalog_cache()");
         let call = try_parse_call(&stmt).unwrap().expect("match");
-        assert!(matches!(call, ProcedureCall::RefreshCatalogCache));
+        assert!(matches!(
+            call,
+            ProcedureCall::RefreshCatalogCache {
+                table: None,
+                schema: None
+            }
+        ));
         assert_eq!(call.name(), "refresh_catalog_cache");
-        // Table-less: no maintenance target.
+        // Not a maintenance target even when narrowed: the router, not the
+        // table-scoped maintenance handler, answers it.
         assert!(call.table().is_none());
+    }
+
+    // Issue #666: the refresh can be narrowed to one table or one schema so
+    // a Hive/Glue manifest cached past its change is dropped on demand.
+    #[test]
+    fn parses_refresh_catalog_cache_scoped() {
+        let stmt =
+            parse_first("CALL system.refresh_catalog_cache(table => 'glue.thecore.tag')");
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        match call {
+            ProcedureCall::RefreshCatalogCache {
+                table: Some(t),
+                schema: None,
+            } => {
+                assert_eq!(t.catalog.as_deref(), Some("glue"));
+                assert_eq!(t.namespace, "thecore");
+                assert_eq!(t.name, "tag");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let stmt = parse_first("CALL system.refresh_catalog_cache(schema => 'glue.thecore')");
+        let call = try_parse_call(&stmt).unwrap().expect("match");
+        match call {
+            ProcedureCall::RefreshCatalogCache {
+                table: None,
+                schema: Some(ns),
+            } => {
+                assert_eq!(ns.catalog.as_deref(), Some("glue"));
+                assert_eq!(ns.namespace, "thecore");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let stmt = parse_first("CALL system.refresh_catalog_cache(tabel => 'x')");
+        let err = try_parse_call(&stmt).unwrap_err();
+        assert!(err.to_string().contains("Unknown argument 'tabel'"), "{err}");
     }
 
     #[test]

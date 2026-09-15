@@ -226,10 +226,11 @@ pub async fn build_glue_root(
     catalog_id: Option<String>,
     databases: Vec<String>,
     limits: crate::hive::manifest::ManifestLimits,
+    timeout: Option<std::time::Duration>,
 ) -> Arc<dyn crate::hive::source::HiveMetadataSource> {
     Arc::new(
         crate::hive::glue_source::GlueMetadataSource::from_env(
-            region, catalog_id, databases, limits,
+            region, catalog_id, databases, limits, timeout,
         )
         .await,
     )

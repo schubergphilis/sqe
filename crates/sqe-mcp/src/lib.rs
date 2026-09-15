@@ -70,7 +70,16 @@ pub struct McpServerState {
     /// these runs on the engine's storage credentials, not the caller's, so
     /// it needs the catalog named in `write_catalogs` explicitly.
     hive_roots: Arc<Vec<String>>,
+    /// `refresh_metadata` cooldown: user + scope -> last refresh (issue
+    /// #666). A model that loops on "table missing, refresh, table missing"
+    /// must not turn into a metastore flood; inside the window the tool
+    /// answers "recently refreshed" without touching a cache.
+    refreshes: Arc<Mutex<HashMap<String, Instant>>>,
 }
+
+/// Least time between two `refresh_metadata` calls for the same user and
+/// scope.
+const REFRESH_COOLDOWN: Duration = Duration::from_secs(10);
 
 /// What a client said about itself on `initialize`, bound to the identity that
 /// said it. The binding stops one caller from relabelling another caller's
@@ -223,7 +232,28 @@ impl McpServerState {
             principals,
             clients: Arc::new(ClientRegistry::default()),
             hive_roots: Arc::new(Vec::new()),
+            refreshes: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Record a `refresh_metadata` call for `key` unless one happened less
+    /// than [`REFRESH_COOLDOWN`] ago; returns how long ago that was.
+    fn refresh_cooldown_hit(&self, key: &str) -> Option<Duration> {
+        let now = Instant::now();
+        let mut map = self
+            .refreshes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(last) = map.get(key) {
+            let since = now.duration_since(*last);
+            if since < REFRESH_COOLDOWN {
+                return Some(since);
+            }
+        }
+        // Keep the map bounded: entries older than the window are useless.
+        map.retain(|_, at| now.duration_since(*at) < REFRESH_COOLDOWN);
+        map.insert(key.to_string(), now);
+        None
     }
 
     /// The `[[hive.roots]]` catalog names; see `McpConfig::write_catalogs`.
@@ -688,6 +718,7 @@ fn tools(config: &McpConfig) -> Vec<Value> {
         tool("sample_rows", "Return up to `limit` rows (default 10, at most 100) of a table, as the authenticated user: row filters and column masks apply. Prefer this over SELECT * for a first look at a table.", json!({"type":"object","properties":{"catalog":{"type":"string"},"schema":{"type":"string"},"table":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["catalog","schema","table"],"additionalProperties":false}), true, false),
         tool("explain_query", "Explain a read-only SQL query without allowing a write statement to be hidden behind EXPLAIN.", one_string_schema("sql"), true, false),
         tool("whoami", "Show the SQE identity, roles, groups, and OAuth scopes for this request; never returns tokens.", empty_schema(), true, false),
+        tool("refresh_metadata", "Drop cached catalog metadata so the next call re-reads it from the source. Use ONLY when a table or column you expect is missing, or a schema looks stale after a change outside SQE; routine queries never need it. Scope it as narrowly as you can: `table` (with `catalog` and `schema`) refreshes one table, `schema` (with `catalog`) one schema, nothing refreshes this session's catalog view. Rate-limited per scope; a repeat inside the window is a no-op that says so.", json!({"type":"object","properties":{"catalog":{"type":"string"},"schema":{"type":"string"},"table":{"type":"string"}},"additionalProperties":false}), false, false),
     ];
     if config.allow_writes {
         tools.push(tool("execute_sql_change", "Execute one change/write SQL statement. Requires the configured OAuth write scope and SQE writer role; the target catalog must be one the operator allowed for MCP writes; source catalog and storage authorization still apply as the authenticated user.", one_string_schema("sql"), false, true));
@@ -795,6 +826,67 @@ async fn call_tool(
             ensure_read_only(inner, session_catalog).map_err(|e| (-32602, e))?;
             format!("EXPLAIN {inner}")
         }
+        "refresh_metadata" => {
+            // Narrowest scope the arguments allow (issue #666). `catalog`
+            // falls back to the session default so `schema` alone works the
+            // way `search_tables` does; a table without a schema is an
+            // argument error, not a guess.
+            let optional = |key: &str| {
+                args.get(key)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+            };
+            let catalog = optional("catalog").or(session_catalog);
+            let (sql, scope) = match (optional("schema"), optional("table")) {
+                (Some(schema), Some(table)) => {
+                    let Some(catalog) = catalog else {
+                        return Err((-32602, "refresh_metadata with `table` needs `catalog` (or a session default catalog)".to_string()));
+                    };
+                    let qualified = format!("{catalog}.{schema}.{table}");
+                    (
+                        format!(
+                            "CALL system.refresh_catalog_cache(table => '{}')",
+                            qualified.replace('\'', "''")
+                        ),
+                        format!("table:{qualified}"),
+                    )
+                }
+                (None, Some(_)) => {
+                    return Err((-32602, "refresh_metadata with `table` also needs `schema`".to_string()));
+                }
+                (Some(schema), None) => {
+                    let Some(catalog) = catalog else {
+                        return Err((-32602, "refresh_metadata with `schema` needs `catalog` (or a session default catalog)".to_string()));
+                    };
+                    let qualified = format!("{catalog}.{schema}");
+                    (
+                        format!(
+                            "CALL system.refresh_catalog_cache(schema => '{}')",
+                            qualified.replace('\'', "''")
+                        ),
+                        format!("schema:{qualified}"),
+                    )
+                }
+                (None, None) => (
+                    "CALL system.refresh_catalog_cache()".to_string(),
+                    "session".to_string(),
+                ),
+            };
+            let key = format!("{}|{scope}", auth.session.user.username);
+            if let Some(since) = state.refresh_cooldown_hit(&key) {
+                return Ok(tool_success(json!({
+                    "scope": scope,
+                    "status": "skipped",
+                    "reason": format!(
+                        "refreshed {}s ago; wait {}s before refreshing this scope again",
+                        since.as_secs(),
+                        REFRESH_COOLDOWN.as_secs()
+                    ),
+                })));
+            }
+            sql
+        }
         _ => return Err((-32602, format!("Unknown tool: {name}"))),
     };
     // Tag the session with the tool and client so the audit trail and
@@ -809,7 +901,31 @@ async fn call_tool(
             state.config.max_result_rows,
             state.config.max_response_bytes,
         ))),
-        Err(error) => Ok(tool_failure(error.to_string())),
+        Err(error) => Ok(tool_failure(with_refresh_hint(name, error.to_string()))),
+    }
+}
+
+/// A not-found answer from a lookup tool gets one line pointing at
+/// `refresh_metadata` (issue #666): a table created or altered outside SQE
+/// can sit behind a cached listing until its TTL, and the model would
+/// otherwise retry the same lookup. Only the lookup tools, only for
+/// not-found, so the hint never appears on a syntax error or a denial.
+fn with_refresh_hint(tool: &str, message: String) -> String {
+    let lookup = matches!(
+        tool,
+        "list_tables" | "describe_table" | "get_table_ddl" | "sample_rows"
+    );
+    let not_found = {
+        let m = message.to_ascii_lowercase();
+        m.contains("not found") || m.contains("does not exist")
+    };
+    if lookup && not_found {
+        format!(
+            "{message}\nIf this table or schema was created or changed recently, call \
+             refresh_metadata for that scope and retry once."
+        )
+    } else {
+        message
     }
 }
 
@@ -1468,6 +1584,60 @@ mod tests {
         assert!(tools(&enabled)
             .iter()
             .any(|tool| tool["name"] == "execute_sql_change"));
+    }
+
+    // Issue #666: `refresh_metadata` is a read tool in effect (it drops
+    // caches, never data) but not read-only by annotation, so a client that
+    // auto-approves read-only tools still asks before a refresh.
+    #[test]
+    fn refresh_metadata_is_advertised_and_not_marked_read_only() {
+        let tool = tools(&McpConfig::default())
+            .into_iter()
+            .find(|tool| tool["name"] == "refresh_metadata")
+            .expect("refresh_metadata advertised");
+        assert_eq!(tool["annotations"]["readOnlyHint"], false);
+        assert_eq!(tool["annotations"]["destructiveHint"], false);
+        let props = &tool["inputSchema"]["properties"];
+        for key in ["catalog", "schema", "table"] {
+            assert!(props.get(key).is_some(), "{key} argument");
+        }
+        assert!(tool["inputSchema"].get("required").is_none(), "every argument is optional");
+    }
+
+    #[test]
+    fn not_found_from_a_lookup_tool_points_at_refresh_metadata() {
+        let hinted = with_refresh_hint("describe_table", "table 'glue.db.t' not found".to_string());
+        assert!(hinted.contains("refresh_metadata"), "{hinted}");
+        let plain = with_refresh_hint("execute_sql_readonly", "table 'x' not found".to_string());
+        assert!(!plain.contains("refresh_metadata"), "only lookup tools get the hint");
+        let denied = with_refresh_hint("describe_table", "permission denied".to_string());
+        assert!(!denied.contains("refresh_metadata"), "only not-found gets the hint");
+    }
+
+    #[test]
+    fn refresh_cooldown_holds_per_user_and_scope() {
+        let state = test_state_for_cooldown();
+        assert!(state.refresh_cooldown_hit("alice|table:c.s.t").is_none(), "first call runs");
+        assert!(
+            state.refresh_cooldown_hit("alice|table:c.s.t").is_some(),
+            "a repeat inside the window is skipped"
+        );
+        assert!(
+            state.refresh_cooldown_hit("alice|schema:c.s").is_none(),
+            "another scope is independent"
+        );
+        assert!(
+            state.refresh_cooldown_hit("bob|table:c.s.t").is_none(),
+            "another user is independent"
+        );
+    }
+
+    fn test_state_for_cooldown() -> McpServerState {
+        McpServerState::new(
+            Arc::new(MockAuth),
+            Arc::new(RecordingExecutor::default()),
+            McpConfig::default(),
+        )
     }
 
     #[test]
