@@ -3703,7 +3703,10 @@ impl QueryHandler {
         // zero-row schema batch.
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
-        info!(
+        // The terminal INFO line ("Query completed", with elapsed_ms) is
+        // written by `QueryTracker::complete`, which both the buffered and
+        // the streaming path reach; this one only adds the batch count.
+        debug!(
             batch_count = batches.len(),
             total_rows = total_rows,
             "Query execution complete"

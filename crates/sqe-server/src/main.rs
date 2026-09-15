@@ -18,6 +18,15 @@ use sqe_trino_compat::server::{
     NodeContext, TrinoAuthenticator, TrinoQueryExecutor, TrinoResultStream,
 };
 
+/// Build identity stamped in by `build.rs` (issue #669): shown in the
+/// startup log and `/api/v1/status` so a debug binary or a stale checkout
+/// is visible before anyone reads a benchmark off it.
+mod build_info {
+    pub const GIT_SHA: &str = env!("SQE_GIT_SHA");
+    pub const PROFILE: &str = env!("SQE_BUILD_PROFILE");
+    pub const IS_DEBUG: bool = cfg!(debug_assertions);
+}
+
 // ── CLI ────────────────────────────────────────────────────────
 #[derive(Parser)]
 #[command(name = "sqe-server", version = sqe_core::VERSION, about = "SQE server — runs as coordinator or worker")]
@@ -295,6 +304,8 @@ struct ClusterStatus {
 struct NodeStatus {
     role: &'static str,
     version: &'static str,
+    git_sha: &'static str,
+    build_profile: &'static str,
     datafusion_version: &'static str,
     uptime_seconds: u64,
 }
@@ -325,6 +336,8 @@ async fn cluster_status(state: axum::extract::State<Arc<HealthState>>) -> Json<C
         node: NodeStatus {
             role: state.role,
             version: sqe_core::VERSION,
+            git_sha: build_info::GIT_SHA,
+            build_profile: build_info::PROFILE,
             datafusion_version: "51",
             uptime_seconds: state.started_at.elapsed().as_secs(),
         },
@@ -1110,7 +1123,22 @@ async fn async_main() -> anyhow::Result<()> {
     )
     .map_err(|e| anyhow::anyhow!(e))?;
 
-    tracing::info!(mode = ?mode, config = config_path, "Starting sqe-server");
+    tracing::info!(
+        mode = ?mode,
+        config = config_path,
+        version = sqe_core::VERSION,
+        git_sha = build_info::GIT_SHA,
+        build_profile = build_info::PROFILE,
+        "Starting sqe-server"
+    );
+    // Issue #669: a debug binary is 5-10x slower on scans and decoding and
+    // was once mistaken for an engine regression. Say so once, loudly.
+    if build_info::IS_DEBUG {
+        tracing::warn!(
+            "debug build: performance is not representative, build with \
+             `cargo build --release --bin sqe-server` for anything but tests"
+        );
+    }
 
     match mode {
         Mode::Coordinator => run_coordinator(config).await,
@@ -2386,6 +2414,8 @@ mod tests {
             node: NodeStatus {
                 role: "coordinator",
                 version: "0.1.0",
+                git_sha: "abc123",
+                build_profile: "release",
                 datafusion_version: "51",
                 uptime_seconds: 120,
             },
@@ -2417,6 +2447,8 @@ mod tests {
             node: NodeStatus {
                 role: "worker",
                 version: "0.1.0",
+                git_sha: "abc123",
+                build_profile: "release",
                 datafusion_version: "51",
                 uptime_seconds: 60,
             },
@@ -2435,6 +2467,8 @@ mod tests {
             node: NodeStatus {
                 role: "coordinator",
                 version: "0.1.0",
+                git_sha: "abc123",
+                build_profile: "debug",
                 datafusion_version: "51",
                 uptime_seconds: 0,
             },
