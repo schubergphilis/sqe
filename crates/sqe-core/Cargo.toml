@@ -49,6 +49,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # crates plus their tests; one pre-main install in the crate every one of
 # them links is the guarantee, the explicit `ensure_crypto_provider()` calls
 # in the binaries' `main` are the belt to this brace.
-ctor = "0.5"
+ctor = "1"
 datafusion = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
