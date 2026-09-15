@@ -877,6 +877,7 @@ fn cache_manifest() -> HiveManifest {
         owner: None,
         created_at: None,
         description: None,
+        view_original_text: None,
         partition_keys: vec![],
         parameters: Default::default(),
         storage_descriptor: sqe_catalog::hive::manifest::StorageDescriptor {
@@ -1513,4 +1514,243 @@ async fn an_etag_less_source_reloads_once_the_ttl_has_lapsed() {
         2,
         "past the TTL the entry is reloaded, whatever was served in between"
     );
+}
+
+// ── Athena / Trino views stored in Glue (issue #667) ───────────────────
+
+mod views {
+    use std::collections::BTreeMap;
+
+    use base64::Engine;
+
+    use sqe_catalog::hive::manifest::{HiveManifest, ManifestLimits, StorageDescriptor};
+    use sqe_catalog::hive::source::HiveMetadataSource;
+    use sqe_catalog::hive::store::HiveManifestStore;
+    use sqe_catalog::hive::HiveError;
+
+    /// The fixture's `sales` database plus views the way Glue would return
+    /// them: `VIRTUAL_VIEW`, empty storage descriptor, the definition in
+    /// `view_original_text`.
+    pub struct ViewSource {
+        inner: HiveManifestStore,
+        views: BTreeMap<String, HiveManifest>,
+    }
+
+    pub fn presto_payload(json: &str) -> String {
+        format!(
+            "/* Presto View: {} */",
+            base64::engine::general_purpose::STANDARD.encode(json)
+        )
+    }
+
+    pub fn view_manifest(name: &str, view_original_text: Option<&str>) -> HiveManifest {
+        HiveManifest {
+            manifest_version: sqe_catalog::hive::manifest::MANIFEST_VERSION,
+            table_type: "VIRTUAL_VIEW".to_string(),
+            database_name: "sales".to_string(),
+            name: name.to_string(),
+            owner: None,
+            created_at: None,
+            description: None,
+            view_original_text: view_original_text.map(str::to_string),
+            partition_keys: vec![],
+            parameters: BTreeMap::from([("presto_view".to_string(), "true".to_string())]),
+            storage_descriptor: StorageDescriptor {
+                location: String::new(),
+                input_format: None,
+                output_format: None,
+                compressed: false,
+                serde_info: Default::default(),
+                columns: vec![],
+                sort_columns: vec![],
+            },
+            sqe: Default::default(),
+        }
+    }
+
+    impl ViewSource {
+        pub fn new(inner: HiveManifestStore, views: Vec<HiveManifest>) -> Self {
+            Self {
+                inner,
+                views: views.into_iter().map(|m| (m.name.clone(), m)).collect(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HiveMetadataSource for ViewSource {
+        async fn list_databases(&self) -> Result<Vec<String>, HiveError> {
+            self.inner.list_databases().await
+        }
+        async fn list_tables(&self, database: &str) -> Result<Vec<String>, HiveError> {
+            let mut names = self.inner.list_tables(database).await?;
+            if database == "sales" {
+                names.extend(self.views.keys().cloned());
+            }
+            Ok(names)
+        }
+        async fn get(&self, database: &str, table: &str) -> Result<HiveManifest, HiveError> {
+            if database == "sales" {
+                if let Some(v) = self.views.get(table) {
+                    return Ok(v.clone());
+                }
+            }
+            self.inner.get(database, table).await
+        }
+        async fn etag(&self, database: &str, table: &str) -> Result<Option<String>, HiveError> {
+            if database == "sales" && self.views.contains_key(table) {
+                return Ok(None);
+            }
+            self.inner.manifest_etag(database, table).await.map(|_| None)
+        }
+        fn limits(&self) -> &ManifestLimits {
+            self.inner.limits()
+        }
+    }
+}
+
+/// A `lake` catalog over the fixture whose metastore also holds the given
+/// Glue-style views.
+async fn root_with_views(
+    f: &hive_fixture::Fixture,
+    ctx: &SessionContext,
+    views: Vec<HiveManifest>,
+) -> Arc<HiveCatalogProvider> {
+    let source = Arc::new(views::ViewSource::new(fixture_store(&f.root), views));
+    let provider = Arc::new(HiveCatalogProvider::with_source(
+        "lake".to_string(),
+        source as Arc<dyn sqe_catalog::hive::source::HiveMetadataSource>,
+        Arc::new(counting::CountingFactory(counting::CountingStore::local())),
+        ctx.runtime_env(),
+        Arc::new(HiveMetadataCache::new()),
+        Duration::from_secs(60),
+    ));
+    provider.refresh_all().await;
+    ctx.register_catalog("lake", provider.clone());
+    provider
+}
+
+/// An Athena view is planned from its Presto payload and answers like a
+/// table. Its SQL is Trino dialect with references relative to the view's
+/// own database (`FROM orders`) and Athena's `awsdatacatalog` qualifier;
+/// both resolve against this catalog.
+#[tokio::test]
+async fn athena_view_over_a_hive_table_is_queryable() {
+    let f = partitioned_csv_root().await;
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_information_schema(true));
+    let unqualified = views::view_manifest(
+        "big_orders",
+        Some(&views::presto_payload(
+            r#"{"originalSql":"SELECT id, amount FROM orders WHERE amount > 15",
+                "catalog":"awsdatacatalog","schema":"sales",
+                "columns":[{"name":"id","type":"bigint"},{"name":"amount","type":"double"}]}"#,
+        )),
+    );
+    let athena_qualified = views::view_manifest(
+        "order_count",
+        Some(&views::presto_payload(
+            r#"{"originalSql":"SELECT count(*) AS n FROM awsdatacatalog.sales.orders",
+                "catalog":"awsdatacatalog","schema":"sales"}"#,
+        )),
+    );
+    let over_a_view = views::view_manifest(
+        "big_order_count",
+        Some(&views::presto_payload(
+            r#"{"originalSql":"SELECT count(*) AS n FROM \"sales\".\"big_orders\"",
+                "catalog":"awsdatacatalog","schema":"sales"}"#,
+        )),
+    );
+    root_with_views(&f, &ctx, vec![unqualified, athena_qualified, over_a_view]).await;
+
+    let n = count_i64(
+        &ctx.sql("SELECT count(*) FROM lake.sales.big_orders")
+            .await
+            .expect("plan view")
+            .collect()
+            .await
+            .expect("run view"),
+    );
+    assert_eq!(n, 2, "amount > 15 keeps 20.0 and 30.5");
+
+    let n = count_i64(
+        &ctx.sql("SELECT n FROM lake.sales.order_count")
+            .await
+            .expect("plan awsdatacatalog-qualified view")
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(n, 3);
+
+    let n = count_i64(
+        &ctx.sql("SELECT n FROM lake.sales.big_order_count")
+            .await
+            .expect("plan view over view")
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(n, 2);
+
+    // information_schema reports it as a VIEW, the way clients decide
+    // whether to offer DDL on it.
+    let kind = ctx
+        .sql(
+            "SELECT table_type FROM lake.information_schema.tables \
+             WHERE table_schema = 'sales' AND table_name = 'big_orders'",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let kind = kind
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .expect("a row")
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::StringArray>()
+        .unwrap()
+        .value(0)
+        .to_string();
+    assert_eq!(kind, "VIEW");
+}
+
+/// A view this release cannot plan is hidden with a reason in the log, not
+/// reported as a table with a missing storage format, and not fatal to the
+/// rest of the database.
+#[tokio::test]
+async fn unreadable_views_are_hidden_not_fatal() {
+    use datafusion::catalog::CatalogProvider;
+
+    let f = partitioned_csv_root().await;
+    let ctx = SessionContext::new();
+    let hive_native = views::view_manifest("hive_native", Some("SELECT * FROM orders"));
+    let no_text = views::view_manifest("no_text", None);
+    let bad_sql = views::view_manifest(
+        "bad_sql",
+        Some(&views::presto_payload(
+            r#"{"originalSql":"SELECT * FROM orders_that_do_not_exist","schema":"sales"}"#,
+        )),
+    );
+    let provider = root_with_views(&f, &ctx, vec![hive_native, no_text, bad_sql]).await;
+
+    let sales = provider.schema("sales").expect("sales");
+    for name in ["hive_native", "no_text", "bad_sql"] {
+        assert!(
+            sales.table(name).await.expect("hidden, not an error").is_none(),
+            "{name} must be hidden"
+        );
+    }
+    // The real table next to them is unaffected.
+    let n = count_i64(
+        &ctx.sql("SELECT count(*) FROM lake.sales.orders")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(n, 3);
 }

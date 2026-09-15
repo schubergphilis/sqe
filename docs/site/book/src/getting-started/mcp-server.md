@@ -42,7 +42,8 @@ The flags:
 
 - `--glue-catalog <name>` attaches the region's Glue Data Catalog under that SQL
   name. Tables resolve as `<name>.<database>.<table>`. Databases and tables are
-  read lazily, so one unreadable table does not take the catalog down.
+  read lazily, so one unreadable table does not take the catalog down. Athena
+  views are expanded from their Glue definition and queried like tables.
 - `--glue-database <db>` restricts the catalog to specific databases. Repeatable,
   and each value may be comma-separated (`--glue-database claude,afas`). Empty
   exposes every database. A table in any other database is not found, so a shared
