@@ -351,7 +351,7 @@ pub fn https_peers_need_trust_root(
 /// No logging here: this runs before any subscriber exists. A failed install
 /// can only mean another pre-main initialiser won the race, in which case
 /// the provider that is installed is the one rustls will use.
-#[ctor::ctor]
+#[ctor::ctor(unsafe)]
 fn install_ring_before_main() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
