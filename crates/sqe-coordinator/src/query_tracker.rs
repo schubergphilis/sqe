@@ -174,6 +174,13 @@ impl QueryTracker {
     }
 }
 
+/// Milliseconds from the query's creation (admission) to `now`. Includes
+/// queueing and planning, unlike `execution_ms`, so it matches what a
+/// client experienced.
+fn wall_elapsed_ms(record: &QueryRecord, now: DateTime<Utc>) -> u64 {
+    (now - record.created).num_milliseconds().max(0) as u64
+}
+
 impl QueryTracker {
     pub fn new(config: &QueryHistoryConfig) -> Self {
         let history = Cache::builder()
@@ -262,8 +269,9 @@ impl QueryTracker {
         peak_memory_bytes: u64,
     ) {
         self.finish(query_id, |record| {
+            let now = Utc::now();
             record.state = QueryState::Finished;
-            record.ended = Some(Utc::now());
+            record.ended = Some(now);
             record.output_rows = rows;
             record.execution_ms = execution_ms;
             record.tables_touched = tables_touched;
@@ -271,17 +279,58 @@ impl QueryTracker {
             record.rows_scanned = rows_scanned;
             record.spill_bytes = spill_bytes;
             record.peak_memory_bytes = peak_memory_bytes;
+            tracing::info!(
+                query_id = %record.query_id,
+                username = %record.user,
+                rows = rows,
+                execution_ms = execution_ms,
+                elapsed_ms = wall_elapsed_ms(record, now),
+                bytes_scanned = bytes_scanned,
+                "Query completed"
+            );
         });
     }
 
+    /// Terminal failure record. Every failure path (buffered execution,
+    /// the query timeout, streaming plan failures, the stream finalizer)
+    /// ends here, so this is the one place that writes the failure to the
+    /// server log (issue #668). Before this, a failed query left only an
+    /// "Executing query" line with no completion and no error: the error
+    /// went back to the client and nowhere else. User errors (syntax, missing
+    /// table, denied) are WARN; internal, resource and external failures
+    /// are ERROR. The message is the full internal one, not the redacted
+    /// client message, because the log is the operator's only copy.
     pub fn failed(&self, query_id: &Uuid, error: &sqe_core::SqeError) {
         let code = error.error_code();
         self.finish(query_id, |record| {
+            let now = Utc::now();
             record.state = QueryState::Failed;
-            record.ended = Some(Utc::now());
+            record.ended = Some(now);
             record.error_type = Some(code.trino_error_type().to_string());
             record.error_code = Some(code.name().to_string());
             record.error_message = Some(error.client_message());
+            let elapsed_ms = wall_elapsed_ms(record, now);
+            if code.is_user_error() {
+                tracing::warn!(
+                    query_id = %record.query_id,
+                    username = %record.user,
+                    error_code = code.name(),
+                    error_type = code.trino_error_type(),
+                    elapsed_ms,
+                    error = %error,
+                    "Query failed"
+                );
+            } else {
+                tracing::error!(
+                    query_id = %record.query_id,
+                    username = %record.user,
+                    error_code = code.name(),
+                    error_type = code.trino_error_type(),
+                    elapsed_ms,
+                    error = %error,
+                    "Query failed"
+                );
+            }
         });
     }
 
@@ -856,5 +905,98 @@ mod tests {
             "cache should evict old entries: found {} records, expected <= 5",
             records.len()
         );
+    }
+
+    /// Captures everything a `tracing` subscriber writes while `f` runs.
+    fn capture_log(f: impl FnOnce()) -> String {
+        use std::io::Write;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    // Issue #668: a failed query used to leave only "Executing query" in the
+    // server log. Every failure path ends in `failed`, so this is the one
+    // event that guarantees an operator can grep the query_id and see why.
+    #[test]
+    fn failed_writes_one_query_failed_line_with_query_id() {
+        let tracker = QueryTracker::new(&test_config());
+        let id = Uuid::now_v7();
+        let log = capture_log(|| {
+            tracker.start(id, "carol", None, "SELECT * FROM nope", "s3", None, vec![], None);
+            let err = sqe_core::SqeError::Execution("table 'nope' not found in catalog".to_string());
+            assert!(err.error_code().is_user_error());
+            tracker.failed(&id, &err);
+        });
+        let failed_lines: Vec<&str> = log.lines().filter(|l| l.contains("Query failed")).collect();
+        assert_eq!(failed_lines.len(), 1, "log was:\n{log}");
+        let line = failed_lines[0];
+        assert!(line.contains(&id.to_string()), "{line}");
+        assert!(line.contains("WARN"), "user errors are WARN: {line}");
+        assert!(line.contains("error_code=\"TABLE_NOT_FOUND\""), "{line}");
+        assert!(line.contains("table 'nope' not found"), "{line}");
+        assert!(line.contains("elapsed_ms="), "{line}");
+        assert_eq!(tracker.get(&id).unwrap().state, QueryState::Failed);
+    }
+
+    #[test]
+    fn failed_internal_error_is_logged_at_error_level() {
+        let tracker = QueryTracker::new(&test_config());
+        let id = Uuid::now_v7();
+        let log = capture_log(|| {
+            tracker.start(id, "dave", None, "SELECT 1", "s4", None, vec![], None);
+            let err = sqe_core::SqeError::Internal(anyhow::anyhow!("worker vanished"));
+            assert!(!err.error_code().is_user_error());
+            tracker.failed(&id, &err);
+        });
+        let line = log
+            .lines()
+            .find(|l| l.contains("Query failed"))
+            .unwrap_or_else(|| panic!("no Query failed line in:\n{log}"));
+        assert!(line.contains("ERROR"), "{line}");
+        assert!(line.contains("worker vanished"), "{line}");
+    }
+
+    #[test]
+    fn complete_writes_query_completed_with_elapsed() {
+        let tracker = QueryTracker::new(&test_config());
+        let id = Uuid::now_v7();
+        let log = capture_log(|| {
+            tracker.start(id, "erin", None, "SELECT 1", "s5", None, vec![], None);
+            tracker.complete(&id, 7, 12, vec![], 0, 0, 0, 0);
+        });
+        let line = log
+            .lines()
+            .find(|l| l.contains("Query completed"))
+            .unwrap_or_else(|| panic!("no Query completed line in:\n{log}"));
+        assert!(line.contains(&id.to_string()), "{line}");
+        assert!(line.contains("rows=7"), "{line}");
+        assert!(line.contains("elapsed_ms="), "{line}");
     }
 }

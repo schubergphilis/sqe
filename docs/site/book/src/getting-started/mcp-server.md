@@ -32,8 +32,11 @@ sqe-server \
 That serves `/mcp` on port 8098 with no authentication, attaches every Glue
 database in the region as the SQL catalog `glue`, and answers reads with your
 own AWS credentials. The `sqe-server` build must include the Glue feature
-(`cargo build -p sqe-server --features glue`, or a release image built with
-it).
+(`cargo build --release -p sqe-server --features glue`, or a release image
+built with it). Build with `--release`: a debug binary decodes Parquet and
+runs DataFusion 5 to 10 times slower, and the server warns at startup when it
+is one. The startup line and `/api/v1/status` report `build_profile` and
+`git_sha` so you can check which binary answered.
 
 The flags:
 
