@@ -93,7 +93,7 @@ pub struct PartitionIndex {
 
 /// A Glue-style column: `StorageDescriptor.Columns[]` and
 /// `TableInput.PartitionKeys[]` both use this shape.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GlueColumn {
     pub name: String,
     pub r#type: String,
@@ -102,7 +102,7 @@ pub struct GlueColumn {
 }
 
 /// Mirrors Glue's `SerDeInfo`.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SerdeInfo {
     #[serde(default)]
     pub serialization_library: Option<String>,
@@ -111,7 +111,7 @@ pub struct SerdeInfo {
 }
 
 /// Mirrors Glue's `StorageDescriptor`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StorageDescriptor {
     pub location: String,
     #[serde(default)]
@@ -132,7 +132,7 @@ pub struct StorageDescriptor {
 /// in their own nested block, rather than mixed into `parameters`, so an
 /// eventual Glue backend can drop this block wholesale instead of picking
 /// SQE keys out of a Glue-owned map.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SqeExtensions {
     #[serde(default)]
     pub secret: Option<String>,
@@ -152,7 +152,7 @@ pub struct SqeExtensions {
 /// engine can still read the manifest. What *is* enforced is
 /// `manifest_version`, which is checked explicitly in [`HiveManifest::parse`]
 /// rather than left to serde.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HiveManifest {
     pub manifest_version: u32,
     pub table_type: String,

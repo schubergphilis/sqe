@@ -1754,3 +1754,283 @@ async fn unreadable_views_are_hidden_not_fatal() {
     );
     assert_eq!(n, 3);
 }
+
+// ── Metadata round trips behind listings (issue #666) ──────────────────
+
+mod bulk {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use sqe_catalog::hive::manifest::{HiveManifest, ManifestLimits};
+    use sqe_catalog::hive::source::HiveMetadataSource;
+    use sqe_catalog::hive::store::HiveManifestStore;
+    use sqe_catalog::hive::HiveError;
+
+    /// Behaves like Glue: no change token, and a listing that already
+    /// carries every table's definition. Counts the per-table fetches the
+    /// provider still makes.
+    pub struct BulkSource {
+        inner: HiveManifestStore,
+        pub get_calls: AtomicUsize,
+        pub list_calls: AtomicUsize,
+    }
+
+    impl BulkSource {
+        pub fn new(inner: HiveManifestStore) -> Self {
+            Self {
+                inner,
+                get_calls: AtomicUsize::new(0),
+                list_calls: AtomicUsize::new(0),
+            }
+        }
+        pub fn gets(&self) -> usize {
+            self.get_calls.load(Ordering::SeqCst)
+        }
+        pub fn lists(&self) -> usize {
+            self.list_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HiveMetadataSource for BulkSource {
+        async fn list_databases(&self) -> Result<Vec<String>, HiveError> {
+            self.inner.list_databases().await
+        }
+        async fn list_tables(&self, database: &str) -> Result<Vec<String>, HiveError> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_tables(database).await
+        }
+        async fn list_manifests(
+            &self,
+            database: &str,
+        ) -> Result<Option<Vec<HiveManifest>>, HiveError> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            let mut out = Vec::new();
+            for name in self.inner.list_tables(database).await? {
+                out.push(self.inner.get(database, &name).await?);
+            }
+            Ok(Some(out))
+        }
+        async fn get(&self, database: &str, table: &str) -> Result<HiveManifest, HiveError> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(database, table).await
+        }
+        async fn etag(&self, database: &str, table: &str) -> Result<Option<String>, HiveError> {
+            self.inner.manifest_etag(database, table).await.map(|_| None)
+        }
+        fn limits(&self) -> &ManifestLimits {
+            self.inner.limits()
+        }
+    }
+}
+
+/// A source whose listing returns full definitions (Glue) warms the
+/// manifest cache: after the pre-plan refresh, loading a listed table costs
+/// no per-table fetch, and `information_schema` reading the whole database
+/// costs one listing, not one fetch per table.
+#[tokio::test]
+async fn a_listing_with_definitions_serves_the_lookups_that_follow() {
+    let f = partitioned_csv_root().await;
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_information_schema(true));
+    let source = Arc::new(bulk::BulkSource::new(fixture_store(&f.root)));
+    let provider = Arc::new(HiveCatalogProvider::with_source(
+        "lake".to_string(),
+        Arc::clone(&source) as Arc<dyn sqe_catalog::hive::source::HiveMetadataSource>,
+        Arc::new(counting::CountingFactory(counting::CountingStore::local())),
+        ctx.runtime_env(),
+        Arc::new(HiveMetadataCache::new()),
+        Duration::from_secs(60),
+    ));
+    provider.refresh_all().await;
+    ctx.register_catalog("lake", provider.clone());
+    assert_eq!(source.lists(), 1, "one listing for the one database");
+
+    load_orders(&provider).await;
+    assert_eq!(
+        source.gets(),
+        0,
+        "the listing already delivered the manifest; no per-table fetch"
+    );
+
+    let rows = ctx
+        .sql("SELECT table_name, table_type FROM lake.information_schema.tables WHERE table_schema = 'sales'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let n: usize = rows.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(n, 1);
+    assert_eq!(source.gets(), 0, "information_schema is answered from the cache too");
+}
+
+/// `information_schema.tables` only needs each table's kind. Answering it
+/// used to build every table, which listed every table's data prefix for
+/// size statistics; the kind comes from the manifest alone.
+#[tokio::test]
+async fn table_type_does_not_list_the_data_prefix() {
+    use datafusion::catalog::CatalogProvider;
+
+    let f = partitioned_csv_root().await;
+    let ctx = SessionContext::new();
+    let (provider, _source, store) =
+        counting_root(&f, &ctx, HiveMetadataCache::new(), false).await;
+    let sales = provider.schema("sales").expect("sales");
+
+    let kind = sales.table_type("orders").await.expect("table_type");
+    assert_eq!(kind, Some(datafusion::logical_expr::TableType::Base));
+    assert_eq!(
+        store.lists(),
+        0,
+        "the table's kind must not cost a data-prefix listing"
+    );
+    assert!(sales.table_type("nope").await.expect("table_type").is_none());
+
+    // Building the table still lists, once, as before.
+    load_orders(&provider).await;
+    assert!(store.lists() >= 1);
+}
+
+// ── Metadata timeouts (issue #666) ─────────────────────────────────────
+
+mod slow {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use sqe_catalog::hive::manifest::{HiveManifest, ManifestLimits};
+    use sqe_catalog::hive::source::HiveMetadataSource;
+    use sqe_catalog::hive::store::HiveManifestStore;
+    use sqe_catalog::hive::HiveError;
+
+    /// The fixture's metastore with a switch that makes every per-table call
+    /// hang well past any timeout under test. Glue-shaped: no change token.
+    pub struct SlowSource {
+        inner: HiveManifestStore,
+        pub stall: AtomicBool,
+    }
+
+    impl SlowSource {
+        pub fn new(inner: HiveManifestStore) -> Self {
+            Self {
+                inner,
+                stall: AtomicBool::new(false),
+            }
+        }
+        async fn maybe_stall(&self) {
+            if self.stall.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HiveMetadataSource for SlowSource {
+        async fn list_databases(&self) -> Result<Vec<String>, HiveError> {
+            self.inner.list_databases().await
+        }
+        async fn list_tables(&self, database: &str) -> Result<Vec<String>, HiveError> {
+            self.maybe_stall().await;
+            self.inner.list_tables(database).await
+        }
+        async fn get(&self, database: &str, table: &str) -> Result<HiveManifest, HiveError> {
+            self.maybe_stall().await;
+            self.inner.get(database, table).await
+        }
+        async fn etag(&self, database: &str, table: &str) -> Result<Option<String>, HiveError> {
+            self.maybe_stall().await;
+            self.inner.manifest_etag(database, table).await.map(|_| None)
+        }
+        fn limits(&self) -> &ManifestLimits {
+            self.inner.limits()
+        }
+    }
+}
+
+/// A metastore that stops answering is cut at the timeout. A table seen
+/// before is served from its last known manifest with a warning; a table
+/// never seen fails with a named error instead of hanging the query.
+#[tokio::test]
+async fn a_stalled_metastore_serves_stale_metadata_or_fails_by_name() {
+    use datafusion::catalog::CatalogProvider;
+    use sqe_catalog::hive::source::TimeoutSource;
+
+    let f = partitioned_csv_root().await;
+    let ctx = SessionContext::new();
+    let slow = Arc::new(slow::SlowSource::new(fixture_store(&f.root)));
+    let bounded: Arc<dyn sqe_catalog::hive::source::HiveMetadataSource> = Arc::new(
+        TimeoutSource::new(
+            Arc::clone(&slow) as Arc<dyn sqe_catalog::hive::source::HiveMetadataSource>,
+            Duration::from_millis(200),
+        ),
+    );
+    // Recheck window zero: every lookup asks the source, so the stall is
+    // hit on the second lookup rather than hidden by the recheck window.
+    let cache = HiveMetadataCache::new().with_recheck(Duration::ZERO);
+    let provider = Arc::new(HiveCatalogProvider::with_source(
+        "lake".to_string(),
+        bounded,
+        Arc::new(counting::CountingFactory(counting::CountingStore::local())),
+        ctx.runtime_env(),
+        Arc::new(cache),
+        Duration::from_secs(60),
+    ));
+    provider.refresh_all().await;
+    ctx.register_catalog("lake", provider.clone());
+
+    // Warm: the table is known.
+    let n = count_i64(
+        &ctx.sql("SELECT count(*) FROM lake.sales.orders")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(n, 3);
+
+    slow.stall.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // Known table: the stalled etag/get is cut and the cached manifest
+    // answers, well inside the 30 s the source would have taken.
+    let started = std::time::Instant::now();
+    let n = count_i64(
+        &ctx.sql("SELECT count(*) FROM lake.sales.orders")
+            .await
+            .expect("stale metadata keeps the table queryable")
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(n, 3);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the timeout must cut the stalled call: took {:?}",
+        started.elapsed()
+    );
+
+    // Never-seen table: nothing stale to serve, so a named error.
+    let sales = provider.schema("sales").expect("sales");
+    let started = std::time::Instant::now();
+    let err = sales
+        .table("never_loaded")
+        .await
+        .expect_err("no stale entry: the timeout is an error");
+    assert!(
+        err.to_string().contains("catalog metadata timeout"),
+        "error must name the timeout: {err}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    // A stalled listing keeps the previous snapshot instead of failing.
+    let before = provider
+        .schema("sales")
+        .expect("sales")
+        .table_names();
+    let started = std::time::Instant::now();
+    let _ = provider.refresh_tables("sales").await;
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(
+        provider.schema("sales").expect("sales").table_names(),
+        before,
+        "a timed-out listing keeps the last known names"
+    );
+}

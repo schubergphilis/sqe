@@ -29,6 +29,7 @@
 //! table this engine cannot read; the rest must stay queryable.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 
@@ -47,6 +48,25 @@ pub trait HiveMetadataSource: Send + Sync {
     /// rather than an error: DataFusion asks about schemas it has merely
     /// seen named, and a hard error there fails the whole query.
     async fn list_tables(&self, database: &str) -> Result<Vec<String>, HiveError>;
+
+    /// Every manifest in `database` in one round trip, for sources whose
+    /// listing call already returns full table definitions (Glue's
+    /// `GetTables` does; a sidecar store's directory listing does not).
+    ///
+    /// `Ok(None)` means "no cheaper than one `get` per table", which is the
+    /// default. A `Some` answer lets the catalog warm the manifest cache
+    /// from a single listing, so `SHOW TABLES`, `information_schema` and
+    /// the first `SELECT` after them pay one paginated call per database
+    /// instead of one fetch per table (issue #666: 618 `GetTable` calls
+    /// behind one `SHOW TABLES`). Same not-found contract as
+    /// [`Self::list_tables`]: an unknown database is `Some(empty)`.
+    async fn list_manifests(
+        &self,
+        database: &str,
+    ) -> Result<Option<Vec<HiveManifest>>, HiveError> {
+        let _ = database;
+        Ok(None)
+    }
 
     /// One table's manifest. [`HiveError::NotFound`] when it does not exist.
     async fn get(&self, database: &str, table: &str) -> Result<HiveManifest, HiveError>;
@@ -126,5 +146,96 @@ impl HiveRoot {
     /// external metastore.
     pub fn sidecar(&self) -> Option<Arc<HiveManifestStore>> {
         self.sidecar.clone()
+    }
+
+    /// Bound every read on this root's metadata source (issue #666). The
+    /// sidecar handle, used by DDL only, is left as is: a write that stalls
+    /// should fail through its own object-store error, not be cut short.
+    #[must_use = "with_metadata_timeout consumes self; bind the returned root"]
+    pub fn with_metadata_timeout(mut self, timeout: Duration) -> Self {
+        self.source = Arc::new(TimeoutSource::new(Arc::clone(&self.source), timeout));
+        self
+    }
+}
+
+/// A [`HiveMetadataSource`] whose every call is cut at `timeout` (issue
+/// #666).
+///
+/// Nothing SQE-side bounded a metastore read before this: a throttled Glue
+/// `GetTable` or a `GetTables` page that never came back stalled the query
+/// in planning with no log line and no way to cancel. The cut is reported as
+/// [`HiveError::Timeout`], which `HiveSchemaProvider` turns into "serve the
+/// stale entry with a warning" when it has one and into a named error when
+/// it does not. Listings are bounded per call, so a multi-database refresh
+/// skips the slow database and keeps its previous snapshot, the way a failed
+/// listing already did.
+pub struct TimeoutSource {
+    inner: Arc<dyn HiveMetadataSource>,
+    timeout: Duration,
+}
+
+impl TimeoutSource {
+    pub fn new(inner: Arc<dyn HiveMetadataSource>, timeout: Duration) -> Self {
+        Self { inner, timeout }
+    }
+
+    async fn bounded<T, F>(&self, op: &str, what: &str, fut: F) -> Result<T, HiveError>
+    where
+        F: std::future::Future<Output = Result<T, HiveError>>,
+    {
+        match tokio::time::timeout(self.timeout, fut).await {
+            Ok(result) => result,
+            Err(_) => Err(HiveError::Timeout(format!(
+                "{op} {what} did not answer within {}s ([hive] metadata_timeout_secs)",
+                self.timeout.as_secs_f64()
+            ))),
+        }
+    }
+}
+
+#[async_trait]
+impl HiveMetadataSource for TimeoutSource {
+    async fn list_databases(&self) -> Result<Vec<String>, HiveError> {
+        self.bounded("list_databases", "", self.inner.list_databases())
+            .await
+    }
+
+    async fn list_tables(&self, database: &str) -> Result<Vec<String>, HiveError> {
+        self.bounded("list_tables", database, self.inner.list_tables(database))
+            .await
+    }
+
+    async fn list_manifests(
+        &self,
+        database: &str,
+    ) -> Result<Option<Vec<HiveManifest>>, HiveError> {
+        self.bounded(
+            "list_manifests",
+            database,
+            self.inner.list_manifests(database),
+        )
+        .await
+    }
+
+    async fn get(&self, database: &str, table: &str) -> Result<HiveManifest, HiveError> {
+        self.bounded(
+            "get",
+            &format!("{database}.{table}"),
+            self.inner.get(database, table),
+        )
+        .await
+    }
+
+    async fn etag(&self, database: &str, table: &str) -> Result<Option<String>, HiveError> {
+        self.bounded(
+            "etag",
+            &format!("{database}.{table}"),
+            self.inner.etag(database, table),
+        )
+        .await
+    }
+
+    fn limits(&self) -> &ManifestLimits {
+        self.inner.limits()
     }
 }

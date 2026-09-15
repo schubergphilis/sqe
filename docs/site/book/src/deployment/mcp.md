@@ -219,6 +219,12 @@ Read tools are always available after the `sqe:mcp:read` scope is validated:
   row filters and masks apply)
 - `explain_query`
 - `whoami` (identity metadata only; never tokens)
+- `refresh_metadata` (drops cached catalog metadata for a `table`, a `schema`,
+  or the session's catalog view; `CALL system.refresh_catalog_cache(...)`
+  underneath, so it needs no privilege and touches no other user's view;
+  one refresh per scope per 10 s, a repeat inside the window is a no-op that
+  says so; not annotated read-only, so clients that auto-approve reads still
+  ask)
 
 `execute_sql_readonly` is enforced with SQE's SQL parser/classifier, not a
 keyword regular expression. Exactly one statement is accepted. DDL, DML,

@@ -154,6 +154,7 @@ Read tools, always available:
 | `execute_sql_readonly` | One read-only statement, checked with SQE's SQL parser, not a regex. |
 | `explain_query` | The plan for a read query. |
 | `whoami` | Identity metadata for the session; never tokens. |
+| `refresh_metadata` | Drop cached catalog metadata for one table, one schema, or the session's catalog view, so the next call re-reads it. For a table created or changed outside SQE; rate-limited per scope. |
 
 `execute_sql_readonly` accepts exactly one statement and rejects DDL, DML,
 grants, secrets and session changes before they reach the query handler. The

@@ -40,4 +40,9 @@ pub enum HiveError {
     Store(String),
     #[error("hive_external: forbidden: {0}")]
     Forbidden(String),
+    /// A metastore call exceeded `[hive] metadata_timeout_secs` (issue
+    /// #666). Distinct from `Store` so the provider can serve a stale cache
+    /// entry for this case and this case only.
+    #[error("hive_external: catalog metadata timeout: {0}")]
+    Timeout(String),
 }
