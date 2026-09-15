@@ -168,6 +168,12 @@ pub struct HiveManifest {
     /// HMS backend is a field mapping rather than a redesign.
     #[serde(default)]
     pub description: Option<String>,
+    /// Glue's `ViewOriginalText`: the encoded view definition when
+    /// `table_type` is `VIRTUAL_VIEW` (see `athena_view.rs`), `None` for a
+    /// storage table. Sidecar manifests never write it; it exists so a Glue
+    /// view is a field mapping like every other Glue attribute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_original_text: Option<String>,
     #[serde(default)]
     pub partition_keys: Vec<GlueColumn>,
     #[serde(default)]
@@ -297,6 +303,7 @@ impl HiveManifest {
             owner: Some(owner.to_string()),
             created_at: Some(created_at.to_string()),
             description: spec.comment.clone(),
+            view_original_text: None,
             partition_keys: spec.partition_keys.iter().map(glue_column_of).collect(),
             // Copied verbatim so `sqe.secret` and any other property (e.g.
             // `classification`) both survive the round trip untouched.

@@ -87,6 +87,12 @@ CSV, line-delimited JSON, and Parquet.
 
 ORC, Avro, SequenceFile, and RCFile all parse in the DDL and are recorded faithfully in the manifest, with their real Hadoop input and output format classes, so `SHOW CREATE TABLE` renders a truthful DDL for a table this cycle cannot read. They are rejected at read time by class name, naming the format, not silently dropped from the manifest.
 
+### Athena and Trino views in Glue
+
+A Glue entry with `TableType = VIRTUAL_VIEW` is an Athena (or Trino) view: no storage, and the definition in `ViewOriginalText` as a `/* Presto View: <base64 JSON> */` payload. SQE decodes the payload, runs the view's Trino-dialect SQL through the same compatibility rewrite user statements get, and plans it against the same catalog with the view's own database as the default schema. `FROM orders`, `FROM "sales"."orders"` and Athena's `FROM awsdatacatalog.sales.orders` all resolve, views over views work, and `information_schema.tables` reports the entry as a `VIEW`. Base tables load through the ordinary provider, so row filters and column masks apply to the underlying scans, not to the view text.
+
+A view whose SQL this release cannot plan (an unsupported function, a base table in a format SQE cannot read) is hidden with a WARN naming the reason, the same way an unreadable table is. Hive-native views, whose `ViewOriginalText` is plain SQL rather than a Presto payload, are not supported and are hidden with a message that says so.
+
 ### SerDe allow-list
 
 Five SerDe classes are supported. Anything else is rejected with the class name in the error.

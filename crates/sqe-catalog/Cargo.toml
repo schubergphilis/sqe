@@ -165,6 +165,8 @@ tokio = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Athena view payloads in Glue are base64 JSON (hive/athena_view.rs).
+base64 = { workspace = true }
 reqwest = { workspace = true }
 # reqwest 0.12 `Client` type for the vendored REST catalog's `with_client`.
 reqwest_legacy = { workspace = true }

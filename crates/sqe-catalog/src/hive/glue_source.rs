@@ -159,6 +159,7 @@ pub fn manifest_from_glue_table(database: &str, t: &Table) -> HiveManifest {
         owner: t.owner().map(str::to_string),
         created_at: t.create_time().map(|d| d.to_string()),
         description: t.description().map(str::to_string),
+        view_original_text: t.view_original_text().map(str::to_string),
         partition_keys: t.partition_keys().iter().map(column_of).collect(),
         // Carries projection.* verbatim, which is what makes a projected
         // table readable without any partitions registered in Glue.
