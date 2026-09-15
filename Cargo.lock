@@ -6410,6 +6410,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-glue",
  "aws-smithy-http-client",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "dashmap",
