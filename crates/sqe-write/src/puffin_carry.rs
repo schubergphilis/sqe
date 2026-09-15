@@ -55,7 +55,7 @@ use tracing::{debug, info, warn};
 
 use crate::commit::commit_with_retry;
 
-/// Nominal entry count `k` of the writer's sketches: `ThetaSketch::builder()`
+/// Nominal entry count `k` of the writer's sketches: `ThetaSketchBuilder::default()`
 /// defaults to `lg_k = 12`. A union that retains more than this many hashes
 /// is cut back to `k` and its theta lowered accordingly.
 pub const NOMINAL_ENTRIES: usize = 4096;
@@ -113,7 +113,7 @@ impl RawThetaSketch {
 
     /// Snapshot a live sketch.
     pub fn from_sketch(sketch: &ThetaSketch) -> Self {
-        Self::new(sketch.theta64(), sketch.iter().collect())
+        Self::new(sketch.theta64(), sketch.iter().map(|e| e.hash()).collect())
     }
 
     /// Decode a blob body written by `serialise_theta_body`.
@@ -481,9 +481,12 @@ pub async fn carry_forward_statistics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqe_catalog::puffin_stats::ThetaSketchBuilder;
 
     fn sketch_of(range: std::ops::Range<u64>) -> ThetaSketch {
-        let mut s = ThetaSketch::builder().build();
+        let mut s = ThetaSketchBuilder::default()
+            .build()
+            .expect("default theta sketch parameters are valid");
         for v in range {
             s.update(v);
         }
