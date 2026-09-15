@@ -38,7 +38,7 @@ services:
 
   # ── bucket-init: create the table bucket ──────────────────────────────
   bucket-init:
-    image: rustfs/rc:v0.1.31
+    image: rustfs/rc:v0.1.34
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -58,7 +58,7 @@ services:
   # call. Signed like every other RustFS request: SigV4, service "s3", plus
   # the S3 payload hash header (here the hash of an empty body).
   s3tables-enable:
-    image: curlimages/curl:8.11.1
+    image: curlimages/curl:8.22.0
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
