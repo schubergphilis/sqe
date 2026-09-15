@@ -402,16 +402,40 @@ impl HiveMetadataCache {
         etag: Option<String>,
     ) {
         let now = Instant::now();
+        let key = Self::key(database, table);
+        // A reload that returns the same definition keeps what the previous
+        // entry learned about the data files (codec probe, size-only
+        // listing). Glue has no change token, so every TTL expiry is a full
+        // refetch; before this, each one also threw the facts away and the
+        // next lookup paid an object-store listing for a table nothing had
+        // touched (issue #666). Facts belong to a manifest version, and an
+        // identical manifest is the same version.
+        let facts = self
+            .inner
+            .get(&key)
+            .filter(|prev| prev.manifest == m)
+            .and_then(|prev| prev.facts);
         self.inner.insert(
-            Self::key(database, table),
+            key,
             CachedManifest {
                 manifest: m,
                 etag,
                 loaded_at: now,
                 verified_at: now,
-                facts: None,
+                facts,
             },
         );
+    }
+
+    /// Cache every manifest of a database at once, from a source whose
+    /// listing returns full definitions (`HiveMetadataSource::list_manifests`).
+    /// Each entry is a fresh load (see [`Self::insert_versioned`]), so the
+    /// lookups that follow a listing, `information_schema` reading every
+    /// table or a `SELECT` on one of them, pay no fetch inside the TTL.
+    pub fn insert_listed(&self, database: &str, manifests: &[HiveManifest]) {
+        for m in manifests {
+            self.insert_versioned(database, &m.name, m.clone(), None);
+        }
     }
 
     /// Use the cached manifest when the store's current ETag matches, or
@@ -474,6 +498,39 @@ impl HiveMetadataCache {
 
     pub fn invalidate(&self, database: &str, table: &str) {
         self.inner.invalidate(&Self::key(database, table));
+    }
+
+    /// Drop every entry of one database (issue #666: `CALL
+    /// system.refresh_catalog_cache(schema => 'cat.db')`). Bounded by the
+    /// database's table count, so an unprivileged caller can at most make
+    /// their own next lookups pay a fetch each.
+    pub fn invalidate_database(&self, database: &str) {
+        let prefix = format!("{database}.");
+        let keys: Vec<String> = self
+            .inner
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, _)| (*k).clone())
+            .collect();
+        for k in keys {
+            self.inner.invalidate(&k);
+        }
+    }
+
+    /// Drop every entry. Process-global, so only the admin-gated
+    /// `POST /api/v1/catalogs/refresh` calls it.
+    pub fn invalidate_all(&self) {
+        self.inner.invalidate_all();
+    }
+
+    /// Entries currently held, for tests and the refresh endpoint's log line.
+    pub fn len(&self) -> usize {
+        self.inner.run_pending_tasks();
+        self.inner.entry_count() as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Claim `bucket_key` for `table_ref` reading under `secret`, or refuse
@@ -1369,7 +1426,18 @@ impl HiveCatalogProvider {
     /// List the tables of `database` and store the result as its snapshot;
     /// same failure contract as [`Self::refresh_databases`].
     pub async fn refresh_tables(&self, database: &str) -> Result<Arc<NamespaceListing>, HiveError> {
-        match self.source.list_tables(database).await {
+        // A source whose listing carries full definitions (Glue) warms the
+        // manifest cache on the way: one paginated call, and the lookups
+        // that follow the listing find every table already loaded.
+        let listed = match self.source.list_manifests(database).await {
+            Ok(Some(manifests)) => {
+                self.manifest_cache.insert_listed(database, &manifests);
+                Ok(manifests.into_iter().map(|m| m.name).collect())
+            }
+            Ok(None) => self.source.list_tables(database).await,
+            Err(e) => Err(e),
+        };
+        match listed {
             Ok(mut names) => {
                 names.sort();
                 Ok(self.listings.store_tables(database, Ok(names)))
@@ -1569,6 +1637,73 @@ pub struct HiveSchemaProvider {
 }
 
 impl HiveSchemaProvider {
+    /// The current manifest for `name`, or `None` when the table does not
+    /// exist. Shared by `table()` and `table_type()`.
+    ///
+    /// Three tiers, cheapest first. DataFusion resolves every table
+    /// reference of a statement through here, `information_schema` calls
+    /// it per table, and the policy layer's tag source reads the same
+    /// cache, so a table touched by one query is looked up several times
+    /// in a few milliseconds: those pay no round trip at all. Past the
+    /// recheck window one HEAD (the manifest ETag) decides between serving
+    /// the entry and reloading it.
+    async fn manifest_for(&self, name: &str) -> DFResult<Option<HiveManifest>> {
+        if let Some(recent) = self.cache.get_if_recently_verified(&self.database, name) {
+            return Ok(Some(recent));
+        }
+        // A metastore call that timed out (issue #666) is answered from the
+        // last known manifest when there is one, with a warning, and as a
+        // named error when there is none. A stale definition of a table
+        // that exists beats a failed query when the metastore is merely
+        // slow; a table never seen cannot be invented.
+        let stale_or_err = |e: HiveError| -> DFResult<Option<HiveManifest>> {
+            if let HiveError::Timeout(_) = &e {
+                if let Some(stale) = self.cache.get(&self.database, name) {
+                    warn!(
+                        database = %self.database, table = %name, error = %e,
+                        "hive_external: serving stale metadata, refresh timed out"
+                    );
+                    return Ok(Some(stale));
+                }
+            }
+            Err(to_df(e))
+        };
+        let etag = match self.source.etag(&self.database, name).await {
+            Ok(e) => e,
+            Err(HiveError::NotFound(_)) => return Ok(None),
+            Err(e) => return stale_or_err(e),
+        };
+        if let Some(cached) = self
+            .cache
+            .get_if_fresh(&self.database, name, etag.as_deref())
+        {
+            return Ok(Some(cached));
+        }
+        let loaded = match self.source.get(&self.database, name).await {
+            Ok(m) => m,
+            Err(HiveError::NotFound(_)) => return Ok(None),
+            Err(e) => return stale_or_err(e),
+        };
+        // Cache BEFORE building the table. The policy layer's `TagSource`
+        // is synchronous and can only answer from this cache, and plan
+        // rewriting runs after the `LogicalPlan` is built, which is after
+        // `table()` returns. If the insert moved below the table build and
+        // the build failed partway, a later retry could rewrite against an
+        // empty cache and deny rather than mask.
+        //
+        // `a_failed_table_build_still_leaves_the_manifest_cached` (see
+        // hive_provider_test.rs) pins this ordering: moving this insert to
+        // just before `table()`'s final `Ok` return, as a mutation check,
+        // makes that test fail while leaving every happy-path test
+        // (including
+        // `loading_a_table_populates_the_metadata_cache_before_returning`)
+        // green, which is exactly why the happy-path test alone was not
+        // enough.
+        self.cache
+            .insert_versioned(&self.database, name, loaded.clone(), etag);
+        Ok(Some(loaded))
+    }
+
     /// Plan an Athena/Trino view (issue #667) and serve it as a `ViewTable`.
     ///
     /// The view's SQL is Trino dialect, so it goes through the same
@@ -1721,56 +1856,28 @@ impl SchemaProvider for HiveSchemaProvider {
         }
     }
 
-    async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
-        // Three tiers, cheapest first. DataFusion resolves every table
-        // reference of a statement through here, `information_schema` calls
-        // it per table, and the policy layer's tag source reads the same
-        // cache, so a table touched by one query is looked up several times
-        // in a few milliseconds: those pay no round trip at all. Past the
-        // recheck window one HEAD (the manifest ETag) decides between
-        // serving the entry and reloading it.
-        let manifest = match self.cache.get_if_recently_verified(&self.database, name) {
-            Some(recent) => recent,
-            None => {
-                let etag = match self.source.etag(&self.database, name).await {
-                    Ok(e) => e,
-                    Err(HiveError::NotFound(_)) => return Ok(None),
-                    Err(e) => return Err(to_df(e)),
-                };
-                match self
-                    .cache
-                    .get_if_fresh(&self.database, name, etag.as_deref())
-                {
-                    Some(cached) => cached,
-                    None => {
-                        let loaded = match self.source.get(&self.database, name).await {
-                            Ok(m) => m,
-                            Err(HiveError::NotFound(_)) => return Ok(None),
-                            Err(e) => return Err(to_df(e)),
-                        };
-                        // Cache BEFORE building the table. The policy layer's
-                        // `TagSource` is synchronous and can only answer from
-                        // this cache, and plan rewriting runs after the
-                        // `LogicalPlan` is built, which is after this call
-                        // returns. If the insert moved below the table build
-                        // and the build failed partway, a later retry could
-                        // rewrite against an empty cache and deny rather than
-                        // mask.
-                        //
-                        // `a_failed_table_build_still_leaves_the_manifest_cached`
-                        // (see hive_provider_test.rs) pins this ordering:
-                        // moving this insert to just before the final `Ok`
-                        // return, as a mutation check, makes that test fail
-                        // while leaving every happy-path test (including
-                        // `loading_a_table_populates_the_metadata_cache_before_returning`)
-                        // green, which is exactly why the happy-path test
-                        // alone was not enough.
-                        self.cache
-                            .insert_versioned(&self.database, name, loaded.clone(), etag);
-                        loaded
-                    }
-                }
+    /// The table's kind from its manifest alone (issue #666). DataFusion's
+    /// `information_schema.tables` asks this for every table in the
+    /// catalog; the default answered it by building the whole table, which
+    /// for a Glue catalog meant one object-store listing per table for
+    /// size-only statistics before a single row was read. The manifest is
+    /// enough: a `VIRTUAL_VIEW` is a view, everything else a base table.
+    /// A table this release cannot read still reports as a base table here
+    /// (it is listed, and `SELECT` on it says why), which is the same answer
+    /// the listing gives.
+    async fn table_type(&self, name: &str) -> DFResult<Option<TableType>> {
+        Ok(self.manifest_for(name).await?.map(|m| {
+            if m.table_type == super::athena_view::VIRTUAL_VIEW {
+                TableType::View
+            } else {
+                TableType::Base
             }
+        }))
+    }
+
+    async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        let Some(manifest) = self.manifest_for(name).await? else {
+            return Ok(None);
         };
 
         // An Athena/Trino view has no storage at all: it is a SQL body to
@@ -2056,6 +2163,82 @@ mod tests {
         assert_eq!(cache.get("sales", "orders").unwrap().name, m.name);
         assert!(cache.get("sales", "other").is_none());
         assert!(cache.get("other", "orders").is_none());
+    }
+
+    // Issue #666: a Glue TTL expiry refetches the manifest; when the
+    // definition has not changed the file facts (codec, listed bytes) are
+    // still valid and must survive, or every expiry costs a listing.
+    #[test]
+    fn reinserting_an_unchanged_manifest_keeps_its_facts() {
+        let cache = HiveMetadataCache::new();
+        let m = HiveManifest {
+            manifest_version: super::super::manifest::MANIFEST_VERSION,
+            table_type: "EXTERNAL_TABLE".to_string(),
+            database_name: "sales".to_string(),
+            name: "orders".to_string(),
+            owner: None,
+            created_at: None,
+            description: None,
+            view_original_text: None,
+            partition_keys: Vec::new(),
+            parameters: Default::default(),
+            storage_descriptor: super::super::manifest::StorageDescriptor {
+                location: "file:///tmp/x".to_string(),
+                input_format: None,
+                output_format: None,
+                compressed: false,
+                serde_info: Default::default(),
+                columns: Vec::new(),
+                sort_columns: Vec::new(),
+            },
+            sqe: Default::default(),
+        };
+        cache.insert("sales", "orders", m.clone());
+        cache.record_facts(
+            "sales",
+            "orders",
+            HiveTableFacts {
+                compression: None,
+                listed_bytes: Some(4096),
+                listed_at: Instant::now(),
+            },
+        );
+
+        // Same definition again (what a TTL-expiry refetch from Glue
+        // returns): facts stay.
+        cache.insert("sales", "orders", m.clone());
+        assert_eq!(
+            cache.facts("sales", "orders").and_then(|f| f.listed_bytes),
+            Some(4096),
+            "an unchanged reload keeps the listed size"
+        );
+
+        // A changed definition is a new version: facts go.
+        let mut changed = m.clone();
+        changed.storage_descriptor.location = "file:///tmp/y".to_string();
+        cache.insert("sales", "orders", changed);
+        assert!(
+            cache.facts("sales", "orders").is_none(),
+            "a changed manifest must not inherit facts from the old one"
+        );
+
+        // Bulk insert from a listing goes through the same rule.
+        let mut back = m.clone();
+        back.storage_descriptor.location = "file:///tmp/y".to_string();
+        cache.record_facts(
+            "sales",
+            "orders",
+            HiveTableFacts {
+                compression: None,
+                listed_bytes: Some(8192),
+                listed_at: Instant::now(),
+            },
+        );
+        cache.insert_listed("sales", &[back]);
+        assert_eq!(
+            cache.facts("sales", "orders").and_then(|f| f.listed_bytes),
+            Some(8192)
+        );
     }
 
     #[test]

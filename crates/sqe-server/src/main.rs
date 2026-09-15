@@ -179,6 +179,10 @@ struct HealthState {
     /// can drop it alongside the session + REST-catalog caches. Populated in
     /// `run_coordinator`; `None` in `run_worker` and tests.
     table_cache: Option<sqe_catalog::TableMetadataCache>,
+    /// Shared Hive manifest cache (issue #666), dropped by the same admin
+    /// refresh so a Glue table changed out of band is re-read before its
+    /// TTL. Populated in `run_coordinator`; `None` in `run_worker` and tests.
+    hive_manifest_cache: Option<Arc<sqe_catalog::hive::provider::HiveMetadataCache>>,
 }
 
 impl sqe_coordinator::web_auth::BearerAdminState for HealthState {
@@ -529,7 +533,18 @@ async fn api_catalogs_refresh(
     if let Some(tc) = &state.table_cache {
         tc.invalidate_all().await;
     }
-    tracing::info!(invalidated = %invalidated, "catalog cache refresh via admin endpoint");
+    // And the shared Hive manifest cache (issue #666): a Glue table altered
+    // out of band otherwise serves its old definition until the TTL lapses.
+    let hive_manifests_dropped = state.hive_manifest_cache.as_ref().map(|c| {
+        let n = c.len();
+        c.invalidate_all();
+        n
+    });
+    tracing::info!(
+        invalidated = %invalidated,
+        hive_manifests_dropped = ?hive_manifests_dropped,
+        "catalog cache refresh via admin endpoint"
+    );
     Json(CatalogRefreshResponse { invalidated })
 }
 
@@ -1609,6 +1624,18 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     // the first request. Probes (/healthz, /readyz) are still served immediately
     // after coordinator startup; the only change vs. the pre-Task-2 placement is
     // that the health server starts a few ms later (after audit file open).
+    // Process-wide Hive manifest cache: the same instance every Hive
+    // consumer receives (Task 8+), built here so the admin refresh endpoint
+    // below can drop it (issue #666).
+    let hive_manifest_cache = Arc::new(
+        sqe_catalog::hive::provider::HiveMetadataCache::with_ttl(std::time::Duration::from_secs(
+            config.hive.metadata_ttl_secs,
+        ))
+        .with_recheck(std::time::Duration::from_secs(
+            config.hive.metadata_recheck_secs,
+        )),
+    );
+
     let health_state = Arc::new(HealthState {
         ready: ready.clone(),
         started_at,
@@ -1635,6 +1662,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         // Same shared cache the QueryHandler uses; drop it on catalog refresh.
         // Cloned (not moved) because `with_table_cache` below still needs it.
         table_cache: Some(table_cache.clone()),
+        hive_manifest_cache: Some(Arc::clone(&hive_manifest_cache)),
         success_audit_dedup: {
             let window = config.metrics.audit.dashboard_access_audit_window_secs;
             if window == 0 {
@@ -1727,11 +1755,8 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     // `main.rs`. Both Arcs must be the same instance every other Hive
     // consumer receives (Task 8+).
     let hive_catalogs = Arc::new(sqe_policy::plan_rewriter::HiveCatalogs::new());
-    let hive_manifest_cache = Arc::new(
-        sqe_catalog::hive::provider::HiveMetadataCache::new().with_recheck(
-            std::time::Duration::from_secs(config.hive.metadata_recheck_secs),
-        ),
-    );
+    // `hive_manifest_cache` is built above the health server so the admin
+    // refresh endpoint can drop it (issue #666).
 
     // Attach every `[[hive.roots]]` configured root before the first
     // session context is ever built; see the matching comment in `main.rs`.
@@ -2101,6 +2126,7 @@ async fn run_worker(config: SqeConfig, config_path: String) -> anyhow::Result<()
         // Workers do not serve the catalog-refresh endpoint or hold the shared
         // table cache.
         table_cache: None,
+        hive_manifest_cache: None,
     });
     start_health_server(health_port, health_state);
 
@@ -2499,6 +2525,7 @@ mod tests {
             dashboard_success: None,
             success_audit_dedup: None,
             table_cache: None,
+            hive_manifest_cache: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -2527,6 +2554,7 @@ mod tests {
             dashboard_success: None,
             success_audit_dedup: None,
             table_cache: None,
+            hive_manifest_cache: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -2561,6 +2589,7 @@ mod tests {
             dashboard_success: None,
             success_audit_dedup: None,
             table_cache: None,
+            hive_manifest_cache: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -2592,6 +2621,7 @@ mod tests {
             dashboard_success: None,
             success_audit_dedup: None,
             table_cache: None,
+            hive_manifest_cache: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -2622,6 +2652,7 @@ mod tests {
             dashboard_success: None,
             success_audit_dedup: None,
             table_cache: None,
+            hive_manifest_cache: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -2688,6 +2719,7 @@ mod tests {
             dashboard_success: None,
             success_audit_dedup: None,
             table_cache: None,
+            hive_manifest_cache: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -2735,6 +2767,7 @@ mod tests {
             dashboard_success: None,
             success_audit_dedup: None,
             table_cache: None,
+            hive_manifest_cache: None,
         });
 
         let Json(items) = api_queries(
@@ -2771,6 +2804,7 @@ mod tests {
             dashboard_success: None,
             success_audit_dedup: None,
             table_cache: None,
+            hive_manifest_cache: None,
         });
         let Json(resp) = api_metrics_history(axum::extract::State(state)).await;
         assert_eq!(
@@ -2815,6 +2849,7 @@ mod tests {
             dashboard_success: None,
             success_audit_dedup: None,
             table_cache: None,
+            hive_manifest_cache: None,
         });
         let Json(resp) = api_metrics_history(axum::extract::State(state)).await;
         assert_eq!(
@@ -2891,6 +2926,7 @@ mod tests {
             dashboard_success: None,
             success_audit_dedup: None,
             table_cache: Some(cache.clone()),
+            hive_manifest_cache: None,
         });
 
         let Json(resp) = api_catalogs_refresh(axum::extract::State(state), None).await;
@@ -2901,6 +2937,67 @@ mod tests {
             "table cache entry survived the refresh handler"
         );
         assert_eq!(cache.entry_count(), 0);
+    }
+
+    // Issue #666: the admin refresh also drops the shared Hive manifest
+    // cache, so a Glue table changed out of band is re-read before its TTL.
+    #[tokio::test]
+    async fn api_catalogs_refresh_drops_hive_manifests() {
+        use sqe_catalog::hive::manifest::{HiveManifest, StorageDescriptor, MANIFEST_VERSION};
+        let hive = Arc::new(sqe_catalog::hive::provider::HiveMetadataCache::new());
+        hive.insert(
+            "sales",
+            "orders",
+            HiveManifest {
+                manifest_version: MANIFEST_VERSION,
+                table_type: "EXTERNAL_TABLE".to_string(),
+                database_name: "sales".to_string(),
+                name: "orders".to_string(),
+                owner: None,
+                created_at: None,
+                description: None,
+                view_original_text: None,
+                partition_keys: vec![],
+                parameters: Default::default(),
+                storage_descriptor: StorageDescriptor {
+                    location: "file:///tmp/x".to_string(),
+                    input_format: None,
+                    output_format: None,
+                    compressed: false,
+                    serde_info: Default::default(),
+                    columns: vec![],
+                    sort_columns: vec![],
+                },
+                sqe: Default::default(),
+            },
+        );
+        assert_eq!(hive.len(), 1, "precondition");
+
+        let state = Arc::new(HealthState {
+            ready: Arc::new(AtomicBool::new(true)),
+            started_at: Instant::now(),
+            role: "coordinator",
+            worker_registry: None,
+            query_tracker: None,
+            web_ui: false,
+            catalog_url: String::new(),
+            node_info: None,
+            metrics_history: None,
+            bearer_provider: None,
+            auth_cfg: None,
+            security_cfg: None,
+            audit: None,
+            anonymous_denied: None,
+            dashboard_success: None,
+            success_audit_dedup: None,
+            table_cache: None,
+            hive_manifest_cache: Some(Arc::clone(&hive)),
+        });
+
+        let Json(resp) = api_catalogs_refresh(axum::extract::State(state), None).await;
+        assert_eq!(resp.invalidated, "all");
+        assert!(hive.get("sales", "orders").is_none(), "hive manifest survived the refresh");
+        assert!(hive.is_empty());
     }
 
     /// The handler must not panic when no table cache is wired (worker role /
@@ -2925,6 +3022,7 @@ mod tests {
             dashboard_success: None,
             success_audit_dedup: None,
             table_cache: None,
+            hive_manifest_cache: None,
         });
         let Json(resp) = api_catalogs_refresh(axum::extract::State(state), None).await;
         assert_eq!(resp.invalidated, "all");
@@ -3011,6 +3109,7 @@ mod tests {
             dashboard_success: None,
             success_audit_dedup: None,
             table_cache: None,
+            hive_manifest_cache: None,
         })
     }
 
@@ -3245,6 +3344,7 @@ mod tests {
             dashboard_success: None,
             success_audit_dedup: None,
             table_cache: None,
+            hive_manifest_cache: None,
         });
         let app = build_health_router(state);
         let req = axum::http::Request::builder()
@@ -3284,6 +3384,7 @@ mod tests {
             dashboard_success: None,
             success_audit_dedup: None,
             table_cache: None,
+            hive_manifest_cache: None,
         });
         let app = build_health_router(state);
         let req = axum::http::Request::builder()
@@ -3351,6 +3452,7 @@ mod tests {
             dashboard_success: Some(counter),
             success_audit_dedup: cache,
             table_cache: None,
+            hive_manifest_cache: None,
         })
     }
 

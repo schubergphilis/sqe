@@ -389,6 +389,8 @@ pub async fn attach_configured_hive_roots(
         max_partition_keys: hive_config.manifest_max_partition_keys,
         max_partition_index_entries: hive_config.manifest_max_partition_index_entries,
     };
+    let metadata_timeout = (hive_config.metadata_timeout_secs > 0)
+        .then(|| std::time::Duration::from_secs(hive_config.metadata_timeout_secs));
     for root in &hive_config.roots {
         if root.name == default_catalog {
             return Err(format!(
@@ -413,7 +415,15 @@ pub async fn attach_configured_hive_roots(
                 .map_err(|e| format!("[[hive.roots]] {}={}: {e}", root.name, root.location))?;
                 sqe_catalog::hive::source::HiveRoot::from_store(store)
             }
-            sqe_core::config::HiveRootKind::Glue => build_glue_hive_root(root, limits).await?,
+            sqe_core::config::HiveRootKind::Glue => {
+                build_glue_hive_root(root, limits, metadata_timeout).await?
+            }
+        };
+        // Every metadata read on the root is cut at `metadata_timeout`
+        // (issue #666); zero disables the bound.
+        let attached = match metadata_timeout {
+            Some(t) => attached.with_metadata_timeout(t),
+            None => attached,
         };
         registry.attach_hive_root(&root.name, attached)?;
         hive_catalogs.insert(&root.name);
@@ -429,12 +439,14 @@ pub async fn attach_configured_hive_roots(
 async fn build_glue_hive_root(
     root: &sqe_core::config::HiveRootConfig,
     limits: sqe_catalog::hive::manifest::ManifestLimits,
+    timeout: Option<std::time::Duration>,
 ) -> Result<sqe_catalog::hive::source::HiveRoot, String> {
     let source = sqe_catalog::mount::build_glue_root(
         root.region.as_deref(),
         root.catalog_id.clone(),
         root.databases.clone(),
         limits,
+        timeout,
     )
     .await;
     Ok(sqe_catalog::hive::source::HiveRoot::from_source(source))
@@ -444,6 +456,7 @@ async fn build_glue_hive_root(
 async fn build_glue_hive_root(
     root: &sqe_core::config::HiveRootConfig,
     _limits: sqe_catalog::hive::manifest::ManifestLimits,
+    _timeout: Option<std::time::Duration>,
 ) -> Result<sqe_catalog::hive::source::HiveRoot, String> {
     Err(format!(
         "[[hive.roots]] '{}' sets kind = \"glue\", which needs the `glue` cargo feature on \

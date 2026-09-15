@@ -436,10 +436,17 @@ impl HiveDdlHandler {
     /// credentials, the same ones for every caller. This gate is the only
     /// thing standing between "engine can read it" and "user can see it",
     /// so it fetches and resolves a policy for every candidate table rather
-    /// than trusting the listing to already be scoped. That is an N+1
-    /// manifest read per `SHOW TABLES` call; acceptable for a first cut,
-    /// worth caching if a Hive root's table count grows large enough to
-    /// notice.
+    /// than trusting the listing to already be scoped.
+    ///
+    /// The policy needs each table's column tags, which live in the
+    /// manifest. The first cut fetched every manifest one by one: against a
+    /// Glue database of 618 tables that was 618 `GetTable` calls behind one
+    /// `SHOW TABLES` (issue #666, 7.8 s). Now, in order: with policy
+    /// enforcement off there is nothing to gate and the names are the
+    /// answer; otherwise a source whose listing carries full definitions
+    /// (Glue's `GetTables`) supplies every manifest in one paginated call
+    /// and warms the shared manifest cache; otherwise the manifest cache is
+    /// tried before the per-table fetch.
     pub async fn list_tables(
         &self,
         user: &SessionUser,
@@ -447,23 +454,57 @@ impl HiveDdlHandler {
         database: &str,
     ) -> Result<Vec<String>, SqeError> {
         let store = self.source_for(root)?;
-        let names = store
-            .list_tables(database)
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
+        let to_sqe = |e: sqe_catalog::hive::HiveError| {
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string())
+        };
 
-        let mut visible = Vec::with_capacity(names.len());
-        for name in names {
-            let manifest = match store.get(database, &name).await {
-                Ok(m) => m,
-                // A table that vanished between `list_tables` and `get`
-                // (dropped concurrently) is omitted rather than erroring the
-                // whole listing.
-                Err(_) => continue,
-            };
-            let policy = self.resolve_policy(user, database, &name, &manifest).await;
+        if self.policy_store.is_none() {
+            return store.list_tables(database).await.map_err(to_sqe);
+        }
+
+        let manifests: Vec<HiveManifest> = match store.list_manifests(database).await.map_err(to_sqe)? {
+            Some(listed) => {
+                if let Some(cache) = &self.manifest_cache {
+                    cache.insert_listed(database, &listed);
+                }
+                listed
+            }
+            None => {
+                let names = store.list_tables(database).await.map_err(to_sqe)?;
+                let mut out = Vec::with_capacity(names.len());
+                for name in names {
+                    let cached = self
+                        .manifest_cache
+                        .as_ref()
+                        .and_then(|c| c.get_if_fresh(database, &name, None));
+                    let manifest = match cached {
+                        Some(m) => m,
+                        None => match store.get(database, &name).await {
+                            Ok(m) => {
+                                if let Some(cache) = &self.manifest_cache {
+                                    cache.insert(database, &name, m.clone());
+                                }
+                                m
+                            }
+                            // A table that vanished between `list_tables`
+                            // and `get` (dropped concurrently) is omitted
+                            // rather than erroring the whole listing.
+                            Err(_) => continue,
+                        },
+                    };
+                    out.push(manifest);
+                }
+                out
+            }
+        };
+
+        let mut visible = Vec::with_capacity(manifests.len());
+        for manifest in manifests {
+            let policy = self
+                .resolve_policy(user, database, &manifest.name, &manifest)
+                .await;
             if !policy_denies_all(&policy) {
-                visible.push(name);
+                visible.push(manifest.name);
             }
         }
         Ok(visible)
