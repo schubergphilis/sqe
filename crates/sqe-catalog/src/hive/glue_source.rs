@@ -70,6 +70,40 @@ impl GlueMetadataSource {
         !self.databases.is_empty() && !self.databases.iter().any(|d| d == database)
     }
 
+    /// One paginated `GetTables` for `database`, mapped to manifests. Backs
+    /// both `list_tables` and `list_manifests`.
+    async fn list_glue_manifests(&self, database: &str) -> Result<Vec<HiveManifest>, HiveError> {
+        // A database outside the allow-list lists no tables, the same empty
+        // answer an unknown database gives.
+        if self.database_blocked(database) {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let mut pages = self
+            .client
+            .get_tables()
+            .set_catalog_id(self.catalog_id.clone())
+            .database_name(database)
+            .into_paginator()
+            .send();
+        while let Some(page) = pages.next().await {
+            let page = match page {
+                Ok(p) => p,
+                // DataFusion asks about schemas it has only seen named, so an
+                // unknown database is an empty list. Erroring here fails the
+                // whole query over a namespace nobody selected from.
+                Err(e) if is_not_found(&e) => return Ok(Vec::new()),
+                Err(e) => return Err(glue_err("get_tables", e)),
+            };
+            out.extend(
+                page.table_list()
+                    .iter()
+                    .map(|t| manifest_from_glue_table(database, t)),
+            );
+        }
+        Ok(out)
+    }
+
     /// Build a client from the ambient AWS configuration: the same provider
     /// chain the AWS CLI uses, so `AWS_PROFILE`, SSO, an instance profile and
     /// a task role all work, and credentials refresh rather than being
@@ -79,6 +113,7 @@ impl GlueMetadataSource {
         catalog_id: Option<String>,
         databases: Vec<String>,
         limits: ManifestLimits,
+        timeout: Option<std::time::Duration>,
     ) -> Self {
         // The shared loader carries the ring HTTPS client; a bare
         // `aws_config::defaults` has none and panics on the first request.
@@ -87,7 +122,26 @@ impl GlueMetadataSource {
             loader = loader.region(aws_config::Region::new(region.to_string()));
         }
         let conf = loader.load().await;
-        Self::new(aws_sdk_glue::Client::new(&conf), catalog_id, databases, limits)
+        let mut builder = aws_sdk_glue::config::Builder::from(&conf);
+        // Bound the SDK's own connect and operation clocks too (issue #666):
+        // the `TimeoutSource` wrapper cuts the await, but an SDK call with
+        // no timeout of its own would keep a connection and a retry loop
+        // alive underneath it.
+        if let Some(t) = timeout {
+            builder = builder.timeout_config(
+                aws_sdk_glue::config::timeout::TimeoutConfig::builder()
+                    .connect_timeout(t.min(std::time::Duration::from_secs(5)))
+                    .operation_attempt_timeout(t)
+                    .operation_timeout(t)
+                    .build(),
+            );
+        }
+        Self::new(
+            aws_sdk_glue::Client::from_conf(builder.build()),
+            catalog_id,
+            databases,
+            limits,
+        )
     }
 }
 
@@ -204,31 +258,25 @@ impl HiveMetadataSource for GlueMetadataSource {
     }
 
     async fn list_tables(&self, database: &str) -> Result<Vec<String>, HiveError> {
-        // A database outside the allow-list lists no tables, the same empty
-        // answer an unknown database gives.
-        if self.database_blocked(database) {
-            return Ok(Vec::new());
-        }
-        let mut out = Vec::new();
-        let mut pages = self
-            .client
-            .get_tables()
-            .set_catalog_id(self.catalog_id.clone())
-            .database_name(database)
-            .into_paginator()
-            .send();
-        while let Some(page) = pages.next().await {
-            let page = match page {
-                Ok(p) => p,
-                // DataFusion asks about schemas it has only seen named, so an
-                // unknown database is an empty list. Erroring here fails the
-                // whole query over a namespace nobody selected from.
-                Err(e) if is_not_found(&e) => return Ok(Vec::new()),
-                Err(e) => return Err(glue_err("get_tables", e)),
-            };
-            out.extend(page.table_list().iter().map(|t| t.name().to_string()));
-        }
-        Ok(out)
+        // `GetTables` returns whole `Table` objects either way, so the names
+        // are the manifests' names; the paginated call is the cost, not the
+        // mapping.
+        Ok(self
+            .list_glue_manifests(database)
+            .await?
+            .into_iter()
+            .map(|m| m.name)
+            .collect())
+    }
+
+    /// `GetTables` already carries every table's full definition, so the
+    /// listing IS the bulk fetch: one paginated call per database instead of
+    /// one `GetTable` per table (issue #666).
+    async fn list_manifests(
+        &self,
+        database: &str,
+    ) -> Result<Option<Vec<HiveManifest>>, HiveError> {
+        self.list_glue_manifests(database).await.map(Some)
     }
 
     async fn get(&self, database: &str, table: &str) -> Result<HiveManifest, HiveError> {

@@ -421,7 +421,7 @@ impl MaintenanceHandler {
             // (`query_handler`) and never dispatched through the table-scoped
             // maintenance handler. Guard the exhaustiveness check without
             // pulling cache logic into this handler.
-            ProcedureCall::RefreshCatalogCache => Err(SqeError::Execution(
+            ProcedureCall::RefreshCatalogCache { .. } => Err(SqeError::Execution(
                 "refresh_catalog_cache is handled by the query router, not the maintenance handler"
                     .to_string(),
             )),
@@ -3286,7 +3286,7 @@ pub(crate) fn procedure_tier(call: &ProcedureCall) -> ProcedureTier {
     match call {
         ProcedureCall::SuggestBloomFilterColumns { .. }
         | ProcedureCall::TableHealth { .. }
-        | ProcedureCall::RefreshCatalogCache => ProcedureTier::ReadOnly,
+        | ProcedureCall::RefreshCatalogCache { .. } => ProcedureTier::ReadOnly,
         ProcedureCall::PurgeOrphanLocations { dry_run: true, .. } => ProcedureTier::ReadOnly,
         ProcedureCall::RewriteDataFiles { .. } | ProcedureCall::RewriteManifests { .. } => {
             ProcedureTier::TableWrite

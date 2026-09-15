@@ -2128,7 +2128,9 @@ impl QueryHandler {
                         // follow-up. require_admin uses [auth] admin_roles.
                         self.require_admin(session, "CALL system.reproject_column_tags")?;
                         self.catalog_ops.reproject_column_tags(session, scope).await
-                    } else if matches!(**call, sqe_sql::ProcedureCall::RefreshCatalogCache) {
+                    } else if let sqe_sql::ProcedureCall::RefreshCatalogCache { table, schema } =
+                        &**call
+                    {
                         // Self-scoped catalog refresh. NOT a table maintenance
                         // op: it skips the table-scoped maintenance
                         // authorization + lineage path, and it must NOT touch
@@ -2150,6 +2152,40 @@ impl QueryHandler {
                         // evict, and the session-cache drop above already
                         // rebuilds this caller's namespace snapshot. The global
                         // table-cache drop lives in `api_catalogs_refresh`.
+                        //
+                        // The Hive manifest cache is the exception (issue
+                        // #666): a `table =>` / `schema =>` argument drops
+                        // that scope's manifests. Those entries are shared
+                        // across sessions but hold no per-user data (the
+                        // policy layer decides per user on top of them), and
+                        // the cost is bounded by the scope named, the same
+                        // invalidation every DDL on the table performs. A
+                        // scope in a catalog that is not a Hive root drops
+                        // nothing here; the session drop below still
+                        // rebuilds the caller's view of it.
+                        let mut scope_label = format!("session:{}", session.user.username);
+                        if let Some(t) = table {
+                            let is_hive = t
+                                .catalog
+                                .as_deref()
+                                .map(|c| self.runtime_catalogs.is_hive_root(c).unwrap_or(false))
+                                .unwrap_or(false);
+                            if is_hive {
+                                self.hive_manifest_cache.invalidate(&t.namespace, &t.name);
+                            }
+                            scope_label = format!("{scope_label},table:{}", t.as_string());
+                        }
+                        if let Some(ns) = schema {
+                            let is_hive = ns
+                                .catalog
+                                .as_deref()
+                                .map(|c| self.runtime_catalogs.is_hive_root(c).unwrap_or(false))
+                                .unwrap_or(false);
+                            if is_hive {
+                                self.hive_manifest_cache.invalidate_database(&ns.namespace);
+                            }
+                            scope_label = format!("{scope_label},schema:{}", ns.as_string());
+                        }
                         crate::session_context::invalidate_session_cache(&session.user.username)
                             .await;
                         let schema = Arc::new(Schema::new(vec![
@@ -2159,10 +2195,7 @@ impl QueryHandler {
                         RecordBatch::try_new(
                             schema,
                             vec![
-                                Arc::new(arrow_array::StringArray::from(vec![format!(
-                                    "session:{}",
-                                    session.user.username
-                                )])),
+                                Arc::new(arrow_array::StringArray::from(vec![scope_label])),
                                 Arc::new(arrow_array::StringArray::from(vec!["refreshed"])),
                             ],
                         )

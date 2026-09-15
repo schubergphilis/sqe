@@ -2944,6 +2944,14 @@ fn default_hive_metadata_recheck_secs() -> u64 {
     10
 }
 
+fn default_hive_metadata_ttl_secs() -> u64 {
+    60
+}
+
+fn default_hive_metadata_timeout_secs() -> u64 {
+    10
+}
+
 /// `[hive]`: warehouse roots to attach at coordinator startup, plus the
 /// manifest size/shape caps enforced on every root. The four caps default
 /// to the exact values `hive::manifest::ManifestLimits::default()` uses
@@ -2970,6 +2978,23 @@ pub struct HiveConfig {
     /// `[catalog] authorization_recheck_secs`.
     #[serde(default = "default_hive_metadata_recheck_secs")]
     pub metadata_recheck_secs: u64,
+    /// How long a cached manifest from a metastore with no change token
+    /// (Glue) is served before it is fetched again. A sidecar root has
+    /// ETags and revalidates instead, so this only bounds Glue-backed
+    /// roots. A refetch that returns an unchanged definition keeps the
+    /// table's cached file facts, so raising this for a read-mostly Glue
+    /// catalog (300-600) mostly saves the `GetTable` round trips; the
+    /// `refresh_metadata` paths drop entries on demand. Default 60.
+    #[serde(default = "default_hive_metadata_ttl_secs")]
+    pub metadata_ttl_secs: u64,
+    /// Upper bound on one metastore call (Glue `GetTable`/`GetTables`, a
+    /// sidecar manifest read). Past it the provider serves the last known
+    /// manifest with a warning when it has one, or fails the query with a
+    /// named "catalog metadata timeout" error when it does not; a listing
+    /// refresh keeps its previous snapshot. `0` disables the bound.
+    /// Default 10.
+    #[serde(default = "default_hive_metadata_timeout_secs")]
+    pub metadata_timeout_secs: u64,
 }
 
 impl Default for HiveConfig {
@@ -2982,6 +3007,8 @@ impl Default for HiveConfig {
             manifest_max_partition_index_entries: default_hive_manifest_max_partition_index_entries(
             ),
             metadata_recheck_secs: default_hive_metadata_recheck_secs(),
+            metadata_ttl_secs: default_hive_metadata_ttl_secs(),
+            metadata_timeout_secs: default_hive_metadata_timeout_secs(),
         }
     }
 }
