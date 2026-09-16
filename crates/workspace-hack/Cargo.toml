@@ -115,7 +115,7 @@ sqlparser = { version = "0.62", features = ["visitor"] }
 subtle = { version = "2" }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "test-util"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring", "tls12"] }
 tokio-stream = { version = "0.1", features = ["fs", "net", "sync"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }

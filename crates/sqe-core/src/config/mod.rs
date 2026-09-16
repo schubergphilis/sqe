@@ -7680,6 +7680,30 @@ partial_progress_batch = 5
     fn aws_env_credentials_are_adopted_when_nothing_else_is_set() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_aws_env();
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIAFROMENV");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-from-env");
+        std::env::set_var("AWS_REGION", "eu-central-1");
+
+        let config = load_with_env();
+
+        // Long-lived keys are pinned, as before.
+        assert_eq!(config.storage.s3_access_key, "AKIAFROMENV");
+        assert_eq!(config.storage.s3_secret_key.expose(), "secret-from-env");
+        assert!(config.storage.s3_session_token.expose().is_empty());
+        assert_eq!(config.storage.s3_region, "eu-central-1");
+        clear_aws_env();
+    }
+
+    #[test]
+    fn temporary_aws_env_credentials_are_not_pinned_into_storage() {
+        // `aws configure export-credentials --format env` and an assumed role
+        // put a session token in the environment. Pinning those into
+        // `[storage]` froze them for the life of the server; after a few
+        // hours every read failed while the process looked healthy. They
+        // stay unpinned so S3 reads go through the AWS SDK chain, which reads
+        // the same environment while valid and refreshes under AWS_PROFILE.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_aws_env();
         std::env::set_var("AWS_ACCESS_KEY_ID", "ASIAFROMENV");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-from-env");
         std::env::set_var("AWS_SESSION_TOKEN", "token-from-env");
@@ -7687,9 +7711,10 @@ partial_progress_batch = 5
 
         let config = load_with_env();
 
-        assert_eq!(config.storage.s3_access_key, "ASIAFROMENV");
-        assert_eq!(config.storage.s3_secret_key.expose(), "secret-from-env");
-        assert_eq!(config.storage.s3_session_token.expose(), "token-from-env");
+        assert!(config.storage.s3_access_key.is_empty(), "temporary keys must not be pinned");
+        assert!(config.storage.s3_secret_key.expose().is_empty());
+        assert!(config.storage.s3_session_token.expose().is_empty());
+        // The region still lands: it is not a credential.
         assert_eq!(config.storage.s3_region, "eu-central-1");
         clear_aws_env();
     }

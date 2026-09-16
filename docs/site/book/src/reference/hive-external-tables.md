@@ -297,9 +297,37 @@ are a permission problem, and the message says so. Over MCP, `list_catalogs`
 reports the same condition per Hive root as `diagnostics[].status =
 "auth_error"`.
 
-Data reads use the same identity through `object_store`. A LIST or GET that
-S3 refuses fails the query with the S3 error (`403 InvalidAccessKeyId` on
-the listing, for example). If every table across unrelated databases reads
+Data reads use the same identity through `object_store`. When `[storage]`
+has no static key, the S3 stores resolve credentials through the AWS SDK
+default chain on every request, and the SDK caches and refreshes them, so a
+profile, SSO session or role that rotates mid-run keeps working for as long
+as the session that issued it lasts. When that session itself ends, or the
+chain has nothing, the query fails with a distinct class,
+`STORAGE_CREDENTIALS_UNAVAILABLE` (gRPC `Unauthenticated`, Trino
+`EXTERNAL`):
+
+```text
+storage credentials expired or unavailable (aws sdk default chain): an error
+occurred while loading credentials: the SSO session has expired. Renew the
+engine's AWS session (aws sso login, or a fresh role session) and restart, or
+run with AWS_PROFILE so the SDK refreshes them
+```
+
+S3's own replies to a stale key (`ExpiredToken`, `InvalidAccessKeyId`, "the
+security token included in the request is invalid") classify the same way,
+so a client can tell this from a bad query and from a missing grant.
+
+Static keys are different. `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`
+in the environment are adopted into `[storage]` as before, but only when no
+`AWS_SESSION_TOKEN` accompanies them: a session token marks temporary
+credentials (`aws configure export-credentials`, an assumed role) that
+expire in hours and that nothing in the process can renew, so pinning them
+froze the server on a clock nobody could see. They are left to the SDK chain
+instead, which reads the same environment while it is valid. Keys set
+explicitly under `[storage]` with a session token are honoured and the server
+warns at startup that they will expire. The MCP `list_catalogs` tool reports
+the state of the engine's storage credentials as an `object_store`
+diagnostics entry. If every table across unrelated databases reads
 as empty at the same time while metadata still resolves, check the age of
 the server's credentials before anything else: two unrelated prefixes being
 genuinely empty at once is the tell, and it has been observed with an
