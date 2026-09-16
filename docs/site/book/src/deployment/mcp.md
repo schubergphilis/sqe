@@ -314,6 +314,93 @@ four metadata statements per user and refused the rest with a memory error. Page
 page further, in which case `next_page_token` points at the first table that
 did not fit. `properties` and column-level statistics are not included.
 
+### Functions available to agents
+
+What an agent can rely on through `execute_sql_readonly`, measured on a
+release build against Glue-backed Hive tables (Parquet, every column type
+below present) on 2026-09-16. Each statement here ran and returned what it
+says; timings were 0.5 to 2.5 s per statement on a laptop, dominated by the
+S3 listing every plan of a Hive table pays.
+
+**Hashing for privacy-preserving identity linking.** Three spellings work
+on `Utf8` and `Utf8View` columns alike:
+
+```sql
+SELECT sha256(lower(email)) AS h FROM glue.crm.customers LIMIT 1;
+-- Utf8: 64 hex characters
+
+SELECT digest(email, 'sha256') AS h FROM glue.crm.customers LIMIT 1;
+-- Binary: base64 in the JSON result; wrap in encode(..., 'hex') for text
+
+SELECT sha256(lower(arrow_cast(email, 'Utf8View'))) FROM glue.crm.customers LIMIT 1;
+```
+
+`sha256()` is SQE's own function, the same one column masking uses. With
+`[policy] mask_key` set it is HMAC-SHA256 under that key, so its output is
+stable within one deployment and different across deployments with
+different keys; without a key it is plain SHA-256 and the startup log says
+so. Overlap between two hash sets:
+
+```sql
+SELECT COUNT(*) FROM (
+  SELECT DISTINCT sha256(lower(email)) AS h FROM glue.crm.customers WHERE email IS NOT NULL
+  INTERSECT
+  SELECT DISTINCT sha256(lower(email))      FROM glue.sales.leads   WHERE email IS NOT NULL
+);
+```
+
+The `IS NOT NULL` matters: `sha256(NULL)` is `NULL`, `DISTINCT` keeps one
+`NULL` row per side, and `INTERSECT` treats `NULL` as equal to `NULL`, so
+two sets that share no value still report an overlap of one without the
+filter (verified). Under policy, a column masked with `MASK_HASH` already
+arrives as the keyed hex digest, so `sha256(lower(col))` hashes that digest:
+still deterministic within the deployment, still an overlap signal, but not
+comparable to a hash of the raw value elsewhere. A nullified column is
+`NULL` for every row and drops out of the count entirely with the filter
+above. Restricted columns keep their name and are `NULL` too.
+
+**Cardinality.** `COUNT(DISTINCT col)` and `approx_distinct(col)` both work
+for every column type the crawler meets: `Boolean`, `Int32`, `Int64`,
+`Decimal128(p, s)` at every precision tried, `Date32`, `Timestamp(µs)`,
+`Utf8`, `Utf8View`, and `List` and `Struct` columns as well. Exact and
+approximate agreed to within 1 percent on the columns measured (for
+example 950,704 exact against 934,606 approximate on an `Int64` key).
+`approx_distinct` returns `UInt64`; `COUNT(DISTINCT)` returns `Int64`. One
+statement can carry both for several columns:
+
+```sql
+SELECT approx_distinct(id), approx_distinct(email), approx_distinct(created_at)
+FROM glue.crm.customers;
+```
+
+**Row counts without a scan.** `get_table_stats` is `SHOW STATS FOR`. For an
+Iceberg table the summary row's `row_count` and `data_size` come from the
+current snapshot. For a Hive table they come from the metastore's table
+parameters (`numRows` / `recordCount`, `totalSize`): present after a Glue
+crawler or `ANALYZE`, absent (`NULL`) on a table Trino or Athena wrote, which
+carries `totalSize = -1`; in that case SQE reports the byte size its planner
+listed and leaves `row_count` `NULL`, and `COUNT(*)` is the exact answer
+(metadata-only on Parquet, half a second on a 1.4 M row table). The same
+numbers ride on `describe_schema` with `include_stats`.
+
+**A planner limit to know about.** A correlated scalar subquery in the
+select list, including one that references a CTE alias, plans and runs:
+
+```sql
+WITH s AS (SELECT id, primary_role_id FROM glue.hr.employees LIMIT 20)
+SELECT s.*, (SELECT COUNT(*) FROM glue.hr.roles o
+             WHERE o.id = s.primary_role_id) AS n
+FROM s;
+```
+
+The same shape with `DISTINCT`, `GROUP BY`, `ORDER BY ... LIMIT` or a join
+inside the CTE, two such subqueries, or `s.*` over a wide table with struct
+and list columns all ran. What DataFusion cannot decorrelate is a
+correlation that is not an equality on outer columns, for example
+`WHERE o.pk = s.a AND o.pk <> s.b`; it fails with `Physical plan does not
+support logical expression ScalarSubquery`. Rewrite that as a pre-aggregated
+CTE joined on the key.
+
 ## Catalog scoping
 
 Two settings decide which catalogs an agent works in.
