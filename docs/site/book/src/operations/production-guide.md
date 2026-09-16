@@ -21,7 +21,7 @@ For the full security, performance, quality, and observability audit, see `docs/
 ### Topology
 
 - One `sqe-coordinator` or `sqe-server` (all-in-one). No workers.
-- Slim Docker image (`docker build .`) with the catalog crate's default feature set. Kitchen-sink backends (Glue, HMS, JDBC, Hadoop): `docker build --build-arg CATALOG_FEATURES=sqe-catalog/full-backends -t sqe-full .`.
+- Slim Docker image (`docker build .`) with the catalog crate's default feature set plus the Glue Hive root, which `sqe-server` always compiles in. The remaining backends (HMS, JDBC, Hadoop): `docker build --build-arg CATALOG_FEATURES=sqe-catalog/full-backends -t sqe-full .`.
 
 ### Security (required even at small scale)
 
@@ -84,7 +84,7 @@ See [`docs/site/book/src/operations/openlineage.md`](./openlineage.md) for sink 
 
 - Polaris or Nessie over Iceberg REST.
 - SigV4 in the default build covers AWS Iceberg REST (Glue/S3 Tables federated endpoints) without the full Glue SDK image.
-- Defer `full-backends` until runtime config actually dispatches to Glue, HMS, or JDBC SQL catalogs.
+- Defer `full-backends` until runtime config actually dispatches to HMS or JDBC SQL catalogs. Glue Hive roots need no extra feature.
 
 ---
 

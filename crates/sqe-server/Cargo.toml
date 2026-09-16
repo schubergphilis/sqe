@@ -14,15 +14,20 @@ description = "The shipped SQE binary: `sqe-server --mode coordinator|worker`, w
 # library crates now depend on neither of each other.
 
 [features]
-# `[[hive.roots]] kind = "glue"`: forwarded to the coordinator (see there).
-glue = ["sqe-coordinator/glue"]
+# The Glue Hive root (`--glue-catalog`, `[[hive.roots]] kind = "glue"`) is
+# always compiled into `sqe-server`: the dependency below enables
+# `sqe-coordinator/glue` unconditionally, so the release-binaries job, the
+# Dockerfile and `scripts/build.sh` (all `--no-default-features`) ship it
+# without a flag. The feature stays as a no-op so `--features glue` keeps
+# working for scripts that pass it.
+glue = []
 
 [[bin]]
 name = "sqe-server"
 path = "src/main.rs"
 
 [dependencies]
-sqe-coordinator = { path = "../sqe-coordinator" }
+sqe-coordinator = { path = "../sqe-coordinator", features = ["glue"] }
 sqe-worker = { path = "../sqe-worker" }
 sqe-core = { path = "../sqe-core" }
 sqe-auth = { path = "../sqe-auth" }
