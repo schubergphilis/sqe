@@ -105,34 +105,140 @@ impl QueryHandler {
         // Per-user memory reservation. Reject when this user's in-flight
         // queries would push past their share of the global pool, before
         // the global red-band check fires for everyone else.
-        let memory_reservation =
-            if self.per_user_memory_budget_bytes > 0 && self.per_query_memory_bytes > 0 {
-                let username = session.user.username.clone();
-                match self.per_user_memory.try_reserve(
-                    &username,
-                    self.per_query_memory_bytes,
-                    self.per_user_memory_budget_bytes,
-                ) {
-                    Some(r) => Some(r),
-                    None => {
-                        let used = self.per_user_memory.used_bytes(&username);
-                        return Err(SqeError::with_code(
-                            SqeErrorCode::ExecutionFailed,
-                            format!(
-                                "Per-user memory budget exceeded for '{}': {} bytes reserved, \
+        //
+        // Metadata statements (SHOW, DESCRIBE, EXPLAIN without ANALYZE) read
+        // catalog state and plan; they never execute a scan, so they take no
+        // share of the user's execution budget. Without this, a crawler that
+        // describes eight tables at once against the defaults (1GB budget,
+        // 256MB per query) sees the fifth `SHOW COLUMNS` refused with a
+        // memory error while the pool is idle. They still take the
+        // concurrency permits above.
+        let reserves_memory = !is_metadata_statement(sql);
+        let memory_reservation = if reserves_memory
+            && self.per_user_memory_budget_bytes > 0
+            && self.per_query_memory_bytes > 0
+        {
+            let username = session.user.username.clone();
+            match self.per_user_memory.try_reserve(
+                &username,
+                self.per_query_memory_bytes,
+                self.per_user_memory_budget_bytes,
+            ) {
+                Some(r) => Some(r),
+                None => {
+                    let used = self.per_user_memory.used_bytes(&username);
+                    return Err(SqeError::with_code(
+                        SqeErrorCode::ExecutionFailed,
+                        format!(
+                            "Per-user memory budget exceeded for '{}': {} bytes reserved, \
                                  limit {} bytes. Wait for in-flight queries to complete.",
-                                username, used, self.per_user_memory_budget_bytes
-                            ),
-                        ));
-                    }
+                            username, used, self.per_user_memory_budget_bytes
+                        ),
+                    ));
                 }
-            } else {
-                None
-            };
+            }
+        } else {
+            None
+        };
 
         Ok(Admission {
             permits,
             memory_reservation,
         })
+    }
+}
+
+/// True when the statement only reads catalog metadata or plans: `SHOW ...`,
+/// `DESCRIBE`/`DESC ...`, and `EXPLAIN ...` other than `EXPLAIN ANALYZE`,
+/// which executes. Admission runs before the parse (the parse itself is what
+/// the size cap and the permits protect), so this looks at the leading
+/// keyword after whitespace and `--` / `/* */` comments. A statement it
+/// misclassifies as a query only pays the reservation it always paid; a
+/// statement it misclassifies as metadata would have to begin with one of
+/// these three keywords and then execute a scan, and only `EXPLAIN ANALYZE`
+/// does, so that one is excluded.
+pub(crate) fn is_metadata_statement(sql: &str) -> bool {
+    let mut words = leading_keywords(sql, 2).into_iter();
+    let Some(first) = words.next() else {
+        return false;
+    };
+    match first.as_str() {
+        "SHOW" | "DESCRIBE" | "DESC" => true,
+        "EXPLAIN" => !words.next().is_some_and(|w| w == "ANALYZE"),
+        _ => false,
+    }
+}
+
+/// The first `n` keyword-like tokens of `sql`, upper-cased, skipping
+/// whitespace, `--` line comments and `/* */` block comments. Stops at the
+/// first token that is not a bare word, so `EXPLAIN (FORMAT ...)` yields
+/// only `EXPLAIN`.
+fn leading_keywords(sql: &str, n: usize) -> Vec<String> {
+    let mut rest = sql;
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        rest = rest.trim_start();
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = after.split_once('\n').map(|(_, r)| r).unwrap_or("");
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("/*") {
+            match after.split_once("*/") {
+                Some((_, r)) => rest = r,
+                None => return out,
+            }
+            continue;
+        }
+        let end = rest
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(rest.len());
+        if end == 0 {
+            return out;
+        }
+        out.push(rest[..end].to_ascii_uppercase());
+        rest = &rest[end..];
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_metadata_statement;
+
+    #[test]
+    fn show_describe_and_explain_are_metadata() {
+        for sql in [
+            "SHOW COLUMNS FROM \"glue\".\"db\".\"t\"",
+            "  show tables in glue.db",
+            "SHOW STATS FOR glue.db.t",
+            "DESCRIBE glue.db.t",
+            "desc t",
+            "EXPLAIN SELECT * FROM glue.db.t LIMIT 1",
+            "explain\nselect 1",
+            "-- crawler\nSHOW COLUMNS FROM t",
+            "/* crawler */ EXPLAIN /* plan only */ SELECT 1",
+        ] {
+            assert!(is_metadata_statement(sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn queries_dml_and_explain_analyze_reserve_memory() {
+        for sql in [
+            "SELECT * FROM glue.db.t",
+            "  select count(*) from t",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            "INSERT INTO t SELECT * FROM s",
+            "CREATE TABLE t AS SELECT * FROM s ORDER BY a",
+            "EXPLAIN ANALYZE SELECT * FROM glue.db.t",
+            "explain analyze verbose select 1",
+            "",
+            "   ",
+            "-- only a comment",
+            "/* unterminated SHOW",
+            "(SELECT 1)",
+        ] {
+            assert!(!is_metadata_statement(sql), "{sql:?}");
+        }
     }
 }
