@@ -1,6 +1,12 @@
 //! Embedded MCP endpoint wiring for the coordinator binary.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
@@ -54,6 +60,12 @@ impl sqe_mcp::QueryExecutor for CoordinatorMcpExecutor {
 
 /// Start MCP inside the coordinator process, sharing auth, query admission,
 /// policy enforcement, and source credentials with Flight SQL and Trino.
+///
+/// Returns the serve task and the address it is bound to (`config.port`
+/// may be 0 for an ephemeral port, which tests use). `alive` is cleared the
+/// moment the serve loop ends for any reason, including a panic, so the
+/// ops port can report a dead `/mcp` on a live PID; the caller decides what
+/// to do about it (`sqe-server` exits, see `watch_mcp_listener` there).
 pub async fn start_mcp_server(
     auth: Arc<dyn AuthProvider>,
     handler: Arc<QueryHandler>,
@@ -61,9 +73,16 @@ pub async fn start_mcp_server(
     config: McpConfig,
     hive_roots: Vec<String>,
     tls: &TlsConfig,
-) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    alive: Arc<AtomicBool>,
+) -> anyhow::Result<(tokio::task::JoinHandle<()>, SocketAddr)> {
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     let app = mcp_router(auth, handler, rate_limiter, config, hive_roots);
+    // Bind synchronously up front so both branches can report the port they
+    // actually got, and so a bind failure is this call's error, not a log
+    // line from a task nobody joins.
+    let std_listener = std::net::TcpListener::bind(addr)?;
+    std_listener.set_nonblocking(true)?;
+    let bound = std_listener.local_addr()?;
 
     if tls.is_enabled() {
         // Checked, not discarded: the old `let _ = ...install_default()`
@@ -94,25 +113,68 @@ pub async fn start_mcp_server(
             crate::tls::DEFAULT_CERT_RELOAD_INTERVAL,
         );
 
-        Ok(tokio::spawn(async move {
-            if let Err(error) = axum_server::bind_rustls(addr, rustls_config)
+        let task = supervise_listener("MCP HTTPS", alive, async move {
+            axum_server::from_tcp_rustls(std_listener, rustls_config)
+                .map_err(anyhow::Error::from)?
                 .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                 .await
-            {
-                tracing::error!(%error, "MCP HTTPS server exited");
-            }
-        }))
+                .map_err(anyhow::Error::from)
+        });
+        Ok((task, bound))
     } else {
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        Ok(tokio::spawn(async move {
-            if let Err(error) = axum::serve(
+        let listener = tokio::net::TcpListener::from_std(std_listener)?;
+        let task = supervise_listener("MCP HTTP", alive, async move {
+            axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
-            {
-                tracing::error!(%error, "MCP HTTP server exited");
-            }
-        }))
+            .map_err(anyhow::Error::from)
+        });
+        Ok((task, bound))
     }
+}
+
+/// Run a serve loop as a task that cannot end silently. `axum::serve` only
+/// returns on an accept error it does not retry, and a panic inside the
+/// accept loop would otherwise unwind into tokio's default hook and a
+/// dropped `JoinHandle`: the process stays up, `pgrep` says healthy, and
+/// `/mcp` refuses connections until someone restarts it (seen twice on
+/// 2026-09-16 after 30 to 60 minutes of idle time). Every exit path here
+/// logs at ERROR and clears `alive`, which `/healthz` and `/readyz` read.
+fn supervise_listener<F>(
+    what: &'static str,
+    alive: Arc<AtomicBool>,
+    serve: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    use futures::FutureExt;
+    /// Clears the flag however the task ends: a return, a panic, or an
+    /// `abort` (which drops the future without running anything after the
+    /// await). A liveness flag that survives its task would be a lie.
+    struct AliveGuard(Arc<AtomicBool>);
+    impl Drop for AliveGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    tokio::spawn(async move {
+        let _guard = AliveGuard(alive);
+        match std::panic::AssertUnwindSafe(serve).catch_unwind().await {
+            Ok(Ok(())) => {
+                tracing::error!("{what} server exited without an error; the listener is closed")
+            }
+            Ok(Err(error)) => tracing::error!(%error, "{what} server exited"),
+            Err(payload) => {
+                let panic = payload
+                    .downcast_ref::<&'static str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                tracing::error!(%panic, "{what} server panicked");
+            }
+        }
+    })
 }

@@ -59,3 +59,4 @@ mod trino_metadata_test;
 mod trino_session_catalog_test;
 mod v3_e2e;
 mod v3_types_integration;
+mod mcp_listener_supervision_e2e;
