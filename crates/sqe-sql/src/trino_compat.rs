@@ -229,8 +229,13 @@ pub fn apply_trino_compat(statements: &mut Vec<Statement>, source: &str) -> bool
     // literal holding a non-ASCII character, which DataFusion's planner
     // rejects as a Value variant it does not know.
     let has_unicode_literal = lower.contains("u&'");
+    // `(select` -> rewrite_correlated_scalar_subquery_to_max: Trino's
+    // non-aggregated correlated scalar subquery, which DataFusion refuses at
+    // plan time and Athena views use as a lookup in the select list.
+    let has_scalar_subquery = lower.contains("(select");
     if !has_json_cast
         && !has_unicode_literal
+        && !has_scalar_subquery
         && !has_dollar
         && !has_grouping_set
         && !has_current_schema
@@ -415,6 +420,9 @@ impl VisitorMut for TrinoCompatVisitor {
             self.rewrites += 1;
         }
         if rewrite_unicode_string_literal(expr) {
+            self.rewrites += 1;
+        }
+        if rewrite_correlated_scalar_subquery_to_max(expr) {
             self.rewrites += 1;
         }
         // ROW constructor rewrite runs before the cast rewrite at this node,
@@ -837,6 +845,151 @@ fn rewrite_utf8_typed_string(expr: &mut Expr) -> bool {
 /// DataFusion's planner then rejects the variant outright ("Unsupported
 /// Value 'UnicodeStringLiteral'"). A plain literal carries the same
 /// characters and plans. Returns true if the rewrite fired.
+/// Trino accepts a correlated scalar subquery without an aggregate,
+/// `(SELECT display_name FROM users WHERE id = o.owner_id)`, and fails at
+/// run time if it yields more than one row. DataFusion refuses the shape at
+/// plan time ("Correlated scalar subquery must be aggregated to return at
+/// most one row"), which is how an Athena view with two such lookups in its
+/// select list stayed hidden. The single projected expression is wrapped in
+/// `max(...)`: identical on the one-row lookups this idiom exists for, and a
+/// defined value where Trino would raise on duplicates.
+///
+/// Only when the subquery looks correlated (its `WHERE` qualifies a column
+/// with a name that is none of its own `FROM` tables or aliases), projects
+/// exactly one item that is not already an aggregate, and has no
+/// `DISTINCT`, `GROUP BY`, `HAVING`, `LIMIT` or `WITH`. An uncorrelated
+/// scalar subquery is left alone: DataFusion plans it as is.
+fn rewrite_correlated_scalar_subquery_to_max(expr: &mut Expr) -> bool {
+    use sqlparser::ast::{GroupByExpr, SelectItem, SetExpr};
+    let Expr::Subquery(query) = expr else {
+        return false;
+    };
+    if query.limit_clause.is_some() || query.with.is_some() {
+        return false;
+    }
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return false;
+    };
+    if select.distinct.is_some() || select.having.is_some() || select.projection.len() != 1 {
+        return false;
+    }
+    if !matches!(&select.group_by, GroupByExpr::Expressions(v, m) if v.is_empty() && m.is_empty()) {
+        return false;
+    }
+    let Some(selection) = select.selection.as_ref() else {
+        return false;
+    };
+    let local = local_relation_names(&select.from);
+    if !references_outer_relation(selection, &local) {
+        return false;
+    }
+    let target = match &mut select.projection[0] {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+        _ => return false,
+    };
+    if is_aggregate_call(target) {
+        return false;
+    }
+    let inner = std::mem::replace(target, Expr::value(Value::Null));
+    *target = Expr::Function(Function {
+        name: ObjectName::from(vec![Ident::new("max")]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(inner))],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    });
+    true
+}
+
+/// The lower-cased table names and aliases a `FROM` clause introduces, so a
+/// qualified column in the same query's `WHERE` can be told apart from one
+/// that reaches out to an enclosing query.
+fn local_relation_names(from: &[sqlparser::ast::TableWithJoins]) -> Vec<String> {
+    use sqlparser::ast::TableFactor;
+    let mut names = Vec::new();
+    let mut push = |factor: &TableFactor| match factor {
+        TableFactor::Table { name, alias, .. } => {
+            if let Some(last) = name.0.last() {
+                names.push(last.to_string().trim_matches('"').to_ascii_lowercase());
+            }
+            if let Some(alias) = alias {
+                names.push(alias.name.value.to_ascii_lowercase());
+            }
+        }
+        TableFactor::Derived {
+            alias: Some(alias), ..
+        } => names.push(alias.name.value.to_ascii_lowercase()),
+        _ => {}
+    };
+    for table in from {
+        push(&table.relation);
+        for join in &table.joins {
+            push(&join.relation);
+        }
+    }
+    names
+}
+
+/// True when `selection` qualifies a column with a name that is not one of
+/// `local`: the outer query's table or alias, which is what makes a
+/// subquery correlated. Nested subqueries inside `selection` are walked
+/// too, so their own aliases can read as outer names; the cost of that
+/// false positive is a `max()` around a one-item projection.
+fn references_outer_relation(selection: &Expr, local: &[String]) -> bool {
+    let mut found = false;
+    let _ = sqlparser::ast::visit_expressions(selection, |e: &Expr| {
+        if let Expr::CompoundIdentifier(parts) = e {
+            if parts.len() >= 2 {
+                let qualifier = parts[parts.len() - 2].value.to_ascii_lowercase();
+                if !local.contains(&qualifier) {
+                    found = true;
+                    return ControlFlow::Break(());
+                }
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    found
+}
+
+fn is_aggregate_call(e: &Expr) -> bool {
+    let Expr::Function(f) = e else {
+        return false;
+    };
+    let name = f
+        .name
+        .0
+        .last()
+        .map(|p| p.to_string().trim_matches('"').to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(
+        name.as_str(),
+        "max"
+            | "min"
+            | "sum"
+            | "count"
+            | "avg"
+            | "array_agg"
+            | "any_value"
+            | "arbitrary"
+            | "first_value"
+            | "last_value"
+            | "bool_or"
+            | "bool_and"
+            | "string_agg"
+            | "listagg"
+            | "approx_distinct"
+            | "approx_percentile"
+    )
+}
+
 fn rewrite_unicode_string_literal(expr: &mut Expr) -> bool {
     if let Expr::Value(value) = expr {
         if let Value::UnicodeStringLiteral(text) = &value.value {
@@ -2349,6 +2502,36 @@ mod tests {
             "JSON literal kept: {out}"
         );
         assert!(out.contains(r#"'{"a": 1}'"#), "string value lost: {out}");
+    }
+
+    #[test]
+    fn correlated_scalar_subquery_without_aggregate_is_wrapped_in_max() {
+        // The Athena lookup idiom: one column from another table, correlated
+        // on the outer row, no aggregate. DataFusion needs the aggregate.
+        let out = rewrite_trino_compat(
+            "SELECT o.id, (SELECT u.display_name FROM users u WHERE u.id = o.owner_id) AS owner \
+             FROM orders o",
+        );
+        assert!(
+            out.contains("(SELECT max(u.display_name) FROM users u WHERE u.id = o.owner_id)"),
+            "{out}"
+        );
+        // Unqualified inner column, qualified outer reference: still correlated.
+        let out = rewrite_trino_compat(
+            "SELECT (SELECT display_name FROM users WHERE id = sa.manager_id) AS m FROM agreements sa",
+        );
+        assert!(out.contains("SELECT max(display_name) FROM users WHERE id = sa.manager_id"), "{out}");
+        // A subquery already aggregated, with DISTINCT, with LIMIT, or not
+        // correlated at all is left alone.
+        for sql in [
+            "SELECT (SELECT count(*) FROM users u WHERE u.id = o.owner_id) AS n FROM orders o",
+            "SELECT (SELECT DISTINCT u.name FROM users u WHERE u.id = o.owner_id) AS n FROM orders o",
+            "SELECT (SELECT u.name FROM users u WHERE u.id = o.owner_id LIMIT 1) AS n FROM orders o",
+            "SELECT (SELECT max(id) FROM users) AS n FROM orders o",
+            "SELECT (SELECT name FROM users u WHERE u.id = 7) AS n FROM orders o",
+        ] {
+            assert_eq!(rewrite_trino_compat(sql), sql, "must be left alone");
+        }
     }
 
     #[test]

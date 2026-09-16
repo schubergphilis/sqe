@@ -1717,6 +1717,66 @@ async fn athena_view_over_a_hive_table_is_queryable() {
     assert_eq!(kind, "VIEW");
 }
 
+/// Two Athena idioms from a live Glue catalog that hid their views. A Trino
+/// lambda, `filter(arr, (tag) -> starts_with(tag, 'x'))`, only parses as a
+/// lambda under the DuckDB dialect the engine session uses; a bare
+/// `SessionConfig` read `->` as the JSON arrow and planned `tag` as a
+/// column ("No field named tag"). And a correlated scalar subquery without
+/// an aggregate, Athena's lookup idiom, is refused by DataFusion at plan
+/// time; the front door wraps the projection in `max()`.
+#[tokio::test]
+async fn athena_views_with_a_lambda_and_a_lookup_subquery_are_queryable() {
+    let f = partitioned_csv_root().await;
+    // A plain context on purpose: the view must plan in its own session.
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_information_schema(true));
+    let lambda_view = views::view_manifest(
+        "tagged_orders",
+        Some(&views::presto_payload(
+            r#"{"originalSql":"SELECT id, regexp_replace(element_at(filter(ARRAY['drt: dev-1', 'app: web'], (tag) -> starts_with(tag, 'drt:')), 1), '^drt:\\s*', '') AS device_id FROM orders",
+                "catalog":"awsdatacatalog","schema":"sales"}"#,
+        )),
+    );
+    let lookup_view = views::view_manifest(
+        "orders_with_lookup",
+        Some(&views::presto_payload(
+            r#"{"originalSql":"SELECT o.id, (SELECT i.amount FROM orders i WHERE i.id = o.id) AS looked_up FROM orders o",
+                "catalog":"awsdatacatalog","schema":"sales"}"#,
+        )),
+    );
+    root_with_views(&f, &ctx, vec![lambda_view, lookup_view]).await;
+
+    let rows = ctx
+        .sql("SELECT device_id FROM lake.sales.tagged_orders ORDER BY id LIMIT 1")
+        .await
+        .expect("plan the lambda view")
+        .collect()
+        .await
+        .expect("run the lambda view");
+    let device = rows
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .expect("a row")
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::StringArray>()
+        .unwrap()
+        .value(0)
+        .to_string();
+    assert_eq!(device, "dev-1", "the lambda kept the drt: tag and the regexp stripped the prefix");
+
+    let n = count_i64(
+        &ctx.sql(
+            "SELECT count(*) FROM lake.sales.orders_with_lookup WHERE looked_up IS NOT NULL",
+        )
+        .await
+        .expect("plan the lookup view")
+        .collect()
+        .await
+        .expect("run the lookup view"),
+    );
+    assert_eq!(n, 3, "every order looks itself up");
+}
+
 /// A view this release cannot plan is hidden with a reason in the log, not
 /// reported as a table with a missing storage format, and not fatal to the
 /// rest of the database.
