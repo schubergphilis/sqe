@@ -948,8 +948,38 @@ async fn call_tool(
             state.config.max_result_rows,
             state.config.max_response_bytes,
         ))),
-        Err(error) => Ok(tool_failure(with_refresh_hint(name, error.to_string()))),
+        Err(error) => Ok(tool_failure(with_decimal_hint(with_refresh_hint(
+            name,
+            error.to_string(),
+        )))),
     }
+}
+
+/// A Parquet value that does not fit the decimal the metastore declares for
+/// its column surfaces as Arrow's bare "1029.23 is too large to store in a
+/// Decimal128 of precision 5. Max is 999.99", which names neither the table
+/// nor the column and reads like an engine bug. It is a metastore
+/// definition narrower than the data (Athena refuses the same row). The
+/// hint says so, names the declared precision so the column can be found
+/// with `describe_table`, and points at the fix, which is not on the client.
+fn with_decimal_hint(message: String) -> String {
+    let lower = message.to_ascii_lowercase();
+    let Some(at) = lower.find("too large to store in a decimal") else {
+        return message;
+    };
+    let precision = lower[at..]
+        .split("precision ")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .filter(|p| !p.is_empty())
+        .map(|p| format!(" (declared precision {p})"))
+        .unwrap_or_default();
+    format!(
+        "{message}\nThe table's metastore definition declares a decimal column{precision} \
+         narrower than the values its data files hold. This is a definition error, not a \
+         query error: widen the column's decimal type in the metastore (Glue: ALTER TABLE ... \
+         CHANGE COLUMN). describe_table shows which column carries that precision."
+    )
 }
 
 /// How long `list_catalogs` waits on each Hive root's probe before calling
@@ -2876,6 +2906,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_decimal_overflow_gets_the_metastore_hint_with_the_declared_precision() {
+        let raw = "Query execution failed: Arrow error: Invalid argument error: 1029.23 is too \
+                   large to store in a Decimal128 of precision 5. Max is 999.99";
+        let hinted = with_decimal_hint(raw.to_string());
+        assert!(hinted.starts_with(raw), "{hinted}");
+        assert!(hinted.contains("(declared precision 5)"), "{hinted}");
+        assert!(hinted.contains("widen the column's decimal type in the metastore"), "{hinted}");
+        assert!(hinted.contains("describe_table"), "{hinted}");
+        // Anything else passes through untouched.
+        let other = "Schema error: No field named tag".to_string();
+        assert_eq!(with_decimal_hint(other.clone()), other);
     }
 
     #[tokio::test]
