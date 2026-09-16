@@ -170,12 +170,18 @@ impl ScalarUDFImpl for Sha256Func {
 /// restarts or query results for the same input will differ across runs.
 pub fn sha256_udf(key: Option<Arc<Vec<u8>>>) -> ScalarUDF {
     if key.is_none() {
-        warn!(
-            "sqe-policy: sha256 column-mask UDF registered without a key. \
-             Hashed values are vulnerable to offline brute force on low-entropy \
-             columns (SSN, phone, employee ID). Set coordinator.policy.mask_key \
-             to enable HMAC-SHA256."
-        );
+        // The UDF is built per session context, so without the `Once` this
+        // printed for every query; the deployment-level fact belongs in the
+        // log once. `policy_wiring` says the same at startup for Ranger.
+        static UNKEYED_WARNED: std::sync::Once = std::sync::Once::new();
+        UNKEYED_WARNED.call_once(|| {
+            warn!(
+                "sqe-policy: sha256 column-mask UDF registered without a key. \
+                 Hashed values are vulnerable to offline brute force on low-entropy \
+                 columns (SSN, phone, employee ID). Set coordinator.policy.mask_key \
+                 to enable HMAC-SHA256."
+            );
+        });
     }
     ScalarUDF::from(Sha256Func::new(key))
 }
