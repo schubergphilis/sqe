@@ -270,6 +270,41 @@ Planning a statement resolves every table reference it names through the catalog
 
 Now a manifest that the metastore confirmed less than `metadata_recheck_secs` ago (default 10) is served as is, and what the two listings learned is kept on the manifest's cache entry until the manifest reloads or the cache TTL (`metadata_ttl_secs`, default 60) expires. Every `CREATE`, `ALTER`, `DROP`, `MSCK REPAIR` and `INSERT` in the coordinator drops the entry for the table it changed, so your own writes are visible immediately. The window only delays what another engine wrote to the same manifest; set `metadata_recheck_secs = 0` to check on every lookup. Glue-backed roots have no change token and already refreshed on the TTL alone; they now honour that TTL under continuous querying, where the previous release kept extending it.
 
+### Glue: when the engine's credentials lapse
+
+A Glue root is read with the engine's own AWS identity (the SDK's default
+chain: `AWS_*` keys, a profile, an SSO session, a task role). When that
+identity stops working, the catalog is reachable but every call fails, and
+the SDK's own message for it is the bare error kind, `dispatch failure`. SQE
+classifies every failed Glue call: a request the SDK could not sign because
+the chain produced no credentials, an SSO session that ended, a
+`credential_process` that failed, or a signed request STS rejects
+(`UnrecognizedClientException`, `InvalidSignatureException`,
+`ExpiredTokenException`, `InvalidClientTokenId`) all surface as
+
+```text
+hive_external: AWS credentials missing or expired for the Glue catalog
+(region=eu-central-1, op=get_databases: dispatch failure: user error: the
+SSO session has expired). Renew the engine's AWS session (aws sso login /
+fresh AWS_* keys) and restart, or fix the credential chain it starts with
+```
+
+on `SHOW SCHEMAS`, `SHOW TABLES`, `DESCRIBE` and the first `SELECT` that
+loads a table. Any other failure keeps the operation name and the SDK's full
+source chain instead of `dispatch failure`. `AccessDeniedException` is
+deliberately not in this class: valid credentials that lack `glue:GetTables`
+are a permission problem, and the message says so. Over MCP, `list_catalogs`
+reports the same condition per Hive root as `diagnostics[].status =
+"auth_error"`.
+
+Data reads use the same identity through `object_store`. A LIST or GET that
+S3 refuses fails the query with the S3 error (`403 InvalidAccessKeyId` on
+the listing, for example). If every table across unrelated databases reads
+as empty at the same time while metadata still resolves, check the age of
+the server's credentials before anything else: two unrelated prefixes being
+genuinely empty at once is the tell, and it has been observed with an
+expired session token on an older build.
+
 ### Glue: one listing warms the whole database
 
 Glue's `GetTables` returns every table's full definition, so a Glue-backed root treats the listing as the fetch. The pre-plan refresh, `SHOW TABLES` and `information_schema` load a database's manifests into the cache in one paginated call, and the `SELECT` that follows finds its table already there. Before this a `SHOW TABLES` against a 618-table database made 618 `GetTable` calls to check each table's policy, which took eight seconds; now it makes the one listing it needed anyway. `information_schema.tables` also answers a table's kind from the manifest alone rather than building the table, so listing a database no longer lists every table's data prefix for size statistics.
