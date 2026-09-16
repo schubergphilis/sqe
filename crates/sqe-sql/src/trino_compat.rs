@@ -225,7 +225,12 @@ pub fn apply_trino_compat(statements: &mut Vec<Statement>, source: &str) -> bool
     // `UNNEST(..) WITH ORDINALITY AS t(x, n)` becomes a row_number() derived
     // table. See #341.
     let has_ordinality = lower.contains("ordinality");
+    // `u&'` -> rewrite_unicode_string_literal: Trino's serialization of any
+    // literal holding a non-ASCII character, which DataFusion's planner
+    // rejects as a Value variant it does not know.
+    let has_unicode_literal = lower.contains("u&'");
     if !has_json_cast
+        && !has_unicode_literal
         && !has_dollar
         && !has_grouping_set
         && !has_current_schema
@@ -407,6 +412,9 @@ impl VisitorMut for TrinoCompatVisitor {
             self.rewrites += 1;
         }
         if rewrite_utf8_typed_string(expr) {
+            self.rewrites += 1;
+        }
+        if rewrite_unicode_string_literal(expr) {
             self.rewrites += 1;
         }
         // ROW constructor rewrite runs before the cast rewrite at this node,
@@ -813,6 +821,26 @@ fn rewrite_utf8_typed_string(expr: &mut Expr) -> bool {
     if let Expr::TypedString(ts) = expr {
         if matches!(ts.data_type, SqlDataType::JSON | SqlDataType::Uuid) {
             *expr = Expr::Value(ts.value.clone());
+            return true;
+        }
+    }
+    false
+}
+
+/// Rewrite a SQL:2011 Unicode string literal (`U&'\2013'`) to the plain
+/// string literal it denotes.
+///
+/// Trino re-serializes any string literal containing a non-ASCII character
+/// in this form, so a view stored by Athena that concatenates an en dash
+/// arrives as `U&' \2013 '`. sqlparser decodes the escapes into the
+/// characters while tokenizing, so the value is already the intended text;
+/// DataFusion's planner then rejects the variant outright ("Unsupported
+/// Value 'UnicodeStringLiteral'"). A plain literal carries the same
+/// characters and plans. Returns true if the rewrite fired.
+fn rewrite_unicode_string_literal(expr: &mut Expr) -> bool {
+    if let Expr::Value(value) = expr {
+        if let Value::UnicodeStringLiteral(text) = &value.value {
+            value.value = Value::SingleQuotedString(text.clone());
             return true;
         }
     }
@@ -2321,6 +2349,22 @@ mod tests {
             "JSON literal kept: {out}"
         );
         assert!(out.contains(r#"'{"a": 1}'"#), "string value lost: {out}");
+    }
+
+    #[test]
+    fn rewrites_unicode_string_literal_to_plain_literal() {
+        // Trino re-serializes a literal with a non-ASCII character as
+        // `U&'...'`; sqlparser decodes it, DataFusion's planner rejects the
+        // variant. The plain literal carries the same characters.
+        let out = rewrite_trino_compat(r"SELECT concat(a, U&' \2013 ', b) AS t FROM x");
+        assert!(!out.contains("U&'"), "unicode literal kept: {out}");
+        assert!(out.contains("' \u{2013} '"), "decoded text lost: {out}");
+        // An escaped quote inside the literal stays a valid literal.
+        let out = rewrite_trino_compat(r"SELECT U&'it''s \00e9' AS t");
+        assert!(out.contains("'it''s \u{e9}'"), "{out}");
+        // A plain literal is left alone.
+        let sql = "SELECT 'plain' AS t";
+        assert_eq!(rewrite_trino_compat(sql), sql);
     }
 
     #[test]
