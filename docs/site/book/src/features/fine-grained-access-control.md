@@ -49,6 +49,21 @@ SQE realizes the full Ranger hive-servicedef built-in mask set. Each Ranger `dat
 
 Character counting is by Unicode scalar, matching Hive, which is what makes the output byte-identical to Spark. Anything SQE cannot map, including a `CUSTOM` expression that fails to parse, restricts the column instead of leaking it. Masking is fail-closed.
 
+## Table access for Hive roots: grant first, deny by default
+
+For an Iceberg table the object-level decision (may this user read this table at all) is Polaris's, made against the caller's own token before SQE plans anything. SQE therefore ignores Ranger *access* policies (`policyType` 0) for Iceberg tables and reads only masks and row filters from the `hive` service.
+
+A Hive root has no Polaris in front of it. A Glue catalog or a sidecar warehouse is read with the engine's credentials, so SQE is the only place a table-level decision can be made. For those tables the Ranger store evaluates the access policies too, with Ranger's own semantics:
+
+- A table is readable when an enabled access policy on its `database` (the policy key `<root>.<database>`) and `table` grants `select` or `all` to the user, one of their roles, or one of their groups. Ranger's `public` group matches every authenticated user.
+- A matching item in `denyPolicyItems` wins over every allow, across all policies, unless a `denyExceptions` item names the user. `allowExceptions` carve a grantee out of an allow the same way.
+- The `column` resource must be `*` (or absent) for the grant to count as table access, exactly as Ranger requires for `SELECT *`. Grant the table, then mask the columns that need it; a grant on two columns alone does not make the table visible.
+- Nothing matching means denied. The table reads as "table not found", the same wording an absent table has, and is left out of `SHOW TABLES`, `information_schema` and the MCP listing tools. Masks and row filters still apply on top of a grant.
+
+This is on by default (`[policy.ranger] hive_access_policies = true`), because the alternative is that every table appearing in a Glue database is open to every authenticated user until someone writes a mask for it. Grant a broad group `select` on `<root>.*` to get the old behaviour deliberately; set the option to `false` to get it silently.
+
+Groups arrive from the JWT (`groups_claim` on the auth provider). A group-bound grant on a deployment without that claim matches nobody, which under this gate means everybody is denied; the store logs the group-only items once per bundle download for that reason.
+
 ## Row filters
 
 A Ranger row-filter policy attaches a boolean SQL expression to a table for a user or role. SQE parses it and injects it as a filter above the scan, so a user sees only the rows the expression admits. Row-filter expressions can reference session context.

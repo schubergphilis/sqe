@@ -3898,6 +3898,27 @@ pub struct RangerPolicyConfig {
     /// `security.allow_unprojected_tags = true` (issue #397).
     #[serde(default)]
     pub project_tags: bool,
+    /// Enforce Ranger ACCESS policies (`policyType` 0) on Hive-root tables:
+    /// a Hive table is readable only when an enabled access policy grants
+    /// `select` (or `all`) on it to the user, one of their roles or one of
+    /// their groups, and no matching deny item takes it away. A table with
+    /// no grant at all reads as "table not found", the same wording an absent
+    /// table has, and is omitted from listings.
+    ///
+    /// ON by default, deliberately. An Iceberg table has Polaris deciding
+    /// object-level access against the caller's own token before SQE plans
+    /// anything; a Hive root (a Glue catalog, a sidecar warehouse) is read
+    /// with the engine's credentials, so SQE is the only place a table-level
+    /// decision can be made. With this off, every table that appears in the
+    /// root is open to every authenticated user until someone writes a
+    /// mask or filter for it, and a new Glue table is exposed the moment
+    /// it is created. Grant first, deny by default, is the safer shape.
+    ///
+    /// Iceberg tables are never gated by this: their access policies stay
+    /// with the catalog. Set `false` to restore the previous behaviour, where
+    /// the Ranger `hive` service supplied masks and row filters only.
+    #[serde(default = "default_true")]
+    pub hive_access_policies: bool,
 }
 
 /// Circuit-breaker defaults shared by the policy backends. 5 consecutive
@@ -3923,6 +3944,7 @@ impl Default for RangerPolicyConfig {
             breaker_recovery_secs: default_policy_breaker_recovery_secs(),
             accept_invalid_certs: false,
             project_tags: false,
+            hive_access_policies: true,
         }
     }
 }
