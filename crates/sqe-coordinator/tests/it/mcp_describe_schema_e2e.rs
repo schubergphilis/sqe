@@ -159,6 +159,7 @@ async fn mcp_describe_schema_describes_an_iceberg_schema_with_stats_in_one_call(
             ..Default::default()
         },
         Vec::new(),
+        &config.storage,
     );
 
     let started = std::time::Instant::now();

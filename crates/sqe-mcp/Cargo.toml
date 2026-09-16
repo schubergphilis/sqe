@@ -33,4 +33,7 @@ workspace = true
 
 [dev-dependencies]
 arrow-schema = { workspace = true }
+# `start_paused` for the describe_schema deadline test: the 20 s probe
+# timeout fires on a paused clock instead of being waited for.
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }

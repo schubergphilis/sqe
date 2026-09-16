@@ -219,7 +219,15 @@ Read tools are always available after the `sqe:mcp:read` scope is validated:
   `reachable`, `auth_error`, `timeout` or `unreachable` with the error text.
   `auth_error` means the engine's own AWS credentials for that root are
   missing or expired, and the detail names the region; nothing the client
-  does fixes that, so a sidecar can show it as an operator problem)
+  does fixes that, so a sidecar can show it as an operator problem. One more
+  entry with `kind: object_store` reports the engine's storage credentials
+  themselves: `provider` (`aws-sdk-default-chain`, `static-keys`,
+  `static-temporary-keys`), `status` (`ok`, `auth_error`, `unknown` for
+  static keys, `timeout`), and `expires_at` when the SDK knows when the
+  current credentials lapse. A sidecar checks this before starting a long
+  job; once it says `auth_error`, every scan fails with
+  `STORAGE_CREDENTIALS_UNAVAILABLE` while `SELECT 1` and the metadata tools
+  still answer)
 - `list_schemas`
 - `list_tables`
 - `describe_table` (columns with type, nullability and the catalog's column
@@ -300,8 +308,16 @@ looser than they are: `SHOW TABLES` lists what the caller may see (Hive roots
 include Athena views; Iceberg REST catalogs include their views), `SHOW COLUMNS
 FROM` per table drops what policy restricts exactly as `describe_table` does,
 `SHOW STATS FOR` reads the Iceberg snapshot summary or the Hive table's
-metastore parameters and never scans, and `EXPLAIN SELECT * FROM t LIMIT 1`
-plans without running. The table kind comes from one `SHOW VIEWS FROM
+metastore parameters and never scans, and `EXPLAIN SELECT * FROM t LIMIT 0`
+resolves and plans the table without running it and without listing its
+storage: resolution is where a Hive table's format, SerDe, location and
+column types are checked and where a view's SQL is planned, and the zero
+limit is eliminated before any scan is built. (`LIMIT 1` listed every table's
+S3 prefix on every call, half a second warm and a hang with expired
+credentials, so `include_queryability` over 40 tables cost 5 s; it now costs
+what the flag-less call costs.) `queryable` therefore means "SQE can resolve
+and plan this table"; whether storage answers is the `object_store` entry of
+`list_catalogs`. The table kind comes from one `SHOW VIEWS FROM
 <catalog>.<schema>` per call and is best effort: one listing of that schema,
 where `information_schema.tables` would enumerate every schema of the catalog
 (12 s cold on a Glue catalog of a hundred databases). On a Hive root the
@@ -309,7 +325,13 @@ metadata statements behind each table (`SHOW COLUMNS`, `SHOW STATS`, `SHOW
 CREATE TABLE`) answer from the same manifest cache the planner uses, so a
 warm crawl pays no metastore round trip per table. Per-table statements run with bounded
 concurrency (eight at a time); one failing table records its `error`,
-`stats_error` or `queryability_error` and the call continues. Those statements
+`stats_error` or `queryability_error` and the call continues. Each of those
+statements also has a 20 s deadline of its own: a Hive table's stats and plan
+touch object storage, and with the engine's credentials expired those calls
+waited rather than failed, so one page over 25 tables hung indefinitely with
+either flag on. A statement past its deadline records the timeout on its
+field (with a pointer to the `list_catalogs` diagnostics) and the page comes
+back. Those statements
 take the caller's concurrency permits but not a share of
 `query.per_user_memory_budget`: `SHOW`, `DESCRIBE` and `EXPLAIN` (without
 `ANALYZE`) never execute a scan, so admission reserves no execution memory for

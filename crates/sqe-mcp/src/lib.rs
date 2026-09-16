@@ -75,7 +75,30 @@ pub struct McpServerState {
     /// must not turn into a metastore flood; inside the window the tool
     /// answers "recently refreshed" without touching a cache.
     refreshes: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Resolves the engine's object-store credentials once and reports the
+    /// outcome, for `list_catalogs` diagnostics. `None` when the embedding
+    /// has no storage to probe (tests, a catalog with no S3 behind it).
+    storage_probe: Option<StorageProbe>,
 }
+
+/// What a storage-credential probe reports. Mirrors
+/// `sqe_catalog::aws_config::StorageCredentialReport` without a dependency
+/// on that crate: `sqe-mcp` is SQL-only, the coordinator wires the probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageCredentialReport {
+    /// `ok`, `auth_error`, or `unknown`.
+    pub status: &'static str,
+    /// `aws-sdk-default-chain`, `static-keys`, `static-temporary-keys`.
+    pub provider: &'static str,
+    /// RFC 3339, when the provider knows when the credentials lapse.
+    pub expires_at: Option<String>,
+    /// The failure text on `auth_error`.
+    pub detail: Option<String>,
+}
+
+/// A probe of the engine's object-store credentials.
+pub type StorageProbe =
+    Arc<dyn Fn() -> futures::future::BoxFuture<'static, StorageCredentialReport> + Send + Sync>;
 
 /// Least time between two `refresh_metadata` calls for the same user and
 /// scope.
@@ -233,7 +256,15 @@ impl McpServerState {
             clients: Arc::new(ClientRegistry::default()),
             hive_roots: Arc::new(Vec::new()),
             refreshes: Arc::new(Mutex::new(HashMap::new())),
+            storage_probe: None,
         }
+    }
+
+    /// Attach the engine's storage-credential probe; `list_catalogs`
+    /// reports its result as an `object_store` diagnostics entry.
+    pub fn with_storage_probe(mut self, probe: StorageProbe) -> Self {
+        self.storage_probe = Some(probe);
+        self
     }
 
     /// Record a `refresh_metadata` call for `key` unless one happened less
@@ -712,7 +743,7 @@ fn tools(config: &McpConfig) -> Vec<Value> {
         tool("list_schemas", "List schemas visible to the authenticated user in a catalog.", one_string_schema("catalog"), true, false),
         tool("list_tables", "List tables visible to the authenticated user in a catalog and schema.", two_string_schema("catalog", "schema"), true, false),
         tool("describe_table", "Return columns for a table visible to the authenticated user.", three_string_schema(), true, false),
-        tool("describe_schema", "Describe every table and view in one schema in a single call, for catalog crawlers: per table the columns describe_table would return (same policy filtering), the table kind (table or view) and source (iceberg, hive_external, view), optionally the metastore's row count and size (`include_stats`: Iceberg snapshot summary or Glue/Hive table parameters, never a scan) and whether `SELECT * ... LIMIT 1` plans (`include_queryability`: planning only, nothing runs). Paged by table name: `page_size` defaults to 200 (at most 500); pass back `next_page_token` for the next page. One table failing does not fail the call; its `error`, `stats_error` or `queryability_error` says why.", json!({"type":"object","properties":{"catalog":{"type":"string"},"schema":{"type":"string"},"include_stats":{"type":"boolean"},"include_queryability":{"type":"boolean"},"page_token":{"type":"string"},"page_size":{"type":"integer","minimum":1,"maximum":500}},"required":["catalog","schema"],"additionalProperties":false}), true, false),
+        tool("describe_schema", "Describe every table and view in one schema in a single call, for catalog crawlers: per table the columns describe_table would return (same policy filtering), the table kind (table or view) and source (iceberg, hive_external, view), optionally the metastore's row count and size (`include_stats`: Iceberg snapshot summary or Glue/Hive table parameters, never a scan) and whether the table resolves and plans (`include_queryability`: `EXPLAIN SELECT * ... LIMIT 0`, table resolution and planning only, no scan and no storage listing; storage reachability is the `object_store` diagnostics entry of list_catalogs). Paged by table name: `page_size` defaults to 200 (at most 500); pass back `next_page_token` for the next page. One table failing does not fail the call; its `error`, `stats_error` or `queryability_error` says why.", json!({"type":"object","properties":{"catalog":{"type":"string"},"schema":{"type":"string"},"include_stats":{"type":"boolean"},"include_queryability":{"type":"boolean"},"page_token":{"type":"string"},"page_size":{"type":"integer","minimum":1,"maximum":500}},"required":["catalog","schema"],"additionalProperties":false}), true, false),
         tool("get_table_ddl", "Return SHOW CREATE TABLE output for a visible table.", three_string_schema(), true, false),
         tool("get_table_stats", "Return Iceberg table statistics visible to the authenticated user. Hive external tables have no snapshot statistics and return an error; use describe_table for them.", three_string_schema(), true, false),
         tool("search_tables", "Find tables by name across the schemas of one catalog (SHOW SCHEMAS, then SHOW TABLES per schema, matched server-side). `pattern` is a SQL LIKE pattern (% and _ are wildcards; a bare word matches as a substring, case-insensitive). `catalog` defaults to the session's default catalog. Only tables visible to the authenticated user are returned.", json!({"type":"object","properties":{"pattern":{"type":"string"},"catalog":{"type":"string"}},"required":["pattern"],"additionalProperties":false}), true, false),
@@ -992,6 +1023,32 @@ async fn list_catalogs_with_diagnostics(
             .collect()
             .await
     };
+    let mut diagnostics = diagnostics;
+    // The engine's own object-store credentials, the one failure that takes
+    // every scan down while `SELECT 1` and the metadata tools keep working.
+    // Bounded like the root probes; a chain that hangs reports `timeout`.
+    if let Some(probe) = &state.storage_probe {
+        let entry = match tokio::time::timeout(CATALOG_PROBE_TIMEOUT, probe()).await {
+            Ok(report) => json!({
+                "kind": "object_store",
+                "status": report.status,
+                "provider": report.provider,
+                "expires_at": report.expires_at,
+                "detail": report.detail,
+            }),
+            Err(_) => json!({
+                "kind": "object_store",
+                "status": "timeout",
+                "provider": Value::Null,
+                "expires_at": Value::Null,
+                "detail": format!(
+                    "no answer from the credential provider within {}s",
+                    CATALOG_PROBE_TIMEOUT.as_secs()
+                ),
+            }),
+        };
+        diagnostics.push(entry);
+    }
     let mut body = batches_json(
         &batches,
         state.config.max_result_rows,
@@ -1203,6 +1260,11 @@ const DESCRIBE_SCHEMA_PAGE_MAX: usize = 500;
 /// cache the coordinator already warmed with the listing, so this bounds
 /// concurrent planner work, not network fan-out.
 const DESCRIBE_SCHEMA_CONCURRENCY: usize = 8;
+/// Deadline for one per-table statement inside `describe_schema` (columns,
+/// stats, plan). Generous for a cold Glue table (a listing plus a manifest,
+/// one to three seconds) and far below the 90 s a caller gives the whole
+/// page; a statement that has not answered by then is not slow, it is stuck.
+const DESCRIBE_SCHEMA_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// `describe_schema`: one schema's tables and views, each described the way
 /// the single-table tools would, in one call.
@@ -1212,7 +1274,9 @@ const DESCRIBE_SCHEMA_CONCURRENCY: usize = 8;
 /// filtered), the columns are `SHOW COLUMNS FROM` per table (the policy
 /// path that drops restricted columns on a Hive table), statistics are
 /// `SHOW STATS FOR` (snapshot or metastore numbers, never a scan), and
-/// queryability is `EXPLAIN SELECT * FROM t LIMIT 1` (planning only). The
+/// queryability is `EXPLAIN SELECT * FROM t LIMIT 0` (table resolution and
+/// planning only; the zero limit is eliminated before any scan, so no
+/// object-store listing happens). The
 /// table kind comes from one `SHOW VIEWS FROM <catalog>.<schema>` per call
 /// and is best effort: a catalog that cannot answer it leaves every entry a
 /// `table`. Per-table statements run with bounded concurrency; a statement
@@ -1344,11 +1408,7 @@ async fn describe_one_table(
         "columns": [],
     });
 
-    match state
-        .executor
-        .execute(session, &format!("SHOW COLUMNS FROM {table}"))
-        .await
-    {
+    match probe(state, session, &format!("SHOW COLUMNS FROM {table}")).await {
         Ok(batches) => {
             let columns: Vec<Value> = rows_json(&batches)
                 .into_iter()
@@ -1377,15 +1437,17 @@ async fn describe_one_table(
         }
     }
 
+    // Each probe has its own deadline. A Hive table's stats and plan both
+    // touch object storage (a listing, a manifest), and with the engine's
+    // credentials expired those calls did not fail, they waited: one
+    // describe_schema over 25 tables hung indefinitely with either flag on
+    // while the flag-less call answered in 0.4 s. A probe past its deadline
+    // records the timeout on its own field and the page goes on.
     if include_stats {
         entry["row_count"] = Value::Null;
         entry["size_bytes"] = Value::Null;
         entry["snapshot_id"] = Value::Null;
-        match state
-            .executor
-            .execute(session, &format!("SHOW STATS FOR {table}"))
-            .await
-        {
+        match probe(state, session, &format!("SHOW STATS FOR {table}")).await {
             Ok(batches) => {
                 // The summary row is the one with no column name.
                 if let Some(summary) = rows_json(&batches)
@@ -1397,25 +1459,51 @@ async fn describe_one_table(
                 }
             }
             Err(error) => {
-                entry["stats_error"] = json!(error.to_string());
+                entry["stats_error"] = json!(error);
             }
         }
     }
 
     if include_queryability {
-        match state
-            .executor
-            .execute(session, &format!("EXPLAIN SELECT * FROM {table} LIMIT 1"))
-            .await
-        {
+        // LIMIT 0, not LIMIT 1: DataFusion resolves the table (which is
+        // where a Hive table's format, SerDe, location and column types are
+        // checked, and where a view's SQL is planned) and then eliminates the
+        // zero limit before physical planning, so no scan is built and no
+        // object-store listing happens. With LIMIT 1 every table paid an S3
+        // LIST per call, half a second warm and a hang with expired
+        // credentials; "queryable" means "SQE can resolve and plan it", and
+        // storage reachability is the object_store entry of list_catalogs.
+        match probe(state, session, &format!("EXPLAIN SELECT * FROM {table} LIMIT 0")).await {
             Ok(_) => entry["queryable"] = json!(true),
             Err(error) => {
                 entry["queryable"] = json!(false);
-                entry["queryability_error"] = json!(error.to_string());
+                entry["queryability_error"] = json!(error);
             }
         }
     }
     entry
+}
+
+/// One per-table statement of `describe_schema`, bounded by
+/// [`DESCRIBE_SCHEMA_PROBE_TIMEOUT`]. The error is the statement's own text,
+/// or the deadline's, so the caller can put it on the table's field.
+async fn probe(
+    state: &McpServerState,
+    session: &Session,
+    sql: &str,
+) -> Result<Vec<RecordBatch>, String> {
+    match tokio::time::timeout(DESCRIBE_SCHEMA_PROBE_TIMEOUT, state.executor.execute(session, sql))
+        .await
+    {
+        Ok(Ok(batches)) => Ok(batches),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err(format!(
+            "probe timed out after {}s (the statement did not fail, it waited: with the \
+             engine's storage credentials expired an object-store call can hang; check \
+             list_catalogs diagnostics)",
+            DESCRIBE_SCHEMA_PROBE_TIMEOUT.as_secs()
+        )),
+    }
 }
 
 /// `table_name -> "view"` for the views of one schema, lower-cased names,
@@ -2791,6 +2879,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_catalogs_reports_the_engines_storage_credentials() {
+        let executor = Arc::new(ProbeExecutor {
+            catalogs: vec!["glue"],
+            schema_errors: HashMap::new(),
+        });
+        let probe: StorageProbe = Arc::new(|| {
+            Box::pin(async {
+                StorageCredentialReport {
+                    status: "auth_error",
+                    provider: "aws-sdk-default-chain",
+                    expires_at: None,
+                    detail: Some(
+                        "storage credentials expired or unavailable (aws sdk default chain): \
+                         the SSO session has expired"
+                            .to_string(),
+                    ),
+                }
+            })
+        });
+        let state = McpServerState::new(Arc::new(MockAuth), executor, static_config(false))
+            .with_hive_roots(vec!["glue".into()])
+            .with_storage_probe(probe);
+        let session = local_session("mcp-reader".into(), vec![]);
+
+        let result = list_catalogs_with_diagnostics(&state, &session).await.unwrap();
+        let diagnostics = result["structuredContent"]["diagnostics"].as_array().unwrap().clone();
+        let storage = diagnostics
+            .iter()
+            .find(|d| d["kind"] == "object_store")
+            .expect("an object_store entry");
+        assert_eq!(storage["status"], "auth_error", "{storage}");
+        assert_eq!(storage["provider"], "aws-sdk-default-chain");
+        assert!(storage["detail"].as_str().unwrap().contains("SSO session has expired"));
+        // The Hive root itself answered, so the two are told apart.
+        let glue = diagnostics.iter().find(|d| d["catalog"] == "glue").unwrap();
+        assert_eq!(glue["status"], "reachable", "{glue}");
+    }
+
+    #[tokio::test]
     async fn list_catalogs_reports_each_hive_roots_credential_state() {
         let executor = Arc::new(ProbeExecutor {
             catalogs: vec!["default", "glue", "lake", "iceberg"],
@@ -2905,6 +3032,9 @@ mod tests {
         /// `EXPLAIN`: one plan row.
         Plan,
         Fail(&'static str),
+        /// Never answers, as an object-store call with expired credentials
+        /// did on 2026-09-16: the deadline is what turns it into an error.
+        Hang,
     }
 
     /// Answers statements by exact SQL, records what was asked, and refuses
@@ -2927,6 +3057,10 @@ mod tests {
             };
             let batch = match answer {
                 Answer::Fail(message) => return Err(SqeError::Execution(message.to_string())),
+                Answer::Hang => {
+                    std::future::pending::<()>().await;
+                    unreachable!("a pending future never resolves")
+                }
                 Answer::Names(names) => RecordBatch::try_new(
                     Arc::new(Schema::new(vec![Field::new("Table", DataType::Utf8, true)])),
                     vec![utf8(names.iter().map(|n| Some(*n)).collect())],
@@ -2993,8 +3127,8 @@ mod tests {
                 ("SHOW COLUMNS FROM \"glue\".\"bi\".\"sales_v\"", cols(&["month", "total"])),
                 ("SHOW STATS FOR \"glue\".\"bi\".\"orders\"", Answer::Stats(Some(1200.0), Some(65536.0))),
                 ("SHOW STATS FOR \"glue\".\"bi\".\"sales_v\"", Answer::Fail("views carry no statistics")),
-                ("EXPLAIN SELECT * FROM \"glue\".\"bi\".\"orders\" LIMIT 1", Answer::Plan),
-                ("EXPLAIN SELECT * FROM \"glue\".\"bi\".\"sales_v\" LIMIT 1", Answer::Fail("Schema error: No field named tag")),
+                ("EXPLAIN SELECT * FROM \"glue\".\"bi\".\"orders\" LIMIT 0", Answer::Plan),
+                ("EXPLAIN SELECT * FROM \"glue\".\"bi\".\"sales_v\" LIMIT 0", Answer::Fail("Schema error: No field named tag")),
             ]),
             asked: Mutex::new(Vec::new()),
         })
@@ -3012,6 +3146,60 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect()
+    }
+
+    /// A stats probe that never answers (an object-store call with expired
+    /// credentials, 2026-09-16) must not hold the page: the table comes back
+    /// with the timeout on `stats_error`, its other probes intact. The
+    /// paused clock makes the 20 s deadline fire without waiting for it.
+    #[tokio::test(start_paused = true)]
+    async fn describe_schema_bounds_a_hanging_probe_and_returns_the_page() {
+        let executor = Arc::new(TableExecutor {
+            answers: HashMap::from([
+                ("SHOW TABLES FROM \"glue\".\"bi\"", Answer::Names(vec!["stuck", "fine"])),
+                ("SHOW VIEWS FROM \"glue\".\"bi\"", Answer::Names(vec![])),
+                (
+                    "SHOW COLUMNS FROM \"glue\".\"bi\".\"stuck\"",
+                    Answer::Columns(vec![("id", "Int64", "NO", None)]),
+                ),
+                (
+                    "SHOW COLUMNS FROM \"glue\".\"bi\".\"fine\"",
+                    Answer::Columns(vec![("id", "Int64", "NO", None)]),
+                ),
+                ("SHOW STATS FOR \"glue\".\"bi\".\"stuck\"", Answer::Hang),
+                ("SHOW STATS FOR \"glue\".\"bi\".\"fine\"", Answer::Stats(Some(7.0), Some(512.0))),
+                ("EXPLAIN SELECT * FROM \"glue\".\"bi\".\"stuck\" LIMIT 0", Answer::Plan),
+                ("EXPLAIN SELECT * FROM \"glue\".\"bi\".\"fine\" LIMIT 0", Answer::Hang),
+            ]),
+            asked: Mutex::new(Vec::new()),
+        });
+        let state = schema_state(executor);
+        let session = local_session("mcp-reader".into(), vec![]);
+
+        let page = describe_schema(
+            &state,
+            &session,
+            &json!({"catalog": "glue", "schema": "bi", "include_stats": true, "include_queryability": true}),
+        )
+        .await
+        .unwrap();
+        let tables = page["tables"].as_array().unwrap();
+        assert_eq!(tables.len(), 2, "{page}");
+        let by = |n: &str| tables.iter().find(|t| t["name"] == n).unwrap().clone();
+        let stuck = by("stuck");
+        assert!(
+            stuck["stats_error"].as_str().unwrap().contains("probe timed out after 20s"),
+            "{stuck}"
+        );
+        assert_eq!(stuck["queryable"], json!(true), "the plan probe still ran: {stuck}");
+        assert_eq!(stuck["columns"].as_array().unwrap().len(), 1);
+        let fine = by("fine");
+        assert_eq!(fine["row_count"], json!(7), "{fine}");
+        assert_eq!(fine["queryable"], json!(false), "{fine}");
+        assert!(
+            fine["queryability_error"].as_str().unwrap().contains("probe timed out"),
+            "{fine}"
+        );
     }
 
     #[tokio::test]
