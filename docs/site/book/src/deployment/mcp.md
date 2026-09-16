@@ -289,8 +289,13 @@ FROM` per table drops what policy restricts exactly as `describe_table` does,
 metastore parameters and never scans, and `EXPLAIN SELECT * FROM t LIMIT 1`
 plans without running. The table kind comes from one `information_schema.tables`
 read per call and is best effort. Per-table statements run with bounded
-concurrency; one failing table records its `error`, `stats_error` or
-`queryability_error` and the call continues. Pages are by table name
+concurrency (eight at a time); one failing table records its `error`,
+`stats_error` or `queryability_error` and the call continues. Those statements
+take the caller's concurrency permits but not a share of
+`query.per_user_memory_budget`: `SHOW`, `DESCRIBE` and `EXPLAIN` (without
+`ANALYZE`) never execute a scan, so admission reserves no execution memory for
+them. Before that exemption the defaults (1GB budget, 256MB per query) admitted
+four metadata statements per user and refused the rest with a memory error. Pages are by table name
 (`page_size` default 200, at most 500), and `max_response_bytes` can shorten a
 page further, in which case `next_page_token` points at the first table that
 did not fit. `properties` and column-level statistics are not included.
