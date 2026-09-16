@@ -148,6 +148,7 @@ async fn mcp_app(ctx: &AcCtx, write_catalogs: Vec<String>) -> Router {
         )),
         mcp,
         Vec::new(),
+        &config.storage,
     )
 }
 

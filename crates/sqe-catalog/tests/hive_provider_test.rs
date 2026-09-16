@@ -1433,6 +1433,64 @@ async fn repeated_lookups_inside_the_recheck_window_pay_one_round_trip() {
     assert_eq!(store.lists(), 2, "no relisting inside the TTL");
 }
 
+/// The queryability probe `describe_schema` runs per table is
+/// `EXPLAIN SELECT * FROM t LIMIT 0`. Resolving the table is where the
+/// format, SerDe, location and column types are checked; the zero limit is
+/// eliminated before physical planning, so no scan is built and storage is
+/// not listed. `LIMIT 1` builds the scan and lists the prefix on every call,
+/// which is what made the probe cost half a second per Glue table and hang
+/// with expired credentials.
+#[tokio::test]
+async fn explain_limit_zero_resolves_the_table_without_listing_storage() {
+    let f = partitioned_csv_root().await;
+    let ctx = SessionContext::new();
+    let (provider, _source, store) =
+        counting_root(&f, &ctx, HiveMetadataCache::new(), true).await;
+    ctx.register_catalog("lake", provider.clone());
+    // DataFusion's own listing (ListingTable::scan) goes through the
+    // session runtime's object-store registry, not the provider's factory,
+    // so count that path too by serving `file://` from the same counter.
+    ctx.runtime_env().register_object_store(
+        &url::Url::parse("file:///").expect("url"),
+        store.clone() as Arc<dyn object_store::ObjectStore>,
+    );
+
+    // Warm: the codec probe and the size-statistics listing, once.
+    let _ = load_orders(&provider).await;
+    let warm = store.lists();
+    assert_eq!(warm, 2, "one listing for the CSV codec, one for size statistics");
+
+    ctx.sql("EXPLAIN SELECT * FROM lake.sales.orders LIMIT 0")
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("explain");
+    assert_eq!(
+        store.lists(),
+        warm,
+        "resolving and planning with LIMIT 0 must not list storage"
+    );
+
+    // The contrast: reading one row has to find the files, so it lists.
+    // (This fixture carries a partition index, so its plan defers the
+    // listing to execution; a Glue table without an index lists at plan
+    // time, which is what `LIMIT 1` in the probe paid on every call.)
+    let rows = ctx
+        .sql("SELECT * FROM lake.sales.orders LIMIT 1")
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("read");
+    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    assert!(
+        store.lists() > warm,
+        "reading lists storage: {} listings after {warm}",
+        store.lists()
+    );
+}
+
 /// `metadata_recheck_secs = 0` restores a HEAD per lookup; the data facts
 /// still belong to the manifest version and are not re-listed while the
 /// ETag matches.

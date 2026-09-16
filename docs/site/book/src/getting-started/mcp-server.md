@@ -76,9 +76,17 @@ export AWS_REGION=eu-central-1
 sqe-server --glue-catalog glue --allow-all-buckets --mcp-only --mcp-anonymous --mcp-port 8098
 ```
 
-No `aws configure export-credentials` step is needed. The SDK refreshes the SSO
-or STS session in the background, so a long-running server keeps working after
-the initial token would have expired.
+No `aws configure export-credentials` step is needed, and for a server that
+runs longer than a session it is the wrong tool: exported keys carry a session
+token, expire in hours, and nothing in the process can renew them. SQE
+therefore does not pin such keys into `[storage]`; S3 reads go through the AWS
+SDK chain, which reads the same environment while it is valid. With
+`AWS_PROFILE` instead, the SDK refreshes the SSO or STS session in the
+background for as long as that session lasts. When it finally ends, queries
+fail with `STORAGE_CREDENTIALS_UNAVAILABLE` and a message that says so, and
+the `list_catalogs` tool reports it under `diagnostics` as an `object_store`
+entry; `SELECT 1` and the metadata tools keep answering, so check that entry
+rather than the process.
 
 The region resolves the same way: `SQE_STORAGE__S3_REGION` (or `[storage]
 s3_region`) wins, then `AWS_REGION`, then `AWS_DEFAULT_REGION`, and finally the

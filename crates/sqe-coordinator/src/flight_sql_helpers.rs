@@ -93,6 +93,10 @@ pub(crate) fn sqe_error_to_status(
         sqe_core::SqeErrorCode::CatalogUnavailable | sqe_core::SqeErrorCode::StorageError => {
             tonic::Code::Unavailable
         }
+        // The engine's own AWS session is over: not the caller's grant
+        // (PermissionDenied) and not transient (Unavailable). Unauthenticated
+        // says "credentials", which is what an operator has to renew.
+        sqe_core::SqeErrorCode::StorageCredentialsUnavailable => tonic::Code::Unauthenticated,
         sqe_core::SqeErrorCode::CircuitBreakerOpen => tonic::Code::FailedPrecondition,
         sqe_core::SqeErrorCode::CommitConflict => tonic::Code::Aborted,
         // Explicit arm for `CatalogError` (previously fell through to the

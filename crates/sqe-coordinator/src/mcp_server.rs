@@ -40,12 +40,65 @@ pub fn mcp_router(
     rate_limiter: Arc<QueryRateLimiter>,
     config: McpConfig,
     hive_roots: Vec<String>,
+    storage: &sqe_core::config::StorageConfig,
 ) -> axum::Router {
     let executor: Arc<dyn sqe_mcp::QueryExecutor> = Arc::new(CoordinatorMcpExecutor {
         handler,
         rate_limiter,
     });
-    sqe_mcp::router(sqe_mcp::McpServerState::new(auth, executor, config).with_hive_roots(hive_roots))
+    sqe_mcp::router(
+        sqe_mcp::McpServerState::new(auth, executor, config)
+            .with_hive_roots(hive_roots)
+            .with_storage_probe(storage_probe(storage)),
+    )
+}
+
+/// The engine's object-store credential probe for `list_catalogs`
+/// diagnostics, from the effective `[storage]` block.
+///
+/// With no static key the S3 stores read through the AWS SDK default chain
+/// (`aws_config::sdk_object_store_credentials`), so the probe resolves that
+/// chain once and reports `ok` with the expiry the SDK knows, or
+/// `auth_error` with the reason (an SSO session that ended, a chain with no
+/// provider). With a static key nothing here can see whether S3 still
+/// accepts it, so the probe says `unknown` and names the kind: a session
+/// token makes them temporary keys that will expire with the session that
+/// issued them, which is the shape that produced "every scan fails after a
+/// few hours while SELECT 1 works".
+pub fn storage_probe(storage: &sqe_core::config::StorageConfig) -> sqe_mcp::StorageProbe {
+    if storage.s3_access_key.is_empty() {
+        return Arc::new(|| {
+            Box::pin(async {
+                let r = sqe_catalog::aws_config::probe_storage_credentials().await;
+                sqe_mcp::StorageCredentialReport {
+                    status: r.status,
+                    provider: r.provider,
+                    expires_at: r.expires_at,
+                    detail: r.detail,
+                }
+            })
+        });
+    }
+    let temporary = !storage.s3_session_token.expose().is_empty();
+    Arc::new(move || {
+        Box::pin(async move {
+            sqe_mcp::StorageCredentialReport {
+                status: "unknown",
+                provider: if temporary {
+                    "static-temporary-keys"
+                } else {
+                    "static-keys"
+                },
+                expires_at: None,
+                detail: temporary.then(|| {
+                    "static keys with a session token expire with the session that issued \
+                     them and cannot be refreshed in-process; run with AWS_PROFILE for \
+                     credentials the SDK renews"
+                        .to_string()
+                }),
+            }
+        })
+    })
 }
 
 #[async_trait]
@@ -66,6 +119,9 @@ impl sqe_mcp::QueryExecutor for CoordinatorMcpExecutor {
 /// moment the serve loop ends for any reason, including a panic, so the
 /// ops port can report a dead `/mcp` on a live PID; the caller decides what
 /// to do about it (`sqe-server` exits, see `watch_mcp_listener` there).
+// One call site (sqe-server main) and one test; the arguments are the
+// coordinator's shared wiring, not a configuration surface to bundle.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_mcp_server(
     auth: Arc<dyn AuthProvider>,
     handler: Arc<QueryHandler>,
@@ -74,9 +130,10 @@ pub async fn start_mcp_server(
     hive_roots: Vec<String>,
     tls: &TlsConfig,
     alive: Arc<AtomicBool>,
+    storage: &sqe_core::config::StorageConfig,
 ) -> anyhow::Result<(tokio::task::JoinHandle<()>, SocketAddr)> {
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    let app = mcp_router(auth, handler, rate_limiter, config, hive_roots);
+    let app = mcp_router(auth, handler, rate_limiter, config, hive_roots, storage);
     // Bind synchronously up front so both branches can report the port they
     // actually got, and so a bind failure is this call's error, not a log
     // line from a task nobody joins.

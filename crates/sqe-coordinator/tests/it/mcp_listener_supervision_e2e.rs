@@ -130,6 +130,7 @@ async fn mcp_listener_answers_again_after_idling_past_the_session_cache_ttl() {
         Vec::new(),
         &config.coordinator.tls,
         alive.clone(),
+        &config.storage,
     )
     .await
     .expect("listener bound");
