@@ -1494,7 +1494,7 @@ mod tests {
     #[test]
     fn parses_refresh_catalog_cache_scoped() {
         let stmt =
-            parse_first("CALL system.refresh_catalog_cache(table => 'glue.thecore.tag')");
+            parse_first("CALL system.refresh_catalog_cache(table => 'glue.sales.orders')");
         let call = try_parse_call(&stmt).unwrap().expect("match");
         match call {
             ProcedureCall::RefreshCatalogCache {
@@ -1502,13 +1502,13 @@ mod tests {
                 schema: None,
             } => {
                 assert_eq!(t.catalog.as_deref(), Some("glue"));
-                assert_eq!(t.namespace, "thecore");
-                assert_eq!(t.name, "tag");
+                assert_eq!(t.namespace, "sales");
+                assert_eq!(t.name, "orders");
             }
             other => panic!("unexpected: {other:?}"),
         }
 
-        let stmt = parse_first("CALL system.refresh_catalog_cache(schema => 'glue.thecore')");
+        let stmt = parse_first("CALL system.refresh_catalog_cache(schema => 'glue.sales')");
         let call = try_parse_call(&stmt).unwrap().expect("match");
         match call {
             ProcedureCall::RefreshCatalogCache {
@@ -1516,7 +1516,7 @@ mod tests {
                 schema: Some(ns),
             } => {
                 assert_eq!(ns.catalog.as_deref(), Some("glue"));
-                assert_eq!(ns.namespace, "thecore");
+                assert_eq!(ns.namespace, "sales");
             }
             other => panic!("unexpected: {other:?}"),
         }

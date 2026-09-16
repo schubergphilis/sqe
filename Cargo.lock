@@ -6445,6 +6445,7 @@ dependencies = [
  "sqe-metrics-core",
  "sqe-policy-api",
  "sqe-sql",
+ "sqe-trino-functions",
  "sqlite-rs",
  "sqlparser",
  "sqlx",
