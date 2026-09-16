@@ -83,6 +83,15 @@ A dedicated MCP listener uses `[coordinator.tls]`. The shared internal web
 listener is plaintext, as before, so terminate TLS at the ingress/reverse proxy.
 In either mode, the public `resource_uri` must use HTTPS in production.
 
+A dedicated listener is also supervised. Its accept loop runs in a task that
+cannot end quietly: a return, an error or a panic is logged at ERROR, the
+liveness flag behind `/healthz` and `/readyz` (`checks.mcp`) is cleared,
+readiness flips, and `sqe-server` exits with status 70 so the supervisor
+restarts it. The alternative, a live PID whose `/mcp` refuses connections, is
+invisible to every health check but the one on this port, and was seen on a
+laptop deployment after an idle hour. See
+[Observability](../features/observability.md#health-endpoints).
+
 ## Deployments with no identity provider
 
 The section above assumes every caller carries a user token. A catalog reached

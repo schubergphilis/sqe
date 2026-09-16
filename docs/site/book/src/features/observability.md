@@ -64,8 +64,17 @@ Available on port 9091 (metrics port + 1) for both coordinator and workers.
 
 | Endpoint | Purpose | Response |
 |---|---|---|
-| `GET /healthz` | Liveness probe | Always returns `200 ok` |
-| `GET /readyz` | Readiness probe | `200` when ready, `503` during init |
+| `GET /healthz` | Liveness probe | `200 ok`; `503 mcp listener down` once a dedicated `/mcp` listener's serve task has ended |
+| `GET /readyz` | Readiness probe | `200` when ready, `503` during init or when a check fails; `checks.mcp` is `ok` or `down` when MCP has its own port |
+
+A dedicated MCP listener (`[mcp] port` > 0) is supervised: if its accept loop
+ends for any reason, including a panic, the coordinator logs at ERROR, clears
+the liveness flag both probes read, flips readiness so a load balancer stops
+routing, and exits with status 70 so the supervisor restarts the process. A
+process that stays up with a closed `/mcp` is the one failure no external
+health check can see, so `sqe-server` does not stay up in that state. With
+`port = 0` the MCP routes share this listener and answering `/healthz` already
+proves them reachable.
 
 ### Cluster Status (Ballista/DataFusion-style)
 

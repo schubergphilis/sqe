@@ -186,6 +186,11 @@ struct HealthState {
     /// The `serving` block of `/api/v1/status`. Populated in
     /// `run_coordinator`; `None` in `run_worker` and tests.
     serving: Option<ServingStatus>,
+    /// `true` while the dedicated `/mcp` listener's serve task is running;
+    /// cleared by `mcp_server::start_mcp_server` the moment it ends. `None`
+    /// when MCP is off or mounted on this listener (`mcp.port = 0`), where
+    /// answering `/healthz` at all already proves the MCP routes are up.
+    mcp_listener_alive: Option<Arc<AtomicBool>>,
 }
 
 impl sqe_coordinator::web_auth::BearerAdminState for HealthState {
@@ -246,8 +251,28 @@ impl sqe_coordinator::web_auth::BearerAdminState for HealthState {
     }
 }
 
-async fn healthz() -> &'static str {
-    "ok"
+/// Liveness. `200 ok` while the process can serve; `503` once the dedicated
+/// `/mcp` listener has died, because a process whose only front door is
+/// closed is not alive in any sense a health check cares about, whatever
+/// `pgrep` says. `sqe-server` also exits in that case (`watch_mcp_listener`);
+/// the 503 covers the window before it does and any embedding that keeps
+/// the process up.
+async fn healthz(state: axum::extract::State<Arc<HealthState>>) -> Response {
+    if mcp_listener_down(&state) {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "mcp listener down",
+        )
+            .into_response();
+    }
+    "ok".into_response()
+}
+
+fn mcp_listener_down(state: &HealthState) -> bool {
+    state
+        .mcp_listener_alive
+        .as_ref()
+        .is_some_and(|alive| !alive.load(Ordering::SeqCst))
 }
 
 async fn readyz(state: axum::extract::State<Arc<HealthState>>) -> Response {
@@ -277,6 +302,19 @@ async fn readyz(state: axum::extract::State<Arc<HealthState>>) -> Response {
             }),
         );
         if !polaris_ok {
+            all_healthy = false;
+        }
+    }
+
+    // The dedicated /mcp listener, when there is one. `down` means its serve
+    // task ended; the process is about to exit (see `watch_mcp_listener`).
+    if let Some(alive) = &state.mcp_listener_alive {
+        let up = alive.load(Ordering::SeqCst);
+        checks.insert(
+            "mcp".to_string(),
+            serde_json::Value::String(if up { "ok" } else { "down" }.to_string()),
+        );
+        if !up {
             all_healthy = false;
         }
     }
@@ -774,6 +812,36 @@ fn start_health_server_with_extra(port: u16, state: Arc<HealthState>, extra: Opt
 }
 
 // ── Graceful shutdown ──────────────────────────────────────────
+/// Exit code when the dedicated `/mcp` listener dies: BSD `EX_SOFTWARE`, so a
+/// supervisor log can tell it from a crash (101) and a clean stop (0).
+const EXIT_MCP_LISTENER_DIED: i32 = 70;
+
+/// Turn a dead `/mcp` listener into a dead process. The serve task cannot
+/// end quietly (`mcp_server::supervise_listener` logs and clears the alive
+/// flag), and this makes sure the process does not outlive it: readiness
+/// flips so a load balancer stops routing, then `exit` runs with
+/// [`EXIT_MCP_LISTENER_DIED`] so the supervisor restarts the container. The
+/// alternative, rebinding in place, would race the old socket's close and
+/// hide the fact that something killed the accept loop. `exit` is a
+/// parameter so the test can observe the call instead of dying.
+fn watch_mcp_listener(
+    listener_task: tokio::task::JoinHandle<()>,
+    ready: Arc<AtomicBool>,
+    exit: impl FnOnce(i32) + Send + 'static,
+) {
+    tokio::spawn(async move {
+        let _ = listener_task.await;
+        ready.store(false, Ordering::SeqCst);
+        tracing::error!(
+            exit_code = EXIT_MCP_LISTENER_DIED,
+            "the /mcp listener task has ended while the process is alive; exiting so a \
+             supervisor restarts it (a dead listener on a live PID is invisible to every \
+             health check but /healthz on this port)"
+        );
+        exit(EXIT_MCP_LISTENER_DIED);
+    });
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c()
@@ -1385,6 +1453,12 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     // What this process serves, for `/api/v1/status`. Taken here, while the
     // effective config (flags applied) is still in scope.
     let serving = serving_status(&config);
+    // Liveness of the dedicated /mcp listener, shared between the serve task
+    // (which clears it) and the health handlers (which read it). Only for a
+    // dedicated port: with `mcp.port = 0` the routes ride this very listener.
+    let mcp_listener_alive: Option<Arc<AtomicBool>> = (config.mcp.is_enabled()
+        && config.mcp.port > 0)
+        .then(|| Arc::new(AtomicBool::new(true)));
 
     // Build NodeInfo for the Overview endpoint from config (config is still in
     // scope at this point; it gets moved into the handlers below).
@@ -1789,6 +1863,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         table_cache: Some(table_cache.clone()),
         hive_manifest_cache: Some(Arc::clone(&hive_manifest_cache)),
         serving: Some(serving),
+        mcp_listener_alive: mcp_listener_alive.clone(),
         success_audit_dedup: {
             let window = config.metrics.audit.dashboard_access_audit_window_secs;
             if window == 0 {
@@ -2012,16 +2087,23 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         ))
     } else {
         if config.mcp.port > 0 {
-            sqe_coordinator::mcp_server::start_mcp_server(
+            let alive = mcp_listener_alive
+                .clone()
+                .expect("mcp_listener_alive is Some whenever mcp.port > 0");
+            let (listener_task, bound) = sqe_coordinator::mcp_server::start_mcp_server(
                 Arc::clone(&auth_chain),
                 Arc::clone(&query_handler),
                 Arc::clone(&rate_limiter),
                 config.mcp.clone(),
                 sqe_coordinator::mcp_server::hive_root_names(&config),
                 &config.coordinator.tls,
+                alive,
             )
             .await?;
-            tracing::info!(port = config.mcp.port, resource = %config.mcp.resource_uri, "MCP endpoint enabled at /mcp");
+            tracing::info!(port = bound.port(), resource = %config.mcp.resource_uri, "MCP endpoint enabled at /mcp");
+            // A dead listener on a live PID is the one failure a health
+            // check cannot see from outside, so do not stay alive to have it.
+            watch_mcp_listener(listener_task, ready.clone(), |code| std::process::exit(code));
         }
         None
     };
@@ -2254,6 +2336,7 @@ async fn run_worker(config: SqeConfig, config_path: String) -> anyhow::Result<()
         table_cache: None,
         hive_manifest_cache: None,
         serving: None,
+        mcp_listener_alive: None,
     });
     start_health_server(health_port, health_state);
 
@@ -2728,6 +2811,7 @@ mod tests {
             table_cache: None,
             hive_manifest_cache: None,
         serving: None,
+        mcp_listener_alive: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -2758,6 +2842,7 @@ mod tests {
             table_cache: None,
             hive_manifest_cache: None,
         serving: None,
+        mcp_listener_alive: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -2794,6 +2879,7 @@ mod tests {
             table_cache: None,
             hive_manifest_cache: None,
         serving: None,
+        mcp_listener_alive: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -2827,6 +2913,7 @@ mod tests {
             table_cache: None,
             hive_manifest_cache: None,
         serving: None,
+        mcp_listener_alive: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -2859,6 +2946,7 @@ mod tests {
             table_cache: None,
             hive_manifest_cache: None,
         serving: None,
+        mcp_listener_alive: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -2927,6 +3015,7 @@ mod tests {
             table_cache: None,
             hive_manifest_cache: None,
         serving: None,
+        mcp_listener_alive: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -2976,6 +3065,7 @@ mod tests {
             table_cache: None,
             hive_manifest_cache: None,
         serving: None,
+        mcp_listener_alive: None,
         });
 
         let Json(items) = api_queries(
@@ -3014,6 +3104,7 @@ mod tests {
             table_cache: None,
             hive_manifest_cache: None,
         serving: None,
+        mcp_listener_alive: None,
         });
         let Json(resp) = api_metrics_history(axum::extract::State(state)).await;
         assert_eq!(
@@ -3060,6 +3151,7 @@ mod tests {
             table_cache: None,
             hive_manifest_cache: None,
         serving: None,
+        mcp_listener_alive: None,
         });
         let Json(resp) = api_metrics_history(axum::extract::State(state)).await;
         assert_eq!(
@@ -3138,6 +3230,7 @@ mod tests {
             table_cache: Some(cache.clone()),
             hive_manifest_cache: None,
         serving: None,
+        mcp_listener_alive: None,
         });
 
         let Json(resp) = api_catalogs_refresh(axum::extract::State(state), None).await;
@@ -3204,6 +3297,7 @@ mod tests {
             table_cache: None,
             hive_manifest_cache: Some(Arc::clone(&hive)),
             serving: None,
+            mcp_listener_alive: None,
         });
 
         let Json(resp) = api_catalogs_refresh(axum::extract::State(state), None).await;
@@ -3236,6 +3330,7 @@ mod tests {
             table_cache: None,
             hive_manifest_cache: None,
         serving: None,
+        mcp_listener_alive: None,
         });
         let Json(resp) = api_catalogs_refresh(axum::extract::State(state), None).await;
         assert_eq!(resp.invalidated, "all");
@@ -3324,7 +3419,70 @@ mod tests {
             table_cache: None,
             hive_manifest_cache: None,
         serving: None,
+        mcp_listener_alive: None,
         })
+    }
+
+    /// A guarded state whose dedicated /mcp listener has died.
+    fn state_with_dead_mcp_listener() -> Arc<HealthState> {
+        let mut state = Arc::try_unwrap(make_guarded_state())
+            .unwrap_or_else(|_| panic!("fresh state has one owner"));
+        state.ready.store(true, Ordering::SeqCst);
+        state.mcp_listener_alive = Some(Arc::new(AtomicBool::new(false)));
+        Arc::new(state)
+    }
+
+    #[tokio::test]
+    async fn healthz_and_readyz_report_a_dead_mcp_listener() {
+        use tower::ServiceExt;
+        let app = build_health_router(state_with_dead_mcp_listener());
+        let req = axum::http::Request::builder()
+            .uri("/healthz")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"mcp listener down");
+
+        let req = axum::http::Request::builder()
+            .uri("/readyz")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "unhealthy");
+        assert_eq!(json["checks"]["mcp"], "down");
+
+        // A live listener, or no dedicated listener at all, is `ok`.
+        let mut live = Arc::try_unwrap(state_with_dead_mcp_listener())
+            .unwrap_or_else(|_| panic!("one owner"));
+        live.mcp_listener_alive = Some(Arc::new(AtomicBool::new(true)));
+        let app = build_health_router(Arc::new(live));
+        let req = axum::http::Request::builder()
+            .uri("/healthz")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn watch_mcp_listener_flips_readiness_and_exits_when_the_task_ends() {
+        let ready = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = tokio::sync::oneshot::channel::<i32>();
+        // A listener whose serve loop returns at once, as a dead accept loop does.
+        let listener_task = tokio::spawn(async {});
+        watch_mcp_listener(listener_task, ready.clone(), move |code| {
+            let _ = tx.send(code);
+        });
+        let code = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("watcher acted within 5 s")
+            .expect("exit was called");
+        assert_eq!(code, EXIT_MCP_LISTENER_DIED);
+        assert!(!ready.load(Ordering::SeqCst), "readiness flips before exit");
     }
 
     #[tokio::test]
@@ -3560,6 +3718,7 @@ mod tests {
             table_cache: None,
             hive_manifest_cache: None,
         serving: None,
+        mcp_listener_alive: None,
         });
         let app = build_health_router(state);
         let req = axum::http::Request::builder()
@@ -3601,6 +3760,7 @@ mod tests {
             table_cache: None,
             hive_manifest_cache: None,
         serving: None,
+        mcp_listener_alive: None,
         });
         let app = build_health_router(state);
         let req = axum::http::Request::builder()
@@ -3670,6 +3830,7 @@ mod tests {
             table_cache: None,
             hive_manifest_cache: None,
         serving: None,
+        mcp_listener_alive: None,
         })
     }
 
