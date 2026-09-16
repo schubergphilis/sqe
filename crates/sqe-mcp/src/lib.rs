@@ -708,7 +708,7 @@ fn auth_error_for_scope(
 fn tools(config: &McpConfig) -> Vec<Value> {
     let mut tools = vec![
         tool("execute_sql_readonly", "Execute exactly one read-only SQL statement. SQE parses and classifies the statement before execution; source grants, row filters, and column masks apply as the authenticated user.", json!({"type":"object","properties":{"sql":{"type":"string"}},"required":["sql"],"additionalProperties":false}), true, false),
-        tool("list_catalogs", "List catalogs visible to the authenticated user.", empty_schema(), true, false),
+        tool("list_catalogs", "List catalogs visible to the authenticated user. `diagnostics` carries one entry per Hive root (Glue, sidecar) with `status` reachable | auth_error | timeout | unreachable and a `detail`: auth_error means the engine's own AWS credentials are missing or expired (the detail names the region), which no retry from the client side can fix.", empty_schema(), true, false),
         tool("list_schemas", "List schemas visible to the authenticated user in a catalog.", one_string_schema("catalog"), true, false),
         tool("list_tables", "List tables visible to the authenticated user in a catalog and schema.", two_string_schema("catalog", "schema"), true, false),
         tool("describe_table", "Return columns for a table visible to the authenticated user.", three_string_schema(), true, false),
@@ -787,6 +787,13 @@ async fn call_tool(
         })));
     }
     let session_catalog = auth.session.default_catalog.as_deref();
+    if name == "list_catalogs" {
+        let session = auth
+            .session
+            .clone()
+            .with_source(Some(source_label(name, client)));
+        return list_catalogs_with_diagnostics(state, &session).await;
+    }
     if name == "search_tables" {
         let session = auth
             .session
@@ -816,7 +823,6 @@ async fn call_tool(
             authorize_write_target(state, &auth.session, &kind)?;
             sql.to_string()
         }
-        "list_catalogs" => "SHOW CATALOGS".to_string(),
         "list_schemas" => format!("SHOW SCHEMAS FROM {}", ident(required(&args, "catalog")?)),
         "list_tables" => format!(
             "SHOW TABLES FROM {}.{}",
@@ -913,6 +919,88 @@ async fn call_tool(
         ))),
         Err(error) => Ok(tool_failure(with_refresh_hint(name, error.to_string()))),
     }
+}
+
+/// How long `list_catalogs` waits on each Hive root's probe before calling
+/// it `timeout`. Bounded because a metastore that hangs must not hang the
+/// one tool an agent calls first.
+const CATALOG_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `list_catalogs`: `SHOW CATALOGS`, plus one `diagnostics` entry per Hive
+/// root the caller can see. Each root is probed with `SHOW SCHEMAS FROM
+/// <root>` (one metastore call, run concurrently, bounded by
+/// [`CATALOG_PROBE_TIMEOUT`]) and reported as `reachable`, `auth_error`
+/// (the engine's AWS credentials are missing or expired; the coordinator
+/// names the region in `detail`), `timeout`, or `unreachable` with the
+/// error text. An Iceberg catalog is listed without a probe: its
+/// authorization is per user and `list_schemas` answers for it. Without
+/// this, an expired SSO session surfaced as `dispatch failure` on the second
+/// tool call and as empty listings after that, and a sidecar had no way to
+/// show "the catalog is fine, the engine's credentials are not".
+async fn list_catalogs_with_diagnostics(
+    state: &McpServerState,
+    session: &Session,
+) -> Result<Value, (i32, String)> {
+    let batches = match state.executor.execute(session, "SHOW CATALOGS").await {
+        Ok(batches) => batches,
+        Err(error) => return Ok(tool_failure(error.to_string())),
+    };
+    let visible = first_column_strings(&batches);
+    let roots: Vec<String> = state
+        .hive_roots
+        .iter()
+        .filter(|root| visible.iter().any(|v| v.eq_ignore_ascii_case(root)))
+        .cloned()
+        .collect();
+    let diagnostics: Vec<Value> = {
+        use futures::StreamExt;
+        futures::stream::iter(roots)
+            .map(|root| async move {
+                let sql = format!("SHOW SCHEMAS FROM {}", ident(&root));
+                let probe = tokio::time::timeout(
+                    CATALOG_PROBE_TIMEOUT,
+                    state.executor.execute(session, &sql),
+                )
+                .await;
+                let (status, detail) = match probe {
+                    Ok(Ok(_)) => ("reachable", None),
+                    Ok(Err(error)) => {
+                        let text = error.to_string();
+                        let status = if text.contains("AWS credentials missing or expired") {
+                            "auth_error"
+                        } else {
+                            "unreachable"
+                        };
+                        (status, Some(text))
+                    }
+                    Err(_) => (
+                        "timeout",
+                        Some(format!(
+                            "no answer from the metastore within {}s",
+                            CATALOG_PROBE_TIMEOUT.as_secs()
+                        )),
+                    ),
+                };
+                json!({
+                    "catalog": root,
+                    "kind": "hive_external",
+                    "status": status,
+                    "detail": detail,
+                })
+            })
+            .buffered(4)
+            .collect()
+            .await
+    };
+    let mut body = batches_json(
+        &batches,
+        state.config.max_result_rows,
+        state.config.max_response_bytes,
+    );
+    if let Value::Object(map) = &mut body {
+        map.insert("diagnostics".to_string(), Value::Array(diagnostics));
+    }
+    Ok(tool_success(body))
 }
 
 /// A not-found answer from a lookup tool gets one line pointing at
@@ -2672,6 +2760,76 @@ mod tests {
             let column = StringArray::from(values.clone());
             Ok(vec![RecordBatch::try_new(schema, vec![Arc::new(column)]).unwrap()])
         }
+    }
+
+    /// Answers `SHOW CATALOGS` with a fixed list and every `SHOW SCHEMAS`
+    /// with a scripted error, so the diagnostics classification is under
+    /// test, not the catalog.
+    struct ProbeExecutor {
+        catalogs: Vec<&'static str>,
+        schema_errors: HashMap<&'static str, SqeError>,
+    }
+
+    #[async_trait]
+    impl QueryExecutor for ProbeExecutor {
+        async fn execute(&self, _session: &Session, sql: &str) -> Result<Vec<RecordBatch>, SqeError> {
+            if sql == "SHOW CATALOGS" {
+                let schema = Arc::new(Schema::new(vec![Field::new("Catalog", DataType::Utf8, true)]));
+                let column = StringArray::from(self.catalogs.clone());
+                return Ok(vec![RecordBatch::try_new(schema, vec![Arc::new(column)]).unwrap()]);
+            }
+            match self.schema_errors.get(sql) {
+                Some(SqeError::Execution(m)) => Err(SqeError::Execution(m.clone())),
+                Some(other) => Err(SqeError::Execution(other.to_string())),
+                None => {
+                    let schema = Arc::new(Schema::new(vec![Field::new("Schema", DataType::Utf8, true)]));
+                    let column = StringArray::from(vec!["a"]);
+                    Ok(vec![RecordBatch::try_new(schema, vec![Arc::new(column)]).unwrap()])
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn list_catalogs_reports_each_hive_roots_credential_state() {
+        let executor = Arc::new(ProbeExecutor {
+            catalogs: vec!["default", "glue", "lake", "iceberg"],
+            schema_errors: HashMap::from([
+                (
+                    "SHOW SCHEMAS FROM \"glue\"",
+                    SqeError::Execution(
+                        "hive_external: AWS credentials missing or expired for the Glue catalog \
+                         (region=eu-central-1, op=get_databases: dispatch failure: user error: \
+                         the SSO session has expired)"
+                            .to_string(),
+                    ),
+                ),
+                (
+                    "SHOW SCHEMAS FROM \"lake\"",
+                    SqeError::Execution("hive_external: object store error: connection refused".to_string()),
+                ),
+            ]),
+        });
+        let state = McpServerState::new(Arc::new(MockAuth), executor, static_config(false))
+            // `hidden` is a Hive root the caller cannot see: no probe, no entry.
+            .with_hive_roots(vec!["glue".into(), "lake".into(), "hidden".into()]);
+        let session = local_session("mcp-reader".into(), vec![]);
+
+        let result = list_catalogs_with_diagnostics(&state, &session).await.unwrap();
+        let body = &result["structuredContent"];
+        assert_eq!(body["rows"].as_array().unwrap().len(), 4, "{body}");
+        let diagnostics = body["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 2, "one per visible Hive root: {diagnostics:?}");
+        let by_name = |n: &str| diagnostics.iter().find(|d| d["catalog"] == n).cloned().unwrap();
+        let glue = by_name("glue");
+        assert_eq!(glue["status"], "auth_error", "{glue}");
+        assert_eq!(glue["kind"], "hive_external");
+        assert!(glue["detail"].as_str().unwrap().contains("region=eu-central-1"), "{glue}");
+        let lake = by_name("lake");
+        assert_eq!(lake["status"], "unreachable", "{lake}");
+        assert!(lake["detail"].as_str().unwrap().contains("connection refused"), "{lake}");
+        // The Iceberg catalog is listed and not probed.
+        assert!(diagnostics.iter().all(|d| d["catalog"] != "iceberg"));
     }
 
     #[tokio::test]

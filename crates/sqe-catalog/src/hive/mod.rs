@@ -45,4 +45,12 @@ pub enum HiveError {
     /// entry for this case and this case only.
     #[error("hive_external: catalog metadata timeout: {0}")]
     Timeout(String),
+    /// The metastore refused or could not sign the call because the engine's
+    /// AWS credentials are missing, expired or invalid (SSO session over,
+    /// `AWS_SESSION_TOKEN` stale, no provider in the chain). Distinct from
+    /// `Store` so the message names the cause and the region instead of the
+    /// SDK's bare "dispatch failure", and so the MCP layer can report the
+    /// catalog as `auth_error` rather than `unreachable`.
+    #[error("hive_external: AWS credentials missing or expired for the Glue catalog ({0})")]
+    Credentials(String),
 }
