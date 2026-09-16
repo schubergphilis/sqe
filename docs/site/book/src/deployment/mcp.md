@@ -208,9 +208,14 @@ Read tools are always available after the `sqe:mcp:read` scope is validated:
 - `list_catalogs`
 - `list_schemas`
 - `list_tables`
-- `describe_table`
+- `describe_table` (columns with type, nullability and the catalog's column
+  comment when it carries one: Iceberg `doc`, Glue column comment)
+- `describe_schema` (a whole schema in one call, for catalog crawlers; see
+  below)
 - `get_table_ddl`
-- `get_table_stats`
+- `get_table_stats` (`SHOW STATS FOR`; Iceberg snapshot counts, or a Hive
+  table's metastore `numRows` / `totalSize` when Glue or Hive recorded them,
+  never a scan)
 - `search_tables` (walks `SHOW SCHEMAS` and `SHOW TABLES` for one catalog and
   matches a LIKE pattern server-side; a bare word is a case-insensitive
   substring match; the catalog defaults to the session's; a schema the caller
@@ -245,6 +250,50 @@ roles where operational isolation is required.
 Results are structured JSON and text content. `max_result_rows` and
 `max_response_bytes` bound model context consumption; `truncated` reports when
 the result was cut. Prefer aggregation and explicit `LIMIT` clauses.
+
+### `describe_schema`: one schema per call
+
+A catalog crawler that runs `describe_table`, `get_table_stats` and
+`explain_query` per table pays three round trips and three sessions for every
+table; over a 600-table Glue catalog that is the crawl time. `describe_schema`
+does the same work server-side in one call:
+
+```json
+{"name": "describe_schema", "arguments": {
+  "catalog": "glue", "schema": "sales",
+  "include_stats": true, "include_queryability": true,
+  "page_size": 200, "page_token": "orders"}}
+```
+
+```json
+{"catalog": "glue", "schema": "sales", "total_tables": 412, "truncated": true,
+ "next_page_token": "shipments",
+ "tables": [
+  {"name": "orders_v", "table_type": "view", "source": "view",
+   "columns": [{"name": "month", "data_type": "Utf8", "nullable": true, "ordinal": 1}],
+   "row_count": null, "size_bytes": null, "snapshot_id": null,
+   "stats_error": "...", "queryable": false,
+   "queryability_error": "Schema error: No field named tag"},
+  {"name": "payments", "table_type": "table", "source": "hive_external",
+   "columns": [{"name": "id", "data_type": "Int64", "nullable": false, "ordinal": 1,
+                "comment": "payment id"}],
+   "row_count": 128400, "size_bytes": 73400320, "snapshot_id": null, "queryable": true}
+ ]}
+```
+
+It is composed of the statements the single-table tools issue, so it is never
+looser than they are: `SHOW TABLES` lists what the caller may see (Hive roots
+include Athena views; Iceberg REST catalogs include their views), `SHOW COLUMNS
+FROM` per table drops what policy restricts exactly as `describe_table` does,
+`SHOW STATS FOR` reads the Iceberg snapshot summary or the Hive table's
+metastore parameters and never scans, and `EXPLAIN SELECT * FROM t LIMIT 1`
+plans without running. The table kind comes from one `information_schema.tables`
+read per call and is best effort. Per-table statements run with bounded
+concurrency; one failing table records its `error`, `stats_error` or
+`queryability_error` and the call continues. Pages are by table name
+(`page_size` default 200, at most 500), and `max_response_bytes` can shorten a
+page further, in which case `next_page_token` points at the first table that
+did not fit. `properties` and column-level statistics are not included.
 
 ## Catalog scoping
 

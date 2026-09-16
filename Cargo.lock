@@ -6667,6 +6667,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "chrono",
+ "futures",
  "serde",
  "serde_json",
  "sqe-auth",
