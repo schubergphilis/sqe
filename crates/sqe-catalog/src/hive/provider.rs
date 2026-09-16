@@ -1737,8 +1737,11 @@ impl HiveSchemaProvider {
         name: &str,
         manifest: &HiveManifest,
     ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        // ERROR, not WARN: the view exists in the catalog and this engine
+        // cannot serve it, which is an outage for whoever queries it, and the
+        // detail is the bug report.
         let hidden = |why: &str, detail: String| {
-            warn!(
+            tracing::error!(
                 database = %self.database, table = %name, error = %detail,
                 "hive_external: view hidden from this catalog: {why}"
             );

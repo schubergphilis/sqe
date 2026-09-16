@@ -14,7 +14,10 @@ pub fn classified_by_text_total() -> u64 {
 
 fn record_text_classification(kind: &'static str, code: SqeErrorCode) {
     CLASSIFIED_BY_TEXT.fetch_add(1, Ordering::Relaxed);
-    tracing::warn!(
+    // A developer signal (the counter is what ops reads), not an operator
+    // one: at WARN it printed several times per failed statement next to
+    // the one `Query failed` line that actually says what went wrong.
+    tracing::debug!(
         kind,
         code = code.name(),
         "sqe_error_classified_by_text_total: classified a stringly-typed error by message text"
