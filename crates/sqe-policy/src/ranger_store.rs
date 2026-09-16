@@ -22,6 +22,7 @@ use crate::policy_breaker::PolicyCircuitBreaker;
 use crate::policy_expr::parse_sql_predicate;
 use crate::session_udf::SessionIdentity;
 use crate::{MaskType, PolicyStore, ResolvedPolicy, TagMaskSpec};
+use sqe_policy_api::HiveCatalogs;
 
 // --- Ranger policy bundle model (ServicePolicies) ---
 
@@ -77,6 +78,47 @@ pub(crate) struct RangerPolicy {
     pub(crate) data_mask_policy_items: Vec<DataMaskPolicyItem>,
     #[serde(rename = "rowFilterPolicyItems", default)]
     pub(crate) row_filter_policy_items: Vec<RowFilterPolicyItem>,
+    /// Access policy (policyType 0) items: the grants. Read only for
+    /// Hive-root tables, see `access_grants_table`.
+    #[serde(rename = "policyItems", default)]
+    pub(crate) policy_items: Vec<AccessPolicyItem>,
+    /// Access policy deny items. A matching deny wins over every allow, as in
+    /// Ranger's own evaluator.
+    #[serde(rename = "denyPolicyItems", default)]
+    pub(crate) deny_policy_items: Vec<AccessPolicyItem>,
+    /// Grantees carved out of `policyItems`.
+    #[serde(rename = "allowExceptions", default)]
+    pub(crate) allow_exceptions: Vec<AccessPolicyItem>,
+    /// Grantees carved out of `denyPolicyItems`.
+    #[serde(rename = "denyExceptions", default)]
+    pub(crate) deny_exceptions: Vec<AccessPolicyItem>,
+}
+
+/// One grantee list with the access types it carries, the shape shared by the
+/// four access-policy item lists (`policyItems`, `denyPolicyItems`,
+/// `allowExceptions`, `denyExceptions`).
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct AccessPolicyItem {
+    #[serde(default)]
+    pub(crate) users: Vec<String>,
+    #[serde(default)]
+    pub(crate) roles: Vec<String>,
+    #[serde(default)]
+    pub(crate) groups: Vec<String>,
+    #[serde(default)]
+    pub(crate) accesses: Vec<RangerAccess>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct RangerAccess {
+    #[serde(rename = "type", default)]
+    pub(crate) access_type: String,
+    #[serde(rename = "isAllowed", default = "default_true")]
+    pub(crate) is_allowed: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -132,9 +174,17 @@ pub(crate) struct RowFilterInfo {
 // --- RangerStore struct, constructor, and download fetch ---
 
 /// PolicyType discriminators in the Ranger bundle JSON (`policyType` field).
-/// 0 = access (not enforced here), 1 = DATAMASK, 2 = ROWFILTER.
+/// 0 = access (enforced for Hive-root tables only, see `access_grants_table`),
+/// 1 = DATAMASK, 2 = ROWFILTER.
+const POLICY_TYPE_ACCESS: i32 = 0;
 const POLICY_TYPE_DATAMASK: i32 = 1;
 const POLICY_TYPE_ROWFILTER: i32 = 2;
+
+/// Ranger's built-in group that every user belongs to. The `hive` servicedef
+/// evaluator matches a `public` item for any authenticated user, whatever the
+/// session's own group list says, so the blanket "everyone may select" policy
+/// operators write against it has to fire here too.
+const PUBLIC_GROUP: &str = "public";
 
 /// Ranger `dataMaskType` discriminator for an operator-authored masking
 /// expression. Shared by `map_mask` and `resolve_tag_policies` so the resource
@@ -170,6 +220,13 @@ pub struct RangerStore {
     last_policy_version: AtomicI64,
     breaker: Arc<PolicyCircuitBreaker>,
     metrics: Option<Arc<MetricsRegistry>>,
+    /// The live Hive-root registry (`ATTACH` adds to it at runtime). A policy
+    /// namespace whose first component is a root name is a Hive table, and
+    /// those are the tables whose access SQE decides itself.
+    hive_catalogs: Arc<HiveCatalogs>,
+    /// `[policy.ranger] hive_access_policies`: gate Hive-root tables on a
+    /// Ranger access grant (default true).
+    hive_access_policies: bool,
 }
 
 impl RangerStore {
@@ -223,7 +280,34 @@ impl RangerStore {
                 Duration::from_secs(cfg.breaker_recovery_secs),
             )),
             metrics: None,
+            hive_catalogs: Arc::new(HiveCatalogs::new()),
+            hive_access_policies: cfg.hive_access_policies,
         })
+    }
+
+    /// Attach the coordinator's Hive-root registry, so `resolve` can tell a
+    /// Hive table (`<root>.<database>` namespace, access decided here) from an
+    /// Iceberg one (access decided by the catalog). Without it every table
+    /// resolves as Iceberg and no access gate applies, so the coordinator
+    /// wires it unconditionally.
+    #[must_use = "with_hive_catalogs consumes self; bind the returned store"]
+    pub fn with_hive_catalogs(mut self, hive_catalogs: Arc<HiveCatalogs>) -> Self {
+        self.hive_catalogs = hive_catalogs;
+        self
+    }
+
+    /// Whether `[policy.ranger] hive_access_policies` is on for this store.
+    pub fn enforces_hive_access(&self) -> bool {
+        self.hive_access_policies
+    }
+
+    /// A Hive-root table needs an access grant when the gate is on and the
+    /// policy namespace starts with a registered root name.
+    fn requires_access_grant(&self, namespace: &str) -> bool {
+        self.hive_access_policies
+            && self
+                .hive_catalogs
+                .contains_name(namespace.split('.').next())
     }
 
     /// Attach a metrics registry. Mirrors `OpaStore::with_metrics`: resolve
@@ -491,7 +575,9 @@ fn policy_matches_table(p: &RangerPolicy, database: &str, table: &str) -> bool {
 fn item_matches(users: &[String], roles: &[String], groups: &[String], user: &SessionUser) -> bool {
     let matched = users.iter().any(|u| u == &user.username)
         || roles.iter().any(|r| user.roles.contains(r))
-        || groups.iter().any(|g| user.groups.contains(g));
+        || groups
+            .iter()
+            .any(|g| g == PUBLIC_GROUP || user.groups.contains(g));
     if !matched && !groups.is_empty() && user.groups.is_empty() {
         // The item is group-bound and the session carries NO groups, which in
         // practice means `[[auth.providers]] groups_claim` is unset so the token's
@@ -525,13 +611,25 @@ fn count_group_only_items(bundle: &ServicePolicies) -> usize {
         policies
             .iter()
             .map(|p| {
+                // `public` is Ranger's everyone-group and matches without a
+                // groups claim, so an item bound only to it is not at risk.
+                let group_only = |users: &[String], roles: &[String], groups: &[String]| {
+                    is_group_only(users, roles, groups) && !groups.iter().any(|g| g == PUBLIC_GROUP)
+                };
                 p.data_mask_policy_items
                     .iter()
-                    .filter(|i| is_group_only(&i.users, &i.roles, &i.groups))
+                    .filter(|i| group_only(&i.users, &i.roles, &i.groups))
                     .count()
                     + p.row_filter_policy_items
                         .iter()
-                        .filter(|i| is_group_only(&i.users, &i.roles, &i.groups))
+                        .filter(|i| group_only(&i.users, &i.roles, &i.groups))
+                        .count()
+                    // Access grants too: with the Hive access gate on, a
+                    // group-only allow that never matches denies everyone.
+                    + p.policy_items
+                        .iter()
+                        .chain(&p.deny_policy_items)
+                        .filter(|i| group_only(&i.users, &i.roles, &i.groups))
                         .count()
             })
             .sum()
@@ -640,16 +738,99 @@ fn map_mask(
     }
 }
 
+/// True when an access-policy item carries `select` (or `all`) as an allowed
+/// access type. Ranger writes `isAllowed: true` on deny items too (the item
+/// list, not the flag, makes it a deny), so the flag only rules out an item
+/// an operator toggled off.
+fn item_grants_select(item: &AccessPolicyItem) -> bool {
+    item.accesses.iter().any(|a| {
+        a.is_allowed && (a.access_type.eq_ignore_ascii_case("select") || a.access_type.eq_ignore_ascii_case("all"))
+    })
+}
+
+/// True when an access policy's `column` resource covers the whole table.
+///
+/// Whole-table access is what a listing, `SELECT *` and `SHOW CREATE TABLE`
+/// need, and it is what Ranger's own evaluator requires for them: a policy
+/// granting `select` on `orders.amount` alone lets Hive read that one column
+/// and denies `SELECT *`. SQE has no column-level access decision on this
+/// path (it does not hold the schema here), so a column-scoped grant does not
+/// make the table visible. Grant `*` for table access, mask the columns that
+/// need it.
+fn column_resource_covers_table(p: &RangerPolicy) -> bool {
+    match p.resources.get("column") {
+        None => true,
+        Some(res) => !res.is_excludes && res.values.iter().any(|v| v == "*"),
+    }
+}
+
+/// Ranger access-policy evaluation for one table: does any enabled
+/// `policyType` 0 policy on this database and table grant `select` to the
+/// user, with no matching deny item?
+///
+/// Order follows the `hive` servicedef evaluator: a deny item that matches
+/// the user (and is not carved out by a `denyExceptions` item) decides
+/// immediately, across every matching policy; only then do the allow items
+/// (minus `allowExceptions`) count. Nothing matching means denied. Policy
+/// priority (`policyPriority` override policies) is not modelled: an
+/// override deny still denies, an override allow does not beat a normal deny
+/// here, which errs on the closed side.
+fn access_grants_table(bundle: &ServicePolicies, user: &SessionUser, database: &str, table: &str) -> bool {
+    let matching: Vec<&RangerPolicy> = bundle
+        .policies
+        .iter()
+        .filter(|p| p.is_enabled && p.policy_type == POLICY_TYPE_ACCESS)
+        .filter(|p| policy_matches_table(p, database, table) && column_resource_covers_table(p))
+        .collect();
+
+    let applies = |items: &[AccessPolicyItem]| {
+        items
+            .iter()
+            .any(|i| item_grants_select(i) && item_matches(&i.users, &i.roles, &i.groups, user))
+    };
+
+    for p in &matching {
+        if applies(&p.deny_policy_items) && !applies(&p.deny_exceptions) {
+            debug!(policy_id = p.id, policy = %p.name, user = %user.username, table, database, "Ranger deny item matched");
+            return false;
+        }
+    }
+    for p in &matching {
+        if applies(&p.policy_items) && !applies(&p.allow_exceptions) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Build a `ResolvedPolicy` from an already-fetched bundle. Pure (no I/O), so it
 /// is unit-tested directly and reused by `resolve()` after a cache miss.
+///
+/// `require_access_grant` is true for a table whose visibility SQE alone
+/// decides (a Hive-root table with `hive_access_policies` on): when no access
+/// policy grants `select`, the result carries the deny-all row filter that
+/// every consumer already treats as "table not found". Iceberg tables pass
+/// `false`, because their object-level decision belongs to the catalog.
 fn resolve_from_bundle(
     bundle: &ServicePolicies,
     user: &SessionUser,
     table: &str,
     namespace: &str,
+    require_access_grant: bool,
 ) -> ResolvedPolicy {
     let database = hive_database(namespace);
     let mut policy = ResolvedPolicy::default();
+
+    if require_access_grant && !access_grants_table(bundle, user, &database, table) {
+        debug!(
+            user = %user.username,
+            table,
+            database = %database,
+            "no Ranger access policy grants select on this Hive table; denying (default deny)"
+        );
+        policy.row_filters.push(lit(false));
+        return policy;
+    }
 
     // Build the identity once for the whole resolution pass. database/schema
     // are None here -- RangerStore doesn't hold the session warehouse; UDFs
@@ -1240,7 +1421,13 @@ impl PolicyStore for RangerStore {
         }
         self.record_cache_miss();
         let bundle = self.cached_bundle().await?;
-        let policy = resolve_from_bundle(&bundle, user, table_name, namespace);
+        let policy = resolve_from_bundle(
+            &bundle,
+            user,
+            table_name,
+            namespace,
+            self.requires_access_grant(namespace),
+        );
         self.cache.insert(key, policy.clone()).await;
         Ok(policy)
     }
@@ -1801,7 +1988,7 @@ mod tests {
     #[test]
     fn mask_null_maps_to_nullify() {
         let bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
-        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales", false);
         assert!(matches!(
             policy.column_masks.get("amount"),
             Some(MaskType::Nullify)
@@ -1811,14 +1998,14 @@ mod tests {
     #[test]
     fn row_filter_applied_for_matching_role() {
         let bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
-        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales", false);
         assert_eq!(policy.row_filters.len(), 1);
     }
 
     #[test]
     fn no_match_for_other_role() {
         let bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
-        let policy = resolve_from_bundle(&bundle, &user("bob", &["engineer"]), "orders", "sales");
+        let policy = resolve_from_bundle(&bundle, &user("bob", &["engineer"]), "orders", "sales", false);
         assert!(policy.column_masks.is_empty());
         assert!(policy.row_filters.is_empty());
     }
@@ -1828,7 +2015,7 @@ mod tests {
         let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
         bundle.policies[0].data_mask_policy_items[0].roles.clear();
         bundle.policies[0].data_mask_policy_items[0].users = vec!["alice".to_string()];
-        let policy = resolve_from_bundle(&bundle, &user("alice", &[]), "orders", "sales");
+        let policy = resolve_from_bundle(&bundle, &user("alice", &[]), "orders", "sales", false);
         assert!(policy.column_masks.contains_key("amount"));
     }
 
@@ -1838,7 +2025,7 @@ mod tests {
         bundle.policies[0].data_mask_policy_items[0]
             .data_mask_info
             .data_mask_type = "MASK_FUTURE_UNSUPPORTED".to_string();
-        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales", false);
         assert!(policy.restricted_columns.contains(&"amount".to_string()));
         assert!(!policy.column_masks.contains_key("amount"));
     }
@@ -1856,7 +2043,7 @@ mod tests {
         bundle.policies[0].data_mask_policy_items[0]
             .data_mask_info
             .value_expr = Some("t.department".to_string());
-        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales", false);
         assert!(
             policy.restricted_columns.contains(&"amount".to_string()),
             "unparseable CUSTOM mask must restrict the column (fail-closed)"
@@ -1880,7 +2067,7 @@ mod tests {
             .get_mut("column")
             .unwrap()
             .is_excludes = true;
-        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales", false);
         assert!(
             policy.row_filters.contains(&lit(false)),
             "column isExcludes datamask must inject a deny (lit(false)) row filter"
@@ -1897,7 +2084,7 @@ mod tests {
         bundle.policies[0].data_mask_policy_items[0]
             .data_mask_info
             .data_mask_type = "MASK_NONE".to_string();
-        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales", false);
         assert!(!policy.column_masks.contains_key("amount"));
         assert!(!policy.restricted_columns.contains(&"amount".to_string()));
     }
@@ -1906,7 +2093,7 @@ mod tests {
     fn disabled_policy_is_skipped() {
         let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
         bundle.policies[0].is_enabled = false; // the datamask policy
-        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales", false);
         assert!(policy.column_masks.is_empty());
     }
 
@@ -1914,7 +2101,7 @@ mod tests {
     fn wrong_table_does_not_match() {
         let bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
         let policy =
-            resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "customers", "sales");
+            resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "customers", "sales", false);
         assert!(policy.column_masks.is_empty());
         assert!(policy.row_filters.is_empty());
     }
@@ -1925,7 +2112,7 @@ mod tests {
         bundle.policies[1].row_filter_policy_items[0]
             .row_filter_info
             .filter_expr = Some("this is not sql !!!".to_string());
-        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales", false);
         // Fail-closed: a broken filter must NOT result in zero filters (which
         // would expose all rows). Expect a lit(false) deny filter instead.
         assert_eq!(policy.row_filters.len(), 1);
@@ -1945,7 +2132,7 @@ mod tests {
             .get_mut("column")
             .unwrap()
             .values = vec!["amount".to_string(), "discount".to_string()];
-        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales", false);
         assert!(policy.column_masks.contains_key("amount"));
         assert!(policy.column_masks.contains_key("discount"));
     }
@@ -1959,7 +2146,7 @@ mod tests {
             .unwrap()
             .values = vec!["*".to_string()];
         let policy =
-            resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "anything", "sales");
+            resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "anything", "sales", false);
         assert!(policy.column_masks.contains_key("amount"));
     }
 
@@ -1969,7 +2156,7 @@ mod tests {
         let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
         let tr = bundle.policies[0].resources.get_mut("table").unwrap();
         tr.is_excludes = true; // exclude "orders"
-        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales", false);
         assert!(policy.column_masks.is_empty());
     }
 
@@ -1979,7 +2166,7 @@ mod tests {
         let mi = &mut bundle.policies[0].data_mask_policy_items[0].data_mask_info;
         mi.data_mask_type = "CUSTOM".to_string();
         mi.value_expr = Some("concat('x', {col})".to_string());
-        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales", false);
         match policy.column_masks.get("amount") {
             Some(crate::MaskType::Custom(e)) => {
                 let s = datafusion::sql::unparser::expr_to_sql(e)
@@ -2002,7 +2189,7 @@ mod tests {
         item.roles.clear();
         item.users.clear();
         item.groups = vec!["analysts_group".to_string()];
-        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales");
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales", false);
         assert!(
             policy.column_masks.is_empty(),
             "group-only item must not match a session with empty groups \
@@ -2022,6 +2209,7 @@ mod tests {
             &user_with_groups("alice", &[], &["analysts_group"]),
             "orders",
             "sales",
+            false,
         );
         assert!(
             policy.column_masks.contains_key("amount"),
@@ -2050,6 +2238,137 @@ mod tests {
         // A second note (another download of the same bundle) bumps again.
         assert_eq!(note_group_only_items(&bundle, Some(&metrics)), 1);
         assert_eq!(metrics.ranger_group_only_items.get(), 2);
+    }
+
+    // --- Hive-root access gate (policyType 0) ---
+
+    /// Access policies on a Glue root `glue`, database `bi`. Table names are
+    /// fixture names, not anything real.
+    const ACCESS_BUNDLE: &str = r#"{
+      "policyVersion": 3,
+      "policies": [
+        {"id":1,"name":"bi-read","policyType":0,"isEnabled":true,
+         "resources":{"database":{"values":["glue.bi"]},"table":{"values":["*"]},"column":{"values":["*"]}},
+         "policyItems":[{"groups":["all-employees"],"accesses":[{"type":"select","isAllowed":true}]}]},
+        {"id":2,"name":"bi-secret-deny","policyType":0,"isEnabled":true,
+         "resources":{"database":{"values":["glue.bi"]},"table":{"values":["secret_*"]},"column":{"values":["*"]}},
+         "denyPolicyItems":[{"groups":["all-employees"],"accesses":[{"type":"select","isAllowed":true}]}],
+         "denyExceptions":[{"groups":["sensitive-readers"],"accesses":[{"type":"select","isAllowed":true}]}]},
+        {"id":3,"name":"bi-partial-columns","policyType":0,"isEnabled":true,
+         "resources":{"database":{"values":["glue.bi"]},"table":{"values":["partial"]},"column":{"values":["amount"]}},
+         "policyItems":[{"groups":["public"],"accesses":[{"type":"select","isAllowed":true}]}]},
+        {"id":4,"name":"bi-public","policyType":0,"isEnabled":true,
+         "resources":{"database":{"values":["glue.bi"]},"table":{"values":["open_t"]}},
+         "policyItems":[{"groups":["public"],"accesses":[{"type":"select","isAllowed":true}]}]},
+        {"id":5,"name":"bi-disabled","policyType":0,"isEnabled":false,
+         "resources":{"database":{"values":["glue.bi"]},"table":{"values":["hidden"]}},
+         "policyItems":[{"groups":["public"],"accesses":[{"type":"all","isAllowed":true}]}]},
+        {"id":6,"name":"bi-admin-except-eve","policyType":0,"isEnabled":true,
+         "resources":{"database":{"values":["glue.bi"]},"table":{"values":["*"]}},
+         "policyItems":[{"roles":["admin"],"accesses":[{"type":"all","isAllowed":true}]}],
+         "allowExceptions":[{"users":["eve"],"accesses":[{"type":"all","isAllowed":true}]}]},
+        {"id":7,"name":"bi-mask-ssn","policyType":1,"isEnabled":true,
+         "resources":{"database":{"values":["glue.bi"]},"table":{"values":["*"]},"column":{"values":["ssn"]}},
+         "dataMaskPolicyItems":[{"groups":["all-employees"],"dataMaskInfo":{"dataMaskType":"MASK_NULL"}}]}
+      ]
+    }"#;
+
+    fn access_bundle() -> ServicePolicies {
+        serde_json::from_str(ACCESS_BUNDLE).unwrap()
+    }
+
+    fn gated(user: &SessionUser, table: &str, namespace: &str) -> ResolvedPolicy {
+        resolve_from_bundle(&access_bundle(), user, table, namespace, true)
+    }
+
+    #[test]
+    fn a_hive_table_with_no_grant_is_denied() {
+        let policy = gated(&user_with_groups("alice", &[], &["all-employees"]), "orders", "glue.other");
+        assert!(crate::plan_rewriter::policy_denies_all(&policy), "no policy names glue.other");
+        // And a user with no groups at all gets nothing from a group-bound grant.
+        let policy = gated(&user("nobody", &[]), "orders", "glue.bi");
+        assert!(crate::plan_rewriter::policy_denies_all(&policy));
+    }
+
+    #[test]
+    fn a_group_grant_opens_the_table_and_masks_still_apply() {
+        let policy = gated(&user_with_groups("alice", &[], &["all-employees"]), "orders", "glue.bi");
+        assert!(!crate::plan_rewriter::policy_denies_all(&policy));
+        assert!(policy.row_filters.is_empty());
+        assert!(matches!(policy.column_masks.get("ssn"), Some(MaskType::Nullify)), "the mask policy still lands");
+    }
+
+    #[test]
+    fn a_deny_item_beats_the_allow_unless_excepted() {
+        let general = user_with_groups("alice", &[], &["all-employees"]);
+        assert!(crate::plan_rewriter::policy_denies_all(&gated(&general, "secret_forecast", "glue.bi")));
+        // Same person, also in the exception group: the deny is carved out and
+        // policy 1 grants.
+        let sensitive = user_with_groups("alice", &[], &["all-employees", "sensitive-readers"]);
+        assert!(!crate::plan_rewriter::policy_denies_all(&gated(&sensitive, "secret_forecast", "glue.bi")));
+    }
+
+    #[test]
+    fn a_column_scoped_grant_does_not_open_the_table() {
+        let policy = gated(&user("carol", &[]), "partial", "glue.bi");
+        assert!(crate::plan_rewriter::policy_denies_all(&policy), "select on one column is not table access");
+    }
+
+    #[test]
+    fn public_grants_every_authenticated_user() {
+        let policy = gated(&user("carol", &[]), "open_t", "glue.bi");
+        assert!(!crate::plan_rewriter::policy_denies_all(&policy));
+    }
+
+    #[test]
+    fn a_disabled_policy_grants_nothing() {
+        assert!(crate::plan_rewriter::policy_denies_all(&gated(&user("carol", &[]), "hidden", "glue.bi")));
+    }
+
+    #[test]
+    fn allow_exceptions_carve_a_user_out_of_a_role_grant() {
+        assert!(!crate::plan_rewriter::policy_denies_all(&gated(&user("dan", &["admin"]), "anything", "glue.bi")));
+        assert!(crate::plan_rewriter::policy_denies_all(&gated(&user("eve", &["admin"]), "anything", "glue.bi")));
+    }
+
+    #[test]
+    fn without_the_gate_the_table_is_open() {
+        let policy = resolve_from_bundle(&access_bundle(), &user("nobody", &[]), "orders", "glue.other", false);
+        assert!(!crate::plan_rewriter::policy_denies_all(&policy));
+    }
+
+    #[test]
+    fn the_gate_applies_to_registered_hive_roots_only() {
+        let roots = Arc::new(HiveCatalogs::new());
+        roots.insert("glue");
+        let store = RangerStore::from_config(&RangerPolicyConfig {
+            url: "http://ranger:6080".into(),
+            ..RangerPolicyConfig::default()
+        })
+        .unwrap()
+        .with_hive_catalogs(roots.clone());
+        assert!(store.enforces_hive_access(), "on by default");
+        assert!(store.requires_access_grant("glue.bi"), "Hive root namespace");
+        assert!(!store.requires_access_grant("sales"), "Iceberg namespace: the catalog decides");
+        assert!(!store.requires_access_grant("a.b.sales"));
+
+        let off = RangerStore::from_config(&RangerPolicyConfig {
+            url: "http://ranger:6080".into(),
+            hive_access_policies: false,
+            ..RangerPolicyConfig::default()
+        })
+        .unwrap()
+        .with_hive_catalogs(roots);
+        assert!(!off.requires_access_grant("glue.bi"));
+    }
+
+    #[test]
+    fn group_only_access_items_are_counted_but_public_is_not() {
+        // Policy 1's allow and policy 2's deny bind to a real group with no
+        // users or roles, as does policy 7's mask item; the public-bound
+        // items (3, 4, 5), the exceptions and the role/user items (6) are not
+        // at risk.
+        assert_eq!(count_group_only_items(&access_bundle()), 3);
     }
 
     // --- map_mask arm tests ---

@@ -285,6 +285,9 @@ the change tool behaves as before.
 Hive external tables are visible through every read tool, with the same
 row filters and column masks as over Flight SQL: the manifest's policy key is
 `<root>.<database>`, and the read tools go through the same query handler.
+With the Ranger engine, a Hive table also needs a Ranger access policy
+granting `select` before any tool lists or reads it; an ungranted table is
+"not found" to `list_tables`, `describe_table` and the query tools alike.
 Two things differ from an interactive session.
 
 - Only `[[hive.roots]]` catalogs are reachable. `ATTACH ... TYPE hive_external`
