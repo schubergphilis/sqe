@@ -22,7 +22,8 @@ pub struct NodeInfo {
     pub name: &'static str,
     pub version: &'static str,
     pub role: &'static str,
-    /// DataFusion version string (hardcoded "51" to match cluster_status).
+    /// The linked DataFusion version (`datafusion::DATAFUSION_VERSION`),
+    /// the same value `/api/v1/status` reports.
     pub datafusion_version: &'static str,
     // ── capabilities ──────────────────────────────────────────────
     pub flight_sql_port: u16,

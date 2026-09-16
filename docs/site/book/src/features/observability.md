@@ -76,19 +76,44 @@ Available on port 9091 (metrics port + 1) for both coordinator and workers.
   "status": "ACTIVE",
   "node": {
     "role": "coordinator",
-    "version": "0.1.0",
-    "datafusionVersion": "51",
+    "version": "0.48.1",
+    "gitSha": "9525cbb8d1e2",
+    "buildProfile": "release",
+    "datafusionVersion": "55.1.0",
     "uptimeSeconds": 3600
   },
   "workers": {
     "total": 2,
     "healthy": 2,
     "healthyUrls": ["http://worker-0:50052", "http://worker-1:50052"]
+  },
+  "serving": {
+    "mode": "full",
+    "flightSqlPort": 50051,
+    "trinoHttpPort": 8080,
+    "quackPort": null,
+    "mcp": {"port": 8099, "authMode": "oauth", "allowWrites": false},
+    "policyEngine": "ranger",
+    "catalogs": [
+      {"name": "glue", "kind": "hive-glue"},
+      {"name": "iceberg", "kind": "rest"}
+    ]
   }
 }
 ```
 
-For worker nodes, the `workers` field is `null`.
+`datafusionVersion` is the version of the DataFusion library the binary was
+linked against. `serving` describes what the process answers: `mode` is
+`mcp-only` when every SQL front door is closed and only `/mcp` is open
+(`--mcp-only`), the port fields are `null` for a disabled listener, `mcp` is
+`null` when MCP is off and otherwise names the auth mode (`oauth`, `static`,
+`anonymous`) and whether writes are advertised, `policyEngine` is the
+`[policy] engine` value, and `catalogs` lists every attached catalog with its
+kind (`rest`, `hms`, `glue`, `jdbc`, `s3tables` for Iceberg catalogs;
+`hive-glue` or `hive-sidecar` for Hive roots, including `--glue-catalog`). It is
+fixed at startup from the effective configuration, flags included.
+
+For worker nodes, the `workers` and `serving` fields are `null`.
 
 ### Trino-Compatible Info (port 8080)
 
