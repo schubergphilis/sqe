@@ -183,6 +183,9 @@ struct HealthState {
     /// refresh so a Glue table changed out of band is re-read before its
     /// TTL. Populated in `run_coordinator`; `None` in `run_worker` and tests.
     hive_manifest_cache: Option<Arc<sqe_catalog::hive::provider::HiveMetadataCache>>,
+    /// The `serving` block of `/api/v1/status`. Populated in
+    /// `run_coordinator`; `None` in `run_worker` and tests.
+    serving: Option<ServingStatus>,
 }
 
 impl sqe_coordinator::web_auth::BearerAdminState for HealthState {
@@ -301,6 +304,121 @@ struct ClusterStatus {
     status: &'static str,
     node: NodeStatus,
     workers: Option<WorkersStatus>,
+    /// What this process is serving: which front doors are open, how MCP
+    /// authenticates, which policy engine runs, and which catalogs are
+    /// attached. `None` on a worker. Fixed at startup from the effective
+    /// config (flags included), so an operator can tell a flag-only
+    /// `--mcp-only --mcp-anonymous` Glue gateway from a full coordinator by
+    /// reading one endpoint instead of the startup log.
+    serving: Option<ServingStatus>,
+}
+
+/// The `serving` block of `/api/v1/status`.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ServingStatus {
+    /// `"mcp-only"` when every SQL front door is closed and only `/mcp`
+    /// answers (`--mcp-only`), else `"full"`.
+    mode: &'static str,
+    /// `None` when that listener is disabled (port 0).
+    flight_sql_port: Option<u16>,
+    trino_http_port: Option<u16>,
+    quack_port: Option<u16>,
+    /// `None` when MCP is not enabled.
+    mcp: Option<McpServingStatus>,
+    /// `[policy] engine`, kebab-case as in the config file.
+    policy_engine: sqe_core::config::PolicyEngine,
+    /// Every attached catalog: `[catalogs.*]` entries, the legacy `[catalog]`
+    /// block when set, and `[[hive.roots]]` (including `--glue-catalog`).
+    catalogs: Vec<CatalogServingStatus>,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct McpServingStatus {
+    /// `0` means `/mcp` is mounted on this health/web listener.
+    port: u16,
+    /// `oauth`, `static` or `anonymous`.
+    auth_mode: &'static str,
+    /// Whether `execute_sql_change` is advertised at all.
+    allow_writes: bool,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct CatalogServingStatus {
+    /// The SQL catalog name.
+    name: String,
+    /// `rest`, `hms`, `glue`, `jdbc`, `s3tables` for Iceberg catalogs;
+    /// `hive-glue` or `hive-sidecar` for Hive roots.
+    kind: &'static str,
+}
+
+fn catalog_backend_name(backend: &sqe_core::config::CatalogBackend) -> &'static str {
+    use sqe_core::config::CatalogBackend;
+    match backend {
+        CatalogBackend::Rest => "rest",
+        CatalogBackend::Hms { .. } => "hms",
+        CatalogBackend::Glue { .. } => "glue",
+        CatalogBackend::Jdbc { .. } => "jdbc",
+        CatalogBackend::S3tables { .. } => "s3tables",
+    }
+}
+
+/// The `serving` block from the effective coordinator config, after every
+/// flag (`--mcp-only`, `--glue-catalog`, `--mcp-anonymous`) has been applied.
+fn serving_status(config: &SqeConfig) -> ServingStatus {
+    let port = |p: u16| (p != 0).then_some(p);
+    let flight_sql_port = port(config.coordinator.flight_sql_port);
+    let trino_http_port = port(config.coordinator.trino_http_port);
+    let quack_port = port(config.coordinator.quack_port);
+    let mcp = config.mcp.is_enabled().then(|| McpServingStatus {
+        port: config.mcp.port,
+        auth_mode: config.mcp.auth.mode.as_str(),
+        allow_writes: config.mcp.allow_writes,
+    });
+    let mode = if flight_sql_port.is_none()
+        && trino_http_port.is_none()
+        && quack_port.is_none()
+        && mcp.is_some()
+    {
+        "mcp-only"
+    } else {
+        "full"
+    };
+    let mut catalogs: Vec<CatalogServingStatus> = config
+        .catalogs
+        .iter()
+        .map(|(name, c)| CatalogServingStatus {
+            name: name.clone(),
+            kind: catalog_backend_name(&c.backend),
+        })
+        .collect();
+    if config.catalogs.is_empty() && !config.catalog.catalog_url.is_empty() {
+        catalogs.push(CatalogServingStatus {
+            name: config.catalog.warehouse.clone(),
+            kind: catalog_backend_name(&config.catalog.backend),
+        });
+    }
+    for root in &config.hive.roots {
+        catalogs.push(CatalogServingStatus {
+            name: root.name.clone(),
+            kind: match root.kind {
+                sqe_core::config::HiveRootKind::Glue => "hive-glue",
+                sqe_core::config::HiveRootKind::Sidecar => "hive-sidecar",
+            },
+        });
+    }
+    catalogs.sort_by(|a, b| a.name.cmp(&b.name));
+    ServingStatus {
+        mode,
+        flight_sql_port,
+        trino_http_port,
+        quack_port,
+        mcp,
+        policy_engine: config.policy.engine,
+        catalogs,
+    }
 }
 
 #[derive(Serialize)]
@@ -342,10 +460,13 @@ async fn cluster_status(state: axum::extract::State<Arc<HealthState>>) -> Json<C
             version: sqe_core::VERSION,
             git_sha: build_info::GIT_SHA,
             build_profile: build_info::PROFILE,
-            datafusion_version: "51",
+            // The linked library's own version, not a literal: this said
+            // "51" through three DataFusion upgrades.
+            datafusion_version: datafusion::DATAFUSION_VERSION,
             uptime_seconds: state.started_at.elapsed().as_secs(),
         },
         workers,
+        serving: state.serving.clone(),
     })
 }
 
@@ -431,7 +552,7 @@ async fn api_overview(
             name: "SQE",
             version: sqe_core::VERSION,
             role: state.role,
-            datafusion_version: "51",
+            datafusion_version: datafusion::DATAFUSION_VERSION,
             flight_sql_port: 0,
             trino_http_port: None,
             quack_port: None,
@@ -1261,6 +1382,10 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         &config.query_history,
     ));
 
+    // What this process serves, for `/api/v1/status`. Taken here, while the
+    // effective config (flags applied) is still in scope.
+    let serving = serving_status(&config);
+
     // Build NodeInfo for the Overview endpoint from config (config is still in
     // scope at this point; it gets moved into the handlers below).
     let node_info = {
@@ -1292,7 +1417,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             name: "SQE",
             version: sqe_core::VERSION,
             role: "coordinator",
-            datafusion_version: "51",
+            datafusion_version: datafusion::DATAFUSION_VERSION,
             flight_sql_port: config.coordinator.flight_sql_port,
             trino_http_port,
             quack_port,
@@ -1663,6 +1788,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         // Cloned (not moved) because `with_table_cache` below still needs it.
         table_cache: Some(table_cache.clone()),
         hive_manifest_cache: Some(Arc::clone(&hive_manifest_cache)),
+        serving: Some(serving),
         success_audit_dedup: {
             let window = config.metrics.audit.dashboard_access_audit_window_secs;
             if window == 0 {
@@ -2127,6 +2253,7 @@ async fn run_worker(config: SqeConfig, config_path: String) -> anyhow::Result<()
         // table cache.
         table_cache: None,
         hive_manifest_cache: None,
+        serving: None,
     });
     start_health_server(health_port, health_state);
 
@@ -2434,6 +2561,53 @@ mod tests {
     }
 
     #[test]
+    fn serving_status_reads_the_effective_flag_only_config() {
+        // The shape `sqe-server --glue-catalog glue --mcp-anonymous
+        // --mcp-port 8099 --mcp-only` leaves behind after the flags apply.
+        let mut config = SqeConfig::load_from_str(DEFAULT_FLAG_ONLY_CONFIG).unwrap();
+        config.coordinator.flight_sql_port = 0;
+        config.coordinator.trino_http_port = 0;
+        config.coordinator.quack_port = 0;
+        config.mcp.enabled = true;
+        config.mcp.port = 8099;
+        config.mcp.auth.mode = sqe_core::config::McpAuthMode::Anonymous;
+        config.catalog.catalog_url = String::new();
+        config.hive.roots.push(sqe_core::config::HiveRootConfig {
+            name: "glue".to_string(),
+            kind: sqe_core::config::HiveRootKind::Glue,
+            location: String::new(),
+            region: None,
+            catalog_id: None,
+            databases: Vec::new(),
+            secret: None,
+        });
+        let serving = serving_status(&config);
+        assert_eq!(serving.mode, "mcp-only");
+        assert_eq!(serving.flight_sql_port, None);
+        assert_eq!(serving.mcp.as_ref().map(|m| m.auth_mode), Some("anonymous"));
+        assert_eq!(serving.mcp.as_ref().map(|m| m.port), Some(8099));
+        assert_eq!(
+            serving.catalogs,
+            vec![CatalogServingStatus {
+                name: "glue".to_string(),
+                kind: "hive-glue"
+            }]
+        );
+
+        // Open one SQL door and it is a full coordinator again.
+        config.coordinator.flight_sql_port = 50051;
+        assert_eq!(serving_status(&config).mode, "full");
+
+        // No MCP and no SQL door is not "mcp-only" either.
+        config.coordinator.flight_sql_port = 0;
+        config.mcp.enabled = false;
+        config.mcp.port = 0;
+        let quiet = serving_status(&config);
+        assert_eq!(quiet.mode, "full");
+        assert!(quiet.mcp.is_none());
+    }
+
+    #[test]
     fn test_cluster_status_serialization_coordinator() {
         let status = ClusterStatus {
             status: "ACTIVE",
@@ -2442,7 +2616,7 @@ mod tests {
                 version: "0.1.0",
                 git_sha: "abc123",
                 build_profile: "release",
-                datafusion_version: "51",
+                datafusion_version: datafusion::DATAFUSION_VERSION,
                 uptime_seconds: 120,
             },
             workers: Some(WorkersStatus {
@@ -2453,13 +2627,38 @@ mod tests {
                     "http://worker2:50052".to_string(),
                 ],
             }),
+            serving: Some(ServingStatus {
+                mode: "mcp-only",
+                flight_sql_port: None,
+                trino_http_port: None,
+                quack_port: None,
+                mcp: Some(McpServingStatus {
+                    port: 8099,
+                    auth_mode: "anonymous",
+                    allow_writes: false,
+                }),
+                policy_engine: sqe_core::config::PolicyEngine::Passthrough,
+                catalogs: vec![CatalogServingStatus {
+                    name: "glue".to_string(),
+                    kind: "hive-glue",
+                }],
+            }),
         };
 
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["status"], "ACTIVE");
         assert_eq!(json["node"]["role"], "coordinator");
         assert_eq!(json["node"]["version"], "0.1.0");
-        assert_eq!(json["node"]["datafusionVersion"], "51");
+        // The real linked version, never a literal that goes stale.
+        assert_eq!(json["node"]["datafusionVersion"], datafusion::DATAFUSION_VERSION);
+        assert!(datafusion::DATAFUSION_VERSION.starts_with("55."), "{}", datafusion::DATAFUSION_VERSION);
+        assert_eq!(json["serving"]["mode"], "mcp-only");
+        assert_eq!(json["serving"]["flightSqlPort"], serde_json::Value::Null);
+        assert_eq!(json["serving"]["mcp"]["authMode"], "anonymous");
+        assert_eq!(json["serving"]["mcp"]["port"], 8099);
+        assert_eq!(json["serving"]["policyEngine"], "passthrough");
+        assert_eq!(json["serving"]["catalogs"][0]["name"], "glue");
+        assert_eq!(json["serving"]["catalogs"][0]["kind"], "hive-glue");
         assert_eq!(json["node"]["uptimeSeconds"], 120);
         assert_eq!(json["workers"]["total"], 3);
         assert_eq!(json["workers"]["healthy"], 2);
@@ -2475,10 +2674,11 @@ mod tests {
                 version: "0.1.0",
                 git_sha: "abc123",
                 build_profile: "release",
-                datafusion_version: "51",
+                datafusion_version: datafusion::DATAFUSION_VERSION,
                 uptime_seconds: 60,
             },
             workers: None,
+            serving: None,
         };
 
         let json = serde_json::to_value(&status).unwrap();
@@ -2495,10 +2695,11 @@ mod tests {
                 version: "0.1.0",
                 git_sha: "abc123",
                 build_profile: "debug",
-                datafusion_version: "51",
+                datafusion_version: datafusion::DATAFUSION_VERSION,
                 uptime_seconds: 0,
             },
             workers: None,
+            serving: None,
         };
 
         let json = serde_json::to_value(&status).unwrap();
@@ -2526,6 +2727,7 @@ mod tests {
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
+        serving: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -2555,6 +2757,7 @@ mod tests {
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
+        serving: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -2590,6 +2793,7 @@ mod tests {
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
+        serving: None,
         });
 
         let Json(status) = cluster_status(axum::extract::State(state)).await;
@@ -2622,6 +2826,7 @@ mod tests {
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
+        serving: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -2653,6 +2858,7 @@ mod tests {
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
+        serving: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -2720,6 +2926,7 @@ mod tests {
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
+        serving: None,
         });
 
         let response = readyz(axum::extract::State(state)).await;
@@ -2768,6 +2975,7 @@ mod tests {
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
+        serving: None,
         });
 
         let Json(items) = api_queries(
@@ -2805,6 +3013,7 @@ mod tests {
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
+        serving: None,
         });
         let Json(resp) = api_metrics_history(axum::extract::State(state)).await;
         assert_eq!(
@@ -2850,6 +3059,7 @@ mod tests {
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
+        serving: None,
         });
         let Json(resp) = api_metrics_history(axum::extract::State(state)).await;
         assert_eq!(
@@ -2927,6 +3137,7 @@ mod tests {
             success_audit_dedup: None,
             table_cache: Some(cache.clone()),
             hive_manifest_cache: None,
+        serving: None,
         });
 
         let Json(resp) = api_catalogs_refresh(axum::extract::State(state), None).await;
@@ -2992,6 +3203,7 @@ mod tests {
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: Some(Arc::clone(&hive)),
+            serving: None,
         });
 
         let Json(resp) = api_catalogs_refresh(axum::extract::State(state), None).await;
@@ -3023,6 +3235,7 @@ mod tests {
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
+        serving: None,
         });
         let Json(resp) = api_catalogs_refresh(axum::extract::State(state), None).await;
         assert_eq!(resp.invalidated, "all");
@@ -3110,6 +3323,7 @@ mod tests {
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
+        serving: None,
         })
     }
 
@@ -3345,6 +3559,7 @@ mod tests {
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
+        serving: None,
         });
         let app = build_health_router(state);
         let req = axum::http::Request::builder()
@@ -3385,6 +3600,7 @@ mod tests {
             success_audit_dedup: None,
             table_cache: None,
             hive_manifest_cache: None,
+        serving: None,
         });
         let app = build_health_router(state);
         let req = axum::http::Request::builder()
@@ -3453,6 +3669,7 @@ mod tests {
             success_audit_dedup: cache,
             table_cache: None,
             hive_manifest_cache: None,
+        serving: None,
         })
     }
 
