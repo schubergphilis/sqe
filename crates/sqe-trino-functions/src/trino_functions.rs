@@ -108,12 +108,11 @@ pub fn register_trino_functions(ctx: &datafusion::prelude::SessionContext) {
     // that use the Trino spelling resolve to the same accumulator.
     register_trino_aggregate_aliases(ctx);
 
-    // Trino split(s, delim) returns ARRAY(VARCHAR). DataFusion's
-    // `string_to_array(s, delim)` returns the same shape; register `split`
-    // as an alias on the same UDF so SELECT split(...) resolves to it.
-    use datafusion::functions_nested::string::string_to_array_udf;
-    let split = (*string_to_array_udf()).clone().with_aliases(["split"]);
-    ctx.register_udf(split);
+    // Trino split(s, delim[, limit]) returns ARRAY(VARCHAR). This used to be
+    // an alias on DataFusion's `string_to_array`, whose third argument is a
+    // null-marker string, so Trino's `split(s, ',', 2)` failed to plan
+    // (Athena views use the limit form). Own UDF, Trino semantics.
+    ctx.register_udf(ScalarUDF::from(TrinoSplit));
 
     // Bitwise scalar functions, `sequence`, and `slice` (#346, #349).
     crate::scalar_fns::register_scalar_fns(ctx);
@@ -1916,6 +1915,132 @@ impl ScalarUDFImpl for TrinoSign {
 
 // ─── codepoint(s) → Unicode code point of a single-char string ─────────────
 
+/// Trino `split(string, delimiter)` and `split(string, delimiter, limit)`.
+///
+/// Splits on the whole delimiter; an empty delimiter splits into characters.
+/// With `limit`, at most `limit` elements come back and the last one holds
+/// the rest of the string, unsplit. `limit` must be positive. A NULL in any
+/// argument yields NULL. An empty string splits to `['']`, as in Trino.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct TrinoSplit;
+
+impl TrinoSplit {
+    fn pieces(text: &str, delimiter: &str, limit: Option<i64>) -> DFResult<Vec<String>> {
+        let limit = match limit {
+            None => None,
+            Some(n) if n > 0 => Some(n as usize),
+            Some(n) => {
+                return Err(DataFusionError::Execution(format!(
+                    "split: limit must be positive, got {n}"
+                )))
+            }
+        };
+        if delimiter.is_empty() {
+            let mut out: Vec<String> = Vec::new();
+            let mut chars = text.chars();
+            loop {
+                if let Some(max) = limit {
+                    if out.len() + 1 == max {
+                        out.push(chars.as_str().to_string());
+                        break;
+                    }
+                }
+                match chars.next() {
+                    Some(c) => out.push(c.to_string()),
+                    None => break,
+                }
+            }
+            if out.is_empty() {
+                out.push(String::new());
+            }
+            return Ok(out);
+        }
+        Ok(match limit {
+            Some(max) => text.splitn(max, delimiter).map(str::to_string).collect(),
+            None => text.split(delimiter).map(str::to_string).collect(),
+        })
+    }
+}
+
+impl ScalarUDFImpl for TrinoSplit {
+    fn name(&self) -> &str {
+        "split"
+    }
+
+    fn signature(&self) -> &Signature {
+        static SIG: std::sync::LazyLock<Signature> = std::sync::LazyLock::new(|| {
+            Signature::one_of(
+                vec![TypeSignature::Any(2), TypeSignature::Any(3)],
+                Volatility::Immutable,
+            )
+        });
+        &SIG
+    }
+
+    fn return_type(&self, _args: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        ))))
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        use arrow::array::{ListBuilder, StringBuilder};
+        let rows = args.number_rows;
+        let as_utf8 = |value: &ColumnarValue, what: &str| -> DFResult<StringArray> {
+            let array = value.to_array(rows)?;
+            let array = arrow::compute::cast(&array, &DataType::Utf8).map_err(|e| {
+                DataFusionError::Plan(format!("split: {what} must be a string: {e}"))
+            })?;
+            Ok(array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("cast to Utf8")
+                .clone())
+        };
+        let texts = as_utf8(&args.args[0], "input")?;
+        let delimiters = as_utf8(&args.args[1], "delimiter")?;
+        let limits = match args.args.get(2) {
+            None => None,
+            Some(value) => {
+                let array = value.to_array(rows)?;
+                let array = arrow::compute::cast(&array, &DataType::Int64).map_err(|e| {
+                    DataFusionError::Plan(format!("split: limit must be an integer: {e}"))
+                })?;
+                Some(
+                    array
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("cast to Int64")
+                        .clone(),
+                )
+            }
+        };
+
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        for row in 0..rows {
+            let limit_is_null = limits.as_ref().is_some_and(|l| l.is_null(row));
+            if texts.is_null(row) || delimiters.is_null(row) || limit_is_null {
+                builder.append_null();
+                continue;
+            }
+            let limit = limits.as_ref().map(|l| l.value(row));
+            for piece in Self::pieces(texts.value(row), delimiters.value(row), limit)? {
+                builder.values().append_value(piece);
+            }
+            builder.append(true);
+        }
+        let list = builder.finish();
+        match args.args.iter().all(|a| matches!(a, ColumnarValue::Scalar(_))) {
+            true => Ok(ColumnarValue::Scalar(
+                datafusion::common::ScalarValue::try_from_array(&list, 0)?,
+            )),
+            false => Ok(ColumnarValue::Array(Arc::new(list) as ArrayRef)),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct TrinoCodepoint;
 
@@ -2862,6 +2987,49 @@ mod tests {
         assert_eq!(
             run_query("SELECT hour(date_parse('2026-03-05 07', '%Y-%m-%d %H'))").await,
             7,
+        );
+    }
+
+    /// Helper: run SQL returning a list of strings from a `split(...)` call.
+    async fn run_split(sql: &str) -> Option<Vec<Option<String>>> {
+        use arrow::array::{Array, ListArray};
+        let ctx = crate::duckdb_test_ctx();
+        register_trino_functions(&ctx);
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let col = batches[0].column(0);
+        let list = col.as_any().downcast_ref::<ListArray>().unwrap();
+        if list.is_null(0) {
+            return None;
+        }
+        let values = list.value(0);
+        let values = values.as_any().downcast_ref::<StringArray>().unwrap();
+        Some(values.iter().map(|v| v.map(str::to_string)).collect())
+    }
+
+    fn strs(values: &[&str]) -> Option<Vec<Option<String>>> {
+        Some(values.iter().map(|v| Some(v.to_string())).collect())
+    }
+
+    #[tokio::test]
+    async fn split_matches_trino_with_and_without_limit() {
+        assert_eq!(run_split("SELECT split('a,b,c', ',')").await, strs(&["a", "b", "c"]));
+        // The last element holds the rest, unsplit.
+        assert_eq!(run_split("SELECT split('a,b,c', ',', 2)").await, strs(&["a", "b,c"]));
+        assert_eq!(run_split("SELECT split('a,b,c', ',', 5)").await, strs(&["a", "b", "c"]));
+        // Multi-character delimiter, and a delimiter that is absent.
+        assert_eq!(run_split("SELECT split('a::b::c', '::')").await, strs(&["a", "b", "c"]));
+        assert_eq!(run_split("SELECT split('abc', ',')").await, strs(&["abc"]));
+        // Trino: an empty string splits to one empty element; an empty
+        // delimiter splits into characters.
+        assert_eq!(run_split("SELECT split('', ',')").await, strs(&[""]));
+        assert_eq!(run_split("SELECT split('abc', '')").await, strs(&["a", "b", "c"]));
+        assert_eq!(run_split("SELECT split('abc', '', 2)").await, strs(&["a", "bc"]));
+        // NULL in, NULL out.
+        assert_eq!(run_split("SELECT split(CAST(NULL AS VARCHAR), ',')").await, None);
+        // Over a column, the array form.
+        assert_eq!(
+            run_split("SELECT split(s, '-', 2) FROM (VALUES ('x-y-z')) AS t(s)").await,
+            strs(&["x", "y-z"])
         );
     }
 
