@@ -279,6 +279,12 @@ fn glue_column_of(c: &sqe_sql::hive_ddl::HiveColumn) -> GlueColumn {
 }
 
 impl HiveManifest {
+    /// True for an Athena / Trino view (`TableType = VIRTUAL_VIEW`); every
+    /// other table type is a storage table.
+    pub fn is_view(&self) -> bool {
+        self.table_type == super::athena_view::VIRTUAL_VIEW
+    }
+
     /// Build a manifest from a freshly-parsed `CREATE EXTERNAL TABLE` spec.
     /// `database` and `owner` come from the session (the spec's own
     /// `database` field may be absent if the statement did not qualify the
