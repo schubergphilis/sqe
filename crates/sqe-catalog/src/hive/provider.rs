@@ -46,7 +46,7 @@ use datafusion::datasource::file_format::file_compression_type::FileCompressionT
 use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::datasource::{TableProvider, ViewTable};
 use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::execution::context::{SessionConfig, SessionContext};
+use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{
@@ -1787,8 +1787,14 @@ impl HiveSchemaProvider {
             manifest_cache: Arc::clone(&self.cache),
             listings: Arc::clone(&self.listings),
         });
+        // The engine's own session flags, not a bare `SessionConfig`: the
+        // DuckDB parse dialect in particular. Under the default (generic)
+        // dialect `(tag) -> starts_with(tag, 'x')` is not a lambda but the
+        // JSON arrow operator, so `filter(tags, (tag) -> ...)` planned `tag`
+        // as a column and the view was hidden with "No field named tag"
+        // while the same expression ran fine as a user statement.
         let ctx = SessionContext::new_with_config_rt(
-            SessionConfig::new()
+            crate::session_tuning::engine_session_config()
                 .with_default_catalog_and_schema(&self.catalog_name, &default_schema),
             Arc::clone(&self.runtime),
         );
@@ -1809,13 +1815,15 @@ impl HiveSchemaProvider {
             }
         }
 
-        // The engine parses with the DuckDB dialect (Trino array lambdas,
-        // `session_tuning.rs`), which does not know `UNNEST(...)` as a table
-        // factor: `CROSS JOIN UNNEST(SEQUENCE(..)) t (p)`, the Trino idiom
-        // for a month series, planned as "table function 'UNNEST' not
-        // found". The generic dialect knows it and DataFusion plans it as a
-        // lateral unnest, so a body the first dialect rejects is parsed once
-        // more with the second before the view is given up on.
+        // The session above parses with the DuckDB dialect (Trino array
+        // lambdas, `session_tuning.rs`), which does not know `UNNEST(...)`
+        // as a table factor: `CROSS JOIN UNNEST(SEQUENCE(..)) t (p)`, the
+        // Trino idiom for a month series, planned as "table function
+        // 'UNNEST' not found". The generic dialect knows it and DataFusion
+        // plans it as a lateral unnest, so a body the first dialect rejects
+        // is parsed once more with the second before the view is given up
+        // on. A body that needs both (a lambda and an UNNEST table factor)
+        // is still out of reach; the error names the first attempt.
         let state = ctx.state();
         let plan = match state.create_logical_plan(&sql).await {
             Ok(p) => p,
