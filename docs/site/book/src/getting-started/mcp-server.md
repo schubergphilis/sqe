@@ -146,7 +146,8 @@ Read tools, always available:
 | `list_catalogs` | Catalogs the session can reach, including Hive roots and the Glue catalog. |
 | `list_schemas` | Schemas (databases) in a catalog. |
 | `list_tables` | Tables in a schema. |
-| `describe_table` | Column names, types and nullability for a table. |
+| `describe_table` | Column names, types, nullability and comments for a table. |
+| `describe_schema` | Every table and view in a schema in one call: columns, kind, optional metastore row counts and whether each table plans. Paged; built for catalog crawlers. |
 | `get_table_ddl` | `SHOW CREATE TABLE` output. |
 | `get_table_stats` | Iceberg statistics; Hive external tables have none, so use `describe_table`. |
 | `search_tables` | Find tables by name across a catalog's schemas (SQL LIKE pattern). |

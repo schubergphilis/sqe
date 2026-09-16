@@ -712,6 +712,7 @@ fn tools(config: &McpConfig) -> Vec<Value> {
         tool("list_schemas", "List schemas visible to the authenticated user in a catalog.", one_string_schema("catalog"), true, false),
         tool("list_tables", "List tables visible to the authenticated user in a catalog and schema.", two_string_schema("catalog", "schema"), true, false),
         tool("describe_table", "Return columns for a table visible to the authenticated user.", three_string_schema(), true, false),
+        tool("describe_schema", "Describe every table and view in one schema in a single call, for catalog crawlers: per table the columns describe_table would return (same policy filtering), the table kind (table or view) and source (iceberg, hive_external, view), optionally the metastore's row count and size (`include_stats`: Iceberg snapshot summary or Glue/Hive table parameters, never a scan) and whether `SELECT * ... LIMIT 1` plans (`include_queryability`: planning only, nothing runs). Paged by table name: `page_size` defaults to 200 (at most 500); pass back `next_page_token` for the next page. One table failing does not fail the call; its `error`, `stats_error` or `queryability_error` says why.", json!({"type":"object","properties":{"catalog":{"type":"string"},"schema":{"type":"string"},"include_stats":{"type":"boolean"},"include_queryability":{"type":"boolean"},"page_token":{"type":"string"},"page_size":{"type":"integer","minimum":1,"maximum":500}},"required":["catalog","schema"],"additionalProperties":false}), true, false),
         tool("get_table_ddl", "Return SHOW CREATE TABLE output for a visible table.", three_string_schema(), true, false),
         tool("get_table_stats", "Return Iceberg table statistics visible to the authenticated user. Hive external tables have no snapshot statistics and return an error; use describe_table for them.", three_string_schema(), true, false),
         tool("search_tables", "Find tables by name across the schemas of one catalog (SHOW SCHEMAS, then SHOW TABLES per schema, matched server-side). `pattern` is a SQL LIKE pattern (% and _ are wildcards; a bare word matches as a substring, case-insensitive). `catalog` defaults to the session's default catalog. Only tables visible to the authenticated user are returned.", json!({"type":"object","properties":{"pattern":{"type":"string"},"catalog":{"type":"string"}},"required":["pattern"],"additionalProperties":false}), true, false),
@@ -792,6 +793,15 @@ async fn call_tool(
             .clone()
             .with_source(Some(source_label(name, client)));
         return search_tables(state, &session, &args).await.map(tool_success);
+    }
+    if name == "describe_schema" {
+        let session = auth
+            .session
+            .clone()
+            .with_source(Some(source_label(name, client)));
+        return describe_schema(state, &session, &args)
+            .await
+            .map(tool_success);
     }
     let sql = match name {
         "execute_sql_readonly" => {
@@ -1073,6 +1083,329 @@ async fn search_tables(
         "returned_rows": returned,
         "truncated": returned < total,
     }))
+}
+
+/// `describe_schema` page bounds. A page is what one crawler request can
+/// digest; the byte cap below still applies inside a page.
+const DESCRIBE_SCHEMA_PAGE_DEFAULT: usize = 200;
+const DESCRIBE_SCHEMA_PAGE_MAX: usize = 500;
+/// Per-table statements in flight at once. Each is a metadata read against a
+/// cache the coordinator already warmed with the listing, so this bounds
+/// concurrent planner work, not network fan-out.
+const DESCRIBE_SCHEMA_CONCURRENCY: usize = 8;
+
+/// `describe_schema`: one schema's tables and views, each described the way
+/// the single-table tools would, in one call.
+///
+/// Composed of the SAME statements those tools issue, so nothing here is
+/// looser than `describe_table`: the listing is `SHOW TABLES` (visibility
+/// filtered), the columns are `SHOW COLUMNS FROM` per table (the policy
+/// path that drops restricted columns on a Hive table), statistics are
+/// `SHOW STATS FOR` (snapshot or metastore numbers, never a scan), and
+/// queryability is `EXPLAIN SELECT * FROM t LIMIT 1` (planning only). The
+/// table kind comes from one `information_schema.tables` read per call and
+/// is best effort: a catalog that cannot answer it leaves every entry a
+/// `table`. Per-table statements run with bounded concurrency; a statement
+/// that fails is recorded on its table and the call goes on.
+async fn describe_schema(
+    state: &McpServerState,
+    session: &Session,
+    args: &Value,
+) -> Result<Value, (i32, String)> {
+    use futures::StreamExt;
+
+    let catalog = required(args, "catalog")?.to_string();
+    let schema = required(args, "schema")?.to_string();
+    let include_stats = bool_arg(args, "include_stats")?;
+    let include_queryability = bool_arg(args, "include_queryability")?;
+    let page_size = page_size_arg(args)?;
+    let page_token = args
+        .get("page_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+
+    let listing = state
+        .executor
+        .execute(
+            session,
+            &format!("SHOW TABLES FROM {}.{}", ident(&catalog), ident(&schema)),
+        )
+        .await
+        .map_err(|e| (-32000, format!("listing tables of {catalog}.{schema}: {e}")))?;
+    let mut names = first_column_strings(&listing);
+    names.sort();
+    names.dedup();
+    let total = names.len();
+    // Pagination by name: the token is the last name of the previous page,
+    // so a table created between pages lands where its name sorts and is
+    // never skipped or repeated.
+    let start = page_token
+        .map(|token| names.partition_point(|n| n.as_str() <= token))
+        .unwrap_or(0);
+    let page: Vec<String> = names[start..].iter().take(page_size).cloned().collect();
+    let more_after_page = start + page.len() < total;
+
+    let kinds = table_kinds(state, session, &catalog, &schema).await;
+    let source = if state
+        .hive_roots
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(&catalog))
+    {
+        "hive_external"
+    } else {
+        "iceberg"
+    };
+
+    let mut entries: Vec<Value> = futures::stream::iter(page)
+        .map(|name| {
+            let kind = kinds
+                .get(&name.to_ascii_lowercase())
+                .map(String::as_str)
+                .unwrap_or("table");
+            describe_one_table(
+                state,
+                session,
+                &catalog,
+                &schema,
+                name,
+                kind,
+                source,
+                include_stats,
+                include_queryability,
+            )
+        })
+        .buffer_unordered(DESCRIBE_SCHEMA_CONCURRENCY)
+        .collect()
+        .await;
+    entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+
+    // The response cap applies inside a page too: drop tables from the end
+    // until it fits, and point the next page at the first one dropped.
+    let mut truncated = false;
+    let fits = |entries: &[Value]| {
+        serde_json::to_vec(&json!({"tables": entries}))
+            .map(|v| v.len() <= state.config.max_response_bytes)
+            .unwrap_or(false)
+    };
+    while entries.len() > 1 && !fits(&entries) {
+        entries.pop();
+        truncated = true;
+    }
+    let next_page_token = if more_after_page || truncated {
+        entries.last().and_then(|e| e["name"].as_str()).map(str::to_string)
+    } else {
+        None
+    };
+
+    let mut out = json!({
+        "catalog": catalog,
+        "schema": schema,
+        "tables": entries,
+        "total_tables": total,
+        "truncated": truncated || more_after_page,
+    });
+    if let Some(token) = next_page_token {
+        out["next_page_token"] = json!(token);
+    }
+    Ok(out)
+}
+
+/// One table's entry. Every statement that fails lands in a field on the
+/// entry rather than failing the call: a crawler wants the other 199 tables.
+#[allow(clippy::too_many_arguments)]
+async fn describe_one_table(
+    state: &McpServerState,
+    session: &Session,
+    catalog: &str,
+    schema: &str,
+    name: String,
+    kind: &str,
+    source: &str,
+    include_stats: bool,
+    include_queryability: bool,
+) -> Value {
+    let table = format!("{}.{}.{}", ident(catalog), ident(schema), ident(&name));
+    let is_view = kind == "view";
+    let mut entry = json!({
+        "name": name,
+        "table_type": if is_view { "view" } else { "table" },
+        "source": if is_view { "view" } else { source },
+        "columns": [],
+    });
+
+    match state
+        .executor
+        .execute(session, &format!("SHOW COLUMNS FROM {table}"))
+        .await
+    {
+        Ok(batches) => {
+            let columns: Vec<Value> = rows_json(&batches)
+                .into_iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    let mut column = json!({
+                        "name": row.get("column_name").cloned().unwrap_or(Value::Null),
+                        "data_type": row.get("data_type").cloned().unwrap_or(Value::Null),
+                        "nullable": row
+                            .get("is_nullable")
+                            .and_then(Value::as_str)
+                            .map(|v| !v.eq_ignore_ascii_case("NO"))
+                            .unwrap_or(true),
+                        "ordinal": index + 1,
+                    });
+                    if let Some(comment) = row.get("comment").filter(|c| !c.is_null()) {
+                        column["comment"] = comment.clone();
+                    }
+                    column
+                })
+                .collect();
+            entry["columns"] = Value::Array(columns);
+        }
+        Err(error) => {
+            entry["error"] = json!(error.to_string());
+        }
+    }
+
+    if include_stats {
+        entry["row_count"] = Value::Null;
+        entry["size_bytes"] = Value::Null;
+        entry["snapshot_id"] = Value::Null;
+        match state
+            .executor
+            .execute(session, &format!("SHOW STATS FOR {table}"))
+            .await
+        {
+            Ok(batches) => {
+                // The summary row is the one with no column name.
+                if let Some(summary) = rows_json(&batches)
+                    .into_iter()
+                    .find(|row| row.get("column_name").is_none_or(Value::is_null))
+                {
+                    entry["row_count"] = whole_number(summary.get("row_count"));
+                    entry["size_bytes"] = whole_number(summary.get("data_size"));
+                }
+            }
+            Err(error) => {
+                entry["stats_error"] = json!(error.to_string());
+            }
+        }
+    }
+
+    if include_queryability {
+        match state
+            .executor
+            .execute(session, &format!("EXPLAIN SELECT * FROM {table} LIMIT 1"))
+            .await
+        {
+            Ok(_) => entry["queryable"] = json!(true),
+            Err(error) => {
+                entry["queryable"] = json!(false);
+                entry["queryability_error"] = json!(error.to_string());
+            }
+        }
+    }
+    entry
+}
+
+/// `table_name -> "table" | "view"` for one schema, lower-cased names, from
+/// `information_schema.tables`. Best effort: an empty map when the catalog
+/// cannot answer, which the caller reads as "everything is a table".
+async fn table_kinds(
+    state: &McpServerState,
+    session: &Session,
+    catalog: &str,
+    schema: &str,
+) -> HashMap<String, String> {
+    let sql = format!(
+        "SELECT table_name, table_type FROM {}.information_schema.tables WHERE table_schema = '{}'",
+        ident(catalog),
+        schema.replace('\'', "''")
+    );
+    match state.executor.execute(session, &sql).await {
+        Ok(batches) => rows_json(&batches)
+            .into_iter()
+            .filter_map(|row| {
+                let name = row.get("table_name")?.as_str()?.to_ascii_lowercase();
+                let kind = row.get("table_type")?.as_str()?.to_ascii_lowercase();
+                let kind = if kind.contains("view") { "view" } else { "table" };
+                Some((name, kind.to_string()))
+            })
+            .collect(),
+        Err(error) => {
+            tracing::debug!(%catalog, %schema, %error, "describe_schema: table kinds unavailable");
+            HashMap::new()
+        }
+    }
+}
+
+/// Rows as JSON objects keyed by column name, in batch order.
+fn rows_json(batches: &[RecordBatch]) -> Vec<Map<String, Value>> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        for row in 0..batch.num_rows() {
+            let mut object = Map::new();
+            for (index, field) in batch.schema().fields().iter().enumerate() {
+                object.insert(
+                    field.name().clone(),
+                    sqe_trino_protocol::encode::arrow_value_to_json(batch.column(index).as_ref(), row),
+                );
+            }
+            rows.push(object);
+        }
+    }
+    rows
+}
+
+/// A statistic as a JSON integer when it is a whole number, else null:
+/// `SHOW STATS` reports Float64, a crawler wants a count.
+fn whole_number(value: Option<&Value>) -> Value {
+    match value {
+        Some(Value::Number(n)) => n
+            .as_f64()
+            .filter(|f| f.is_finite() && *f >= 0.0)
+            .map(|f| json!(f.round() as u64))
+            .unwrap_or(Value::Null),
+        Some(Value::String(s)) => s
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite() && *f >= 0.0)
+            .map(|f| json!(f.round() as u64))
+            .unwrap_or(Value::Null),
+        _ => Value::Null,
+    }
+}
+
+/// An optional boolean argument; accepts JSON booleans and the strings
+/// `true` / `false`, since MCP clients differ on how they send them.
+fn bool_arg(args: &Value, name: &str) -> Result<bool, (i32, String)> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(Value::String(s)) if s.eq_ignore_ascii_case("true") => Ok(true),
+        Some(Value::String(s)) if s.eq_ignore_ascii_case("false") => Ok(false),
+        Some(_) => Err((-32602, format!("{name} must be a boolean"))),
+    }
+}
+
+/// `page_size` for `describe_schema`: absent means the default, anything
+/// else is clamped to `1..=DESCRIBE_SCHEMA_PAGE_MAX`.
+fn page_size_arg(args: &Value) -> Result<usize, (i32, String)> {
+    let Some(value) = args.get("page_size") else {
+        return Ok(DESCRIBE_SCHEMA_PAGE_DEFAULT);
+    };
+    let size = match value {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse::<u64>().ok(),
+        Value::Null => Some(DESCRIBE_SCHEMA_PAGE_DEFAULT as u64),
+        _ => None,
+    }
+    .ok_or_else(|| (-32602, "page_size must be a positive integer".to_string()))?;
+    if size == 0 {
+        return Err((-32602, "page_size must be a positive integer".to_string()));
+    }
+    Ok((size as usize).min(DESCRIBE_SCHEMA_PAGE_MAX))
 }
 
 fn required<'a>(args: &'a Value, name: &str) -> Result<&'a str, (i32, String)> {
@@ -2379,6 +2712,319 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["rows"][0]["table_name"], "audit");
+    }
+
+    // ── describe_schema ──────────────────────────────────────────────────
+
+    /// What one statement answers in the `describe_schema` fixture.
+    #[derive(Clone)]
+    enum Answer {
+        /// `SHOW TABLES`: one `Table` column.
+        Names(Vec<&'static str>),
+        /// `SHOW COLUMNS`: `(column_name, data_type, is_nullable, comment)`.
+        Columns(Vec<(&'static str, &'static str, &'static str, Option<&'static str>)>),
+        /// `information_schema.tables`: `(table_name, table_type)`.
+        Kinds(Vec<(&'static str, &'static str)>),
+        /// `SHOW STATS`: the summary row's `(row_count, data_size)` after one
+        /// column row.
+        Stats(Option<f64>, Option<f64>),
+        /// `EXPLAIN`: one plan row.
+        Plan,
+        Fail(&'static str),
+    }
+
+    /// Answers statements by exact SQL, records what was asked, and refuses
+    /// anything unscripted, as a catalog refuses what the caller may not see.
+    struct TableExecutor {
+        answers: HashMap<&'static str, Answer>,
+        asked: Mutex<Vec<String>>,
+    }
+
+    fn utf8(values: Vec<Option<&str>>) -> Arc<dyn arrow_array::Array> {
+        Arc::new(StringArray::from(values))
+    }
+
+    #[async_trait]
+    impl QueryExecutor for TableExecutor {
+        async fn execute(&self, _session: &Session, sql: &str) -> Result<Vec<RecordBatch>, SqeError> {
+            self.asked.lock().unwrap().push(sql.to_string());
+            let Some(answer) = self.answers.get(sql) else {
+                return Err(SqeError::Auth(format!("not authorized: {sql}")));
+            };
+            let batch = match answer {
+                Answer::Fail(message) => return Err(SqeError::Execution(message.to_string())),
+                Answer::Names(names) => RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![Field::new("Table", DataType::Utf8, true)])),
+                    vec![utf8(names.iter().map(|n| Some(*n)).collect())],
+                ),
+                Answer::Columns(columns) => RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("column_name", DataType::Utf8, false),
+                        Field::new("data_type", DataType::Utf8, false),
+                        Field::new("is_nullable", DataType::Utf8, false),
+                        Field::new("comment", DataType::Utf8, true),
+                    ])),
+                    vec![
+                        utf8(columns.iter().map(|c| Some(c.0)).collect()),
+                        utf8(columns.iter().map(|c| Some(c.1)).collect()),
+                        utf8(columns.iter().map(|c| Some(c.2)).collect()),
+                        utf8(columns.iter().map(|c| c.3).collect()),
+                    ],
+                ),
+                Answer::Kinds(kinds) => RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("table_name", DataType::Utf8, false),
+                        Field::new("table_type", DataType::Utf8, false),
+                    ])),
+                    vec![
+                        utf8(kinds.iter().map(|k| Some(k.0)).collect()),
+                        utf8(kinds.iter().map(|k| Some(k.1)).collect()),
+                    ],
+                ),
+                Answer::Stats(row_count, data_size) => RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("column_name", DataType::Utf8, true),
+                        Field::new("data_size", DataType::Float64, true),
+                        Field::new("row_count", DataType::Float64, true),
+                    ])),
+                    vec![
+                        utf8(vec![Some("id"), None]),
+                        Arc::new(arrow_array::Float64Array::from(vec![None, *data_size])),
+                        Arc::new(arrow_array::Float64Array::from(vec![None, *row_count])),
+                    ],
+                ),
+                Answer::Plan => RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![Field::new("plan", DataType::Utf8, true)])),
+                    vec![utf8(vec![Some("TableScan")])],
+                ),
+            }
+            .unwrap();
+            Ok(vec![batch])
+        }
+    }
+
+    fn schema_fixture() -> Arc<TableExecutor> {
+        let cols = |names: &[&'static str]| {
+            Answer::Columns(names.iter().map(|n| (*n, "Utf8", "YES", None)).collect())
+        };
+        Arc::new(TableExecutor {
+            answers: HashMap::from([
+                (
+                    "SHOW TABLES FROM \"glue\".\"bi\"",
+                    Answer::Names(vec!["events", "orders", "customers", "broken", "sales_v"]),
+                ),
+                (
+                    "SELECT table_name, table_type FROM \"glue\".information_schema.tables WHERE table_schema = 'bi'",
+                    Answer::Kinds(vec![("orders", "BASE TABLE"), ("sales_v", "VIEW")]),
+                ),
+                ("SHOW COLUMNS FROM \"glue\".\"bi\".\"broken\"", Answer::Fail("hive_external: unreadable storage")),
+                ("SHOW COLUMNS FROM \"glue\".\"bi\".\"customers\"", cols(&["id", "email"])),
+                ("SHOW COLUMNS FROM \"glue\".\"bi\".\"events\"", cols(&["ts", "kind"])),
+                (
+                    "SHOW COLUMNS FROM \"glue\".\"bi\".\"orders\"",
+                    // `ssn` is restricted for this caller: the coordinator's
+                    // SHOW COLUMNS already left it out, and so must we.
+                    Answer::Columns(vec![
+                        ("id", "Int64", "NO", Some("order id")),
+                        ("amount", "Float64", "YES", None),
+                    ]),
+                ),
+                ("SHOW COLUMNS FROM \"glue\".\"bi\".\"sales_v\"", cols(&["month", "total"])),
+                ("SHOW STATS FOR \"glue\".\"bi\".\"orders\"", Answer::Stats(Some(1200.0), Some(65536.0))),
+                ("SHOW STATS FOR \"glue\".\"bi\".\"sales_v\"", Answer::Fail("views carry no statistics")),
+                ("EXPLAIN SELECT * FROM \"glue\".\"bi\".\"orders\" LIMIT 1", Answer::Plan),
+                ("EXPLAIN SELECT * FROM \"glue\".\"bi\".\"sales_v\" LIMIT 1", Answer::Fail("Schema error: No field named tag")),
+            ]),
+            asked: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn schema_state(executor: Arc<TableExecutor>) -> McpServerState {
+        McpServerState::new(Arc::new(MockAuth), executor, static_config(false))
+            .with_hive_roots(vec!["glue".to_string()])
+    }
+
+    fn names_of(result: &Value) -> Vec<&str> {
+        result["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn describe_schema_pages_by_table_name() {
+        let executor = schema_fixture();
+        let state = schema_state(executor.clone());
+        let session = local_session("mcp-reader".into(), vec![]);
+
+        let first = describe_schema(&state, &session, &json!({"catalog": "glue", "schema": "bi", "page_size": 2}))
+            .await
+            .unwrap();
+        assert_eq!(names_of(&first), vec!["broken", "customers"], "sorted, first page: {first}");
+        assert_eq!(first["total_tables"], 5);
+        assert_eq!(first["truncated"], true);
+        assert_eq!(first["next_page_token"], "customers");
+
+        let second = describe_schema(
+            &state,
+            &session,
+            &json!({"catalog": "glue", "schema": "bi", "page_size": 2, "page_token": "customers"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(names_of(&second), vec!["events", "orders"]);
+        assert_eq!(second["next_page_token"], "orders");
+
+        let third = describe_schema(
+            &state,
+            &session,
+            &json!({"catalog": "glue", "schema": "bi", "page_size": 2, "page_token": "orders"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(names_of(&third), vec!["sales_v"]);
+        assert_eq!(third["truncated"], false);
+        assert!(third.get("next_page_token").is_none(), "{third}");
+
+        // A page bigger than the cap is clamped, not refused; zero is an error.
+        assert_eq!(page_size_arg(&json!({})).unwrap(), DESCRIBE_SCHEMA_PAGE_DEFAULT);
+        assert_eq!(page_size_arg(&json!({"page_size": 100000})).unwrap(), DESCRIBE_SCHEMA_PAGE_MAX);
+        assert!(page_size_arg(&json!({"page_size": 0})).is_err());
+
+        // Without stats or queryability nothing but SHOW COLUMNS ran per table.
+        let asked = executor.asked.lock().unwrap().clone();
+        assert!(!asked.iter().any(|s| s.starts_with("SHOW STATS") || s.starts_with("EXPLAIN")), "{asked:?}");
+    }
+
+    #[tokio::test]
+    async fn describe_schema_isolates_one_tables_failure_and_reports_kinds_stats_and_plans() {
+        let executor = schema_fixture();
+        let state = schema_state(executor.clone());
+        let session = local_session("mcp-reader".into(), vec![]);
+
+        let result = describe_schema(
+            &state,
+            &session,
+            &json!({"catalog": "glue", "schema": "bi", "include_stats": true, "include_queryability": "true"}),
+        )
+        .await
+        .unwrap();
+        let tables = result["tables"].as_array().unwrap();
+        let by_name = |name: &str| tables.iter().find(|t| t["name"] == name).unwrap().clone();
+
+        // The unreadable table is an entry with an error, not a failed call.
+        let broken = by_name("broken");
+        assert!(broken["error"].as_str().unwrap().contains("unreadable storage"), "{broken}");
+        assert_eq!(broken["columns"], json!([]));
+        assert_eq!(tables.len(), 5);
+
+        // A regular Hive table: columns with ordinals and the Glue comment,
+        // metastore numbers as integers, plans fine.
+        let orders = by_name("orders");
+        assert_eq!(orders["table_type"], "table");
+        assert_eq!(orders["source"], "hive_external");
+        assert_eq!(orders["columns"][0]["name"], "id");
+        assert_eq!(orders["columns"][0]["nullable"], false);
+        assert_eq!(orders["columns"][0]["ordinal"], 1);
+        assert_eq!(orders["columns"][0]["comment"], "order id");
+        assert_eq!(orders["columns"][1]["ordinal"], 2);
+        assert!(orders["columns"][1].get("comment").is_none(), "no comment, no key: {orders}");
+        assert_eq!(orders["row_count"], 1200);
+        assert_eq!(orders["size_bytes"], 65536);
+        assert_eq!(orders["snapshot_id"], Value::Null);
+        assert_eq!(orders["queryable"], true);
+
+        // A view: kind from information_schema, no stats (recorded, not
+        // fatal), and the planning error a crawler marks it unqueryable with.
+        let view = by_name("sales_v");
+        assert_eq!(view["table_type"], "view");
+        assert_eq!(view["source"], "view");
+        assert_eq!(view["row_count"], Value::Null);
+        assert!(view["stats_error"].as_str().unwrap().contains("no statistics"));
+        assert_eq!(view["queryable"], false);
+        assert!(view["queryability_error"].as_str().unwrap().contains("No field named tag"));
+
+        // A table the kinds listing did not mention is a table; a table with
+        // no scripted stats or plan records that too rather than failing.
+        let events = by_name("events");
+        assert_eq!(events["table_type"], "table");
+        assert!(events["stats_error"].as_str().is_some());
+        assert_eq!(events["queryable"], false);
+
+        // Argument validation.
+        let err = describe_schema(&state, &session, &json!({"catalog": "glue", "schema": "bi", "include_stats": 3}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, -32602);
+        let err = describe_schema(&state, &session, &json!({"catalog": "glue"})).await.unwrap_err();
+        assert_eq!(err.0, -32602);
+
+        // A schema the caller may not list is the one error that fails the call.
+        let err = describe_schema(&state, &session, &json!({"catalog": "glue", "schema": "locked"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, -32000);
+        assert!(err.1.contains("listing tables of glue.locked"), "{}", err.1);
+    }
+
+    #[tokio::test]
+    async fn describe_schema_columns_are_exactly_what_describe_table_returns() {
+        let executor = schema_fixture();
+        let state = schema_state(executor.clone());
+        let session = local_session("mcp-reader".into(), vec![]);
+
+        // The single-table tool, through the same call path clients use.
+        let single = call_tool(
+            &state,
+            &AuthContext {
+                session: session.clone(),
+                scopes: None,
+            },
+            None,
+            &json!({"name": "describe_table", "arguments": {"catalog": "glue", "schema": "bi", "table": "orders"}}),
+        )
+        .await
+        .unwrap();
+        let single_names: Vec<&str> = single["structuredContent"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["column_name"].as_str().unwrap())
+            .collect();
+        assert_eq!(single_names, vec!["id", "amount"], "the restricted column is absent: {single}");
+
+        let bulk = describe_schema(&state, &session, &json!({"catalog": "glue", "schema": "bi"}))
+            .await
+            .unwrap();
+        let orders = bulk["tables"].as_array().unwrap().iter().find(|t| t["name"] == "orders").unwrap();
+        let bulk_names: Vec<&str> = orders["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(bulk_names, single_names);
+
+        // Same statement, so the same policy path: whatever SHOW COLUMNS
+        // withholds from describe_table it withholds here.
+        let asked = executor.asked.lock().unwrap().clone();
+        let column_statements: Vec<&String> = asked
+            .iter()
+            .filter(|s| s.ends_with("\"orders\"") && s.starts_with("SHOW COLUMNS"))
+            .collect();
+        assert_eq!(column_statements.len(), 2);
+        assert_eq!(column_statements[0], column_statements[1]);
+    }
+
+    #[test]
+    fn describe_schema_is_advertised_as_a_read_tool() {
+        let listed = tools(&static_config(false));
+        let tool = listed.iter().find(|t| t["name"] == "describe_schema").expect("advertised");
+        assert_eq!(tool["annotations"]["readOnlyHint"], true);
+        assert_eq!(tool["inputSchema"]["required"], json!(["catalog", "schema"]));
+        assert_eq!(tool["inputSchema"]["properties"]["page_size"]["maximum"], 500);
     }
 
     #[test]

@@ -5065,9 +5065,79 @@ impl QueryHandler {
         let df = ctx.sql(&col_sql).await.map_err(|e| {
             SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("failed to query information_schema.columns: {e}"))
         })?;
-        df.collect()
+        let batches = df
+            .collect()
             .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("failed to collect column metadata: {e}")))
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("failed to collect column metadata: {e}")))?;
+        // Iceberg keeps a per-column `doc`; `information_schema.columns`
+        // does not carry it, so fetch the (cached) table metadata for the
+        // comments. Best effort: a table that is not an Iceberg table, or
+        // one this catalog cannot load, simply has no comments.
+        let comments = match parts.as_slice() {
+            [.., schema, table] => self
+                .iceberg_column_comments(session, &parts, schema, table)
+                .await,
+            _ => std::collections::HashMap::new(),
+        };
+        with_column_comments(batches, &comments)
+    }
+
+    /// `doc` per column of an Iceberg table, keyed by column name. Empty when
+    /// the table cannot be loaded as Iceberg; `SHOW COLUMNS` never fails on
+    /// a missing comment.
+    async fn iceberg_column_comments(
+        &self,
+        session: &Session,
+        parts: &[String],
+        schema: &str,
+        table: &str,
+    ) -> std::collections::HashMap<String, String> {
+        use iceberg::{NamespaceIdent, TableIdent};
+        let catalog = match parts.len() {
+            3 => Some(parts[0].as_str()),
+            _ => None,
+        };
+        let Ok(session_catalog) = self.show_catalog(session, catalog).await else {
+            return std::collections::HashMap::new();
+        };
+        let ident = TableIdent::new(NamespaceIdent::new(schema.to_string()), table.to_string());
+        match session_catalog.load_table(&ident).await {
+            Ok(loaded) => {
+                let metadata = loaded.metadata();
+                // The schema's own `doc` first; then SQE's `COMMENT ON COLUMN`,
+                // which `handle_comment_on` stores as the table property
+                // `comment.<column>` because the REST catalog has no
+                // per-field doc update.
+                let mut comments: std::collections::HashMap<String, String> = metadata
+                    .current_schema()
+                    .as_struct()
+                    .fields()
+                    .iter()
+                    .filter_map(|f| {
+                        f.doc
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|d| !d.is_empty())
+                            .map(|d| (f.name.clone(), d.to_string()))
+                    })
+                    .collect();
+                for (key, value) in metadata.properties() {
+                    if let Some(column) = key.strip_prefix("comment.") {
+                        let value = value.trim();
+                        if !value.is_empty() {
+                            comments
+                                .entry(column.to_string())
+                                .or_insert_with(|| value.to_string());
+                        }
+                    }
+                }
+                comments
+            }
+            Err(error) => {
+                tracing::debug!(%error, table = %ident, "no Iceberg column comments for SHOW COLUMNS");
+                std::collections::HashMap::new()
+            }
+        }
     }
 
     /// Handle SHOW TABLES by listing tables in a namespace from the Polaris catalog.
@@ -5178,9 +5248,18 @@ impl QueryHandler {
                     );
                 }
             }
+            // Views too, as Trino's SHOW TABLES does: a Polaris view is
+            // queried like a table, so a listing that omits it sends the
+            // MCP crawler and every JDBC tool looking for something they can
+            // never find. REST-only; other backends answer with an error
+            // that is swallowed here, as `list_metadata_tables` does.
+            if let Ok(views) = session_catalog.list_views(ns).await {
+                names.extend(views);
+            }
         }
         // Trino lists table names sorted.
         names.sort();
+        names.dedup();
 
         let mut table_builder = StringBuilder::new();
         for name in &names {
@@ -5697,7 +5776,7 @@ impl QueryHandler {
         // `plan_incremental`), we default every delete file to "no reference"
         // which keeps equality deletes intact. This is the same defensive
         // default the helper uses in its unit tests.
-        let empty_refs: HashMap<String, Option<String>> = HashMap::new();
+        let empty_refs: HashMap<String, Option<String>> = std::collections::HashMap::new();
         let kept_deletes = sqe_catalog::incremental_scan::reconcile_in_range_deletes(
             &plan.data_files,
             std::mem::take(&mut plan.delete_files),
@@ -6745,12 +6824,31 @@ impl QueryHandler {
         // catalog, with polaris-auto discovery) so SHOW STATS finds tables in
         // the caller's catalog instead of failing against the default
         // warehouse ("Failed to load table ... does not exist"). (#6)
-        let parts: Vec<&str> = table_name.splitn(3, '.').collect();
-        let (catalog, namespace, bare_table) = match parts.len() {
-            1 => (None, "default", parts[0]),
-            2 => (None, parts[0], parts[1]),
-            _ => (Some(parts[0]), parts[1], parts[2]),
+        //
+        // Quote-aware: the MCP tools and Trino clients send
+        // `"cat"."schema"."table"`, and a quoted part is a name, not a name
+        // with quotes in it.
+        let parts = split_qualified_identifier(table_name);
+        let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+        let (catalog, namespace, bare_table) = match parts.as_slice() {
+            [t] => (None, "default", *t),
+            [s, t] => (None, *s, *t),
+            [c, s, t, ..] => (Some(*c), *s, *t),
+            [] => (None, "default", table_name),
         };
+
+        // A Hive root answers from its manifest: the metastore's own
+        // `numRows` / `totalSize`, never a scan (the MCP `describe_schema`
+        // tool asks this for every table in a Glue database).
+        if let Some(root) = catalog {
+            if self.runtime_catalogs.is_hive_root(root).unwrap_or(false) {
+                let stats = self
+                    .hive_ddl_handler
+                    .show_stats(&session.user, root, namespace, bare_table)
+                    .await?;
+                return build_show_stats_batch(&stats.columns, stats.row_count, stats.data_size);
+            }
+        }
         let session_catalog = self.show_catalog(session, catalog).await?;
 
         let ns_ident = NamespaceIdent::new(namespace.to_string());
@@ -6822,7 +6920,7 @@ impl QueryHandler {
                 governed_show_stats(&policy, column_names, row_count)
             }
         };
-        build_show_stats_batch(&column_names, row_count)
+        build_show_stats_batch(&column_names, row_count, None)
     }
 
     async fn handle_analyze_dispatch(
@@ -8076,19 +8174,19 @@ fn extract_otel_table_info(kind: &StatementKind) -> Option<(Option<String>, Opti
 /// `DESCRIBE`/`SHOW COLUMNS` against a Hive root and against an Iceberg table
 /// answer in one shape. Hive external columns are all nullable, so
 /// `is_nullable` is always `YES`.
-fn hive_columns_batch(columns: &[(String, String)]) -> sqe_core::Result<Vec<RecordBatch>> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("column_name", DataType::Utf8, false),
-        Field::new("data_type", DataType::Utf8, false),
-        Field::new("is_nullable", DataType::Utf8, false),
-    ]));
+fn hive_columns_batch(
+    columns: &[crate::hive_ddl_handler::HiveDescribedColumn],
+) -> sqe_core::Result<Vec<RecordBatch>> {
+    let schema = Arc::new(show_columns_schema());
     let mut name_b = StringBuilder::new();
     let mut type_b = StringBuilder::new();
     let mut nullable_b = StringBuilder::new();
-    for (name, data_type) in columns {
-        name_b.append_value(name);
-        type_b.append_value(data_type);
+    let mut comment_b = StringBuilder::new();
+    for column in columns {
+        name_b.append_value(&column.name);
+        type_b.append_value(&column.data_type);
         nullable_b.append_value("YES");
+        comment_b.append_option(column.comment.as_deref());
     }
     let batch = RecordBatch::try_new(
         schema,
@@ -8096,6 +8194,61 @@ fn hive_columns_batch(columns: &[(String, String)]) -> sqe_core::Result<Vec<Reco
             Arc::new(name_b.finish()) as ArrayRef,
             Arc::new(type_b.finish()) as ArrayRef,
             Arc::new(nullable_b.finish()) as ArrayRef,
+            Arc::new(comment_b.finish()) as ArrayRef,
+        ],
+    )
+    .map_err(|e| {
+        SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("Failed to create result batch: {e}"),
+        )
+    })?;
+    Ok(vec![batch])
+}
+
+/// The `SHOW COLUMNS` / `DESCRIBE` result layout: `information_schema.columns`'
+/// three identifying columns plus the column comment, NULL when the catalog
+/// carries none (Iceberg `doc`, Glue column `Comment`).
+fn show_columns_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("column_name", DataType::Utf8, false),
+        Field::new("data_type", DataType::Utf8, false),
+        Field::new("is_nullable", DataType::Utf8, false),
+        Field::new("comment", DataType::Utf8, true),
+    ])
+}
+
+/// Re-shape an `information_schema.columns` projection into the `SHOW
+/// COLUMNS` layout, attaching each column's comment from `comments`.
+fn with_column_comments(
+    batches: Vec<RecordBatch>,
+    comments: &std::collections::HashMap<String, String>,
+) -> sqe_core::Result<Vec<RecordBatch>> {
+    let schema = Arc::new(show_columns_schema());
+    let mut name_b = StringBuilder::new();
+    let mut type_b = StringBuilder::new();
+    let mut nullable_b = StringBuilder::new();
+    let mut comment_b = StringBuilder::new();
+    for batch in &batches {
+        let text = |index: usize, row: usize| -> String {
+            arrow::util::display::array_value_to_string(batch.column(index), row)
+                .unwrap_or_default()
+        };
+        for row in 0..batch.num_rows() {
+            let name = text(0, row);
+            comment_b.append_option(comments.get(&name).map(String::as_str));
+            name_b.append_value(name);
+            type_b.append_value(text(1, row));
+            nullable_b.append_value(text(2, row));
+        }
+    }
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(name_b.finish()) as ArrayRef,
+            Arc::new(type_b.finish()) as ArrayRef,
+            Arc::new(nullable_b.finish()) as ArrayRef,
+            Arc::new(comment_b.finish()) as ArrayRef,
         ],
     )
     .map_err(|e| {
@@ -8396,6 +8549,7 @@ fn governed_show_stats(
 fn build_show_stats_batch(
     column_names: &[String],
     row_count: Option<f64>,
+    data_size: Option<f64>,
 ) -> sqe_core::Result<Vec<RecordBatch>> {
     use arrow_array::builder::Float64Builder;
     let schema = Arc::new(Schema::new(vec![
@@ -8426,7 +8580,7 @@ fn build_show_stats_batch(
     }
     // Summary row.
     name_b.append_null();
-    data_size_b.append_null();
+    data_size_b.append_option(data_size);
     distinct_b.append_null();
     nulls_b.append_null();
     match row_count {
@@ -9152,7 +9306,7 @@ mod tests {
     fn show_stats_batch_has_trino_shape() {
         use arrow_array::Array;
         let cols = vec!["id".to_string(), "name".to_string()];
-        let batches = build_show_stats_batch(&cols, Some(42.0)).unwrap();
+        let batches = build_show_stats_batch(&cols, Some(42.0), None).unwrap();
         let b = &batches[0];
         // Trino's 7-column layout.
         assert_eq!(
