@@ -27,6 +27,28 @@ use sqe_sql::hive_ddl::HiveTableSpec;
 
 use crate::runtime_catalog::RuntimeCatalogRegistry;
 
+/// One `SHOW COLUMNS` row for a Hive table: the Glue column comment rides
+/// along, since Glue is the one catalog SQE reads that carries per-column
+/// comments today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HiveDescribedColumn {
+    pub name: String,
+    pub data_type: String,
+    pub comment: Option<String>,
+}
+
+/// `SHOW STATS FOR` a Hive table, from the manifest's parameters.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HiveTableStats {
+    /// Column names the caller may see, in manifest order.
+    pub columns: Vec<String>,
+    /// `numRows` / `recordCount` when the metastore has one and no row filter
+    /// applies.
+    pub row_count: Option<f64>,
+    /// `totalSize` in bytes when the metastore has one.
+    pub data_size: Option<f64>,
+}
+
 /// Which backend a resolved table reference names. `resolve_table_kind` is
 /// the only place this is decided; every dispatch site that needs to tell
 /// a Hive table apart from an Iceberg one calls it rather than growing its
@@ -538,20 +560,8 @@ impl HiveDdlHandler {
         root: &str,
         database: &str,
         table: &str,
-    ) -> Result<Vec<(String, String)>, SqeError> {
-        let source = self.source_for(root)?;
-        let manifest = source
-            .get(database, table)
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
-
-        let policy = self.resolve_policy(user, database, table, &manifest).await;
-        if policy_denies_all(&policy) {
-            // Same wording as `show_create_table`: denied reads as absent.
-            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                "hive_external: table not found: {database}.{table}"
-            )));
-        }
+    ) -> Result<Vec<HiveDescribedColumn>, SqeError> {
+        let (manifest, policy) = self.visible_manifest(user, root, database, table).await?;
 
         let mut columns = Vec::with_capacity(
             manifest.storage_descriptor.columns.len() + manifest.partition_keys.len(),
@@ -567,9 +577,91 @@ impl HiveDdlHandler {
             }
             let data_type = sqe_catalog::hive::serde_map::arrow_type(&column.r#type)
                 .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
-            columns.push((column.name.clone(), data_type.to_string()));
+            columns.push(HiveDescribedColumn {
+                name: column.name.clone(),
+                data_type: data_type.to_string(),
+                comment: column
+                    .comment
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string),
+            });
         }
         Ok(columns)
+    }
+
+    /// `SHOW STATS FOR <root>.<database>.<table>`: the table-level numbers
+    /// a Hive metastore already carries, never a scan.
+    ///
+    /// Glue and Hive keep the last `ANALYZE` / crawler figures in the
+    /// table parameters: `numRows` (Hive, Glue crawler) or `recordCount`
+    /// (Glue console), and `totalSize` in bytes, with Spark's
+    /// `spark.sql.statistics.*` spellings as a fallback. Absent parameters
+    /// report NULL; a `COUNT(*)` is what the caller runs if they need the
+    /// exact number today.
+    ///
+    /// Same governance as the Iceberg statement: a denied table is "not
+    /// found", restricted columns are absent from the column rows, and a row
+    /// filter makes the total someone else's number, so it is NULL.
+    pub async fn show_stats(
+        &self,
+        user: &SessionUser,
+        root: &str,
+        database: &str,
+        table: &str,
+    ) -> Result<HiveTableStats, SqeError> {
+        let (manifest, policy) = self.visible_manifest(user, root, database, table).await?;
+        let columns = manifest
+            .storage_descriptor
+            .columns
+            .iter()
+            .chain(manifest.partition_keys.iter())
+            .filter(|c| !policy.restricted_columns.contains(&c.name))
+            .map(|c| c.name.clone())
+            .collect();
+        let number = |keys: &[&str]| {
+            keys.iter()
+                .find_map(|k| manifest.parameters.get(*k))
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .filter(|n| *n >= 0.0)
+        };
+        let row_count = if policy.row_filters.is_empty() {
+            number(&["numRows", "recordCount", "spark.sql.statistics.numRows"])
+        } else {
+            None
+        };
+        let data_size = number(&["totalSize", "spark.sql.statistics.totalSize", "rawDataSize"]);
+        Ok(HiveTableStats {
+            columns,
+            row_count,
+            data_size,
+        })
+    }
+
+    /// The manifest of a table the user may know exists, with the policy
+    /// that governs it. A denied table gets the SAME "table not found"
+    /// wording an absent table has (`show_create_table`'s convention).
+    async fn visible_manifest(
+        &self,
+        user: &SessionUser,
+        root: &str,
+        database: &str,
+        table: &str,
+    ) -> Result<(HiveManifest, sqe_policy::ResolvedPolicy), SqeError> {
+        let source = self.source_for(root)?;
+        let manifest = source
+            .get(database, table)
+            .await
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
+
+        let policy = self.resolve_policy(user, database, table, &manifest).await;
+        if policy_denies_all(&policy) {
+            return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
+                "hive_external: table not found: {database}.{table}"
+            )));
+        }
+        Ok((manifest, policy))
     }
 
     /// `ALTER TABLE ... ADD PARTITION` against a Hive root: append one
