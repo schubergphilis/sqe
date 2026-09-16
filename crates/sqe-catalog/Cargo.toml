@@ -137,6 +137,9 @@ hive-external = ["dep:thiserror"]
 [dependencies]
 sqe-core = { path = "../sqe-core" }
 sqe-sql = { path = "../sqe-sql" }
+# Athena/Trino views in Glue are planned inside this crate (hive/provider.rs
+# plan_view); they need the same Trino function set a user statement gets.
+sqe-trino-functions = { path = "../sqe-trino-functions" }
 # Only the interfaces (PolicyStore, GrantBackend, HiveCatalogs), not the
 # policy engine: build-time item C1. With the full `sqe-policy` here the
 # 22 s policy compile sat in front of this crate's on every cold build.

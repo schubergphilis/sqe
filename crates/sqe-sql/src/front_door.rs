@@ -129,6 +129,7 @@ impl SqlFrontDoor {
                 let rewritten = crate::rewrite_paren_less_values(sql);
                 let rewritten = crate::rewrite_bare_table(&rewritten);
                 let rewritten = crate::rewrite_nested_row_cast(&rewritten);
+                let rewritten = crate::rewrite_trim_both_from(&rewritten);
                 if rewritten == sql {
                     return Err(parse_error(first_err));
                 }

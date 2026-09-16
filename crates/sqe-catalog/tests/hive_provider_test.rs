@@ -1755,6 +1755,47 @@ async fn unreadable_views_are_hidden_not_fatal() {
     assert_eq!(n, 3);
 }
 
+/// The first live Glue catalog hid two of its three views (#667 follow-up).
+/// Three Trino idioms from those bodies, each of which failed in the
+/// original planning context: `date_parse` with a `%Y%m` format (chrono
+/// refused the partial date), `trim(BOTH FROM x)` (sqlparser rejects the
+/// form without a trim character) and `CROSS JOIN UNNEST(SEQUENCE(..)) t (p)`
+/// (the DuckDB planner dialect has no UNNEST table factor). The view is
+/// planned with the engine's Trino function set, through the same front
+/// door a user statement takes, and with a generic-dialect retry.
+#[tokio::test]
+async fn athena_view_with_trino_idioms_plans() {
+    let f = partitioned_csv_root().await;
+    let ctx = SessionContext::new();
+    let view = views::view_manifest(
+        "orders_by_month",
+        Some(&views::presto_payload(
+            r#"{"originalSql":"SELECT id, trim(BOTH FROM CAST(id AS VARCHAR)) tid, DATE_PARSE(REPLACE(SUBSTR(dt, 1, 7), '-', ''), '%Y%m') period, t.m FROM orders CROSS JOIN UNNEST(SEQUENCE(DATE '2026-01-01', DATE '2026-03-01', INTERVAL '1' MONTH)) t (m) WHERE amount > 15",
+                "catalog":"awsdatacatalog","schema":"sales"}"#,
+        )),
+    );
+    root_with_views(&f, &ctx, vec![view]).await;
+
+    let n = count_i64(
+        &ctx.sql("SELECT count(*) FROM lake.sales.orders_by_month")
+            .await
+            .expect("view with Trino idioms plans")
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(n, 6, "2 orders over 15 x 3 months");
+
+    let periods = ctx
+        .sql("SELECT count(DISTINCT period) FROM lake.sales.orders_by_month WHERE tid = '2'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(count_i64(&periods), 1, "date_parse('202601', '%Y%m') yields one period");
+}
+
 // ── Metadata round trips behind listings (issue #666) ──────────────────
 
 mod bulk {

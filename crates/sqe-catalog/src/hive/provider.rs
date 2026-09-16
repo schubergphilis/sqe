@@ -1759,7 +1759,21 @@ impl HiveSchemaProvider {
         };
 
         let default_schema = view.schema.clone().unwrap_or_else(|| self.database.clone());
-        let sql = sqe_sql::trino_compat::rewrite_trino_compat(&view.original_sql);
+        // The same front door a user statement passes through (Trino-shape
+        // source fallbacks, the compat AST rewrites, identifier folding), not
+        // only `rewrite_trino_compat`: an Athena view body is exactly the
+        // SQL a Trino client would send, and the first live catalog (#667
+        // follow-up) had views the narrower rewrite left unplannable.
+        let sql = match sqe_sql::SqlFrontDoor::new(sqe_sql::WireDialect::Flight)
+            .with_session_catalog(Some(self.catalog_name.clone()))
+            .normalize(&view.original_sql)
+        {
+            Ok(normalized) => sqe_sql::rewrite_named_tvf_args(normalized.sql()),
+            Err(e) => {
+                hidden("its SQL does not parse in this release", e.to_string());
+                return Ok(None);
+            }
+        };
 
         let planning_catalog: Arc<dyn CatalogProvider> = Arc::new(HiveCatalogProvider {
             name: self.catalog_name.clone(),
@@ -1775,6 +1789,13 @@ impl HiveSchemaProvider {
                 .with_default_catalog_and_schema(&self.catalog_name, &default_schema),
             Arc::clone(&self.runtime),
         );
+        // The function set a user statement plans with. Without it every
+        // view using date_parse, from_iso8601_timestamp, sequence, array_join
+        // and the rest of Trino's library failed as "unknown function" in a
+        // bare DataFusion context, which is how the first live Glue catalog
+        // hid two of its three views.
+        sqe_trino_functions::register_trino_functions(&ctx);
+        sqe_trino_functions::register_extended_trino_functions(&ctx);
         ctx.register_catalog(&self.catalog_name, Arc::clone(&planning_catalog));
         for alias in ["awsdatacatalog"]
             .into_iter()
@@ -1785,16 +1806,36 @@ impl HiveSchemaProvider {
             }
         }
 
-        let plan = match ctx.sql(&sql).await {
-            Ok(df) => match df.into_optimized_plan() {
-                Ok(p) => p,
-                Err(e) => {
-                    hidden("its SQL does not optimize", e.to_string());
-                    return Ok(None);
+        // The engine parses with the DuckDB dialect (Trino array lambdas,
+        // `session_tuning.rs`), which does not know `UNNEST(...)` as a table
+        // factor: `CROSS JOIN UNNEST(SEQUENCE(..)) t (p)`, the Trino idiom
+        // for a month series, planned as "table function 'UNNEST' not
+        // found". The generic dialect knows it and DataFusion plans it as a
+        // lateral unnest, so a body the first dialect rejects is parsed once
+        // more with the second before the view is given up on.
+        let state = ctx.state();
+        let plan = match state.create_logical_plan(&sql).await {
+            Ok(p) => p,
+            Err(first) => {
+                let retry = match state
+                    .sql_to_statement(&sql, &datafusion::common::config::Dialect::Generic)
+                {
+                    Ok(stmt) => state.statement_to_plan(stmt).await,
+                    Err(e) => Err(e),
+                };
+                match retry {
+                    Ok(p) => p,
+                    Err(_) => {
+                        hidden("its SQL does not plan in this release", first.to_string());
+                        return Ok(None);
+                    }
                 }
-            },
+            }
+        };
+        let plan = match state.optimize(&plan) {
+            Ok(p) => p,
             Err(e) => {
-                hidden("its SQL does not plan in this release", e.to_string());
+                hidden("its SQL does not optimize", e.to_string());
                 return Ok(None);
             }
         };
