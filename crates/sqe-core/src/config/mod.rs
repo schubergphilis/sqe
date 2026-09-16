@@ -335,7 +335,10 @@ pub struct QueryConfig {
     /// the global pool is below the red-band. Supports "B", "KB", "MB",
     /// "GB" suffixes. Default: "1GB". Set to "0" to disable per-user
     /// memory accounting (admission falls back to the global FairSpillPool
-    /// pressure check alone).
+    /// pressure check alone). Metadata statements (`SHOW`, `DESCRIBE`,
+    /// `EXPLAIN` without `ANALYZE`) reserve nothing against this budget:
+    /// they never execute a scan, and a catalog crawler describing many
+    /// tables concurrently must not be refused while the pool is idle.
     #[serde(default = "default_per_user_memory_budget")]
     pub per_user_memory_budget: String,
     /// Queries taking longer than this are logged at WARN level. Default: 30. Set to 0 to disable.
