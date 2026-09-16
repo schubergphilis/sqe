@@ -1300,6 +1300,35 @@ fn scalar_to_naive_dt(sv: &datafusion::common::ScalarValue) -> DFResult<Option<N
 
 // ─── date_parse(string, format_pattern) → Timestamp ─────────────────────────
 
+/// Parse `s` with a chrono format the way Trino's `date_parse` does: a
+/// field the format does not name takes its lowest value (month and day 1,
+/// time 00:00:00). `date_parse('202601', '%Y%m')` is a real Athena idiom (a
+/// `YYYYMM` period column) and chrono's whole-value parsers refuse it as
+/// "input is not enough for unique date and time"; filling the blanks from
+/// the partially parsed fields is what Trino does.
+fn parse_trino_datetime(s: &str, chrono_fmt: &str) -> Result<NaiveDateTime, String> {
+    use chrono::format::{parse, Parsed, StrftimeItems};
+
+    let mut parsed = Parsed::new();
+    parse(&mut parsed, s, StrftimeItems::new(chrono_fmt)).map_err(|e| e.to_string())?;
+    if parsed.month.is_none() {
+        parsed.set_month(1).map_err(|e| e.to_string())?;
+    }
+    if parsed.day.is_none() {
+        parsed.set_day(1).map_err(|e| e.to_string())?;
+    }
+    if parsed.hour_div_12.is_none() && parsed.hour_mod_12.is_none() {
+        parsed.set_hour(0).map_err(|e| e.to_string())?;
+    }
+    if parsed.minute.is_none() {
+        parsed.set_minute(0).map_err(|e| e.to_string())?;
+    }
+    if parsed.second.is_none() {
+        parsed.set_second(0).map_err(|e| e.to_string())?;
+    }
+    parsed.to_naive_datetime_with_offset(0).map_err(|e| e.to_string())
+}
+
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct DateParse;
 
@@ -1339,17 +1368,11 @@ impl ScalarUDFImpl for DateParse {
             ColumnarValue::Scalar(sv) => {
                 let us = match sv {
                     ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
-                        // Try full datetime parse first, then date-only
-                        let dt = NaiveDateTime::parse_from_str(s, &chrono_fmt)
-                            .or_else(|_| {
-                                chrono::NaiveDate::parse_from_str(s, &chrono_fmt)
-                                    .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
-                            })
-                            .map_err(|e| {
-                                DataFusionError::Plan(format!(
-                                    "date_parse: failed to parse '{s}' with format '{pattern}': {e}"
-                                ))
-                            })?;
+                        let dt = parse_trino_datetime(s, &chrono_fmt).map_err(|e| {
+                            DataFusionError::Plan(format!(
+                                "date_parse: failed to parse '{s}' with format '{pattern}': {e}"
+                            ))
+                        })?;
                         Some(dt.and_utc().timestamp_micros())
                     }
                     ScalarValue::Utf8(None) | ScalarValue::LargeUtf8(None) => None,
@@ -1377,12 +1400,7 @@ impl ScalarUDFImpl for DateParse {
                     .iter()
                     .map(|opt| {
                         opt.map(|s| {
-                            let dt = NaiveDateTime::parse_from_str(s, &chrono_fmt)
-                                .or_else(|_| {
-                                    chrono::NaiveDate::parse_from_str(s, &chrono_fmt)
-                                        .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
-                                })
-                                .unwrap_or_default();
+                            let dt = parse_trino_datetime(s, &chrono_fmt).unwrap_or_default();
                             dt.and_utc().timestamp_micros()
                         })
                     })
@@ -2826,6 +2844,24 @@ mod tests {
         assert_eq!(
             run_query("SELECT hour(date_parse('2024-01-15 14:30:00', '%Y-%m-%d %H:%i:%s'))").await,
             14,
+        );
+    }
+
+    // Trino fills fields the format does not name with their lowest value:
+    // `date_parse('202601', '%Y%m')` is 2026-01-01 00:00:00. An Athena view
+    // over a `YYYYMM` period column depends on it (#667 follow-up).
+    #[tokio::test]
+    async fn date_parse_fills_missing_fields_like_trino() {
+        assert_eq!(
+            run_query("SELECT month(date_parse('202603', '%Y%m'))").await,
+            3,
+        );
+        assert_eq!(run_query("SELECT day(date_parse('202603', '%Y%m'))").await, 1);
+        assert_eq!(run_query("SELECT hour(date_parse('202603', '%Y%m'))").await, 0);
+        assert_eq!(run_query("SELECT month(date_parse('2026', '%Y'))").await, 1);
+        assert_eq!(
+            run_query("SELECT hour(date_parse('2026-03-05 07', '%Y-%m-%d %H'))").await,
+            7,
         );
     }
 

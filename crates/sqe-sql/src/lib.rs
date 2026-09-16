@@ -11,6 +11,7 @@ pub mod hive_partitions;
 pub mod metadata;
 pub mod nested_row_cast;
 pub mod paren_less_values;
+pub mod trim_compat;
 pub mod partition;
 pub mod partition_evolution;
 pub mod pipeline_types;
@@ -47,6 +48,7 @@ pub use metadata::{
 };
 pub use nested_row_cast::rewrite_nested_row_cast;
 pub use paren_less_values::rewrite_paren_less_values;
+pub use trim_compat::rewrite_trim_both_from;
 pub use partition::{is_create_external_table, normalize_partitioned_by};
 pub use partition_evolution::{try_parse_partition_evolution, PartitionEvolution};
 pub use pipeline_types::{pre_parse_pipeline, ClassifiableSql, UserSql};
