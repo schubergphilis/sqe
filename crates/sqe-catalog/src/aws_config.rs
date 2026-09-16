@@ -60,6 +60,11 @@ pub fn sdk_config_loader() -> aws_config::ConfigLoader {
 /// same way they do for the catalog. Credentials resolve on each call and the
 /// SDK provider caches and refreshes them, so an SSO or STS session that
 /// rotates mid-run keeps working (unlike keys captured once into `[storage]`).
+/// How long one credential resolution through the SDK chain may take before
+/// it is reported as a credential failure rather than waited on. The SDK's
+/// own operation timeouts do not cover every provider in the chain.
+const CREDENTIAL_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Debug)]
 struct SdkObjectStoreCredentials {
     provider: OnceCell<SharedCredentialsProvider>,
@@ -94,15 +99,34 @@ impl CredentialProvider for SdkObjectStoreCredentials {
     type Credential = AwsCredential;
 
     async fn get_credential(&self) -> object_store::Result<Arc<AwsCredential>> {
-        let creds =
-            self.provider()
-                .await?
-                .provide_credentials()
-                .await
-                .map_err(|e| object_store::Error::Generic {
-                    store: "S3",
-                    source: Box::new(e),
-                })?;
+        // Bounded: a chain that waits (an SSO token exchange against a portal
+        // that never answers, IMDS on a laptop, a credential_process that
+        // hangs) held every scan open with no error to report, and a
+        // describe_schema over 25 tables hung indefinitely on it. Past the
+        // deadline this is the same credential failure, named as such.
+        let provider = self.provider().await?;
+        let resolved = tokio::time::timeout(CREDENTIAL_RESOLVE_TIMEOUT, provider.provide_credentials())
+            .await
+            .map_err(|_| object_store::Error::Generic {
+                store: "S3",
+                source: format!(
+                    "storage credentials expired or unavailable (aws sdk default chain): the \
+                     credential provider did not answer within {}s. Renew the engine's AWS \
+                     session (aws sso login, or a fresh role session) and restart, or run \
+                     with AWS_PROFILE so the SDK refreshes them",
+                    CREDENTIAL_RESOLVE_TIMEOUT.as_secs()
+                )
+                .into(),
+            })?;
+        let creds = resolved.map_err(|e| object_store::Error::Generic {
+            store: "S3",
+            // The SDK's own Display is "an error occurred while loading
+            // credentials"; the reason (SSO session over, no provider,
+            // a failed credential_process) is in the source chain, and
+            // this text is what the coordinator classifies as
+            // STORAGE_CREDENTIALS_UNAVAILABLE.
+            source: storage_credentials_unavailable(&e).into(),
+        })?;
         Ok(Arc::new(AwsCredential {
             key_id: creds.access_key_id().to_string(),
             secret_key: creds.secret_access_key().to_string(),
@@ -119,6 +143,98 @@ impl CredentialProvider for SdkObjectStoreCredentials {
 pub fn sdk_object_store_credentials() -> AwsCredentialProvider {
     Arc::new(SdkObjectStoreCredentials::new())
 }
+
+/// The distinct message for "the engine's storage credentials cannot be
+/// resolved": named as such, with the provider and the SDK's full source
+/// chain, and the remedy. `sqe-core` classifies this text as
+/// `STORAGE_CREDENTIALS_UNAVAILABLE`, so a client can tell an expired SSO
+/// session from a bad query.
+pub fn storage_credentials_unavailable(e: &dyn std::error::Error) -> String {
+    let mut chain = vec![e.to_string()];
+    let mut cur = e.source();
+    while let Some(next) = cur {
+        chain.push(next.to_string());
+        cur = next.source();
+    }
+    format!(
+        "storage credentials expired or unavailable (aws sdk default chain): {}. Renew the \
+         engine's AWS session (aws sso login, or a fresh role session) and restart, or run \
+         with AWS_PROFILE so the SDK refreshes them",
+        chain.join(": ")
+    )
+}
+
+/// What a storage-credential probe reports: enough for a sidecar to decide
+/// whether to start a long job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageCredentialReport {
+    /// `ok`, `auth_error`, or `unknown` (static keys: valid until they are
+    /// not, and nothing here can see their expiry).
+    pub status: &'static str,
+    /// Where the credentials come from: `aws-sdk-default-chain`,
+    /// `static-keys`, `static-temporary-keys`.
+    pub provider: &'static str,
+    /// RFC 3339, when the SDK knows when the current credentials lapse.
+    pub expires_at: Option<String>,
+    /// The failure text on `auth_error`.
+    pub detail: Option<String>,
+}
+
+/// Resolve credentials once through the AWS SDK default chain and report
+/// the outcome. Cheap when the SDK has them cached, one provider round trip
+/// (SSO token exchange, STS assume-role, IMDS) when it does not; the caller
+/// bounds it. This is the same chain the S3 stores read with, so an
+/// `auth_error` here is exactly the failure the next scan would hit.
+pub async fn probe_storage_credentials() -> StorageCredentialReport {
+    let conf = sdk_config_loader().load().await;
+    let Some(provider) = conf.credentials_provider() else {
+        return StorageCredentialReport {
+            status: "auth_error",
+            provider: "aws-sdk-default-chain",
+            expires_at: None,
+            detail: Some(
+                "AWS credential provider chain returned no provider (no profile, SSO \
+                 session, env keys or instance role)"
+                    .to_string(),
+            ),
+        };
+    };
+    let resolved =
+        match tokio::time::timeout(CREDENTIAL_RESOLVE_TIMEOUT, provider.provide_credentials()).await {
+            Ok(r) => r,
+            Err(_) => {
+                return StorageCredentialReport {
+                    status: "auth_error",
+                    provider: "aws-sdk-default-chain",
+                    expires_at: None,
+                    detail: Some(format!(
+                        "the credential provider did not answer within {}s",
+                        CREDENTIAL_RESOLVE_TIMEOUT.as_secs()
+                    )),
+                }
+            }
+        };
+    match resolved {
+        Ok(creds) => StorageCredentialReport {
+            status: "ok",
+            provider: "aws-sdk-default-chain",
+            expires_at: creds.expiry().map(|t| {
+                chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339_opts(
+                    chrono::SecondsFormat::Secs,
+                    true,
+                )
+            }),
+            detail: None,
+        },
+        Err(e) => StorageCredentialReport {
+            status: "auth_error",
+            provider: "aws-sdk-default-chain",
+            expires_at: None,
+            detail: Some(storage_credentials_unavailable(&e)),
+        },
+    }
+}
+
 
 /// The region the AWS SDK resolves: `AWS_REGION`, `AWS_DEFAULT_REGION`, or the
 /// active profile's `region` in `~/.aws/config`. Used to fill
@@ -209,4 +325,46 @@ pub async fn build_aws_config(
     }
 
     Ok(loader.load().await)
+}
+
+#[cfg(test)]
+mod credential_message_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct Leaf;
+    impl std::fmt::Display for Leaf {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("the SSO session has expired")
+        }
+    }
+    impl std::error::Error for Leaf {}
+
+    #[derive(Debug)]
+    struct Outer(Leaf);
+    impl std::fmt::Display for Outer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an error occurred while loading credentials")
+        }
+    }
+    impl std::error::Error for Outer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn the_message_names_the_class_the_chain_and_the_remedy() {
+        let text = storage_credentials_unavailable(&Outer(Leaf));
+        assert!(
+            text.starts_with("storage credentials expired or unavailable (aws sdk default chain): "),
+            "{text}"
+        );
+        assert!(
+            text.contains("an error occurred while loading credentials: the SSO session has expired"),
+            "{text}"
+        );
+        assert!(text.contains("aws sso login"), "{text}");
+        assert!(text.contains("AWS_PROFILE"), "{text}");
+    }
 }

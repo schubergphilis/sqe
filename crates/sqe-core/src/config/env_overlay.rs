@@ -116,10 +116,26 @@ pub(super) fn apply_aws_env_fallbacks(config: &mut SqeConfig) {
             non_empty("AWS_ACCESS_KEY_ID"),
             non_empty("AWS_SECRET_ACCESS_KEY"),
         ) {
-            config.storage.s3_access_key = access;
-            config.storage.s3_secret_key = SecretString::new(secret);
-            if let Some(token) = non_empty("AWS_SESSION_TOKEN") {
-                config.storage.s3_session_token = SecretString::new(token);
+            if non_empty("AWS_SESSION_TOKEN").is_some() {
+                // Temporary keys (`aws configure export-credentials`, an
+                // assumed role) expire in hours and nothing in this process
+                // can renew them. Pinning them into `[storage]` froze them
+                // for the life of the server: after a few hours every read
+                // failed while the process looked healthy. Left unpinned,
+                // S3 reads resolve through the AWS SDK default chain, which
+                // reads the same environment while it is valid and, when
+                // the operator runs with `AWS_PROFILE` (SSO, a role) instead,
+                // refreshes on its own.
+                tracing::warn!(
+                    "AWS_ACCESS_KEY_ID + AWS_SESSION_TOKEN in the environment are temporary \
+                     credentials: S3 reads use the AWS SDK credential chain rather than pinning \
+                     them, and they still expire with the session that issued them. For a \
+                     long-running server prefer AWS_PROFILE (SSO or a role), which the SDK \
+                     refreshes"
+                );
+            } else {
+                config.storage.s3_access_key = access;
+                config.storage.s3_secret_key = SecretString::new(secret);
             }
         }
     }

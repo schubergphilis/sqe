@@ -1205,6 +1205,23 @@ async fn async_main() -> anyhow::Result<()> {
         );
     }
 
+    // Static keys with a session token are temporary credentials frozen
+    // into the process: they expire with the session that issued them and
+    // nothing here can renew them. Every scan then fails while SELECT 1 and
+    // the metadata tools keep working, which is the shape that cost a day
+    // on 2026-09-16. Say so at startup, once, where the operator is looking.
+    if !config.storage.s3_access_key.is_empty()
+        && !config.storage.s3_session_token.expose().is_empty()
+    {
+        tracing::warn!(
+            "[storage] carries a static access key WITH a session token: these are temporary \
+             credentials and will expire with the session that issued them; the server \
+             cannot refresh them and every object-store read will then fail with \
+             STORAGE_CREDENTIALS_UNAVAILABLE. For a long-running server leave the keys \
+             unset and run with AWS_PROFILE (SSO or a role), which the AWS SDK refreshes."
+        );
+    }
+
     // MCP-only: close the SQL front doors, keep just /mcp (and the ops
     // health/metrics port). Applied before validate so it composes with the
     // other flags. Requires MCP to be enabled, or the process would serve
@@ -2084,6 +2101,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             Arc::clone(&rate_limiter),
             config.mcp.clone(),
             sqe_coordinator::mcp_server::hive_root_names(&config),
+            &config.storage,
         ))
     } else {
         if config.mcp.port > 0 {
@@ -2098,6 +2116,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
                 sqe_coordinator::mcp_server::hive_root_names(&config),
                 &config.coordinator.tls,
                 alive,
+                &config.storage,
             )
             .await?;
             tracing::info!(port = bound.port(), resource = %config.mcp.resource_uri, "MCP endpoint enabled at /mcp");

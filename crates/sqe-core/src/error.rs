@@ -429,6 +429,13 @@ pub enum SqeErrorCode {
     /// gRPC mapping is `FailedPrecondition` rather than `Unavailable`.
     CircuitBreakerOpen,
     StorageError,
+    /// The engine's own object-store credentials cannot be resolved or are
+    /// rejected: an SSO session that ended, a provider chain with nothing
+    /// in it, a session token S3 no longer accepts. Distinct from
+    /// `StorageError` because no retry and no change to the query fixes it;
+    /// an operator has to renew the engine's AWS session. `SELECT 1` keeps
+    /// working while every scan fails with this.
+    StorageCredentialsUnavailable,
     CommitConflict,
     // Feature support
     NotSupported,
@@ -497,6 +504,7 @@ impl SqeErrorCode {
             SqeErrorCode::CatalogUnavailable => "CATALOG_UNAVAILABLE",
             SqeErrorCode::CircuitBreakerOpen => "CIRCUIT_BREAKER_OPEN",
             SqeErrorCode::StorageError => "STORAGE_ERROR",
+            SqeErrorCode::StorageCredentialsUnavailable => "STORAGE_CREDENTIALS_UNAVAILABLE",
             SqeErrorCode::CommitConflict => "COMMIT_CONFLICT",
             SqeErrorCode::NotSupported => "NOT_SUPPORTED",
             SqeErrorCode::InternalError => "GENERIC_INTERNAL_ERROR",
@@ -532,6 +540,7 @@ impl SqeErrorCode {
             SqeErrorCode::CatalogUnavailable => 65603,
             SqeErrorCode::CircuitBreakerOpen => 65604,
             SqeErrorCode::StorageError => 65601,
+            SqeErrorCode::StorageCredentialsUnavailable => 65605,
             SqeErrorCode::CommitConflict => 65602,
             SqeErrorCode::NotSupported => 100,
             SqeErrorCode::InternalError => 65540,
@@ -547,7 +556,8 @@ impl SqeErrorCode {
                 SqeErrorCode::CatalogError
                 | SqeErrorCode::CatalogUnavailable
                 | SqeErrorCode::CircuitBreakerOpen
-                | SqeErrorCode::StorageError => "EXTERNAL",
+                | SqeErrorCode::StorageError
+                | SqeErrorCode::StorageCredentialsUnavailable => "EXTERNAL",
                 _ => "INTERNAL_ERROR",
             }
         }
@@ -561,6 +571,9 @@ impl SqeErrorCode {
             SqeErrorCode::CatalogUnavailable => "Catalog is unavailable (retry shortly)",
             SqeErrorCode::CircuitBreakerOpen => "Catalog circuit breaker is open (recent failures)",
             SqeErrorCode::StorageError => "Storage operation failed",
+            SqeErrorCode::StorageCredentialsUnavailable => {
+                "Storage credentials expired or unavailable (renew the engine's AWS session)"
+            }
             SqeErrorCode::CommitConflict => "Commit conflict",
             SqeErrorCode::ResourceExhausted => "Resource exhausted",
             SqeErrorCode::QueryTimeout => "Query timed out",
@@ -738,6 +751,23 @@ fn classify_catalog_error(msg: &str) -> SqeErrorCode {
 /// Classify a [`SqeError::Execution`] message into a specific error code.
 fn classify_execution_error(msg: &str) -> SqeErrorCode {
     let lower = msg.to_lowercase();
+    // The engine's own storage credentials, before every other pattern: the
+    // S3 replies below also say "forbidden" (a 403 body) and would land in
+    // AccessDenied, which tells the client the *user* lacks a grant. Here
+    // nobody's grant is wrong; the engine's AWS session is over. The first
+    // two texts are SQE's own (`aws_config::storage_credentials_unavailable`)
+    // and the SDK's; the rest are what S3 and STS answer to a key or token
+    // that is expired, invalid or unknown.
+    if lower.contains("storage credentials expired or unavailable")
+        || lower.contains("error occurred while loading credentials")
+        || lower.contains("expiredtoken")
+        || lower.contains("invalidaccesskeyid")
+        || lower.contains("invalidclienttokenid")
+        || lower.contains("security token included in the request is invalid")
+        || lower.contains("security token included in the request is expired")
+    {
+        return SqeErrorCode::StorageCredentialsUnavailable;
+    }
     // Auth/access patterns must run before any other keyword check.
     // Polaris's 401/403 bodies are wrapped through the write path as
     // `SqeError::Execution(...)` (commit failures, INSERT/CTAS transactions),
@@ -1501,6 +1531,43 @@ mod tests {
         );
         assert_eq!(SqeErrorCode::CatalogError.trino_error_type(), "EXTERNAL");
         assert_eq!(SqeErrorCode::StorageError.trino_error_type(), "EXTERNAL");
+        assert_eq!(
+            SqeErrorCode::StorageCredentialsUnavailable.trino_error_type(),
+            "EXTERNAL"
+        );
+    }
+
+    #[test]
+    fn expired_storage_credentials_are_their_own_class_not_access_denied() {
+        // SQE's own text (SDK chain bridge), the SDK's, and S3's reply to a
+        // stale key: none of them is the user's grant being wrong.
+        for msg in [
+            "Physical plan creation failed: Object Store error: Generic S3 error: storage \
+             credentials expired or unavailable (aws sdk default chain): an error occurred \
+             while loading credentials: the SSO session has expired",
+            "Object Store error: Generic S3 error: an error occurred while loading credentials",
+            "Object Store error: Generic S3 error: Error performing list request: Server \
+             returned non-2xx status code: 403 Forbidden: <Error><Code>InvalidAccessKeyId</Code>",
+            "Object Store error: Generic S3 error: 400 Bad Request: <Error><Code>ExpiredToken\
+             </Code><Message>The provided token has expired.</Message>",
+        ] {
+            let err = SqeError::Execution(msg.to_string());
+            assert_eq!(
+                err.error_code(),
+                SqeErrorCode::StorageCredentialsUnavailable,
+                "{msg}"
+            );
+        }
+        assert_eq!(
+            SqeErrorCode::StorageCredentialsUnavailable.name(),
+            "STORAGE_CREDENTIALS_UNAVAILABLE"
+        );
+        assert!(!SqeErrorCode::StorageCredentialsUnavailable.is_user_error());
+        // A plain 403 on a grant is still the user's problem.
+        assert_eq!(
+            SqeError::Execution("403 Forbidden: access denied to table t".to_string()).error_code(),
+            SqeErrorCode::AccessDenied
+        );
     }
 
     #[test]
