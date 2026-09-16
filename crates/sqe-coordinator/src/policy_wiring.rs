@@ -83,7 +83,24 @@ pub fn build_policy_enforcer(
                 );
             }
             let store = sqe_policy::ranger_store::RangerStore::from_config(rc)
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                // The store decides table-level access for Hive roots on its
+                // own (there is no Polaris in front of a Glue catalog or a
+                // sidecar warehouse), so it needs the same live root registry
+                // the rewriter keys policies with.
+                .with_hive_catalogs(hive_catalogs.clone());
+            if store.enforces_hive_access() {
+                tracing::info!(
+                    "Ranger access policies gate Hive-root tables: a table with no `select` \
+                     grant for the user reads as not found (policy.ranger.hive_access_policies)"
+                );
+            } else {
+                tracing::warn!(
+                    "policy.ranger.hive_access_policies = false: every Hive-root table is \
+                     readable by every authenticated user unless a row filter denies it; \
+                     Ranger supplies masks and filters only"
+                );
+            }
             let store = match &metrics {
                 Some(m) => store.with_metrics(m.clone()),
                 None => store,
