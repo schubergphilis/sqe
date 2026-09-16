@@ -39,6 +39,10 @@ pub struct GlueMetadataSource {
     /// exposes the whole catalog.
     databases: Vec<String>,
     limits: ManifestLimits,
+    /// The region the client signs for, named in credential errors so an
+    /// operator can tell "no credentials" from "credentials for the wrong
+    /// account or region" without reading the SDK's source chain.
+    region: Option<String>,
 }
 
 impl std::fmt::Debug for GlueMetadataSource {
@@ -56,12 +60,27 @@ impl GlueMetadataSource {
         databases: Vec<String>,
         limits: ManifestLimits,
     ) -> Self {
+        let region = client.config().region().map(|r| r.to_string());
         Self {
             client,
             catalog_id,
             databases,
             limits,
+            region,
         }
+    }
+
+    /// Map one failed SDK call. Credential failures get their own variant
+    /// and a message that names the cause and the region; everything else
+    /// keeps the operation name and the SDK's full source chain, because
+    /// `SdkError`'s own `Display` is the bare kind ("dispatch failure") and
+    /// the reason lives two levels down.
+    fn glue_err<E, R>(&self, op: &str, e: aws_sdk_glue::error::SdkError<E, R>) -> HiveError
+    where
+        E: std::error::Error + 'static,
+        R: std::fmt::Debug + 'static,
+    {
+        classify_glue_error(op, self.region.as_deref(), &format!("{e:?}"), &error_chain(&e))
     }
 
     /// `true` when `database` is outside the configured allow-list. An empty
@@ -93,7 +112,7 @@ impl GlueMetadataSource {
                 // unknown database is an empty list. Erroring here fails the
                 // whole query over a namespace nobody selected from.
                 Err(e) if is_not_found(&e) => return Ok(Vec::new()),
-                Err(e) => return Err(glue_err("get_tables", e)),
+                Err(e) => return Err(self.glue_err("get_tables", e)),
             };
             out.extend(
                 page.table_list()
@@ -230,8 +249,71 @@ pub fn manifest_from_glue_table(database: &str, t: &Table) -> HiveManifest {
     }
 }
 
-fn glue_err(op: &str, e: impl std::fmt::Display) -> HiveError {
-    HiveError::Store(format!("glue {op} failed: {e}"))
+/// Every message in an error's `source()` chain, outermost first. The SDK
+/// renders `SdkError::DispatchFailure` as "dispatch failure" and puts the
+/// reason ("no credentials in the property bag", "the SSO session has
+/// expired") in the sources, so this is what the operator has to see.
+fn error_chain(e: &dyn std::error::Error) -> Vec<String> {
+    let mut out = vec![e.to_string()];
+    let mut cur = e.source();
+    while let Some(next) = cur {
+        out.push(next.to_string());
+        cur = next.source();
+    }
+    out
+}
+
+/// The SDK error shapes that mean "the engine's AWS credentials are not
+/// usable", matched on the `Debug` rendering (the service error code) and
+/// the source-chain text (the credential provider's own message).
+///
+/// - `DispatchFailure` from a `User` connector error whose chain talks about
+///   credentials, a token or a provider: no credentials at all, an SSO
+///   session that ended, a `credential_process` that failed.
+/// - `UnrecognizedClientException` / `InvalidSignatureException` /
+///   `ExpiredTokenException` / `InvalidClientTokenId`: the request was signed
+///   with a key STS no longer knows, which is what a stale
+///   `AWS_SESSION_TOKEN` produces.
+///
+/// `AccessDeniedException` is deliberately not here: valid credentials that
+/// lack `glue:GetTables` is a permission answer, not a credential one.
+fn is_credential_failure(debug: &str, chain: &[String]) -> bool {
+    let lower = debug.to_ascii_lowercase();
+    if lower.contains("unrecognizedclientexception")
+        || lower.contains("invalidsignatureexception")
+        || lower.contains("expiredtokenexception")
+        || lower.contains("invalidclienttokenid")
+        || lower.contains("credentialsstale")
+    {
+        return true;
+    }
+    let dispatch = lower.starts_with("dispatchfailure");
+    let text = chain.join(" | ").to_ascii_lowercase();
+    dispatch
+        && (text.contains("credential")
+            || text.contains("no providers in chain")
+            || text.contains("token")
+            || text.contains("sso")
+            || text.contains("expired"))
+}
+
+/// One failed Glue call as a [`HiveError`]. Pure over strings so the
+/// classification has tests without an SDK client.
+fn classify_glue_error(
+    op: &str,
+    region: Option<&str>,
+    debug: &str,
+    chain: &[String],
+) -> HiveError {
+    let detail = chain.join(": ");
+    if is_credential_failure(debug, chain) {
+        return HiveError::Credentials(format!(
+            "region={}, op={op}: {detail}. Renew the engine's AWS session (aws sso login / \
+             fresh AWS_* keys) and restart, or fix the credential chain it starts with",
+            region.unwrap_or("unset")
+        ));
+    }
+    HiveError::Store(format!("glue {op} failed: {detail}"))
 }
 
 #[async_trait]
@@ -251,7 +333,7 @@ impl HiveMetadataSource for GlueMetadataSource {
             .into_paginator()
             .send();
         while let Some(page) = pages.next().await {
-            let page = page.map_err(|e| glue_err("get_databases", e))?;
+            let page = page.map_err(|e| self.glue_err("get_databases", e))?;
             out.extend(page.database_list().iter().map(|d| d.name().to_string()));
         }
         Ok(out)
@@ -298,7 +380,7 @@ impl HiveMetadataSource for GlueMetadataSource {
             Err(e) if is_not_found(&e) => {
                 return Err(HiveError::NotFound(format!("{database}.{table}")))
             }
-            Err(e) => return Err(glue_err("get_table", e)),
+            Err(e) => return Err(self.glue_err("get_table", e)),
         };
         let t = resp
             .table()
@@ -323,4 +405,90 @@ fn is_not_found<E: std::fmt::Debug>(e: &E) -> bool {
     // The SDK models EntityNotFound per-operation, so matching the rendered
     // error keeps one predicate for every call rather than three.
     format!("{e:?}").contains("EntityNotFound")
+}
+
+#[cfg(test)]
+mod error_classification_tests {
+    use super::*;
+
+    fn chain(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_dispatch_failure_about_credentials_names_the_cause_and_region() {
+        // What the SDK produces when the SSO session is over: Display is
+        // "dispatch failure", the reason is two sources down.
+        let err = classify_glue_error(
+            "get_databases",
+            Some("eu-central-1"),
+            "DispatchFailure(DispatchFailure { source: ConnectorError { kind: User, .. } })",
+            &chain(&[
+                "dispatch failure",
+                "user error",
+                "failed to load credentials: the SSO session has expired",
+            ]),
+        );
+        let text = err.to_string();
+        assert!(matches!(err, HiveError::Credentials(_)), "{text}");
+        assert!(text.contains("AWS credentials missing or expired for the Glue catalog"), "{text}");
+        assert!(text.contains("region=eu-central-1"), "{text}");
+        assert!(text.contains("op=get_databases"), "{text}");
+        assert!(text.contains("SSO session has expired"), "{text}");
+        assert!(text.contains("aws sso login"), "{text}");
+    }
+
+    #[test]
+    fn no_credentials_in_the_chain_is_a_credential_failure_too() {
+        let err = classify_glue_error(
+            "get_table",
+            None,
+            "DispatchFailure(DispatchFailure { source: ConnectorError { kind: User, .. } })",
+            &chain(&["dispatch failure", "user error", "no providers in chain provided credentials"]),
+        );
+        assert!(matches!(err, HiveError::Credentials(_)), "{err}");
+        assert!(err.to_string().contains("region=unset"), "{err}");
+    }
+
+    #[test]
+    fn a_stale_session_token_rejected_by_sts_is_a_credential_failure() {
+        for code in [
+            "UnrecognizedClientException",
+            "ExpiredTokenException",
+            "InvalidSignatureException",
+        ] {
+            let err = classify_glue_error(
+                "get_tables",
+                Some("eu-west-1"),
+                &format!("ServiceError(ServiceError {{ source: Unhandled(Unhandled {{ code: {code} }}) }})"),
+                &chain(&["service error", "unhandled error", "The security token included in the request is invalid"]),
+            );
+            assert!(matches!(err, HiveError::Credentials(_)), "{code}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_network_dispatch_failure_and_a_permission_denial_stay_store_errors_with_the_chain() {
+        let io = classify_glue_error(
+            "get_databases",
+            Some("eu-central-1"),
+            "DispatchFailure(DispatchFailure { source: ConnectorError { kind: Io, .. } })",
+            &chain(&["dispatch failure", "io error", "connection refused"]),
+        );
+        assert!(matches!(io, HiveError::Store(_)), "{io}");
+        assert_eq!(
+            io.to_string(),
+            "hive_external: object store error: glue get_databases failed: dispatch failure: io error: connection refused"
+        );
+
+        // Valid credentials without glue:GetTables: a permission answer.
+        let denied = classify_glue_error(
+            "get_tables",
+            Some("eu-central-1"),
+            "ServiceError(ServiceError { source: AccessDeniedException(AccessDeniedException { .. }) })",
+            &chain(&["service error", "User is not authorized to perform: glue:GetTables"]),
+        );
+        assert!(matches!(denied, HiveError::Store(_)), "{denied}");
+        assert!(denied.to_string().contains("not authorized to perform"), "{denied}");
+    }
 }
