@@ -230,6 +230,7 @@ Hive DDL, `MSCK REPAIR`, `SHOW PARTITIONS`, `ANALYZE`, and manifest access all s
 | `ALTER TABLE ... DROP PARTITION` | Supported. Removes the index entry, never the data. `PURGE` rejected, naming cycle 4. Refused on projection-enabled tables (projection owns the partition set) |
 | `MSCK REPAIR TABLE` | Supported. Relists the table location and rewrites the index. The remedy for a stale index. Junk paths (non-`k=v` dirs, untypeable values, files at the table root) are skipped, matching Hive and Athena. No-op on projection-enabled tables |
 | `SHOW PARTITIONS` | Supported. Reads the index when present, lists when absent |
+| `SHOW VIEWS FROM <root>.<database>` | Supported. The Athena / Trino views (`TableType = VIRTUAL_VIEW`) among the tables the caller may see, one `View` column, from one database listing. `SHOW TABLES` lists views and tables together, as Trino does; this is how a crawler tells them apart without `information_schema.tables`, which enumerates the whole catalog to answer for one schema |
 | `ALTER TABLE ... SET TAGS`, masking policy statements | Rejected, naming cycle 3 |
 | `INSERT INTO` | **Supported.** Appends into `k=v/` partition directories, refreshes the partition index, and drops the cached session context so the next query sees the rows. See [Writes](#writes) |
 | `INSERT OVERWRITE`, `REPLACE INTO` | Rejected, naming why it cannot be made atomic |

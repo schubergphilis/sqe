@@ -1276,6 +1276,8 @@ impl QueryHandler {
 
                 StatementKind::ShowTables(filter) => self.handle_show_tables(session, filter).await,
 
+                StatementKind::ShowViews(filter) => self.handle_show_views(session, filter).await,
+
                 StatementKind::Utility(stmt) => {
                     if let sqlparser::ast::Statement::Explain {
                         analyze, statement, ..
@@ -5271,6 +5273,73 @@ impl QueryHandler {
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to create result batch: {e}")))?;
 
         Ok(vec![batch])
+    }
+
+    /// `SHOW VIEWS FROM <catalog>.<schema>`: the views among that schema's
+    /// tables, one `View` column, sorted. `SHOW TABLES` lists views alongside
+    /// tables (as Trino does) and gives no way to tell them apart; the
+    /// alternative, `information_schema.tables`, enumerates every schema of
+    /// the catalog to answer for one, which against a Glue catalog of a
+    /// hundred databases is a `GetTables` per database (12 s cold for one
+    /// `describe_schema`). This is one listing of one schema.
+    ///
+    /// A Hive root answers from its manifests (`TableType = VIRTUAL_VIEW`),
+    /// policy-gated like `SHOW TABLES`. An Iceberg catalog answers from the
+    /// REST `list_views`; a backend without views is an empty result, not an
+    /// error, matching how `SHOW TABLES` treats it.
+    async fn handle_show_views(
+        &self,
+        session: &Session,
+        filter: &str,
+    ) -> sqe_core::Result<Vec<RecordBatch>> {
+        let catalog = show_tables_catalog(filter);
+        let schema_name =
+            parse_show_tables_namespace(filter).or_else(|| session.default_schema.clone());
+        let mut names: Vec<String> = Vec::new();
+        match catalog.as_deref() {
+            Some(root) if self.runtime_catalogs.is_hive_root(root).unwrap_or(false) => {
+                let database = schema_name.ok_or_else(|| {
+                    SqeError::Execution(
+                        "SHOW VIEWS against a Hive root needs a database (e.g. \
+                         `SHOW VIEWS FROM lake.sales`)"
+                            .to_string(),
+                    )
+                })?;
+                names = self
+                    .hive_ddl_handler
+                    .list_views(&session.user, root, &database)
+                    .await?;
+            }
+            _ => {
+                let session_catalog = self.show_catalog(session, catalog.as_deref()).await?;
+                let namespaces = match schema_name {
+                    None => namespaces_or_empty_on_denial(session_catalog.list_namespaces().await)?,
+                    Some(name) => vec![iceberg::NamespaceIdent::new(name)],
+                };
+                for ns in &namespaces {
+                    if let Ok(views) = session_catalog.list_views(ns).await {
+                        names.extend(views);
+                    }
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("View", DataType::Utf8, false)]));
+        let mut builder = StringBuilder::new();
+        for name in &names {
+            builder.append_value(name);
+        }
+        let column: ArrayRef = Arc::new(builder.finish());
+        RecordBatch::try_new(schema, vec![column])
+            .map(|batch| vec![batch])
+            .map_err(|e| {
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Failed to create result batch: {e}"),
+                )
+            })
     }
 
     /// Handle CREATE VIEW by inferring the output schema from the SELECT query
