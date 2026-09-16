@@ -86,6 +86,9 @@ pub enum StatementKind {
     ShowCatalogs,
     ShowSchemas(String),
     ShowTables(String),
+    /// `SHOW VIEWS [FROM <catalog>.<schema>]`: the views among a schema's
+    /// tables, same `IN`/`FROM` filter string as `ShowTables`.
+    ShowViews(String),
     /// GRANT or DENY privilege statement
     Grant(Box<Statement>),
     /// REVOKE privilege statement
@@ -262,6 +265,7 @@ impl StatementKind {
             StatementKind::ShowCatalogs => "showcatalogs",
             StatementKind::ShowSchemas(_) => "showschemas",
             StatementKind::ShowTables(_) => "showtables",
+            StatementKind::ShowViews(_) => "showviews",
             StatementKind::Grant(_) => "grant",
             StatementKind::Revoke(_) => "revoke",
             StatementKind::Deny(_) => "deny",
@@ -1066,13 +1070,26 @@ pub(crate) fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
         // SHOW CREATE TABLE — reconstruct DDL from metadata
         Statement::ShowCreate { .. } => Ok(StatementKind::ShowCreateTable(Box::new(stmt))),
 
+        // SHOW VIEWS — the views of one schema, same filter shape as
+        // SHOW TABLES. Routed rather than left to DataFusion, which has no
+        // SHOW VIEWS and answered with a parse error.
+        Statement::ShowViews {
+            ref show_options, ..
+        } => {
+            let filter = show_options
+                .show_in
+                .as_ref()
+                .map(|si| si.to_string())
+                .unwrap_or_default();
+            Ok(StatementKind::ShowViews(filter))
+        }
+
         // Other SHOW variants → Utility
         Statement::ShowFunctions { .. }
         | Statement::ShowStatus { .. }
         | Statement::ShowVariables { .. }
         | Statement::ShowColumns { .. }
-        | Statement::ShowCollation { .. }
-        | Statement::ShowViews { .. } => Ok(StatementKind::Utility(Box::new(stmt))),
+        | Statement::ShowCollation { .. } => Ok(StatementKind::Utility(Box::new(stmt))),
 
         // UPDATE → dedicated variant for routing to the write handler
         Statement::Update { .. } => Ok(StatementKind::Update(Box::new(stmt))),
@@ -1852,6 +1869,25 @@ mod tests {
             matches!(result, Ok(StatementKind::ShowTables(_))),
             "Expected ShowTables, got: {result:?}",
         );
+    }
+
+    #[test]
+    fn show_views_carries_the_same_filter_as_show_tables() {
+        let bare = parse_and_classify("SHOW VIEWS");
+        assert!(
+            matches!(bare, Ok(StatementKind::ShowViews(ref f)) if f.is_empty()),
+            "Expected ShowViews with no filter, got: {bare:?}",
+        );
+        let qualified = parse_and_classify("SHOW VIEWS FROM \"glue\".\"bi\"");
+        let tables = parse_and_classify("SHOW TABLES FROM \"glue\".\"bi\"");
+        match (qualified, tables) {
+            (Ok(StatementKind::ShowViews(views)), Ok(StatementKind::ShowTables(tables))) => {
+                assert_eq!(views, tables, "one filter parser serves both statements");
+                assert!(views.contains("bi"), "{views}");
+            }
+            other => panic!("expected ShowViews and ShowTables, got: {other:?}"),
+        }
+        assert_eq!(StatementKind::ShowViews(String::new()).name(), "showviews");
     }
 
     #[test]

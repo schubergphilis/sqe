@@ -965,6 +965,8 @@ fn sample_limit(args: &Value) -> Result<u64, (i32, String)> {
 
 /// Most schemas `search_tables` walks in one catalog.
 const SEARCH_SCHEMAS_MAX: usize = 200;
+/// `SHOW TABLES` statements `search_tables` keeps in flight at once.
+const SEARCH_SCHEMAS_CONCURRENCY: usize = 8;
 
 /// Case-insensitive SQL `LIKE`: `%` matches any run, `_` one character, and
 /// there is no escape. A pattern with neither wildcard matches as a
@@ -1045,21 +1047,41 @@ async fn search_tables(
         .execute(session, &format!("SHOW SCHEMAS FROM {}", ident(&catalog)))
         .await
         .map_err(|e| (-32000, format!("listing schemas of {catalog}: {e}")))?;
-    let mut rows = Vec::new();
-    let mut total = 0usize;
-    for schema in first_column_strings(&schemas)
+    // One `SHOW TABLES` per schema, a bounded number in flight at once
+    // (`buffered`, so results come back in schema order and the response is
+    // deterministic). Serially, a Glue catalog of 135 databases took 17 s
+    // for one search; each listing is a metastore round trip and nothing
+    // here depends on the previous one.
+    let schema_names: Vec<String> = first_column_strings(&schemas)
         .into_iter()
         .filter(|s| !s.eq_ignore_ascii_case("information_schema"))
         .take(SEARCH_SCHEMAS_MAX)
-    {
-        let sql = format!("SHOW TABLES FROM {}.{}", ident(&catalog), ident(&schema));
-        let tables = match state.executor.execute(session, &sql).await {
-            Ok(batches) => first_column_strings(&batches),
-            Err(error) => {
-                tracing::debug!(%catalog, %schema, %error, "search_tables: schema skipped");
-                continue;
-            }
-        };
+        .collect();
+    let listings: Vec<(String, Option<Vec<String>>)> = {
+        use futures::StreamExt;
+        futures::stream::iter(schema_names)
+            .map(|schema| {
+                let catalog = catalog.clone();
+                async move {
+                    let sql = format!("SHOW TABLES FROM {}.{}", ident(&catalog), ident(&schema));
+                    let tables = match state.executor.execute(session, &sql).await {
+                        Ok(batches) => Some(first_column_strings(&batches)),
+                        Err(error) => {
+                            tracing::debug!(%catalog, %schema, %error, "search_tables: schema skipped");
+                            None
+                        }
+                    };
+                    (schema, tables)
+                }
+            })
+            .buffered(SEARCH_SCHEMAS_CONCURRENCY)
+            .collect()
+            .await
+    };
+    let mut rows = Vec::new();
+    let mut total = 0usize;
+    for (schema, tables) in listings {
+        let Some(tables) = tables else { continue };
         for table in tables.into_iter().filter(|t| like_matches(pattern, t)) {
             total += 1;
             if rows.len() < state.config.max_result_rows {
@@ -1103,8 +1125,8 @@ const DESCRIBE_SCHEMA_CONCURRENCY: usize = 8;
 /// path that drops restricted columns on a Hive table), statistics are
 /// `SHOW STATS FOR` (snapshot or metastore numbers, never a scan), and
 /// queryability is `EXPLAIN SELECT * FROM t LIMIT 1` (planning only). The
-/// table kind comes from one `information_schema.tables` read per call and
-/// is best effort: a catalog that cannot answer it leaves every entry a
+/// table kind comes from one `SHOW VIEWS FROM <catalog>.<schema>` per call
+/// and is best effort: a catalog that cannot answer it leaves every entry a
 /// `table`. Per-table statements run with bounded concurrency; a statement
 /// that fails is recorded on its table and the call goes on.
 async fn describe_schema(
@@ -1308,29 +1330,24 @@ async fn describe_one_table(
     entry
 }
 
-/// `table_name -> "table" | "view"` for one schema, lower-cased names, from
-/// `information_schema.tables`. Best effort: an empty map when the catalog
-/// cannot answer, which the caller reads as "everything is a table".
+/// `table_name -> "view"` for the views of one schema, lower-cased names,
+/// from `SHOW VIEWS FROM <catalog>.<schema>`. Best effort: an empty map when
+/// the catalog cannot answer, which the caller reads as "everything is a
+/// table".
 async fn table_kinds(
     state: &McpServerState,
     session: &Session,
     catalog: &str,
     schema: &str,
 ) -> HashMap<String, String> {
-    let sql = format!(
-        "SELECT table_name, table_type FROM {}.information_schema.tables WHERE table_schema = '{}'",
-        ident(catalog),
-        schema.replace('\'', "''")
-    );
+    // One listing of one schema. `information_schema.tables` answered the
+    // same question by enumerating every schema of the catalog, which on a
+    // Glue catalog of a hundred databases was 12 s cold for one call.
+    let sql = format!("SHOW VIEWS FROM {}.{}", ident(catalog), ident(schema));
     match state.executor.execute(session, &sql).await {
-        Ok(batches) => rows_json(&batches)
+        Ok(batches) => first_column_strings(&batches)
             .into_iter()
-            .filter_map(|row| {
-                let name = row.get("table_name")?.as_str()?.to_ascii_lowercase();
-                let kind = row.get("table_type")?.as_str()?.to_ascii_lowercase();
-                let kind = if kind.contains("view") { "view" } else { "table" };
-                Some((name, kind.to_string()))
-            })
+            .map(|name| (name.to_ascii_lowercase(), "view".to_string()))
             .collect(),
         Err(error) => {
             tracing::debug!(%catalog, %schema, %error, "describe_schema: table kinds unavailable");
@@ -1472,6 +1489,7 @@ fn is_read_only(kind: &StatementKind) -> bool {
             | StatementKind::ShowCatalogs
             | StatementKind::ShowSchemas(_)
             | StatementKind::ShowTables(_)
+            | StatementKind::ShowViews(_)
             | StatementKind::ShowGrants(_)
             | StatementKind::ShowEffectiveGrants(_)
             | StatementKind::ShowEffectivePolicy(_)
@@ -2719,12 +2737,10 @@ mod tests {
     /// What one statement answers in the `describe_schema` fixture.
     #[derive(Clone)]
     enum Answer {
-        /// `SHOW TABLES`: one `Table` column.
+        /// `SHOW TABLES` / `SHOW VIEWS`: one name column.
         Names(Vec<&'static str>),
         /// `SHOW COLUMNS`: `(column_name, data_type, is_nullable, comment)`.
         Columns(Vec<(&'static str, &'static str, &'static str, Option<&'static str>)>),
-        /// `information_schema.tables`: `(table_name, table_type)`.
-        Kinds(Vec<(&'static str, &'static str)>),
         /// `SHOW STATS`: the summary row's `(row_count, data_size)` after one
         /// column row.
         Stats(Option<f64>, Option<f64>),
@@ -2771,16 +2787,6 @@ mod tests {
                         utf8(columns.iter().map(|c| c.3).collect()),
                     ],
                 ),
-                Answer::Kinds(kinds) => RecordBatch::try_new(
-                    Arc::new(Schema::new(vec![
-                        Field::new("table_name", DataType::Utf8, false),
-                        Field::new("table_type", DataType::Utf8, false),
-                    ])),
-                    vec![
-                        utf8(kinds.iter().map(|k| Some(k.0)).collect()),
-                        utf8(kinds.iter().map(|k| Some(k.1)).collect()),
-                    ],
-                ),
                 Answer::Stats(row_count, data_size) => RecordBatch::try_new(
                     Arc::new(Schema::new(vec![
                         Field::new("column_name", DataType::Utf8, true),
@@ -2813,10 +2819,7 @@ mod tests {
                     "SHOW TABLES FROM \"glue\".\"bi\"",
                     Answer::Names(vec!["events", "orders", "customers", "broken", "sales_v"]),
                 ),
-                (
-                    "SELECT table_name, table_type FROM \"glue\".information_schema.tables WHERE table_schema = 'bi'",
-                    Answer::Kinds(vec![("orders", "BASE TABLE"), ("sales_v", "VIEW")]),
-                ),
+                ("SHOW VIEWS FROM \"glue\".\"bi\"", Answer::Names(vec!["sales_v"])),
                 ("SHOW COLUMNS FROM \"glue\".\"bi\".\"broken\"", Answer::Fail("hive_external: unreadable storage")),
                 ("SHOW COLUMNS FROM \"glue\".\"bi\".\"customers\"", cols(&["id", "email"])),
                 ("SHOW COLUMNS FROM \"glue\".\"bi\".\"events\"", cols(&["ts", "kind"])),

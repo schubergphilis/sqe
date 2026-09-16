@@ -287,8 +287,13 @@ include Athena views; Iceberg REST catalogs include their views), `SHOW COLUMNS
 FROM` per table drops what policy restricts exactly as `describe_table` does,
 `SHOW STATS FOR` reads the Iceberg snapshot summary or the Hive table's
 metastore parameters and never scans, and `EXPLAIN SELECT * FROM t LIMIT 1`
-plans without running. The table kind comes from one `information_schema.tables`
-read per call and is best effort. Per-table statements run with bounded
+plans without running. The table kind comes from one `SHOW VIEWS FROM
+<catalog>.<schema>` per call and is best effort: one listing of that schema,
+where `information_schema.tables` would enumerate every schema of the catalog
+(12 s cold on a Glue catalog of a hundred databases). On a Hive root the
+metadata statements behind each table (`SHOW COLUMNS`, `SHOW STATS`, `SHOW
+CREATE TABLE`) answer from the same manifest cache the planner uses, so a
+warm crawl pays no metastore round trip per table. Per-table statements run with bounded
 concurrency (eight at a time); one failing table records its `error`,
 `stats_error` or `queryability_error` and the call continues. Those statements
 take the caller's concurrency permits but not a share of

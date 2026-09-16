@@ -484,12 +484,66 @@ impl HiveDdlHandler {
             return store.list_tables(database).await.map_err(to_sqe);
         }
 
-        let manifests: Vec<HiveManifest> = match store.list_manifests(database).await.map_err(to_sqe)? {
+        let manifests = self.database_manifests(&store, database).await?;
+
+        let mut visible = Vec::with_capacity(manifests.len());
+        for manifest in manifests {
+            let policy = self
+                .resolve_policy(user, database, &manifest.name, &manifest)
+                .await;
+            if !policy_denies_all(&policy) {
+                visible.push(manifest.name);
+            }
+        }
+        Ok(visible)
+    }
+
+    /// `SHOW VIEWS FROM <root>.<database>`: the Athena / Trino views
+    /// (`TableType = VIRTUAL_VIEW`) among the tables the caller may see,
+    /// sorted. One database listing, so a crawler that needs to tell views
+    /// from tables asks this instead of `information_schema.tables`, which
+    /// enumerates every database of the catalog to answer for one.
+    pub async fn list_views(
+        &self,
+        user: &SessionUser,
+        root: &str,
+        database: &str,
+    ) -> Result<Vec<String>, SqeError> {
+        let store = self.source_for(root)?;
+        let manifests = self.database_manifests(&store, database).await?;
+        let mut views = Vec::new();
+        for manifest in manifests {
+            if !manifest.is_view() {
+                continue;
+            }
+            let policy = self
+                .resolve_policy(user, database, &manifest.name, &manifest)
+                .await;
+            if !policy_denies_all(&policy) {
+                views.push(manifest.name);
+            }
+        }
+        views.sort();
+        Ok(views)
+    }
+
+    /// Every manifest of `database`: one listing call when the source can
+    /// (Glue's `GetTables`), otherwise one `get` per name, both warming the
+    /// cache the planner reads.
+    async fn database_manifests(
+        &self,
+        store: &Arc<dyn sqe_catalog::hive::source::HiveMetadataSource>,
+        database: &str,
+    ) -> Result<Vec<HiveManifest>, SqeError> {
+        let to_sqe = |e: sqe_catalog::hive::HiveError| {
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string())
+        };
+        match store.list_manifests(database).await.map_err(to_sqe)? {
             Some(listed) => {
                 if let Some(cache) = &self.manifest_cache {
                     cache.insert_listed(database, &listed);
                 }
-                listed
+                Ok(listed)
             }
             None => {
                 let names = store.list_tables(database).await.map_err(to_sqe)?;
@@ -516,20 +570,9 @@ impl HiveDdlHandler {
                     };
                     out.push(manifest);
                 }
-                out
-            }
-        };
-
-        let mut visible = Vec::with_capacity(manifests.len());
-        for manifest in manifests {
-            let policy = self
-                .resolve_policy(user, database, &manifest.name, &manifest)
-                .await;
-            if !policy_denies_all(&policy) {
-                visible.push(manifest.name);
+                Ok(out)
             }
         }
-        Ok(visible)
     }
 
     /// `SHOW SCHEMAS FROM <root>`: the databases the root's metadata source
@@ -631,7 +674,18 @@ impl HiveDdlHandler {
         } else {
             None
         };
-        let data_size = number(&["totalSize", "spark.sql.statistics.totalSize", "rawDataSize"]);
+        // Glue tables written by Trino or Athena carry `totalSize = -1`, so
+        // the planner's own size-only listing (recorded on the cache entry
+        // when it first planned the table) is the next best number. Still
+        // never a scan: a table nobody has planned yet reports NULL.
+        let data_size = number(&["totalSize", "spark.sql.statistics.totalSize", "rawDataSize"])
+            .or_else(|| {
+                self.manifest_cache
+                    .as_ref()
+                    .and_then(|c| c.facts(database, table))
+                    .and_then(|f| f.listed_bytes)
+                    .map(|b| b as f64)
+            });
         Ok(HiveTableStats {
             columns,
             row_count,
@@ -649,11 +703,7 @@ impl HiveDdlHandler {
         database: &str,
         table: &str,
     ) -> Result<(HiveManifest, sqe_policy::ResolvedPolicy), SqeError> {
-        let source = self.source_for(root)?;
-        let manifest = source
-            .get(database, table)
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
+        let manifest = self.manifest_cached(root, database, table).await?;
 
         let policy = self.resolve_policy(user, database, table, &manifest).await;
         if policy_denies_all(&policy) {
@@ -662,6 +712,44 @@ impl HiveDdlHandler {
             )));
         }
         Ok((manifest, policy))
+    }
+
+    /// One table's manifest through the same three tiers the planner uses
+    /// (`HiveCatalogProvider::manifest_for`): served without a round trip
+    /// inside the recheck window, then one ETag check against the cached
+    /// copy, then a fetch that is cached for the next caller.
+    ///
+    /// Before this, every `SHOW COLUMNS`, `SHOW STATS` and `SHOW CREATE
+    /// TABLE` fetched the definition from the metastore again, which against
+    /// Glue is a `GetTable` round trip of 60 to 80 ms per statement while the
+    /// planner next door answered the same table from memory. A crawler
+    /// describing a 40-table database paid it 80 times per pass.
+    ///
+    /// A handler built without a cache (tests, embeddings) keeps the direct
+    /// fetch.
+    async fn manifest_cached(
+        &self,
+        root: &str,
+        database: &str,
+        table: &str,
+    ) -> Result<HiveManifest, SqeError> {
+        let source = self.source_for(root)?;
+        let to_sqe = |e: sqe_catalog::hive::HiveError| {
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string())
+        };
+        let Some(cache) = &self.manifest_cache else {
+            return source.get(database, table).await.map_err(to_sqe);
+        };
+        if let Some(recent) = cache.get_if_recently_verified(database, table) {
+            return Ok(recent);
+        }
+        let etag = source.etag(database, table).await.map_err(to_sqe)?;
+        if let Some(fresh) = cache.get_if_fresh(database, table, etag.as_deref()) {
+            return Ok(fresh);
+        }
+        let loaded = source.get(database, table).await.map_err(to_sqe)?;
+        cache.insert_versioned(database, table, loaded.clone(), etag);
+        Ok(loaded)
     }
 
     /// `ALTER TABLE ... ADD PARTITION` against a Hive root: append one
