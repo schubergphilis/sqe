@@ -149,7 +149,7 @@ revoked grant from a catalog nobody gave a token.
 | Object-level authority | Polaris, on the `polaris` service | Polaris, same service, IF a per-user token is presented |
 | Identity for object level | OIDC JWT, signature verified | OIDC JWT, signature verified |
 | Identity for fine-grained | derived from the same verified JWT | `HADOOP_USER_NAME`, an unauthenticated string the client picks |
-| `policyType-0` access policies | ignored | REQUIRED, else default-deny |
+| `policyType-0` access policies | ignored for Iceberg (Polaris decides); REQUIRED for Hive-root tables, else default-deny | REQUIRED, else default-deny |
 | Row filters and masks | plan rewriter, before optimization | Kyuubi extension, at analysis |
 | Tag associations read from | Iceberg property `sqe.column-tags` | Ranger tag store (needs the projector) |
 | Resource mask vs tag mask | RESOURCE wins | TAG wins |
