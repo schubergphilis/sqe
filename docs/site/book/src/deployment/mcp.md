@@ -214,7 +214,12 @@ callers can reach.
 Read tools are always available after the `sqe:mcp:read` scope is validated:
 
 - `execute_sql_readonly`
-- `list_catalogs`
+- `list_catalogs` (plus `diagnostics`: one entry per Hive root the caller
+  can see, probed with `SHOW SCHEMAS` under a 5 s bound and reported as
+  `reachable`, `auth_error`, `timeout` or `unreachable` with the error text.
+  `auth_error` means the engine's own AWS credentials for that root are
+  missing or expired, and the detail names the region; nothing the client
+  does fixes that, so a sidecar can show it as an operator problem)
 - `list_schemas`
 - `list_tables`
 - `describe_table` (columns with type, nullability and the catalog's column
