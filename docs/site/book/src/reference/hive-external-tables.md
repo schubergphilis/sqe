@@ -270,6 +270,29 @@ Planning a statement resolves every table reference it names through the catalog
 
 Now a manifest that the metastore confirmed less than `metadata_recheck_secs` ago (default 10) is served as is, and what the two listings learned is kept on the manifest's cache entry until the manifest reloads or the cache TTL (`metadata_ttl_secs`, default 60) expires. Every `CREATE`, `ALTER`, `DROP`, `MSCK REPAIR` and `INSERT` in the coordinator drops the entry for the table it changed, so your own writes are visible immediately. The window only delays what another engine wrote to the same manifest; set `metadata_recheck_secs = 0` to check on every lookup. Glue-backed roots have no change token and already refreshed on the TTL alone; they now honour that TTL under continuous querying, where the previous release kept extending it.
 
+### Declared versus stored decimal types
+
+The metastore's column types are the schema. A Parquet file may carry a wider
+decimal than its column declares, for instance `decimal(10,2)` in the file
+under a Glue column declared `decimal(5,2)` after a table was widened by a
+writer but not in Glue. SQE reads at the declared type, as Athena does, so
+every row that fits reads fine and the first value that does not fails the
+statement:
+
+```text
+Arrow error: Invalid argument error: 1029.23 is too large to store in a
+Decimal128 of precision 5. Max is 999.99
+```
+
+That is a type error in the table definition, not an engine fault, and it is
+classified as one (`TYPE_MISMATCH`, so the detail reaches the client). Over
+MCP the message carries a hint naming the declared precision and the fix:
+widen the column's decimal type in the metastore (`ALTER TABLE ... CHANGE
+COLUMN` in Glue). `describe_table` shows which column carries that precision.
+SQE does not silently read at the file's wider type: the declared type is what
+every other engine on the same table reports, and changing it in one place
+would make the same column answer differently in two.
+
 ### Glue: when the engine's credentials lapse
 
 A Glue root is read with the engine's own AWS identity (the SDK's default

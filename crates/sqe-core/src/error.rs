@@ -801,6 +801,12 @@ fn classify_execution_error(msg: &str) -> SqeErrorCode {
     if lower.contains("typesignatureclass")
         || lower.contains("type mismatch")
         || lower.contains("add explicit type casts")
+        // A Parquet value that does not fit the decimal the metastore
+        // declares for its column ("1029.23 is too large to store in a
+        // Decimal128 of precision 5"): the table definition is narrower
+        // than the data, a type error in the metastore, not an engine
+        // fault. Athena refuses the same row for the same reason.
+        || lower.contains("too large to store in a decimal")
         || lower.contains("invalid comparison operation")
         || lower.contains("invalid argument error")
         // iceberg-rust rejects a literal whose type does not match the column
@@ -1535,6 +1541,17 @@ mod tests {
             SqeErrorCode::StorageCredentialsUnavailable.trino_error_type(),
             "EXTERNAL"
         );
+    }
+
+    #[test]
+    fn a_decimal_value_wider_than_the_declared_column_is_a_type_error() {
+        let err = SqeError::Execution(
+            "Arrow error: Invalid argument error: 1029.23 is too large to store in a \
+             Decimal128 of precision 5. Max is 999.99"
+                .to_string(),
+        );
+        assert_eq!(err.error_code(), SqeErrorCode::TypeMismatch);
+        assert!(SqeErrorCode::TypeMismatch.is_user_error(), "the detail must reach the client");
     }
 
     #[test]
