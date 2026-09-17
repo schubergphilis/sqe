@@ -2176,7 +2176,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-json"
-version = "0.54.2"
+version = "0.55.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08429be4acbb04ebab87f2a542737aef8c799ca1b8f0b7b34f286160606caee3"
 dependencies = [
  "datafusion",
  "jiter",
@@ -3885,7 +3887,9 @@ dependencies = [
 
 [[package]]
 name = "jiter"
-version = "0.15.0"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc2f2b4e673d798b3dbad0af24bc23b92013e680a6b9ad300b4e5e52fafe0586"
 dependencies = [
  "ahash",
  "bitvec",
@@ -8807,3 +8811,11 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
+
+[[patch.unused]]
+name = "datafusion-functions-json"
+version = "0.54.2"
+
+[[patch.unused]]
+name = "jiter"
+version = "0.15.0"
