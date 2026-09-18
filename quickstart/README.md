@@ -75,6 +75,7 @@ validated from a clean state.
 | [`polaris-keycloak-client-id`](./polaris-keycloak-client-id/) | Polaris + Keycloak; SQE mints user tokens via the OIDC password grant (client credentials) | **validated 2026-06-06** |
 | [`polaris-keycloak-user-token`](./polaris-keycloak-user-token/) | Same stack; clients bring a pre-minted Keycloak token (`--token`), SQE validates + passes it through | **validated 2026-06-06** |
 | [`mcp`](./mcp/) | Reuses the user-token stack; authenticated SQE MCP, read/write gates, protocol tests, Codex + Claude setup | runnable harness |
+| [`mcp-ranger-okta`](./mcp-ranger-okta/) | Reuses the Ranger stack; SQE MCP with Okta as identity provider, Ranger masks per Okta group, all source settings via `SQE_*` env for a later Fargate move | runnable harness |
 | [`polaris-ranger-keycloak`](./polaris-ranger-keycloak/) | Polaris + Apache Ranger access control: SQE writes GRANT/REVOKE to Ranger, Polaris enforces, column masks match Spark + Kyuubi byte-for-byte | test harness (`test.sh` + `parity-test.sh`) |
 | [`nessie`](./nessie/) | Project Nessie as the Iceberg REST catalog (auth-less, anonymous SQE) | **validated 2026-06-06** |
 | [`rustfs-s3tables`](./rustfs-s3tables/) | RustFS S3 Tables: the Iceberg REST catalog inside the object store; SQE signs it client-side with the S3 keys (auth-less, anonymous SQE) | **validated 2026-09-14** |
