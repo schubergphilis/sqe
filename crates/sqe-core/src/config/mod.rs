@@ -2427,18 +2427,7 @@ pub struct ExternalAuthConfig {
     #[serde(default)]
     pub token_endpoint: Option<String>,
     #[serde(default)]
-    pub device_authorization_endpoint: Option<String>,
-    #[serde(default)]
-    pub device: Option<DeviceAuthConfig>,
-    #[serde(default)]
     pub accept_invalid_certs: bool,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct DeviceAuthConfig {
-    pub client_id: String,
-    #[serde(default = "default_external_scopes")]
-    pub scopes: Vec<String>,
 }
 
 fn default_redirect_uri() -> String {
@@ -6286,9 +6275,6 @@ fn validate_urls(config: &SqeConfig, errors: &mut Vec<String>) {
         if let Some(v) = ext.token_endpoint.as_deref() {
             check("auth.external.token_endpoint", v);
         }
-        if let Some(v) = ext.device_authorization_endpoint.as_deref() {
-            check("auth.external.device_authorization_endpoint", v);
-        }
     }
 
     check("access_control.url", &config.access_control.url);
@@ -8966,20 +8952,12 @@ type = "aws"
             client_id = "sqe"
             client_secret = "secret"
             scopes = ["openid", "profile"]
-
-            [device]
-            client_id = "sqe-cli"
-            scopes = ["openid", "profile", "offline_access"]
         "#;
         let config: ExternalAuthConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.issuer, "https://idp.example.com/realms/sqe");
         assert_eq!(config.client_id, "sqe");
         assert_eq!(config.client_secret, Some("secret".to_string()));
         assert_eq!(config.challenge_timeout_secs, 900);
-        assert!(config.device.is_some());
-        let device = config.device.unwrap();
-        assert_eq!(device.client_id, "sqe-cli");
-        assert_eq!(device.scopes, vec!["openid", "profile", "offline_access"]);
     }
 
     #[test]
@@ -8990,7 +8968,6 @@ type = "aws"
         "#;
         let config: ExternalAuthConfig = toml::from_str(toml_str).unwrap();
         assert!(config.client_secret.is_none());
-        assert!(config.device.is_none());
         assert_eq!(config.scopes, vec!["openid", "profile"]);
     }
 

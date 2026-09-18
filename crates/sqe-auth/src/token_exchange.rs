@@ -89,13 +89,6 @@ impl Default for TokenExchangeConfig {
 #[derive(Debug, Deserialize)]
 struct TokenExchangeResponse {
     access_token: String,
-    #[allow(dead_code)]
-    token_type: String,
-    #[allow(dead_code)]
-    expires_in: Option<u64>,
-    /// RFC 8693 may return an `issued_token_type` — we don't need it.
-    #[allow(dead_code)]
-    issued_token_type: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
