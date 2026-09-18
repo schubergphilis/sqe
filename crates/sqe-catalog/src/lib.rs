@@ -4,7 +4,6 @@ pub mod aws_config;
 pub mod backends;
 #[cfg(feature = "rest")]
 pub mod catalog_provider;
-pub mod circuit_breaker;
 pub mod expr_to_predicate;
 pub mod file_tvf_common;
 pub mod file_tvf_prepare;
@@ -64,7 +63,8 @@ pub use access_control::AccessControlClient;
 pub use aws_config::build_aws_config;
 #[cfg(feature = "rest")]
 pub use catalog_provider::SqeCatalogProvider;
-pub use circuit_breaker::CircuitBreaker;
+pub use sqe_core::circuit_breaker;
+pub use sqe_core::CircuitBreaker;
 pub use footer_cache::FooterCache;
 pub use iceberg_scan::coalesce_file_entries;
 pub use iceberg_scan::IcebergScanExec;
