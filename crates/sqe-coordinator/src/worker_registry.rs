@@ -666,11 +666,6 @@ impl WorkerRegistry {
         Ok(outcome)
     }
 
-    /// True when `url` is already in the registry (configured or discovered).
-    pub async fn is_known(&self, url: &str) -> bool {
-        self.inner.read().await.workers.contains_key(url)
-    }
-
     /// Immediately mark a worker as unhealthy.
     ///
     /// Unlike [`mark_failed`](Self::mark_failed), this does not use a

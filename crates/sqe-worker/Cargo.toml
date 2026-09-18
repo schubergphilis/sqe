@@ -10,10 +10,6 @@ repository.workspace = true
 name = "sqe_worker"
 path = "src/lib.rs"
 
-[[bin]]
-name = "sqe-worker"
-path = "src/main.rs"
-
 [dependencies]
 sqe-core = { path = "../sqe-core" }
 sqe-catalog = { path = "../sqe-catalog" }
@@ -42,7 +38,6 @@ tokio-stream = "0.1"
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-futures = { version = "0.2", features = ["futures-03"] }
-tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 futures = { workspace = true }
@@ -50,7 +45,6 @@ bytes = { workspace = true }
 anyhow = { workspace = true }
 url = { workspace = true }
 chrono = { workspace = true }
-opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 subtle = { workspace = true }
 prometheus = { workspace = true }

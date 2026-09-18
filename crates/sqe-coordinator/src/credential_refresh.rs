@@ -279,28 +279,9 @@ where
 /// `allow_unauthenticated = true`.
 ///
 /// Returns `Ok(())` if the worker accepted the credentials, or an error if the
-/// Flight call failed. Builds a fresh `Endpoint` per call; prefer
-/// [`push_credentials_to_worker_with_pool`] when a [`ChannelPool`] is available.
+/// Flight call failed. Reuses a cached `Channel` when a [`ChannelPool`] is
+/// given, else builds a fresh `Endpoint` per call.
 pub async fn push_credentials_to_worker(
-    worker_url: &str,
-    credentials: &RefreshableCredentials,
-    worker_secret: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    push_credentials_to_worker_inner(worker_url, credentials, worker_secret, None).await
-}
-
-/// Variant of [`push_credentials_to_worker`] that reuses a cached `Channel`
-/// from a shared [`ChannelPool`].
-pub async fn push_credentials_to_worker_with_pool(
-    pool: &ChannelPool,
-    worker_url: &str,
-    credentials: &RefreshableCredentials,
-    worker_secret: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    push_credentials_to_worker_inner(worker_url, credentials, worker_secret, Some(pool)).await
-}
-
-async fn push_credentials_to_worker_inner(
     worker_url: &str,
     credentials: &RefreshableCredentials,
     worker_secret: &str,
@@ -407,7 +388,7 @@ where
         match get_fresh_credentials(fragment).await {
             Some(creds) => {
                 let new_expiry = creds.expiry;
-                match push_credentials_to_worker(&worker_url, &creds, worker_secret).await {
+                match push_credentials_to_worker(&worker_url, &creds, worker_secret, None).await {
                     Ok(()) => {
                         tracker.update_expiry(&fragment_id, new_expiry).await;
                         success_count += 1;
@@ -607,7 +588,7 @@ mod tests {
             expiry: Utc::now() + Duration::hours(1),
         };
 
-        let result = push_credentials_to_worker("http://127.0.0.1:19999", &creds, "").await;
+        let result = push_credentials_to_worker("http://127.0.0.1:19999", &creds, "", None).await;
         assert!(result.is_err(), "push to unreachable worker should fail");
     }
 
@@ -622,7 +603,7 @@ mod tests {
         };
 
         let result =
-            push_credentials_to_worker("http://127.0.0.1:19999", &creds, "shared-secret").await;
+            push_credentials_to_worker("http://127.0.0.1:19999", &creds, "shared-secret", None).await;
         assert!(
             result.is_err(),
             "push to unreachable worker should fail even with a secret set"

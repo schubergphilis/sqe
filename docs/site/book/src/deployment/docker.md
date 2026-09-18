@@ -1,6 +1,6 @@
 # Docker
 
-SQE ships as a **single Docker image** containing the engine binaries (`sqe-server`, `sqe-worker`) and the client (`sqe-cli`).
+SQE ships as a **single Docker image** containing the engine binary (`sqe-server`, run with `--mode coordinator` or `--mode worker`) and the client (`sqe-cli`).
 
 ## Image Layout
 

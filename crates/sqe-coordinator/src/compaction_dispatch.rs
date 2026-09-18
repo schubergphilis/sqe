@@ -3,7 +3,7 @@
 //!
 //! Mirrors the dispatch pattern already used for scan tickets
 //! (`distributed_scan::dispatch_to_worker`) and credential pushes
-//! (`credential_refresh::push_credentials_to_worker_inner`): build/reuse a
+//! (`credential_refresh::push_credentials_to_worker`): build/reuse a
 //! Flight channel, sign the exact wire bytes, attach the worker-secret and
 //! signature headers, call `do_action`, and drain the response stream. What
 //! is new here: the action is `"compact_file_group"`, the response is a

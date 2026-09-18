@@ -785,10 +785,6 @@ fn build_health_router(state: Arc<HealthState>) -> Router {
     app.with_state(state)
 }
 
-fn start_health_server(port: u16, state: Arc<HealthState>) {
-    start_health_server_with_extra(port, state, None);
-}
-
 fn start_health_server_with_extra(port: u16, state: Arc<HealthState>, extra: Option<Router>) {
     let mut app = build_health_router(state);
     if let Some(extra) = extra {
@@ -955,9 +951,7 @@ impl TrinoAuthenticator for AuthenticatorAdapter {
                 .authenticate(&credentials)
                 .await
                 .map_err(|e| trino_auth_error(e, ""))?;
-            return Ok(sqe_coordinator::auth_session::identity_to_session(
-                identity, None,
-            ));
+            return Ok(identity.into_session(None));
         }
         self.authenticator
             .authenticate(username, password)
@@ -987,10 +981,7 @@ impl TrinoAuthenticator for AuthenticatorAdapter {
 
         // Fall back to the raw JWT as the catalog token when the provider did
         // not supply one (passthrough to Polaris).
-        Ok(sqe_coordinator::auth_session::identity_to_session(
-            identity,
-            Some(token),
-        ))
+        Ok(identity.into_session(Some(token)))
     }
 }
 
@@ -1718,10 +1709,11 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
     // Attach the OCSF export spool when audit export is enabled.
     let (audit_logger, shipper_spool_path) =
         if config.metrics.audit_export.enabled && config.metrics.audit_export.target == "otlp" {
-            let spool = sqe_coordinator::derive_spool_path(
-                &config.metrics.audit_export.spool_path,
-                &config.metrics.audit_log_path,
-            );
+            let spool = if config.metrics.audit_export.spool_path.is_empty() {
+                format!("{}.ocsf.spool.jsonl", config.metrics.audit_log_path)
+            } else {
+                config.metrics.audit_export.spool_path.clone()
+            };
             let logger = audit_logger
                 .with_export_spool(&spool)
                 .map_err(|e| anyhow::anyhow!("audit export: failed to open spool file: {e}"))?;
@@ -2357,7 +2349,7 @@ async fn run_worker(config: SqeConfig, config_path: String) -> anyhow::Result<()
         serving: None,
         mcp_listener_alive: None,
     });
-    start_health_server(health_port, health_state);
+    start_health_server_with_extra(health_port, health_state, None);
 
     let port = config.worker.flight_port;
     let addr = format!("0.0.0.0:{port}").parse()?;
