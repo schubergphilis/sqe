@@ -12,7 +12,6 @@ path = "src/lib.rs"
 
 [dependencies]
 sqe-core = { path = "../sqe-core" }
-sqe-catalog = { path = "../sqe-catalog" }
 # `MetricsRegistry` only: the registry crate, under the name the sources use
 # (review 803 item 2). No exporters, no OTel SDK, no `/metrics` server.
 sqe-metrics = { path = "../sqe-metrics-core", package = "sqe-metrics-core" }
@@ -30,8 +29,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
-subtle = { workspace = true }
+hex = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
+bytes = { workspace = true }
 tempfile = { workspace = true }
