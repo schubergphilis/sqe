@@ -2430,7 +2430,7 @@ async fn run_worker(config: SqeConfig, config_path: String) -> anyhow::Result<()
 
 // ── OpenLineage observer construction ─────────────────────────
 
-/// Build the [`sqe_lineage::LineageObserver`] from `[metrics.openlineage]`.
+/// Build the [`sqe_lineage::ChannelObserver`] from `[metrics.openlineage]`.
 ///
 /// Returns `None` when the section is disabled (the default). When enabled,
 /// validates the config, opens the configured sinks (file and/or HTTP, with
@@ -2442,7 +2442,7 @@ async fn run_worker(config: SqeConfig, config_path: String) -> anyhow::Result<()
 /// task pattern.
 fn build_lineage_observer(
     config: &SqeConfig,
-) -> anyhow::Result<Option<Arc<dyn sqe_lineage::LineageObserver>>> {
+) -> anyhow::Result<Option<Arc<sqe_lineage::ChannelObserver>>> {
     if !config.metrics.openlineage.enabled {
         return Ok(None);
     }

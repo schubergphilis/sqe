@@ -11,6 +11,7 @@
 //! the commit/`RewriteFilesAction` path) remain in `sqe-coordinator::maintenance`
 //! and call into this crate's primitives with already-resolved inputs.
 
+pub mod parquet_writer_config;
 pub mod dispatch;
 pub mod progress;
 pub mod rewrite;

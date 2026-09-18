@@ -18,9 +18,6 @@ use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
-use sqe_catalog::parquet_writer_config::{
-    self, writer_props_for_table as shared_writer_props_for_table,
-};
 use sqe_core::SqeError;
 
 use tracing::{info, instrument};
@@ -101,20 +98,9 @@ pub async fn collect_live_data_files(table: &Table) -> sqe_core::Result<Vec<Data
 }
 use sqe_core::SqeErrorCode;
 
-/// Iceberg table property that lists columns to get Parquet bloom filters.
-///
-/// Re-exported from [`sqe_catalog::parquet_writer_config`] so the coordinator
-/// and worker share the same property name. Value is a comma-separated list of
-/// column names (case-sensitive, matched against top-level schema fields).
-pub use parquet_writer_config::PROP_BLOOM_FILTER_COLUMNS;
-
-/// Iceberg table property for the bloom filter false-positive probability.
-///
-/// Re-exported; defaults to [`DEFAULT_BLOOM_FILTER_FPP`] when absent.
-pub use parquet_writer_config::PROP_BLOOM_FILTER_FPP;
-
-/// Default bloom filter FPP when the table property is absent.
-pub use parquet_writer_config::DEFAULT_BLOOM_FILTER_FPP;
+pub use sqe_compaction::parquet_writer_config::{
+    DEFAULT_BLOOM_FILTER_FPP, PROP_BLOOM_FILTER_COLUMNS, PROP_BLOOM_FILTER_FPP,
+};
 
 /// Resolve the effective Parquet write compression.
 ///
@@ -129,23 +115,12 @@ pub fn resolve_write_compression(session_codec: Option<&str>, config_codec: &str
 ///
 /// Used by the position-delete writer and other paths that do not carry an
 /// Iceberg table context. Data-file writes go through
-/// [`writer_props_for_table`] so that per-table bloom filter settings apply.
+/// `sqe_compaction::parquet_writer_config::writer_props_for_table` so that
+/// per-table bloom filter settings apply.
 fn writer_props(compression: Compression) -> WriterProperties {
     WriterProperties::builder()
         .set_compression(compression)
         .build()
-}
-
-/// Build `WriterProperties` honouring the table's bloom filter properties.
-///
-/// Thin wrapper around [`sqe_catalog::parquet_writer_config::writer_props_for_table`]
-/// so both coordinator and worker see identical behaviour for
-/// `write.parquet.bloom-filter-columns` and `write.parquet.bloom-filter-fpp`.
-///
-/// Absence of the bloom filter columns property leaves the writer with no
-/// bloom filters (matching Iceberg spec default).
-pub fn writer_props_for_table(table: &Table, compression: Compression) -> WriterProperties {
-    shared_writer_props_for_table(table, compression)
 }
 
 /// Write already-materialised RecordBatches as Parquet data files for an
@@ -591,117 +566,12 @@ pub async fn write_equality_delete_key_files(
     Ok(delete_files)
 }
 
-/// Write equality-delete files for an Iceberg table (Phase E, task 6.7).
-///
-/// Each row in `key_batches` represents one logical row to delete. The writer
-/// projects `equality_ids` out of the table's full schema and records them as
-/// the equality keys. Compared to position deletes this is snapshot-stable
-/// (new data files matching the same equality keys are also deleted) and avoids
-/// per-row scan cost for the writer.
-///
-/// `equality_ids` defaults to the table's `identifier-field-ids` when empty;
-/// callers typically pass the declared primary key.
-///
-/// Returns `DataFile` descriptors with `content_type = EqualityDeletes`, ready
-/// to be passed to `RowDeltaAction::add_delete_files()`.
-pub async fn write_equality_delete_files(
-    table: &Table,
-    key_batches: Vec<RecordBatch>,
-    equality_ids: Vec<i32>,
-    compression: Compression,
-) -> sqe_core::Result<Vec<DataFile>> {
-    let total_rows: usize = key_batches.iter().map(|b| b.num_rows()).sum();
-    if total_rows == 0 {
-        return Ok(vec![]);
-    }
-
-    let iceberg_schema = table.metadata().current_schema();
-
-    // Resolve equality ids: fall back to declared identifier-field-ids when
-    // caller passes an empty vec. DELETE on a table without declared PK or
-    // explicit equality columns is an error.
-    let resolved_ids: Vec<i32> = if equality_ids.is_empty() {
-        iceberg_schema.identifier_field_ids().collect()
-    } else {
-        equality_ids
-    };
-    if resolved_ids.is_empty() {
-        return Err(SqeError::Execution(
-            "equality delete requires identifier-field-ids on the table or explicit equality_ids"
-                .to_string(),
-        ));
-    }
-
-    info!(
-        table = %table.identifier(),
-        total_rows,
-        equality_ids = ?resolved_ids,
-        "Writing equality delete files"
-    );
-
-    // Stamp field-ids on the Arrow schema so the projector inside the writer
-    // can match PARQUET:field_id metadata against `resolved_ids`.
-    let stamped = stamp_batches(key_batches, iceberg_schema.as_ref())?;
-
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Location generator error: {e}")))?;
-
-    let write_id = Uuid::now_v7();
-    let file_name_generator = DefaultFileNameGenerator::new(
-        format!("{write_id}-eq-delete"),
-        None,
-        iceberg::spec::DataFileFormat::Parquet,
-    );
-
-    // The Parquet writer takes the Iceberg schema; the equality-delete writer
-    // then projects keys from it via `EqualityDeleteWriterConfig`.
-    let parquet_writer_builder =
-        ParquetWriterBuilder::new(writer_props(compression), iceberg_schema.clone());
-
-    let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
-        parquet_writer_builder,
-        table.file_io().clone(),
-        location_generator,
-        file_name_generator,
-    );
-
-    let config = EqualityDeleteWriterConfig::new(resolved_ids, iceberg_schema.clone())
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Equality delete config error: {e}")))?;
-
-    let eq_delete_builder = EqualityDeleteFileWriterBuilder::new(rolling_writer_builder, config);
-
-    let mut writer = eq_delete_builder
-        .build(None)
-        .await
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build equality delete writer: {e}")))?;
-
-    for batch in stamped {
-        writer
-            .write(batch)
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to write equality deletes: {e}")))?;
-    }
-
-    let delete_files = writer
-        .close()
-        .await
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to close equality delete writer: {e}")))?;
-
-    info!(
-        table = %table.identifier(),
-        delete_file_count = delete_files.len(),
-        "Equality delete files written"
-    );
-
-    Ok(delete_files)
-}
-
 #[cfg(test)]
 mod tests {
     use arrow_schema::Schema as ArrowSchema;
 
     // Bloom filter unit tests live next to their implementation in
-    // `sqe_catalog::parquet_writer_config`. The coordinator writer is a
+    // `sqe_compaction::parquet_writer_config`. The coordinator writer is a
     // thin wrapper; end-to-end coverage runs in
     // `tests/bloom_distributed_write.rs`.
     //

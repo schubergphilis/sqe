@@ -293,7 +293,7 @@ pub async fn write_data_files_streaming(
     // (a 1-line forwarder): call the shared helper directly rather than
     // duplicating that wrapper across the crate boundary.
     let parquet_writer_builder = ParquetWriterBuilder::new(
-        sqe_catalog::parquet_writer_config::writer_props_for_table(table, compression),
+        crate::parquet_writer_config::writer_props_for_table(table, compression),
         table.metadata().current_schema().clone(),
     );
 
