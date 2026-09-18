@@ -1,7 +1,7 @@
 //! Circuit breaker for external service calls.
 //!
-//! Protects catalog (Polaris REST) calls from cascading failure when the
-//! upstream is unavailable. The circuit transitions through three states:
+//! Protects remote calls (Polaris REST catalog, Ranger policy fetches) from
+//! cascading failure when the upstream is unavailable. The circuit transitions through three states:
 //!
 //! ```text
 //!   Closed ──N failures──► Open ──recovery_timeout──► Half-Open
