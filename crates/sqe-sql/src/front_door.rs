@@ -198,11 +198,6 @@ impl NormalizedSql {
         self.statements.first()
     }
 
-    /// True for SQE-only grammar that never had a sqlparser AST.
-    pub fn is_custom_grammar(&self) -> bool {
-        self.custom.is_some()
-    }
-
     /// True when a source-level fallback rewrote the text before parsing.
     pub fn source_rewritten(&self) -> bool {
         self.source_rewritten
@@ -392,7 +387,6 @@ mod tests {
         let n = SqlFrontDoor::new(WireDialect::Trino)
             .normalize("-- leading comment\nSHOW TAGS ON ns.t")
             .unwrap();
-        assert!(n.is_custom_grammar());
         assert!(n.statements().is_empty());
         assert_eq!(n.update_type(), None);
         assert!(matches!(
