@@ -3,8 +3,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
-#[cfg(feature = "worker-shuffle")]
-use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::{
@@ -26,12 +24,7 @@ use sqe_core::FlightCompression;
 use sqe_metrics::propagation::extract_trace_context;
 use sqe_metrics::WorkerMetricsRegistry;
 use sqe_planner::{ScanTask, WorkerCapacity, WorkerFault, SCAN_TASK_VERSION_CURRENT};
-#[cfg(feature = "worker-shuffle")]
-use sqe_spill::{
-    split_default_read_headroom, AdmissionRequest, AttemptManifest, ExchangeAttemptStore,
-    ReclaimableConsumer, SpillScope, TaskKey, WorkloadClass,
-};
-use sqe_spill::{ByteBudget, BytePermit, LiveConsumerRegistry, MemoryGovernor, SpillManager};
+use sqe_spill::{ByteBudget, BytePermit, MemoryGovernor, SpillManager};
 use tokio_util::sync::CancellationToken;
 
 use crate::compaction::{
@@ -39,8 +32,6 @@ use crate::compaction::{
 };
 use crate::credential_channel::{CredentialStore, RefreshableCredentials};
 use crate::executor::{self, ObjectStoreFactory};
-#[cfg(feature = "worker-shuffle")]
-use crate::shuffle::{ExchangeDescriptor, ShuffleManager};
 use crate::status::WorkerStatus;
 
 /// Yields `inner`'s items unchanged and drops `held` when the stream ends,
@@ -80,8 +71,6 @@ where
         item
     }
 }
-#[cfg(feature = "worker-shuffle")]
-use crate::spill_buffer::SpillablePartitionBuffer;
 
 /// Streams `RecordBatch`es into the Flight encoder while holding each batch's
 /// scan-budget permit until the encoder polls the next item (or the stream
@@ -287,8 +276,6 @@ pub struct WorkerFlightService {
     credential_store: CredentialStore,
     session_ctx: SessionContext,
     footer_cache: Option<Arc<FooterCache>>,
-    #[cfg(feature = "worker-shuffle")]
-    shuffle_manager: ShuffleManager,
     /// Maximum duration for a single scan task. 0 means no timeout.
     scan_timeout: std::time::Duration,
     /// IPC compression for DoGet responses (worker -> coordinator).
@@ -296,8 +283,6 @@ pub struct WorkerFlightService {
     flight_compression: FlightCompression,
     /// IPC compression for DoExchange shuffle responses.
     /// Default: ZSTD.
-    #[cfg(feature = "worker-shuffle")]
-    shuffle_compression: FlightCompression,
     /// Shared secret used to authenticate inbound Flight calls. When empty
     /// the worker accepts unauthenticated traffic (operators must opt in
     /// via `worker.allow_unauthenticated = true`, enforced at config load).
@@ -312,18 +297,12 @@ pub struct WorkerFlightService {
     spill_manager: Option<Arc<SpillManager>>,
     /// Byte budget for shuffle partition buffers (from
     /// `worker.memory.shuffle_memory_budget`). Atomic for hot config reload.
-    #[cfg(feature = "worker-shuffle")]
-    shuffle_memory_budget: Arc<std::sync::atomic::AtomicUsize>,
     /// Scan timeout seconds (0 = none). Atomic for hot config reload.
     scan_timeout_secs: Arc<std::sync::atomic::AtomicU64>,
     /// Worker-wide temporary memory governor (Phase 7). Admits shuffle /
     /// operator grants so concurrent stages cannot race the FairSpillPool.
     memory_governor: Option<Arc<MemoryGovernor>>,
-    /// Live reclaimable operators (join/agg/sort) registered under the governor.
-    live_consumers: Arc<LiveConsumerRegistry>,
     /// Durable exchange attempt manifests (Phase 8).
-    #[cfg(feature = "worker-shuffle")]
-    exchange_store: Arc<ExchangeAttemptStore>,
     /// Byte budget for encoded Flight frames in flight to the coordinator
     /// (`worker.memory.flight_budget`, issue #407). `None` means "not
     /// configured": `do_get` then falls back to [`default_flight_budget`], so
@@ -380,35 +359,6 @@ pub(crate) struct CompactionSeam {
     /// share one store.
     pub(crate) file_io: FileIO,
 }
-
-/// Lightweight reclaimable consumer for one DoExchange partition grant.
-#[cfg(feature = "worker-shuffle")]
-struct ShufflePartitionConsumer {
-    name: String,
-    desired: usize,
-    minimum: usize,
-}
-
-#[cfg(feature = "worker-shuffle")]
-impl ReclaimableConsumer for ShufflePartitionConsumer {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn desired_bytes(&self) -> usize {
-        self.desired
-    }
-    fn minimum_bytes(&self) -> usize {
-        self.minimum
-    }
-    fn try_reclaim(&self, _target: usize) -> usize {
-        0
-    }
-}
-
-/// Default shuffle budget when not configured (64 MiB) — enough for laptop
-/// tests and small clusters without an explicit sub-budget.
-#[cfg(feature = "worker-shuffle")]
-const DEFAULT_SHUFFLE_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
 
 /// Worker-side compaction deadline used when nothing configured one
 /// (embedded / test construction). Mirrors `worker.compaction_timeout_secs`'s
@@ -662,27 +612,16 @@ impl WorkerFlightService {
             credential_store,
             session_ctx,
             footer_cache: None,
-            #[cfg(feature = "worker-shuffle")]
-            shuffle_manager: ShuffleManager::new(),
             scan_timeout: std::time::Duration::from_secs(600),
             flight_compression: FlightCompression::Zstd,
-            #[cfg(feature = "worker-shuffle")]
-            shuffle_compression: FlightCompression::Zstd,
             worker_secret: String::new(),
             ticket_pin: None,
             advertise_url: String::new(),
             accept_hmac_tickets: false,
             spill_manager: None,
             flight_budget: None,
-            #[cfg(feature = "worker-shuffle")]
-            shuffle_memory_budget: Arc::new(std::sync::atomic::AtomicUsize::new(
-                DEFAULT_SHUFFLE_MEMORY_BUDGET,
-            )),
             scan_timeout_secs: Arc::new(std::sync::atomic::AtomicU64::new(600)),
             memory_governor: None,
-            live_consumers: Arc::new(LiveConsumerRegistry::new()),
-            #[cfg(feature = "worker-shuffle")]
-            exchange_store: Arc::new(ExchangeAttemptStore::new()),
             compaction_timeout: Some(std::time::Duration::from_secs(
                 DEFAULT_COMPACTION_TIMEOUT_SECS,
             )),
@@ -822,14 +761,6 @@ impl WorkerFlightService {
         self
     }
 
-    /// Set the IPC compression for DoExchange shuffle responses.
-    #[cfg(feature = "worker-shuffle")]
-    #[must_use = "with_shuffle_compression consumes self; bind the returned service"]
-    pub fn with_shuffle_compression(mut self, compression: FlightCompression) -> Self {
-        self.shuffle_compression = compression;
-        self
-    }
-
     /// Set the shared secret used to authenticate inbound Flight calls
     /// (`do_get` scan tickets and `do_action("refresh_credentials")`).
     /// An empty secret disables enforcement: callers must explicitly opt
@@ -880,31 +811,6 @@ impl WorkerFlightService {
     #[must_use = "with_flight_budget consumes self; bind the returned service"]
     pub fn with_flight_budget(mut self, budget: ByteBudget) -> Self {
         self.flight_budget = Some(budget);
-        self
-    }
-
-    /// Set the shuffle partition byte budget used by spillable DoExchange.
-    #[cfg(feature = "worker-shuffle")]
-    #[must_use = "with_shuffle_memory_budget consumes self; bind the returned service"]
-    pub fn with_shuffle_memory_budget(self, bytes: usize) -> Self {
-        self.shuffle_memory_budget
-            .store(bytes.max(64 * 1024), std::sync::atomic::Ordering::Release);
-        self
-    }
-
-    /// Share the shuffle-budget atom with hot-reload.
-    #[cfg(feature = "worker-shuffle")]
-    #[must_use = "with_shuffle_memory_budget_atom consumes self; bind the returned service"]
-    pub fn with_shuffle_memory_budget_atom(
-        mut self,
-        atom: Arc<std::sync::atomic::AtomicUsize>,
-    ) -> Self {
-        // Adopt the shared hot-reload atom as-is. It is already seeded with the
-        // resolved shuffle budget by `WorkerHotConfig::new`. Copying this
-        // service's default (64 MiB) value into it, as the old direction did,
-        // clobbered the configured budget on every boot until the next
-        // sqe.toml change forced a hot-reload to write the real value back.
-        self.shuffle_memory_budget = atom;
         self
     }
 
@@ -991,37 +897,6 @@ impl WorkerFlightService {
     /// Memory governor when wired at bootstrap.
     pub fn memory_governor(&self) -> Option<&Arc<MemoryGovernor>> {
         self.memory_governor.as_ref()
-    }
-
-    /// Live consumer registry for join/agg/sort reclaim.
-    pub fn live_consumers(&self) -> &Arc<LiveConsumerRegistry> {
-        &self.live_consumers
-    }
-
-    /// Durable exchange attempt store (Phase 8).
-    #[cfg(feature = "worker-shuffle")]
-    pub fn exchange_store(&self) -> &Arc<ExchangeAttemptStore> {
-        &self.exchange_store
-    }
-
-    /// Configured shuffle memory budget in bytes.
-    #[cfg(feature = "worker-shuffle")]
-    pub fn shuffle_memory_budget(&self) -> usize {
-        self.shuffle_memory_budget
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Release every worker-side registry entry keyed by `query_id`.
-    ///
-    /// The DoExchange registries are keyed by a network-supplied
-    /// `query_id`/`stage_id`, so the coordinator's "query finished" action must
-    /// call this or they grow for the lifetime of the process (review finding
-    /// 600). Returns the number of entries dropped across the receiver
-    /// registry, the attempt gate and the durable exchange store.
-    #[cfg(feature = "worker-shuffle")]
-    pub async fn forget_query(&self, query_id: &str) -> usize {
-        self.shuffle_manager.forget_query(query_id).await
-            + self.exchange_store.forget_query(query_id)
     }
 
     /// Live scan timeout, honouring hot-reloaded `scan_timeout_secs` when set.
@@ -1198,300 +1073,6 @@ impl WorkerFlightService {
         &self.credential_store
     }
 
-    /// Returns a reference to the shuffle manager.
-    #[cfg(feature = "worker-shuffle")]
-    pub fn shuffle_manager(&self) -> &ShuffleManager {
-        &self.shuffle_manager
-    }
-
-    /// Spillable DoExchange path: append into a per-attempt
-    /// [`SpillablePartitionBuffer`], finish (force residual spill), then stream
-    /// segments back without holding the full exchange volume in RAM.
-    #[cfg(feature = "worker-shuffle")]
-    async fn do_exchange_spill(
-        &self,
-        query_id: &str,
-        stage_id: &str,
-        partition_id: u32,
-        attempt_id: u32,
-        spill_manager: Arc<SpillManager>,
-        mut flight_batch_stream: FlightRecordBatchStream,
-    ) -> Result<Response<BoxStream<FlightData>>, Status> {
-        let attempt_gate = self.shuffle_manager.attempts().clone();
-        let budget_bytes = self.shuffle_memory_budget();
-
-        // Phase 8: reject late data against durable exchange winner registry.
-        let task_key = TaskKey::new(query_id, stage_id, format!("p{partition_id}"), partition_id);
-        if !self.exchange_store.admit(&task_key, attempt_id) {
-            return Err(Status::aborted(format!(
-                "rejecting late exchange attempt query={query_id} stage={stage_id} \
-                 partition={partition_id} attempt={attempt_id}"
-            )));
-        }
-
-        // Phase 7: admit a shuffle partition grant through the worker governor
-        // when configured. RAII guard releases the grant on all exit paths.
-        let grant_name = format!("{stage_id}-p{partition_id}-a{attempt_id}");
-        let consumer = ShufflePartitionConsumer {
-            name: grant_name.clone(),
-            desired: budget_bytes,
-            // Minimum: enough for one soft-watermark slice so a partition can
-            // always spill-progress rather than fail admission immediately.
-            minimum: (budget_bytes / 8).max(64 * 1024),
-        };
-        // Hold for the full DoExchange spill path; Drop releases the grant.
-        let mut _grant_guard: Option<sqe_spill::GrantGuard> = None;
-        let granted_capacity = if let Some(gov) = self.memory_governor.clone() {
-            match gov.try_admit_guarded(
-                AdmissionRequest {
-                    query_id: query_id.to_string(),
-                    name: grant_name.clone(),
-                    class: WorkloadClass::Shuffle,
-                    desired_bytes: consumer.desired,
-                    minimum_bytes: consumer.minimum,
-                },
-                &consumer,
-            ) {
-                Ok((grant, guard)) => {
-                    let cap = grant.capacity_bytes();
-                    debug!(
-                        query_id = %query_id,
-                        stage_id = %stage_id,
-                        partition_id = partition_id,
-                        granted = cap,
-                        desired = budget_bytes,
-                        admissions = gov.admissions(),
-                        "DoExchange shuffle grant admitted"
-                    );
-                    _grant_guard = Some(guard);
-                    cap
-                }
-                Err(sqe_spill::AdmissionDecision::Rejected {
-                    reason,
-                    pool_bytes,
-                    minima_sum,
-                }) => {
-                    return Err(Status::resource_exhausted(format!(
-                        "shuffle memory admission rejected for query={query_id} \
-                         stage={stage_id} partition={partition_id}: {reason} \
-                         (pool={pool_bytes}, minima={minima_sum})"
-                    )));
-                }
-                Err(sqe_spill::AdmissionDecision::Granted(_)) => budget_bytes,
-            }
-        } else {
-            budget_bytes
-        };
-
-        // Carve spill-read/merge headroom out of the *granted* capacity so
-        // writers cannot pin the entire grant while a drain still needs memory.
-        let (writer_cap, read_headroom) = split_default_read_headroom(granted_capacity);
-        let pool = Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(
-            writer_cap.max(1024 * 1024),
-        ));
-        let budget = ByteBudget::new(
-            format!("shuffle-{query_id}-{stage_id}-p{partition_id}"),
-            writer_cap,
-            Some(pool),
-        );
-        let _read_headroom = read_headroom;
-        debug!(
-            query_id = %query_id,
-            stage_id = %stage_id,
-            partition_id = partition_id,
-            writer_cap = writer_cap,
-            read_headroom = read_headroom,
-            granted_capacity = granted_capacity,
-            parent_budget = budget_bytes,
-            "DoExchange shuffle budget split (writer + spill-read headroom)"
-        );
-        let scope = SpillScope::new(query_id, stage_id, "do_exchange", partition_id, attempt_id);
-
-        // Lazy buffer: schema comes from the first non-empty batch.
-        let mut buffer: Option<SpillablePartitionBuffer> = None;
-        let mut batch_count = 0u64;
-        let mut rejected = 0u64;
-        let mut peak_resident = 0usize;
-        let mut schema: Option<arrow_schema::SchemaRef> = None;
-
-        while let Some(batch_result) = flight_batch_stream.next().await {
-            match batch_result {
-                Ok(batch) => {
-                    if batch.num_rows() == 0 {
-                        continue;
-                    }
-                    if !attempt_gate
-                        .admit(query_id, stage_id, partition_id, attempt_id)
-                        .await
-                    {
-                        rejected += 1;
-                        if let Some(ref mut buf) = buffer {
-                            buf.cancel();
-                        }
-                        break;
-                    }
-                    if buffer.is_none() {
-                        schema = Some(batch.schema());
-                        buffer = Some(SpillablePartitionBuffer::new(
-                            spill_manager.clone(),
-                            scope.clone(),
-                            batch.schema(),
-                            budget.clone(),
-                            Some(self.metrics.clone()),
-                        ));
-                    }
-                    let buf = buffer.as_mut().expect("buffer just created");
-                    if let Err(e) = buf.append(batch).await {
-                        buf.fail(e.to_string());
-                        return Err(Status::resource_exhausted(format!(
-                            "shuffle spill intake failed: {e}"
-                        )));
-                    }
-                    peak_resident = peak_resident.max(buf.resident_bytes());
-                    batch_count += 1;
-                }
-                Err(e) => {
-                    // Client disconnect / RPC cancel must not finish partial data.
-                    if let Some(ref mut buf) = buffer {
-                        if is_exchange_cancelled(&e) {
-                            buf.cancel();
-                        } else {
-                            buf.fail(e.to_string());
-                        }
-                    }
-                    if is_exchange_cancelled(&e) {
-                        return Err(Status::cancelled(format!(
-                            "DoExchange cancelled mid-intake: {e}"
-                        )));
-                    }
-                    return Err(Status::internal(format!(
-                        "Error decoding flight data in DoExchange: {e}"
-                    )));
-                }
-            }
-        }
-
-        debug!(
-            query_id = %query_id,
-            stage_id = %stage_id,
-            partition_id = partition_id,
-            attempt_id = attempt_id,
-            batch_count = batch_count,
-            rejected_late = rejected,
-            peak_resident = peak_resident,
-            budget = budget_bytes,
-            "DoExchange spill intake complete"
-        );
-
-        if rejected > 0 {
-            // Drop buffer (armed guard cleans spill) without shipping partial rows.
-            drop(buffer);
-            return Err(Status::aborted(format!(
-                "rejecting late shuffle data for query={query_id} stage={stage_id} \
-                 partition={partition_id} attempt={attempt_id} after {batch_count} batches"
-            )));
-        }
-
-        // Empty exchange: no schema observed — return an empty Flight stream.
-        let Some(schema) = schema else {
-            let shuffle_opts = ipc_options_for(self.shuffle_compression)?;
-            let empty =
-                futures::stream::empty::<Result<RecordBatch, arrow_flight::error::FlightError>>();
-            let flight_stream = FlightDataEncoderBuilder::new()
-                .with_schema(Arc::new(arrow_schema::Schema::empty()))
-                .with_options(shuffle_opts)
-                .build(empty)
-                .map_err(Status::from);
-            return Ok(Response::new(
-                Box::pin(flight_stream) as BoxStream<FlightData>
-            ));
-        };
-
-        let mut buffer = buffer.expect("schema implies buffer");
-        let manifest = buffer
-            .finish()
-            .await
-            .map_err(|e| Status::internal(format!("shuffle spill finish failed: {e}")))?;
-        info!(
-            query_id = %query_id,
-            stage_id = %stage_id,
-            partition_id = partition_id,
-            rows = manifest.rows,
-            batches = manifest.batches,
-            segments = manifest.segments,
-            physical_bytes = manifest.physical_bytes,
-            peak_resident = peak_resident,
-            "DoExchange spill partition finished"
-        );
-
-        // Phase 8: publish durable attempt manifest and commit as winner so
-        // retries can reuse segments and late lower attempts are rejected.
-        let task_id = format!("p{partition_id}");
-        let mut attempt_manifest =
-            AttemptManifest::new(query_id, stage_id, &task_id, partition_id, attempt_id);
-        attempt_manifest.rows = manifest.rows;
-        attempt_manifest.batches = manifest.batches;
-        attempt_manifest.logical_bytes = manifest.logical_bytes;
-        attempt_manifest.physical_bytes = manifest.physical_bytes;
-        attempt_manifest.segments = (0..manifest.segments)
-            .map(|i| format!("seg-{i:08}"))
-            .collect();
-        match self.exchange_store.publish(attempt_manifest) {
-            Err(e) => {
-                // publish() rejects only when this attempt is strictly lower
-                // than an already-committed winner, i.e. it is a stale loser.
-                // Falling through to drain would stream the losing attempt's
-                // rows to the consumer and duplicate the winner's output on
-                // retry, so abort rather than warn-and-continue.
-                return Err(Status::aborted(format!(
-                    "exchange attempt superseded by a committed winner: {e}"
-                )));
-            }
-            Ok(()) => {
-                let key = TaskKey::new(query_id, stage_id, &task_id, partition_id);
-                if let Err(e) = self.exchange_store.commit_winner(&key, attempt_id) {
-                    // Higher winner already committed — treat as late attempt.
-                    return Err(Status::aborted(format!(
-                        "exchange winner commit rejected: {e}"
-                    )));
-                }
-            }
-        }
-
-        let drain = buffer
-            .into_drain_stream()
-            .await
-            .map_err(|e| Status::internal(format!("shuffle spill drain open failed: {e}")))?;
-
-        // Keep the governor grant alive until the client finishes draining
-        // (or disconnects). Dropping it at the end of this function would free
-        // the grant while FlightData is still in flight.
-        let output_stream = GrantHeldStream {
-            inner: Box::pin(drain.map(|item| {
-                item.map_err(|e| {
-                    arrow_flight::error::FlightError::Tonic(Box::new(Status::internal(
-                        e.to_string(),
-                    )))
-                })
-            })),
-            _guard: _grant_guard,
-        };
-
-        let shuffle_opts = ipc_options_for(self.shuffle_compression)?;
-        self.metrics
-            .flight_encode_resident_bytes
-            .set(peak_resident as f64);
-        let flight_stream = FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .with_options(shuffle_opts)
-            .build(output_stream)
-            .map_err(Status::from);
-
-        Ok(Response::new(
-            Box::pin(flight_stream) as BoxStream<FlightData>
-        ))
-    }
-
     /// Wrap this service in a tonic server with an explicit inbound message
     /// ceiling (#432).
     ///
@@ -1506,43 +1087,6 @@ impl WorkerFlightService {
 }
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
-
-/// Holds a governor [`sqe_spill::GrantGuard`] for the lifetime of a Flight
-/// response stream so shuffle memory is not released mid-drain.
-#[cfg(feature = "worker-shuffle")]
-struct GrantHeldStream<S> {
-    inner: Pin<Box<S>>,
-    _guard: Option<sqe_spill::GrantGuard>,
-}
-
-#[cfg(feature = "worker-shuffle")]
-impl<S> Stream for GrantHeldStream<S>
-where
-    S: Stream + Unpin,
-{
-    type Item = S::Item;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.inner).poll_next(cx)
-    }
-}
-
-/// Detect client disconnect / RPC cancellation on the DoExchange request stream.
-#[cfg(feature = "worker-shuffle")]
-fn is_exchange_cancelled(err: &arrow_flight::error::FlightError) -> bool {
-    match err {
-        arrow_flight::error::FlightError::Tonic(status) => {
-            matches!(status.code(), tonic::Code::Cancelled | tonic::Code::Aborted)
-        }
-        other => {
-            let s = other.to_string().to_ascii_lowercase();
-            s.contains("cancel")
-                || s.contains("broken pipe")
-                || s.contains("connection reset")
-                || s.contains("h2 protocol error")
-        }
-    }
-}
 
 #[tonic::async_trait]
 impl FlightService for WorkerFlightService {
@@ -1949,7 +1493,8 @@ impl FlightService for WorkerFlightService {
         Err(Status::unimplemented("Workers don't support do_put"))
     }
 
-    /// Inert DoExchange for the default build (`worker-shuffle` off).
+    /// DoExchange is not part of the executed topology: workers scan and
+    /// stream Arrow back, every join/aggregate/sort runs on the coordinator.
     ///
     /// No query plan produces shuffle traffic, so serving an intake here would
     /// be pure attack surface: a secret holder could fill the spill volume and
@@ -1957,7 +1502,6 @@ impl FlightService for WorkerFlightService {
     /// `query_id`/`stage_id` (review finding 600). With the feature off those
     /// maps do not exist in this binary at all; the secret gate is kept so an
     /// unauthenticated caller still learns nothing about the build.
-    #[cfg(not(feature = "worker-shuffle"))]
     async fn do_exchange(
         &self,
         request: Request<Streaming<FlightData>>,
@@ -1965,193 +1509,6 @@ impl FlightService for WorkerFlightService {
         self.verify_worker_secret(request.metadata())?;
         Err(Status::unimplemented(
             "DoExchange shuffle intake is not enabled on this worker",
-        ))
-    }
-
-    #[cfg(feature = "worker-shuffle")]
-    async fn do_exchange(
-        &self,
-        request: Request<Streaming<FlightData>>,
-    ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        // Gate the shuffle stream behind the worker secret before consuming
-        // the request, exactly as `do_get`/`refresh_credentials` do. Without
-        // this an attacker with network access could push arbitrary
-        // RecordBatches into a stage receiver (result poisoning) or drain a
-        // partition channel for an in-flight distributed query.
-        self.verify_worker_secret(request.metadata())?;
-
-        let mut stream = request.into_inner();
-
-        // 1. Read the first FlightData message to get the descriptor.
-        let first_msg = stream.next().await.ok_or_else(|| {
-            Status::invalid_argument("DoExchange stream ended before descriptor message")
-        })??;
-
-        let descriptor = first_msg.flight_descriptor.as_ref().ok_or_else(|| {
-            Status::invalid_argument("First DoExchange message must contain a FlightDescriptor")
-        })?;
-
-        let exchange_desc = ExchangeDescriptor::from_bytes(&descriptor.cmd).map_err(|e| {
-            Status::invalid_argument(format!(
-                "Failed to decode ExchangeDescriptor from descriptor cmd: {e}"
-            ))
-        })?;
-
-        let (query_id, stage_id) = exchange_desc.stage_key();
-        let partition_id = exchange_desc.partition_id();
-        let attempt_id = exchange_desc.attempt_id();
-
-        info!(
-            query_id = %query_id,
-            stage_id = %stage_id,
-            partition_id = partition_id,
-            attempt_id = attempt_id,
-            "DoExchange: receiving shuffle data"
-        );
-
-        // Phase 4: reject late data from a losing/obsolete task attempt before
-        // touching partition buffers.
-        if !self
-            .shuffle_manager
-            .attempts()
-            .admit(&query_id, &stage_id, partition_id, attempt_id)
-            .await
-        {
-            return Err(Status::aborted(format!(
-                "rejecting late shuffle data for query={query_id} stage={stage_id} \
-                 partition={partition_id} attempt={attempt_id} (a newer attempt already won)"
-            )));
-        }
-
-        // 3. Decode incoming RecordBatches. Chain the first message (which may
-        //    also contain data) with the rest of the request stream.
-        let remaining_stream =
-            stream.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e)));
-        let first_stream = futures::stream::once(async move { Ok(first_msg) });
-        let combined = first_stream.chain(remaining_stream);
-        let flight_batch_stream = FlightRecordBatchStream::new_from_flight_data(combined);
-
-        // Prefer spillable intake when a SpillManager is configured: bounded
-        // resident memory under shuffle_memory_budget with soft-watermark
-        // spill. Falls back to the legacy mpsc ShuffleReceiver path otherwise.
-        if let Some(spill_manager) = self.spill_manager.clone() {
-            return self
-                .do_exchange_spill(
-                    query_id.as_str(),
-                    stage_id.as_str(),
-                    partition_id,
-                    attempt_id,
-                    spill_manager,
-                    flight_batch_stream,
-                )
-                .await;
-        }
-
-        let mut flight_batch_stream = flight_batch_stream;
-
-        // ── Legacy mpsc path (no spill substrate) ──────────────────────────
-        let shuffle_receiver = self
-            .shuffle_manager
-            .get(&query_id, &stage_id)
-            .await
-            .ok_or_else(|| {
-                Status::not_found(format!(
-                    "No shuffle receiver registered for query={query_id}, stage={stage_id} \
-                     (and spill is disabled)"
-                ))
-            })?;
-
-        if shuffle_receiver.sender(partition_id).is_none() {
-            return Err(Status::not_found(format!(
-                "No sender for partition {partition_id} in query={query_id}, stage={stage_id}"
-            )));
-        }
-
-        let schema = shuffle_receiver.schema().clone();
-        let query_id_clone = query_id.clone();
-        let stage_id_clone = stage_id.clone();
-        let intake_receiver = shuffle_receiver.clone();
-        let attempt_gate = self.shuffle_manager.attempts().clone();
-        tokio::spawn(async move {
-            let mut batch_count = 0u64;
-            let mut rejected = 0u64;
-            while let Some(batch_result) = flight_batch_stream.next().await {
-                match batch_result {
-                    Ok(batch) => {
-                        if batch.num_rows() == 0 {
-                            continue;
-                        }
-                        if !attempt_gate
-                            .admit(&query_id_clone, &stage_id_clone, partition_id, attempt_id)
-                            .await
-                        {
-                            rejected += 1;
-                            break;
-                        }
-                        batch_count += 1;
-                        if intake_receiver
-                            .send_batch(partition_id, batch)
-                            .await
-                            .is_err()
-                        {
-                            warn!(
-                                query_id = %query_id_clone,
-                                stage_id = %stage_id_clone,
-                                partition_id = partition_id,
-                                "Shuffle receiver channel closed, stopping intake"
-                            );
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            query_id = %query_id_clone,
-                            stage_id = %stage_id_clone,
-                            partition_id = partition_id,
-                            error = %e,
-                            "Error decoding flight data in DoExchange"
-                        );
-                        break;
-                    }
-                }
-            }
-            debug!(
-                query_id = %query_id_clone,
-                stage_id = %stage_id_clone,
-                partition_id = partition_id,
-                attempt_id = attempt_id,
-                batch_count = batch_count,
-                rejected_late = rejected,
-                "DoExchange intake complete (mpsc path)"
-            );
-        });
-
-        let rx = shuffle_receiver
-            .take_receiver(partition_id)
-            .await
-            .ok_or_else(|| {
-                Status::already_exists(format!(
-                    "Receiver for partition {partition_id} already taken \
-                     (query={query_id}, stage={stage_id})"
-                ))
-            })?;
-
-        let output_stream = futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|batch| (batch, rx))
-        });
-
-        let shuffle_opts = ipc_options_for(self.shuffle_compression)?;
-        self.metrics
-            .flight_encode_resident_bytes
-            .set(shuffle_receiver.resident_bytes() as f64);
-        let flight_stream = FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .with_options(shuffle_opts)
-            .build(output_stream.map(Ok))
-            .map_err(Status::from);
-
-        Ok(Response::new(
-            Box::pin(flight_stream) as Self::DoExchangeStream
         ))
     }
 
@@ -2759,14 +2116,12 @@ mod tests {
         assert_ne!(err.code(), tonic::Code::Unauthenticated);
     }
 
-    // ── Review finding 600: DoExchange is inert without `worker-shuffle` ─────
+    // ── DoExchange is inert (no shuffle topology) ─────
 
     /// Stands in for the gRPC frame decoder. The inert `do_exchange` must
     /// refuse before it reads a frame, so decoding here is a test failure.
-    #[cfg(not(feature = "worker-shuffle"))]
     struct NeverDecoder;
 
-    #[cfg(not(feature = "worker-shuffle"))]
     impl tonic::codec::Decoder for NeverDecoder {
         type Item = FlightData;
         type Error = Status;
@@ -2779,7 +2134,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "worker-shuffle"))]
     fn empty_exchange_request() -> Request<Streaming<FlightData>> {
         Request::new(Streaming::new_request(
             NeverDecoder,
@@ -2792,7 +2146,6 @@ mod tests {
     /// With the shuffle subsystem compiled out there is no receiver registry,
     /// attempt gate or exchange store in the process, so the endpoint must
     /// refuse outright rather than half-serve.
-    #[cfg(not(feature = "worker-shuffle"))]
     #[tokio::test]
     async fn do_exchange_is_unimplemented_without_worker_shuffle() {
         let svc = make_service("");
@@ -2806,7 +2159,6 @@ mod tests {
 
     /// The secret gate stays in front of the refusal, so an anonymous caller
     /// cannot probe which features a worker was built with.
-    #[cfg(not(feature = "worker-shuffle"))]
     #[tokio::test]
     async fn do_exchange_still_rejects_a_bad_secret_first() {
         let svc = make_service("expected-secret");
