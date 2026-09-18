@@ -6911,7 +6911,6 @@ dependencies = [
  "proptest",
  "sqe-core",
  "sqlparser",
- "tracing",
  "workspace-hack",
 ]
 
@@ -6926,7 +6925,6 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "chrono",
- "dashmap",
  "datafusion",
  "futures",
  "hex",

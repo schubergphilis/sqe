@@ -14,6 +14,7 @@
 //! Only the keyword pair is substituted; the parenthesised expression
 //! list is left untouched. The substitution is whole-token (case
 //! insensitive) and respects string literals.
+use crate::token_scan::is_ident_byte;
 
 /// Rewrite the `PARTITIONED BY` keyword pair to `PARTITION BY` so
 /// sqlparser-rs accepts the Iceberg-style transform list. Only matches
@@ -95,10 +96,6 @@ pub fn normalize_partitioned_by(sql: &str) -> String {
     }
 
     out
-}
-
-fn is_ident_byte(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_'
 }
 
 fn case_insensitive_eq(a: &[u8], b: &[u8]) -> bool {
