@@ -1,0 +1,11 @@
+[mcp_servers.sqe]
+url = "http://localhost:19092/mcp"
+default_tools_approval_mode = "writes"
+required = true
+startup_timeout_sec = 20
+tool_timeout_sec = 60
+
+# Okta gates dynamic client registration, so the pre-created native app is used.
+[mcp_servers.sqe.oauth]
+client_id = "OKTA_CLIENT_ID"
+callback_url = "http://localhost:8400/callback"
