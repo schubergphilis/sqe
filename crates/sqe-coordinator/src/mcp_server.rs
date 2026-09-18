@@ -53,6 +53,33 @@ pub fn mcp_router(
     )
 }
 
+/// The AWS SDK default-chain probe. The SDK config module is compiled only
+/// with an AWS catalog feature (`glue` / `s3tables`); a build without one
+/// cannot resolve the chain and says so instead of failing to compile.
+#[cfg(feature = "glue")]
+async fn sdk_chain_report() -> sqe_mcp::StorageCredentialReport {
+    let r = sqe_catalog::aws_config::probe_storage_credentials().await;
+    sqe_mcp::StorageCredentialReport {
+        status: r.status,
+        provider: r.provider,
+        expires_at: r.expires_at,
+        detail: r.detail,
+    }
+}
+
+#[cfg(not(feature = "glue"))]
+async fn sdk_chain_report() -> sqe_mcp::StorageCredentialReport {
+    sqe_mcp::StorageCredentialReport {
+        status: "unknown",
+        provider: "aws-sdk-default-chain",
+        expires_at: None,
+        detail: Some(
+            "built without the glue feature; the AWS SDK credential chain is not probed"
+                .to_string(),
+        ),
+    }
+}
+
 /// The engine's object-store credential probe for `list_catalogs`
 /// diagnostics, from the effective `[storage]` block.
 ///
@@ -67,17 +94,7 @@ pub fn mcp_router(
 /// few hours while SELECT 1 works".
 pub fn storage_probe(storage: &sqe_core::config::StorageConfig) -> sqe_mcp::StorageProbe {
     if storage.s3_access_key.is_empty() {
-        return Arc::new(|| {
-            Box::pin(async {
-                let r = sqe_catalog::aws_config::probe_storage_credentials().await;
-                sqe_mcp::StorageCredentialReport {
-                    status: r.status,
-                    provider: r.provider,
-                    expires_at: r.expires_at,
-                    detail: r.detail,
-                }
-            })
-        });
+        return Arc::new(|| Box::pin(sdk_chain_report()));
     }
     let temporary = !storage.s3_session_token.expose().is_empty();
     Arc::new(move || {
