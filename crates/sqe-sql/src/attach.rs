@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 
 use sqe_core::{Secret, SqeError, SqeErrorCode};
 
+use crate::token_scan::strip_prefix_ci;
+
 /// `ATTACH '<location>' AS <name> (TYPE <kind>, <option> = <value>, ...)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachStatement {
@@ -234,8 +236,7 @@ pub fn try_parse_attach(sql: &str) -> Result<Option<AttachStatement>, SqeError> 
     let after_location = after_location.trim();
 
     // Match `AS <name>`.
-    let after_as = after_location
-        .strip_prefix_ci("AS")
+    let after_as = strip_keyword_ci(after_location, "AS")
         .ok_or_else(|| err("ATTACH: expected AS <name> after the location string"))?;
     let after_as = after_as.trim();
 
@@ -349,13 +350,6 @@ pub fn try_parse_drop_secret(sql: &str) -> Result<Option<DropSecretStatement>, S
     }))
 }
 
-/// Returns `true` if the SQL is `SHOW SECRETS` (case-insensitive, with or
-/// without trailing semicolon and surrounding whitespace).
-pub fn is_show_secrets(sql: &str) -> bool {
-    let trimmed = sql.trim().trim_end_matches(';').trim();
-    trimmed.eq_ignore_ascii_case("SHOW SECRETS")
-}
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -364,30 +358,13 @@ fn err(msg: &str) -> SqeError {
     SqeError::with_code(SqeErrorCode::ExecutionFailed, msg.to_string())
 }
 
-/// Trait-like helper: case-insensitive prefix strip that requires a trailing
-/// non-identifier character (whitespace) to avoid swallowing `ASBC`-style
-/// identifiers when looking for the keyword `AS`.
-trait StripPrefixCi {
-    fn strip_prefix_ci(&self, prefix: &str) -> Option<&str>;
-}
-
-impl StripPrefixCi for str {
-    fn strip_prefix_ci(&self, prefix: &str) -> Option<&str> {
-        let plen = prefix.len();
-        if self.len() < plen {
-            return None;
-        }
-        if !self[..plen].eq_ignore_ascii_case(prefix) {
-            return None;
-        }
-        // Reject if the character right after the prefix could continue an
-        // identifier (e.g. `AS` must not match the start of `ASCII`).
-        let rest = &self[plen..];
-        match rest.chars().next() {
-            None => Some(rest),
-            Some(c) if !is_ident_continue(c) => Some(rest),
-            _ => None,
-        }
+/// Case-insensitive keyword strip that also requires the next character not
+/// to continue an identifier, so `AS` does not match the start of `ASCII`.
+fn strip_keyword_ci<'a>(s: &'a str, keyword: &str) -> Option<&'a str> {
+    let rest = strip_prefix_ci(s, keyword)?;
+    match rest.chars().next() {
+        Some(c) if is_ident_continue(c) => None,
+        _ => Some(rest),
     }
 }
 

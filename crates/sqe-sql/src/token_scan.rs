@@ -83,6 +83,20 @@ pub(crate) fn byte_offset(sql: &str, loc: Location) -> usize {
     sql.len()
 }
 
+/// Case-insensitive ASCII prefix strip. `prefix` must be ASCII, so its byte
+/// length is a char boundary in `s`; matching and slicing the same string
+/// avoids the uppercase-then-slice mismatch that used to panic (finding 107).
+pub(crate) fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let pfx = prefix.as_bytes();
+    let head = s.as_bytes().get(..pfx.len())?;
+    head.eq_ignore_ascii_case(pfx).then(|| &s[pfx.len()..])
+}
+
+/// True for a byte that can continue an unquoted SQL identifier.
+pub(crate) fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 /// The uppercased value of the token at `parser`'s current position plus `n`
 /// when it is an unquoted word (keyword or plain identifier); `None` for
 /// quoted identifiers, literals, punctuation and EOF.

@@ -19,7 +19,7 @@ use crate::tags::{
 };
 use crate::token_scan::{
     at_end, consume_word, consume_words, expect_end, expect_word, leading_words, parse_error,
-    parse_name_ref, parse_principal_name, remaining_text, syntax_error, word_at,
+    parse_name_ref, parse_principal_name, remaining_text, strip_prefix_ci, syntax_error, word_at,
 };
 
 /// Target for SHOW GRANTS statements.
@@ -394,27 +394,6 @@ pub fn parse_and_classify_typed(
     sql: &crate::pipeline_types::ClassifiableSql,
 ) -> sqe_core::Result<StatementKind> {
     parse_and_classify(sql.as_str())
-}
-
-/// Strip a case-insensitive ASCII `prefix` from `s`, returning the remainder.
-///
-/// The previous pre-scan tested `prefix` against `s.to_ascii_uppercase()` but sliced
-/// the ORIGINAL string by the prefix's byte length. `to_uppercase()` can change
-/// a string's byte length for some Unicode code points, so the matched-prefix
-/// length on the uppercased copy could differ from the byte span in the
-/// original and slice on a non-char-boundary (panic). Matching the prefix and
-/// slicing against the SAME string removes that mismatch entirely. All the
-/// keyword prefixes here are pure ASCII, so a byte-wise case-insensitive
-/// comparison is correct.
-fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    let bytes = s.as_bytes();
-    let pfx = prefix.as_bytes();
-    if bytes.len() >= pfx.len() && bytes[..pfx.len()].eq_ignore_ascii_case(pfx) {
-        // `prefix` is ASCII, so its byte length is a valid char boundary in `s`.
-        s.get(pfx.len()..)
-    } else {
-        None
-    }
 }
 
 /// Detect the Trino/SQL `ALTER TABLE ... DROP COLUMN [IF EXISTS] <a.b...>`
