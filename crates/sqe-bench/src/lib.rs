@@ -18,7 +18,6 @@ pub mod run;
 pub mod sink;
 pub mod status;
 pub mod suite;
-pub mod test;
 
 /// Format a scale factor as an identifier-safe string (no dots).
 /// 0.01 → "0_01", 1.0 → "1", 10.0 → "10"

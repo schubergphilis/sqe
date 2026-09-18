@@ -14,17 +14,6 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
 
-/// Initialize the full observability stack.
-///
-/// - Always: `tracing-subscriber` with JSON formatting + env filter
-/// - When `otlp_endpoint` is non-empty: adds OTel trace, metrics, and log
-///   exporters via OTLP/gRPC
-///
-/// Returns an [`OtelGuard`] that flushes and shuts down providers on drop.
-pub fn init_telemetry(service_name: &str, otlp_endpoint: &str) -> Result<OtelGuard, String> {
-    init_telemetry_with_sampling(service_name, otlp_endpoint, "", 0.01)
-}
-
 /// Initialize the full observability stack with a configurable trace sampling rate.
 ///
 /// `trace_sample_rate` controls the fraction of traces exported (0.0–1.0).

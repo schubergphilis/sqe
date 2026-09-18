@@ -1,5 +1,5 @@
 //! Fuzz the full message decoder: header + body, including the DataChunk
-//! payloads of PrepareResponse / FetchResponse / AppendRequest, and then the
+//! payloads of PrepareResponse / FetchResponse, and then the
 //! Arrow bridge for every chunk a well-formed message carries. Seeds live in
 //! `corpus/decode_message/` (captured from a real DuckDB `quack_serve`).
 #![no_main]
@@ -15,7 +15,6 @@ fuzz_target!(|data: &[u8]| {
     let chunks = match &body {
         QuackMessage::PrepareResponse(r) => r.results.iter().collect::<Vec<_>>(),
         QuackMessage::FetchResponse(r) => r.results.iter().collect(),
-        QuackMessage::AppendRequest(r) => vec![&r.append_chunk],
         _ => Vec::new(),
     };
     for chunk in chunks {

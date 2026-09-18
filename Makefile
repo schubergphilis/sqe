@@ -97,9 +97,7 @@ BENCH_ENV       = PROFILE=$(BENCH_PROFILE) BENCH_LOG_DIR=$(BENCH_LOG_DIR)
         test-integration test-distributed test-integration-down \
         audit audit-advisories \
         audit-deny audit-licenses \
-        benchmark_sf0.1 benchmark_sf1 benchmark_sf10 benchmark_all \
-        benchmark_sf0.1_trino benchmark_sf1_trino benchmark_sf10_trino \
-        benchmark_all_trino \
+        benchmark_all benchmark_all_trino \
         clippy fmt fmt-check pre-commit clean clean-rust clean-rustbook \
         clean-ebook clean-benchmark-charts clean-images check-tools maintain \
         build build-sqe sbom sbom-sqe sqe-config images \
@@ -323,28 +321,18 @@ audit-licenses:
 # ── Benchmarks ────────────────────────────────────────────────────────────
 # One suite sweep per scale factor; the _trino variants add --compare-trino
 # and fail the run if a Trino outage silently skipped any comparison.
-benchmark_sf0.1:
-	@$(BENCH_ENV) $(BENCH_RUN) 0.1 $(BENCH_SUITES)
+# `make benchmark_sf<scale>` / `make benchmark_sf<scale>_trino`; make picks
+# the `_trino` rule for its shorter stem.
+benchmark_sf%:
+	@$(BENCH_ENV) $(BENCH_RUN) $* $(BENCH_SUITES)
 
-benchmark_sf1:
-	@$(BENCH_ENV) $(BENCH_RUN) 1 $(BENCH_SUITES)
-
-benchmark_sf10:
-	@$(BENCH_ENV) $(BENCH_RUN) 10 $(BENCH_SUITES)
+benchmark_sf%_trino:
+	@$(BENCH_ENV) TRINO_MEMORY=$(TRINO_MEMORY) $(BENCH_RUN) $* --compare-trino $(BENCH_SUITES)
 
 benchmark_all:
 	@$(BENCH_ENV) $(BENCH_RUN) 0.1 $(BENCH_SUITES)
 	@$(BENCH_ENV) $(BENCH_RUN) 1 $(BENCH_SUITES)
 	@$(BENCH_ENV) $(BENCH_RUN) 10 $(BENCH_SUITES)
-
-benchmark_sf0.1_trino:
-	@$(BENCH_ENV) TRINO_MEMORY=$(TRINO_MEMORY) $(BENCH_RUN) 0.1 --compare-trino $(BENCH_SUITES)
-
-benchmark_sf1_trino:
-	@$(BENCH_ENV) TRINO_MEMORY=$(TRINO_MEMORY) $(BENCH_RUN) 1 --compare-trino $(BENCH_SUITES)
-
-benchmark_sf10_trino:
-	@$(BENCH_ENV) TRINO_MEMORY=$(TRINO_MEMORY) $(BENCH_RUN) 10 --compare-trino $(BENCH_SUITES)
 
 benchmark_all_trino:
 	@$(BENCH_ENV) TRINO_MEMORY=$(TRINO_MEMORY) $(BENCH_RUN) 0.1 --compare-trino $(BENCH_SUITES)

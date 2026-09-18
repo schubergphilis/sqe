@@ -18,7 +18,6 @@ pub struct RunArgs {
     pub host: String,
     pub port: u16,
     pub compare_trino: bool,
-    pub smoke: bool,
     pub query: Option<String>,
     /// Bearer token for the golden Polaris (the coordinator forwards it via
     /// bearer_passthrough). Sourced from env `BENCH_GOLDEN_TOKEN`.
@@ -30,12 +29,6 @@ pub struct RunArgs {
 }
 
 pub async fn run(args: RunArgs) -> anyhow::Result<()> {
-    if args.smoke {
-        anyhow::bail!(
-            "--smoke parity mode is not yet implemented (tracked for a follow-up); omit --smoke to run the suites"
-        );
-    }
-
     let profile = profile::load_profile(&args.profile)?;
     let creds = profile::resolve_s3_credentials(&profile.s3)?;
 
