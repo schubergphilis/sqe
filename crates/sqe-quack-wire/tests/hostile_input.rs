@@ -38,7 +38,6 @@ fn exercise(bytes: &[u8]) {
         let chunks: Vec<&DataChunk> = match &body {
             QuackMessage::PrepareResponse(r) => r.results.iter().collect(),
             QuackMessage::FetchResponse(r) => r.results.iter().collect(),
-            QuackMessage::AppendRequest(r) => vec![&r.append_chunk],
             _ => Vec::new(),
         };
         for chunk in chunks {

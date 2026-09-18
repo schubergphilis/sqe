@@ -34,15 +34,8 @@ pub struct QuackTableProvider {
 }
 
 impl QuackTableProvider {
-    /// Connect to `uri`, run `sql`, cache the result. Schema is inferred
-    /// from the first `RecordBatch`; an empty result set is reported as an
-    /// error because we can't synthesize an Arrow schema with no data.
-    pub fn new(uri: &str, token: Option<&str>, sql: &str) -> Result<Self, ClientError> {
-        Self::new_with_policy(uri, token, sql, QuackTargetPolicy::permissive())
-    }
-
-    /// Like [`QuackTableProvider::new`] but the destination must pass
-    /// `policy` before a socket is opened and the decoded result is capped
+    /// Connect to `uri`, run `sql`, cache the result. The destination must
+    /// pass `policy` before a socket is opened and the decoded result is capped
     /// by `policy.max_result_bytes`. This is the constructor the SQL-facing
     /// TVF uses (review finding 604).
     pub fn new_with_policy(
@@ -63,10 +56,6 @@ impl QuackTableProvider {
         })
     }
 
-    /// Number of batches captured.
-    pub fn batches(&self) -> &[arrow_array::RecordBatch] {
-        &self.batches
-    }
 }
 
 #[async_trait]

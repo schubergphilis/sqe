@@ -46,7 +46,7 @@ use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::SessionContext;
 use sqe_core::config::StorageConfig;
 
-use crate::writable_iceberg_catalog::WritableIcebergCatalog;
+use sqe_catalog::writable_iceberg_catalog::WritableIcebergCatalog;
 
 use crate::client::{QueryResult, SqlClient};
 
@@ -697,21 +697,6 @@ impl EmbeddedClient {
             hive_roots: HashMap::new(),
             storage,
         })
-    }
-
-    /// Build an embedded client backed by a cloud catalog (Glue or
-    /// S3 Tables), attached read-only and mounted under `catalog_name`.
-    /// Auth uses the AWS credential chain. Requires the `aws` cargo
-    /// feature; without it the backend constructor returns a clear
-    /// error naming the missing feature.
-    #[allow(dead_code)]
-    pub async fn with_backend(
-        memory_limit_bytes: usize,
-        backend: sqe_core::config::CatalogBackend,
-        catalog_name: &str,
-        s3: &EmbeddedS3Options,
-    ) -> anyhow::Result<Self> {
-        Self::with_backend_and_policy(memory_limit_bytes, backend, catalog_name, s3, None).await
     }
 
     pub async fn with_backend_and_policy(
