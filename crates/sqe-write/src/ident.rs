@@ -96,16 +96,7 @@ pub fn resolve_table_ident(
 /// the read path's `sqe_sql::extract_catalog_qualifiers` access (`.value`, no
 /// quote/case normalisation) so reads and writes resolve the same catalog name.
 pub fn catalog_qualifier(name: &ObjectName) -> Option<String> {
-    let parts: Vec<&str> = name
-        .0
-        .iter()
-        .filter_map(|p| p.as_ident())
-        .map(|ident| ident.value.as_str())
-        .collect();
-    match parts.as_slice() {
-        [catalog, _namespace, _table] => Some((*catalog).to_string()),
-        _ => None,
-    }
+    leading_qualifier(name, 3)
 }
 
 /// Extract the catalog qualifier from a 2-part *schema* reference
@@ -114,16 +105,18 @@ pub fn catalog_qualifier(name: &ObjectName) -> Option<String> {
 /// `CREATE/DROP SCHEMA catalog.schema` is two parts (catalog + namespace),
 /// whereas a table reference is three (catalog + namespace + table).
 pub fn schema_catalog_qualifier(name: &ObjectName) -> Option<String> {
-    let parts: Vec<&str> = name
+    leading_qualifier(name, 2)
+}
+
+/// First identifier of `name` when it has exactly `parts` identifiers.
+fn leading_qualifier(name: &ObjectName, parts: usize) -> Option<String> {
+    let idents: Vec<&str> = name
         .0
         .iter()
         .filter_map(|p| p.as_ident())
         .map(|ident| ident.value.as_str())
         .collect();
-    match parts.as_slice() {
-        [catalog, _schema] => Some((*catalog).to_string()),
-        _ => None,
-    }
+    (idents.len() == parts).then(|| idents[0].to_string())
 }
 
 #[cfg(test)]

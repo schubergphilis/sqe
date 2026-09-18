@@ -219,7 +219,7 @@ pub struct QueryHandler {
     /// emit-eligible (see `should_emit`), `execute()` calls
     /// `on_query_start` / `on_query_complete` / `on_query_fail` around the
     /// dispatch.
-    lineage: Option<Arc<dyn sqe_lineage::LineageObserver>>,
+    lineage: Option<Arc<sqe_lineage::ChannelObserver>>,
     query_tracker: Arc<QueryTracker>,
     query_cache: Option<Arc<ResultCache>>,
     /// Semaphore limiting global concurrent query execution.
@@ -353,7 +353,7 @@ impl QueryHandler {
         query_tracker: Arc<QueryTracker>,
         query_cache: Option<Arc<ResultCache>>,
         grant_backend: Option<Arc<dyn GrantBackend>>,
-        lineage: Option<Arc<dyn sqe_lineage::LineageObserver>>,
+        lineage: Option<Arc<sqe_lineage::ChannelObserver>>,
         runtime_catalogs: RuntimeCatalogRegistry,
         secrets: SecretStore,
     ) -> sqe_core::Result<Self> {
