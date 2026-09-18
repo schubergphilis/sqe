@@ -1843,6 +1843,23 @@ impl HiveSchemaProvider {
                 }
             }
         };
+        // A view body names its base tables the way the author wrote them
+        // (`t`, `db.t`, `awsdatacatalog.db.t`) and DataFusion keeps that
+        // spelling in the `TableScan`. The policy rewriter keys a scan with
+        // no catalog as an Iceberg table (`resolve_policy_key`), and there an
+        // unknown tag state denies fail-closed: on the first live Glue
+        // catalog every Athena view answered zero rows while its base tables
+        // read fine by their three-part names. Qualify every scan under this
+        // root so policy sees `{root}.{db}`, the key the Ranger grants use.
+        let mut aliases = vec!["awsdatacatalog"];
+        aliases.extend(view.catalog.as_deref());
+        let plan = match qualify_view_scans(plan, &self.catalog_name, &default_schema, &aliases) {
+            Ok(p) => p,
+            Err(e) => {
+                hidden("its base-table references could not be qualified", e.to_string());
+                return Ok(None);
+            }
+        };
         let plan = match state.optimize(&plan) {
             Ok(p) => p,
             Err(e) => {
@@ -1852,6 +1869,43 @@ impl HiveSchemaProvider {
         };
         Ok(Some(Arc::new(ViewTable::new(plan, Some(sql)))))
     }
+}
+
+/// Rewrite every `TableScan` of a view body to `{root}.{schema}.{table}`.
+///
+/// A scan that already names another catalog is left alone unless that name
+/// is one of `aliases` (Athena writes `awsdatacatalog`, Trino the catalog the
+/// view was created in), which all mean this root. A scan with no schema takes
+/// `default_schema`, the database the view lives in, exactly as the planner
+/// resolved it.
+fn qualify_view_scans(
+    plan: LogicalPlan,
+    root: &str,
+    default_schema: &str,
+    aliases: &[&str],
+) -> DFResult<LogicalPlan> {
+    plan.transform_down(|node| {
+        let LogicalPlan::TableScan(mut scan) = node else {
+            return Ok(Transformed::no(node));
+        };
+        let ours = match scan.table_name.catalog() {
+            None => true,
+            Some(c) => c == root || aliases.contains(&c),
+        };
+        if !ours {
+            return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
+        }
+        let schema = scan
+            .table_name
+            .schema()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(default_schema)
+            .to_string();
+        let table = scan.table_name.table().to_string();
+        scan.table_name = datafusion::common::TableReference::full(root, schema, table);
+        Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
+    })
+    .data()
 }
 
 impl fmt::Debug for HiveSchemaProvider {
@@ -2136,6 +2190,56 @@ impl SchemaProvider for HiveSchemaProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Athena view bodies reference base tables as `t`, `db.t` or
+    /// `awsdatacatalog.db.t`; policy keys on the catalog, so every scan must
+    /// end up under the Hive root (#667 follow-up: views answered zero rows).
+    #[tokio::test]
+    async fn view_scans_are_qualified_under_the_root() {
+        use datafusion::arrow::array::Int32Array;
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::catalog::{MemoryCatalogProvider, MemorySchemaProvider};
+        use datafusion::datasource::MemTable;
+        use datafusion::prelude::SessionConfig;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
+        let mem = MemorySchemaProvider::new();
+        mem.register_table("t".into(), Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()))
+            .unwrap();
+        let cat = Arc::new(MemoryCatalogProvider::new());
+        cat.register_schema("db", Arc::new(mem)).unwrap();
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_default_catalog_and_schema("glue", "db"),
+        );
+        ctx.register_catalog("glue", Arc::clone(&cat) as Arc<dyn CatalogProvider>);
+        ctx.register_catalog("awsdatacatalog", cat as Arc<dyn CatalogProvider>);
+
+        let sql = "SELECT t.a FROM t \
+                   JOIN db.t AS t2 ON t.a = t2.a \
+                   JOIN awsdatacatalog.db.t AS t3 ON t.a = t3.a";
+        let plan = ctx.state().create_logical_plan(sql).await.unwrap();
+
+        fn scan_names(plan: &LogicalPlan) -> Vec<String> {
+            let mut names = Vec::new();
+            plan.apply(|node| {
+                if let LogicalPlan::TableScan(scan) = node {
+                    names.push(scan.table_name.to_string());
+                }
+                Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+            names
+        }
+        let before = scan_names(&plan);
+        assert!(
+            before.iter().any(|n| !n.starts_with("glue.")),
+            "premise: the planner keeps the author's spelling, got {before:?}"
+        );
+
+        let plan = qualify_view_scans(plan, "glue", "db", &["awsdatacatalog"]).unwrap();
+        assert_eq!(scan_names(&plan), vec!["glue.db.t"; 3]);
+    }
     use datafusion::common::Column;
 
     fn col(name: &str) -> Expr {
