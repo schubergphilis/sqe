@@ -10,7 +10,6 @@ pub mod file_tvf_common;
 pub mod file_tvf_prepare;
 pub mod footer_cache;
 pub mod grant_chameleon;
-pub mod hf_tree_cache;
 #[cfg(feature = "hive-external")]
 pub mod hive;
 #[cfg(feature = "rest")]
@@ -39,11 +38,6 @@ pub use session_tuning::engine_session_config;
 pub mod schema_provider;
 #[cfg(feature = "rest")]
 pub mod table_provider;
-// `read_delta` is temporarily unwired for the DataFusion 54 bump: deltalake-core
-// has no DF 54 release yet (its `DeltaTableProvider` targets an older DataFusion).
-// The module file is kept on disk; restore this `pub mod` and the `delta` feature
-// in Cargo.toml once delta-rs ships DF 54 support.
-// pub mod read_delta;
 pub mod read_json;
 mod read_json_buffer;
 pub mod read_parquet;
@@ -56,7 +50,6 @@ pub mod system_catalog;
 pub mod system_jdbc;
 #[cfg(feature = "rest")]
 pub mod system_metadata;
-pub mod topk;
 pub mod writable_iceberg_catalog;
 
 pub use access_control::AccessControlClient;

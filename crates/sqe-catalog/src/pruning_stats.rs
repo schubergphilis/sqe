@@ -436,7 +436,7 @@ fn median_relative_spread(per_file: &[(f64, f64)]) -> Option<f64> {
         .iter()
         .map(|(lo, hi)| ((hi - lo) / range).clamp(0.0, 1.0))
         .collect();
-    spreads.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    spreads.sort_by(f64::total_cmp);
     let mid = spreads.len() / 2;
     Some(if spreads.len() % 2 == 0 {
         (spreads[mid - 1] + spreads[mid]) / 2.0
