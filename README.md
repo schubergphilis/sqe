@@ -298,7 +298,7 @@ Full archive in [`docs/site/blog/`](docs/site/blog/).
 | `sqe-policy` | Policy enforcement (passthrough, in-memory, Apache Ranger) |
 | `sqe-planner` | Plan splitting, star-schema reorder, join strategy |
 | `sqe-coordinator` | Flight SQL server, query handler, Trino HTTP |
-| `sqe-worker` | Stateless DataFusion executor |
+| `sqe-worker` | Stateless DataFusion executor (library; runs as `sqe-server --mode worker`) |
 | `sqe-cli` | Interactive SQL client (cluster + embedded modes) |
 | `sqe-metrics` | Prometheus, OpenTelemetry, audit logger |
 | `sqe-lineage` | OpenLineage 2-0-2 emitter; column-level lineage |

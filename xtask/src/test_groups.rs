@@ -38,7 +38,7 @@ use serde::Serialize;
 /// checker rejects anything else so a typo cannot create a group of one.
 pub const STACKS: &[(&str, &str)] = &[
     ("polaris", "docker-compose.test.yml: Polaris (in-memory) + RustFS; `make test-integration`"),
-    ("polaris+workers", "test.yml + docker-compose.distributed.yml (two sqe-worker processes); `make test-distributed`"),
+    ("polaris+workers", "test.yml + docker-compose.distributed.yml (two `sqe-server --mode worker` processes); `make test-distributed`"),
     ("ranger", "quickstart/polaris-ranger-keycloak; `scripts/access-control-test.sh`"),
     ("ranger+spark", "quickstart/polaris-ranger-keycloak plus Spark; `scripts/spark-access-control-test.sh`"),
     ("spark", "docker-compose.spark.yml + iceberg-spark-runtime"),

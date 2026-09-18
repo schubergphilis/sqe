@@ -871,6 +871,7 @@ impl MaintenanceHandler {
         snapshot_properties: Option<std::collections::HashMap<String, String>>,
     ) -> sqe_core::Result<RewriteOutcome> {
         const MAX_COMMIT_ATTEMPTS: usize = 4;
+
         let mut attempt: usize = 0;
         loop {
             attempt += 1;
@@ -894,11 +895,8 @@ impl MaintenanceHandler {
                     // classify_commit_error tags retryable conflicts in the
                     // message ("retryable" / "conflict"). Anything else is a
                     // permanent failure we surface immediately.
-                    let msg = e.to_string().to_lowercase();
-                    let retryable = msg.contains("retryable") || msg.contains("conflict");
-                    if retryable && attempt < MAX_COMMIT_ATTEMPTS {
-                        let backoff =
-                            std::time::Duration::from_millis(50 * (1u64 << (attempt - 1)));
+                    if is_retryable_commit_error(&e) && attempt < MAX_COMMIT_ATTEMPTS {
+                        let backoff = commit_backoff(attempt);
                         warn!(
                             table = %to_table_ident(table_ref),
                             attempt,
@@ -1460,11 +1458,8 @@ impl MaintenanceHandler {
                     // re-dispatch from scratch rather than patch the stale
                     // attempt, for the same correctness reason
                     // `rewrite_data_files` re-reads on retry.
-                    let msg = e.to_string().to_lowercase();
-                    let retryable = msg.contains("retryable") || msg.contains("conflict");
-                    if retryable && attempt < MAX_COMMIT_ATTEMPTS {
-                        let backoff =
-                            std::time::Duration::from_millis(50 * (1u64 << (attempt - 1)));
+                    if is_retryable_commit_error(&e) && attempt < MAX_COMMIT_ATTEMPTS {
+                        let backoff = commit_backoff(attempt);
                         warn!(
                             table = %to_table_ident(table_ref),
                             attempt,
@@ -2199,11 +2194,11 @@ impl MaintenanceHandler {
                     // commit`'s own internal retry budget exhausted by
                     // sustained contention). Reload and re-dispatch, same
                     // as above, rather than recommitting stale output.
-                    let msg = e.to_string().to_lowercase();
-                    let retryable = msg.contains("retryable") || msg.contains("conflict");
-                    if retry_on_conflict && retryable && attempt < MAX_COMMIT_ATTEMPTS {
-                        let backoff =
-                            std::time::Duration::from_millis(50 * (1u64 << (attempt - 1)));
+                    if retry_on_conflict
+                        && is_retryable_commit_error(&e)
+                        && attempt < MAX_COMMIT_ATTEMPTS
+                    {
+                        let backoff = commit_backoff(attempt);
                         warn!(
                             table = %ident,
                             attempt,
@@ -3057,6 +3052,18 @@ fn is_strictly_under(candidate: &str, base: &str) -> bool {
     let b = canonicalize_uri(base);
     let prefix = format!("{b}/");
     cand.starts_with(&prefix) && cand.len() > prefix.len()
+}
+
+/// `classify_commit_error` tags retryable conflicts in the message
+/// ("retryable" / "conflict"). Anything else is a permanent failure.
+fn is_retryable_commit_error(e: &impl std::fmt::Display) -> bool {
+    let msg = e.to_string().to_lowercase();
+    msg.contains("retryable") || msg.contains("conflict")
+}
+
+/// Exponential backoff before retrying commit `attempt` (1-based).
+fn commit_backoff(attempt: usize) -> std::time::Duration {
+    std::time::Duration::from_millis(50 * (1u64 << (attempt - 1)))
 }
 
 /// Translate an iceberg commit error into an SQE error, preserving retryable

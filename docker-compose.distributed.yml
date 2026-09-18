@@ -37,7 +37,7 @@ services:
   # ── SQE Worker 1 ───────────────────────────────────────────
   worker-1:
     build: .
-    entrypoint: ["sqe-worker", "--config", "/config/worker.toml"]
+    entrypoint: ["sqe-server", "--mode", "worker", "--config", "/config/worker.toml"]
     volumes:
       - ./tests/distributed/worker.toml:/config/worker.toml:ro
     ports:
@@ -58,7 +58,7 @@ services:
   # ── SQE Worker 2 ───────────────────────────────────────────
   worker-2:
     build: .
-    entrypoint: ["sqe-worker", "--config", "/config/worker.toml"]
+    entrypoint: ["sqe-server", "--mode", "worker", "--config", "/config/worker.toml"]
     volumes:
       - ./tests/distributed/worker.toml:/config/worker.toml:ro
     ports:
