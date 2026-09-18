@@ -95,11 +95,9 @@ sqe-quack-server = { path = "../sqe-quack-server" }
 sqe-quack-client = { path = "../sqe-quack-client" }
 sqe-mcp = { path = "../sqe-mcp" }
 sqe-lineage = { path = "../sqe-lineage" }
-prometheus = { workspace = true }
 chrono = { workspace = true }
 croner = { workspace = true }
 axum = { workspace = true }
-reqwest = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 subtle = { workspace = true }

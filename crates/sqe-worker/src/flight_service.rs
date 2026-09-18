@@ -842,14 +842,6 @@ impl WorkerFlightService {
         &self.scan_budget
     }
 
-    /// Share a [`WorkerStatus`] created elsewhere (the heartbeat task reads
-    /// the same one).
-    #[must_use = "with_status consumes self; bind the returned service"]
-    pub fn with_status(mut self, status: Arc<WorkerStatus>) -> Self {
-        self.status = status;
-        self
-    }
-
     /// Process identity and load counters (finding 609).
     pub fn status(&self) -> &Arc<WorkerStatus> {
         &self.status

@@ -4289,17 +4289,18 @@ impl QueryHandler {
             })
             .collect();
 
-        let scheduler = crate::scheduler::WeightedScheduler::new();
-        // `NoHealthyWorkers` here is the race with the health checker between
-        // reading `healthy` above and now: infrastructure, so `Err` (402).
+        // `None` here is the race with the health checker between reading
+        // `healthy` above and now: infrastructure, so `Err` (402).
         let assignments =
-            crate::scheduler::FragmentScheduler::assign(&scheduler, &scan_tasks, &worker_infos)
-                .map_err(|e| {
-                    SqeError::with_code(
-                        SqeErrorCode::ExecutionFailed,
-                        format!("scheduling {} scan tasks failed: {e}", scan_tasks.len()),
-                    )
-                })?;
+            crate::scheduler::assign(&scan_tasks, &worker_infos).ok_or_else(|| {
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!(
+                        "scheduling {} scan tasks failed: no healthy workers available",
+                        scan_tasks.len()
+                    ),
+                )
+            })?;
 
         let worker_urls: Vec<String> = assignments.iter().map(|a| a.worker_url.clone()).collect();
 

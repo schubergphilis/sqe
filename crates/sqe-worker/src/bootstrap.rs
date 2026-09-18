@@ -1,17 +1,15 @@
 //! Shared worker bootstrap.
 //!
-//! Both the standalone `sqe-worker` binary and `sqe-server --mode worker` must
-//! build an identically-wired [`WorkerFlightService`]: shared worker secret,
+//! `sqe-server --mode worker` builds the wired [`WorkerFlightService`] here: shared worker secret,
 //! Parquet footer cache, credential store, IPC compression, and a running
 //! heartbeat task. Before this module the two paths diverged: `run_worker` in
 //! sqe-server dropped `.with_worker_secret()`, the footer cache, and never
 //! started the heartbeat, so Helm-deployed workers (which run `--mode worker`)
 //! were unauthenticated, uncached, and invisible to the coordinator (#219).
 //!
-//! One function ([`build_worker_service`]) now wires the service, derives the
-//! advertise URL, starts the heartbeat, and emits the security warnings. Each
-//! binary keeps its own TLS-build and `serve` loop (they differ: sqe-server
-//! adds a health server and graceful shutdown).
+//! One function ([`build_worker_service_with_hot_reload`]) wires the service,
+//! derives the advertise URL, starts the heartbeat, and emits the security
+//! warnings; the binary keeps the TLS build and `serve` loop.
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -36,30 +34,8 @@ use crate::config_reload::{
 use crate::flight_service::WorkerFlightService;
 use crate::heartbeat;
 
-/// Build the fully-wired worker Flight service and start its heartbeat task.
-///
-/// Wiring (kept identical across both binaries):
-/// - worker secret (authenticates inbound scan tickets / credential refresh);
-/// - Parquet footer cache sized from `storage.footer_cache_size`;
-/// - DoGet + shuffle IPC compression from `coordinator.shuffle_compression`;
-/// - scan timeout from `worker.scan_timeout_secs`;
-/// - a background heartbeat to `worker.coordinator_url` advertising a routable
-///   URL derived via [`derive_advertise_url`].
-///
-/// Fails loudly when a configured key would otherwise be silently inert: an
-/// undeliverable advertise URL aborts startup rather than letting the worker
-/// run invisibly. `SqeConfig::validate()` (called by each binary before this)
-/// already rejects the empty-secret and plaintext-transport cases.
-pub fn build_worker_service(
-    config: &SqeConfig,
-    metrics: Arc<WorkerMetricsRegistry>,
-    session_ctx: SessionContext,
-) -> anyhow::Result<WorkerFlightService> {
-    build_worker_service_with_hot_reload(config, metrics, session_ctx, None, None)
-}
-
-/// Like [`build_worker_service`], with optional resizable pool + config path for
-/// memory hot-reload and live cgroup need tracking.
+/// Optional resizable pool + config path enable memory hot-reload and live
+/// cgroup need tracking.
 pub fn build_worker_service_with_hot_reload(
     config: &SqeConfig,
     metrics: Arc<WorkerMetricsRegistry>,

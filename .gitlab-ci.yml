@@ -153,9 +153,9 @@ release-binaries:
       set -euo pipefail
       echo "profile: $CARGO_PROFILE"
       cargo build --locked --profile "$CARGO_PROFILE" --no-default-features \
-        --bin sqe-server --bin sqe-worker --bin sqe-cli --bin sqe-bench
+        --bin sqe-server --bin sqe-cli --bin sqe-bench
       mkdir -p out
-      for b in sqe-server sqe-worker sqe-cli sqe-bench; do
+      for b in sqe-server sqe-cli sqe-bench; do
         cp "target/$CARGO_PROFILE/$b" out/
         strip "out/$b"
       done

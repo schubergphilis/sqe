@@ -34,7 +34,7 @@ LABEL org.opencontainers.image.title="sqe" \
       org.opencontainers.image.revision="${GIT_REVISION}" \
       org.opencontainers.image.source="https://github.com/schuberg/sqe"
 
-COPY out/sqe-server out/sqe-worker out/sqe-cli /usr/local/bin/
+COPY out/sqe-server out/sqe-cli /usr/local/bin/
 COPY --from=healthcheck-bin /bin/wget /usr/local/bin/wget
 
 EXPOSE 50051 50052 8080 9090 9091

@@ -72,8 +72,7 @@ RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},sharing=locked,target
     FEATURES=""; if [ -n "$CATALOG_FEATURES" ]; then FEATURES="--features ${CATALOG_FEATURES}"; fi; \
     cargo chef cook --locked --profile "${CARGO_PROFILE}" \
       --recipe-path recipe.json --no-default-features $FEATURES \
-      --package sqe-server --package sqe-worker \
-      --package sqe-cli --package sqe-bench \
+      --package sqe-server --package sqe-cli --package sqe-bench \
     && sccache --show-stats
 
 FROM deps AS builder
@@ -90,10 +89,9 @@ RUN --mount=type=cache,id=sqe-cargo-registry-${TARGETARCH},sharing=locked,target
     --mount=type=cache,id=sqe-target-${CARGO_PROFILE}-${TARGETARCH},sharing=locked,target=/build/target \
     FEATURES=""; if [ -n "$CATALOG_FEATURES" ]; then FEATURES="--features ${CATALOG_FEATURES}"; fi; \
     cargo build --locked --profile "${CARGO_PROFILE}" --no-default-features $FEATURES \
-      --bin sqe-server --bin sqe-worker --bin sqe-cli --bin sqe-bench \
+      --bin sqe-server --bin sqe-cli --bin sqe-bench \
     && mkdir -p /build/out \
     && cp "target/${CARGO_PROFILE}/sqe-server" \
-      "target/${CARGO_PROFILE}/sqe-worker" \
       "target/${CARGO_PROFILE}/sqe-cli" \
       "target/${CARGO_PROFILE}/sqe-bench" /build/out/ \
     && sccache --show-stats
@@ -129,8 +127,7 @@ LABEL org.opencontainers.image.title="sqe" \
       org.opencontainers.image.revision="${GIT_REVISION}" \
       org.opencontainers.image.source="https://github.com/schuberg/sqe"
 
-COPY --from=builder /build/out/sqe-server /build/out/sqe-worker \
-    /build/out/sqe-cli /usr/local/bin/
+COPY --from=builder /build/out/sqe-server /build/out/sqe-cli /usr/local/bin/
 COPY --from=healthcheck-bin /bin/wget /usr/local/bin/wget
 
 EXPOSE 50051 50052 8080 9090 9091
