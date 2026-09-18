@@ -1,4 +1,4 @@
-//! Phase 0/1 memory gates: zero-pruning scan, wide-batch queue bounds, shuffle.
+//! Phase 0/1 memory gates: zero-pruning scan and wide-batch queue bounds.
 //!
 //! Plan: `docs/superpowers/plans/2026-07-25-bounded-memory-spill-execution.md`
 //!
@@ -10,19 +10,13 @@ mod common;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-#[cfg(feature = "worker-shuffle")]
-use arrow_array::RecordBatch;
 use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
-#[cfg(feature = "worker-shuffle")]
-use sqe_spill::ByteBudget;
 use sqe_worker::executor::{
     execute_scan_streaming_with_store, ScanBudget, SCAN_CHANNEL_ITEM_CAPACITY,
 };
-#[cfg(feature = "worker-shuffle")]
-use sqe_worker::shuffle::{ShuffleReceiver, DEFAULT_CHANNEL_CAPACITY};
 
 use common::*;
 
@@ -211,140 +205,4 @@ async fn phase0_reproducer_wide_batch_queue_exceeds_narrow() {
     })
     .expect("write baseline");
     eprintln!("wrote baseline case to {}", path.display());
-}
-
-/// Phase 0 gate: item-bounded shuffle can hold ≥10x a configured budget.
-///
-/// Shuffle-only, so it compiles only with `worker-shuffle` (finding 600).
-#[cfg(feature = "worker-shuffle")]
-#[tokio::test]
-async fn phase0_reproducer_shuffle_exceeds_byte_budget() {
-    let metrics = worker_metrics();
-    let schema = wide_batch(1, 16).schema();
-    let receiver = ShuffleReceiver::new_with_metrics(
-        1,
-        schema,
-        DEFAULT_CHANNEL_CAPACITY,
-        Some(metrics.clone()),
-    )
-    // This reproducer measures the old item-only bound. The production
-    // receiver now has a byte cap; leaving it enabled would correctly
-    // backpressure this producer, which has no consumer, and hang the test.
-    .with_max_resident_bytes(0);
-
-    const ROWS: usize = 256;
-    const PAYLOAD: usize = 4_096;
-    let mut sent = 0usize;
-    let mut buffered_bytes = 0usize;
-
-    for _ in 0..DEFAULT_CHANNEL_CAPACITY {
-        let batch = wide_batch(ROWS, PAYLOAD);
-        let sz = batch.get_array_memory_size();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            receiver.send_batch(0, batch),
-        )
-        .await
-        .expect("item-only reproducer send must not block")
-        .expect("channel should accept up to capacity");
-        sent += 1;
-        buffered_bytes += sz;
-    }
-
-    let resident = receiver.resident_bytes();
-    assert_eq!(sent, DEFAULT_CHANNEL_CAPACITY);
-    assert_eq!(resident, buffered_bytes);
-    assert!(
-        resident >= 10 * SHUFFLE_MEMORY_BUDGET_BYTES,
-        "expected shuffle resident bytes ({resident}) ≥ 10x budget ({})",
-        SHUFFLE_MEMORY_BUDGET_BYTES
-    );
-
-    let path = record_baseline_case(BaselineCase {
-        name: "shuffle_exceeds_byte_budget".to_string(),
-        wall_time_ms: 0,
-        bytes_input: buffered_bytes as u64,
-        bytes_decoded_or_buffered: resident as u64,
-        peak_rss_bytes: process_rss_bytes(),
-        peak_tracked_bytes: metrics.shuffle_resident_bytes.get() as u64,
-        failure_reason: Some(format!(
-            "item-bounded shuffle held {resident} bytes at capacity {DEFAULT_CHANNEL_CAPACITY} \
-             against budget {}",
-            SHUFFLE_MEMORY_BUDGET_BYTES
-        )),
-        notes: format!(
-            "capacity={DEFAULT_CHANNEL_CAPACITY}, batch≈1MiB, budget={}",
-            SHUFFLE_MEMORY_BUDGET_BYTES
-        ),
-    })
-    .expect("write baseline");
-    eprintln!("wrote baseline case to {}", path.display());
-}
-
-/// Phase 4 gate: ≥10x shuffle budget completes with spill and bounded residency.
-///
-/// Covered end-to-end at the buffer + DoExchange intake logic by
-/// `spill_buffer::tests::do_exchange_style_ten_x_intake_stays_bounded` and
-/// `ten_x_budget_completes_via_spill`. Flight-level round-trip stays in
-/// worker unit/integration suites that spin a real Flight server.
-///
-/// Shuffle-only, so it compiles only with `worker-shuffle` (finding 600).
-#[cfg(feature = "worker-shuffle")]
-#[tokio::test]
-async fn shuffle_ten_x_budget_completes_with_spill() {
-    use arrow_array::Int64Array;
-    use arrow_schema::{DataType, Field, Schema};
-    use datafusion::execution::memory_pool::FairSpillPool;
-    use futures::StreamExt;
-    use sqe_spill::{LocalSegmentStore, SpillManager, SpillScope};
-    use sqe_worker::spill_buffer::SpillablePartitionBuffer;
-    use std::sync::Arc;
-
-    let budget_bytes = SHUFFLE_MEMORY_BUDGET_BYTES; // 4 MiB
-    let tmp = tempfile::tempdir().unwrap();
-    let store = Arc::new(LocalSegmentStore::open(tmp.path(), 1 << 30, 0, 4, 4).unwrap());
-    let manager = Arc::new(SpillManager::new(store, std::time::Duration::from_secs(0)));
-    let pool = Arc::new(FairSpillPool::new(budget_bytes.max(1024 * 1024)));
-    let budget = ByteBudget::new("shuffle-10x", budget_bytes, Some(pool));
-    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-    let scope = SpillScope::new("q-10x-gate", "s0", "do_exchange", 0, 0);
-    let mut buf = SpillablePartitionBuffer::new(manager, scope, schema.clone(), budget, None);
-
-    // ~40 MiB of i64 batches (10x the 4 MiB budget).
-    let rows_per_batch = 64 * 1024; // 512 KiB of i64 + overhead
-    let n_batches = 80;
-    let mut appended = 0usize;
-    let mut peak = 0usize;
-    for i in 0..n_batches {
-        let vals: Vec<i64> = (0..rows_per_batch as i64)
-            .map(|r| i as i64 * 1_000_000 + r)
-            .collect();
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vals))]).unwrap();
-        appended += batch.get_array_memory_size();
-        buf.append(batch).await.unwrap();
-        peak = peak.max(buf.resident_bytes());
-        assert!(
-            buf.resident_bytes() <= budget_bytes + 512 * 1024,
-            "resident {} exceeded 4 MiB budget headroom",
-            buf.resident_bytes()
-        );
-    }
-    assert!(
-        appended >= 10 * budget_bytes,
-        "appended {appended} < 10x budget {budget_bytes}"
-    );
-
-    let manifest = buf.finish().await.unwrap();
-    let mut drain = buf.into_drain_stream().await.unwrap();
-    let mut rows = 0usize;
-    while let Some(item) = drain.next().await {
-        rows += item.unwrap().num_rows();
-    }
-    assert_eq!(rows as u64, manifest.rows);
-    assert_eq!(rows, n_batches * rows_per_batch);
-    assert!(
-        peak <= budget_bytes + 512 * 1024,
-        "peak resident {peak} must stay near shuffle budget {budget_bytes}"
-    );
 }
