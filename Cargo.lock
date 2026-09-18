@@ -6374,7 +6374,6 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "async-trait",
- "bytes",
  "chrono",
  "clap",
  "csv",
@@ -6393,7 +6392,6 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
- "url",
  "workspace-hack",
 ]
 
@@ -6470,25 +6468,19 @@ dependencies = [
  "anyhow",
  "arrow",
  "arrow-array",
- "arrow-flight",
  "arrow-schema",
  "assert_cmd",
  "async-trait",
- "bytes",
  "chrono",
  "clap",
- "dashmap",
  "datafusion",
  "datafusion-functions-json",
- "futures",
  "iceberg",
  "iceberg-catalog-sql",
  "iceberg-datafusion",
  "predicates",
- "prost",
  "rpassword",
  "rustyline",
- "serde",
  "serde_json",
  "sqe-catalog",
  "sqe-core",
@@ -6499,7 +6491,6 @@ dependencies = [
  "sqlparser",
  "tempfile",
  "tokio",
- "tonic",
  "workspace-hack",
 ]
 
@@ -6548,7 +6539,6 @@ dependencies = [
  "croner",
  "dashmap",
  "datafusion",
- "datafusion-expr",
  "datafusion-functions-json",
  "datafusion-proto",
  "futures",
@@ -6787,7 +6777,6 @@ dependencies = [
 name = "sqe-quack-client"
 version = "0.48.1"
 dependencies = [
- "arrow",
  "arrow-array",
  "arrow-schema",
  "async-trait",
@@ -6955,7 +6944,6 @@ name = "sqe-trino-functions"
 version = "0.48.1"
 dependencies = [
  "arrow",
- "arrow-array",
  "base64 0.23.1",
  "chrono",
  "chrono-tz",
@@ -6977,7 +6965,6 @@ name = "sqe-trino-protocol"
 version = "0.48.1"
 dependencies = [
  "arrow-array",
- "arrow-buffer",
  "arrow-cast",
  "arrow-flight",
  "arrow-schema",

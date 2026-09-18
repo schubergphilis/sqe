@@ -228,3 +228,8 @@ sqe-auth = { path = "../sqe-auth" }
 # `[catalog.backend]` block into `SqeConfig` rather than constructing
 # all 14 SqeConfig fields by hand.
 toml = { workspace = true }
+
+[package.metadata.cargo-machete]
+# `sqlx` is a feature knob: `sql-postgres` / `sql-sqlite` forward driver
+# features to it; the vendored iceberg-catalog-sql does the importing.
+ignored = ["sqlx"]
