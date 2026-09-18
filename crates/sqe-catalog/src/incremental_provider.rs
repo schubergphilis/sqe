@@ -286,23 +286,6 @@ impl IncrementalScanExec {
         }
     }
 
-    /// Override the number of output partitions.
-    ///
-    /// Each partition reads a round-robin slice of the planned `data_files`
-    /// list, allowing DataFusion to scan a wide change-log range in parallel.
-    #[allow(dead_code)]
-    fn with_target_partitions(mut self, target_partitions: usize) -> Self {
-        let n = target_partitions.max(1);
-        self.target_partitions = n;
-        let eq = self.properties.eq_properties.clone();
-        self.properties = Arc::new(PlanProperties::new(
-            eq,
-            Partitioning::UnknownPartitioning(n),
-            self.properties.emission_type,
-            self.properties.boundedness,
-        ));
-        self
-    }
 }
 
 impl std::fmt::Debug for IncrementalScanExec {

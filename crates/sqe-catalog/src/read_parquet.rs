@@ -58,17 +58,6 @@ struct ReadParquetArgs {
 }
 
 impl ReadParquetArgs {
-    /// Construct a new `ReadParquetArgs` with `path` replaced. Used when
-    /// the caller resolves an `hf://` URL to its HTTPS form before
-    /// schema inference. Returns a fresh value rather than mutating
-    /// the input so the original `args` borrow stays valid.
-    #[allow(dead_code)]
-    fn clone_with_path(&self, path: String) -> Self {
-        let mut out = self.clone();
-        out.path = path;
-        out
-    }
-
     /// Project this struct onto the shared [`FileTvfArgs`] shape so the
     /// common register helpers (Azure / GCS) can be called.
     fn as_file_tvf_args(&self) -> crate::file_tvf_common::FileTvfArgs {
@@ -242,7 +231,7 @@ async fn build_listing_table(
     // HTTPS URLs.
     let mut args_local;
     let args = if crate::file_tvf_common::is_hf_path(&args.path) {
-        args_local = args.clone_with_path(args.path.clone());
+        args_local = args.clone();
         let tmp = crate::file_tvf_common::resolve_hf_url(&args.path).ok_or_else(|| {
             datafusion::error::DataFusionError::Plan(format!(
                 "read_parquet: malformed HuggingFace URL '{}'",

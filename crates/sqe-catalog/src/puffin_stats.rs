@@ -229,22 +229,6 @@ pub fn puffin_stats_enabled(table_properties: &HashMap<String, String>) -> bool 
         .unwrap_or(false)
 }
 
-/// Build a path for the Puffin sidecar given the table's metadata directory.
-///
-/// The Iceberg spec is silent on the exact location; we mirror the convention
-/// used by Trino and Spark: `<metadata_dir>/<snapshot_id>-<uuid>.stats`.
-pub fn puffin_sidecar_path(metadata_location: &str, snapshot_id: i64) -> String {
-    // metadata_location looks like `s3://bucket/ns/table/metadata/00003-abc.json`
-    // or `<prefix>/metadata/00003-abc.json`. Strip the filename and append the
-    // sidecar name so the file lands next to the table metadata.
-    let dir = metadata_location
-        .rsplit_once('/')
-        .map(|(head, _tail)| head)
-        .unwrap_or(metadata_location);
-    let uuid = uuid::Uuid::new_v4();
-    format!("{dir}/{snapshot_id}-{uuid}.stats")
-}
-
 /// Build one theta sketch per top-level column in the schema.
 ///
 /// Per-column theta sketches keyed by Iceberg field id, in schema order:
