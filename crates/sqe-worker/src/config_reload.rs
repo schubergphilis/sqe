@@ -228,7 +228,6 @@ pub fn apply_memory_hot_reload(
             error!(
                 requested_governor_pool_bytes = budgets.governor_pool_bytes,
                 current_governor_pool_bytes = prev_gov,
-                granted_sum = handles.governor.granted_sum(),
                 reason = %e,
                 "Ignoring hot-reload shrink of governor pool: current grants/use \
                  exceed the new window. Keeping previous governor capacity."

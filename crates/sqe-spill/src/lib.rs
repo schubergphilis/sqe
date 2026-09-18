@@ -14,15 +14,9 @@
 pub mod accounted;
 pub mod budget;
 pub mod error;
-/// Durable exchange attempt manifests. Gated behind the `exchange` feature:
-/// the only consumer is the worker's `worker-shuffle` DoExchange intake, which
-/// no query plan reaches (review finding 600).
-#[cfg(feature = "exchange")]
-pub mod exchange;
 pub mod fault;
 pub mod governor;
 pub mod manager;
-pub mod operator_admit;
 pub mod reclaim;
 pub mod resizable_pool;
 pub mod scope;
@@ -38,32 +32,17 @@ pub use budget::{
     DEFAULT_BUDGET_GRANULARITY, DEFAULT_READ_HEADROOM_DEN, DEFAULT_READ_HEADROOM_NUM,
 };
 pub use error::{BudgetError, Result};
-#[cfg(feature = "exchange")]
-pub use exchange::{
-    exchange_scope, read_manifest, write_manifest_atomic, AttemptManifest, AttemptState,
-    ExchangeAttemptStore, SharedExchangeAttemptStore, TaskKey, ATTEMPT_MANIFEST_VERSION,
-};
 pub use fault::{
     clear_faults, faults_injected, install_faults, serial_test_guard, take_fault, FaultSession,
     SpillFault,
 };
-pub use governor::{
-    AdmissionDecision, AdmissionRequest, GrantGuard, MemoryGovernor, SharedMemoryGovernor,
-    WorkloadClass,
-};
+pub use governor::MemoryGovernor;
 pub use manager::{SpillManager, SpillScopeGuard};
-pub use operator_admit::{
-    admit_operator, LiveConsumerRegistry, OperatorConsumer, OperatorGrantGuard,
-};
-pub use reclaim::{GrantRegistry, MemoryGrant, ReclaimableConsumer, SharedGrantRegistry};
-pub use resizable_pool::{ResizableFairSpillPool, ShrinkBelowUse};
+pub use reclaim::{MemoryGrant, ReclaimableConsumer};
+pub use resizable_pool::ResizableFairSpillPool;
 pub use scope::SpillScope;
 pub use segment::{SpillSegment, SEGMENT_FORMAT_VERSION, SEGMENT_MAGIC};
 pub use store::{SegmentReader, SegmentStore, SegmentWriter};
 pub use store_local::LocalSegmentStore;
-pub use store_s3::{
-    lifecycle_attributes, lifecycle_tags_for_partial, lifecycle_tags_for_segment, S3SegmentStore,
-    S3SpillConfig, LIFECYCLE_PURPOSE_KEY, LIFECYCLE_PURPOSE_PARTIAL, LIFECYCLE_PURPOSE_SEGMENT,
-    LIFECYCLE_QUERY_KEY, LIFECYCLE_TAG_KEY, LIFECYCLE_TAG_VALUE,
-};
+pub use store_s3::{S3SegmentStore, S3SpillConfig};
 pub use store_tiered::TieredSegmentStore;

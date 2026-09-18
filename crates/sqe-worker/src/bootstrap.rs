@@ -138,16 +138,6 @@ pub fn build_worker_service_with_hot_reload(
             budgets.budget_granularity_bytes,
             None,
         ));
-    // Shuffle-only wiring: the DoExchange intake these configure only exists
-    // when `worker-shuffle` is compiled in (review finding 600). The resolved
-    // budget stays on `WorkerHotConfig` either way so config validation and
-    // hot-reload arithmetic are unchanged.
-    #[cfg(feature = "worker-shuffle")]
-    {
-        service = service
-            .with_shuffle_compression(shuffle_compression)
-            .with_shuffle_memory_budget_atom(Arc::clone(&hot.shuffle_budget_bytes));
-    }
     if let Some(sm) = spill_manager {
         service = service.with_spill_manager(sm);
     }

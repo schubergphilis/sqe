@@ -58,10 +58,6 @@ impl SegmentStore for TieredSegmentStore {
             Ok(w) => Ok(Box::new(TieredWriter {
                 inner: w,
                 backend: Backend::Local,
-                s3: self.s3.clone(),
-                scope: scope.clone(),
-                sequence,
-                schema,
             })),
             Err(e) if Self::is_local_pressure(&e) => {
                 warn!(
@@ -75,10 +71,6 @@ impl SegmentStore for TieredSegmentStore {
                 Ok(Box::new(TieredWriter {
                     inner: w,
                     backend: Backend::S3,
-                    s3: self.s3.clone(),
-                    scope: scope.clone(),
-                    sequence,
-                    schema,
                 }))
             }
             Err(e) => Err(e),
@@ -132,10 +124,6 @@ enum Backend {
 struct TieredWriter {
     inner: Box<dyn SegmentWriter>,
     backend: Backend,
-    s3: Arc<S3SegmentStore>,
-    scope: SpillScope,
-    sequence: u64,
-    schema: SchemaRef,
 }
 
 #[async_trait]
@@ -167,10 +155,4 @@ impl SegmentWriter for TieredWriter {
     async fn abort(self: Box<Self>) -> Result<()> {
         self.inner.abort().await
     }
-}
-
-// silence unused fields on TieredWriter for future seamless failover
-#[allow(dead_code)]
-fn _tiered_fields(w: &TieredWriter) {
-    let _ = (&w.s3, &w.scope, w.sequence, &w.schema);
 }

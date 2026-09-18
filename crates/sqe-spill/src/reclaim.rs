@@ -1,12 +1,5 @@
-//! Reclaimable memory consumers for operator grants (Phase 5b / Phase 7).
-//!
-//! Until the negotiating governor ships in Phase 7, grants are fixed carve-outs
-//! from `operator_budget` via [`crate::ByteBudget`]. Consumers register desired
-//! and minimum bytes; the registry hands out a [`MemoryGrant`] that can later
-//! be reclaimed without changing call sites.
-
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+//! Reclaimable memory consumers and fixed [`MemoryGrant`] carve-outs from
+//! `operator_budget` via [`crate::ByteBudget`].
 
 use crate::budget::ByteBudget;
 
@@ -93,91 +86,5 @@ impl MemoryGrant {
     pub fn soft_limit_bytes(&self) -> usize {
         let cap = self.capacity_bytes();
         (cap.saturating_mul(3) / 4).max(1)
-    }
-}
-
-/// Process-local registry of reclaimable consumers (placeholder for Phase 7
-/// negotiation). Tracks registered desired bytes for diagnostics.
-#[derive(Default)]
-pub struct GrantRegistry {
-    total_desired: AtomicUsize,
-    total_minimum: AtomicUsize,
-    registrations: AtomicUsize,
-}
-
-impl GrantRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Record a consumer's bounds and return a fixed grant of `capacity`
-    /// (caller chooses capacity from operator_budget / policy).
-    pub fn register(&self, consumer: &dyn ReclaimableConsumer, capacity: usize) -> MemoryGrant {
-        self.total_desired
-            .fetch_add(consumer.desired_bytes(), Ordering::Relaxed);
-        self.total_minimum
-            .fetch_add(consumer.minimum_bytes(), Ordering::Relaxed);
-        self.registrations.fetch_add(1, Ordering::Relaxed);
-        MemoryGrant::with_bounds(
-            consumer.name(),
-            capacity,
-            consumer.desired_bytes(),
-            consumer.minimum_bytes(),
-        )
-    }
-
-    pub fn registrations(&self) -> usize {
-        self.registrations.load(Ordering::Relaxed)
-    }
-
-    pub fn total_desired(&self) -> usize {
-        self.total_desired.load(Ordering::Relaxed)
-    }
-
-    pub fn total_minimum(&self) -> usize {
-        self.total_minimum.load(Ordering::Relaxed)
-    }
-}
-
-/// Shared registry handle.
-pub type SharedGrantRegistry = Arc<GrantRegistry>;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct DummyJoin {
-        desired: usize,
-        minimum: usize,
-    }
-
-    impl ReclaimableConsumer for DummyJoin {
-        fn name(&self) -> &str {
-            "dummy-join"
-        }
-        fn desired_bytes(&self) -> usize {
-            self.desired
-        }
-        fn minimum_bytes(&self) -> usize {
-            self.minimum
-        }
-        fn try_reclaim(&self, _target: usize) -> usize {
-            0
-        }
-    }
-
-    #[test]
-    fn register_tracks_bounds_and_soft_limit() {
-        let reg = GrantRegistry::new();
-        let c = DummyJoin {
-            desired: 64 * 1024 * 1024,
-            minimum: 8 * 1024 * 1024,
-        };
-        let grant = reg.register(&c, 16 * 1024 * 1024);
-        assert_eq!(reg.registrations(), 1);
-        assert_eq!(reg.total_desired(), c.desired);
-        assert_eq!(grant.capacity_bytes() % (64 * 1024), 0); // unit aligned
-        assert!(grant.soft_limit_bytes() <= grant.capacity_bytes());
-        assert!(grant.soft_limit_bytes() >= grant.capacity_bytes() / 2);
     }
 }
