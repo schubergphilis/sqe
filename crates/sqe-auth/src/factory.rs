@@ -203,7 +203,6 @@ pub async fn build_auth_chain(config: &AuthConfig) -> sqe_core::Result<AuthChain
                         keys_file: keys_file.into(),
                         key_prefix: key_prefix.clone(),
                         role_mappings: config.role_mappings.clone(),
-                        ..Default::default()
                     };
                     let provider = ApiKeyProvider::new(ak_config).map_err(|e| {
                         sqe_core::SqeError::Config(format!("Failed to create ApiKeyProvider: {e}"))

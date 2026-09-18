@@ -6,7 +6,6 @@ pub mod aws_iam;
 pub mod bearer_passthrough;
 pub mod bearer_token;
 pub mod chain;
-pub mod device_code;
 pub mod factory;
 pub mod identity_session;
 pub mod mtls;
@@ -22,12 +21,6 @@ pub mod provider;
 pub mod token_cache;
 pub mod token_exchange;
 
-/// Deprecated: use `oidc_password` instead.
-#[deprecated(note = "renamed to oidc_password")]
-pub mod keycloak {
-    pub use crate::oidc_password::*;
-}
-
 pub use anonymous::{AnonymousProvider, AnonymousProviderConfig};
 pub use api_key::{ApiKeyEntry, ApiKeyProvider, ApiKeyProviderConfig};
 pub use auth_code::{AuthCodeChallenge, AuthCodeService};
@@ -35,7 +28,6 @@ pub use authenticator::Authenticator;
 pub use aws_iam::{AwsIamProvider, AwsIamProviderConfig, KeyMapping as AwsKeyMapping};
 pub use bearer_token::{BearerTokenProvider, BearerTokenProviderConfig};
 pub use chain::AuthChain;
-pub use device_code::{DeviceAuthSession, DeviceCodeService, DevicePollResult};
 pub use factory::build_auth_chain;
 pub use identity_session::DEFAULT_SESSION_LIFETIME;
 pub use mtls::{MtlsProvider, MtlsProviderConfig};

@@ -604,16 +604,12 @@ user = "dev-user"
 roles = ["admin"]
 ```
 
-For CLI logins without a username and password, configure the interactive device-code flow under `[auth.external]`:
+For browser-based logins without a username and password, configure the OAuth2 authorization-code flow under `[auth.external]`:
 
 ```toml
 [auth.external]
 issuer = "https://keycloak.example.com/realms/iceberg"
 client_id = "sqe-cli"
-scopes = ["openid", "profile"]
-
-[auth.external.device]
-client_id = "sqe-cli-device"
 scopes = ["openid", "profile"]
 ```
 

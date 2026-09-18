@@ -22,14 +22,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::provider::{AuthError, AuthProvider, FlightCredentials, Identity};
 
@@ -77,8 +76,6 @@ pub struct ApiKeyProviderConfig {
     pub key_prefix: String,
     /// Group → roles mapping. Keys are group names, values are role lists.
     pub role_mappings: HashMap<String, Vec<String>>,
-    /// How often to check the keys file for changes (default: 30s).
-    pub reload_interval: Duration,
 }
 
 impl Default for ApiKeyProviderConfig {
@@ -87,7 +84,6 @@ impl Default for ApiKeyProviderConfig {
             keys_file: PathBuf::from("api-keys.toml"),
             key_prefix: "sqe_".to_string(),
             role_mappings: HashMap::new(),
-            reload_interval: Duration::from_secs(30),
         }
     }
 }
@@ -123,42 +119,6 @@ impl ApiKeyProvider {
         }
     }
 
-    /// Spawn a background task that polls the keys file for changes.
-    ///
-    /// The task runs until the returned `tokio::task::JoinHandle` is aborted.
-    pub fn spawn_reload_watcher(&self) -> tokio::task::JoinHandle<()> {
-        let keys = Arc::clone(&self.keys);
-        let path = self.config.keys_file.clone();
-        let interval = self.config.reload_interval;
-
-        tokio::spawn(async move {
-            let mut last_modified = file_mtime(&path);
-            loop {
-                tokio::time::sleep(interval).await;
-                let current_mtime = file_mtime(&path);
-                if current_mtime != last_modified {
-                    match load_keys_from_file_async(&path).await {
-                        Ok(new_keys) => {
-                            info!(
-                                keys_file = %path.display(),
-                                key_count = new_keys.len(),
-                                "API keys reloaded"
-                            );
-                            *keys.write().await = new_keys;
-                            last_modified = current_mtime;
-                        }
-                        Err(e) => {
-                            warn!(
-                                keys_file = %path.display(),
-                                error = %e,
-                                "Failed to reload API keys — keeping previous set"
-                            );
-                        }
-                    }
-                }
-            }
-        })
-    }
 
     /// Resolve groups to roles via the configured role mappings.
     fn resolve_roles(&self, groups: &[String]) -> Vec<String> {
@@ -241,21 +201,6 @@ fn load_keys_from_file(path: &Path) -> Result<Vec<ApiKeyEntry>, anyhow::Error> {
     Ok(keys_file.keys)
 }
 
-/// Async variant of [`load_keys_from_file`] -- safe to call from Tokio worker threads.
-async fn load_keys_from_file_async(path: &Path) -> Result<Vec<ApiKeyEntry>, anyhow::Error> {
-    let content = tokio::fs::read_to_string(path)
-        .await
-        .map_err(|e| anyhow::anyhow!("cannot read keys file {}: {e}", path.display()))?;
-    let keys_file: KeysFile = toml::from_str(&content)
-        .map_err(|e| anyhow::anyhow!("cannot parse keys file {}: {e}", path.display()))?;
-    Ok(keys_file.keys)
-}
-
-/// Get file modification time as an opaque comparable value.
-fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
-}
-
 fn sha256_digest(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -277,7 +222,6 @@ mod tests {
             keys_file: PathBuf::from("/nonexistent"),
             key_prefix: "sqe_".to_string(),
             role_mappings,
-            reload_interval: Duration::from_secs(30),
         }
     }
 
@@ -481,110 +425,6 @@ user = "other"
         assert_eq!(keys_file.keys[1].user, "other");
         assert!(keys_file.keys[1].groups.is_empty());
     }
-
-    // -----------------------------------------------------------------------
-    // Hot-reload: writing new file updates keys
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn reload_picks_up_new_key() {
-        // nosemgrep: opt.aikido.semgrep-rules.rust.lang.security.temp-dir -- test-only scratch dir, pid+nonce suffixed, holds no secret material
-        let dir = std::env::temp_dir().join(format!(
-            "sqe-api-key-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let keys_path = dir.join("keys.toml");
-
-        // Write initial file with one key.
-        std::fs::write(
-            &keys_path,
-            r#"
-[[keys]]
-key = "sqe_original"
-user = "original-user"
-"#,
-        )
-        .unwrap();
-        let initial_mtime = std::fs::metadata(&keys_path).unwrap().modified().unwrap();
-
-        let config = ApiKeyProviderConfig {
-            keys_file: keys_path.clone(),
-            key_prefix: "sqe_".to_string(),
-            role_mappings: HashMap::new(),
-            reload_interval: Duration::from_millis(20),
-        };
-
-        let provider = ApiKeyProvider::new(config).unwrap();
-        let watcher = provider.spawn_reload_watcher();
-
-        // Original key works.
-        let creds = FlightCredentials {
-            password: Some(sqe_core::SecretString::new("sqe_original".to_string())),
-            ..Default::default()
-        };
-        let id = provider.authenticate(&creds).await.unwrap();
-        assert_eq!(id.user_id, "original-user");
-
-        // The watcher samples mtime on first poll. Yield so that sample
-        // happens against the original file; if it starts after the rewrite
-        // it never sees a change.
-        tokio::time::sleep(Duration::from_millis(30)).await;
-
-        std::fs::write(
-            &keys_path,
-            r#"
-[[keys]]
-key = "sqe_original"
-user = "original-user"
-
-[[keys]]
-key = "sqe_newkey"
-user = "new-user"
-"#,
-        )
-        .unwrap();
-        // Some CI filesystems have 1s mtime granularity. A 100ms sleep is
-        // not enough for the watcher to see a change, so bump mtime past
-        // the value it already sampled.
-        let later = initial_mtime + Duration::from_secs(2);
-        std::fs::File::open(&keys_path)
-            .unwrap()
-            .set_modified(later)
-            .unwrap();
-
-        let creds2 = FlightCredentials {
-            password: Some(sqe_core::SecretString::new("sqe_newkey".to_string())),
-            ..Default::default()
-        };
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        let id2 = loop {
-            match provider.authenticate(&creds2).await {
-                Ok(id) => break id,
-                Err(e) if tokio::time::Instant::now() < deadline => {
-                    let _ = e;
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                Err(e) => {
-                    watcher.abort();
-                    let _ = std::fs::remove_dir_all(&dir);
-                    panic!("new key never became valid after reload: {e}");
-                }
-            }
-        };
-        assert_eq!(id2.user_id, "new-user");
-
-        watcher.abort();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // -----------------------------------------------------------------------
-    // Constant-time: different-length keys don't match
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn different_length_key_does_not_match() {
