@@ -17,15 +17,9 @@
 //! distributed sort, distributed aggregate and broadcast/shuffle-hash join
 //! rules that used to live here had no caller in any binary and were
 //! deleted on 2026-09-11 (issue #551); git history before that date keeps
-//! them. Three modules stay because a dated plan wires them in:
-//! [`external_aggregate`] and [`grace_hash_join`] (bounded-memory plan
-//! Phase 5, `docs/superpowers/plans/2026-07-25-bounded-memory-spill-execution.md`)
-//! and [`predicate_transfer`] (lakehouse performance roadmap).
+//! them.
 
-pub mod external_aggregate;
-pub mod grace_hash_join;
 pub mod join_strategy;
-pub mod predicate_transfer;
 pub mod scan_morsel;
 pub mod scan_task;
 pub mod single_distinct_count;
@@ -37,20 +31,7 @@ pub mod stats;
 pub mod worker_fault;
 pub mod worker_protocol;
 
-pub use external_aggregate::{
-    ensure_decomposable, external_hash_aggregate, AggregateConsumer, DecomposableAgg,
-    DfAggregateSpillCase, DfAggregateSpillGateReport, ExternalAggregateConfig,
-    ExternalAggregateError, ExternalAggregateProfile,
-};
-pub use grace_hash_join::{
-    choose_local_join_strategy, grace_inner_join, GraceHashJoinConfig, GraceJoinConsumer,
-    GraceJoinProfile, LocalJoinStrategy, DEFAULT_GRACE_PARTITIONS, DEFAULT_MAX_RECURSION,
-};
 pub use join_strategy::{BuildSizeEstimate, JoinStrategyRule, DEFAULT_HASH_JOIN_THRESHOLD};
-pub use predicate_transfer::{
-    build_predicate_transfer, extract_distinct_from_batches, extract_distinct_values,
-    PredicateTransfer, MAX_PREDICATE_TRANSFER_VALUES,
-};
 pub use scan_morsel::SCAN_TASK_VERSION_V3;
 pub use scan_morsel::{
     group_row_groups_into_morsels, plan_file_byte_morsels, plan_scan_morsels, RowGroupSlice,

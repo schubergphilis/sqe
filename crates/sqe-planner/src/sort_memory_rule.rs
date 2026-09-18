@@ -118,7 +118,7 @@ impl PhysicalOptimizerRule for SortMemoryRule {
             return Ok(plan);
         }
 
-        match policy.can_admit(0) {
+        match policy.can_admit() {
             Ok(()) => {
                 debug!(
                     sort_grant = self.sort_grant_bytes,
