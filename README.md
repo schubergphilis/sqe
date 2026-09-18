@@ -170,7 +170,7 @@ Client (JDBC / Flight SQL / Trino HTTP / MCP)
    +-----------+
 ```
 
-Distributed mode is a **distributed scan**: the coordinator hands each worker a secured `ScanTask` (file list, projection, predicate, limit) with the user's bearer token, workers scan and stream Arrow batches back, and every join, aggregate and sort runs on the coordinator. There is no stage-based shuffle on any query path; the `DoExchange` intake exists only behind the `worker-shuffle` cargo feature. Size the coordinator for the post-scan work. Worker heartbeats carry `sqe.proto.version` and the DataFusion version, and a mismatched worker is refused at registration (a legacy versionless heartbeat is refused only under `production_mode`).
+Distributed mode is a **distributed scan**: the coordinator hands each worker a secured `ScanTask` (file list, projection, predicate, limit) with the user's bearer token, workers scan and stream Arrow batches back, and every join, aggregate and sort runs on the coordinator. There is no stage-based shuffle on any query path; workers answer `DoExchange` with `Unimplemented`. Size the coordinator for the post-scan work. Worker heartbeats carry `sqe.proto.version` and the DataFusion version, and a mismatched worker is refused at registration (a legacy versionless heartbeat is refused only under `production_mode`).
 
 Detailed Mermaid diagrams (query pipeline, crate dependencies, caching layers, distributed scan, write path) in [`docs/site/book/src/architecture/overview.md`](docs/site/book/src/architecture/overview.md).
 

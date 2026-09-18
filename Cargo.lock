@@ -6901,7 +6901,6 @@ dependencies = [
  "futures",
  "object_store",
  "serde",
- "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
