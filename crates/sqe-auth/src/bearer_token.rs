@@ -308,25 +308,6 @@ impl BearerTokenProvider {
         })
     }
 
-    /// Create a new provider with a custom reqwest client (for testing).
-    #[cfg(test)]
-    #[allow(dead_code)]
-    fn with_client(config: BearerTokenProviderConfig, client: reqwest::Client) -> Self {
-        let jwks_cache = Cache::builder()
-            .max_capacity(1)
-            .time_to_live(Duration::from_secs(15 * 60))
-            .build();
-
-        Self {
-            client,
-            config,
-            jwks_cache,
-            fetch_mutex: Mutex::new(()),
-            last_refetch: Mutex::new(None),
-            key_grace_window: KEY_RETIREMENT_GRACE,
-        }
-    }
-
     /// Override the key-retirement grace window (tests only).
     #[cfg(test)]
     fn with_key_grace_window(mut self, window: Duration) -> Self {

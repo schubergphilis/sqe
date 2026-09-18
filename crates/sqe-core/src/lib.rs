@@ -20,7 +20,7 @@ pub use process_memory::{
 };
 
 pub use config::{
-    parse_memory_limit, AuthProviderConfig, DeviceAuthConfig, ExternalAuthConfig,
+    parse_memory_limit, AuthProviderConfig, ExternalAuthConfig,
     FlightCompression, MemoryPoolKind, ProfileMode, QueryCacheConfig, QueryConfig,
     QueryHistoryConfig, ResolvedWorkerMemory, ServerMode, SortMode, SqeConfig,
     WorkerMemoryConfig, WorkerSpillConfig,

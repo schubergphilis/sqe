@@ -65,10 +65,7 @@ impl Default for OidcPasswordProviderConfig {
 struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
-    #[allow(dead_code)]
     expires_in: u64,
-    #[allow(dead_code)]
-    token_type: String,
 }
 
 /// OIDC password grant authentication provider.
