@@ -36,6 +36,13 @@ pub fn overlay_env(root: &mut toml::Value) -> Result<Vec<String>, SqeError> {
     for (env_key, path) in ALIASES {
         if let Some(raw) = read_env(env_key)? {
             insert_path(root, path, env_key, &raw)?;
+            if *path == "catalog.catalog_url" {
+                // `polaris_url` is a serde alias of `catalog_url`; leaving both
+                // in the tree is a "duplicate field" error at deserialize.
+                if let Some(catalog) = root.get_mut("catalog").and_then(|c| c.as_table_mut()) {
+                    catalog.remove("polaris_url");
+                }
+            }
             log_override(env_key, path, &raw);
             applied.push((*env_key).to_string());
         }
