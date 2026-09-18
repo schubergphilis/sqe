@@ -2593,7 +2593,6 @@ fn build_oauth2_state(
         issuer: ext.issuer.clone(),
         authorization_endpoint_override: ext.authorization_endpoint.clone(),
         token_endpoint_override: ext.token_endpoint.clone(),
-        device_authorization_endpoint_override: ext.device_authorization_endpoint.clone(),
         accept_invalid_certs: ext.accept_invalid_certs,
     };
 

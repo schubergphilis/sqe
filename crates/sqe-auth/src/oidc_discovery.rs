@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::provider::AuthError;
 
@@ -11,8 +11,6 @@ use crate::provider::AuthError;
 pub struct DiscoveredEndpoints {
     pub authorization_endpoint: String,
     pub token_endpoint: String,
-    #[serde(default)]
-    pub device_authorization_endpoint: Option<String>,
     pub jwks_uri: String,
     pub issuer: String,
     #[serde(default)]
@@ -24,7 +22,6 @@ pub struct OidcDiscoveryConfig {
     pub issuer: String,
     pub authorization_endpoint_override: Option<String>,
     pub token_endpoint_override: Option<String>,
-    pub device_authorization_endpoint_override: Option<String>,
     pub accept_invalid_certs: bool,
 }
 
@@ -83,32 +80,15 @@ impl OidcDiscovery {
         if let Some(ref ep) = self.config.token_endpoint_override {
             endpoints.token_endpoint = ep.clone();
         }
-        if let Some(ref ep) = self.config.device_authorization_endpoint_override {
-            endpoints.device_authorization_endpoint = Some(ep.clone());
-        }
-
-        if endpoints.device_authorization_endpoint.is_none() {
-            warn!("IdP does not advertise device_authorization_endpoint — device code flow unavailable");
-        }
 
         info!(
             issuer = %endpoints.issuer,
             authorization_endpoint = %endpoints.authorization_endpoint,
             token_endpoint = %endpoints.token_endpoint,
-            device_authorization_endpoint = ?endpoints.device_authorization_endpoint,
             "OIDC discovery complete"
         );
 
         Ok(endpoints)
-    }
-
-    pub async fn device_authorization_endpoint(&self) -> Result<&str, AuthError> {
-        let ep = self.endpoints().await?;
-        ep.device_authorization_endpoint.as_deref().ok_or_else(|| {
-            AuthError::Internal(anyhow::anyhow!(
-                "IdP does not support device authorization grant"
-            ))
-        })
     }
 
     pub async fn token_endpoint(&self) -> Result<&str, AuthError> {
@@ -141,10 +121,6 @@ mod tests {
             "https://idp.example.com/authorize"
         );
         assert_eq!(endpoints.token_endpoint, "https://idp.example.com/token");
-        assert_eq!(
-            endpoints.device_authorization_endpoint.as_deref(),
-            Some("https://idp.example.com/device")
-        );
         assert_eq!(endpoints.jwks_uri, "https://idp.example.com/certs");
     }
 
@@ -157,7 +133,6 @@ mod tests {
             "jwks_uri": "https://idp.example.com/certs"
         });
         let endpoints: DiscoveredEndpoints = serde_json::from_value(json).unwrap();
-        assert!(endpoints.device_authorization_endpoint.is_none());
         assert!(endpoints.userinfo_endpoint.is_none());
     }
 
@@ -167,7 +142,6 @@ mod tests {
             issuer: "https://idp.example.com".to_string(),
             authorization_endpoint_override: None,
             token_endpoint_override: None,
-            device_authorization_endpoint_override: None,
             accept_invalid_certs: false,
         };
         assert!(OidcDiscovery::new(config).is_ok());
