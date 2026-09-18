@@ -15,10 +15,6 @@ use sqe_spill::{split_default_read_headroom, MemoryGrant};
 /// buffer reservations; keep this modest for laptop 64 MiB workers.
 pub const DEFAULT_SORT_MERGE_FANIN: usize = 8;
 
-/// Minimum reserved merge headroom as a fraction of the sort grant (25%).
-pub const DEFAULT_MERGE_HEADROOM_NUM: usize = 1;
-pub const DEFAULT_MERGE_HEADROOM_DEN: usize = 4;
-
 /// Policy for one sort operator under a fixed grant.
 #[derive(Debug, Clone)]
 pub struct SortMemoryPolicy {
@@ -42,24 +38,10 @@ impl SortMemoryPolicy {
         headroom
     }
 
-    /// Bytes available for creating sorted runs before merge.
-    pub fn run_budget_bytes(&self) -> usize {
-        let (writer, _) = split_default_read_headroom(self.grant.capacity_bytes());
-        writer
-    }
-
-    /// Per-run merge buffer size given current fan-in.
-    pub fn per_run_merge_buffer(&self) -> usize {
-        let fan = self.max_fan_in.max(1);
-        (self.merge_headroom_bytes() / fan).max(1)
-    }
-
-    /// Whether admitting a sort whose estimated input is `input_bytes` can
-    /// complete under this policy without unbounded merge reservations.
-    ///
-    /// Conservative: require that the merge headroom alone can hold
-    /// `max_fan_in` buffers of at least 64 KiB each.
-    pub fn can_admit(&self, _input_bytes: usize) -> Result<(), SortAdmissionError> {
+    /// Whether a sort can complete under this policy without unbounded merge
+    /// reservations: the merge headroom must hold `max_fan_in` buffers of at
+    /// least 64 KiB each.
+    pub fn can_admit(&self) -> Result<(), SortAdmissionError> {
         let min_buffer: usize = 64 * 1024;
         let need = min_buffer.saturating_mul(self.max_fan_in.max(1));
         if self.merge_headroom_bytes() < need {
@@ -70,21 +52,6 @@ impl SortMemoryPolicy {
             });
         }
         Ok(())
-    }
-
-    /// Number of merge passes required to reduce `num_runs` with capped fan-in.
-    pub fn merge_passes(&self, num_runs: usize) -> usize {
-        if num_runs <= 1 {
-            return 0;
-        }
-        let fan = self.max_fan_in.max(2);
-        let mut runs = num_runs;
-        let mut passes = 0;
-        while runs > 1 {
-            runs = runs.div_ceil(fan);
-            passes += 1;
-        }
-        passes
     }
 }
 
@@ -122,23 +89,11 @@ mod tests {
     use sqe_spill::MemoryGrant;
 
     #[test]
-    fn headroom_split_leaves_run_budget() {
-        let grant = MemoryGrant::new("sort", 4 * 1024 * 1024);
-        let policy = SortMemoryPolicy::from_grant(grant);
-        assert!(policy.merge_headroom_bytes() > 0);
-        assert!(policy.run_budget_bytes() > policy.merge_headroom_bytes());
-        assert_eq!(
-            policy.run_budget_bytes() + policy.merge_headroom_bytes(),
-            policy.grant.capacity_bytes()
-        );
-    }
-
-    #[test]
     fn admit_rejects_tiny_grant() {
         let grant = MemoryGrant::new("tiny", 1024);
         let mut policy = SortMemoryPolicy::from_grant(grant);
         policy.max_fan_in = 8;
-        let err = policy.can_admit(10_000_000).unwrap_err();
+        let err = policy.can_admit().unwrap_err();
         assert!(matches!(
             err,
             SortAdmissionError::InsufficientMergeHeadroom { .. }
@@ -149,17 +104,6 @@ mod tests {
     fn admit_accepts_reasonable_grant() {
         let grant = MemoryGrant::new("ok", 8 * 1024 * 1024);
         let policy = SortMemoryPolicy::from_grant(grant);
-        assert!(policy.can_admit(100_000_000).is_ok());
-    }
-
-    #[test]
-    fn merge_passes_caps_fan_in() {
-        let grant = MemoryGrant::new("s", 8 * 1024 * 1024);
-        let mut policy = SortMemoryPolicy::from_grant(grant);
-        policy.max_fan_in = 4;
-        // 100 runs with fan-in 4: 100→25→7→2→1 = 4 passes
-        assert_eq!(policy.merge_passes(100), 4);
-        assert_eq!(policy.merge_passes(1), 0);
-        assert_eq!(policy.merge_passes(4), 1);
+        assert!(policy.can_admit().is_ok());
     }
 }
