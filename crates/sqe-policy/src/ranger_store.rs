@@ -18,7 +18,7 @@ use sqe_core::{SecretString, SessionUser};
 use sqe_metrics::MetricsRegistry;
 use tracing::{debug, warn};
 
-use crate::policy_breaker::PolicyCircuitBreaker;
+use sqe_core::CircuitBreaker;
 use crate::policy_expr::parse_sql_predicate;
 use crate::session_udf::SessionIdentity;
 use crate::{MaskType, PolicyStore, ResolvedPolicy, TagMaskSpec};
@@ -218,7 +218,7 @@ pub struct RangerStore {
     /// ResolvedPolicy cache is dropped so Ranger Admin edits take effect
     /// on the next resolve instead of waiting out a second TTL (#425).
     last_policy_version: AtomicI64,
-    breaker: Arc<PolicyCircuitBreaker>,
+    breaker: Arc<CircuitBreaker>,
     metrics: Option<Arc<MetricsRegistry>>,
     /// The live Hive-root registry (`ATTACH` adds to it at runtime). A policy
     /// namespace whose first component is a root name is a Hive table, and
@@ -274,7 +274,7 @@ impl RangerStore {
                 .max_capacity(1)
                 .build(),
             last_policy_version: AtomicI64::new(0),
-            breaker: Arc::new(PolicyCircuitBreaker::new(
+            breaker: Arc::new(CircuitBreaker::new(
                 "Ranger",
                 cfg.breaker_failure_threshold,
                 Duration::from_secs(cfg.breaker_recovery_secs),

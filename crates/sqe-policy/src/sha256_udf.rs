@@ -41,22 +41,14 @@ fn hash_value(key: Option<&[u8]>, val: &[u8]) -> String {
                 HmacSha256::new_from_slice(k).expect("HMAC-SHA256 accepts any key length");
             mac.update(val);
             let result = mac.finalize().into_bytes();
-            hex_lower(&result)
+            hex::encode(result)
         }
         None => {
             let mut hasher = Sha256::new();
             hasher.update(val);
-            hex_lower(&hasher.finalize())
+            hex::encode(hasher.finalize())
         }
     }
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
 }
 
 #[derive(Debug)]
