@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "sqe": {
+      "type": "http",
+      "url": "http://localhost:19092/mcp",
+      "oauth": {
+        "clientId": "${OKTA_CLIENT_ID}",
+        "callbackPort": 8400
+      }
+    }
+  }
+}
