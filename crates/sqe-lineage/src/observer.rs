@@ -153,12 +153,6 @@ impl QueryFailCtx {
     }
 }
 
-pub trait LineageObserver: Send + Sync {
-    fn on_query_start(&self, ctx: QueryStartCtx);
-    fn on_query_complete(&self, ctx: QueryCompleteCtx);
-    fn on_query_fail(&self, ctx: QueryFailCtx);
-}
-
 pub enum LineageMsg {
     Start(QueryStartCtx),
     Complete(QueryCompleteCtx),
@@ -183,14 +177,14 @@ impl ChannelObserver {
     }
 }
 
-impl LineageObserver for ChannelObserver {
-    fn on_query_start(&self, ctx: QueryStartCtx) {
+impl ChannelObserver {
+    pub fn on_query_start(&self, ctx: QueryStartCtx) {
         self.try_send(LineageMsg::Start(ctx));
     }
-    fn on_query_complete(&self, ctx: QueryCompleteCtx) {
+    pub fn on_query_complete(&self, ctx: QueryCompleteCtx) {
         self.try_send(LineageMsg::Complete(ctx));
     }
-    fn on_query_fail(&self, ctx: QueryFailCtx) {
+    pub fn on_query_fail(&self, ctx: QueryFailCtx) {
         self.try_send(LineageMsg::Fail(ctx));
     }
 }

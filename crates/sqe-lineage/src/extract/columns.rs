@@ -62,17 +62,8 @@ pub fn indirect_sort() -> Transformation {
 pub fn indirect_window() -> Transformation {
     make("INDIRECT", "WINDOW", false)
 }
-pub fn indirect_conditional() -> Transformation {
-    make("INDIRECT", "CONDITIONAL", false)
-}
 pub fn masked() -> Transformation {
     make("DIRECT", "MASKED", true)
-}
-pub fn merge_insert() -> Transformation {
-    make("DIRECT", "MERGE_INSERT", false)
-}
-pub fn merge_update() -> Transformation {
-    make("DIRECT", "MERGE_UPDATE", false)
 }
 
 fn make(kind: &str, subtype: &str, masking: bool) -> Transformation {
@@ -435,17 +426,6 @@ fn trace_window(w: &Window, mut child_trace: ColumnTrace) -> ColumnTrace {
     out.extend(win_traces);
     out
 }
-
-// E12: MERGE rule deferred until DF 53.1 MERGE LogicalPlan shape is verified.
-// DataFusion 53.1 has no `LogicalPlan::Merge` variant: writes are represented
-// as `LogicalPlan::Dml(DmlStatement)` with a single `WriteOp` (Insert/Delete/
-// Update/Ctas/Truncate). Spec §5.3 describes the desired per-branch
-// `MergeInsert`/`MergeUpdate` annotations; current Dml/Ctas variants are
-// handled at the dataset level via E2 (extract::datasets::extract_outputs)
-// and column-level via E14 (trace_plan on the source subplan). The
-// `merge_insert()` / `merge_update()` factories above stay available for the
-// follow-up that lands once DataFusion exposes a MERGE plan node (or once
-// SQE's coordinator desugars MERGE into a tree we can pattern-match on).
 
 /// Extension column trace rule (E11).
 ///

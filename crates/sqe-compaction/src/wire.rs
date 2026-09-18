@@ -33,7 +33,6 @@
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use subtle::ConstantTimeEq;
 
 use crate::rewrite::SortSpec;
 
@@ -266,29 +265,20 @@ pub fn sign(bytes: &[u8], secret: &str) -> String {
     let mut mac =
         <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
     mac.update(bytes);
-    hex_encode(&mac.finalize().into_bytes())
+    hex::encode(mac.finalize().into_bytes())
 }
 
 /// Constant-time verification of `sig` (lowercase hex) against the
-/// HMAC-SHA256 tag of `bytes` keyed by `secret`.
-///
-/// Returns `false` on any mismatch, including a length mismatch (checked
-/// before the constant-time comparison, as `subtle::ConstantTimeEq` requires
-/// equal-length inputs).
+/// HMAC-SHA256 tag of `bytes` keyed by `secret`. `false` on any mismatch,
+/// including undecodable hex; `Mac::verify_slice` is constant-time.
 pub fn verify(bytes: &[u8], sig: &str, secret: &str) -> bool {
-    let expected = sign(bytes, secret);
-    let provided_bytes = sig.as_bytes();
-    let expected_bytes = expected.as_bytes();
-    provided_bytes.len() == expected_bytes.len() && bool::from(provided_bytes.ct_eq(expected_bytes))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
+    let Ok(tag) = hex::decode(sig) else {
+        return false;
+    };
+    let mut mac =
+        <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
+    mac.update(bytes);
+    mac.verify_slice(&tag).is_ok()
 }
 
 #[cfg(test)]

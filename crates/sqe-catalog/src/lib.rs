@@ -23,7 +23,6 @@ pub mod info_schema;
 pub mod late_materialize;
 pub mod lazy_object_store;
 pub mod mount;
-pub mod parquet_writer_config;
 pub mod pruning_stats;
 pub mod puffin_stats;
 pub mod read_csv;

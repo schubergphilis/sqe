@@ -615,17 +615,6 @@ async fn rollback_ctas_partial_create(
     }
 }
 
-/// Backoff (exponential + jitter, capped ~1s) for retrying a CoW UPDATE/DELETE
-/// after an optimistic-concurrency conflict. Mirrors `commit_with_retry`'s
-/// schedule. CoW cannot use `commit_with_retry` directly because the rewritten
-/// data files are snapshot-specific: on conflict the whole rewrite must re-run
-/// against the reloaded snapshot, not just re-commit stale files.
-fn cow_conflict_backoff_ms(attempt: u32) -> u64 {
-    let base = 50_u64.saturating_mul(1_u64 << attempt.saturating_sub(1));
-    let jitter = (Uuid::new_v4().as_u128() as u64) % 50;
-    base.saturating_add(jitter).min(1000)
-}
-
 /// Max attempts for a CoW UPDATE/DELETE that loses an optimistic-concurrency race.
 const COW_MAX_ATTEMPTS: u32 = 4;
 
@@ -739,7 +728,7 @@ impl WriteHandler {
                             .with_label_values(&[op])
                             .inc();
                     }
-                    let sleep_ms = cow_conflict_backoff_ms(attempt);
+                    let sleep_ms = crate::commit::conflict_backoff_ms(attempt);
                     warn!(
                         table = %table_ident,
                         op,

@@ -11,6 +11,14 @@ use iceberg::{Catalog, TableIdent};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+/// Backoff (exponential + jitter, capped ~1s) before retrying commit
+/// `attempt` (1-based) after an optimistic-concurrency conflict.
+pub(crate) fn conflict_backoff_ms(attempt: u32) -> u64 {
+    let base = 50_u64.saturating_mul(1_u64 << attempt.saturating_sub(1));
+    let jitter = (Uuid::new_v4().as_u128() as u64) % 50;
+    base.saturating_add(jitter).min(1000)
+}
+
 /// Bounded retry around an Iceberg commit that may lose an optimistic-concurrency
 /// race against another writer.
 ///
@@ -66,9 +74,7 @@ where
                     last_err = Some(e);
                     break;
                 }
-                let base_ms: u64 = 50_u64.saturating_mul(1_u64 << (attempt - 1));
-                let jitter_ms: u64 = (Uuid::new_v4().as_u128() as u64) % 50;
-                let sleep_ms = base_ms.saturating_add(jitter_ms).min(1000);
+                let sleep_ms = conflict_backoff_ms(attempt);
                 warn!(
                     table = %table_ident,
                     op,
