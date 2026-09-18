@@ -95,7 +95,7 @@ BENCH_ENV       = PROFILE=$(BENCH_PROFILE) BENCH_LOG_DIR=$(BENCH_LOG_DIR)
         ebook-pdf ebook-epub ebook-html \
         benchmark-charts test test-access-control test-access-control-spark \
         test-integration test-distributed test-integration-down \
-        audit audit-advisories \
+        audit audit-advisories metrics-layering-check \
         audit-deny audit-licenses \
         benchmark_sf0.1 benchmark_sf1 benchmark_sf10 benchmark_all \
         benchmark_sf0.1_trino benchmark_sf1_trino benchmark_sf10_trino \
@@ -308,6 +308,11 @@ audit-advisories:
 # [licenses] section, and cargo-deny >= 0.16 rejects every license that is not
 # explicitly allowed -- so `cargo deny check licenses` fails on MIT and
 # Apache-2.0 today. `make audit-licenses` runs it for whoever adds that policy.
+metrics-layering-check:  ## Only runtime crates may link the full sqe-metrics crate
+	@bad=$$(grep -l 'path = "../sqe-metrics" }' crates/*/Cargo.toml | grep -vE 'sqe-(coordinator|server|worker|lineage)/'); \
+	if [ -n "$$bad" ]; then echo "full sqe-metrics linked by a library crate (use sqe-metrics-core):"; echo "$$bad"; exit 1; fi
+	@echo "==> metrics layering ok"
+
 audit-deny:
 	@command -v cargo-deny >/dev/null 2>&1 || \
 		{ echo "cargo-deny not found. Install with: cargo install cargo-deny"; exit 1; }
