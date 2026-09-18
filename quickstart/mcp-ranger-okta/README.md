@@ -28,10 +28,13 @@ quickstart needs a real Okta tenant.
 3. **Claim** `groups` on the access token, value expression `Groups` matching a
    regex like `.*`. Create Okta groups named after the Ranger roles the stack
    bootstraps: `analyst`, `engineer`, `sqe_admin`.
-4. **Application**: a native or web app with Authorization Code + PKCE (browser
-   OAuth from Codex or Claude Code `/mcp`), or device authorization for CLIs.
+4. **Application**: OIDC Native app `sqemcp`, no secret, grant types Authorization
+   Code + Refresh Token (+ Device Authorization for the token script), redirect URI
+   `http://localhost:8400/callback`, assigned to the groups.
+5. **Access policy** on the server for that client: all of its grant types, any
+   assigned user, any scope. Without it Okta answers `access_denied` after login.
 
-Copy the server's issuer URI into `.env`.
+Copy the server's issuer URI and the app's client ID into `.env`.
 
 ## Run it
 
@@ -39,15 +42,34 @@ Copy the server's issuer URI into `.env`.
 cd quickstart/mcp-ranger-okta
 cp .env.example .env          # set OKTA_ISSUER
 ./run.sh                      # stack + metadata/challenge checks
-OKTA_TOKEN=$(...) ./run.sh    # adds whoami + a Ranger-masked read as that user
+./mint-okta-token.sh --decode  # device flow; shows iss/aud/scp/groups SQE will check
+OKTA_TOKEN=$(./mint-okta-token.sh) ./run.sh   # adds whoami + a Ranger-masked read as that user
 ./run.sh --writes             # expose execute_sql_change to engineer / sqe_admin groups
 ./run.sh --down
 ```
 
-Point Codex or Claude Code at `http://localhost:19092/mcp`; SQE advertises Okta
-through RFC 9728 metadata so `/mcp` authentication in the client walks the
-OAuth flow itself. The client templates in [`../mcp/clients/`](../mcp/clients/)
-work with the port changed.
+## Connect Claude Code or Codex
+
+The MCP authorization flow is Authorization Code + PKCE: the client hits `/mcp`,
+gets a 401 pointing at Okta, opens the browser, and Okta redirects to a loopback
+callback the client listens on. Okta rejects anonymous dynamic client
+registration, so both clients are given the `sqemcp` app's client ID.
+
+Register `http://localhost:8400/callback` as a sign-in redirect URI on the app
+(Okta needs the exact port; no wildcards), then:
+
+```bash
+# Claude Code
+claude mcp add --transport http --client-id "$OKTA_CLIENT_ID" --callback-port 8400 \
+  sqe http://localhost:19092/mcp
+# or copy clients/claude.mcp.json to .mcp.json; then in Claude Code: /mcp -> authenticate
+
+# Codex: paste clients/codex-config.toml into ~/.codex/config.toml with the client ID, then
+codex mcp login sqe
+```
+
+For a token in a shell (smoke tests, `run.sh`), the app also has the Device
+Authorization grant: `./mint-okta-token.sh --decode`.
 
 ## Environment contract
 
