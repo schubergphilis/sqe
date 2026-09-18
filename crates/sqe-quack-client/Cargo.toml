@@ -8,7 +8,6 @@ repository.workspace = true
 
 [dependencies]
 sqe-quack-wire = { path = "../sqe-quack-wire" }
-arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 async-trait = { workspace = true }
