@@ -1,0 +1,45 @@
+# MCP + Okta overlay. The base stack (Keycloak, Polaris, Ranger, RustFS,
+# bootstrap, seed, SQE image) comes from ../polaris-ranger-keycloak/docker-compose.yml.
+# Only SQE's config, its MCP port and the env-driven source settings live here.
+#
+# Every SQE_* variable below is the same one a Fargate task definition would
+# carry: SQE_<SECTION>__<FIELD> walks into the TOML tree, array entries by index.
+services:
+  sqe:
+    environment:
+      RUST_LOG: "info,sqe_mcp=debug,sqe_auth=debug,sqe_policy=debug"
+      # ── Okta (auth provider index 1; index 0 is the Keycloak ROPC seed user) ──
+      SQE_AUTH__PROVIDERS__1__ISSUER: ${OKTA_ISSUER}
+      SQE_AUTH__PROVIDERS__1__JWKS_URL: ${OKTA_ISSUER}/v1/keys
+      SQE_AUTH__PROVIDERS__1__AUDIENCE: ${OKTA_AUDIENCE:-http://localhost:${SQE_MCP_PORT:-19092}/mcp}
+      SQE_MCP__AUTHORIZATION_SERVERS__0: ${OKTA_ISSUER}
+      SQE_MCP__RESOURCE_URI: http://localhost:${SQE_MCP_PORT:-19092}/mcp
+      SQE_MCP__ALLOW_WRITES: ${MCP_ALLOW_WRITES:-false}
+      # ── Source databases (Polaris catalogs) ──
+      SQE_CATALOGS__SALES_WH__POLARIS_URL: ${SALES_WH_POLARIS_URL:-http://polaris:8181/api/catalog}
+      SQE_CATALOGS__SALES_WH__WAREHOUSE: ${SALES_WH_WAREHOUSE:-sales_wh}
+      SQE_CATALOGS__OPS_WH__POLARIS_URL: ${OPS_WH_POLARIS_URL:-http://polaris:8181/api/catalog}
+      SQE_CATALOGS__OPS_WH__WAREHOUSE: ${OPS_WH_WAREHOUSE:-ops_wh}
+      SQE_CATALOG__POLARIS_URL: ${SALES_WH_POLARIS_URL:-http://polaris:8181/api/catalog}
+      SQE_CATALOG__WAREHOUSE: ${SALES_WH_WAREHOUSE:-sales_wh}
+      # ── Object storage ──
+      SQE_STORAGE__S3_ENDPOINT: ${S3_ENDPOINT:-http://rustfs:9000}
+      SQE_STORAGE__S3_REGION: ${S3_REGION:-us-east-1}
+      SQE_STORAGE__S3_ACCESS_KEY: ${S3_ACCESS_KEY:-s3admin}
+      SQE_STORAGE__S3_SECRET_KEY: ${S3_SECRET_KEY:-s3adminpw}
+      # ── Ranger ──
+      SQE_POLICY__RANGER__URL: ${RANGER_URL:-http://ranger-admin:6080}
+      SQE_POLICY__RANGER__ADMIN_PASSWORD: ${RANGER_ADMIN_PASSWORD:-rangerR0cks!}
+      SQE_ACCESS_CONTROL__URL: ${RANGER_URL:-http://ranger-admin:6080}
+      SQE_ACCESS_CONTROL__RANGER__ADMIN_PASSWORD: ${RANGER_ADMIN_PASSWORD:-rangerR0cks!}
+    volumes:
+      # Overlay paths resolve relative to the first compose file.
+      - ./sqe.toml:/etc/sqe/sqe.toml:ro
+    ports:
+      # MCP shares SQE's existing web/health listener (prometheus_port + 1).
+      - "${SQE_MCP_PORT:-19092}:9091"
+
+  # Only the Ranger parity test (../polaris-ranger-keycloak/parity-test.sh)
+  # needs Spark. `docker compose --profile parity up` brings it back.
+  spark:
+    profiles: ["parity"]

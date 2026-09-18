@@ -40,8 +40,9 @@ Copy the server's issuer URI and the app's client ID into `.env`.
 
 ```bash
 cd quickstart/mcp-ranger-okta
-cp .env.example .env          # set OKTA_ISSUER
-./run.sh                      # stack + metadata/challenge checks
+cp .env.example .env          # set OKTA_ISSUER and OKTA_CLIENT_ID
+docker compose up -d --wait   # plain compose works: the Ranger stack is `include`d
+./run.sh                      # same, plus metadata/challenge checks
 ./mint-okta-token.sh --decode  # device flow; shows iss/aud/scp/groups SQE will check
 OKTA_TOKEN=$(./mint-okta-token.sh) ./run.sh   # adds whoami + a Ranger-masked read as that user
 ./run.sh --writes             # expose execute_sql_change to engineer / sqe_admin groups
