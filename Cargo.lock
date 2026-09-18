@@ -7039,7 +7039,6 @@ dependencies = [
  "tracing",
  "tracing-futures",
  "tracing-opentelemetry",
- "tracing-subscriber",
  "url",
  "uuid",
  "workspace-hack",
