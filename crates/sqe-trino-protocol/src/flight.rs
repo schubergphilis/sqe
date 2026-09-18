@@ -167,12 +167,6 @@ impl FlightSqlClient {
         self.inner.set_token(token.into());
     }
 
-    /// Escape hatch to the underlying arrow-flight client (prepared
-    /// statements, catalog metadata RPCs).
-    pub fn inner_mut(&mut self) -> &mut FlightSqlServiceClient<Channel> {
-        &mut self.inner
-    }
-
     /// Run a statement and collect every batch from every endpoint.
     pub async fn execute_collect(
         &mut self,

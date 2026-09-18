@@ -13,6 +13,7 @@
 //! so there is no AST to work on. The scan skips string literals and quoted
 //! identifiers, so `'TRIM(BOTH FROM'` inside a literal is left alone, and
 //! matches are case-insensitive with any whitespace between the tokens.
+use crate::token_scan::is_ident_byte;
 
 /// Rewrite `TRIM(BOTH FROM ` / `TRIM(LEADING FROM ` / `TRIM(TRAILING FROM `
 /// into `TRIM(` / `LTRIM(` / `RTRIM(`. Returns the input unchanged when no
@@ -100,10 +101,6 @@ fn take_keyword(rest: &str, kw: &str) -> Option<usize> {
 
 fn skip_ws(rest: &str) -> usize {
     rest.len() - rest.trim_start().len()
-}
-
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 fn utf8_len(first: u8) -> usize {

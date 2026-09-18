@@ -5,6 +5,8 @@
 
 use sqe_core::{Result, SqeError, SqeErrorCode};
 
+use crate::token_scan::strip_prefix_ci;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyTarget {
     Table(String),
@@ -249,12 +251,6 @@ fn expect_kw<'a>(s: &'a str, keyword: &str) -> Result<&'a str> {
         })
         .map(str::trim_start)
         .ok_or_else(|| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("CREATE POLICY: expected {keyword}")))
-}
-
-fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    s.get(..prefix.len())
-        .filter(|head| head.eq_ignore_ascii_case(prefix))
-        .map(|_| &s[prefix.len()..])
 }
 
 fn require_empty(rest: &str) -> Result<()> {
