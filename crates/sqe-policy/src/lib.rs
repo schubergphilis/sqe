@@ -1,7 +1,6 @@
 pub mod grants;
 pub mod mask_udf;
 pub mod plan_rewriter;
-pub mod policy_breaker;
 pub mod policy_expr;
 pub mod policy_store;
 pub mod ranger_store;
