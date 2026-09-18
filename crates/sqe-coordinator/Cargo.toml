@@ -85,7 +85,6 @@ anyhow = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
 datafusion-functions-json = { workspace = true }
-datafusion-expr = { workspace = true }
 sqlparser = { workspace = true }
 iceberg = { workspace = true }
 parquet = { workspace = true }

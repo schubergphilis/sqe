@@ -185,6 +185,37 @@ release-binaries:
       variables:
         CARGO_PROFILE: "release"
 
+# Unused-dependency gate. cargo-machete is a source scan (no compile), so the
+# job is seconds; it runs whenever a manifest changes. Feature-only knobs are
+# listed under [package.metadata.cargo-machete] in the crate that owns them.
+deps-check:
+  stage: test
+  needs: []
+  image: "$AIKIDO_RUST_IMAGE"
+  timeout: 15m
+  variables:
+    CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
+  cache:
+    key: "deps-check-cargo-home"
+    paths:
+      - .cargo-home/bin/
+      - .cargo-home/registry/
+  script:
+    - |
+      set -euo pipefail
+      command -v cargo-machete >/dev/null 2>&1 || cargo install cargo-machete --locked
+      cargo machete --with-metadata crates/sqe-*
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - Cargo.toml
+        - Cargo.lock
+        - "crates/*/Cargo.toml"
+        - "crates/**/*.rs"
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
 # Image assembly from the release-binaries artifact (Dockerfile.ci, COPY only).
 # The 3h timeout is a leftover ceiling from when this job compiled the engine
 # inside kaniko; the job now takes minutes.
