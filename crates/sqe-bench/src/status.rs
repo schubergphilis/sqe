@@ -10,7 +10,7 @@
 //!      the run loop (`test.rs`) and exit code (`run.rs`) treat
 //!      timeouts/vacuous results distinctly.
 
-use arrow_array::{cast::AsArray, Array, Float32Array, Float64Array, RecordBatch};
+use arrow_array::{Array, RecordBatch};
 use arrow_schema::DataType;
 
 #[derive(Debug)]
@@ -195,110 +195,7 @@ fn cell_to_string(array: &dyn Array, row: usize) -> String {
     if array.is_null(row) {
         return "NULL".to_string();
     }
-
-    match array.data_type() {
-        DataType::Float32 => {
-            let v = array
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .unwrap()
-                .value(row);
-            format!("{v}")
-        }
-        DataType::Float64 => {
-            let v = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .unwrap()
-                .value(row);
-            format!("{v}")
-        }
-        DataType::Utf8 => array.as_string::<i32>().value(row).to_string(),
-        DataType::LargeUtf8 => array.as_string::<i64>().value(row).to_string(),
-        DataType::Int8 => format!(
-            "{}",
-            array
-                .as_primitive::<arrow_array::types::Int8Type>()
-                .value(row)
-        ),
-        DataType::Int16 => format!(
-            "{}",
-            array
-                .as_primitive::<arrow_array::types::Int16Type>()
-                .value(row)
-        ),
-        DataType::Int32 => format!(
-            "{}",
-            array
-                .as_primitive::<arrow_array::types::Int32Type>()
-                .value(row)
-        ),
-        DataType::Int64 => format!(
-            "{}",
-            array
-                .as_primitive::<arrow_array::types::Int64Type>()
-                .value(row)
-        ),
-        DataType::UInt8 => format!(
-            "{}",
-            array
-                .as_primitive::<arrow_array::types::UInt8Type>()
-                .value(row)
-        ),
-        DataType::UInt16 => format!(
-            "{}",
-            array
-                .as_primitive::<arrow_array::types::UInt16Type>()
-                .value(row)
-        ),
-        DataType::UInt32 => format!(
-            "{}",
-            array
-                .as_primitive::<arrow_array::types::UInt32Type>()
-                .value(row)
-        ),
-        DataType::UInt64 => format!(
-            "{}",
-            array
-                .as_primitive::<arrow_array::types::UInt64Type>()
-                .value(row)
-        ),
-        DataType::Boolean => format!("{}", array.as_boolean().value(row)),
-        DataType::Date32 | DataType::Date64 => {
-            arrow::util::display::array_value_to_string(array, row).unwrap_or_default()
-        }
-        DataType::Decimal128(_, scale) => {
-            let raw = array
-                .as_primitive::<arrow_array::types::Decimal128Type>()
-                .value(row);
-            let scale = *scale as u32;
-            if scale == 0 {
-                format!("{raw}")
-            } else {
-                let divisor = 10i128.pow(scale);
-                let integer = raw / divisor;
-                let frac = (raw % divisor).unsigned_abs();
-                format!("{integer}.{frac:0>width$}", width = scale as usize)
-            }
-        }
-        DataType::Utf8View => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<arrow_array::StringViewArray>()
-                .unwrap();
-            arr.value(row).to_string()
-        }
-        DataType::Timestamp(_, _) | DataType::Time32(_) | DataType::Time64(_) => {
-            arrow::util::display::array_value_to_string(array, row).unwrap_or_default()
-        }
-        DataType::Decimal256(_, _) => {
-            arrow::util::display::array_value_to_string(array, row).unwrap_or_default()
-        }
-        other => {
-            // Fallback: use Debug representation of the array type
-            format!("<{other}>")
-        }
-    }
+    arrow::util::display::array_value_to_string(array, row).unwrap_or_default()
 }
 
 /// Return a boolean mask of which columns contain float values, aligned to

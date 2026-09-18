@@ -507,48 +507,6 @@ impl FetchResponse {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppendRequest {
-    pub schema_name: String,
-    pub table_name: String,
-    pub append_chunk: DataChunk,
-}
-
-impl AppendRequest {
-    pub fn encode(&self, s: &mut BinarySerializer) {
-        s.begin_property(1);
-        s.write_string(&self.schema_name);
-        s.end_property();
-        s.begin_property(2);
-        s.write_string(&self.table_name);
-        s.end_property();
-        // `append_chunk` is `unique_ptr<DataChunkWrapper>` — same
-        // nullable-present byte as the result lists.
-        s.begin_property(3);
-        s.begin_nullable(true);
-        encode_data_chunk_wrapper(s, &self.append_chunk);
-        s.end_nullable(true);
-        s.end_property();
-    }
-
-    pub fn decode(d: &mut BinaryDeserializer<'_>) -> crate::Result<Self> {
-        d.expect_field(1)?;
-        let schema_name = d.read_string()?;
-        d.expect_field(2)?;
-        let table_name = d.read_string()?;
-        d.expect_field(3)?;
-        if !d.read_nullable_present()? {
-            return Err(crate::WireError::NullDataChunkWrapper);
-        }
-        let append_chunk = decode_data_chunk_wrapper(d)?;
-        Ok(Self {
-            schema_name,
-            table_name,
-            append_chunk,
-        })
-    }
-}
-
 // -----------------------------------------------------------------------------
 // Top-level message envelope
 // -----------------------------------------------------------------------------
@@ -561,7 +519,6 @@ pub enum QuackMessage {
     PrepareResponse(PrepareResponse),
     FetchRequest(FetchRequest),
     FetchResponse(FetchResponse),
-    AppendRequest(AppendRequest),
     SuccessResponse,
     DisconnectMessage,
     ErrorResponse(ErrorResponse),
@@ -576,7 +533,6 @@ impl QuackMessage {
             QuackMessage::PrepareResponse(_) => MessageType::PrepareResponse,
             QuackMessage::FetchRequest(_) => MessageType::FetchRequest,
             QuackMessage::FetchResponse(_) => MessageType::FetchResponse,
-            QuackMessage::AppendRequest(_) => MessageType::AppendRequest,
             QuackMessage::SuccessResponse => MessageType::SuccessResponse,
             QuackMessage::DisconnectMessage => MessageType::DisconnectMessage,
             QuackMessage::ErrorResponse(_) => MessageType::ErrorResponse,
@@ -597,7 +553,6 @@ pub fn encode_message(header: &MessageHeader, body: &QuackMessage) -> Vec<u8> {
         QuackMessage::PrepareResponse(b) => b.encode(&mut s),
         QuackMessage::FetchRequest(b) => b.encode(&mut s),
         QuackMessage::FetchResponse(b) => b.encode(&mut s),
-        QuackMessage::AppendRequest(b) => b.encode(&mut s),
         QuackMessage::SuccessResponse => SuccessResponse.encode(&mut s),
         QuackMessage::DisconnectMessage => DisconnectMessage.encode(&mut s),
         QuackMessage::ErrorResponse(b) => b.encode(&mut s),
@@ -626,7 +581,8 @@ pub fn decode_message(bytes: &[u8]) -> crate::Result<(MessageHeader, QuackMessag
         }
         MessageType::FetchRequest => QuackMessage::FetchRequest(FetchRequest::decode(&mut d)?),
         MessageType::FetchResponse => QuackMessage::FetchResponse(FetchResponse::decode(&mut d)?),
-        MessageType::AppendRequest => QuackMessage::AppendRequest(AppendRequest::decode(&mut d)?),
+        // Wire type 9 is DuckDB's append path; SQE has no write path over Quack.
+        MessageType::AppendRequest => return Err(crate::WireError::UnknownMessageType(9)),
         MessageType::SuccessResponse => {
             SuccessResponse::decode(&mut d)?;
             QuackMessage::SuccessResponse
@@ -895,24 +851,6 @@ mod tests {
         let bytes = s.into_bytes();
         let mut d = BinaryDeserializer::new(&bytes);
         let decoded = FetchResponse::decode(&mut d).unwrap();
-        d.expect_object_end().unwrap();
-        assert_eq!(decoded, original);
-    }
-
-    #[test]
-    fn append_request_roundtrips() {
-        let original = AppendRequest {
-            schema_name: "main".to_string(),
-            table_name: "events".to_string(),
-            append_chunk: sample_chunk_integer_column(),
-        };
-        let mut s = BinarySerializer::new();
-        s.begin_object();
-        original.encode(&mut s);
-        s.end_object();
-        let bytes = s.into_bytes();
-        let mut d = BinaryDeserializer::new(&bytes);
-        let decoded = AppendRequest::decode(&mut d).unwrap();
         d.expect_object_end().unwrap();
         assert_eq!(decoded, original);
     }
