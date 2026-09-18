@@ -92,28 +92,12 @@ impl BinarySerializer {
         varint::encode_unsigned(value as u64, &mut self.out);
     }
 
-    pub fn write_u16(&mut self, value: u16) {
-        varint::encode_unsigned(value as u64, &mut self.out);
-    }
-
     pub fn write_u32(&mut self, value: u32) {
         varint::encode_unsigned(value as u64, &mut self.out);
     }
 
     pub fn write_u64(&mut self, value: u64) {
         varint::encode_unsigned(value, &mut self.out);
-    }
-
-    pub fn write_i8(&mut self, value: i8) {
-        varint::encode_signed(value as i64, &mut self.out);
-    }
-
-    pub fn write_i16(&mut self, value: i16) {
-        varint::encode_signed(value as i64, &mut self.out);
-    }
-
-    pub fn write_i32(&mut self, value: i32) {
-        varint::encode_signed(value as i64, &mut self.out);
     }
 
     pub fn write_i64(&mut self, value: i64) {
@@ -127,10 +111,6 @@ impl BinarySerializer {
         let upper = (value >> 64) as i64;
         varint::encode_signed(lower, &mut self.out);
         varint::encode_signed(upper, &mut self.out);
-    }
-
-    pub fn write_f32(&mut self, value: f32) {
-        self.out.extend_from_slice(&value.to_le_bytes());
     }
 
     pub fn write_f64(&mut self, value: f64) {
@@ -263,18 +243,6 @@ impl<'a> BinaryDeserializer<'a> {
         Ok(value)
     }
 
-    pub fn read_i8(&mut self) -> crate::Result<i8> {
-        self.read_i64().map(|v| v as i8)
-    }
-
-    pub fn read_i16(&mut self) -> crate::Result<i16> {
-        self.read_i64().map(|v| v as i16)
-    }
-
-    pub fn read_i32(&mut self) -> crate::Result<i32> {
-        self.read_i64().map(|v| v as i32)
-    }
-
     pub fn read_i64(&mut self) -> crate::Result<i64> {
         let (value, consumed) = varint::decode_signed(&self.buf[self.pos..])?;
         self.pos += consumed;
@@ -285,28 +253,6 @@ impl<'a> BinaryDeserializer<'a> {
         let lower = self.read_i64()? as u64 as i128;
         let upper = self.read_i64()? as i128;
         Ok((upper << 64) | lower)
-    }
-
-    pub fn read_f32(&mut self) -> crate::Result<f32> {
-        debug_assert!(self.pos <= self.buf.len(), "pos advanced past buffer end");
-        if self.buf.len().saturating_sub(self.pos) < 4 {
-            return Err(crate::WireError::UnexpectedEof);
-        }
-        let mut buf = [0u8; 4];
-        buf.copy_from_slice(&self.buf[self.pos..self.pos + 4]);
-        self.pos += 4;
-        Ok(f32::from_le_bytes(buf))
-    }
-
-    pub fn read_f64(&mut self) -> crate::Result<f64> {
-        debug_assert!(self.pos <= self.buf.len(), "pos advanced past buffer end");
-        if self.buf.len().saturating_sub(self.pos) < 8 {
-            return Err(crate::WireError::UnexpectedEof);
-        }
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(&self.buf[self.pos..self.pos + 8]);
-        self.pos += 8;
-        Ok(f64::from_le_bytes(buf))
     }
 
     pub fn read_string(&mut self) -> crate::Result<String> {
@@ -336,10 +282,6 @@ impl<'a> BinaryDeserializer<'a> {
         }
         self.pos += len;
         Ok(())
-    }
-
-    pub fn read_list_count(&mut self) -> crate::Result<u64> {
-        self.read_u64()
     }
 
     /// Read a wire count and reject it when it exceeds the bytes remaining in

@@ -26,19 +26,6 @@ fn validate_correlation_id(value: &str) -> Option<String> {
     .then(|| value.to_string())
 }
 
-pub fn correlation_ids_from_metadata(metadata: &MetadataMap) -> CorrelationIds {
-    CorrelationIds {
-        request_id: metadata
-            .get("x-request-id")
-            .and_then(|value| value.to_str().ok())
-            .and_then(validate_correlation_id),
-        session_id: metadata
-            .get("x-session-id")
-            .and_then(|value| value.to_str().ok())
-            .and_then(validate_correlation_id),
-    }
-}
-
 pub fn correlation_ids_from_headers(headers: &axum::http::HeaderMap) -> CorrelationIds {
     CorrelationIds {
         request_id: headers
@@ -218,14 +205,6 @@ pub fn current_trace_id() -> Option<String> {
     }
 }
 
-/// Return the current active span ID (16-char lowercase hex).
-pub fn current_span_id() -> Option<String> {
-    let cx = tracing::Span::current().context();
-    let span_ref = cx.span();
-    let sc = span_ref.span_context();
-    sc.is_valid().then(|| format!("{:016x}", sc.span_id()))
-}
-
 /// Record lowercase W3C trace and span identifiers on a span that declares
 /// `trace_id` and `span_id` fields. JSON logging includes these ancestor span
 /// fields for ordinary tracing events emitted anywhere below the boundary.
@@ -336,10 +315,10 @@ mod tests {
         assert_eq!(ids.session_id, None);
 
         let oversized = "a".repeat(CORRELATION_ID_MAX_LEN + 1);
-        let mut metadata = MetadataMap::new();
-        metadata.insert("x-request-id", oversized.parse().unwrap());
-        metadata.insert("x-session-id", "session-42".parse().unwrap());
-        let ids = correlation_ids_from_metadata(&metadata);
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-request-id", oversized.parse().unwrap());
+        headers.insert("x-session-id", "session-42".parse().unwrap());
+        let ids = correlation_ids_from_headers(&headers);
         assert_eq!(ids.request_id, None);
         assert_eq!(ids.session_id.as_deref(), Some("session-42"));
     }

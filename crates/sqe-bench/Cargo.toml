@@ -26,11 +26,9 @@ clap = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
-arrow-flight = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
 parquet = { workspace = true }
-object_store = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 # reqwest is `rustls-no-provider` workspace-wide; sqe-bench does not link
@@ -47,8 +45,9 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 url = { workspace = true }
-tonic = { workspace = true }
-futures = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+futures = { workspace = true }

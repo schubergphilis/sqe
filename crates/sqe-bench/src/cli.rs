@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::query::QualifyTables;
-use crate::{client, comparison, generate, load, report, run, sink, test};
+use crate::{client, comparison, generate, load, report, run, sink, suite};
 
 #[derive(Parser)]
 #[command(
@@ -342,10 +342,6 @@ pub enum Command {
         /// Also run the Trino comparison and emit compare-*.json.
         #[arg(long)]
         compare_trino: bool,
-
-        /// Attach-vs-primary parity smoke (not yet implemented).
-        #[arg(long)]
-        smoke: bool,
 
         /// Run only a single query id (e.g. `q05`).
         #[arg(long)]
@@ -774,16 +770,20 @@ pub async fn run() -> anyhow::Result<()> {
                 eprintln!("[sqe-bench] connected, running tests...");
             }
 
-            let results = test::run_benchmark_test(
+            let results = suite::run_suite(
                 bench_client.as_ref(),
+                None,
                 &benchmark,
                 scale,
                 query.as_deref(),
                 catalog.as_deref(),
                 namespace.as_deref(),
+                "",
+                None,
                 qualify_tables,
             )
-            .await?;
+            .await?
+            .results;
 
             report::print_summary(&benchmark, scale, protocol_str, &results);
 
@@ -800,7 +800,6 @@ pub async fn run() -> anyhow::Result<()> {
             host,
             port,
             compare_trino,
-            smoke,
             query,
             qualify_tables,
         } => {
@@ -815,7 +814,6 @@ pub async fn run() -> anyhow::Result<()> {
                 host,
                 port,
                 compare_trino,
-                smoke,
                 query,
                 golden_token,
                 trino_endpoint,
