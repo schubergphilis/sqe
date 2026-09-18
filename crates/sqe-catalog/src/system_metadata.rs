@@ -28,12 +28,9 @@ pub struct MetadataSchemaProvider {
 
 impl MetadataSchemaProvider {
     pub fn new(entries: Vec<SystemCatalogEntry>) -> Self {
-        let mut seen = std::collections::HashSet::new();
-        let catalogs = entries
-            .into_iter()
-            .filter(|e| seen.insert(e.name.clone()))
-            .collect();
-        Self { catalogs }
+        Self {
+            catalogs: crate::system_jdbc::dedup_entries(entries),
+        }
     }
 }
 

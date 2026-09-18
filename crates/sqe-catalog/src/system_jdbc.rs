@@ -48,7 +48,7 @@ impl JdbcSchemaProvider {
 }
 
 /// Deduplicate reachable catalogs by name, preserving order (primary first).
-fn dedup_entries(entries: Vec<SystemCatalogEntry>) -> Vec<SystemCatalogEntry> {
+pub(crate) fn dedup_entries(entries: Vec<SystemCatalogEntry>) -> Vec<SystemCatalogEntry> {
     let mut seen = std::collections::HashSet::new();
     entries
         .into_iter()
