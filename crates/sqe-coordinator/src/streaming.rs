@@ -638,35 +638,6 @@ impl TrackedRecordBatchStream {
         }
     }
 
-    /// Construct a tracked stream carrying multiple permits (per-user and
-    /// global). Useful when admission control involves layered semaphores.
-    pub fn with_permits_and_cancel_token(
-        inner: SendableRecordBatchStream,
-        finalizer: StreamFinalizer,
-        permits: Vec<OwnedSemaphorePermit>,
-        cancel_token: CancellationToken,
-    ) -> Self {
-        let schema = inner.schema();
-        Self {
-            inner,
-            schema,
-            finalizer: Some(finalizer),
-            rows_so_far: 0,
-            _permits: permits,
-            _teardown: None,
-            _per_user_reservation: None,
-            cancel_wait: Some(Box::pin(cancel_token.clone().cancelled_owned())),
-            cancel_token: Some(cancel_token),
-            cancelled: false,
-            idle_timeout: None,
-            idle_sleep: None,
-            idle_progress: None,
-            query_deadline: None,
-            deadline_sleep: None,
-            query_timeout: None,
-        }
-    }
-
     /// Variant that also carries a per-user memory reservation. The
     /// reservation is released when the stream drops, freeing the user's
     /// share of the per-user memory budget.

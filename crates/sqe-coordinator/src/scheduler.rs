@@ -1,9 +1,7 @@
 //! Fragment scheduler — assigns scan tasks to workers with load weighting.
 //!
-//! The [`FragmentScheduler`] trait defines the interface for scheduling
-//! strategies. The default implementation, [`WeightedScheduler`], assigns
-//! fragments to the worker with the lowest accumulated cost, skipping
-//! unhealthy workers.
+//! [`assign`] hands each fragment to the worker with the lowest accumulated
+//! cost, skipping unhealthy workers.
 
 use sqe_planner::ScanTask;
 use tracing::debug;
@@ -32,45 +30,6 @@ pub struct Assignment {
     /// URL of the assigned worker.
     pub worker_url: String,
 }
-
-/// Trait for fragment scheduling strategies.
-///
-/// Implementations receive a list of scan tasks and worker information,
-/// and return an assignment of each task to exactly one worker.
-pub trait FragmentScheduler: Send + Sync + std::fmt::Debug {
-    /// Assign each scan task to a worker.
-    ///
-    /// Returns a Vec of [`Assignment`]s, one per input task, in the same
-    /// order as the input `tasks` slice.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if no healthy workers are available.
-    fn assign(
-        &self,
-        tasks: &[ScanTask],
-        workers: &[WorkerInfo],
-    ) -> Result<Vec<Assignment>, SchedulerError>;
-}
-
-/// Errors that can occur during fragment scheduling.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SchedulerError {
-    /// No healthy workers are available to receive fragments.
-    NoHealthyWorkers,
-}
-
-impl std::fmt::Display for SchedulerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SchedulerError::NoHealthyWorkers => {
-                write!(f, "No healthy workers available for scheduling")
-            }
-        }
-    }
-}
-
-impl std::error::Error for SchedulerError {}
 
 /// Estimates the cost of a scan task.
 ///
@@ -122,116 +81,92 @@ fn preferred_worker(file_paths: &[String], num_workers: usize) -> usize {
     (hash as usize) % num_workers
 }
 
-/// Weighted fragment scheduler that assigns tasks to the least-loaded worker.
-///
-/// Strategy:
-/// 1. Filter out unhealthy workers.
-/// 2. Initialize each worker's load from its `in_flight_load` (same unit as
-///    `estimate_cost`).
-/// 3. Sort tasks by estimated cost (descending) so the heaviest tasks
-///    are assigned first ("largest-first" bin-packing heuristic).
-/// 4. Assign each task to the worker with the currently lowest total load.
-///
-/// This produces a balanced distribution even when tasks have varying costs,
-/// and naturally handles the case where some workers already have in-flight work.
-#[derive(Debug, Default)]
-pub struct WeightedScheduler;
+/// Weighted least-loaded assignment with file affinity: the biggest tasks go
+/// first, each to its hash-preferred worker unless that worker is more than
+/// 20% above the least-loaded one. `None` when no worker is healthy.
+pub(crate) fn assign(tasks: &[ScanTask], workers: &[WorkerInfo]) -> Option<Vec<Assignment>> {
+    // Filter to only healthy workers
+    let healthy: Vec<&WorkerInfo> = workers.iter().filter(|w| w.healthy).collect();
 
-impl WeightedScheduler {
-    pub fn new() -> Self {
-        Self
+    if healthy.is_empty() {
+        return None;
     }
-}
 
-impl FragmentScheduler for WeightedScheduler {
-    fn assign(
-        &self,
-        tasks: &[ScanTask],
-        workers: &[WorkerInfo],
-    ) -> Result<Vec<Assignment>, SchedulerError> {
-        // Filter to only healthy workers
-        let healthy: Vec<&WorkerInfo> = workers.iter().filter(|w| w.healthy).collect();
+    if tasks.is_empty() {
+        return Some(vec![]);
+    }
 
-        if healthy.is_empty() {
-            return Err(SchedulerError::NoHealthyWorkers);
-        }
+    // Build a load tracker: (accumulated_load, worker_index_in_healthy).
+    // `in_flight_load` is already in `estimate_cost` units, so adding task
+    // costs below compares like with like.
+    let mut loads: Vec<(u64, usize)> = healthy
+        .iter()
+        .enumerate()
+        .map(|(i, w)| (w.in_flight_load, i))
+        .collect();
 
-        if tasks.is_empty() {
-            return Ok(vec![]);
-        }
+    // Sort tasks by estimated cost descending (largest-first bin packing).
+    // We track original indices so we can place assignments correctly.
+    let mut indexed_tasks: Vec<(usize, u64)> = tasks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (i, estimate_cost(t)))
+        .collect();
+    indexed_tasks.sort_by_key(|t| std::cmp::Reverse(t.1));
 
-        // Build a load tracker: (accumulated_load, worker_index_in_healthy).
-        // `in_flight_load` is already in `estimate_cost` units, so adding task
-        // costs below compares like with like.
-        let mut loads: Vec<(u64, usize)> = healthy
+    // Pre-allocate the result vector with placeholders
+    let mut assignments: Vec<Option<Assignment>> = vec![None; tasks.len()];
+
+    for (task_idx, cost) in indexed_tasks {
+        // Find the worker with the lowest current load.
+        // On ties, the first worker (by position) wins, which provides
+        // stable, deterministic ordering.
+        let min_pos = loads
             .iter()
             .enumerate()
-            .map(|(i, w)| (w.in_flight_load, i))
-            .collect();
+            .min_by_key(|(_, (load, _))| *load)
+            .map(|(pos, _)| pos)
+            .expect("healthy workers vec is non-empty");
 
-        // Sort tasks by estimated cost descending (largest-first bin packing).
-        // We track original indices so we can place assignments correctly.
-        let mut indexed_tasks: Vec<(usize, u64)> = tasks
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (i, estimate_cost(t)))
-            .collect();
-        indexed_tasks.sort_by_key(|t| std::cmp::Reverse(t.1));
+        // Cache affinity: prefer the consistent-hash worker if its load is within 20% of minimum
+        let preferred = preferred_worker(&tasks[task_idx].data_file_paths, healthy.len());
+        let preferred_load = loads[preferred].0;
+        let min_load = loads[min_pos].0;
+        let threshold = min_load + (min_load / 5).max(1); // 20% tolerance
 
-        // Pre-allocate the result vector with placeholders
-        let mut assignments: Vec<Option<Assignment>> = vec![None; tasks.len()];
+        let chosen = if preferred_load <= threshold {
+            preferred
+        } else {
+            min_pos
+        };
 
-        for (task_idx, cost) in indexed_tasks {
-            // Find the worker with the lowest current load.
-            // On ties, the first worker (by position) wins, which provides
-            // stable, deterministic ordering.
-            let min_pos = loads
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, (load, _))| *load)
-                .map(|(pos, _)| pos)
-                .expect("healthy workers vec is non-empty");
+        let worker_idx = loads[chosen].1;
+        let worker = &healthy[worker_idx];
 
-            // Cache affinity: prefer the consistent-hash worker if its load is within 20% of minimum
-            let preferred = preferred_worker(&tasks[task_idx].data_file_paths, healthy.len());
-            let preferred_load = loads[preferred].0;
-            let min_load = loads[min_pos].0;
-            let threshold = min_load + (min_load / 5).max(1); // 20% tolerance
+        assignments[task_idx] = Some(Assignment {
+            task_index: task_idx,
+            worker_url: worker.url.clone(),
+        });
 
-            let chosen = if preferred_load <= threshold {
-                preferred
-            } else {
-                min_pos
-            };
-
-            let worker_idx = loads[chosen].1;
-            let worker = &healthy[worker_idx];
-
-            assignments[task_idx] = Some(Assignment {
-                task_index: task_idx,
-                worker_url: worker.url.clone(),
-            });
-
-            // Update the load for this worker
-            loads[chosen].0 += cost;
-        }
-
-        let result: Vec<Assignment> = assignments
-            .into_iter()
-            .map(|a| {
-                a.expect("BUG: every task must be assigned; healthy worker check passed above")
-            })
-            .collect();
-
-        debug!(
-            task_count = tasks.len(),
-            worker_count = healthy.len(),
-            assignments = ?result.iter().map(|a| (&a.worker_url, a.task_index)).collect::<Vec<_>>(),
-            "Fragment scheduling complete"
-        );
-
-        Ok(result)
+        // Update the load for this worker
+        loads[chosen].0 += cost;
     }
+
+    let result: Vec<Assignment> = assignments
+        .into_iter()
+        .map(|a| {
+            a.expect("BUG: every task must be assigned; healthy worker check passed above")
+        })
+        .collect();
+
+    debug!(
+        task_count = tasks.len(),
+        worker_count = healthy.len(),
+        assignments = ?result.iter().map(|a| (&a.worker_url, a.task_index)).collect::<Vec<_>>(),
+        "Fragment scheduling complete"
+    );
+
+    Some(result)
 }
 
 #[cfg(test)]
@@ -286,7 +221,6 @@ mod tests {
     /// 500 MB task went to the idle one, took the second task too.
     #[test]
     fn test_in_flight_load_is_in_cost_units() {
-        let scheduler = WeightedScheduler::new();
         let busy_reserved = estimate_cost(&make_task_with_sizes("inflight", &[500 * MB]));
         assert_eq!(busy_reserved, 500);
         let tasks = vec![
@@ -298,7 +232,7 @@ mod tests {
             make_worker("http://w2:50052", true, 0),
         ];
 
-        let assignments = scheduler.assign(&tasks, &workers).unwrap();
+        let assignments = assign(&tasks, &workers).unwrap();
         assert_eq!(assignments.len(), 2);
         assert_ne!(
             assignments[0].worker_url, assignments[1].worker_url,
@@ -308,7 +242,6 @@ mod tests {
 
     #[test]
     fn test_even_distribution() {
-        let scheduler = WeightedScheduler::new();
         let tasks = vec![
             make_task("f1", 2, 10),
             make_task("f2", 2, 10),
@@ -320,7 +253,7 @@ mod tests {
             make_worker("http://w2:50052", true, 0),
         ];
 
-        let assignments = scheduler.assign(&tasks, &workers).unwrap();
+        let assignments = assign(&tasks, &workers).unwrap();
         assert_eq!(assignments.len(), 4);
 
         // Count tasks per worker
@@ -340,14 +273,13 @@ mod tests {
 
     #[test]
     fn test_skip_unhealthy_workers() {
-        let scheduler = WeightedScheduler::new();
         let tasks = vec![make_task("f1", 3, 10), make_task("f2", 3, 10)];
         let workers = vec![
             make_worker("http://w1:50052", false, 0), // unhealthy
             make_worker("http://w2:50052", true, 0),
         ];
 
-        let assignments = scheduler.assign(&tasks, &workers).unwrap();
+        let assignments = assign(&tasks, &workers).unwrap();
         assert_eq!(assignments.len(), 2);
 
         // All tasks should go to w2 (the only healthy worker)
@@ -361,21 +293,19 @@ mod tests {
 
     #[test]
     fn test_no_healthy_workers_returns_error() {
-        let scheduler = WeightedScheduler::new();
         let tasks = vec![make_task("f1", 1, 10)];
         let workers = vec![
             make_worker("http://w1:50052", false, 0),
             make_worker("http://w2:50052", false, 0),
         ];
 
-        let result = scheduler.assign(&tasks, &workers);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), SchedulerError::NoHealthyWorkers);
+        let result = assign(&tasks, &workers);
+        assert!(result.is_none());
+        assert!(result.is_none());
     }
 
     #[test]
     fn test_single_worker() {
-        let scheduler = WeightedScheduler::new();
         let tasks = vec![
             make_task("f1", 5, 10),
             make_task("f2", 3, 10),
@@ -383,7 +313,7 @@ mod tests {
         ];
         let workers = vec![make_worker("http://w1:50052", true, 0)];
 
-        let assignments = scheduler.assign(&tasks, &workers).unwrap();
+        let assignments = assign(&tasks, &workers).unwrap();
         assert_eq!(assignments.len(), 3);
 
         for a in &assignments {
@@ -393,7 +323,6 @@ mod tests {
 
     #[test]
     fn test_more_fragments_than_workers() {
-        let scheduler = WeightedScheduler::new();
         let tasks = vec![
             make_task("f1", 2, 10),
             make_task("f2", 2, 10),
@@ -406,7 +335,7 @@ mod tests {
             make_worker("http://w2:50052", true, 0),
         ];
 
-        let assignments = scheduler.assign(&tasks, &workers).unwrap();
+        let assignments = assign(&tasks, &workers).unwrap();
         assert_eq!(assignments.len(), 5);
 
         let w1_count = assignments
@@ -427,7 +356,6 @@ mod tests {
 
     #[test]
     fn test_weighted_distribution_unequal_costs() {
-        let scheduler = WeightedScheduler::new();
         // One heavy task (10 files × 100 MB) and two light tasks (1 file × 100 MB each)
         let tasks = vec![
             make_task("heavy", 10, 100),
@@ -439,7 +367,7 @@ mod tests {
             make_worker("http://w2:50052", true, 0),
         ];
 
-        let assignments = scheduler.assign(&tasks, &workers).unwrap();
+        let assignments = assign(&tasks, &workers).unwrap();
         assert_eq!(assignments.len(), 3);
 
         // The heavy task should be on one worker, both light tasks on the other.
@@ -460,14 +388,13 @@ mod tests {
 
     #[test]
     fn test_existing_load_influences_assignment() {
-        let scheduler = WeightedScheduler::new();
         let tasks = vec![make_task("f1", 2, 10)];
         let workers = vec![
             make_worker("http://w1:50052", true, 10), // already loaded
             make_worker("http://w2:50052", true, 0),  // idle
         ];
 
-        let assignments = scheduler.assign(&tasks, &workers).unwrap();
+        let assignments = assign(&tasks, &workers).unwrap();
         assert_eq!(assignments.len(), 1);
 
         // Should assign to w2 since it has lower load
@@ -479,28 +406,25 @@ mod tests {
 
     #[test]
     fn test_empty_tasks() {
-        let scheduler = WeightedScheduler::new();
         let tasks: Vec<ScanTask> = vec![];
         let workers = vec![make_worker("http://w1:50052", true, 0)];
 
-        let assignments = scheduler.assign(&tasks, &workers).unwrap();
+        let assignments = assign(&tasks, &workers).unwrap();
         assert!(assignments.is_empty());
     }
 
     #[test]
     fn test_empty_workers() {
-        let scheduler = WeightedScheduler::new();
         let tasks = vec![make_task("f1", 1, 10)];
         let workers: Vec<WorkerInfo> = vec![];
 
-        let result = scheduler.assign(&tasks, &workers);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), SchedulerError::NoHealthyWorkers);
+        let result = assign(&tasks, &workers);
+        assert!(result.is_none());
+        assert!(result.is_none());
     }
 
     #[test]
     fn test_task_index_preservation() {
-        let scheduler = WeightedScheduler::new();
         let tasks = vec![
             make_task("f0", 1, 10),
             make_task("f1", 5, 10),
@@ -511,7 +435,7 @@ mod tests {
             make_worker("http://w2:50052", true, 0),
         ];
 
-        let assignments = scheduler.assign(&tasks, &workers).unwrap();
+        let assignments = assign(&tasks, &workers).unwrap();
 
         // Each assignment should have the correct task_index
         for (i, a) in assignments.iter().enumerate() {
@@ -576,10 +500,9 @@ mod tests {
         // Run many concurrent assignments (simulated via threads since assign is sync)
         let results: Vec<_> = (0..50)
             .map(|_| {
-                let s = WeightedScheduler::new();
                 let t = tasks.clone();
                 let w = workers.clone();
-                std::thread::spawn(move || s.assign(&t, &w))
+                std::thread::spawn(move || assign(&t, &w))
             })
             .collect::<Vec<_>>()
             .into_iter()
@@ -606,7 +529,6 @@ mod tests {
         // After assigning tasks, the internal load balancing should have produced
         // a fair distribution. We verify this by examining the final assignment
         // spread across workers.
-        let scheduler = WeightedScheduler::new();
         // 6 tasks with varying sizes: 1000, 800, 600, 400, 200, 100 MB
         let tasks = vec![
             make_task_with_sizes("heavy", &[1000 * MB]),
@@ -622,7 +544,7 @@ mod tests {
             make_worker("http://w3:50052", true, 0),
         ];
 
-        let assignments = scheduler.assign(&tasks, &workers).unwrap();
+        let assignments = assign(&tasks, &workers).unwrap();
         assert_eq!(assignments.len(), 6);
 
         // Compute the total cost assigned to each worker using estimate_cost
@@ -649,7 +571,6 @@ mod tests {
     #[test]
     fn test_rebalancing_after_failure() {
         // After marking a worker unhealthy, reassigning should skip it.
-        let scheduler = WeightedScheduler::new();
         let tasks = vec![
             make_task("f1", 3, 10),
             make_task("f2", 3, 10),
@@ -663,7 +584,7 @@ mod tests {
             make_worker("http://w2:50052", true, 0),
             make_worker("http://w3:50052", true, 0),
         ];
-        let assignments_before = scheduler.assign(&tasks, &workers_before).unwrap();
+        let assignments_before = assign(&tasks, &workers_before).unwrap();
         assert_eq!(assignments_before.len(), 4);
 
         // Now w2 has failed — simulate by passing it as unhealthy
@@ -672,7 +593,7 @@ mod tests {
             make_worker("http://w2:50052", false, 0), // unhealthy
             make_worker("http://w3:50052", true, 0),
         ];
-        let assignments_after = scheduler.assign(&tasks, &workers_after).unwrap();
+        let assignments_after = assign(&tasks, &workers_after).unwrap();
         assert_eq!(assignments_after.len(), 4);
 
         // No task should be assigned to the unhealthy worker
@@ -750,7 +671,6 @@ mod tests {
     fn test_cache_affinity_prefers_consistent_worker() {
         // When all workers have equal load, the scheduler should consistently
         // pick the same worker for the same file path (cache affinity).
-        let scheduler = WeightedScheduler::new();
         let file_path = "s3://bucket/dashboard/metrics.parquet".to_string();
 
         let task1 = ScanTask::builder("q1_scan", vec![file_path.clone()], storage())
@@ -767,8 +687,8 @@ mod tests {
         ];
 
         // Both scans reference the same file; each is submitted as a separate single-task batch.
-        let a1 = scheduler.assign(&[task1], &workers).unwrap();
-        let a2 = scheduler.assign(&[task2], &workers).unwrap();
+        let a1 = assign(&[task1], &workers).unwrap();
+        let a2 = assign(&[task2], &workers).unwrap();
 
         // The same file path must consistently hash to the same worker
         assert_eq!(
@@ -779,7 +699,6 @@ mod tests {
 
     #[test]
     fn test_all_unhealthy_except_one() {
-        let scheduler = WeightedScheduler::new();
         let tasks = vec![
             make_task("f1", 2, 10),
             make_task("f2", 2, 10),
@@ -791,7 +710,7 @@ mod tests {
             make_worker("http://w3:50052", true, 0), // only healthy one
         ];
 
-        let assignments = scheduler.assign(&tasks, &workers).unwrap();
+        let assignments = assign(&tasks, &workers).unwrap();
         assert_eq!(assignments.len(), 3);
 
         for a in &assignments {
