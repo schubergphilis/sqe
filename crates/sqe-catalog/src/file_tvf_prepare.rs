@@ -215,7 +215,7 @@ impl FileTableFunctions {
 /// The file table functions this module knows how to prepare. A statement
 /// that mentions none of them (case-insensitively) has nothing to prepare,
 /// which lets callers skip the parse and the session-context build.
-pub const FILE_TABLE_FUNCTIONS: [&str; 4] = ["read_parquet", "read_csv", "read_json", "read_delta"];
+pub const FILE_TABLE_FUNCTIONS: [&str; 3] = ["read_parquet", "read_csv", "read_json"];
 
 /// True when `sql` mentions one of [`FILE_TABLE_FUNCTIONS`]; a textual test
 /// that may say yes for a comment or a string, never no for a real call.

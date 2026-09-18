@@ -19,7 +19,7 @@ use object_store::{ObjectMeta, ObjectStore};
 use regex::Regex;
 use tracing::{debug, instrument, warn};
 
-use sqe_core::{Result as SqeResult, SqeError};
+use sqe_core::Result as SqeResult;
 
 /// A discovered table in a Hadoop-layout warehouse.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,13 +205,6 @@ impl HadoopBackend {
             .into_iter()
             .find(|t| t.namespace == wanted_ns && t.name == table))
     }
-}
-
-/// Convenience wrapper around `object_store` errors that maps them to
-/// `SqeError::Catalog` consistently.
-#[allow(dead_code)]
-fn map_err<E: std::fmt::Display>(ctx: &str, err: E) -> SqeError {
-    SqeError::Catalog(format!("{ctx}: {err}"))
 }
 
 #[cfg(test)]
