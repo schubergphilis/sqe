@@ -47,7 +47,6 @@ sqe-trino-functions = { path = "../sqe-trino-functions" }
 sqe-trino-protocol = { path = "../sqe-trino-protocol", features = ["client", "flight"] }
 sqe-policy = { path = "../sqe-policy" }
 arrow = { workspace = true }
-arrow-flight = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
 datafusion = { workspace = true }
@@ -61,13 +60,7 @@ iceberg-datafusion = { workspace = true }
 # DashMap powers the writable catalog's per-name schema cache; same
 # concurrency-friendly map iceberg-datafusion uses for its own
 # table-level cache.
-dashmap = { workspace = true }
-tonic = { workspace = true, features = ["transport", "tls-native-roots"] }
 tokio = { workspace = true }
-futures = { workspace = true }
-bytes = { workspace = true }
-prost = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
 rustyline = "18"

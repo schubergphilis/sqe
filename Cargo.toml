@@ -311,3 +311,9 @@ jiter = { path = "vendor/jiter" }
 # only thing holding DF 54 + arrow 58 in the tree. See
 # vendor/datafusion-functions-json/Cargo.toml for the retirement condition.
 datafusion-functions-json = { path = "vendor/datafusion-functions-json" }
+
+[workspace.metadata.cargo-machete]
+# hakari's workspace-hack is linked for feature unification, never imported.
+# `make deps-check` scans crates/sqe-* only, so the hack crate's own manifest
+# (every dep unused by design) is never inspected.
+ignored = ["workspace-hack"]
