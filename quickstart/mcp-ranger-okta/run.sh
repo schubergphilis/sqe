@@ -8,13 +8,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 . ../_shared/lib.sh
 
-BASE=../polaris-ranger-keycloak
 for a in "$@"; do
   case "$a" in
     --writes) export MCP_ALLOW_WRITES=true ;;
-    --down)
-      docker compose --env-file .env -p sqe-mcp-ranger-okta -f $BASE/docker-compose.yml -f docker-compose.yml down -v
-      exit 0 ;;
+    --down) docker compose down -v; exit 0 ;;
     *) die "unknown arg: $a (use --writes or --down)" ;;
   esac
 done
@@ -24,9 +21,8 @@ require docker curl jq
 set -a; . ./.env; set +a
 case "$OKTA_ISSUER" in *CHANGE-ME*) die "set OKTA_ISSUER in .env" ;; esac
 
-COMPOSE=(docker compose --env-file .env -p sqe-mcp-ranger-okta -f $BASE/docker-compose.yml -f docker-compose.yml)
 step "starting Keycloak + Polaris + Ranger + RustFS + SQE (Ranger first boot takes 2-4 min)"
-"${COMPOSE[@]}" up -d --build --wait
+docker compose up -d --build --wait
 ok "stack ready"
 
 MCP_URL="http://localhost:${SQE_MCP_PORT:-19092}/mcp"
