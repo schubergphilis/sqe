@@ -747,9 +747,10 @@ impl HiveDdlHandler {
         if let Some(fresh) = cache.get_if_fresh(database, table, etag.as_deref()) {
             return Ok(fresh);
         }
-        let loaded = source.get(database, table).await.map_err(to_sqe)?;
-        cache.insert_versioned(database, table, loaded.clone(), etag);
-        Ok(loaded)
+        cache
+            .load(source.as_ref(), database, table, etag)
+            .await
+            .map_err(to_sqe)
     }
 
     /// `ALTER TABLE ... ADD PARTITION` against a Hive root: append one
