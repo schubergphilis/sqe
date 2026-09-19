@@ -2937,7 +2937,7 @@ fn default_hive_metadata_recheck_secs() -> u64 {
 }
 
 fn default_hive_metadata_ttl_secs() -> u64 {
-    60
+    600
 }
 
 fn default_hive_metadata_timeout_secs() -> u64 {
@@ -2974,9 +2974,11 @@ pub struct HiveConfig {
     /// (Glue) is served before it is fetched again. A sidecar root has
     /// ETags and revalidates instead, so this only bounds Glue-backed
     /// roots. A refetch that returns an unchanged definition keeps the
-    /// table's cached file facts, so raising this for a read-mostly Glue
-    /// catalog (300-600) mostly saves the `GetTable` round trips; the
-    /// `refresh_metadata` paths drop entries on demand. Default 60.
+    /// table's cached file facts, so the TTL mostly bounds `GetTables`
+    /// round trips and how long another engine's schema change goes
+    /// unseen; the `refresh_metadata` paths drop entries on demand. The
+    /// same window bounds the shared database and table-name listings.
+    /// Default 600.
     #[serde(default = "default_hive_metadata_ttl_secs")]
     pub metadata_ttl_secs: u64,
     /// Upper bound on one metastore call (Glue `GetTable`/`GetTables`, a
