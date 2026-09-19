@@ -101,9 +101,12 @@ const TABLE_NAMES_CACHE_CAPACITY: u64 = 1024;
 ///
 /// Shared by the catalog provider and every [`HiveSchemaProvider`] it
 /// issues, so a listing refreshed for one query's planning serves the next
-/// one within `ttl`. Per provider, not process-global like the Iceberg
-/// snapshots: a Hive listing is not principal-filtered, and the provider is
-/// itself session-scoped, so there is no cross-session sharing to gain.
+/// one within `ttl`. Process-wide per catalog name, handed out by
+/// [`HiveMetadataCache::listings_for`]: a Hive listing is not
+/// principal-filtered (the `caller` gate runs at table load, not here), and
+/// an MCP tool call is a session of its own, so without sharing every
+/// `describe_schema` paid one `GetTables` per database it touched no matter
+/// how fresh the previous call's snapshot was.
 pub struct HiveListings {
     /// How long a snapshot is served without being re-listed. A snapshot
     /// older than this is still served (last known) until the next refresh
@@ -166,6 +169,18 @@ impl HiveListings {
         let merged = Arc::new(merge_listing(previous.as_deref(), outcome));
         self.tables.insert(database.to_string(), Arc::clone(&merged));
         merged
+    }
+
+    /// Drop the table snapshot of `database` (every database's when
+    /// `None`) and the database list, since the first table of a new
+    /// database creates it, so the next pre-plan refresh re-lists instead
+    /// of waiting out the TTL.
+    fn invalidate_database(&self, database: Option<&str>) {
+        match database {
+            Some(database) => self.tables.invalidate(database),
+            None => self.tables.invalidate_all(),
+        }
+        *self.databases.write().unwrap_or_else(PoisonError::into_inner) = None;
     }
 }
 
@@ -318,7 +333,7 @@ struct CachedManifest {
 /// or one dbt step makes for the same table pay one metadata round trip,
 /// not one each. Past that, `HiveSchemaProvider::table` asks the source for
 /// the manifest's ETag: a match extends the entry, a change reloads it, and
-/// a source without ETags (Glue) reloads when `ttl` (default 60 s) has
+/// a source without ETags (Glue) reloads when `ttl` (default 600 s) has
 /// elapsed since the load. Every DDL and write path in this process calls
 /// `invalidate` on the tables it changes, so the window only delays what
 /// another process wrote. Set `recheck` to zero to check on every lookup.
@@ -326,6 +341,9 @@ pub struct HiveMetadataCache {
     inner: SyncCache<String, CachedManifest>,
     ttl: Duration,
     recheck: Duration,
+    /// The database and table-name snapshots per catalog name, shared by
+    /// every session's provider for that catalog (see [`HiveListings`]).
+    listings: Mutex<HashMap<String, Arc<HiveListings>>>,
     /// Guards against the collision `register_object_store` cannot see on
     /// its own: DataFusion's `ObjectStoreRegistry` keys purely on
     /// `scheme://host:port` (see `object_store_bucket_key`), discarding the
@@ -355,9 +373,9 @@ impl Default for HiveMetadataCache {
 }
 
 impl HiveMetadataCache {
-    /// 60 s TTL for ETag-less sources, 10 s recheck window.
+    /// 600 s TTL for ETag-less sources, 10 s recheck window.
     pub fn new() -> Self {
-        Self::with_ttl(Duration::from_secs(60))
+        Self::with_ttl(Duration::from_secs(600))
     }
 
     pub fn with_ttl(ttl: Duration) -> Self {
@@ -367,8 +385,24 @@ impl HiveMetadataCache {
                 .build(),
             ttl,
             recheck: DEFAULT_METADATA_RECHECK,
+            listings: Mutex::new(HashMap::new()),
             object_store_owners: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The shared listing snapshots for `catalog`, created on first use
+    /// with `ttl`. Every session's provider for the same catalog name gets
+    /// the same instance, so a `GetTables` one call paid serves the next
+    /// call inside the TTL, and `invalidate_table_names` from a DDL
+    /// statement is seen by every session.
+    pub fn listings_for(&self, catalog: &str, ttl: Duration) -> Arc<HiveListings> {
+        Arc::clone(
+            self.listings
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(catalog.to_string())
+                .or_insert_with(|| Arc::new(HiveListings::new(ttl))),
+        )
     }
 
     /// How long a confirmed entry is served without asking the source
@@ -496,14 +530,19 @@ impl HiveMetadataCache {
         }
     }
 
+    /// Drop one manifest and the listing snapshots of its database. The
+    /// listings go too because every DDL and write path ends here, and a
+    /// `CREATE EXTERNAL TABLE` or `DROP TABLE` changes the names the
+    /// shared snapshot serves to every session, this one included.
     pub fn invalidate(&self, database: &str, table: &str) {
         self.inner.invalidate(&Self::key(database, table));
+        self.invalidate_listings(Some(database));
     }
 
     /// Drop every entry of one database (issue #666: `CALL
-    /// system.refresh_catalog_cache(schema => 'cat.db')`). Bounded by the
-    /// database's table count, so an unprivileged caller can at most make
-    /// their own next lookups pay a fetch each.
+    /// system.refresh_catalog_cache(schema => 'cat.db')`) and its listing
+    /// snapshots. Bounded by the database's table count, so an unprivileged
+    /// caller can at most make their own next lookups pay a fetch each.
     pub fn invalidate_database(&self, database: &str) {
         let prefix = format!("{database}.");
         let keys: Vec<String> = self
@@ -515,12 +554,28 @@ impl HiveMetadataCache {
         for k in keys {
             self.inner.invalidate(&k);
         }
+        self.invalidate_listings(Some(database));
     }
 
-    /// Drop every entry. Process-global, so only the admin-gated
-    /// `POST /api/v1/catalogs/refresh` calls it.
+    /// Drop every entry and every listing. Process-global, so only the
+    /// admin-gated `POST /api/v1/catalogs/refresh` calls it.
     pub fn invalidate_all(&self) {
         self.inner.invalidate_all();
+        self.invalidate_listings(None);
+    }
+
+    /// Manifest keys carry no catalog name, so a database invalidation
+    /// drops that database's listing in every catalog. Rare and cheap: the
+    /// next refresh re-lists one database per catalog.
+    fn invalidate_listings(&self, database: Option<&str>) {
+        for listings in self
+            .listings
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+        {
+            listings.invalidate_database(database);
+        }
     }
 
     /// Entries currently held, for tests and the refresh endpoint's log line.
@@ -1364,6 +1419,7 @@ impl HiveCatalogProvider {
         manifest_cache: Arc<HiveMetadataCache>,
         cache_ttl: Duration,
     ) -> Self {
+        let listings = manifest_cache.listings_for(&name, cache_ttl);
         Self {
             name,
             source: Arc::clone(&store) as Arc<dyn HiveMetadataSource>,
@@ -1371,7 +1427,7 @@ impl HiveCatalogProvider {
             data_store_factory,
             runtime,
             manifest_cache,
-            listings: Arc::new(HiveListings::new(cache_ttl)),
+            listings,
         }
     }
 
@@ -1385,6 +1441,7 @@ impl HiveCatalogProvider {
         manifest_cache: Arc<HiveMetadataCache>,
         cache_ttl: Duration,
     ) -> Self {
+        let listings = manifest_cache.listings_for(&name, cache_ttl);
         Self {
             name,
             source,
@@ -1392,7 +1449,7 @@ impl HiveCatalogProvider {
             data_store_factory,
             runtime,
             manifest_cache,
-            listings: Arc::new(HiveListings::new(cache_ttl)),
+            listings,
         }
     }
 
@@ -1553,12 +1610,7 @@ impl HiveCatalogProvider {
     /// visible to the next `table()` call with no cache to invalidate. The
     /// listing snapshots are the only stale-listing risk.
     pub fn invalidate_table_names(&self, database: &str) {
-        self.listings.tables.invalidate(database);
-        *self
-            .listings
-            .databases
-            .write()
-            .unwrap_or_else(PoisonError::into_inner) = None;
+        self.listings.invalidate_database(Some(database));
     }
 }
 
@@ -2704,5 +2756,58 @@ mod listing_tests {
         assert!(p.listings().tables("sales").is_none());
         assert!(p.listings().databases().is_none());
         assert!(p.schema_names().is_empty());
+    }
+
+    /// An MCP tool call is a session of its own with a provider of its
+    /// own. The listing snapshots live in the process-wide cache per
+    /// catalog name, so the second session's pre-plan refresh inside the
+    /// TTL costs no metastore call, and a DDL invalidation from one
+    /// session is what the next session re-lists after.
+    #[tokio::test]
+    async fn sessions_share_one_listing_per_catalog() {
+        let source = ScriptedSource::new(&[("sales", &["orders"])]);
+        let cache = Arc::new(HiveMetadataCache::new());
+        let session = |cache: &Arc<HiveMetadataCache>| {
+            HiveCatalogProvider::with_source(
+                "lake".to_string(),
+                Arc::clone(&source) as Arc<dyn HiveMetadataSource>,
+                Arc::new(UnusedFactory),
+                RuntimeEnvBuilder::new().build_arc().expect("runtime"),
+                Arc::clone(cache),
+                Duration::from_secs(60),
+            )
+        };
+
+        let first = session(&cache);
+        first
+            .refresh_referenced("SELECT * FROM lake.sales.orders", None, None)
+            .await;
+        assert_eq!(source.calls().len(), 1);
+
+        let second = session(&cache);
+        second
+            .refresh_referenced("SELECT * FROM lake.sales.orders", None, None)
+            .await;
+        assert_eq!(source.calls().len(), 1, "second session serves the first one's listing");
+        assert_eq!(second.schema_names(), vec!["sales".to_string()]);
+
+        first.invalidate_table_names("sales");
+        second
+            .refresh_referenced("SELECT * FROM lake.sales.orders", None, None)
+            .await;
+        assert_eq!(source.calls().len(), 2, "one session's DDL invalidation is seen by the other");
+
+        let other_catalog = HiveCatalogProvider::with_source(
+            "other".to_string(),
+            Arc::clone(&source) as Arc<dyn HiveMetadataSource>,
+            Arc::new(UnusedFactory),
+            RuntimeEnvBuilder::new().build_arc().expect("runtime"),
+            Arc::clone(&cache),
+            Duration::from_secs(60),
+        );
+        assert!(
+            other_catalog.listings().databases().is_none(),
+            "listings are per catalog name, not per cache"
+        );
     }
 }
