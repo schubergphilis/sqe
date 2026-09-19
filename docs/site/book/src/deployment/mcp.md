@@ -464,6 +464,25 @@ the change tool behaves as before.
 
 ## Hive tables over MCP
 
+A Glue catalog is usually wider than what one agent should see. Scope the
+root to named databases with `--glue-database` (repeatable or
+comma-separated) or `databases = [...]` on the `[[hive.roots]]` entry:
+
+```bash
+sqe-server --glue-catalog glue --glue-database afas_raw,claude \
+  --allow-s3-prefix s3://lake/ --mcp-anonymous --mcp-port 8098
+```
+
+`list_schemas`, `search_tables`, `describe_schema` and `information_schema`
+see only those databases, and a table anywhere else is not found rather than
+denied, so the scope leaks no names. Names are folded to lower case, which is
+how Glue stores them, and each is checked against the catalog at the first
+listing: a database that does not exist is logged at WARN and not listed,
+instead of appearing as a schema with no tables. This is a visibility scope,
+not authorization: every caller of the endpoint sees the same set. Per-user
+access on top of it is the identity provider plus the Ranger engine, as for
+any other catalog.
+
 Hive external tables are visible through every read tool, with the same
 row filters and column masks as over Flight SQL: the manifest's policy key is
 `<root>.<database>`, and the read tools go through the same query handler.
