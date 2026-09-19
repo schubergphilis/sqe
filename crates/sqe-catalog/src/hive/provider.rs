@@ -438,6 +438,32 @@ impl HiveMetadataCache {
         }
     }
 
+    /// One table's manifest on a cache miss. A source whose listing carries
+    /// full definitions (Glue `GetTables`) is asked for the whole database:
+    /// one paginated call costs about what one `GetTable` does, and every
+    /// other table of the database is cached on the way, so the lookups that
+    /// follow (a crawler's next `describe_table`, a join's second table) pay
+    /// nothing. A source without such a listing falls back to `get`.
+    /// [`HiveError::NotFound`] when the table is not in the database.
+    pub async fn load(
+        &self,
+        source: &dyn HiveMetadataSource,
+        database: &str,
+        table: &str,
+        etag: Option<String>,
+    ) -> Result<HiveManifest, HiveError> {
+        if let Some(listed) = source.list_manifests(database).await? {
+            self.insert_listed(database, &listed);
+            return listed
+                .into_iter()
+                .find(|m| m.name == table)
+                .ok_or_else(|| HiveError::NotFound(format!("{database}.{table}")));
+        }
+        let loaded = source.get(database, table).await?;
+        self.insert_versioned(database, table, loaded.clone(), etag);
+        Ok(loaded)
+    }
+
     /// Use the cached manifest when the store's current ETag matches, or
     /// when the store has no ETag and the TTL has not elapsed. A changed
     /// ETag returns `None` so the caller reloads. A hit counts as a
@@ -1679,29 +1705,27 @@ impl HiveSchemaProvider {
         {
             return Ok(Some(cached));
         }
-        let loaded = match self.source.get(&self.database, name).await {
-            Ok(m) => m,
-            Err(HiveError::NotFound(_)) => return Ok(None),
-            Err(e) => return stale_or_err(e),
-        };
-        // Cache BEFORE building the table. The policy layer's `TagSource`
-        // is synchronous and can only answer from this cache, and plan
-        // rewriting runs after the `LogicalPlan` is built, which is after
-        // `table()` returns. If the insert moved below the table build and
-        // the build failed partway, a later retry could rewrite against an
-        // empty cache and deny rather than mask.
+        // `ManifestCache::load` caches BEFORE this returns and the table is
+        // built. The policy layer's `TagSource` is synchronous and can only
+        // answer from this cache, and plan rewriting runs after the
+        // `LogicalPlan` is built, which is after `table()` returns. If the
+        // insert moved below the table build and the build failed partway, a
+        // later retry could rewrite against an empty cache and deny rather
+        // than mask.
         //
         // `a_failed_table_build_still_leaves_the_manifest_cached` (see
-        // hive_provider_test.rs) pins this ordering: moving this insert to
+        // hive_provider_test.rs) pins this ordering: moving the insert to
         // just before `table()`'s final `Ok` return, as a mutation check,
         // makes that test fail while leaving every happy-path test
         // (including
         // `loading_a_table_populates_the_metadata_cache_before_returning`)
         // green, which is exactly why the happy-path test alone was not
         // enough.
-        self.cache
-            .insert_versioned(&self.database, name, loaded.clone(), etag);
-        Ok(Some(loaded))
+        match self.cache.load(self.source.as_ref(), &self.database, name, etag).await {
+            Ok(m) => Ok(Some(m)),
+            Err(HiveError::NotFound(_)) => Ok(None),
+            Err(e) => stale_or_err(e),
+        }
     }
 
     /// Plan an Athena/Trino view (issue #667) and serve it as a `ViewTable`.
