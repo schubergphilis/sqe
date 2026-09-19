@@ -158,8 +158,42 @@ impl QueryTracker {
             f(&mut record);
             self.history.insert(*query_id, Arc::new(record));
         } else if let Some(old) = self.history.get(query_id) {
+            // Already terminal: a second `failed` for the same error (the
+            // timeout arm marks the query, then the shared error path marks
+            // it again) must not log and count the failure twice. Only a
+            // cancel that landed first is refined by the later verdict.
+            if old.state != QueryState::Canceled {
+                return;
+            }
             let mut record = (*old).clone();
             f(&mut record);
+            self.history.insert(*query_id, Arc::new(record));
+        }
+    }
+
+    /// The caller of an in-flight query went away without waiting for a
+    /// verdict: the future driving it was dropped (an HTTP client that gave
+    /// up, an MCP deadline). Moves the record to history as `Canceled` with
+    /// the reason, so `system.runtime.queries` and the history do not show
+    /// a query that is still "running" hours after nothing runs it. A no-op
+    /// once the query is terminal.
+    pub fn abandoned(&self, query_id: &Uuid, reason: &str) {
+        if let Some((_, active)) = self.active.remove(query_id) {
+            active.token.cancel();
+            let mut record = (*active.record).clone();
+            let now = Utc::now();
+            record.state = QueryState::Canceled;
+            record.ended = Some(now);
+            record.error_code = Some("QUERY_ABANDONED".to_string());
+            record.error_message = Some(reason.to_string());
+            let elapsed_ms = wall_elapsed_ms(&record, now);
+            tracing::warn!(
+                query_id = %record.query_id,
+                username = %record.user,
+                elapsed_ms,
+                reason,
+                "Query abandoned by its caller"
+            );
             self.history.insert(*query_id, Arc::new(record));
         }
     }
@@ -509,6 +543,63 @@ mod tests {
         assert!(rec.error_code.is_some());
         assert!(rec.error_message.is_some());
         assert_eq!(tracker.active_count(), 0);
+    }
+
+    /// The timeout arm marks the query failed and the shared error path
+    /// marks it again with the same error; the second verdict is dropped so
+    /// the failure is logged and counted once.
+    #[tokio::test]
+    async fn a_second_failure_verdict_on_a_terminal_query_is_dropped() {
+        let tracker = QueryTracker::new(&test_config());
+        let id = Uuid::now_v7();
+        tracker.start(id, "carol", None, "SELECT 1", "s3", None, vec![], None);
+        tracker.running(&id, 0);
+        let timeout = sqe_core::SqeError::with_code(
+            sqe_core::SqeErrorCode::ExecutionFailed,
+            "Query timed out after 300s".to_string(),
+        );
+        tracker.failed(&id, &timeout);
+        let first = tracker.get(&id).unwrap();
+        let other = sqe_core::SqeError::with_code(
+            sqe_core::SqeErrorCode::ExecutionFailed,
+            "a different verdict".to_string(),
+        );
+        tracker.failed(&id, &other);
+        let second = tracker.get(&id).unwrap();
+        assert_eq!(second.state, QueryState::Failed);
+        assert_eq!(second.error_message, first.error_message, "first verdict stands");
+        assert_eq!(second.ended, first.ended);
+    }
+
+    /// A dropped caller moves the query to `Canceled` with the reason; the
+    /// history never shows a query as running when nothing runs it, and a
+    /// verdict arriving afterwards refines the record rather than being lost.
+    #[tokio::test]
+    async fn abandoned_cancels_an_active_query_and_is_a_no_op_once_terminal() {
+        let tracker = QueryTracker::new(&test_config());
+        let id = Uuid::now_v7();
+        let token = tracker.start(id, "dave", None, "SELECT 1", "s3", None, vec![], None);
+        tracker.running(&id, 0);
+        tracker.abandoned(&id, "caller went away");
+        assert!(token.is_cancelled(), "the in-flight work is told to stop");
+        let rec = tracker.get(&id).unwrap();
+        assert_eq!(rec.state, QueryState::Canceled);
+        assert_eq!(rec.error_code.as_deref(), Some("QUERY_ABANDONED"));
+        assert_eq!(rec.error_message.as_deref(), Some("caller went away"));
+        assert_eq!(tracker.active_count(), 0);
+
+        // Already terminal: nothing changes.
+        tracker.abandoned(&id, "again");
+        assert_eq!(
+            tracker.get(&id).unwrap().error_message.as_deref(),
+            Some("caller went away")
+        );
+        // A finished query is not abandoned by a late guard drop.
+        let done = Uuid::now_v7();
+        tracker.start(done, "dave", None, "SELECT 2", "s3", None, vec![], None);
+        tracker.complete(&done, 1, 1, vec![], 0, 0, 0, 0);
+        tracker.abandoned(&done, "late");
+        assert_eq!(tracker.get(&done).unwrap().state, QueryState::Finished);
     }
 
     #[tokio::test]

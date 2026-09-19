@@ -78,6 +78,27 @@ type OpenStreamResult = (
     Vec<sqe_metrics::audit::Resource>,
 );
 
+/// Marks a tracked query abandoned if the future running it is dropped
+/// before a verdict. `execute_inner` is awaited inline by every front door,
+/// so a client that disconnects, or an MCP call that hits its deadline,
+/// drops the future mid-flight: the DataFusion streams stop with it, but the
+/// tracker record stayed `Running` for as long as the process lived. On the
+/// normal paths `complete` or `failed` has already moved the record to
+/// history, and the drop is a no-op.
+struct AbandonedQueryGuard<'a> {
+    tracker: &'a QueryTracker,
+    query_id: uuid::Uuid,
+}
+
+impl Drop for AbandonedQueryGuard<'_> {
+    fn drop(&mut self) {
+        self.tracker.abandoned(
+            &self.query_id,
+            "the caller stopped waiting before the query finished",
+        );
+    }
+}
+
 /// Determine the effective query timeout for a session.
 ///
 /// If any of the user's roles appear in `config.role_overrides`, the highest
@@ -1117,6 +1138,10 @@ impl QueryHandler {
             session.user.roles.clone(),
             trace_id.clone(),
         );
+        let _abandon_guard = AbandonedQueryGuard {
+            tracker: &self.query_tracker,
+            query_id,
+        };
         if let Some(ref metrics) = self.metrics {
             metrics
                 .active_queries

@@ -68,12 +68,63 @@ const CREDENTIAL_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::fro
 #[derive(Debug)]
 struct SdkObjectStoreCredentials {
     provider: OnceCell<SharedCredentialsProvider>,
+    /// The last credentials the chain produced, and when they lapse.
+    ///
+    /// The SDK's default chain does NOT cache: since aws-config 1.x the
+    /// cache lives in each service client's identity resolver, and
+    /// `object_store` calls the chain directly. So every S3 request, every
+    /// listing of every partition, went to the SSO portal for role
+    /// credentials, and a sixteen-wide partition listing answered
+    /// `TooManyRequestsException: HTTP 429` within seconds, reported as
+    /// "storage credentials expired". One resolution per
+    /// [`CREDENTIAL_REFRESH_AHEAD`] window is what a client does; this does
+    /// the same for the data path. Refreshes are single-flight: concurrent
+    /// callers wait for the one in progress rather than each asking the
+    /// portal.
+    cache: tokio::sync::Mutex<Option<CachedCredential>>,
 }
+
+struct CachedCredential {
+    /// Not derived `Debug`: the value is key material.
+    credential: Arc<AwsCredential>,
+    /// When to resolve again: the credential's own expiry minus
+    /// [`CREDENTIAL_REFRESH_AHEAD`], or [`CREDENTIAL_CACHE_WITHOUT_EXPIRY`]
+    /// from resolution for credentials that carry no expiry (static keys,
+    /// `credential_process` output without one), which still rotate on disk.
+    refresh_at: std::time::Instant,
+}
+
+impl std::fmt::Debug for CachedCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedCredential")
+            .field("refresh_at", &self.refresh_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How long before a credential's expiry it is resolved again, so no request
+/// is ever signed with one about to lapse.
+const CREDENTIAL_REFRESH_AHEAD: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// Cache lifetime for a credential that names no expiry.
+const CREDENTIAL_CACHE_WITHOUT_EXPIRY: std::time::Duration =
+    std::time::Duration::from_secs(15 * 60);
 
 impl SdkObjectStoreCredentials {
     fn new() -> Self {
         Self {
             provider: OnceCell::new(),
+            cache: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// A bridge over a given chain, for tests that count resolutions.
+    #[cfg(test)]
+    fn with_provider(provider: SharedCredentialsProvider) -> Self {
+        let cell = OnceCell::new();
+        cell.set(provider).expect("fresh cell");
+        Self {
+            provider: cell,
+            cache: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -92,6 +143,20 @@ impl SdkObjectStoreCredentials {
             })
             .await
     }
+
+    /// When credentials resolved now should be resolved again.
+    fn refresh_at(expiry: Option<std::time::SystemTime>) -> std::time::Instant {
+        let now = std::time::Instant::now();
+        match expiry.and_then(|e| e.duration_since(std::time::SystemTime::now()).ok()) {
+            // Ahead of expiry, but never in the past: a credential handed
+            // out with under five minutes left is still used until it
+            // lapses rather than re-resolved on every call.
+            Some(left) => now + left.saturating_sub(CREDENTIAL_REFRESH_AHEAD).max(
+                std::time::Duration::from_secs(30).min(left),
+            ),
+            None => now + CREDENTIAL_CACHE_WITHOUT_EXPIRY,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -99,6 +164,14 @@ impl CredentialProvider for SdkObjectStoreCredentials {
     type Credential = AwsCredential;
 
     async fn get_credential(&self) -> object_store::Result<Arc<AwsCredential>> {
+        // One resolution at a time; everyone else waits for it and reads
+        // the result. Holding the lock across the resolve is the point.
+        let mut cached = self.cache.lock().await;
+        if let Some(entry) = cached.as_ref() {
+            if std::time::Instant::now() < entry.refresh_at {
+                return Ok(Arc::clone(&entry.credential));
+            }
+        }
         // Bounded: a chain that waits (an SSO token exchange against a portal
         // that never answers, IMDS on a laptop, a credential_process that
         // hangs) held every scan open with no error to report, and a
@@ -127,11 +200,112 @@ impl CredentialProvider for SdkObjectStoreCredentials {
             // STORAGE_CREDENTIALS_UNAVAILABLE.
             source: storage_credentials_unavailable(&e).into(),
         })?;
-        Ok(Arc::new(AwsCredential {
+        let credential = Arc::new(AwsCredential {
             key_id: creds.access_key_id().to_string(),
             secret_key: creds.secret_access_key().to_string(),
             token: creds.session_token().map(str::to_string),
-        }))
+        });
+        *cached = Some(CachedCredential {
+            credential: Arc::clone(&credential),
+            refresh_at: Self::refresh_at(creds.expiry()),
+        });
+        Ok(credential)
+    }
+}
+
+#[cfg(test)]
+mod credential_cache_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, SystemTime};
+
+    /// A chain that counts how often it is asked, handing out credentials
+    /// with the given expiry.
+    #[derive(Debug)]
+    struct Counting {
+        calls: Arc<AtomicUsize>,
+        expiry: Option<SystemTime>,
+    }
+
+    impl ProvideCredentials for Counting {
+        fn provide_credentials<'a>(
+            &'a self,
+        ) -> aws_credential_types::provider::future::ProvideCredentials<'a>
+        where
+            Self: 'a,
+        {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let expiry = self.expiry;
+            aws_credential_types::provider::future::ProvideCredentials::new(async move {
+                Ok(aws_credential_types::Credentials::new(
+                    format!("AKIA{n}"),
+                    "secret",
+                    Some("token".to_string()),
+                    expiry,
+                    "counting",
+                ))
+            })
+        }
+    }
+
+    fn bridge(expiry: Option<SystemTime>) -> (SdkObjectStoreCredentials, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = SharedCredentialsProvider::new(Counting {
+            calls: Arc::clone(&calls),
+            expiry,
+        });
+        (SdkObjectStoreCredentials::with_provider(provider), calls)
+    }
+
+    /// Every S3 request asks for credentials; the chain is asked once.
+    #[tokio::test]
+    async fn concurrent_requests_resolve_the_chain_once() {
+        let (bridge, calls) = bridge(Some(SystemTime::now() + Duration::from_secs(3600)));
+        let bridge = Arc::new(bridge);
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let b = Arc::clone(&bridge);
+            handles.push(tokio::spawn(async move { b.get_credential().await.unwrap() }));
+        }
+        let mut keys = std::collections::BTreeSet::new();
+        for h in handles {
+            keys.insert(h.await.unwrap().key_id.clone());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one resolution for 32 callers");
+        assert_eq!(keys.len(), 1, "every caller got the same credential");
+    }
+
+    /// A credential about to lapse is resolved again ahead of its expiry;
+    /// one with no expiry is kept for the fixed window.
+    #[tokio::test]
+    async fn a_credential_near_expiry_is_refreshed_and_one_without_expiry_is_kept() {
+        // Expires in 4 minutes: inside the refresh-ahead window, so it is
+        // used, but only for the short grace period, after which the chain
+        // is asked again.
+        let soon = Some(SystemTime::now() + Duration::from_secs(4 * 60));
+        let at = SdkObjectStoreCredentials::refresh_at(soon);
+        let left = at.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            left <= Duration::from_secs(30) && left > Duration::from_secs(20),
+            "near-expiry credentials are reused for a short grace period only: {left:?}"
+        );
+        // Plenty of time left: refresh five minutes ahead of expiry.
+        let later = Some(SystemTime::now() + Duration::from_secs(3600));
+        let at = SdkObjectStoreCredentials::refresh_at(later);
+        let left = at.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            left > Duration::from_secs(54 * 60) && left <= Duration::from_secs(55 * 60),
+            "{left:?}"
+        );
+        // No expiry: the fixed window.
+        let at = SdkObjectStoreCredentials::refresh_at(None);
+        let left = at.saturating_duration_since(std::time::Instant::now());
+        assert!(left > Duration::from_secs(14 * 60), "{left:?}");
+
+        let (bridge, calls) = bridge(None);
+        bridge.get_credential().await.unwrap();
+        bridge.get_credential().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
 

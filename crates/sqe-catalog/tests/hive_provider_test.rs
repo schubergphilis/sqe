@@ -1266,6 +1266,9 @@ mod counting {
     pub struct CountingStore {
         inner: Arc<dyn ObjectStore>,
         pub list_calls: AtomicUsize,
+        /// How many upcoming `list` calls answer with an error instead of
+        /// reaching the filesystem: a credential outage, scripted.
+        pub fail_next_lists: AtomicUsize,
     }
 
     impl CountingStore {
@@ -1273,10 +1276,16 @@ mod counting {
             Arc::new(Self {
                 inner: Arc::new(object_store::local::LocalFileSystem::new()),
                 list_calls: AtomicUsize::new(0),
+                fail_next_lists: AtomicUsize::new(0),
             })
         }
         pub fn lists(&self) -> usize {
             self.list_calls.load(Ordering::SeqCst)
+        }
+        fn take_failure(&self) -> bool {
+            self.fail_next_lists
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
         }
     }
 
@@ -1321,6 +1330,14 @@ mod counting {
             prefix: Option<&ObjectPath>,
         ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
             self.list_calls.fetch_add(1, Ordering::SeqCst);
+            if self.take_failure() {
+                return Box::pin(futures::stream::once(async {
+                    Err(object_store::Error::Generic {
+                        store: "S3",
+                        source: "storage credentials expired or unavailable: 429".into(),
+                    })
+                }));
+            }
             self.inner.list(prefix)
         }
         async fn list_with_delimiter(
@@ -2191,5 +2208,148 @@ async fn a_stalled_metastore_serves_stale_metadata_or_fails_by_name() {
         provider.schema("sales").expect("sales").table_names(),
         before,
         "a timed-out listing keeps the last known names"
+    );
+}
+
+/// A limited scan over a projected table reads partitions lazily, newest
+/// first, and stops at the limit. Before this, `scan_from_entries` built one
+/// `ListingTable` scan per surviving partition at plan time, and building it
+/// lists the prefix: `LIMIT 10` on a 1,241-day snapshot table paid 1,241
+/// listings, twenty minutes, for one file's worth of rows. Here the two
+/// projected partitions are read one at a time: `LIMIT 1` is satisfied by
+/// the newest and never lists the older; `LIMIT 2` needs both; and an
+/// unlimited `count(*)` still reads everything through the eager union.
+#[tokio::test]
+async fn a_limited_scan_reads_projected_partitions_newest_first_and_stops_at_the_limit() {
+    let f = partitioned_csv_root().await;
+    {
+        let store = fixture_store(&f.root);
+        let mut m = store.get("sales", "orders").await.unwrap();
+        m.parameters
+            .insert("projection.enabled".into(), "true".into());
+        m.parameters
+            .insert("projection.dt.type".into(), "enum".into());
+        m.parameters.insert(
+            "projection.dt.values".into(),
+            "2026-01-01,2026-01-02".into(),
+        );
+        store.put(&m, false).await.unwrap();
+    }
+    let ctx = SessionContext::new();
+    let (provider, _source, store) =
+        counting_root(&f, &ctx, HiveMetadataCache::new(), true).await;
+    ctx.register_catalog("lake", provider.clone());
+    // DataFusion's own listing goes through the runtime's object-store
+    // registry; serve `file://` from the same counter so it is counted too.
+    ctx.runtime_env().register_object_store(
+        &url::Url::parse("file:///").expect("url"),
+        store.clone() as Arc<dyn object_store::ObjectStore>,
+    );
+    let _ = load_orders(&provider).await;
+    let warm = store.lists();
+
+    let explain = ctx
+        .sql("EXPLAIN SELECT id, dt FROM lake.sales.orders LIMIT 1")
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("explain");
+    let explain = datafusion::arrow::util::pretty::pretty_format_batches(&explain)
+        .expect("format")
+        .to_string();
+    assert!(
+        explain.contains("LazyPartitionScanExec: partitions=2, limit=1"),
+        "a limited scan over two partitions plans lazily: {explain}"
+    );
+    assert_eq!(
+        store.lists(),
+        warm,
+        "planning the lazy scan lists nothing; listing is deferred to execution"
+    );
+
+    let one = ctx
+        .sql("SELECT id, dt FROM lake.sales.orders LIMIT 1")
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("read");
+    let text = datafusion::arrow::util::pretty::pretty_format_batches(&one)
+        .expect("format")
+        .to_string();
+    assert_eq!(one.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    assert!(
+        text.contains("2026-01-02") && text.contains("| 3 "),
+        "the newest partition answers a bare LIMIT: {text}"
+    );
+    let after_one = store.lists() - warm;
+    assert_eq!(
+        after_one, 1,
+        "LIMIT 1 over two partitions lists exactly the one it reads"
+    );
+
+    let two = ctx
+        .sql("SELECT id, dt FROM lake.sales.orders LIMIT 2")
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("read");
+    assert_eq!(two.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    let text = datafusion::arrow::util::pretty::pretty_format_batches(&two)
+        .expect("format")
+        .to_string();
+    assert!(
+        text.contains("2026-01-02") && text.contains("2026-01-01"),
+        "a limit past the newest partition continues into the next: {text}"
+    );
+    assert!(
+        store.lists() > warm + after_one,
+        "LIMIT 2 lists again for the partition it continues into"
+    );
+
+    let n = count_i64(
+        &ctx.sql("SELECT count(*) FROM lake.sales.orders")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(n, 3, "an unlimited scan still reads every partition");
+}
+
+/// A compression probe that fails to list (a credential outage, the SSO
+/// portal answering 429 under a burst) must not be remembered as
+/// "uncompressed": that guess was cached for a gzipped JSON table and every
+/// read for the next minute failed inside the JSON parser. The failed probe
+/// records no codec; the next lookup probes again and records the real one.
+#[tokio::test]
+async fn a_failed_compression_probe_is_not_recorded_as_a_fact() {
+    use std::sync::atomic::Ordering;
+
+    let f = partitioned_csv_root().await;
+    let ctx = SessionContext::new();
+    let (provider, _source, store) =
+        counting_root(&f, &ctx, HiveMetadataCache::new(), true).await;
+
+    store.fail_next_lists.store(1, Ordering::SeqCst);
+    let _ = load_orders(&provider).await;
+    let facts = provider.manifest_cache().facts("sales", "orders");
+    assert!(
+        facts.as_ref().is_none_or(|f| f.compression.is_none()),
+        "a failed probe records no codec: {:?}",
+        facts.as_ref().and_then(|f| f.compression)
+    );
+
+    let _ = load_orders(&provider).await;
+    let facts = provider
+        .manifest_cache()
+        .facts("sales", "orders")
+        .expect("facts after a successful probe");
+    assert!(
+        facts.compression.is_some(),
+        "the next lookup probes again and records the codec"
     );
 }

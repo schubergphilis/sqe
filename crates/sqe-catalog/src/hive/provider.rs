@@ -69,7 +69,8 @@ use super::manifest::{HiveManifest, PartitionIndex, PartitionIndexEntry};
 use super::partition::{
     evaluate_projection, parse_projection, prune_entries_owned, ProjectionConfig,
 };
-use super::scan_exec::{HiveScanExec, HiveScanSpec};
+use super::scan_exec::{HiveScanExec, HiveScanSpec, LazyPartitionScanExec, LazyScanParts};
+use datafusion::execution::session_state::SessionState;
 use super::serde_map::{arrow_type, listing_options, resolve_format, ResolvedFormat};
 use super::stats::{analyzed_statistics, row_width_hint, size_only_from_index};
 use super::source::HiveMetadataSource;
@@ -227,14 +228,20 @@ pub use super::manifest::HIVE_DEFAULT_PARTITION;
 /// [`HiveTableFacts`] refresh (manifest reload or cache TTL) is what it costs;
 /// `HiveSchemaProvider::table` keeps the answer on the manifest's cache entry.
 ///
-/// Falls back to `current` when the prefix is empty, unreachable, or the
-/// first object names no codec. A listing failure is not fatal here: the
-/// scan itself will surface it with a better message than this would.
+/// `Some(current)` when the prefix is empty or the first object names no
+/// codec; `None` when the listing FAILED, so the caller does not record a
+/// guess as a fact. A listing failure is not fatal here: the scan itself
+/// will surface it with a better message than this would. But it must not be
+/// remembered either: a transient credential error (the SSO portal answering
+/// 429 under a burst of resolutions) once landed "uncompressed" in the facts
+/// cache for a gzipped JSON table, and every read of it for the next minute
+/// failed as `Encountered unexpected ''` from the JSON parser, a message that
+/// names neither the codec nor the credentials.
 async fn detect_compression(
     store: &Arc<dyn ObjectStore>,
     prefix: &object_store::path::Path,
     current: FileCompressionType,
-) -> FileCompressionType {
+) -> Option<FileCompressionType> {
     let mut stream = store.list(Some(prefix));
     loop {
         match stream.try_next().await {
@@ -245,12 +252,12 @@ async fn detect_compression(
                 if meta.size == 0 || key.ends_with('/') || key.contains("/_sqe/") {
                     continue;
                 }
-                return super::serde_map::compression_from_key(key).unwrap_or(current);
+                return Some(super::serde_map::compression_from_key(key).unwrap_or(current));
             }
-            Ok(None) => return current,
+            Ok(None) => return Some(current),
             Err(e) => {
-                warn!(prefix = %prefix, error = %e, "hive_external: could not list files to detect compression; assuming uncompressed");
-                return current;
+                warn!(prefix = %prefix, error = %e, "hive_external: could not list files to detect compression; assuming uncompressed for this statement only");
+                return None;
             }
         }
     }
@@ -957,47 +964,86 @@ impl HiveTableProvider {
             return Ok(Arc::new(EmptyExec::new(out_schema)));
         }
 
-        let n_file = self.file_schema.fields().len();
-        let file_proj = file_column_projection(projection, n_file);
         let data_filters: Vec<Expr> = filters
             .iter()
             .filter(|f| !references_only_partition_cols(f, &self.partition_columns))
             .cloned()
             .collect();
 
-        let mut plans = Vec::with_capacity(entries.len());
-        for entry in &entries {
-            let url = table_location_url(&entry.location).map_err(to_df)?;
-            let store = self
-                .data_store_factory
-                .store_for(&entry.location, self.secret.as_deref())
-                .map_err(to_df)?;
-            self.runtime
-                .register_object_store(url.as_ref(), store);
-
-            let options = listing_options(&self.resolved, Vec::new()).map_err(to_df)?;
-            let config = ListingTableConfig::new(url)
-                .with_listing_options(options)
-                .with_schema(Arc::clone(&self.file_schema));
-            // As a trait object for the same compile-time reason as
-            // `HiveTableProvider::inner`: this future holds it across the
-            // `.await`, and `dyn TableProvider::scan` is an opaque `BoxFuture`.
-            let listing: Arc<dyn TableProvider> = Arc::new(ListingTable::try_new(config)?);
-            let plan = listing
-                .scan(state, file_proj.as_ref(), &data_filters, limit)
-                .await?;
-            let plan = attach_partition_values(
-                plan,
-                &self.file_schema,
-                &self.partition_columns,
-                &entry.values,
-                projection,
-                &self.schema,
-            )?;
-            let plan = nullify_default_partition_columns(plan, &self.partition_columns)?;
-            plans.push(plan);
+        // A limited scan over more than one partition reads lazily, newest
+        // first, and stops at the limit (`LazyPartitionScanExec`). Building a
+        // partition's scan lists its prefix, so the eager union below costs
+        // one listing per surviving partition before the first row; under
+        // `LIMIT 10` on a 1,241-day snapshot table that was twenty minutes
+        // for one file's worth of rows. The lazy node needs the concrete
+        // session state to build scans at execute time; a `Session` that is
+        // not one (tests with a bare trait object) takes the eager path.
+        if let Some(limit) = limit.filter(|_| entries.len() > 1) {
+            if let Some(session_state) = state.as_any().downcast_ref::<SessionState>() {
+                let mut ordered = entries.clone();
+                ordered.sort_by(|a, b| b.values.cmp(&a.values));
+                let lazy = LazyPartitionScanExec::new(LazyScanParts {
+                    entries: ordered,
+                    state: session_state.clone(),
+                    resolved: self.resolved.clone(),
+                    file_schema: Arc::clone(&self.file_schema),
+                    full_schema: Arc::clone(&self.schema),
+                    partition_columns: self.partition_columns.clone(),
+                    projection: projection.map(<[usize]>::to_vec),
+                    data_filters,
+                    limit,
+                    secret: self.secret.clone(),
+                    data_store_factory: Arc::clone(&self.data_store_factory),
+                    runtime: Arc::clone(&self.runtime),
+                });
+                return Ok(Arc::new(HiveScanExec::new(
+                    Arc::new(lazy),
+                    HiveScanSpec {
+                        entries,
+                        resolved: self.resolved.clone(),
+                        partition_columns: self.partition_columns.clone(),
+                        full_schema: Arc::clone(&self.schema),
+                        secret: self.secret.clone(),
+                        data_store_factory: Arc::clone(&self.data_store_factory),
+                    },
+                )));
+            }
         }
 
+        // Every partition is read: build the per-partition scans with their
+        // listings in flight together, in entry order.
+        let plans: Vec<Arc<dyn ExecutionPlan>> = {
+            use futures::StreamExt;
+            // Built as plain futures first (an `Iterator::map`, whose closure
+            // borrows each entry for the whole method), then driven by the
+            // stream; a `StreamExt::map` closure would have to accept the
+            // borrow for any lifetime and cannot return a future tied to it.
+            let futures: Vec<_> = entries
+                .iter()
+                .map(|entry| {
+                    plan_partition_scan(
+                        state,
+                        entry,
+                        &self.resolved,
+                        &self.file_schema,
+                        &self.schema,
+                        &self.partition_columns,
+                        projection,
+                        &data_filters,
+                        limit,
+                        &self.data_store_factory,
+                        self.secret.as_deref(),
+                        &self.runtime,
+                    )
+                })
+                .collect();
+            futures::stream::iter(futures)
+                .buffered(super::scan_exec::PARTITION_LIST_CONCURRENCY)
+                .try_collect()
+                .await?
+        };
+
+        let mut plans = plans;
         let inner: Arc<dyn ExecutionPlan> = if plans.len() == 1 {
             plans.pop().unwrap()
         } else {
@@ -1021,6 +1067,65 @@ impl HiveTableProvider {
             },
         )))
     }
+}
+
+/// Build the scan of ONE partition: register its object store, list it
+/// through a `ListingTable`, then attach the directory-encoded partition
+/// values as literal columns and fold the Hive NULL sentinel. The eager
+/// union calls this at plan time for every surviving partition;
+/// `LazyPartitionScanExec` calls it at execute time, one partition at a
+/// time. One function so the two paths cannot drift.
+///
+/// Boxed for the same compile-time reason as `scan_from_entries`: the
+/// coroutine holds `Expr`s across the await.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn plan_partition_scan<'a>(
+    state: &'a dyn Session,
+    entry: &'a PartitionIndexEntry,
+    resolved: &'a ResolvedFormat,
+    file_schema: &'a SchemaRef,
+    full_schema: &'a SchemaRef,
+    partition_columns: &'a [String],
+    projection: Option<&'a [usize]>,
+    data_filters: &'a [Expr],
+    limit: Option<usize>,
+    data_store_factory: &'a Arc<dyn HiveDataStoreFactory>,
+    secret: Option<&'a str>,
+    runtime: &'a RuntimeEnv,
+) -> BoxFuture<'a, DFResult<Arc<dyn ExecutionPlan>>> {
+    Box::pin(async move {
+        let url = table_location_url(&entry.location).map_err(to_df)?;
+        // The factory caches stores per bucket and secret, so this is a
+        // lookup after the first partition, and the registry keys on the
+        // bucket too: one registration per bucket, repeated harmlessly.
+        let store = data_store_factory
+            .store_for(&entry.location, secret)
+            .map_err(to_df)?;
+        runtime.register_object_store(url.as_ref(), store);
+
+        let n_file = file_schema.fields().len();
+        let file_proj = file_column_projection(projection, n_file);
+        let options = listing_options(resolved, Vec::new()).map_err(to_df)?;
+        let config = ListingTableConfig::new(url)
+            .with_listing_options(options)
+            .with_schema(Arc::clone(file_schema));
+        // As a trait object for the same compile-time reason as
+        // `HiveTableProvider::inner`: this future holds it across the
+        // `.await`, and `dyn TableProvider::scan` is an opaque `BoxFuture`.
+        let listing: Arc<dyn TableProvider> = Arc::new(ListingTable::try_new(config)?);
+        let plan = listing
+            .scan(state, file_proj.as_ref(), data_filters, limit)
+            .await?;
+        let plan = attach_partition_values(
+            plan,
+            file_schema,
+            partition_columns,
+            &entry.values,
+            projection,
+            full_schema,
+        )?;
+        nullify_default_partition_columns(plan, partition_columns)
+    })
 }
 
 fn projected_schema(schema: &Schema, projection: Option<&[usize]>) -> SchemaRef {
@@ -2077,10 +2182,15 @@ impl SchemaProvider for HiveSchemaProvider {
             resolved.compression = match facts.as_ref().and_then(|f| f.compression) {
                 Some(known) => known,
                 None => {
-                    let detected =
-                        detect_compression(&data_store, url.prefix(), resolved.compression).await;
-                    detected_compression = Some(detected);
-                    detected
+                    match detect_compression(&data_store, url.prefix(), resolved.compression).await
+                    {
+                        Some(detected) => {
+                            detected_compression = Some(detected);
+                            detected
+                        }
+                        // Not recorded: the next lookup probes again.
+                        None => resolved.compression,
+                    }
                 }
             };
         }
