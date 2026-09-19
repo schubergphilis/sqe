@@ -252,11 +252,11 @@ pub fn session_hive_catalog_from_source(
     cache_ttl: std::time::Duration,
 ) -> Arc<crate::hive::provider::HiveCatalogProvider> {
     let factory: Arc<dyn crate::hive::provider::HiveDataStoreFactory> =
-        Arc::new(EngineHiveDataStoreFactory {
-            storage: storage.clone(),
-            secrets: secrets.clone(),
+        Arc::new(EngineHiveDataStoreFactory::new(
+            storage.clone(),
+            secrets.clone(),
             caller,
-        });
+        ));
     Arc::new(crate::hive::provider::HiveCatalogProvider::with_source(
         name.to_string(),
         source,
@@ -298,11 +298,11 @@ pub fn session_hive_catalog(
     cache_ttl: std::time::Duration,
 ) -> Arc<crate::hive::provider::HiveCatalogProvider> {
     let factory: Arc<dyn crate::hive::provider::HiveDataStoreFactory> =
-        Arc::new(EngineHiveDataStoreFactory {
-            storage: storage.clone(),
-            secrets: secrets.clone(),
+        Arc::new(EngineHiveDataStoreFactory::new(
+            storage.clone(),
+            secrets.clone(),
             caller,
-        });
+        ));
     Arc::new(crate::hive::provider::HiveCatalogProvider::new(
         name.to_string(),
         root,
@@ -326,6 +326,53 @@ struct EngineHiveDataStoreFactory {
     storage: StorageConfig,
     secrets: SecretStore,
     caller: TvfCaller,
+    /// Built stores by `(bucket or scheme root, secret name)`. A scan over a
+    /// projected table asks for one store per partition entry, and building
+    /// an S3 store is not free: a fresh HTTP client and, with no static key,
+    /// a fresh AWS SDK credential chain that loads the profile and resolves
+    /// an SSO or role session before its first LIST. Against a 1,241-day
+    /// snapshot table that was 1,241 credential resolutions and 1,241
+    /// clients for one `LIMIT 10`, twenty minutes before the first row.
+    /// One store per bucket and secret is what a client is for; the SDK
+    /// provider inside it refreshes its own credentials. Entries expire so
+    /// a rotated `sqe.secret` is picked up within [`STORE_CACHE_TTL`].
+    stores: moka::sync::Cache<(String, Option<String>), Arc<dyn ObjectStore>>,
+}
+
+/// How long a built data store is reused before its credentials are read
+/// again from the secret store or the SDK chain.
+#[cfg(feature = "hive-external")]
+const STORE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+#[cfg(feature = "hive-external")]
+impl EngineHiveDataStoreFactory {
+    fn new(storage: StorageConfig, secrets: SecretStore, caller: TvfCaller) -> Self {
+        Self {
+            storage,
+            secrets,
+            caller,
+            stores: moka::sync::Cache::builder()
+                .max_capacity(256)
+                .time_to_live(STORE_CACHE_TTL)
+                .build(),
+        }
+    }
+
+    /// The cache key for `location`: an S3 URL keys on its bucket (the
+    /// store is bucket-scoped and every partition of a table shares it), a
+    /// local path on its scheme, so the one `LocalFileSystem` is shared too.
+    fn store_key(location: &str) -> String {
+        let lower = location.to_lowercase();
+        if lower.starts_with("s3://") || lower.starts_with("s3a://") {
+            crate::file_tvf_common::extract_bucket(location)
+                .map(|b| format!("s3://{b}"))
+                .unwrap_or_else(|| location.to_string())
+        } else if let Some(scheme_end) = lower.find("://") {
+            lower[..scheme_end].to_string()
+        } else {
+            "file".to_string()
+        }
+    }
 }
 
 #[cfg(feature = "hive-external")]
@@ -352,18 +399,24 @@ impl crate::hive::provider::HiveDataStoreFactory for EngineHiveDataStoreFactory 
             .check_path(location, &self.caller, false)
             .map_err(crate::hive::HiveError::Forbidden)?;
 
-        match secret {
+        let key = (Self::store_key(location), secret.map(str::to_string));
+        if let Some(store) = self.stores.get(&key) {
+            return Ok(store);
+        }
+        let built: Arc<dyn ObjectStore> = match secret {
             Some(secret_name) => {
                 let resolved = self.secrets.get(secret_name).map_err(|e| {
                     crate::hive::HiveError::Validation(format!(
                         "secret '{secret_name}' could not be resolved: {e}"
                     ))
                 })?;
-                store_for_secret(location, secret_name, &resolved, &self.storage)
+                store_for_secret(location, secret_name, &resolved, &self.storage)?
             }
             None => hive_object_store_for_location(location, &self.storage)
-                .map_err(crate::hive::HiveError::Store),
-        }
+                .map_err(crate::hive::HiveError::Store)?,
+        };
+        self.stores.insert(key, Arc::clone(&built));
+        Ok(built)
     }
 }
 
@@ -1498,15 +1551,59 @@ mod hive_secret_store_tests {
 #[cfg(all(test, feature = "hive-external"))]
 mod hive_factory_debug_tests {
     use super::*;
+    use crate::hive::provider::HiveDataStoreFactory;
 
     #[test]
     fn debug_impl_does_not_panic_and_omits_credential_fields() {
-        let factory = EngineHiveDataStoreFactory {
-            storage: StorageConfig::default(),
-            secrets: SecretStore::new(),
-            caller: TvfCaller::for_user("alice".to_string(), Vec::new()),
-        };
+        let factory = EngineHiveDataStoreFactory::new(
+            StorageConfig::default(),
+            SecretStore::new(),
+            TvfCaller::for_user("alice".to_string(), Vec::new()),
+        );
         let out = format!("{factory:?}");
         assert!(out.contains("alice"), "got {out}");
+    }
+
+    /// Every partition of a projected table asks the factory for a store;
+    /// building one is an HTTP client and, without static keys, a fresh AWS
+    /// credential chain. One store per bucket is what the cache is for.
+    #[test]
+    fn store_key_is_the_bucket_for_s3_and_the_scheme_for_local_paths() {
+        assert_eq!(
+            EngineHiveDataStoreFactory::store_key(
+                "s3://lake/afas/snapshots/t/snapshot_date=2026-09-16/"
+            ),
+            "s3://lake"
+        );
+        assert_eq!(
+            EngineHiveDataStoreFactory::store_key("s3a://lake/other/prefix/"),
+            "s3://lake"
+        );
+        assert_eq!(
+            EngineHiveDataStoreFactory::store_key("file:///tmp/wh/dt=1/"),
+            "file"
+        );
+        assert_eq!(EngineHiveDataStoreFactory::store_key("/tmp/wh/dt=1/"), "file");
+    }
+
+    #[test]
+    fn the_same_local_root_is_served_by_one_cached_store() {
+        let mut storage = StorageConfig::default();
+        storage.tvf.allow_local_paths = true;
+        let factory = EngineHiveDataStoreFactory::new(
+            storage,
+            SecretStore::new(),
+            TvfCaller::trusted_local(),
+        );
+        let a = factory
+            .store_for("file:///tmp/wh/dt=2026-01-01/", None)
+            .expect("store");
+        let b = factory
+            .store_for("file:///tmp/wh/dt=2026-01-02/", None)
+            .expect("store");
+        assert!(Arc::ptr_eq(&a, &b), "two partitions of one root share a store");
+        // moka's counters are eventually consistent; settle them first.
+        factory.stores.run_pending_tasks();
+        assert_eq!(factory.stores.entry_count(), 1);
     }
 }

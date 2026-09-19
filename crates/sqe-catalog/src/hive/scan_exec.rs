@@ -29,6 +29,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use futures::TryStreamExt;
@@ -38,11 +39,17 @@ use url::Url;
 use arrow_schema::SchemaRef;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::Result as DFResult;
+use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::execution::session_state::SessionState;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::PhysicalExpr;
+use datafusion::logical_expr::Expr;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
-    ReplaceChildrenOptions,
+    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan,
+    ExecutionPlanProperties, Partitioning, PlanProperties, ReplaceChildrenOptions,
 };
 
 use super::manifest::PartitionIndexEntry;
@@ -117,48 +124,309 @@ impl HiveScanExec {
     /// A partition whose listing fails is an error rather than an empty
     /// partition: silently returning no files would turn an unreachable
     /// location into a query that succeeds with missing rows.
+    ///
+    /// Partitions are listed [`PARTITION_LIST_CONCURRENCY`] at a time, in
+    /// entry order. Each listing is one object-store round trip and none
+    /// depends on another; serially, a 1,241-partition table paid 1,241
+    /// round trips end to end before the first task could be built.
     pub async fn partition_files(&self) -> Result<Vec<PartitionListing>, HiveError> {
+        use futures::StreamExt;
         let ext = self.spec.resolved.file_extension.clone();
-        let mut out = Vec::with_capacity(self.spec.entries.len());
+        // Plain futures first, driven by the stream after. A `StreamExt::map`
+        // closure returning an `async move` over the borrowed entry is the
+        // "implementation of `Send` is not general enough" shape: the
+        // closure's argument lifetime is higher-ranked and the coordinator's
+        // `Send` proof over the future that awaits this cannot close it.
+        let listings: Vec<_> = self
+            .spec
+            .entries
+            .iter()
+            .map(|entry| {
+                let ext = ext.clone();
+                async move {
+                    let url = table_location_url(&entry.location)?;
+                    let store = self
+                        .spec
+                        .data_store_factory
+                        .store_for(&entry.location, self.spec.secret.as_deref())?;
 
-        for entry in &self.spec.entries {
-            let url = table_location_url(&entry.location)?;
-            let store = self
-                .spec
-                .data_store_factory
-                .store_for(&entry.location, self.spec.secret.as_deref())?;
+                    let metas: Vec<ObjectMeta> = store
+                        .list(Some(url.prefix()))
+                        .try_collect()
+                        .await
+                        .map_err(|e| {
+                            HiveError::Validation(format!(
+                                "listing partition `{}`: {e}",
+                                entry.location
+                            ))
+                        })?;
 
-            let metas: Vec<ObjectMeta> = store
-                .list(Some(url.prefix()))
-                .try_collect()
-                .await
-                .map_err(|e| {
-                    HiveError::Validation(format!(
-                        "listing partition `{}`: {e}",
-                        entry.location
-                    ))
-                })?;
+                    let base = Url::parse(&entry.location).map_err(|e| {
+                        HiveError::Validation(format!(
+                            "partition location `{}`: {e}",
+                            entry.location
+                        ))
+                    })?;
 
-            let base = Url::parse(&entry.location).map_err(|e| {
-                HiveError::Validation(format!("partition location `{}`: {e}", entry.location))
-            })?;
-
-            let mut files = Vec::new();
-            for m in metas {
-                let key = m.location.as_ref();
-                // Skip directory markers and anything the table's format would
-                // not read. An empty declared extension means "no filter",
-                // which is how Hive's extensionless part files are handled.
-                if key.ends_with('/') || (!ext.is_empty() && !key.ends_with(&ext)) {
-                    continue;
+                    let mut files = Vec::new();
+                    for m in metas {
+                        let key = m.location.as_ref();
+                        // Skip directory markers and anything the table's
+                        // format would not read. An empty declared extension
+                        // means "no filter", which is how Hive's extensionless
+                        // part files are handled.
+                        if key.ends_with('/') || (!ext.is_empty() && !key.ends_with(&ext)) {
+                            continue;
+                        }
+                        let mut full = base.clone();
+                        full.set_path(key);
+                        files.push((full.to_string(), m.size));
+                    }
+                    Ok::<PartitionListing, HiveError>((entry.values.clone(), files))
                 }
-                let mut full = base.clone();
-                full.set_path(key);
-                files.push((full.to_string(), m.size));
-            }
-            out.push((entry.values.clone(), files));
+            })
+            .collect();
+        futures::stream::iter(listings)
+            .buffered(PARTITION_LIST_CONCURRENCY)
+            .try_collect()
+            .await
+    }
+}
+
+/// Partition listings in flight at once, for both the coordinator-local plan
+/// build and the worker-task listing. Bounded so a wide table does not open
+/// thousands of connections; high enough that a listing round trip of a
+/// second amortises to a few milliseconds per partition.
+pub const PARTITION_LIST_CONCURRENCY: usize = 16;
+
+/// A Hive scan under a row limit that lists and reads one partition at a
+/// time, newest first, and stops when the limit is met.
+///
+/// `scan_from_entries` used to build one `ListingTable` scan per surviving
+/// partition at plan time, and building it lists the partition's prefix.
+/// Under `LIMIT 10` on a 1,241-day snapshot table that was 1,241 listings,
+/// one per day, to read ten rows from one file, and the plan held every
+/// file's metadata in memory before the first byte was read. Here the plan
+/// holds the entries and everything needed to build a partition's scan; the
+/// build happens in `execute`, entry by entry, and the next partition is not
+/// touched once `limit` rows have been produced. A `LIMIT` without `ORDER BY`
+/// promises nothing about which rows come back, so reading the newest
+/// partition first is a valid answer and the useful one for a snapshot table.
+///
+/// Only a limited scan comes here. Without a limit every partition is read
+/// anyway, and the eager union keeps its parallelism across partitions.
+pub struct LazyPartitionScanExec {
+    parts: Arc<LazyScanParts>,
+    properties: Arc<PlanProperties>,
+}
+
+/// What building one partition's scan needs; shared with the stream so a
+/// clone of the node is one `Arc` bump.
+pub struct LazyScanParts {
+    /// In the order partitions are read. `scan_from_entries` sorts them
+    /// newest first.
+    pub entries: Vec<PartitionIndexEntry>,
+    pub state: SessionState,
+    pub resolved: ResolvedFormat,
+    pub file_schema: SchemaRef,
+    pub full_schema: SchemaRef,
+    pub partition_columns: Vec<String>,
+    pub projection: Option<Vec<usize>>,
+    pub data_filters: Vec<Expr>,
+    pub limit: usize,
+    pub secret: Option<String>,
+    pub data_store_factory: Arc<dyn HiveDataStoreFactory>,
+    pub runtime: Arc<RuntimeEnv>,
+}
+
+impl LazyPartitionScanExec {
+    pub fn new(parts: LazyScanParts) -> Self {
+        let schema = projected_schema(&parts.full_schema, parts.projection.as_deref());
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(schema),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+        Self {
+            parts: Arc::new(parts),
+            properties: Arc::new(properties),
         }
-        Ok(out)
+    }
+
+    pub fn partition_count(&self) -> usize {
+        self.parts.entries.len()
+    }
+
+    pub fn limit(&self) -> usize {
+        self.parts.limit
+    }
+}
+
+impl fmt::Debug for LazyPartitionScanExec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LazyPartitionScanExec")
+            .field("partitions", &self.parts.entries.len())
+            .field("limit", &self.parts.limit)
+            .field("format", &self.parts.resolved.kind)
+            .finish()
+    }
+}
+
+impl DisplayAs for LazyPartitionScanExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => write!(
+                f,
+                "LazyPartitionScanExec: partitions={}, limit={}, format={:?}, order=newest-first",
+                self.parts.entries.len(),
+                self.parts.limit,
+                self.parts.resolved.kind
+            ),
+            DisplayFormatType::TreeRender => write!(f, "LazyPartitionScanExec"),
+        }
+    }
+}
+
+impl ExecutionPlan for LazyPartitionScanExec {
+    fn name(&self) -> &str {
+        "LazyPartitionScanExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        Vec::new()
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    #[allow(deprecated)]
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        if !children.is_empty() {
+            return Err(datafusion::error::DataFusionError::Internal(
+                "LazyPartitionScanExec has no children".to_string(),
+            ));
+        }
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        use futures::StreamExt;
+        if partition != 0 {
+            return Err(datafusion::error::DataFusionError::Internal(format!(
+                "LazyPartitionScanExec has one output partition, asked for {partition}"
+            )));
+        }
+        let schema = self.schema();
+        let parts = Arc::clone(&self.parts);
+        // Rows still owed. Shared with the per-entry step so a partition
+        // whose turn comes after the limit is met is never listed: the
+        // flatten below asks for the next inner stream as soon as the
+        // previous one ends, before the limit step sees that it is done.
+        let remaining = Arc::new(AtomicUsize::new(parts.limit));
+        let empty_schema = Arc::clone(&schema);
+        let entries: Vec<PartitionIndexEntry> = parts.entries.clone();
+        let inner = futures::stream::iter(entries)
+            .then({
+                let remaining = Arc::clone(&remaining);
+                move |entry| {
+                    let parts = Arc::clone(&parts);
+                    let context = Arc::clone(&context);
+                    let remaining = Arc::clone(&remaining);
+                    let empty_schema = Arc::clone(&empty_schema);
+                    async move {
+                        if remaining.load(Ordering::SeqCst) == 0 {
+                            let done: SendableRecordBatchStream = Box::pin(
+                                RecordBatchStreamAdapter::new(empty_schema, futures::stream::empty()),
+                            );
+                            return Ok(done);
+                        }
+                        let plan = super::provider::plan_partition_scan(
+                            &parts.state,
+                            &entry,
+                            &parts.resolved,
+                            &parts.file_schema,
+                            &parts.full_schema,
+                            &parts.partition_columns,
+                            parts.projection.as_deref(),
+                            &parts.data_filters,
+                            Some(parts.limit),
+                            &parts.data_store_factory,
+                            parts.secret.as_deref(),
+                            &parts.runtime,
+                        )
+                        .await?;
+                        let plan: Arc<dyn ExecutionPlan> =
+                            if plan.output_partitioning().partition_count() > 1 {
+                                Arc::new(CoalescePartitionsExec::new(plan))
+                            } else {
+                                plan
+                            };
+                        plan.execute(0, context)
+                    }
+                }
+            })
+            .try_flatten()
+            .scan(remaining, |remaining, item| {
+                let out = match item {
+                    Err(e) => Some(Err(e)),
+                    Ok(batch) => {
+                        let left = remaining.load(Ordering::SeqCst);
+                        if left == 0 {
+                            None
+                        } else {
+                            let take = batch.num_rows().min(left);
+                            remaining.fetch_sub(take, Ordering::SeqCst);
+                            Some(Ok(if take < batch.num_rows() {
+                                batch.slice(0, take)
+                            } else {
+                                batch
+                            }))
+                        }
+                    }
+                };
+                futures::future::ready(out)
+            });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, inner)))
+    }
+}
+
+fn projected_schema(schema: &SchemaRef, projection: Option<&[usize]>) -> SchemaRef {
+    match projection {
+        Some(idx) => {
+            let fields: Vec<arrow_schema::Field> =
+                idx.iter().map(|&i| schema.field(i).clone()).collect();
+            Arc::new(
+                arrow_schema::Schema::new(fields).with_metadata(schema.metadata().clone()),
+            )
+        }
+        None => Arc::clone(schema),
     }
 }
 

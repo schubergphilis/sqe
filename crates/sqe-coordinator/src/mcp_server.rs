@@ -21,6 +21,8 @@ use crate::{rate_limiter::QueryRateLimiter, QueryHandler};
 struct CoordinatorMcpExecutor {
     handler: Arc<QueryHandler>,
     rate_limiter: Arc<QueryRateLimiter>,
+    /// `mcp.request_timeout_secs`; zero disables the deadline.
+    request_timeout: std::time::Duration,
 }
 
 /// The `[[hive.roots]]` catalog names, which the MCP change tool treats as
@@ -45,6 +47,7 @@ pub fn mcp_router(
     let executor: Arc<dyn sqe_mcp::QueryExecutor> = Arc::new(CoordinatorMcpExecutor {
         handler,
         rate_limiter,
+        request_timeout: std::time::Duration::from_secs(config.request_timeout_secs),
     });
     sqe_mcp::router(
         sqe_mcp::McpServerState::new(auth, executor, config)
@@ -124,7 +127,29 @@ impl sqe_mcp::QueryExecutor for CoordinatorMcpExecutor {
         self.rate_limiter
             .check(&session.user.username)
             .map_err(|error| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("rate limit: {error}")))?;
-        self.handler.execute(session, sql, None).await
+        let run = self.handler.execute(session, sql, None);
+        if self.request_timeout.is_zero() {
+            return run.await;
+        }
+        // Past the deadline the future is dropped, which stops the
+        // DataFusion streams and object-store calls under it, and the
+        // handler's guard marks the query abandoned. Before this, an MCP
+        // caller that gave up after ninety seconds and retried left the
+        // first attempt running to the five-minute query timeout beside the
+        // second: four such attempts on two snapshot tables held the
+        // coordinator for half an hour and 1.8 GB.
+        match tokio::time::timeout(self.request_timeout, run).await {
+            Ok(result) => result,
+            Err(_) => Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!(
+                    "the statement did not finish within the MCP deadline of {}s and was \
+                     cancelled (mcp.request_timeout_secs); narrow it with a partition \
+                     predicate or a LIMIT, or raise the deadline",
+                    self.request_timeout.as_secs()
+                ),
+            )),
+        }
     }
 }
 

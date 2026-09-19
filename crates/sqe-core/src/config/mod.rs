@@ -912,6 +912,13 @@ pub struct McpConfig {
     /// Maximum JSON bytes returned in one MCP tool response.
     #[serde(default = "default_mcp_max_response_bytes")]
     pub max_response_bytes: usize,
+    /// Deadline for one statement run by an MCP tool call, in seconds; `0`
+    /// leaves only `query.timeout_secs`. An MCP client waits about a minute
+    /// and a half and then retries, so a statement that outlives the caller
+    /// is work nobody collects: past this deadline it is cancelled and the
+    /// tool reports the deadline instead. Set it below the client's own.
+    #[serde(default = "default_mcp_request_timeout_secs")]
+    pub request_timeout_secs: u64,
     /// Catalogs the change/write tool may target. Empty means any catalog
     /// EXCEPT a `[[hive.roots]]` catalog: Hive roots are reached with the
     /// engine's own credentials, so an agent writing there acts as SQE, not
@@ -947,6 +954,7 @@ impl Default for McpConfig {
             write_roles: default_mcp_write_roles(),
             max_result_rows: default_mcp_max_result_rows(),
             max_response_bytes: default_mcp_max_response_bytes(),
+            request_timeout_secs: default_mcp_request_timeout_secs(),
             write_catalogs: Vec::new(),
             default_catalog: None,
             default_schema: None,
@@ -1126,6 +1134,9 @@ fn default_mcp_max_result_rows() -> usize {
 }
 fn default_mcp_max_response_bytes() -> usize {
     2 * 1024 * 1024
+}
+fn default_mcp_request_timeout_secs() -> u64 {
+    75
 }
 
 fn valid_oauth_scope(scope: &str) -> bool {
