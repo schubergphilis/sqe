@@ -203,6 +203,10 @@ deps-check:
   script:
     - |
       set -euo pipefail
+      # The cache restores the binary into $CARGO_HOME/bin, which is not on
+      # PATH in the image; without this the probe misses and the reinstall
+      # fails with "binary `cargo-machete` already exists".
+      export PATH="$CARGO_HOME/bin:$PATH"
       command -v cargo-machete >/dev/null 2>&1 || cargo install cargo-machete --locked
       cargo machete --with-metadata crates/sqe-*
   rules:
