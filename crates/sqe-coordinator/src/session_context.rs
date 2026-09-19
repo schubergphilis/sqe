@@ -625,27 +625,18 @@ pub async fn create_session_context(
             // (the one process-wide manifest cache every session's provider
             // reads through).
             //
-            // `cache_ttl` (60s) matches the embedded CLI's
-            // `attach_hive_root`: how long the provider's database and
-            // table-name snapshots are served before the next pre-plan
-            // refresh (`QueryHandler::refresh_listing_snapshots`, review
-            // 806) re-lists them. The synchronous `schema_names()` /
-            // `table_names()` hooks only ever serve those snapshots. A fresh
-            // provider starts with none, so the CALLING session always sees
-            // a `CREATE EXTERNAL TABLE` or `DROP TABLE` it just issued:
-            // `HiveDdlHandler` invalidates that session's own cached
-            // `SessionContext` (`invalidate_session_cache`, per-user, not
-            // the root-level ATTACH/DETACH convention's
-            // `invalidate_all_session_caches`), which forces this whole
-            // function to rebuild on that session's very next call, and a
-            // rebuild means a fresh provider whose first pre-plan refresh
-            // lists anew. A DIFFERENT session that already has a live
-            // `HiveCatalogProvider` for this root is not touched by that
-            // invalidation and keeps serving its own snapshots until they
-            // age past the 60s TTL below -- a stale listing for that long
-            // is expected, correct behaviour, not a bug, but it is easy to
-            // misread this loop as re-registering every session's provider
-            // on every DDL statement, which it does not.
+            // `cache_ttl` (`[hive] metadata_ttl_secs`) is how long the
+            // database and table-name snapshots are served before the next
+            // pre-plan refresh (`QueryHandler::refresh_listing_snapshots`,
+            // review 806) re-lists them. The snapshots live in
+            // `hive_manifest_cache` per catalog name, not in the provider:
+            // an MCP tool call is a session of its own, and a per-provider
+            // snapshot meant one `GetTables` per database per call. The
+            // synchronous `schema_names()` / `table_names()` hooks only ever
+            // serve those snapshots. `HiveDdlHandler` calls
+            // `invalidate_table_names` after `CREATE EXTERNAL TABLE` or
+            // `DROP TABLE`, which every session sees because the snapshots
+            // are shared; another process's DDL is visible after the TTL.
             for (name, root) in &hive_roots {
                 let hive_caller = sqe_core::config::TvfCaller::for_user(
                     session.user.username.clone(),
@@ -659,7 +650,7 @@ pub async fn create_session_context(
                     hive_caller,
                     ctx.runtime_env(),
                     Arc::clone(hive_manifest_cache),
-                    std::time::Duration::from_secs(60),
+                    std::time::Duration::from_secs(config.hive.metadata_ttl_secs),
                 );
                 ctx.register_catalog(name.clone(), hive_provider);
             }
