@@ -15,7 +15,7 @@
 # Reuse the packaged cargo-chef binary without surrendering the repository's
 # pinned Rust toolchain to whichever compiler the cargo-chef image currently
 # carries.
-FROM lukemathwalker/cargo-chef:latest-rust-bookworm@sha256:14ac293f096e29d01296479bb2f81ec1fb0d6ff166dc2be399cf79cc79ec4906 AS cargo-chef-bin
+FROM lukemathwalker/cargo-chef:latest-rust-bookworm@sha256:5a37e174ceb7ccbebd6d0024049e9308f4de399bbcabbc3c6c649c70486880d5 AS cargo-chef-bin
 
 # Renovate's "container images" group bumps tag and digest together; the rust tag must match rust-toolchain.toml.
 FROM rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS chef
