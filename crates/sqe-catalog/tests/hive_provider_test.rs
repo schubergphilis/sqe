@@ -2039,6 +2039,35 @@ async fn a_listing_with_definitions_serves_the_lookups_that_follow() {
     assert_eq!(source.gets(), 0, "information_schema is answered from the cache too");
 }
 
+/// A cache miss on one table of a Glue-like source loads the database
+/// through the listing, not `GetTable`: the listing costs about the same as
+/// one fetch and leaves every sibling table cached for the calls that follow
+/// (a crawler's next `describe_table`, a join's second table).
+#[tokio::test]
+async fn a_miss_loads_the_whole_database_through_the_listing() {
+    let f = partitioned_csv_root().await;
+    let ctx = SessionContext::new();
+    let source = Arc::new(bulk::BulkSource::new(fixture_store(&f.root)));
+    let provider = Arc::new(HiveCatalogProvider::with_source(
+        "lake".to_string(),
+        Arc::clone(&source) as Arc<dyn sqe_catalog::hive::source::HiveMetadataSource>,
+        Arc::new(counting::CountingFactory(counting::CountingStore::local())),
+        ctx.runtime_env(),
+        Arc::new(HiveMetadataCache::new()),
+        Duration::from_secs(60),
+    ));
+    // No pre-plan refresh: the first lookup is a cold miss.
+    load_orders(&provider).await;
+    assert_eq!(source.gets(), 0, "the miss is served by the listing, not a per-table fetch");
+    assert_eq!(source.lists(), 1, "one listing for the database");
+
+    // Everything the listing returned is cached: the next lookup inside the
+    // TTL costs neither a fetch nor a second listing.
+    load_orders(&provider).await;
+    assert_eq!(source.gets(), 0);
+    assert_eq!(source.lists(), 1, "no second listing inside the TTL");
+}
+
 /// `information_schema.tables` only needs each table's kind. Answering it
 /// used to build every table, which listed every table's data prefix for
 /// size statistics; the kind comes from the manifest alone.
