@@ -44,6 +44,7 @@ write_roles = ["data_writer"]
 # default_schema = "analytics"
 max_result_rows = 1000
 max_response_bytes = 2097152
+request_timeout_secs = 75    # per-statement deadline for a tool call; 0 = query.timeout_secs only
 
 [[auth.providers]]
 type = "bearer_token"
@@ -268,6 +269,17 @@ then needs all three independent authorizations:
 Keep `allow_writes = false` for analytics assistants. For automation requiring
 writes, use a separate deployment/configuration and narrowly scoped source
 roles where operational isolation is required.
+
+Every statement a tool runs carries a deadline, `request_timeout_secs`
+(default 75 s, below the minute and a half most MCP clients wait before they
+retry). Past it the statement is cancelled, its query record reads
+`QUERY_ABANDONED`, and the tool answers with the deadline and the two ways
+out: a partition predicate or a `LIMIT`, or a longer deadline. Without this an
+agent that gave up and retried left the first attempt running to
+`query.timeout_secs` beside the second; on two thousand-partition snapshot
+tables that held the coordinator for half an hour. `0` leaves only the query
+timeout. A caller that disconnects mid-statement is treated the same way: the
+work stops and the record says the caller left.
 
 Results are structured JSON and text content. `max_result_rows` and
 `max_response_bytes` bound model context consumption; `truncated` reports when
