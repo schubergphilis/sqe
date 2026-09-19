@@ -47,7 +47,9 @@ The flags:
 - `--glue-database <db>` restricts the catalog to specific databases. Repeatable,
   and each value may be comma-separated (`--glue-database claude,afas`). Empty
   exposes every database. A table in any other database is not found, so a shared
-  Glue catalog can be scoped to what one deployment should see.
+  Glue catalog can be scoped to what one deployment should see. Names are folded
+  to lower case (Glue stores them that way) and checked against the catalog at
+  the first listing; a misspelt one is a WARN in the log, not an empty schema.
 - `--allow-s3-prefix <prefix>` (repeatable) is the read boundary. Reads use the
   engine's own AWS credentials, so a table whose location is not under one of
   these prefixes is refused. Name every bucket your tables live in. A prefix of

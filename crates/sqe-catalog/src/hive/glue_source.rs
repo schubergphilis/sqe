@@ -61,6 +61,17 @@ impl GlueMetadataSource {
         limits: ManifestLimits,
     ) -> Self {
         let region = client.config().region().map(|r| r.to_string());
+        // Glue stores database names lower-cased, whatever case the console
+        // or the DDL used, so a scope written as `Claude` would list a
+        // schema no query could resolve and hide the real `claude`. Folded
+        // once here; every comparison below is exact against these.
+        let mut databases: Vec<String> = databases
+            .into_iter()
+            .map(|d| d.trim().to_ascii_lowercase())
+            .filter(|d| !d.is_empty())
+            .collect();
+        databases.sort();
+        databases.dedup();
         Self {
             client,
             catalog_id,
@@ -86,7 +97,17 @@ impl GlueMetadataSource {
     /// `true` when `database` is outside the configured allow-list. An empty
     /// list allows everything.
     fn database_blocked(&self, database: &str) -> bool {
-        !self.databases.is_empty() && !self.databases.iter().any(|d| d == database)
+        !self.databases.is_empty()
+            && !self
+                .databases
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(database))
+    }
+
+    /// The configured scope, lower-cased and deduplicated. Empty means the
+    /// whole catalog.
+    pub fn scope(&self) -> &[String] {
+        &self.databases
     }
 
     /// One paginated `GetTables` for `database`, mapped to manifests. Backs
@@ -319,11 +340,39 @@ fn classify_glue_error(
 #[async_trait]
 impl HiveMetadataSource for GlueMetadataSource {
     async fn list_databases(&self) -> Result<Vec<String>, HiveError> {
-        // With an allow-list, skip the catalog scan and return it directly:
-        // the databases the operator named are the answer, and a name that
-        // does not exist in Glue simply lists no tables later.
+        // With an allow-list, skip the catalog scan: the databases the
+        // operator named are the answer. Each is checked against Glue once
+        // per refresh, so a misspelt scope entry is a WARN at the first
+        // listing rather than a schema that lists and answers nothing; the
+        // check is skipped, not fatal, when Glue cannot be asked (the scope
+        // is still served and the tables call surfaces the real error).
         if !self.databases.is_empty() {
-            return Ok(self.databases.clone());
+            let mut present = Vec::with_capacity(self.databases.len());
+            for name in &self.databases {
+                match self
+                    .client
+                    .get_database()
+                    .set_catalog_id(self.catalog_id.clone())
+                    .name(name)
+                    .send()
+                    .await
+                {
+                    Ok(_) => present.push(name.clone()),
+                    Err(e) if e.as_service_error().is_some_and(|s| s.is_entity_not_found_exception()) => {
+                        tracing::warn!(
+                            database = %name,
+                            "glue: a database named in the scope (--glue-database / hive.roots.databases) \
+                             does not exist in this catalog and is not listed"
+                        );
+                    }
+                    Err(e) => {
+                        let err = self.glue_err("get_database", e);
+                        tracing::warn!(database = %name, error = %err, "glue: could not verify a scoped database; serving it unverified");
+                        present.push(name.clone());
+                    }
+                }
+            }
+            return Ok(present);
         }
         let mut out = Vec::new();
         let mut pages = self
@@ -405,6 +454,45 @@ fn is_not_found<E: std::fmt::Debug>(e: &E) -> bool {
     // The SDK models EntityNotFound per-operation, so matching the rendered
     // error keeps one predicate for every call rather than three.
     format!("{e:?}").contains("EntityNotFound")
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    fn source(databases: &[&str]) -> GlueMetadataSource {
+        // No HTTP client and no credentials: nothing here sends a request.
+        let conf = aws_sdk_glue::Config::builder()
+            .behavior_version_latest()
+            .region(aws_config::Region::new("eu-central-1"))
+            .build();
+        GlueMetadataSource::new(
+            aws_sdk_glue::Client::from_conf(conf),
+            None,
+            databases.iter().map(|d| d.to_string()).collect(),
+            ManifestLimits::default(),
+        )
+    }
+
+    /// Glue lower-cases database names; the scope is folded to match, so
+    /// `--glue-database Claude,afas_raw` scopes to `claude` and `afas_raw`
+    /// and a lookup in either case is answered.
+    #[test]
+    fn the_scope_is_lower_cased_trimmed_and_deduplicated() {
+        let s = source(&["Claude", " afas_raw ", "claude", ""]);
+        assert_eq!(s.scope(), ["afas_raw", "claude"]);
+        assert!(!s.database_blocked("claude"));
+        assert!(!s.database_blocked("CLAUDE"));
+        assert!(!s.database_blocked("afas_raw"));
+        assert!(s.database_blocked("usage_data_raw"));
+    }
+
+    #[test]
+    fn an_empty_scope_blocks_nothing() {
+        let s = source(&[]);
+        assert!(s.scope().is_empty());
+        assert!(!s.database_blocked("anything"));
+    }
 }
 
 #[cfg(test)]
