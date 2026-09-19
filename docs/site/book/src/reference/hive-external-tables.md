@@ -168,6 +168,21 @@ Without a prior `ANALYZE TABLE`, planning uses size-derived statistics from the 
 
 ## Server mode
 
+A Glue root can be scoped to named databases, in config or on the command line:
+
+```toml
+[[hive.roots]]
+name      = "glue"
+kind      = "glue"
+databases = ["afas_raw", "claude"]   # empty = the whole catalog
+```
+
+```bash
+sqe-server --glue-catalog glue --glue-database afas_raw,claude
+```
+
+Only those databases are listed, and a table anywhere else is not found rather than denied. Names are folded to lower case, which is how Glue stores them, and each is checked with `GetDatabase` at the first listing: a name that does not exist is a WARN in the log and is not listed, so a typo does not become an empty schema. This is a visibility scope shared by every caller of the server, not per-user authorization; that stays with the identity provider and the policy engine.
+
 Verified through a real `sqe-server` process over Flight SQL, not only in-process: the quickstart's `./run.sh --server` boots a coordinator that attaches its root from `[[hive.roots]]`, runs the same DDL and the same queries as the embedded path, restarts the coordinator, and reads the tables back from the manifests. Same row counts, same rendered DDL.
 
 Two things a server-mode deployment needs that embedded mode does not. `[storage.tvf] allowed_object_store_prefixes` is mandatory: server mode fails closed on object-store paths, so with no allowlist every `s3://` read is denied, including the manifest load behind a Hive table. And nothing else has to be reachable. A coordinator whose `[catalog]` points at an Iceberg endpoint nobody is listening on still boots, attaches its Hive roots, and answers every Hive query, which is what a Hive-only deployment looks like.
