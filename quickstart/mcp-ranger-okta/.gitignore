@@ -1,1 +1,5 @@
 .mcp.json
+.agents/
+.claude/skills/
+.grok/
+skills-lock.json
