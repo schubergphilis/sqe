@@ -32,14 +32,17 @@ use crate::provider::AuthError;
 ///   (e.g. in [`crate::pending_auth::PendingAuthStore`])
 #[derive(Debug, Clone)]
 pub struct AuthCodeChallenge {
-    /// Unique identifier for this auth session (opaque to the IdP).
+    /// Unique identifier for this auth session (opaque to the IdP). Handed to
+    /// the *client* only (Trino `x_token_server`); the browser never sees it.
     pub auth_id: String,
     /// Full URL to redirect the user to for authentication.
     pub authorization_url: String,
     /// The PKCE verifier — **keep secret, never sent to the browser**.
     /// Sent to the token endpoint in [`AuthCodeService::exchange_code`].
     pub code_verifier: String,
-    /// Random state value to prevent CSRF.  Must be verified in the callback.
+    /// CSRF `state` = hex(sha256(auth_id)). Browser-visible (initiate URL, IdP
+    /// redirect, callback), but one-way: knowing it does not yield `auth_id`,
+    /// so it cannot be used to poll the token (#709).
     pub state: String,
 }
 
@@ -119,10 +122,10 @@ impl AuthCodeService {
     pub async fn start_challenge(&self) -> Result<AuthCodeChallenge, AuthError> {
         let auth_endpoint = self.discovery.authorization_endpoint().await?;
 
-        let auth_id = generate_random_string(16);
+        let auth_id = generate_random_string(32);
         let code_verifier = generate_code_verifier();
         let code_challenge = compute_code_challenge(&code_verifier);
-        let state = generate_random_string(32);
+        let state = hex::encode(Sha256::digest(auth_id.as_bytes()));
 
         let scope = self.scopes.join(" ");
 
