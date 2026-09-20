@@ -59,6 +59,12 @@ struct Cli {
     #[arg(long)]
     mcp_port: Option<u16>,
 
+    /// Interface the dedicated `/mcp` listener binds. Default: 127.0.0.1
+    /// with `--mcp-anonymous`, 0.0.0.0 otherwise. Overrides `[mcp]
+    /// bind_address`.
+    #[arg(long, value_name = "IP")]
+    mcp_bind: Option<String>,
+
     /// Attach the AWS Glue Data Catalog as a read-only Hive catalog under
     /// this SQL name, so every Glue database in the region resolves as
     /// `<name>.<database>.<table>`. Equivalent to a `[[hive.roots]]` entry
@@ -1181,6 +1187,32 @@ async fn async_main() -> anyhow::Result<()> {
             "WARNING: MCP is UNAUTHENTICATED (--mcp-anonymous). Every caller reaching the \
              endpoint reads as one anonymous identity using the engine's storage credentials. \
              Use [mcp.auth] mode = \"static\" or \"oauth\" outside a trusted network."
+        );
+    }
+    if let Some(bind) = &cli.mcp_bind {
+        config.mcp.bind_address = bind.clone();
+    }
+    // #672: a leftover `port` line is not a decision to serve /mcp.
+    if config.mcp.enabled_by_port_only() {
+        tracing::warn!(
+            port = config.mcp.port,
+            "DEPRECATED: [mcp] port is set without enabled = true; /mcp is served for this \
+             release only. Set [mcp] enabled = true to keep it, or remove port to close it."
+        );
+    }
+    // #671: an unauthenticated endpoint off loopback is a choice the operator
+    // made by name (bind_address / --mcp-bind, or port = 0 on the web
+    // listener, which binds every interface); say so where they are looking.
+    if config.mcp.is_enabled()
+        && config.mcp.auth.mode == sqe_core::config::McpAuthMode::Anonymous
+        && (config.mcp.port == 0 || !config.mcp.bind_ip().is_ok_and(|ip| ip.is_loopback()))
+    {
+        tracing::warn!(
+            bind = %config.mcp.bind_address,
+            port = config.mcp.port,
+            "WARNING: the UNAUTHENTICATED /mcp endpoint is reachable from the network. Set a \
+             dedicated [mcp] port and leave bind_address empty (or 127.0.0.1) to keep it on \
+             loopback."
         );
     }
 

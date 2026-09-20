@@ -32,6 +32,7 @@ internet-facing endpoint.
 [mcp]
 enabled = true
 # port = 8081 # optional dedicated listener; omit/zero to share health/web port
+# bind_address = "0.0.0.0" # dedicated listener's interface; empty = 127.0.0.1 in anonymous mode, 0.0.0.0 otherwise
 resource_uri = "https://sqe.example.com/mcp"
 authorization_servers = ["https://idp.example.com/realms/data"]
 allowed_origins = [] # add exact browser origins only when browser MCP clients need them
