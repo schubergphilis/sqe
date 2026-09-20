@@ -2030,8 +2030,8 @@ fn ensure_read_only(sql: &str, session_catalog: Option<&str>) -> Result<Statemen
     // and FROM read_parquet(...) as Query. Those skip catalog/Ranger (#703 #704).
     if let Some(name) = file_tvf_in(&kind) {
         return Err(format!(
-            "Read-only tool rejected file table function {name}; MCP queries catalog tables, \
-             not object-store paths. Use sample_rows or SELECT from a table name"
+            "Read-only tool rejected table function {name}; MCP queries catalog tables, \
+             not object-store paths or remote engines. Use sample_rows or SELECT from a table name"
         ));
     }
     if let Some(shape) = query_write_shape(&kind) {
@@ -2040,8 +2040,10 @@ fn ensure_read_only(sql: &str, session_catalog: Option<&str>) -> Result<Statemen
     Ok(kind)
 }
 
-/// File TVFs that read object-store or local paths with engine credentials.
-const FILE_TABLE_FUNCTIONS: [&str; 3] = ["read_parquet", "read_csv", "read_json"];
+/// Table functions that bypass the catalog: file TVFs read object-store or
+/// local paths with engine credentials, `quack_query` runs SQL on a remote
+/// engine (#749). Refused by both tools.
+const DENIED_TABLE_FUNCTIONS: [&str; 4] = ["read_parquet", "read_csv", "read_json", "quack_query"];
 
 fn object_name_last(name: &sqlparser::ast::ObjectName) -> Option<String> {
     name.0
@@ -2052,7 +2054,7 @@ fn object_name_last(name: &sqlparser::ast::ObjectName) -> Option<String> {
 
 fn is_file_tvf_name(name: &sqlparser::ast::ObjectName) -> Option<String> {
     let last = object_name_last(name)?;
-    FILE_TABLE_FUNCTIONS
+    DENIED_TABLE_FUNCTIONS
         .contains(&last.as_str())
         .then_some(last)
 }
@@ -2128,10 +2130,27 @@ fn walk_query_shape(kind: &StatementKind) -> QueryShapeFinder {
         file_tvf: None,
         write_shape: None,
     };
-    if let StatementKind::Query(stmt) = kind {
-        let _ = stmt.as_ref().visit(&mut finder);
+    if let Some(stmt) = statement_of(kind) {
+        let _ = stmt.visit(&mut finder);
     }
     finder
+}
+
+/// The parsed statement behind the kinds both tools walk for table
+/// functions: the read-only kind and the change kinds that carry a query
+/// (CTAS, INSERT ... SELECT, CREATE VIEW, MERGE; #723).
+fn statement_of(kind: &StatementKind) -> Option<&sqlparser::ast::Statement> {
+    match kind {
+        StatementKind::Query(s)
+        | StatementKind::CreateTable(s)
+        | StatementKind::Ctas(s)
+        | StatementKind::Insert(s)
+        | StatementKind::Merge(s)
+        | StatementKind::Delete(s)
+        | StatementKind::Update(s)
+        | StatementKind::CreateView(s) => Some(s.as_ref()),
+        _ => None,
+    }
 }
 
 fn file_tvf_in(kind: &StatementKind) -> Option<String> {
@@ -2213,6 +2232,15 @@ fn ensure_change(sql: &str, session_catalog: Option<&str>) -> Result<StatementKi
              table, schema and view DDL; grants, policies, secrets, catalogs, session \
              settings and procedures go through Flight SQL or Trino HTTP",
             kind.name()
+        ));
+    }
+    // Same denylist as the read-only tool (#723): CTAS / INSERT ... SELECT
+    // FROM read_parquet(...) would otherwise read object-store paths on the
+    // engine's credentials through the write tool.
+    if let Some(name) = file_tvf_in(&kind) {
+        return Err(format!(
+            "Change tool rejected table function {name}; MCP statements read catalog tables, \
+             not object-store paths or remote engines"
         ));
     }
     Ok(kind)
@@ -2756,6 +2784,32 @@ mod tests {
         ensure_read_only("SELECT 'read_parquet' AS x", None).expect("literal is not a TVF");
         ensure_read_only("SELECT * FROM read_parquet", None)
             .expect("bare name without args is a table, not a TVF");
+    }
+
+    /// #723 #749: the change tool applies the same denylist, and the
+    /// outbound `quack_query` TVF is on it for both tools.
+    #[test]
+    fn change_guard_rejects_denied_table_functions() {
+        for sql in [
+            "CREATE TABLE t AS SELECT * FROM read_parquet('s3://b/x.parquet')",
+            "INSERT INTO t SELECT * FROM read_csv('/tmp/x.csv')",
+            "CREATE VIEW v AS SELECT * FROM read_json('hf://datasets/x')",
+            "INSERT INTO t SELECT * FROM quack_query('quack:h:9495', 'SELECT 1')",
+            "CREATE TABLE t AS WITH s AS (SELECT * FROM read_parquet('s3://b/x')) SELECT * FROM s",
+        ] {
+            let err = ensure_change(sql, None).expect_err(sql);
+            assert!(
+                err.contains("Change tool rejected table function"),
+                "{sql}: {err}"
+            );
+        }
+        ensure_change("CREATE TABLE t AS SELECT * FROM src", None).expect("plain CTAS passes");
+        let err = ensure_read_only(
+            "SELECT * FROM quack_query('quack:h:9495', 'SELECT 1')",
+            None,
+        )
+        .expect_err("quack_query");
+        assert!(err.contains("quack_query"), "{err}");
     }
 
     #[test]

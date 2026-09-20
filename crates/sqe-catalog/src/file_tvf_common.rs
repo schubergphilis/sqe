@@ -916,6 +916,36 @@ pub fn build_gcs_store(
         ))
     })?;
 
+    // #728: a caller-named key file is a read of the engine's filesystem,
+    // gated like every other local path. The engine's own
+    // `[storage] gcs_service_account_path` is operator config and stays.
+    if let Some(path) = args
+        .gcs_service_account_path
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        if !storage.tvf.allow_local_paths {
+            return Err(DataFusionError::Plan(format!(
+                "{fn_name}: gcs_service_account_path '{path}' names a file on the engine's \
+                 filesystem and local paths are disabled (`[storage.tvf] allow_local_paths = false`)"
+            )));
+        }
+    }
+    // #727: object_store honours `gcs_base_url` inside the service-account
+    // JSON, so an inline key is also an endpoint override; check it exactly
+    // like `endpoint =>` on S3 (#46). Unparseable JSON fails in the builder.
+    if let Some(base_url) = args
+        .gcs_service_account_key
+        .as_deref()
+        .and_then(|key| serde_json::from_str::<serde_json::Value>(key).ok())
+        .and_then(|json| json.get("gcs_base_url")?.as_str().map(str::to_owned))
+    {
+        storage
+            .tvf
+            .check_endpoint(&base_url)
+            .map_err(|e| DataFusionError::Plan(format!("{fn_name}: gcs_base_url: {e}")))?;
+    }
+
     let mut builder = GoogleCloudStorageBuilder::new().with_bucket_name(bucket);
 
     let creds = resolve_gcs_credentials(args, storage);
@@ -1232,6 +1262,36 @@ mod tests {
         };
         let caller = TvfCaller::for_user("alice".to_string(), Vec::new());
         assert!(enforce_tvf_path_policy("read_csv", &args, &storage, &caller).is_ok());
+    }
+
+    /// #727: `gcs_base_url` in an inline key is an endpoint override and
+    /// meets the HTTP allowlist; #728: a caller's key-file path is a local
+    /// path and meets `allow_local_paths`.
+    #[test]
+    fn gcs_store_gates_inline_base_url_and_caller_key_path() {
+        let storage = StorageConfig::default();
+        let args = FileTvfArgs {
+            path: "gs://b/x.csv".to_string(),
+            gcs_service_account_key: Some(
+                r#"{"type":"service_account","gcs_base_url":"http://169.254.169.254","disable_oauth":true}"#
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let msg = build_gcs_store("read_csv", &args, &storage)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("allowed_http_hosts"), "got: {msg}");
+
+        let args = FileTvfArgs {
+            path: "gs://b/x.csv".to_string(),
+            gcs_service_account_path: Some("/etc/passwd".to_string()),
+            ..Default::default()
+        };
+        let msg = build_gcs_store("read_csv", &args, &storage)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("allow_local_paths"), "got: {msg}");
     }
 
     #[test]

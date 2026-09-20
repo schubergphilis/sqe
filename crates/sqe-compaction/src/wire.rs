@@ -141,6 +141,14 @@ impl From<SortSpecWire> for SortSpec {
 /// tick) fans out into one `CompactGroupRequest` per bin-packed group.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CompactGroupRequest {
+    /// Worker URL this request was minted for, as the coordinator dials it
+    /// (#730). The worker compares it to its `advertise_url`; a request
+    /// captured from one worker cannot be replayed to another.
+    #[serde(default)]
+    pub audience: String,
+    /// Unix seconds after which the worker refuses the request (#730).
+    #[serde(default)]
+    pub expires_at: i64,
     /// Identifier for the parent job, shared across all groups in the job.
     pub job_id: String,
     /// Identifier for this group within the job.
@@ -172,6 +180,8 @@ impl std::fmt::Debug for CompactGroupRequest {
     /// `{:?}` on the whole request still never leaks secrets.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompactGroupRequest")
+            .field("audience", &self.audience)
+            .field("expires_at", &self.expires_at)
             .field("job_id", &self.job_id)
             .field("group_id", &self.group_id)
             .field("table_ident", &self.table_ident)
@@ -300,6 +310,8 @@ mod tests {
 
     fn sample_request() -> CompactGroupRequest {
         CompactGroupRequest {
+            audience: "http://worker-1:50052".to_string(),
+            expires_at: 1_900_000_000,
             job_id: "job-001".to_string(),
             group_id: 3,
             table_ident: "catalog.ns.orders".to_string(),
