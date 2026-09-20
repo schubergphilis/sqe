@@ -134,6 +134,7 @@ async fn mcp_listener_answers_again_after_idling_past_the_session_cache_ttl() {
         &config.coordinator.tls,
         alive.clone(),
         &config.storage,
+        sqe_coordinator::mcp_server::CancellationToken::new(),
     )
     .await
     .expect("listener bound");

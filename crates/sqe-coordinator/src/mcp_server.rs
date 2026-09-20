@@ -59,11 +59,62 @@ pub fn mcp_router(
         request_timeout: std::time::Duration::from_secs(config.request_timeout_secs),
         metadata_rate_limiter,
     });
+    // The whole request, not just the statement: auth (a JWKS fetch), the
+    // metadata fan-out and the encoding run outside the executor's deadline,
+    // and before this the only bound on a request was the engine's five
+    // minute query timeout (#679). Sits above the statement deadline so a
+    // statement times out with its own message first.
+    let request_deadline = (config.request_timeout_secs > 0).then(|| {
+        std::time::Duration::from_secs(config.request_timeout_secs + REQUEST_DEADLINE_MARGIN_SECS)
+    });
     sqe_mcp::router(
         sqe_mcp::McpServerState::new(auth, executor, config)
             .with_hive_roots(hive_roots)
             .with_storage_probe(storage_probe(storage)),
     )
+    .layer(axum::middleware::from_fn_with_state(
+        request_deadline,
+        request_deadline_layer,
+    ))
+}
+
+/// Added to `mcp.request_timeout_secs` for the request-level deadline.
+const REQUEST_DEADLINE_MARGIN_SECS: u64 = 15;
+
+/// How long in-flight MCP requests get to finish after the shutdown signal.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Signal the MCP listener to stop accepting and drain (#679). Re-exported
+/// so the binary does not need the crate for one type.
+pub use tokio_util::sync::CancellationToken;
+
+async fn request_deadline_layer(
+    axum::extract::State(deadline): axum::extract::State<Option<std::time::Duration>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(deadline) = deadline else {
+        return next.run(request).await;
+    };
+    match tokio::time::timeout(deadline, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => (
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+            axum::Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {
+                    "code": -32000,
+                    "message": format!(
+                        "the request did not finish within {}s (mcp.request_timeout_secs + {}) and was cancelled",
+                        deadline.as_secs(), REQUEST_DEADLINE_MARGIN_SECS
+                    )
+                }
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// The AWS SDK default-chain probe. The SDK config module is compiled only
@@ -194,6 +245,7 @@ pub async fn start_mcp_server(
     tls: &TlsConfig,
     alive: Arc<AtomicBool>,
     storage: &sqe_core::config::StorageConfig,
+    shutdown: CancellationToken,
 ) -> anyhow::Result<(tokio::task::JoinHandle<()>, SocketAddr)> {
     // Loopback by default in anonymous mode, every interface otherwise;
     // `validate` already rejected an address that does not parse (#671).
@@ -229,16 +281,45 @@ pub async fn start_mcp_server(
             axum_server::tls_rustls::RustlsConfig::from_config(material.rustls_server_config());
 
         // Rotation without a restart. The Flight listener cannot do this; see
-        // the module docs on `crate::tls`.
-        let _reload_task = crate::tls::spawn_cert_reload_watch(
+        // the module docs on `crate::tls`. Supervised (#679): a reloader that
+        // died would go on serving the certificate it last loaded, and an
+        // expired certificate is the kind of failure nobody sees in a log
+        // until a client refuses to connect.
+        let reload_task = crate::tls::spawn_cert_reload_watch(
             tls.clone(),
             rustls_config.clone(),
             crate::tls::DEFAULT_CERT_RELOAD_INTERVAL,
         );
+        let reload_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let outcome = reload_task.await;
+            if reload_shutdown.is_cancelled() {
+                return;
+            }
+            match outcome {
+                Ok(()) => tracing::error!(
+                    "MCP TLS certificate reload task exited; the certificate loaded at startup \
+                     is served until a restart"
+                ),
+                Err(error) => tracing::error!(
+                    %error,
+                    "MCP TLS certificate reload task panicked; the certificate loaded at startup \
+                     is served until a restart"
+                ),
+            }
+        });
 
-        let task = supervise_listener("MCP HTTPS", alive, async move {
+        let handle = axum_server::Handle::new();
+        let stop = handle.clone();
+        let drain = shutdown.clone();
+        tokio::spawn(async move {
+            drain.cancelled().await;
+            stop.graceful_shutdown(Some(SHUTDOWN_GRACE));
+        });
+        let task = supervise_listener("MCP HTTPS", alive, shutdown, async move {
             axum_server::from_tcp_rustls(std_listener, rustls_config)
                 .map_err(anyhow::Error::from)?
+                .handle(handle)
                 .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                 .await
                 .map_err(anyhow::Error::from)
@@ -246,11 +327,13 @@ pub async fn start_mcp_server(
         Ok((task, bound))
     } else {
         let listener = tokio::net::TcpListener::from_std(std_listener)?;
-        let task = supervise_listener("MCP HTTP", alive, async move {
+        let drain = shutdown.clone();
+        let task = supervise_listener("MCP HTTP", alive, shutdown, async move {
             axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<SocketAddr>(),
             )
+            .with_graceful_shutdown(async move { drain.cancelled().await })
             .await
             .map_err(anyhow::Error::from)
         });
@@ -268,6 +351,7 @@ pub async fn start_mcp_server(
 fn supervise_listener<F>(
     what: &'static str,
     alive: Arc<AtomicBool>,
+    shutdown: CancellationToken,
     serve: F,
 ) -> tokio::task::JoinHandle<()>
 where
@@ -286,6 +370,10 @@ where
     tokio::spawn(async move {
         let _guard = AliveGuard(alive);
         match std::panic::AssertUnwindSafe(serve).catch_unwind().await {
+            // The one expected exit: the shutdown signal drained it (#679).
+            Ok(Ok(())) if shutdown.is_cancelled() => {
+                tracing::info!("{what} server drained and closed on shutdown")
+            }
             Ok(Ok(())) => {
                 tracing::error!("{what} server exited without an error; the listener is closed")
             }
