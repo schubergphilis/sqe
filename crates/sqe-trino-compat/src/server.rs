@@ -925,7 +925,11 @@ fn basic_session_key(user: &str, pass: &str) -> String {
 /// surfaces as `ResourceExhausted`, everything else is a rejection. The
 /// principal logged is a username or a bearer fingerprint, never a raw
 /// credential.
-fn classify_auth_error(error: &sqe_core::SqeError, principal: &str, client_ip: &str) -> AuthFailure {
+fn classify_auth_error(
+    error: &sqe_core::SqeError,
+    principal: &str,
+    client_ip: &str,
+) -> AuthFailure {
     if error.error_code() == sqe_core::SqeErrorCode::ResourceExhausted {
         warn!(
             principal = %principal,
@@ -1792,13 +1796,32 @@ fn parse_trino_duration(s: &str) -> Option<std::time::Duration> {
     None
 }
 
-/// Derive the base URL from the `Host` header, falling back to `localhost:<port>`.
-fn extract_base_url(headers: &HeaderMap, bound_port: u16) -> String {
-    let scheme = extract_header(headers, "x-forwarded-proto").unwrap_or_else(|| "http".to_string());
-    if let Some(host) = extract_header(headers, "host") {
-        format!("{scheme}://{host}")
-    } else {
-        format!("http://localhost:{bound_port}")
+/// Is the connecting peer one of `[security] trusted_proxies`? Same rule
+/// `resolve_client_ip` applies to `x-forwarded-for`.
+fn peer_is_trusted_proxy<A, Q>(state: &TrinoState<A, Q>, peer: SocketAddr) -> bool {
+    let ip = peer.ip().to_string();
+    state
+        .security
+        .trusted_proxies
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case(&ip))
+}
+
+/// Derive the base URL for `nextUri`/`infoUri`, falling back to
+/// `localhost:<port>`. `x-forwarded-proto` / `x-forwarded-host` are honoured
+/// only from a trusted proxy; anyone else gets the plain `Host` header over
+/// the connection's own scheme (this listener is plain HTTP). Issue #726.
+fn extract_base_url(headers: &HeaderMap, bound_port: u16, trusted_proxy: bool) -> String {
+    let forwarded = |name: &str| {
+        trusted_proxy
+            .then(|| extract_header(headers, name))
+            .flatten()
+    };
+    let scheme = forwarded("x-forwarded-proto").unwrap_or_else(|| "http".to_string());
+    let host = forwarded("x-forwarded-host").or_else(|| extract_header(headers, "host"));
+    match host {
+        Some(host) => format!("{scheme}://{host}"),
+        None => format!("http://localhost:{bound_port}"),
     }
 }
 
@@ -2144,7 +2167,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         );
 
         let query_id = Uuid::new_v4().to_string();
-        let base_url = extract_base_url(&headers, state.port);
+        let base_url = extract_base_url(&headers, state.port, peer_is_trusted_proxy(&state, peer));
 
         // Trino prepared statements are stateless: the client carries the prepared
         // SQL in X-Trino-Prepared-Statement headers and submits `EXECUTE <name>
@@ -2428,7 +2451,7 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             }
         };
 
-        let base_url = extract_base_url(&headers, state.port);
+        let base_url = extract_base_url(&headers, state.port, peer_is_trusted_proxy(&state, peer));
 
         let Some(handle) = registered else {
             return not_found_response(state.as_ref(), &base_url, &id);
@@ -2524,7 +2547,7 @@ async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             }
         };
 
-        let base_url = extract_base_url(&headers, state.port);
+        let base_url = extract_base_url(&headers, state.port, peer_is_trusted_proxy(&state, peer));
         let next_token: usize = token.parse().unwrap_or(1usize).saturating_add(1);
 
         let handle = match registered {
@@ -5195,13 +5218,19 @@ mod tests {
     fn test_extract_base_url_from_host_header() {
         let mut headers = HeaderMap::new();
         headers.insert("host", "myhost:9090".parse().unwrap());
-        assert_eq!(extract_base_url(&headers, 8080), "http://myhost:9090");
+        assert_eq!(
+            extract_base_url(&headers, 8080, false),
+            "http://myhost:9090"
+        );
     }
 
     #[test]
     fn test_extract_base_url_fallback() {
         let headers = HeaderMap::new();
-        assert_eq!(extract_base_url(&headers, 8080), "http://localhost:8080");
+        assert_eq!(
+            extract_base_url(&headers, 8080, false),
+            "http://localhost:8080"
+        );
     }
 
     #[test]
@@ -5209,7 +5238,24 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("host", "myhost:9090".parse().unwrap());
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
-        assert_eq!(extract_base_url(&headers, 8080), "https://myhost:9090");
+        headers.insert("x-forwarded-host", "public.example".parse().unwrap());
+        assert_eq!(
+            extract_base_url(&headers, 8080, true),
+            "https://public.example"
+        );
+    }
+
+    /// #726: forwarded headers from an untrusted peer must not steer nextUri.
+    #[test]
+    fn test_extract_base_url_ignores_forwarded_headers_from_untrusted_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "myhost:9090".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-host", "evil.example".parse().unwrap());
+        assert_eq!(
+            extract_base_url(&headers, 8080, false),
+            "http://myhost:9090"
+        );
     }
 
     // ── Bearer JWT passthrough tests ────────────────────────────
