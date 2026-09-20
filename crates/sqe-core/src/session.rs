@@ -52,6 +52,11 @@ pub struct Session {
     pub default_schema: Option<String>,
     /// Client source identifier (from X-Trino-Source).
     pub source: Option<String>,
+    /// The address the caller connected from, when the front door knows it.
+    /// MCP sets it so that in the modes where every caller is one configured
+    /// user (`static`, `anonymous`) the client registry and the query rate
+    /// limit still tell callers apart (#680).
+    pub peer_ip: Option<String>,
     /// Named Iceberg branch for writes in this session. When set via
     /// `SET WRITE_BRANCH = '<name>'`, INSERT/UPDATE/DELETE/MERGE statements
     /// route their snapshot ref updates to this branch instead of `main`.
@@ -114,6 +119,7 @@ impl Session {
             default_catalog: None,
             default_schema: None,
             source: None,
+            peer_ip: None,
             write_branch: None,
             compression_codec: None,
             maintenance_authority: false,
@@ -180,6 +186,11 @@ impl Session {
     #[must_use = "with_source consumes self; bind the returned Session"]
     pub fn with_source(mut self, source: Option<String>) -> Self {
         self.source = source;
+        self
+    }
+
+    pub fn with_peer_ip(mut self, peer_ip: Option<String>) -> Self {
+        self.peer_ip = peer_ip;
         self
     }
 

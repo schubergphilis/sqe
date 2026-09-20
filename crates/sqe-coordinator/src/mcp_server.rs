@@ -185,8 +185,15 @@ pub fn storage_probe(storage: &sqe_core::config::StorageConfig) -> sqe_mcp::Stor
 #[async_trait]
 impl sqe_mcp::QueryExecutor for CoordinatorMcpExecutor {
     async fn execute(&self, session: &Session, sql: &str) -> Result<Vec<RecordBatch>, SqeError> {
+        // Keyed on `(peer, user)`, not the user alone (#680): in static and
+        // anonymous mode every caller is one configured user, and a per-user
+        // limit would be one shared global that any single client can spend.
+        let key = match &session.peer_ip {
+            Some(peer) => format!("{peer}|{}", session.user.username),
+            None => session.user.username.clone(),
+        };
         self.rate_limiter
-            .check(&session.user.username)
+            .check(&key)
             .map_err(|error| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("rate limit: {error}")))?;
         let run = self.handler.execute(session, sql, None);
         if self.request_timeout.is_zero() {

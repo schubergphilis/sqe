@@ -144,11 +144,14 @@ pub type StorageProbe =
 /// scope.
 const REFRESH_COOLDOWN: Duration = Duration::from_secs(10);
 
-/// What a client said about itself on `initialize`, bound to the identity that
-/// said it. The binding stops one caller from relabelling another caller's
-/// audit trail by replaying a session id it observed.
+/// What a client said about itself on `initialize`, bound to the identity
+/// that said it AND the address it said it from. The binding stops one
+/// caller from relabelling another caller's audit trail by replaying a
+/// session id it observed; the address matters in the modes where every
+/// caller is the same configured user (#680).
 struct ClientSession {
     user: String,
+    peer: String,
     label: String,
     seen: Instant,
 }
@@ -159,7 +162,7 @@ struct ClientRegistry {
 }
 
 impl ClientRegistry {
-    fn insert(&self, user: &str, label: String) -> String {
+    fn insert(&self, user: &str, peer: &str, label: String) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if inner.len() >= CLIENT_SESSIONS_MAX {
@@ -179,6 +182,7 @@ impl ClientRegistry {
             id.clone(),
             ClientSession {
                 user: user.to_string(),
+                peer: peer.to_string(),
                 label,
                 seen: Instant::now(),
             },
@@ -186,20 +190,23 @@ impl ClientRegistry {
         id
     }
 
-    /// The label for `id`, only if `user` is the identity that registered it.
-    fn label(&self, id: &str, user: &str) -> Option<String> {
+    /// The label for `id`, only if `user` at `peer` is who registered it.
+    fn label(&self, id: &str, user: &str, peer: &str) -> Option<String> {
         let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let session = inner.get_mut(id)?;
-        if session.user != user {
+        if session.user != user || session.peer != peer {
             return None;
         }
         session.seen = Instant::now();
         Some(session.label.clone())
     }
 
-    fn remove(&self, id: &str, user: &str) {
+    fn remove(&self, id: &str, user: &str, peer: &str) {
         let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if inner.get(id).is_some_and(|session| session.user == user) {
+        if inner
+            .get(id)
+            .is_some_and(|session| session.user == user && session.peer == peer)
+        {
             inner.remove(id);
         }
     }
@@ -421,7 +428,9 @@ async fn mcp_delete(
     match authenticate(&state, &headers, peer.ip().to_string()).await {
         Ok(auth) => {
             if let Some(id) = session_id(&headers) {
-                state.clients.remove(id, &auth.session.user.username);
+                state
+                    .clients
+                    .remove(id, &auth.session.user.username, &peer.ip().to_string());
             }
             StatusCode::NO_CONTENT.into_response()
         }
@@ -440,9 +449,14 @@ fn session_id(headers: &HeaderMap) -> Option<&str> {
 /// The client label for this request: what the client said on `initialize`
 /// if it echoes the `Mcp-Session-Id` we issued and is still the same identity,
 /// else the sanitized `User-Agent`, else nothing.
-fn client_label(state: &McpServerState, headers: &HeaderMap, user: &str) -> Option<String> {
+fn client_label(
+    state: &McpServerState,
+    headers: &HeaderMap,
+    user: &str,
+    peer: &str,
+) -> Option<String> {
     session_id(headers)
-        .and_then(|id| state.clients.label(id, user))
+        .and_then(|id| state.clients.label(id, user, peer))
         .or_else(|| {
             headers
                 .get(header::USER_AGENT)
@@ -510,11 +524,12 @@ async fn mcp_post(
         "initialize" => {
             // Remember who is talking so every later call can be attributed
             // to this client in the audit trail. Nothing else hangs off the id.
+            let peer_ip = peer.ip().to_string();
             let label = client_label_from_client_info(&request.params)
-                .or_else(|| client_label(&state, &headers, user))
+                .or_else(|| client_label(&state, &headers, user, &peer_ip))
                 .unwrap_or_else(|| "unknown".to_string());
             tracing::info!(user, client = %label, "MCP client initialized");
-            issued_session_id = Some(state.clients.insert(user, label));
+            issued_session_id = Some(state.clients.insert(user, &peer_ip, label));
             Ok(json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": { "tools": { "listChanged": false } },
@@ -533,7 +548,7 @@ async fn mcp_post(
             "cacheScope": "public",
         })),
         "tools/call" => {
-            let client = client_label(&state, &headers, user);
+            let client = client_label(&state, &headers, user, &peer.ip().to_string());
             call_tool(&state, &auth, client.as_deref(), &request.params).await
         }
         "notifications/initialized" => return StatusCode::ACCEPTED.into_response(),
@@ -580,11 +595,17 @@ async fn authenticate(
     // modes never reach a provider: the static compare is constant-time
     // against a local list and costs no IdP round trip, which is what the
     // limiter exists to cap.
-    match state.config.auth.mode {
+    let auth = match state.config.auth.mode {
         McpAuthMode::Oauth => authenticate_oauth(state, headers, &peer_ip).await,
         McpAuthMode::Static => authenticate_static(state, headers),
         McpAuthMode::Anonymous => Ok(authenticate_anonymous(state)),
-    }
+    }?;
+    // The coordinator keys the query rate limit on `(peer, user)` from this
+    // (#680): in static and anonymous mode every caller is one user.
+    Ok(AuthContext {
+        session: auth.session.with_peer_ip(Some(peer_ip)),
+        ..auth
+    })
 }
 
 /// Match the caller's bearer against the configured static principals.
@@ -2929,6 +2950,59 @@ mod tests {
             executor.2.lock().unwrap().as_deref(),
             Some("mcp:execute_sql_readonly:codex-cli/1.2")
         );
+    }
+
+    /// #680: in static and anonymous mode every caller is the same user, so
+    /// the binding also covers the address. The same principal from another
+    /// host replaying the id gets its own label, and its session carries
+    /// its own peer for the rate-limit key.
+    #[tokio::test]
+    async fn the_same_principal_from_another_address_cannot_borrow_a_session_id() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let app = router(McpServerState::new(
+            Arc::new(MockAuth),
+            executor.clone(),
+            static_config(false),
+        ));
+        let init = send(&app, READ_TOKEN, &[], initialize("claude-code", "2.1.0")).await;
+        let laptop_session_id = session_id_of(&init);
+
+        let request = Request::post("/mcp")
+            .extension(ConnectInfo(SocketAddr::from(([10, 0, 0, 9], 4242))))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {READ_TOKEN}"))
+            .header(SESSION_ID_HEADER, &laptop_session_id)
+            .header("user-agent", "codex-cli/1.2")
+            .body(Body::from(tool_call("execute_sql_readonly")))
+            .unwrap();
+        let call = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(call.status(), StatusCode::OK);
+        assert_eq!(
+            executor.2.lock().unwrap().as_deref(),
+            Some("mcp:execute_sql_readonly:codex-cli/1.2"),
+            "the label registered from 127.0.0.1 is not applied to a call from 10.0.0.9"
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_carry_the_peer_address_for_the_rate_limit_key() {
+        let peer_seen = Arc::new(Mutex::new(None));
+        struct PeerExecutor(Arc<Mutex<Option<String>>>);
+        #[async_trait]
+        impl QueryExecutor for PeerExecutor {
+            async fn execute(&self, session: &Session, _sql: &str) -> Result<Vec<RecordBatch>, SqeError> {
+                *self.0.lock().unwrap() = session.peer_ip.clone();
+                Ok(Vec::new())
+            }
+        }
+        let app = router(McpServerState::new(
+            Arc::new(MockAuth),
+            Arc::new(PeerExecutor(peer_seen.clone())),
+            static_config(false),
+        ));
+        let call = send(&app, READ_TOKEN, &[], tool_call("execute_sql_readonly")).await;
+        assert_eq!(call.status(), StatusCode::OK);
+        assert_eq!(peer_seen.lock().unwrap().as_deref(), Some("127.0.0.1"));
     }
 
     #[tokio::test]
