@@ -617,10 +617,16 @@ impl BearerTokenProvider {
         validation.validate_nbf = true;
         validation.leeway = self.config.leeway_secs;
 
+        // jsonwebtoken only compares `aud`/`iss` when the claim is *present*,
+        // so a configured binding must also make the claim required or a
+        // token that simply omits it sails through (#710).
+        let mut required = vec!["exp"];
+
         // Configure audience validation.
         match &self.config.audience {
             Some(aud) if !aud.is_empty() => {
                 validation.set_audience(&[aud]);
+                required.push("aud");
             }
             _ => {
                 validation.validate_aud = false;
@@ -629,16 +635,14 @@ impl BearerTokenProvider {
 
         // Configure issuer validation. Required unless the operator opted
         // into `allow_unbounded_issuer`, which `new` already warned about.
-        // `iss` also joins the required-claims set: jsonwebtoken only
-        // compares the issuer when the claim is *present*, so without this a
-        // token that simply omits `iss` would sail past a configured issuer.
         match &self.config.issuer {
             Some(iss) if !iss.is_empty() => {
                 validation.set_issuer(&[iss]);
-                validation.set_required_spec_claims(&["exp", "iss"]);
+                required.push("iss");
             }
             _ => {}
         }
+        validation.set_required_spec_claims(&required);
 
         validation
     }
@@ -1673,6 +1677,46 @@ Gsk+TB4BOZOZvvRKOPj1Dj5tcKc/tv2Hx8kiS4egVEC2qWmKaBDbv9kN
                 assert!(msg.contains("iss"), "Expected an issuer claim error: {msg}");
             }
             other => panic!("Expected AuthFailed for a missing iss claim, got: {other:?}"),
+        }
+    }
+
+    /// #710: a configured audience must reject a token that omits `aud`, not
+    /// just one that carries the wrong value.
+    #[tokio::test]
+    async fn missing_audience_claim_rejected_when_audience_configured() {
+        let jwks = build_jwks_json();
+        let (_handle, jwks_url) = start_jwks_server(jwks).await;
+
+        let config = BearerTokenProviderConfig {
+            jwks_url: jwks_url.clone(),
+            audience: Some("expected-audience".to_string()),
+            allow_unbounded_issuer: true,
+            allow_insecure_jwks: true,
+            ..Default::default()
+        };
+        let provider = BearerTokenProvider::new(config).unwrap();
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = json!({
+            "sub": "alice",
+            // no "aud" claim at all
+            "exp": now + 3600,
+            "iat": now
+        });
+
+        let creds = FlightCredentials {
+            bearer_token: Some(sqe_core::SecretString::new(build_signed_jwt(&claims))),
+            ..Default::default()
+        };
+
+        match provider.authenticate(&creds).await {
+            Err(AuthError::AuthFailed(msg)) => {
+                assert!(
+                    msg.contains("aud"),
+                    "Expected an audience claim error: {msg}"
+                );
+            }
+            other => panic!("Expected AuthFailed for a missing aud claim, got: {other:?}"),
         }
     }
 

@@ -19,6 +19,8 @@ pub enum PendingAuth {
     AwaitingCallback {
         code_verifier: String,
         state: String,
+        /// IdP authorization URL the browser is redirected to on `initiate`.
+        authorization_url: String,
         created_at: Instant,
     },
     Complete(TokenSet),
@@ -40,12 +42,19 @@ impl PendingAuthStore {
         }
     }
 
-    pub fn insert_pending(&self, auth_id: &str, code_verifier: String, state: String) {
+    pub fn insert_pending(
+        &self,
+        auth_id: &str,
+        code_verifier: String,
+        state: String,
+        authorization_url: String,
+    ) {
         self.store.insert(
             auth_id.to_string(),
             PendingAuth::AwaitingCallback {
                 code_verifier,
                 state,
+                authorization_url,
                 created_at: Instant::now(),
             },
         );
@@ -77,7 +86,12 @@ mod tests {
     #[test]
     fn insert_and_poll_pending() {
         let store = PendingAuthStore::new(Duration::from_secs(60));
-        store.insert_pending("auth-1", "verifier".to_string(), "state-abc".to_string());
+        store.insert_pending(
+            "auth-1",
+            "verifier".to_string(),
+            "state-abc".to_string(),
+            String::new(),
+        );
         let result = store.poll("auth-1");
         assert!(result.is_some());
         match result.unwrap() {
@@ -96,7 +110,7 @@ mod tests {
     #[test]
     fn complete_overwrites_pending() {
         let store = PendingAuthStore::new(Duration::from_secs(60));
-        store.insert_pending("auth-1", "v".to_string(), "s".to_string());
+        store.insert_pending("auth-1", "v".to_string(), "s".to_string(), String::new());
         store.complete(
             "auth-1",
             TokenSet {
@@ -118,7 +132,7 @@ mod tests {
     #[test]
     fn fail_overwrites_pending() {
         let store = PendingAuthStore::new(Duration::from_secs(60));
-        store.insert_pending("auth-1", "v".to_string(), "s".to_string());
+        store.insert_pending("auth-1", "v".to_string(), "s".to_string(), String::new());
         store.fail("auth-1", "user denied".to_string());
         match store.poll("auth-1").unwrap() {
             PendingAuth::Failed(msg) => assert_eq!(msg, "user denied"),
@@ -129,7 +143,7 @@ mod tests {
     #[test]
     fn remove_deletes_session() {
         let store = PendingAuthStore::new(Duration::from_secs(60));
-        store.insert_pending("auth-1", "v".to_string(), "s".to_string());
+        store.insert_pending("auth-1", "v".to_string(), "s".to_string(), String::new());
         store.remove("auth-1");
         assert!(store.poll("auth-1").is_none());
     }
