@@ -119,6 +119,9 @@ async fn mcp_listener_answers_again_after_idling_past_the_session_cache_ttl() {
         Arc::new(sqe_coordinator::rate_limiter::QueryRateLimiter::new(
             &config.rate_limit,
         )),
+        Arc::new(sqe_coordinator::rate_limiter::MetadataRateLimiter::new(
+            &config.rate_limit,
+        )),
         McpConfig {
             enabled: true,
             // 0: an ephemeral port, reported back so the test cannot collide.
