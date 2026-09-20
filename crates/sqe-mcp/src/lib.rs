@@ -37,7 +37,45 @@ pub const TOOLS_LIST_TTL_MS: u64 = 3_600_000;
 
 #[async_trait]
 pub trait QueryExecutor: Send + Sync + 'static {
+    /// A statement the caller asked for (`execute_sql_readonly`, `sample_rows`,
+    /// the change tool). The coordinator charges it to the per-user query
+    /// limiter.
     async fn execute(&self, session: &Session, sql: &str) -> Result<Vec<RecordBatch>, SqeError>;
+
+    /// A `SHOW` / `EXPLAIN` a metadata tool issues on the caller's behalf,
+    /// possibly hundreds per call (`search_tables` walks one `SHOW TABLES`
+    /// per schema). Not charged per statement: the tool call was admitted
+    /// once by [`Self::admit_metadata_call`]. Defaults to `execute` for
+    /// executors without a limiter.
+    async fn execute_metadata(&self, session: &Session, sql: &str) -> Result<Vec<RecordBatch>, SqeError> {
+        self.execute(session, sql).await
+    }
+
+    /// One charge per metadata tool call (`rate_limit.metadata_per_user_per_minute`
+    /// in the coordinator). `Err` is the denial the tool reports.
+    fn admit_metadata_call(&self, session: &Session) -> Result<(), SqeError> {
+        let _ = session;
+        Ok(())
+    }
+}
+
+/// Tools whose statements are metadata reads on the caller's behalf: admitted
+/// once per call, their `SHOW`s never charged to the query limiter. Everything
+/// else (`execute_sql_readonly`, `sample_rows`, the change tool,
+/// `refresh_metadata`) is a statement the caller asked for.
+fn is_metadata_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "list_catalogs"
+            | "list_schemas"
+            | "list_tables"
+            | "describe_table"
+            | "describe_schema"
+            | "get_table_ddl"
+            | "get_table_stats"
+            | "search_tables"
+            | "explain_query"
+    )
 }
 
 /// The `Mcp-Session-Id` header (MCP Streamable HTTP, 2025-11-25).
@@ -764,7 +802,7 @@ fn tools(config: &McpConfig) -> Vec<Value> {
         tool("describe_schema", "Describe every table and view in one schema in a single call, for catalog crawlers: per table the columns describe_table would return (same policy filtering), the table kind (table or view) and source (iceberg, hive_external, view), optionally the metastore's row count and size (`include_stats`: Iceberg snapshot summary or Glue/Hive table parameters, never a scan) and whether the table resolves and plans (`include_queryability`: `EXPLAIN SELECT * ... LIMIT 0`, table resolution and planning only, no scan and no storage listing; storage reachability is the `object_store` diagnostics entry of list_catalogs). Paged by table name: `page_size` defaults to 200 (at most 500); pass back `next_page_token` for the next page. One table failing does not fail the call; its `error`, `stats_error` or `queryability_error` says why.", json!({"type":"object","properties":{"catalog":{"type":"string"},"schema":{"type":"string"},"include_stats":{"type":"boolean"},"include_queryability":{"type":"boolean"},"page_token":{"type":"string"},"page_size":{"type":"integer","minimum":1,"maximum":500}},"required":["catalog","schema"],"additionalProperties":false}), true, false),
         tool("get_table_ddl", "Return SHOW CREATE TABLE output for a visible table.", three_string_schema(), true, false),
         tool("get_table_stats", "Return Iceberg table statistics visible to the authenticated user. Hive external tables have no snapshot statistics and return an error; use describe_table for them.", three_string_schema(), true, false),
-        tool("search_tables", "Find tables by name across the schemas of one catalog (SHOW SCHEMAS, then SHOW TABLES per schema, matched server-side). `pattern` is a SQL LIKE pattern (% and _ are wildcards; a bare word matches as a substring, case-insensitive). `catalog` defaults to the session's default catalog. Only tables visible to the authenticated user are returned; each row carries table_type (table or view). Follow up with describe_schema on the schemas that matched.", json!({"type":"object","properties":{"pattern":{"type":"string"},"catalog":{"type":"string"}},"required":["pattern"],"additionalProperties":false}), true, false),
+        tool("search_tables", "Find tables by name across the schemas of one catalog (SHOW SCHEMAS, then SHOW TABLES per schema, matched server-side). `pattern` is a SQL LIKE pattern (% and _ are wildcards; a bare word matches as a substring, case-insensitive). `catalog` defaults to the session's default catalog. Only tables visible to the authenticated user are returned; each row carries table_type (table or view). Paged by (schema, table): `page_size` defaults to 200 (at most 500); pass back `next_page_token` for the next page. `skipped_schemas` names every schema that could not be listed and why; nothing is dropped silently. Follow up with describe_schema on the schemas that matched.", json!({"type":"object","properties":{"pattern":{"type":"string"},"catalog":{"type":"string"},"page_token":{"type":"string"},"page_size":{"type":"integer","minimum":1,"maximum":500}},"required":["pattern"],"additionalProperties":false}), true, false),
         tool("sample_rows", "Return up to `limit` rows (default 10, at most 100) of a table, as the authenticated user: row filters and column masks apply. Prefer this over SELECT * for a first look at a table.", json!({"type":"object","properties":{"catalog":{"type":"string"},"schema":{"type":"string"},"table":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["catalog","schema","table"],"additionalProperties":false}), true, false),
         tool("explain_query", "Explain a read-only SQL query without allowing a write statement to be hidden behind EXPLAIN.", one_string_schema("sql"), true, false),
         tool("whoami", "Show the SQE identity, roles, groups, and OAuth scopes for this request; never returns tokens.", empty_schema(), true, false),
@@ -834,6 +872,11 @@ async fn call_tool(
             "oauth_scopes": auth.scopes,
             "client": client,
         })));
+    }
+    if is_metadata_tool(name) {
+        if let Err(error) = state.executor.admit_metadata_call(&auth.session) {
+            return Ok(tool_failure(format!("rate limit: {error}")));
+        }
     }
     let session_catalog = auth.session.default_catalog.as_deref();
     if name == "list_catalogs" {
@@ -966,7 +1009,12 @@ async fn call_tool(
         .session
         .clone()
         .with_source(Some(source_label(name, client)));
-    match state.executor.execute(&session, &sql).await {
+    let result = if is_metadata_tool(name) {
+        state.executor.execute_metadata(&session, &sql).await
+    } else {
+        state.executor.execute(&session, &sql).await
+    };
+    match result {
         Ok(batches) => Ok(tool_success(batches_json(
             &batches,
             state.config.max_result_rows,
@@ -1026,7 +1074,7 @@ async fn list_catalogs_with_diagnostics(
     state: &McpServerState,
     session: &Session,
 ) -> Result<Value, (i32, String)> {
-    let batches = match state.executor.execute(session, "SHOW CATALOGS").await {
+    let batches = match state.executor.execute_metadata(session, "SHOW CATALOGS").await {
         Ok(batches) => batches,
         Err(error) => return Ok(tool_failure(error.to_string())),
     };
@@ -1044,7 +1092,7 @@ async fn list_catalogs_with_diagnostics(
                 let sql = format!("SHOW SCHEMAS FROM {}", ident(&root));
                 let probe = tokio::time::timeout(
                     CATALOG_PROBE_TIMEOUT,
-                    state.executor.execute(session, &sql),
+                    state.executor.execute_metadata(session, &sql),
                 )
                 .await;
                 let (status, detail) = match probe {
@@ -1221,9 +1269,7 @@ async fn list_tables(
     let catalog = required(args, "catalog")?;
     let schema = required(args, "schema")?;
     let sql = format!("SHOW TABLES FROM {}.{}", ident(catalog), ident(schema));
-    let names = state
-        .executor
-        .execute(session, &sql)
+    let names = state.executor.execute_metadata(session, &sql)
         .await
         .map_err(|e| (-32000, e.to_string()))?;
     let kinds = table_kinds(state, session, catalog, schema).await;
@@ -1287,9 +1333,7 @@ async fn search_tables(
                     .to_string(),
             )
         })?;
-    let schemas = state
-        .executor
-        .execute(session, &format!("SHOW SCHEMAS FROM {}", ident(&catalog)))
+    let schemas = state.executor.execute_metadata(session, &format!("SHOW SCHEMAS FROM {}", ident(&catalog)))
         .await
         .map_err(|e| (-32000, format!("listing schemas of {catalog}: {e}")))?;
     // One `SHOW TABLES` per schema, a bounded number in flight at once
@@ -1297,23 +1341,37 @@ async fn search_tables(
     // deterministic). Serially, a Glue catalog of 135 databases took 17 s
     // for one search; each listing is a metastore round trip and nothing
     // here depends on the previous one.
-    let schema_names: Vec<String> = first_column_strings(&schemas)
+    let page_size = page_size_arg(args)?.min(state.config.max_result_rows.max(1));
+    let page_token = args
+        .get("page_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(decode_search_token)
+        .transpose()?;
+    let mut all_schemas: Vec<String> = first_column_strings(&schemas)
         .into_iter()
         .filter(|s| !s.eq_ignore_ascii_case("information_schema"))
-        .take(SEARCH_SCHEMAS_MAX)
         .collect();
-    let listings: Vec<(String, Option<Vec<String>>)> = {
+    all_schemas.sort();
+    let mut skipped: Vec<Value> = all_schemas
+        .iter()
+        .skip(SEARCH_SCHEMAS_MAX)
+        .map(|s| json!({"schema": s, "reason": format!("beyond the {SEARCH_SCHEMAS_MAX}-schema walk cap")}))
+        .collect();
+    let schema_names: Vec<String> = all_schemas.into_iter().take(SEARCH_SCHEMAS_MAX).collect();
+    let listings: Vec<(String, Result<Vec<String>, String>)> = {
         use futures::StreamExt;
         futures::stream::iter(schema_names)
             .map(|schema| {
                 let catalog = catalog.clone();
                 async move {
                     let sql = format!("SHOW TABLES FROM {}.{}", ident(&catalog), ident(&schema));
-                    let tables = match state.executor.execute(session, &sql).await {
-                        Ok(batches) => Some(first_column_strings(&batches)),
+                    let tables = match state.executor.execute_metadata(session, &sql).await {
+                        Ok(batches) => Ok(first_column_strings(&batches)),
                         Err(error) => {
                             tracing::debug!(%catalog, %schema, %error, "search_tables: schema skipped");
-                            None
+                            Err(error.to_string())
                         }
                     };
                     (schema, tables)
@@ -1323,39 +1381,47 @@ async fn search_tables(
             .collect()
             .await
     };
-    let mut rows = Vec::new();
-    let mut total = 0usize;
+    // Every match, ordered by (schema, table): the page token is the last
+    // pair of the previous page, so a table created between pages lands
+    // where it sorts and is never skipped or repeated.
+    let mut matches: Vec<(String, String)> = Vec::new();
     for (schema, tables) in listings {
-        let Some(tables) = tables else { continue };
-        let matched: Vec<String> = tables
-            .into_iter()
-            .filter(|t| like_matches(pattern, t))
-            .collect();
-        if matched.is_empty() {
-            continue;
-        }
-        // One `SHOW VIEWS` per schema that matched, not per schema walked:
-        // a search usually lands in a few schemas, and the kind is what lets
-        // an agent tell a view from a table without a call per name.
-        let kinds = if rows.len() < state.config.max_result_rows {
-            table_kinds(state, session, &catalog, &schema).await
-        } else {
-            HashMap::new()
-        };
-        for table in matched {
-            total += 1;
-            if rows.len() < state.config.max_result_rows {
-                rows.push(json!({
-                    "table_catalog": catalog,
-                    "table_schema": schema,
-                    "table_name": table,
-                    "table_type": table_type_of(&kinds, &table),
-                }));
+        match tables {
+            Ok(tables) => {
+                let mut names: Vec<String> = tables.into_iter().filter(|t| like_matches(pattern, t)).collect();
+                names.sort();
+                names.dedup();
+                matches.extend(names.into_iter().map(|t| (schema.clone(), t)));
             }
+            Err(reason) => skipped.push(json!({"schema": schema, "reason": reason})),
         }
     }
-    let returned = rows.len();
-    Ok(json!({
+    let total = matches.len();
+    let start = page_token
+        .as_ref()
+        .map(|token| matches.partition_point(|m| m <= token))
+        .unwrap_or(0);
+    let page: Vec<(String, String)> = matches[start..].iter().take(page_size).cloned().collect();
+    let more_after_page = start + page.len() < total;
+
+    // One `SHOW VIEWS` per schema on this page, not per schema walked: a
+    // search usually lands in a few schemas, and the kind is what lets an
+    // agent tell a view from a table without a call per name.
+    let mut kinds_by_schema: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut rows = Vec::with_capacity(page.len());
+    for (schema, table) in &page {
+        if !kinds_by_schema.contains_key(schema) {
+            let kinds = table_kinds(state, session, &catalog, schema).await;
+            kinds_by_schema.insert(schema.clone(), kinds);
+        }
+        rows.push(json!({
+            "table_catalog": catalog,
+            "table_schema": schema,
+            "table_name": table,
+            "table_type": table_type_of(&kinds_by_schema[schema], table),
+        }));
+    }
+    let mut out = json!({
         "columns": [
             {"name": "table_catalog", "type": "Utf8"},
             {"name": "table_schema", "type": "Utf8"},
@@ -1364,9 +1430,31 @@ async fn search_tables(
         ],
         "rows": rows,
         "total_rows": total,
-        "returned_rows": returned,
-        "truncated": returned < total,
-    }))
+        "returned_rows": page.len(),
+        "truncated": more_after_page,
+        "skipped_schemas": skipped,
+    });
+    if more_after_page {
+        if let Some((schema, table)) = page.last() {
+            out["next_page_token"] = json!(encode_search_token(schema, table));
+        }
+    }
+    Ok(out)
+}
+
+/// `search_tables` page token: the `(schema, table)` pair the page ended on.
+/// Opaque to the caller; the separator cannot occur in an identifier.
+const SEARCH_TOKEN_SEPARATOR: char = '\u{1f}';
+
+fn encode_search_token(schema: &str, table: &str) -> String {
+    format!("{schema}{SEARCH_TOKEN_SEPARATOR}{table}")
+}
+
+fn decode_search_token(token: &str) -> Result<(String, String), (i32, String)> {
+    token
+        .split_once(SEARCH_TOKEN_SEPARATOR)
+        .map(|(s, t)| (s.to_string(), t.to_string()))
+        .ok_or_else(|| (-32602, "page_token is not one search_tables returned".to_string()))
 }
 
 /// `describe_schema` page bounds. A page is what one crawler request can
@@ -1416,9 +1504,7 @@ async fn describe_schema(
         .map(str::trim)
         .filter(|t| !t.is_empty());
 
-    let listing = state
-        .executor
-        .execute(
+    let listing = state.executor.execute_metadata(
             session,
             &format!("SHOW TABLES FROM {}.{}", ident(&catalog), ident(&schema)),
         )
@@ -1609,7 +1695,7 @@ async fn probe(
     session: &Session,
     sql: &str,
 ) -> Result<Vec<RecordBatch>, String> {
-    match tokio::time::timeout(DESCRIBE_SCHEMA_PROBE_TIMEOUT, state.executor.execute(session, sql))
+    match tokio::time::timeout(DESCRIBE_SCHEMA_PROBE_TIMEOUT, state.executor.execute_metadata(session, sql))
         .await
     {
         Ok(Ok(batches)) => Ok(batches),
@@ -1637,7 +1723,7 @@ async fn table_kinds(
     // same question by enumerating every schema of the catalog, which on a
     // Glue catalog of a hundred databases was 12 s cold for one call.
     let sql = format!("SHOW VIEWS FROM {}.{}", ident(catalog), ident(schema));
-    match state.executor.execute(session, &sql).await {
+    match state.executor.execute_metadata(session, &sql).await {
         Ok(batches) => first_column_strings(&batches)
             .into_iter()
             .map(|name| (name.to_ascii_lowercase(), "view".to_string()))
@@ -1699,7 +1785,7 @@ fn bool_arg(args: &Value, name: &str) -> Result<bool, (i32, String)> {
     }
 }
 
-/// `page_size` for `describe_schema`: absent means the default, anything
+/// `page_size` for `describe_schema` and `search_tables`: absent means the default, anything
 /// else is clamped to `1..=DESCRIBE_SCHEMA_PAGE_MAX`.
 fn page_size_arg(args: &Value) -> Result<usize, (i32, String)> {
     let Some(value) = args.get("page_size") else {
@@ -3373,18 +3459,39 @@ mod tests {
         )
         .await
         .unwrap();
-        // Two matches across two schemas; the response cap keeps one and says so.
+        // Two matches across two schemas; the response cap keeps one, says so,
+        // and hands out the token for the rest.
         assert_eq!(result["total_rows"], 2);
         assert_eq!(result["returned_rows"], 1);
         assert_eq!(result["truncated"], true);
         assert_eq!(result["rows"][0]["table_schema"], "ac");
         assert_eq!(result["rows"][0]["table_name"], "orders");
         assert_eq!(result["rows"][0]["table_type"], "table", "no SHOW VIEWS answer for ac: a table");
+        let token = result["next_page_token"].as_str().unwrap().to_string();
+        // The schema the caller may not list is reported, never dropped.
+        assert_eq!(result["skipped_schemas"][0]["schema"], "locked");
+        assert!(result["skipped_schemas"][0]["reason"].as_str().unwrap().contains("not authorized"));
         let asked = executor.asked.lock().unwrap().clone();
         assert!(
             !asked.iter().any(|s| s == "SHOW VIEWS FROM \"sales_wh\".\"ops\""),
-            "the cap was reached before ops; its kinds are not fetched: {asked:?}"
+            "ops is not on this page; its kinds are not fetched: {asked:?}"
         );
+        let next = search_tables(
+            &state,
+            &session,
+            &json!({"pattern": "ord", "catalog": "sales_wh", "page_token": token}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(next["rows"][0]["table_schema"], "ops");
+        assert_eq!(next["rows"][0]["table_name"], "order_events");
+        assert_eq!(next["rows"][0]["table_type"], "view");
+        assert_eq!(next["truncated"], false);
+        assert!(next.get("next_page_token").is_none());
+        let bad = search_tables(&state, &session, &json!({"pattern": "ord", "catalog": "sales_wh", "page_token": "junk"}))
+            .await
+            .unwrap_err();
+        assert_eq!(bad.0, -32602);
         assert!(
             !asked.iter().any(|s| s.contains("information_schema")),
             "information_schema is not a schema to search: {asked:?}"
@@ -3412,6 +3519,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["rows"][0]["table_type"], "view", "{result}");
+    }
+
+    /// A walk over more schemas than one call's query budget lists everything:
+    /// the tool call is admitted once and its `SHOW`s take the metadata lane.
+    #[tokio::test]
+    async fn search_tables_over_135_schemas_is_one_admission_and_no_query_charge() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct LaneCounter {
+            admitted: AtomicUsize,
+            query_lane: AtomicUsize,
+            metadata_lane: AtomicUsize,
+        }
+        #[async_trait]
+        impl QueryExecutor for LaneCounter {
+            async fn execute(&self, _s: &Session, _sql: &str) -> Result<Vec<RecordBatch>, SqeError> {
+                self.query_lane.fetch_add(1, Ordering::SeqCst);
+                Err(SqeError::Execution("the query lane must not carry metadata".into()))
+            }
+            async fn execute_metadata(&self, _s: &Session, sql: &str) -> Result<Vec<RecordBatch>, SqeError> {
+                self.metadata_lane.fetch_add(1, Ordering::SeqCst);
+                let schema = Arc::new(Schema::new(vec![Field::new("Name", DataType::Utf8, true)]));
+                let values: Vec<String> = if sql.starts_with("SHOW SCHEMAS") {
+                    (0..135).map(|i| format!("db{i:03}")).collect()
+                } else if sql.starts_with("SHOW TABLES") {
+                    vec!["orders".to_string(), "audit".to_string()]
+                } else {
+                    Vec::new()
+                };
+                Ok(vec![RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))]).unwrap()])
+            }
+            fn admit_metadata_call(&self, _s: &Session) -> Result<(), SqeError> {
+                self.admitted.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let executor = Arc::new(LaneCounter {
+            admitted: AtomicUsize::new(0),
+            query_lane: AtomicUsize::new(0),
+            metadata_lane: AtomicUsize::new(0),
+        });
+        let mut config = static_config(false);
+        config.max_result_rows = 500;
+        let state = McpServerState::new(Arc::new(MockAuth), executor.clone(), config);
+        let auth = AuthContext { session: local_session("mcp-reader".into(), vec![]), scopes: None };
+        let result = call_tool(
+            &state,
+            &auth,
+            None,
+            &json!({"name": "search_tables", "arguments": {"pattern": "ord", "catalog": "glue", "page_size": 500}}),
+        )
+        .await
+        .unwrap();
+        let body = &result["structuredContent"];
+        assert_eq!(body["total_rows"], 135, "{body}");
+        assert_eq!(body["returned_rows"], 135);
+        assert_eq!(body["skipped_schemas"].as_array().unwrap().len(), 0);
+        assert_eq!(executor.admitted.load(Ordering::SeqCst), 1, "one admission per tool call");
+        assert_eq!(executor.query_lane.load(Ordering::SeqCst), 0);
+        // SHOW SCHEMAS + 135 SHOW TABLES + one SHOW VIEWS per schema on the page.
+        assert_eq!(executor.metadata_lane.load(Ordering::SeqCst), 1 + 135 + 135);
     }
 
     /// `list_tables` carries the kind of every name from one `SHOW VIEWS`, so an
