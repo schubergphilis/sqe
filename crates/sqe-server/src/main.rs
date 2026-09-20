@@ -829,11 +829,19 @@ const EXIT_MCP_LISTENER_DIED: i32 = 70;
 fn watch_mcp_listener(
     listener_task: tokio::task::JoinHandle<()>,
     ready: Arc<AtomicBool>,
+    shutdown: sqe_coordinator::mcp_server::CancellationToken,
     exit: impl FnOnce(i32) + Send + 'static,
 ) {
     tokio::spawn(async move {
         let _ = listener_task.await;
         ready.store(false, Ordering::SeqCst);
+        // Drained on the shutdown signal (#679): the process is on its way
+        // out already, and exiting 70 here would tell the supervisor a
+        // healthy stop was a crash.
+        if shutdown.is_cancelled() {
+            tracing::info!("the /mcp listener closed on shutdown");
+            return;
+        }
         tracing::error!(
             exit_code = EXIT_MCP_LISTENER_DIED,
             "the /mcp listener task has ended while the process is alive; exiting so a \
@@ -2133,6 +2141,16 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             let alive = mcp_listener_alive
                 .clone()
                 .expect("mcp_listener_alive is Some whenever mcp.port > 0");
+            // SIGTERM/SIGINT stop the accept loop and drain in-flight calls
+            // (#679); the same signal the SQL listeners already act on.
+            let mcp_shutdown = sqe_coordinator::mcp_server::CancellationToken::new();
+            tokio::spawn({
+                let token = mcp_shutdown.clone();
+                async move {
+                    shutdown_signal().await;
+                    token.cancel();
+                }
+            });
             let (listener_task, bound) = sqe_coordinator::mcp_server::start_mcp_server(
                 Arc::clone(&auth_chain),
                 Arc::clone(&query_handler),
@@ -2143,12 +2161,15 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
                 &config.coordinator.tls,
                 alive,
                 &config.storage,
+                mcp_shutdown.clone(),
             )
             .await?;
             tracing::info!(port = bound.port(), resource = %config.mcp.resource_uri, "MCP endpoint enabled at /mcp");
             // A dead listener on a live PID is the one failure a health
             // check cannot see from outside, so do not stay alive to have it.
-            watch_mcp_listener(listener_task, ready.clone(), |code| std::process::exit(code));
+            watch_mcp_listener(listener_task, ready.clone(), mcp_shutdown, |code| {
+                std::process::exit(code)
+            });
         }
         None
     };
@@ -3518,7 +3539,8 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel::<i32>();
         // A listener whose serve loop returns at once, as a dead accept loop does.
         let listener_task = tokio::spawn(async {});
-        watch_mcp_listener(listener_task, ready.clone(), move |code| {
+        let shutdown = sqe_coordinator::mcp_server::CancellationToken::new();
+        watch_mcp_listener(listener_task, ready.clone(), shutdown, move |code| {
             let _ = tx.send(code);
         });
         let code = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
@@ -3527,6 +3549,27 @@ mod tests {
             .expect("exit was called");
         assert_eq!(code, EXIT_MCP_LISTENER_DIED);
         assert!(!ready.load(Ordering::SeqCst), "readiness flips before exit");
+    }
+
+    /// #679: the listener ending because shutdown drained it is not a crash.
+    #[tokio::test]
+    async fn watch_mcp_listener_does_not_exit_when_the_listener_closed_on_shutdown() {
+        let ready = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = tokio::sync::oneshot::channel::<i32>();
+        let shutdown = sqe_coordinator::mcp_server::CancellationToken::new();
+        shutdown.cancel();
+        let listener_task = tokio::spawn(async {});
+        watch_mcp_listener(listener_task, ready.clone(), shutdown, move |code| {
+            let _ = tx.send(code);
+        });
+        // The watcher returns without calling `exit`, so the sender is
+        // dropped unsent (Ok(Err)); a value would mean exit was called.
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await;
+        assert!(
+            matches!(outcome, Ok(Err(_))),
+            "exit must not be called on a drained listener: {outcome:?}"
+        );
+        assert!(!ready.load(Ordering::SeqCst), "readiness still flips");
     }
 
     #[tokio::test]
