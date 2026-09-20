@@ -266,9 +266,19 @@ max_entries = 10000             # Max queries retained in history
 ttl_secs = 1800                 # History entry TTL (30 min)
 
 [rate_limit]
-enabled = false                 # Enable per-user and global rate limiting
+enabled = false                 # Enable every limiter below
+# Statements a caller asked for: Flight SQL, Trino HTTP, and the MCP tools
+# execute_sql_readonly, sample_rows, execute_sql_change, refresh_metadata.
 per_user_queries_per_minute = 60
 global_queries_per_minute = 1000
+# Metadata browsing: Flight SQL GetTables/GetSchemas and one charge per MCP
+# metadata tool call (list_*, describe_*, search_tables, get_table_*,
+# explain_query). The SHOW statements a tool issues inside one call are not
+# charged, so a search over 135 schemas costs one unit, not 136.
+metadata_per_user_per_minute = 120
+# Credential presentations per (peer, principal) before any provider runs;
+# the per-peer budget is five times this. 429 on the HTTP paths.
+auth_attempts_per_minute = 10
 
 [quack_client]
 enabled = false                 # Enable quack_query(uri, sql) TVF (finding 604). Disabled by default: SSRF risk.

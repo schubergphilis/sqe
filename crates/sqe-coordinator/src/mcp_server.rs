@@ -16,13 +16,21 @@ use sqe_core::{
     Session, SqeError, SqeErrorCode,
 };
 
-use crate::{rate_limiter::QueryRateLimiter, QueryHandler};
+use crate::{
+    rate_limiter::{MetadataRateLimiter, QueryRateLimiter},
+    QueryHandler,
+};
 
 struct CoordinatorMcpExecutor {
     handler: Arc<QueryHandler>,
+    /// Statements the caller asked for: `rate_limit.per_user_queries_per_minute`.
     rate_limiter: Arc<QueryRateLimiter>,
     /// `mcp.request_timeout_secs`; zero disables the deadline.
     request_timeout: std::time::Duration,
+    /// One charge per metadata tool call: `rate_limit.metadata_per_user_per_minute`.
+    /// The `SHOW`s inside the call are not charged (#699: `search_tables` over
+    /// 135 schemas burned the query budget and dropped the tail).
+    metadata_rate_limiter: Arc<MetadataRateLimiter>,
 }
 
 /// The `[[hive.roots]]` catalog names, which the MCP change tool treats as
@@ -40,6 +48,7 @@ pub fn mcp_router(
     auth: Arc<dyn AuthProvider>,
     handler: Arc<QueryHandler>,
     rate_limiter: Arc<QueryRateLimiter>,
+    metadata_rate_limiter: Arc<MetadataRateLimiter>,
     config: McpConfig,
     hive_roots: Vec<String>,
     storage: &sqe_core::config::StorageConfig,
@@ -48,6 +57,7 @@ pub fn mcp_router(
         handler,
         rate_limiter,
         request_timeout: std::time::Duration::from_secs(config.request_timeout_secs),
+        metadata_rate_limiter,
     });
     sqe_mcp::router(
         sqe_mcp::McpServerState::new(auth, executor, config)
@@ -151,6 +161,16 @@ impl sqe_mcp::QueryExecutor for CoordinatorMcpExecutor {
             )),
         }
     }
+
+    async fn execute_metadata(&self, session: &Session, sql: &str) -> Result<Vec<RecordBatch>, SqeError> {
+        self.handler.execute(session, sql, None).await
+    }
+
+    fn admit_metadata_call(&self, session: &Session) -> Result<(), SqeError> {
+        self.metadata_rate_limiter
+            .check(&session.user.username)
+            .map_err(|error| SqeError::with_code(SqeErrorCode::ResourceExhausted, error.to_string()))
+    }
 }
 
 /// Start MCP inside the coordinator process, sharing auth, query admission,
@@ -168,6 +188,7 @@ pub async fn start_mcp_server(
     auth: Arc<dyn AuthProvider>,
     handler: Arc<QueryHandler>,
     rate_limiter: Arc<QueryRateLimiter>,
+    metadata_rate_limiter: Arc<MetadataRateLimiter>,
     config: McpConfig,
     hive_roots: Vec<String>,
     tls: &TlsConfig,
@@ -178,7 +199,7 @@ pub async fn start_mcp_server(
     // `validate` already rejected an address that does not parse (#671).
     let ip = config.bind_ip().map_err(anyhow::Error::msg)?;
     let addr = SocketAddr::new(ip, config.port);
-    let app = mcp_router(auth, handler, rate_limiter, config, hive_roots, storage);
+    let app = mcp_router(auth, handler, rate_limiter, metadata_rate_limiter, config, hive_roots, storage);
     // Bind synchronously up front so both branches can report the port they
     // actually got, and so a bind failure is this call's error, not a log
     // line from a task nobody joins.
