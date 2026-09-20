@@ -14,6 +14,7 @@ use std::{
 
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
+use tracing::Instrument;
 use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
@@ -119,6 +120,11 @@ pub struct McpServerState {
     /// outcome, for `list_catalogs` diagnostics. `None` when the embedding
     /// has no storage to probe (tests, a catalog with no S3 behind it).
     storage_probe: Option<StorageProbe>,
+    /// `Retry-After` for a pre-auth denial: the pre-auth limiter's answer
+    /// carries no wait time (its error is the same for every adapter), so
+    /// this is the bucket's refill interval, `60 / auth_attempts_per_minute`
+    /// rounded up, which is the longest a client can have to wait.
+    auth_retry_after: Duration,
 }
 
 /// What a storage-credential probe reports. Mirrors
@@ -304,6 +310,7 @@ impl McpServerState {
             hive_roots: Arc::new(Vec::new()),
             refreshes: Arc::new(Mutex::new(HashMap::new())),
             storage_probe: None,
+            auth_retry_after: Duration::from_secs(6),
         }
     }
 
@@ -337,6 +344,12 @@ impl McpServerState {
     /// The `[[hive.roots]]` catalog names; see `McpConfig::write_catalogs`.
     pub fn with_hive_roots(mut self, roots: Vec<String>) -> Self {
         self.hive_roots = Arc::new(roots);
+        self
+    }
+
+    /// `Retry-After` for a pre-auth denial, from `rate_limit.auth_attempts_per_minute`.
+    pub fn with_auth_rate(mut self, attempts_per_minute: u32) -> Self {
+        self.auth_retry_after = Duration::from_secs(60u64.div_ceil(u64::from(attempts_per_minute.max(1))));
         self
     }
 }
@@ -517,19 +530,84 @@ async fn mcp_post(
             &format!("{} {}", state.config.read_scope, state.config.write_scope),
         );
     }
+    if request.method == "notifications/initialized" {
+        return StatusCode::ACCEPTED.into_response();
+    }
     let id = request.id.clone();
     let user = auth.session.user.username.as_str();
     let mut issued_session_id = None;
-    let result = match request.method.as_str() {
+    // One span per request, child of the caller's `traceparent` when it sent
+    // one: the statement span below it stamps the same trace id on the audit
+    // record, and the response carries it back, so an agent's question and
+    // the engine's record of what ran can be correlated.
+    let span = tracing::info_span!(
+        "mcp.request",
+        method = %request.method,
+        user = %user,
+        trace_id = tracing::field::Empty,
+        span_id = tracing::field::Empty,
+    );
+    sqe_metrics_core::propagation::adopt_trace_context_from_headers(&span, &headers);
+    let (result, trace_id) = async {
+        let result = dispatch(
+            &state,
+            &auth,
+            &headers,
+            &request,
+            &peer.ip().to_string(),
+            &mut issued_session_id,
+        )
+        .await;
+        (result, sqe_metrics_core::propagation::current_trace_id())
+    }
+    .instrument(span)
+    .await;
+    // Without an OTel layer no span context is valid; a fresh id still lets
+    // the client refer to this exchange, it just correlates with nothing.
+    let trace_id = trace_id.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+    let mut response = match result {
+        Ok(value) => rpc_result(id, with_trace_meta(value, &trace_id)),
+        Err((code, message)) => rpc_error(id, code, message),
+    };
+    if let Some(value) = issued_session_id
+        .as_deref()
+        .and_then(|id| HeaderValue::from_str(id).ok())
+    {
+        response.headers_mut().insert(SESSION_ID_HEADER, value);
+    }
+    response
+}
+
+/// `result._meta.trace_id`: the W3C trace id of this exchange (MCP reserves
+/// `_meta` on results for exactly this kind of side channel).
+fn with_trace_meta(mut value: Value, trace_id: &str) -> Value {
+    if let Some(object) = value.as_object_mut() {
+        let meta = object.entry("_meta").or_insert_with(|| json!({}));
+        if let Some(meta) = meta.as_object_mut() {
+            meta.insert("trace_id".to_string(), json!(trace_id));
+        }
+    }
+    value
+}
+
+async fn dispatch(
+    state: &McpServerState,
+    auth: &AuthContext,
+    headers: &HeaderMap,
+    request: &JsonRpcRequest,
+    peer_ip: &str,
+    issued_session_id: &mut Option<String>,
+) -> Result<Value, (i32, String)> {
+    let user = auth.session.user.username.as_str();
+    match request.method.as_str() {
         "initialize" => {
             // Remember who is talking so every later call can be attributed
             // to this client in the audit trail. Nothing else hangs off the id.
-            let peer_ip = peer.ip().to_string();
             let label = client_label_from_client_info(&request.params)
-                .or_else(|| client_label(&state, &headers, user, &peer_ip))
+                .or_else(|| client_label(state, headers, user, peer_ip))
                 .unwrap_or_else(|| "unknown".to_string());
             tracing::info!(user, client = %label, "MCP client initialized");
-            issued_session_id = Some(state.clients.insert(user, &peer_ip, label));
+            *issued_session_id = Some(state.clients.insert(user, peer_ip, label));
             Ok(json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": { "tools": { "listChanged": false } },
@@ -548,23 +626,11 @@ async fn mcp_post(
             "cacheScope": "public",
         })),
         "tools/call" => {
-            let client = client_label(&state, &headers, user, &peer.ip().to_string());
-            call_tool(&state, &auth, client.as_deref(), &request.params).await
+            let client = client_label(state, headers, user, peer_ip);
+            call_tool(state, auth, client.as_deref(), &request.params).await
         }
-        "notifications/initialized" => return StatusCode::ACCEPTED.into_response(),
         _ => Err((-32601, format!("Method not found: {}", request.method))),
-    };
-    let mut response = match result {
-        Ok(value) => rpc_result(id, value),
-        Err((code, message)) => rpc_error(id, code, message),
-    };
-    if let Some(value) = issued_session_id
-        .as_deref()
-        .and_then(|id| HeaderValue::from_str(id).ok())
-    {
-        response.headers_mut().insert(SESSION_ID_HEADER, value);
     }
-    response
 }
 
 fn origin_allowed(config: &McpConfig, headers: &HeaderMap) -> bool {
@@ -699,11 +765,22 @@ async fn authenticate_oauth(
         .await
         .map_err(|error| match error {
             // #562: denied by the pre-auth limiter before any provider ran.
-            sqe_auth::AuthError::RateLimited => (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({"error":"rate_limited"})),
-            )
-                .into_response(),
+            sqe_auth::AuthError::RateLimited => {
+                let secs = state.auth_retry_after.as_secs().max(1);
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(header::RETRY_AFTER, secs.to_string())],
+                    Json(json!({
+                        "error": "rate_limited",
+                        "limiter": "auth",
+                        "window_seconds": 60,
+                        "retry_after_seconds": secs,
+                        "knobs": ["rate_limit.auth_attempts_per_minute", "rate_limit.auth_burst"],
+                        "detail": "too many credential presentations from this peer; wait and resend the same request",
+                    })),
+                )
+                    .into_response()
+            }
             error => {
                 tracing::warn!(error = %error, "MCP bearer authentication failed");
                 auth_error(
@@ -815,7 +892,7 @@ The change tool is separately gated by OAuth scope, SQE role and source-data aut
 
 fn tools(config: &McpConfig) -> Vec<Value> {
     let mut tools = vec![
-        tool("execute_sql_readonly", "Execute exactly one read-only SQL statement. SQE parses and classifies the statement before execution; source grants, row filters, and column masks apply as the authenticated user. A query without its own LIMIT is capped at the server's max_result_rows; when `truncated` is true, total_rows means 'more than the cap', so aggregate or add LIMIT instead of paging.", json!({"type":"object","properties":{"sql":{"type":"string"}},"required":["sql"],"additionalProperties":false}), true, false),
+        tool("execute_sql_readonly", "Execute exactly one read-only SQL statement against catalog tables. SQE parses and classifies the statement before execution; source grants, row filters, and column masks apply as the authenticated user. File table functions (read_parquet, read_csv, read_json) are refused: they bypass the catalog. A query without its own LIMIT is capped at the server's max_result_rows; when `truncated` is true, total_rows means 'more than the cap', so aggregate or add LIMIT instead of paging. Do not scan information_schema across a whole catalog: over a Glue catalog it enumerates every database first (135 databases took 12 s cold for one call and client timeouts for columns). Use describe_schema per schema and search_tables for names instead.", json!({"type":"object","properties":{"sql":{"type":"string"}},"required":["sql"],"additionalProperties":false}), true, false),
         tool("list_catalogs", "List catalogs visible to the authenticated user. `diagnostics` carries one entry per Hive root (Glue, sidecar) with `status` reachable | auth_error | timeout | unreachable and a `detail`: auth_error means the engine's own AWS credentials are missing or expired, which no retry from the client side can fix; the detail carries an error_id the operator can find in the server log.", empty_schema(), true, false),
         tool("list_schemas", "List schemas visible to the authenticated user in a catalog.", one_string_schema("catalog"), true, false),
         tool("list_tables", "List tables and views visible to the authenticated user in a catalog and schema; each row carries table_type (table or view). To see columns for all of them at once use describe_schema.", two_string_schema("catalog", "schema"), true, false),
@@ -896,7 +973,7 @@ async fn call_tool(
     }
     if is_metadata_tool(name) {
         if let Err(error) = state.executor.admit_metadata_call(&auth.session) {
-            return Ok(tool_failure(format!("rate limit: {error}")));
+            return Ok(tool_failure(error.to_string()));
         }
     }
     let session_catalog = auth.session.default_catalog.as_deref();
@@ -1946,11 +2023,123 @@ fn is_read_only(kind: &StatementKind) -> bool {
 /// Classify and require a read-only kind; returns the kind for the caller.
 fn ensure_read_only(sql: &str, session_catalog: Option<&str>) -> Result<StatementKind, String> {
     let kind = classify(sql, session_catalog)?;
-    if is_read_only(&kind) {
-        Ok(kind)
-    } else {
-        Err(format!("Read-only tool rejected {} statement", kind.name()))
+    if !is_read_only(&kind) {
+        return Err(format!("Read-only tool rejected {} statement", kind.name()));
     }
+    // Query is an allow-list kind, but sqlparser types SELECT INTO, WITH-INSERT
+    // and FROM read_parquet(...) as Query. Those skip catalog/Ranger (#703 #704).
+    if let Some(name) = file_tvf_in(&kind) {
+        return Err(format!(
+            "Read-only tool rejected file table function {name}; MCP queries catalog tables, \
+             not object-store paths. Use sample_rows or SELECT from a table name"
+        ));
+    }
+    if let Some(shape) = query_write_shape(&kind) {
+        return Err(format!("Read-only tool rejected {shape}"));
+    }
+    Ok(kind)
+}
+
+/// File TVFs that read object-store or local paths with engine credentials.
+const FILE_TABLE_FUNCTIONS: [&str; 3] = ["read_parquet", "read_csv", "read_json"];
+
+fn object_name_last(name: &sqlparser::ast::ObjectName) -> Option<String> {
+    name.0
+        .last()
+        .and_then(|part| part.as_ident())
+        .map(|ident| ident.value.to_ascii_lowercase())
+}
+
+fn is_file_tvf_name(name: &sqlparser::ast::ObjectName) -> Option<String> {
+    let last = object_name_last(name)?;
+    FILE_TABLE_FUNCTIONS
+        .contains(&last.as_str())
+        .then_some(last)
+}
+
+struct QueryShapeFinder {
+    file_tvf: Option<String>,
+    write_shape: Option<&'static str>,
+}
+
+impl sqlparser::ast::Visitor for QueryShapeFinder {
+    type Break = ();
+
+    fn pre_visit_table_factor(
+        &mut self,
+        factor: &sqlparser::ast::TableFactor,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        use sqlparser::ast::{Expr, TableFactor};
+        let name = match factor {
+            TableFactor::Table {
+                name,
+                args: Some(_),
+                ..
+            }
+            | TableFactor::Function { name, .. } => is_file_tvf_name(name),
+            TableFactor::TableFunction {
+                expr: Expr::Function(func),
+                ..
+            } => is_file_tvf_name(&func.name),
+            _ => None,
+        };
+        if let Some(name) = name {
+            self.file_tvf = Some(name);
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_query(
+        &mut self,
+        query: &sqlparser::ast::Query,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        use sqlparser::ast::SetExpr;
+        self.write_shape = match query.body.as_ref() {
+            SetExpr::Insert(_) => Some("insert statement"),
+            SetExpr::Update(_) => Some("update statement"),
+            SetExpr::Delete(_) => Some("delete statement"),
+            SetExpr::Merge(_) => Some("merge statement"),
+            _ => None,
+        };
+        if self.write_shape.is_some() {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    }
+
+    fn pre_visit_select(
+        &mut self,
+        select: &sqlparser::ast::Select,
+    ) -> std::ops::ControlFlow<Self::Break> {
+        if select.into.is_some() {
+            self.write_shape = Some("select into statement");
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    }
+}
+
+fn walk_query_shape(kind: &StatementKind) -> QueryShapeFinder {
+    use sqlparser::ast::Visit;
+    let mut finder = QueryShapeFinder {
+        file_tvf: None,
+        write_shape: None,
+    };
+    if let StatementKind::Query(stmt) = kind {
+        let _ = stmt.as_ref().visit(&mut finder);
+    }
+    finder
+}
+
+fn file_tvf_in(kind: &StatementKind) -> Option<String> {
+    walk_query_shape(kind).file_tvf
+}
+
+fn query_write_shape(kind: &StatementKind) -> Option<&'static str> {
+    walk_query_shape(kind).write_shape
 }
 
 /// Append `LIMIT max_rows + 1` to a plain query that has no row bound of its
@@ -2347,7 +2536,23 @@ fn tool_success(value: Value) -> Value {
     json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value,"isError":false})
 }
 fn tool_failure(message: String) -> Value {
+    if let Some(secs) = retry_after_in(&message) {
+        // A limiter denial (`RateLimitDenial::into_error` text): structured so
+        // a client can wait exactly that long instead of giving up on a
+        // string. The limiter name and knob are in the text.
+        return json!({
+            "content":[{"type":"text","text":message}],
+            "isError":true,
+            "structuredContent":{"error":"rate_limited","retry_after_seconds":secs,"detail":message},
+        });
+    }
     json!({"content":[{"type":"text","text":message}],"isError":true})
+}
+
+/// The `retry after {n}s` a limiter denial ends with, if this is one.
+fn retry_after_in(message: &str) -> Option<u64> {
+    let rest = message.rsplit_once("retry after ")?.1;
+    rest.strip_suffix('s')?.trim().parse().ok()
 }
 fn rpc_result(id: Option<Value>, result: Value) -> Response {
     (
@@ -2407,6 +2612,9 @@ mod tests {
         Mutex<Option<String>>,
         Mutex<Option<(Option<String>, Option<String>)>>,
         Mutex<Option<String>>,
+        /// `current_trace_id()` at execute time: what the statement span and
+        /// the audit record see.
+        Mutex<Option<Option<String>>>,
     );
 
     #[async_trait]
@@ -2427,8 +2635,69 @@ mod tests {
                 session.default_schema.clone(),
             ));
             *self.4.lock().unwrap() = Some(sql.to_string());
+            *self.5.lock().unwrap() = Some(sqe_metrics_core::propagation::current_trace_id());
             Ok(vec![])
         }
+    }
+
+    /// `traceparent` on the request becomes the trace the statement runs in
+    /// (what the audit record stamps) and comes back as `_meta.trace_id`; a
+    /// request without one gets a fresh id.
+    #[tokio::test(flavor = "current_thread")]
+    async fn traceparent_correlates_the_request_the_statement_and_the_response() {
+        use opentelemetry::trace::TracerProvider;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("mcp-trace-test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+        // Process-wide, not thread-local: the request runs across tokio
+        // worker threads under the harness, and a thread-local default
+        // leaves the OTel layer behind on the test's own thread, so the
+        // adopted context reads as invalid and a fresh id comes back.
+        // Nothing else in this suite installs a subscriber.
+        let _ = tracing::subscriber::set_global_default(subscriber);
+
+        let executor = Arc::new(RecordingExecutor::default());
+        let app = router(McpServerState::new(
+            Arc::new(MockAuth),
+            executor.clone(),
+            test_config(),
+        ));
+        let token = scoped_token("sqe:mcp:read");
+        let trace = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let traceparent = format!("00-{trace}-00f067aa0ba902b7-01");
+        let response = send(&app, &token, &[("traceparent", traceparent.as_str())], tool_call("execute_sql_readonly")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["result"]["_meta"]["trace_id"], trace, "{body}");
+        assert_eq!(
+            executor.5.lock().unwrap().clone().flatten().as_deref(),
+            Some(trace),
+            "the statement ran inside the caller's trace"
+        );
+
+        let response = send(&app, &token, &[], tool_call("execute_sql_readonly")).await;
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        let fresh = body["result"]["_meta"]["trace_id"].as_str().unwrap();
+        assert_eq!(fresh.len(), 32, "{fresh}");
+        assert_ne!(fresh, trace);
+        assert_eq!(
+            executor.5.lock().unwrap().clone().flatten().as_deref(),
+            Some(fresh),
+            "statement and response share the fresh trace"
+        );
     }
 
     fn test_config() -> McpConfig {
@@ -3104,11 +3373,29 @@ mod tests {
         assert_eq!(first.status(), StatusCode::OK);
         let second = send(&app, &token, &[], tool_call("execute_sql_readonly")).await;
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            second.headers().get(header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            Some("6"),
+            "60 / the default 10 attempts per minute"
+        );
         let bytes = axum::body::to_bytes(second.into_body(), usize::MAX)
             .await
             .unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error"], "rate_limited");
+        assert_eq!(body["limiter"], "auth");
+        assert_eq!(body["window_seconds"], 60);
+        assert_eq!(body["retry_after_seconds"], 6);
+        assert!(body["knobs"].as_array().unwrap().iter().any(|k| k == "rate_limit.auth_burst"));
+
+        // A limiter denial inside a tool call is structured the same way.
+        let failure = tool_failure(
+            "Rate limit exceeded: per-user limit reached for user 'u' (rate_limit.per_user_queries_per_minute, per minute); retry after 3s".to_string(),
+        );
+        assert_eq!(failure["isError"], true);
+        assert_eq!(failure["structuredContent"]["error"], "rate_limited");
+        assert_eq!(failure["structuredContent"]["retry_after_seconds"], 3);
+        assert!(tool_failure("table not found".to_string()).get("structuredContent").is_none());
 
         let seen = auth.seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
@@ -3182,7 +3469,16 @@ mod tests {
         assert_eq!(first["ttlMs"], json!(TOOLS_LIST_TTL_MS));
         assert_eq!(first["cacheScope"], json!("public"));
         assert!(!first["tools"].as_array().unwrap().is_empty());
-        assert_eq!(list().await, first, "the list a client caches is the list it would get again");
+        // `_meta.trace_id` is per request by design; the list itself is not.
+        let without_meta = |mut v: Value| {
+            v.as_object_mut().unwrap().remove("_meta");
+            v
+        };
+        assert_eq!(
+            without_meta(list().await),
+            without_meta(first),
+            "the list a client caches is the list it would get again"
+        );
     }
 
     #[tokio::test]
@@ -3791,6 +4087,8 @@ mod tests {
         assert!(desc("describe_table").contains("describe_schema"));
         assert!(desc("list_tables").contains("table_type"));
         assert!(desc("search_tables").contains("table_type"));
+        assert!(desc("execute_sql_readonly").contains("Do not scan information_schema across a whole catalog"));
+        assert!(desc("execute_sql_readonly").contains("describe_schema"));
     }
 
     // ── describe_schema ──────────────────────────────────────────────────

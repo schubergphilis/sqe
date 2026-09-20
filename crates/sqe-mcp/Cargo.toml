@@ -13,6 +13,7 @@ sqe-sql = { path = "../sqe-sql" }
 # The Arrow-to-JSON value encoder only; the Trino server crate is not linked
 # here any more (review 803, item 3).
 sqe-trino-protocol = { path = "../sqe-trino-protocol", features = ["arrow"] }
+sqe-metrics-core = { path = "../sqe-metrics-core", features = ["propagation"] }
 arrow-array = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
@@ -33,6 +34,10 @@ workspace = true
 
 [dev-dependencies]
 arrow-schema = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }
 # `start_paused` for the describe_schema deadline test: the 20 s probe
 # timeout fires on a paused clock instead of being waited for.
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

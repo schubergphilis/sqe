@@ -919,6 +919,7 @@ mod tests {
             &sqe_core::config::RateLimitConfig {
                 enabled: true,
                 auth_attempts_per_minute: 1,
+                auth_burst: 1,
                 ..Default::default()
             },
         ));

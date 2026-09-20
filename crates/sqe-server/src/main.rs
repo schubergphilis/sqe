@@ -2135,6 +2135,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             config.mcp.clone(),
             sqe_coordinator::mcp_server::hive_root_names(&config),
             &config.storage,
+            &config.rate_limit,
         ))
     } else {
         if config.mcp.port > 0 {
@@ -2161,6 +2162,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
                 &config.coordinator.tls,
                 alive,
                 &config.storage,
+                &config.rate_limit,
                 mcp_shutdown.clone(),
             )
             .await?;
