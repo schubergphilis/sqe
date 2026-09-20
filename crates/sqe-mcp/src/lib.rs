@@ -27,7 +27,7 @@ use serde_json::{json, Map, Value};
 use sqe_auth::{AuthProvider, FlightCredentials};
 use sqe_core::{
     config::{McpAuthMode, McpConfig, McpPrincipalConfig},
-    SecretString, Session, SqeError,
+    SecretString, Session, SqeError, SqeErrorCode,
 };
 use sqe_sql::StatementKind;
 
@@ -795,7 +795,7 @@ The change tool is separately gated by OAuth scope, SQE role and source-data aut
 fn tools(config: &McpConfig) -> Vec<Value> {
     let mut tools = vec![
         tool("execute_sql_readonly", "Execute exactly one read-only SQL statement. SQE parses and classifies the statement before execution; source grants, row filters, and column masks apply as the authenticated user. A query without its own LIMIT is capped at the server's max_result_rows; when `truncated` is true, total_rows means 'more than the cap', so aggregate or add LIMIT instead of paging.", json!({"type":"object","properties":{"sql":{"type":"string"}},"required":["sql"],"additionalProperties":false}), true, false),
-        tool("list_catalogs", "List catalogs visible to the authenticated user. `diagnostics` carries one entry per Hive root (Glue, sidecar) with `status` reachable | auth_error | timeout | unreachable and a `detail`: auth_error means the engine's own AWS credentials are missing or expired (the detail names the region), which no retry from the client side can fix.", empty_schema(), true, false),
+        tool("list_catalogs", "List catalogs visible to the authenticated user. `diagnostics` carries one entry per Hive root (Glue, sidecar) with `status` reachable | auth_error | timeout | unreachable and a `detail`: auth_error means the engine's own AWS credentials are missing or expired, which no retry from the client side can fix; the detail carries an error_id the operator can find in the server log.", empty_schema(), true, false),
         tool("list_schemas", "List schemas visible to the authenticated user in a catalog.", one_string_schema("catalog"), true, false),
         tool("list_tables", "List tables and views visible to the authenticated user in a catalog and schema; each row carries table_type (table or view). To see columns for all of them at once use describe_schema.", two_string_schema("catalog", "schema"), true, false),
         tool("describe_table", "Return columns for one table you already chose. To explore a schema use describe_schema, which returns the columns of every table in one paged call.", three_string_schema(), true, false),
@@ -1022,9 +1022,44 @@ async fn call_tool(
         ))),
         Err(error) => Ok(tool_failure(with_decimal_hint(with_refresh_hint(
             name,
-            error.to_string(),
+            client_error_text(&error),
         )))),
     }
+}
+
+/// What the model is told when the engine fails (#675). A user error (bad
+/// SQL, a name that does not exist, a denial) is about the caller's own
+/// statement and goes through verbatim, as it does on Flight and Trino. A
+/// system error (object store, catalog, execution) carries bucket names,
+/// object keys, hostnames and region or account hints, and an agent
+/// transcript is a leaky place for those: the client gets the code's
+/// generic sentence and an `error_id`, and the full text goes to the server
+/// log at WARN under that id. Two system texts stay verbatim because their
+/// hints are the fix: the Arrow decimal overflow (value and precision only,
+/// see `with_decimal_hint`) and a rate-limit denial (retry-after).
+fn client_error_text(error: &SqeError) -> String {
+    let full = error.to_string();
+    let code = error.error_code();
+    let lower = full.to_ascii_lowercase();
+    if code.is_user_error()
+        || code == SqeErrorCode::ResourceExhausted
+        || lower.starts_with("rate limit")
+        || lower.contains("too large to store in a decimal")
+    {
+        return full;
+    }
+    let error_id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
+    tracing::warn!(
+        error_id,
+        error_code = code.name(),
+        error = %full,
+        "MCP tool call failed; detail withheld from the client"
+    );
+    format!(
+        "{} [{}, error_id {error_id}]. The server log has the detail under that id.",
+        code.generic_message(),
+        code.name()
+    )
 }
 
 /// A Parquet value that does not fit the decimal the metastore declares for
@@ -1063,9 +1098,9 @@ const CATALOG_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// root the caller can see. Each root is probed with `SHOW SCHEMAS FROM
 /// <root>` (one metastore call, run concurrently, bounded by
 /// [`CATALOG_PROBE_TIMEOUT`]) and reported as `reachable`, `auth_error`
-/// (the engine's AWS credentials are missing or expired; the coordinator
-/// names the region in `detail`), `timeout`, or `unreachable` with the
-/// error text. An Iceberg catalog is listed without a probe: its
+/// (the engine's AWS credentials are missing or expired), `timeout`, or
+/// `unreachable`, with the redacted error text of `client_error_text` as
+/// `detail` (#675). An Iceberg catalog is listed without a probe: its
 /// authorization is per user and `list_schemas` answers for it. Without
 /// this, an expired SSO session surfaced as `dispatch failure` on the second
 /// tool call and as empty listings after that, and a sidecar had no way to
@@ -1098,13 +1133,18 @@ async fn list_catalogs_with_diagnostics(
                 let (status, detail) = match probe {
                     Ok(Ok(_)) => ("reachable", None),
                     Ok(Err(error)) => {
-                        let text = error.to_string();
-                        let status = if text.contains("AWS credentials missing or expired") {
+                        // Classified on the full text, reported with the
+                        // redacted one (#675): the region and the SSO detail
+                        // are in the server log under the error_id.
+                        let status = if error
+                            .to_string()
+                            .contains("AWS credentials missing or expired")
+                        {
                             "auth_error"
                         } else {
                             "unreachable"
                         };
-                        (status, Some(text))
+                        (status, Some(client_error_text(&error)))
                     }
                     Err(_) => (
                         "timeout",
@@ -1636,7 +1676,8 @@ async fn describe_one_table(
             entry["columns"] = Value::Array(columns);
         }
         Err(error) => {
-            entry["error"] = json!(error.to_string());
+            // Already the client text: `probe` redacts (#675).
+            entry["error"] = json!(error);
         }
     }
 
@@ -1699,7 +1740,7 @@ async fn probe(
         .await
     {
         Ok(Ok(batches)) => Ok(batches),
-        Ok(Err(error)) => Err(error.to_string()),
+        Ok(Err(error)) => Err(client_error_text(&error)),
         Err(_) => Err(format!(
             "probe timed out after {}s (the statement did not fail, it waited: with the \
              engine's storage credentials expired an object-store call can hang; check \
@@ -3423,12 +3464,50 @@ mod tests {
         let glue = by_name("glue");
         assert_eq!(glue["status"], "auth_error", "{glue}");
         assert_eq!(glue["kind"], "hive_external");
-        assert!(glue["detail"].as_str().unwrap().contains("region=eu-central-1"), "{glue}");
+        // #675: classified on the full text, but the region and the SSO
+        // detail stay in the server log; the client gets the id to quote.
+        let detail = glue["detail"].as_str().unwrap();
+        assert!(!detail.contains("eu-central-1") && detail.contains("error_id"), "{glue}");
         let lake = by_name("lake");
         assert_eq!(lake["status"], "unreachable", "{lake}");
-        assert!(lake["detail"].as_str().unwrap().contains("connection refused"), "{lake}");
+        let detail = lake["detail"].as_str().unwrap();
+        assert!(!detail.contains("connection refused") && detail.contains("error_id"), "{lake}");
         // The Iceberg catalog is listed and not probed.
         assert!(diagnostics.iter().all(|d| d["catalog"] != "iceberg"));
+    }
+
+    /// #675: a system error's text (bucket, key, host, region) stays in the
+    /// server log; a user error, the decimal overflow and a rate-limit
+    /// denial go through verbatim because the caller can act on them.
+    #[test]
+    fn system_error_text_is_withheld_from_the_client_and_user_errors_are_not() {
+        let storage = SqeError::Execution(
+            "hive_external: object store error: GET s3://acme-prod-lake/dt=2026/part-0.parquet \
+             from https://s3.eu-central-1.amazonaws.com: 403"
+                .to_string(),
+        );
+        let text = client_error_text(&storage);
+        for leak in ["acme-prod-lake", "part-0", "amazonaws", "eu-central-1"] {
+            assert!(!text.contains(leak), "{text}");
+        }
+        assert!(text.contains("error_id"), "{text}");
+
+        let missing = SqeError::with_code(
+            SqeErrorCode::TableNotFound,
+            "table 'sales.orderz' not found; did you mean 'sales.orders'?",
+        );
+        assert_eq!(client_error_text(&missing), missing.to_string());
+
+        let decimal = SqeError::Execution(
+            "1029.23 is too large to store in a Decimal128 of precision 5. Max is 999.99".to_string(),
+        );
+        assert!(client_error_text(&decimal).contains("precision 5"));
+
+        let limited = SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            "rate limit: 120 queries per minute; retry after 12s",
+        );
+        assert!(client_error_text(&limited).contains("retry after 12s"));
     }
 
     #[tokio::test]
@@ -3749,7 +3828,9 @@ mod tests {
                 ),
                 ("SHOW COLUMNS FROM \"glue\".\"bi\".\"sales_v\"", cols(&["month", "total"])),
                 ("SHOW STATS FOR \"glue\".\"bi\".\"orders\"", Answer::Stats(Some(1200.0), Some(65536.0))),
-                ("SHOW STATS FOR \"glue\".\"bi\".\"sales_v\"", Answer::Fail("views carry no statistics")),
+                // A user-class refusal (NotSupported) goes through verbatim; a
+                // storage text would not (#675, see `broken` above).
+                ("SHOW STATS FOR \"glue\".\"bi\".\"sales_v\"", Answer::Fail("SHOW STATS is not supported for a view: views carry no statistics")),
                 ("EXPLAIN SELECT * FROM \"glue\".\"bi\".\"orders\" LIMIT 0", Answer::Plan),
                 ("EXPLAIN SELECT * FROM \"glue\".\"bi\".\"sales_v\" LIMIT 0", Answer::Fail("Schema error: No field named tag")),
             ]),
@@ -3887,8 +3968,10 @@ mod tests {
         let by_name = |name: &str| tables.iter().find(|t| t["name"] == name).unwrap().clone();
 
         // The unreadable table is an entry with an error, not a failed call.
+        // The storage text itself stays in the server log (#675).
         let broken = by_name("broken");
-        assert!(broken["error"].as_str().unwrap().contains("unreadable storage"), "{broken}");
+        let error = broken["error"].as_str().unwrap();
+        assert!(error.contains("error_id") && !error.contains("unreadable storage"), "{broken}");
         assert_eq!(broken["columns"], json!([]));
         assert_eq!(tables.len(), 5);
 
