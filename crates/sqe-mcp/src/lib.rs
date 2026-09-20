@@ -481,7 +481,7 @@ async fn mcp_post(
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": { "tools": { "listChanged": false } },
                 "serverInfo": { "name": "sqe", "version": sqe_core::VERSION },
-                "instructions": "Governed SQL access. Prefer read-only metadata and query tools. The change tool is separately gated by OAuth scope, SQE role, and source-data authorization."
+                "instructions": SERVER_INSTRUCTIONS
             }))
         }
         "ping" => Ok(json!({})),
@@ -746,17 +746,25 @@ fn auth_error_for_scope(
     response
 }
 
+/// What `initialize` tells an agent about this server. Under four sentences
+/// on purpose: the first live agent made 21 `describe_table` calls where 3
+/// `describe_schema` calls would have done, because nothing pointed it there.
+const SERVER_INSTRUCTIONS: &str = "Governed SQL access as the authenticated user: source grants, row filters and column masks apply to every statement. \
+To find tables use search_tables, then describe_schema: it returns every table of a schema with columns, table_type and queryable in one paged call; describe_table is for one table you already chose. \
+Rows of list_tables and search_tables carry table_type (table or view). \
+The change tool is separately gated by OAuth scope, SQE role and source-data authorization.";
+
 fn tools(config: &McpConfig) -> Vec<Value> {
     let mut tools = vec![
         tool("execute_sql_readonly", "Execute exactly one read-only SQL statement. SQE parses and classifies the statement before execution; source grants, row filters, and column masks apply as the authenticated user.", json!({"type":"object","properties":{"sql":{"type":"string"}},"required":["sql"],"additionalProperties":false}), true, false),
         tool("list_catalogs", "List catalogs visible to the authenticated user. `diagnostics` carries one entry per Hive root (Glue, sidecar) with `status` reachable | auth_error | timeout | unreachable and a `detail`: auth_error means the engine's own AWS credentials are missing or expired (the detail names the region), which no retry from the client side can fix.", empty_schema(), true, false),
         tool("list_schemas", "List schemas visible to the authenticated user in a catalog.", one_string_schema("catalog"), true, false),
-        tool("list_tables", "List tables visible to the authenticated user in a catalog and schema.", two_string_schema("catalog", "schema"), true, false),
-        tool("describe_table", "Return columns for a table visible to the authenticated user.", three_string_schema(), true, false),
+        tool("list_tables", "List tables and views visible to the authenticated user in a catalog and schema; each row carries table_type (table or view). To see columns for all of them at once use describe_schema.", two_string_schema("catalog", "schema"), true, false),
+        tool("describe_table", "Return columns for one table you already chose. To explore a schema use describe_schema, which returns the columns of every table in one paged call.", three_string_schema(), true, false),
         tool("describe_schema", "Describe every table and view in one schema in a single call, for catalog crawlers: per table the columns describe_table would return (same policy filtering), the table kind (table or view) and source (iceberg, hive_external, view), optionally the metastore's row count and size (`include_stats`: Iceberg snapshot summary or Glue/Hive table parameters, never a scan) and whether the table resolves and plans (`include_queryability`: `EXPLAIN SELECT * ... LIMIT 0`, table resolution and planning only, no scan and no storage listing; storage reachability is the `object_store` diagnostics entry of list_catalogs). Paged by table name: `page_size` defaults to 200 (at most 500); pass back `next_page_token` for the next page. One table failing does not fail the call; its `error`, `stats_error` or `queryability_error` says why.", json!({"type":"object","properties":{"catalog":{"type":"string"},"schema":{"type":"string"},"include_stats":{"type":"boolean"},"include_queryability":{"type":"boolean"},"page_token":{"type":"string"},"page_size":{"type":"integer","minimum":1,"maximum":500}},"required":["catalog","schema"],"additionalProperties":false}), true, false),
         tool("get_table_ddl", "Return SHOW CREATE TABLE output for a visible table.", three_string_schema(), true, false),
         tool("get_table_stats", "Return Iceberg table statistics visible to the authenticated user. Hive external tables have no snapshot statistics and return an error; use describe_table for them.", three_string_schema(), true, false),
-        tool("search_tables", "Find tables by name across the schemas of one catalog (SHOW SCHEMAS, then SHOW TABLES per schema, matched server-side). `pattern` is a SQL LIKE pattern (% and _ are wildcards; a bare word matches as a substring, case-insensitive). `catalog` defaults to the session's default catalog. Only tables visible to the authenticated user are returned.", json!({"type":"object","properties":{"pattern":{"type":"string"},"catalog":{"type":"string"}},"required":["pattern"],"additionalProperties":false}), true, false),
+        tool("search_tables", "Find tables by name across the schemas of one catalog (SHOW SCHEMAS, then SHOW TABLES per schema, matched server-side). `pattern` is a SQL LIKE pattern (% and _ are wildcards; a bare word matches as a substring, case-insensitive). `catalog` defaults to the session's default catalog. Only tables visible to the authenticated user are returned; each row carries table_type (table or view). Follow up with describe_schema on the schemas that matched.", json!({"type":"object","properties":{"pattern":{"type":"string"},"catalog":{"type":"string"}},"required":["pattern"],"additionalProperties":false}), true, false),
         tool("sample_rows", "Return up to `limit` rows (default 10, at most 100) of a table, as the authenticated user: row filters and column masks apply. Prefer this over SELECT * for a first look at a table.", json!({"type":"object","properties":{"catalog":{"type":"string"},"schema":{"type":"string"},"table":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100}},"required":["catalog","schema","table"],"additionalProperties":false}), true, false),
         tool("explain_query", "Explain a read-only SQL query without allowing a write statement to be hidden behind EXPLAIN.", one_string_schema("sql"), true, false),
         tool("whoami", "Show the SQE identity, roles, groups, and OAuth scopes for this request; never returns tokens.", empty_schema(), true, false),
@@ -842,6 +850,17 @@ async fn call_tool(
             .with_source(Some(source_label(name, client)));
         return search_tables(state, &session, &args).await.map(tool_success);
     }
+    if name == "list_tables" {
+        let session = auth
+            .session
+            .clone()
+            .with_source(Some(source_label(name, client)));
+        return Ok(match list_tables(state, &session, &args).await {
+            Ok(value) => tool_success(value),
+            Err((-32602, message)) => return Err((-32602, message)),
+            Err((_, message)) => tool_failure(with_refresh_hint(name, message)),
+        });
+    }
     if name == "describe_schema" {
         let session = auth
             .session
@@ -865,11 +884,6 @@ async fn call_tool(
             sql.to_string()
         }
         "list_schemas" => format!("SHOW SCHEMAS FROM {}", ident(required(&args, "catalog")?)),
-        "list_tables" => format!(
-            "SHOW TABLES FROM {}.{}",
-            ident(required(&args, "catalog")?),
-            ident(required(&args, "schema")?)
-        ),
         "describe_table" => format!("SHOW COLUMNS FROM {}", table_ref(&args)?),
         "get_table_ddl" => format!("SHOW CREATE TABLE {}", table_ref(&args)?),
         "get_table_stats" => format!("SHOW STATS FOR {}", table_ref(&args)?),
@@ -1195,6 +1209,52 @@ fn first_column_strings(batches: &[RecordBatch]) -> Vec<String> {
     out
 }
 
+/// `list_tables`: `SHOW TABLES` plus `SHOW VIEWS` for one schema, so every row
+/// says whether it is a table or a view without a second call per name. The
+/// same two listings `describe_schema` runs; a catalog that cannot answer
+/// `SHOW VIEWS` lists everything as a table (`table_kinds` is best effort).
+async fn list_tables(
+    state: &McpServerState,
+    session: &Session,
+    args: &Value,
+) -> Result<Value, (i32, String)> {
+    let catalog = required(args, "catalog")?;
+    let schema = required(args, "schema")?;
+    let sql = format!("SHOW TABLES FROM {}.{}", ident(catalog), ident(schema));
+    let names = state
+        .executor
+        .execute(session, &sql)
+        .await
+        .map_err(|e| (-32000, e.to_string()))?;
+    let kinds = table_kinds(state, session, catalog, schema).await;
+    let rows: Vec<Value> = first_column_strings(&names)
+        .into_iter()
+        .take(state.config.max_result_rows)
+        .map(|name| {
+            json!({
+                "table_name": name,
+                "table_type": table_type_of(&kinds, &name),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "columns": [
+            {"name": "table_name", "type": "Utf8"},
+            {"name": "table_type", "type": "Utf8"},
+        ],
+        "rows": rows,
+    }))
+}
+
+/// `"view"` when `kinds` (from `SHOW VIEWS`) lists the name, else `"table"`.
+fn table_type_of(kinds: &HashMap<String, String>, name: &str) -> &'static str {
+    if kinds.contains_key(&name.to_ascii_lowercase()) {
+        "view"
+    } else {
+        "table"
+    }
+}
+
 /// `search_tables`: walk `SHOW SCHEMAS` and `SHOW TABLES` for one catalog and
 /// match names in the server.
 ///
@@ -1267,13 +1327,29 @@ async fn search_tables(
     let mut total = 0usize;
     for (schema, tables) in listings {
         let Some(tables) = tables else { continue };
-        for table in tables.into_iter().filter(|t| like_matches(pattern, t)) {
+        let matched: Vec<String> = tables
+            .into_iter()
+            .filter(|t| like_matches(pattern, t))
+            .collect();
+        if matched.is_empty() {
+            continue;
+        }
+        // One `SHOW VIEWS` per schema that matched, not per schema walked:
+        // a search usually lands in a few schemas, and the kind is what lets
+        // an agent tell a view from a table without a call per name.
+        let kinds = if rows.len() < state.config.max_result_rows {
+            table_kinds(state, session, &catalog, &schema).await
+        } else {
+            HashMap::new()
+        };
+        for table in matched {
             total += 1;
             if rows.len() < state.config.max_result_rows {
                 rows.push(json!({
                     "table_catalog": catalog,
                     "table_schema": schema,
                     "table_name": table,
+                    "table_type": table_type_of(&kinds, &table),
                 }));
             }
         }
@@ -1284,6 +1360,7 @@ async fn search_tables(
             {"name": "table_catalog", "type": "Utf8"},
             {"name": "table_schema", "type": "Utf8"},
             {"name": "table_name", "type": "Utf8"},
+            {"name": "table_type", "type": "Utf8"},
         ],
         "rows": rows,
         "total_rows": total,
@@ -3054,6 +3131,7 @@ mod tests {
                 ),
                 ("SHOW TABLES FROM \"sales_wh\".\"ac\"", vec!["orders", "customers"]),
                 ("SHOW TABLES FROM \"sales_wh\".\"ops\"", vec!["order_events", "audit"]),
+                ("SHOW VIEWS FROM \"sales_wh\".\"ops\"", vec!["order_events"]),
                 // "locked" has no answer: the executor refuses it, as a catalog
                 // refuses a schema the caller may not list.
             ]),
@@ -3077,7 +3155,12 @@ mod tests {
         assert_eq!(result["truncated"], true);
         assert_eq!(result["rows"][0]["table_schema"], "ac");
         assert_eq!(result["rows"][0]["table_name"], "orders");
+        assert_eq!(result["rows"][0]["table_type"], "table", "no SHOW VIEWS answer for ac: a table");
         let asked = executor.asked.lock().unwrap().clone();
+        assert!(
+            !asked.iter().any(|s| s == "SHOW VIEWS FROM \"sales_wh\".\"ops\""),
+            "the cap was reached before ops; its kinds are not fetched: {asked:?}"
+        );
         assert!(
             !asked.iter().any(|s| s.contains("information_schema")),
             "information_schema is not a schema to search: {asked:?}"
@@ -3100,6 +3183,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["rows"][0]["table_name"], "audit");
+        assert_eq!(result["rows"][0]["table_type"], "table");
+        let result = search_tables(&state, &session, &json!({"pattern": "events"}))
+            .await
+            .unwrap();
+        assert_eq!(result["rows"][0]["table_type"], "view", "{result}");
+    }
+
+    /// `list_tables` carries the kind of every name from one `SHOW VIEWS`, so an
+    /// agent can skip views without a call per table.
+    #[tokio::test]
+    async fn list_tables_marks_views_from_one_show_views() {
+        let executor = Arc::new(ScriptedExecutor {
+            answers: HashMap::from([
+                ("SHOW TABLES FROM \"glue\".\"bi\"", vec!["Sales_V", "facts"]),
+                ("SHOW VIEWS FROM \"glue\".\"bi\"", vec!["sales_v"]),
+                ("SHOW TABLES FROM \"glue\".\"raw\"", vec!["events"]),
+            ]),
+            asked: Mutex::new(Vec::new()),
+        });
+        let state = McpServerState::new(Arc::new(MockAuth), executor.clone(), static_config(false));
+        let session = local_session("mcp-reader".into(), vec![]);
+
+        let result = list_tables(&state, &session, &json!({"catalog": "glue", "schema": "bi"}))
+            .await
+            .unwrap();
+        assert_eq!(result["rows"][0]["table_name"], "Sales_V");
+        assert_eq!(result["rows"][0]["table_type"], "view", "kinds compare case-insensitively");
+        assert_eq!(result["rows"][1]["table_type"], "table");
+        assert_eq!(result["columns"][1]["name"], "table_type");
+
+        // A schema whose views cannot be listed lists everything as a table.
+        let result = list_tables(&state, &session, &json!({"catalog": "glue", "schema": "raw"}))
+            .await
+            .unwrap();
+        assert_eq!(result["rows"][0]["table_type"], "table");
+        assert_eq!(executor.asked.lock().unwrap().len(), 4, "two statements per call");
+
+        // A schema the caller may not list is the executor's error, not a panic.
+        let err = list_tables(&state, &session, &json!({"catalog": "glue", "schema": "locked"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, -32000);
+        assert!(err.1.contains("not authorized"), "{}", err.1);
+    }
+
+    /// The text an agent reads first steers it to `describe_schema`.
+    #[test]
+    fn instructions_and_descriptions_point_at_describe_schema() {
+        assert!(SERVER_INSTRUCTIONS.contains("search_tables, then describe_schema"));
+        assert!(SERVER_INSTRUCTIONS.matches(". ").count() < 4, "under four sentences: {SERVER_INSTRUCTIONS}");
+        let tools = tools(&static_config(false));
+        let desc = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap()["description"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert!(desc("describe_table").contains("one table you already chose"));
+        assert!(desc("describe_table").contains("describe_schema"));
+        assert!(desc("list_tables").contains("table_type"));
+        assert!(desc("search_tables").contains("table_type"));
     }
 
     // ── describe_schema ──────────────────────────────────────────────────
