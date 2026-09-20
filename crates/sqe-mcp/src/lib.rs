@@ -885,7 +885,7 @@ fn auth_error_for_scope(
 /// What `initialize` tells an agent about this server. Under four sentences
 /// on purpose: the first live agent made 21 `describe_table` calls where 3
 /// `describe_schema` calls would have done, because nothing pointed it there.
-const SERVER_INSTRUCTIONS: &str = "Governed SQL access as the authenticated user: source grants, row filters and column masks apply to every statement. \
+const SERVER_INSTRUCTIONS: &str = "Governed SQL access as the authenticated user: source grants, row filters and column masks apply to every statement, and file table functions (read_parquet, read_csv, read_json) are refused. \
 To find tables use search_tables, then describe_schema: it returns every table of a schema with columns, table_type and queryable in one paged call; describe_table is for one table you already chose. \
 Rows of list_tables and search_tables carry table_type (table or view). \
 The change tool is separately gated by OAuth scope, SQE role and source-data authorization.";
@@ -2734,6 +2734,28 @@ mod tests {
         ] {
             assert!(ensure_read_only(sql, None).is_err(), "must reject: {sql}");
         }
+    }
+
+    #[test]
+    fn read_only_guard_rejects_file_tvfs_and_query_shaped_writes() {
+        for sql in [
+            "SELECT * FROM read_parquet('s3://bucket/x.parquet')",
+            "SELECT * FROM read_csv('/tmp/x.csv')",
+            "SELECT * FROM read_json('hf://datasets/x')",
+            "WITH t AS (SELECT * FROM read_parquet('s3://b/x')) SELECT * FROM t",
+            "SELECT * FROM u JOIN read_parquet('s3://b/x') v ON true",
+            "SELECT 1 INTO t",
+            "WITH x AS (SELECT 1 AS a) INSERT INTO t SELECT * FROM x",
+        ] {
+            let err = ensure_read_only(sql, None).expect_err(sql);
+            assert!(
+                err.contains("Read-only tool rejected"),
+                "{sql}: {err}"
+            );
+        }
+        ensure_read_only("SELECT 'read_parquet' AS x", None).expect("literal is not a TVF");
+        ensure_read_only("SELECT * FROM read_parquet", None)
+            .expect("bare name without args is a table, not a TVF");
     }
 
     #[test]
