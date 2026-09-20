@@ -174,9 +174,11 @@ Read tools, always available:
 | `refresh_metadata` | Drop cached catalog metadata for one table, one schema, or the session's catalog view, so the next call re-reads it. For a table created or changed outside SQE; rate-limited per scope. |
 
 `execute_sql_readonly` accepts exactly one statement and rejects DDL, DML,
-grants, secrets and session changes before they reach the query handler. The
-write tool `execute_sql_change` is not advertised unless `allow_writes = true`,
-which anonymous mode never allows.
+grants, secrets and session changes before they reach the query handler. File
+table functions (`read_parquet`, `read_csv`, `read_json`) are refused too: MCP
+queries catalog tables, not object-store paths. The write tool
+`execute_sql_change` is not advertised unless `allow_writes = true`, which
+anonymous mode never allows.
 
 ## Auth modes
 
