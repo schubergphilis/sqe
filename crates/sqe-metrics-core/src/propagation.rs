@@ -188,6 +188,14 @@ pub fn attach_trace_context_from_headers(headers: &axum::http::HeaderMap) {
     let _ = tracing::Span::current().set_parent(cx);
 }
 
+/// Make `span` a child of the W3C trace context in `headers` (a fresh root
+/// when the caller sent none) and record its ids on it. For a handler that
+/// owns its request span instead of running inside one (the MCP endpoint).
+pub fn adopt_trace_context_from_headers(span: &tracing::Span, headers: &axum::http::HeaderMap) {
+    let _ = span.set_parent(extract_trace_context_from_headers(headers));
+    record_trace_fields(span);
+}
+
 /// Return the current active trace ID (32-char lowercase hex) if a valid
 /// OpenTelemetry span context is present on the current tracing span.
 /// Returns None when OTel is not initialized or no sampled span is active.

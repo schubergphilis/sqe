@@ -44,6 +44,7 @@ pub fn hive_root_names(config: &sqe_core::config::SqeConfig) -> Vec<String> {
 /// `auth` is the coordinator's provider chain, already wrapped in the
 /// pre-auth rate limiter (#562); MCP sends the peer address in the
 /// credentials and maps the denial to 429.
+#[allow(clippy::too_many_arguments)]
 pub fn mcp_router(
     auth: Arc<dyn AuthProvider>,
     handler: Arc<QueryHandler>,
@@ -52,6 +53,7 @@ pub fn mcp_router(
     config: McpConfig,
     hive_roots: Vec<String>,
     storage: &sqe_core::config::StorageConfig,
+    rate_limit: &sqe_core::config::RateLimitConfig,
 ) -> axum::Router {
     let executor: Arc<dyn sqe_mcp::QueryExecutor> = Arc::new(CoordinatorMcpExecutor {
         handler,
@@ -70,7 +72,8 @@ pub fn mcp_router(
     sqe_mcp::router(
         sqe_mcp::McpServerState::new(auth, executor, config)
             .with_hive_roots(hive_roots)
-            .with_storage_probe(storage_probe(storage)),
+            .with_storage_probe(storage_probe(storage))
+            .with_auth_rate(rate_limit.auth_attempts_per_minute),
     )
     .layer(axum::middleware::from_fn_with_state(
         request_deadline,
@@ -192,9 +195,8 @@ impl sqe_mcp::QueryExecutor for CoordinatorMcpExecutor {
             Some(peer) => format!("{peer}|{}", session.user.username),
             None => session.user.username.clone(),
         };
-        self.rate_limiter
-            .check(&key)
-            .map_err(|error| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("rate limit: {error}")))?;
+        // The denial already carries the code, the knob and the wait.
+        self.rate_limiter.check(&key)?;
         let run = self.handler.execute(session, sql, None);
         if self.request_timeout.is_zero() {
             return run.await;
@@ -225,9 +227,7 @@ impl sqe_mcp::QueryExecutor for CoordinatorMcpExecutor {
     }
 
     fn admit_metadata_call(&self, session: &Session) -> Result<(), SqeError> {
-        self.metadata_rate_limiter
-            .check(&session.user.username)
-            .map_err(|error| SqeError::with_code(SqeErrorCode::ResourceExhausted, error.to_string()))
+        self.metadata_rate_limiter.check(&session.user.username)
     }
 }
 
@@ -252,13 +252,14 @@ pub async fn start_mcp_server(
     tls: &TlsConfig,
     alive: Arc<AtomicBool>,
     storage: &sqe_core::config::StorageConfig,
+    rate_limit: &sqe_core::config::RateLimitConfig,
     shutdown: CancellationToken,
 ) -> anyhow::Result<(tokio::task::JoinHandle<()>, SocketAddr)> {
     // Loopback by default in anonymous mode, every interface otherwise;
     // `validate` already rejected an address that does not parse (#671).
     let ip = config.bind_ip().map_err(anyhow::Error::msg)?;
     let addr = SocketAddr::new(ip, config.port);
-    let app = mcp_router(auth, handler, rate_limiter, metadata_rate_limiter, config, hive_roots, storage);
+    let app = mcp_router(auth, handler, rate_limiter, metadata_rate_limiter, config, hive_roots, storage, rate_limit);
     // Bind synchronously up front so both branches can report the port they
     // actually got, and so a bind failure is this call's error, not a log
     // line from a task nobody joins.
