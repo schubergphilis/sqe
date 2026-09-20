@@ -163,7 +163,13 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Create or update the release
+      # Assets are written once. A `workflow_dispatch` runs this YAML from
+      # whatever branch was selected, so a release that already has assets
+      # must not be overwritable from here (#713): no `--clobber`, and an
+      # existing asset makes `gh release upload` fail. Backfilling a tag that
+      # predates this workflow (its documented use) hits the create branch or
+      # an asset-less release, both of which still work.
+      - name: Create or fill the release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -174,7 +180,11 @@ jobs:
           tag="${INPUT_TAG:-$REF_NAME}"
           ls -la dist
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/* --clobber
+            if [ "$(gh release view "$tag" --json assets --jq '.assets | length')" != "0" ]; then
+              echo "release $tag already has assets; refusing to overwrite them" >&2
+              exit 1
+            fi
+            gh release upload "$tag" dist/*
           else
             gh release create "$tag" dist/* \
               --title "SQE $tag" \

@@ -195,6 +195,12 @@ deps-check:
   timeout: 15m
   variables:
     CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
+    CARGO_MACHETE_VERSION: "0.9.2"
+  # The cache carries an executable that the default branch then runs. That
+  # is only safe because the project has "separate caches for protected
+  # branches" on (ci_separated_caches = true): an MR pipeline cannot write
+  # the cache that main restores (#714). Keep that setting on, and keep the
+  # tool pinned so a stale cache is at least a known version.
   cache:
     key: "deps-check-cargo-home"
     paths:
@@ -207,7 +213,8 @@ deps-check:
       # PATH in the image; without this the probe misses and the reinstall
       # fails with "binary `cargo-machete` already exists".
       export PATH="$CARGO_HOME/bin:$PATH"
-      command -v cargo-machete >/dev/null 2>&1 || cargo install cargo-machete --locked
+      cargo-machete --version 2>/dev/null | grep -qF "$CARGO_MACHETE_VERSION" \
+        || cargo install cargo-machete --locked --force --version "$CARGO_MACHETE_VERSION"
       cargo machete --with-metadata crates/sqe-*
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
