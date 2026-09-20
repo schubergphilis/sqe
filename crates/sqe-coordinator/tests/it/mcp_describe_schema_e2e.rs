@@ -152,6 +152,9 @@ async fn mcp_describe_schema_describes_an_iceberg_schema_with_stats_in_one_call(
         Arc::new(sqe_coordinator::rate_limiter::QueryRateLimiter::new(
             &config.rate_limit,
         )),
+        Arc::new(sqe_coordinator::rate_limiter::MetadataRateLimiter::new(
+            &config.rate_limit,
+        )),
         McpConfig {
             enabled: true,
             resource_uri: "https://sqe.test/mcp".to_string(),
