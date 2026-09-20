@@ -4341,6 +4341,13 @@ pub struct RateLimitConfig {
     /// credential stuffing impractical against the upstream IdP.
     #[serde(default = "default_auth_rpm")]
     pub auth_attempts_per_minute: u32,
+    /// How many credential presentations one (peer-ip, principal) may make
+    /// at once before the per-minute rate applies. An MCP client fans a
+    /// dozen metadata calls out in one second, each carrying the same
+    /// bearer; a burst below that denies a legitimate agent on its first
+    /// question. Defaults to 20. The sustained rate is unchanged.
+    #[serde(default = "default_auth_burst")]
+    pub auth_burst: u32,
     /// Pre-auth rate limit on metadata browse paths (Flight catalog,
     /// schemas, tables, prepared-statement schema lookup). Each call
     /// triggers a Polaris fan-out and was previously uncapped.
@@ -4356,6 +4363,7 @@ impl Default for RateLimitConfig {
             per_user_queries_per_minute: default_per_user_rpm(),
             global_queries_per_minute: default_global_rpm(),
             auth_attempts_per_minute: default_auth_rpm(),
+            auth_burst: default_auth_burst(),
             metadata_per_user_per_minute: default_metadata_rpm(),
         }
     }
@@ -5188,6 +5196,9 @@ fn default_global_rpm() -> u32 {
 }
 fn default_auth_rpm() -> u32 {
     10
+}
+fn default_auth_burst() -> u32 {
+    20
 }
 fn default_metadata_rpm() -> u32 {
     120

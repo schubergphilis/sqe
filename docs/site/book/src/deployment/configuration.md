@@ -277,8 +277,12 @@ global_queries_per_minute = 1000
 # charged, so a search over 135 schemas costs one unit, not 136.
 metadata_per_user_per_minute = 120
 # Credential presentations per (peer, principal) before any provider runs;
-# the per-peer budget is five times this. 429 on the HTTP paths.
+# the per-peer budget is five times this. Denials are 429 with Retry-After
+# and a JSON body naming the limiter, the window and these knobs.
 auth_attempts_per_minute = 10
+# How many presentations one (peer, principal) may make at once before the
+# rate applies: an MCP agent fans a dozen metadata calls out in one second.
+auth_burst = 20
 
 [quack_client]
 enabled = false                 # Enable quack_query(uri, sql) TVF (finding 604). Disabled by default: SSRF risk.
@@ -414,6 +418,9 @@ Every config field can be overridden via environment variable. Convention: `SQE_
 | `SQE_RATE_LIMIT__ENABLED` | `rate_limit.enabled` | bool |
 | `SQE_RATE_LIMIT__PER_USER_QUERIES_PER_MINUTE` | `rate_limit.per_user_queries_per_minute` | u32 |
 | `SQE_RATE_LIMIT__GLOBAL_QUERIES_PER_MINUTE` | `rate_limit.global_queries_per_minute` | u32 |
+| `SQE_RATE_LIMIT__METADATA_PER_USER_PER_MINUTE` | `rate_limit.metadata_per_user_per_minute` | u32 |
+| `SQE_RATE_LIMIT__AUTH_ATTEMPTS_PER_MINUTE` | `rate_limit.auth_attempts_per_minute` | u32 |
+| `SQE_RATE_LIMIT__AUTH_BURST` | `rate_limit.auth_burst` | u32 |
 | **Metrics** | | |
 | `SQE_METRICS__PROMETHEUS_PORT` | `metrics.prometheus_port` | u16 |
 | `SQE_METRICS__OTLP_ENDPOINT` | `metrics.otlp_endpoint` | string |
