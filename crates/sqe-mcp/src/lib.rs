@@ -748,7 +748,7 @@ fn auth_error_for_scope(
 
 fn tools(config: &McpConfig) -> Vec<Value> {
     let mut tools = vec![
-        tool("execute_sql_readonly", "Execute exactly one read-only SQL statement. SQE parses and classifies the statement before execution; source grants, row filters, and column masks apply as the authenticated user.", json!({"type":"object","properties":{"sql":{"type":"string"}},"required":["sql"],"additionalProperties":false}), true, false),
+        tool("execute_sql_readonly", "Execute exactly one read-only SQL statement. SQE parses and classifies the statement before execution; source grants, row filters, and column masks apply as the authenticated user. A query without its own LIMIT is capped at the server's max_result_rows; when `truncated` is true, total_rows means 'more than the cap', so aggregate or add LIMIT instead of paging.", json!({"type":"object","properties":{"sql":{"type":"string"}},"required":["sql"],"additionalProperties":false}), true, false),
         tool("list_catalogs", "List catalogs visible to the authenticated user. `diagnostics` carries one entry per Hive root (Glue, sidecar) with `status` reachable | auth_error | timeout | unreachable and a `detail`: auth_error means the engine's own AWS credentials are missing or expired (the detail names the region), which no retry from the client side can fix.", empty_schema(), true, false),
         tool("list_schemas", "List schemas visible to the authenticated user in a catalog.", one_string_schema("catalog"), true, false),
         tool("list_tables", "List tables visible to the authenticated user in a catalog and schema.", two_string_schema("catalog", "schema"), true, false),
@@ -854,8 +854,8 @@ async fn call_tool(
     let sql = match name {
         "execute_sql_readonly" => {
             let sql = required(&args, "sql")?;
-            ensure_read_only(sql, session_catalog).map_err(|e| (-32602, e))?;
-            sql.to_string()
+            let kind = ensure_read_only(sql, session_catalog).map_err(|e| (-32602, e))?;
+            with_row_cap(sql, &kind, state.config.max_result_rows)
         }
         "execute_sql_change" => {
             authorize_write(state, auth)?;
@@ -1728,6 +1728,61 @@ fn ensure_read_only(sql: &str, session_catalog: Option<&str>) -> Result<Statemen
     }
 }
 
+/// Append `LIMIT max_rows + 1` to a plain query that has no row bound of its
+/// own (issue #670). The response keeps at most `max_rows` rows, so without
+/// this the coordinator collected the whole result (up to
+/// `query.max_result_rows`, a million rows by default) for a thousand-row
+/// answer. One extra row keeps `truncated` honest: `total_rows` then reads
+/// `max_rows + 1`, meaning "more than the cap", not the true count.
+///
+/// Text append, not an AST print: the executor must see the ORIGINAL text
+/// (time-travel clauses are stripped from the classification copy). A
+/// statement that already carries LIMIT, FETCH, or a FOR clause, or ends in a
+/// comment that would swallow the suffix, is passed through unchanged; every
+/// non-query kind (SHOW ...) is too.
+fn with_row_cap(sql: &str, kind: &StatementKind, max_rows: usize) -> String {
+    let StatementKind::Query(stmt) = kind else {
+        return sql.to_string();
+    };
+    let sqlparser::ast::Statement::Query(query) = stmt.as_ref() else {
+        return sql.to_string();
+    };
+    if query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || query.for_clause.is_some()
+        || !query.pipe_operators.is_empty()
+        || max_rows == 0
+        || ends_with_comment(sql)
+    {
+        return sql.to_string();
+    }
+    let trimmed = sql.trim_end().trim_end_matches(';').trim_end();
+    format!("{trimmed} LIMIT {}", max_rows.saturating_add(1))
+}
+
+/// Whether the last token of `sql` is a comment, in which case anything
+/// appended to the text would become part of it.
+fn ends_with_comment(sql: &str) -> bool {
+    use sqlparser::{
+        dialect::GenericDialect,
+        tokenizer::{Token, Tokenizer, Whitespace},
+    };
+    let Ok(tokens) = Tokenizer::new(&GenericDialect {}, sql).tokenize() else {
+        return true;
+    };
+    tokens
+        .iter()
+        .rev()
+        .find(|token| {
+            !matches!(
+                token,
+                Token::Whitespace(Whitespace::Space | Whitespace::Newline | Whitespace::Tab)
+                    | Token::SemiColon
+            )
+        })
+        .is_some_and(|token| matches!(token, Token::Whitespace(_)))
+}
+
 /// Classify and require a change kind; returns the kind so the target gate
 /// can inspect it without parsing twice.
 fn ensure_change(sql: &str, session_catalog: Option<&str>) -> Result<StatementKind, String> {
@@ -1976,6 +2031,14 @@ fn batches_json(batches: &[RecordBatch], max_rows: usize, max_bytes: usize) -> V
         })
         .unwrap_or_default();
     let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    // Byte accounting is incremental (issue #670): each row is encoded once
+    // and its length added to a running total, against the fixed cost of the
+    // column list and the object framing. The old probe re-serialized the
+    // whole accumulated array after every row, quadratic in the row cap.
+    let framing = serde_json::to_vec(&json!({"columns": columns, "rows": []}))
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX);
+    let mut used = framing;
     let mut rows = Vec::new();
     'batches: for batch in batches {
         for row in 0..batch.num_rows() {
@@ -1989,15 +2052,16 @@ fn batches_json(batches: &[RecordBatch], max_rows: usize, max_bytes: usize) -> V
                     sqe_trino_protocol::encode::arrow_value_to_json(batch.column(index).as_ref(), row),
                 );
             }
-            rows.push(Value::Object(object));
-            let probe = json!({"columns":columns,"rows":rows});
-            if serde_json::to_vec(&probe)
-                .map(|v| v.len() > max_bytes)
-                .unwrap_or(true)
-            {
-                rows.pop();
+            let object = Value::Object(object);
+            // The row's bytes plus the separating comma.
+            let cost = serde_json::to_vec(&object)
+                .map(|v| v.len() + 1)
+                .unwrap_or(usize::MAX);
+            if used.saturating_add(cost) > max_bytes {
                 break 'batches;
             }
+            used += cost;
+            rows.push(object);
         }
     }
     let returned_rows = rows.len();
@@ -2235,6 +2299,90 @@ mod tests {
         assert_eq!(value["total_rows"], 3);
         assert_eq!(value["returned_rows"], 2);
         assert_eq!(value["truncated"], true);
+    }
+
+    #[test]
+    fn result_serialization_is_byte_bounded_and_the_body_fits_the_cap() {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let values: Vec<String> = (0..50).map(|i| format!("row-{i:0>40}")).collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(
+                values.iter().map(String::as_str).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        let cap = 600;
+        let value = batches_json(&[batch], 1_000, cap);
+        let returned = value["returned_rows"].as_u64().unwrap();
+        assert!(returned > 0 && returned < 50, "returned {returned}");
+        assert_eq!(value["truncated"], true);
+        let body = serde_json::to_vec(&json!({"columns": value["columns"], "rows": value["rows"]}))
+            .unwrap();
+        assert!(body.len() <= cap, "{} > {cap}", body.len());
+        // A cap below the framing returns no rows rather than failing.
+        let none = batches_json(&[], 1_000, 1);
+        assert_eq!(none["returned_rows"], 0);
+    }
+
+    #[test]
+    fn plain_queries_get_a_row_cap_and_bounded_or_non_query_statements_do_not() {
+        let cap = |sql: &str| {
+            let kind = ensure_read_only(sql, None).unwrap();
+            with_row_cap(sql, &kind, 1_000)
+        };
+        assert_eq!(cap("SELECT * FROM t"), "SELECT * FROM t LIMIT 1001");
+        assert_eq!(cap("SELECT * FROM t;  "), "SELECT * FROM t LIMIT 1001");
+        assert_eq!(
+            cap("WITH c AS (SELECT 1 AS x) SELECT x FROM c UNION ALL SELECT 2"),
+            "WITH c AS (SELECT 1 AS x) SELECT x FROM c UNION ALL SELECT 2 LIMIT 1001"
+        );
+        assert_eq!(
+            cap("SELECT * FROM t FOR VERSION AS OF 42"),
+            "SELECT * FROM t FOR VERSION AS OF 42 LIMIT 1001"
+        );
+        assert_eq!(cap("SELECT * FROM t LIMIT 5"), "SELECT * FROM t LIMIT 5");
+        assert_eq!(
+            cap("SELECT * FROM t ORDER BY 1 LIMIT 5 OFFSET 2"),
+            "SELECT * FROM t ORDER BY 1 LIMIT 5 OFFSET 2"
+        );
+        assert_eq!(
+            cap("SELECT * FROM t FETCH FIRST 3 ROWS ONLY"),
+            "SELECT * FROM t FETCH FIRST 3 ROWS ONLY"
+        );
+        assert_eq!(cap("SELECT 1 -- trailing"), "SELECT 1 -- trailing");
+        assert_eq!(cap("SHOW TABLES FROM c.s"), "SHOW TABLES FROM c.s");
+        let kind = ensure_read_only("SELECT 1", None).unwrap();
+        assert_eq!(with_row_cap("SELECT 1", &kind, 0), "SELECT 1");
+    }
+
+    #[tokio::test]
+    async fn execute_sql_readonly_sends_the_capped_statement_to_the_engine() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let app = router(McpServerState::new(
+            Arc::new(MockAuth),
+            executor.clone(),
+            test_config(),
+        ));
+        let token = scoped_token("sqe:mcp:read");
+        let request = Request::post("/mcp")
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "jsonrpc":"2.0",
+                    "id":1,
+                    "method":"tools/call",
+                    "params":{"name":"execute_sql_readonly","arguments":{"sql":"SELECT * FROM t"}}
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let expected = format!("SELECT * FROM t LIMIT {}", test_config().max_result_rows + 1);
+        assert_eq!(executor.4.lock().unwrap().as_deref(), Some(expected.as_str()));
     }
 
     #[tokio::test]
