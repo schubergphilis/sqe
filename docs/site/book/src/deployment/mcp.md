@@ -94,6 +94,17 @@ invisible to every health check but the one on this port, and was seen on a
 laptop deployment after an idle hour. See
 [Observability](../features/observability.md#health-endpoints).
 
+Three more bounds sit on the listener. Every request has a deadline of
+`request_timeout_secs` plus fifteen seconds (90 s at the default), covering
+the parts a statement deadline does not: the token check, the metadata
+fan-out and the encoding; past it the client gets a 504 with a JSON-RPC
+error. `SIGTERM` and `SIGINT` stop the accept loop and give in-flight calls
+thirty seconds to finish instead of cutting them, and that exit is logged as
+a shutdown, not as the crash the supervisor watches for. The TLS certificate
+reload task is supervised: if it ends, the log says so at ERROR, because the
+alternative is serving the startup certificate until it expires with nothing
+in the log.
+
 ## Okta as the authorization server
 
 Any provider that publishes discovery metadata and signs JWTs works; Okta needs
