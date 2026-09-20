@@ -763,7 +763,7 @@ fn tools(config: &McpConfig) -> Vec<Value> {
         tool("refresh_metadata", "Drop cached catalog metadata so the next call re-reads it from the source. Use ONLY when a table or column you expect is missing, or a schema looks stale after a change outside SQE; routine queries never need it. Scope it as narrowly as you can: `table` (with `catalog` and `schema`) refreshes one table, `schema` (with `catalog`) one schema, nothing refreshes this session's catalog view. Rate-limited per scope; a repeat inside the window is a no-op that says so.", json!({"type":"object","properties":{"catalog":{"type":"string"},"schema":{"type":"string"},"table":{"type":"string"}},"additionalProperties":false}), false, false),
     ];
     if config.allow_writes {
-        tools.push(tool("execute_sql_change", "Execute one change/write SQL statement. Requires the configured OAuth write scope and SQE writer role; the target catalog must be one the operator allowed for MCP writes; source catalog and storage authorization still apply as the authenticated user.", one_string_schema("sql"), false, true));
+        tools.push(tool("execute_sql_change", "Execute one data or DDL statement: INSERT, UPDATE, DELETE, MERGE, CREATE/DROP/ALTER TABLE, SCHEMA or VIEW, TRUNCATE, ANALYZE. Grants, policies, secrets, catalogs, session settings and procedures are refused here and go through Flight SQL or Trino HTTP. Requires the configured OAuth write scope and SQE writer role; the target catalog must be one the operator allowed for MCP writes; source catalog and storage authorization still apply as the authenticated user.", one_string_schema("sql"), false, true));
     }
     tools
 }
@@ -1738,7 +1738,51 @@ fn ensure_change(sql: &str, session_catalog: Option<&str>) -> Result<StatementKi
             kind.name()
         ));
     }
+    if !is_change_surface(&kind) {
+        return Err(format!(
+            "{} is outside execute_sql_change's surface, which is data statements and \
+             table, schema and view DDL; grants, policies, secrets, catalogs, session \
+             settings and procedures go through Flight SQL or Trino HTTP",
+            kind.name()
+        ));
+    }
     Ok(kind)
+}
+
+/// What `execute_sql_change` executes (#677): data statements and the DDL
+/// of tables, schemas and views. Everything else that is not read-only
+/// (GRANT/REVOKE/DENY, policy and tag DDL, secrets, ATTACH/DETACH, session
+/// settings, transactions, procedures, CALL) is administration, which the
+/// tool's name and description do not announce and an operator enabling
+/// `allow_writes` does not expect. The engine still authorizes what passes;
+/// this is the tool's own surface, fail closed on kinds it does not list.
+fn is_change_surface(kind: &StatementKind) -> bool {
+    matches!(
+        kind,
+        StatementKind::CreateTable(_)
+            | StatementKind::CreateExternalTable(_)
+            | StatementKind::Ctas(_)
+            | StatementKind::Insert(_)
+            | StatementKind::Merge(_)
+            | StatementKind::Delete(_)
+            | StatementKind::Update(_)
+            | StatementKind::Drop(_)
+            | StatementKind::Rename(_)
+            | StatementKind::AlterSchema(_)
+            | StatementKind::AlterTableProps(_)
+            | StatementKind::Comment(_)
+            | StatementKind::DropNestedColumn { .. }
+            | StatementKind::PartitionEvolution(_)
+            | StatementKind::RefDdl(_)
+            | StatementKind::HivePartitionDdl(_)
+            | StatementKind::MsckRepairTable(_)
+            | StatementKind::Analyze(_)
+            | StatementKind::Truncate(_)
+            | StatementKind::CreateView(_)
+            | StatementKind::DropView(_)
+            | StatementKind::CreateSchema(_)
+            | StatementKind::DropSchema(_)
+    )
 }
 
 /// Where a change statement writes, as the parser sees it.
@@ -2765,34 +2809,36 @@ mod tests {
         assert!(executed(&executor).is_some());
     }
 
+    /// A procedure has no parser-visible target, which used to make it the
+    /// fail-closed case of the catalog gate. Since #677 it never reaches the
+    /// gate: procedures are outside the tool's surface, gated or not.
     #[tokio::test]
-    async fn change_tool_fails_closed_on_statements_without_a_table_target() {
-        let mut config = static_config(true);
-        config.write_catalogs = vec!["iceberg".to_string()];
-        let (body, executor) = change(
-            config,
-            &[],
-            WRITE_TOKEN,
-            "CALL system.rewrite_data_files(table => 'ns.t')",
-        )
-        .await;
-        assert_eq!(body["error"]["code"], -32003, "{body}");
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("cannot determine the target catalog"));
-        assert!(executed(&executor).is_none());
-
-        // With nothing configured to gate on, the same call is unchanged.
-        let (body, executor) = change(
-            static_config(true),
-            &[],
-            WRITE_TOKEN,
-            "CALL system.rewrite_data_files(table => 'ns.t')",
-        )
-        .await;
-        assert!(body.get("error").is_none(), "{body}");
-        assert!(executed(&executor).is_some());
+    async fn change_tool_refuses_a_procedure_before_the_catalog_gate() {
+        for (config, hive_roots) in [
+            (
+                {
+                    let mut c = static_config(true);
+                    c.write_catalogs = vec!["iceberg".to_string()];
+                    c
+                },
+                vec![],
+            ),
+            (static_config(true), vec![]),
+        ] {
+            let (body, executor) = change(
+                config,
+                &hive_roots,
+                WRITE_TOKEN,
+                "CALL system.rewrite_data_files(table => 'ns.t')",
+            )
+            .await;
+            assert_eq!(body["error"]["code"], -32602, "{body}");
+            assert!(body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("outside execute_sql_change"));
+            assert!(executed(&executor).is_none());
+        }
     }
 
     #[tokio::test]
@@ -2872,6 +2918,36 @@ mod tests {
             executor.3.lock().unwrap().clone(),
             Some((Some("iceberg".to_string()), Some("ns".to_string())))
         );
+    }
+
+    /// #677: the change tool is data and table/schema/view DDL. Administration
+    /// that is not read-only is refused by the tool itself, before the engine.
+    #[test]
+    fn change_tool_refuses_administration_statements() {
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t WHERE a = 1",
+            "CREATE TABLE t (a INT)",
+            "ALTER TABLE t RENAME TO u",
+            "TRUNCATE TABLE t",
+            "CREATE SCHEMA s",
+            "DROP VIEW v",
+        ] {
+            ensure_change(sql, Some("dflt")).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        for sql in [
+            "GRANT SELECT ON t TO ROLE analyst",
+            "REVOKE SELECT ON t FROM ROLE analyst",
+            "CALL system.rewrite_data_files(table => 'ns.t')",
+            "ATTACH 's3://b/wh/' AS lake (TYPE hive_external)",
+            "DROP SECRET partner",
+            "SET SESSION iceberg.compression_codec = 'ZSTD'",
+            "BEGIN",
+        ] {
+            let err = ensure_change(sql, Some("dflt")).expect_err(sql);
+            assert!(err.contains("outside execute_sql_change"), "{sql}: {err}");
+        }
     }
 
     #[test]

@@ -272,6 +272,15 @@ then needs all three independent authorizations:
 2. the SQE identity has at least one role in `write_roles`;
 3. SQE and the source catalog/storage authorize that exact user and statement.
 
+The tool's surface is data statements and the DDL of tables, schemas and
+views: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `CREATE`/`DROP`/`ALTER TABLE`,
+`SCHEMA` or `VIEW`, `TRUNCATE`, `ANALYZE`, partition and branch DDL. Anything
+else that is not read-only, `GRANT`/`REVOKE`/`DENY`, policy and tag DDL,
+secrets, `ATTACH`/`DETACH`, `SET SESSION`, transactions, `CALL` and
+maintenance procedures, is refused by the tool before the engine sees it.
+Administration goes through Flight SQL or Trino HTTP, where the operator
+expects it.
+
 Keep `allow_writes = false` for analytics assistants. For automation requiring
 writes, use a separate deployment/configuration and narrowly scoped source
 roles where operational isolation is required.
