@@ -1036,26 +1036,41 @@ impl WorkerFlightService {
             .get(SCAN_SIGNATURE_HEADER)
             .and_then(|v| v.to_str().ok())
             .is_some_and(sqe_core::ticket_signing::TicketVerifier::is_asymmetric_signature);
-        if asymmetric && (task.audience.is_empty() || task.expires_at == 0) {
-            return Err(Status::unauthenticated(
-                "Signed scan ticket lacks audience or expiry",
-            ));
+        self.verify_binding("scan ticket", &task.audience, task.expires_at, asymmetric)
+    }
+
+    /// Shared audience + expiry gate for scan tickets and `compact_file_group`
+    /// requests (#724, #730). `required` demands both fields be present.
+    ///
+    /// #724: an audience on the wire with no `advertise_url` on this worker
+    /// fails closed. Skipping the comparison let a static-`worker_urls`
+    /// worker (no heartbeat, so `bootstrap` never set the URL) accept
+    /// tickets minted for another worker.
+    fn verify_binding(
+        &self,
+        what: &str,
+        audience: &str,
+        expires_at: i64,
+        required: bool,
+    ) -> Result<(), Status> {
+        if required && (audience.is_empty() || expires_at == 0) {
+            return Err(Status::unauthenticated(format!(
+                "Signed {what} lacks audience or expiry"
+            )));
         }
-        if !task.audience.is_empty()
-            && !self.advertise_url.is_empty()
-            && task.audience != self.advertise_url
-        {
+        if !audience.is_empty() && audience != self.advertise_url {
             warn!(
-                audience = %task.audience,
+                audience = %audience,
                 advertise_url = %self.advertise_url,
-                "Rejected scan ticket addressed to another worker"
+                "Rejected {what} addressed to another worker"
             );
-            return Err(Status::unauthenticated(
-                "Scan ticket audience does not match this worker",
-            ));
+            return Err(Status::unauthenticated(format!(
+                "{what} audience does not match this worker (set worker.advertise_url to the \
+                 URL the coordinator dials)"
+            )));
         }
-        if task.expires_at != 0 && chrono::Utc::now().timestamp() > task.expires_at {
-            return Err(Status::unauthenticated("Scan ticket has expired"));
+        if expires_at != 0 && chrono::Utc::now().timestamp() > expires_at {
+            return Err(Status::unauthenticated(format!("{what} has expired")));
         }
         Ok(())
     }
@@ -1337,6 +1352,14 @@ impl FlightService for WorkerFlightService {
                 let request = CompactGroupRequest::from_bytes(&action.body).map_err(|e| {
                     Status::invalid_argument(format!("Failed to decode CompactGroupRequest: {e}"))
                 })?;
+                // #730: the HMAC binds the bytes, not the recipient or the
+                // clock. Bind to this worker and a deadline like scan tickets.
+                self.verify_binding(
+                    "compaction request",
+                    &request.audience,
+                    request.expires_at,
+                    !self.worker_secret.is_empty(),
+                )?;
                 let group_id = request.group_id;
 
                 info!(
@@ -1692,6 +1715,7 @@ mod tests {
         WorkerFlightService::new(metrics, SessionContext::new())
             .with_worker_secret(secret.to_string())
             .with_accept_hmac_tickets(true)
+            .with_advertise_url(W1.to_string())
     }
 
     /// Recompute the HMAC-SHA256 tag (hex) the coordinator would attach, used
@@ -1983,6 +2007,23 @@ mod tests {
         assert!(err.message().contains("audience"), "{err}");
     }
 
+    /// #724: a worker that never learned its own URL (static `worker_urls`
+    /// deployment, no `with_advertise_url`) must still refuse a ticket
+    /// addressed to another worker instead of skipping the comparison.
+    #[tokio::test]
+    async fn do_get_rejects_foreign_audience_when_worker_has_no_advertise_url() {
+        let signer = sqe_core::ticket_signing::TicketSigner::generate().unwrap();
+        let pin = Arc::new(crate::ticket_pin::TicketKeyPin::floating());
+        pin.pin_b64(signer.public_key_b64()).unwrap();
+        let metrics = Arc::new(WorkerMetricsRegistry::new().unwrap());
+        let svc = WorkerFlightService::new(metrics, SessionContext::new())
+            .with_worker_secret("expected-secret".to_string())
+            .with_ticket_pin(pin);
+        let err = do_get_signed(&svc, &signer, bound_ticket(W1, future())).await;
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert!(err.message().contains("audience"), "{err}");
+    }
+
     #[tokio::test]
     async fn do_get_rejects_expired_or_unbound_ed25519_ticket() {
         let signer = sqe_core::ticket_signing::TicketSigner::generate().unwrap();
@@ -2239,7 +2280,13 @@ mod tests {
     // no-real-backend tests above).
 
     fn make_compact_request_bytes() -> Vec<u8> {
+        make_compact_request_bytes_bound(W1, future())
+    }
+
+    fn make_compact_request_bytes_bound(audience: &str, expires_at: i64) -> Vec<u8> {
         sqe_compaction::wire::CompactGroupRequest {
+            audience: audience.to_string(),
+            expires_at,
             job_id: "job-sig".to_string(),
             group_id: 1,
             table_ident: "catalog.ns.tbl".to_string(),
@@ -2366,6 +2413,43 @@ mod tests {
         let response = unwrap_ok(svc.do_action(request).await);
         let err = drain_to_first_error(response).await;
         assert_ne!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    /// #730: a correctly HMAC-signed request minted for another worker, or
+    /// past its deadline, or lacking either binding, is Unauthenticated.
+    #[tokio::test]
+    async fn compact_file_group_rejects_foreign_audience_expired_or_unbound() {
+        let svc = make_service("expected-secret");
+        for (body, needle) in [
+            (
+                make_compact_request_bytes_bound("http://w2.cluster:50052", future()),
+                "audience",
+            ),
+            (
+                make_compact_request_bytes_bound(W1, Utc::now().timestamp() - 1),
+                "expired",
+            ),
+            (
+                make_compact_request_bytes_bound("", 0),
+                "audience or expiry",
+            ),
+        ] {
+            let signature = sqe_compaction::wire::sign(&body, "expected-secret");
+            let action = Action {
+                r#type: "compact_file_group".to_string(),
+                body: bytes::Bytes::from(body),
+            };
+            let mut request = Request::new(action);
+            request
+                .metadata_mut()
+                .insert(WORKER_SECRET_HEADER, "expected-secret".parse().unwrap());
+            request
+                .metadata_mut()
+                .insert(COMPACT_SIGNATURE_HEADER, signature.parse().unwrap());
+            let err = unwrap_err(svc.do_action(request).await);
+            assert_eq!(err.code(), tonic::Code::Unauthenticated, "{err}");
+            assert!(err.message().contains(needle), "{err}");
+        }
     }
 
     #[tokio::test]

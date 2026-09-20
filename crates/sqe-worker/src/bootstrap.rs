@@ -153,18 +153,30 @@ pub fn build_worker_service_with_hot_reload(
         );
     }
 
+    // The advertise URL is derived once at startup. Scan tickets and
+    // compaction requests name their worker (#724/#730), so every worker
+    // needs it, not only heartbeating ones: a static-`worker_urls` worker
+    // without it rejects every bound ticket. It must be routable: an
+    // undeliverable URL aborts boot (fail loudly) instead of poisoning the
+    // coordinator's registry with 0.0.0.0.
+    let advertise_url = derive_advertise_url(config);
+    match &advertise_url {
+        Ok(url) => service = service.with_advertise_url(url.clone()),
+        Err(e) => tracing::warn!(
+            "cannot derive worker.advertise_url ({e}); this worker will refuse audience-bound \
+             scan tickets until worker.advertise_url is set"
+        ),
+    }
+
     // Heartbeat to the coordinator. Only started when a coordinator URL is
-    // configured. The advertise URL is derived once at startup and must be
-    // routable: an undeliverable URL aborts boot (fail loudly) instead of
-    // poisoning the coordinator's registry with 0.0.0.0.
+    // configured.
     if !config.worker.coordinator_url.is_empty() {
-        let advertise_url = derive_advertise_url(config).map_err(|e| {
+        let advertise_url = advertise_url.map_err(|e| {
             anyhow::anyhow!(
                 "cannot start worker heartbeat: {e}. (worker.coordinator_url is set, \
                  so the worker must advertise a routable address)"
             )
         })?;
-        service = service.with_advertise_url(advertise_url.clone());
         let interval = Duration::from_secs(config.worker.heartbeat_interval_secs);
         tracing::info!(
             coordinator = %config.worker.coordinator_url,

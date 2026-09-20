@@ -2133,7 +2133,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             Arc::clone(&rate_limiter),
             Arc::clone(&metadata_rate_limiter),
             config.mcp.clone(),
-            sqe_coordinator::mcp_server::hive_root_names(&config),
+            sqe_coordinator::mcp_server::engine_credential_catalog_names(&config),
             &config.storage,
             &config.rate_limit,
         ))
@@ -2158,7 +2158,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
                 Arc::clone(&rate_limiter),
                 Arc::clone(&metadata_rate_limiter),
                 config.mcp.clone(),
-                sqe_coordinator::mcp_server::hive_root_names(&config),
+                sqe_coordinator::mcp_server::engine_credential_catalog_names(&config),
                 &config.coordinator.tls,
                 alive,
                 &config.storage,

@@ -5526,6 +5526,21 @@ impl SqeConfig {
                                 .to_string(),
                         );
                     }
+                    // #704: anonymous off loopback is a startup WARN (#671);
+                    // with every bucket readable on the engine's credentials
+                    // it is a refusal.
+                    if self.storage.tvf.allow_all_object_stores
+                        && (self.mcp.port == 0
+                            || !self.mcp.bind_ip().is_ok_and(|ip| ip.is_loopback()))
+                    {
+                        errors.push(
+                            "mcp.auth.mode = \"anonymous\" with storage.tvf.allow_all_object_stores \
+                             (--allow-all-buckets) needs the /mcp listener on loopback: set a \
+                             dedicated mcp.port and leave mcp.bind_address empty or 127.0.0.1, or \
+                             authenticate MCP"
+                                .to_string(),
+                        );
+                    }
                 }
             }
             if self.mcp.max_result_rows == 0 || self.mcp.max_response_bytes == 0 {
@@ -7464,6 +7479,24 @@ partial_progress_batch = 5
         );
     }
 
+    /// #704: `--allow-all-buckets` plus `--mcp-anonymous` only on loopback.
+    #[test]
+    fn mcp_anonymous_with_allow_all_buckets_must_stay_on_loopback() {
+        let mut config = mcp_enabled_config();
+        config.mcp.auth.mode = McpAuthMode::Anonymous;
+        config.storage.tvf.allow_all_object_stores = true;
+        config.validate().expect("default anonymous bind is loopback");
+        config.mcp.bind_address = "0.0.0.0".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("allow_all_object_stores"), "got: {err}");
+        // port = 0 rides the web listener, which binds every interface.
+        config.mcp.bind_address.clear();
+        config.mcp.enabled = true;
+        config.mcp.port = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("allow_all_object_stores"), "got: {err}");
+    }
+
     #[test]
     fn mcp_anonymous_mode_is_refused_in_production() {
         let mut config = mcp_enabled_config();
@@ -8106,6 +8139,14 @@ s3_secret_key = "configured-secret"
         assert!(
             err.contains("allow_unauthenticated_workers") && err.contains("worker_secret"),
             "got: {err}"
+        );
+        // #719: heartbeat-only discovery (empty worker_urls) is live on the
+        // waiver alone, so the rule must fire without any static URL.
+        config.coordinator.worker_urls.clear();
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(
+            err.contains("allow_unauthenticated_workers") && err.contains("worker_secret"),
+            "heartbeat-only: {err}"
         );
     }
 
