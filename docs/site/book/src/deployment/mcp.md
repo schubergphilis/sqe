@@ -275,9 +275,15 @@ Read tools are always available after the `sqe:mcp:read` scope is validated:
   `STORAGE_CREDENTIALS_UNAVAILABLE` while `SELECT 1` and the metadata tools
   still answer)
 - `list_schemas`
-- `list_tables`
+- `list_tables` (every row carries `table_type`, `table` or `view`, from one
+  `SHOW VIEWS` per call, so an agent tells the two apart without a call per
+  name)
 - `describe_table` (columns with type, nullability and the catalog's column
-  comment when it carries one: Iceberg `doc`, Glue column comment)
+  comment when it carries one: Iceberg `doc`, Glue column comment; for one
+  table already chosen. The server's `initialize` instructions steer agents
+  to `search_tables` then `describe_schema` for exploration: the first live
+  agent made 21 `describe_table` calls where 3 `describe_schema` calls would
+  have done)
 - `describe_schema` (a whole schema in one call, for catalog crawlers; see
   below)
 - `get_table_ddl`
@@ -287,7 +293,8 @@ Read tools are always available after the `sqe:mcp:read` scope is validated:
 - `search_tables` (walks `SHOW SCHEMAS` and `SHOW TABLES` for one catalog and
   matches a LIKE pattern server-side; a bare word is a case-insensitive
   substring match; the catalog defaults to the session's; a schema the caller
-  may not list is skipped)
+  may not list is skipped; rows carry `table_type` from one `SHOW VIEWS` per
+  schema that matched)
 - `sample_rows` (`SELECT * ... LIMIT n` as the caller, default 10, at most 100;
   row filters and masks apply)
 - `explain_query`
