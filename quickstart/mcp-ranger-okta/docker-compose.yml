@@ -1,6 +1,93 @@
-# Plain `docker compose up` works here. The whole Polaris + Ranger + Keycloak
-# stack is included; docker-compose.override.yml (auto-loaded) swaps SQE's
-# config for the Okta + MCP one and adds the env-driven source settings.
-include:
-  - path: ../polaris-ranger-keycloak/docker-compose.yml
-    env_file: .env
+# SQE + Apache Ranger. Okta is the only identity provider; the data lives
+# outside the stack: the AWS Glue Data Catalog read live, files in S3 through
+# the AWS credential chain. No Keycloak, no Polaris, no RustFS.
+#
+# Every SQE_* variable is one a Fargate task definition carries unchanged:
+# SQE_<SECTION>__<FIELD> walks into sqe.toml, array entries by index.
+services:
+  ranger-db:
+    extends:
+      file: ../polaris-ranger-keycloak/docker-compose.yml
+      service: ranger-db
+
+  ranger-admin:
+    extends:
+      file: ../polaris-ranger-keycloak/docker-compose.yml
+      service: ranger-admin
+    depends_on:
+      ranger-db:
+        condition: service_healthy
+
+  # Hive-type service `query` + the two group policies SQE enforces.
+  ranger-setup:
+    image: curlimages/curl:8.22.0
+    entrypoint: ["sh", "/bootstrap-ranger.sh"]
+    environment:
+      RANGER_URL: http://ranger-admin:6080
+      RANGER_USER: admin
+      RANGER_PASS: ${RANGER_ADMIN_PASSWORD:-rangerR0cks!}
+      READONLY_GROUP: ${READONLY_GROUP:-datalake_readonly}
+      SENSITIVE_GROUP: ${SENSITIVE_GROUP:-datalake_sensitive_ro}
+      SENSITIVE_TABLES: ${SENSITIVE_TABLES:-}
+    volumes:
+      - ./ranger/bootstrap-ranger.sh:/bootstrap-ranger.sh:ro
+    restart: "no"
+    depends_on:
+      ranger-admin:
+        condition: service_healthy
+
+  sqe:
+    image: ${SQE_IMAGE:-sqe-quickstart:latest}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: runtime
+      args:
+        CARGO_PROFILE: ${SQE_CARGO_PROFILE:-dev-release}
+    # The same shape as a laptop run of
+    #   sqe-server --glue-catalog glue --allow-all-buckets --mcp-only ...
+    # with Okta instead of --mcp-anonymous. GLUE_DATABASES (comma list) scopes
+    # the catalog to those databases; unset exposes every database.
+    command: >-
+      --config /etc/sqe/sqe.toml
+      --glue-catalog ${GLUE_CATALOG:-glue}
+      --glue-region ${AWS_REGION:-eu-central-1}
+      ${GLUE_DATABASES:+--glue-database ${GLUE_DATABASES}}
+      --allow-all-buckets
+      --mcp-only
+    environment:
+      RUST_LOG: "info,sqe_mcp=debug,sqe_auth=debug,sqe_policy=debug"
+      # ── AWS credentials for Glue + S3: inherited from the shell that runs
+      #    `docker compose up` (aws sso login + export). On Fargate leave them
+      #    unset and the task role is used. ──
+      AWS_REGION: ${AWS_REGION:-eu-central-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      SQE_STORAGE__S3_REGION: ${AWS_REGION:-eu-central-1}
+      # ── Okta (the only auth provider, index 0) ──
+      SQE_AUTH__PROVIDERS__0__ISSUER: ${OKTA_ISSUER}
+      SQE_AUTH__PROVIDERS__0__JWKS_URL: ${OKTA_ISSUER}/v1/keys
+      SQE_AUTH__PROVIDERS__0__AUDIENCE: ${OKTA_AUDIENCE:-http://localhost:${SQE_MCP_PORT:-19092}/mcp}
+      SQE_MCP__AUTHORIZATION_SERVERS__0: ${OKTA_ISSUER}
+      SQE_MCP__RESOURCE_URI: http://localhost:${SQE_MCP_PORT:-19092}/mcp
+      SQE_MCP__ALLOW_WRITES: ${MCP_ALLOW_WRITES:-false}
+      # ── Ranger ──
+      SQE_POLICY__RANGER__URL: http://ranger-admin:6080
+      SQE_POLICY__RANGER__ADMIN_PASSWORD: ${RANGER_ADMIN_PASSWORD:-rangerR0cks!}
+    volumes:
+      - ./sqe.toml:/etc/sqe/sqe.toml:ro
+    ports:
+      - "${SQE_MCP_PORT:-19092}:9091" # /mcp on the web/health listener; --mcp-only closes the SQL ports
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9091/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    depends_on:
+      ranger-setup:
+        condition: service_completed_successfully
+
+volumes:
+  ranger-db-data:

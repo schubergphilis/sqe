@@ -99,6 +99,7 @@
 - [Polaris + Keycloak (client credentials)](./quickstart/polaris-keycloak-client-id.md)
 - [Polaris + Keycloak (user token)](./quickstart/polaris-keycloak-user-token.md)
 - [MCP with Codex and Claude](./quickstart/mcp.md)
+- [MCP with Ranger and Okta on external data](./quickstart/mcp-ranger-okta.md)
 - [Polaris + Ranger + Keycloak (fine-grained masking + Spark parity)](./quickstart/polaris-ranger-keycloak.md)
 - [Polaris + Ranger (service principal)](./quickstart/polaris-ranger-service-principal.md)
 - [Project Nessie (Iceberg REST catalog)](./quickstart/nessie.md)
