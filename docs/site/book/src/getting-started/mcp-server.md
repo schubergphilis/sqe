@@ -100,6 +100,12 @@ gives both the credentials and the region.
   and under `production_mode`.
 - `--mcp-port <n>` is the MCP port. Zero mounts `/mcp` on the existing web
   listener instead.
+- `--mcp-bind <ip>` is the interface that port listens on. With
+  `--mcp-anonymous` the default is `127.0.0.1`, so the unauthenticated
+  endpoint is reachable from this machine only; pass `--mcp-bind 0.0.0.0` to
+  open it to the network on purpose. Authenticated modes default to
+  `0.0.0.0`. With port zero the web listener's bind applies (every
+  interface), and the server warns when that exposes an anonymous endpoint.
 
 The same flags work on top of a real config file (`--config sqe.toml`) when you
 need TLS, a Polaris catalog, storage keys, or per-principal MCP tokens. The

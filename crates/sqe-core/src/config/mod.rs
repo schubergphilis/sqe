@@ -884,6 +884,13 @@ pub struct McpConfig {
     /// Dedicated TCP port for `/mcp`; zero mounts on the existing web listener.
     #[serde(default)]
     pub port: u16,
+    /// Interface the dedicated `/mcp` listener binds. Empty picks
+    /// `127.0.0.1` under `[mcp.auth] mode = "anonymous"` and `0.0.0.0`
+    /// otherwise, so an unauthenticated endpoint on a laptop or bastion is
+    /// not reachable from the network unless this says so (#671). Ignored
+    /// with `port = 0`, where `/mcp` rides the web listener's bind.
+    #[serde(default)]
+    pub bind_address: String,
     /// Canonical RFC 8707 resource identifier (normally the public MCP URL).
     #[serde(default)]
     pub resource_uri: String,
@@ -945,6 +952,7 @@ impl Default for McpConfig {
         Self {
             enabled: false,
             port: 0,
+            bind_address: String::new(),
             resource_uri: String::new(),
             authorization_servers: Vec::new(),
             allowed_origins: Vec::new(),
@@ -1117,6 +1125,29 @@ fn default_mcp_anonymous_user() -> String {
 impl McpConfig {
     pub fn is_enabled(&self) -> bool {
         self.enabled || self.port > 0
+    }
+
+    /// `port > 0` with `enabled = false`: served today for backwards
+    /// compatibility, warned about at startup, and gone in the next release
+    /// (#672). A leftover `port` line must not be what opens the surface.
+    pub fn enabled_by_port_only(&self) -> bool {
+        !self.enabled && self.port > 0
+    }
+
+    /// The interface the dedicated listener binds: `bind_address`, or the
+    /// mode's default when it is empty (loopback for anonymous, every
+    /// interface otherwise). `Err` names an address that does not parse.
+    pub fn bind_ip(&self) -> Result<std::net::IpAddr, String> {
+        let raw = self.bind_address.trim();
+        if raw.is_empty() {
+            return Ok(if self.auth.mode == McpAuthMode::Anonymous {
+                std::net::Ipv4Addr::LOCALHOST.into()
+            } else {
+                std::net::Ipv4Addr::UNSPECIFIED.into()
+            });
+        }
+        raw.parse()
+            .map_err(|_| format!("mcp.bind_address is not an IP address: {raw:?}"))
     }
 }
 
@@ -5318,6 +5349,9 @@ impl SqeConfig {
         }
         if self.mcp.is_enabled() {
             let mp = self.mcp.port;
+            if let Err(e) = self.mcp.bind_ip() {
+                errors.push(e);
+            }
             if mp > 0 {
                 for (name, port) in [
                     (
@@ -7334,6 +7368,41 @@ partial_progress_batch = 5
     #[test]
     fn mcp_auth_mode_defaults_to_oauth() {
         assert_eq!(McpAuthConfig::default().mode, McpAuthMode::Oauth);
+    }
+
+    /// #671: an unauthenticated listener stays on loopback unless the
+    /// operator names another interface; authenticated modes keep 0.0.0.0.
+    #[test]
+    fn mcp_bind_defaults_to_loopback_only_for_anonymous() {
+        let mut mcp = McpConfig::default();
+        assert_eq!(mcp.bind_ip().unwrap(), std::net::IpAddr::from([0, 0, 0, 0]));
+        mcp.auth.mode = McpAuthMode::Anonymous;
+        assert_eq!(mcp.bind_ip().unwrap(), std::net::IpAddr::from([127, 0, 0, 1]));
+        mcp.bind_address = "0.0.0.0".to_string();
+        assert_eq!(mcp.bind_ip().unwrap(), std::net::IpAddr::from([0, 0, 0, 0]));
+        mcp.bind_address = "eth0".to_string();
+        assert!(mcp.bind_ip().unwrap_err().contains("mcp.bind_address"));
+    }
+
+    #[test]
+    fn mcp_bind_address_that_does_not_parse_fails_validation() {
+        let mut config = mcp_enabled_config();
+        config.mcp.bind_address = "sqe.internal".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("mcp.bind_address"), "{err}");
+    }
+
+    /// #672: `port` alone still serves (one release), but is flagged so the
+    /// startup WARN fires; `enabled = true` is the intended switch.
+    #[test]
+    fn mcp_port_only_is_flagged_as_the_deprecated_enable() {
+        let mut mcp = McpConfig {
+            port: 8081,
+            ..Default::default()
+        };
+        assert!(mcp.is_enabled() && mcp.enabled_by_port_only());
+        mcp.enabled = true;
+        assert!(!mcp.enabled_by_port_only());
     }
 
     #[test]

@@ -50,8 +50,9 @@ ca_file = ""                    # Optional PEM CA. Server side: requires a clien
 allow_ip_advertise = false      # Permit a bare-IP worker.advertise_url under TLS (needs IP SANs)
 
 [mcp]                           # Model Context Protocol endpoint. Off by default.
-enabled = false                 # true mounts /mcp; a nonzero port also enables it
+enabled = false                 # true mounts /mcp. A nonzero port alone still does, with a deprecation WARN, for one release
 port = 0                        # 0 = share the health/web listener; nonzero = own listener + TLS
+bind_address = ""               # Own listener's interface; empty = 127.0.0.1 under mode = "anonymous", 0.0.0.0 otherwise
 resource_uri = ""               # Public MCP URL; the RFC 8707 resource / token audience
 authorization_servers = []      # Issuers advertised in RFC 9728 metadata
 allowed_origins = []            # Exact browser origins; native clients send no Origin
