@@ -21,6 +21,7 @@ how to use it.
 | [Polaris + Keycloak (client credentials)](./polaris-keycloak-client-id.md) | Polaris + Keycloak; SQE mints user tokens via the OIDC password grant | validated |
 | [Polaris + Keycloak (user token)](./polaris-keycloak-user-token.md) | Same stack; clients bring a pre-minted Keycloak token, SQE validates + passes it through | validated |
 | [MCP with Codex and Claude](./mcp.md) | Reuses the user-token stack; MCP read/write gates, tests and client configuration | runnable harness |
+| [MCP with Ranger and Okta on external data](./mcp-ranger-okta.md) | SQE + Ranger only; Okta browser login from Claude Code or Codex, Ranger grants per Okta group, Glue Data Catalog + S3 read live; Okta objects as Terraform | runnable harness |
 | [Project Nessie](./nessie.md) | Nessie as the Iceberg REST catalog (auth-less, anonymous SQE) | validated |
 | [RustFS S3 Tables](./rustfs-s3tables.md) | The Iceberg REST catalog inside RustFS; client-side SigV4 with the S3 keys (auth-less, anonymous SQE) | validated |
 | [Unity Catalog OSS](./unity-oss.md) | Unity Catalog OSS over Iceberg REST (read-only; catalog-browse demo) | validated |
