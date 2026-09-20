@@ -290,6 +290,15 @@ Results are structured JSON and text content. `max_result_rows` and
 `max_response_bytes` bound model context consumption; `truncated` reports when
 the result was cut. Prefer aggregation and explicit `LIMIT` clauses.
 
+The row cap is also pushed into the engine. A plain query without its own
+`LIMIT`, `FETCH` or `FOR` clause reaches the coordinator as
+`... LIMIT max_result_rows + 1`, so a `SELECT *` over a large table plans a
+bounded scan instead of collecting the whole result and keeping the first
+thousand rows. When that cap fires, `total_rows` reads `max_result_rows + 1`,
+meaning "more than the cap", not the true row count; `truncated` is still
+`true`. Statements that carry their own bound, `SHOW` statements and
+`explain_query` are passed through unchanged.
+
 ### `describe_schema`: one schema per call
 
 A catalog crawler that runs `describe_table`, `get_table_stats` and
