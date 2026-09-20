@@ -6,6 +6,7 @@
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Duration;
 
 use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 use sqe_core::config::RateLimitConfig;
@@ -36,17 +37,21 @@ impl AuthRateLimiter {
                 by_ip: None,
             };
         }
-        let quota = Quota::per_minute(
-            NonZeroU32::new(config.auth_attempts_per_minute)
-                .unwrap_or(NonZeroU32::new(10).unwrap()),
-        );
+        let rate = NonZeroU32::new(config.auth_attempts_per_minute).unwrap_or(NonZeroU32::new(10).unwrap());
+        // The burst is what one client may present at once (an MCP agent's
+        // parallel metadata calls, each with the same bearer); the rate is
+        // what it may sustain. Below the rate, the burst is the rate.
+        let burst = NonZeroU32::new(config.auth_burst.max(config.auth_attempts_per_minute))
+            .unwrap_or(rate);
+        let quota = Quota::per_minute(rate).allow_burst(burst);
         // Per-IP budget is intentionally larger than the per-tuple
         // budget so legitimate shared NAT egress isn't penalised but
         // a stuffer rotating usernames still trips the IP cap.
         let ip_quota = Quota::per_minute(
             NonZeroU32::new(config.auth_attempts_per_minute.saturating_mul(5))
                 .unwrap_or(NonZeroU32::new(50).unwrap()),
-        );
+        )
+        .allow_burst(NonZeroU32::new(burst.get().saturating_mul(5)).unwrap_or(burst));
         Self {
             enabled: true,
             limiter: Some(Arc::new(RateLimiter::keyed(quota))),
@@ -72,6 +77,40 @@ impl AuthRateLimiter {
                 .map_err(|_| SqeError::Auth("rate-limited".to_string()))?;
         }
         Ok(())
+    }
+}
+
+/// Seconds until the bucket a denial came from admits one more request,
+/// rounded up and at least one, so a client can wait exactly that long
+/// instead of guessing.
+fn retry_after_secs<P: governor::clock::Reference>(not_until: &governor::NotUntil<P>, now: P) -> u64 {
+    let wait = not_until.wait_time_from(now);
+    wait.as_secs() + u64::from(wait.subsec_nanos() > 0).max(u64::from(wait.is_zero()))
+}
+
+/// One denial from the query or metadata limiter, with what the caller needs
+/// to behave: how long to wait and which knob sets the budget. Renders as the
+/// `SqeError` text every protocol already carries; `retry after {n}s` at the
+/// end is what the MCP adapter reads back for `Retry-After`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateLimitDenial {
+    pub limiter: &'static str,
+    pub knob: &'static str,
+    pub retry_after: Duration,
+    pub detail: String,
+}
+
+impl RateLimitDenial {
+    pub fn into_error(self) -> SqeError {
+        SqeError::with_code(
+            SqeErrorCode::ResourceExhausted,
+            format!(
+                "Rate limit exceeded: {} ({}, per minute); retry after {}s",
+                self.detail,
+                self.knob,
+                self.retry_after.as_secs()
+            ),
+        )
     }
 }
 
@@ -197,10 +236,15 @@ impl MetadataRateLimiter {
             return Ok(());
         }
         if let Some(ref l) = self.per_user {
-            l.check_key(&user_id.to_string()).map_err(|_| {
-                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "Rate limit exceeded: metadata browse limit reached for user '{user_id}'"
-                ))
+            l.check_key(&user_id.to_string()).map_err(|not_until| {
+                let secs = retry_after_secs(&not_until, governor::clock::Clock::now(l.clock()));
+                RateLimitDenial {
+                    limiter: "metadata",
+                    knob: "rate_limit.metadata_per_user_per_minute",
+                    retry_after: Duration::from_secs(secs),
+                    detail: format!("metadata browse limit reached for user '{user_id}'"),
+                }
+                .into_error()
             })?;
         }
         Ok(())
@@ -260,17 +304,29 @@ impl QueryRateLimiter {
 
         // Per-user check
         if let Some(ref limiter) = self.per_user {
-            limiter.check_key(&user_id.to_string()).map_err(|_| {
-                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "Rate limit exceeded: per-user limit reached for user '{user_id}'"
-                ))
+            limiter.check_key(&user_id.to_string()).map_err(|not_until| {
+                let secs = retry_after_secs(&not_until, governor::clock::Clock::now(limiter.clock()));
+                RateLimitDenial {
+                    limiter: "query",
+                    knob: "rate_limit.per_user_queries_per_minute",
+                    retry_after: Duration::from_secs(secs),
+                    detail: format!("per-user limit reached for user '{user_id}'"),
+                }
+                .into_error()
             })?;
         }
 
         // Global check
         if let Some(ref limiter) = self.global {
-            limiter.check().map_err(|_| {
-                SqeError::with_code(SqeErrorCode::ExecutionFailed, "Rate limit exceeded: global query limit reached".to_string())
+            limiter.check().map_err(|not_until| {
+                let secs = retry_after_secs(&not_until, governor::clock::Clock::now(limiter.clock()));
+                RateLimitDenial {
+                    limiter: "query",
+                    knob: "rate_limit.global_queries_per_minute",
+                    retry_after: Duration::from_secs(secs),
+                    detail: "global query limit reached".to_string(),
+                }
+                .into_error()
             })?;
         }
 
@@ -305,6 +361,7 @@ mod tests {
         let limiter = Arc::new(AuthRateLimiter::new(&RateLimitConfig {
             enabled: true,
             auth_attempts_per_minute: 1,
+            auth_burst: 1,
             ..Default::default()
         }));
         let wrapped = RateLimitedAuthProvider::new(
@@ -431,6 +488,42 @@ mod tests {
         assert!(limiter.check("user_b").is_ok());
     }
 
+    /// One agent's parallel metadata calls: a dozen presentations of the same
+    /// bearer inside one second pass at the defaults, and the denial that
+    /// follows the burst says how long to wait and which knob sets it.
+    #[test]
+    fn a_dozen_concurrent_presentations_pass_at_the_defaults() {
+        let limiter = AuthRateLimiter::new(&RateLimitConfig {
+            enabled: true,
+            ..RateLimitConfig::default()
+        });
+        for i in 0..12 {
+            limiter.check("10.0.0.7", "bearer:abc").unwrap_or_else(|e| panic!("call {i} denied: {e}"));
+        }
+        let config = RateLimitConfig::default();
+        let mut denied = 0;
+        for _ in 12..(config.auth_burst + 5) {
+            if limiter.check("10.0.0.7", "bearer:abc").is_err() {
+                denied += 1;
+            }
+        }
+        assert!(denied >= 1, "the burst is finite");
+        assert_eq!(config.auth_burst, 20);
+
+        let query = QueryRateLimiter::new(&RateLimitConfig {
+            enabled: true,
+            per_user_queries_per_minute: 1,
+            ..RateLimitConfig::default()
+        });
+        query.check("u").unwrap();
+        let err = query.check("u").unwrap_err();
+        assert_eq!(err.error_code(), SqeErrorCode::ResourceExhausted);
+        let text = err.to_string();
+        assert!(text.contains("rate_limit.per_user_queries_per_minute"), "{text}");
+        assert!(text.contains("retry after "), "{text}");
+        assert!(text.ends_with('s'), "{text}");
+    }
+
     #[test]
     fn auth_rate_limiter_disabled_is_noop() {
         let config = RateLimitConfig {
@@ -438,6 +531,7 @@ mod tests {
             per_user_queries_per_minute: 1,
             global_queries_per_minute: 1,
             auth_attempts_per_minute: 1,
+            auth_burst: 1,
             metadata_per_user_per_minute: 1,
         };
         let limiter = AuthRateLimiter::new(&config);
@@ -453,6 +547,7 @@ mod tests {
             per_user_queries_per_minute: 1000,
             global_queries_per_minute: 1000,
             auth_attempts_per_minute: 1,
+            auth_burst: 1,
             metadata_per_user_per_minute: 1000,
         };
         let limiter = AuthRateLimiter::new(&config);
@@ -469,6 +564,7 @@ mod tests {
             global_queries_per_minute: 1000,
             // tuple budget = 1, per-ip budget = 5
             auth_attempts_per_minute: 1,
+            auth_burst: 1,
             metadata_per_user_per_minute: 1000,
         };
         let limiter = AuthRateLimiter::new(&config);
@@ -492,6 +588,7 @@ mod tests {
             per_user_queries_per_minute: 1,
             global_queries_per_minute: 1,
             auth_attempts_per_minute: 1,
+            auth_burst: 1,
             metadata_per_user_per_minute: 1,
         };
         let limiter = MetadataRateLimiter::new(&config);
@@ -507,6 +604,7 @@ mod tests {
             per_user_queries_per_minute: 1000,
             global_queries_per_minute: 1000,
             auth_attempts_per_minute: 1000,
+            auth_burst: 1000,
             metadata_per_user_per_minute: 1,
         };
         let limiter = MetadataRateLimiter::new(&config);
@@ -528,10 +626,11 @@ mod tests {
 
         assert!(limiter.check("frank").is_ok());
         let err = limiter.check("frank").unwrap_err();
-        // SqeError::Execution — not Auth — so the session is preserved.
+        // ResourceExhausted, not Auth, so the session is preserved and the
+        // protocol adapters answer 429 / RESOURCE_EXHAUSTED.
         assert!(
-            err.error_code() == SqeErrorCode::ExecutionFailed,
-            "Expected Execution error variant, got: {err:?}"
+            err.error_code() == SqeErrorCode::ResourceExhausted,
+            "Expected a ResourceExhausted denial, got: {err:?}"
         );
     }
 }

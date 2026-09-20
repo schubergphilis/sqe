@@ -644,6 +644,16 @@ same tuple the Trino and Basic paths use. The credential half is a SHA-256
 fingerprint of the bearer, so agents behind one proxy address get separate
 budgets and a token-rotating attacker does not.
 
+### Trace correlation
+
+A client that sends a W3C `traceparent` header makes the request span, the
+statement span below it and the audit record part of its own trace: the
+audit line's `trace_id` is the caller's. The response carries the same id
+back as `result._meta.trace_id` on every successful JSON-RPC result, so an
+agent's question and the engine's record of what ran can be joined without
+timestamps. A request without `traceparent` starts a fresh trace and returns
+that id. The propagation code is the one Flight SQL and Trino HTTP use.
+
 ## Design references
 
 The design follows the MCP 2025-11-25 authorization requirements (OAuth 2.1,
