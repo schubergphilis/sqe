@@ -373,6 +373,17 @@ pub fn like_match(pattern: &str, value: &str) -> bool {
     like_match_inner(&p, &v)
 }
 
+/// `"ns"."level"."table"` -- every dotted namespace level and the table name
+/// double-quoted with embedded quotes doubled, so catalog-supplied names are
+/// identifiers and never SQL (#712).
+fn quote_qualified(ns: &str, table: &str) -> String {
+    ns.split('.')
+        .chain(std::iter::once(table))
+        .map(|part| format!("\"{}\"", part.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 fn like_match_inner(pattern: &[char], value: &[char]) -> bool {
     match (pattern.first(), value.first()) {
         (None, None) => true,
@@ -1782,8 +1793,11 @@ impl FlightSqlService for SqeFlightSqlService {
             // listing and load) falls back to empty rather than failing
             // the whole `getTables()` call.
             if include_schema {
-                let qualified = format!("{ns}.{table_name}");
-                match self.query_handler.get_schema(&session, &qualified).await {
+                // Catalog-returned names are data, not SQL: quote every
+                // component so a namespace like `SELECT 1 --` cannot plan
+                // as a statement through `get_schema` (#712).
+                let sql = format!("SELECT * FROM {}", quote_qualified(ns, table_name));
+                match self.query_handler.get_schema(&session, &sql).await {
                     Ok(schema) => {
                         builder
                             .append(&catalog_name, ns, table_name, "TABLE", &schema)
@@ -2662,8 +2676,8 @@ impl FlightSqlService for SqeFlightSqlService {
                 // capacity, failures_since_last). Older workers send the 408
                 // `HeartbeatPayload` or a bare URL; `parse` accepts all three
                 // and reports the older two as legacy (`v == 0`).
-                let hello =
-                    sqe_planner::WorkerHello::parse(&action.body).map_err(Status::invalid_argument)?;
+                let hello = sqe_planner::WorkerHello::parse(&action.body)
+                    .map_err(Status::invalid_argument)?;
                 let worker_url = hello.url.as_str();
 
                 if worker_url.is_empty() {
@@ -3222,6 +3236,16 @@ mod tests {
     fn like_match_basic() {
         assert!(super::like_match("orders", "orders"));
         assert!(!super::like_match("orders", "other"));
+    }
+
+    /// #712: a hostile namespace stays an identifier, never a statement.
+    #[test]
+    fn quote_qualified_neutralises_sql_in_catalog_names() {
+        assert_eq!(super::quote_qualified("a.b", "t"), r#""a"."b"."t""#);
+        assert_eq!(
+            super::quote_qualified(r#"SELECT 1 --"#, r#"x"y"#),
+            r#""SELECT 1 --"."x""y""#
+        );
     }
 
     #[test]

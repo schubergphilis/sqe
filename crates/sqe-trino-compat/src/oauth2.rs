@@ -21,14 +21,22 @@ pub struct OAuth2State {
     pub base_url: String,
 }
 
+/// Store key for a client-held `auth_id`: `hex(sha256(auth_id))`, which is
+/// also the OAuth2 `state` the IdP echoes back. The client polls with
+/// `auth_id`; the browser only ever sees the hash (initiate path, `state`),
+/// so nothing browser-visible can fetch the token (#709). Mirrors Trino's
+/// `OAuth2TokenExchange` (store keyed by `hash(authId)`).
+fn poll_key(auth_id: &str) -> String {
+    hex::encode(Sha256::digest(auth_id.as_bytes()))
+}
+
 /// Generate a 401 WWW-Authenticate challenge for Trino external auth.
-/// Returns `(session_key, www_authenticate_header_value)`.
+/// Returns `(auth_id, www_authenticate_header_value)`.
 ///
-/// The pending session is keyed by the OAuth2 `state` value. The IdP echoes
-/// only `state` (and `code`) back to the callback, so `state` is the single
-/// high-entropy value that ties the issued request to its callback, serves as
-/// the token-poll id, and acts as the anti-CSRF token verified in the callback
-/// (RFC 6749 section 10.12).
+/// One pending session, keyed by `challenge.state == poll_key(auth_id)`:
+/// `initiate/{state}` redirects it, the callback (`?state=`) completes it, and
+/// `token/{auth_id}` polls it. `state` doubles as the anti-CSRF token verified
+/// in the callback (RFC 6749 section 10.12).
 pub async fn generate_challenge(state: &OAuth2State) -> Result<(String, String), StatusCode> {
     let challenge = state
         .auth_code_service
@@ -39,46 +47,38 @@ pub async fn generate_challenge(state: &OAuth2State) -> Result<(String, String),
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+    let auth_id = challenge.auth_id;
     let session_key = challenge.state.clone();
-    let session_key_hash = hex::encode(Sha256::digest(session_key.as_bytes()));
+    debug_assert_eq!(session_key, poll_key(&auth_id));
 
-    state
-        .pending_store
-        .insert_pending(&session_key, challenge.code_verifier, challenge.state);
-
-    let initiate_url = format!(
-        "{}/oauth2/token/initiate/{}",
-        state.base_url, session_key_hash
+    state.pending_store.insert_pending(
+        &session_key,
+        challenge.code_verifier,
+        challenge.state,
+        challenge.authorization_url,
     );
-    let token_url = format!("{}/oauth2/token/{}", state.base_url, session_key);
+
+    let initiate_url = format!("{}/oauth2/token/initiate/{}", state.base_url, session_key);
+    let token_url = format!("{}/oauth2/token/{}", state.base_url, auth_id);
 
     let www_authenticate =
         format!("Bearer x_redirect_server=\"{initiate_url}\", x_token_server=\"{token_url}\"");
 
-    Ok((session_key, www_authenticate))
+    Ok((auth_id, www_authenticate))
 }
 
 /// GET /oauth2/token/initiate/{auth_id_hash}
-/// Redirects the user's browser to the IdP's authorization endpoint.
+/// Redirects the user's browser to the IdP authorization URL of the pending
+/// session issued in the 401 challenge. Unknown or already-used hash -> 404.
 pub async fn initiate_handler(
     State(state): State<Arc<OAuth2State>>,
-    Path(_auth_id_hash): Path<String>,
+    Path(auth_id_hash): Path<String>,
 ) -> Response {
-    match state.auth_code_service.start_challenge().await {
-        Ok(challenge) => {
-            // Key by `state` so the callback can both locate and CSRF-verify the
-            // session (the IdP echoes back only `state`).
-            state.pending_store.insert_pending(
-                &challenge.state.clone(),
-                challenge.code_verifier,
-                challenge.state,
-            );
-            Redirect::temporary(&challenge.authorization_url).into_response()
-        }
-        Err(e) => {
-            warn!(error = %e, "Failed to generate authorization URL");
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response()
-        }
+    match state.pending_store.poll(&auth_id_hash) {
+        Some(PendingAuth::AwaitingCallback {
+            authorization_url, ..
+        }) => Redirect::temporary(&authorization_url).into_response(),
+        _ => (StatusCode::NOT_FOUND, "Auth session not found or expired").into_response(),
     }
 }
 
@@ -172,19 +172,25 @@ pub enum TokenPollResponse {
 }
 
 /// GET /oauth2/token/{auth_id} — polled by the Trino JDBC driver.
+/// A completed session is consumed on first read (one-shot), so the token
+/// cannot be fetched again even by a party that later learns `auth_id`.
 pub async fn poll_token_handler(
     State(state): State<Arc<OAuth2State>>,
     Path(auth_id): Path<String>,
 ) -> Response {
-    match state.pending_store.poll(&auth_id) {
+    let key = poll_key(&auth_id);
+    match state.pending_store.poll(&key) {
         Some(PendingAuth::AwaitingCallback { .. }) => {
             let next_uri = format!("{}/oauth2/token/{}", state.base_url, auth_id);
             Json(TokenPollResponse::Pending { next_uri }).into_response()
         }
-        Some(PendingAuth::Complete(tokens)) => Json(TokenPollResponse::Complete {
-            token: tokens.access_token,
-        })
-        .into_response(),
+        Some(PendingAuth::Complete(tokens)) => {
+            state.pending_store.remove(&key);
+            Json(TokenPollResponse::Complete {
+                token: tokens.access_token,
+            })
+            .into_response()
+        }
         Some(PendingAuth::Failed(msg)) => {
             Json(TokenPollResponse::Error { error: msg }).into_response()
         }
@@ -197,7 +203,7 @@ pub async fn delete_token_handler(
     State(state): State<Arc<OAuth2State>>,
     Path(auth_id): Path<String>,
 ) -> StatusCode {
-    state.pending_store.remove(&auth_id);
+    state.pending_store.remove(&poll_key(&auth_id));
     StatusCode::NO_CONTENT
 }
 
@@ -252,7 +258,12 @@ mod tests {
     #[test]
     fn pending_store_lifecycle() {
         let store = PendingAuthStore::new(Duration::from_secs(60));
-        store.insert_pending("test-id", "verifier".to_string(), "state".to_string());
+        store.insert_pending(
+            "test-id",
+            "verifier".to_string(),
+            "state".to_string(),
+            String::new(),
+        );
 
         assert!(matches!(
             store.poll("test-id"),
@@ -286,6 +297,7 @@ mod tests {
             "good-state",
             "verifier-1".to_string(),
             "good-state".to_string(),
+            String::new(),
         );
 
         let result = verify_state_and_take_verifier(&store, "good-state");
@@ -302,6 +314,7 @@ mod tests {
             "lookup-key",
             "verifier-2".to_string(),
             "real-state".to_string(),
+            String::new(),
         );
 
         let result = verify_state_and_take_verifier(&store, "lookup-key");
@@ -315,10 +328,80 @@ mod tests {
             "good-state",
             "verifier-3".to_string(),
             "good-state".to_string(),
+            String::new(),
         );
 
         // An attacker-supplied state that was never issued misses the store.
         let result = verify_state_and_take_verifier(&store, "forged-state");
         assert!(result.is_err(), "unknown state must be rejected");
+    }
+
+    /// #709: the browser sees only `state == poll_key(auth_id)`; that value
+    /// must serve `initiate` but never the token. The client-held `auth_id`
+    /// fetches the token exactly once.
+    #[tokio::test]
+    async fn browser_visible_state_initiates_but_cannot_poll_and_token_is_one_shot() {
+        use sqe_auth::oidc_discovery::{OidcDiscovery, OidcDiscoveryConfig};
+
+        let discovery = Arc::new(
+            OidcDiscovery::new(OidcDiscoveryConfig {
+                issuer: "http://127.0.0.1:1".to_string(),
+                authorization_endpoint_override: None,
+                token_endpoint_override: None,
+                accept_invalid_certs: false,
+            })
+            .unwrap(),
+        );
+        let state = Arc::new(OAuth2State {
+            auth_code_service: Arc::new(AuthCodeService::new(
+                discovery,
+                "cid",
+                None,
+                "http://sqe/oauth2/callback",
+                vec![],
+            )),
+            pending_store: Arc::new(PendingAuthStore::new(Duration::from_secs(60))),
+            base_url: "http://sqe:8080".to_string(),
+        });
+
+        let auth_id = "client-only-auth-id";
+        let key = poll_key(auth_id);
+        state.pending_store.insert_pending(
+            &key,
+            "verifier".to_string(),
+            key.clone(),
+            "http://idp/authorize?state=x".to_string(),
+        );
+
+        // Browser-visible hash drives the redirect...
+        let resp = initiate_handler(State(state.clone()), Path(key.clone())).await;
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            resp.headers().get("location").unwrap(),
+            "http://idp/authorize?state=x"
+        );
+        // ...and an unknown hash does not mint a fresh session.
+        let resp = initiate_handler(State(state.clone()), Path("nope".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        state.pending_store.complete(
+            &key,
+            sqe_auth::pending_auth::TokenSet {
+                access_token: "at".to_string(),
+                id_token: None,
+                refresh_token: None,
+                expires_in: 3600,
+            },
+        );
+
+        // The browser-visible value cannot fetch the token.
+        let resp = poll_token_handler(State(state.clone()), Path(key.clone())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // The client's auth_id can, exactly once.
+        let resp = poll_token_handler(State(state.clone()), Path(auth_id.to_string())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = poll_token_handler(State(state.clone()), Path(auth_id.to_string())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
