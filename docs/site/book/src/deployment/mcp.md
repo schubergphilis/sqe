@@ -629,8 +629,9 @@ mcp:<tool>:<client name>/<client version>
 The client name and version come from the `clientInfo` the MCP client sends on
 `initialize`. SQE answers `initialize` with an `Mcp-Session-Id` header; a
 client that echoes it on later requests gets that label on every call. The id
-is advisory. An unknown id, one from before a restart, or one issued to a
-different identity is ignored, never rejected, and the label falls back to the
+is advisory. An unknown id, one from before a restart, one issued to a
+different identity, or one presented from a different client address than it
+was issued to is ignored, never rejected, and the label falls back to the
 request's `User-Agent`, then to the bare `mcp:<tool>` form. Labels are reduced
 to printable ASCII and cut at 64 bytes before they reach a log line.
 
