@@ -30,7 +30,7 @@ use tracing::{debug, info_span, warn, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::types::{ErrorResponse, TokenResponse};
-use crate::{GCP_CLOUD_PLATFORM_SCOPE, RestCatalogConfig};
+use crate::{RestCatalogConfig, GCP_CLOUD_PLATFORM_SCOPE};
 
 pub(crate) struct HttpClient {
     client: Client,
@@ -99,10 +99,9 @@ impl HttpClient {
         // Track whether the caller intends this client to be
         // authenticated. Used by [`authenticate`] to refuse silent
         // unauthenticated requests if the live token is later lost.
-        let auth_required =
-            token.as_deref().is_some_and(|t| !t.is_empty())
-                || credential.is_some()
-                || gcp_credential.is_some();
+        let auth_required = token.as_deref().is_some_and(|t| !t.is_empty())
+            || credential.is_some()
+            || gcp_credential.is_some();
         Ok(HttpClient {
             client: cfg.client().unwrap_or_default(),
             token: Mutex::new(token),
@@ -145,9 +144,7 @@ impl HttpClient {
         // Surface it here so the failure points at the merge boundary,
         // not the request site, and includes operator-actionable text.
         let saved_user_token = self.token.into_inner();
-        let user_had_token = saved_user_token
-            .as_deref()
-            .is_some_and(|t| !t.is_empty());
+        let user_had_token = saved_user_token.as_deref().is_some_and(|t| !t.is_empty());
         let cfg_token = cfg.token();
         let server_clobbered_with_empty =
             user_had_token && matches!(cfg_token.as_deref(), Some(""));
@@ -177,6 +174,9 @@ impl HttpClient {
             || merged_token.as_deref().is_some_and(|t| !t.is_empty())
             || merged_credential.is_some()
             || merged_gcp.is_some();
+        #[cfg(feature = "aws-sigv4")]
+        let bearer_bound =
+            merged_token.as_deref().is_some_and(|t| !t.is_empty()) || merged_credential.is_some();
 
         Ok(HttpClient {
             client: cfg.client().unwrap_or(self.client),
@@ -200,8 +200,20 @@ impl HttpClient {
             // `/v1/config` response, which lands here through
             // `merge_with_config`. Rebuild the signer once we have
             // the merged props.
+            //
+            // Never for a bearer-bound client, though: a server that
+            // advertises `rest.sigv4-enabled` would otherwise swap the
+            // caller's per-user token for the process's AWS identity on
+            // every following request (confused deputy). Only a signer
+            // the user config itself asked for survives alongside a
+            // bearer; the server-advertised one is dropped and the
+            // bearer stays on the wire.
             #[cfg(feature = "aws-sigv4")]
-            sigv4_signer: build_sigv4_signer(cfg).or(self.sigv4_signer),
+            sigv4_signer: if bearer_bound {
+                self.sigv4_signer
+            } else {
+                build_sigv4_signer(cfg).or(self.sigv4_signer)
+            },
             auth_required,
         })
     }
@@ -504,10 +516,7 @@ impl HttpClient {
             match self.client.execute(request).await {
                 Ok(response) => {
                     let status = response.status();
-                    tracing::Span::current().record(
-                        "http.response.status_code",
-                        status.as_u16(),
-                    );
+                    tracing::Span::current().record("http.response.status_code", status.as_u16());
                     if status.is_client_error() || status.is_server_error() {
                         tracing::Span::current().record("error.type", "http_status");
                         tracing::Span::current().record("otel.status_code", "ERROR");
@@ -857,5 +866,45 @@ mod tests {
 
         let live = updated.token.lock().await;
         assert_eq!(live.as_deref(), Some("server-issued-token"));
+    }
+
+    /// Issue 748: a `/v1/config` that advertises `rest.sigv4-enabled`
+    /// must not swap a per-user bearer for the process's AWS identity.
+    #[cfg(feature = "aws-sigv4")]
+    #[test]
+    fn server_advertised_sigv4_does_not_replace_a_bearer() {
+        let sigv4_props = |token: Option<&str>| {
+            let mut props = HashMap::new();
+            props.insert("rest.sigv4-enabled".to_string(), "true".to_string());
+            props.insert("rest.signing-name".to_string(), "glue".to_string());
+            props.insert(
+                "rest.signing-region".to_string(),
+                "eu-central-1".to_string(),
+            );
+            if let Some(t) = token {
+                props.insert("token".to_string(), t.to_string());
+            }
+            RestCatalogConfig::builder()
+                .uri("http://localhost:8181".to_string())
+                .props(props)
+                .build()
+        };
+
+        // Bearer-bound client, server turns SigV4 on: the bearer wins.
+        let bearer = HttpClient::new(&config_with_token(Some("user-bearer")))
+            .unwrap()
+            .update_with(&sigv4_props(Some("user-bearer")))
+            .unwrap();
+        assert!(
+            bearer.sigv4_signer.is_none(),
+            "server-advertised SigV4 replaced a bearer"
+        );
+
+        // No bearer anywhere (auth = aws): the advertised signer is adopted.
+        let anonymous = HttpClient::new(&config_with_token(None))
+            .unwrap()
+            .update_with(&sigv4_props(None))
+            .unwrap();
+        assert!(anonymous.sigv4_signer.is_some());
     }
 }
