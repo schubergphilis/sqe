@@ -33,12 +33,25 @@ struct CoordinatorMcpExecutor {
     metadata_rate_limiter: Arc<MetadataRateLimiter>,
 }
 
-/// The `[[hive.roots]]` catalog names, which the MCP change tool treats as
-/// engine-credential targets (see `McpConfig::write_catalogs`). Session
-/// `ATTACH`ed Hive catalogs cannot exist over MCP: a session there lives for
-/// one request.
-pub fn hive_root_names(config: &sqe_core::config::SqeConfig) -> Vec<String> {
-    config.hive.roots.iter().map(|root| root.name.clone()).collect()
+/// Catalog names the MCP change tool treats as engine-credential targets
+/// (see `McpConfig::write_catalogs`): every `[[hive.roots]]` entry, plus any
+/// configured catalog that does not carry the caller's own bearer to the
+/// catalog, i.e. a non-REST backend (Glue, HMS, JDBC, S3 Tables) or a REST
+/// catalog whose `auth` is static, client-credentials, anonymous or AWS
+/// (#718). A write there runs as the coordinator, so it needs an explicit
+/// opt-in. Session `ATTACH`ed catalogs cannot exist over MCP: a session there
+/// lives for one request.
+pub fn engine_credential_catalog_names(config: &sqe_core::config::SqeConfig) -> Vec<String> {
+    use sqe_core::config::{CatalogAuthConfig, CatalogBackend};
+    let mut names: Vec<String> = config.hive.roots.iter().map(|root| root.name.clone()).collect();
+    for (name, catalog) in config.flattened_catalogs() {
+        let per_user_rest = matches!(catalog.backend, CatalogBackend::Rest)
+            && matches!(catalog.auth, None | Some(CatalogAuthConfig::SessionBearer));
+        if !per_user_rest {
+            names.push(name);
+        }
+    }
+    names
 }
 
 /// `auth` is the coordinator's provider chain, already wrapped in the
@@ -396,4 +409,41 @@ where
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqe_core::config::{CatalogAuthConfig, CatalogBackend, SqeConfig};
+
+    #[test]
+    fn engine_credential_catalogs_are_named_per_user_rest_is_not() {
+        let mut config: SqeConfig = toml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/sqe-test.toml"
+        )))
+        .expect("example config parses");
+        config.hive.roots.clear();
+        config.catalogs.clear();
+        let mut polaris = config.catalog.clone();
+        polaris.backend = CatalogBackend::Rest;
+        polaris.auth = None;
+        let mut static_rest = polaris.clone();
+        static_rest.auth = Some(CatalogAuthConfig::Static {
+            token: "t".to_string(),
+        });
+        let mut glue = polaris.clone();
+        glue.backend = CatalogBackend::Glue {
+            region: "eu-central-1".to_string(),
+            warehouse: String::new(),
+            endpoint: None,
+        };
+        config.catalogs.insert("polaris".to_string(), polaris);
+        config.catalogs.insert("partner".to_string(), static_rest);
+        config.catalogs.insert("glue".to_string(), glue);
+
+        let mut names = engine_credential_catalog_names(&config);
+        names.sort();
+        assert_eq!(names, vec!["glue".to_string(), "partner".to_string()]);
+    }
 }

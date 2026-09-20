@@ -76,6 +76,8 @@ async fn compact_file_group_against_live_s3() {
     };
 
     let request = CompactGroupRequest {
+        audience: String::new(),
+        expires_at: 0,
         job_id: "protocol-live".to_string(),
         group_id: 0,
         table_ident: "protocol.live.table".to_string(),

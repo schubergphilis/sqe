@@ -620,6 +620,8 @@ mod tests {
 
     fn sample_request(group_file_paths: Vec<String>, snapshot_id: i64) -> CompactGroupRequest {
         CompactGroupRequest {
+            audience: String::new(),
+            expires_at: 0,
             job_id: "job-1".to_string(),
             group_id: 0,
             table_ident: "catalog.ns.tbl".to_string(),

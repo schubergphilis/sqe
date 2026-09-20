@@ -116,15 +116,18 @@ pub const PRODUCTION_RULES: &[ProductionRule] = &[
     },
     ProductionRule {
         name: "worker-secret-required",
-        summary: "`coordinator.worker_urls` with an empty `coordinator.worker_secret` and `allow_unauthenticated_workers = true` is refused (any TCP-reachable client may register as a worker).",
+        summary: "An empty `coordinator.worker_secret` with `allow_unauthenticated_workers = true` is refused regardless of `worker_urls` (the waiver alone makes heartbeat discovery live, so any TCP-reachable client may register as a worker; #719).",
         check: |c| {
-            (!c.coordinator.worker_urls.is_empty()
-                && c.coordinator.worker_secret.is_empty()
-                && c.coordinator.allow_unauthenticated_workers)
+            // #719: `distributed_enabled` (sqe-server) and
+            // `mode::warns_unauthenticated_workers` both treat the waiver alone
+            // as live heartbeat discovery, so this rule must not key off
+            // `worker_urls`.
+            (c.coordinator.worker_secret.is_empty() && c.coordinator.allow_unauthenticated_workers)
                 .then(|| {
-                    "production_mode: coordinator.worker_urls is set with an empty \
-                     coordinator.worker_secret and coordinator.allow_unauthenticated_workers \
-                     = true (any TCP-reachable client may register as a worker)"
+                    "production_mode: coordinator.worker_secret is empty with \
+                     coordinator.allow_unauthenticated_workers = true (heartbeat discovery \
+                     is live on the waiver alone, so any TCP-reachable client may register \
+                     as a worker and receive user bearer tokens)"
                         .to_string()
                 })
         },

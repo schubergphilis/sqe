@@ -124,6 +124,9 @@ fn build_compact_request(
     s3: &S3Conn,
 ) -> CompactGroupRequest {
     CompactGroupRequest {
+        // Bound per dispatch attempt in `dispatch_group_to_worker` (#730).
+        audience: String::new(),
+        expires_at: 0,
         job_id: job_id.to_string(),
         group_id,
         table_ident: table_ident.to_string(),
@@ -195,6 +198,13 @@ async fn dispatch_group_to_worker(
     group_timeout: Duration,
     heartbeat_timeout: Duration,
 ) -> Result<CompactGroupResponse, DispatchError> {
+    // #730: bind the request to this worker and to a deadline before
+    // signing, like scan tickets (601), so a captured request cannot be
+    // replayed to another worker or later. The deadline is the call's own
+    // end-to-end bound: nothing legitimately arrives after it.
+    let mut request = request.clone();
+    request.audience = worker_url.to_string();
+    request.expires_at = chrono::Utc::now().timestamp() + group_timeout.as_secs() as i64;
     let body = request.to_bytes().map_err(|e| {
         DispatchError::application(format!("failed to encode CompactGroupRequest: {e}"))
     })?;
