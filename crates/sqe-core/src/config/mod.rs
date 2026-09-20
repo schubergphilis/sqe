@@ -10487,26 +10487,15 @@ warehouse = "wh"
     fn mcp_ranger_okta_quickstart_env_contract_loads() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let vars = [
-            ("SQE_AUTH__PROVIDERS__1__ISSUER", "https://dev-1.okta.com/oauth2/aus1"),
-            ("SQE_AUTH__PROVIDERS__1__JWKS_URL", "https://dev-1.okta.com/oauth2/aus1/v1/keys"),
-            ("SQE_AUTH__PROVIDERS__1__AUDIENCE", "http://localhost:19092/mcp"),
+            ("SQE_AUTH__PROVIDERS__0__ISSUER", "https://dev-1.okta.com/oauth2/aus1"),
+            ("SQE_AUTH__PROVIDERS__0__JWKS_URL", "https://dev-1.okta.com/oauth2/aus1/v1/keys"),
+            ("SQE_AUTH__PROVIDERS__0__AUDIENCE", "http://localhost:19092/mcp"),
             ("SQE_MCP__AUTHORIZATION_SERVERS__0", "https://dev-1.okta.com/oauth2/aus1"),
             ("SQE_MCP__RESOURCE_URI", "http://localhost:19092/mcp"),
             ("SQE_MCP__ALLOW_WRITES", "false"),
-            ("SQE_CATALOGS__SALES_WH__POLARIS_URL", "http://p:8181/api/catalog"),
-            ("SQE_CATALOGS__SALES_WH__WAREHOUSE", "sales_wh"),
-            ("SQE_CATALOGS__OPS_WH__POLARIS_URL", "http://p:8181/api/catalog"),
-            ("SQE_CATALOGS__OPS_WH__WAREHOUSE", "ops2"),
-            ("SQE_CATALOG__POLARIS_URL", "http://p:8181/api/catalog"),
-            ("SQE_CATALOG__WAREHOUSE", "sales_wh"),
-            ("SQE_STORAGE__S3_ENDPOINT", "http://s3:9000"),
-            ("SQE_STORAGE__S3_REGION", "us-east-1"),
-            ("SQE_STORAGE__S3_ACCESS_KEY", "k"),
-            ("SQE_STORAGE__S3_SECRET_KEY", "s"),
+            ("SQE_STORAGE__S3_REGION", "eu-west-1"),
             ("SQE_POLICY__RANGER__URL", "http://ranger:6080"),
             ("SQE_POLICY__RANGER__ADMIN_PASSWORD", "pw"),
-            ("SQE_ACCESS_CONTROL__URL", "http://ranger:6080"),
-            ("SQE_ACCESS_CONTROL__RANGER__ADMIN_PASSWORD", "pw"),
         ];
         for (k, v) in vars {
             std::env::set_var(k, v);
@@ -10519,13 +10508,19 @@ warehouse = "wh"
         }
         let config = loaded.unwrap_or_else(|e| panic!("mcp-ranger-okta sqe.toml failed to load: {e}"));
         assert_eq!(config.mcp.authorization_servers, ["https://dev-1.okta.com/oauth2/aus1"]);
-        assert_eq!(config.catalogs["ops_wh"].warehouse, "ops2");
-        match &config.auth.providers[1] {
-            AuthProviderConfig::BearerToken { issuer, audience, .. } => {
+        assert!(config.hive.roots.is_empty(), "the Glue root comes from --glue-catalog");
+        assert!(
+            config.flattened_catalogs().is_empty(),
+            "no Iceberg catalog: a placeholder URL becomes the default catalog and breaks every SQL session"
+        );
+        assert_eq!(config.storage.s3_region, "eu-west-1");
+        match &config.auth.providers[0] {
+            AuthProviderConfig::BearerToken { issuer, audience, roles_claim, .. } => {
                 assert_eq!(issuer.as_deref(), Some("https://dev-1.okta.com/oauth2/aus1"));
                 assert_eq!(audience.as_deref(), Some("http://localhost:19092/mcp"));
+                assert_eq!(roles_claim, "groups");
             }
-            other => panic!("provider 1 should be Okta bearer_token, got {other:?}"),
+            other => panic!("provider 0 should be Okta bearer_token, got {other:?}"),
         }
     }
 }

@@ -94,6 +94,45 @@ invisible to every health check but the one on this port, and was seen on a
 laptop deployment after an idle hour. See
 [Observability](../features/observability.md#health-endpoints).
 
+## Okta as the authorization server
+
+Any provider that publishes discovery metadata and signs JWTs works; Okta needs
+three decisions that are easy to get wrong.
+
+- Use a **custom authorization server** (Security > API > Authorization
+  Servers), not the org server. The org server issues opaque access tokens SQE
+  cannot verify. Its issuer is `https://<org>.okta.com/oauth2/<server id>`
+  and that is the value for `authorization_servers` and `issuer`.
+- Set the server **audience** to `mcp.resource_uri`, define the scopes
+  `sqe:mcp:read` (default) and `sqe:mcp:write`, and add a `groups` claim on
+  the **access token** (value type Groups, regex filter). SQE reads the user
+  from `sub` and roles and groups from that claim.
+- Give the app an **access policy** whose rule allows the Authorization Code
+  grant. Without the policy Okta answers `access_denied` after login; with a
+  rule that lists only Device Authorization the browser shows "You are not
+  allowed to access this app" and the System Log says `no_matching_policy`.
+
+The app itself is a native, public client: Authorization Code + PKCE, no
+secret, sign-in redirect on the loopback port the MCP client listens on
+(`http://localhost:8400/callback` for the quickstart). Okta rejects anonymous
+dynamic client registration, so the client id is handed to the client
+(`claude mcp add --client-id ... --callback-port 8400`, or `oauth.clientId` in
+`.mcp.json`). The client id is not a secret.
+
+```toml
+[[auth.providers]]
+type = "bearer_token"
+jwks_url = "https://<org>.okta.com/oauth2/<server id>/v1/keys"
+issuer = "https://<org>.okta.com/oauth2/<server id>"
+audience = "http://localhost:19092/mcp"   # = mcp.resource_uri
+user_claim = "sub"
+roles_claim = "groups"
+groups_claim = "groups"
+```
+
+The runnable version, with the Okta objects as Terraform, is
+[MCP with Ranger and Okta on external data](../quickstart/mcp-ranger-okta.md).
+
 ## Deployments with no identity provider
 
 The section above assumes every caller carries a user token. A catalog reached
