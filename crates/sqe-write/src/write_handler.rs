@@ -1940,6 +1940,9 @@ impl WriteHandler {
             *plan_out = Some(sqe_lineage::PlanOrHint::Plan(Box::new(wrapper)));
         }
 
+        let stream = self
+            .with_check_guard(session, ctx, &table_ident, &table, stream)
+            .await?;
         let (stream, sketch_acc) = tap_stream_for_puffin_sketches(&table, stream);
 
         let tracker = new_upload_tracker();
@@ -2295,6 +2298,12 @@ impl WriteHandler {
         let stream: datafusion::execution::SendableRecordBatchStream = Box::pin(
             RecordBatchStreamAdapter::new(arrow_schema, Box::pin(mapped)),
         );
+        // DoPut has no session SessionContext; a bare one evaluates the
+        // target's row filter over each uploaded batch (#729). A filter that
+        // needs another table fails closed here rather than being skipped.
+        let stream = self
+            .with_check_guard(session, &DFSessionContext::new(), &table_ident, &table, stream)
+            .await?;
 
         let tracker = new_upload_tracker();
         let cleanup_guard =
@@ -2414,7 +2423,7 @@ impl WriteHandler {
             .map(|w| format!("{w}"))
             .unwrap_or_else(|| "TRUE".to_string());
         let (where_sql, joins_sql, _in_subq_guard) =
-            self.lift_in_subqueries(&raw_where, ctx).await?;
+            self.lift_in_subqueries(session, &raw_where, ctx).await?;
 
         // Partition-pruned CoW under optimistic-concurrency retry: each attempt
         // re-reads the snapshot, rewrites only data files whose partition could
@@ -2634,7 +2643,7 @@ impl WriteHandler {
         // Lift any `IN (subquery)` expressions; see `handle_delete` for details.
         // The guard must outlive the per-batch loop below.
         let (where_sql, joins_sql, _in_subq_guard) =
-            self.lift_in_subqueries(&raw_where, ctx).await?;
+            self.lift_in_subqueries(session, &raw_where, ctx).await?;
         info!(
             table = %table_ident,
             file_count = old_data_files.len(),
@@ -2909,7 +2918,7 @@ impl WriteHandler {
             .map(|w| format!("{w}"))
             .unwrap_or_else(|| "TRUE".to_string());
         let (where_sql, joins_sql, _in_subq_guard) =
-            self.lift_in_subqueries(&raw_where, ctx).await?;
+            self.lift_in_subqueries(session, &raw_where, ctx).await?;
         info!(
             table = %table_ident,
             file_count = old_data_files.len(),
@@ -3176,7 +3185,7 @@ impl WriteHandler {
         // Lift any `IN (subquery)` expressions; see `handle_delete` for details.
         // The guard must outlive every rewrite below.
         let (where_sql, joins_sql, _in_subq_guard) =
-            self.lift_in_subqueries(&raw_where, ctx).await?;
+            self.lift_in_subqueries(session, &raw_where, ctx).await?;
 
         // Partition-pruned CoW under optimistic-concurrency retry. Each attempt
         // re-reads the current snapshot, rewrites only the data files whose
@@ -3494,7 +3503,7 @@ impl WriteHandler {
             .map(|w| format!("{w}"))
             .unwrap_or_else(|| "TRUE".to_string());
         let (where_sql, joins_sql, _in_subq_guard) =
-            self.lift_in_subqueries(&raw_where, ctx).await?;
+            self.lift_in_subqueries(session, &raw_where, ctx).await?;
 
         info!(
             table = %table_ident,
@@ -5829,11 +5838,125 @@ impl WriteHandler {
     /// strict SQL `IN`/`NOT IN` semantics in the presence of NULLs.
     async fn lift_in_subqueries(
         &self,
+        session: &Session,
         where_sql: &str,
         ctx: &DFSessionContext,
     ) -> sqe_core::Result<(String, String, InSubqueryCleanup)> {
-        lift_in_subqueries(where_sql, ctx).await
+        // #731: the keyset materialiser is a SELECT the user wrote; run it
+        // through the same enforcer as INSERT/MERGE sources so a row filter
+        // on the subquery's table cannot be probed via DELETE ... WHERE IN.
+        let enforce = self
+            .policy_enforcer
+            .as_deref()
+            .map(|enf| (enf, &session.user));
+        lift_in_subqueries_enforced(where_sql, ctx, enforce).await
     }
+
+    /// PostgreSQL RLS `WITH CHECK` for appends (#729): a caller whose SELECT
+    /// on `table` is row-filtered may not insert rows that filter would hide,
+    /// nor non-NULL values into a column restricted (nullified) for them.
+    /// Wraps `stream` so the first offending batch fails the statement before
+    /// anything is committed. No enforcer or no target policy: pass-through.
+    async fn with_check_guard(
+        &self,
+        session: &Session,
+        ctx: &DFSessionContext,
+        table_ident: &TableIdent,
+        table: &IcebergTable,
+        stream: datafusion::execution::SendableRecordBatchStream,
+    ) -> sqe_core::Result<datafusion::execution::SendableRecordBatchStream> {
+        if self.policy_enforcer.is_none() {
+            return Ok(stream);
+        }
+        let target_schema = Arc::new(
+            iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).map_err(
+                |e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to derive target Arrow schema: {e}")),
+            )?,
+        );
+        let predicates = self
+            .compute_write_predicates(session, table_ident, target_schema, &mut None)
+            .await?;
+        if predicates.is_empty() {
+            return Ok(stream);
+        }
+        let shared = Arc::new((ctx.clone(), table_ident.clone(), predicates));
+        let schema = stream.schema();
+        let checked = stream.and_then(move |batch| {
+            let shared = shared.clone();
+            async move {
+                let (ctx, ident, predicates) = &*shared;
+                check_batch_within_policy(ctx, &batch, ident, predicates)
+                    .await
+                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+                Ok(batch)
+            }
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, checked)))
+    }
+}
+
+/// Refuse `batch` if any row falls outside the caller's row filter on the
+/// target, or sets a restricted (nullified) column to a non-NULL value.
+/// Row-filter evaluation reuses the DML scratch-table evaluator; the filter
+/// runs over the RAW incoming values (masks do not gate writes, as in
+/// PostgreSQL).
+async fn check_batch_within_policy(
+    ctx: &DFSessionContext,
+    batch: &RecordBatch,
+    table_ident: &TableIdent,
+    predicates: &sqe_policy::write_predicates::WritePolicyPredicates,
+) -> sqe_core::Result<()> {
+    use arrow_array::Array as _;
+    use datafusion::arrow::array::Int64Array;
+
+    let denied = |what: String| {
+        SqeError::with_code(
+            SqeErrorCode::AccessDenied,
+            format!("write to {table_ident} violates row-level security policy: {what}"),
+        )
+    };
+
+    for (col, mask_sql) in &predicates.column_mask_sqls {
+        let upper = mask_sql.trim().to_ascii_uppercase();
+        let is_nullify = upper == "NULL" || upper.starts_with("CAST(NULL ");
+        if !is_nullify {
+            continue;
+        }
+        if let Some(array) = batch.column_by_name(col) {
+            if array.null_count() < array.len() {
+                return Err(denied(format!("column `{col}` is restricted for this user")));
+            }
+        }
+    }
+
+    let Some(rf) = &predicates.row_filter_sql else {
+        return Ok(());
+    };
+    let scratch = ScratchTable::register(ctx, batch)?;
+    let eval_sql = format!(
+        "SELECT CAST(COUNT(*) AS BIGINT) FROM {scratch} AS \"{name}\" \
+         WHERE NOT COALESCE(CAST(({rf}) AS BOOLEAN), FALSE)",
+        scratch = scratch.qualified(),
+        name = table_ident.name(),
+    );
+    let batches = ctx
+        .sql(&eval_sql)
+        .await
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("WITH CHECK evaluation failed: {e}")))?
+        .collect()
+        .await
+        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("WITH CHECK evaluation failed: {e}")))?;
+    drop(scratch);
+    let outside = batches
+        .first()
+        .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
+        .filter(|a| a.len() == 1)
+        .map(|a| a.value(0))
+        .unwrap_or(0);
+    if outside > 0 {
+        return Err(denied(format!("{outside} row(s) fall outside the caller's row filter")));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -5851,6 +5974,16 @@ impl WriteHandler {
 pub async fn lift_in_subqueries(
     where_sql: &str,
     ctx: &DFSessionContext,
+) -> sqe_core::Result<(String, String, InSubqueryCleanup)> {
+    lift_in_subqueries_enforced(where_sql, ctx, None).await
+}
+
+/// [`lift_in_subqueries`] with the keyset SELECT run through `enforce`
+/// (enforcer + user) before it is materialised (#731).
+async fn lift_in_subqueries_enforced(
+    where_sql: &str,
+    ctx: &DFSessionContext,
+    enforce: Option<(&dyn sqe_policy::PolicyEnforcer, &sqe_core::SessionUser)>,
 ) -> sqe_core::Result<(String, String, InSubqueryCleanup)> {
     use datafusion::datasource::MemTable;
     use sqlparser::ast::SetExpr;
@@ -5997,9 +6130,17 @@ pub async fn lift_in_subqueries(
         // data; every LEFT JOIN lookup misses and `COALESCE(..., FALSE)`
         // evaluates to FALSE — i.e. `IN (empty)` is FALSE and `NOT IN
         // (empty)` is TRUE, matching the old rewriter's behaviour).
-        let mat_df = ctx.sql(&materialiser_sql).await.map_err(|e| {
+        let mut mat_df = ctx.sql(&materialiser_sql).await.map_err(|e| {
             SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("IN-subquery materialiser plan failed: {e}"))
         })?;
+        // #731: the subquery is user SQL over policy-governed tables; apply
+        // row filters / masks / restrictions exactly as a SELECT would.
+        if let Some((enf, user)) = enforce {
+            let (enforced, _summary) = enf.evaluate(user, mat_df.logical_plan().clone()).await?;
+            mat_df = ctx.execute_logical_plan(enforced).await.map_err(|e| {
+                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("IN-subquery materialiser policy plan failed: {e}"))
+            })?;
+        }
         let schema: Arc<ArrowSchema> = Arc::new(mat_df.schema().as_arrow().clone());
         let batches = mat_df.collect().await.map_err(|e| {
             SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("IN-subquery materialiser execution failed: {e}"))
@@ -9461,6 +9602,75 @@ s3_path_style = true
         for i in 0..regions.len() {
             assert_eq!(regions.value(i), "US", "EU rows must not survive");
         }
+    }
+
+    // #729: appends honour the target row filter / restricted columns
+    // (PostgreSQL RLS WITH CHECK) instead of only the source SELECT.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_check_refuses_rows_outside_row_filter_and_restricted_values() {
+        use datafusion::logical_expr::{col, lit};
+        let (handler, session, table_ident, ctx) = employees_handler_with_policy(
+            Some(col("region").eq(lit("EU"))),
+            vec![("ssn", sqe_policy::MaskType::Nullify)],
+        )
+        .await;
+        let predicates = compute_predicates_for_employees(&handler, &session, &table_ident).await;
+
+        // Mixed EU/US batch with plaintext ssn: refused (restricted column set).
+        let err = check_batch_within_policy(&ctx, &make_employee_batch(), &table_ident, &predicates)
+            .await
+            .expect_err("non-NULL restricted column must be refused");
+        assert!(err.to_string().contains("restricted"), "{err}");
+
+        // NULL ssn, but a US row: refused by the row filter.
+        let batch = make_employee_batch();
+        let ssn_null = Arc::new(arrow_array::StringArray::from(vec![None::<&str>; 4]));
+        let mixed = arrow_array::RecordBatch::try_new(
+            batch.schema(),
+            vec![batch.column(0).clone(), ssn_null.clone(), batch.column(2).clone()],
+        )
+        .unwrap();
+        let err = check_batch_within_policy(&ctx, &mixed, &table_ident, &predicates)
+            .await
+            .expect_err("rows outside the row filter must be refused");
+        assert!(err.to_string().contains("2 row(s) fall outside"), "{err}");
+
+        // All EU, NULL ssn: admitted.
+        let eu_only = arrow::compute::filter_record_batch(
+            &mixed,
+            &arrow_array::BooleanArray::from(vec![true, false, true, false]),
+        )
+        .unwrap();
+        check_batch_within_policy(&ctx, &eu_only, &table_ident, &predicates)
+            .await
+            .expect("visible rows are admitted");
+    }
+
+    // #731: the IN-subquery keyset SELECT goes through the enforcer, so a
+    // DELETE/UPDATE ... WHERE id IN (SELECT ...) only sees the caller's rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_subquery_lift_applies_row_filter_to_keyset() {
+        use datafusion::logical_expr::{col, lit};
+        let (handler, session, _table_ident, ctx) =
+            employees_handler_with_policy(Some(col("region").eq(lit("EU"))), vec![]).await;
+        ctx.register_batch("employees", make_employee_batch()).unwrap();
+
+        let (where_sql, joins_sql, _guard) = handler
+            .lift_in_subqueries(&session, "id IN (SELECT id FROM employees)", &ctx)
+            .await
+            .unwrap();
+        // The outer scan is deliberately unenforced: only the keyset decides.
+        let rows: usize = ctx
+            .sql(&format!("SELECT id FROM employees{joins_sql} WHERE {where_sql}"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 2, "keyset must contain only the EU ids (1, 3)");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
