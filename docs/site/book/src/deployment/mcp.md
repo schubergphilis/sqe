@@ -212,6 +212,11 @@ callers can reach.
 
 ## Tools
 
+The tool set is fixed per process, so `tools/list` carries the spec's cache
+hints (`ttlMs` of one hour, `cacheScope: public`, SEP-2549). A client that
+honours them lists once per session instead of once per turn; older clients
+ignore the two fields.
+
 Read tools are always available after the `sqe:mcp:read` scope is validated:
 
 - `execute_sql_readonly`
