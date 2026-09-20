@@ -822,7 +822,11 @@ fn classify_execution_error(msg: &str) -> SqeErrorCode {
         SqeErrorCode::TableNotFound
     } else if lower.contains("schema") && lower.contains("not found") {
         SqeErrorCode::SchemaNotFound
-    } else if lower.contains("column") && lower.contains("not found") {
+    } else if (lower.contains("column") && lower.contains("not found"))
+        // DataFusion's own spelling: `Schema error: No field named tag.`
+        // A user's column reference, not an engine fault.
+        || lower.contains("no field named")
+    {
         SqeErrorCode::ColumnNotFound
     } else if lower.contains("invalid function") || lower.contains("no function matches") {
         SqeErrorCode::FunctionNotFound
@@ -1240,6 +1244,14 @@ mod tests {
             "Query execution error: table 'orders' not found in catalog".to_string(),
         );
         assert_eq!(err.error_code(), SqeErrorCode::TableNotFound);
+    }
+
+    #[test]
+    fn error_code_column_not_found_from_datafusion_schema_error() {
+        let err = SqeError::Execution("Schema error: No field named tag. Valid fields are t.id".to_string());
+        let code = err.error_code();
+        assert_eq!(code, SqeErrorCode::ColumnNotFound);
+        assert!(code.is_user_error());
     }
 
     #[test]

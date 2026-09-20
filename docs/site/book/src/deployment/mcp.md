@@ -262,10 +262,12 @@ Read tools are always available after the `sqe:mcp:read` scope is validated:
 - `execute_sql_readonly`
 - `list_catalogs` (plus `diagnostics`: one entry per Hive root the caller
   can see, probed with `SHOW SCHEMAS` under a 5 s bound and reported as
-  `reachable`, `auth_error`, `timeout` or `unreachable` with the error text.
+  `reachable`, `auth_error`, `timeout` or `unreachable` with a `detail`.
   `auth_error` means the engine's own AWS credentials for that root are
-  missing or expired, and the detail names the region; nothing the client
-  does fixes that, so a sidecar can show it as an operator problem. One more
+  missing or expired; nothing the client does fixes that, so a sidecar can
+  show it as an operator problem. The detail is the redacted form described
+  under "Error text" below, so the region and the SSO message are in the
+  server log under the `error_id`, not in the transcript. One more
   entry with `kind: object_store` reports the engine's storage credentials
   themselves: `provider` (`aws-sdk-default-chain`, `static-keys`,
   `static-temporary-keys`), `status` (`ok`, `auth_error`, `unknown` for
@@ -509,6 +511,28 @@ correlation that is not an equality on outer columns, for example
 `WHERE o.pk = s.a AND o.pk <> s.b`; it fails with `Physical plan does not
 support logical expression ScalarSubquery`. Rewrite that as a pre-aggregated
 CTE joined on the key.
+
+## Error text
+
+A tool that fails returns `isError: true` with one text line. What that line
+says depends on who can act on it. A user error (syntax, an unknown table or
+column, a denial, a cancelled query) is about the caller's own statement and
+is returned verbatim, as it is on Flight SQL and Trino. A system error (object
+store, catalog, execution, timeout) is returned as the error class's generic
+sentence plus an `error_id`:
+
+```text
+Storage operation failed [STORAGE_ERROR, error_id 3f9c1a7e2b40]. The server log has the detail under that id.
+```
+
+The full text, which carries bucket names, object keys, hostnames and region or
+account hints, is written to the coordinator log at WARN under that
+`error_id`. An agent transcript is not the place for it. Two system texts stay
+verbatim because the hint in them is the fix: the Arrow decimal overflow (a
+value and a precision, with the pointer at the metastore definition) and a
+rate-limit denial (its retry-after). The `detail` of `list_catalogs`
+diagnostics and the per-table `error` of `describe_schema` follow the same
+rule.
 
 ## Catalog scoping
 
