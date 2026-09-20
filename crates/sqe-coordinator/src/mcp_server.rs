@@ -174,7 +174,10 @@ pub async fn start_mcp_server(
     alive: Arc<AtomicBool>,
     storage: &sqe_core::config::StorageConfig,
 ) -> anyhow::Result<(tokio::task::JoinHandle<()>, SocketAddr)> {
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+    // Loopback by default in anonymous mode, every interface otherwise;
+    // `validate` already rejected an address that does not parse (#671).
+    let ip = config.bind_ip().map_err(anyhow::Error::msg)?;
+    let addr = SocketAddr::new(ip, config.port);
     let app = mcp_router(auth, handler, rate_limiter, config, hive_roots, storage);
     // Bind synchronously up front so both branches can report the port they
     // actually got, and so a bind failure is this call's error, not a log
