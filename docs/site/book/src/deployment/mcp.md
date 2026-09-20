@@ -322,7 +322,10 @@ Read tools are always available after the `sqe:mcp:read` scope is validated:
 `execute_sql_readonly` is enforced with SQE's SQL parser/classifier, not a
 keyword regular expression. Exactly one statement is accepted. DDL, DML,
 maintenance procedures, grants, secrets, and session mutations are rejected
-before reaching the query handler.
+before reaching the query handler. File table functions (`read_parquet`,
+`read_csv`, `read_json`) are refused: they read object-store paths with the
+engine's credentials and skip catalog grants. Query a table name, or use
+`sample_rows`.
 
 `execute_sql_change` is not advertised unless `allow_writes = true`. A call
 then needs all three independent authorizations:
