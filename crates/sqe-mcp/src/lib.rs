@@ -32,6 +32,8 @@ use sqe_core::{
 use sqe_sql::StatementKind;
 
 pub const PROTOCOL_VERSION: &str = "2025-11-25";
+/// How long a client may serve `tools/list` from its cache (one hour).
+pub const TOOLS_LIST_TTL_MS: u64 = 3_600_000;
 
 #[async_trait]
 pub trait QueryExecutor: Send + Sync + 'static {
@@ -483,7 +485,15 @@ async fn mcp_post(
             }))
         }
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tools(&state.config) })),
+        // The tool set is fixed per process (config, not caller), so the
+        // spec's cache hints (SEP-2549, 2026-07-28) tell a client to stop
+        // re-listing on every turn: an hour, cacheable by anyone in between.
+        // Older clients ignore the two fields.
+        "tools/list" => Ok(json!({
+            "tools": tools(&state.config),
+            "ttlMs": TOOLS_LIST_TTL_MS,
+            "cacheScope": "public",
+        })),
         "tools/call" => {
             let client = client_label(&state, &headers, user);
             call_tool(&state, &auth, client.as_deref(), &request.params).await
@@ -2672,6 +2682,37 @@ mod tests {
 
     fn executed(executor: &RecordingExecutor) -> Option<String> {
         executor.4.lock().unwrap().clone()
+    }
+
+    /// The tool set is fixed per process, so `tools/list` tells the client
+    /// to cache it (SEP-2549) and returns the same list every time.
+    #[tokio::test]
+    async fn tools_list_carries_cache_hints_and_is_stable() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let app = router(McpServerState::new(
+            Arc::new(MockAuth),
+            executor,
+            static_config(false),
+        ));
+        let list = || async {
+            let response = send(
+                &app,
+                READ_TOKEN,
+                &[],
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.to_string(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<Value>(&bytes).unwrap()["result"].clone()
+        };
+        let first = list().await;
+        assert_eq!(first["ttlMs"], json!(TOOLS_LIST_TTL_MS));
+        assert_eq!(first["cacheScope"], json!("public"));
+        assert!(!first["tools"].as_array().unwrap().is_empty());
+        assert_eq!(list().await, first, "the list a client caches is the list it would get again");
     }
 
     #[tokio::test]
