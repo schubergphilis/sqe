@@ -210,37 +210,63 @@ impl sqe_mcp::QueryExecutor for CoordinatorMcpExecutor {
         };
         // The denial already carries the code, the knob and the wait.
         self.rate_limiter.check(&key)?;
-        let run = self.handler.execute(session, sql, None);
-        if self.request_timeout.is_zero() {
-            return run.await;
-        }
-        // Past the deadline the future is dropped, which stops the
-        // DataFusion streams and object-store calls under it, and the
-        // handler's guard marks the query abandoned. Before this, an MCP
-        // caller that gave up after ninety seconds and retried left the
-        // first attempt running to the five-minute query timeout beside the
-        // second: four such attempts on two snapshot tables held the
-        // coordinator for half an hour and 1.8 GB.
-        match tokio::time::timeout(self.request_timeout, run).await {
-            Ok(result) => result,
-            Err(_) => Err(SqeError::with_code(
-                SqeErrorCode::ExecutionFailed,
-                format!(
-                    "the statement did not finish within the MCP deadline of {}s and was \
-                     cancelled (mcp.request_timeout_secs); narrow it with a partition \
-                     predicate or a LIMIT, or raise the deadline",
-                    self.request_timeout.as_secs()
-                ),
-            )),
-        }
+        with_deadline(self.request_timeout, self.handler.execute(session, sql, None)).await
     }
 
+    /// Same deadline as `execute` (#738), and at most
+    /// [`METADATA_STATEMENTS_MAX`] in flight process-wide (#678): each
+    /// `search_tables` / `describe_schema` call fans out eight statements,
+    /// so concurrent calls multiplied planner work without a bound. Waiting
+    /// for a permit counts against the deadline.
     async fn execute_metadata(&self, session: &Session, sql: &str) -> Result<Vec<RecordBatch>, SqeError> {
-        self.handler.execute(session, sql, None).await
+        with_deadline(self.request_timeout, async {
+            let _permit = METADATA_STATEMENTS
+                .acquire()
+                .await
+                .expect("metadata statement semaphore is never closed");
+            self.handler.execute(session, sql, None).await
+        })
+        .await
     }
 
     fn admit_metadata_call(&self, session: &Session) -> Result<(), SqeError> {
         self.metadata_rate_limiter.check(&session.user.username)
+    }
+}
+
+/// Metadata statements (the `SHOW`s a tool issues) in flight at once, across
+/// every MCP request in the process (#678).
+// ponytail: fixed constant; make it `mcp.metadata_concurrency` if a deployment needs to tune it.
+const METADATA_STATEMENTS_MAX: usize = 16;
+static METADATA_STATEMENTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(METADATA_STATEMENTS_MAX);
+
+/// Run a statement under `mcp.request_timeout_secs`; zero disables it.
+///
+/// Past the deadline the future is dropped, which stops the DataFusion
+/// streams and object-store calls under it, and the handler's guard marks
+/// the query abandoned. Before this, an MCP caller that gave up after
+/// ninety seconds and retried left the first attempt running to the
+/// five-minute query timeout beside the second: four such attempts on two
+/// snapshot tables held the coordinator for half an hour and 1.8 GB.
+async fn with_deadline<F>(timeout: std::time::Duration, run: F) -> Result<Vec<RecordBatch>, SqeError>
+where
+    F: std::future::Future<Output = Result<Vec<RecordBatch>, SqeError>>,
+{
+    if timeout.is_zero() {
+        return run.await;
+    }
+    match tokio::time::timeout(timeout, run).await {
+        Ok(result) => result,
+        Err(_) => Err(SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!(
+                "the statement did not finish within the MCP deadline of {}s and was \
+                 cancelled (mcp.request_timeout_secs); narrow it with a partition \
+                 predicate or a LIMIT, or raise the deadline",
+                timeout.as_secs()
+            ),
+        )),
     }
 }
 
@@ -445,5 +471,22 @@ mod tests {
         let mut names = engine_credential_catalog_names(&config);
         names.sort();
         assert_eq!(names, vec!["glue".to_string(), "partner".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    /// #738: the metadata lane shares the statement deadline.
+    #[tokio::test]
+    async fn a_hanging_statement_is_cut_at_the_deadline() {
+        let hang = std::future::pending::<Result<Vec<RecordBatch>, SqeError>>();
+        let err = with_deadline(std::time::Duration::from_millis(20), hang)
+            .await
+            .expect_err("deadline");
+        assert!(err.to_string().contains("MCP deadline"), "{err}");
+        let quick = with_deadline(std::time::Duration::ZERO, async { Ok(Vec::new()) }).await;
+        assert!(quick.is_ok());
     }
 }
