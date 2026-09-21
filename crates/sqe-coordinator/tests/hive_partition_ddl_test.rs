@@ -418,18 +418,11 @@ fn create_with_unknown_projection_key_is_refused() {
     });
 }
 
+/// `lake.sales.orders` exists, then a deny-all policy lands on it keyed the
+/// way a `SELECT` resolves a Hive table (`{root}.{database}`, #715). The
+/// table is created BEFORE the policy because CREATE is gated too (#717).
 async fn harness_with_denied_orders() -> Harness {
     let store = Arc::new(InMemoryPolicyStore::new());
-    store
-        .add_table_policy(
-            "sales",
-            "orders",
-            ResolvedPolicy {
-                row_filters: vec![datafusion::logical_expr::lit(false)],
-                ..Default::default()
-            },
-        )
-        .await;
     let root_dir = tempfile::tempdir().expect("tempdir");
     let audit_dir = tempfile::tempdir().expect("tempdir");
     let log_path = audit_dir.path().join("audit.jsonl");
@@ -439,7 +432,7 @@ async fn harness_with_denied_orders() -> Harness {
     let tracker = Arc::new(QueryTracker::new(&config.query_history));
     let handler = QueryHandler::new(
         Arc::new(PassthroughEnforcer),
-        Some(store as Arc<dyn PolicyStore>),
+        Some(Arc::clone(&store) as Arc<dyn PolicyStore>),
         config,
         None,
         None,
@@ -490,6 +483,16 @@ async fn harness_with_denied_orders() -> Harness {
         )
         .await
         .expect("create");
+    store
+        .add_table_policy(
+            "lake.sales",
+            "orders",
+            ResolvedPolicy {
+                row_filters: vec![datafusion::logical_expr::lit(false)],
+                ..Default::default()
+            },
+        )
+        .await;
     Harness {
         handler,
         session,
@@ -498,6 +501,36 @@ async fn harness_with_denied_orders() -> Harness {
         _dirs: vec![root_dir, audit_dir],
         _mock: mock,
     }
+}
+
+#[test]
+fn denied_user_cannot_create_or_drop_and_show_tables_omits_the_table() {
+    block_on_prod_stack(async {
+        let h = harness_with_denied_orders().await;
+        for sql in [
+            "CREATE EXTERNAL TABLE lake.sales.orders (id BIGINT) STORED AS PARQUET \
+             LOCATION 'file:///nowhere'",
+            "DROP TABLE lake.sales.orders",
+        ] {
+            let err = h.execute_for_test(sql).await.expect_err(sql);
+            assert!(err.to_string().contains("denied"), "{sql}: {err}");
+        }
+        let listed = h
+            .execute_for_test("SHOW TABLES FROM lake.sales")
+            .await
+            .expect("SHOW TABLES");
+        let names: Vec<String> = listed
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_string::<i32>()
+                    .iter()
+                    .filter_map(|s| s.map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(names.is_empty(), "denied table listed: {names:?}");
+    });
 }
 
 #[test]

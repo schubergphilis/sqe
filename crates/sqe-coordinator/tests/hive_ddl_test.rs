@@ -865,9 +865,15 @@ async fn create_external_table_rejects_an_unknown_secret_reference() {
 #[tokio::test]
 async fn a_fully_denied_hive_table_is_invisible_to_show_tables_and_show_create_table() {
     let store = Arc::new(InMemoryPolicyStore::new());
+    // The harness creates the table as the session under test, and a
+    // fully-denied session can no longer CREATE EXTERNAL TABLE (#717), so the
+    // deny is registered after setup.
+    let h = handler_with_root_and_policy("lake", store.clone()).await;
     store
         .add_table_policy(
-            "sales",
+            // Keyed like SELECT resolves a Hive root table: `{root}.{database}`
+            // (#715); a policy on the bare database no longer gates metadata.
+            "lake.sales",
             "orders",
             ResolvedPolicy {
                 row_filters: vec![datafusion::logical_expr::lit(false)],
@@ -875,7 +881,6 @@ async fn a_fully_denied_hive_table_is_invisible_to_show_tables_and_show_create_t
             },
         )
         .await;
-    let h = handler_with_root_and_policy("lake", store).await;
 
     let show_tables = h
         .execute_for_test("SHOW TABLES FROM lake.sales")
@@ -922,7 +927,7 @@ async fn a_column_restricted_hive_table_hides_only_that_column_in_show_create_ta
     let store = Arc::new(InMemoryPolicyStore::new());
     store
         .add_table_policy(
-            "sales",
+            "lake.sales",
             "orders",
             ResolvedPolicy {
                 restricted_columns: vec!["amount".to_string()],
