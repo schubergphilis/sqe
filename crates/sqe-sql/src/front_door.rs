@@ -130,6 +130,10 @@ impl SqlFrontDoor {
                 let rewritten = crate::rewrite_bare_table(&rewritten);
                 let rewritten = crate::rewrite_nested_row_cast(&rewritten);
                 let rewritten = crate::rewrite_trim_both_from(&rewritten);
+                // Trino `CREATE VIEW ... SECURITY DEFINER|INVOKER`: the Flight
+                // path folds it in `pre_parse_pipeline`; the Trino path enters
+                // here directly, so fold it here too (#768).
+                let rewritten = crate::rewrite_view_compat(&rewritten).sql;
                 if rewritten == sql {
                     return Err(parse_error(first_err));
                 }
@@ -414,6 +418,22 @@ mod tests {
             classify_normalized(n).unwrap(),
             StatementKind::Insert(_)
         ));
+    }
+
+    #[test]
+    fn create_view_security_clause_parses_on_every_door() {
+        // #768: dbt-trino renders `security definer`; Flight accepted it, the
+        // Trino door said "Expected: AS, found: security".
+        for dialect in DIALECTS {
+            let n = SqlFrontDoor::new(dialect)
+                .normalize(
+                    "create or replace view quickstart.demo.v1 security definer as select 1 as x",
+                )
+                .unwrap_or_else(|e| panic!("{dialect:?}: {e}"));
+            assert_eq!(n.update_type(), Some(UpdateType::CreateView));
+            assert!(n.source_rewritten());
+            assert!(n.sql().contains(crate::VIEW_SECURITY_OPTION), "{}", n.sql());
+        }
     }
 
     #[test]
