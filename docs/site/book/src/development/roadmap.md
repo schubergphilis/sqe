@@ -283,6 +283,7 @@ Iceberg V3 table format support landed end-to-end. The vendored fork at `vendor/
 - Error messages tuned for catalog and auth failures
 - Partition pruning across all predicate types
 - Iceberg parity harness (`test/iceberg-parity-harness`): DDL/DML/metadata/interop scenarios diffed against Trino on a shared catalog
+- Security audit 2026-09-20 (#708): 33 of 38 source-first findings fixed in ten themed merge requests (2026-09-20/21). Trino OAuth2 pending sessions keyed by the client id; `aud` required when configured; SHOW GRANTS and SET TAGS gated; DML subqueries and appends under the policy enforcer; Hive metadata keyed like SELECT; worker tickets and compaction requests audience-bound; MCP fails closed on unknown table functions and the `system` catalog; redaction handles doubled quotes and ATTACH keys; production_mode refuses inline TVF credentials, HMAC tickets and unverified advertise. Open with documented seams: #716 (Hive information_schema per user), #676, #729 (Hive append), #750
 
 ---
 
@@ -316,7 +317,7 @@ Deferrals (documented): mTLS, per-event user-OIDC bearer forwarding, MERGE per-b
 
 ## Web UI (Done)
 
-A read-only ops dashboard ships in the coordinator binary, on the health port (`metrics_port + 1`). Queries with per-fragment timing, cluster nodes, live engine metrics with 12h history, and the audit operator log. No login (network-gated), no build step, no external assets. Toggle with `[metrics] web_ui`. Reference: [Web UI](../operations/web-ui.md).
+A read-only ops dashboard ships in the coordinator binary, on the health port (`metrics_port + 1`). Queries with per-fragment timing, cluster nodes, live engine metrics with 12h history, and the audit operator log. Admin bearer required (`require_admin_bearer`), no build step, no external assets. Off by default; toggle with `[metrics] web_ui`. Reference: [Web UI](../operations/web-ui.md).
 
 ---
 
