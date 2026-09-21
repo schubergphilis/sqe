@@ -8,6 +8,19 @@ A dbt adapter for SQE (Sovereign Query Engine) over ADBC Flight SQL.
 pip install dbt-sqe   # or: pip install -e adapters/dbt-sqe
 ```
 
+`setup.cfg` carries the tested ranges; `requirements-lock.txt` pins the
+exact, hash-verified set. For a reproducible install use the lock first:
+
+```bash
+pip install --require-hashes -r requirements-lock.txt && pip install --no-deps -e adapters/dbt-sqe
+```
+
+Refresh the lock after bumping a range (run from `adapters/dbt-sqe`):
+
+```bash
+uv pip compile --python-version 3.11 --generate-hashes -o requirements-lock.txt setup.cfg
+```
+
 ## Authentication
 
 The adapter supports three auth styles in `profiles.yml`. See
