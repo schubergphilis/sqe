@@ -97,6 +97,10 @@ spec:
               containerPort: {{ .Values.config.metrics.prometheus_port }}
             - name: health
               containerPort: {{ .Values.healthPort }}
+            {{- if .Values.config.mcp.enabled }}
+            - name: mcp
+              containerPort: {{ .Values.config.mcp.port }}
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /healthz

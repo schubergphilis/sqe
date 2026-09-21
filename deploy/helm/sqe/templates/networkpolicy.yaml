@@ -1,0 +1,43 @@
+{{- if .Values.networkPolicy.enabled -}}
+{{- /* #674: default-deny ingress to the coordinator; allow the SQL ports from
+`from`, flight-sql from this chart's workers, and mcp from `mcpFrom`. */ -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "sqe.fullname" . }}-coordinator
+  labels:
+    {{- include "sqe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: coordinator
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "sqe.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: coordinator
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - port: {{ .Values.config.coordinator.flight_sql_port }}
+        - port: {{ .Values.config.coordinator.trino_http_port }}
+        - port: {{ .Values.config.metrics.prometheus_port }}
+      {{- with .Values.networkPolicy.from }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- if .Values.worker.enabled }}
+    - ports:
+        - port: {{ .Values.config.coordinator.flight_sql_port }}
+      from:
+        - podSelector:
+            matchLabels:
+              {{- include "sqe.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: worker
+    {{- end }}
+    {{- if .Values.config.mcp.enabled }}
+    - ports:
+        - port: {{ .Values.config.mcp.port }}
+      {{- with .Values.networkPolicy.mcpFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+{{- end }}
