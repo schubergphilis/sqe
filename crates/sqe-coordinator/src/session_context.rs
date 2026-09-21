@@ -868,6 +868,23 @@ pub(crate) fn discovery_template(config: &SqeConfig) -> Option<sqe_core::config:
         .or_else(|| flattened.first());
     pick.map(|(_, c)| (*c).clone())
         .filter(|c| matches!(c.backend, sqe_core::config::CatalogBackend::Rest))
+        // Finding 752: the clone carries the template's `auth` onto a
+        // warehouse the caller named. Only per-user auth may travel; a
+        // Static / ClientCredentials / Aws template would hand the caller
+        // the engine's identity on any warehouse they can spell.
+        .filter(|c| {
+            let per_user = matches!(
+                c.auth,
+                None | Some(sqe_core::config::CatalogAuthConfig::SessionBearer)
+            );
+            if !per_user {
+                debug!(
+                    catalog_url = %c.catalog_url,
+                    "catalog discovery disabled: template catalog auth is not per-user"
+                );
+            }
+            per_user
+        })
 }
 
 /// Attempt to resolve `warehouse` as a Polaris catalog and build its
@@ -1115,6 +1132,20 @@ s3_path_style = true
             cloned.backend,
             sqe_core::config::CatalogBackend::Rest
         ));
+    }
+
+    /// Finding 752: a template with engine-held auth must not be cloned onto
+    /// caller-named warehouses; discovery fails closed instead.
+    #[test]
+    fn discovery_template_refuses_non_per_user_auth() {
+        let mut config = test_config_rest();
+        assert!(discovery_template(&config).is_some());
+        config.catalog.auth = Some(sqe_core::config::CatalogAuthConfig::SessionBearer);
+        assert!(discovery_template(&config).is_some());
+        config.catalog.auth = Some(sqe_core::config::CatalogAuthConfig::Static {
+            token: "engine-token".to_string(),
+        });
+        assert!(discovery_template(&config).is_none());
     }
 
     /// Issue #240: the session-context cache must hold well beyond the old cap

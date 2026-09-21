@@ -791,17 +791,39 @@ fn build_health_router(state: Arc<HealthState>) -> Router {
     app.with_state(state)
 }
 
-fn start_health_server_with_extra(port: u16, state: Arc<HealthState>, extra: Option<Router>) {
+/// Interface for the health/web and metrics listeners (finding 764). An
+/// unauthenticated MCP gateway (`--mcp-anonymous`) keeps every ops listener on
+/// loopback as well, since `/api/v1/status` and `/metrics` are unauthenticated
+/// and `/mcp` may itself be mounted on the health listener (`[mcp] port = 0`).
+/// An explicit `[mcp] bind_address` / `--mcp-bind` is the operator's choice
+/// and is followed. Every other mode binds all interfaces, as before.
+fn ops_bind_ip(config: &SqeConfig) -> std::net::IpAddr {
+    if config.mcp.is_enabled() && config.mcp.auth.mode == sqe_core::config::McpAuthMode::Anonymous {
+        config
+            .mcp
+            .bind_ip()
+            .unwrap_or_else(|_| std::net::Ipv4Addr::LOCALHOST.into())
+    } else {
+        std::net::Ipv4Addr::UNSPECIFIED.into()
+    }
+}
+
+fn start_health_server_with_extra(
+    bind: std::net::IpAddr,
+    port: u16,
+    state: Arc<HealthState>,
+    extra: Option<Router>,
+) {
     let mut app = build_health_router(state);
     if let Some(extra) = extra {
         app = app.merge(extra);
     }
 
     tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+        let listener = tokio::net::TcpListener::bind(std::net::SocketAddr::new(bind, port))
             .await
             .expect("Failed to bind health server");
-        tracing::info!("Health endpoints on port {port} (/healthz, /readyz, /api/v1/status)");
+        tracing::info!("Health endpoints on {bind}:{port} (/healthz, /readyz, /api/v1/status)");
         // Serve with connect-info so the dashboard-access guard can extract the
         // peer TCP address for client_ip in audit events.
         axum::serve(
@@ -1204,16 +1226,18 @@ async fn async_main() -> anyhow::Result<()> {
     if config.mcp.enabled_by_port_only() {
         tracing::warn!(
             port = config.mcp.port,
-            "DEPRECATED: [mcp] port is set without enabled = true; /mcp is served for this \
-             release only. Set [mcp] enabled = true to keep it, or remove port to close it."
+            "[mcp] port is set without enabled = true, so /mcp is NOT served (#672). Set \
+             [mcp] enabled = true to serve it, or remove port."
         );
     }
     // #671: an unauthenticated endpoint off loopback is a choice the operator
     // made by name (bind_address / --mcp-bind, or port = 0 on the web
     // listener, which binds every interface); say so where they are looking.
+    // Finding 764: with port = 0 the health listener now follows the same
+    // bind (`ops_bind_ip`), so only a non-loopback address is an exposure.
     if config.mcp.is_enabled()
         && config.mcp.auth.mode == sqe_core::config::McpAuthMode::Anonymous
-        && (config.mcp.port == 0 || !config.mcp.bind_ip().is_ok_and(|ip| ip.is_loopback()))
+        && !config.mcp.bind_ip().is_ok_and(|ip| ip.is_loopback())
     {
         tracing::warn!(
             bind = %config.mcp.bind_address,
@@ -1572,6 +1596,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
 
     let _metrics_server = sqe_metrics::server::start_metrics_server(
         metrics.clone(),
+        ops_bind_ip(&config),
         config.metrics.prometheus_port,
     )
     .map_err(|e| anyhow::anyhow!("failed to bind metrics server: {e}"))?;
@@ -2175,7 +2200,12 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         }
         None
     };
-    start_health_server_with_extra(health_port, health_state, mcp_web_router);
+    start_health_server_with_extra(
+        ops_bind_ip(&config),
+        health_port,
+        health_state,
+        mcp_web_router,
+    );
 
     // Trino compat
     if config.coordinator.trino_http_port > 0 {
@@ -2406,7 +2436,8 @@ async fn run_worker(config: SqeConfig, config_path: String) -> anyhow::Result<()
         serving: None,
         mcp_listener_alive: None,
     });
-    start_health_server_with_extra(health_port, health_state, None);
+    let worker_bind: std::net::IpAddr = std::net::Ipv4Addr::UNSPECIFIED.into();
+    start_health_server_with_extra(worker_bind, health_port, health_state, None);
 
     let port = config.worker.flight_port;
     let addr = format!("0.0.0.0:{port}").parse()?;
@@ -2417,6 +2448,7 @@ async fn run_worker(config: SqeConfig, config_path: String) -> anyhow::Result<()
     );
     let _metrics_server = sqe_metrics::server::start_metrics_server(
         worker_metrics.clone(),
+        worker_bind,
         config.metrics.prometheus_port,
     )
     .map_err(|e| anyhow::anyhow!("failed to bind metrics server: {e}"))?;
@@ -2708,6 +2740,37 @@ mod tests {
         let ready = AtomicBool::new(true);
         flip_ready_and_drain(&ready, 1).await;
         assert!(!ready.load(Ordering::Relaxed));
+    }
+
+    /// Finding 764: anonymous MCP pulls the health and metrics listeners onto
+    /// loopback unless the operator bound MCP elsewhere by name.
+    #[test]
+    fn ops_bind_follows_anonymous_mcp_to_loopback() {
+        let mut config = SqeConfig::load_from_str(DEFAULT_FLAG_ONLY_CONFIG).unwrap();
+        assert!(
+            ops_bind_ip(&config).is_unspecified(),
+            "no MCP: all interfaces"
+        );
+
+        config.mcp.enabled = true;
+        config.mcp.port = 8099;
+        config.mcp.auth.mode = sqe_core::config::McpAuthMode::Static;
+        assert!(
+            ops_bind_ip(&config).is_unspecified(),
+            "authenticated MCP: unchanged"
+        );
+
+        config.mcp.auth.mode = sqe_core::config::McpAuthMode::Anonymous;
+        assert!(
+            ops_bind_ip(&config).is_loopback(),
+            "anonymous MCP: loopback"
+        );
+
+        config.mcp.bind_address = "0.0.0.0".to_string();
+        assert!(
+            ops_bind_ip(&config).is_unspecified(),
+            "explicit bind is the operator's call"
+        );
     }
 
     #[test]

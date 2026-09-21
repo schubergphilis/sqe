@@ -13,12 +13,16 @@ use crate::HasRegistry;
 /// Works with any registry type that implements [`HasRegistry`] — both the
 /// coordinator's [`MetricsRegistry`](crate::MetricsRegistry) and the worker's
 /// [`WorkerMetricsRegistry`](crate::WorkerMetricsRegistry).
+///
+/// `bind` is the interface to listen on; the caller derives it (finding 764:
+/// an `--mcp-anonymous` gateway keeps its ops listeners on loopback too).
 pub fn start_metrics_server<R: HasRegistry + Clone>(
     metrics: Arc<R>,
+    bind: std::net::IpAddr,
     port: u16,
 ) -> Result<tokio::task::JoinHandle<()>, std::io::Error> {
-    let addr = format!("0.0.0.0:{port}");
-    let std_listener = std::net::TcpListener::bind(&addr)?;
+    let addr = std::net::SocketAddr::new(bind, port);
+    let std_listener = std::net::TcpListener::bind(addr)?;
     std_listener.set_nonblocking(true)?;
     info!("Metrics server listening on {addr}");
     Ok(tokio::spawn(async move {
@@ -119,7 +123,8 @@ mod tests {
         let metrics = Arc::new(MetricsRegistry::new().unwrap());
         let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let err = start_metrics_server(metrics, port).expect_err("port is taken");
+        let err = start_metrics_server(metrics, std::net::Ipv4Addr::UNSPECIFIED.into(), port)
+            .expect_err("port is taken");
         assert!(
             matches!(
                 err.kind(),

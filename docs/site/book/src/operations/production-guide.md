@@ -310,8 +310,12 @@ Route audit logs and traces through an OpenTelemetry Collector when possible. Au
 | `grant-backend-configured` | `access_control.backend = none` without `security.allow_no_grant_backend = true` (GRANT and REVOKE would be rejected). |
 | `ranger-mask-key` | `policy.engine = ranger` with an empty `policy.mask_key` and no `security.allow_unkeyed_hash_masks = true` (MASK_HASH would fall back to unsalted SHA-256). |
 | `ranger-project-tags` | `policy.engine = ranger` with `policy.ranger.project-tags = false` and no `security.allow_unprojected_tags = true` (Spark would return columns SQE masks). |
+| `no-hmac-tickets` | `worker.accept_hmac_tickets = true` (the HMAC key is the shared worker secret, so it proves nothing about who authored a scan ticket). |
+| `verified-worker-advertise` | `coordinator.allow_unverified_advertise = true` (a secret holder could register an attacker URL and receive every user's scan tickets). |
+| `no-inline-tvf-credentials` | `storage.tvf.allow_inline_credentials = true` (the default; caller-supplied object-store keys would bypass `allowed_object_store_prefixes`). |
 | `mcp-https-resource-uri` | An `http://` `mcp.resource_uri` while MCP is enabled. |
 | `mcp-https-authorization-servers` | An `http://` issuer in `mcp.authorization_servers` while MCP is enabled. |
+| `ranger-grant-backend-url` | `access_control.backend = ranger` with an empty `access_control.url` (the grant backend would silently be absent and GRANT / REVOKE NotImplemented). |
 | `mcp-no-anonymous-auth` | `mcp.auth.mode = anonymous` while MCP is enabled. |
 
 ---
