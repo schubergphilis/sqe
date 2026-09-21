@@ -3016,13 +3016,12 @@ impl SessionCatalog {
             .max()
             .map_or(1, |id| id + 1);
         let schema = view_schema_from_json(schema, next_schema_id)?;
-        let version = sqe_view_version(
-            next_version_id,
-            schema.schema_id(),
-            sql,
-            namespace,
-            &self.warehouse,
-        )?;
+        // The server's `add-schema` reuses an existing id when the new schema
+        // is structurally identical (Java + vendored builder both do), so the
+        // fresh id we picked may never be registered and `add-view-version`
+        // then fails with "Cannot add version with unknown schema" (#770).
+        // `-1` means "the schema added in this commit", whatever id it got.
+        let version = sqe_view_version(next_version_id, -1, sql, namespace, &self.warehouse)?;
         let last_column_id = Some(schema.highest_field_id());
         let mut updates = vec![
             iceberg::ViewUpdate::AddSchema {
@@ -5454,7 +5453,11 @@ mod view_rest_tests {
             body["updates"][1]["view-version"]["version-id"], 3,
             "max(1,2)+1"
         );
-        assert_eq!(body["updates"][1]["view-version"]["schema-id"], 1);
+        assert_eq!(
+            body["updates"][1]["view-version"]["schema-id"], -1,
+            "must reference the schema added in this commit, not a guessed id: \
+             the server reuses an existing id for an identical schema (#770)"
+        );
         assert_eq!(
             body["updates"][1]["view-version"]["representations"][0]["sql"],
             "SELECT 3 AS x"
