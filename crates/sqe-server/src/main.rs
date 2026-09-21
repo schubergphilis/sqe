@@ -281,6 +281,40 @@ fn mcp_listener_down(state: &HealthState) -> bool {
         .is_some_and(|alive| !alive.load(Ordering::SeqCst))
 }
 
+/// Cap on concurrent outbound catalog probes from `/readyz` (#754). The
+/// endpoint is unauthenticated, so without this every parallel probe became
+/// a 5 s GET against the catalog. Probes beyond the cap answer from the last
+/// result while it is fresh, else 503 (fail closed, no fan-out).
+const READYZ_MAX_PROBES: usize = 4;
+const READYZ_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+static READYZ_PROBE_SEM: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(READYZ_MAX_PROBES);
+/// `(probed_at, catalog_url, ok)` of the last completed probe.
+static READYZ_LAST: std::sync::Mutex<Option<(Instant, String, bool)>> = std::sync::Mutex::new(None);
+
+async fn probe_catalog(catalog_url: &str) -> bool {
+    let Ok(_permit) = READYZ_PROBE_SEM.try_acquire() else {
+        return READYZ_LAST
+            .lock()
+            .ok()
+            .and_then(|last| last.clone())
+            .is_some_and(|(at, url, ok)| {
+                ok && url == catalog_url && at.elapsed() < READYZ_CACHE_TTL
+            });
+    };
+    let ok = reqwest::Client::new()
+        .get(format!("{catalog_url}/api/catalog/v1/config"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map(|r| r.status().is_success() || r.status().as_u16() == 401)
+        .unwrap_or(false);
+    if let Ok(mut last) = READYZ_LAST.lock() {
+        *last = Some((Instant::now(), catalog_url.to_string(), ok));
+    }
+    ok
+}
+
 async fn readyz(state: axum::extract::State<Arc<HealthState>>) -> Response {
     if !state.ready.load(Ordering::Relaxed) {
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not ready").into_response();
@@ -291,13 +325,7 @@ async fn readyz(state: axum::extract::State<Arc<HealthState>>) -> Response {
 
     // Check Polaris catalog reachability
     if !state.catalog_url.is_empty() {
-        let polaris_ok = reqwest::Client::new()
-            .get(format!("{}/api/catalog/v1/config", state.catalog_url))
-            .timeout(std::time::Duration::from_secs(5))
-            .send()
-            .await
-            .map(|r| r.status().is_success() || r.status().as_u16() == 401)
-            .unwrap_or(false);
+        let polaris_ok = probe_catalog(&state.catalog_url).await;
 
         checks.insert(
             "polaris".to_string(),
@@ -3084,6 +3112,40 @@ mod tests {
             response.status(),
             axum::http::StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[tokio::test]
+    async fn readyz_caps_concurrent_catalog_probes() {
+        // #754: 20 parallel /readyz against a catalog that never answers must
+        // open at most READYZ_MAX_PROBES connections; the rest answer from
+        // cache or 503 without fanning out.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let fake = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                held.push(sock); // hang: never respond
+            }
+        });
+        let calls: Vec<_> = (0..20)
+            .map(|_| {
+                let url = url.clone();
+                tokio::spawn(async move { probe_catalog(&url).await })
+            })
+            .collect();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            accepted.load(Ordering::SeqCst) <= READYZ_MAX_PROBES,
+            "probes fanned out: {}",
+            accepted.load(Ordering::SeqCst)
+        );
+        for c in calls {
+            c.abort();
+        }
+        fake.abort();
     }
 
     // All CoordinatorConfig fields carry `#[serde(default)]`, so an empty TOML
