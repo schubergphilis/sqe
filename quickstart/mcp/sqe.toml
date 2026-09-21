@@ -29,6 +29,8 @@ keycloak_url = "http://keycloak:8080"
 realm = "iceberg"
 client_id = "sqe-client"
 client_secret = ""
+# DEV ONLY: skips TLS certificate checks towards Keycloak. The stack is plain
+# HTTP on a Docker network; a real deployment keeps this true.
 ssl_verification = false
 
 [[auth.providers]]
@@ -37,7 +39,11 @@ jwks_url = "http://keycloak:8080/realms/iceberg/protocol/openid-connect/certs"
 issuer = "http://keycloak:8080/realms/iceberg"
 user_claim = "preferred_username"
 roles_claim = "realm_access.roles"
+# DEV ONLY: accepts tokens without an `aud` equal to the MCP resource_uri. A
+# token minted for any client then works here; production pins the audience.
 allow_unbounded_audience = true
+# DEV ONLY: fetches signing keys over plain HTTP from the Docker-only Keycloak
+# hostname. Production requires an https JWKS URL.
 allow_insecure_jwks = true
 
 [catalogs.quickstart]
@@ -53,9 +59,10 @@ warehouse = "quickstart"
 [storage]
 s3_endpoint = "http://rustfs:9000"
 s3_region = "us-east-1"
-s3_access_key = "s3admin"
-s3_secret_key = "s3adminpw"
+# The RustFS keys come from the environment, not this file: docker-compose.yml
+# sets SQE_STORAGE__S3_ACCESS_KEY and SQE_STORAGE__S3_SECRET_KEY from .env.
 s3_path_style = true
+# DEV ONLY: plain HTTP to the object store inside the Docker network.
 s3_allow_http = true
 
 [policy]

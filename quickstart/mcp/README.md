@@ -62,7 +62,7 @@ that the reader is still denied because OAuth scope alone grants nothing.
 Mint a short-lived user token in the shell that will start Codex:
 
 ```bash
-export SQE_MCP_TOKEN="$(./mint-token.sh adminuser adminuser123)"
+export SQE_MCP_TOKEN="$(./mint-token.sh)"
 ./setup-client.sh codex
 ```
 
@@ -84,7 +84,7 @@ HTTP bearer tokens and interactive MCP OAuth; see the
 ## Connect Claude Code
 
 ```bash
-export SQE_MCP_TOKEN="$(./mint-token.sh adminuser adminuser123)"
+export SQE_MCP_TOKEN="$(./mint-token.sh)"
 ./setup-client.sh claude
 cp clients/claude.mcp.json /path/to/your/project/.mcp.json
 cd /path/to/your/project
@@ -133,6 +133,14 @@ deployment, give Keycloak and SQE public HTTPS URLs and use browser OAuth:
   stack. `SQE_MCP__ALLOW_WRITES` is the only runtime behavior override.
 - [`.env.example`](./.env.example) contains local ports and demo credentials.
   Change `SQE_MCP_PORT` and the public `resource_uri` override together.
+  The RustFS keys reach SQE as `SQE_STORAGE__S3_ACCESS_KEY` and
+  `SQE_STORAGE__S3_SECRET_KEY` through the Compose overlay. SQE reads any
+  `SQE_<SECTION>__<KEY>` variable as an override of `sqe.toml`, so no secret
+  needs to be in the file. The demo user passwords follow the same route:
+  `mint-token.sh` reads `MINT_USER`, `MINT_PASSWORD`, `ADMINUSER_PASSWORD` and
+  `TESTUSER_PASSWORD` from the environment.
+- Every line in `sqe.toml` that relaxes a check is marked `# DEV ONLY:` with
+  what it relaxes. None of them belongs in a deployment.
 - [`clients/`](./clients/) contains templates only; no bearer token is stored.
 
 Read responses are capped at 100 rows and 256 KiB for predictable model
