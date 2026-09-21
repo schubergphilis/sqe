@@ -18,15 +18,16 @@
 use tokio::sync::OnceCell;
 
 use super::validate_puffin_compression;
-use crate::Result;
 use crate::io::InputFile;
 use crate::puffin::blob::Blob;
 use crate::puffin::metadata::{BlobMetadata, FileMetadata};
+use crate::{Error, ErrorKind, Result};
 
 /// Puffin reader
 pub struct PuffinReader {
     input_file: InputFile,
     file_metadata: OnceCell<FileMetadata>,
+    file_length: OnceCell<u64>,
 }
 
 impl PuffinReader {
@@ -35,7 +36,15 @@ impl PuffinReader {
         Self {
             input_file,
             file_metadata: OnceCell::new(),
+            file_length: OnceCell::new(),
         }
+    }
+
+    async fn file_length(&self) -> Result<u64> {
+        self.file_length
+            .get_or_try_init(|| async { Ok(self.input_file.metadata().await?.size) })
+            .await
+            .copied()
     }
 
     /// Returns file metadata
@@ -49,9 +58,23 @@ impl PuffinReader {
     pub async fn blob(&self, blob_metadata: &BlobMetadata) -> Result<Blob> {
         validate_puffin_compression(blob_metadata.compression_codec)?;
 
-        let file_read = self.input_file.reader().await?;
+        // Footer metadata is untrusted: guard against offset+length overflow
+        // and ranges past EOF before the storage layer allocates for them.
         let start = blob_metadata.offset;
-        let end = start + blob_metadata.length;
+        let file_length = self.file_length().await?;
+        let end = start
+            .checked_add(blob_metadata.length)
+            .filter(|end| *end <= file_length)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Blob range {start}+{} exceeds Puffin file length {file_length}",
+                        blob_metadata.length
+                    ),
+                )
+            })?;
+        let file_read = self.input_file.reader().await?;
         let bytes = file_read.read(start..end).await?;
         let data = blob_metadata.compression_codec.decompress(bytes.to_vec())?;
 
@@ -72,6 +95,7 @@ mod tests {
 
     use crate::ErrorKind;
     use crate::compression::CompressionCodec;
+    use crate::io::FileIOBuilder;
     use crate::puffin::metadata::BlobMetadata;
     use crate::puffin::reader::PuffinReader;
     use crate::puffin::test_utils::{
@@ -128,6 +152,48 @@ mod tests {
                 .unwrap(),
             blob_1(),
         )
+    }
+
+    #[tokio::test]
+    async fn test_blob_range_overflow_or_past_eof_rejected() {
+        // Self-contained: the footer is never parsed, only the file length,
+        // so any 64-byte file stands in for the (untrusted) Puffin file.
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("blob.bin");
+        std::fs::write(&path, [0u8; 64]).unwrap();
+        let input_file = FileIOBuilder::new_fs_io()
+            .build()
+            .unwrap()
+            .new_input(path.to_str().unwrap())
+            .unwrap();
+        let reader = PuffinReader::new(input_file);
+        for (offset, length) in [(u64::MAX - 1, 10), (4, u64::MAX), (4, 61), (65, 0)] {
+            let meta = BlobMetadata {
+                r#type: "test-type".to_string(),
+                fields: vec![1],
+                snapshot_id: 1,
+                sequence_number: 1,
+                offset,
+                length,
+                compression_codec: CompressionCodec::None,
+                properties: HashMap::new(),
+            };
+            let err = reader.blob(&meta).await.unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::DataInvalid, "{offset}+{length}");
+            assert!(err.to_string().contains("exceeds Puffin file length"));
+        }
+        // In-bounds range still reads.
+        let meta = BlobMetadata {
+            r#type: "test-type".to_string(),
+            fields: vec![1],
+            snapshot_id: 1,
+            sequence_number: 1,
+            offset: 4,
+            length: 60,
+            compression_codec: CompressionCodec::None,
+            properties: HashMap::new(),
+        };
+        assert_eq!(reader.blob(&meta).await.unwrap().data.len(), 60);
     }
 
     #[tokio::test]

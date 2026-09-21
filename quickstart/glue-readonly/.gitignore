@@ -1,0 +1,2 @@
+# Real account ids / bucket names live here, never in sqe.toml.
+*.local.toml

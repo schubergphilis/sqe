@@ -13,4 +13,18 @@ if grep -rnaIE "$PATTERN" "$ROOT" \
   echo "LEAK-SCAN: docs/site contains secrets/PII (hits above)" >&2
   exit 1
 fi
-echo "leak-scan: docs/site clean"
+# Committed quickstart configs and test fixtures must not carry a real AWS
+# account id either (#741: quickstart/glue-readonly/sqe.toml shipped one).
+# Only the account-id branch applies here; the hostname/user patterns above
+# are legitimate in developer-facing files.
+ACCOUNT_ID='(^|[^0-9])[0-9]{12}([^0-9]|$)'
+if grep -rnaIE "$ACCOUNT_ID" quickstart tests \
+     --exclude-dir=.venv --exclude-dir=node_modules --exclude-dir=target \
+     --include='*.md' --include='*.toml' --include='*.json' --include='*.yml' \
+     --include='*.yaml' --include='*.sh' --include='*.py' --include='*.rs' \
+     --include='*.sql' --include='*.env' --include='*.properties' \
+   | grep -vE '123456789012|000000000000'; then
+  echo "LEAK-SCAN: quickstart/ or tests/ contains an AWS account id (hits above)" >&2
+  exit 1
+fi
+echo "leak-scan: $ROOT, quickstart/ and tests/ clean"
