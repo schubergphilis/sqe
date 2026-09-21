@@ -710,6 +710,24 @@ impl BearerTokenProvider {
             .unwrap_or_default()
     }
 
+    /// OAuth scopes: `scope` (space-separated string) and `scp` (array or
+    /// string), merged. Issue #676.
+    fn extract_scopes(claims: &serde_json::Value) -> Vec<String> {
+        let mut out = Vec::new();
+        for name in ["scope", "scp"] {
+            match claims.get(name) {
+                Some(serde_json::Value::String(s)) => {
+                    out.extend(s.split_whitespace().map(String::from))
+                }
+                Some(serde_json::Value::Array(arr)) => {
+                    out.extend(arr.iter().filter_map(|v| v.as_str().map(String::from)))
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
     /// Extract roles from JWT claims using the configured `roles_claim` path.
     fn extract_roles(claims: &serde_json::Value, roles_claim: &str) -> Vec<String> {
         Self::extract_string_list(claims, roles_claim)
@@ -815,6 +833,7 @@ impl AuthProvider for BearerTokenProvider {
             catalog_token: Some(sqe_core::SecretString::new(token)),
             refresh_token: None,
             expires_at,
+            scopes: Self::extract_scopes(claims),
         })
     }
 
@@ -1126,6 +1145,16 @@ Gsk+TB4BOZOZvvRKOPj1Dj5tcKc/tv2Hx8kiS4egVEC2qWmKaBDbv9kN
     // -----------------------------------------------------------------------
     // extract_roles
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_scopes_reads_scope_string_and_scp_array() {
+        let claims = serde_json::json!({"scope": "sqe:mcp:read openid", "scp": ["extra"]});
+        assert_eq!(
+            BearerTokenProvider::extract_scopes(&claims),
+            vec!["sqe:mcp:read", "openid", "extra"]
+        );
+        assert!(BearerTokenProvider::extract_scopes(&serde_json::json!({"sub": "x"})).is_empty());
+    }
 
     #[test]
     fn extract_roles_nested() {
@@ -2167,6 +2196,7 @@ Gsk+TB4BOZOZvvRKOPj1Dj5tcKc/tv2Hx8kiS4egVEC2qWmKaBDbv9kN
             catalog_token: Some(sqe_core::SecretString::new("the-jwt-token".to_string())),
             refresh_token: None,
             expires_at: None,
+            scopes: vec![],
         };
 
         let result = provider
@@ -2197,6 +2227,7 @@ Gsk+TB4BOZOZvvRKOPj1Dj5tcKc/tv2Hx8kiS4egVEC2qWmKaBDbv9kN
             catalog_token: None,
             refresh_token: None,
             expires_at: None,
+            scopes: vec![],
         };
 
         let result = provider

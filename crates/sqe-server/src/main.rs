@@ -3501,6 +3501,7 @@ mod tests {
                     catalog_token: None,
                     refresh_token: None,
                     expires_at: None,
+                    scopes: vec![],
                 }),
                 "user-tok" => Ok(sqe_auth::Identity {
                     user_id: "user".into(),
@@ -3512,6 +3513,7 @@ mod tests {
                     catalog_token: None,
                     refresh_token: None,
                     expires_at: None,
+                    scopes: vec![],
                 }),
                 _ => Err(sqe_auth::AuthError::AuthFailed("bad token".into())),
             }

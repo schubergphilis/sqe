@@ -66,6 +66,7 @@ impl AuthProvider for AcceptProvider {
             catalog_token: None,
             refresh_token: None,
             expires_at: self.expires_at,
+            scopes: vec![],
         })
     }
 }

@@ -526,6 +526,66 @@ correlation that is not an equality on outer columns, for example
 support logical expression ScalarSubquery`. Rewrite that as a pre-aggregated
 CTE joined on the key.
 
+## Limits and exposure
+
+Every number below is the default from `McpConfig` and `RateLimitConfig`.
+Change them in `sqe.toml` under `[mcp]` and `[rate_limit]`.
+
+Response size. A tool response carries at most `max_result_rows` rows
+(1000) and `max_response_bytes` of JSON (2 MiB). A query without its own
+`LIMIT` gets the row cap appended, so `truncated: true` means "more than the
+cap", not "page for the rest". One string cell is cut at 64 KiB with a
+`...[truncated N bytes]` marker. `sample_rows` returns at most 100 rows and
+`describe_schema` pages at 200 tables, 500 at most. The request body is
+capped at 1 MiB by the router.
+
+Deadline. `request_timeout_secs` (75) bounds one statement run by a tool
+call; past it the statement is cancelled and the tool reports the deadline.
+The whole HTTP request gets that value plus 15 seconds, after which the
+server answers 504. Zero leaves only `query.timeout_secs`.
+
+Rate limits. `[rate_limit]` is off by default and required under
+`production_mode`. Enabled, it charges one query per `execute_sql_readonly`,
+`sample_rows`, `refresh_metadata` and change call against
+`per_user_queries_per_minute` (60), keyed on peer address plus user so a
+static or anonymous deployment is not one shared bucket, and against
+`global_queries_per_minute` (1000). The metadata tools, `explain_query`
+included, charge `metadata_per_user_per_minute` (120) once per call. Both denials come back as a tool
+failure with `error: rate_limited` and `retry_after_seconds`, so the agent
+waits instead of retrying blind. Credential presentations are limited before
+any provider runs: `auth_attempts_per_minute` (10) with a burst of
+`auth_burst` (20) per peer, answered with HTTP 429 and a `Retry-After`
+header. The metadata `SHOW` statements behind `search_tables` and
+`describe_schema` also share a process-wide ceiling of 16 in flight.
+
+Bind address. With `port = 0` the endpoint rides the web listener. With a
+dedicated port, an empty `bind_address` means `127.0.0.1` under
+`[mcp.auth] mode = "anonymous"` and `0.0.0.0` otherwise. Anonymous mode also
+pulls the health and metrics listeners onto loopback unless `bind_address`
+names another interface. Anonymous with `--allow-all-buckets` off loopback is
+refused at startup.
+
+Denylist. The read tools accept one statement, classified by the SQL parser
+before execution. Refused before the query handler sees them: DDL, DML,
+grants, secrets and session changes; `SELECT INTO`, `WITH ... INSERT` and
+quoted paths in `FROM`; every table function except the catalog-scoped
+Iceberg metadata TVFs (`table_snapshots`, `table_manifests`,
+`table_history`, `table_files`, `table_partitions`, `table_refs`); the
+`system` catalog, whose runtime views carry every client's SQL; and
+`information_schema.df_settings`, which lists the engine's runtime settings,
+spill path included. The rest of `information_schema` stays readable.
+
+Kubernetes. The Helm chart's `config.mcp` block renders `[mcp]`, a `mcp`
+container port (8098) and, with `ingress.enabled`, a `/mcp` path on the
+coordinator host. That path requires `ingress.tls`; the chart refuses to
+render it over plain HTTP, and it refuses `auth.mode = "anonymous"`
+outright. `networkPolicy.enabled` denies all ingress to the coordinator
+except the listed ports, and `networkPolicy.mcpFrom` names the peers allowed
+to reach the MCP port; an empty list allows any source on that port. Static
+principals take their token from an environment variable named in
+`token_env`, injected through `existingSecret` or `extraEnv`, never a literal
+in values.
+
 ## Error text
 
 A tool that fails returns `isError: true` with one text line. What that line

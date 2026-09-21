@@ -80,6 +80,7 @@ impl AuthProvider for BearerPassthroughProvider {
             catalog_token: Some(token.clone()),
             refresh_token: None,
             expires_at: None,
+            scopes: vec![],
         })
     }
 

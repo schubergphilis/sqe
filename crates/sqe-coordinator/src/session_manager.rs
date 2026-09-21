@@ -1166,6 +1166,7 @@ mod tests {
                     catalog_token: Some(t.clone()),
                     refresh_token: None,
                     expires_at: None,
+                    scopes: vec![],
                 }),
                 _ => Err(sqe_auth::AuthError::NotMyCredentials),
             }
@@ -1197,6 +1198,7 @@ mod tests {
                     catalog_token: Some(t.clone()),
                     refresh_token: None,
                     expires_at: Some(Utc::now() + self.expires_in),
+                    scopes: vec![],
                 }),
                 _ => Err(sqe_auth::AuthError::NotMyCredentials),
             }
