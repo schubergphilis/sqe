@@ -1123,13 +1123,14 @@ fn default_mcp_anonymous_user() -> String {
 }
 
 impl McpConfig {
+    /// `enabled` alone (#672): a leftover `port` line is not what opens the
+    /// surface. `--mcp-port` and `--mcp-anonymous` set `enabled` themselves.
     pub fn is_enabled(&self) -> bool {
-        self.enabled || self.port > 0
+        self.enabled
     }
 
-    /// `port > 0` with `enabled = false`: served today for backwards
-    /// compatibility, warned about at startup, and gone in the next release
-    /// (#672). A leftover `port` line must not be what opens the surface.
+    /// `port > 0` with `enabled = false`: the surface is OFF; `validate`
+    /// and the startup path warn so the operator learns why nothing listens.
     pub fn enabled_by_port_only(&self) -> bool {
         !self.enabled && self.port > 0
     }
@@ -3503,17 +3504,70 @@ impl TvfPolicy {
         let host = parsed
             .host_str()
             .ok_or_else(|| "TVF: malformed URL (missing host)".to_string())?;
-        if self.allow_http
-            || self
-                .allowed_http_hosts
-                .iter()
-                .any(|h| h.eq_ignore_ascii_case(host))
+        if self.allow_http {
+            return Ok(());
+        }
+        if !self
+            .allowed_http_hosts
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(host))
+        {
+            return Err(format!(
+                "TVF: HTTP host '{host}' is not in `[storage.tvf] allowed_http_hosts`"
+            ));
+        }
+        // Finding 753: an allow-listed *name* can be rebound by its DNS owner
+        // to IMDS or loopback after the operator vetted it. A literal IP or a
+        // loopback name is the operator naming the address itself, so only
+        // hostnames are resolved. TOCTOU remains: the HTTP client resolves
+        // again, and a fast-flux record can differ between the two lookups.
+        if host_is_loopback(host)
+            || host
+                .trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok()
         {
             return Ok(());
         }
-        Err(format!(
-            "TVF: HTTP host '{host}' is not in `[storage.tvf] allowed_http_hosts`"
-        ))
+        // ponytail: blocking resolver on the planning path; async lookup if it shows up in traces.
+        let port = parsed.port_or_known_default().unwrap_or(80);
+        // A lookup failure is not rebinding evidence (no address to reach);
+        // the HTTP client reports it on its own.
+        let addrs: Vec<std::net::IpAddr> = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+            .map(|it| it.map(|a| a.ip()).collect())
+            .unwrap_or_default();
+        match self.rebinding_target(&addrs) {
+            None => Ok(()),
+            Some(ip) => Err(format!(
+                "TVF: HTTP host '{host}' resolves to {ip}, a link-local, loopback or \
+                 unspecified address; allow-list the literal IP instead if intended"
+            )),
+        }
+    }
+
+    /// The first resolved address that must not be reached through an
+    /// allow-listed hostname (finding 753) and that the operator did not also
+    /// allow-list as a literal. Pure so the resolver can be bypassed in tests.
+    fn rebinding_target(&self, addrs: &[std::net::IpAddr]) -> Option<std::net::IpAddr> {
+        const IMDS_V6: std::net::Ipv6Addr =
+            std::net::Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x254);
+        let blocked = |ip: &std::net::IpAddr| match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+                    || *v6 == IMDS_V6
+            }
+        };
+        let listed = |ip: &std::net::IpAddr| {
+            self.allowed_http_hosts
+                .iter()
+                .any(|h| h.trim_matches(['[', ']']).parse::<std::net::IpAddr>() == Ok(*ip))
+        };
+        addrs.iter().copied().find(|ip| blocked(ip) && !listed(ip))
     }
 }
 
@@ -5357,6 +5411,13 @@ impl SqeConfig {
                     "port conflict: coordinator.quack_port and metrics.prometheus_port are both {qp}"
                 ));
             }
+        }
+        if self.mcp.enabled_by_port_only() {
+            tracing::warn!(
+                port = self.mcp.port,
+                "[mcp] port is set without enabled = true; /mcp is NOT served (#672). Set \
+                 [mcp] enabled = true to serve it, or remove port."
+            );
         }
         if self.mcp.is_enabled() {
             let mp = self.mcp.port;
@@ -7333,6 +7394,7 @@ partial_progress_batch = 5
     #[test]
     fn test_validate_mcp_requires_oauth_resource_metadata() {
         let mut config = valid_config();
+        config.mcp.enabled = true;
         config.mcp.port = 8081;
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("mcp.resource_uri"), "got: {err}");
@@ -7342,6 +7404,7 @@ partial_progress_batch = 5
     #[test]
     fn test_validate_mcp_accepts_secure_read_only_config() {
         let mut config = valid_config();
+        config.mcp.enabled = true;
         config.mcp.port = 8081;
         config.mcp.resource_uri = "https://sqe.example.com/mcp".to_string();
         config.mcp.authorization_servers = vec!["https://idp.example.com/realm".to_string()];
@@ -7351,6 +7414,7 @@ partial_progress_batch = 5
     #[test]
     fn test_validate_mcp_write_mode_requires_scope_and_role() {
         let mut config = valid_config();
+        config.mcp.enabled = true;
         config.mcp.port = 8081;
         config.mcp.resource_uri = "https://sqe.example.com/mcp".to_string();
         config.mcp.authorization_servers = vec!["https://idp.example.com/realm".to_string()];
@@ -7367,6 +7431,7 @@ partial_progress_batch = 5
 
     fn mcp_enabled_config() -> SqeConfig {
         let mut config = valid_config();
+        config.mcp.enabled = true;
         config.mcp.port = 8081;
         config.mcp.resource_uri = "https://sqe.example.com/mcp".to_string();
         config
@@ -7418,17 +7483,17 @@ partial_progress_batch = 5
         assert!(err.contains("mcp.bind_address"), "{err}");
     }
 
-    /// #672: `port` alone still serves (one release), but is flagged so the
-    /// startup WARN fires; `enabled = true` is the intended switch.
+    /// #672: `port` alone does NOT serve; it is flagged so the WARN fires.
+    /// `enabled = true` is the only switch.
     #[test]
-    fn mcp_port_only_is_flagged_as_the_deprecated_enable() {
+    fn mcp_port_only_does_not_enable_the_surface() {
         let mut mcp = McpConfig {
             port: 8081,
             ..Default::default()
         };
-        assert!(mcp.is_enabled() && mcp.enabled_by_port_only());
+        assert!(!mcp.is_enabled() && mcp.enabled_by_port_only());
         mcp.enabled = true;
-        assert!(!mcp.enabled_by_port_only());
+        assert!(mcp.is_enabled() && !mcp.enabled_by_port_only());
     }
 
     #[test]
@@ -7960,7 +8025,28 @@ s3_secret_key = "configured-secret"
         // hardened config; the tests below flip each back to its default.
         config.policy.engine = PolicyEngine::InMemory;
         config.access_control.backend = AccessControlBackend::Polaris;
+        // Finding 751: inline TVF credentials default on; hardened turns it off.
+        config.storage.tvf.allow_inline_credentials = false;
         config
+    }
+
+    /// Finding 751: the three switches production mode used to let through.
+    #[test]
+    fn validate_production_rejects_hmac_tickets_unverified_advertise_and_inline_tvf_creds() {
+        let mut config = valid_production_config();
+        config.worker.accept_hmac_tickets = true;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(err.contains("worker.accept_hmac_tickets"), "{err}");
+
+        let mut config = valid_production_config();
+        config.coordinator.allow_unverified_advertise = true;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(err.contains("coordinator.allow_unverified_advertise"), "{err}");
+
+        let mut config = valid_production_config();
+        config.storage.tvf.allow_inline_credentials = true;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(err.contains("storage.tvf.allow_inline_credentials"), "{err}");
     }
 
     #[test]
@@ -10034,6 +10120,39 @@ audience = "polaris"
                 assert!(policy.check_endpoint(destination).is_err(), "{destination}");
             }
         }
+    }
+
+    /// Finding 753: an allow-listed hostname that resolves to IMDS, loopback,
+    /// link-local or unspecified is refused unless the operator also
+    /// allow-listed that literal IP. Loopback names and literal IPs are the
+    /// operator's own choice and are not resolved.
+    #[test]
+    fn tvf_allowed_hostname_rebound_to_internal_address_is_refused() {
+        let by_name = TvfPolicy {
+            allowed_http_hosts: vec!["data.example.com".into(), "localhost".into()],
+            ..Default::default()
+        };
+        use std::net::IpAddr;
+        let imds: IpAddr = "169.254.169.254".parse().unwrap();
+        let imds_v6: IpAddr = "fd00:ec2::254".parse().unwrap();
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        let public: IpAddr = "93.184.216.34".parse().unwrap();
+        assert_eq!(by_name.rebinding_target(&[public, imds]), Some(imds));
+        assert_eq!(by_name.rebinding_target(&[imds_v6]), Some(imds_v6));
+        assert_eq!(by_name.rebinding_target(&[lo]), Some(lo));
+        assert!(by_name.rebinding_target(&["fe80::1".parse().unwrap()]).is_some());
+        assert!(by_name.rebinding_target(&["0.0.0.0".parse().unwrap()]).is_some());
+        assert_eq!(by_name.rebinding_target(&[public]), None);
+        // Named loopback and literal IPs are not resolved: the operator chose them.
+        assert!(check_remote(&by_name, "http://localhost:9000/x").is_ok());
+
+        let literal = TvfPolicy {
+            allowed_http_hosts: vec!["127.0.0.1".into(), "169.254.169.254".into()],
+            ..Default::default()
+        };
+        assert_eq!(literal.rebinding_target(&[lo, imds]), None);
+        assert!(check_remote(&literal, "http://127.0.0.1:9000/x").is_ok());
+        assert!(check_remote(&literal, "http://169.254.169.254/latest").is_ok());
     }
 
     #[test]

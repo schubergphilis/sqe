@@ -1357,14 +1357,6 @@ const SEARCH_SCHEMAS_CONCURRENCY: usize = 8;
 /// there is no escape. A pattern with neither wildcard matches as a
 /// substring, which is what a caller typing a word means.
 fn like_matches(pattern: &str, name: &str) -> bool {
-    fn go(p: &[char], s: &[char]) -> bool {
-        match p.split_first() {
-            None => s.is_empty(),
-            Some(('%', rest)) => (0..=s.len()).any(|i| go(rest, &s[i..])),
-            Some(('_', rest)) => !s.is_empty() && go(rest, &s[1..]),
-            Some((c, rest)) => s.first().is_some_and(|d| d == c) && go(rest, &s[1..]),
-        }
-    }
     let pattern = pattern.to_lowercase();
     let bare = !pattern.contains('%') && !pattern.contains('_');
     let p: Vec<char> = if bare {
@@ -1373,8 +1365,35 @@ fn like_matches(pattern: &str, name: &str) -> bool {
         pattern.chars().collect()
     };
     let s: Vec<char> = name.to_lowercase().chars().collect();
-    go(&p, &s)
+    // Two pointers with backtrack to the last `%` (#739): the recursive
+    // version tried every split per `%`, depth = pattern length.
+    let (mut pi, mut si) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while si < s.len() {
+        match p.get(pi) {
+            Some('%') => {
+                star = Some((pi, si));
+                pi += 1;
+            }
+            Some(c) if *c == '_' || *c == s[si] => {
+                pi += 1;
+                si += 1;
+            }
+            _ => match star {
+                Some((sp, ss)) => {
+                    pi = sp + 1;
+                    si = ss + 1;
+                    star = Some((sp, ss + 1));
+                }
+                None => return false,
+            },
+        }
+    }
+    p[pi..].iter().all(|c| *c == '%')
 }
+
+/// Longest `search_tables` pattern accepted; longer is an argument error.
+const SEARCH_PATTERN_MAX_CHARS: usize = 256;
 
 /// The first column of a `SHOW` result as strings, in row order.
 fn first_column_strings(batches: &[RecordBatch]) -> Vec<String> {
@@ -1457,6 +1476,12 @@ async fn search_tables(
     args: &Value,
 ) -> Result<Value, (i32, String)> {
     let pattern = required(args, "pattern")?;
+    if pattern.chars().count() > SEARCH_PATTERN_MAX_CHARS {
+        return Err((
+            -32602,
+            format!("pattern is longer than {SEARCH_PATTERN_MAX_CHARS} characters"),
+        ));
+    }
     let catalog = args
         .get("catalog")
         .and_then(Value::as_str)
@@ -1954,6 +1979,9 @@ fn ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 fn table_ref(args: &Value) -> Result<String, (i32, String)> {
+    if required(args, "catalog")?.eq_ignore_ascii_case("system") {
+        return Err((-32602, "the system catalog is not an MCP surface".to_string()));
+    }
     Ok(format!(
         "{}.{}.{}",
         ident(required(args, "catalog")?),
@@ -2028,22 +2056,36 @@ fn ensure_read_only(sql: &str, session_catalog: Option<&str>) -> Result<Statemen
     }
     // Query is an allow-list kind, but sqlparser types SELECT INTO, WITH-INSERT
     // and FROM read_parquet(...) as Query. Those skip catalog/Ranger (#703 #704).
-    if let Some(name) = file_tvf_in(&kind) {
-        return Err(format!(
-            "Read-only tool rejected table function {name}; MCP queries catalog tables, \
-             not object-store paths or remote engines. Use sample_rows or SELECT from a table name"
-        ));
+    let shape = walk_query_shape(&kind);
+    if let Some(reason) = shape.denied {
+        return Err(format!("Read-only tool rejected {reason}"));
     }
-    if let Some(shape) = query_write_shape(&kind) {
+    if let Some(shape) = shape.write_shape {
         return Err(format!("Read-only tool rejected {shape}"));
     }
     Ok(kind)
 }
 
-/// Table functions that bypass the catalog: file TVFs read object-store or
-/// local paths with engine credentials, `quack_query` runs SQL on a remote
-/// engine (#749). Refused by both tools.
-const DENIED_TABLE_FUNCTIONS: [&str; 4] = ["read_parquet", "read_csv", "read_json", "quack_query"];
+/// The table functions a tool statement may call: the catalog-scoped Iceberg
+/// metadata TVFs (`crates/sqe-catalog/src/iceberg_metadata_tvf.rs`), which
+/// resolve through the catalog. Everything else with `(...)` in FROM is
+/// refused (#766): `read_*`, `*_scan`, `quack_query` and whatever gets
+/// registered next read paths with the engine's credentials.
+const CATALOG_TABLE_FUNCTIONS: [&str; 6] = [
+    "table_snapshots",
+    "table_manifests",
+    "table_history",
+    "table_files",
+    "table_partitions",
+    "table_refs",
+];
+
+/// Scalar-position names that are still file readers (`SELECT read_csv('x')`).
+fn is_file_reader_name(name: &str) -> bool {
+    matches!(name, "read_parquet" | "read_csv" | "read_json" | "quack_query")
+        || name.starts_with("read_")
+        || name.ends_with("_scan")
+}
 
 fn object_name_last(name: &sqlparser::ast::ObjectName) -> Option<String> {
     name.0
@@ -2052,15 +2094,35 @@ fn object_name_last(name: &sqlparser::ast::ObjectName) -> Option<String> {
         .map(|ident| ident.value.to_ascii_lowercase())
 }
 
-fn is_file_tvf_name(name: &sqlparser::ast::ObjectName) -> Option<String> {
-    let last = object_name_last(name)?;
-    DENIED_TABLE_FUNCTIONS
-        .contains(&last.as_str())
-        .then_some(last)
+/// A table function call outside [`CATALOG_TABLE_FUNCTIONS`]: the reason text.
+fn denied_table_function(name: &sqlparser::ast::ObjectName) -> Option<String> {
+    let last = object_name_last(name).unwrap_or_default();
+    (!CATALOG_TABLE_FUNCTIONS.contains(&last.as_str())).then(|| {
+        format!(
+            "table function {last}; MCP queries catalog tables, not object-store paths. \
+             Use sample_rows or SELECT from a table name"
+        )
+    })
+}
+
+/// A plain relation the tools must not read: the `system` catalog (#705:
+/// `system.runtime.queries` carries every client's SQL) and a quoted path
+/// used as a table (`FROM '/tmp/x.parquet'`).
+fn denied_relation(name: &sqlparser::ast::ObjectName) -> Option<String> {
+    let first = name.0.first()?.as_ident()?;
+    if first.quote_style == Some('\'') {
+        return Some(format!(
+            "path {:?} in FROM; MCP queries catalog tables, not object-store paths",
+            first.value
+        ));
+    }
+    (name.0.len() > 1 && first.value.eq_ignore_ascii_case("system")).then(|| {
+        format!("system catalog table {name}; the runtime views are an operator surface")
+    })
 }
 
 struct QueryShapeFinder {
-    file_tvf: Option<String>,
+    denied: Option<String>,
     write_shape: Option<&'static str>,
 }
 
@@ -2072,22 +2134,33 @@ impl sqlparser::ast::Visitor for QueryShapeFinder {
         factor: &sqlparser::ast::TableFactor,
     ) -> std::ops::ControlFlow<Self::Break> {
         use sqlparser::ast::{Expr, TableFactor};
-        let name = match factor {
+        self.denied = match factor {
             TableFactor::Table {
                 name,
                 args: Some(_),
                 ..
             }
-            | TableFactor::Function { name, .. } => is_file_tvf_name(name),
+            | TableFactor::Function { name, .. } => denied_table_function(name),
+            TableFactor::Table { name, .. } => denied_relation(name),
             TableFactor::TableFunction {
                 expr: Expr::Function(func),
                 ..
-            } => is_file_tvf_name(&func.name),
+            } => denied_table_function(&func.name),
+            TableFactor::TableFunction { .. } => Some("TABLE(<expression>) in FROM".to_string()),
             _ => None,
         };
-        if let Some(name) = name {
-            self.file_tvf = Some(name);
+        if self.denied.is_some() {
             return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &sqlparser::ast::Expr) -> std::ops::ControlFlow<Self::Break> {
+        if let sqlparser::ast::Expr::Function(func) = expr {
+            if let Some(name) = object_name_last(&func.name).filter(|n| is_file_reader_name(n)) {
+                self.denied = Some(format!("file function {name} in an expression"));
+                return std::ops::ControlFlow::Break(());
+            }
         }
         std::ops::ControlFlow::Continue(())
     }
@@ -2124,41 +2197,33 @@ impl sqlparser::ast::Visitor for QueryShapeFinder {
     }
 }
 
+/// The parsed statement of the kinds whose sources can hide a table
+/// function or a `system` read: queries and the data statements the change
+/// tool runs (`INSERT ... SELECT FROM read_parquet(...)`).
+fn statement_of(kind: &StatementKind) -> Option<&sqlparser::ast::Statement> {
+    match kind {
+        StatementKind::Query(stmt)
+        | StatementKind::CreateTable(stmt)
+        | StatementKind::Ctas(stmt)
+        | StatementKind::Insert(stmt)
+        | StatementKind::Merge(stmt)
+        | StatementKind::Delete(stmt)
+        | StatementKind::Update(stmt)
+        | StatementKind::CreateView(stmt) => Some(stmt.as_ref()),
+        _ => None,
+    }
+}
+
 fn walk_query_shape(kind: &StatementKind) -> QueryShapeFinder {
     use sqlparser::ast::Visit;
     let mut finder = QueryShapeFinder {
-        file_tvf: None,
+        denied: None,
         write_shape: None,
     };
     if let Some(stmt) = statement_of(kind) {
         let _ = stmt.visit(&mut finder);
     }
     finder
-}
-
-/// The parsed statement behind the kinds both tools walk for table
-/// functions: the read-only kind and the change kinds that carry a query
-/// (CTAS, INSERT ... SELECT, CREATE VIEW, MERGE; #723).
-fn statement_of(kind: &StatementKind) -> Option<&sqlparser::ast::Statement> {
-    match kind {
-        StatementKind::Query(s)
-        | StatementKind::CreateTable(s)
-        | StatementKind::Ctas(s)
-        | StatementKind::Insert(s)
-        | StatementKind::Merge(s)
-        | StatementKind::Delete(s)
-        | StatementKind::Update(s)
-        | StatementKind::CreateView(s) => Some(s.as_ref()),
-        _ => None,
-    }
-}
-
-fn file_tvf_in(kind: &StatementKind) -> Option<String> {
-    walk_query_shape(kind).file_tvf
-}
-
-fn query_write_shape(kind: &StatementKind) -> Option<&'static str> {
-    walk_query_shape(kind).write_shape
 }
 
 /// Append `LIMIT max_rows + 1` to a plain query that has no row bound of its
@@ -2234,14 +2299,8 @@ fn ensure_change(sql: &str, session_catalog: Option<&str>) -> Result<StatementKi
             kind.name()
         ));
     }
-    // Same denylist as the read-only tool (#723): CTAS / INSERT ... SELECT
-    // FROM read_parquet(...) would otherwise read object-store paths on the
-    // engine's credentials through the write tool.
-    if let Some(name) = file_tvf_in(&kind) {
-        return Err(format!(
-            "Change tool rejected table function {name}; MCP statements read catalog tables, \
-             not object-store paths or remote engines"
-        ));
+    if let Some(reason) = walk_query_shape(&kind).denied {
+        return Err(format!("execute_sql_change rejected {reason}"));
     }
     Ok(kind)
 }
@@ -2526,6 +2585,10 @@ fn batches_json(batches: &[RecordBatch], max_rows: usize, max_bytes: usize) -> V
         .unwrap_or(usize::MAX);
     let mut used = framing;
     let mut rows = Vec::new();
+    // One wide cell must not be the whole budget (#707): `repeat('x', 1e6)`
+    // is one row under the row cap and a megabyte to the model.
+    let cell_budget = max_bytes.min(CELL_BYTES_MAX);
+    let mut cell_truncated = false;
     'batches: for batch in batches {
         for row in 0..batch.num_rows() {
             if rows.len() >= max_rows {
@@ -2533,10 +2596,21 @@ fn batches_json(batches: &[RecordBatch], max_rows: usize, max_bytes: usize) -> V
             }
             let mut object = Map::new();
             for (index, field) in batch.schema().fields().iter().enumerate() {
-                object.insert(
-                    field.name().clone(),
-                    sqe_trino_protocol::encode::arrow_value_to_json(batch.column(index).as_ref(), row),
-                );
+                let mut value =
+                    sqe_trino_protocol::encode::arrow_value_to_json(batch.column(index).as_ref(), row);
+                if let Value::String(text) = &mut value {
+                    if text.len() > cell_budget {
+                        let mut end = cell_budget;
+                        while !text.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        let dropped = text.len() - end;
+                        text.truncate(end);
+                        text.push_str(&format!("...[truncated {dropped} bytes]"));
+                        cell_truncated = true;
+                    }
+                }
+                object.insert(field.name().clone(), value);
             }
             let object = Value::Object(object);
             // The row's bytes plus the separating comma.
@@ -2556,9 +2630,12 @@ fn batches_json(batches: &[RecordBatch], max_rows: usize, max_bytes: usize) -> V
         "rows": rows,
         "returned_rows": returned_rows,
         "total_rows": total_rows,
-        "truncated": returned_rows < total_rows
+        "truncated": returned_rows < total_rows || cell_truncated
     })
 }
+
+/// Longest string cell serialized into a tool response (#707).
+const CELL_BYTES_MAX: usize = 64 * 1024;
 
 fn tool_success(value: Value) -> Value {
     json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value,"isError":false})
@@ -2786,6 +2863,81 @@ mod tests {
             .expect("bare name without args is a table, not a TVF");
     }
 
+    /// #766: every table function outside the catalog-scoped Iceberg metadata
+    /// set is refused, as is a quoted path in FROM and a file reader in scalar
+    /// position. `read_/**/csv('x')` does NOT become `read_csv`: the comment
+    /// is whitespace to the tokenizer, so it parses as table `read_` aliased
+    /// `csv (x)`, a plain catalog relation with no file access.
+    #[test]
+    fn read_only_guard_fails_closed_on_unknown_table_functions_and_paths() {
+        for sql in [
+            "SELECT * FROM parquet_scan('x')",
+            "SELECT read_csv('x')",
+            "SELECT * FROM t WHERE read_parquet('x') IS NOT NULL",
+            "SELECT * FROM '/tmp/x.parquet'",
+            "SELECT * FROM quack_query('a','b')",
+            "SELECT * FROM some_new_tvf('x')",
+            "SELECT * FROM TABLE(read_parquet('x'))",
+        ] {
+            let err = ensure_read_only(sql, None).expect_err(sql);
+            assert!(err.contains("Read-only tool rejected"), "{sql}: {err}");
+        }
+        let kind = ensure_read_only("SELECT * FROM read_/**/csv('x')", None).expect("plain table read_");
+        assert!(format!("{kind:?}").contains("value: \"read_\""), "{kind:?}");
+        ensure_read_only("SELECT * FROM table_snapshots('s','t')", None).expect("catalog TVF stays");
+        ensure_read_only("SELECT * FROM iceberg.table_files('s','t')", None).expect("qualified catalog TVF stays");
+        ensure_read_only("SELECT upper(name) FROM t WHERE length(name) > 1", None)
+            .expect("ordinary scalar functions stay");
+        let err = ensure_change("INSERT INTO t SELECT * FROM read_parquet('x')", None)
+            .expect_err("change tool sources are gated too");
+        assert!(err.contains("execute_sql_change rejected"), "{err}");
+    }
+
+    /// #705 #763: `system.runtime.queries` carries every client's SQL text.
+    #[test]
+    fn read_only_guard_refuses_the_system_catalog() {
+        for sql in [
+            "SELECT query FROM system.runtime.queries",
+            "SELECT * FROM SYSTEM.runtime.nodes",
+            "WITH q AS (SELECT * FROM system.runtime.tasks) SELECT * FROM q",
+            "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM system.runtime.queries)",
+        ] {
+            let err = ensure_read_only(sql, None).expect_err(sql);
+            assert!(err.contains("Read-only tool rejected system catalog"), "{sql}: {err}");
+        }
+        ensure_read_only("SELECT * FROM system", None).expect("a table named system is not the catalog");
+        ensure_read_only("SELECT * FROM iceberg.system.t", None).expect("a schema named system is fine");
+        let err = table_ref(&json!({"catalog": "System", "schema": "runtime", "table": "queries"}))
+            .expect_err("sample_rows shares the gate");
+        assert_eq!(err.0, -32602);
+    }
+
+    #[test]
+    fn like_matcher_is_iterative_and_patterns_are_capped() {
+        // Depth = pattern length before #739; this would overflow the stack.
+        let long = "%".repeat(1 << 20) + "z";
+        assert!(!like_matches(&long, &"a".repeat(2_000)));
+        assert!(like_matches(&"%".repeat(500), "anything"));
+        assert!(like_matches("%a%b%c", "xaxbxc"));
+        assert!(!like_matches("%a%b%c", "xaxbxcx"));
+        assert!(like_matches("a%", "a"));
+        assert!(!like_matches("a_", "a"));
+    }
+
+    #[test]
+    fn a_wide_cell_is_cut_to_the_cell_budget_and_reported() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
+        let wide = "x".repeat(100 * 1024);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![wide.as_str()]))])
+            .unwrap();
+        let value = batches_json(&[batch], 10, 1024 * 1024);
+        let cell = value["rows"][0]["v"].as_str().unwrap();
+        assert!(cell.len() < CELL_BYTES_MAX + 64, "{}", cell.len());
+        assert!(cell.ends_with("bytes]"), "{}", &cell[cell.len() - 40..]);
+        assert_eq!(value["returned_rows"], 1);
+        assert_eq!(value["truncated"], true);
+    }
+
     /// #723 #749: the change tool applies the same denylist, and the
     /// outbound `quack_query` TVF is on it for both tools.
     #[test]
@@ -2799,7 +2951,7 @@ mod tests {
         ] {
             let err = ensure_change(sql, None).expect_err(sql);
             assert!(
-                err.contains("Change tool rejected table function"),
+                err.contains("rejected table function"),
                 "{sql}: {err}"
             );
         }
