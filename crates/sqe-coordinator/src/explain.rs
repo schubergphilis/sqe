@@ -9,7 +9,7 @@ use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::physical_plan::metrics::MetricValue;
-use datafusion::physical_plan::{collect, displayable, ExecutionPlan};
+use datafusion::physical_plan::{displayable, execute_stream, ExecutionPlan};
 use datafusion::prelude::SessionContext;
 
 use sqe_catalog::IcebergScanExec;
@@ -151,9 +151,7 @@ impl ExplainHandler {
 
         // Execute — populates metrics on each node in-place
         let execute_start = std::time::Instant::now();
-        collect(physical.clone(), ctx.task_ctx())
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("EXPLAIN ANALYZE execution failed: {e}")))?;
+        drain_capped(&physical, ctx, self.query_config.max_result_rows, "EXPLAIN ANALYZE").await?;
         let execute_ms = execute_start.elapsed().as_secs_f64() * 1000.0;
 
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
@@ -292,9 +290,7 @@ impl ExplainHandler {
 
         // Execute — populates per-node metrics in-place
         let execute_start = std::time::Instant::now();
-        collect(physical.clone(), ctx.task_ctx())
-            .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("EXPLAIN FULL execution failed: {e}")))?;
+        drain_capped(&physical, ctx, self.query_config.max_result_rows, "EXPLAIN FULL").await?;
         let execute_ms = execute_start.elapsed().as_secs_f64() * 1000.0;
 
         let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
@@ -648,9 +644,68 @@ fn walk_full(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<FullRow>) {
     }
 }
 
+/// Run `plan` for its operator metrics only, discarding every batch, and stop
+/// with the SELECT path's error once more than `max_rows` rows have streamed
+/// (`0` = uncapped). EXPLAIN ANALYZE / FULL used `collect()`, which buffered
+/// the entire result the buffered SELECT path refuses to buffer (#734).
+async fn drain_capped(
+    plan: &Arc<dyn ExecutionPlan>,
+    ctx: &SessionContext,
+    max_rows: usize,
+    what: &str,
+) -> sqe_core::Result<()> {
+    use futures::TryStreamExt;
+    let fail = |e: datafusion::error::DataFusionError| {
+        SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("{what} execution failed: {e}"),
+        )
+    };
+    let mut stream = execute_stream(Arc::clone(plan), ctx.task_ctx()).map_err(fail)?;
+    let mut rows: usize = 0;
+    while let Some(batch) = stream.try_next().await.map_err(fail)? {
+        rows = rows.saturating_add(batch.num_rows());
+        if max_rows > 0 && rows > max_rows {
+            return Err(SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!(
+                    "{what} result exceeds maximum allowed rows ({rows} > {max_rows}). \
+                     Reason: configured max_result_rows={max_rows}. Use LIMIT to reduce \
+                     output or raise the limit in config."
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::require_query;
+    use super::{drain_capped, require_query};
+    use datafusion::prelude::SessionContext;
+
+    #[tokio::test]
+    async fn explain_execution_stops_at_max_result_rows() {
+        let ctx = SessionContext::new();
+        let plan = ctx
+            .sql("SELECT * FROM (VALUES (1), (2), (3), (4), (5)) AS t(n)")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        drain_capped(&plan, &ctx, 0, "EXPLAIN ANALYZE")
+            .await
+            .unwrap();
+        drain_capped(&plan, &ctx, 5, "EXPLAIN ANALYZE")
+            .await
+            .unwrap();
+        let err = drain_capped(&plan, &ctx, 2, "EXPLAIN ANALYZE")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_result_rows=2"), "{err}");
+    }
 
     #[test]
     fn explain_refuses_anything_but_a_query() {
