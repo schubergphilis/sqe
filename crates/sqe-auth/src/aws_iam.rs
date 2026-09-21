@@ -318,6 +318,7 @@ impl AuthProvider for AwsIamProvider {
                 catalog_token: None,
                 refresh_token: None,
                 expires_at: None,
+                scopes: vec![],
             })
         } else {
             // --- Config-only path ---
@@ -339,6 +340,7 @@ impl AuthProvider for AwsIamProvider {
                     catalog_token: None,
                     refresh_token: None,
                     expires_at: None,
+                    scopes: vec![],
                 })
             } else {
                 warn!(
@@ -900,6 +902,7 @@ mod tests {
             catalog_token: None,
             refresh_token: None,
             expires_at: None,
+            scopes: vec![],
         };
 
         let result = provider.refresh_catalog_token(&identity).await;

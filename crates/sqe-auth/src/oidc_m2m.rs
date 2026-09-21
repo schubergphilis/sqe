@@ -220,6 +220,7 @@ impl AuthProvider for OidcM2mProvider {
             catalog_token: Some(sqe_core::SecretString::new(token)),
             refresh_token: None,
             expires_at: None,
+            scopes: vec![],
         })
     }
 

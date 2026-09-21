@@ -61,6 +61,7 @@ impl AuthProvider for AnonymousProvider {
             catalog_token: None,
             refresh_token: None,
             expires_at: None,
+            scopes: vec![],
         })
     }
 
@@ -161,6 +162,7 @@ mod tests {
             catalog_token: None,
             refresh_token: None,
             expires_at: None,
+            scopes: vec![],
         };
 
         let result = provider.refresh_catalog_token(&identity).await;

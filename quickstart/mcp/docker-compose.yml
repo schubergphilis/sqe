@@ -6,6 +6,9 @@ services:
       RUST_LOG: "info,sqe_mcp=debug,sqe_auth=debug"
       SQE_MCP__ALLOW_WRITES: ${MCP_ALLOW_WRITES:-false}
       SQE_MCP__RESOURCE_URI: http://localhost:${SQE_MCP_PORT:-19091}/mcp
+      # Object-store keys live in .env, not in sqe.toml (#681).
+      SQE_STORAGE__S3_ACCESS_KEY: ${S3_ACCESS_KEY:-s3admin}
+      SQE_STORAGE__S3_SECRET_KEY: ${S3_SECRET_KEY:-s3adminpw}
     volumes:
       # Compose resolves overlay paths relative to the first compose file.
       - ../mcp/sqe.toml:/etc/sqe/sqe.toml:ro

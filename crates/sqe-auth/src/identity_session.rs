@@ -69,6 +69,7 @@ mod tests {
             catalog_token: Some(SecretString::new("catalog-tok".to_string())),
             refresh_token: Some(SecretString::new("refresh-tok".to_string())),
             expires_at: Some(Utc::now() + Duration::minutes(7)),
+            scopes: vec![],
         }
     }
 

@@ -107,6 +107,7 @@ async fn quack_select_one_round_trip() {
             catalog_token: Some(sqe_core::SecretString::new(bearer.clone())),
             refresh_token: None,
             expires_at: None,
+            scopes: vec![],
         },
     });
     let executor: Arc<dyn sqe_quack_server::QueryExecutor> =

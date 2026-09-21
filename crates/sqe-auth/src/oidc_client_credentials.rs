@@ -237,6 +237,7 @@ impl OidcClientCredentialsProvider {
             catalog_token: Some(SecretString::new(access_token)),
             refresh_token: None,
             expires_at,
+            scopes: vec![],
         }
     }
 }
@@ -497,6 +498,7 @@ mod tests {
             catalog_token: None,
             refresh_token: None,
             expires_at: None,
+            scopes: vec![],
         };
         assert!(p.refresh_catalog_token(&id).await.unwrap().is_none());
     }

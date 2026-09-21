@@ -114,6 +114,7 @@ impl MaintenancePrincipal {
             catalog_token: None,
             refresh_token: None,
             expires_at: None,
+            scopes: vec![],
         };
         let refreshed = self
             .provider
@@ -198,6 +199,7 @@ mod tests {
             catalog_token: Some(sqe_core::SecretString::new("fake-token".to_string())),
             refresh_token: None,
             expires_at: None,
+            scopes: vec![],
         }
     }
 

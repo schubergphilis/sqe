@@ -59,6 +59,7 @@ impl AuthProvider for FakeAuth {
             catalog_token: None,
             refresh_token: None,
             expires_at: Some(chrono::Utc::now() + chrono::Duration::minutes(5)),
+            scopes: vec![],
         })
     }
 }
