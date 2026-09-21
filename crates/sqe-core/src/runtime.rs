@@ -121,6 +121,18 @@ mod tests {
         }
     }
 
+    /// The builder honours the configured stack: a worker thread on the
+    /// default 8 MiB runtime recurses through ~4 MiB, which would abort the
+    /// process on tokio's 2 MiB default.
+    #[test]
+    fn server_runtime_threads_get_the_configured_stack() {
+        let cfg: CoordinatorConfig = toml::from_str("").expect("all fields default");
+        assert_eq!(cfg.runtime_stack_mib, DEFAULT_RUNTIME_STACK_MIB);
+        let rt = build_server_runtime(&cfg, "sqe-test").expect("runtime");
+        let depth = rt.block_on(async { tokio::spawn(async { burn(1000) }).await.expect("task") });
+        assert_eq!(depth, 1000);
+    }
+
     /// The property #640 is about: a planning phase that needs more stack
     /// than a runtime thread has completes instead of aborting the process.
     /// Runtime threads here get 1 MiB; the recursion needs about 12 MiB.
