@@ -163,6 +163,21 @@ fn client_key(peer: SocketAddr, forwarded_for: Option<&str>, security: &Security
     strip_port(&resolved).to_string()
 }
 
+/// Every `x-forwarded-for` line joined into one comma-separated field, as
+/// RFC 7230 defines repeated headers (finding 740). `HeaderMap::get` returns
+/// only the first line, so a client that appends a second header could put a
+/// hop after the proxy's own and become the rightmost hop `resolve_client_ip`
+/// trusts.
+fn forwarded_for_header(headers: &HeaderMap) -> Option<String> {
+    let joined = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(", ");
+    (!joined.is_empty()).then_some(joined)
+}
+
 pub fn router(state: QuackServerState) -> Router {
     Router::new()
         .route("/", get(identify))
@@ -236,8 +251,8 @@ async fn handle_quack(
     // needs it on the ConnectionRequest path; every *post*-connect path needs
     // it to check the session's client binding (finding 606), so it can no
     // longer live inside the ConnectionRequest arm.
-    let forwarded_for = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
-    let client_ip = client_key(peer, forwarded_for, &state.security);
+    let forwarded_for = forwarded_for_header(&headers);
+    let client_ip = client_key(peer, forwarded_for.as_deref(), &state.security);
 
     match (request_header.r#type, request_body) {
         (MessageType::ConnectionRequest, QuackMessage::ConnectionRequest(req)) => {
@@ -793,6 +808,36 @@ mod tests {
             client_key(proxy, Some("203.0.113.5"), &trusted),
             client_key(proxy, Some("198.51.100.9"), &trusted),
             "two real clients behind one trusted proxy must not share a bucket"
+        );
+    }
+
+    /// Finding 740: two `x-forwarded-for` lines must resolve exactly like one
+    /// comma-separated field, so a client-appended second line cannot become
+    /// the session key.
+    #[test]
+    fn forwarded_for_joins_repeated_header_lines() {
+        let mut two_lines = HeaderMap::new();
+        two_lines.append("x-forwarded-for", "203.0.113.5".parse().unwrap());
+        two_lines.append("x-forwarded-for", "10.0.0.2".parse().unwrap());
+        let mut one_line = HeaderMap::new();
+        one_line.append("x-forwarded-for", "203.0.113.5, 10.0.0.2".parse().unwrap());
+
+        assert_eq!(
+            forwarded_for_header(&two_lines),
+            forwarded_for_header(&one_line)
+        );
+        assert_eq!(forwarded_for_header(&HeaderMap::new()), None);
+
+        let proxy: SocketAddr = "10.0.0.1:50000".parse().unwrap();
+        let trusted = SecurityConfig {
+            trusted_proxies: vec!["10.0.0.1".to_string(), "10.0.0.2".to_string()],
+            ..SecurityConfig::default()
+        };
+        // Both proxies trusted: the real client is the rightmost untrusted hop
+        // on the joined field, not the first line's last entry.
+        assert_eq!(
+            client_key(proxy, forwarded_for_header(&two_lines).as_deref(), &trusted),
+            "203.0.113.5"
         );
     }
 }
