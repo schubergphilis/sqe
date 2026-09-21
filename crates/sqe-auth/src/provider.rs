@@ -73,6 +73,10 @@ pub struct Identity {
     /// (anonymous, mTLS), in which case the `SessionManager` falls back to a
     /// default. Issue #26.
     pub expires_at: Option<DateTime<Utc>>,
+    /// OAuth scopes granted to the token (`scope` space-separated string or
+    /// `scp` array/string). Empty when the provider does not know them
+    /// (anonymous, mTLS, API key, ...). Issue #676.
+    pub scopes: Vec<String>,
 }
 
 /// Errors returned by `AuthProvider::authenticate`.
@@ -233,6 +237,7 @@ mod tests {
             catalog_token: Some(SecretString::new("ey-very-secret-jwt-value".to_string())),
             refresh_token: Some(SecretString::new("very-secret-refresh-token".to_string())),
             expires_at: None,
+            scopes: vec![],
         };
         let debug = format!("{:?}", identity);
 

@@ -35,14 +35,17 @@ step "starting the reused Keycloak + Polaris + RustFS stack and SQE MCP"
 ok "stack ready; MCP is sharing SQE web port ${SQE_MCP_PORT:-19091}"
 
 step "minting short-lived per-user tokens"
-SQE_MCP_TOKEN=$(./mint-token.sh adminuser adminuser123 "openid sqe:mcp:write")
-SQE_MCP_READER_TOKEN=$(./mint-token.sh testuser testuser123 "openid sqe:mcp:write")
+# Users and passwords travel in the environment (.env), not on argv (#681).
+SQE_MCP_TOKEN=$(MINT_USER=adminuser ./mint-token.sh)
+SQE_MCP_READER_TOKEN=$(MINT_USER=testuser ./mint-token.sh)
 export SQE_MCP_TOKEN SQE_MCP_READER_TOKEN
 ok "adminuser and testuser tokens minted"
 
 step "seeding the reusable quickstart table through Flight SQL as adminuser"
-"${COMPOSE[@]}" exec -T sqe sqe-cli --port 50051 --token "$SQE_MCP_TOKEN" \
-  --file /queries.sql --stop-on-error >/dev/null
+# The token enters the container through the environment; only the inner
+# sqe-cli process sees it as an argument.
+"${COMPOSE[@]}" exec -T -e SQE_MCP_TOKEN sqe sh -c \
+  'exec sqe-cli --port 50051 --token "$SQE_MCP_TOKEN" --file /queries.sql --stop-on-error' >/dev/null
 ok "quickstart.demo.events contains four rows"
 
 export SQE_MCP_URL="http://localhost:${SQE_MCP_PORT:-19091}/mcp"

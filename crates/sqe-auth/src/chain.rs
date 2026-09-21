@@ -166,6 +166,7 @@ mod tests {
                 catalog_token: Some(sqe_core::SecretString::new("test-token".to_string())),
                 refresh_token: None,
                 expires_at: None,
+                scopes: vec![],
             })
         }
     }
@@ -321,6 +322,7 @@ mod tests {
             catalog_token: None,
             refresh_token: None,
             expires_at: None,
+            scopes: vec![],
         };
 
         let result = chain.refresh_catalog_token(&identity).await;
@@ -345,6 +347,7 @@ mod tests {
             catalog_token: None,
             refresh_token: None,
             expires_at: None,
+            scopes: vec![],
         };
 
         let result = chain.refresh_catalog_token(&identity).await;
@@ -400,6 +403,7 @@ mod tests {
                     catalog_token: Some(p.clone()),
                     refresh_token: None,
                     expires_at: None,
+                    scopes: vec![],
                 }),
                 _ => Err(AuthError::NotMyCredentials),
             }
@@ -428,6 +432,7 @@ mod tests {
                     catalog_token: Some(t.clone()),
                     refresh_token: None,
                     expires_at: None,
+                    scopes: vec![],
                 }),
                 _ => Err(AuthError::NotMyCredentials),
             }

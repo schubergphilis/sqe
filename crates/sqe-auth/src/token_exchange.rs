@@ -278,6 +278,7 @@ impl TokenExchangeProvider {
             catalog_token: Some(sqe_core::SecretString::new(access_token.to_string())),
             refresh_token: Some(sqe_core::SecretString::new(subject_token.to_string())),
             expires_at,
+            scopes: vec![],
         })
     }
 

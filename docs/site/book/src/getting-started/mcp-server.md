@@ -173,12 +173,20 @@ Read tools, always available:
 | `whoami` | Identity metadata for the session; never tokens. |
 | `refresh_metadata` | Drop cached catalog metadata for one table, one schema, or the session's catalog view, so the next call re-reads it. For a table created or changed outside SQE; rate-limited per scope. |
 
-`execute_sql_readonly` accepts exactly one statement and rejects DDL, DML,
-grants, secrets and session changes before they reach the query handler. File
-table functions (`read_parquet`, `read_csv`, `read_json`) are refused too: MCP
-queries catalog tables, not object-store paths. The write tool
-`execute_sql_change` is not advertised unless `allow_writes = true`, which
-anonymous mode never allows.
+`execute_sql_readonly` accepts exactly one statement. The SQL parser
+classifies it first; DDL, DML, grants, secrets and session changes are
+rejected before they reach the query handler. So are file table functions
+(`read_parquet`, `read_csv`, `read_json`), quoted paths in `FROM`, the
+`system` catalog and `information_schema.df_settings`: MCP queries catalog
+tables, not object-store paths or the engine's own runtime. What the parser
+does not stop, the catalog does: row filters, column masks and grants apply
+as the calling user. This is tested, not asserted: the router suite in
+`crates/sqe-mcp/tests/router.rs` drives the HTTP gates and the DDL refusal
+end to end on every CI run, and the parser refusals are unit tests in the
+same crate. The full list of limits is in
+[Limits and exposure](../deployment/mcp.md#limits-and-exposure). The write
+tool `execute_sql_change` is not advertised unless `allow_writes = true`,
+which anonymous mode never allows.
 
 ## Auth modes
 

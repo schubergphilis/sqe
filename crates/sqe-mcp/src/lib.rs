@@ -790,7 +790,14 @@ async fn authenticate_oauth(
                 )
             }
         })?;
-    let scopes = token_scopes(token).ok_or_else(|| {
+    // #676: the validated provider knows the scopes (JWT claims, introspection).
+    // Only decode the payload ourselves when the provider left them empty.
+    let scopes = if identity.scopes.is_empty() {
+        token_scopes(token)
+    } else {
+        Some(identity.scopes.iter().cloned().collect())
+    };
+    let scopes = scopes.ok_or_else(|| {
         tracing::warn!("MCP bearer has no readable OAuth scope/scp claim");
         auth_error(
             &state.config,
@@ -1011,10 +1018,12 @@ async fn call_tool(
             .await
             .map(tool_success);
     }
+    let mut show_catalogs = false;
     let sql = match name {
         "execute_sql_readonly" => {
             let sql = required(&args, "sql")?;
             let kind = ensure_read_only(sql, session_catalog).map_err(|e| (-32602, e))?;
+            show_catalogs = matches!(kind, StatementKind::ShowCatalogs);
             with_row_cap(sql, &kind, state.config.max_result_rows)
         }
         "execute_sql_change" => {
@@ -1113,11 +1122,18 @@ async fn call_tool(
         state.executor.execute(&session, &sql).await
     };
     match result {
-        Ok(batches) => Ok(tool_success(batches_json(
-            &batches,
-            state.config.max_result_rows,
-            state.config.max_response_bytes,
-        ))),
+        Ok(batches) => {
+            let batches = if show_catalogs {
+                strip_phantom_catalogs(batches, &state.hive_roots)
+            } else {
+                batches
+            };
+            Ok(tool_success(batches_json(
+                &batches,
+                state.config.max_result_rows,
+                state.config.max_response_bytes,
+            )))
+        }
         Err(error) => Ok(tool_failure(with_decimal_hint(with_refresh_hint(
             name,
             client_error_text(&error),
@@ -1208,7 +1224,7 @@ async fn list_catalogs_with_diagnostics(
     session: &Session,
 ) -> Result<Value, (i32, String)> {
     let batches = match state.executor.execute_metadata(session, "SHOW CATALOGS").await {
-        Ok(batches) => batches,
+        Ok(batches) => strip_phantom_catalogs(batches, &state.hive_roots),
         Err(error) => return Ok(tool_failure(error.to_string())),
     };
     let visible = first_column_strings(&batches);
@@ -1269,18 +1285,22 @@ async fn list_catalogs_with_diagnostics(
     // Bounded like the root probes; a chain that hangs reports `timeout`.
     if let Some(probe) = &state.storage_probe {
         let entry = match tokio::time::timeout(CATALOG_PROBE_TIMEOUT, probe()).await {
+            // Status and a reason only (#765): the provider kind and the
+            // expiry timestamp describe the engine's credential setup, which
+            // an agent transcript has no use for.
             Ok(report) => json!({
                 "kind": "object_store",
                 "status": report.status,
-                "provider": report.provider,
-                "expires_at": report.expires_at,
-                "detail": report.detail,
+                "detail": report.detail.or_else(|| {
+                    report.expires_at.is_some().then(|| {
+                        "temporary credentials; the SDK renews them while the session lasts"
+                            .to_string()
+                    })
+                }),
             }),
             Err(_) => json!({
                 "kind": "object_store",
                 "status": "timeout",
-                "provider": Value::Null,
-                "expires_at": Value::Null,
                 "detail": format!(
                     "no answer from the credential provider within {}s",
                     CATALOG_PROBE_TIMEOUT.as_secs()
@@ -1298,6 +1318,41 @@ async fn list_catalogs_with_diagnostics(
         map.insert("diagnostics".to_string(), Value::Array(diagnostics));
     }
     Ok(tool_success(body))
+}
+
+/// Catalog names `SHOW CATALOGS` lists that no statement can resolve (#706):
+/// the engine's placeholder for an unnamed warehouse and DataFusion's own
+/// defaults. `list_schemas` on them fails with "unknown catalog", so an
+/// agent that walks the list trips on the first entry. A Hive root with one
+/// of these names is real and kept.
+// ponytail: a REST catalog literally named `default` is dropped too; pass
+// the configured names into the state if a deployment ever does that.
+const PHANTOM_CATALOGS: [&str; 3] = ["default", "datafusion", "system"];
+
+fn strip_phantom_catalogs(batches: Vec<RecordBatch>, hive_roots: &[String]) -> Vec<RecordBatch> {
+    let is_phantom = |name: &str| {
+        PHANTOM_CATALOGS
+            .iter()
+            .any(|p| name.eq_ignore_ascii_case(p))
+            && !hive_roots.iter().any(|r| name.eq_ignore_ascii_case(r))
+    };
+    batches
+        .into_iter()
+        .filter_map(|batch| {
+            let names = first_column_strings(std::slice::from_ref(&batch));
+            if names.len() != batch.num_rows() || !names.iter().any(|n| is_phantom(n)) {
+                return Some(batch);
+            }
+            let kept: Vec<&str> = names
+                .iter()
+                .map(String::as_str)
+                .filter(|n| !is_phantom(n))
+                .collect();
+            let mut columns: Vec<arrow_array::ArrayRef> = batch.columns().to_vec();
+            columns[0] = Arc::new(arrow_array::StringArray::from(kept));
+            RecordBatch::try_new(batch.schema(), columns).ok()
+        })
+        .collect()
 }
 
 /// A not-found answer from a lookup tool gets one line pointing at
@@ -2106,8 +2161,9 @@ fn denied_table_function(name: &sqlparser::ast::ObjectName) -> Option<String> {
 }
 
 /// A plain relation the tools must not read: the `system` catalog (#705:
-/// `system.runtime.queries` carries every client's SQL) and a quoted path
-/// used as a table (`FROM '/tmp/x.parquet'`).
+/// `system.runtime.queries` carries every client's SQL), DataFusion's
+/// `information_schema.df_settings` (#765: runtime settings, the spill path
+/// among them) and a quoted path used as a table (`FROM '/tmp/x.parquet'`).
 fn denied_relation(name: &sqlparser::ast::ObjectName) -> Option<String> {
     let first = name.0.first()?.as_ident()?;
     if first.quote_style == Some('\'') {
@@ -2116,9 +2172,22 @@ fn denied_relation(name: &sqlparser::ast::ObjectName) -> Option<String> {
             first.value
         ));
     }
-    (name.0.len() > 1 && first.value.eq_ignore_ascii_case("system")).then(|| {
-        format!("system catalog table {name}; the runtime views are an operator surface")
-    })
+    if name.0.len() > 1 && first.value.eq_ignore_ascii_case("system") {
+        return Some(format!(
+            "system catalog table {name}; the runtime views are an operator surface"
+        ));
+    }
+    let parts: Vec<String> = name
+        .0
+        .iter()
+        .filter_map(|p| p.as_ident())
+        .map(|i| i.value.to_ascii_lowercase())
+        .collect();
+    matches!(
+        parts.as_slice(),
+        [.., schema, table] if schema == "information_schema" && table == "df_settings"
+    )
+    .then(|| format!("{name}; the engine's runtime settings are an operator surface"))
 }
 
 struct QueryShapeFinder {
@@ -2703,6 +2772,7 @@ mod tests {
                 catalog_token: None,
                 refresh_token: None,
                 expires_at: Some(chrono::Utc::now() + chrono::Duration::minutes(5)),
+                scopes: vec![],
             })
         }
     }
@@ -3035,6 +3105,46 @@ mod tests {
             Arc::new(RecordingExecutor::default()),
             McpConfig::default(),
         )
+    }
+
+    /// #676: an opaque (non-JWT) bearer passes when the provider already
+    /// reported the scopes on the `Identity`.
+    #[tokio::test]
+    async fn provider_scopes_win_over_payload_decoding_for_opaque_tokens() {
+        struct ScopedAuth;
+        #[async_trait]
+        impl AuthProvider for ScopedAuth {
+            async fn authenticate_oauth(
+                &self,
+                c: &FlightCredentials,
+            ) -> Result<Identity, AuthError> {
+                self.authenticate(c).await
+            }
+            async fn authenticate(&self, _c: &FlightCredentials) -> Result<Identity, AuthError> {
+                let mut identity = MockAuth.authenticate(&FlightCredentials::default()).await?;
+                identity.scopes = vec!["sqe:mcp:read".to_string()];
+                Ok(identity)
+            }
+        }
+        let state = McpServerState::new(
+            Arc::new(ScopedAuth),
+            Arc::new(RecordingExecutor::default()),
+            McpConfig::default(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer opaque-token-no-dots".parse().unwrap());
+        let ctx = authenticate_oauth(&state, &headers, "127.0.0.1")
+            .await
+            .unwrap_or_else(|r| panic!("opaque token rejected: {}", r.status()));
+        assert!(ctx.scopes.expect("scopes").contains("sqe:mcp:read"));
+        // Without provider scopes the same opaque token still has no readable scope.
+        let state = McpServerState::new(
+            Arc::new(MockAuth),
+            Arc::new(RecordingExecutor::default()),
+            McpConfig::default(),
+        );
+        let denied = authenticate_oauth(&state, &headers, "127.0.0.1").await.err().expect("403");
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]
@@ -4021,7 +4131,11 @@ mod tests {
             .find(|d| d["kind"] == "object_store")
             .expect("an object_store entry");
         assert_eq!(storage["status"], "auth_error", "{storage}");
-        assert_eq!(storage["provider"], "aws-sdk-default-chain");
+        // #765: the provider kind and the expiry never reach the client.
+        assert!(
+            storage.get("provider").is_none() && storage.get("expires_at").is_none(),
+            "{storage}"
+        );
         assert!(storage["detail"].as_str().unwrap().contains("SSO session has expired"));
         // The Hive root itself answered, so the two are told apart.
         let glue = diagnostics.iter().find(|d| d["catalog"] == "glue").unwrap();
@@ -4055,7 +4169,9 @@ mod tests {
 
         let result = list_catalogs_with_diagnostics(&state, &session).await.unwrap();
         let body = &result["structuredContent"];
-        assert_eq!(body["rows"].as_array().unwrap().len(), 4, "{body}");
+        // #706: the engine's `default` placeholder is not a catalog anyone can name.
+        assert_eq!(body["rows"].as_array().unwrap().len(), 3, "{body}");
+        assert_eq!(body["total_rows"], 3, "{body}");
         let diagnostics = body["diagnostics"].as_array().unwrap();
         assert_eq!(diagnostics.len(), 2, "one per visible Hive root: {diagnostics:?}");
         let by_name = |n: &str| diagnostics.iter().find(|d| d["catalog"] == n).cloned().unwrap();
@@ -4072,6 +4188,111 @@ mod tests {
         assert!(!detail.contains("connection refused") && detail.contains("error_id"), "{lake}");
         // The Iceberg catalog is listed and not probed.
         assert!(diagnostics.iter().all(|d| d["catalog"] != "iceberg"));
+    }
+
+    /// #706: `default`, `datafusion` and `system` are not catalogs a
+    /// statement can name, unless one is a configured Hive root.
+    #[tokio::test]
+    async fn list_catalogs_drops_phantom_catalog_names_unless_they_are_hive_roots() {
+        let executor = Arc::new(ProbeExecutor {
+            catalogs: vec!["default", "glue", "datafusion", "system"],
+            schema_errors: HashMap::new(),
+        });
+        let state = McpServerState::new(Arc::new(MockAuth), executor, static_config(false))
+            .with_hive_roots(vec!["glue".into()]);
+        let session = local_session("mcp-reader".into(), vec![]);
+        let body = list_catalogs_with_diagnostics(&state, &session)
+            .await
+            .unwrap()["structuredContent"]
+            .clone();
+        let names: Vec<&str> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["Catalog"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["glue"], "{body}");
+
+        // A Hive root that happens to be called `default` is real and stays.
+        let executor = Arc::new(ProbeExecutor {
+            catalogs: vec!["default", "glue"],
+            schema_errors: HashMap::new(),
+        });
+        let state = McpServerState::new(Arc::new(MockAuth), executor, static_config(false))
+            .with_hive_roots(vec!["default".into()]);
+        let body = list_catalogs_with_diagnostics(&state, &session)
+            .await
+            .unwrap()["structuredContent"]
+            .clone();
+        assert_eq!(body["rows"].as_array().unwrap().len(), 2, "{body}");
+    }
+
+    /// #765: an expiring SDK credential is reported as temporary, never with its timestamp.
+    #[tokio::test]
+    async fn list_catalogs_diagnostics_never_carry_the_credential_expiry() {
+        let executor = Arc::new(ProbeExecutor {
+            catalogs: vec!["glue"],
+            schema_errors: HashMap::new(),
+        });
+        let probe: StorageProbe = Arc::new(|| {
+            Box::pin(async {
+                StorageCredentialReport {
+                    status: "ok",
+                    provider: "aws-sdk-default-chain",
+                    expires_at: Some("2026-09-21T12:00:00Z".to_string()),
+                    detail: None,
+                }
+            })
+        });
+        let state = McpServerState::new(Arc::new(MockAuth), executor, static_config(false))
+            .with_storage_probe(probe);
+        let session = local_session("mcp-reader".into(), vec![]);
+        let result = list_catalogs_with_diagnostics(&state, &session)
+            .await
+            .unwrap();
+        let text = result["structuredContent"].to_string();
+        assert!(
+            !text.contains("2026-09-21")
+                && !text.contains("expires_at")
+                && !text.contains("aws-sdk"),
+            "{text}"
+        );
+        let storage = result["structuredContent"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["kind"] == "object_store")
+            .unwrap()
+            .clone();
+        assert_eq!(storage["status"], "ok");
+        assert!(
+            storage["detail"]
+                .as_str()
+                .unwrap()
+                .contains("temporary credentials"),
+            "{storage}"
+        );
+    }
+
+    /// #765: `df_settings` lists the engine's runtime settings (spill path
+    /// included); the rest of `information_schema` stays readable.
+    #[test]
+    fn read_only_refuses_df_settings_but_not_information_schema_tables() {
+        for sql in [
+            "SELECT * FROM information_schema.df_settings",
+            "SELECT * FROM iceberg.information_schema.df_settings",
+            "SELECT name FROM INFORMATION_SCHEMA.DF_SETTINGS WHERE name LIKE '%spill%'",
+        ] {
+            let err = ensure_read_only(sql, Some("iceberg")).expect_err(sql);
+            assert!(
+                err.to_ascii_lowercase().contains("df_settings") && err.contains("operator surface"),
+                "{sql}: {err}"
+            );
+        }
+        ensure_read_only("SELECT * FROM information_schema.tables", Some("iceberg"))
+            .expect("tables");
+        ensure_read_only("SELECT * FROM iceberg.information_schema.columns", Some("iceberg"))
+            .expect("columns");
     }
 
     /// #675: a system error's text (bucket, key, host, region) stays in the
