@@ -1,5 +1,6 @@
 """SQE connection manager using ADBC Flight SQL."""
 
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -53,6 +54,47 @@ class SQECredentials(Credentials):
         return ("host", "port", "database", "schema", "user", "method", "client_id")
 
 
+# Leading `/* dbt query comment */` and `-- line` comments, then the first
+# keyword. Statements with no result set go through Flight SQL ExecuteUpdate
+# (`executescript` -> execute_update): ExecuteQuery+DoGet on them hits #771
+# on SQE < 0.49. INSERT/MERGE/DELETE/UPDATE return a rows_affected row via
+# ExecuteQuery, so they stay on `execute` and keep their rowcount.
+_NO_RESULT_SQL = re.compile(
+    r"^(?:\s*(?:/\*.*?\*/|--[^\n]*))*\s*(?:create|drop|alter|set|grant|revoke|comment|use)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+class _Cursor:
+    """ADBC cursor proxy: routes no-result statements to ExecuteUpdate."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def execute(self, sql, parameters=None):
+        if parameters is None and _NO_RESULT_SQL.match(sql):
+            self._inner.executescript(sql)
+        else:
+            self._inner.execute(sql, parameters)
+        return self
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class _Handle:
+    """ADBC connection proxy whose cursors are `_Cursor`s."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def cursor(self, *args, **kwargs):
+        return _Cursor(self._inner.cursor(*args, **kwargs))
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 class SQEConnectionManager(SQLConnectionManager):
     """Manages ADBC Flight SQL connections to SQE."""
 
@@ -83,8 +125,7 @@ class SQEConnectionManager(SQLConnectionManager):
             if db_kwargs:
                 kwargs["db_kwargs"] = db_kwargs
 
-            handle = connect(**kwargs)
-            connection.handle = handle
+            connection.handle = _Handle(connect(**kwargs))
             connection.state = "open"
         except Exception as e:
             connection.handle = None
