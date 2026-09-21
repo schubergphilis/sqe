@@ -2,6 +2,21 @@
 {{- if and .Values.coordinator.production_mode .Values.worker.enabled (not (include "sqe.workerSecretConfigured" .)) }}
 {{- fail "coordinator.production_mode=true and worker.enabled=true require workerSecret.existingSecret or workerSecret.value (see values-production.yaml)" }}
 {{- end }}
+{{- /* #674: MCP guards. anonymous is refused outright; oauth needs issuers; /mcp behind ingress needs TLS. */ -}}
+{{- if .Values.config.mcp.enabled }}
+{{- if eq .Values.config.mcp.auth.mode "anonymous" }}
+{{- fail "config.mcp.auth.mode=anonymous is not deployable from this chart; use oauth or static" }}
+{{- end }}
+{{- if not (has .Values.config.mcp.auth.mode (list "oauth" "static")) }}
+{{- fail (printf "config.mcp.auth.mode must be oauth or static, got %q" .Values.config.mcp.auth.mode) }}
+{{- end }}
+{{- if and (eq .Values.config.mcp.auth.mode "oauth") (not .Values.config.mcp.authorization_servers) }}
+{{- fail "config.mcp.auth.mode=oauth requires config.mcp.authorization_servers" }}
+{{- end }}
+{{- if and .Values.ingress.enabled (not .Values.ingress.tls) }}
+{{- fail "config.mcp.enabled=true with ingress.enabled=true requires ingress.tls (bearer tokens over plaintext)" }}
+{{- end }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -62,6 +77,11 @@ data:
     s3_region = {{ .Values.config.storage.s3_region | quote }}
     s3_path_style = {{ .Values.config.storage.s3_path_style }}
 
+    [storage.tvf]
+    # Caller-supplied object-store keys on read_parquet & co. bypass the
+    # prefix allowlist; production_mode refuses true (#751).
+    allow_inline_credentials = {{ .Values.config.storage.tvf.allow_inline_credentials }}
+
     [policy]
     engine = {{ .Values.config.policy.engine | quote }}
     {{- if eq .Values.config.policy.engine "ranger" }}
@@ -77,11 +97,13 @@ data:
     [access_control]
     backend = {{ .Values.config.access_control.backend | quote }}
     {{- if eq .Values.config.access_control.backend "ranger" }}
-    # Grants go to the same Ranger Admin the policy engine reads from.
+    # #732: the grant backend reads the top-level access_control.url (RangerConfig
+    # has no url field). Same Ranger Admin the policy engine reads from.
+    url = {{ required "config.access_control.backend=ranger requires config.policy.ranger.url" .Values.config.policy.ranger.url | quote }}
 
     [access_control.ranger]
-    url = {{ .Values.config.policy.ranger.url | quote }}
     service-name = {{ .Values.config.policy.ranger.service_name | quote }}
+    admin-user = {{ .Values.config.access_control.ranger.admin_user | quote }}
     {{- end }}
 
     # Architecture review 212: production_mode refuses policy.engine =
@@ -89,6 +111,29 @@ data:
     [security]
     allow_no_policy_engine = {{ .Values.config.security.allow_no_policy_engine }}
     allow_no_grant_backend = {{ .Values.config.security.allow_no_grant_backend }}
+
+    {{- with .Values.config.mcp }}
+    {{- if .enabled }}
+
+    [mcp]
+    enabled = true
+    port = {{ .port }}
+    resource_uri = {{ required "config.mcp.enabled=true requires config.mcp.resource_uri (absolute URL ending in /mcp)" .resource_uri | quote }}
+    authorization_servers = {{ .authorization_servers | toJson }}
+    allow_writes = {{ .allow_writes }}
+    write_catalogs = {{ .write_catalogs | toJson }}
+
+    [mcp.auth]
+    mode = {{ .auth.mode | quote }}
+    {{- range .auth.principals }}
+
+    [[mcp.auth.principals]]
+    user = {{ .user | quote }}
+    roles = {{ .roles | default list | toJson }}
+    token_env = {{ required "config.mcp.auth.principals[].token_env is required" .token_env | quote }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
 
     [rate_limit]
     enabled = {{ .Values.config.rate_limit.enabled }}
