@@ -2353,13 +2353,23 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         );
         *handle.abort.lock() = Some(task.abort_handle());
 
-        // Bounded wait: return the first page inline if the query finished, else a
-        // started response the client polls.
+        // Bounded wait: a query that finished already skips the queued route
+        // and points straight at results page 0. The POST itself never carries
+        // columns or data: trino-go-client (ADBC Trino, Grafana) only reads
+        // rows from `nextUri` pages, exactly like real Trino serves them (#767).
         await_terminal_or_timeout(&handle, DEFAULT_MAX_WAIT).await;
 
         let status_is_finished = matches!(*handle.status.lock(), QueryStatus::Finished);
         if status_is_finished {
-            let mut resp = serve_page(&handle, &base_url, &query_id, 0).await;
+            let mut resp = (
+                StatusCode::OK,
+                Json(build_finished_redirect_response(
+                    &base_url,
+                    &query_id,
+                    &owner.poll_token,
+                )),
+            )
+                .into_response();
             if let Some(ref update) = session_update {
                 apply_session_headers(resp.headers_mut(), update);
             }
@@ -3176,9 +3186,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_fast_query_returns_inline_finished() {
+    async fn submit_fast_query_never_inlines_data_and_pages_via_next_uri() {
         // open=true: execute returns immediately, so the query finishes within
-        // the bounded wait and the POST returns its (empty) result inline.
+        // the bounded wait. Even then the POST carries no columns/data (#767:
+        // trino-go-client only reads nextUri pages); it points at results page 0.
         let open = Arc::new(AtomicBool::new(true));
         let gate = Arc::new(tokio::sync::Notify::new());
         let state = gated_state(open, gate);
@@ -3189,13 +3200,30 @@ mod tests {
             "SELECT 1".to_string(),
         )
         .await;
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: protocol::TrinoResponse = serde_json::from_slice(&body).unwrap();
-        // A columnless empty result reports FINISHED with no further nextUri.
-        assert_eq!(json.stats.state, "FINISHED");
-        assert!(json.next_uri.is_none());
+        let json = body_json(resp).await;
+        assert!(json.data.is_none());
+        assert!(json.columns.is_none());
+        assert_ne!(json.stats.state, "FINISHED");
+        let next = json.next_uri.clone().expect("POST always carries nextUri");
+        assert!(
+            next.contains("/v1/statement/") && !next.contains("/queued/"),
+            "{next}"
+        );
+        // Following it yields the (columnless, empty) result and ends the chain.
+        let (id, slug) = split_queued_uri(&next);
+        let page = body_json(
+            get_results(
+                State(state.clone()),
+                test_peer(),
+                HeaderMap::new(),
+                Path((id, slug, "0".to_string())),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(page.stats.state, "FINISHED");
+        assert!(page.next_uri.is_none());
+        assert_eq!(page.columns.map(|c| c.len()), Some(0));
     }
 
     #[tokio::test]
@@ -3249,6 +3277,38 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    /// What every Trino client does after the POST: follow `nextUri` through
+    /// the results route (poll token only, no credentials) and merge the
+    /// pages. Returns the terminal page with all rows accumulated.
+    async fn follow_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
+        state: &Arc<TrinoState<A, Q>>,
+        resp: Response,
+    ) -> TrinoResponse {
+        let mut tr = body_json(resp).await;
+        let mut data: Option<Vec<Vec<serde_json::Value>>> = None;
+        while let Some(next) = tr.next_uri.take() {
+            assert!(
+                !next.contains("/queued/"),
+                "fast query must skip the queued route: {next}"
+            );
+            let parts: Vec<&str> = next.rsplitn(4, '/').collect();
+            let path = Path((
+                parts[2].to_string(),
+                parts[1].to_string(),
+                parts[0].to_string(),
+            ));
+            tr = body_json(
+                get_results(State(state.clone()), test_peer(), HeaderMap::new(), path).await,
+            )
+            .await;
+            if let Some(rows) = tr.data.take() {
+                data.get_or_insert_with(Vec::new).extend(rows);
+            }
+        }
+        tr.data = data;
+        tr
     }
 
     #[tokio::test]
@@ -3658,7 +3718,7 @@ mod tests {
         );
 
         let resp = submit_query::<MockAuthOk, RecordingQuery>(
-            State(state),
+            State(state.clone()),
             test_peer(),
             headers,
             "SHOW SESSION LIKE 'iceberg.compression_codec'".to_string(),
@@ -3671,10 +3731,7 @@ mod tests {
             seen.lock().is_empty(),
             "SHOW SESSION must not be sent to the executor"
         );
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let tr: TrinoResponse = serde_json::from_slice(&body).unwrap();
+        let tr = follow_results(&state, resp).await;
         // Trino's 5-column shape.
         let cols: Vec<String> = tr
             .columns
@@ -3876,17 +3933,17 @@ mod tests {
         )
         .await
         .into_response();
-        assert_eq!(body_json(resp).await.stats.state, "FINISHED");
+        assert_eq!(follow_results(&state, resp).await.stats.state, "FINISHED");
 
         let resp = submit_query::<MockAuthOk, RecordingQuery>(
-            State(state),
+            State(state.clone()),
             test_peer(),
             basic_auth_header("alice", "pw"),
             "EXECUTE IMMEDIATE 'SELECT ? AS a, ? AS b' USING 42, 'x'".to_string(),
         )
         .await
         .into_response();
-        assert_eq!(body_json(resp).await.stats.state, "FINISHED");
+        assert_eq!(follow_results(&state, resp).await.stats.state, "FINISHED");
 
         let seen = seen.lock();
         assert_eq!(
@@ -3980,7 +4037,7 @@ mod tests {
         )
         .await
         .into_response();
-        let tr = body_json(resp).await;
+        let tr = follow_results(&state, resp).await;
         let data = tr.data.expect("data");
         assert_eq!(data.len(), session_props::SESSION_PROPERTIES.len());
         assert_eq!(data[0][0], serde_json::json!("iceberg.compression_codec"));
@@ -3996,14 +4053,14 @@ mod tests {
                 .unwrap(),
         );
         let resp = submit_query::<MockAuthOk, RecordingQuery>(
-            State(state),
+            State(state.clone()),
             test_peer(),
             headers,
             "SHOW SESSION LIKE '%'".to_string(),
         )
         .await
         .into_response();
-        let data = body_json(resp).await.data.expect("data");
+        let data = follow_results(&state, resp).await.data.expect("data");
         assert_eq!(data.len(), 1);
         assert_eq!(data[0][1], serde_json::json!("LZ4"));
         assert!(seen.lock().is_empty());
@@ -4035,7 +4092,7 @@ mod tests {
         assert_eq!(body_json(resp).await.update_type.as_deref(), Some("USE"));
 
         let resp = submit_query::<MockAuthOk, RecordingQuery>(
-            State(state),
+            State(state.clone()),
             test_peer(),
             basic_auth_header("alice", "pw"),
             "-- switch\nUSE \"My Lake\".gold".to_string(),
@@ -4055,7 +4112,7 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("gold")
         );
-        let tr = body_json(resp).await;
+        let tr = follow_results(&state, resp).await;
         assert_eq!(tr.stats.state, "FINISHED");
         assert_eq!(tr.update_type.as_deref(), Some("USE"));
         assert_eq!(seen.lock().len(), 1, "USE reaches the executor once");
@@ -4152,7 +4209,7 @@ mod tests {
             )
             .await
             .into_response();
-            let tr = body_json(resp).await;
+            let tr = follow_results(&state, resp).await;
             assert_eq!(tr.stats.state, "FINISHED", "{sql}");
             assert_eq!(tr.update_type.as_deref(), expected, "{sql}");
         }
@@ -4210,7 +4267,7 @@ mod tests {
             )
             .await
             .into_response();
-            let tr = body_json(resp).await;
+            let tr = follow_results(&state, resp).await;
             let data = tr.data.expect("data rows");
             assert_eq!(data.len(), 2, "{sql}: no row may be scoped out");
             assert_eq!(data[1][0], serde_json::json!("system"), "{sql}");
@@ -4273,7 +4330,7 @@ mod tests {
         headers.insert("x-trino-catalog", "iceberg".parse().unwrap());
 
         let resp = submit_query::<MockAuthOk, InfoSchemaQuery>(
-            State(state),
+            State(state.clone()),
             test_peer(),
             headers,
             "SELECT table_catalog, column_name, data_type FROM information_schema.columns"
@@ -4283,10 +4340,7 @@ mod tests {
         .into_response();
 
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let tr: TrinoResponse = serde_json::from_slice(&body).unwrap();
+        let tr = follow_results(&state, resp).await;
         let data = tr.data.expect("data rows");
 
         // The `system` row is scoped out (session catalog = iceberg), and the
