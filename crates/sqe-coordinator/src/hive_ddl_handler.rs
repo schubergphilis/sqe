@@ -21,7 +21,9 @@ use sqe_core::{SecretStore, Session, SessionUser, SqeError, SqeErrorCode};
 use sqe_metrics::audit::{
     Actor, AuditEvent, AuditKind, AuditLogger, ObjectType, Outcome, Resource,
 };
-use sqe_policy::plan_rewriter::{policy_denies_all, resolve_effective_policy, HiveCatalogs};
+use sqe_policy::plan_rewriter::{
+    policy_denies_all, resolve_effective_policy, resolve_policy_key_for_ident, HiveCatalogs,
+};
 use sqe_policy::PolicyStore;
 use sqe_sql::hive_ddl::HiveTableSpec;
 
@@ -321,6 +323,17 @@ impl HiveDdlHandler {
             HiveManifest::from_spec(spec, &database, &session.user.username, &created_at);
         parse_projection(&manifest.parameters, &manifest.partition_keys)
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
+        // Same gate as ADD PARTITION (#717): whoever writes a manifest picks
+        // the table's name and LOCATION, so a denied principal must not.
+        self.refuse_if_denied(
+            &session.user,
+            catalog_name,
+            &database,
+            &spec.name,
+            &manifest,
+            "CREATE EXTERNAL TABLE",
+        )
+        .await?;
 
         store
             .put(&manifest, spec.if_not_exists)
@@ -376,6 +389,14 @@ impl HiveDdlHandler {
         }
 
         let store = self.store_for(catalog)?;
+        // A missing table surfaces here with `HiveError::NotFound`'s "table
+        // not found" wording, which `hive_drop_target_missing` still matches.
+        let manifest = store
+            .get(schema, table)
+            .await
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
+        self.refuse_if_denied(&session.user, catalog, schema, table, &manifest, "DROP TABLE")
+            .await?;
         store
             .delete(schema, table)
             .await
@@ -424,7 +445,7 @@ impl HiveDdlHandler {
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
 
-        let policy = self.resolve_policy(user, schema, table, &manifest).await;
+        let policy = self.resolve_policy(user, catalog, schema, table, &manifest).await;
         if policy_denies_all(&policy) {
             // Identical wording to `HiveManifestStore::get`'s own not-found
             // error (see `HiveError::NotFound`'s `Display`): a caller with
@@ -489,7 +510,7 @@ impl HiveDdlHandler {
         let mut visible = Vec::with_capacity(manifests.len());
         for manifest in manifests {
             let policy = self
-                .resolve_policy(user, database, &manifest.name, &manifest)
+                .resolve_policy(user, root, database, &manifest.name, &manifest)
                 .await;
             if !policy_denies_all(&policy) {
                 visible.push(manifest.name);
@@ -517,7 +538,7 @@ impl HiveDdlHandler {
                 continue;
             }
             let policy = self
-                .resolve_policy(user, database, &manifest.name, &manifest)
+                .resolve_policy(user, root, database, &manifest.name, &manifest)
                 .await;
             if !policy_denies_all(&policy) {
                 views.push(manifest.name);
@@ -705,7 +726,9 @@ impl HiveDdlHandler {
     ) -> Result<(HiveManifest, sqe_policy::ResolvedPolicy), SqeError> {
         let manifest = self.manifest_cached(root, database, table).await?;
 
-        let policy = self.resolve_policy(user, database, table, &manifest).await;
+        let policy = self
+            .resolve_policy(user, root, database, table, &manifest)
+            .await;
         if policy_denies_all(&policy) {
             return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "hive_external: table not found: {database}.{table}"
@@ -770,6 +793,7 @@ impl HiveDdlHandler {
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
         self.refuse_if_denied(
             &session.user,
+            &root,
             &database,
             &table,
             &manifest,
@@ -818,6 +842,7 @@ impl HiveDdlHandler {
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
         self.refuse_if_denied(
             &session.user,
+            &root,
             &database,
             &table,
             &manifest,
@@ -905,7 +930,7 @@ impl HiveDdlHandler {
             Err(sqe_catalog::hive::HiveError::NotFound(_)) => return Ok(()),
             Err(e) => return Err(SqeError::Execution(e.to_string())),
         };
-        self.refuse_if_denied(&session.user, &database, &table, &manifest, statement)
+        self.refuse_if_denied(&session.user, &root, &database, &table, &manifest, statement)
             .await
     }
 
@@ -921,7 +946,7 @@ impl HiveDdlHandler {
             .get(&database, &table)
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
-        self.refuse_if_denied(&session.user, &database, &table, &manifest, audit_label)
+        self.refuse_if_denied(&session.user, &root, &database, &table, &manifest, audit_label)
             .await?;
 
         let count = sqe_catalog::hive::partition::msck_repair(
@@ -957,7 +982,7 @@ impl HiveDdlHandler {
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
 
         let policy = self
-            .resolve_policy(user, &database, &table, &manifest)
+            .resolve_policy(user, &root, &database, &table, &manifest)
             .await;
         if policy_denies_all(&policy) {
             return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
@@ -990,7 +1015,7 @@ impl HiveDdlHandler {
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
 
         let policy = self
-            .resolve_policy(&session.user, &database, &table, &manifest)
+            .resolve_policy(&session.user, &root, &database, &table, &manifest)
             .await;
         if policy_denies_all(&policy) {
             return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
@@ -1042,9 +1067,16 @@ impl HiveDdlHandler {
     /// during planning, which neither `show_create_table` nor `list_tables`
     /// goes through (there is no LogicalPlan here), so it may not be warm.
     /// Reading the manifest's own field is both simpler and never stale.
+    ///
+    /// Keyed EXACTLY as a `SELECT` on the same table is (`resolve_policy_key`:
+    /// `{root}.{database}` for a registered Hive root), not the bare
+    /// database: with the bare key, Ranger's `requires_access_grant`
+    /// default-deny never fired and a `SHOW TABLES` listed what a `SELECT`
+    /// refused (#715).
     async fn resolve_policy(
         &self,
         user: &SessionUser,
+        root: &str,
         database: &str,
         table: &str,
         manifest: &HiveManifest,
@@ -1052,6 +1084,19 @@ impl HiveDdlHandler {
         let Some(store) = self.policy_store.as_deref() else {
             return sqe_policy::ResolvedPolicy::default();
         };
+        let namespace = self
+            .hive_catalogs
+            .as_deref()
+            .and_then(|catalogs| {
+                resolve_policy_key_for_ident(
+                    Some(root),
+                    std::slice::from_ref(&database.to_string()),
+                    table,
+                    catalogs,
+                )
+            })
+            .map(|(namespace, _)| namespace)
+            .unwrap_or_else(|| format!("{root}.{database}"));
         let col_tags: HashMap<String, Vec<String>> = manifest
             .sqe
             .column_tags
@@ -1062,7 +1107,7 @@ impl HiveDdlHandler {
             store,
             user,
             table,
-            database,
+            &namespace,
             &col_tags,
             self.mask_precedence,
         )
@@ -1072,12 +1117,15 @@ impl HiveDdlHandler {
     async fn refuse_if_denied(
         &self,
         user: &SessionUser,
+        root: &str,
         database: &str,
         table: &str,
         manifest: &HiveManifest,
         statement: &str,
     ) -> Result<(), SqeError> {
-        let policy = self.resolve_policy(user, database, table, manifest).await;
+        let policy = self
+            .resolve_policy(user, root, database, table, manifest)
+            .await;
         if policy_denies_all(&policy) {
             return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "hive_external: {statement} denied on {database}.{table}"

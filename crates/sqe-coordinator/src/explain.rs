@@ -65,6 +65,7 @@ impl ExplainHandler {
         inner_sql: &str,
         ctx: &SessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        require_query(inner_sql)?;
         crate::query_handler::prepare_file_tvfs(ctx, inner_sql).await?;
         let df = ctx
             .sql(inner_sql)
@@ -120,6 +121,7 @@ impl ExplainHandler {
         inner_sql: &str,
         ctx: &SessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        require_query(inner_sql)?;
         let total_start = std::time::Instant::now();
 
         let parse_start = std::time::Instant::now();
@@ -260,6 +262,7 @@ impl ExplainHandler {
         inner_sql: &str,
         ctx: &SessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        require_query(inner_sql)?;
         let total_start = std::time::Instant::now();
 
         let parse_start = std::time::Instant::now();
@@ -388,6 +391,25 @@ impl ExplainHandler {
 // ---------------------------------------------------------------------------
 // Private row types and free-function tree walkers
 // ---------------------------------------------------------------------------
+
+/// EXPLAIN in every form plans the inner statement through `ctx.sql`, and
+/// ANALYZE / FULL then `collect()` it. DataFusion executes DDL eagerly in
+/// `sql()` and DML on `collect()`, so an inner `INSERT` / `DROP` would run
+/// against the Hive provider with none of SQE's write gates (#711). Only a
+/// query may be explained; the same allow-list MCP's `explain_query` uses.
+fn require_query(inner_sql: &str) -> sqe_core::Result<()> {
+    let kind = sqe_sql::classifier::parse_and_classify(inner_sql)?;
+    if matches!(kind, sqe_sql::classifier::StatementKind::Query(_)) {
+        return Ok(());
+    }
+    Err(SqeError::with_code(
+        SqeErrorCode::ExecutionFailed,
+        format!(
+            "EXPLAIN only accepts a query; {} statements are not explained (run them directly)",
+            kind.name()
+        ),
+    ))
+}
 
 /// Build an `AnalyzeRow` for a phase-level timing entry. Phase rows
 /// only carry `elapsed_ms`; the other metric columns are `None` so
@@ -623,5 +645,25 @@ fn walk_full(node: &Arc<dyn ExecutionPlan>, rows: &mut Vec<FullRow>) {
             spilled_bytes,
             spilled_rows,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::require_query;
+
+    #[test]
+    fn explain_refuses_anything_but_a_query() {
+        assert!(require_query("SELECT 1").is_ok());
+        assert!(require_query("WITH t AS (SELECT 1 AS n) SELECT n FROM t").is_ok());
+        for sql in [
+            "INSERT INTO lake.sales.orders SELECT 1, 2.0, 'x'",
+            "DELETE FROM lake.sales.orders WHERE id = 1",
+            "DROP TABLE lake.sales.orders",
+            "CREATE EXTERNAL TABLE t (a INT) STORED AS PARQUET LOCATION 's3://b/p'",
+        ] {
+            let err = require_query(sql).expect_err(sql).to_string();
+            assert!(err.contains("EXPLAIN only accepts a query"), "{sql}: {err}");
+        }
     }
 }
