@@ -26,6 +26,11 @@ config:
   # REST catalog (issue #395).
   catalog:
     require_vended_credentials: true
+  # production_mode refuses caller-supplied object-store keys on the file
+  # table functions (#751).
+  storage:
+    tvf:
+      allow_inline_credentials: false
   # production_mode refuses the default policy engine (passthrough enforces
   # no row filters, masks or column restrictions) and the default grant
   # backend (none) unless the matching security.allow_* flag acknowledges
@@ -42,7 +47,9 @@ config:
       service_name: "sqe"
       project_tags: true
   access_control:
-    # Rendered with the same Ranger Admin as [access_control.ranger].
+    # Rendered as access_control.url = policy.ranger.url (the field the grant
+    # backend reads, #732); templating fails while that url is empty. Password:
+    # SQE_ACCESS_CONTROL__RANGER__ADMIN_PASSWORD env override.
     backend: ranger
   # To run WITHOUT a policy engine or grant backend on purpose, say so
   # explicitly instead; production_mode then starts and logs the disabled

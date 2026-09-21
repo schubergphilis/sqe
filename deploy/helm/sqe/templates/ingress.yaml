@@ -44,5 +44,15 @@ spec:
                 port:
                   name: {{ .portName | default "trino-http" }}
           {{- end }}
+          {{- if $.Values.config.mcp.enabled }}
+          # #674: MCP rides the same host; TLS is enforced in configmap.yaml.
+          - path: /mcp
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "sqe.fullname" $ }}-coordinator
+                port:
+                  name: mcp
+          {{- end }}
     {{- end }}
 {{- end }}

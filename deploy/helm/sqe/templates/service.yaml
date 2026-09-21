@@ -20,3 +20,8 @@ spec:
     - name: metrics
       port: {{ .Values.service.metricsPort }}
       targetPort: metrics
+    {{- if .Values.config.mcp.enabled }}
+    - name: mcp
+      port: {{ .Values.service.mcpPort }}
+      targetPort: mcp
+    {{- end }}

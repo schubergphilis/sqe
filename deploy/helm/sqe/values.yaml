@@ -98,6 +98,21 @@ service:
   flightSqlPort: 50051
   trinoHttpPort: 8080
   metricsPort: 9090
+  mcpPort: 8098
+
+# ── NetworkPolicy (#674) ────────────────────────────────────
+# Off by default. When on, the coordinator pod denies all ingress except:
+# flight-sql/trino-http/metrics from `from` peers, flight-sql from this
+# chart's workers, and the mcp port from `mcpFrom` peers. Entries are
+# NetworkPolicyPeer objects (podSelector / namespaceSelector / ipBlock). An
+# empty list allows any source on those ports. Kubelet probes are exempt on
+# the common CNIs.
+networkPolicy:
+  enabled: false
+  from: []
+    # - namespaceSelector:
+    #     matchLabels: { kubernetes.io/metadata.name: ingress-nginx }
+  mcpFrom: []
 
 # ── Ingress (TLS termination) ────────────────────────────────
 # SEC-06: the coordinator's HTTP listeners (Trino HTTP, web UI, Quack) are
@@ -168,6 +183,10 @@ config:
     s3_region: "us-east-1"
     s3_path_style: true
     # s3_access_key / s3_secret_key: set via secret or env override
+    tvf:
+      # Dev default matches the engine default; values-production.yaml sets
+      # false, which production_mode requires (#751).
+      allow_inline_credentials: true
 
   # Dev default: no policy engine, no grant backend. production_mode refuses
   # both defaults unless the matching security.allow_* flag acknowledges
@@ -183,7 +202,12 @@ config:
       # false without security.allow_unprojected_tags.
       project_tags: true
   access_control:
+    # Grant backend (GRANT / REVOKE). "ranger" reuses policy.ranger.url as the
+    # engine's `access_control.url` (#732); the admin password arrives as the
+    # SQE_ACCESS_CONTROL__RANGER__ADMIN_PASSWORD env override.
     backend: "none"
+    ranger:
+      admin_user: "admin"
   security:
     allow_no_policy_engine: false
     allow_no_grant_backend: false
@@ -197,6 +221,29 @@ config:
     # lockstep (audit.path + audit.fileName). Setting it here would let the
     # config drift from the mount and write audit records to a path that has no
     # durable volume behind it.
+
+  # MCP resource server (#674). Off by default. Renders [mcp] into sqe.toml,
+  # a `mcp` container/Service port, and (with ingress.enabled) a `/mcp` path
+  # that requires ingress.tls. auth.mode is oauth or static only: the chart
+  # refuses anonymous at render time.
+  mcp:
+    enabled: false
+    port: 8098
+    # Public URL clients use, e.g. https://sqe.example.com/mcp. Required when
+    # enabled; production_mode requires https.
+    resource_uri: ""
+    # OAuth/OIDC issuers; required for auth.mode=oauth.
+    authorization_servers: []
+    allow_writes: false
+    write_catalogs: []
+    auth:
+      mode: "oauth"
+      # auth.mode=static only. token_env names an env var on the coordinator
+      # (inject it via existingSecret/extraEnv), never a literal token.
+      principals: []
+        # - user: agent
+        #   roles: [data_reader]
+        #   token_env: SQE_MCP_AGENT_TOKEN
 
   # Rate limiting. Required when coordinator.production_mode=true (the engine's
   # production validator rejects rate_limit.enabled=false in that mode). Rendered
