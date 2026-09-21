@@ -1427,7 +1427,16 @@ impl WriteHandler {
         .await?;
         *policy_summary_out = Some(policy_summary);
 
-        let arrow_schema = Arc::new(df.schema().as_arrow().clone());
+        // Iceberg v2 has no timestamp_ns (v3 only); DataFusion's
+        // `current_timestamp`/`now()` yield ns. Derive the target schema at
+        // the precision the format version can hold; the streaming sink casts
+        // every batch onto the table schema (`apply_stamped_schema`), so the
+        // ns values are narrowed to µs on write (#773).
+        let create_format_version = self.format_version();
+        let arrow_schema = Arc::new(timestamps_for_format_version(
+            df.schema().as_arrow(),
+            create_format_version,
+        ));
         let iceberg_schema = arrow_schema_to_iceberg(&arrow_schema)?;
 
         info!(
@@ -1542,7 +1551,6 @@ impl WriteHandler {
             );
         }
 
-        let create_format_version = self.format_version();
         let location = unique_table_location(catalog.as_ref(), &namespace, &create_name).await;
         // Merge user TBLPROPERTIES / WITH options (see handle_ctas for why):
         // a CTAS must keep properties like write.parquet.bloom-filter-* that
@@ -7240,6 +7248,33 @@ fn arrow_schema_to_iceberg(arrow_schema: &ArrowSchema) -> sqe_core::Result<Icebe
         .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build Iceberg schema: {e}")))
 }
 
+/// Narrow nanosecond timestamps to microseconds when the target format
+/// version cannot store them: Iceberg `timestamp_ns`/`timestamptz_ns` exist
+/// only from v3 (#773). V3 targets are returned unchanged.
+// ponytail: top-level columns only; recurse into struct/list/map if a nested
+// ns timestamp ever reaches a v2 CTAS.
+pub(crate) fn timestamps_for_format_version(
+    arrow_schema: &ArrowSchema,
+    format_version: FormatVersion,
+) -> ArrowSchema {
+    use arrow_schema::{DataType, TimeUnit};
+    if format_version == FormatVersion::V3 {
+        return arrow_schema.clone();
+    }
+    let fields: Vec<arrow_schema::Field> = arrow_schema
+        .fields()
+        .iter()
+        .map(|f| match f.data_type() {
+            DataType::Timestamp(TimeUnit::Nanosecond, tz) => f
+                .as_ref()
+                .clone()
+                .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, tz.clone())),
+            _ => f.as_ref().clone(),
+        })
+        .collect();
+    ArrowSchema::new_with_metadata(fields, arrow_schema.metadata().clone())
+}
+
 /// Build an Iceberg schema from an Arrow schema, applying column DEFAULTs.
 ///
 /// For each column def with a `DEFAULT` option, extracts the literal and
@@ -8673,6 +8708,65 @@ mod tests {
             sql_type_to_arrow(&ct.columns[1].data_type).unwrap(),
             DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
         );
+    }
+
+    #[test]
+    fn test_timestamps_for_format_version_narrows_ns_to_us_on_v2_only() {
+        // #773: `current_timestamp` is ns in DataFusion; v2 has no timestamp_ns.
+        use arrow_array::TimestampNanosecondArray;
+        use arrow_schema::Field;
+        use iceberg::spec::{PrimitiveType, Type};
+
+        let ns = ArrowSchema::new(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
+            Field::new(
+                "utcts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new("id", DataType::Int64, false),
+        ]);
+
+        let v2 = timestamps_for_format_version(&ns, FormatVersion::V2);
+        assert_eq!(
+            v2.field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        assert_eq!(
+            v2.field(1).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(v2.field(2).data_type(), &DataType::Int64);
+        let iceberg = arrow_schema_to_iceberg(&v2).unwrap();
+        let fields = iceberg.as_struct().fields();
+        assert!(matches!(*fields[0].field_type, Type::Primitive(PrimitiveType::Timestamp)));
+        assert!(matches!(*fields[1].field_type, Type::Primitive(PrimitiveType::Timestamptz)));
+
+        // The sink casts ns batches onto the (µs) table schema.
+        let stamped = sqe_compaction::writer::build_stamped_schema(&iceberg).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(ns.clone()),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![1_700_000_000_123_456_789i64])),
+                Arc::new(
+                    TimestampNanosecondArray::from(vec![1_700_000_000_123_456_789i64])
+                        .with_timezone("UTC"),
+                ),
+                Arc::new(arrow_array::Int64Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let cast = sqe_compaction::writer::apply_stamped_schema(batch, &stamped).unwrap();
+        let us = cast
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(us.value(0), 1_700_000_000_123_456);
+
+        // V3 keeps nanoseconds.
+        let v3 = timestamps_for_format_version(&ns, FormatVersion::V3);
+        assert_eq!(v3.field(0).data_type(), &DataType::Timestamp(TimeUnit::Nanosecond, None));
     }
 
     #[test]
