@@ -252,6 +252,7 @@ mod tests {
             grantee: Grantee::User("alice".into()),
             grantor: None,
             object: Default::default(),
+            grantor_is_admin: false,
         };
         let req = to_revoke_request(&stmt);
         assert_eq!(req.privilege, "INSERT");

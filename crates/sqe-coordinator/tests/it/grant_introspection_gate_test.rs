@@ -27,6 +27,7 @@ struct RecordingBackend {
     granted: AtomicBool,
     revoked: AtomicBool,
     show_effective_called: AtomicBool,
+    show_grants_called: AtomicBool,
     check_access_called: AtomicBool,
 }
 
@@ -47,6 +48,7 @@ impl GrantBackend for RecordingBackend {
         _token: &str,
         _filter: &GrantFilter,
     ) -> sqe_core::Result<Vec<GrantEntry>> {
+        self.show_grants_called.store(true, Ordering::SeqCst);
         Ok(vec![])
     }
 
@@ -291,6 +293,69 @@ async fn show_effective_grants_admin_can_introspect_anyone() {
         backend.show_effective_called.load(Ordering::SeqCst),
         "admin introspection must reach the backend"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #721 - SHOW GRANTS gets the same self-or-admin gate
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn show_grants_to_self_is_allowed() {
+    let backend = Arc::new(RecordingBackend::default());
+    let store = Arc::new(RecordingStore::default());
+    let handler = make_handler(backend.clone(), store.clone());
+    let session = session_for("alice", vec!["analyst"]);
+
+    handler
+        .execute(&session, "SHOW GRANTS TO USER \"alice\"", None)
+        .await
+        .expect("self-introspection must be allowed");
+    assert!(backend.show_grants_called.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn show_grants_on_other_targets_requires_admin() {
+    for sql in [
+        "SHOW GRANTS TO USER \"bob\"",
+        "SHOW GRANTS TO ROLE \"analyst\"",
+        "SHOW GRANTS ON cat.ns.tbl",
+    ] {
+        let backend = Arc::new(RecordingBackend::default());
+        let store = Arc::new(RecordingStore::default());
+        let handler = make_handler(backend.clone(), store.clone());
+        let session = session_for("alice", vec!["analyst"]);
+
+        let err = handler
+            .execute(&session, sql, None)
+            .await
+            .expect_err("non-admin must not list other principals' grants");
+        assert!(
+            err.to_string().contains("403"),
+            "{sql}: expected 403: {err}"
+        );
+        assert!(
+            !backend.show_grants_called.load(Ordering::SeqCst),
+            "{sql}: must be rejected before the service-identity backend runs"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #747 - SET/UNSET TAGS is policy DDL, admin only
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn set_tags_requires_admin() {
+    let backend = Arc::new(RecordingBackend::default());
+    let store = Arc::new(RecordingStore::default());
+    let handler = make_handler(backend, store);
+    let session = session_for("alice", vec!["analyst"]);
+
+    let err = handler
+        .execute(&session, "ALTER TABLE cat.ns.tbl UNSET TAGS (ssn)", None)
+        .await
+        .expect_err("non-admin must not rewrite column tags");
+    assert!(err.to_string().contains("403"), "expected 403: {err}");
 }
 
 #[tokio::test]

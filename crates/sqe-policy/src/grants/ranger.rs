@@ -457,7 +457,7 @@ impl RangerGrantBackend {
         grantee: &Grantee,
     ) -> sqe_core::Result<&'a str> {
         let catalog = catalog.ok_or_else(|| {
-            sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
+            sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed,
                 "Ranger GRANT requires a catalog (use catalog.namespace.table)",
             )
         })?;
@@ -494,9 +494,35 @@ impl RangerGrantBackend {
     }
 
     /// POST a GrantRevokeRequest to the grant or revoke endpoint.
+    /// Lifting a DENY goes through the policy API, which authorizes the REST
+    /// admin SQE connects with, never the grantor. Under `ranger-delegate` the
+    /// coordinator's admin gate has stood down, so the only proof the caller may
+    /// touch this resource is a grantor-authorized revoke POST that Ranger
+    /// accepted first (`ranger_authorized`). Without one, refuse rather than
+    /// PUT the policy as admin on a non-admin's say-so (#720).
+    fn require_deny_lift_authority(
+        &self,
+        ranger_authorized: bool,
+        grantee: &Grantee,
+    ) -> sqe_core::Result<()> {
+        if ranger_authorized || !self.delegates_authority_to_ranger() {
+            return Ok(());
+        }
+        Err(sqe_core::SqeError::Catalog(format!(
+            "403 Forbidden: a DENY on this resource for {} could not be lifted: under \
+             grant_authority = \"ranger-delegate\" Ranger authorizes the grantor only for \
+             access it holds, and it holds none here. Lifting the deny needs an admin.",
+            grantee.name()
+        )))
+    }
+
     /// Strip any deny item equivalent to what `DENY` would have written for this
     /// statement. No-op when the resource has no policy or no matching item.
-    async fn remove_deny_items(&self, stmt: &RevokeStatement) -> sqe_core::Result<()> {
+    async fn remove_deny_items(
+        &self,
+        stmt: &RevokeStatement,
+        ranger_authorized: bool,
+    ) -> sqe_core::Result<()> {
         let Some(catalog) = stmt.catalog.as_deref() else {
             return Ok(());
         };
@@ -528,6 +554,7 @@ impl RangerGrantBackend {
         if kept.len() == items.len() {
             return Ok(());
         }
+        self.require_deny_lift_authority(ranger_authorized, &stmt.grantee)?;
         policy["denyPolicyItems"] = serde_json::Value::Array(kept);
         let id = policy
             .get("id")
@@ -1623,6 +1650,7 @@ impl RangerGrantBackend {
         &self,
         resource: &BTreeMap<String, String>,
         grantee: &Grantee,
+        ranger_authorized: bool,
     ) -> sqe_core::Result<()> {
         let Some(mut policy) = self.policy_by_resource(resource).await? else {
             return Ok(());
@@ -1675,6 +1703,7 @@ impl RangerGrantBackend {
         if !changed {
             return Ok(());
         }
+        self.require_deny_lift_authority(ranger_authorized, grantee)?;
         policy["denyPolicyItems"] = serde_json::json!(kept);
         if let Some(id) = policy.get("id").and_then(serde_json::Value::as_i64) {
             self.put_policy(id, &policy).await?;
@@ -1722,8 +1751,9 @@ impl RangerGrantBackend {
             // statement is idempotent and a denial cannot outlive the grant.
             self.remove_all_grant_labels(&body.resource, &stmt.grantee)
                 .await;
+            // No revoke POST ran, so Ranger has not authorized the grantor here.
             return self
-                .remove_all_deny_items(&body.resource, &stmt.grantee)
+                .remove_all_deny_items(&body.resource, &stmt.grantee, stmt.grantor_is_admin)
                 .await;
         }
         debug!(
@@ -1736,7 +1766,7 @@ impl RangerGrantBackend {
             .await?;
         self.remove_all_grant_labels(&body.resource, &stmt.grantee)
             .await;
-        self.remove_all_deny_items(&body.resource, &stmt.grantee)
+        self.remove_all_deny_items(&body.resource, &stmt.grantee, true)
             .await
     }
 
@@ -2128,7 +2158,8 @@ impl GrantBackend for RangerGrantBackend {
                     &stmt.privilege,
                 )
                 .await;
-                return self.remove_deny_items(stmt).await;
+                // Nothing was POSTed, so Ranger has not authorized the grantor.
+                return self.remove_deny_items(stmt, stmt.grantor_is_admin).await;
             }
         }
 
@@ -2142,7 +2173,7 @@ impl GrantBackend for RangerGrantBackend {
         // Without this, DENY is a one-way door: the grant endpoint only touches
         // allow items, so undoing a denial would need Ranger console access. That
         // is not an acceptable operational story for a statement SQE offers.
-        self.remove_deny_items(stmt).await
+        self.remove_deny_items(stmt, true).await
     }
 
     /// DENY goes through the POLICY api, not grant/revoke.
@@ -2163,7 +2194,7 @@ impl GrantBackend for RangerGrantBackend {
     /// only check. Ranger offers no grantor-scoped deny.
     async fn deny(&self, _token: &str, stmt: &GrantStatement) -> sqe_core::Result<()> {
         let catalog = stmt.catalog.as_deref().ok_or_else(|| {
-            sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
+            sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed,
                 "Ranger DENY requires a catalog (use catalog.namespace.table)",
             )
         })?;
@@ -2336,7 +2367,7 @@ impl GrantBackend for RangerGrantBackend {
         check: &AccessCheck,
     ) -> sqe_core::Result<AccessCheckResult> {
         let catalog = check.catalog.as_deref().ok_or_else(|| {
-            sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed, 
+            sqe_core::SqeError::with_code(sqe_core::SqeErrorCode::ExecutionFailed,
                 "Ranger check_access requires a catalog; use catalog.namespace.table",
             )
         })?;
@@ -2511,6 +2542,78 @@ mod tests {
             delegate.enforces_grantor_authority(),
             "delegate mode is precisely the case where Ranger performs the check"
         );
+    }
+
+    /// #720: under `ranger-delegate` the coordinator's admin gate stands down
+    /// and Ranger authorizes the grantor only on the revoke POST. A DENY-only
+    /// policy means nothing is held, so no POST runs and nobody has authorized
+    /// the caller; the deny must then stay, not be PUT away as the REST admin.
+    #[tokio::test]
+    async fn delegate_revoke_all_refuses_to_lift_a_deny_nobody_authorized() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/service/public/v2/api/policy"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "id": 7,
+                "isEnabled": true,
+                "resources": {
+                    "root": {"values": ["POLARIS"]},
+                    "catalog": {"values": ["wh"]},
+                    "namespace": {"values": ["sales"]},
+                    "table": {"values": ["orders"]}
+                },
+                "policyItems": [],
+                "denyPolicyItems": [
+                    {"roles": ["analyst"], "accesses": [
+                        {"type": "table-data-read", "isAllowed": true}
+                    ]}
+                ]
+            }])))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let backend = RangerGrantBackend::new(
+            &server.uri(),
+            "polaris",
+            "admin",
+            "admin-pw",
+            "POLARIS",
+            30,
+            false,
+            sqe_core::config::GrantAuthority::RangerDelegate,
+        )
+        .unwrap();
+        let stmt = RevokeStatement {
+            privilege: "ALL PRIVILEGES".to_string(),
+            catalog: Some("wh".to_string()),
+            namespace: Some("sales".to_string()),
+            table: Some("orders".to_string()),
+            grantee: Grantee::Role("analyst".to_string()),
+            grantor: Some("mallory".to_string()),
+            object: Default::default(),
+            grantor_is_admin: false,
+        };
+
+        let err = backend
+            .revoke("token", &stmt)
+            .await
+            .expect_err("a deny nobody authorized lifting must not be lifted");
+        assert!(err.to_string().contains("403"), "expected 403: {err}");
+        let puts = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.method == wiremock::http::Method::PUT)
+            .count();
+        assert_eq!(puts, 0, "the policy must not be PUT as the REST admin");
     }
 
     #[test]
