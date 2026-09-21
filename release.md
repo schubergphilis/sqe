@@ -134,6 +134,12 @@ scripts/release.sh 0.35.1 --push
 
 The tag pipeline fires on the tag push regardless of branch.
 
+The tag pipeline does not reuse anything from the `main` pipeline: `release-binaries`
+excludes tags, so `aikido-release-image` runs kaniko against the root `Dockerfile`
+and compiles from source a second time. The `:vX.Y.Z` / `:stable` image is
+therefore a separate build of the same commit; the tested binaries (`out/`) are
+the ones packaged into the short-SHA image by `aikido-build`. See #736.
+
 ### Pre-releases
 
 ```bash

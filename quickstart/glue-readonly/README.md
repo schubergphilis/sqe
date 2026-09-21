@@ -33,11 +33,12 @@ export AWS_REGION=eu-central-1
 # 2. Mirror the catalog (~610 tables, a couple of minutes).
 python3 scripts/glue-to-sidecar.py --root ~/.sqe/gluemirror
 
-# 3. Edit sqe.toml: set hive.roots.location to your mirror path and
-#    allowed_object_store_prefixes to your buckets.
+# 3. Copy sqe.toml to sqe.local.toml (gitignored) and set hive.roots.location
+#    to your mirror path and allowed_object_store_prefixes to your buckets.
+cp quickstart/glue-readonly/sqe.toml quickstart/glue-readonly/sqe.local.toml
 
 # 4. Start.
-SQE_CONFIG=quickstart/glue-readonly/sqe.toml sqe-server
+SQE_CONFIG=quickstart/glue-readonly/sqe.local.toml sqe-server
 ```
 
 Or skip the `[mcp]` block entirely and use the flags, which set the same

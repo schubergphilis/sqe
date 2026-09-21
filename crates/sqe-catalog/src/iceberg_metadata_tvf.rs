@@ -14,6 +14,21 @@
 //! Each function is implemented as [`TableFunctionImpl`] — the same pattern
 //! as [`crate::read_parquet::ReadParquetFunction`].
 //!
+//! ## Authorization (#750)
+//!
+//! The only gate is the catalog load. `IcebergMetadataProvider::scan` calls
+//! `SessionCatalog::load_table` on the *session's* catalog, which carries the
+//! caller's own bearer token, so a Polaris principal without `loadTable` on
+//! the table gets the catalog's 403 and no metadata. Nothing else applies:
+//! the policy rewriter keys `TableScan`s by `scan.table_name`, which for a
+//! TVF is the function name (`table_files`), not the target table, so
+//! Ranger/in-memory SELECT policies on the target are not consulted and the
+//! output (file paths, partition values, bounds) bypasses row filters and
+//! column masks. `append_metadata_tvf_targets` in the coordinator already
+//! resolves the target table for cache invalidation and audit; routing that
+//! same ident through `SessionCatalog::authorize_table_access` (or the policy
+//! store) before `scan` is the seam for table-level governance here.
+//!
 //! ## Removing block_in_place (issue #19)
 //!
 //! Earlier versions bridged DataFusion's sync `TableFunctionImpl::call` into

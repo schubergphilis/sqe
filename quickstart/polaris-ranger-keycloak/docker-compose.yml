@@ -119,6 +119,7 @@ services:
     image: postgres:13.23
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rangerR0cks!}
+      RANGER_DB_PASSWORD: ${RANGER_ADMIN_PASSWORD:-rangerR0cks!} # read by init_postgres.sh
     volumes:
       - ranger-db-data:/var/lib/postgresql/data
       - ./ranger/init_postgres.sh:/docker-entrypoint-initdb.d/init_postgres.sh:ro
@@ -129,8 +130,8 @@ services:
       retries: 30
 
   # ── Ranger Admin — the policy store SQE writes to ─────────────────────
-  # Official apache/ranger image (postgres build). install.properties is mounted
-  # because the image deletes the bundled one. Solr audit is disabled. First boot
+  # Official apache/ranger image (postgres build). Our install.properties
+  # replaces the image's template (Solr audit disabled, db_host=ranger-db). First boot
   # runs schema DDL and can take 2-4 minutes; the port-open healthcheck just
   # gates dependents, and ranger-setup does the real REST-readiness wait.
   ranger-admin:
@@ -169,10 +170,22 @@ services:
       RANGER_DB_TYPE: postgres
       KERBEROS_ENABLED: "false"
       DEBUG_ADMIN: "false"
+      # ranger.sh copies $RANGER_SCRIPTS/ranger-admin-install.properties to
+      # install.properties at first boot and APPENDS db_user/db_password/
+      # rangerAdmin_password/... from these three variables; setup.sh takes the
+      # last occurrence, so the mounted template carries no passwords. The
+      # image ties the Ranger admin password to the DB password, hence one
+      # variable feeds both here and in ranger-db. Changing it after the
+      # ranger-db-data volume exists needs `docker compose down -v`.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rangerR0cks!}
+      RANGER_DB_USER: rangeradmin
+      RANGER_DB_PASSWORD: ${RANGER_ADMIN_PASSWORD:-rangerR0cks!}
     volumes:
-      - ./ranger/install.properties:/opt/ranger/admin/install.properties:ro
+      - ./ranger/install.properties:/home/ranger/scripts/ranger-admin-install.properties:ro
     ports:
-      - "${RANGER_PORT:-26080}:6080"
+      # Loopback only: Ranger Admin is basic-auth with a well-known default
+      # password; nothing outside this host needs to reach it.
+      - "127.0.0.1:${RANGER_PORT:-26080}:6080"
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6080'"]
       interval: 10s
