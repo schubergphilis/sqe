@@ -3160,6 +3160,13 @@ impl QueryHandler {
                 // TrackedRecordBatchStream finalizer (not the `execute` path), so
                 // carry the policy summary out to the caller, which stows it on
                 // the StreamFinalizer for the audit emission at stream end.
+                deny_hidden_metadata_tvf_targets(
+                    self.policy_store.as_deref(),
+                    &session.user,
+                    self.config.policy.mask_precedence,
+                    &metadata_tvf_targets(&plan),
+                )
+                .await?;
                 let (enforced_plan, policy_summary) = {
                     let _policy_span = tracing::info_span!(
                         "sqe.policy_rewrite",
@@ -3628,6 +3635,13 @@ impl QueryHandler {
             // Get the logical plan, give pinned scans their real identity back
             // (400), and run policy enforcement.
             let plan = tt_cleanup.restore_identities(df.logical_plan().clone())?;
+            deny_hidden_metadata_tvf_targets(
+                self.policy_store.as_deref(),
+                &session.user,
+                self.config.policy.mask_precedence,
+                &metadata_tvf_targets(&plan),
+            )
+            .await?;
             let (enforced_plan, policy_summary) = {
                 let _policy_span = tracing::info_span!(
                     "sqe.policy_rewrite",
@@ -7514,21 +7528,74 @@ fn append_metadata_tvf_targets(
     plan: &datafusion::logical_expr::LogicalPlan,
     tables: &mut Vec<String>,
 ) {
+    for (ns, table) in metadata_tvf_targets(plan) {
+        let target = format!("{ns}.{table}");
+        if !tables.contains(&target) {
+            tables.push(target);
+        }
+    }
+}
+
+/// `(namespace, table)` of every metadata TVF scan in `plan`, deduplicated.
+fn metadata_tvf_targets(plan: &datafusion::logical_expr::LogicalPlan) -> Vec<(String, String)> {
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let mut targets = Vec::new();
     let _ = plan.apply(|node| {
         if let datafusion::logical_expr::LogicalPlan::TableScan(scan) = node {
             if let Ok(provider) = datafusion::datasource::source_as_provider(&scan.source) {
                 if let Some(target) =
-                    sqe_catalog::iceberg_metadata_tvf::metadata_tvf_target_table(provider.as_ref())
+                    sqe_catalog::iceberg_metadata_tvf::metadata_tvf_target_ident(provider.as_ref())
                 {
-                    if !tables.contains(&target) {
-                        tables.push(target);
+                    if !targets.contains(&target) {
+                        targets.push(target);
                     }
                 }
             }
         }
         Ok(TreeNodeRecursion::Continue)
     });
+    targets
+}
+
+/// Refuse a statement whose metadata TVF targets (`table_files('ns','t')`,
+/// ...) the policy store denies `user` all access to (#750).
+///
+/// The rewriter keys `TableScan`s by `scan.table_name`, which for a TVF is
+/// the function name, so the target table's SELECT policy is never consulted
+/// there; without this gate a default-deny user reads object-store paths,
+/// partition values and row counts of a table it cannot SELECT from. Same
+/// wording as a missing table so "denied" is indistinguishable from "never
+/// existed" (the SHOW CREATE TABLE / SHOW TABLES convention). Table-level
+/// only: partition values of restricted or masked columns still flow through
+/// for a caller with any privilege on the table.
+async fn deny_hidden_metadata_tvf_targets(
+    store: Option<&dyn PolicyStore>,
+    user: &sqe_core::session::SessionUser,
+    precedence: sqe_core::config::MaskPrecedence,
+    targets: &[(String, String)],
+) -> sqe_core::Result<()> {
+    let Some(store) = store else {
+        return Ok(());
+    };
+    let no_tags = std::collections::HashMap::new();
+    for (ns, table) in targets {
+        let policy = sqe_policy::plan_rewriter::resolve_effective_policy(
+            store,
+            user,
+            table,
+            ns,
+            &no_tags,
+            precedence,
+        )
+        .await;
+        if sqe_policy::plan_rewriter::policy_denies_all(&policy) {
+            return Err(SqeError::with_code(
+                SqeErrorCode::TableNotFound,
+                format!("table not found: {ns}.{table}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn explicit_catalog_component(table: &str) -> Option<&str> {
@@ -9186,6 +9253,57 @@ mod show_stats_policy_tests {
         let (columns, rows) = governed_show_stats(&policy, cols(&["id", "email"]), Some(3.0));
         assert_eq!(columns, cols(&["id", "email"]));
         assert_eq!(rows, Some(3.0));
+    }
+
+    /// #750: `SELECT * FROM table_files('sales','orders')` resolves to the
+    /// target `(sales, orders)`; with a deny-all policy on it the statement is
+    /// refused as "table not found" before the rewrite, without the deny it
+    /// passes the gate. The target list is what `metadata_tvf_targets` yields
+    /// for that plan (its provider needs a live `SessionCatalog`).
+    #[tokio::test]
+    async fn denied_metadata_tvf_target_is_refused_as_table_not_found() {
+        use super::deny_hidden_metadata_tvf_targets;
+        use sqe_core::config::MaskPrecedence;
+        use sqe_core::session::SessionUser;
+        use sqe_policy::policy_store::InMemoryPolicyStore;
+        use sqe_policy::PolicyStore;
+
+        let store = InMemoryPolicyStore::new();
+        let user = SessionUser {
+            username: "analyst".to_string(),
+            roles: Vec::new(),
+            subject: None,
+            email: None,
+            groups: Vec::new(),
+        };
+        let targets = vec![("sales".to_string(), "orders".to_string())];
+        let precedence = MaskPrecedence::Tag;
+        let store_ref: Option<&dyn PolicyStore> = Some(&store);
+
+        assert!(
+            deny_hidden_metadata_tvf_targets(None, &user, precedence, &targets)
+                .await
+                .is_ok(),
+            "no policy store: passthrough"
+        );
+        assert!(
+            deny_hidden_metadata_tvf_targets(store_ref, &user, precedence, &targets)
+                .await
+                .is_ok(),
+            "no policy on the target: passes"
+        );
+
+        let mut deny = ResolvedPolicy::default();
+        deny.row_filters.push(lit(false));
+        store.add_table_policy("sales", "orders", deny).await;
+        let err = deny_hidden_metadata_tvf_targets(store_ref, &user, precedence, &targets)
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), sqe_core::SqeErrorCode::TableNotFound);
+        assert!(
+            err.to_string().contains("table not found: sales.orders"),
+            "{err}"
+        );
     }
 }
 

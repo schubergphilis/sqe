@@ -5900,7 +5900,7 @@ impl WriteHandler {
 /// Row-filter evaluation reuses the DML scratch-table evaluator; the filter
 /// runs over the RAW incoming values (masks do not gate writes, as in
 /// PostgreSQL).
-async fn check_batch_within_policy(
+pub(crate) async fn check_batch_within_policy(
     ctx: &DFSessionContext,
     batch: &RecordBatch,
     table_ident: &TableIdent,

@@ -23,14 +23,30 @@
 //! A caller who needs snapshot isolation on write needs an Iceberg table.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion::datasource::source_as_provider;
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::{dml::InsertOp, DmlStatement, LogicalPlan, WriteOp};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use datafusion::prelude::SessionContext;
+use futures::TryStreamExt;
+use iceberg::{NamespaceIdent, TableIdent};
 use sqlparser::ast::Statement;
 
 use sqe_core::{SqeError, SqeErrorCode};
+
+use crate::write_handler::check_batch_within_policy;
+
+fn exec_err(what: &str, e: impl std::fmt::Display) -> SqeError {
+    SqeError::with_code(
+        SqeErrorCode::ExecutionFailed,
+        format!("hive insert: {what}: {e}"),
+    )
+}
 
 /// One-row `count` result, matching what the Iceberg insert path returns so a
 /// client cannot tell which engine path served the statement.
@@ -116,13 +132,96 @@ pub async fn handle_insert(
     let plan = state
         .create_logical_plan(sql)
         .await
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("hive insert: planning failed: {e}")))?;
-    let plan = enforce_insert_source(plan, enforcer, user, policy_summary_out).await?;
-    let df = datafusion::dataframe::DataFrame::new(state, plan);
-    let batches = df
-        .collect()
-        .await
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("hive insert: {e}")))?;
+        .map_err(|e| exec_err("planning failed", e))?;
+    let LogicalPlan::Dml(dml) = plan else {
+        return Err(SqeError::Execution(
+            "hive insert: statement did not plan to an INSERT".to_string(),
+        ));
+    };
+    let source = Arc::unwrap_or_clone(dml.input);
+    let (enforced, summary) = enforcer.evaluate(user, source).await?;
+    *policy_summary_out = Some(summary);
+
+    // WITH CHECK on the TARGET (#729), same as the Iceberg INSERT path: the
+    // source enforcement above only filters what the caller may read; a
+    // row-filtered caller must also not append rows their own SELECT on the
+    // target would hide. Keyed exactly like the read path's
+    // `resolve_policy_key` for a Hive catalog: `<catalog>.<schema>`.
+    let namespace_key = match (dml.table_name.catalog(), dml.table_name.schema()) {
+        (Some(cat), Some(schema)) => format!("{cat}.{schema}"),
+        (None, Some(schema)) => schema.to_string(),
+        _ => "default".to_string(),
+    };
+    let (predicates, _) = sqe_policy::write_predicates::extract_write_predicates(
+        enforcer,
+        user,
+        &namespace_key,
+        dml.table_name.table(),
+        dml.target.schema(),
+    )
+    .await?;
+
+    let batches = if predicates.is_empty() {
+        let plan = LogicalPlan::Dml(DmlStatement::new(
+            dml.table_name,
+            dml.target,
+            dml.op,
+            Arc::new(enforced),
+        ));
+        datafusion::dataframe::DataFrame::new(state, plan)
+            .collect()
+            .await
+            .map_err(|e| exec_err("failed", e))?
+    } else {
+        let physical = state
+            .create_physical_plan(&enforced)
+            .await
+            .map_err(|e| exec_err("physical planning failed", e))?;
+        let stream = datafusion::physical_plan::execute_stream(physical, state.task_ctx())
+            .map_err(|e| exec_err("failed to start source stream", e))?;
+        let ident = TableIdent::new(
+            NamespaceIdent::new(namespace_key),
+            dml.table_name.table().to_string(),
+        );
+        let shared = Arc::new((ctx.clone(), ident, predicates));
+        let schema = stream.schema();
+        let checked = stream.and_then(move |batch| {
+            let shared = shared.clone();
+            async move {
+                let (ctx, ident, predicates) = &*shared;
+                check_batch_within_policy(ctx, &batch, ident, predicates)
+                    .await
+                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+                Ok(batch)
+            }
+        });
+        let checked: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema.clone(), checked));
+        let input = StreamingTableExec::try_new(
+            schema.clone(),
+            vec![Arc::new(OneShotPartition {
+                schema,
+                stream: Mutex::new(Some(checked)),
+            })],
+            None,
+            vec![],
+            false,
+            None,
+        )
+        .map_err(|e| exec_err("checked source", e))?;
+        let insert_op = match dml.op {
+            WriteOp::Insert(op) => op,
+            _ => InsertOp::Append,
+        };
+        let sink = source_as_provider(&dml.target)
+            .map_err(|e| exec_err("target provider", e))?
+            .insert_into(&state, Arc::new(input), insert_op)
+            .await
+            .map_err(|e| exec_err("sink planning failed", e))?;
+        datafusion::physical_plan::collect(sink, state.task_ctx())
+            .await
+            .map_err(|e| exec_err("failed", e))?
+    };
 
     // DataFusion's insert returns a one-row count. Read it rather than
     // re-deriving one, so the number reported is the number the sink wrote.
@@ -136,31 +235,40 @@ pub async fn handle_insert(
     rows_written(written)
 }
 
-/// Run the INSERT's source plan through the policy enforcer and rebuild the
-/// DML node around the enforced input. Anything that is not an INSERT (the
-/// planner should never hand us one here) is refused rather than executed
-/// unenforced.
-async fn enforce_insert_source(
-    plan: datafusion::logical_expr::LogicalPlan,
-    enforcer: &dyn sqe_policy::PolicyEnforcer,
-    user: &sqe_core::SessionUser,
-    policy_summary_out: &mut Option<sqe_policy::PolicySummary>,
-) -> Result<datafusion::logical_expr::LogicalPlan, SqeError> {
-    use datafusion::logical_expr::{DmlStatement, LogicalPlan};
-    let LogicalPlan::Dml(dml) = plan else {
-        return Err(SqeError::Execution(
-            "hive insert: statement did not plan to an INSERT".to_string(),
-        ));
-    };
-    let source = Arc::unwrap_or_clone(dml.input);
-    let (enforced, summary) = enforcer.evaluate(user, source).await?;
-    *policy_summary_out = Some(summary);
-    Ok(LogicalPlan::Dml(DmlStatement::new(
-        dml.table_name,
-        dml.target,
-        dml.op,
-        Arc::new(enforced),
-    )))
+/// A single-partition [`PartitionStream`] handing out an already-started
+/// stream once. `StreamingTableExec` is the smallest `ExecutionPlan` that
+/// accepts a stream, and the sink executes its input exactly once.
+struct OneShotPartition {
+    schema: SchemaRef,
+    stream: Mutex<Option<SendableRecordBatchStream>>,
+}
+
+impl std::fmt::Debug for OneShotPartition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OneShotPartition")
+            .field("schema", &self.schema)
+            .finish()
+    }
+}
+
+impl PartitionStream for OneShotPartition {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+        match self.stream.lock().ok().and_then(|mut s| s.take()) {
+            Some(s) => s,
+            None => Box::pin(RecordBatchStreamAdapter::new(
+                self.schema.clone(),
+                futures::stream::once(async {
+                    Err(datafusion::error::DataFusionError::Internal(
+                        "hive insert: checked source stream executed twice".to_string(),
+                    ))
+                }),
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -606,5 +714,89 @@ mod ctas_tests {
         let err =
             ctas_spec(&c, &schema(&[("dt", DataType::Utf8)])).expect_err("no file columns left");
         assert!(err.to_string().contains("nothing to store"), "{err}");
+    }
+
+    // #729: the target's row filter gates the append, not only the source
+    // SELECT. Target is a plain DataFusion listing table (the same
+    // `ListingTable::insert_into` a `HiveTableProvider` delegates to).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hive_insert_refuses_rows_outside_target_row_filter_and_writes_nothing() {
+        use datafusion::logical_expr::{col, lit};
+        use sqe_policy::plan_rewriter::PolicyPlanRewriter;
+        use sqe_policy::policy_store::InMemoryPolicyStore;
+        use sqe_policy::ResolvedPolicy;
+
+        let store = InMemoryPolicyStore::new();
+        let mut pol = ResolvedPolicy::default();
+        pol.row_filters.push(col("region").eq(lit("EU")));
+        store.add_table_policy("default", "employees", pol).await;
+        let enforcer = PolicyPlanRewriter::new(Arc::new(store));
+        let user = sqe_core::Session::new(
+            "alice".to_string(),
+            "tok".to_string().into(),
+            None,
+            chrono::Utc::now(),
+            vec![],
+        )
+        .user;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = SessionContext::new();
+        ctx.sql(&format!(
+            "CREATE EXTERNAL TABLE employees (id BIGINT, region VARCHAR) \
+             STORED AS PARQUET LOCATION '{}/'",
+            dir.path().display()
+        ))
+        .await
+        .unwrap();
+        let src_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+        let src = RecordBatch::try_new(
+            src_schema,
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1_i64, 2])),
+                Arc::new(arrow_array::StringArray::from(vec!["EU", "US"])),
+            ],
+        )
+        .unwrap();
+        ctx.register_batch("src", src).unwrap();
+
+        let run = |sql: &'static str| {
+            let ctx = &ctx;
+            let enforcer = &enforcer;
+            let user = &user;
+            async move {
+                let mut summary = None;
+                let stmt = Parser::parse_sql(&GenericDialect {}, sql)
+                    .unwrap()
+                    .remove(0);
+                handle_insert(ctx, &stmt, sql, enforcer, user, &mut summary).await
+            }
+        };
+        let files = || std::fs::read_dir(dir.path()).unwrap().count();
+
+        let err = run("INSERT INTO employees SELECT * FROM src")
+            .await
+            .expect_err("a US row must be refused by the EU row filter");
+        assert!(err.to_string().contains("fall outside"), "{err}");
+        assert_eq!(
+            files(),
+            0,
+            "nothing may be written when the statement is refused"
+        );
+
+        let ok = run("INSERT INTO employees SELECT * FROM src WHERE region = 'EU'")
+            .await
+            .expect("EU-only rows are admitted");
+        let n = ok[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 1);
+        assert_eq!(files(), 1);
     }
 }

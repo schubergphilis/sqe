@@ -16,18 +16,19 @@
 //!
 //! ## Authorization (#750)
 //!
-//! The only gate is the catalog load. `IcebergMetadataProvider::scan` calls
+//! Two gates. `IcebergMetadataProvider::scan` calls
 //! `SessionCatalog::load_table` on the *session's* catalog, which carries the
 //! caller's own bearer token, so a Polaris principal without `loadTable` on
-//! the table gets the catalog's 403 and no metadata. Nothing else applies:
-//! the policy rewriter keys `TableScan`s by `scan.table_name`, which for a
-//! TVF is the function name (`table_files`), not the target table, so
-//! Ranger/in-memory SELECT policies on the target are not consulted and the
-//! output (file paths, partition values, bounds) bypasses row filters and
-//! column masks. `append_metadata_tvf_targets` in the coordinator already
-//! resolves the target table for cache invalidation and audit; routing that
-//! same ident through `SessionCatalog::authorize_table_access` (or the policy
-//! store) before `scan` is the seam for table-level governance here.
+//! the table gets the catalog's 403 and no metadata. The policy rewriter
+//! does not apply here: it keys `TableScan`s by `scan.table_name`, which for
+//! a TVF is the function name (`table_files`), not the target table. The
+//! coordinator therefore resolves the target via [`metadata_tvf_target_ident`]
+//! before the rewrite (`deny_hidden_metadata_tvf_targets` in
+//! `query_handler.rs`) and refuses the statement as "table not found" when the
+//! policy store denies the caller all access to the target. Residual: row
+//! filters and column masks still do not reach this output, so partition
+//! values and bounds of a restricted or masked column remain visible to a
+//! caller who holds any privilege on the table.
 //!
 //! ## Removing block_in_place (issue #19)
 //!
@@ -171,22 +172,21 @@ impl TableProvider for IcebergMetadataProvider {
 
 /// If `provider` is one of the Iceberg metadata TVF providers
 /// (`table_files`, `table_snapshots`, `table_manifests`, ...), return the
-/// underlying Iceberg table as `namespace.table`.
+/// underlying Iceberg table as `(namespace, table)`.
 ///
 /// The query result cache indexes cached results by the table names in the
 /// plan's `TableScan` nodes, but a metadata TVF scan carries the function
 /// name, not the target table -- so DML writes never invalidated cached TVF
 /// results and `table_files()` counts went stale after DELETE/UPDATE/MERGE
 /// (#371). The coordinator calls this to index those entries under the real
-/// table.
-pub fn metadata_tvf_target_table(provider: &dyn TableProvider) -> Option<String> {
+/// table, and to resolve the target's policy before the rewrite (#750).
+pub fn metadata_tvf_target_ident(provider: &dyn TableProvider) -> Option<(String, String)> {
     (provider as &dyn std::any::Any)
         .downcast_ref::<IcebergMetadataProvider>()
         .map(|p| {
-            format!(
-                "{}.{}",
+            (
                 p.ident.namespace().as_ref().join("."),
-                p.ident.name()
+                p.ident.name().to_string(),
             )
         })
 }
