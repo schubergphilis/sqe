@@ -649,6 +649,13 @@ impl QueryHandler {
         &self.write_handler
     }
 
+    /// The result cache, for write entry points that bypass `execute()`
+    /// (Flight `DoPut` ingest) and must still drop the target's cached
+    /// SELECTs (#746).
+    pub fn query_cache(&self) -> Option<&Arc<ResultCache>> {
+        self.query_cache.as_ref()
+    }
+
     /// Returns the audit logger, if one was wired at construction time.
     ///
     /// Used by `SqeFlightSqlService` to emit `AuditKind::Auth` events from the
@@ -3063,6 +3070,9 @@ impl QueryHandler {
                     cancel_token,
                 )
                 .with_teardown(tt_cleanup)
+                // `query.max_result_rows` bounds the streaming path like the
+                // buffered one (#735); 0 = unlimited.
+                .with_max_rows(self.config.query.max_result_rows)
                 .with_idle_timeout(std::time::Duration::from_secs(
                     self.config.query.stream_idle_timeout_secs,
                 ))

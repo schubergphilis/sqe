@@ -44,7 +44,13 @@ pub fn redact_pii(sql: &str) -> String {
         .get_or_init(|| regex::Regex::new(r"'\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{1,7}'").unwrap());
     let secret_re = SECRET_RE.get_or_init(|| {
         regex::Regex::new(
-            r"(?i)\b(TOKEN|PASSWORD|PASSWD|SECRET|ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN|API_KEY|CLIENT_SECRET|BEARER)\b(\s*=\s*|\s+|\s*\(\s*)'[^']*'",
+            // Keyword = any identifier ENDING in a secret-ish suffix, so the
+            // ATTACH dialect (`S3_SECRET_KEY`, `S3_ACCESS_KEY`,
+            // `S3_SESSION_TOKEN`) and `CLIENT_SECRET` / `ACCESS_KEY_ID` all
+            // match without a per-dialect list (#744 #762). The literal
+            // accepts SQL `''` escapes so `PASSWORD 'it''s'` is consumed
+            // whole instead of stopping at the doubled quote (#733).
+            r"(?i)\b([A-Z0-9_]*(?:TOKEN|PASSWORD|PASSWD|SECRET|ACCESS_KEY|ACCESS_KEY_ID|SECRET_KEY|API_KEY|BEARER))\b(\s*=\s*|\s+|\s*\(\s*)'(?:[^']|'')*'",
         )
         .unwrap()
     });
@@ -345,6 +351,40 @@ mod tests {
         assert!(!redacted.contains("'abc'"));
         assert!(!redacted.contains("'def'"));
         assert!(!redacted.contains("'ghi'"));
+    }
+
+    #[test]
+    fn redact_secret_with_doubled_quote_escape() {
+        // #733: `''` inside the literal must not end the match early.
+        let sql = "CREATE SECRET s (TYPE password, PASSWORD 'it''s-secret-tail')";
+        let redacted = redact_pii(sql);
+        assert!(!redacted.contains("secret-tail"), "{redacted}");
+        assert!(redacted.contains("PASSWORD '[REDACTED]'"), "{redacted}");
+    }
+
+    #[test]
+    fn redact_attach_s3_credentials() {
+        // #744 #762: ATTACH dialect option names.
+        let sql = "ATTACH 'x' AS lake (TYPE iceberg_rest, S3_ACCESS_KEY 'AKIAEXAMPLE', \
+            S3_SECRET_KEY = 'wJalrXUtnFEMI/EXAMPLE', S3_SESSION_TOKEN 'FQoDEXAMPLE', \
+            CLIENT_SECRET 'oidc-secret', S3_ENDPOINT 'http://minio:9000')";
+        let redacted = redact_pii(sql);
+        for leaked in [
+            "AKIAEXAMPLE",
+            "wJalrXUtnFEMI/EXAMPLE",
+            "FQoDEXAMPLE",
+            "oidc-secret",
+        ] {
+            assert!(!redacted.contains(leaked), "{leaked} leaked: {redacted}");
+        }
+        assert!(
+            redacted.contains("S3_SECRET_KEY = '[REDACTED]'"),
+            "{redacted}"
+        );
+        assert!(
+            redacted.contains("'http://minio:9000'"),
+            "non-secret option must survive: {redacted}"
+        );
     }
 
     #[test]

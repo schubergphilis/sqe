@@ -816,11 +816,19 @@ impl SqeFlightSqlService {
     /// means audit IPs always reflect the actual TCP peer.
     fn extract_client_ip<T>(&self, request: &Request<T>) -> String {
         let peer = request.remote_addr().map(|a| a.to_string());
-        let xff = request
-            .metadata()
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+        // Every header line, joined per RFC 7230, so a second
+        // X-Forwarded-For line cannot hide the rightmost untrusted hop
+        // (#740, same shape as the quack server).
+        let xff = {
+            let joined = request
+                .metadata()
+                .get_all("x-forwarded-for")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect::<Vec<_>>()
+                .join(", ");
+            (!joined.is_empty()).then_some(joined)
+        };
         self.config
             .security
             .resolve_client_ip(peer.as_deref(), xff.as_deref())
@@ -2322,6 +2330,13 @@ impl FlightSqlService for SqeFlightSqlService {
             .handle_ingest_streaming(&session, &qualified, Box::pin(flight_stream))
             .await
             .map_err(|e| sqe_error_to_status(&e, None))?;
+        // `after_commit` drops the session and table-metadata caches; the
+        // result cache lives on the QueryHandler, so a SELECT of the same
+        // text kept serving pre-ingest rows until its TTL (#746). Same call
+        // the SQL INSERT arm makes.
+        if let Some(cache) = self.query_handler.query_cache() {
+            cache.invalidate(&qualified);
+        }
 
         Ok(rows as i64)
     }

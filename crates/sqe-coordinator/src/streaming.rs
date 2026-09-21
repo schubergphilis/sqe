@@ -577,6 +577,10 @@ pub struct TrackedRecordBatchStream {
     deadline_sleep: Option<Pin<Box<Sleep>>>,
     /// The duration behind `query_deadline`, kept for the abort message.
     query_timeout: Option<Duration>,
+    /// `query.max_result_rows` for the streaming path. The buffered SELECT
+    /// path errors once the row count passes it; before this the stream
+    /// only counted rows for audit and never enforced the cap (#735).
+    max_rows: Option<usize>,
 }
 
 impl TrackedRecordBatchStream {
@@ -605,6 +609,7 @@ impl TrackedRecordBatchStream {
             query_deadline: None,
             deadline_sleep: None,
             query_timeout: None,
+            max_rows: None,
         }
     }
 
@@ -635,6 +640,7 @@ impl TrackedRecordBatchStream {
             query_deadline: None,
             deadline_sleep: None,
             query_timeout: None,
+            max_rows: None,
         }
     }
 
@@ -666,6 +672,7 @@ impl TrackedRecordBatchStream {
             query_deadline: None,
             deadline_sleep: None,
             query_timeout: None,
+            max_rows: None,
         }
     }
 
@@ -712,6 +719,40 @@ impl TrackedRecordBatchStream {
             self.query_timeout = Some(total);
         }
         self
+    }
+
+    /// Enforce `query.max_result_rows` on the stream: once more rows than
+    /// `max` have been handed to the client the stream ends with the same
+    /// error the buffered path returns. `0` (unlimited) installs nothing.
+    pub fn with_max_rows(mut self, max: usize) -> Self {
+        if max > 0 {
+            self.max_rows = Some(max);
+        }
+        self
+    }
+
+    /// Abort because `rows_so_far` passed `max_rows` (#735). Mirrors the
+    /// buffered path's error text so clients see one message for both.
+    fn abort_max_rows(&mut self, max: usize) -> Poll<Option<Result<RecordBatch, DataFusionError>>> {
+        warn!(
+            rows_so_far = self.rows_so_far,
+            max_result_rows = max,
+            "Stream exceeded max_result_rows, aborting query and releasing permits"
+        );
+        self.cancelled = true;
+        let msg = format!(
+            "Query result exceeds maximum allowed rows ({} > {max}). \
+             Reason: configured max_result_rows={max}. Use LIMIT to reduce output \
+             or raise the limit in config.",
+            self.rows_so_far
+        );
+        if let Some(f) = self.finalizer.take() {
+            f.on_error(
+                self.rows_so_far,
+                &sqe_core::SqeError::with_code(SqeErrorCode::ExecutionFailed, msg.clone()),
+            );
+        }
+        Poll::Ready(Some(Err(DataFusionError::Execution(msg))))
     }
 
     /// Abort the stream because the absolute deadline passed: finalize as a
@@ -785,6 +826,11 @@ impl Stream for TrackedRecordBatchStream {
                     return self.abort_deadline();
                 }
                 self.rows_so_far = self.rows_so_far.saturating_add(batch.num_rows());
+                if let Some(max) = self.max_rows {
+                    if self.rows_so_far > max {
+                        return self.abort_max_rows(max);
+                    }
+                }
                 self.reset_idle_timer();
                 Poll::Ready(Some(Ok(batch)))
             }
@@ -1171,6 +1217,44 @@ mod tests {
         let _ok = stream.next().await.unwrap().unwrap();
         let err = stream.next().await.unwrap();
         assert!(err.is_err());
+        drop(stream);
+
+        let record = find_record(&tracker, qid);
+        assert_eq!(record.state, QueryState::Failed);
+    }
+
+    #[tokio::test]
+    async fn tracked_stream_enforces_max_result_rows() {
+        // #735: the streaming SELECT path must stop at query.max_result_rows
+        // with the buffered path's error, and finalize as Failed.
+        let (plan, schema, runtime) = trivial_plan().await;
+        let tracker = test_tracker();
+        let fin = test_finalizer(Arc::clone(&tracker), plan, runtime);
+        let qid = fin.query_id;
+        tracker.start(
+            qid,
+            "test-user",
+            None,
+            "SELECT 1",
+            "test-session",
+            None,
+            vec![],
+            None,
+        );
+
+        let inner = fixed_stream(
+            Arc::clone(&schema),
+            vec![sample_batch(10), sample_batch(10), sample_batch(10)],
+        );
+        let mut stream = TrackedRecordBatchStream::new(inner, fin, None).with_max_rows(15);
+
+        let _first = stream.next().await.unwrap().unwrap();
+        let err = stream.next().await.unwrap().unwrap_err().to_string();
+        assert!(err.contains("max_result_rows=15"), "{err}");
+        assert!(
+            stream.next().await.is_none(),
+            "stream must end after the cap error"
+        );
         drop(stream);
 
         let record = find_record(&tracker, qid);

@@ -462,7 +462,19 @@ impl SessionManager {
 
         let json = serde_json::to_string_pretty(&sessions)
             .map_err(|e| format!("Failed to serialize sessions: {e}"))?;
-        std::fs::write(path, json).map_err(|e| format!("Failed to write session snapshot: {e}"))?;
+        // Session ids are Flight bearers: write 0600 to a sibling temp file and
+        // rename over the target so the file is never world-readable, not even
+        // between create and chmod (#743; mirrors `sqe_core::secret`).
+        let tmp = format!("{path}.tmp");
+        std::fs::write(&tmp, json).map_err(|e| format!("Failed to write session snapshot: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("Failed to chmod session snapshot: {e}"))?;
+        }
+        std::fs::rename(&tmp, path)
+            .map_err(|e| format!("Failed to rename session snapshot into place: {e}"))?;
         tracing::debug!(
             path = path,
             count = sessions.len(),
@@ -972,6 +984,18 @@ mod tests {
         manager
             .snapshot_to_file(&tmp_path)
             .expect("snapshot_to_file should succeed");
+
+        // #743: the snapshot carries bearer session ids; owner-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&tmp_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "session snapshot must be mode 0600");
+            assert!(
+                !std::path::Path::new(&format!("{tmp_path}.tmp")).exists(),
+                "temp file must be renamed away"
+            );
+        }
 
         // File must exist and contain valid JSON
         let content = std::fs::read_to_string(&tmp_path)

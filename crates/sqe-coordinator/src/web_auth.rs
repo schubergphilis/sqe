@@ -248,11 +248,17 @@ where
         .map(|ci| ci.0.to_string());
 
     // Extract the X-Forwarded-For header, if present.
-    let xff: Option<String> = request
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+    // All header lines joined (#740): `get` would return only the first.
+    let xff: Option<String> = {
+        let joined = request
+            .headers()
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect::<Vec<_>>()
+            .join(", ");
+        (!joined.is_empty()).then_some(joined)
+    };
 
     // Resolve the client IP using the state's configured proxy trust list.
     // `resolve_client_ip` on the trait defaults to peer-wins (no XFF);
