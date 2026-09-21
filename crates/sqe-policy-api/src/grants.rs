@@ -120,6 +120,10 @@ pub struct RevokeStatement {
     pub grantor: Option<String>,
     /// See `GrantStatement::object`.
     pub object: GrantObjectKind,
+    /// The caller holds an engine admin role. Under `ranger-delegate` the
+    /// backend only lets a grantor lift a DENY after Ranger authorized a
+    /// revoke on that resource; an admin needs no such proof (#720).
+    pub grantor_is_admin: bool,
 }
 
 /// What kind of object a GRANT names.

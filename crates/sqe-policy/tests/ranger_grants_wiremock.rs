@@ -438,6 +438,7 @@ fn revoke_all_stmt() -> sqe_policy::grants::RevokeStatement {
         grantee: Grantee::Role("analyst".to_string()),
         grantor: Some("carol".to_string()),
         object: Default::default(),
+        grantor_is_admin: false,
     }
 }
 
@@ -797,6 +798,7 @@ async fn policy_api_revoke_with_no_policy_is_a_noop() {
         grantee: Grantee::Role("analyst".to_string()),
         grantor: Some("carol".to_string()),
         object: Default::default(),
+        grantor_is_admin: false,
     };
     policy_api_backend(&server.uri())
         .revoke("token", &stmt)
