@@ -9,7 +9,7 @@
 # Prerequisites:
 #   1. python3 scripts/glue-to-sidecar.py --root ~/.sqe/gluemirror
 #   2. eval "$(aws configure export-credentials --format env)"
-#   3. SQE_CONFIG=quickstart/glue-readonly/sqe.toml sqe-server
+#   3. SQE_CONFIG=quickstart/glue-readonly/sqe.local.toml sqe-server
 
 [coordinator]
 flight_port = 50051
@@ -56,13 +56,12 @@ allow_local_paths = true
 # use the engine's AWS credentials, so this list is the real access
 # boundary: anything not named here is refused, and anything named here is
 # readable by any caller. Keep it to the buckets you mean.
+# Placeholders: copy this file to sqe.local.toml (gitignored, like
+# benchmarks/profiles/*.local.toml) and put your real account id / bucket
+# names there. `make leak-scan` rejects a committed 12-digit account id.
 allowed_object_store_prefixes = [
-  "s3://sbp-a-088044431914-datalake-raw-datazone/",
-  "s3://sbp-a-088044431914-datalake-refined-datazone/",
-  "s3://sbp-a-088044431914-datalake-refined-sensitive-datazone/",
-  "s3://sbp-a-088044431914-datalake-transient-datazone/",
-  "s3://sbp-a-088044431914-datalake-ingestion-datazone/",
-  "s3://sbp-a-088044431914-datalake-staging-datazone/",
+  "s3://example-123456789012-datalake-raw/",
+  "s3://example-123456789012-datalake-refined/",
 ]
 
 [hive]
@@ -77,7 +76,7 @@ manifest_max_partition_index_entries = 100000
 # live view.
 [[hive.roots]]
 name = "glue"
-location = "file:///Users/jjverhoeks/.sqe/gluemirror/"
+location = "file:///home/you/.sqe/gluemirror/"
 
 [mcp]
 enabled = true
