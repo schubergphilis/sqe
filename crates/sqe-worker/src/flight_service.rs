@@ -72,6 +72,56 @@ where
     }
 }
 
+/// Finding 745: `scan_timeout_secs` is documented as the budget for the whole
+/// scan task, but `do_get` used to apply it to setup only, so a slow consumer
+/// kept the producer draining files for as long as it stayed connected. This
+/// ends the batch stream with `DEADLINE_EXCEEDED` when the deadline passes and
+/// drops the inner stream, which closes the producer's channel and stops it at
+/// its next send. `None` deadline (`scan_timeout_secs = 0`) never fires.
+struct ScanDeadline<S> {
+    inner: Option<Pin<Box<S>>>,
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+    fragment_id: String,
+}
+
+impl<S> ScanDeadline<S> {
+    fn new(inner: S, deadline: Option<tokio::time::Instant>, fragment_id: String) -> Self {
+        Self {
+            inner: Some(Box::pin(inner)),
+            sleep: deadline.map(|d| Box::pin(tokio::time::sleep_until(d))),
+            fragment_id,
+        }
+    }
+}
+
+impl<S, T> Stream for ScanDeadline<S>
+where
+    S: Stream<Item = Result<T, arrow_flight::error::FlightError>>,
+{
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        let Some(inner) = this.inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        if let Some(sleep) = this.sleep.as_mut() {
+            if std::future::Future::poll(sleep.as_mut(), cx).is_ready() {
+                warn!(fragment_id = %this.fragment_id, "Scan task exceeded scan_timeout; ending stream");
+                // Dropping the receiver is what stops the producer.
+                this.inner = None;
+                return Poll::Ready(Some(Err(arrow_flight::error::FlightError::Tonic(
+                    Box::new(Status::deadline_exceeded(format!(
+                        "Scan task {} exceeded scan_timeout",
+                        this.fragment_id
+                    ))),
+                ))));
+            }
+        }
+        inner.as_mut().poll_next(cx)
+    }
+}
+
 /// Streams `RecordBatch`es into the Flight encoder while holding each batch's
 /// scan-budget permit until the encoder polls the next item (or the stream
 /// ends / is dropped on client disconnect).
@@ -1198,23 +1248,27 @@ impl FlightService for WorkerFlightService {
                 Some(scan_budget),
             );
 
-            let (schema, batch_stream) = if scan_timeout.is_zero() {
-                prepare.await
-            } else {
-                tokio::time::timeout(scan_timeout, prepare)
-                    .await
-                    .map_err(|_| {
-                        warn!(
-                            fragment_id = %fragment_id,
-                            timeout_secs = scan_timeout.as_secs(),
-                            "Scan task setup timed out"
-                        );
-                        Status::deadline_exceeded(format!(
-                            "Scan task {} setup timed out after {}s",
-                            fragment_id,
-                            scan_timeout.as_secs()
-                        ))
-                    })?
+            // One budget for setup and streaming together (finding 745).
+            let deadline =
+                (!scan_timeout.is_zero()).then(|| tokio::time::Instant::now() + scan_timeout);
+            let (schema, batch_stream) = match deadline {
+                None => prepare.await,
+                Some(deadline) => {
+                    tokio::time::timeout_at(deadline, prepare)
+                        .await
+                        .map_err(|_| {
+                            warn!(
+                                fragment_id = %fragment_id,
+                                timeout_secs = scan_timeout.as_secs(),
+                                "Scan task setup timed out"
+                            );
+                            Status::deadline_exceeded(format!(
+                                "Scan task {} setup timed out after {}s",
+                                fragment_id,
+                                scan_timeout.as_secs()
+                            ))
+                        })?
+                }
             }
             .map_err(|e| {
                 // Finding 602: classify from the typed chain (the executor
@@ -1252,6 +1306,7 @@ impl FlightService for WorkerFlightService {
             // (or the client disconnects mid-stream) they drop, the credential
             // entry is removed via `tokio::spawn` and the in-flight count
             // steps down. No sentinel item is ever emitted.
+            let mapped_stream = ScanDeadline::new(mapped_stream, deadline, fragment_id.clone());
             let mapped_stream = HoldUntilEnd::new(mapped_stream, (cleanup_guard, inflight_guard));
             // AccountedFlightStream: retain each batch's scan-budget permit
             // until the Flight encoder polls for the next batch (or the
@@ -1606,6 +1661,31 @@ mod tests {
             40 * 1024 * 1024,
             "fallback must match the config default of a tenth of the pool"
         );
+    }
+
+    /// Finding 745: a producer that never ends is cut at the scan deadline
+    /// with DEADLINE_EXCEEDED, and its channel closes so it stops draining.
+    #[tokio::test]
+    async fn scan_deadline_cuts_endless_producer() {
+        use arrow_flight::error::FlightError;
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<u8, FlightError>>(1);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(20);
+        let mut s = Box::pin(ScanDeadline::new(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+            Some(deadline),
+            "frag-1".to_string(),
+        ));
+        tx.send(Ok(1)).await.unwrap();
+        assert!(matches!(s.next().await, Some(Ok(1))));
+        // The producer sends nothing more but never ends: the deadline fires.
+        match s.next().await {
+            Some(Err(FlightError::Tonic(status))) => {
+                assert_eq!(status.code(), tonic::Code::DeadlineExceeded)
+            }
+            other => panic!("expected deadline error, got {other:?}"),
+        }
+        assert!(tx.is_closed(), "receiver must drop so the producer stops");
+        assert!(s.next().await.is_none());
     }
 
     /// The charge must follow the frame the transport currently holds: one

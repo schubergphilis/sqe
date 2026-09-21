@@ -246,6 +246,44 @@ pub const PRODUCTION_RULES: &[ProductionRule] = &[
                 })
         },
     },
+    // Finding 751: three more dev-only switches that used to start silently.
+    ProductionRule {
+        name: "no-hmac-tickets",
+        summary: "`worker.accept_hmac_tickets` must be false (the HMAC key is the shared worker secret, so it proves nothing about who authored a scan ticket).",
+        check: |c| {
+            c.worker.accept_hmac_tickets.then(|| {
+                "production_mode: worker.accept_hmac_tickets must be false (the HMAC \
+                 key is the shared worker_secret, so any secret holder can forge scan \
+                 tickets; finish the Ed25519 rollout instead)"
+                    .to_string()
+            })
+        },
+    },
+    ProductionRule {
+        name: "verified-worker-advertise",
+        summary: "`coordinator.allow_unverified_advertise` must be false (a secret holder could register an attacker URL and receive every user's scan tickets).",
+        check: |c| {
+            c.coordinator.allow_unverified_advertise.then(|| {
+                "production_mode: coordinator.allow_unverified_advertise must be false \
+                 (a worker_secret holder could advertise an attacker URL and receive \
+                 every user's scan tickets and vended credentials)"
+                    .to_string()
+            })
+        },
+    },
+    ProductionRule {
+        name: "no-inline-tvf-credentials",
+        summary: "`storage.tvf.allow_inline_credentials` must be false (caller-supplied object-store keys would bypass `allowed_object_store_prefixes`, turning the coordinator into an arbitrary fetcher).",
+        check: |c| {
+            c.storage.tvf.allow_inline_credentials.then(|| {
+                "production_mode: storage.tvf.allow_inline_credentials must be false \
+                 (it defaults to true; caller-supplied object-store keys bypass \
+                 allowed_object_store_prefixes, so any user can turn the coordinator \
+                 into an arbitrary fetcher)"
+                    .to_string()
+            })
+        },
+    },
     // The three MCP rules apply only when the MCP listener is enabled; the
     // shape checks on the same fields (absolute URL, path /mcp, issuer has a
     // host) run in every mode and live in `validate()`.
@@ -285,6 +323,20 @@ pub const PRODUCTION_RULES: &[ProductionRule] = &[
                 })
                 .collect();
             (!offenders.is_empty()).then(|| offenders.join("; "))
+        },
+    },
+    ProductionRule {
+        name: "ranger-grant-backend-url",
+        summary: "`access_control.backend = ranger` with an empty `access_control.url` (the grant backend would silently be absent and GRANT / REVOKE NotImplemented).",
+        check: |c| {
+            (c.access_control.backend == AccessControlBackend::Ranger
+                && c.access_control.url.trim().is_empty())
+            .then(|| {
+                "production_mode: access_control.backend is ranger but access_control.url is \
+                 empty (no grant backend would be built; GRANT / REVOKE would be \
+                 NotImplemented). Set access_control.url to the Ranger Admin base URL."
+                    .to_string()
+            })
         },
     },
     ProductionRule {
