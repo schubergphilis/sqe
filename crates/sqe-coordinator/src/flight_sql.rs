@@ -431,13 +431,15 @@ pub fn encode_batches_to_stream(
     batches: Vec<RecordBatch>,
     options: IpcWriteOptions,
 ) -> Result<Response<FlightStream>, Status> {
-    if batches.is_empty() {
-        let stream = futures::stream::empty();
-        let flight_stream: FlightStream = Box::pin(stream);
-        return Ok(Response::new(flight_stream));
-    }
-
-    let schema = batches[0].schema();
+    // #771: a statement with no result set (DDL) still needs a schema
+    // message, otherwise ADBC/dbt see EOF on DoGet and report failure for a
+    // statement that ran. `with_schema` queues the schema up front, so an
+    // empty batch stream yields schema + end-of-stream. `Schema::empty()`
+    // matches what GetFlightInfo advertises for these kinds.
+    let schema = batches
+        .first()
+        .map(|b| b.schema())
+        .unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()));
     let batch_stream = stream::iter(batches.into_iter().map(Ok));
     let flight_stream = FlightDataEncoderBuilder::new()
         .with_schema(schema)
@@ -3185,6 +3187,45 @@ mod tests {
         let options = arrow_ipc::writer::IpcWriteOptions::default();
         let result = super::encode_batches_to_stream(vec![], options);
         assert!(result.is_ok(), "empty batches should produce Ok response");
+    }
+
+    /// #771: DDL through GetFlightInfo + DoGet ran but the stream ended
+    /// with no schema message, so ADBC reported EOF for a statement that
+    /// succeeded. The stream must yield a schema frame, then complete Ok.
+    #[tokio::test]
+    async fn do_get_ddl_kind_yields_schema_then_completes() {
+        let (service, token, _tracker) = cancel_test_service().await;
+        let info = service
+            .get_flight_info_statement(
+                CommandStatementQuery {
+                    query: "SET TIME ZONE 'UTC'".to_string(),
+                    transaction_id: None,
+                },
+                authed(&token, FlightDescriptor::new_cmd(vec![])),
+            )
+            .await
+            .expect("get_flight_info_statement")
+            .into_inner();
+        let ticket = info.endpoint[0].ticket.as_ref().expect("ticket").clone();
+        let fetch = decode_ticket(&ticket);
+
+        let mut stream = service
+            .do_get_fallback(authed(&token, ticket), fetch.as_any())
+            .await
+            .expect("do_get")
+            .into_inner();
+        let first = stream
+            .next()
+            .await
+            .expect("schema frame, not EOF")
+            .expect("schema frame is Ok");
+        let schema = Schema::try_from(&first).expect("first frame decodes as a schema");
+        assert_eq!(
+            schema.fields().len(),
+            0,
+            "no-result statement has an empty schema"
+        );
+        assert!(stream.next().await.is_none(), "then end-of-stream");
     }
 
     // -----------------------------------------------------------------------
