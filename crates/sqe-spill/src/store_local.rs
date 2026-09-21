@@ -168,10 +168,16 @@ impl SegmentStore for LocalSegmentStore {
         // oversubscribe; true size is reconciled on finish.
         self.reserve_quota(64 * 1024)?;
 
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        // Segments hold user data under the engine identity: owner-only, not
+        // whatever the umask leaves (#757). The rename in `finish` keeps it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts
             .open(&partial)
             .map_err(|e| BudgetError::SpillIo {
                 path: partial.display().to_string(),
@@ -657,6 +663,23 @@ mod tests {
 
         store.delete_scope(&scope).await.unwrap();
         assert!(!seg.path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn segment_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let _serial = crate::fault::serial_test_guard();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalSegmentStore::open(tmp.path(), 1 << 30, 0, 2, 2).unwrap();
+        let scope = SpillScope::new("q", "s", "op", 0, 0);
+        let mut w = store.create_writer(&scope, 0, batch(1).schema()).await.unwrap();
+        w.write_batch(&batch(1)).await.unwrap();
+        let seg = w.finish().await.unwrap();
+        let mode = fs::metadata(&seg.path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "segment mode {mode:o}");
+        let dir_mode = fs::metadata(tmp.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "root mode {dir_mode:o}");
     }
 
     #[tokio::test]
