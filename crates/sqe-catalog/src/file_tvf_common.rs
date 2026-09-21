@@ -1273,6 +1273,7 @@ mod tests {
         let args = FileTvfArgs {
             path: "gs://b/x.csv".to_string(),
             gcs_service_account_key: Some(
+                // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.security.detected-google-gcm-service-account -- no key material; a fixture that only names the endpoint under test (#727)
                 r#"{"type":"service_account","gcs_base_url":"http://169.254.169.254","disable_oauth":true}"#
                     .to_string(),
             ),

@@ -21,6 +21,9 @@ ci-config-sanity:
   image: python:3.12-alpine@sha256:b64631e04e4920160c50fbe8d8df828f7f35f06f425cb44aa09bca53e708a35a
   script:
     - python -m json.tool renovate.json >/dev/null
+    # #639: no bare `#[ignore]`; every ignored test names its stack/reason.
+    - apk add --no-cache make >/dev/null
+    - make check-ignore-reasons
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
