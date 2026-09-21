@@ -1552,6 +1552,10 @@ impl QueryHandler {
                     Ok(vec![])
                 }
                 StatementKind::SetTags(stmt) => {
+                    // Tags drive masking, so a tag write is policy DDL: an
+                    // UNSET TAGS drops the Ranger mask on that column. Same gate
+                    // as CREATE/DROP POLICY and CALL system.reproject_column_tags.
+                    self.require_admin(session, "ALTER TABLE ... SET/UNSET TAGS")?;
                     self.reject_if_hive_table(
                         session,
                         &TableReference::from(stmt.table.as_str()),
@@ -1566,6 +1570,8 @@ impl QueryHandler {
                     Ok(vec![])
                 }
                 StatementKind::SetMaskingPolicy(op) => {
+                    // Same write as SET TAGS, spelled differently.
+                    self.require_admin(session, "ALTER TABLE ... SET/UNSET MASKING POLICY")?;
                     let stmt = self.masking_policy_to_tag_op(op).await?;
                     self.catalog_ops.set_column_tags(session, &stmt).await?;
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
@@ -6181,6 +6187,7 @@ impl QueryHandler {
             // over.
             grantor: Some(session.user.username.clone()),
             object: grant_stmt.object,
+            grantor_is_admin: self.config.auth.has_admin_role(&session.user.roles),
         };
         backend
             .revoke(session.access_token().expose(), &revoke_stmt)
@@ -6227,6 +6234,20 @@ impl QueryHandler {
         session: &Session,
         target: &sqe_sql::ShowGrantsTarget,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
+        // Same self-or-admin gate as SHOW EFFECTIVE GRANTS (issue #260): the
+        // Ranger and Polaris backends list as the service identity, so an
+        // ungated read let any user enumerate anyone's grants. `TO USER <self>`
+        // is self-service; a resource, role, group or other user needs admin.
+        let target_user = match target {
+            sqe_sql::ShowGrantsTarget::ToGrantee {
+                grantee_type,
+                grantee_name,
+            } if !matches!(grantee_type.to_uppercase().as_str(), "ROLE" | "GROUP") => {
+                grantee_name.as_str()
+            }
+            _ => "",
+        };
+        self.require_self_or_admin(session, target_user, "SHOW GRANTS")?;
         let backend = self.require_grant_backend()?;
 
         let filter = match target {

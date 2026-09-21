@@ -144,6 +144,14 @@ fn u64_to_i64_saturating(v: u64) -> i64 {
 }
 
 fn build_queries_table(records: &[Arc<QueryRecord>]) -> DFResult<Arc<dyn TableProvider>> {
+    let batch = queries_batch(records)?;
+    Ok(Arc::new(MemTable::try_new(
+        batch.schema(),
+        vec![vec![batch]],
+    )?))
+}
+
+fn queries_batch(records: &[Arc<QueryRecord>]) -> DFResult<RecordBatch> {
     let schema = Arc::new(queries_schema());
 
     let tz: Arc<str> = Arc::from("UTC");
@@ -180,7 +188,10 @@ fn build_queries_table(records: &[Arc<QueryRecord>]) -> DFResult<Arc<dyn TablePr
             Some(s) => source_b.append_value(s),
             None => source_b.append_null(),
         }
-        query_b.append_value(&rec.sql);
+        // Same redaction as the web UI query list: the tracker stores SQL
+        // verbatim, and this table is readable by every authenticated session,
+        // so a `CREATE SECRET ... TOKEN '<jwt>'` would otherwise be one SELECT away.
+        query_b.append_value(sqe_metrics::audit::redact_pii(&rec.sql));
         resource_group_b.append_value("global");
         queued_ms_b.append_value(u64_to_i64_saturating(rec.queued_ms));
         analysis_ms_b.append_value(0); // no separate analysis phase
@@ -223,8 +234,8 @@ fn build_queries_table(records: &[Arc<QueryRecord>]) -> DFResult<Arc<dyn TablePr
         }
     }
 
-    let batch = RecordBatch::try_new(
-        schema.clone(),
+    Ok(RecordBatch::try_new(
+        schema,
         vec![
             Arc::new(query_id_b.finish()) as ArrayRef,
             Arc::new(state_b.finish()) as ArrayRef,
@@ -250,9 +261,7 @@ fn build_queries_table(records: &[Arc<QueryRecord>]) -> DFResult<Arc<dyn TablePr
             Arc::new(error_code_b.finish()) as ArrayRef,
             Arc::new(rows_written_b.finish()) as ArrayRef,
         ],
-    )?;
-
-    Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    )?)
 }
 
 // ---------------------------------------------------------------------------
@@ -406,7 +415,13 @@ mod tests {
 
     /// A tracker record in `state` for `user`, with every other field at its
     /// idle value. Tests set what they assert on.
-    fn record(n: u128, state: QueryState, user: &str, source: Option<&str>, sql: &str) -> QueryRecord {
+    fn record(
+        n: u128,
+        state: QueryState,
+        user: &str,
+        source: Option<&str>,
+        sql: &str,
+    ) -> QueryRecord {
         QueryRecord {
             query_id: Uuid::from_u128(n),
             state,
@@ -456,7 +471,13 @@ mod tests {
         failed.error_type = Some("SyntaxError".to_string());
         failed.error_code = Some("42000".to_string());
 
-        let mut running = record(3, QueryState::Running, "carol", Some("dbt"), "SELECT * FROM orders");
+        let mut running = record(
+            3,
+            QueryState::Running,
+            "carol",
+            Some("dbt"),
+            "SELECT * FROM orders",
+        );
         running.queued_ms = 1;
         running.planning_ms = 5;
 
@@ -513,6 +534,36 @@ mod tests {
                 "queries column {i} name mismatch"
             );
         }
+    }
+
+    /// #725: the tracker keeps SQL verbatim and this table is readable by every
+    /// authenticated session, so the `query` column must go through the same
+    /// redaction as the web UI list.
+    #[test]
+    fn queries_table_redacts_secret_literals() {
+        let rec = record(
+            9,
+            QueryState::Finished,
+            "root",
+            None,
+            "CREATE SECRET s TYPE oidc TOKEN 'eyJhbGciOi.super-secret'",
+        );
+        let batch = queries_batch(&[Arc::new(rec)]).unwrap();
+        let col = batch
+            .column_by_name("query")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        let shown = col.value(0);
+        assert!(
+            !shown.contains("super-secret"),
+            "secret literal leaked: {shown}"
+        );
+        assert!(
+            shown.contains("[REDACTED]"),
+            "expected redaction marker: {shown}"
+        );
     }
 
     #[test]
