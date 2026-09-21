@@ -51,13 +51,18 @@ impl SchemaProvider for MetadataSchemaProvider {
             "table_properties".into(),
             "schema_properties".into(),
             "table_comments".into(),
+            "materialized_views".into(),
         ]
     }
 
     fn table_exist(&self, name: &str) -> bool {
         matches!(
             name,
-            "catalogs" | "table_properties" | "schema_properties" | "table_comments"
+            "catalogs"
+                | "table_properties"
+                | "schema_properties"
+                | "table_comments"
+                | "materialized_views"
         )
     }
 
@@ -70,6 +75,7 @@ impl SchemaProvider for MetadataSchemaProvider {
             "table_properties" => Ok(Some(self.build_table_properties_table().await?)),
             "schema_properties" => Ok(Some(self.build_schema_properties_table().await?)),
             "table_comments" => Ok(Some(self.build_table_comments_table().await?)),
+            "materialized_views" => Ok(Some(build_materialized_views_table()?)),
             _ => Ok(None),
         }
     }
@@ -315,9 +321,55 @@ pub fn build_catalogs_table(catalogs: &[String]) -> DFResult<Arc<dyn TableProvid
     Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
 }
 
+/// Build the `system.metadata.materialized_views` table with Trino's columns.
+/// Always empty: SQE has no materialized views. dbt-trino LEFT JOINs it in
+/// `list_relations_without_caching`, so it must exist (#769).
+pub fn build_materialized_views_table() -> DFResult<Arc<dyn TableProvider>> {
+    let schema = Arc::new(Schema::new(
+        [
+            "catalog_name",
+            "schema_name",
+            "name",
+            "storage_catalog",
+            "storage_schema",
+            "storage_table",
+            "freshness",
+            "owner",
+            "comment",
+            "definition",
+        ]
+        .map(|name| Field::new(name, DataType::Utf8, true))
+        .to_vec(),
+    ));
+    Ok(Arc::new(MemTable::try_new(schema, vec![vec![]])?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn materialized_views_table_is_empty_with_trino_columns() {
+        let table = build_materialized_views_table().unwrap();
+        let schema = table.schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "catalog_name",
+                "schema_name",
+                "name",
+                "storage_catalog",
+                "storage_schema",
+                "storage_table",
+                "freshness",
+                "owner",
+                "comment",
+                "definition"
+            ]
+        );
+        assert!(MetadataSchemaProvider::new(vec![]).table_exist("materialized_views"));
+    }
 
     #[test]
     fn test_catalogs_table_schema() {

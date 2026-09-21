@@ -205,6 +205,11 @@ impl Exchange {
     }
 }
 
+/// All `data` rows across a list of pages, in order.
+fn all_rows(pages: &[Exchange]) -> Vec<Value> {
+    pages.iter().flat_map(Exchange::rows).collect()
+}
+
 /// Response headers worth pinning in the golden: everything the Trino
 /// protocol drives through headers, plus the rate-limit hint.
 const RECORDED_HEADERS: &[&str] = &[
@@ -330,6 +335,31 @@ impl Harness {
             body,
             text,
         }
+    }
+
+    /// Follow `nextUri` from `first` until a page without one, recording each
+    /// hop as `<name>-<n>`. Returns the pages in order, `first` excluded. The
+    /// POST never carries columns or data (#767): the first page does.
+    async fn follow(&mut self, name: &str, first: &Exchange) -> Vec<Exchange> {
+        let mut pages = Vec::new();
+        let mut next = first.next_uri();
+        while let Some(uri) = next {
+            let page = self
+                .step(&format!("{name}-{}", pages.len()), self.http.get(&uri))
+                .await;
+            next = page.next_uri();
+            pages.push(page);
+        }
+        pages
+    }
+
+    /// POST a statement as `user` and follow it to its terminal page.
+    /// Returns the POST exchange and the pages after it.
+    async fn run_as(&mut self, name: &str, user: &str, sql: &str) -> (Exchange, Vec<Exchange>) {
+        let req = self.post_as(user, sql);
+        let first = self.step(name, req).await;
+        let pages = self.follow(name, &first).await;
+        (first, pages)
     }
 
     /// Compare the recorded transcript against `tests/fixtures/wire/<name>.json`.
@@ -470,16 +500,25 @@ async fn info_endpoints() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn select_finishes_inline_with_trino_column_names() {
+async fn select_pages_columns_and_rows_via_next_uri() {
     let mut h = Harness::start().await;
     let req = h.post_as("alice", "SELECT 1 AS one, 'x' AS s, 1 + 1");
-    let page = h.step("post", req).await;
+    let posted = h.step("post", req).await;
+    assert_eq!(posted.status, 200);
+    // The POST never inlines a result (#767, trino-go-client): RUNNING plus a
+    // nextUri to results page 0, no columns, no data.
+    assert_eq!(posted.state(), "RUNNING");
+    assert!(posted.body.get("columns").is_none(), "POST carries no columns");
+    assert!(posted.body.get("data").is_none(), "POST carries no data");
+    let next = posted.next_uri().expect("POST carries nextUri");
+    assert!(next.ends_with("/0") && !next.contains("/queued/"), "{next}");
+
+    let pages = h.follow("page", &posted).await;
+    assert_eq!(pages.len(), 1, "single result page");
+    let page = &pages[0];
     assert_eq!(page.status, 200);
     assert_eq!(page.state(), "FINISHED");
-    assert!(
-        page.next_uri().is_none(),
-        "single page must not carry nextUri"
-    );
+    assert!(page.next_uri().is_none(), "last page must not carry nextUri");
     let names: Vec<&str> = page.body["columns"]
         .as_array()
         .expect("columns")
@@ -497,13 +536,18 @@ async fn select_finishes_inline_with_trino_column_names() {
 async fn paginated_select_follows_next_uri_to_finished() {
     let mut h = Harness::start().await;
     let req = h.post_as("alice", "SELECT id, name FROM t ORDER BY id");
-    let first = h.step("post", req).await;
+    let posted = h.step("post", req).await;
+    assert_eq!(posted.status, 200);
+    assert_eq!(posted.state(), "RUNNING");
+    assert!(posted.rows().is_empty(), "POST carries no data");
+    let mut next = posted.next_uri().expect("POST has nextUri");
+
+    let first = h.step("page-0", h.http.get(&next)).await;
     assert_eq!(first.status, 200);
     assert_eq!(first.state(), "RUNNING");
     assert_eq!(first.rows().len(), 1000);
-
     let mut all_rows = first.rows();
-    let mut next = first.next_uri().expect("first page has nextUri");
+    next = first.next_uri().expect("first page has nextUri");
 
     let second = h.step("page-1", h.http.get(&next)).await;
     assert_eq!(second.status, 200);
@@ -617,11 +661,14 @@ async fn prepared_statement_round_trips_through_headers() {
     let req = h
         .post_as("alice", "EXECUTE q1 USING 42")
         .header("X-Trino-Prepared-Statement", &added);
-    let executed = h.step("execute", req).await;
-    assert_eq!(executed.status, 200);
+    let posted = h.step("execute", req).await;
+    assert_eq!(posted.status, 200);
+    assert_eq!(posted.state(), "RUNNING");
+    let pages = h.follow("execute-page", &posted).await;
+    let executed = pages.last().expect("EXECUTE has a result page");
     assert_eq!(executed.state(), "FINISHED");
-    assert_eq!(executed.rows(), vec![json!([42])]);
-    assert_eq!(executed.body["columns"][0]["name"], json!("v"));
+    assert_eq!(all_rows(&pages), vec![json!([42])]);
+    assert_eq!(pages[0].body["columns"][0]["name"], json!("v"));
 
     let req = h
         .post_as("alice", "DESCRIBE OUTPUT q1")
@@ -666,12 +713,17 @@ async fn prepared_statement_round_trips_through_headers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn use_and_session_statements_echo_headers() {
     let mut h = Harness::start().await;
-    let req = h.post_as("alice", "USE lake.gold");
-    let used = h.step("use", req).await;
-    assert_eq!(used.status, 200);
+    // USE reaches the executor, so it pages like a query. It finished inside
+    // the POST's bounded wait, so the POST is the hop that knows the outcome
+    // and carries the headers; the results page does not repeat them.
+    let (posted, pages) = h.run_as("use", "alice", "USE lake.gold").await;
+    assert_eq!(posted.status, 200);
+    assert_eq!(posted.state(), "RUNNING");
+    assert_eq!(posted.header("x-trino-set-catalog").as_deref(), Some("lake"));
+    assert_eq!(posted.header("x-trino-set-schema").as_deref(), Some("gold"));
+    let used = pages.last().expect("USE has a terminal page");
     assert_eq!(used.state(), "FINISHED");
-    assert_eq!(used.header("x-trino-set-catalog").as_deref(), Some("lake"));
-    assert_eq!(used.header("x-trino-set-schema").as_deref(), Some("gold"));
+    assert!(used.header("x-trino-set-catalog").is_none());
     assert_eq!(used.body["columns"], json!([]), "USE has no result columns");
     assert!(
         used.body.get("data").is_none(),
@@ -703,9 +755,11 @@ async fn use_and_session_statements_echo_headers() {
     let req = h
         .post_as("alice", "SHOW SESSION")
         .header("X-Trino-Session", &set_session);
-    let shown = h.step("show-session", req).await;
-    assert_eq!(shown.state(), "FINISHED");
-    let rows = shown.rows();
+    let posted = h.step("show-session", req).await;
+    assert_eq!(posted.state(), "RUNNING");
+    let pages = h.follow("show-session-page", &posted).await;
+    assert_eq!(pages.last().expect("page").state(), "FINISHED");
+    let rows = all_rows(&pages);
     assert_eq!(rows.len(), 1, "SHOW SESSION lists exactly the allow-list");
     assert_eq!(rows[0][0], json!("iceberg.compression_codec"));
     assert_eq!(rows[0][1], json!("ZSTD"), "replayed value is in effect");
@@ -736,8 +790,9 @@ async fn basic_and_bearer_auth_gate_submit_and_cancel() {
     let bad_bearer = h.step("bad-bearer", req).await;
     assert_eq!(bad_bearer.status, 401);
 
-    let good_basic = h.step("basic", h.post_as("alice", "SELECT 1")).await;
-    assert_eq!(good_basic.state(), "FINISHED");
+    let (good_basic, pages) = h.run_as("basic", "alice", "SELECT 1").await;
+    assert_eq!(good_basic.state(), "RUNNING");
+    assert_eq!(pages.last().expect("result page").state(), "FINISHED");
 
     // Bearer-owned running query: cancel by another principal is refused,
     // cancel by the owner (legacy DELETE, credential path) succeeds.
@@ -824,9 +879,11 @@ async fn information_schema_is_qualified_with_the_session_catalog() {
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name",
         )
         .header("X-Trino-Catalog", "datafusion");
-    let page = h.step("information-schema", req).await;
-    assert_eq!(page.status, 200);
-    assert_eq!(page.state(), "FINISHED");
-    assert_eq!(page.rows(), vec![json!(["t"])]);
+    let posted = h.step("information-schema", req).await;
+    assert_eq!(posted.status, 200);
+    assert_eq!(posted.state(), "RUNNING");
+    let pages = h.follow("information-schema-page", &posted).await;
+    assert_eq!(pages.last().expect("result page").state(), "FINISHED");
+    assert_eq!(all_rows(&pages), vec![json!(["t"])]);
     h.assert_golden("information_schema");
 }
