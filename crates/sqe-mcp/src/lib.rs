@@ -2118,6 +2118,23 @@ fn ensure_read_only(sql: &str, session_catalog: Option<&str>) -> Result<Statemen
     if let Some(shape) = shape.write_shape {
         return Err(format!("Read-only tool rejected {shape}"));
     }
+    // SHOW CREATE names its target outside any TableFactor, so the visitor
+    // above never sees it (#774): run the relation denylist on it directly.
+    if let StatementKind::ShowCreateTable(stmt) = &kind {
+        if let sqlparser::ast::Statement::ShowCreate { obj_name, .. } = stmt.as_ref() {
+            if let Some(reason) = denied_relation(obj_name) {
+                return Err(format!("Read-only tool rejected {reason}"));
+            }
+        }
+    }
+    // A trailing comment would swallow the appended LIMIT of `with_row_cap`,
+    // so the engine collected the whole result (#775). Refuse it instead of
+    // running uncapped.
+    if matches!(kind, StatementKind::Query(_)) && ends_with_comment(sql) {
+        return Err("Read-only tool rejected a statement ending in a comment; \
+                    remove the trailing comment"
+            .to_string());
+    }
     Ok(kind)
 }
 
@@ -2304,9 +2321,9 @@ fn walk_query_shape(kind: &StatementKind) -> QueryShapeFinder {
 ///
 /// Text append, not an AST print: the executor must see the ORIGINAL text
 /// (time-travel clauses are stripped from the classification copy). A
-/// statement that already carries LIMIT, FETCH, or a FOR clause, or ends in a
-/// comment that would swallow the suffix, is passed through unchanged; every
-/// non-query kind (SHOW ...) is too.
+/// statement that already carries LIMIT, FETCH, or a FOR clause is passed
+/// through unchanged; every non-query kind (SHOW ...) is too. A trailing
+/// comment would swallow the suffix; `ensure_read_only` rejects those (#775).
 fn with_row_cap(sql: &str, kind: &StatementKind, max_rows: usize) -> String {
     let StatementKind::Query(stmt) = kind else {
         return sql.to_string();
@@ -2319,7 +2336,6 @@ fn with_row_cap(sql: &str, kind: &StatementKind, max_rows: usize) -> String {
         || query.for_clause.is_some()
         || !query.pipe_operators.is_empty()
         || max_rows == 0
-        || ends_with_comment(sql)
     {
         return sql.to_string();
     }
@@ -2327,8 +2343,9 @@ fn with_row_cap(sql: &str, kind: &StatementKind, max_rows: usize) -> String {
     format!("{trimmed} LIMIT {}", max_rows.saturating_add(1))
 }
 
-/// Whether the last token of `sql` is a comment, in which case anything
-/// appended to the text would become part of it.
+/// Whether the last token of `sql` is a line comment, in which case anything
+/// appended to the text would become part of it. A closed block comment is
+/// safe to append after.
 fn ends_with_comment(sql: &str) -> bool {
     use sqlparser::{
         dialect::GenericDialect,
@@ -2347,7 +2364,7 @@ fn ends_with_comment(sql: &str) -> bool {
                     | Token::SemiColon
             )
         })
-        .is_some_and(|token| matches!(token, Token::Whitespace(_)))
+        .is_some_and(|token| matches!(token, Token::Whitespace(Whitespace::SingleLineComment { .. })))
 }
 
 /// Classify and require a change kind; returns the kind so the target gate
@@ -3226,8 +3243,14 @@ mod tests {
             cap("SELECT * FROM t FETCH FIRST 3 ROWS ONLY"),
             "SELECT * FROM t FETCH FIRST 3 ROWS ONLY"
         );
-        assert_eq!(cap("SELECT 1 -- trailing"), "SELECT 1 -- trailing");
+        assert_eq!(cap("SELECT 1 /* note */"), "SELECT 1 /* note */ LIMIT 1001");
         assert_eq!(cap("SHOW TABLES FROM c.s"), "SHOW TABLES FROM c.s");
+        // #775: a trailing comment would swallow the LIMIT; it is refused,
+        // not run uncapped.
+        for sql in ["SELECT 1 -- trailing", "SELECT * FROM t --", "SELECT 1; --"] {
+            let err = ensure_read_only(sql, None).expect_err(sql);
+            assert!(err.contains("ending in a comment"), "{sql}: {err}");
+        }
         let kind = ensure_read_only("SELECT 1", None).unwrap();
         assert_eq!(with_row_cap("SELECT 1", &kind, 0), "SELECT 1");
     }
@@ -4293,6 +4316,25 @@ mod tests {
             .expect("tables");
         ensure_read_only("SELECT * FROM iceberg.information_schema.columns", Some("iceberg"))
             .expect("columns");
+    }
+
+    /// #774: `SHOW CREATE` names its target outside a TableFactor; the
+    /// denylist must still see it.
+    #[test]
+    fn read_only_refuses_show_create_of_denied_relations() {
+        for sql in [
+            "SHOW CREATE TABLE system.runtime.queries",
+            "SHOW CREATE VIEW system.runtime.queries",
+            "SHOW CREATE TABLE \"SYSTEM\".runtime.queries",
+            "SHOW CREATE TABLE information_schema.df_settings",
+            "SHOW CREATE TABLE iceberg.INFORMATION_SCHEMA.\"df_settings\"",
+        ] {
+            let err = ensure_read_only(sql, Some("iceberg")).expect_err(sql);
+            assert!(err.contains("operator surface"), "{sql}: {err}");
+        }
+        ensure_read_only("SHOW CREATE TABLE iceberg.sales.orders", Some("iceberg")).expect("ddl");
+        ensure_read_only("SHOW CREATE TABLE information_schema.tables", Some("iceberg"))
+            .expect("info schema tables");
     }
 
     /// #675: a system error's text (bucket, key, host, region) stays in the
