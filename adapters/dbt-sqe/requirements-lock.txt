@@ -46,7 +46,7 @@ adbc-driver-manager==1.12.0 \
     #   -c /private/tmp/claude-502/-Users-jjverhoeks-git-schuberg-vpf-data-ai-chameleon-Applications-sqlengine/6065c382-f105-4519-b13e-33b965a2ca20/scratchpad/dbtvenv/../constraints.txt
     #   dbt-sqe (setup.cfg)
     #   adbc-driver-flightsql
-agate==1.9.1 \
+agate==1.14.2 \
     --hash=sha256:1cf329510b3dde07c4ad1740b7587c9c679abc3dcd92bb1107eabc10c2e03c50 \
     --hash=sha256:bc60880c2ee59636a2a80cd8603d63f995be64526abf3cbba12f00767bcd5b3d
     # via
@@ -289,7 +289,7 @@ dbt-common==1.39.0 \
     #   dbt-sqe (setup.cfg)
     #   dbt-adapters
     #   dbt-core
-dbt-core==1.11.13 \
+dbt-core==1.12.5 \
     --hash=sha256:358a9c0660be1e80dd5f988520ee46088f24903b0da08368bcf660e14b6e6353 \
     --hash=sha256:93d261ac4bb1f6373f879c1795ec46c995816835f187d11899915cba1f81a254
     # via
@@ -323,7 +323,7 @@ dbt-protos==1.0.565 \
     #   dbt-adapters
     #   dbt-common
     #   dbt-core
-dbt-semantic-interfaces==0.9.0 \
+dbt-semantic-interfaces==0.10.5 \
     --hash=sha256:1b54c06ba89190a47a7f0563360930a0cce869e55b484ca09d261ade0e319155 \
     --hash=sha256:5c921257dce8bb51c9ffb5479f2bdd959e16ebfb98ee833de6daa70788c47271
     # via
@@ -335,7 +335,7 @@ deepdiff==8.6.2 \
     # via
     #   -c /private/tmp/claude-502/-Users-jjverhoeks-git-schuberg-vpf-data-ai-chameleon-Applications-sqlengine/6065c382-f105-4519-b13e-33b965a2ca20/scratchpad/dbtvenv/../constraints.txt
     #   dbt-common
-idna==3.19 \
+idna==3.20 \
     --hash=sha256:5e0811a4383b21dc5838069f801c4fb62113b7447663d2530d2bd6e77b49bf15 \
     --hash=sha256:815e7be7a7806d54abb586dc943addc79e8b2ee16915059658cbeff4b1b43bf4
     # via
@@ -481,7 +481,7 @@ markupsafe==3.0.3 \
     # via
     #   -c /private/tmp/claude-502/-Users-jjverhoeks-git-schuberg-vpf-data-ai-chameleon-Applications-sqlengine/6065c382-f105-4519-b13e-33b965a2ca20/scratchpad/dbtvenv/../constraints.txt
     #   jinja2
-mashumaro==3.14 \
+mashumaro==3.22 \
     --hash=sha256:5ef6f2b963892cbe9a4ceb3441dfbea37f8c3412523f25d42e9b3a7186555f1d \
     --hash=sha256:c12a649599a8f7b1a0b35d18f12e678423c3066189f7bc7bd8dd431c5c8132c3
     # via
@@ -695,7 +695,7 @@ pydantic==2.13.5 \
     #   -c /private/tmp/claude-502/-Users-jjverhoeks-git-schuberg-vpf-data-ai-chameleon-Applications-sqlengine/6065c382-f105-4519-b13e-33b965a2ca20/scratchpad/dbtvenv/../constraints.txt
     #   dbt-core
     #   dbt-semantic-interfaces
-pydantic-core==2.46.5 \
+pydantic-core==2.49.0 \
     --hash=sha256:013d6f3483d81e02e7c328831808f336c8596ee33b4bd4026b9ffb1e960b8942 \
     --hash=sha256:03b9666e41e35d8909852ba191a0607520f81b74eaf12ccf8737005dbb313821 \
     --hash=sha256:045ab3b6d308439e32b81cc173bba5b9018bc6ed896afd0c65b3b009b1699af5 \
@@ -826,7 +826,7 @@ python-dateutil==2.9.0.post0 \
     #   -c /private/tmp/claude-502/-Users-jjverhoeks-git-schuberg-vpf-data-ai-chameleon-Applications-sqlengine/6065c382-f105-4519-b13e-33b965a2ca20/scratchpad/dbtvenv/../constraints.txt
     #   dbt-common
     #   dbt-semantic-interfaces
-python-slugify==9.0.0 \
+python-slugify==9.1.0 \
     --hash=sha256:1cd20fe7ebf941b11964a92aba9e5319edfe18606276c6e2481b92e737cde44a \
     --hash=sha256:b1180fb0fd6b3590e7fbd8328b08d56cde9dcac736527a070c0a811480621316
     # via
@@ -1071,7 +1071,7 @@ snowplow-tracker==1.1.0 \
     # via
     #   -c /private/tmp/claude-502/-Users-jjverhoeks-git-schuberg-vpf-data-ai-chameleon-Applications-sqlengine/6065c382-f105-4519-b13e-33b965a2ca20/scratchpad/dbtvenv/../constraints.txt
     #   dbt-core
-sqlparse==0.5.5 \
+sqlparse==0.6.0 \
     --hash=sha256:12a08b3bf3eec877c519589833aed092e2444e68240a3577e8e26148acc7b1ba \
     --hash=sha256:e20d4a9b0b8585fdf63b10d30066c7c94c5d7a7ec47c889a2d83a3caa93ff28e
     # via
@@ -1106,7 +1106,7 @@ typing-inspection==0.4.4 \
     # via
     #   -c /private/tmp/claude-502/-Users-jjverhoeks-git-schuberg-vpf-data-ai-chameleon-Applications-sqlengine/6065c382-f105-4519-b13e-33b965a2ca20/scratchpad/dbtvenv/../constraints.txt
     #   pydantic
-urllib3==2.7.0 \
+urllib3==2.8.0 \
     --hash=sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c \
     --hash=sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897
     # via
