@@ -32,7 +32,7 @@
 //! user.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
@@ -1518,7 +1518,23 @@ pub struct HiveCatalogProvider {
     /// `HiveSchemaProvider` this catalog issues via `schema()`; see
     /// [`HiveListings`].
     listings: Arc<HiveListings>,
+    /// Per-session table visibility (#716). `None` = no policy store =
+    /// everything the listing has is visible (passthrough).
+    visibility: RwLock<Option<HiveVisibility>>,
+    /// The tables of each database `refresh_referenced` resolved through
+    /// `visibility` for this session's user. A database with no entry has
+    /// not been resolved and is served unfiltered; the SELECT path's
+    /// policy rewriter still gates it.
+    visible: Arc<RwLock<HashMap<String, HashSet<String>>>>,
 }
+
+/// Async "may this session's user see `database`.`table`" predicate. The
+/// listings are process-wide and principal-agnostic; the coordinator hands
+/// each per-session provider one of these, resolved through the same policy
+/// path `SHOW TABLES` uses, and `refresh_referenced` precomputes the answer
+/// so the synchronous `table_names()` can serve it.
+pub type HiveVisibility =
+    Arc<dyn Fn(String, String) -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
 
 impl fmt::Debug for HiveCatalogProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1559,6 +1575,8 @@ impl HiveCatalogProvider {
             runtime,
             manifest_cache,
             listings,
+            visibility: RwLock::new(None),
+            visible: Arc::default(),
         }
     }
 
@@ -1581,7 +1599,19 @@ impl HiveCatalogProvider {
             runtime,
             manifest_cache,
             listings,
+            visibility: RwLock::new(None),
+            visible: Arc::default(),
         }
+    }
+
+    /// Gate `table_names()` / `table_exist()` / `table()` on `predicate`
+    /// (#716). Resolved per database on the next [`Self::refresh_referenced`],
+    /// never inside the synchronous hooks.
+    pub fn set_visibility(&self, predicate: HiveVisibility) {
+        *self
+            .visibility
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(predicate);
     }
 
     /// The catalog's name as registered with DataFusion.
@@ -1683,19 +1713,46 @@ impl HiveCatalogProvider {
 
         if sql_reads_information_schema(sql) {
             if let Some(listing) = self.listings.databases() {
+                // A `WHERE table_schema = '<db>'` conjunct pins the rows to
+                // one database (#701): refresh only that one instead of all
+                // 135 of a Glue catalog. Any other shape refreshes them all.
+                let pinned = sqe_sql::pinned_table_schema_from_sql(sql);
                 for db in &listing.names {
-                    if !databases.iter().any(|d| d.eq_ignore_ascii_case(db)) {
+                    let wanted = pinned.as_ref().is_none_or(|p| p.eq_ignore_ascii_case(db));
+                    if wanted && !databases.iter().any(|d| d.eq_ignore_ascii_case(db)) {
                         databases.push(db.clone());
                     }
                 }
             }
         }
 
+        let visibility = self
+            .visibility
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         for db in databases {
-            if self.listings.tables_fresh(&db) {
-                continue;
+            if !self.listings.tables_fresh(&db) {
+                let _ = self.refresh_tables(&db).await;
             }
-            let _ = self.refresh_tables(&db).await;
+            // Resolved on every statement, like `SHOW TABLES`, so a policy
+            // change is visible without waiting out a TTL.
+            let Some(visibility) = &visibility else {
+                continue;
+            };
+            let Some(listing) = self.listings.tables(&db) else {
+                continue;
+            };
+            let mut allowed = HashSet::with_capacity(listing.names.len());
+            for table in &listing.names {
+                if visibility(db.clone(), table.clone()).await {
+                    allowed.insert(table.clone());
+                }
+            }
+            self.visible
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(db, allowed);
         }
     }
 
@@ -1800,6 +1857,7 @@ impl CatalogProvider for HiveCatalogProvider {
             runtime: Arc::clone(&self.runtime),
             cache: Arc::clone(&self.manifest_cache),
             listings: Arc::clone(&self.listings),
+            visible: Arc::clone(&self.visible),
         }))
     }
 }
@@ -1817,9 +1875,21 @@ pub struct HiveSchemaProvider {
     runtime: Arc<RuntimeEnv>,
     cache: Arc<HiveMetadataCache>,
     listings: Arc<HiveListings>,
+    /// See `HiveCatalogProvider::visible`.
+    visible: Arc<RwLock<HashMap<String, HashSet<String>>>>,
 }
 
 impl HiveSchemaProvider {
+    /// `false` only when this session resolved the database's visibility
+    /// (#716) and `name` was denied; an unresolved database is visible.
+    fn visible(&self, name: &str) -> bool {
+        self.visible
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&self.database)
+            .is_none_or(|allowed| allowed.contains(name))
+    }
+
     /// The current manifest for `name`, or `None` when the table does not
     /// exist. Shared by `table()` and `table_type()`.
     ///
@@ -1967,6 +2037,10 @@ impl HiveSchemaProvider {
             runtime: Arc::clone(&self.runtime),
             manifest_cache: Arc::clone(&self.cache),
             listings: Arc::clone(&self.listings),
+            // A view body planned against a table this session may not see
+            // resolves to "not found" like the user's own reference would.
+            visibility: RwLock::new(None),
+            visible: Arc::clone(&self.visible),
         });
         // The engine's own session flags, not a bare `SessionConfig`: the
         // DuckDB parse dialect in particular. Under the default (generic)
@@ -2118,7 +2192,12 @@ impl SchemaProvider for HiveSchemaProvider {
                         "hive_external: serving last known table list; metastore listing is stale"
                     );
                 }
-                listing.names.clone()
+                listing
+                    .names
+                    .iter()
+                    .filter(|n| self.visible(n))
+                    .cloned()
+                    .collect()
             }
             None => {
                 debug!(
@@ -2133,7 +2212,7 @@ impl SchemaProvider for HiveSchemaProvider {
     fn table_exist(&self, name: &str) -> bool {
         match self.listings.tables(&self.database) {
             Some(listing) if listing.stale_error.is_none() => {
-                listing.names.iter().any(|n| n == name)
+                listing.names.iter().any(|n| n == name) && self.visible(name)
             }
             // No usable snapshot must not read as "table does not exist": a
             // `DROP TABLE IF EXISTS` would silently no-op. Unknown is
@@ -2163,6 +2242,10 @@ impl SchemaProvider for HiveSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        // A denied table is absent, not an error (#716), same as SHOW TABLES.
+        if !self.visible(name) {
+            return Ok(None);
+        }
         let Some(manifest) = self.manifest_for(name).await? else {
             return Ok(None);
         };
@@ -2869,6 +2952,49 @@ mod listing_tests {
         let mut calls = source.calls();
         calls.sort();
         assert_eq!(calls, vec!["hr".to_string(), "sales".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_pinned_table_schema_refreshes_only_that_database() {
+        let source = ScriptedSource::new(&[("sales", &["orders"]), ("hr", &["people"])]);
+        let p = provider(Arc::clone(&source), Duration::from_secs(60));
+
+        p.refresh_referenced(
+            "SELECT table_name FROM lake.information_schema.tables \
+             WHERE table_schema = 'sales' AND table_name LIKE 'o%'",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(source.calls(), vec!["sales".to_string()]);
+
+        // `OR` cannot pin: every database is refreshed.
+        p.refresh_referenced(
+            "SELECT table_name FROM lake.information_schema.tables \
+             WHERE table_schema = 'sales' OR table_schema = 'hr'",
+            None,
+            None,
+        )
+        .await;
+        let mut calls = source.calls();
+        calls.sort();
+        assert_eq!(calls, vec!["hr".to_string(), "sales".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_visibility_predicate_hides_denied_tables_from_the_sync_hooks() {
+        let source = ScriptedSource::new(&[("sales", &["orders", "returns"])]);
+        let p = provider(Arc::clone(&source), Duration::from_secs(60));
+        p.set_visibility(Arc::new(|_db, table| Box::pin(async move { table != "orders" })));
+
+        p.refresh_referenced("SELECT * FROM lake.sales.orders", None, None).await;
+        let schema = p.schema("sales").expect("schema");
+        assert_eq!(schema.table_names(), vec!["returns".to_string()]);
+        assert!(!schema.table_exist("orders"));
+        assert!(schema.table_exist("returns"));
+        assert!(schema.table("orders").await.expect("no error").is_none());
+        // An unresolved database stays unfiltered.
+        assert!(p.schema("hr").expect("schema").table_exist("anything"));
     }
 
     #[tokio::test]
