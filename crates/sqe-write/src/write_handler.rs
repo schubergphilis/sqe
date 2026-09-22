@@ -1215,10 +1215,21 @@ impl WriteHandler {
             &self.config.query.max_query_memory,
         ));
         // The refusal is `DataFusionError::ResourcesExhausted`; the `From`
-        // conversion keeps it `ResourceExhausted` on the wire.
+        // conversion keeps it `ResourceExhausted` on the wire. Name the
+        // statement shape and the write-side remedy: the planner's text only
+        // knows about sorts, the user typed a CTAS/INSERT with ORDER BY.
         let physical = gate
             .optimize(physical, state.config_options())
-            .map_err(SqeError::from)?;
+            .map_err(|e| match e {
+                datafusion::error::DataFusionError::ResourcesExhausted(msg) => SqeError::with_code(
+                    SqeErrorCode::ResourceExhausted,
+                    format!(
+                        "{what} with sort-on-write (ORDER BY) cannot be admitted: {msg} \
+                             Write without the sort hint or raise query.max_query_memory."
+                    ),
+                ),
+                other => SqeError::from(other),
+            })?;
         datafusion::physical_plan::execute_stream(physical, state.task_ctx()).map_err(|e| {
             SqeError::with_code(
                 SqeErrorCode::ExecutionFailed,
@@ -7942,7 +7953,17 @@ mod tests {
             SqeErrorCode::ResourceExhausted,
             "{refused}"
         );
-        assert!(refused.to_string().contains("sort merge admission failed"), "{refused}");
+        assert!(
+            refused.to_string().contains("sort merge admission failed"),
+            "{refused}"
+        );
+        assert!(
+            refused
+                .to_string()
+                .contains("test with sort-on-write (ORDER BY)")
+                && refused.to_string().contains("Write without the sort hint"),
+            "refusal must name the statement shape and remedy: {refused}"
+        );
 
         let stream = handler
             .execute_source_stream(
