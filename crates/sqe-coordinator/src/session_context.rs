@@ -171,14 +171,13 @@ async fn build_session_catalog(
 /// On a cache hit the `SessionContext` and `SessionCatalog` are cloned in O(1)
 /// and returned immediately, skipping all registration work.
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(skip(config, session, _policy_store, query_tracker, runtime, prom_metrics, table_cache, runtime_catalogs, hive_manifest_cache, secrets), fields(username = %session.user.username))]
+#[tracing::instrument(skip(config, session, policy_store, query_tracker, runtime, prom_metrics, table_cache, runtime_catalogs, hive_manifest_cache, secrets), fields(username = %session.user.username))]
 pub async fn create_session_context(
     config: &SqeConfig,
     session: &Session,
-    // No longer reaches the catalog providers (#665: the information_schema
-    // column filter it fed was dead code). Kept in the signature for the
-    // 29 call sites until the next session-context slice removes it.
-    _policy_store: Option<&Arc<dyn PolicyStore>>,
+    // Gates the per-session Hive providers' table visibility (#716). The
+    // Iceberg providers do not read it (#665).
+    policy_store: Option<&Arc<dyn PolicyStore>>,
     query_tracker: &Arc<QueryTracker>,
     runtime: Option<&Arc<RuntimeEnv>>,
     prom_metrics: Option<&Arc<sqe_metrics::MetricsRegistry>>,
@@ -652,6 +651,34 @@ pub async fn create_session_context(
                     Arc::clone(hive_manifest_cache),
                     std::time::Duration::from_secs(config.hive.metadata_ttl_secs),
                 );
+                // #716: DataFusion's information_schema lists Hive tables
+                // through the process-wide, principal-agnostic listings.
+                // Gate them per session with the SAME resolution
+                // `HiveDdlHandler::list_tables` uses for SHOW TABLES, keyed
+                // `{root}.{database}` (#715). No policy store = passthrough.
+                if let Some(store) = policy_store {
+                    let store = Arc::clone(store);
+                    let user = session.user.clone();
+                    let root = name.clone();
+                    let precedence = config.policy.mask_precedence;
+                    hive_provider.set_visibility(Arc::new(move |database, table| {
+                        let (store, user, root) = (Arc::clone(&store), user.clone(), root.clone());
+                        Box::pin(async move {
+                            // ponytail: no manifest column tags here; tags
+                            // yield masks, never the lit(false) deny-all.
+                            let policy = sqe_policy::plan_rewriter::resolve_effective_policy(
+                                store.as_ref(),
+                                &user,
+                                &table,
+                                &format!("{root}.{database}"),
+                                &std::collections::HashMap::new(),
+                                precedence,
+                            )
+                            .await;
+                            !sqe_policy::plan_rewriter::policy_denies_all(&policy)
+                        })
+                    }));
+                }
                 ctx.register_catalog(name.clone(), hive_provider);
             }
 
