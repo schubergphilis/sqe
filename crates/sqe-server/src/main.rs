@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -943,7 +944,43 @@ async fn shutdown_signal() {
 /// follow-up (see MR).
 async fn shutdown_with_drain(ready: Arc<AtomicBool>, drain_secs: u64) {
     shutdown_signal().await;
-    flip_ready_and_drain(&ready, drain_secs).await;
+    let drain_secs = effective_drain_secs(drain_secs, std::io::stderr().is_terminal());
+    // A second SIGINT/SIGTERM during the drain means "now": exit the way a
+    // shell expects (130) instead of making the operator wait it out.
+    tokio::select! {
+        _ = flip_ready_and_drain(&ready, drain_secs) => {}
+        _ = shutdown_signal() => {
+            tracing::warn!("second shutdown signal during drain; exiting now");
+            std::process::exit(130);
+        }
+    }
+    // tonic's graceful stop then waits for every open connection to close,
+    // which an idle keep-alive client can hold for as long as it likes. Bound
+    // that: the accept loop is already closed, so nothing new is lost.
+    tokio::spawn(async {
+        tokio::time::sleep(CONNECTION_DRAIN_LIMIT).await;
+        tracing::warn!(
+            limit_secs = CONNECTION_DRAIN_LIMIT.as_secs(),
+            "connections still open after the drain limit; exiting"
+        );
+        std::process::exit(0);
+    });
+}
+
+/// How long tonic may wait for open connections after the drain (see
+/// [`shutdown_with_drain`]).
+const CONNECTION_DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The drain exists so a Kubernetes Service stops routing to this pod before
+/// it closes. A process whose stderr is a terminal is a laptop run that nobody
+/// routes to, so it drains nothing; `shutdown_drain_secs` keeps its meaning
+/// everywhere else.
+fn effective_drain_secs(configured: u64, interactive: bool) -> u64 {
+    if interactive {
+        0
+    } else {
+        configured
+    }
 }
 
 /// Flip readiness to NOT-ready, then sleep the bounded drain period. Split out
@@ -2760,6 +2797,13 @@ mod tests {
             !ready.load(Ordering::Relaxed),
             "readiness must be flipped to NOT-ready on shutdown"
         );
+    }
+
+    #[test]
+    fn interactive_runs_skip_the_drain_and_pods_keep_it() {
+        assert_eq!(effective_drain_secs(25, true), 0);
+        assert_eq!(effective_drain_secs(25, false), 25);
+        assert_eq!(effective_drain_secs(0, false), 0);
     }
 
     #[tokio::test]
