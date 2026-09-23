@@ -148,8 +148,8 @@ once_cell = { version = "1" }
 proc-macro2 = { version = "1" }
 quote = { version = "1" }
 serde_core = { version = "1", features = ["alloc", "rc"] }
-syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "full", "visit", "visit-mut"] }
-syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
+syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
+syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "full", "visit-mut"] }
 toml_datetime = { version = "1", features = ["serde"] }
 toml_parser = { version = "1" }
 winnow = { version = "1" }
