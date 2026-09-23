@@ -487,14 +487,11 @@ impl TableMetadataBuilder {
     pub fn remove_snapshots(mut self, snapshot_ids: &[i64]) -> Self {
         let mut removed_snapshots = Vec::with_capacity(snapshot_ids.len());
 
-        self.metadata.snapshots.retain(|k, _| {
-            if snapshot_ids.contains(k) {
-                removed_snapshots.push(*k);
-                false
-            } else {
-                true
+        for snapshot_id in snapshot_ids {
+            if self.metadata.snapshots.remove(snapshot_id).is_some() {
+                removed_snapshots.push(*snapshot_id);
             }
-        });
+        }
 
         if !removed_snapshots.is_empty() {
             self.changes.push(TableUpdate::RemoveSnapshots {
@@ -2209,6 +2206,89 @@ mod tests {
             snapshot_id: 1,
             timestamp_ms: snapshot.timestamp_ms()
         }])
+    }
+
+    #[test]
+    fn test_remove_snapshots() {
+        let builder = builder_without_changes(FormatVersion::V2);
+        let last_updated_ms = builder.metadata.last_updated_ms;
+        let snapshot = |snapshot_id, sequence_number| {
+            Snapshot::builder()
+                .with_snapshot_id(snapshot_id)
+                .with_timestamp_ms(last_updated_ms + sequence_number)
+                .with_sequence_number(sequence_number)
+                .with_schema_id(0)
+                .with_manifest_list(format!("/snap-{snapshot_id}.avro"))
+                .with_summary(Summary {
+                    operation: Operation::Append,
+                    additional_properties: HashMap::new(),
+                })
+                .build()
+        };
+
+        let metadata = builder
+            .add_snapshot(snapshot(1, 1))
+            .unwrap()
+            .add_snapshot(snapshot(2, 2))
+            .unwrap()
+            .add_snapshot(snapshot(3, 3))
+            .unwrap()
+            .set_ref("tag", SnapshotReference {
+                snapshot_id: 3,
+                retention: SnapshotRetention::Tag {
+                    max_ref_age_ms: None,
+                },
+            })
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+
+        let build_result = metadata
+            .into_builder(None)
+            .remove_snapshots(&[3, 4, 1, 3])
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            build_result
+                .metadata
+                .snapshots()
+                .map(|snapshot| snapshot.snapshot_id())
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert!(!build_result.metadata.refs.contains_key("tag"));
+
+        let mut removed_ids = build_result
+            .changes
+            .into_iter()
+            .find_map(|update| match update {
+                TableUpdate::RemoveSnapshots { snapshot_ids } => Some(snapshot_ids),
+                _ => None,
+            })
+            .unwrap();
+        removed_ids.sort_unstable();
+        assert_eq!(removed_ids, vec![1, 3]);
+    }
+
+    #[test]
+    fn test_remove_snapshots_cleans_up_dangling_refs_without_removals() {
+        let mut builder = builder_without_changes(FormatVersion::V2);
+        builder
+            .metadata
+            .refs
+            .insert("dangling".to_string(), SnapshotReference {
+                snapshot_id: 1,
+                retention: SnapshotRetention::Tag {
+                    max_ref_age_ms: None,
+                },
+            });
+
+        let build_result = builder.remove_snapshots(&[]).build().unwrap();
+
+        assert!(build_result.metadata.refs.is_empty());
+        assert!(build_result.changes.is_empty());
     }
 
     #[test]
