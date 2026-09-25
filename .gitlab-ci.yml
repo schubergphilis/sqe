@@ -199,6 +199,13 @@ release-binaries:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
       when: never
+    # Not on `.gitlab-ci.yml` changes: that made every CI-config MR compile
+    # release binaries (41 min on !1162) and starved the shared runners. An MR
+    # that edits this job, malware-scan or aikido-build-validate can still run
+    # them: start its pipeline with SQE_FORCE_IMAGE_BUILD=1. Main always runs them.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $SQE_FORCE_IMAGE_BUILD == "1"'
+      variables:
+        CARGO_PROFILE: "dev-release"
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:
         - Dockerfile
@@ -207,7 +214,6 @@ release-binaries:
         - Cargo.lock
         - rust-toolchain.toml
         - .cargo/config.toml
-        - .gitlab-ci.yml
         - "crates/*/Cargo.toml"
         - "vendor/**/*"
         - "xtask/**/*"
@@ -403,6 +409,8 @@ aikido-build-validate:
     - job: release-binaries
       artifacts: true
   rules:
+    # Same trigger as release-binaries, whose artifact it needs (see there).
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $SQE_FORCE_IMAGE_BUILD == "1"'
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       changes:
         - Dockerfile
@@ -411,7 +419,6 @@ aikido-build-validate:
         - Cargo.lock
         - rust-toolchain.toml
         - .cargo/config.toml
-        - .gitlab-ci.yml
         - "crates/*/Cargo.toml"
         - "vendor/**/*"
         - "xtask/**/*"
