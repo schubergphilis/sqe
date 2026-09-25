@@ -46,9 +46,9 @@ The only Okta value a user ever sees is the client id, and it is not a secret. O
 
 ## Three Okta settings that decide everything
 
-**A custom authorization server.** The org authorization server that every tenant has issues opaque access tokens. SQE cannot verify those; it needs a JWT with a JWKS behind it. A custom server (Security > API > Authorization Servers) issues JWTs, and its issuer is `https://<org>.okta.com/oauth2/<server id>`. That string is both `authorization_servers` on the MCP side and `issuer` on the token verifier.
+**A custom authorization server.** The org authorization server that every tenant has issues opaque access tokens. SQE cannot verify those. It needs a JWT with a JWKS behind it. A custom server (Security > API > Authorization Servers) issues JWTs, and its issuer is `https://<org>.okta.com/oauth2/<server id>`. That string is both `authorization_servers` on the MCP side and `issuer` on the token verifier.
 
-**Audience and claims.** The server's audience must equal SQE's `mcp.resource_uri`, character for character; a mismatch is a `401` with nothing else to go on. The scopes are `sqe:mcp:read`, marked default so clients that ask for nothing still get it, and `sqe:mcp:write`. And a `groups` claim goes on the access token, value type Groups, filtered by a regex such as `^datalake_.*`. SQE reads the user from `sub` and the roles and groups from that claim. The groups are what Ranger matches.
+**Audience and claims.** The server's audience must equal SQE's `mcp.resource_uri`, character for character. A mismatch is a `401` with nothing else to go on. The scopes are `sqe:mcp:read`, marked default so clients that ask for nothing still get it, and `sqe:mcp:write`. And a `groups` claim goes on the access token, value type Groups, filtered by a regex such as `^datalake_.*`. SQE reads the user from `sub` and the roles and groups from that claim. The groups are what Ranger matches.
 
 **An access policy with the right grant.** A custom authorization server issues nothing until a policy says it may. Without one, the login succeeds and Okta then answers `access_denied` with "Policy evaluation failed". We created the policy with a single rule for the device grant, because that is what we tested first from a shell, and moved on.
 
@@ -77,13 +77,13 @@ The login worked, the metadata tools listed 135 databases and 600 tables, and ev
 
 The quickstart's `sqe.toml` had a placeholder Iceberg catalog URL, put there to satisfy a validator. SQE registered the placeholder as the default catalog and tried to list its namespaces while building every SQL session. `SHOW` statements do not build that session, so the metadata tools kept working and the failure read as authorization. The fix is an empty `[catalog]` table, which the config test now asserts.
 
-The second was quieter. The `search_tables` tool runs one `SHOW TABLES` per database, and each one counted against the per-user rate limit of 120 a minute. With 135 databases the tail was skipped, logged at debug level, and the model was handed a partial listing that looked complete. The quickstart raises the limit above the database count; the tool should count once per call and say what it skipped, and that is now an issue.
+The second was quieter. The `search_tables` tool runs one `SHOW TABLES` per database, and each one counted against the per-user rate limit of 120 a minute. With 135 databases the tail was skipped, logged at debug level, and the model was handed a partial listing that looked complete. The quickstart raises the limit above the database count. The tool should count once per call and say what it skipped, and that is now an issue.
 
 Neither slip was Okta's fault and neither was Ranger's. Both were only visible because the engine logs every policy decision with the user, the table and the counts of masks, filters and restricted columns. Read those lines before you touch a policy.
 
 ## Credentials, region, Fargate
 
-The one credential in the system is the engine's own AWS identity for Glue and S3, and it lives nowhere in the repository. On a laptop, `aws sso login` and `eval "$(aws configure export-credentials --format env)"` put session credentials in the shell, and Compose passes them into the container. On Fargate the variables stay unset and the task role is picked up by the SDK chain. The same compose command and the same `SQE_*` variables describe both; a task definition is a transcription.
+The one credential in the system is the engine's own AWS identity for Glue and S3, and it lives nowhere in the repository. On a laptop, `aws sso login` and `eval "$(aws configure export-credentials --format env)"` put session credentials in the shell, and Compose passes them into the container. On Fargate the variables stay unset and the task role is picked up by the SDK chain. The same compose command and the same `SQE_*` variables describe both. A task definition is a transcription.
 
 Session credentials expire, and expired credentials do not fail loudly. Reads return empty or hang. The README says so twice.
 
