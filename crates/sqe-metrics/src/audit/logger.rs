@@ -1769,6 +1769,46 @@ mod tests {
     ///
     /// The spool must also contain a valid OCSF record with `class_uid` and a stamped
     /// `metadata.sequence` value, confirming the spool is written AFTER `chain.stamp`.
+    /// The compactor truncates only when the acked offset covers the whole
+    /// file. An offset one byte short means unshipped data: leave it alone.
+    #[test]
+    fn spool_compactor_truncates_only_a_fully_shipped_spool() {
+        let dir = tempfile::tempdir().unwrap();
+        let native_path = dir.path().join("audit.jsonl");
+        let spool_path = dir.path().join("audit.spool.jsonl");
+        let spool = spool_path.to_str().unwrap();
+        let logger = AuditLogger::with_config(
+            native_path.to_str().unwrap(),
+            crate::audit::AuditFormat::Native,
+        )
+        .unwrap()
+        .with_export_spool(spool)
+        .unwrap();
+        let compactor = logger.spool_compactor(spool);
+
+        logger.log_event(crate::audit::sample_query_event());
+        logger.flush();
+        let len = std::fs::metadata(&spool_path).unwrap().len();
+        assert!(len > 0);
+
+        assert!(!compactor.compact_if_drained(len - 1).unwrap());
+        assert_eq!(std::fs::metadata(&spool_path).unwrap().len(), len);
+
+        assert!(compactor.compact_if_drained(len).unwrap());
+        assert_eq!(std::fs::metadata(&spool_path).unwrap().len(), 0);
+
+        // The writer keeps appending from offset 0 after the truncate.
+        logger.log_event(crate::audit::sample_query_event());
+        logger.flush();
+        let after = std::fs::read_to_string(&spool_path).unwrap();
+        assert_eq!(
+            after.lines().count(),
+            1,
+            "one fresh record, no hole: {after:?}"
+        );
+        assert!(after.starts_with('{'), "no NUL padding before the record");
+    }
+
     #[test]
     fn with_export_spool_writes_ocsf_to_spool_and_native_to_primary() {
         let dir = tempfile::tempdir().unwrap();
