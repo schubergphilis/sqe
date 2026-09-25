@@ -2176,15 +2176,16 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-json"
-version = "0.55.2"
+version = "0.55.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08429be4acbb04ebab87f2a542737aef8c799ca1b8f0b7b34f286160606caee3"
+checksum = "4543d091fd7ed933186be63f715bbe48e46280288c2f39c8c3ee4b5d2cdca078"
 dependencies = [
  "datafusion",
  "jiter",
  "log",
  "paste",
  "serde_json",
+ "smallvec",
 ]
 
 [[package]]
@@ -8790,11 +8791,3 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[patch.unused]]
-name = "datafusion-functions-json"
-version = "0.54.2"
-
-[[patch.unused]]
-name = "jiter"
-version = "0.15.0"
