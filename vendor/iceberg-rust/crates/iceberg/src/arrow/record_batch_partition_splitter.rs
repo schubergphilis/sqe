@@ -15,16 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch, StructArray};
+use arrow_buffer::BooleanBufferBuilder;
 use arrow_select::filter::filter_record_batch;
-use hashbrown::HashMap;
 
 use super::arrow_struct_to_literal;
 use super::partition_value_calculator::PartitionValueCalculator;
+use crate::Result;
+use crate::error::invalid_data;
 use crate::spec::{Literal, PartitionKey, PartitionSpecRef, SchemaRef, StructType};
-use crate::{Error, ErrorKind, Result};
 
 /// Column name for the projected partition values struct
 pub const PROJECTED_PARTITION_VALUE_COLUMN: &str = "_partition";
@@ -127,9 +129,8 @@ impl RecordBatchPartitionSplitter {
                     if let Some(Literal::Struct(s)) = s {
                         Ok(s)
                     } else {
-                        Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            "Partition value is not a struct literal or is null",
+                        Err(invalid_data!(
+                            "Partition value is not a struct literal or is null"
                         ))
                     }
                 })
@@ -139,23 +140,15 @@ impl RecordBatchPartitionSplitter {
             let partition_column = batch
                 .column_by_name(PROJECTED_PARTITION_VALUE_COLUMN)
                 .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "Partition column '{PROJECTED_PARTITION_VALUE_COLUMN}' not found in batch"
-                        ),
+                    invalid_data!(
+                        "Partition column '{PROJECTED_PARTITION_VALUE_COLUMN}' not found in batch"
                     )
                 })?;
 
             let partition_struct_array = partition_column
                 .as_any()
                 .downcast_ref::<StructArray>()
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        "Partition column is not a StructArray",
-                    )
-                })?;
+                .ok_or_else(|| invalid_data!("Partition column is not a StructArray"))?;
 
             let arrow_struct_array = Arc::new(partition_struct_array.clone()) as ArrayRef;
             let struct_array = arrow_struct_to_literal(&arrow_struct_array, &self.partition_type)?;
@@ -166,9 +159,8 @@ impl RecordBatchPartitionSplitter {
                     if let Some(Literal::Struct(s)) = s {
                         Ok(s)
                     } else {
-                        Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            "Partition value is not a struct literal or is null",
+                        Err(invalid_data!(
+                            "Partition value is not a struct literal or is null"
                         ))
                     }
                 })
@@ -177,10 +169,19 @@ impl RecordBatchPartitionSplitter {
     }
 
     /// Split the record batch into multiple record batches based on the partition spec.
+    pub fn split(&self, batch: &RecordBatch) -> Result<Vec<(PartitionKey, RecordBatch)>> {
+        Ok(self
+            .split_with_indices(batch)?
+            .into_iter()
+            .map(|(partition_key, partition_batch, _)| (partition_key, partition_batch))
+            .collect())
+    }
+
+    /// Split the record batch and retain each partition row's index in the input batch.
     ///
     /// Returns tuples of `(partition_key, partition_batch, row_ids)` where `row_ids[i]` is the
     /// index in the original input batch of row `i` in `partition_batch`.
-    pub fn split(
+    pub(crate) fn split_with_indices(
         &self,
         batch: &RecordBatch,
     ) -> Result<Vec<(PartitionKey, RecordBatch, Vec<usize>)>> {
@@ -188,20 +189,24 @@ impl RecordBatchPartitionSplitter {
 
         // Group the batch by row value.
         let mut group_ids: HashMap<crate::spec::Struct, Vec<usize>> = HashMap::new();
-        for (row_id, row) in partition_structs.iter().enumerate() {
-            group_ids.entry_ref(row).or_default().push(row_id);
-        }
+        partition_structs
+            .into_iter()
+            .enumerate()
+            .for_each(|(row_id, row)| {
+                group_ids.entry(row).or_default().push(row_id);
+            });
 
         // Partition the batch with same partition partition_values
         let mut partition_batches = Vec::with_capacity(group_ids.len());
         for (row, row_ids) in group_ids.into_iter() {
             // generate the bool filter array from column_ids
             let filter_array: BooleanArray = {
-                let mut filter = vec![false; batch.num_rows()];
+                let mut builder = BooleanBufferBuilder::new(batch.num_rows());
+                builder.append_n(batch.num_rows(), false);
                 for &row_id in &row_ids {
-                    filter[row_id] = true;
+                    builder.set_bit(row_id, true);
                 }
-                filter.into()
+                BooleanArray::new(builder.finish(), None)
             };
 
             // Create PartitionKey from the partition struct
@@ -225,7 +230,6 @@ impl RecordBatchPartitionSplitter {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
 
     use arrow_array::{Int32Array, RecordBatch, StringArray};
@@ -291,7 +295,7 @@ mod tests {
         let mut partitioned_batches = partition_splitter
             .split(&batch)
             .expect("Failed to split RecordBatch");
-        partitioned_batches.sort_by_key(|(partition_key, _, _)| {
+        partitioned_batches.sort_by_key(|(partition_key, _)| {
             if let PrimitiveLiteral::Int(i) = partition_key.data().fields()[0]
                 .as_ref()
                 .unwrap()
@@ -340,7 +344,7 @@ mod tests {
 
         let partition_values = partitioned_batches
             .iter()
-            .map(|(partition_key, _, _)| partition_key.data().clone())
+            .map(|(partition_key, _)| partition_key.data().clone())
             .collect::<Vec<_>>();
         // check partition value is struct(1), struct(2), struct(3)
         assert_eq!(partition_values, vec![
@@ -432,7 +436,7 @@ mod tests {
 
         // Split using the pre-computed partition column
         let mut partitioned_batches = partition_splitter
-            .split(&batch)
+            .split_with_indices(&batch)
             .expect("Failed to split RecordBatch");
 
         partitioned_batches.sort_by_key(|(partition_key, _, _)| {

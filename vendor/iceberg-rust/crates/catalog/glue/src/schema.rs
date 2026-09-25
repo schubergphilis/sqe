@@ -25,7 +25,7 @@ pub(crate) const ICEBERG_FIELD_CURRENT: &str = "iceberg.field.current";
 use std::collections::HashMap;
 
 use aws_sdk_glue::types::Column;
-use iceberg::Result;
+use iceberg::{Error, ErrorKind, Result};
 use iceberg::spec::{PrimitiveType, SchemaVisitor, TableMetadata, VariantType, visit_schema};
 
 use crate::error::from_aws_build_error;
@@ -79,11 +79,7 @@ impl GlueSchemaBuilder {
 impl SchemaVisitor for GlueSchemaBuilder {
     type T = String;
 
-    fn schema(
-        &mut self,
-        _schema: &iceberg::spec::Schema,
-        value: Self::T,
-    ) -> iceberg::Result<String> {
+    fn schema(&mut self, _schema: &iceberg::spec::Schema, value: Self::T) -> Result<String> {
         Ok(value)
     }
 
@@ -96,7 +92,7 @@ impl SchemaVisitor for GlueSchemaBuilder {
         &mut self,
         r#_struct: &iceberg::spec::StructType,
         results: Vec<String>,
-    ) -> iceberg::Result<String> {
+    ) -> Result<String> {
         Ok(format!("struct<{}>", results.join(", ")))
     }
 
@@ -105,13 +101,9 @@ impl SchemaVisitor for GlueSchemaBuilder {
         Ok(())
     }
 
-    fn field(
-        &mut self,
-        field: &iceberg::spec::NestedFieldRef,
-        value: String,
-    ) -> iceberg::Result<String> {
+    fn field(&mut self, field: &iceberg::spec::NestedFieldRef, value: String) -> Result<String> {
         if self.is_inside_struct() {
-            return Ok(format!("{}:{}", field.name, &value));
+            return Ok(format!("{}:{}", field.name, value));
         }
 
         let parameters = HashMap::from([
@@ -142,7 +134,7 @@ impl SchemaVisitor for GlueSchemaBuilder {
         Ok(value)
     }
 
-    fn list(&mut self, _list: &iceberg::spec::ListType, value: String) -> iceberg::Result<String> {
+    fn list(&mut self, _list: &iceberg::spec::ListType, value: String) -> Result<String> {
         Ok(format!("array<{value}>"))
     }
 
@@ -151,12 +143,18 @@ impl SchemaVisitor for GlueSchemaBuilder {
         _map: &iceberg::spec::MapType,
         key_value: String,
         value: String,
-    ) -> iceberg::Result<String> {
+    ) -> Result<String> {
         Ok(format!("map<{key_value},{value}>"))
     }
 
-    fn primitive(&mut self, p: &iceberg::spec::PrimitiveType) -> iceberg::Result<Self::T> {
+    fn primitive(&mut self, p: &PrimitiveType) -> Result<Self::T> {
         let glue_type = match p {
+            PrimitiveType::Unknown => {
+                return Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    format!("Conversion from {p:?} is not supported"),
+                ));
+            }
             PrimitiveType::Boolean => "boolean".to_string(),
             PrimitiveType::Int => "int".to_string(),
             PrimitiveType::Long => "bigint".to_string(),
@@ -165,8 +163,8 @@ impl SchemaVisitor for GlueSchemaBuilder {
             PrimitiveType::Date => "date".to_string(),
             PrimitiveType::Timestamp => "timestamp".to_string(),
             PrimitiveType::TimestampNs => "timestamp_ns".to_string(),
-            // Glue has no timezone-aware timestamp type. Match Spark's Glue
-            // integration by storing the equivalent non-timezone type.
+            // Glue has no timezone-aware timestamp type; map to the equivalent non-tz type,
+            // matching the behavior of the AWS Glue catalog module in apache/iceberg.
             PrimitiveType::Timestamptz => "timestamp".to_string(),
             PrimitiveType::TimestamptzNs => "timestamp_ns".to_string(),
             PrimitiveType::Time | PrimitiveType::String | PrimitiveType::Uuid => {
@@ -324,18 +322,12 @@ mod tests {
                     "name": "c14",
                     "required": true,
                     "type": "timestamptz"
-                },
-                {
-                    "id": 15,
-                    "name": "c15",
-                    "required": true,
-                    "type": "timestamptz_ns"
                 }
             ]
         }"#;
 
         let schema = serde_json::from_str::<Schema>(record)?;
-        let metadata = create_metadata_with_format_version(schema, FormatVersion::V3)?;
+        let metadata = create_metadata(schema)?;
 
         let result = GlueSchemaBuilder::from_iceberg(&metadata)?.build();
 
@@ -354,7 +346,43 @@ mod tests {
             create_column("c12", "binary", "12", false)?,
             create_column("c13", "binary", "13", false)?,
             create_column("c14", "timestamp", "14", false)?,
-            create_column("c15", "timestamp_ns", "15", false)?,
+        ];
+
+        assert_eq!(result, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_schema_with_nanosecond_timestamps() -> Result<()> {
+        let record = r#"{
+            "type": "struct",
+            "schema-id": 1,
+            "fields": [
+                {
+                    "id": 1,
+                    "name": "c1",
+                    "required": true,
+                    "type": "timestamp_ns"
+                },
+                {
+                    "id": 2,
+                    "name": "c2",
+                    "required": true,
+                    "type": "timestamptz_ns"
+                }
+            ]
+        }"#;
+
+        let schema = serde_json::from_str::<Schema>(record)?;
+        // Nanosecond timestamps are only valid from format version 3 onwards.
+        let metadata = create_metadata_with_format_version(schema, FormatVersion::V3)?;
+
+        let result = GlueSchemaBuilder::from_iceberg(&metadata)?.build();
+
+        let expected = vec![
+            create_column("c1", "timestamp_ns", "1", false)?,
+            create_column("c2", "timestamp_ns", "2", false)?,
         ];
 
         assert_eq!(result, expected);

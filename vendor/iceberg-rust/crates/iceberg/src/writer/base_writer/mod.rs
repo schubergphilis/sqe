@@ -22,3 +22,4 @@ pub mod data_file_writer;
 pub mod deletion_vector_writer;
 pub mod equality_delete_writer;
 pub mod position_delete_file_writer;
+pub mod position_delete_writer;

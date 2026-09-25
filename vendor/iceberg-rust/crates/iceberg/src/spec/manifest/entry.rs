@@ -21,13 +21,13 @@ use apache_avro::Schema as AvroSchema;
 use once_cell::sync::Lazy;
 use typed_builder::TypedBuilder;
 
+use crate::Error;
 use crate::avro::schema_to_avro_schema;
-use crate::error::Result;
+use crate::error::{Result, invalid_data};
 use crate::spec::{
     DataContentType, DataFile, INITIAL_SEQUENCE_NUMBER, ListType, Literal, ManifestFile, MapType,
     NestedField, NestedFieldRef, PrimitiveLiteral, PrimitiveType, Schema, StructType, Type,
 };
-use crate::{Error, ErrorKind};
 
 /// Reference to [`ManifestEntry`].
 pub type ManifestEntryRef = Arc<ManifestEntry>;
@@ -147,12 +147,6 @@ impl ManifestEntry {
     pub fn data_file(&self) -> &DataFile {
         &self.data_file
     }
-
-    /// File sequence number indicating when the file was added. Inherited when null and status is 1 (added).
-    #[inline]
-    pub fn file_sequence_number(&self) -> Option<i64> {
-        self.file_sequence_number
-    }
 }
 
 /// Used to track additions and deletions in ManifestEntry.
@@ -176,10 +170,7 @@ impl TryFrom<i32> for ManifestStatus {
             0 => Ok(ManifestStatus::Existing),
             1 => Ok(ManifestStatus::Added),
             2 => Ok(ManifestStatus::Deleted),
-            _ => Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!("manifest status {v} is invalid"),
-            )),
+            _ => Err(invalid_data!("manifest status {v} is invalid")),
         }
     }
 }

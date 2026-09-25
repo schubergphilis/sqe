@@ -32,9 +32,8 @@ use super::decimal_utils::{
 use super::primitive::PrimitiveLiteral;
 use super::struct_value::Struct;
 use super::temporal::{date, time, timestamp, timestamptz};
-use crate::error::Result;
+use crate::error::{Result, invalid_data};
 use crate::spec::datatypes::{PrimitiveType, Type};
-use crate::{Error, ErrorKind};
 
 /// Values present in iceberg type
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -80,9 +79,10 @@ impl Literal {
     /// assert_eq!(Literal::Primitive(PrimitiveLiteral::Boolean(false)), t);
     /// ```
     pub fn bool_from_str<S: AsRef<str>>(s: S) -> Result<Self> {
-        let v = s.as_ref().parse::<bool>().map_err(|e| {
-            Error::new(ErrorKind::DataInvalid, "Can't parse string to bool.").with_source(e)
-        })?;
+        let v = s
+            .as_ref()
+            .parse::<bool>()
+            .map_err(|e| invalid_data!("Can't parse string to bool.").with_source(e))?;
         Ok(Self::Primitive(PrimitiveLiteral::Boolean(v)))
     }
 
@@ -164,11 +164,7 @@ impl Literal {
     /// ```
     pub fn date_from_str<S: AsRef<str>>(s: S) -> Result<Self> {
         let t = s.as_ref().parse::<NaiveDate>().map_err(|e| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!("Can't parse date from string: {}", s.as_ref()),
-            )
-            .with_source(e)
+            invalid_data!("Can't parse date from string: {}", s.as_ref()).with_source(e)
         })?;
 
         Ok(Self::date(date::date_from_naive_date(t)))
@@ -188,10 +184,7 @@ impl Literal {
     /// ```
     pub fn date_from_ymd(year: i32, month: u32, day: u32) -> Result<Self> {
         let t = NaiveDate::from_ymd_opt(year, month, day).ok_or_else(|| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!("Can't create date from year: {year}, month: {month}, day: {day}"),
-            )
+            invalid_data!("Can't create date from year: {year}, month: {month}, day: {day}")
         })?;
 
         Ok(Self::date(date::date_from_naive_date(t)))
@@ -230,11 +223,7 @@ impl Literal {
     /// ```
     pub fn time_from_str<S: AsRef<str>>(s: S) -> Result<Self> {
         let t = s.as_ref().parse::<NaiveTime>().map_err(|e| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!("Can't parse time from string: {}", s.as_ref()),
-            )
-            .with_source(e)
+            invalid_data!("Can't parse time from string: {}", s.as_ref()).with_source(e)
         })?;
 
         Ok(Self::time_from_naive_time(t))
@@ -253,10 +242,7 @@ impl Literal {
     /// ```
     pub fn time_from_hms_micro(hour: u32, min: u32, sec: u32, micro: u32) -> Result<Self> {
         let t = NaiveTime::from_hms_micro_opt(hour, min, sec, micro)
-            .ok_or_else(|| Error::new(
-                ErrorKind::DataInvalid,
-                format!("Can't create time from hour: {hour}, min: {min}, second: {sec}, microsecond: {micro}"),
-            ))?;
+            .ok_or_else(|| invalid_data!("Can't create time from hour: {hour}, min: {min}, second: {sec}, microsecond: {micro}"))?;
         Ok(Self::time_from_naive_time(t))
     }
 
@@ -314,18 +300,16 @@ impl Literal {
     /// assert_eq!(t, t2);
     /// ```
     pub fn timestamp_from_str<S: AsRef<str>>(s: S) -> Result<Self> {
-        let dt = DateTime::<Utc>::from_str(s.as_ref()).map_err(|e| {
-            Error::new(ErrorKind::DataInvalid, "Can't parse datetime.").with_source(e)
-        })?;
+        let dt = DateTime::<Utc>::from_str(s.as_ref())
+            .map_err(|e| invalid_data!("Can't parse datetime.").with_source(e))?;
 
         Ok(Self::timestamp_from_datetime(dt))
     }
 
     /// Similar to [`Literal::timestamp_from_str`], but return timestamp with timezone literal.
     pub fn timestamptz_from_str<S: AsRef<str>>(s: S) -> Result<Self> {
-        let dt = DateTime::<Utc>::from_str(s.as_ref()).map_err(|e| {
-            Error::new(ErrorKind::DataInvalid, "Can't parse datetime.").with_source(e)
-        })?;
+        let dt = DateTime::<Utc>::from_str(s.as_ref())
+            .map_err(|e| invalid_data!("Can't parse datetime.").with_source(e))?;
 
         Ok(Self::timestamptz_from_datetime(dt))
     }
@@ -354,11 +338,7 @@ impl Literal {
     /// ```
     pub fn uuid_from_str<S: AsRef<str>>(s: S) -> Result<Self> {
         let uuid = Uuid::parse_str(s.as_ref()).map_err(|e| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!("Can't parse uuid from string: {}", s.as_ref()),
-            )
-            .with_source(e)
+            invalid_data!("Can't parse uuid from string: {}", s.as_ref()).with_source(e)
         })?;
         Ok(Self::uuid(uuid))
     }
@@ -435,30 +415,31 @@ impl Literal {
                     Ok(Some(Literal::Primitive(PrimitiveLiteral::Int(
                         number
                             .as_i64()
-                            .ok_or(Error::new(
-                                crate::ErrorKind::DataInvalid,
-                                "Failed to convert json number to int",
-                            ))?
+                            .ok_or(invalid_data!("Failed to convert json number to int"))?
                             .try_into()?,
                     ))))
                 }
-                (PrimitiveType::Long, JsonValue::Number(number)) => Ok(Some(Literal::Primitive(
-                    PrimitiveLiteral::Long(number.as_i64().ok_or(Error::new(
-                        crate::ErrorKind::DataInvalid,
-                        "Failed to convert json number to long",
-                    ))?),
-                ))),
+                (PrimitiveType::Long, JsonValue::Number(number)) => {
+                    Ok(Some(Literal::Primitive(PrimitiveLiteral::Long(
+                        number
+                            .as_i64()
+                            .ok_or(invalid_data!("Failed to convert json number to long"))?,
+                    ))))
+                }
                 (PrimitiveType::Float, JsonValue::Number(number)) => Ok(Some(Literal::Primitive(
-                    PrimitiveLiteral::Float(OrderedFloat(number.as_f64().ok_or(Error::new(
-                        crate::ErrorKind::DataInvalid,
-                        "Failed to convert json number to float",
-                    ))? as f32)),
+                    PrimitiveLiteral::Float(OrderedFloat(
+                        number
+                            .as_f64()
+                            .ok_or(invalid_data!("Failed to convert json number to float"))?
+                            as f32,
+                    )),
                 ))),
                 (PrimitiveType::Double, JsonValue::Number(number)) => Ok(Some(Literal::Primitive(
-                    PrimitiveLiteral::Double(OrderedFloat(number.as_f64().ok_or(Error::new(
-                        crate::ErrorKind::DataInvalid,
-                        "Failed to convert json number to double",
-                    ))?)),
+                    PrimitiveLiteral::Double(OrderedFloat(
+                        number
+                            .as_f64()
+                            .ok_or(invalid_data!("Failed to convert json number to double"))?,
+                    )),
                 ))),
                 (PrimitiveType::Date, JsonValue::String(s)) => {
                     Ok(Some(Literal::Primitive(PrimitiveLiteral::Int(
@@ -469,9 +450,8 @@ impl Literal {
                     Ok(Some(Literal::Primitive(PrimitiveLiteral::Int(
                         number
                             .as_i64()
-                            .ok_or(Error::new(
-                                crate::ErrorKind::DataInvalid,
-                                "Failed to convert json number to date (days since epoch)",
+                            .ok_or(invalid_data!(
+                                "Failed to convert json number to date (days since epoch)"
                             ))?
                             .try_into()?,
                     ))))
@@ -493,14 +473,41 @@ impl Literal {
                         )),
                     ))))
                 }
+                (PrimitiveType::TimestampNs, JsonValue::String(s)) => {
+                    let ndt = NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f")?;
+                    let nanos = timestamp::datetime_to_nanoseconds(&ndt).ok_or_else(|| {
+                        invalid_data!(
+                            "Timestamp is outside the representable nanosecond range: {ndt}"
+                        )
+                    })?;
+                    Ok(Some(Literal::Primitive(PrimitiveLiteral::Long(nanos))))
+                }
+                (PrimitiveType::TimestamptzNs, JsonValue::String(s)) => {
+                    let dt = Utc.from_utc_datetime(&NaiveDateTime::parse_from_str(
+                        &s,
+                        "%Y-%m-%dT%H:%M:%S%.f+00:00",
+                    )?);
+                    let nanos = timestamptz::datetimetz_to_nanoseconds(&dt).ok_or_else(|| {
+                        invalid_data!(
+                            "Timestamptz is outside the representable nanosecond range: {dt}"
+                        )
+                    })?;
+                    Ok(Some(Literal::Primitive(PrimitiveLiteral::Long(nanos))))
+                }
                 (PrimitiveType::String, JsonValue::String(s)) => {
                     Ok(Some(Literal::Primitive(PrimitiveLiteral::String(s))))
                 }
                 (PrimitiveType::Uuid, JsonValue::String(s)) => Ok(Some(Literal::Primitive(
                     PrimitiveLiteral::UInt128(Uuid::parse_str(&s)?.as_u128()),
                 ))),
-                (PrimitiveType::Fixed(_), JsonValue::String(_)) => todo!(),
-                (PrimitiveType::Binary, JsonValue::String(_)) => todo!(),
+                (PrimitiveType::Fixed(size), JsonValue::String(s)) => {
+                    let bytes = decode_hex_bytes(&s)?;
+                    validate_fixed_size(bytes.len(), *size)?;
+                    Ok(Some(Literal::Primitive(PrimitiveLiteral::Binary(bytes))))
+                }
+                (PrimitiveType::Binary, JsonValue::String(s)) => Ok(Some(Literal::Primitive(
+                    PrimitiveLiteral::Binary(decode_hex_bytes(&s)?),
+                ))),
                 (
                     PrimitiveType::Decimal {
                         precision: _,
@@ -514,32 +521,28 @@ impl Literal {
                         decimal_mantissa(&rescaled),
                     ))))
                 }
+                (PrimitiveType::Unknown, value) if !value.is_null() => Err(invalid_data!(
+                    "Unknown type only supports null default values"
+                )),
                 (_, JsonValue::Null) => Ok(None),
-                (i, j) => Err(Error::new(
-                    crate::ErrorKind::DataInvalid,
-                    format!("The json value {j} doesn't fit to the iceberg type {i}."),
+                (i, j) => Err(invalid_data!(
+                    "The json value {j} doesn't fit to the iceberg type {i}."
                 )),
             },
             Type::Struct(schema) => {
                 if let JsonValue::Object(mut object) = value {
-                    Ok(Some(Literal::Struct(Struct::from_iter(
-                        schema.fields().iter().map(|field| {
-                            object.remove(&field.id.to_string()).and_then(|value| {
-                                Literal::try_from_json(value, &field.field_type)
-                                    .and_then(|value| {
-                                        value.ok_or(Error::new(
-                                            ErrorKind::DataInvalid,
-                                            "Key of map cannot be null",
-                                        ))
-                                    })
-                                    .ok()
-                            })
-                        }),
-                    ))))
+                    let values = schema
+                        .fields()
+                        .iter()
+                        .map(|field| match object.remove(&field.id.to_string()) {
+                            Some(value) => Literal::try_from_json(value, &field.field_type),
+                            None => Ok(None),
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(Some(Literal::Struct(Struct::from_iter(values))))
                 } else {
-                    Err(Error::new(
-                        crate::ErrorKind::DataInvalid,
-                        "The json value for a struct type must be an object.",
+                    Err(invalid_data!(
+                        "The json value for a struct type must be an object."
                     ))
                 }
             }
@@ -554,9 +557,8 @@ impl Literal {
                             .collect::<Result<Vec<_>>>()?,
                     )))
                 } else {
-                    Err(Error::new(
-                        crate::ErrorKind::DataInvalid,
-                        "The json value for a list type must be an array.",
+                    Err(invalid_data!(
+                        "The json value for a list type must be an array."
                     ))
                 }
             }
@@ -565,16 +567,23 @@ impl Literal {
                     if let (Some(JsonValue::Array(keys)), Some(JsonValue::Array(values))) =
                         (object.remove("keys"), object.remove("values"))
                     {
+                        if keys.len() != values.len() {
+                            return Err(invalid_data!(
+                                "Map keys and values must have the same length, got {} keys and {} values",
+                                keys.len(),
+                                values.len()
+                            ));
+                        }
+
                         Ok(Some(Literal::Map(Map::from_iter(
                             keys.into_iter()
-                                .zip(values.into_iter())
+                                .zip(values)
                                 .map(|(key, value)| {
                                     Ok((
                                         Literal::try_from_json(key, &map.key_field.field_type)
                                             .and_then(|value| {
-                                                value.ok_or(Error::new(
-                                                    ErrorKind::DataInvalid,
-                                                    "Key of map cannot be null",
+                                                value.ok_or(invalid_data!(
+                                                    "Key of map cannot be null"
                                                 ))
                                             })?,
                                         Literal::try_from_json(value, &map.value_field.field_type)?,
@@ -583,21 +592,18 @@ impl Literal {
                                 .collect::<Result<Vec<_>>>()?,
                         ))))
                     } else {
-                        Err(Error::new(
-                            crate::ErrorKind::DataInvalid,
-                            "The json value for a list type must be an array.",
+                        Err(invalid_data!(
+                            "The json value for a list type must be an array."
                         ))
                     }
                 } else {
-                    Err(Error::new(
-                        crate::ErrorKind::DataInvalid,
-                        "The json value for a list type must be an array.",
+                    Err(invalid_data!(
+                        "The json value for a list type must be an array."
                     ))
                 }
             }
-            Type::Variant(_) => Err(Error::new(
-                ErrorKind::DataInvalid,
-                "Variant type is not supported for single-value JSON serialization",
+            Type::Variant(_) => Err(invalid_data!(
+                "Variant type is not supported for single-value JSON serialization"
             )),
         }
     }
@@ -663,13 +669,13 @@ impl Literal {
                 (_, PrimitiveLiteral::UInt128(val)) => {
                     Ok(JsonValue::String(Uuid::from_u128(val).to_string()))
                 }
-                (_, PrimitiveLiteral::Binary(val)) => Ok(JsonValue::String(val.iter().fold(
-                    String::new(),
-                    |mut acc, x| {
-                        acc.push_str(&format!("{x:x}"));
-                        acc
-                    },
-                ))),
+                (PrimitiveType::Fixed(size), PrimitiveLiteral::Binary(val)) => {
+                    validate_fixed_size(val.len(), *size)?;
+                    Ok(JsonValue::String(encode_hex_bytes(&val)))
+                }
+                (PrimitiveType::Binary, PrimitiveLiteral::Binary(val)) => {
+                    Ok(JsonValue::String(encode_hex_bytes(&val)))
+                }
                 (_, PrimitiveLiteral::Int128(val)) => match r#type {
                     Type::Primitive(PrimitiveType::Decimal {
                         precision: _precision,
@@ -678,14 +684,12 @@ impl Literal {
                         let decimal = try_decimal_from_i128_with_scale(val, *scale)?;
                         Ok(JsonValue::String(decimal.to_string()))
                     }
-                    _ => Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        "The iceberg type for decimal literal must be decimal.",
+                    _ => Err(invalid_data!(
+                        "The iceberg type for decimal literal must be decimal."
                     ))?,
                 },
-                _ => Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "The iceberg value doesn't fit to the iceberg type.",
+                _ => Err(invalid_data!(
+                    "The iceberg value doesn't fit to the iceberg type."
                 )),
             },
             (Literal::Struct(s), Type::Struct(struct_type)) => {
@@ -722,9 +726,8 @@ impl Literal {
                 object.insert("values".to_string(), JsonValue::Array(json_values));
                 Ok(JsonValue::Object(object))
             }
-            (value, r#type) => Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!("The iceberg value {value:?} doesn't fit to the iceberg type {type}."),
+            (value, r#type) => Err(invalid_data!(
+                "The iceberg value {value:?} doesn't fit to the iceberg type {type}."
             )),
         }
     }
@@ -746,5 +749,55 @@ impl Literal {
             },
             _ => unimplemented!(),
         }
+    }
+}
+
+fn decode_hex_bytes(value: &str) -> Result<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return Err(invalid_data!(
+            "Hex string must have an even number of characters: {value:?}"
+        ));
+    }
+
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|chunk| {
+            let high = decode_hex_digit(chunk[0], value)?;
+            let low = decode_hex_digit(chunk[1], value)?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+fn decode_hex_digit(digit: u8, value: &str) -> Result<u8> {
+    match digit {
+        b'0'..=b'9' => Ok(digit - b'0'),
+        b'a'..=b'f' => Ok(digit - b'a' + 10),
+        b'A'..=b'F' => Ok(digit - b'A' + 10),
+        _ => Err(invalid_data!(
+            "Hex string contains invalid character: {value:?}"
+        )),
+    }
+}
+
+fn encode_hex_bytes(bytes: &[u8]) -> String {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX_DIGITS[(byte >> 4) as usize] as char);
+        output.push(HEX_DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn validate_fixed_size(actual: usize, expected: u64) -> Result<()> {
+    if actual as u64 == expected {
+        Ok(())
+    } else {
+        Err(invalid_data!(
+            "Fixed type must be exactly {expected} bytes, got {actual}"
+        ))
     }
 }

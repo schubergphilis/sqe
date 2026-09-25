@@ -27,7 +27,7 @@ use fnv::FnvHashSet;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::error::{Result, invalid_data};
 use crate::expr::visitors::bound_predicate_visitor::visit as visit_bound;
 use crate::expr::visitors::predicate_visitor::visit;
 use crate::expr::visitors::rewrite_not::RewriteNotVisitor;
@@ -53,7 +53,7 @@ impl<'de, T: Deserialize<'de>, const N: usize> Deserialize<'de> for LogicalExpre
     where D: serde::Deserializer<'de> {
         let inputs = Vec::<Box<T>>::deserialize(deserializer)?;
         Ok(LogicalExpression::new(
-            array_init::from_iter(inputs.into_iter()).ok_or_else(|| {
+            array_init::from_iter(inputs).ok_or_else(|| {
                 serde::de::Error::custom(format!("Failed to deserialize LogicalExpression: the len of inputs is not match with the len of LogicalExpression {N}"))
             })?,
         ))
@@ -398,12 +398,9 @@ impl Bind for Predicate {
                     }
                     &PredicateOperator::IsNan | &PredicateOperator::NotNan => {
                         if !bound_expr.term.field().field_type.is_floating_type() {
-                            return Err(Error::new(
-                                ErrorKind::DataInvalid,
-                                format!(
-                                    "Expecting floating point type, but found {}",
-                                    bound_expr.term.field().field_type
-                                ),
+                            return Err(invalid_data!(
+                                "Expecting floating point type, but found {}",
+                                bound_expr.term.field().field_type
                             ));
                         }
                     }

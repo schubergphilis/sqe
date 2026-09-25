@@ -17,57 +17,19 @@
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
 
-use gcp_auth::TokenProvider;
-use http::StatusCode;
 use iceberg::{Error, ErrorKind, Result};
 use opentelemetry::propagation::Injector;
 use reqwest::header::HeaderMap;
-use reqwest::{Client, IntoUrl, Method, Request, RequestBuilder, Response};
+use reqwest::{Client, IntoUrl, Method, Request, RequestBuilder};
 use serde::de::DeserializeOwned;
-use tokio::sync::Mutex;
-use tracing::{debug, info_span, warn, Instrument};
+use tracing::{Instrument, info_span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::types::{ErrorResponse, TokenResponse};
-use crate::{RestCatalogConfig, GCP_CLOUD_PLATFORM_SCOPE};
+use crate::RestCatalogConfig;
 
-pub(crate) struct HttpClient {
-    client: Client,
-
-    /// The token to be used for authentication.
-    ///
-    /// It's possible to fetch the token from the server while needed.
-    token: Mutex<Option<String>>,
-    /// The token endpoint to be used for authentication.
-    token_endpoint: String,
-    /// The credential to be used for authentication.
-    credential: Option<(Option<String>, String)>,
-    /// Extra headers to be added to each request.
-    extra_headers: HeaderMap,
-    /// Extra oauth parameters to be added to each authentication request.
-    extra_oauth_params: HashMap<String, String>,
-    /// Whether to disable header redaction in error logs (defaults to false for security).
-    disable_header_redaction: bool,
-    /// GCP service account JSON for authentication.
-    gcp_credential: Option<String>,
-    /// AWS SigV4 signer. `Some` when `rest.sigv4-enabled=true` was
-    /// resolved from either the user config or the server's
-    /// `/v1/config` defaults; in that case the OAuth/Bearer path is
-    /// bypassed and outgoing requests are signed with SigV4 instead.
-    #[cfg(feature = "aws-sigv4")]
-    sigv4_signer: Option<crate::sigv4::SigV4Signer>,
-    /// Whether this client was constructed with *any* form of
-    /// authentication (token, credential, or GCP service account).
-    /// When true, [`authenticate`] refuses to send a request with no
-    /// `Authorization` header even if the live token has been cleared
-    /// out from under it. This catches the regression in
-    /// <https://sbp.gitlab.schubergphilis.com/.../sqlengine/-/issues/2>
-    /// where some outbound REST calls were arriving at Polaris without
-    /// the bearer header under concurrency.
-    auth_required: bool,
-}
-
+/// Writes W3C trace-context headers into an outgoing request.
 struct HeaderInjector<'a>(&'a mut HeaderMap);
 
 impl Injector for HeaderInjector<'_> {
@@ -80,40 +42,101 @@ impl Injector for HeaderInjector<'_> {
         }
     }
 }
+use crate::auth::{AuthSession, NoopSession};
+use crate::request::HttpRequest;
+use crate::response::HttpResponse;
+
+/// The catalog's HTTP client, handed to an [`AuthManager`] so its own
+/// requests share the catalog's connection pool and configuration.
+///
+/// [`AuthManager`]: crate::auth::AuthManager
+#[derive(Clone)]
+pub struct HttpClient {
+    client: Client,
+
+    /// Extra headers to be added to each request.
+    extra_headers: HeaderMap,
+    /// Whether to disable header redaction in error logs (defaults to false for security).
+    disable_header_redaction: bool,
+    /// Authenticates everything this client sends. A client handed to an
+    /// [`AuthManager`] carries no authentication, since that is what the
+    /// manager is about to create.
+    ///
+    /// [`AuthManager`]: crate::auth::AuthManager
+    auth_session: Arc<dyn AuthSession>,
+}
 
 impl Debug for HttpClient {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        // The inner client is omitted: an injected one may carry secrets in
+        // its default headers.
         f.debug_struct("HttpClient")
-            .field("client", &self.client)
-            .field("extra_headers", &self.extra_headers)
+            .field(
+                // `header.*` values may hold secrets (e.g. `authorization`).
+                "extra_headers",
+                &format_headers_redacted(&self.extra_headers, self.disable_header_redaction),
+            )
             .finish_non_exhaustive()
     }
 }
 
 impl HttpClient {
+    /// The same client authenticating with `auth_session` instead: a derived
+    /// auth session reuses the connection pool and headers of the client it
+    /// came from, carrying its own authentication.
+    pub fn with_auth_session(&self, auth_session: Arc<dyn AuthSession>) -> Self {
+        Self {
+            auth_session,
+            ..self.clone()
+        }
+    }
+
+    /// The same client with no authentication, for the requests that must not
+    /// carry it — a session refreshing its own token over the client it
+    /// authenticates would otherwise recurse.
+    pub fn without_auth_session(&self) -> Self {
+        self.with_auth_session(Arc::new(NoopSession))
+    }
+
+    /// Sends a form-encoded POST and returns the response status and body,
+    /// which is what an [`AuthManager`] needs to exchange a credential for a
+    /// token. Only `headers` are sent; the catalog's own extra headers are
+    /// not merged in.
+    ///
+    /// Like every request, it carries this client's session; call
+    /// [`Self::without_auth_session`] first to send it unauthenticated.
+    ///
+    /// [`AuthManager`]: crate::auth::AuthManager
+    pub async fn post_form(
+        &self,
+        url: &str,
+        headers: &HeaderMap,
+        form: &HashMap<&str, &str>,
+    ) -> Result<HttpResponse> {
+        let mut request = HttpRequest::build(
+            self.client
+                .request(Method::POST, url)
+                .headers(headers.clone())
+                .form(form),
+        )?;
+        // `headers` may carry a `content-type: application/json` that `form`
+        // leaves in place.
+        request.headers_mut().insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        self.auth_session.authenticate(&mut request).await?;
+        let response = self.client.execute(request.into_inner()).await?;
+        HttpResponse::read(response).await
+    }
+
     /// Create a new http client.
-    pub fn new(cfg: &RestCatalogConfig) -> Result<Self> {
-        let token = cfg.token();
-        let credential = cfg.credential();
-        let gcp_credential = cfg.gcp_credential();
-        // Track whether the caller intends this client to be
-        // authenticated. Used by [`authenticate`] to refuse silent
-        // unauthenticated requests if the live token is later lost.
-        let auth_required = token.as_deref().is_some_and(|t| !t.is_empty())
-            || credential.is_some()
-            || gcp_credential.is_some();
+    pub(crate) fn new(cfg: &RestCatalogConfig) -> Result<Self> {
         Ok(HttpClient {
-            client: cfg.client().unwrap_or_default(),
-            token: Mutex::new(token),
-            token_endpoint: cfg.get_token_endpoint(),
-            credential,
+            client: cfg.client(),
             extra_headers: cfg.extra_headers()?,
-            extra_oauth_params: cfg.extra_oauth_params(),
             disable_header_redaction: cfg.disable_header_redaction(),
-            gcp_credential,
-            #[cfg(feature = "aws-sigv4")]
-            sigv4_signer: build_sigv4_signer(cfg),
-            auth_required,
+            auth_session: Arc::new(NoopSession),
         })
     }
 
@@ -121,439 +144,124 @@ impl HttpClient {
     ///
     /// If cfg carries new value, we will use cfg instead.
     /// Otherwise, we will keep the old value.
-    pub fn update_with(self, cfg: &RestCatalogConfig) -> Result<Self> {
+    pub(crate) fn update_with(self, cfg: &RestCatalogConfig) -> Result<Self> {
         let extra_headers = (!cfg.extra_headers()?.is_empty())
             .then(|| cfg.extra_headers())
             .transpose()?
             .unwrap_or(self.extra_headers);
-
-        // Detect token-clobber at the merge boundary. Issue #2.
-        //
-        // The merge in [`RestCatalogConfig::merge_with_config`] folds the
-        // server's `/v1/config` response into the user-supplied props.
-        // The `overrides` map wins over the user's props. If a server
-        // operator (or a misconfigured server) emits
-        //   "overrides": { "token": "" }
-        // the merge silently overwrites the caller's real bearer with
-        // the empty string. With `or_else` semantics on `cfg.token()`,
-        // `Some("")` short-circuits the fallback to the saved token —
-        // we would otherwise pick up the saved value.
-        //
-        // The downstream `authenticate` already refuses to send an
-        // empty bearer (loud error per the second guard in this file).
-        // Surface it here so the failure points at the merge boundary,
-        // not the request site, and includes operator-actionable text.
-        let saved_user_token = self.token.into_inner();
-        let user_had_token = saved_user_token.as_deref().is_some_and(|t| !t.is_empty());
-        let cfg_token = cfg.token();
-        let server_clobbered_with_empty =
-            user_had_token && matches!(cfg_token.as_deref(), Some(""));
-        if server_clobbered_with_empty {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "REST catalog `/v1/config` response cleared the user-supplied \
-                 token (empty-string override). This is a server-side \
-                 misconfiguration; the client would otherwise quietly send \
-                 every outbound request without an Authorization header and \
-                 401 at the server. Remove or correct the `token` field in \
-                 the catalog's /v1/config overrides.",
-            ));
-        }
-
-        // Preserve the original auth-required flag across updates.
-        // The merge folds in the server's `/v1/config` response; if a
-        // server-side override silently clobbers the user-supplied token
-        // (e.g. overrides "token" -> "" or omits it entirely while the
-        // user had one), the live `cfg` would resolve to no auth.
-        // Without this flag we'd construct a client that quietly drops
-        // the bearer on every outbound request and 401s downstream.
-        let merged_token = cfg_token.or(saved_user_token);
-        let merged_credential = cfg.credential().or(self.credential);
-        let merged_gcp = cfg.gcp_credential().or(self.gcp_credential);
-        let auth_required = self.auth_required
-            || merged_token.as_deref().is_some_and(|t| !t.is_empty())
-            || merged_credential.is_some()
-            || merged_gcp.is_some();
-        #[cfg(feature = "aws-sigv4")]
-        let bearer_bound =
-            merged_token.as_deref().is_some_and(|t| !t.is_empty()) || merged_credential.is_some();
-
         Ok(HttpClient {
-            client: cfg.client().unwrap_or(self.client),
-            token: Mutex::new(merged_token),
-            token_endpoint: if !cfg.get_token_endpoint().is_empty() {
-                cfg.get_token_endpoint()
-            } else {
-                self.token_endpoint
-            },
-            credential: merged_credential,
+            // `cfg.client()` returns the same shared client.
+            client: cfg.client(),
             extra_headers,
-            extra_oauth_params: if !cfg.extra_oauth_params().is_empty() {
-                cfg.extra_oauth_params()
-            } else {
-                self.extra_oauth_params
-            },
             disable_header_redaction: cfg.disable_header_redaction(),
-            gcp_credential: merged_gcp,
-            // The user config doesn't carry SigV4 props on the first
-            // pass; the AWS endpoint advertises them in its
-            // `/v1/config` response, which lands here through
-            // `merge_with_config`. Rebuild the signer once we have
-            // the merged props.
-            //
-            // Never for a bearer-bound client, though: a server that
-            // advertises `rest.sigv4-enabled` would otherwise swap the
-            // caller's per-user token for the process's AWS identity on
-            // every following request (confused deputy). Only a signer
-            // the user config itself asked for survives alongside a
-            // bearer; the server-advertised one is dropped and the
-            // bearer stays on the wire.
-            #[cfg(feature = "aws-sigv4")]
-            sigv4_signer: if bearer_bound {
-                self.sigv4_signer
-            } else {
-                build_sigv4_signer(cfg).or(self.sigv4_signer)
-            },
-            auth_required,
+            auth_session: self.auth_session,
         })
     }
 
-    /// This API is testing only to assert the token.
+    /// Testing only: the session authenticating this client's requests.
+    #[cfg(test)]
+    pub(crate) fn auth_session(&self) -> &Arc<dyn AuthSession> {
+        &self.auth_session
+    }
+
+    /// Testing only: the bearer token `session` would attach.
+    ///
+    /// Authenticates a throwaway request (never sent) and reads the header
+    /// back, so it works for any [`AuthSession`].
     #[cfg(test)]
     pub(crate) async fn token(&self) -> Option<String> {
-        let mut req = self
-            .request(Method::GET, &self.token_endpoint)
-            .build()
-            .unwrap();
-        self.authenticate(&mut req).await.ok();
-        self.token.lock().await.clone()
-    }
-
-    async fn exchange_credential_for_token(&self) -> Result<String> {
-        // Credential must exist here.
-        let (client_id, client_secret) = self.credential.as_ref().ok_or_else(|| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                "Credential must be provided for authentication",
-            )
-        })?;
-
-        let mut params = HashMap::with_capacity(4);
-        params.insert("grant_type", "client_credentials");
-        if let Some(client_id) = client_id {
-            params.insert("client_id", client_id);
-        }
-        params.insert("client_secret", client_secret);
-        params.extend(
-            self.extra_oauth_params
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str())),
-        );
-
-        let mut auth_req = self
-            .request(Method::POST, &self.token_endpoint)
-            .form(&params)
-            .build()?;
-        // extra headers add content-type application/json header it's necessary to override it with proper type
-        // note that form call doesn't add content-type header if already present
-        auth_req.headers_mut().insert(
-            http::header::CONTENT_TYPE,
-            http::HeaderValue::from_static("application/x-www-form-urlencoded"),
-        );
-        let auth_url = auth_req.url().clone();
-        let auth_resp = self.execute(auth_req).await?;
-
-        let auth_res: TokenResponse = if auth_resp.status() == StatusCode::OK {
-            let text = auth_resp
-                .bytes()
-                .await
-                .map_err(|err| err.with_url(auth_url.clone()))?;
-            Ok(serde_json::from_slice(&text).map_err(|e| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "Failed to parse response from rest catalog server!",
-                )
-                .with_context("operation", "auth")
-                .with_context("url", auth_url.to_string())
-                .with_context("json", String::from_utf8_lossy(&text))
-                .with_source(e)
-            })?)
-        } else {
-            let code = auth_resp.status();
-            let text = auth_resp
-                .bytes()
-                .await
-                .map_err(|err| err.with_url(auth_url.clone()))?;
-            let e: ErrorResponse = serde_json::from_slice(&text).map_err(|e| {
-                Error::new(ErrorKind::Unexpected, "Received unexpected response")
-                    .with_context("code", code.to_string())
-                    .with_context("operation", "auth")
-                    .with_context("url", auth_url.to_string())
-                    .with_context("json", String::from_utf8_lossy(&text))
-                    .with_source(e)
-            })?;
-            Err(Error::from(e))
-        }?;
-        Ok(auth_res.access_token)
-    }
-
-    /// Exchange GCP service account for access token using gcp_auth library.
-    async fn exchange_gcp_credential_for_token(&self) -> Result<String> {
-        let service_account_json = self.gcp_credential.as_ref().ok_or_else(|| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                "GCP service account must be provided for authentication",
-            )
-        })?;
-
-        // Use gcp_auth library to handle authentication
-        let service_account = gcp_auth::CustomServiceAccount::from_json(service_account_json)
-            .map_err(|e| {
-                Error::new(ErrorKind::DataInvalid, "Invalid GCP service account JSON")
-                    .with_source(e)
-            })?;
-
-        // Get access token with cloud-platform scope
-        let scopes = &[GCP_CLOUD_PLATFORM_SCOPE];
-        let token = service_account.token(scopes).await.map_err(|e| {
-            Error::new(ErrorKind::Unexpected, "Failed to get GCP access token").with_source(e)
-        })?;
-
-        Ok(token.as_str().to_string())
-    }
-
-    /// Invalidate the current token without generating a new one. On the next request, the client
-    /// will attempt to generate a new token.
-    pub(crate) async fn invalidate_token(&self) -> Result<()> {
-        *self.token.lock().await = None;
-        Ok(())
-    }
-
-    /// Invalidate the current token and set a new one. Generates a new token before invalidating
-    /// the current token, meaning the old token will be used until this function acquires the lock
-    /// and overwrites the token.
-    ///
-    /// If credential is invalid, or the request fails, this method will return an error and leave
-    /// the current token unchanged.
-    pub(crate) async fn regenerate_token(&self) -> Result<()> {
-        let new_token = self.exchange_token().await?;
-        *self.token.lock().await = Some(new_token.clone());
-        Ok(())
-    }
-
-    async fn exchange_token(&self) -> Result<String> {
-        if self.gcp_credential.is_some() {
-            self.exchange_gcp_credential_for_token().await
-        } else {
-            self.exchange_credential_for_token().await
-        }
-    }
-
-    fn can_refresh_token(&self) -> bool {
-        self.credential.is_some() || self.gcp_credential.is_some()
-    }
-
-    /// Authenticates the request by adding a bearer token to the authorization header.
-    ///
-    /// This method supports four authentication modes:
-    ///
-    /// 1. **No authentication** - Skip authentication when no credentials are configured.
-    /// 2. **Token authentication** - Use the provided `token` directly for authentication.
-    /// 3. **OAuth authentication** - Exchange `credential` for a token, cache it, then use it for authentication.
-    /// 4. **GCP Service Account** - Use GCP service account to get access token.
-    ///
-    /// When both `credential` and `token` are present, `token` takes precedence.
-    /// When GCP service account is present, it takes precedence over credential-based auth.
-    async fn authenticate(&self, req: &mut Request) -> Result<()> {
-        // AWS SigV4 path: short-circuits the OAuth/Bearer flow entirely
-        // because AWS's REST endpoints reject Bearer headers and need
-        // the request to be signed with the resolved AWS credentials.
-        // Triggered by `rest.sigv4-enabled=true` in either user or
-        // server-supplied config.
-        #[cfg(feature = "aws-sigv4")]
-        if let Some(signer) = self.sigv4_signer.as_ref() {
-            return signer.sign(req).await;
-        }
-
-        // Clone the token from lock without holding the lock for entire function.
-        let token = self.token.lock().await.clone();
-
-        if self.credential.is_none() && token.is_none() && self.gcp_credential.is_none() {
-            if self.auth_required {
-                // Defensive guard for issue #2. If this client was
-                // constructed with a token / credential / GCP creds
-                // (auth_required = true) but the live state has none,
-                // the bearer was lost somewhere between session setup
-                // and the outbound request. Refuse to send the
-                // request unauthenticated; the catch downstream
-                // (Polaris 401, mistranslated to TABLE_NOT_FOUND in
-                // older builds) is exactly what we want to avoid.
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Refusing to send outbound REST request without \
-                         Authorization: client was configured with \
-                         authentication but the live token has been \
-                         cleared. Method={} path={}",
-                        req.method(),
-                        req.url().path(),
-                    ),
-                ));
-            }
-            // Genuinely-unauthenticated path: the endpoint permits
-            // anonymous access. Still log so an operator can correlate
-            // against the server-side access log if a 401 surfaces.
-            // Path only, never the full URL (would leak names of
-            // catalogs/tables on the wire).
-            warn!(
-                method = %req.method(),
-                path = req.url().path(),
-                "Outbound REST request issued WITHOUT Authorization \
-                 (no token, no credential, no GCP creds). If this is \
-                 unexpected, the bearer was lost between session setup \
-                 and outbound request."
-            );
-            return Ok(());
-        }
-
-        // Either use the provided token or exchange credential for token, cache and use that
-        let token = match token {
-            Some(token) => token,
-            None => {
-                let token = self.exchange_token().await?;
-                // Update token so that we use it for next request instead of
-                // exchanging credential for token from the server again
-                *self.token.lock().await = Some(token.clone());
-                token
-            }
-        };
-
-        // Defensive guard: a token of length 0 must never go on the
-        // wire as `Authorization: Bearer ` (empty bearer). That fails
-        // 401 at the server with no useful diagnostic and used to be
-        // mistranslated to TABLE_NOT_FOUND downstream.
-        if token.is_empty() {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "Refusing to send empty bearer token: catalog auth is \
-                 misconfigured (token resolved to empty string).",
-            ));
-        }
-
-        // Insert token in request.
-        req.headers_mut().insert(
-            http::header::AUTHORIZATION,
-            format!("Bearer {token}").parse().map_err(|e| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    "Invalid token received from catalog server!",
-                )
-                .with_source(e)
-            })?,
-        );
-
-        // Diagnostic trace at the moment the request gains its
-        // Authorization header. Records token length only, never the
-        // value, never any byte that could be reversed back into the
-        // token. Combined with the warn! above, the SQE log alone
-        // can answer "did this outbound call have a bearer?" without
-        // cross-referencing the catalog's access log.
-        debug!(
-            method = %req.method(),
-            path = req.url().path(),
-            token_len = token.len(),
-            "Outbound REST request authenticated with Bearer token"
-        );
-
-        Ok(())
+        let mut request = HttpRequest::build(
+            self.client
+                .request(Method::GET, "http://localhost/token-probe"),
+        )
+        .ok()?;
+        self.auth_session.authenticate(&mut request).await.ok()?;
+        let request = request.into_inner();
+        request
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)?
+            .to_str()
+            .ok()?
+            .strip_prefix("Bearer ")
+            .map(str::to_string)
     }
 
     #[inline]
-    pub fn request<U: IntoUrl>(&self, method: Method, url: U) -> RequestBuilder {
+    pub(crate) fn request<U: IntoUrl>(&self, method: Method, url: U) -> RequestBuilder {
         self.client
             .request(method, url)
             .headers(self.extra_headers.clone())
     }
 
-    /// Executes the given `Request` and returns a `Response`.
-    pub async fn execute(&self, mut request: Request) -> Result<Response> {
-        // SQE PATCH (sqe#388): fill in the catalog-wide extra headers without
-        // clobbering a header the caller deliberately set on this request.
-        //
-        // This was `request.headers_mut().extend(self.extra_headers.clone())`.
-        // `HeaderMap::extend` overwrites same-key values, so it silently undid
-        // `exchange_credential_for_token`'s content-type override: the token
-        // request went out with a form-urlencoded body under
-        // `Content-Type: application/json` (hardcoded in
-        // `RestCatalogConfig::extra_headers`), and Polaris rejected it with a
-        // 415 `@Consumes` mismatch, breaking every client-credentials flow.
-        //
-        // `request()` above already applies these headers, so this only has to
-        // cover requests built without it.
-        for (name, value) in self.extra_headers.iter() {
-            if !request.headers().contains_key(name) {
-                request.headers_mut().insert(name, value.clone());
-            }
+    /// Sends `request` to the Iceberg REST catalog, authenticated by this
+    /// client's session.
+    pub(crate) async fn query_catalog(&self, request: HttpRequest) -> Result<HttpResponse> {
+        // A request with a streaming body cannot be replayed; it gets no retry.
+        let retry = request.try_clone();
+        let (response, sent) = self.send_authenticated(request).await?;
+        if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(response);
         }
-        let method = request.method().clone();
-        let path = request.url().path().to_string();
-        let host = request.url().host_str().unwrap_or_default().to_string();
+        match retry {
+            Some(retry) if self.auth_session.on_unauthorized(&sent).await? => {
+                Ok(self.send_authenticated(retry).await?.0)
+            }
+            _ => Ok(response),
+        }
+    }
+
+    /// Authenticates and sends `request`, returning the response together
+    /// with the headers that went out, so a 401 can be matched to its token.
+    async fn send_authenticated(&self, mut request: HttpRequest) -> Result<(HttpResponse, HttpRequest)> {
+        // Authenticate first, then apply extra headers, so a configured
+        // `header.authorization` keeps overriding a token (unchanged behavior).
+        self.auth_session.authenticate(&mut request).await?;
+        let mut request = request.into_inner();
+        request.headers_mut().extend(self.extra_headers.clone());
+        let mut sent = Request::new(request.method().clone(), request.url().clone());
+        *sent.headers_mut() = request.headers().clone();
+
+        // SQE PATCH (observability): one client span per catalog call, and
+        // the W3C `traceparent` of the current trace on the wire, so Polaris
+        // requests correlate with the SQE query that caused them.
         let span = info_span!(
             "iceberg.rest.request",
             db.system.name = "iceberg",
-            http.request.method = %method,
-            server.address = %host,
-            url.path = %path,
+            http.request.method = %request.method(),
+            server.address = %request.url().host_str().unwrap_or_default(),
+            url.path = %request.url().path(),
             http.response.status_code = tracing::field::Empty,
             error.type = tracing::field::Empty,
             otel.status_code = tracing::field::Empty,
         );
-        async move {
+        let response = async move {
             let context = tracing::Span::current().context();
             opentelemetry::global::get_text_map_propagator(|propagator| {
                 propagator.inject_context(&context, &mut HeaderInjector(request.headers_mut()));
             });
+            let current = tracing::Span::current();
             match self.client.execute(request).await {
                 Ok(response) => {
                     let status = response.status();
-                    tracing::Span::current().record("http.response.status_code", status.as_u16());
+                    current.record("http.response.status_code", status.as_u16());
                     if status.is_client_error() || status.is_server_error() {
-                        tracing::Span::current().record("error.type", "http_status");
-                        tracing::Span::current().record("otel.status_code", "ERROR");
+                        current.record("error.type", "http_status");
+                        current.record("otel.status_code", "ERROR");
                     } else {
-                        tracing::Span::current().record("otel.status_code", "OK");
+                        current.record("otel.status_code", "OK");
                     }
-                    Ok(response)
+                    HttpResponse::read(response).await
                 }
                 Err(error) => {
-                    tracing::Span::current().record("error.type", "transport");
-                    tracing::Span::current().record("otel.status_code", "ERROR");
+                    current.record("error.type", "transport");
+                    current.record("otel.status_code", "ERROR");
                     Err(error.into())
                 }
             }
         }
         .instrument(span)
-        .await
-    }
-
-    // Queries the Iceberg REST catalog after authentication with the given `Request` and
-    // returns a `Response`.
-    pub async fn query_catalog(&self, mut request: Request) -> Result<Response> {
-        let retry_request = request.try_clone();
-        self.authenticate(&mut request).await?;
-        let response = self.execute(request).await?;
-
-        if response.status() != StatusCode::UNAUTHORIZED || !self.can_refresh_token() {
-            return Ok(response);
-        }
-
-        let Some(mut retry_request) = retry_request else {
-            return Ok(response);
-        };
-
-        self.invalidate_token().await?;
-        self.authenticate(&mut retry_request).await?;
-        self.execute(retry_request).await
+        .await?;
+        Ok((response, HttpRequest::new(sent)))
     }
 
     /// Returns whether header redaction is disabled for this client.
@@ -562,45 +270,46 @@ impl HttpClient {
     }
 }
 
-/// Deserializes a catalog response into the given [`DeserializedOwned`] type.
+/// Deserializes a catalog response into the given [`DeserializeOwned`] type.
 ///
 /// Returns an error if unable to parse the response bytes.
-pub(crate) async fn deserialize_catalog_response<R: DeserializeOwned>(
-    response: Response,
+pub(crate) fn deserialize_catalog_response<R: DeserializeOwned>(
+    response: HttpResponse,
 ) -> Result<R> {
-    let bytes = response.bytes().await?;
+    let bytes = response.body();
 
-    serde_json::from_slice::<R>(&bytes).map_err(|e| {
+    serde_json::from_slice::<R>(bytes).map_err(|e| {
         Error::new(
             ErrorKind::Unexpected,
             "Failed to parse response from rest catalog server",
         )
-        .with_context("json", String::from_utf8_lossy(&bytes))
+        .with_context("json", String::from_utf8_lossy(bytes))
         .with_source(e)
     })
 }
 
-/// Headers that contain sensitive information and should be excluded from logs.
-const SENSITIVE_HEADERS: &[&str] = &[
-    "authorization",
-    "proxy-authorization",
-    "set-cookie",
-    "cookie",
-    "x-api-key",
-    "x-auth-token",
-];
-
-/// Returns true if the header name is considered sensitive.
+/// Returns true if the header may carry a secret (matched by substring, so
+/// e.g. `x-client-secret` is covered along with `authorization`).
 fn is_sensitive_header(name: &str) -> bool {
     let name_lower = name.to_lowercase();
-    SENSITIVE_HEADERS.iter().any(|h| name_lower == *h)
+    [
+        "auth",
+        "token",
+        "secret",
+        "key",
+        "password",
+        "cookie",
+        "credential",
+    ]
+    .iter()
+    .any(|pattern| name_lower.contains(pattern))
 }
 
 /// Redacts sensitive headers and returns a debug-formatted string.
 ///
 /// If `disable_redaction` is true, returns all headers without redaction.
-/// Otherwise, replaces sensitive header values with "[REDACTED]".
-fn format_headers_redacted(headers: &HeaderMap, disable_redaction: bool) -> String {
+/// Otherwise, replaces sensitive header values with `[REDACTED]`.
+pub(crate) fn format_headers_redacted(headers: &HeaderMap, disable_redaction: bool) -> String {
     if disable_redaction {
         // Return all headers as-is without redaction
         let all: HashMap<&str, &str> = headers
@@ -624,32 +333,9 @@ fn format_headers_redacted(headers: &HeaderMap, disable_redaction: bool) -> Stri
     format!("{redacted:?}")
 }
 
-/// Build a SigV4 signer from the merged catalog config when the
-/// server (or the user) advertises `rest.sigv4-enabled=true`.
-///
-/// Returns `None` when SigV4 is off or when the required signing-name
-/// or signing-region props are missing. The signer caches the AWS
-/// credentials provider chain on first sign call, so building it is
-/// cheap.
-#[cfg(feature = "aws-sigv4")]
-fn build_sigv4_signer(cfg: &RestCatalogConfig) -> Option<crate::sigv4::SigV4Signer> {
-    if !cfg.sigv4_enabled() {
-        return None;
-    }
-    let region = cfg.signing_region()?;
-    let name = cfg.signing_name()?;
-    let signer = crate::sigv4::SigV4Signer::new(region, name);
-    Some(match cfg.sigv4_static_credentials() {
-        Some((access_key_id, secret_access_key, session_token)) => {
-            signer.with_static_credentials(access_key_id, secret_access_key, session_token)
-        }
-        None => signer,
-    })
-}
-
 /// Deserializes a unexpected catalog response into an error.
-pub(crate) async fn deserialize_unexpected_catalog_error(
-    response: Response,
+pub(crate) fn deserialize_unexpected_catalog_error(
+    response: HttpResponse,
     disable_header_redaction: bool,
 ) -> Error {
     let err = Error::new(
@@ -662,20 +348,146 @@ pub(crate) async fn deserialize_unexpected_catalog_error(
         format_headers_redacted(response.headers(), disable_header_redaction),
     );
 
-    let bytes = match response.bytes().await {
-        Ok(bytes) => bytes,
-        Err(err) => return err.into(),
-    };
-
+    let bytes = response.body();
     if bytes.is_empty() {
         return err;
     }
-    err.with_context("json", String::from_utf8_lossy(&bytes))
+    err.with_context("json", String::from_utf8_lossy(bytes))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct StaticSession;
+
+    #[async_trait::async_trait]
+    impl AuthSession for StaticSession {
+        async fn authenticate(&self, request: &mut HttpRequest) -> Result<()> {
+            request
+                .headers_mut()
+                .insert("authorization", "Bearer tok".parse().unwrap());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_truncated_body_error_names_the_url() {
+        // `bytes()` builds its error without a URL, so `read` attaches the one
+        // the response came from; otherwise a failure can't be attributed to a
+        // catalog. Needs a raw socket: the body has to be cut short.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            // Promise more than is sent, then hang up.
+            let _ = std::io::Write::write_all(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort",
+            );
+        });
+
+        let url = format!("http://{addr}/token");
+        let err = HttpClient::new(&RestCatalogConfig::builder().uri(url.clone()).build())
+            .unwrap()
+            .post_form(&url, &HeaderMap::new(), &HashMap::new())
+            .await
+            .unwrap_err();
+
+        assert!(format!("{err:?}").contains(&url), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_reading_a_response_keeps_status_headers_and_body() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/token")
+            .with_status(418)
+            .with_header("x-request-id", "abc123")
+            .with_body("brewing")
+            .create_async()
+            .await;
+
+        let response = HttpClient::new(&RestCatalogConfig::builder().uri(server.url()).build())
+            .unwrap()
+            .post_form(
+                &format!("{}/token", server.url()),
+                &HeaderMap::new(),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 418);
+        assert_eq!(response.headers().get("x-request-id").unwrap(), "abc123");
+        assert_eq!(response.body(), b"brewing");
+        mock.assert_async().await;
+    }
+
+    #[test]
+    fn test_unexpected_error_carries_status_headers_and_body() {
+        // Everything a user needs to diagnose an unexpected status, with the
+        // sensitive headers held back.
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer leaked".parse().unwrap());
+        headers.insert("x-request-id", "abc123".parse().unwrap());
+        let response = HttpResponse::new(
+            http::StatusCode::IM_A_TEAPOT,
+            headers,
+            br#"{"error": "nope"}"#.to_vec(),
+        );
+
+        let err = format!(
+            "{:?}",
+            deserialize_unexpected_catalog_error(response, false)
+        );
+
+        assert!(err.contains("418"), "{err}");
+        assert!(err.contains("x-request-id"), "{err}");
+        assert!(err.contains("abc123"), "{err}");
+        assert!(err.contains("nope"), "{err}");
+        assert!(!err.contains("leaked"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_post_form_carries_the_session_until_it_is_removed() {
+        // Every request a client sends carries its session; a caller that
+        // needs an unauthenticated one removes the session first.
+        let mut server = mockito::Server::new_async().await;
+        let signed = server
+            .mock("POST", "/token")
+            .match_header("authorization", "Bearer tok")
+            .with_status(200)
+            .create_async()
+            .await;
+        let unsigned = server
+            .mock("POST", "/token")
+            .match_header("authorization", mockito::Matcher::Missing)
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let client = HttpClient::new(&RestCatalogConfig::builder().uri(server.url()).build())
+            .unwrap()
+            .with_auth_session(Arc::new(StaticSession));
+        let url = format!("{}/token", server.url());
+
+        client
+            .post_form(&url, &HeaderMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+        signed.assert_async().await;
+
+        client
+            .without_auth_session()
+            .post_form(&url, &HeaderMap::new(), &HashMap::new())
+            .await
+            .unwrap();
+        unsigned.assert_async().await;
+    }
 
     #[test]
     fn test_format_headers_redacted_empty() {
@@ -696,6 +508,31 @@ mod tests {
         assert!(result.contains("application/json"));
         assert!(result.contains("x-request-id"));
         assert!(result.contains("abc123"));
+    }
+
+    #[tokio::test]
+    async fn test_http_client_debug_redacts_headers() {
+        let config = RestCatalogConfig::builder()
+            .uri("http://localhost".to_string())
+            .props(HashMap::from([
+                ("header.authorization".to_string(), "Basic xyz".to_string()),
+                (
+                    "header.x-client-secret".to_string(),
+                    "shh-secret".to_string(),
+                ),
+                (
+                    "header.x-client-credential".to_string(),
+                    "cred-value".to_string(),
+                ),
+            ]))
+            .build();
+        let client = HttpClient::new(&config).unwrap();
+
+        let out = format!("{client:?}");
+        assert!(!out.contains("Basic xyz"));
+        assert!(!out.contains("shh-secret"));
+        assert!(!out.contains("cred-value"));
+        assert!(out.contains("[REDACTED]"));
     }
 
     #[test]
@@ -791,120 +628,5 @@ mod tests {
         assert!(result.contains("application/json"));
         // [REDACTED] should NOT be present when redaction is disabled
         assert!(!result.contains("[REDACTED]"));
-    }
-
-    // ─── Issue #2 token-clobber guard ────────────────────────────────────
-    //
-    // update_with() is the merge point between user props and the server's
-    // /v1/config response. If the server emits `overrides.token = ""`, the
-    // merge silently overwrites the user-supplied bearer with empty. The
-    // previous `or_else` semantics on `cfg.token()` would propagate that
-    // empty value to the live token mutex; downstream `authenticate()`
-    // refused the request, but the failure pointed at the request site
-    // rather than the actual misconfiguration (the merge boundary).
-
-    fn config_with_token(token: Option<&str>) -> RestCatalogConfig {
-        let mut props = HashMap::new();
-        if let Some(t) = token {
-            props.insert("token".to_string(), t.to_string());
-        }
-        RestCatalogConfig::builder()
-            .uri("http://localhost:8181".to_string())
-            .props(props)
-            .build()
-    }
-
-    #[test]
-    fn update_with_rejects_server_overriding_token_to_empty() {
-        // Set up: user supplied a real bearer.
-        let initial = HttpClient::new(&config_with_token(Some("user-real-bearer")))
-            .expect("client construction with real token must succeed");
-
-        // Server's /v1/config response carries an empty-string token
-        // override. The merged config therefore has Some("") for token.
-        let merged = config_with_token(Some(""));
-
-        let err = initial
-            .update_with(&merged)
-            .expect_err("update_with must reject empty-string token override");
-
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("token") && msg.contains("misconfiguration"),
-            "error must point at the merge boundary: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn update_with_preserves_user_token_when_server_omits_it() {
-        // Common case: server's /v1/config has no `token` override at all.
-        // The user-supplied token must survive the merge.
-        let initial = HttpClient::new(&config_with_token(Some("user-real-bearer")))
-            .expect("client construction must succeed");
-
-        let merged = config_with_token(None);
-        let updated = initial
-            .update_with(&merged)
-            .expect("merge with no server-side token override must succeed");
-
-        // Confirm the live token mutex retains the user's bearer.
-        let live = updated.token.lock().await;
-        assert_eq!(live.as_deref(), Some("user-real-bearer"));
-    }
-
-    #[tokio::test]
-    async fn update_with_lets_server_token_win_when_user_had_none() {
-        // Edge case: anonymous user, server starts handing out tokens.
-        // The merge picks up the server token.
-        let initial = HttpClient::new(&config_with_token(None))
-            .expect("anonymous client construction must succeed");
-
-        let merged = config_with_token(Some("server-issued-token"));
-        let updated = initial
-            .update_with(&merged)
-            .expect("server-supplied token on an anonymous client must merge");
-
-        let live = updated.token.lock().await;
-        assert_eq!(live.as_deref(), Some("server-issued-token"));
-    }
-
-    /// Issue 748: a `/v1/config` that advertises `rest.sigv4-enabled`
-    /// must not swap a per-user bearer for the process's AWS identity.
-    #[cfg(feature = "aws-sigv4")]
-    #[test]
-    fn server_advertised_sigv4_does_not_replace_a_bearer() {
-        let sigv4_props = |token: Option<&str>| {
-            let mut props = HashMap::new();
-            props.insert("rest.sigv4-enabled".to_string(), "true".to_string());
-            props.insert("rest.signing-name".to_string(), "glue".to_string());
-            props.insert(
-                "rest.signing-region".to_string(),
-                "eu-central-1".to_string(),
-            );
-            if let Some(t) = token {
-                props.insert("token".to_string(), t.to_string());
-            }
-            RestCatalogConfig::builder()
-                .uri("http://localhost:8181".to_string())
-                .props(props)
-                .build()
-        };
-
-        // Bearer-bound client, server turns SigV4 on: the bearer wins.
-        let bearer = HttpClient::new(&config_with_token(Some("user-bearer")))
-            .unwrap()
-            .update_with(&sigv4_props(Some("user-bearer")))
-            .unwrap();
-        assert!(
-            bearer.sigv4_signer.is_none(),
-            "server-advertised SigV4 replaced a bearer"
-        );
-
-        // No bearer anywhere (auth = aws): the advertised signer is adopted.
-        let anonymous = HttpClient::new(&config_with_token(None))
-            .unwrap()
-            .update_with(&sigv4_props(None))
-            .unwrap();
-        assert!(anonymous.sigv4_signer.is_some());
     }
 }

@@ -21,7 +21,9 @@ use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 
 use crate::arrow::ArrowReader;
+use crate::arrow::reader::ParquetReadOptions;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
+use crate::arrow::scan_metrics::ScanMetrics;
 use crate::io::FileIO;
 use crate::scan::{ArrowRecordBatchStream, FileScanTaskDeleteFile};
 use crate::spec::{Schema, SchemaRef};
@@ -44,43 +46,45 @@ pub trait DeleteFileLoader {
 #[derive(Clone, Debug)]
 pub(crate) struct BasicDeleteFileLoader {
     file_io: FileIO,
+    scan_metrics: ScanMetrics,
 }
 
 #[allow(unused_variables)]
 impl BasicDeleteFileLoader {
-    pub fn new(file_io: FileIO) -> Self {
-        BasicDeleteFileLoader { file_io }
+    pub fn new(file_io: FileIO, scan_metrics: ScanMetrics) -> Self {
+        BasicDeleteFileLoader {
+            file_io,
+            scan_metrics,
+        }
     }
 
-    pub(crate) fn input_file(&self, data_file_path: &str) -> Result<crate::io::InputFile> {
-        self.file_io.new_input(data_file_path)
+    pub(crate) fn file_io(&self) -> &FileIO {
+        &self.file_io
     }
+
     /// Loads a RecordBatchStream for a given datafile.
-    ///
-    /// `bytes_read_counter` is shared with the per-scan [`ScanMetrics`] so
-    /// delete-file bytes count towards the same scan total as data-file
-    /// bytes (apache iceberg-rust#2349).  `None` skips counting — useful
-    /// for ad-hoc loads outside a scan.
     pub(crate) async fn parquet_to_batch_stream(
         &self,
         data_file_path: &str,
         file_size_in_bytes: u64,
-        bytes_read_counter: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+        key_metadata: Option<&[u8]>,
     ) -> Result<ArrowRecordBatchStream> {
         /*
            Essentially a super-cut-down ArrowReader. We can't use ArrowReader directly
            as that introduces a circular dependency.
         */
-        let (parquet_file_reader, arrow_metadata) =
-            ArrowReader::open_parquet_and_load_metadata(
-                data_file_path,
-                self.file_io.clone(),
-                false,
-                None,
-                file_size_in_bytes,
-                bytes_read_counter,
-            )
-            .await?;
+        let parquet_read_options = ParquetReadOptions::builder().build();
+
+        let (parquet_file_reader, arrow_metadata) = ArrowReader::open_parquet_file(
+            data_file_path,
+            &self.file_io,
+            file_size_in_bytes,
+            parquet_read_options,
+            self.scan_metrics.bytes_read_counter(),
+            key_metadata,
+        )
+        .await?;
+
         let record_batch_stream =
             ParquetRecordBatchStreamBuilder::new_with_metadata(parquet_file_reader, arrow_metadata)
                 .build()?
@@ -97,9 +101,13 @@ impl BasicDeleteFileLoader {
         record_batch_stream: ArrowRecordBatchStream,
         target_schema: Arc<Schema>,
         equality_ids: &[i32],
+        require_source_columns: bool,
     ) -> Result<ArrowRecordBatchStream> {
-        let mut record_batch_transformer =
-            RecordBatchTransformerBuilder::new(target_schema.clone(), equality_ids).build();
+        let mut builder = RecordBatchTransformerBuilder::new(target_schema.clone(), equality_ids);
+        if require_source_columns {
+            builder = builder.with_required_source_fields(equality_ids.iter().copied());
+        }
+        let mut record_batch_transformer = builder.build();
 
         let record_batch_stream = record_batch_stream.map(move |record_batch| {
             record_batch.and_then(|record_batch| {
@@ -119,7 +127,11 @@ impl DeleteFileLoader for BasicDeleteFileLoader {
         schema: SchemaRef,
     ) -> Result<ArrowRecordBatchStream> {
         let raw_batch_stream = self
-            .parquet_to_batch_stream(&task.file_path, task.file_size_in_bytes, None)
+            .parquet_to_batch_stream(
+                &task.file_path,
+                task.file_size_in_bytes,
+                task.key_metadata.as_deref(),
+            )
             .await?;
 
         // For equality deletes, only evolve the equality_ids columns.
@@ -129,7 +141,13 @@ impl DeleteFileLoader for BasicDeleteFileLoader {
             None => schema.field_id_to_name_map().keys().cloned().collect(),
         };
 
-        Self::evolve_schema(raw_batch_stream, schema, &field_ids).await
+        Self::evolve_schema(
+            raw_batch_stream,
+            schema,
+            &field_ids,
+            task.equality_ids.is_some(),
+        )
+        .await
     }
 }
 
@@ -139,36 +157,195 @@ mod tests {
 
     use super::*;
     use crate::arrow::delete_filter::tests::setup;
-    use crate::spec::DataContentType;
+    use crate::arrow::test_utils::write_encrypted_parquet;
+    use crate::spec::DataFileFormat;
 
     #[tokio::test]
     async fn test_basic_delete_file_loader_read_delete_file() {
         let tmp_dir = TempDir::new().unwrap();
         let table_location = tmp_dir.path();
-        let file_io = FileIO::from_path(table_location.as_os_str().to_str().unwrap())
-            .unwrap()
-            .build()
-            .unwrap();
+        let file_io = FileIO::new_with_fs();
 
-        let delete_file_loader = BasicDeleteFileLoader::new(file_io.clone());
+        let scan_metrics = ScanMetrics::new();
+        let delete_file_loader = BasicDeleteFileLoader::new(file_io.clone(), scan_metrics);
 
         let file_scan_tasks = setup(table_location);
 
-        let delete_task = FileScanTaskDeleteFile {
-            file_path: file_scan_tasks[0].deletes[0].data_file_path.clone(),
-            file_size_in_bytes: file_scan_tasks[0].deletes[0].file_size_in_bytes,
-            file_type: DataContentType::PositionDeletes,
-            partition_spec_id: 0,
-            equality_ids: None,
-        };
-
         let result = delete_file_loader
-            .read_delete_file(&delete_task, file_scan_tasks[0].schema_ref())
+            .read_delete_file(
+                &file_scan_tasks[0].deletes()[0],
+                file_scan_tasks[0].schema_ref(),
+            )
             .await
             .unwrap();
 
         let result = result.try_collect::<Vec<_>>().await.unwrap();
 
         assert_eq!(result.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_read_encrypted_positional_delete_file() {
+        use std::sync::Arc;
+
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+
+        use crate::arrow::delete_filter::tests::create_pos_del_schema;
+        use crate::encryption::StandardKeyMetadata;
+        use crate::scan::FileScanTaskDeleteFile;
+        use crate::spec::{DataContentType, DataFileFormat};
+
+        let encryption_key = b"0123456789abcdef";
+        let aad_prefix = b"aad_prefix";
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap();
+        let file_io = FileIO::new_with_fs();
+
+        let positional_delete_schema = create_pos_del_schema();
+        let file_path_col = Arc::new(StringArray::from_iter_values(vec!["data.parquet"; 4]));
+        let pos_col = Arc::new(Int64Array::from(vec![0i64, 1, 5, 10]));
+        let batch = RecordBatch::try_new(positional_delete_schema.clone(), vec![
+            file_path_col,
+            pos_col,
+        ])
+        .unwrap();
+
+        let del_path = format!("{table_location}/encrypted-pos-del.parquet");
+        write_encrypted_parquet(&del_path, &batch, encryption_key, Some(aad_prefix));
+
+        let key_metadata = StandardKeyMetadata::try_new(encryption_key)
+            .unwrap()
+            .with_aad_prefix(aad_prefix)
+            .encode()
+            .unwrap();
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    crate::spec::NestedField::required(
+                        2147483546,
+                        "file_path",
+                        crate::spec::Type::Primitive(crate::spec::PrimitiveType::String),
+                    )
+                    .into(),
+                    crate::spec::NestedField::required(
+                        2147483545,
+                        "pos",
+                        crate::spec::Type::Primitive(crate::spec::PrimitiveType::Long),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let task = FileScanTaskDeleteFile {
+            file_path: del_path.clone(),
+            file_size_in_bytes: std::fs::metadata(&del_path).unwrap().len(),
+            file_type: DataContentType::PositionDeletes,
+            file_format: DataFileFormat::Parquet,
+            partition_spec_id: 0,
+            equality_ids: None,
+            sequence_number: 0,
+            key_metadata: Some(Box::from(key_metadata.as_ref())),
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            record_count: None,
+        };
+
+        let scan_metrics = ScanMetrics::new();
+        let delete_file_loader = BasicDeleteFileLoader::new(file_io, scan_metrics);
+
+        let result = delete_file_loader
+            .read_delete_file(&task, schema)
+            .await
+            .unwrap();
+
+        let batches: Vec<_> = result.try_collect().await.unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_read_encrypted_equality_delete_file() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use arrow_array::{Int64Array, RecordBatch};
+        use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+
+        use crate::encryption::StandardKeyMetadata;
+        use crate::scan::FileScanTaskDeleteFile;
+        use crate::spec::{DataContentType, DataFileFormat};
+
+        let encryption_key = b"0123456789abcdef";
+        let aad_prefix = b"my-table-uuid!!";
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap();
+        let file_io = FileIO::new_with_fs();
+
+        let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+            ),
+        ]));
+
+        let id_col = Arc::new(Int64Array::from(vec![100i64, 200, 300]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![id_col]).unwrap();
+
+        let del_path = format!("{table_location}/encrypted-eq-del.parquet");
+        write_encrypted_parquet(&del_path, &batch, encryption_key, Some(aad_prefix));
+
+        let key_metadata = StandardKeyMetadata::try_new(encryption_key)
+            .unwrap()
+            .with_aad_prefix(aad_prefix)
+            .encode()
+            .unwrap();
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    crate::spec::NestedField::required(
+                        1,
+                        "id",
+                        crate::spec::Type::Primitive(crate::spec::PrimitiveType::Long),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let task = FileScanTaskDeleteFile {
+            file_path: del_path.clone(),
+            file_size_in_bytes: std::fs::metadata(&del_path).unwrap().len(),
+            file_type: DataContentType::EqualityDeletes,
+            file_format: DataFileFormat::Parquet,
+            partition_spec_id: 0,
+            equality_ids: Some(vec![1]),
+            sequence_number: 0,
+            key_metadata: Some(Box::from(key_metadata.as_ref())),
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            record_count: None,
+        };
+
+        let scan_metrics = ScanMetrics::new();
+        let delete_file_loader = BasicDeleteFileLoader::new(file_io, scan_metrics);
+
+        let result = delete_file_loader
+            .read_delete_file(&task, schema)
+            .await
+            .unwrap();
+
+        let batches: Vec<_> = result.try_collect().await.unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 3);
     }
 }

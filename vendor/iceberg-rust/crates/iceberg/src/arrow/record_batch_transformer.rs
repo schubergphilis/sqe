@@ -15,25 +15,49 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use arrow_arith::boolean::is_not_null;
 use arrow_array::{
-    Array as ArrowArray, ArrayRef, Int32Array, RecordBatch, RecordBatchOptions, RunArray,
+    Array as ArrowArray, ArrayRef, Int32Array, Int64Array, RecordBatch, RecordBatchOptions,
+    RunArray, StructArray,
 };
 use arrow_cast::cast;
 use arrow_schema::{
-    DataType, Field, FieldRef, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef, SchemaRef,
+    DataType, Field, FieldRef, Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+    SchemaRef,
 };
+use arrow_select::zip::zip;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::arrow::value::{create_primitive_array_repeated, create_primitive_array_single_element};
-use crate::arrow::{datum_to_arrow_type_with_ree, schema_to_arrow_schema};
-use crate::metadata_columns::get_metadata_field;
+use crate::arrow::{
+    datum_to_arrow_type_with_ree, primitive_type_to_arrow_type_with_ree, schema_to_arrow_schema,
+    type_to_arrow_type,
+};
+use crate::error::invalid_data;
+use crate::metadata_columns::{
+    RESERVED_COL_NAME_PARTITION, RESERVED_FIELD_ID_PARTITION, get_metadata_field,
+};
 use crate::spec::{
-    Datum, Literal, PartitionSpec, PrimitiveLiteral, Schema as IcebergSchema, Struct, Transform,
+    Datum, Literal, PartitionSpec, PrimitiveLiteral, Schema as IcebergSchema, Struct, StructType,
+    Transform,
 };
 use crate::{Error, ErrorKind, Result};
+
+/// Create an Arrow Field with PARQUET_FIELD_ID_META_KEY metadata attached.
+fn field_with_id(
+    name: impl Into<String>,
+    data_type: DataType,
+    nullable: bool,
+    field_id: i32,
+) -> Field {
+    Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
+        PARQUET_FIELD_ID_META_KEY.to_string(),
+        field_id.to_string(),
+    )]))
+}
 
 /// Build a map of field ID to constant value (as Datum) for identity-partitioned fields.
 ///
@@ -59,11 +83,11 @@ fn constants_map(
     for (pos, field) in partition_spec.fields().iter().enumerate() {
         // Only identity transforms should use constant values from partition metadata
         if matches!(field.transform, Transform::Identity) {
-            // Get the field from schema to extract its type
-            let iceberg_field = schema.field_by_id(field.source_id).ok_or(Error::new(
-                ErrorKind::Unexpected,
-                format!("Field {} not found in schema", field.source_id),
-            ))?;
+            // The source column may have been dropped from the schema after the spec was
+            // created. It cannot be projected in that case, so no constant is needed.
+            let Some(iceberg_field) = schema.field_by_id(field.source_id) else {
+                continue;
+            };
 
             // Ensure the field type is primitive
             let prim_type = match &*iceberg_field.field_type {
@@ -127,18 +151,37 @@ pub(crate) enum ColumnSource {
         source_index: usize,
     },
 
-    // Signifies that a new column has been inserted before the column
-    // with index `index`. (we choose "before" rather than "after" so
-    // that we can use usize; if we insert after, then we need to
-    // be able to store -1 here to signify that a new
-    // column is to be added at the front of the column list).
-    // If multiple columns need to be inserted at a given
-    // location, they should all be given the same index, as the index
-    // here refers to the original RecordBatch, not the interim state after
-    // a preceding operation.
+    // Materializes a column by looking up its per-file constant in the
+    // transformer's `constant_fields` map by `field_id`, producing a column of
+    // `target_type`. Handles the three non-coalesce `ColumnConstant` variants:
+    // scalar values (`_file`, `_spec_id`, identity partitions), the `_partition`
+    // struct, and all-null metadata columns. The coalesce variant routes to
+    // `Coalesce` instead. Resolved at apply time rather than baking the value here.
+    ConstantLookup {
+        field_id: i32,
+        target_type: DataType,
+    },
+
+    // Inserts a schema-evolution default value (the field's `initial_default`,
+    // or null for an absent optional field). Distinct from `ConstantLookup`:
+    // this value comes from the table schema, not the per-file constant map.
     Add {
         target_type: DataType,
         value: Option<PrimitiveLiteral>,
+    },
+
+    // A metadata column read from the file and coalesced with a per-file
+    // fallback looked up in `constant_fields` by `field_id`: the source column's
+    // value where non-null, else the fallback constant. The entry at `field_id`
+    // must be a `ColumnConstant::CoalesceLastUpdatedSeq` (the apply arm rejects
+    // any other variant). Used for `_last_updated_sequence_number` when the file
+    // physically carries the per-row column. The result is cast to `target_type`
+    // so it matches the (run-end-encoded) type the constant and null paths
+    // produce for the column.
+    Coalesce {
+        field_id: i32,
+        source_index: usize,
+        target_type: DataType,
     },
     // The iceberg spec refers to other permissible schema evolution actions
     // (see https://iceberg.apache.org/spec/#schema-evolution):
@@ -186,13 +229,77 @@ enum SchemaComparison {
 
 /// Builder for RecordBatchTransformer to improve ergonomics when constructing with optional parameters.
 ///
-/// Constant fields are pre-computed for both virtual/metadata fields (like _file) and
-/// identity-partitioned fields to avoid duplicate work during batch processing.
+/// All per-file constants (scalar metadata like `_file`, identity partition values,
+/// and the `_partition` struct) are stored in a single `constant_fields` map keyed by
+/// field_id (via [`ColumnConstant`]). Each is resolved at apply time from that single
+/// map (through a `ConstantLookup` or `Coalesce` action) rather than baked into the
+/// action.
 #[derive(Debug)]
 pub(crate) struct RecordBatchTransformerBuilder {
     snapshot_schema: Arc<IcebergSchema>,
     projected_iceberg_field_ids: Vec<i32>,
-    constant_fields: HashMap<i32, Datum>,
+    constant_fields: HashMap<i32, ColumnConstant>,
+    virtual_fields: HashSet<i32>,
+    require_source_fields: HashSet<i32>,
+}
+
+/// How a metadata (or identity-partition) column's values are supplied.
+///
+/// Covers scalar constants (metadata columns like `_file` and `_spec_id`, and
+/// identity partition source fields), the struct `_partition` column, an all-null
+/// column, and a per-row column coalesced with a per-file fallback.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ColumnConstant {
+    /// A scalar constant (e.g., `_file` path, `_spec_id`, identity partition values).
+    /// The Datum carries both the Iceberg type and the value.
+    Scalar(Datum),
+    /// A struct constant (the `_partition` column). Each child is a primitive constant
+    /// or null (for partition evolution gaps).
+    Struct(StructConstant),
+    /// An all-null metadata column, carrying its Arrow type. Used when a metadata
+    /// column resolves to null (e.g. `_last_updated_sequence_number` for a file
+    /// with a null `first_row_id`). A distinct variant (rather than `Scalar` with a
+    /// null value) because `Datum` always represents a non-null value; the type is
+    /// computed once so the schema and column-source paths cannot derive it apart.
+    Null(DataType),
+    /// A metadata column physically present in the file that must be coalesced with
+    /// a per-file fallback: read the per-row value, substitute this Datum where the
+    /// per-row value is null (e.g. `_last_updated_sequence_number` on a file that
+    /// carries the column, falling back to the data sequence number).
+    CoalesceLastUpdatedSeq(Datum),
+}
+
+/// Pre-computed data for a struct constant column.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StructConstant {
+    fields: Fields,
+    child_values: Vec<Option<PrimitiveLiteral>>,
+}
+
+impl StructConstant {
+    /// Create a new StructConstant, validating that fields and child_values have
+    /// the same length.
+    pub(crate) fn new(fields: Fields, child_values: Vec<Option<PrimitiveLiteral>>) -> Result<Self> {
+        if fields.len() != child_values.len() {
+            return Err(invalid_data!(
+                "StructConstant: fields length ({}) != child_values length ({})",
+                fields.len(),
+                child_values.len()
+            ));
+        }
+        Ok(Self {
+            fields,
+            child_values,
+        })
+    }
+
+    pub(crate) fn fields(&self) -> &Fields {
+        &self.fields
+    }
+
+    pub(crate) fn child_values(&self) -> &[Option<PrimitiveLiteral>] {
+        &self.child_values
+    }
 }
 
 impl RecordBatchTransformerBuilder {
@@ -204,18 +311,56 @@ impl RecordBatchTransformerBuilder {
             snapshot_schema,
             projected_iceberg_field_ids: projected_iceberg_field_ids.to_vec(),
             constant_fields: HashMap::new(),
+            virtual_fields: HashSet::new(),
+            require_source_fields: HashSet::new(),
         }
     }
 
-    /// Add a constant value for a specific field ID.
+    /// Add a scalar constant value for a specific field ID.
     /// This is used for virtual/metadata fields like _file that have constant values per batch.
-    ///
-    /// # Arguments
-    /// * `field_id` - The field ID to associate with the constant
-    /// * `datum` - The constant value (with type) for this field
     pub(crate) fn with_constant(mut self, field_id: i32, datum: Datum) -> Self {
-        self.constant_fields.insert(field_id, datum);
+        self.constant_fields
+            .insert(field_id, ColumnConstant::Scalar(datum));
         self
+    }
+
+    /// Add a coalesced `_last_updated_sequence_number` column for a specific field ID:
+    /// the file's per-row value where non-null, falling back to `datum` where null.
+    /// Used when the file physically carries the column.
+    pub(crate) fn with_coalesced_last_updated_seq_column(
+        mut self,
+        field_id: i32,
+        datum: Datum,
+    ) -> Self {
+        self.constant_fields
+            .insert(field_id, ColumnConstant::CoalesceLastUpdatedSeq(datum));
+        self
+    }
+
+    /// Add an all-null metadata column for a specific field ID.
+    /// Used for metadata columns that resolve to null (e.g.
+    /// `_last_updated_sequence_number` when the file has a null `first_row_id`).
+    pub(crate) fn with_null_metadata_column(mut self, field_id: i32) -> Result<Self> {
+        let iceberg_field = get_metadata_field(field_id)?;
+        let prim_type = iceberg_field
+            .field_type
+            .as_primitive_type()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!(
+                        "Metadata column {} has non-primitive type {:?}",
+                        iceberg_field.name, iceberg_field.field_type
+                    ),
+                )
+            })?;
+        // Use the same run-end-encoded type as the non-null constant path, so a
+        // column keeps one Arrow type whether a given file resolves it to a value
+        // or to null.
+        let arrow_type = primitive_type_to_arrow_type_with_ree(prim_type);
+        self.constant_fields
+            .insert(field_id, ColumnConstant::Null(arrow_type));
+        Ok(self)
     }
 
     /// Set partition spec and data together for identifying identity-transformed partition columns.
@@ -228,16 +373,41 @@ impl RecordBatchTransformerBuilder {
         partition_spec: Arc<PartitionSpec>,
         partition_data: Struct,
     ) -> Result<Self> {
-        // Compute partition constants for identity-transformed fields (already returns Datum)
         let partition_constants =
             constants_map(&partition_spec, &partition_data, &self.snapshot_schema)?;
 
-        // Add partition constants to constant_fields
         for (field_id, datum) in partition_constants {
-            self.constant_fields.insert(field_id, datum);
+            self.constant_fields
+                .insert(field_id, ColumnConstant::Scalar(datum));
         }
 
         Ok(self)
+    }
+
+    /// Set virtual fields such as '_pos'. Caller must have registered a corresponding
+    /// ArrowReaderOptions::with_virtual_columns call on the reader
+    pub(crate) fn with_virtual_field(mut self, field_id: i32) -> Self {
+        self.virtual_fields.insert(field_id);
+        self
+    }
+
+    /// Set a pre-computed _partition column constant directly.
+    pub(crate) fn with_partition_constant(mut self, partition_column: StructConstant) -> Self {
+        self.constant_fields.insert(
+            RESERVED_FIELD_ID_PARTITION,
+            ColumnConstant::Struct(partition_column),
+        );
+        self
+    }
+
+    /// Require these projected fields to be present in the source file instead of
+    /// falling back to initial-default/null materialization (equality delete columns).
+    pub(crate) fn with_required_source_fields(
+        mut self,
+        field_ids: impl IntoIterator<Item = i32>,
+    ) -> Self {
+        self.require_source_fields.extend(field_ids);
+        self
     }
 
     pub(crate) fn build(self) -> RecordBatchTransformer {
@@ -245,6 +415,8 @@ impl RecordBatchTransformerBuilder {
             snapshot_schema: self.snapshot_schema,
             projected_iceberg_field_ids: self.projected_iceberg_field_ids,
             constant_fields: self.constant_fields,
+            virtual_fields: self.virtual_fields,
+            require_source_fields: self.require_source_fields,
             batch_transform: None,
         }
     }
@@ -284,10 +456,16 @@ impl RecordBatchTransformerBuilder {
 pub(crate) struct RecordBatchTransformer {
     snapshot_schema: Arc<IcebergSchema>,
     projected_iceberg_field_ids: Vec<i32>,
-    // Pre-computed constant field information: field_id -> Datum
-    // Includes both virtual/metadata fields (like _file) and identity-partitioned fields
-    // Datum holds both the Iceberg type and the value
-    constant_fields: HashMap<i32, Datum>,
+    // Unified map of all per-file constant columns (metadata, identity partition, _partition struct).
+    constant_fields: HashMap<i32, ColumnConstant>,
+
+    // Field IDs whose data is delivered by the source batch as an arrow-rs virtual column
+    // (e.g. _pos via RowNumber). These fields bypass the snapshot-schema lookup and the
+    // Iceberg projection rules (name mapping / initial-default / null)
+    virtual_fields: HashSet<i32>,
+
+    // Field IDs that must resolve from the source file; see `with_required_source_fields`.
+    require_source_fields: HashSet<i32>,
 
     // BatchTransform gets lazily constructed based on the schema of
     // the first RecordBatch we receive from the file
@@ -330,6 +508,8 @@ impl RecordBatchTransformer {
                     self.snapshot_schema.as_ref(),
                     &self.projected_iceberg_field_ids,
                     &self.constant_fields,
+                    &self.virtual_fields,
+                    &self.require_source_fields,
                 )?);
 
                 self.process_record_batch(record_batch)?
@@ -348,7 +528,9 @@ impl RecordBatchTransformer {
         source_schema: &ArrowSchemaRef,
         snapshot_schema: &IcebergSchema,
         projected_iceberg_field_ids: &[i32],
-        constant_fields: &HashMap<i32, Datum>,
+        constant_fields: &HashMap<i32, ColumnConstant>,
+        virtual_fields: &HashSet<i32>,
+        require_source_fields: &HashSet<i32>,
     ) -> Result<BatchTransform> {
         let mapped_unprojected_arrow_schema = Arc::new(schema_to_arrow_schema(snapshot_schema)?);
         let field_id_to_mapped_schema_map =
@@ -359,49 +541,91 @@ impl RecordBatchTransformer {
         let fields: Result<Vec<_>> = projected_iceberg_field_ids
             .iter()
             .map(|field_id| {
-                // Check if this is a constant field
-                if constant_fields.contains_key(field_id) {
-                    // For metadata/virtual fields (like _file), get name from metadata_columns
-                    // For partition fields, get name from schema (they exist in schema)
-                    if let Ok(iceberg_field) = get_metadata_field(*field_id) {
-                        // This is a metadata/virtual field - convert Iceberg field to Arrow
-                        let datum = constant_fields.get(field_id).ok_or(Error::new(
-                            ErrorKind::Unexpected,
-                            "constant field not found",
-                        ))?;
-                        let arrow_type = datum_to_arrow_type_with_ree(datum);
-                        let arrow_field =
-                            Field::new(&iceberg_field.name, arrow_type, !iceberg_field.required)
-                                .with_metadata(HashMap::from([(
-                                    PARQUET_FIELD_ID_META_KEY.to_string(),
-                                    iceberg_field.id.to_string(),
-                                )]));
-                        Ok(Arc::new(arrow_field))
-                    } else {
-                        // This is a partition constant field (exists in schema but uses constant value)
-                        let field = &field_id_to_mapped_schema_map
-                            .get(field_id)
-                            .ok_or(Error::new(ErrorKind::Unexpected, "field not found"))?
-                            .0;
-                        let datum = constant_fields.get(field_id).ok_or(Error::new(
-                            ErrorKind::Unexpected,
-                            "constant field not found",
-                        ))?;
-                        let arrow_type = datum_to_arrow_type_with_ree(datum);
-                        // Use the type from constant_fields (REE for constants)
-                        let constant_field =
-                            Field::new(field.name(), arrow_type, field.is_nullable())
-                                .with_metadata(field.metadata().clone());
-                        Ok(Arc::new(constant_field))
+                match constant_fields.get(field_id) {
+                    Some(ColumnConstant::Struct(pc))
+                        if *field_id == RESERVED_FIELD_ID_PARTITION =>
+                    {
+                        let struct_type = DataType::Struct(pc.fields().clone());
+                        let nullable = pc.fields().is_empty();
+                        let arrow_field = field_with_id(
+                            RESERVED_COL_NAME_PARTITION,
+                            struct_type,
+                            nullable,
+                            *field_id,
+                        );
+                        return Ok(Arc::new(arrow_field));
                     }
-                } else {
-                    // Regular field - use schema as-is
-                    Ok(field_id_to_mapped_schema_map
-                        .get(field_id)
-                        .ok_or(Error::new(ErrorKind::Unexpected, "field not found"))?
-                        .0
-                        .clone())
+                    Some(ColumnConstant::Struct(_)) => {
+                        return Err(Error::new(
+                            ErrorKind::Unexpected,
+                            format!(
+                                "Struct column constants are only supported for the `_partition` \
+                                 metadata column (field id {RESERVED_FIELD_ID_PARTITION}), but \
+                                 one was set for field id {field_id}"
+                            ),
+                        ));
+                    }
+                    Some(ColumnConstant::Scalar(datum)) => {
+                        if let Ok(iceberg_field) = get_metadata_field(*field_id) {
+                            let arrow_type = datum_to_arrow_type_with_ree(datum);
+                            let arrow_field = field_with_id(
+                                &iceberg_field.name,
+                                arrow_type,
+                                !iceberg_field.required,
+                                iceberg_field.id,
+                            );
+                            return Ok(Arc::new(arrow_field));
+                        }
+                        // Identity partition constant -- fall through to use the
+                        // mapped schema field (read from file if present).
+                    }
+                    Some(ColumnConstant::Null(arrow_type)) => {
+                        let iceberg_field = get_metadata_field(*field_id)?;
+                        // Always nullable: this arm produces an all-null column regardless
+                        // of the field's declared optionality.
+                        let arrow_field = field_with_id(
+                            &iceberg_field.name,
+                            arrow_type.clone(),
+                            true,
+                            iceberg_field.id,
+                        );
+                        return Ok(Arc::new(arrow_field));
+                    }
+                    Some(ColumnConstant::CoalesceLastUpdatedSeq(datum)) => {
+                        // Same run-end-encoded type as the constant/null paths, so the
+                        // column has one Arrow type whether a file coalesces, uses the
+                        // constant, or is nulled.
+                        let iceberg_field = get_metadata_field(*field_id)?;
+                        let arrow_field = field_with_id(
+                            &iceberg_field.name,
+                            datum_to_arrow_type_with_ree(datum),
+                            true,
+                            iceberg_field.id,
+                        );
+                        return Ok(Arc::new(arrow_field));
+                    }
+                    None => {}
                 }
+
+                if virtual_fields.contains(field_id) {
+                    let virtual_field = get_metadata_field(*field_id)?;
+                    let arrow_type = type_to_arrow_type(&virtual_field.field_type)?;
+                    let arrow_field = field_with_id(
+                        &virtual_field.name,
+                        arrow_type,
+                        !virtual_field.required,
+                        virtual_field.id,
+                    );
+                    return Ok(Arc::new(arrow_field));
+                }
+
+                // Regular fields and identity-partitioned constant fields both exist in the
+                // table schema, so use the mapped Arrow field as-is.
+                Ok(field_id_to_mapped_schema_map
+                    .get(field_id)
+                    .ok_or(Error::new(ErrorKind::Unexpected, "field not found"))?
+                    .0
+                    .clone())
             })
             .collect();
 
@@ -417,24 +641,28 @@ impl RecordBatchTransformer {
                     projected_iceberg_field_ids,
                     field_id_to_mapped_schema_map,
                     constant_fields,
+                    virtual_fields,
+                    require_source_fields,
                 )?,
                 target_schema,
             }),
         }
     }
 
-    /// Compares the source and target schemas
-    /// Determines if they have changed in any meaningful way:
-    ///  * If they have different numbers of fields, then we need to modify
-    ///    the incoming RecordBatch schema AND columns
-    ///  * If they have the same number of fields, but some of them differ in
-    ///    either data type or nullability, then we need to modify the
-    ///    incoming RecordBatch schema AND columns
-    ///  * If the schemas differ only in the column names, then we need
-    ///    to modify the RecordBatch schema BUT we can keep the
-    ///    original column data unmodified
-    ///  * If the schemas are identical (or differ only in inconsequential
-    ///    ways) then we can pass through the original RecordBatch unmodified
+    /// Compares the source and target schemas to decide how much work the
+    /// transform must do. The checks are applied in this order:
+    ///  1. If the schemas have different numbers of fields, they are
+    ///     `Different`: we must rebuild both the schema AND the columns.
+    ///  2. If every field matches positionally in name, data type, and
+    ///     nullability, they are `Equivalent`: the original RecordBatch can be
+    ///     passed through unmodified.
+    ///  3. If they contain the same set of fields but in a different order
+    ///     (detected via set-equality, since field names are unique), they are
+    ///     `Different`: the columns must be rebuilt in the target order.
+    ///  4. Otherwise, the fields align positionally: if any differs in data
+    ///     type or nullability the schemas are `Different` (rebuild schema AND
+    ///     columns); if they differ only in names, it is `NameChangesOnly` and
+    ///     we can relabel the schema BUT keep the original column data.
     fn compare_schemas(
         source_schema: &ArrowSchemaRef,
         target_schema: &ArrowSchemaRef,
@@ -443,32 +671,37 @@ impl RecordBatchTransformer {
             return SchemaComparison::Different;
         }
 
-        let mut names_changed = false;
+        let field_eq = |a: &FieldRef, b: &FieldRef| {
+            a.name() == b.name()
+                && a.data_type() == b.data_type()
+                && a.is_nullable() == b.is_nullable()
+        };
 
-        for (source_field, target_field) in source_schema
-            .fields()
-            .iter()
-            .zip(target_schema.fields().iter())
-        {
-            // DataType equality (==) is recursive and includes nested field names
-            // and metadata, so e.g. List(Field("item", Int32)) != List(Field("element", Int32)).
-            // This correctly routes nested-field-name mismatches to SchemaComparison::Different,
-            // which triggers generate_transform_operations where they are handled via cast.
-            if source_field.data_type() != target_field.data_type()
-                || source_field.is_nullable() != target_field.is_nullable()
-            {
-                return SchemaComparison::Different;
-            }
+        let positional = || source_schema.fields().iter().zip(target_schema.fields());
 
-            if source_field.name() != target_field.name() {
-                names_changed = true;
-            }
+        // Field-by-field identical: nothing to do.
+        if positional().all(|(s, t)| field_eq(s, t)) {
+            return SchemaComparison::Equivalent;
         }
 
-        if names_changed {
-            SchemaComparison::NameChangesOnly
+        // Same set of fields but reordered: rebuild in target (selection) order.
+        // Lengths are equal and field names are unique, so this is set-equality.
+        let reordered = target_schema
+            .fields()
+            .iter()
+            .all(|t| source_schema.fields().iter().any(|s| field_eq(s, t)));
+        if reordered {
+            return SchemaComparison::Different;
+        }
+
+        // Not a reordering: any type/nullability difference needs a full
+        // rebuild; otherwise only names differ and we can just relabel.
+        if positional()
+            .any(|(s, t)| s.data_type() != t.data_type() || s.is_nullable() != t.is_nullable())
+        {
+            SchemaComparison::Different
         } else {
-            SchemaComparison::Equivalent
+            SchemaComparison::NameChangesOnly
         }
     }
 
@@ -477,7 +710,9 @@ impl RecordBatchTransformer {
         snapshot_schema: &IcebergSchema,
         projected_iceberg_field_ids: &[i32],
         field_id_to_mapped_schema_map: HashMap<i32, (FieldRef, usize)>,
-        constant_fields: &HashMap<i32, Datum>,
+        constant_fields: &HashMap<i32, ColumnConstant>,
+        virtual_fields: &HashSet<i32>,
+        require_source_fields: &HashSet<i32>,
     ) -> Result<Vec<ColumnSource>> {
         let field_id_to_source_schema_map =
             Self::build_field_id_to_arrow_schema_map(source_schema)?;
@@ -485,16 +720,101 @@ impl RecordBatchTransformer {
         projected_iceberg_field_ids
             .iter()
             .map(|field_id| {
-                // Check if this is a constant field (metadata/virtual or identity-partitioned)
-                // Constant fields always use their pre-computed constant values, regardless of whether
-                // they exist in the Parquet file. This is per Iceberg spec rule #1: partition metadata
-                // is authoritative and should be preferred over file data.
-                if let Some(datum) = constant_fields.get(field_id) {
-                    let arrow_type = datum_to_arrow_type_with_ree(datum);
-                    return Ok(ColumnSource::Add {
-                        value: Some(datum.literal().clone()),
-                        target_type: arrow_type,
-                    });
+                match constant_fields.get(field_id) {
+                    Some(ColumnConstant::Struct(pc))
+                        if *field_id == RESERVED_FIELD_ID_PARTITION =>
+                    {
+                        // The struct apply arm rebuilds the column from the map entry's own
+                        // fields/child_values, so `target_type` is a placeholder here and is
+                        // not read for the struct case (only the scalar/null cases consult it).
+                        return Ok(ColumnSource::ConstantLookup {
+                            field_id: *field_id,
+                            target_type: DataType::Struct(pc.fields().clone()),
+                        });
+                    }
+                    Some(ColumnConstant::Struct(_)) => {
+                        return Err(Error::new(
+                            ErrorKind::Unexpected,
+                            format!(
+                                "Struct column constants are only supported for the `_partition` \
+                                 metadata column (field id {RESERVED_FIELD_ID_PARTITION}), but \
+                                 one was set for field id {field_id}"
+                            ),
+                        ));
+                    }
+                    Some(ColumnConstant::Scalar(datum)) => {
+                        // Metadata/virtual fields (like _file, _spec_id) never exist in the
+                        // data file, so they always use their pre-computed constant value.
+                        //
+                        // For identity-partitioned fields, the Iceberg spec's "Column
+                        // Projection" rules only apply to "field ids which are not present in
+                        // a data file". When the column IS present in the Parquet file, it
+                        // must be read from the file; the partition metadata constant is only
+                        // a fallback for when the column is absent (e.g. add_files).
+                        let is_metadata = get_metadata_field(*field_id).is_ok();
+                        let present_in_file =
+                            field_id_to_source_schema_map.contains_key(field_id);
+
+                        if is_metadata || !present_in_file {
+                            let arrow_type = if is_metadata {
+                                datum_to_arrow_type_with_ree(datum)
+                            } else {
+                                field_id_to_mapped_schema_map
+                                    .get(field_id)
+                                    .ok_or(Error::new(
+                                        ErrorKind::Unexpected,
+                                        "could not find field in schema",
+                                    ))?
+                                    .0
+                                    .data_type()
+                                    .clone()
+                            };
+
+                            return Ok(ColumnSource::ConstantLookup {
+                                field_id: *field_id,
+                                target_type: arrow_type,
+                            });
+                        }
+                        // Identity partition field present in the file -- fall through
+                        // to read from the file instead of using the constant.
+                    }
+                    Some(ColumnConstant::Null(arrow_type)) => {
+                        return Ok(ColumnSource::ConstantLookup {
+                            field_id: *field_id,
+                            target_type: arrow_type.clone(),
+                        });
+                    }
+                    Some(ColumnConstant::CoalesceLastUpdatedSeq(datum)) => {
+                        // Registered only for `_last_updated_sequence_number`, and only after
+                        // the pipeline detects the embedded field id, so the source column is
+                        // always present in the file.
+                        let (_, source_index) =
+                            field_id_to_source_schema_map.get(field_id).ok_or_else(|| {
+                                Error::new(
+                                    ErrorKind::Unexpected,
+                                    format!(
+                                        "coalesce registered for field id {field_id} but the \
+                                         column is absent from the file batch"
+                                    ),
+                                )
+                            })?;
+                        return Ok(ColumnSource::Coalesce {
+                            field_id: *field_id,
+                            source_index: *source_index,
+                            target_type: datum_to_arrow_type_with_ree(datum),
+                        });
+                    }
+                    None => {}
+                }
+
+                if virtual_fields.contains(field_id) {
+                    let (_, source_index) = field_id_to_source_schema_map
+                        .get(field_id)
+                        .ok_or_else(|| Error::new(
+                            ErrorKind::Unexpected,
+                            format!("virtual column for field id {field_id} is not present in source batch — ensure ArrowReaderOptions::with_virtual_columns was applied"),
+                        ))?;
+                    return Ok(ColumnSource::PassThrough { source_index: *source_index });
                 }
 
                 let (target_field, _) =
@@ -502,7 +822,7 @@ impl RecordBatchTransformer {
                         .get(field_id)
                         .ok_or(Error::new(
                             ErrorKind::Unexpected,
-                            "could not find field in schema",
+                            format!("could not find field {field_id} in schema"),
                         ))?;
                 let target_type = target_field.data_type();
 
@@ -532,16 +852,13 @@ impl RecordBatchTransformer {
                 let field_by_id = field_id_to_source_schema_map.get(field_id).map(
                     |(source_field, source_index)| {
                         if source_field.data_type() == target_type {
-                            // Exact match: data type including nested field names are identical,
-                            // so the column can be used as-is.
                             ColumnSource::PassThrough {
                                 source_index: *source_index,
                             }
                         } else {
-                            // Covers both field-name normalization (e.g., Parquet's List inner
-                            // field "item" → Iceberg's "element", or Map's "entries" →
-                            // "key_value") and actual type promotion (e.g., Int32 → Int64).
-                            // Arrow's cast() handles both correctly.
+                            // Besides physical type promotion, casting normalizes nested
+                            // Parquet names such as list `item` and map `entries` to
+                            // Iceberg's `element` and `key_value`.
                             ColumnSource::Promote {
                                 target_type: target_type.clone(),
                                 source_index: *source_index,
@@ -555,6 +872,18 @@ impl RecordBatchTransformer {
                 let column_source = if let Some(source) = field_by_id {
                     source
                 } else {
+                    // A default/null column here would silently change what the file
+                    // means (e.g. an equality delete key).
+                    if require_source_fields.contains(field_id) {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "Missing required source column for field {} (id {field_id})",
+                                iceberg_field.name
+                            ),
+                        ));
+                    }
+
                     // Rules #2, #3 and #4:
                     // Rule #2 (name mapping) was already applied in reader.rs if needed.
                     // If field_id is still not found, the column doesn't exist in the Parquet file.
@@ -567,10 +896,7 @@ impl RecordBatchTransformer {
                     // Iceberg-Java's Parquet readers (BaseParquetReaders / SparkParquetReaders),
                     // which raise "Missing required field: <name>".
                     if iceberg_field.initial_default.is_none() && iceberg_field.required {
-                        return Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            format!("Missing required field: {}", iceberg_field.name),
-                        ));
+                        return Err(invalid_data!("Missing required field: {}", iceberg_field.name));
                     }
 
                     let default_value = iceberg_field.initial_default.as_ref().and_then(|lit| {
@@ -599,12 +925,9 @@ impl RecordBatchTransformer {
         for (source_field_idx, source_field) in source_schema.fields.iter().enumerate() {
             // Check if field has a field ID in metadata
             if let Some(field_id_str) = source_field.metadata().get(PARQUET_FIELD_ID_META_KEY) {
-                let this_field_id = field_id_str.parse().map_err(|e| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("field id not parseable as an i32: {e}"),
-                    )
-                })?;
+                let this_field_id = field_id_str
+                    .parse()
+                    .map_err(|e| invalid_data!("field id not parseable as an i32: {e}"))?;
 
                 field_id_to_source_schema
                     .insert(this_field_id, (source_field.clone(), source_field_idx));
@@ -637,16 +960,94 @@ impl RecordBatchTransformer {
                     } => cast(&*columns[*source_index], target_type)?,
 
                     ColumnSource::Add { target_type, value } => {
-                        Self::create_column(target_type, value, num_rows)?
+                        Self::create_column(target_type, value.as_ref(), num_rows)?
+                    }
+
+                    // Resolve the per-file constant for this field id from the map and
+                    // materialize it as the target type.
+                    ColumnSource::ConstantLookup {
+                        field_id,
+                        target_type,
+                    } => match self.constant_fields.get(field_id) {
+                        Some(ColumnConstant::Scalar(datum)) => {
+                            Self::create_column(target_type, Some(datum.literal()), num_rows)?
+                        }
+                        Some(ColumnConstant::Null(_)) => {
+                            Self::create_column(target_type, None, num_rows)?
+                        }
+                        Some(ColumnConstant::Struct(sc)) => {
+                            Self::create_struct_column(sc.fields(), sc.child_values(), num_rows)?
+                        }
+                        other => {
+                            return Err(Error::new(
+                                ErrorKind::Unexpected,
+                                format!(
+                                    "ConstantLookup for field id {field_id} expected a scalar, \
+                                     null, or struct constant, found {other:?}"
+                                ),
+                            ));
+                        }
+                    },
+
+                    ColumnSource::Coalesce {
+                        field_id,
+                        source_index,
+                        target_type,
+                    } => {
+                        let Some(ColumnConstant::CoalesceLastUpdatedSeq(datum)) =
+                            self.constant_fields.get(field_id)
+                        else {
+                            return Err(Error::new(
+                                ErrorKind::Unexpected,
+                                format!(
+                                    "Coalesce for field id {field_id} expected a coalesce \
+                                     fallback constant in the constant map"
+                                ),
+                            ));
+                        };
+                        Self::create_coalesce_column(
+                            &columns[*source_index],
+                            datum.literal(),
+                            target_type,
+                        )?
                     }
                 })
             })
             .collect()
     }
 
+    /// Builds a coalesced column: the source column's per-row value where non-null,
+    /// else the scalar `fallback`, cast to `target_type` (the run-end-encoded type
+    /// the column's other paths produce).
+    fn create_coalesce_column(
+        source: &ArrayRef,
+        fallback: &PrimitiveLiteral,
+        target_type: &DataType,
+    ) -> Result<ArrayRef> {
+        if source.data_type() != &DataType::Int64 {
+            return Err(invalid_data!(
+                "coalesce source must be Int64, got {}",
+                source.data_type()
+            ));
+        }
+        let PrimitiveLiteral::Long(seq) = fallback else {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                format!("coalesce fallback must be a long, got {fallback:?}"),
+            ));
+        };
+        let scalar = Int64Array::new_scalar(*seq);
+        let mask = is_not_null(source)?;
+        let coalesced = zip(&mask, source, &scalar)?;
+        // Cast to the run-end-encoded target type for column-type uniformity across the
+        // constant/null/coalesce paths (not for compression -- a per-row-varying column
+        // gains nothing from REE).
+        Ok(cast(&coalesced, target_type)?)
+    }
+
     fn create_column(
         target_type: &DataType,
-        prim_lit: &Option<PrimitiveLiteral>,
+        prim_lit: Option<&PrimitiveLiteral>,
         num_rows: usize,
     ) -> Result<ArrayRef> {
         // Check if this is a RunEndEncoded type (for constant fields)
@@ -680,6 +1081,89 @@ impl RecordBatchTransformer {
             create_primitive_array_repeated(target_type, prim_lit, num_rows)
         }
     }
+
+    fn create_struct_column(
+        fields: &Fields,
+        child_values: &[Option<PrimitiveLiteral>],
+        num_rows: usize,
+    ) -> Result<ArrayRef> {
+        if fields.is_empty() {
+            let nulls = arrow_buffer::NullBuffer::new_null(num_rows);
+            return Ok(Arc::new(StructArray::new_empty_fields(
+                num_rows,
+                Some(nulls),
+            )));
+        }
+
+        let child_arrays: Vec<ArrayRef> = fields
+            .iter()
+            .zip(child_values.iter())
+            .map(|(field, value)| {
+                create_primitive_array_repeated(field.data_type(), value.as_ref(), num_rows)
+            })
+            .collect::<Result<_>>()?;
+
+        Ok(Arc::new(StructArray::try_new(
+            fields.clone(),
+            child_arrays,
+            None,
+        )?))
+    }
+}
+
+/// Builds a [`StructConstant`] from the unified partition type and a file's
+/// partition spec/data.
+///
+/// If `unified_partition_type` has no fields (unpartitioned table), returns an empty constant
+/// that renders as a null struct column.
+///
+/// For each field in the unified partition type:
+/// - If it corresponds to a field in this file's partition spec, use the value from partition_data
+/// - Otherwise (partition evolution), use null
+pub(crate) fn build_partition_constant(
+    unified_partition_type: &StructType,
+    partition_spec: &PartitionSpec,
+    partition_data: &Struct,
+) -> Result<StructConstant> {
+    // Unpartitioned table: empty struct rendered as null
+    if unified_partition_type.fields().is_empty() {
+        return StructConstant::new(Fields::empty(), vec![]);
+    }
+
+    use crate::arrow::type_to_arrow_type;
+
+    let spec_fields = partition_spec.fields();
+
+    let mut arrow_fields = Vec::with_capacity(unified_partition_type.fields().len());
+    let mut child_values = Vec::with_capacity(unified_partition_type.fields().len());
+
+    for unified_field in unified_partition_type.fields() {
+        let arrow_type = type_to_arrow_type(&unified_field.field_type)?;
+        // Don't attach PARQUET_FIELD_ID_META_KEY metadata to child fields --
+        // Spark's output schema for _partition doesn't include it, and Arrow's
+        // Field::eq checks metadata, causing the schema adapter to insert an
+        // unnecessary cast operation per batch.
+        // Always nullable: partition evolution means any field may be absent
+        // for files written under a different spec.
+        let arrow_field = Field::new(&unified_field.name, arrow_type, true);
+        arrow_fields.push(Arc::new(arrow_field));
+
+        // Find matching field in this file's partition spec by field_id
+        let value = spec_fields
+            .iter()
+            .position(|f| f.field_id == unified_field.id)
+            .and_then(|pos| {
+                // Get the value from partition_data at this position
+                match &partition_data[pos] {
+                    Some(Literal::Primitive(prim)) => Some(prim.clone()),
+                    _ => None,
+                }
+            });
+
+        child_values.push(value);
+    }
+
+    StructConstant::new(Fields::from(arrow_fields), child_values)
 }
 
 #[cfg(test)]
@@ -689,15 +1173,27 @@ mod test {
 
     use arrow_array::{
         Array, Date32Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int32Array,
-        Int64Array, LargeBinaryArray, RecordBatch, StringArray, Time64MicrosecondArray,
+        Int64Array, LargeBinaryArray, ListArray, MapArray, RecordBatch, StringArray, StructArray,
+        Time64MicrosecondArray,
     };
+    use arrow_cast::cast;
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
+    use super::{PARQUET_FIELD_ID_META_KEY, field_with_id};
+    use crate::arrow::build_partition_constant;
     use crate::arrow::record_batch_transformer::{
         RecordBatchTransformer, RecordBatchTransformerBuilder,
     };
-    use crate::spec::{Literal, NestedField, PrimitiveType, Schema, Struct, Type};
+    use crate::spec::{
+        ListType, Literal, MapType, NestedField, PrimitiveType, Schema, Struct, StructType, Type,
+    };
+
+    fn simple_field(name: &str, data_type: DataType, nullable: bool, field_id: &str) -> Field {
+        Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            field_id.to_string(),
+        )]))
+    }
 
     /// Helper to extract string values from either StringArray or RunEndEncoded<StringArray>
     /// Returns empty string for null values
@@ -823,8 +1319,8 @@ mod test {
                 .build();
 
         let file_schema = Arc::new(ArrowSchema::new(vec![
-            simple_field("id", DataType::Int32, false, "1"),
-            simple_field("name", DataType::Utf8, true, "2"),
+            field_with_id("id", DataType::Int32, false, 1),
+            field_with_id("name", DataType::Utf8, true, 2),
         ]));
 
         let file_batch = RecordBatch::try_new(file_schema, vec![
@@ -891,11 +1387,11 @@ mod test {
             RecordBatchTransformerBuilder::new(snapshot_schema, &projected_iceberg_field_ids)
                 .build();
 
-        let file_schema = Arc::new(ArrowSchema::new(vec![simple_field(
+        let file_schema = Arc::new(ArrowSchema::new(vec![field_with_id(
             "id",
             DataType::Int32,
             false,
-            "1",
+            1,
         )]));
         let file_batch =
             RecordBatch::try_new(file_schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])
@@ -924,7 +1420,7 @@ mod test {
                     NestedField::optional(
                         3,
                         "struct_col",
-                        Type::Struct(crate::spec::StructType::new(vec![
+                        Type::Struct(StructType::new(vec![
                             NestedField::optional(
                                 100,
                                 "inner_field",
@@ -945,8 +1441,8 @@ mod test {
                 .build();
 
         let file_schema = Arc::new(ArrowSchema::new(vec![
-            simple_field("id", DataType::Int32, false, "1"),
-            simple_field("data", DataType::Utf8, false, "2"),
+            field_with_id("id", DataType::Int32, false, 1),
+            field_with_id("data", DataType::Utf8, false, 2),
         ]));
 
         let file_batch = RecordBatch::try_new(file_schema, vec![
@@ -979,11 +1475,237 @@ mod test {
         let struct_column = result
             .column(2)
             .as_any()
-            .downcast_ref::<arrow_array::StructArray>()
+            .downcast_ref::<StructArray>()
             .unwrap();
         assert!(struct_column.is_null(0));
         assert!(struct_column.is_null(1));
         assert!(struct_column.is_null(2));
+    }
+
+    #[test]
+    fn schema_evolution_materializes_all_missing_types_with_nulls() {
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "binary", Type::Primitive(PrimitiveType::Binary))
+                        .into(),
+                    NestedField::optional(3, "time", Type::Primitive(PrimitiveType::Time)).into(),
+                    NestedField::optional(4, "uuid", Type::Primitive(PrimitiveType::Uuid)).into(),
+                    NestedField::optional(5, "fixed", Type::Primitive(PrimitiveType::Fixed(4)))
+                        .into(),
+                    NestedField::optional(
+                        6,
+                        "nested",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::optional(
+                                7,
+                                "nested_binary",
+                                Type::Primitive(PrimitiveType::Binary),
+                            )
+                            .into(),
+                        ])),
+                    )
+                    .into(),
+                    NestedField::optional(
+                        8,
+                        "list",
+                        Type::List(ListType::new(
+                            NestedField::list_element(
+                                9,
+                                Type::Primitive(PrimitiveType::Fixed(2)),
+                                false,
+                            )
+                            .into(),
+                        )),
+                    )
+                    .into(),
+                    NestedField::optional(
+                        10,
+                        "map",
+                        Type::Map(MapType::new(
+                            NestedField::map_key_element(
+                                11,
+                                Type::Primitive(PrimitiveType::String),
+                            )
+                            .into(),
+                            NestedField::map_value_element(
+                                12,
+                                Type::Primitive(PrimitiveType::Uuid),
+                                false,
+                            )
+                            .into(),
+                        )),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let projected_field_ids = [1, 2, 3, 4, 5, 6, 8, 10];
+        let mut transformer =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids).build();
+        let file_schema = Arc::new(ArrowSchema::new(vec![simple_field(
+            "id",
+            DataType::Int32,
+            false,
+            "1",
+        )]));
+        let file_batch =
+            RecordBatch::try_new(file_schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])
+                .unwrap();
+
+        let result = transformer.process_record_batch(file_batch).unwrap();
+        assert_eq!(result.num_columns(), projected_field_ids.len());
+        assert_eq!(result.num_rows(), 3);
+        assert!(result.column(1).as_any().is::<LargeBinaryArray>());
+        assert!(result.column(2).as_any().is::<Time64MicrosecondArray>());
+        assert!(result.column(3).as_any().is::<FixedSizeBinaryArray>());
+        assert!(result.column(4).as_any().is::<FixedSizeBinaryArray>());
+        assert_eq!(result.column(3).data_type(), &DataType::FixedSizeBinary(16));
+        assert_eq!(result.column(4).data_type(), &DataType::FixedSizeBinary(4));
+        assert!(result.column(5).as_any().is::<StructArray>());
+        assert!(result.column(6).as_any().is::<ListArray>());
+        assert!(result.column(7).as_any().is::<MapArray>());
+        for column in result.columns().iter().skip(1) {
+            assert!((0..result.num_rows()).all(|row| column.is_null(row)));
+        }
+    }
+
+    #[test]
+    fn nested_list_field_name_is_normalized() {
+        use arrow_buffer::OffsetBuffer;
+
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(
+                        2,
+                        "items",
+                        Type::List(ListType::new(
+                            NestedField::list_element(
+                                3,
+                                Type::Primitive(PrimitiveType::Int),
+                                false,
+                            )
+                            .into(),
+                        )),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let item_field = Arc::new(Field::new("item", DataType::Int32, true).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "3".to_string())]),
+        ));
+        let file_schema = Arc::new(ArrowSchema::new(vec![
+            simple_field("id", DataType::Int32, false, "1"),
+            Field::new("items", DataType::List(item_field.clone()), true).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
+            ),
+        ]));
+        let list = ListArray::new(
+            item_field,
+            OffsetBuffer::from_lengths([2, 1]),
+            Arc::new(Int32Array::from(vec![10, 20, 30])),
+            None,
+        );
+        let file_batch = RecordBatch::try_new(file_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(list),
+        ])
+        .unwrap();
+        let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
+
+        let result = transformer.process_record_batch(file_batch).unwrap();
+        let DataType::List(element) = result.column(1).data_type() else {
+            panic!("expected list column");
+        };
+        assert_eq!(element.name(), "element");
+        RecordBatch::try_new(result.schema(), result.columns().to_vec()).unwrap();
+    }
+
+    #[test]
+    fn nested_map_field_name_is_normalized() {
+        use arrow_buffer::OffsetBuffer;
+
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(
+                        2,
+                        "properties",
+                        Type::Map(MapType::new(
+                            NestedField::map_key_element(3, Type::Primitive(PrimitiveType::String))
+                                .into(),
+                            NestedField::map_value_element(
+                                4,
+                                Type::Primitive(PrimitiveType::String),
+                                false,
+                            )
+                            .into(),
+                        )),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let key_field = Arc::new(Field::new("key", DataType::Utf8, false).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "3".to_string())]),
+        ));
+        let value_field = Arc::new(Field::new("value", DataType::Utf8, true).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "4".to_string())]),
+        ));
+        let entries_field = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(vec![key_field.clone(), value_field.clone()].into()),
+            false,
+        ));
+        let file_schema = Arc::new(ArrowSchema::new(vec![
+            simple_field("id", DataType::Int32, false, "1"),
+            Field::new(
+                "properties",
+                DataType::Map(entries_field.clone(), false),
+                true,
+            )
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+        let entries = StructArray::new(
+            vec![key_field, value_field].into(),
+            vec![
+                Arc::new(StringArray::from(vec!["a"])),
+                Arc::new(StringArray::from(vec![Some("1")])),
+            ],
+            None,
+        );
+        let map = MapArray::new(
+            entries_field,
+            OffsetBuffer::from_lengths([1, 0]),
+            entries,
+            None,
+            false,
+        );
+        let file_batch = RecordBatch::try_new(file_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(map),
+        ])
+        .unwrap();
+        let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
+
+        let result = transformer.process_record_batch(file_batch).unwrap();
+        let DataType::Map(entries, _) = result.column(1).data_type() else {
+            panic!("expected map column");
+        };
+        assert_eq!(entries.name(), "key_value");
+        RecordBatch::try_new(result.schema(), result.columns().to_vec()).unwrap();
     }
 
     pub fn source_record_batch() -> RecordBatch {
@@ -1066,36 +1788,28 @@ mod test {
 
     fn arrow_schema_already_same_as_target() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
-            simple_field("a", DataType::Utf8, true, "10"),
-            simple_field("b", DataType::Int64, false, "11"),
-            simple_field("c", DataType::Float64, false, "12"),
-            simple_field("e", DataType::Utf8, true, "14"),
-            simple_field("f", DataType::Utf8, false, "15"),
+            field_with_id("a", DataType::Utf8, true, 10),
+            field_with_id("b", DataType::Int64, false, 11),
+            field_with_id("c", DataType::Float64, false, 12),
+            field_with_id("e", DataType::Utf8, true, 14),
+            field_with_id("f", DataType::Utf8, false, 15),
         ]))
     }
 
     fn arrow_schema_promotion_addition_and_renaming_required() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
-            simple_field("b", DataType::Int32, false, "11"),
-            simple_field("c", DataType::Float32, false, "12"),
-            simple_field("d", DataType::Int32, false, "13"),
-            simple_field("e_old", DataType::Utf8, true, "14"),
+            field_with_id("b", DataType::Int32, false, 11),
+            field_with_id("c", DataType::Float32, false, 12),
+            field_with_id("d", DataType::Int32, false, 13),
+            field_with_id("e_old", DataType::Utf8, true, 14),
         ]))
     }
 
     fn arrow_schema_no_promotion_addition_or_renaming_required() -> Arc<ArrowSchema> {
         Arc::new(ArrowSchema::new(vec![
-            simple_field("d", DataType::Int32, false, "13"),
-            simple_field("e", DataType::Utf8, true, "14"),
+            field_with_id("d", DataType::Int32, false, 13),
+            field_with_id("e", DataType::Utf8, true, 14),
         ]))
-    }
-
-    /// Create a simple arrow field with metadata.
-    fn simple_field(name: &str, ty: DataType, nullable: bool, value: &str) -> Field {
-        Field::new(name, ty, nullable).with_metadata(HashMap::from([(
-            PARQUET_FIELD_ID_META_KEY.to_string(),
-            value.to_string(),
-        )]))
     }
 
     /// Test for add_files with Parquet files that have NO field IDs (Hive tables).
@@ -1277,8 +1991,8 @@ mod test {
 
         // Parquet file contains both id and name columns
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
-            simple_field("id", DataType::Int32, false, "1"),
-            simple_field("name", DataType::Utf8, true, "2"),
+            field_with_id("id", DataType::Int32, false, 1),
+            field_with_id("name", DataType::Utf8, true, 2),
         ]));
 
         let projected_field_ids = [1, 2]; // id, name
@@ -1398,8 +2112,8 @@ mod test {
 
         // Parquet file contains only id and name (dept is in partition path)
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
-            simple_field("id", DataType::Int32, false, "1"),
-            simple_field("name", DataType::Utf8, true, "3"),
+            field_with_id("id", DataType::Int32, false, 1),
+            field_with_id("name", DataType::Utf8, true, 3),
         ]));
 
         let projected_field_ids = [1, 2, 3]; // id, dept, name
@@ -1439,6 +2153,83 @@ mod test {
         // name column comes from file
         assert_eq!(get_string_value(result.column(2).as_ref(), 0), "Alice");
         assert_eq!(get_string_value(result.column(2).as_ref(), 1), "Bob");
+    }
+
+    /// Test that a dropped identity partition source column is skipped rather than erroring.
+    ///
+    /// A historical spec may use `identity(col)` where `col` was later dropped from the
+    /// schema. `constants_map()` must skip that field instead of failing, so the file can
+    /// still be read (the dropped column is not projected).
+    #[test]
+    fn dropped_identity_partition_source_column_is_skipped() {
+        use crate::spec::{Struct, Transform};
+
+        // Original schema used to build the spec: has id, dept, name.
+        let original_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::required(2, "dept", Type::Primitive(PrimitiveType::String)).into(),
+                    NestedField::optional(3, "name", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        // Spec: identity(dept). Built against the original schema where dept still exists.
+        let partition_spec = Arc::new(
+            crate::spec::PartitionSpec::builder(original_schema.clone())
+                .with_spec_id(0)
+                .add_partition_field("dept", "dept", Transform::Identity)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+
+        // Evolved snapshot schema: dept (field id 2) has been dropped.
+        let evolved_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(3, "name", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let partition_data = Struct::from_iter(vec![Some(Literal::string("engineering"))]);
+
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            field_with_id("id", DataType::Int32, false, 1),
+            field_with_id("name", DataType::Utf8, true, 3),
+        ]));
+
+        let projected_field_ids = [1, 3]; // id, name -- dept is gone
+
+        // The dropped source column must not cause an error here.
+        let mut transformer =
+            RecordBatchTransformerBuilder::new(evolved_schema, &projected_field_ids)
+                .with_partition(partition_spec, partition_data)
+                .expect("dropped partition source column should be skipped, not error")
+                .build();
+
+        let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
+            Arc::new(Int32Array::from(vec![100, 200])),
+            Arc::new(StringArray::from(vec!["Alice", "Bob"])),
+        ])
+        .unwrap();
+
+        let result = transformer.process_record_batch(parquet_batch).unwrap();
+
+        // Only the live columns are projected; no constant is added for the dropped dept.
+        assert_eq!(result.num_columns(), 2);
+        assert_eq!(result.num_rows(), 2);
+        assert_eq!(get_int_value(result.column(0).as_ref(), 0), 100);
+        assert_eq!(get_int_value(result.column(0).as_ref(), 1), 200);
+        assert_eq!(get_string_value(result.column(1).as_ref(), 0), "Alice");
+        assert_eq!(get_string_value(result.column(1).as_ref(), 1), "Bob");
     }
 
     /// Test bucket partitioning with renamed source column.
@@ -1507,8 +2298,8 @@ mod test {
         // Parquet file has OLD column name "id" but SAME field_id=1
         // Field-ID-based mapping should find this despite name mismatch
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
-            simple_field("id", DataType::Int32, false, "1"),
-            simple_field("name", DataType::Utf8, true, "2"),
+            field_with_id("id", DataType::Int32, false, 1),
+            field_with_id("name", DataType::Utf8, true, 2),
         ]));
 
         let projected_field_ids = [1, 2]; // row_id (field_id=1), name (field_id=2)
@@ -1612,8 +2403,8 @@ mod test {
         // Has id (field_id=1) and data (field_id=3, assigned by ArrowReader via name mapping)
         // Missing: dept (in partition), category (has default), notes (no default)
         let parquet_schema = Arc::new(ArrowSchema::new(vec![
-            simple_field("id", DataType::Int32, false, "1"),
-            simple_field("data", DataType::Utf8, false, "3"),
+            field_with_id("id", DataType::Int32, false, 1),
+            field_with_id("data", DataType::Utf8, false, 3),
         ]));
 
         let projected_field_ids = [1, 2, 3, 4, 5]; // id, dept, data, category, notes
@@ -1704,11 +2495,11 @@ mod test {
         // Partition has null value for the data column
         let partition_data = Struct::from_iter(vec![None]);
 
-        let file_schema = Arc::new(ArrowSchema::new(vec![simple_field(
+        let file_schema = Arc::new(ArrowSchema::new(vec![field_with_id(
             "id",
             DataType::Int32,
             true,
-            "1",
+            1,
         )]));
 
         let projected_field_ids = [1, 2];
@@ -1741,599 +2532,536 @@ mod test {
         assert!(data_col.is_null(2));
     }
 
-    // -----------------------------------------------------------------------
-    // Helpers for List / Map field-name normalization tests
-    // -----------------------------------------------------------------------
-
-    /// Build an Iceberg schema that contains a single `list<int>` column
-    /// with nullable elements.
-    fn iceberg_schema_with_list() -> Schema {
-        Schema::builder()
-            .with_schema_id(1)
-            .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::optional(
-                    2,
-                    "tags",
-                    Type::List(crate::spec::ListType {
-                        element_field: NestedField::list_element(
-                            3,
-                            Type::Primitive(PrimitiveType::Int),
-                            false, // optional (nullable) elements
-                        )
-                        .into(),
-                    }),
-                )
-                .into(),
-            ])
-            .build()
-            .unwrap()
-    }
-
-    /// Build a Parquet-style Arrow schema + `RecordBatch` where the list inner
-    /// field is named `inner_name` (e.g. `"item"` for Parquet, `"element"` for
-    /// Iceberg).
-    fn parquet_batch_with_list_field_name(
-        inner_name: &str,
-        id_values: Vec<i32>,
-        list_values: Vec<i32>,
-        offsets: Vec<usize>,
-    ) -> RecordBatch {
-        use arrow_array::ListArray;
-        use arrow_buffer::OffsetBuffer;
-
-        let inner_field = Arc::new(Field::new(inner_name, DataType::Int32, true).with_metadata(
-            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "3".to_string())]),
-        ));
-        let schema = Arc::new(ArrowSchema::new(vec![
-            simple_field("id", DataType::Int32, false, "1"),
-            Field::new("tags", DataType::List(inner_field.clone()), true).with_metadata(
-                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
-            ),
-        ]));
-
-        let values = Int32Array::from(list_values);
-        let offset_buf = OffsetBuffer::from_lengths(offsets);
-        let list_array = ListArray::new(inner_field, offset_buf, Arc::new(values), None);
-
-        RecordBatch::try_new(schema, vec![
-            Arc::new(Int32Array::from(id_values)),
-            Arc::new(list_array),
-        ])
-        .unwrap()
-    }
-
-    /// Assert that every column in `batch` has a data type that exactly matches
-    /// the corresponding schema field (strict `==`, the same check that
-    /// `RecordBatch::try_new` / `concat_batches` performs).
-    fn assert_strict_schema_match(batch: &RecordBatch) {
-        let schema = batch.schema();
-        for (i, field) in schema.fields().iter().enumerate() {
-            assert_eq!(
-                batch.column(i).data_type(),
-                field.data_type(),
-                "column {} data type does not strictly match schema field '{}'",
-                i,
-                field.name(),
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Tests
-    // -----------------------------------------------------------------------
-
-    /// Parquet files store list inner fields as `"item"` while Iceberg uses
-    /// `"element"`. The transformer must cast the column so that the output
-    /// data type exactly matches the target schema, including nested field
-    /// names. Without this, downstream consumers that use strict schema
-    /// validation (e.g. DataFusion's `concat_batches` → `RecordBatch::try_new`)
-    /// fail with "column types must match schema types".
     #[test]
-    fn list_field_name_normalized_from_item_to_element() {
-        let snapshot_schema = Arc::new(iceberg_schema_with_list());
-        let projected = [1, 2];
-        let mut transformer =
-            RecordBatchTransformerBuilder::new(snapshot_schema, &projected).build();
-
-        let file_batch =
-            parquet_batch_with_list_field_name("item", vec![1, 2], vec![10, 20, 30], vec![2, 1]);
-
-        let result = transformer.process_record_batch(file_batch).unwrap();
-
-        assert_eq!(result.num_columns(), 2);
-        assert_eq!(result.num_rows(), 2);
-        assert_strict_schema_match(&result);
-
-        // Schema-level check
-        let list_dt = result.schema().field(1).data_type().clone();
-        match &list_dt {
-            DataType::List(f) => assert_eq!(f.name(), "element"),
-            other => panic!("expected List, got {other:?}"),
-        }
-
-        // Column-level check (the actual array, not just the schema wrapper)
-        match result.column(1).data_type() {
-            DataType::List(f) => assert_eq!(f.name(), "element"),
-            other => panic!("expected List, got {other:?}"),
-        }
-
-        // Must survive strict RecordBatch::try_new (same validation concat_batches uses)
-        RecordBatch::try_new(result.schema(), result.columns().to_vec())
-            .expect("result batch must pass strict schema validation");
-    }
-
-    /// When the Parquet file already uses `"element"` (matching Iceberg), the
-    /// transformer must take the `PassThrough` path — no cast needed. We verify
-    /// by checking the output is identical to the input.
-    #[test]
-    fn list_field_name_already_matching_uses_passthrough() {
-        let snapshot_schema = Arc::new(iceberg_schema_with_list());
-        let projected = [1, 2];
-        let mut transformer =
-            RecordBatchTransformerBuilder::new(snapshot_schema, &projected).build();
-
-        let file_batch =
-            parquet_batch_with_list_field_name("element", vec![1, 2], vec![10, 20, 30], vec![2, 1]);
-
-        let result = transformer.process_record_batch(file_batch).unwrap();
-
-        assert_eq!(result.num_columns(), 2);
-        assert_eq!(result.num_rows(), 2);
-        assert_strict_schema_match(&result);
-
-        // Data must be identical — no unnecessary cast
-        assert_eq!(
-            result
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap()
-                .values(),
-            &[1, 2],
-        );
-        let list_col = result
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow_array::ListArray>()
-            .unwrap();
-        // first row: [10,20], second row: [30]
-        assert_eq!(list_col.value(0).len(), 2);
-        assert_eq!(list_col.value(1).len(), 1);
-    }
-
-    /// Verify that list data values survive the cast-based normalization
-    /// intact, including nulls.
-    #[test]
-    fn list_field_name_normalization_preserves_data() {
-        use arrow_array::ListArray;
-        use arrow_buffer::OffsetBuffer;
-
-        let snapshot_schema = Arc::new(iceberg_schema_with_list());
-        let projected = [1, 2];
-        let mut transformer =
-            RecordBatchTransformerBuilder::new(snapshot_schema, &projected).build();
-
-        let inner_field = Arc::new(Field::new("item", DataType::Int32, true).with_metadata(
-            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "3".to_string())]),
-        ));
-        let schema = Arc::new(ArrowSchema::new(vec![
-            simple_field("id", DataType::Int32, false, "1"),
-            Field::new("tags", DataType::List(inner_field.clone()), true).with_metadata(
-                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
-            ),
-        ]));
-
-        // Row 0: [10, null, 30]   Row 1: []   Row 2: null (whole list null)
-        let values = Int32Array::from(vec![Some(10), None, Some(30)]);
-        let offsets = OffsetBuffer::from_lengths([3, 0, 0]);
-        let nulls = arrow_buffer::NullBuffer::from(vec![true, true, false]);
-        let list_array = ListArray::new(inner_field, offsets, Arc::new(values), Some(nulls));
-
-        let file_batch = RecordBatch::try_new(schema, vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(list_array),
-        ])
-        .unwrap();
-
-        let result = transformer.process_record_batch(file_batch).unwrap();
-
-        assert_eq!(result.num_rows(), 3);
-        assert_strict_schema_match(&result);
-
-        let list_col = result
-            .column(1)
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .unwrap();
-
-        // Row 0: [10, null, 30]
-        assert!(!list_col.is_null(0));
-        let row0 = list_col.value(0);
-        let row0_ints = row0.as_any().downcast_ref::<Int32Array>().unwrap();
-        assert_eq!(row0_ints.len(), 3);
-        assert_eq!(row0_ints.value(0), 10);
-        assert!(row0_ints.is_null(1));
-        assert_eq!(row0_ints.value(2), 30);
-
-        // Row 1: []
-        assert!(!list_col.is_null(1));
-        assert_eq!(list_col.value(1).len(), 0);
-
-        // Row 2: null
-        assert!(list_col.is_null(2));
-    }
-
-    /// Processing multiple batches through the same transformer must work.
-    /// The `BatchTransform` is lazily initialized on the first batch, so
-    /// subsequent batches reuse the same transform. Both must produce
-    /// normalized output.
-    #[test]
-    fn list_field_name_normalization_multiple_batches() {
-        let snapshot_schema = Arc::new(iceberg_schema_with_list());
-        let projected = [1, 2];
-        let mut transformer =
-            RecordBatchTransformerBuilder::new(snapshot_schema, &projected).build();
-
-        let batch1 =
-            parquet_batch_with_list_field_name("item", vec![1, 2], vec![10, 20, 30], vec![2, 1]);
-        let batch2 = parquet_batch_with_list_field_name("item", vec![3], vec![40, 50], vec![2]);
-
-        let result1 = transformer.process_record_batch(batch1).unwrap();
-        let result2 = transformer.process_record_batch(batch2).unwrap();
-
-        for (i, result) in [&result1, &result2].iter().enumerate() {
-            assert_strict_schema_match(result);
-            match result.column(1).data_type() {
-                DataType::List(f) => assert_eq!(
-                    f.name(),
-                    "element",
-                    "batch {i}: inner field should be 'element'"
-                ),
-                other => panic!("batch {i}: expected List, got {other:?}"),
-            }
-        }
-
-        // Verify concat_batches would work (it uses RecordBatch::try_new internally)
-        let schema = result1.schema();
-        let concat = arrow_select::concat::concat_batches(&schema, [&result1, &result2]);
-        assert!(
-            concat.is_ok(),
-            "concat_batches must succeed after normalization: {:?}",
-            concat.err()
-        );
-        assert_eq!(concat.unwrap().num_rows(), 3);
-    }
-
-    /// Map type: Parquet may store the map entries struct field with a
-    /// different name than Iceberg's `"key_value"`. Verify that the
-    /// transformer normalizes the struct field names inside the map.
-    #[test]
-    fn map_field_name_normalized() {
-        use arrow_array::MapArray;
-        use arrow_buffer::OffsetBuffer;
+    fn pos_column() {
+        use crate::metadata_columns::RESERVED_FIELD_ID_POS;
 
         let snapshot_schema = Arc::new(
             Schema::builder()
-                .with_schema_id(1)
-                .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                    NestedField::optional(
-                        2,
-                        "props",
-                        Type::Map(crate::spec::MapType::new(
-                            NestedField::map_key_element(3, Type::Primitive(PrimitiveType::String))
-                                .into(),
-                            NestedField::map_value_element(
-                                4,
-                                Type::Primitive(PrimitiveType::String),
-                                true,
-                            )
-                            .into(),
-                        )),
-                    )
-                    .into(),
-                ])
-                .build()
-                .unwrap(),
-        );
-        let projected = [1, 2];
-        let mut transformer =
-            RecordBatchTransformerBuilder::new(snapshot_schema, &projected).build();
-
-        // Parquet uses "entries" for the struct field and "key"/"value" for children.
-        // Iceberg's schema_to_arrow_schema uses "key_value" and "key"/"value".
-        let key_field = Arc::new(Field::new("key", DataType::Utf8, false).with_metadata(
-            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "3".to_string())]),
-        ));
-        let value_field = Arc::new(Field::new("value", DataType::Utf8, true).with_metadata(
-            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "4".to_string())]),
-        ));
-        // Parquet standard uses "entries"; Iceberg uses "key_value"
-        let entries_field = Arc::new(Field::new(
-            "entries",
-            DataType::Struct(vec![key_field.clone(), value_field.clone()].into()),
-            false,
-        ));
-        let file_schema = Arc::new(ArrowSchema::new(vec![
-            simple_field("id", DataType::Int32, false, "1"),
-            Field::new("props", DataType::Map(entries_field.clone(), false), true).with_metadata(
-                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
-            ),
-        ]));
-
-        // Build a MapArray directly: row 0 → {"a":"1"}, row 1 → {} (empty)
-        let keys = StringArray::from(vec!["a"]);
-        let values = StringArray::from(vec![Some("1")]);
-        let struct_array = arrow_array::StructArray::new(
-            vec![key_field.clone(), value_field.clone()].into(),
-            vec![Arc::new(keys) as _, Arc::new(values) as _],
-            None,
-        );
-        let offsets = OffsetBuffer::from_lengths([1, 0]); // row0: 1 entry, row1: 0 entries
-        let map_array = MapArray::new(entries_field, offsets, struct_array, None, false);
-
-        let file_batch = RecordBatch::try_new(file_schema, vec![
-            Arc::new(Int32Array::from(vec![1, 2])),
-            Arc::new(map_array),
-        ])
-        .unwrap();
-
-        let result = transformer.process_record_batch(file_batch).unwrap();
-
-        assert_eq!(result.num_columns(), 2);
-        assert_eq!(result.num_rows(), 2);
-        assert_strict_schema_match(&result);
-
-        // Verify the map struct field is normalized to "key_value"
-        match result.column(1).data_type() {
-            DataType::Map(entries, _) => {
-                assert_eq!(
-                    entries.name(),
-                    "key_value",
-                    "Map entries field should be 'key_value', got '{}'",
-                    entries.name(),
-                );
-            }
-            other => panic!("expected Map, got {other:?}"),
-        }
-
-        // Must survive strict RecordBatch::try_new
-        RecordBatch::try_new(result.schema(), result.columns().to_vec())
-            .expect("result batch must pass strict schema validation");
-    }
-
-    /// Asserts that schema evolution correctly materializes a null-filled column when the
-    /// source Parquet file is missing the Binary column. Verifies it correctly handles the
-    /// conversion from Iceberg Binary to Arrow Binary.
-    ///
-    /// Before this was fixed, a schema evolution adding a binary column could results in
-    /// failures where the old parquet files could not be re-written due to
-    /// "Unexpected => unexpected target column type LargeBinary"
-    #[test]
-    fn schema_evolution_adds_binary_column_with_nulls() {
-        let snapshot_schema = Arc::new(
-            Schema::builder()
-                .with_schema_id(1)
+                .with_schema_id(0)
                 .with_fields(vec![
                     NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
                     NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
-                    NestedField::optional(3, "bin_col", Type::Primitive(PrimitiveType::Binary))
-                        .into(),
                 ])
                 .build()
                 .unwrap(),
         );
-        let projected_iceberg_field_ids = [1, 2, 3];
 
-        let mut transformer =
-            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_iceberg_field_ids)
-                .build();
-
-        let file_schema = Arc::new(ArrowSchema::new(vec![
-            simple_field("id", DataType::Int32, false, "1"),
-            simple_field("name", DataType::Utf8, true, "2"),
+        // Simulate what arrow-rs's virtual-column reader produces: file columns
+        // followed by the _pos Int64 column carrying absolute file row indices.
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            field_with_id("id", DataType::Int32, false, 1),
+            field_with_id("name", DataType::Utf8, true, 2),
+            field_with_id("_pos", DataType::Int64, false, RESERVED_FIELD_ID_POS),
         ]));
 
-        let file_batch = RecordBatch::try_new(file_schema, vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec![
-                Some("Alice"),
-                Some("Bob"),
-                Some("Charlie"),
-            ])),
+        let projected_field_ids = [1, 2, RESERVED_FIELD_ID_POS];
+
+        let mut transformer =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids)
+                .with_virtual_field(RESERVED_FIELD_ID_POS)
+                .build();
+
+        let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
+            Arc::new(Int32Array::from(vec![100, 200, 300])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            Arc::new(Int64Array::from(vec![0, 1, 2])),
         ])
         .unwrap();
 
-        let result = transformer.process_record_batch(file_batch).unwrap();
+        let result = transformer.process_record_batch(parquet_batch).unwrap();
 
         assert_eq!(result.num_columns(), 3);
         assert_eq!(result.num_rows(), 3);
 
+        // id column from file
         let id_col = result
             .column(0)
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        assert_eq!(id_col.values(), &[1, 2, 3]);
+        assert_eq!(id_col.values(), &[100, 200, 300]);
+
+        // name column from file
+        let name_col = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(name_col.value(0), "a");
+
+        // _pos column
+        let pos_col = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        assert_eq!(pos_col.len(), 3);
+        assert_eq!(pos_col.values(), &[0, 1, 2]);
+    }
+
+    #[test]
+    fn last_updated_sequence_number_constant() {
+        use crate::metadata_columns::RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER;
+        use crate::spec::Datum;
+
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        // The column is not physically present in the file; it is materialized as
+        // a per-file constant equal to the data sequence number.
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![field_with_id(
+            "id",
+            DataType::Int32,
+            false,
+            1,
+        )]));
+
+        let projected_field_ids = [1, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER];
+
+        let mut transformer =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids)
+                .with_constant(
+                    RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+                    Datum::long(7),
+                )
+                .build();
+
+        let parquet_batch =
+            RecordBatch::try_new(parquet_schema, vec![Arc::new(Int32Array::from(vec![
+                10, 20, 30,
+            ]))])
+            .unwrap();
+
+        let result = transformer.process_record_batch(parquet_batch).unwrap();
+
+        assert_eq!(result.num_columns(), 2);
+        assert_eq!(result.num_rows(), 3);
+
+        // Every row's logical value is 7 (the data sequence number), regardless of
+        // the physical (run-end) encoding.
+        assert_last_updated_seq_column(&result, &[Some(7), Some(7), Some(7)]);
+    }
+
+    #[test]
+    fn last_updated_sequence_number_null_column() {
+        use crate::metadata_columns::RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER;
+
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![field_with_id(
+            "id",
+            DataType::Int32,
+            false,
+            1,
+        )]));
+
+        let projected_field_ids = [1, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER];
+
+        // The null-gate path (a file with a null first_row_id): the whole column is null.
+        let mut transformer =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids)
+                .with_null_metadata_column(RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER)
+                .unwrap()
+                .build();
+
+        let parquet_batch =
+            RecordBatch::try_new(parquet_schema, vec![Arc::new(Int32Array::from(vec![
+                10, 20, 30,
+            ]))])
+            .unwrap();
+
+        let result = transformer.process_record_batch(parquet_batch).unwrap();
+
+        // Every row's logical value is null.
+        assert_last_updated_seq_column(&result, &[None, None, None]);
+    }
+
+    /// Builds a transformer + a file batch for the coalesce case: `id` plus a physical
+    /// `_last_updated_sequence_number` column carrying `seq_values`.
+    fn coalesce_transformer_and_batch(
+        seq_values: Vec<Option<i64>>,
+        id_values: Vec<i32>,
+        fallback: i64,
+    ) -> (RecordBatchTransformer, RecordBatch) {
+        use crate::metadata_columns::{
+            RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
+            RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+        };
+        use crate::spec::Datum;
+
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            field_with_id("id", DataType::Int32, false, 1),
+            field_with_id(
+                RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
+                DataType::Int64,
+                true,
+                RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+            ),
+        ]));
+        let projected_field_ids = [1, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER];
+        let transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids)
+            .with_coalesced_last_updated_seq_column(
+                RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+                Datum::long(fallback),
+            )
+            .build();
+        let batch = RecordBatch::try_new(parquet_schema, vec![
+            Arc::new(Int32Array::from(id_values)),
+            Arc::new(Int64Array::from(seq_values)),
+        ])
+        .unwrap();
+        (transformer, batch)
+    }
+
+    /// Reads the `_last_updated_sequence_number` column by name (encoding-agnostic: casts
+    /// through the run-end-encoding to logical Int64) and asserts its per-row values.
+    fn assert_last_updated_seq_column(result: &RecordBatch, expected: &[Option<i64>]) {
+        use crate::metadata_columns::RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER;
+
+        let col = result
+            .column_by_name(RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER)
+            .expect("_last_updated_sequence_number column should be present");
+        let logical = cast(col, &DataType::Int64).unwrap();
+        let values = logical.as_any().downcast_ref::<Int64Array>().unwrap();
+        let actual: Vec<Option<i64>> = (0..values.len())
+            .map(|i| (!values.is_null(i)).then(|| values.value(i)))
+            .collect();
+        assert_eq!(&actual, expected);
+    }
+
+    #[test]
+    fn last_updated_sequence_number_coalesce_column() {
+        let (mut transformer, batch) =
+            coalesce_transformer_and_batch(vec![Some(5), None, Some(8)], vec![10, 20, 30], 9);
+        let result = transformer.process_record_batch(batch).unwrap();
+
+        // Per-row value where non-null; the fallback (9) where null.
+        assert_last_updated_seq_column(&result, &[Some(5), Some(9), Some(8)]);
+    }
+
+    #[test]
+    fn last_updated_sequence_number_coalesce_all_null() {
+        // Every row falls back. This is the only input that distinguishes the `is_not_null`
+        // mask from `is_null` -- a mixed input passes under either polarity.
+        let (mut transformer, batch) =
+            coalesce_transformer_and_batch(vec![None, None, None], vec![10, 20, 30], 9);
+        let result = transformer.process_record_batch(batch).unwrap();
+
+        assert_last_updated_seq_column(&result, &[Some(9), Some(9), Some(9)]);
+    }
+
+    #[test]
+    fn last_updated_sequence_number_coalesce_all_non_null() {
+        // Nothing falls back: every per-row value passes through, and the run-end-encoding
+        // cast still yields a valid array.
+        let (mut transformer, batch) =
+            coalesce_transformer_and_batch(vec![Some(5), Some(6), Some(7)], vec![10, 20, 30], 9);
+        let result = transformer.process_record_batch(batch).unwrap();
+
+        assert_last_updated_seq_column(&result, &[Some(5), Some(6), Some(7)]);
+    }
+
+    #[test]
+    fn last_updated_sequence_number_coalesce_empty_batch() {
+        // A 0-row batch (reachable when a predicate or positional deletes clear a row
+        // group) must still produce a well-formed, empty column of the shared type.
+        let (mut transformer, batch) = coalesce_transformer_and_batch(vec![], vec![], 9);
+        let result = transformer.process_record_batch(batch).unwrap();
+
+        assert_eq!(result.num_rows(), 0);
+        assert_last_updated_seq_column(&result, &[]);
+    }
+
+    /// field 1 and RESERVED_FIELD_ID_POS are of identical type
+    /// swapping their projection order should not lead to [`SchemaComparison::NameChangesOnly`]
+    #[test]
+    fn reorder_pos_column_with_columns_of_identical_type() {
+        use crate::metadata_columns::RESERVED_FIELD_ID_POS;
+
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "id_long", Type::Primitive(PrimitiveType::Long))
+                        .into(),
+                    NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            field_with_id("id_long", DataType::Int64, false, 1),
+            field_with_id("name", DataType::Utf8, true, 2),
+            field_with_id("_pos", DataType::Int64, false, RESERVED_FIELD_ID_POS),
+        ]));
+
+        let projected_field_ids = [RESERVED_FIELD_ID_POS, 2, 1];
+
+        let mut transformer =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids)
+                .with_virtual_field(RESERVED_FIELD_ID_POS)
+                .build();
+
+        let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
+            Arc::new(Int64Array::from(vec![100, 200, 300])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            Arc::new(Int64Array::from(vec![0, 1, 2])),
+        ])
+        .unwrap();
+
+        let result = transformer.process_record_batch(parquet_batch).unwrap();
+
+        assert_eq!(result.num_columns(), 3);
+        assert_eq!(result.num_rows(), 3);
+
+        let pos_col = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(pos_col.values(), &[0, 1, 2]);
 
         let name_col = result
             .column(1)
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        assert_eq!(name_col.value(0), "Alice");
-        assert_eq!(name_col.value(1), "Bob");
-        assert_eq!(name_col.value(2), "Charlie");
+        assert_eq!(name_col.value(0), "a");
+        assert_eq!(name_col.value(1), "b");
+        assert_eq!(name_col.value(2), "c");
 
-        let bin_col = result
+        let id_col = result
             .column(2)
             .as_any()
-            .downcast_ref::<LargeBinaryArray>()
+            .downcast_ref::<Int64Array>()
             .unwrap();
-        assert!(bin_col.is_null(0));
-        assert!(bin_col.is_null(1));
-        assert!(bin_col.is_null(2));
+
+        assert_eq!(id_col.len(), 3);
+        assert_eq!(id_col.values(), &[100, 200, 300]);
     }
 
-    /// Asserts that schema evolution correctly materializes a null-filled column when the
-    /// source Parquet file is missing the Time column. Verifies it correctly handles the
-    /// conversion from Iceberg Time to Arrow Time64(Microsecond).
     #[test]
-    fn schema_evolution_adds_time_column_with_nulls() {
+    fn partition_column_struct_constant() {
+        use arrow_array::StructArray;
+
+        use crate::metadata_columns::RESERVED_FIELD_ID_PARTITION;
+        use crate::spec::Transform;
+
         let snapshot_schema = Arc::new(
             Schema::builder()
-                .with_schema_id(1)
+                .with_schema_id(0)
                 .with_fields(vec![
                     NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
                     NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
-                    NestedField::optional(3, "time_col", Type::Primitive(PrimitiveType::Time))
-                        .into(),
                 ])
                 .build()
                 .unwrap(),
         );
-        let projected_iceberg_field_ids = [1, 2, 3];
 
-        let mut transformer =
-            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_iceberg_field_ids)
-                .build();
+        // Partition spec: identity(id)
+        let partition_spec = Arc::new(
+            crate::spec::PartitionSpec::builder(snapshot_schema.clone())
+                .with_spec_id(0)
+                .add_partition_field("id", "id", Transform::Identity)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
 
-        let file_schema = Arc::new(ArrowSchema::new(vec![
-            simple_field("id", DataType::Int32, false, "1"),
-            simple_field("name", DataType::Utf8, true, "2"),
+        // Unified partition type: just one field (same as the spec's type)
+        let unified_partition_type = partition_spec.partition_type(&snapshot_schema).unwrap();
+
+        // Partition data: id=42
+        let partition_data = Struct::from_iter(vec![Some(Literal::int(42))]);
+
+        // Parquet file has both columns
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            field_with_id("id", DataType::Int32, false, 1),
+            field_with_id("name", DataType::Utf8, true, 2),
         ]));
 
-        let file_batch = RecordBatch::try_new(file_schema, vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec![
-                Some("Alice"),
-                Some("Bob"),
-                Some("Charlie"),
-            ])),
+        // Project id, name, and _partition
+        let projected_field_ids = [1, 2, RESERVED_FIELD_ID_PARTITION];
+
+        let partition_column =
+            build_partition_constant(&unified_partition_type, &partition_spec, &partition_data)
+                .unwrap();
+        let mut transformer =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids)
+                .with_partition_constant(partition_column)
+                .build();
+
+        let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
+            Arc::new(Int32Array::from(vec![100, 200, 300])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
         ])
         .unwrap();
 
-        let result = transformer.process_record_batch(file_batch).unwrap();
+        let result = transformer.process_record_batch(parquet_batch).unwrap();
 
         assert_eq!(result.num_columns(), 3);
         assert_eq!(result.num_rows(), 3);
 
-        let time_col = result
+        // id column from file
+        let id_col = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(id_col.values(), &[100, 200, 300]);
+
+        // name column from file
+        let name_col = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(name_col.value(0), "a");
+
+        // _partition struct column
+        let partition_col = result
             .column(2)
             .as_any()
-            .downcast_ref::<Time64MicrosecondArray>()
+            .downcast_ref::<StructArray>()
             .unwrap();
-        assert!(time_col.is_null(0));
-        assert!(time_col.is_null(1));
-        assert!(time_col.is_null(2));
+        assert_eq!(partition_col.num_columns(), 1);
+        assert_eq!(partition_col.len(), 3);
+
+        let inner = partition_col
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(inner.value(0), 42);
+        assert_eq!(inner.value(1), 42);
+        assert_eq!(inner.value(2), 42);
     }
 
-    /// Asserts that schema evolution correctly materializes a null-filled column when the
-    /// source Parquet file is missing the Uuid column. Verifies it correctly handles the
-    /// conversion from Iceberg Uuid to Arrow FixedSizeBinary(16).
     #[test]
-    fn schema_evolution_adds_uuid_column_with_nulls() {
+    fn partition_column_with_evolution() {
+        use arrow_array::StructArray;
+
+        use crate::metadata_columns::RESERVED_FIELD_ID_PARTITION;
+        use crate::partitioning::compute_unified_partition_type;
+        use crate::spec::Transform;
+
+        // Schema with two fields that could be partition sources
         let snapshot_schema = Arc::new(
             Schema::builder()
-                .with_schema_id(1)
+                .with_schema_id(0)
                 .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                    NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
-                    NestedField::optional(3, "uuid_col", Type::Primitive(PrimitiveType::Uuid))
-                        .into(),
+                    NestedField::required(1, "year", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::required(2, "month", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(3, "data", Type::Primitive(PrimitiveType::String)).into(),
                 ])
                 .build()
                 .unwrap(),
         );
-        let projected_iceberg_field_ids = [1, 2, 3];
 
+        // Old spec: partition by year only
+        let spec_v0 = crate::spec::PartitionSpec::builder(snapshot_schema.clone())
+            .with_spec_id(0)
+            .add_partition_field("year", "year", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // New spec: partition by year and month
+        let spec_v1 = crate::spec::PartitionSpec::builder(snapshot_schema.clone())
+            .with_spec_id(1)
+            .add_partition_field("year", "year", Transform::Identity)
+            .unwrap()
+            .add_partition_field("month", "month", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        // Unified type includes both year and month
+        let unified_partition_type =
+            compute_unified_partition_type([&spec_v0, &spec_v1].into_iter(), &snapshot_schema)
+                .unwrap();
+
+        assert_eq!(unified_partition_type.fields().len(), 2);
+
+        // File written with spec_v0 (only has year=2023)
+        let partition_data = Struct::from_iter(vec![Some(Literal::int(2023))]);
+
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![field_with_id(
+            "data",
+            DataType::Utf8,
+            true,
+            3,
+        )]));
+
+        let projected_field_ids = [3, RESERVED_FIELD_ID_PARTITION];
+
+        let partition_column =
+            build_partition_constant(&unified_partition_type, &spec_v0, &partition_data).unwrap();
         let mut transformer =
-            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_iceberg_field_ids)
+            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids)
+                .with_partition_constant(partition_column)
                 .build();
 
-        let file_schema = Arc::new(ArrowSchema::new(vec![
-            simple_field("id", DataType::Int32, false, "1"),
-            simple_field("name", DataType::Utf8, true, "2"),
-        ]));
-
-        let file_batch = RecordBatch::try_new(file_schema, vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec![
-                Some("Alice"),
-                Some("Bob"),
-                Some("Charlie"),
-            ])),
-        ])
-        .unwrap();
-
-        let result = transformer.process_record_batch(file_batch).unwrap();
-
-        assert_eq!(result.num_columns(), 3);
-        assert_eq!(result.num_rows(), 3);
-
-        let uuid_col = result
-            .column(2)
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
+        let parquet_batch =
+            RecordBatch::try_new(parquet_schema, vec![Arc::new(StringArray::from(vec![
+                "hello", "world",
+            ]))])
             .unwrap();
-        assert_eq!(uuid_col.data_type(), &DataType::FixedSizeBinary(16));
-        assert!(uuid_col.is_null(0));
-        assert!(uuid_col.is_null(1));
-        assert!(uuid_col.is_null(2));
-    }
 
-    /// Asserts that schema evolution correctly materializes a null-filled column when the
-    /// source Parquet file is missing the Fixed column. Verifies it correctly handles the
-    /// conversion from Iceberg Fixed(len) to Arrow FixedSizeBinary(len).
-    #[test]
-    fn schema_evolution_adds_fixed_column_with_nulls() {
-        let snapshot_schema = Arc::new(
-            Schema::builder()
-                .with_schema_id(1)
-                .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                    NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
-                    NestedField::optional(3, "fixed_col", Type::Primitive(PrimitiveType::Fixed(4)))
-                        .into(),
-                ])
-                .build()
-                .unwrap(),
-        );
-        let projected_iceberg_field_ids = [1, 2, 3];
+        let result = transformer.process_record_batch(parquet_batch).unwrap();
 
-        let mut transformer =
-            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_iceberg_field_ids)
-                .build();
+        assert_eq!(result.num_columns(), 2);
+        assert_eq!(result.num_rows(), 2);
 
-        let file_schema = Arc::new(ArrowSchema::new(vec![
-            simple_field("id", DataType::Int32, false, "1"),
-            simple_field("name", DataType::Utf8, true, "2"),
-        ]));
-
-        let file_batch = RecordBatch::try_new(file_schema, vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec![
-                Some("Alice"),
-                Some("Bob"),
-                Some("Charlie"),
-            ])),
-        ])
-        .unwrap();
-
-        let result = transformer.process_record_batch(file_batch).unwrap();
-
-        assert_eq!(result.num_columns(), 3);
-        assert_eq!(result.num_rows(), 3);
-
-        let fixed_col = result
-            .column(2)
+        // _partition struct has 2 fields: year (present) and month (null for this old spec file)
+        let partition_col = result
+            .column(1)
             .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
+            .downcast_ref::<StructArray>()
             .unwrap();
-        assert_eq!(fixed_col.data_type(), &DataType::FixedSizeBinary(4));
-        assert!(fixed_col.is_null(0));
-        assert!(fixed_col.is_null(1));
-        assert!(fixed_col.is_null(2));
+        assert_eq!(partition_col.num_columns(), 2);
+
+        let year_col = partition_col
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(year_col.value(0), 2023);
+        assert_eq!(year_col.value(1), 2023);
+
+        let month_col = partition_col
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert!(month_col.is_null(0));
+        assert!(month_col.is_null(1));
     }
 }

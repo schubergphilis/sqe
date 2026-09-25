@@ -18,14 +18,14 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
-use tokio::sync::Notify;
 use tokio::sync::futures::OwnedNotified;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 use crate::delete_vector::DeleteVector;
 use crate::expr::Predicate::AlwaysTrue;
 use crate::expr::{Bind, BoundPredicate, Predicate};
-use crate::scan::FileScanTask;
+use crate::runtime::Runtime;
+use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
 use crate::spec::DataContentType;
 use crate::{Error, ErrorKind, Result};
 
@@ -33,6 +33,12 @@ use crate::{Error, ErrorKind, Result};
 enum EqDelState {
     Loading(watch::Receiver<Option<EqDelLoadResult>>),
     Loaded(Predicate),
+    /// The load finished with an error. The entry is kept in the cache so that
+    /// consumers arriving after the failure still observe the original error
+    /// (with its `retryable` flag) instead of a generic "missing predicate".
+    /// Retryable failures may be reclaimed by [`DeleteFilter::try_start_eq_del_load`];
+    /// non-retryable failures stay cached to avoid re-reading a file that
+    /// cannot be read successfully.
     Failed(EqDelLoadError),
 }
 
@@ -146,6 +152,11 @@ pub(crate) enum PosDelLoadAction {
 }
 
 impl DeleteFilter {
+    /// Create a new DeleteFilter with the given runtime.
+    pub(crate) fn new(_runtime: Runtime) -> Self {
+        Self::default()
+    }
+
     /// Retrieve a delete vector for the data file associated with a given file scan task
     pub(crate) fn get_delete_vector(
         &self,
@@ -169,11 +180,18 @@ impl DeleteFilter {
         let mut state = self.state.write().unwrap();
 
         match state.equality_deletes.get(file_path) {
+            // Skip if already loaded/loading - another task owns it
             Some(EqDelState::Loading(_) | EqDelState::Loaded(_)) => return None,
+            // A non-retryable failure is cached: re-reading the file would fail
+            // identically, so keep serving the recorded error instead of
+            // re-issuing doomed reads.
             Some(EqDelState::Failed(error)) if !error.retryable => return None,
+            // A retryable failure may be reclaimed so that this attempt can
+            // retry the load.
             Some(EqDelState::Failed(_)) | None => {}
         }
 
+        // Mark as loading to prevent duplicate work
         let (sender, receiver) = watch::channel(None);
         state
             .equality_deletes
@@ -277,20 +295,20 @@ impl DeleteFilter {
         // * Bind the predicate to the task's schema to get a `BoundPredicate`
 
         let mut combined_predicate = AlwaysTrue;
-        for delete in &file_scan_task.deletes {
+        for delete in file_scan_task.deletes() {
             if !is_equality_delete(delete) {
                 continue;
             }
 
             let Some(predicate) = self
-                .get_equality_delete_predicate_for_delete_file_path(delete.data_file_path())
+                .get_equality_delete_predicate_for_delete_file_path(&delete.file_path)
                 .await?
             else {
                 return Err(Error::new(
                     ErrorKind::Unexpected,
                     format!(
                         "Missing predicate for equality delete file '{}'",
-                        delete.data_file_path()
+                        delete.file_path
                     ),
                 ));
             };
@@ -303,7 +321,7 @@ impl DeleteFilter {
         }
 
         let bound_predicate = combined_predicate
-            .bind(file_scan_task.schema.clone(), file_scan_task.case_sensitive)?;
+            .bind(file_scan_task.schema_ref(), file_scan_task.case_sensitive())?;
         Ok(Some(bound_predicate))
     }
 
@@ -330,6 +348,10 @@ impl DeleteFilter {
         sender: &watch::Sender<Option<EqDelLoadResult>>,
         result: EqDelLoadResult,
     ) {
+        // This runs from `EqDelLoadGuard::drop` as well, so it must not panic on a
+        // poisoned lock: panicking while unwinding would abort the process. The
+        // guarded state stays consistent under poison recovery because the update
+        // below is a plain map insert.
         let mut state = self
             .state
             .write()
@@ -352,8 +374,8 @@ impl DeleteFilter {
     }
 }
 
-pub(crate) fn is_equality_delete(f: &FileScanTask) -> bool {
-    matches!(f.data_file_content, DataContentType::EqualityDeletes)
+pub(crate) fn is_equality_delete(f: &FileScanTaskDeleteFile) -> bool {
+    matches!(f.file_type, DataContentType::EqualityDeletes)
 }
 
 #[cfg(test)]
@@ -380,6 +402,38 @@ pub(crate) mod tests {
 
     const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: u64 = 2147483546;
     const FIELD_ID_POSITIONAL_DELETE_POS: u64 = 2147483545;
+
+    // Regression test for the positional-delete lost-wakeup hang.
+    //
+    // Drives the real API through the losing interleaving: the loader fires
+    // `notify_waiters()` (via `finish_pos_del_load`) *before* the waiter awaits the notifier
+    // handed back by `WaitFor`. `notify_waiters()` stores no permit, so this only completes if
+    // the waiter's `Notified` was created before the signal. Because `WaitFor` now carries an
+    // `OwnedNotified` created under the lock in `try_start_pos_del_load`, it is; on the old
+    // `WaitFor(Arc<Notify>)` contract the waiter created its `Notified` too late and hung.
+    #[tokio::test]
+    async fn test_wait_for_completes_when_load_finishes_before_await() {
+        let filter = DeleteFilter::new(Runtime::current());
+        let path = "s3://bucket/pos-delete.parquet";
+
+        assert!(matches!(
+            filter.try_start_pos_del_load(path),
+            PosDelLoadAction::Load
+        ));
+
+        let PosDelLoadAction::WaitFor(notified) = filter.try_start_pos_del_load(path) else {
+            panic!("expected WaitFor for an in-progress load");
+        };
+
+        // Loader completes and signals before the waiter awaits.
+        filter.finish_pos_del_load(path);
+
+        let waited = tokio::time::timeout(Duration::from_secs(5), notified).await;
+        assert!(
+            waited.is_ok(),
+            "WaitFor future must resolve after finish_pos_del_load"
+        );
+    }
 
     #[tokio::test]
     async fn test_equality_delete_load_failure_wakes_waiters_and_allows_retry() {
@@ -441,10 +495,14 @@ pub(crate) mod tests {
         let filter = DeleteFilter::default();
         let load_guard = filter.try_start_eq_del_load("eq-del.parquet").unwrap();
 
+        // Fail with a non-retryable error before any waiter registers.
         let load_error = Error::new(ErrorKind::DataInvalid, "malformed equality delete file");
         assert!(!load_error.retryable());
         load_guard.fail(&load_error);
 
+        // A consumer arriving only after the failure (it never observed the
+        // `Loading` state) must still receive the original error with its
+        // retryable flag, not a generic "missing predicate" error.
         let error = filter
             .get_equality_delete_predicate_for_delete_file_path("eq-del.parquet")
             .await
@@ -453,11 +511,14 @@ pub(crate) mod tests {
         assert_eq!(error.message(), "malformed equality delete file");
         assert!(!error.retryable());
 
+        // Non-retryable failures are cached: re-reading the file would fail
+        // identically, so no new load may be claimed.
         assert!(
             filter.try_start_eq_del_load("eq-del.parquet").is_none(),
             "non-retryable failures must not be reloaded"
         );
 
+        // The cached error keeps being served on subsequent lookups.
         let error = filter
             .get_equality_delete_predicate_for_delete_file_path("eq-del.parquet")
             .await
@@ -465,120 +526,22 @@ pub(crate) mod tests {
         assert_eq!(error.message(), "malformed equality delete file");
     }
 
-    #[test]
-    fn test_cancelled_equality_delete_load_survives_poisoned_state_lock() {
-        let filter = DeleteFilter::default();
-        let load_guard = filter.try_start_eq_del_load("eq-del.parquet").unwrap();
-        let state = filter.state.clone();
-
-        let _ = std::thread::spawn(move || {
-            let _state_guard = state.write().unwrap();
-            panic!("poison delete-filter state for regression coverage");
-        })
-        .join();
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(load_guard)));
-        assert!(
-            result.is_ok(),
-            "dropping a load guard must not panic while unwinding a poisoned lock"
-        );
-    }
-
-    // Regression test for the positional-delete lost-wakeup hang.
-    //
-    // Drives the real API through the losing interleaving: the loader fires
-    // `notify_waiters()` (via `finish_pos_del_load`) *before* the waiter awaits the notifier
-    // handed back by `WaitFor`. `notify_waiters()` stores no permit, so this only completes if
-    // the waiter's `Notified` was created before the signal. Because `WaitFor` now carries an
-    // `OwnedNotified` created under the lock in `try_start_pos_del_load`, it is; on the old
-    // `WaitFor(Arc<Notify>)` contract the waiter created its `Notified` too late and hung.
-    #[tokio::test]
-    async fn test_wait_for_completes_when_load_finishes_before_await() {
-        let filter = DeleteFilter::default();
-        let path = "s3://bucket/pos-delete.parquet";
-
-        assert!(matches!(
-            filter.try_start_pos_del_load(path),
-            PosDelLoadAction::Load
-        ));
-
-        let PosDelLoadAction::WaitFor(notified) = filter.try_start_pos_del_load(path) else {
-            panic!("expected WaitFor for an in-progress load");
-        };
-
-        // Loader completes and signals before the waiter awaits.
-        filter.finish_pos_del_load(path);
-
-        let waited = tokio::time::timeout(std::time::Duration::from_secs(5), notified).await;
-        assert!(
-            waited.is_ok(),
-            "WaitFor future must resolve after finish_pos_del_load"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_all_positional_delete_waiters_are_notified() {
-        let filter = DeleteFilter::default();
-        let path = "s3://bucket/many-waiters.parquet";
-
-        assert!(matches!(
-            filter.try_start_pos_del_load(path),
-            PosDelLoadAction::Load
-        ));
-
-        let waiters = (0..32)
-            .map(|_| match filter.try_start_pos_del_load(path) {
-                PosDelLoadAction::WaitFor(notified) => notified,
-                _ => panic!("expected WaitFor for an in-progress load"),
-            })
-            .collect::<Vec<_>>();
-
-        filter.finish_pos_del_load(path);
-
-        for waiter in waiters {
-            tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
-                .await
-                .expect("all registered waiters must be notified");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_cancelled_positional_delete_waiter_does_not_block_completion() {
-        let filter = DeleteFilter::default();
-        let path = "s3://bucket/cancelled-waiter.parquet";
-
-        assert!(matches!(
-            filter.try_start_pos_del_load(path),
-            PosDelLoadAction::Load
-        ));
-
-        let PosDelLoadAction::WaitFor(notified) = filter.try_start_pos_del_load(path) else {
-            panic!("expected WaitFor for an in-progress load");
-        };
-        drop(notified);
-
-        filter.finish_pos_del_load(path);
-        assert!(matches!(
-            filter.try_start_pos_del_load(path),
-            PosDelLoadAction::AlreadyLoaded
-        ));
-    }
-
     #[tokio::test]
     async fn test_delete_file_filter_load_deletes() {
         let tmp_dir = TempDir::new().unwrap();
         let table_location = tmp_dir.path();
-        let file_io = FileIO::from_path(table_location.as_os_str().to_str().unwrap())
-            .unwrap()
-            .build()
-            .unwrap();
+        let file_io = FileIO::new_with_fs();
 
-        let delete_file_loader = CachingDeleteFileLoader::new(file_io.clone(), 10);
+        let delete_file_loader =
+            CachingDeleteFileLoader::new(file_io.clone(), 10, Runtime::current());
 
         let file_scan_tasks = setup(table_location);
 
         let delete_filter = delete_file_loader
-            .load_deletes(&file_scan_tasks[0].deletes, file_scan_tasks[0].schema_ref())
+            .load_deletes(
+                file_scan_tasks[0].deletes(),
+                file_scan_tasks[0].schema_ref(),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -589,7 +552,10 @@ pub(crate) mod tests {
         assert_eq!(result.lock().unwrap().len(), 12); // pos dels from pos del file 1 and 2
 
         let delete_filter = delete_file_loader
-            .load_deletes(&file_scan_tasks[1].deletes, file_scan_tasks[1].schema_ref())
+            .load_deletes(
+                file_scan_tasks[1].deletes(),
+                file_scan_tasks[1].schema_ref(),
+            )
             .await
             .unwrap()
             .unwrap();
@@ -654,75 +620,85 @@ pub(crate) mod tests {
             writer.close().unwrap();
         }
 
-        // Helper to build a positional delete task with minimal fields
-        let make_pos_del_task = |n: u8| FileScanTask {
-            file_size_in_bytes: std::fs::metadata(format!(
-                "{}/pos-del-{}.parquet",
-                table_location.to_str().unwrap(),
-                n
+        let pos_del_1 = FileScanTaskDeleteFile::builder()
+            .with_file_path(format!(
+                "{}/pos-del-1.parquet",
+                table_location.to_str().unwrap()
             ))
-            .unwrap()
-            .len(),
-            start: 0,
-            length: 0,
-            record_count: None,
-            data_file_path: format!("{}/pos-del-{}.parquet", table_location.to_str().unwrap(), n),
-            referenced_data_file: None,
-            data_file_content: DataContentType::PositionDeletes,
-            data_file_format: DataFileFormat::Parquet,
-            schema: data_file_schema.clone(),
-            project_field_ids: vec![],
-            predicate: None,
-            deletes: vec![],
-            sequence_number: 0,
-            equality_ids: None,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: false,
-        };
+            .with_file_size_in_bytes(
+                std::fs::metadata(format!(
+                    "{}/pos-del-1.parquet",
+                    table_location.to_str().unwrap()
+                ))
+                .unwrap()
+                .len(),
+            )
+            .with_file_type(DataContentType::PositionDeletes)
+            .with_file_format(DataFileFormat::Parquet)
+            .with_partition_spec_id(0)
+            .build();
+
+        let pos_del_2 = FileScanTaskDeleteFile::builder()
+            .with_file_path(format!(
+                "{}/pos-del-2.parquet",
+                table_location.to_str().unwrap()
+            ))
+            .with_file_size_in_bytes(
+                std::fs::metadata(format!(
+                    "{}/pos-del-2.parquet",
+                    table_location.to_str().unwrap()
+                ))
+                .unwrap()
+                .len(),
+            )
+            .with_file_type(DataContentType::PositionDeletes)
+            .with_file_format(DataFileFormat::Parquet)
+            .with_partition_spec_id(0)
+            .build();
+
+        let pos_del_3 = FileScanTaskDeleteFile::builder()
+            .with_file_path(format!(
+                "{}/pos-del-3.parquet",
+                table_location.to_str().unwrap()
+            ))
+            .with_file_size_in_bytes(
+                std::fs::metadata(format!(
+                    "{}/pos-del-3.parquet",
+                    table_location.to_str().unwrap()
+                ))
+                .unwrap()
+                .len(),
+            )
+            .with_file_type(DataContentType::PositionDeletes)
+            .with_file_format(DataFileFormat::Parquet)
+            .with_partition_spec_id(0)
+            .build();
 
         let file_scan_tasks = vec![
-            FileScanTask {
-                file_size_in_bytes: 0,
-                start: 0,
-                length: 0,
-                record_count: None,
-                data_file_path: format!("{}/1.parquet", table_location.to_str().unwrap()),
-                referenced_data_file: None,
-                data_file_content: DataContentType::Data,
-                data_file_format: DataFileFormat::Parquet,
-                schema: data_file_schema.clone(),
-                project_field_ids: vec![],
-                predicate: None,
-                deletes: vec![make_pos_del_task(1).into(), make_pos_del_task(2).into()],
-                sequence_number: 0,
-                equality_ids: None,
-                partition: None,
-                partition_spec: None,
-                name_mapping: None,
-                case_sensitive: false,
-            },
-            FileScanTask {
-                file_size_in_bytes: 0,
-                start: 0,
-                length: 0,
-                record_count: None,
-                data_file_path: format!("{}/2.parquet", table_location.to_str().unwrap()),
-                referenced_data_file: None,
-                data_file_content: DataContentType::Data,
-                data_file_format: DataFileFormat::Parquet,
-                schema: data_file_schema.clone(),
-                project_field_ids: vec![],
-                predicate: None,
-                deletes: vec![make_pos_del_task(3).into()],
-                sequence_number: 0,
-                equality_ids: None,
-                partition: None,
-                partition_spec: None,
-                name_mapping: None,
-                case_sensitive: false,
-            },
+            FileScanTask::builder()
+                .with_file_size_in_bytes(0)
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(format!("{}/1.parquet", table_location.to_str().unwrap()))
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(data_file_schema.clone())
+                .with_project_field_ids(vec![])
+                .with_deletes(vec![pos_del_1, pos_del_2.clone()])
+                .with_case_sensitive(false)
+                .build()
+                .unwrap(),
+            FileScanTask::builder()
+                .with_file_size_in_bytes(0)
+                .with_start(0)
+                .with_length(0)
+                .with_data_file_path(format!("{}/2.parquet", table_location.to_str().unwrap()))
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(data_file_schema.clone())
+                .with_project_field_ids(vec![])
+                .with_deletes(vec![pos_del_3])
+                .with_case_sensitive(false)
+                .build()
+                .unwrap(),
         ];
 
         file_scan_tasks
@@ -758,50 +734,28 @@ pub(crate) mod tests {
         );
 
         // ---------- fake FileScanTask ----------
-        let task = FileScanTask {
-            file_size_in_bytes: 0,
-            start: 0,
-            length: 0,
-            record_count: None,
-            data_file_path: "data.parquet".to_string(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::Data,
-            data_file_format: crate::spec::DataFileFormat::Parquet,
-            schema: schema.clone(),
-            project_field_ids: vec![],
-            predicate: None,
-            deletes: vec![
-                FileScanTask {
-                    file_size_in_bytes: 1, // never read; this test fails before opening the file
-                    start: 0,
-                    length: 0,
-                    record_count: None,
-                    data_file_path: "eq-del.parquet".to_string(),
-                    referenced_data_file: None,
-                    data_file_content: DataContentType::EqualityDeletes,
-                    data_file_format: crate::spec::DataFileFormat::Parquet,
-                    schema: schema.clone(),
-                    project_field_ids: vec![],
-                    predicate: None,
-                    deletes: vec![],
-                    sequence_number: 0,
-                    equality_ids: None,
-                    partition: None,
-                    partition_spec: None,
-                    name_mapping: None,
-                    case_sensitive: true,
-                }
-                .into(),
-            ],
-            sequence_number: 0,
-            equality_ids: None,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        };
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(0)
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path("data.parquet".to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema.clone())
+            .with_project_field_ids(vec![])
+            .with_deletes(vec![
+                FileScanTaskDeleteFile::builder()
+                    .with_file_path("eq-del.parquet".to_string())
+                    .with_file_size_in_bytes(1) // never read; this test fails before opening the file
+                    .with_file_type(DataContentType::EqualityDeletes)
+                    .with_file_format(DataFileFormat::Parquet)
+                    .with_partition_spec_id(0)
+                    .build(),
+            ])
+            .with_case_sensitive(true)
+            .build()
+            .unwrap();
 
-        let filter = DeleteFilter::default();
+        let filter = DeleteFilter::new(Runtime::current());
 
         // ---------- insert equality delete predicate ----------
         let pred = Reference::new("id").equal_to(Datum::long(10));

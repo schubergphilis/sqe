@@ -22,14 +22,15 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, RecordBatch, StructArray};
+use arrow_array::{ArrayRef, RecordBatch, StructArray, new_null_array};
 use arrow_schema::DataType;
 
 use super::record_batch_projector::RecordBatchProjector;
 use super::type_to_arrow_type;
-use crate::spec::{PartitionSpec, Schema, StructType, Type};
+use crate::Result;
+use crate::error::invalid_data;
+use crate::spec::{PartitionSpec, Schema, StructType, Transform, Type};
 use crate::transform::{BoxedTransformFunction, create_transform_function};
-use crate::{Error, ErrorKind, Result};
 
 /// Calculator for partition values in Iceberg tables.
 ///
@@ -38,7 +39,7 @@ use crate::{Error, ErrorKind, Result};
 #[derive(Debug)]
 pub struct PartitionValueCalculator {
     projector: RecordBatchProjector,
-    transform_functions: Vec<BoxedTransformFunction>,
+    transform_functions: Vec<(Transform, BoxedTransformFunction)>,
     partition_type: StructType,
     partition_arrow_type: DataType,
 }
@@ -63,17 +64,16 @@ impl PartitionValueCalculator {
     /// - Projector initialization fails
     pub fn try_new(partition_spec: &PartitionSpec, table_schema: &Schema) -> Result<Self> {
         if partition_spec.is_unpartitioned() {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "Cannot create partition calculator for unpartitioned table",
+            return Err(invalid_data!(
+                "Cannot create partition calculator for unpartitioned table"
             ));
         }
 
         // Create transform functions for each partition field
-        let transform_functions: Vec<BoxedTransformFunction> = partition_spec
+        let transform_functions: Vec<(Transform, BoxedTransformFunction)> = partition_spec
             .fields()
             .iter()
-            .map(|pf| create_transform_function(&pf.transform))
+            .map(|pf| Ok((pf.transform, create_transform_function(&pf.transform)?)))
             .collect::<Result<Vec<_>>>()?;
 
         // Extract source field IDs for projection
@@ -140,28 +140,31 @@ impl PartitionValueCalculator {
         let expected_struct_fields = match &self.partition_arrow_type {
             DataType::Struct(fields) => fields.clone(),
             _ => {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "Expected partition type must be a struct",
-                ));
+                return Err(invalid_data!("Expected partition type must be a struct"));
             }
         };
 
         // Apply transforms to each source column
         let mut partition_values = Vec::with_capacity(self.transform_functions.len());
-        for (source_column, transform_fn) in source_columns.iter().zip(&self.transform_functions) {
-            let partition_value = transform_fn.transform(source_column.clone())?;
+        for ((source_column, (transform, transform_fn)), field) in source_columns
+            .iter()
+            .zip(&self.transform_functions)
+            .zip(&expected_struct_fields)
+        {
+            // A compatibility-bound `void` field may use `int` as its result type even
+            // when its source is non-primitive. Construct the all-null result from the
+            // derived partition type rather than from the source array type.
+            let partition_value = if *transform == Transform::Void {
+                new_null_array(field.data_type(), source_column.len())
+            } else {
+                transform_fn.transform(source_column.clone())?
+            };
             partition_values.push(partition_value);
         }
 
         // Construct the StructArray
         let struct_array = StructArray::try_new(expected_struct_fields, partition_values, None)
-            .map_err(|e| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("Failed to create partition struct array: {e}"),
-                )
-            })?;
+            .map_err(|e| invalid_data!("Failed to create partition struct array: {e}"))?;
 
         Ok(Arc::new(struct_array))
     }
@@ -175,7 +178,10 @@ mod tests {
     use arrow_schema::{Field, Schema as ArrowSchema};
 
     use super::*;
-    use crate::spec::{NestedField, PartitionSpecBuilder, PrimitiveType, Transform};
+    use crate::arrow::schema_to_arrow_schema;
+    use crate::spec::{
+        NestedField, PartitionSpec, PartitionSpecBuilder, PrimitiveType, VariantType,
+    };
 
     #[test]
     fn test_partition_calculator_identity_transform() {
@@ -226,6 +232,54 @@ mod tests {
         assert_eq!(id_partition.value(0), 10);
         assert_eq!(id_partition.value(1), 20);
         assert_eq!(id_partition.value(2), 30);
+    }
+
+    #[test]
+    fn test_partition_calculator_void_non_primitive_source_uses_int_result() {
+        let table_schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "v", Type::Variant(VariantType)).into(),
+            ])
+            .build()
+            .unwrap();
+        let partition_spec: PartitionSpec = serde_json::from_value(serde_json::json!({
+            "spec-id": 0,
+            "fields": [
+                {
+                    "source-id": 2,
+                    "field-id": 1000,
+                    "name": "v_part",
+                    "transform": "void"
+                },
+                {
+                    "source-id": 1,
+                    "field-id": 1001,
+                    "name": "id_part",
+                    "transform": "identity"
+                }
+            ]
+        }))
+        .unwrap();
+        let calculator = PartitionValueCalculator::try_new(&partition_spec, &table_schema).unwrap();
+
+        let arrow_schema = Arc::new(schema_to_arrow_schema(&table_schema).unwrap());
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            new_null_array(arrow_schema.field(1).data_type(), 3),
+        ];
+        let batch = RecordBatch::try_new(arrow_schema, columns).unwrap();
+        let result = calculator.calculate(&batch).unwrap();
+        let struct_array = result.as_any().downcast_ref::<StructArray>().unwrap();
+        let v_partition = struct_array
+            .column_by_name("v_part")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        assert_eq!(v_partition.iter().collect::<Vec<_>>(), vec![None; 3]);
     }
 
     #[test]
