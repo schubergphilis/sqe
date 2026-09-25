@@ -276,8 +276,9 @@ async fn conflicting_new_position_delete_on_rewritten_file_is_a_retryable_confli
         .expect("snapshot exists");
     // old.parquet must still be live (not replaced by new.parquet) -- proof
     // that the compacted output was never committed over the dangling delete.
-    let manifest_list = final_snapshot
-        .load_manifest_list(reloaded.file_io(), reloaded.metadata())
+    let manifest_list = reloaded
+        .manifest_list_reader(final_snapshot)
+        .load()
         .await
         .expect("load manifest list");
     let mut live_data_paths = std::collections::HashSet::new();
@@ -368,8 +369,9 @@ async fn same_scenario_without_baseline_silently_resurrects_rows() {
         .metadata()
         .current_snapshot()
         .expect("snapshot exists");
-    let manifest_list = final_snapshot
-        .load_manifest_list(reloaded.file_io(), reloaded.metadata())
+    let manifest_list = reloaded
+        .manifest_list_reader(final_snapshot)
+        .load()
         .await
         .expect("load manifest list");
     let mut live_data_paths = std::collections::HashSet::new();
@@ -615,8 +617,9 @@ async fn multi_file_position_delete_with_no_referenced_path_is_a_conflict() {
         .metadata()
         .current_snapshot()
         .expect("snapshot exists");
-    let manifest_list = final_snapshot
-        .load_manifest_list(reloaded.file_io(), reloaded.metadata())
+    let manifest_list = reloaded
+        .manifest_list_reader(final_snapshot)
+        .load()
         .await
         .expect("load manifest list");
     let mut live_data_paths = std::collections::HashSet::new();
