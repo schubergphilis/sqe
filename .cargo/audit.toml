@@ -40,10 +40,10 @@
 #   object_store bumps quick-xml past 0.41.
 [advisories]
 ignore = [
-    "RUSTSEC-2023-0071",
-    "RUSTSEC-2024-0436",
-    "RUSTSEC-2026-0176",
-    "RUSTSEC-2026-0177",
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
+    "RUSTSEC-2023-0071",  # review-by 2026-11-25 owner=sqe-maintainers
+    "RUSTSEC-2024-0436",  # review-by 2026-12-25 owner=sqe-maintainers
+    "RUSTSEC-2026-0176",  # review-by 2026-12-25 owner=sqe-maintainers
+    "RUSTSEC-2026-0177",  # review-by 2026-12-25 owner=sqe-maintainers
+    "RUSTSEC-2026-0194",  # review-by 2026-10-25 owner=sqe-maintainers
+    "RUSTSEC-2026-0195",  # review-by 2026-10-25 owner=sqe-maintainers
 ]
