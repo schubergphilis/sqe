@@ -103,16 +103,16 @@ services:
 
   # ── Ranger Admin database ─────────────────────────────────────────────
   ranger-db:
-    # Pinned to 13 like the sibling quickstart's ranger-db. postgres 18+ stores
-    # data in a major-version-specific subdirectory, so an existing volume from
-    # an older image is unreadable and the container exits 1 before ranger-admin
-    # can start. renovate.json holds postgres at `<14` for this reason; that pin
-    # stops new bumps but did not roll back the 18.3 already committed here.
-    image: postgres:13.23
+    # Same major as the sibling quickstart's ranger-db: 17, the newest on the
+    # pre-18 data layout (renovate.json caps postgres at <18). The volume name
+    # carries the major, so an existing volume from 13 is left unmounted and a
+    # fresh one initialises instead of the container exiting 1 before
+    # ranger-admin can start. On the next major, rename the volume again.
+    image: postgres:17.11
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rangerR0cks!}
     volumes:
-      - ranger-db-data:/var/lib/postgresql/data
+      - ranger-db-pg17-data:/var/lib/postgresql/data
       - ./ranger/init_postgres.sh:/docker-entrypoint-initdb.d/init_postgres.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -299,4 +299,4 @@ services:
 
 volumes:
   rustfs-data:
-  ranger-db-data:
+  ranger-db-pg17-data:

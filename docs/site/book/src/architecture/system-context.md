@@ -83,6 +83,6 @@ Each dependency, the version SQE pins today, and how it is kept current. Renovat
 | Apache Polaris (quickstarts) | 1.7.0 | Latest release | Renovate |
 | Apache Ranger (quickstarts) | 2.8.0 | Latest release | Renovate |
 | Keycloak (quickstarts) | 26.7.0 | Latest release | Renovate |
-| PostgreSQL (quickstarts, test stack) | **13, end of life since November 2025** | Five years per major | Needs a major upgrade; quickstart and test use only |
+| PostgreSQL (quickstarts, test stack) | 17 | Five years per major | Renovate keeps 17.x patched; a major move is a hand change, with the volume name carrying the major |
 
 A dependency past its end of life is a finding: upgrade it, or record why it stays and until when.

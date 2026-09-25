@@ -158,7 +158,10 @@
     },
     {
       "description": [
-        "The Ranger quickstart's postgres is held on 13.x deliberately. A bump to 18.3",
+        "Postgres (Ranger quickstarts, test stack) is held within one major: 17.x since",
+        "2026-09-25, moved by hand from end-of-life 13 with the volume name carrying the",
+        "major so old volumes are left unmounted. Renovate keeps 17.x patched and may not",
+        "cross a major. History: a bot bump from 13.23 to 18.3",
         "broke the whole stack: postgres 18 stores data in a major-version-specific",
         "subdirectory, so an existing volume is unreadable and the container exits 1.",
         "ranger-admin never starts, which takes out make test-access-control and",
@@ -170,7 +173,7 @@
       ],
       "matchManagers": ["docker-compose"],
       "matchPackageNames": ["postgres"],
-      "allowedVersions": "<14",
+      "allowedVersions": "<18",
       "minimumReleaseAge": "7 days"
     }
   ]
