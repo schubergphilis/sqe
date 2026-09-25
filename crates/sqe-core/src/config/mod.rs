@@ -795,10 +795,12 @@ pub struct CoordinatorConfig {
     /// Default: lz4.
     #[serde(default = "default_flight_compression")]
     pub flight_compression: FlightCompression,
-    /// Arrow Flight IPC compression for internal shuffle (DoExchange) transfers.
-    /// Default: zstd.
-    #[serde(default = "default_shuffle_compression")]
-    pub shuffle_compression: FlightCompression,
+    /// Arrow Flight IPC compression for scan results workers stream back to
+    /// the coordinator (worker DoGet). Internal traffic, so the better ratio
+    /// wins. Default: zstd. `shuffle_compression` is the pre-2026-09 name
+    /// (from the deleted DoExchange shuffle) and still parses.
+    #[serde(default = "default_worker_flight_compression", alias = "shuffle_compression")]
+    pub worker_flight_compression: FlightCompression,
     /// Tokio worker-thread stack size in MiB for sqe-server and sqe-worker.
     /// Default: 8. Shared so the three entry points cannot drift.
     #[serde(default = "default_runtime_stack_mib")]
@@ -1299,7 +1301,7 @@ impl std::fmt::Debug for CoordinatorConfig {
             .field("spill_dir", &self.spill_dir)
             .field("spill_compression", &self.spill_compression)
             .field("flight_compression", &self.flight_compression)
-            .field("shuffle_compression", &self.shuffle_compression)
+            .field("worker_flight_compression", &self.worker_flight_compression)
             .field("max_workers", &self.max_workers)
             .field("transport", &self.transport)
             .field(
@@ -1344,7 +1346,7 @@ pub enum FlightCompression {
     None,
     /// LZ4 Frame -- fast decompression, good for client-facing responses.
     Lz4,
-    /// Zstandard -- better compression ratio, good for internal shuffle.
+    /// Zstandard -- better compression ratio, good for internal worker traffic.
     Zstd,
 }
 
@@ -1549,8 +1551,10 @@ pub struct WorkerMemoryConfig {
     /// 40% of `worker.memory_limit`.
     #[serde(default)]
     pub operator_budget: String,
-    /// Byte budget for shuffle partition buffers. Default: 20% of
-    /// `worker.memory_limit`.
+    /// Deprecated and ignored: sized the DoExchange shuffle buffers, which
+    /// were deleted in 2026-09 (workers only scan). Still parsed so existing
+    /// configs keep loading under `deny_unknown_fields`; setting it logs a
+    /// warning. Its 20% default went back to `spill_io_budget`'s remainder.
     #[serde(default)]
     pub shuffle_memory_budget: String,
     /// Byte budget for spill I/O read/write buffers. Default: remainder, at
@@ -1748,7 +1752,7 @@ pub struct WorkerConfig {
     pub heartbeat_interval_secs: u64,
     #[serde(default = "default_memory")]
     pub memory_limit: String,
-    /// Sub-budgets for scan / Flight / operators / shuffle / spill I/O.
+    /// Sub-budgets for scan / Flight / operators / spill I/O.
     /// See [`WorkerMemoryConfig`].
     #[serde(default)]
     pub memory: WorkerMemoryConfig,
@@ -1899,13 +1903,12 @@ impl WorkerMemoryConfig {
 
         // Fractions of the tracked limit. Defaults sum to 100% so an empty
         // [worker.memory] table always validates.
-        // scan 20% + flight 10% + operator 40% + shuffle 20% + spill_io 10%.
+        // scan 20% + flight 10% + operator 40% + spill_io remainder (30%).
         let scan = parse_or(&self.scan_budget, memory_limit_bytes / 5)?;
         let flight = parse_or(&self.flight_budget, memory_limit_bytes / 10)?;
         let operator = parse_or(&self.operator_budget, (memory_limit_bytes * 2) / 5)?;
-        let shuffle = parse_or(&self.shuffle_memory_budget, memory_limit_bytes / 5)?;
         let spill_fallback = memory_limit_bytes
-            .saturating_sub(scan + flight + operator + shuffle)
+            .saturating_sub(scan + flight + operator)
             .max(memory_limit_bytes / 10);
         let spill_io = parse_or(&self.spill_io_budget, spill_fallback)?;
         let headroom = parse_or(
@@ -1922,7 +1925,6 @@ impl WorkerMemoryConfig {
             scan_budget: scan,
             flight_budget: flight,
             operator_budget: operator,
-            shuffle_memory_budget: shuffle,
             spill_io_budget: spill_io,
             budget_granularity: granularity.max(1),
         })
@@ -1936,7 +1938,6 @@ pub struct ResolvedWorkerMemory {
     pub scan_budget: usize,
     pub flight_budget: usize,
     pub operator_budget: usize,
-    pub shuffle_memory_budget: usize,
     pub spill_io_budget: usize,
     pub budget_granularity: usize,
 }
@@ -1947,7 +1948,6 @@ impl ResolvedWorkerMemory {
         self.scan_budget
             + self.flight_budget
             + self.operator_budget
-            + self.shuffle_memory_budget
             + self.spill_io_budget
     }
 }
@@ -5154,7 +5154,7 @@ fn default_spill_compression() -> FlightCompression {
 fn default_flight_compression() -> FlightCompression {
     FlightCompression::Lz4
 }
-fn default_shuffle_compression() -> FlightCompression {
+fn default_worker_flight_compression() -> FlightCompression {
     FlightCompression::Zstd
 }
 fn default_runtime_stack_mib() -> usize {
@@ -6085,6 +6085,9 @@ impl SqeConfig {
         if let Some(w) = self.legacy_auth_ignored_warning() {
             tracing::warn!("{w}");
         }
+        if !self.worker.memory.shuffle_memory_budget.is_empty() {
+            tracing::warn!("config key 'worker.memory.shuffle_memory_budget' is ignored: it sized the DoExchange shuffle buffers, which no longer exist (workers only scan). Remove it; its share of worker.memory_limit now goes to spill_io_budget's default.");
+        }
     }
 
     /// #276: when both the legacy flat endpoint config (`auth.keycloak_url` /
@@ -6193,10 +6196,6 @@ fn validate_byte_sizes(config: &SqeConfig, errors: &mut Vec<String>) {
         &config.worker.memory.operator_budget,
     );
     check(
-        "worker.memory.shuffle_memory_budget",
-        &config.worker.memory.shuffle_memory_budget,
-    );
-    check(
         "worker.memory.spill_io_budget",
         &config.worker.memory.spill_io_budget,
     );
@@ -6256,7 +6255,7 @@ fn validate_byte_sizes(config: &SqeConfig, errors: &mut Vec<String>) {
                 errors.push(format!(
                     "worker.memory sub-budgets sum to {sum} bytes which exceeds \
                      worker.memory_limit ({limit} bytes); reduce scan/flight/\
-                     operator/shuffle/spill_io budgets"
+                     operator/spill_io budgets"
                 ));
             }
         }
@@ -6621,6 +6620,29 @@ mod tests {
     // (coordinator/auth/catalog are required top-level keys with no
     // `#[serde(default)]`), so the parse-based tests below include a
     // minimal-but-required TOML skeleton rather than an empty string.
+
+    /// The shuffle-era keys still load (deny_unknown_fields would otherwise
+    /// fail old configs at boot): `shuffle_compression` is an alias of
+    /// `worker_flight_compression`, and `shuffle_memory_budget` parses but
+    /// no longer takes a share of `worker.memory_limit`.
+    #[test]
+    fn shuffle_era_keys_still_parse() {
+        let toml = r#"
+[coordinator]
+shuffle_compression = "lz4"
+[auth]
+[catalog]
+catalog_url = ""
+[worker.memory]
+shuffle_memory_budget = "900MB"
+"#;
+        let cfg: SqeConfig = toml::from_str(toml).expect("shuffle-era config parses");
+        assert_eq!(cfg.coordinator.worker_flight_compression, FlightCompression::Lz4);
+        let limit = 1024 * 1024 * 1024;
+        let r = cfg.worker.memory.resolve_bytes(limit).unwrap();
+        assert!(r.chargeable_sum() <= limit, "ignored budget must not count");
+        assert_eq!(r.spill_io_budget, limit - r.scan_budget - r.flight_budget - r.operator_budget);
+    }
 
     #[test]
     fn maintenance_defaults_to_off_when_absent() {
@@ -7010,7 +7032,7 @@ partial_progress_batch = 5
                 spill_dir: default_coordinator_spill_dir(),
                 spill_compression: default_spill_compression(),
                 flight_compression: default_flight_compression(),
-                shuffle_compression: default_shuffle_compression(),
+                worker_flight_compression: default_worker_flight_compression(),
                 runtime_stack_mib: default_runtime_stack_mib(),
                 max_workers: default_max_workers(),
                 transport: GrpcTransportConfig::default(),

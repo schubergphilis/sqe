@@ -155,15 +155,15 @@
       }
     },
     {
-      "title": "Shuffle Traffic",
+      "title": "Worker Scan and Flight Buffers",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
       "targets": [
-        { "expr": "rate(sqe_shuffle_bytes_sent_total[30s])", "legendFormat": "Sent B/s" },
-        { "expr": "rate(sqe_shuffle_bytes_received_total[30s])", "legendFormat": "Received B/s" }
+        { "expr": "sqe_worker_scan_queue_resident_bytes", "legendFormat": "Scan queue {{instance}}" },
+        { "expr": "sqe_worker_flight_inflight_bytes", "legendFormat": "Flight in flight {{instance}}" }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "Bps" }
+        "defaults": { "unit": "bytes" }
       }
     },
     {
