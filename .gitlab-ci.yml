@@ -300,6 +300,37 @@ deps-check:
         - .cargo/audit.toml
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
+# Helm chart gate: lint the production overlay and check the rendered pods
+# against the Pod Security "restricted" fields (non-root, RuntimeDefault
+# seccomp, no privilege escalation, read-only root, drop ALL, no host
+# namespaces) plus a NetworkPolicy per component. A chart change that drops
+# any of them fails here instead of in a cluster admission controller.
+helm-chart-check:
+  stage: test
+  needs: []
+  image:
+    name: alpine/helm:3.19.0@sha256:aef9b56f64e866207d9591d0abd8f6d767b36aadd12edf68f8a719716d9d29c9
+    entrypoint: [""]
+  variables:
+    # The production overlay needs these to render; they are placeholders.
+    HELM_SETS: >-
+      --set config.policy.ranger.url=http://ranger:6080
+      --set existingSecret=placeholder
+      --set workerSecret.existingSecret=placeholder
+      --set worker.enabled=true
+  script:
+    - apk add --no-cache python3 py3-yaml >/dev/null
+    - helm lint deploy/helm/sqe -f deploy/helm/sqe/values-production.yaml $HELM_SETS
+    - helm template sqe deploy/helm/sqe -f deploy/helm/sqe/values-production.yaml $HELM_SETS > rendered.yaml
+    - python3 scripts/check-helm-hardening.py < rendered.yaml
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - "deploy/helm/**/*"
+        - scripts/check-helm-hardening.py
+        - .gitlab-ci.yml
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
 # Image assembly from the release-binaries artifact (Dockerfile.ci, COPY only).
 # The 3h timeout is a leftover ceiling from when this job compiled the engine
 # inside kaniko; the job now takes minutes.
