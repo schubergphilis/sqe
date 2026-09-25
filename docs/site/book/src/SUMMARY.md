@@ -139,6 +139,7 @@
 - [Web UI](./operations/web-ui.md)
 - [On-Call Runbook](./operations/runbook.md)
 - [Production guide (scaling phases)](./operations/production-guide.md)
+- [Shared responsibility](./operations/shared-responsibility.md)
 
 ---
 
