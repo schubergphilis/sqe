@@ -345,13 +345,15 @@ impl SpoolCompactor {
     /// Empty the spool if its length is exactly `shipped_to`, the byte offset
     /// the shipper has acked up to. Returns `Ok(true)` when it truncated.
     pub fn compact_if_drained(&self, shipped_to: u64) -> std::io::Result<bool> {
-        let mut guard = spool_lock(&self.sink);
-        let Some(sink) = guard.as_mut() else {
+        // Held for the check AND the truncate: the writer's BufWriter can spill
+        // to the file inside write_line, which runs under this lock. Records
+        // still in the BufWriter need no flush: they are not in the file, were
+        // never shipped, and land at offset 0 after the truncate. A partial
+        // line on disk makes len != shipped_to, so it is never cut.
+        let guard = spool_lock(&self.sink);
+        if guard.is_none() {
             return Ok(false);
-        };
-        // Push buffered records to the file first: a record still in the
-        // BufWriter was never shipped and would make the length check lie.
-        sink.flush()?;
+        }
         let len = std::fs::metadata(&self.path)?.len();
         if len == 0 || len != shipped_to {
             return Ok(false);

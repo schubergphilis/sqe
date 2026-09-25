@@ -47,7 +47,7 @@ Anything under "you own" is not done by SQE. If your security or audit framework
 - Retention per log class, immutable (WORM) storage and backups of the indexed logs.
 - Access control on the logs, with access to the logs itself logged.
 - Alerting when SQE goes silent. Alert on the export metrics above, not only on process liveness.
-- The size of the local spool. SQE warns at `max_spool_bytes` and does not rotate or prune the spool.
+- Disk for the local spool during a collector outage. SQE empties the spool once it is shipped, but keeps every unshipped event, so an outage grows it.
 
 ## Encryption
 

@@ -296,8 +296,12 @@ Lower values reduce latency to the SIEM at the cost of more frequent OTLP calls.
 
 Spool size threshold in bytes. When the spool file exceeds this value the exporter
 emits a `WARN` log. The exporter continues and queries are never blocked. Default:
-1 073 741 824 (1 GiB). Spool rotation and automatic pruning are not implemented in
-this release; size management is left to the operator.
+1 073 741 824 (1 GiB).
+
+The shipper empties the spool once every record in it has shipped and it has reached
+16 MiB, so a healthy exporter keeps it small. A spool only grows past that while the
+collector is unreachable. SQE never drops unshipped events to save space; the
+`SqeAuditExportStalled` alert is the signal to act.
 
 #### `start_at`
 
@@ -366,9 +370,6 @@ connectivity problem.
 
 ### Deferred
 
-- **Spool rotation and retention.** Only a bounded-growth `WARN` at `max_spool_bytes`
-  is implemented. Rotation, age-based pruning, and size-capped compaction are not
-  built yet.
 - **Kafka target.** The `target = "kafka"` config key is reserved. It is not
   implemented in this release.
 
