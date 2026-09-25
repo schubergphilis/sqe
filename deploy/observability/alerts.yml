@@ -77,14 +77,38 @@ groups:
             Queries fail-closed (deny-all). Check Ranger Admin reachability
             and sqe_policy_resolve_duration_seconds.
 
-      - alert: SqeOpaCircuitOpen
-        expr: sqe_policy_circuit_breaker_state{backend="opa"} == 2
-        for: 2m
+  # Silent-source detection for the OCSF audit export: the SIEM must learn
+  # when SQE stops sending. Series exist only when [audit.export] is configured.
+  - name: sqe.audit
+    rules:
+      - alert: SqeAuditExportFailing
+        expr: increase(sqe_audit_export_batch_failures_total[15m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: SQE audit export batches are failing
+          description: >
+            Audit batches have failed to ship for 15m. Events queue in the
+            local spool. Check the export endpoint and its TLS.
+
+      - alert: SqeAuditExportStalled
+        # Backlog present and nothing shipped for 30m. An idle coordinator has
+        # lag 0 and stays silent. last_success is 0 until the first ship, so a
+        # backlog that never shipped also fires.
+        expr: |
+          sqe_audit_export_spool_lag_bytes > 0
+            and
+          (time() - sqe_audit_export_last_success_timestamp) > 1800
+        for: 10m
         labels:
           severity: critical
         annotations:
-          summary: OPA policy circuit breaker is open
-          description: Policy fetches to OPA are failing. Queries fail-closed.
+          summary: SQE audit events are not reaching the SIEM
+          description: >
+            {{ $value | humanize1024 }}B of audit events are waiting in the
+            spool and nothing has shipped for 30m. The SIEM is missing audit
+            events from this coordinator.
 
   - name: sqe.workers
     rules:
