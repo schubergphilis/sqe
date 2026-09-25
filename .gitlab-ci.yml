@@ -6,7 +6,13 @@
 workflow:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    # A scheduled scan runs on main, and every job is interruptible (see
+    # `default:` below), so the next merge to main used to auto-cancel it
+    # half way (pipeline 1634184). The weekly rescan and the monthly review
+    # must run to the end.
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      auto_cancel:
+        on_new_commit: none
     - if: '$CI_COMMIT_TAG'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
