@@ -474,6 +474,34 @@ pub(crate) fn build_merge_select(
     let mut inner_cols: Vec<String> = Vec::with_capacity(names.target_columns.len() + 1);
     for col in names.target_columns {
         let passthrough = format!("{}.\"{col}\"", names.target_ref);
+        // V3 row lineage (present only when the caller added the reserved
+        // names): a row keeps `_row_id` unless inserted, and gets a NULL
+        // `_last_updated_sequence_number` when inserted or updated so it
+        // inherits the new file's sequence number.
+        let is_row_id = col == iceberg::metadata_columns::RESERVED_COL_NAME_ROW_ID;
+        let is_last_updated =
+            col == iceberg::metadata_columns::RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER;
+        if is_row_id || is_last_updated {
+            const NULL: &str = "CAST(NULL AS BIGINT)";
+            let updated = if is_last_updated { NULL } else { passthrough.as_str() };
+            let mut arms: Vec<String> = Vec::new();
+            for clause in &classified.matched {
+                let v = if matches!(clause.op, MergeOp::Update(_)) { updated } else { passthrough.as_str() };
+                arms.push(case_arm(&matched_cond, clause.predicate.as_deref(), v));
+            }
+            for clause in &classified.not_matched {
+                arms.push(case_arm(&source_only_cond, clause.predicate.as_deref(), NULL));
+            }
+            for clause in &classified.by_source {
+                let v = if matches!(clause.op, MergeOp::Update(_)) { updated } else { passthrough.as_str() };
+                arms.push(case_arm(&target_only_cond, clause.predicate.as_deref(), v));
+            }
+            inner_cols.push(format!(
+                "CASE {} ELSE {passthrough} END AS \"{col}\"",
+                arms.join(" ")
+            ));
+            continue;
+        }
         let mut arms: Vec<String> = Vec::new();
         for clause in &classified.matched {
             // DELETE rows are dropped by the keep filter; project the target

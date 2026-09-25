@@ -2575,7 +2575,6 @@ mod tests {
     // `ctx.progress_tx`, and can observe `ctx.cancel`.
 
     use crate::compaction::GroupRewriteCtx;
-    use iceberg::io::FileIOBuilder;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     // Plain `Duration` is `chrono::Duration` in this module (imported for the
     // credential-refresh tests above), hence the alias.
@@ -2584,7 +2583,7 @@ mod tests {
     /// In-memory object store. Every clone shares one map, so the stub's
     /// uploads and the handler's cleanup see the same objects.
     fn memory_io() -> FileIO {
-        FileIOBuilder::new("memory").build().unwrap()
+        iceberg::io::FileIO::new_with_memory()
     }
 
     async fn write_object(io: &FileIO, path: &str) {

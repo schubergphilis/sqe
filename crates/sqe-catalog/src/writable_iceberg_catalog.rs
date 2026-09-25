@@ -42,7 +42,7 @@ use dashmap::DashMap;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use iceberg::{Catalog, NamespaceIdent};
-use iceberg_datafusion::IcebergCatalogProvider;
+use datafusion_iceberg::IcebergCatalogProvider;
 
 /// A `CatalogProvider` over an iceberg::Catalog that supports both
 /// reads and namespace-level writes.

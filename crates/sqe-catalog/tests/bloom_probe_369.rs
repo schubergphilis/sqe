@@ -195,9 +195,9 @@ mod reader_e2e {
     use arrow_array::{Int64Array, RecordBatch};
     use futures::TryStreamExt;
     use iceberg::arrow::ArrowReaderBuilder;
-    use iceberg::io::FileIOBuilder;
+    use iceberg::io::FileIO;
     use iceberg::scan::{FileScanTask, FileScanTaskStream};
-    use iceberg::spec::{DataContentType, DataFileFormat};
+    use iceberg::spec::DataFileFormat;
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
     use parquet::file::properties::WriterProperties;
 
@@ -252,26 +252,18 @@ mod reader_e2e {
     }
 
     fn scan_task(path: &str, schema: Arc<Schema>, predicate: Predicate) -> FileScanTask {
-        FileScanTask {
-            file_size_in_bytes: std::fs::metadata(path).unwrap().len(),
-            start: 0,
-            length: 0,
-            record_count: None,
-            data_file_path: path.to_string(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::Data,
-            data_file_format: DataFileFormat::Parquet,
-            schema: schema.clone(),
-            project_field_ids: vec![1],
-            predicate: Some(predicate.bind(schema, true).unwrap()),
-            deletes: vec![],
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-            sequence_number: 0,
-            equality_ids: None,
-        }
+        FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(path).unwrap().len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(path.to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema.clone())
+            .with_project_field_ids(vec![1])
+            .with_predicate(Some(predicate.bind(schema, true).unwrap()))
+            .with_case_sensitive(true)
+            .build()
+            .unwrap()
     }
 
     /// Run one scan; returns (total rows, row_groups_pruned_bloom).
@@ -285,7 +277,7 @@ mod reader_e2e {
     }
 
     fn reader_builder() -> ArrowReaderBuilder {
-        ArrowReaderBuilder::new(FileIOBuilder::new_fs_io().build().unwrap())
+        ArrowReaderBuilder::new(FileIO::new_with_fs(), iceberg::Runtime::current())
             .with_data_file_concurrency_limit(1)
     }
 
@@ -384,7 +376,7 @@ mod case_union {
     use datafusion::physical_expr::expressions::{lit, CaseExpr, Column};
     use datafusion::physical_expr::PhysicalExpr;
     use datafusion::scalar::ScalarValue;
-    use iceberg_datafusion::physical_plan::physical_to_predicate::convert_physical_filters_to_predicate;
+    use sqe_catalog::physical_to_predicate::convert_physical_filters_to_predicate;
 
     fn arrow_schema() -> ArrowSchema {
         ArrowSchema::new(vec![
@@ -552,7 +544,7 @@ mod case_union {
     // over-cap column restores the pre-`df5c59d` behavior for large sets (the
     // CASE was untranslatable then) while keeping the win for small selective
     // sets.
-    use iceberg_datafusion::physical_plan::physical_to_predicate::convert_physical_filters_to_predicate_capped;
+    use sqe_catalog::physical_to_predicate::convert_physical_filters_to_predicate_capped;
 
     fn convert_capped(expr: Arc<dyn PhysicalExpr>, max: usize) -> Option<Predicate> {
         convert_physical_filters_to_predicate_capped(&[expr], max)

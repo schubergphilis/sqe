@@ -51,14 +51,14 @@ arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
 datafusion = { workspace = true }
 datafusion-functions-json = { workspace = true }
-# Embedded persistent catalog, exposed to DataFusion via iceberg-datafusion.
+# Embedded persistent catalog, exposed to DataFusion via datafusion-iceberg.
 # iceberg-catalog-sql is only needed by the `sqlite-c` fallback engine; the
 # default `sqlite-rs` engine lives in sqe-catalog.
 iceberg = { workspace = true }
 iceberg-catalog-sql = { workspace = true, optional = true }
-iceberg-datafusion = { workspace = true }
+datafusion-iceberg = { workspace = true }
 # DashMap powers the writable catalog's per-name schema cache; same
-# concurrency-friendly map iceberg-datafusion uses for its own
+# concurrency-friendly map datafusion-iceberg uses for its own
 # table-level cache.
 tokio = { workspace = true }
 serde_json = { workspace = true }

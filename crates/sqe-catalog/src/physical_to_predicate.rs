@@ -308,10 +308,10 @@ fn collect_membership_sets(
                     _ => None,
                 },
             };
-            if let Some((col, lit)) = col_lit
-                && let Some(datum) = scalar_to_datum(&lit)
-            {
-                out.entry(col).or_default().push(datum);
+            if let Some((col, lit)) = col_lit {
+                if let Some(datum) = scalar_to_datum(&lit) {
+                    out.entry(col).or_default().push(datum);
+                }
             }
         }
         return;

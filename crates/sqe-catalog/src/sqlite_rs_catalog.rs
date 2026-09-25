@@ -59,6 +59,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -167,13 +168,8 @@ impl SqliteRsCatalog {
             ));
         }
         let warehouse_location = warehouse_location.into();
-        let scheme = warehouse_location
-            .split("://")
-            .next()
-            .filter(|s| !s.is_empty() && *s != warehouse_location.as_str())
-            .unwrap_or("s3")
-            .to_string();
-        let fileio = FileIOBuilder::new(scheme).build()?;
+        // Storage is resolved per path scheme (`file://`, `s3://`, ...).
+        let fileio = FileIOBuilder::new(crate::storage_factory()).build();
 
         let db_path = canonical_db_path(db_path.as_ref())?;
         let shared = shared_connection(&db_path).await?;
@@ -768,6 +764,12 @@ impl Catalog for SqliteRsCatalog {
         Ok(())
     }
 
+    async fn purge_table(&self, table: &TableIdent) -> Result<()> {
+        let table_info = self.load_table(table).await?;
+        self.drop_table(table).await?;
+        iceberg::drop_table_data(&table_info).await
+    }
+
     async fn load_table(&self, identifier: &TableIdent) -> Result<Table> {
         let rows = self
             .fetch_rows(
@@ -789,6 +791,7 @@ impl Catalog for SqliteRsCatalog {
         let metadata_location = text(row, 0)?;
         let metadata = TableMetadata::read_from(&self.fileio, &metadata_location).await?;
         Table::builder()
+            .runtime(iceberg::Runtime::current())
             .file_io(self.fileio.clone())
             .identifier(identifier.clone())
             .metadata_location(metadata_location)
@@ -810,8 +813,8 @@ impl Catalog for SqliteRsCatalog {
             return table_already_exists_err(&tbl_ident);
         }
 
-        let (tbl_creation, location) = match creation.location.clone() {
-            Some(location) => (creation, location),
+        let tbl_creation = match creation.location.clone() {
+            Some(_) => creation,
             None => {
                 // Namespace `location` property first, then the warehouse.
                 let nsp_properties = self.get_namespace(namespace).await?.properties().clone();
@@ -820,24 +823,21 @@ impl Catalog for SqliteRsCatalog {
                     None => format!("{}/{}", self.warehouse_location, namespace.join("/")),
                 };
                 let tbl_location = format!("{}/{}", nsp_location, tbl_ident.name());
-                (
-                    TableCreation {
-                        location: Some(tbl_location.clone()),
-                        ..creation
-                    },
-                    tbl_location,
-                )
+                TableCreation {
+                    location: Some(tbl_location),
+                    ..creation
+                }
             }
         };
 
         let tbl_metadata = TableMetadataBuilder::from_table_creation(tbl_creation)?
             .build()?
             .metadata;
-        let tbl_metadata_location =
-            MetadataLocation::new_with_table_location(location).to_string();
+        let metadata_location = MetadataLocation::try_new_with_metadata(&tbl_metadata)?;
         tbl_metadata
-            .write_to(&self.fileio, &tbl_metadata_location)
+            .write_to(&self.fileio, &metadata_location)
             .await?;
+        let tbl_metadata_location = metadata_location.to_string();
 
         self.execute(
             format!(
@@ -856,6 +856,7 @@ impl Catalog for SqliteRsCatalog {
         .await?;
 
         Table::builder()
+            .runtime(iceberg::Runtime::current())
             .file_io(self.fileio.clone())
             .metadata_location(tbl_metadata_location)
             .identifier(tbl_ident)
@@ -953,6 +954,7 @@ impl Catalog for SqliteRsCatalog {
         )
         .await?;
         Table::builder()
+            .runtime(iceberg::Runtime::current())
             .identifier(table_ident.clone())
             .metadata_location(metadata_location)
             .metadata(metadata)
@@ -971,7 +973,10 @@ impl Catalog for SqliteRsCatalog {
         let staged_metadata_location = staged_table.metadata_location_result()?.to_string();
         staged_table
             .metadata()
-            .write_to(staged_table.file_io(), &staged_metadata_location)
+            .write_to(
+                staged_table.file_io(),
+                &MetadataLocation::from_str(&staged_metadata_location)?,
+            )
             .await?;
 
         // The sqlx path is one conditional UPDATE (`... AND metadata_location

@@ -20,7 +20,7 @@ mod glue {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use iceberg::io::OpenDalStorageFactory;
+    use iceberg_storage_opendal::OpenDalStorageFactory;
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
     use iceberg_catalog_glue::{GlueCatalogBuilder, AWS_REGION_NAME, GLUE_CATALOG_PROP_WAREHOUSE};
 
@@ -59,7 +59,7 @@ mod glue {
         // doesn't write Parquet, so the Fs storage factory is enough
         // to satisfy `with_storage_factory`. Same pattern as HMS.
         let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
-            Arc::new(OpenDalStorageFactory::Fs);
+            Arc::new(OpenDalStorageFactory::fs());
 
         // Build the upstream GlueCatalog directly through the loader
         // builder pattern — same path the iceberg-catalog-loader uses
@@ -106,7 +106,7 @@ mod glue {
     #[tokio::test]
     async fn glue_builder_rejects_empty_warehouse() {
         let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
-            Arc::new(OpenDalStorageFactory::Fs);
+            Arc::new(OpenDalStorageFactory::fs());
         // Empty warehouse must fail fast at builder.load() rather than
         // surfacing a confusing AWS error later.
         let res = GlueCatalogBuilder::default()
@@ -127,7 +127,7 @@ mod hms {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use iceberg::io::OpenDalStorageFactory;
+    use iceberg_storage_opendal::OpenDalStorageFactory;
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
     use iceberg_catalog_hms::{
         HmsCatalogBuilder, HMS_CATALOG_PROP_URI, HMS_CATALOG_PROP_WAREHOUSE,
@@ -170,7 +170,7 @@ mod hms {
         // credentials. (Same pattern the existing iceberg-catalog-sql
         // test below uses on line ~209.)
         let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
-            Arc::new(OpenDalStorageFactory::Fs);
+            Arc::new(OpenDalStorageFactory::fs());
 
         // Build the upstream HmsCatalog directly through the builder
         // pattern — same path iceberg-catalog-loader uses when SQE's
@@ -232,7 +232,7 @@ mod sql {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use iceberg::io::OpenDalStorageFactory;
+    use iceberg_storage_opendal::OpenDalStorageFactory;
     use iceberg::CatalogBuilder;
     use iceberg_catalog_sql::{
         SqlCatalogBuilder, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE,
@@ -265,7 +265,7 @@ mod sql {
         props.insert(SQL_CATALOG_PROP_WAREHOUSE.to_string(), warehouse);
 
         let storage_factory: Arc<dyn iceberg::io::StorageFactory> =
-            Arc::new(OpenDalStorageFactory::Fs);
+            Arc::new(OpenDalStorageFactory::fs());
 
         let res = SqlCatalogBuilder::default()
             .with_storage_factory(storage_factory)
@@ -294,7 +294,7 @@ mod sql_postgres {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use iceberg::io::OpenDalStorageFactory;
+    use iceberg_storage_opendal::OpenDalStorageFactory;
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
     use iceberg_catalog_sql::{
         SqlCatalogBuilder, SQL_CATALOG_PROP_URI, SQL_CATALOG_PROP_WAREHOUSE,
@@ -327,7 +327,7 @@ mod sql_postgres {
         props.insert(SQL_CATALOG_PROP_WAREHOUSE.to_string(), warehouse);
 
         let catalog = SqlCatalogBuilder::default()
-            .with_storage_factory(Arc::new(OpenDalStorageFactory::Fs))
+            .with_storage_factory(Arc::new(OpenDalStorageFactory::fs()))
             .load("postgres-jdbc-test", props)
             .await
             .expect("SqlCatalog should build against live Postgres");
@@ -519,7 +519,7 @@ warehouse = "{warehouse}"
         props.insert(SQL_CATALOG_PROP_WAREHOUSE.to_string(), warehouse.clone());
 
         let catalog = SqlCatalogBuilder::default()
-            .with_storage_factory(Arc::new(OpenDalStorageFactory::Fs))
+            .with_storage_factory(Arc::new(OpenDalStorageFactory::fs()))
             .load("postgres-jdbc-v3-test", props)
             .await
             .expect("SqlCatalog should build against live Postgres");
