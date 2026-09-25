@@ -186,6 +186,43 @@ Redaction and GDPR masking run before chain stamping so the chain covers the
 post-redaction bytes. Modifying a record to restore redacted content will break the
 chain.
 
+### Verifying a log or an extract
+
+`sqe-server --verify-audit <file>` checks the chain of a native audit file and exits
+without starting a server. Exit code 0 means intact, 1 means broken, with the first bad
+line named. The report carries what a chain-of-custody record needs:
+
+```text
+sha256:          2f1e56dc...   (the file as handed over)
+records:         151 (seq 100..=250)
+first prev_hash: 0414fcbc...   (hash of seq 99 in the source log)
+last hash:       0f2b6079...   (prev_hash of seq 251 in the source log)
+chain:           OK
+```
+
+Verification needs the native file: `format = "native"` or `"both"`. An `ocsf`-only
+deployment has nothing to recompute the hashes from, so pick `"both"` if you may ever
+need to prove a log is intact.
+
+### Extracting records for an investigation
+
+1. Copy the audit file. Never edit or filter the live file in place.
+2. Cut a contiguous line range from the copy with `sed -n 'FIRST,LASTp'`. Find the line
+   numbers with `grep -n '"seq":100,'`. Do not rewrite lines with `jq` or an editor: a
+   reformatted line no longer matches its hash.
+3. Run `sqe-server --verify-audit` on the source copy and on the extract. Both must say
+   `OK`.
+4. Check the anchors. The extract's `first prev_hash` must equal the `hash` of the record
+   before it in the source, and its `last hash` the `prev_hash` of the record after it.
+   Matching anchors prove nothing was cut from either end.
+5. Record the extract's sha256, sequence range and both anchors, with who made it and
+   when, and hand over the extract and the report together. The receiver reruns
+   `--verify-audit` and compares the sha256.
+
+A `broken segment` line in the report marks a restart after a crash left a torn record.
+The writer starts a fresh segment on purpose, so the log stays verifiable. Keep the
+report line with the extract: it explains the gap.
+
 ## PII redaction (always-on)
 
 Before any record is written, `redact_pii` runs unconditionally on the SQL query text.
