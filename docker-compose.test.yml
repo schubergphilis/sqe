@@ -86,15 +86,14 @@ services:
   # 15432 is offset from the production default (5432) to avoid
   # collisions on dev boxes.
   postgres:
-    # Pinned to 13 to match renovate.json's `allowedVersions: "<14"` for
-    # postgres. 18+ stores data in a major-version-specific subdirectory, so an
-    # existing volume from an older image is unreadable and the container exits 1
-    # before pg_isready ever passes. That is what broke the Ranger quickstart on
-    # 2026-08-07; the follow-up pinned ranger-db and left this service on 18,
-    # where nobody noticed because `TYPE jdbc` was unimplemented and so nothing
-    # ever started it. If you already have a volume built by 18, reset it with
-    # `docker compose -f docker-compose.test.yml down -v`.
-    image: postgres:13-alpine
+    # 17, the newest major on the pre-18 data layout (renovate.json caps
+    # postgres at <18). A data directory only opens under the major that
+    # created it, so the volume name carries the major: a volume from an older
+    # image is simply not mounted and a fresh one initialises, instead of the
+    # container exiting 1 before pg_isready. 18+ also moves data into a
+    # major-version subdirectory (what broke the Ranger quickstart on
+    # 2026-08-07). On the next major, rename the volume again.
+    image: postgres:17-alpine
     environment:
       POSTGRES_USER: iceberg
       POSTGRES_PASSWORD: iceberg
@@ -108,8 +107,8 @@ services:
       retries: 15
       start_period: 5s
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - postgres17-data:/var/lib/postgresql/data
 
 volumes:
   rustfs-data:
-  postgres-data:
+  postgres17-data:

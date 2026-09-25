@@ -534,8 +534,8 @@ warehouse = "{warehouse}"
             .expect("create_namespace through JDBC backend");
 
         // Schema with a single int column. We don't need a V3-only
-        // type here; the `format-version=3` table property is what
-        // iceberg-rust round-trips through the catalog.
+        // type here; the format version is what iceberg-rust
+        // round-trips through the catalog.
         let schema = IcebergSchema::builder()
             .with_fields(vec![NestedField::required(
                 1,
@@ -546,14 +546,13 @@ warehouse = "{warehouse}"
             .build()
             .expect("schema builder");
 
-        let mut table_props = HashMap::new();
-        table_props.insert("format-version".to_string(), "3".to_string());
-
+        // The re-vendored TableCreation rejects `format-version` as a table
+        // property (reserved) and takes it as a typed field instead.
         let table_name = format!("v3_table_{}", uuid::Uuid::new_v4().simple());
         let creation = TableCreation::builder()
             .name(table_name.clone())
             .schema(schema)
-            .properties(table_props)
+            .format_version(iceberg::spec::FormatVersion::V3)
             .build();
 
         // create_table writes the manifest under the warehouse root.
