@@ -95,3 +95,9 @@ SQE holds almost no state. Tables live in your object store and catalog. The coo
 **SQE ships:** a security disclosure process in `SECURITY.md` for vulnerabilities in SQE itself, and an [On-Call Runbook](./runbook.md) for known failure modes.
 
 **You own:** incident management for your deployment, including priorities, customer notification and root-cause reports.
+
+## Go-live and retirement
+
+**SQE ships:** standard [go-live and retirement checklists](./go-live-checklist.md) that exercise the controls on this page.
+
+**You own:** running them at go-live and at retirement, and keeping the signed-off record.
