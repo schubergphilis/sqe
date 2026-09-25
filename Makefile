@@ -322,6 +322,9 @@ check-ignore-reasons:  ## Every #[ignore] must carry a reason (#639): needs:<sta
 	if [ -n "$$bad" ]; then echo "bare #[ignore] without a reason (use #[ignore = \"needs:<stack>; <run hint>\"]):"; echo "$$bad"; exit 1; fi
 	@echo "==> ignore reasons ok"
 
+check-test-layout:  ## One integration-test binary per crate (tests/it/main.rs); each extra tests/*.rs relinks DataFusion
+	@scripts/check-test-layout.sh
+
 audit-deny:
 	@command -v cargo-deny >/dev/null 2>&1 || \
 		{ echo "cargo-deny not found. Install with: cargo install cargo-deny"; exit 1; }
