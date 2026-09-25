@@ -111,6 +111,12 @@ variables:
   # Passed as --target to kaniko so we never accidentally ship an intermediate
   # builder stage if stage order in Dockerfile drifts.
   AIKIDO_DOCKER_TARGET: "runtime"
+  # Keyless cosign signature on every vX.Y.Z image (aikido-sign-image, GitLab
+  # OIDC -> Sigstore). Opt-in upstream; release images must be signed so
+  # deployers can verify what they run. Needs runner egress to Sigstore; if the
+  # first tag pipeline fails here, the image is already pushed, only the
+  # signature is missing.
+  AIKIDO_SIGN: "1"
 
 # ── Binaries for the image, compiled by cargo in the test stage ──────
 # The image used to be compiled inside kaniko in .post, after the tests: a
@@ -191,6 +197,12 @@ release-binaries:
 # Unused-dependency gate. cargo-machete is a source scan (no compile), so the
 # job is seconds; it runs whenever a manifest changes. Feature-only knobs are
 # listed under [package.metadata.cargo-machete] in the crate that owns them.
+#
+# Also the BLOCKING supply-chain gate: cargo deny (advisories, bans, licenses,
+# sources) and cargo audit (RustSec, honouring .cargo/audit.toml). aikido-test-rust
+# runs both too, but as `|| echo "(non-blocking)"`, so a known advisory would
+# merge with a warning nobody reads. Both read Cargo.lock only,
+# no compile.
 deps-check:
   stage: test
   needs: []
@@ -199,6 +211,8 @@ deps-check:
   variables:
     CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
     CARGO_MACHETE_VERSION: "0.9.2"
+    CARGO_DENY_VERSION: "0.19.6"
+    CARGO_AUDIT_VERSION: "0.22.1"
   # The cache carries an executable that the default branch then runs. That
   # is only safe because the project has "separate caches for protected
   # branches" on (ci_separated_caches = true): an MR pipeline cannot write
@@ -219,6 +233,12 @@ deps-check:
       cargo-machete --version 2>/dev/null | grep -qF "$CARGO_MACHETE_VERSION" \
         || cargo install cargo-machete --locked --force --version "$CARGO_MACHETE_VERSION"
       cargo machete --with-metadata crates/sqe-*
+      cargo-deny --version 2>/dev/null | grep -qF "$CARGO_DENY_VERSION" \
+        || cargo install cargo-deny --locked --force --version "$CARGO_DENY_VERSION"
+      cargo-audit --version 2>/dev/null | grep -qF "$CARGO_AUDIT_VERSION" \
+        || cargo install cargo-audit --locked --force --version "$CARGO_AUDIT_VERSION"
+      cargo deny check
+      cargo audit
       # No cargo needed; rides along because the job already runs on every
       # MR that touches crates/**/*.rs.
       scripts/check-test-layout.sh
@@ -231,6 +251,8 @@ deps-check:
         - Cargo.lock
         - "crates/*/Cargo.toml"
         - "crates/**/*.rs"
+        - deny.toml
+        - .cargo/audit.toml
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
 # Image assembly from the release-binaries artifact (Dockerfile.ci, COPY only).
@@ -514,6 +536,12 @@ aikido-release-image:
   interruptible: false
 aikido-sign-image:
   interruptible: false
+
+# SAST blocks at the .asset `warn_on` tier (high). The platform leaves it
+# advisory ("SAST never blocks a merge"); here a high SAST finding blocks
+# promotion like any other high finding. Medium and Info still only report.
+aikido-sast:
+  allow_failure: false
 
 # ===== repo-specific integration suites (docker-in-docker), hosted here =====
 #
