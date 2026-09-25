@@ -138,6 +138,7 @@
 - [Audit Logging (OCSF)](./operations/audit-logging.md)
 - [Web UI](./operations/web-ui.md)
 - [On-Call Runbook](./operations/runbook.md)
+- [Secret inventory and rotation](./operations/secret-rotation.md)
 - [Production guide (scaling phases)](./operations/production-guide.md)
 - [Shared responsibility](./operations/shared-responsibility.md)
 
