@@ -68,7 +68,7 @@ Anything under "you own" is not done by SQE. If your security or audit framework
 
 - The identity provider, MFA and the joiner, mover and leaver process.
 - Periodic review of Ranger policies and Polaris grants.
-- Storing and rotating SQE's own secrets: `worker_secret`, `policy.mask_key` and the OIDC client secrets. Rotating `mask_key` changes every `MASK_HASH` output, so plan it with the consumers of those hashes.
+- Storing and rotating SQE's own secrets. [Secret Inventory and Rotation](./secret-rotation.md) lists every one, with what breaks when it changes and how to rotate it.
 
 ## Network
 
