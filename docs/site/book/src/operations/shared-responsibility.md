@@ -72,9 +72,9 @@ Anything under "you own" is not done by SQE. If your security or audit framework
 
 ## Network
 
-**SQE ships:** a default-deny ingress NetworkPolicy in the chart. It is **off by default** (`networkPolicy.enabled: false`) because the right `from` selectors depend on your cluster.
+**SQE ships:** default-deny ingress NetworkPolicies for the coordinator and the workers. Workers accept traffic from the coordinator only. `values-production.yaml` turns them on; the base `values.yaml` leaves them off for local installs. Listing rules under `networkPolicy.egress` turns on default-deny egress too, with DNS and the coordinator-worker traffic added by the chart. Pods run with the `RuntimeDefault` seccomp profile, and CI fails any chart change that drops a Pod Security "restricted" control.
 
-**You own:** turning it on, and adding egress rules that limit coordinator and workers to the catalog, identity provider, object store and policy service.
+**You own:** narrowing `networkPolicy.from` to your ingress controller and Prometheus, and filling `networkPolicy.egress` with your catalog, identity provider, object store, policy service and OTLP collector.
 
 ## Backup and continuity
 
