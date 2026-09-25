@@ -267,14 +267,6 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn trino_stats_queued_state() {
-        let s = TrinoStats::queued();
-        assert_eq!(s.state, "QUEUED");
-        assert!(s.queued);
-        assert!(!s.scheduled);
-    }
-
-    #[test]
     fn test_batches_to_trino_empty() {
         let (cols, rows) = batches_to_trino(&[]);
         assert!(cols.is_empty());

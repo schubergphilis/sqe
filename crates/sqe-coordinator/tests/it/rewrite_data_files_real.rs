@@ -14,7 +14,7 @@
 //! ```text
 //! docker compose -f docker-compose.test.yml up -d
 //! ./scripts/bootstrap-test.sh
-//! cargo test --package sqe-coordinator --test rewrite_data_files_real -- --ignored
+//! cargo test --package sqe-coordinator --test it rewrite_data_files_real -- --ignored
 //! ```
 //!
 //! Each row is tiny (`id BIGINT`) so 50 single-row INSERTs leave 50 small

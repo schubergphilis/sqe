@@ -32,7 +32,6 @@ pub const DEFAULT_CONFIG_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 pub struct WorkerHotConfig {
     pub memory_limit_bytes: Arc<AtomicUsize>,
-    pub shuffle_budget_bytes: Arc<AtomicUsize>,
     /// `memory_limit + process_headroom` for cgroup fail-closed / watch.
     pub configured_need_bytes: Arc<AtomicU64>,
     pub scan_timeout_secs: Arc<AtomicU64>,
@@ -41,13 +40,11 @@ pub struct WorkerHotConfig {
 impl WorkerHotConfig {
     pub fn new(
         memory_limit_bytes: usize,
-        shuffle_budget_bytes: usize,
         configured_need_bytes: u64,
         scan_timeout_secs: u64,
     ) -> Self {
         Self {
             memory_limit_bytes: Arc::new(AtomicUsize::new(memory_limit_bytes.max(1))),
-            shuffle_budget_bytes: Arc::new(AtomicUsize::new(shuffle_budget_bytes.max(64 * 1024))),
             configured_need_bytes: Arc::new(AtomicU64::new(configured_need_bytes)),
             scan_timeout_secs: Arc::new(AtomicU64::new(scan_timeout_secs)),
         }
@@ -100,7 +97,7 @@ impl BootConfigIdentity {
     }
 }
 
-/// Resolve memory_limit, governor pool, shuffle budget, and configured need.
+/// Resolve memory_limit, governor pool, sub-budgets, and configured need.
 pub fn resolve_memory_budgets(config: &SqeConfig) -> anyhow::Result<ResolvedMemoryBudgets> {
     let memory_limit = parse_memory_limit(&config.worker.memory_limit).map_err(|e| {
         anyhow::anyhow!(
@@ -113,16 +110,12 @@ pub fn resolve_memory_budgets(config: &SqeConfig) -> anyhow::Result<ResolvedMemo
         .memory
         .resolve_bytes(memory_limit)
         .map_err(|e| anyhow::anyhow!("worker.memory: {e}"))?;
-    let governor_pool = resolved
-        .operator_budget
-        .saturating_add(resolved.shuffle_memory_budget)
-        .max(1024 * 1024);
+    let governor_pool = resolved.operator_budget.max(1024 * 1024);
     let configured_need = (memory_limit as u64).saturating_add(resolved.process_headroom as u64);
     Ok(ResolvedMemoryBudgets {
         memory_limit_bytes: memory_limit,
         governor_pool_bytes: governor_pool,
-        shuffle_budget_bytes: resolved.shuffle_memory_budget.max(64 * 1024),
-        // Same floor as shuffle: a budget below one accounting unit would round
+        // Floor of one accounting unit: a budget below it would round
         // to zero capacity, and `ByteBudget` then rejects every frame with
         // ItemTooLarge, silently turning the charge off (issue #407).
         flight_budget_bytes: resolved.flight_budget.max(64 * 1024),
@@ -140,7 +133,6 @@ pub fn resolve_memory_budgets(config: &SqeConfig) -> anyhow::Result<ResolvedMemo
 pub struct ResolvedMemoryBudgets {
     pub memory_limit_bytes: usize,
     pub governor_pool_bytes: usize,
-    pub shuffle_budget_bytes: usize,
     /// Capacity for the encoded-Flight-frame budget (issue #407).
     pub flight_budget_bytes: usize,
     /// Capacity for the worker-wide scan budget (`[worker.memory]
@@ -248,12 +240,6 @@ pub fn apply_memory_hot_reload(
             .configured_need_bytes
             .store(budgets.configured_need_bytes, Ordering::Release);
     }
-    if !governor_shrink_ignored {
-        handles
-            .hot
-            .shuffle_budget_bytes
-            .store(budgets.shuffle_budget_bytes, Ordering::Release);
-    }
     handles
         .hot
         .scan_timeout_secs
@@ -277,7 +263,6 @@ pub fn apply_memory_hot_reload(
         info!(
             memory_limit_bytes = applied_limit,
             governor_pool_bytes = applied_gov,
-            shuffle_budget_bytes = budgets.shuffle_budget_bytes,
             process_headroom_bytes = budgets.process_headroom_bytes,
             configured_need_bytes = budgets.configured_need_bytes,
             scan_timeout_secs = budgets.scan_timeout_secs,
@@ -383,8 +368,7 @@ pub fn spawn_config_reload_watch(
                                 handles.hot.configured_need_bytes.load(Ordering::Acquire);
                             if budgets.memory_limit_bytes == prev_limit
                                 && budgets.configured_need_bytes == prev_need
-                                && budgets.shuffle_budget_bytes
-                                    == handles.hot.shuffle_budget_bytes.load(Ordering::Acquire)
+                                && budgets.governor_pool_bytes == handles.governor.pool_bytes()
                                 && budgets.scan_timeout_secs
                                     == handles.hot.scan_timeout_secs.load(Ordering::Acquire)
                             {
@@ -451,7 +435,6 @@ mod tests {
         let governor = Arc::new(MemoryGovernor::new(gov_bytes));
         let hot = Arc::new(WorkerHotConfig::new(
             pool_bytes,
-            50 * 1024 * 1024,
             pool_bytes as u64 + 256 * 1024 * 1024,
             600,
         ));
@@ -570,7 +553,6 @@ prometheus_port = {prometheus_port}
         let budgets = ResolvedMemoryBudgets {
             memory_limit_bytes: 400 * 1024 * 1024,
             governor_pool_bytes: 250 * 1024 * 1024,
-            shuffle_budget_bytes: 80 * 1024 * 1024,
             flight_budget_bytes: 40 * 1024 * 1024,
             scan_budget_bytes: 80 * 1024 * 1024,
             budget_granularity_bytes: 64 * 1024,
@@ -587,10 +569,6 @@ prometheus_port = {prometheus_port}
         assert_eq!(
             hot.memory_limit_bytes.load(Ordering::Acquire),
             400 * 1024 * 1024
-        );
-        assert_eq!(
-            hot.shuffle_budget_bytes.load(Ordering::Acquire),
-            80 * 1024 * 1024
         );
         assert_eq!(hot.scan_timeout_secs.load(Ordering::Acquire), 120);
         assert_eq!(
@@ -614,7 +592,6 @@ prometheus_port = {prometheus_port}
         let budgets = ResolvedMemoryBudgets {
             memory_limit_bytes: 16 * 1024 * 1024, // below reserved
             governor_pool_bytes: 32 * 1024 * 1024,
-            shuffle_budget_bytes: 8 * 1024 * 1024,
             flight_budget_bytes: 4 * 1024 * 1024,
             scan_budget_bytes: 8 * 1024 * 1024,
             budget_granularity_bytes: 64 * 1024,

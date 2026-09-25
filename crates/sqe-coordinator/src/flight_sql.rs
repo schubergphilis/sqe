@@ -408,8 +408,8 @@ fn like_match_inner(pattern: &[char], value: &[char]) -> bool {
 
 /// Build [`IpcWriteOptions`] for a given compression setting.
 ///
-/// Used by both the coordinator (client-facing DoGet) and shared with workers
-/// for shuffle DoExchange encoding.
+/// Used by the coordinator (client-facing DoGet) and by workers (scan results
+/// to the coordinator, `coordinator.worker_flight_compression`).
 pub fn ipc_options_for(
     compression: sqe_core::FlightCompression,
 ) -> Result<IpcWriteOptions, Status> {
