@@ -6,7 +6,7 @@
 //! ```text
 //! docker compose -f docker-compose.test.yml up -d
 //! ./scripts/bootstrap-test.sh
-//! cargo test --package sqe-coordinator --test maintenance_procedures_test -- --ignored
+//! cargo test --package sqe-coordinator --test it maintenance_procedures_test -- --ignored
 //! ```
 //!
 //! Non-ignored tests in this file exercise the parser -> classifier path

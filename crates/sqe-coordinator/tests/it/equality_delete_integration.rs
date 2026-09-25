@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! ./scripts/start-spark-interop.sh
-//! cargo test --package sqe-coordinator --test equality_delete_integration -- --ignored
+//! cargo test --package sqe-coordinator --test it equality_delete_integration -- --ignored
 //! ```
 //!
 //! The Spark interop test (`spark_reads_sqe_equality_delete_file`) is NOT
