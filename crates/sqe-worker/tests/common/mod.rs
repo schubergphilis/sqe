@@ -377,7 +377,6 @@ pub async fn sample_peaks(
         let tracked = pool_reserved()
             .max(metrics.scan_decode_resident_bytes.get() as usize)
             .max(metrics.scan_queue_resident_bytes.get() as usize)
-            .max(metrics.shuffle_resident_bytes.get() as usize)
             .max(metrics.flight_encode_resident_bytes.get() as usize);
         peak_tracked.observe(tracked);
         peak_rss.observe(process_rss_bytes() as usize);

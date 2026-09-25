@@ -17,7 +17,7 @@ use crate::error::{BudgetError, Result};
 /// this size so the semaphore can track capacity with a bounded permit count.
 pub const DEFAULT_BUDGET_GRANULARITY: usize = 64 * 1024;
 
-/// Default fraction of a shuffle/scan parent budget reserved for spill-read
+/// Default fraction of a scan/operator parent budget reserved for spill-read
 /// and merge headroom (1/4 = 25%). Writers must not consume this slice so a
 /// slow consumer can still stream spilled segments without waiting for
 /// writers to free memory.
@@ -70,7 +70,7 @@ pub fn split_default_read_headroom(capacity: usize) -> (usize, usize) {
 ///    whole capacity fails with [`BudgetError::ItemTooLarge`].
 /// 2. **Worker pool** (optional) — each permit owns a [`MemoryReservation`]
 ///    grown via `try_grow`. This keeps DataFusion operators aware of scan /
-///    Flight / shuffle buffer residency under the same `worker.memory_limit`.
+///    Flight buffer residency under the same `worker.memory_limit`.
 #[derive(Clone, Debug)]
 pub struct ByteBudget {
     inner: Arc<Inner>,

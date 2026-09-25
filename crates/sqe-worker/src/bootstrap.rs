@@ -43,7 +43,7 @@ pub fn build_worker_service_with_hot_reload(
     memory_pool: Option<Arc<ResizableFairSpillPool>>,
     config_path: Option<&str>,
 ) -> anyhow::Result<WorkerFlightService> {
-    let shuffle_compression = config.coordinator.shuffle_compression;
+    let worker_flight_compression = config.coordinator.worker_flight_compression;
     crate::executor::configure_row_group_pruning(config.worker.row_group_pruning);
 
     // Parquet footer cache: avoids re-reading file metadata from S3 on every
@@ -55,7 +55,6 @@ pub fn build_worker_service_with_hot_reload(
     let budgets = resolve_memory_budgets(config)?;
     let hot = Arc::new(WorkerHotConfig::new(
         budgets.memory_limit_bytes,
-        budgets.shuffle_budget_bytes,
         budgets.configured_need_bytes,
         budgets.scan_timeout_secs,
     ));
@@ -100,7 +99,7 @@ pub fn build_worker_service_with_hot_reload(
         .with_scan_timeout(config.worker.scan_timeout_secs)
         // Finding 608: worker-side ceiling on one compact_file_group rewrite.
         .with_compaction_timeout(config.worker.compaction_timeout_secs)
-        .with_flight_compression(shuffle_compression)
+        .with_flight_compression(worker_flight_compression)
         .with_footer_cache(footer_cache)
         .with_worker_secret(config.worker.worker_secret.clone())
         .with_scan_timeout_atom(Arc::clone(&hot.scan_timeout_secs))
