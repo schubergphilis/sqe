@@ -325,6 +325,9 @@ check-ignore-reasons:  ## Every #[ignore] must carry a reason (#639): needs:<sta
 check-advisory-ignores:  ## Every ignored advisory (deny.toml, .cargo/audit.toml, .grype.yaml) has an owner and an unexpired review date
 	@python3 scripts/check-advisory-ignores.py
 
+dast:  ## DAST baseline: OWASP ZAP against a local sqe-server's HTTP listener (needs Docker; local gate)
+	@scripts/dast-baseline.sh
+
 check-test-layout:  ## One integration-test binary per crate (tests/it/main.rs); each extra tests/*.rs relinks DataFusion
 	@scripts/check-test-layout.sh
 
