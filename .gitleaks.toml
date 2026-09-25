@@ -6,6 +6,7 @@
 #   * local runs        -> gitleaks dir .        (or gitleaks detect)
 #   * the commit hook    -> .pre-commit-config.yaml (gitleaks git --staged)
 #   * the CI gate        -> aikido-secret-scan job (gitleaks detect --no-git)
+#   * the history scan   -> aikido-secret-scan-history (weekly schedule)
 # without any --config flag.
 #
 # Design rule: keep suppressions as narrow as possible so real secrets are still
@@ -13,11 +14,17 @@
 #   1. an inline `gitleaks:allow` comment on the offending line (travels with the
 #      code, cannot mask a leak in any other file) -- used for the test fixtures
 #      in crates/sqe-core/src/secret.rs,
-#   2. a path-scoped allowlist (condition = "AND": placeholder allowed ONLY in
-#      the docs/scripts that use it),
-#   3. an exact-value allowlist for a unique, unmistakable example string.
-# Broad, unscoped regexes are avoided: a loose pattern can unmask a real secret
-# that merely contains the same substring.
+#   2. an exact-value allowlist for a unique, unmistakable example string,
+#   3. for a finding in an old blob that no value rule fits, its fingerprint in
+#      .gitleaksignore (commit:file:rule:line, cannot match anything else).
+#
+# Never combine `paths` with `regexes` under condition = "AND". The gitleaks in
+# use (8.30) then suppresses EVERY finding in those paths, whatever the regex
+# says. Until 2026-09-25 such a block hid all secrets under docs/, openspec/,
+# testing/ and scripts/: a planted AWS key there went unreported. Path-only
+# entries remain solely for paths that are exempt as a whole (build output,
+# vendored code, the TLS test key files). Before adding one, plant a fake key
+# in the path and confirm it is still reported elsewhere.
 #
 # NOTE: this scans committed content only. It does NOT catch runtime leaks such
 # as a secret written to a log at execution time -- those need a code fix.
@@ -35,31 +42,27 @@ paths = [
     '''(^|/)vendor/''',
 ]
 
-# 2. Documentation and test-script credential placeholders. condition = "AND"
-#    means a hit is allowed ONLY when it is both in one of these paths AND matches
-#    a placeholder pattern -- the same string in engine source is still flagged.
+# 2. Committed TLS test fixtures. crates/sqe-core/tests/fixtures/tls/ holds a
+#    throwaway self-signed CA and two leaf key pairs (SAN worker-1.sqe.test /
+#    localhost) that exist only so the TLS builder and certificate-reload tests
+#    can run without openssl at test time. They sign nothing outside the test
+#    process. Path-only, so it covers exactly the .key files in that directory.
 [[allowlists]]
-description = "Doc / test-script credential placeholders (path-scoped)"
-condition = "AND"
+description = "TLS test fixtures (key files in one directory)"
 paths = [
-    '''(^|/)docs/''',
-    '''(^|/)openspec/''',
-    '''(^|/)testing/''',
-    '''(^|/)scripts/''',
-]
-regexes = [
-    '''your-password''',
-    '''\bs3cr3t\b''',
-    '''sqe_k?_?abc123def456''',
+    '''(^|/)crates/sqe-core/tests/fixtures/tls/[^/]+\.key$''',
 ]
 
-# 3. Unique example values matched by their exact content. Each is specific
-#    enough that it cannot collide with a real secret.
+# 3. Values that cannot be real secrets, matched against the extracted secret
+#    only (the default regexTarget), in any path. Each is a documented
+#    placeholder, a published quickstart default, a test fixture, or a shape
+#    no credential has.
 [[allowlists]]
-description = "Unique example values"
+description = "Placeholder, fixture and published-default values"
 regexes = [
-    # Example API key in api_key.rs doc-comment / configuration.md
+    # Example API keys in api_key.rs doc-comments and the deployment docs.
     '''sqe_k?_?abc123def456''',
+    '''sqe_k?_?xyz789ghi012''',
     # PKCS#1 RSA key used only for JWT-signing tests (bearer_token.rs
     # TEST_RSA_PRIVATE_KEY_PEM); matched by its unique leading bytes so a real
     # RSA key cannot be masked. Lives inside a string literal, so it cannot take
@@ -69,117 +72,36 @@ regexes = [
     # TEST_EC_PRIVATE_KEY_PEM), matched by its unique leading bytes. The `+`
     # is base64 payload, not a quantifier, so it must be escaped.
     '''MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcb/PT1Xj\+xW0FvVc''',
-    # Test fixtures in crates/sqe-core/src/secret.rs. These carry inline
-    # `gitleaks:allow` comments in the working tree, but the history scan
-    # (aikido-secret-scan-history) reads old blobs where the comment was not
-    # present yet, so the inline form cannot suppress them. Both are unmistakable
-    # dummies used to assert that Debug redaction works.
+    # Test fixtures in crates/sqe-core/src/secret.rs. They carry inline
+    # `gitleaks:allow` comments now, but the history scan reads old blobs where
+    # the comment was not present yet. Dummies asserting Debug redaction works.
     '''hunter2-very-private''',
     '''0123456789abcdef''',
-    # Documented example API key. The `abc123def456` variant is already listed
-    # above; this is the second placeholder value used in the deployment docs
-    # (historically docs/deployment.md, now under docs/site/).
-    '''sqe_k?_?xyz789ghi012''',
-    # HMAC-SHA256 fixture digest in sha256_udf.rs (openssl of key=pepper / msg=SSN).
-    # Not a secret. rustfmt put the hex on its own line and generic-api-key
-    # started matching it on every pipeline.
+    # HMAC-SHA256 fixture digest in sha256_udf.rs (key=pepper / msg=SSN).
     '''40966d99be0fda85dac0b2f8d9f00b434b89b0d3e2b3f4bdcbf1dd31a2b7092f''',
+    # Doc and test-script placeholders: `-u jacob:your-password` in the book,
+    # `-u root:s3cr3t` in the tempto notes.
+    '''your-password''',
+    '''\bs3cr3t\b''',
+    # Published quickstart defaults: the Ranger admin password (in
+    # docker-compose.yml, ranger/install.properties and the README) and the
+    # Keycloak demo user carol (keycloak/realm-ranger.json). Gate nothing outside
+    # a laptop.
+    '''rangerR0cks!''',
+    '''carol123''',
+    # `Basic cm9vdDpyb290` = root:root, the default of a removed Trino test script.
+    '''cm9vdDpyb290''',
+    # The MCP quickstart test sends this bearer to prove a bad token gets 401;
+    # base64 "sqe-writer-token-1" is the documented token_b64 example.
+    '''not\.a\.valid\.jwt''',
+    '''c3FlLXdyaXRlci10b2tlbi0x''',
+    # Test scripts pass credentials as shell variables (`-u "$SQE_USER:..."`,
+    # `${SQE_USER:-root}`); a real credential never starts with `$`.
+    '''^\$\{?[A-Za-z_]''',
+    # generic-api-key reads TPC-H join predicates in committed EXPLAIN output
+    # (`c_custkey = tpch_sf1.orders.o_custkey`) as key = value. The value is a
+    # dotted column identifier ending in `x_...key`.
+    '''^([a-z0-9_]+\.)*[a-z]{1,2}_[a-z]+key$''',
 ]
 
-# 4. History-only false positives that cannot be expressed as a value match.
-#    The aikido-secret-scan-history job scans every commit, so a finding in a
-#    blob that predates a rename or an inline `gitleaks:allow` stays flagged
-#    forever and no working-tree edit can clear it.
-#
-#    These two test scripts build Trino-compat HTTP calls whose credentials come
-#    from shell variables ($SQE_USER, $TRINO_PASSWORD, ...), which the curl-auth
-#    rules match on shape alone. The allowlist is scoped three ways at once
-#    (condition = "AND"): only these two files, only a line that actually
-#    contains a `$`-interpolated value, and only via `regexTarget = "line"`.
-#    A hardcoded literal such as `curl -u admin:s3cr3tpw` has no `$` on the line
-#    and is still reported. Verified against a probe repo: a planted
-#    non-placeholder AWS secret in scripts/distributed-test.sh is still caught.
-[[allowlists]]
-description = "Variable-interpolated curl auth in test scripts (history scan)"
-condition = "AND"
-paths = [
-    '''(^|/)scripts/distributed-test\.sh$''',
-    '''(^|/)scripts/verify_trino_compatibility\.sh$''',
-]
-regexTarget = "line"
-regexes = [
-    '''curl[^\n]*\$\{?[A-Za-z_][A-Za-z0-9_]*''',
-]
-
-# 5. Same history-only class, different value: the Ranger access-control plan
-#    quotes runnable `curl -s -u admin:'rangerR0cks!'` recipes against the local
-#    quickstart. `rangerR0cks!` is the quickstart's PUBLISHED default, already in
-#    docker-compose.yml, ranger/install.properties and the quickstart README as a
-#    `${RANGER_ADMIN_PASSWORD:-rangerR0cks!}` default. It gates nothing outside a
-#    developer's laptop.
-#
-#    Why an allowlist and not an edit: `aikido-secret-scan-history` reads every
-#    commit, so the finding lives in the blob at 288e5b6 forever and no
-#    working-tree change can clear it. Rewriting main's history to remove three
-#    doc lines would be far worse than the finding.
-#
-#    Scoped three ways (condition = "AND"): only this one file, only a line
-#    carrying this exact known-public value, and via `regexTarget = "line"`. A
-#    different credential in the same file is still reported, and this value in
-#    any other path is still reported. Note the unquoted `-u admin:rangerR0cks!`
-#    form in docs/internal/plans/2026-06-18-ranger-access-control-backend.md does
-#    NOT trip `curl-auth-user` and needs no entry -- the rule matches the quoted
-#    shape.
-[[allowlists]]
-description = "Quickstart default Ranger password in a plan doc (history scan)"
-condition = "AND"
-paths = [
-    '''(^|/)docs/superpowers/plans/2026-07-31-ranger-access-control-e2e\.md$''',
-]
-regexTarget = "line"
-regexes = [
-    '''curl[^\n]*-u admin:'rangerR0cks!'''',
-]
-
-# 6. Block 5 again, one plan doc later. The Spark/Ranger parity plan carries the
-#    same runnable Ranger recipes, in the safer defaulted form:
-#
-#      curl -s -u "admin:${RANGER_ADMIN_PASSWORD:-<the same published default>}"
-#
-#    `curl-auth-user` matches the SHAPE, so parameterising the password does not
-#    help: the literal default still sits on the line. Same published quickstart
-#    value as block 5, same reasoning, same three-way scoping, and the same reason
-#    it has to be an allowlist rather than an edit -- the finding lives in the blob
-#    at 037681b and the history scan reads every commit.
-#
-#    That this recurred one plan later says it will keep recurring: any doc quoting
-#    a runnable Ranger curl trips it. The durable fix is a rule-level exception for
-#    this one known-public value, which belongs upstream in the aikido policy
-#    rather than in a seventh per-file block here. This keeps main publishing in
-#    the meantime.
-[[allowlists]]
-description = "Quickstart default Ranger password in the Spark parity plan (history scan)"
-condition = "AND"
-paths = [
-    '''(^|/)docs/superpowers/plans/2026-08-06-spark-ranger-access-control-parity\.md$''',
-]
-regexTarget = "line"
-regexes = [
-    '''curl[^\n]*-u "admin:\$\{RANGER_ADMIN_PASSWORD:-rangerR0cks!\}"''',
-]
-
-# 5. Committed TLS test fixtures. crates/sqe-core/tests/fixtures/tls/ holds a
-#    throwaway self-signed CA and two leaf key pairs (SAN worker-1.sqe.test /
-#    localhost) that exist only so the TLS builder and certificate-reload tests
-#    can run without openssl at test time. They sign nothing outside the test
-#    process. Scoped to that one directory AND to PEM private-key blocks, so a
-#    real key committed anywhere else is still flagged.
-[[allowlists]]
-description = "TLS test fixtures (path-scoped private keys)"
-condition = "AND"
-paths = [
-    '''(^|/)crates/sqe-core/tests/fixtures/tls/[^/]+\.key$''',
-]
-regexes = [
-    '''-----BEGIN (RSA |EC )?PRIVATE KEY-----''',
-]
+# Findings no value rule fits are listed by fingerprint in .gitleaksignore.
