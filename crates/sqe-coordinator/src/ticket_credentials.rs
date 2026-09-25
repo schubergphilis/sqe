@@ -101,8 +101,7 @@ fn warn_static_once() {
 /// Vended S3 credentials from the table's FileIO properties, when the
 /// catalog supplied them at LOAD_TABLE time.
 fn vended_credentials(table: &Table) -> Option<ScanCredentials> {
-    let (_, props, _) = table.file_io().clone().into_builder().into_parts();
-    vended_from_props(&props)
+    vended_from_props(table.file_io().config().props())
 }
 
 fn vended_from_props(props: &std::collections::HashMap<String, String>) -> Option<ScanCredentials> {

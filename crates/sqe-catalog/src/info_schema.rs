@@ -602,6 +602,15 @@ fn iceberg_to_sql_type_info(t: &iceberg::spec::Type) -> SqlTypeInfo {
                 numeric_scale: None,
                 datetime_precision: None,
             },
+            // V3 `unknown`: a column whose values are always null.
+            PrimitiveType::Unknown => SqlTypeInfo {
+                data_type: "unknown".to_string(),
+                udt_name: "unknown".to_string(),
+                character_maximum_length: None,
+                numeric_precision: None,
+                numeric_scale: None,
+                datetime_precision: None,
+            },
         },
         Type::Struct(_) => SqlTypeInfo {
             data_type: "row".to_string(),

@@ -546,8 +546,9 @@ mod snapshot_schema_tests {
             "metadata-log": []
         }"#;
         let metadata: iceberg::spec::TableMetadata = serde_json::from_str(META_V2).unwrap();
-        let file_io = iceberg::io::FileIOBuilder::new_fs_io().build().unwrap();
+        let file_io = iceberg::io::FileIO::new_with_fs();
         iceberg::table::Table::builder()
+            .runtime(iceberg::Runtime::current())
             .metadata(metadata)
             .identifier(TableIdent::new(
                 NamespaceIdent::new("ns".to_string()),

@@ -735,7 +735,7 @@ pub async fn read_ndv_blobs(
     statistics_file: &StatisticsFile,
 ) -> iceberg::Result<Vec<NdvBlob>> {
     let input = file_io.new_input(&statistics_file.statistics_path)?;
-    let reader = PuffinReader::new(input);
+    let reader = PuffinReader::new(input).await?;
     let file_metadata = reader.file_metadata().await?;
     let mut out = Vec::new();
     for meta in file_metadata.blobs() {
@@ -832,7 +832,6 @@ mod tests {
 
     use arrow_array::{ArrayRef, Int64Array, StringArray};
     use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
-    use iceberg::io::FileIOBuilder;
     use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
     use tempfile::TempDir;
 
@@ -1041,7 +1040,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let base_dir = temp.path().to_string_lossy().to_string();
 
-        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let file_io = iceberg::io::FileIO::new_with_fs();
         let schema = schema_id_name();
         let batch = sample_batch(vec![1, 2, 3, 4], vec!["a", "b", "c", "d"]);
 
@@ -1070,7 +1069,7 @@ mod tests {
     async fn read_ndv_blobs_round_trips_body_and_properties() {
         let temp = TempDir::new().unwrap();
         let base_dir = temp.path().to_string_lossy().to_string();
-        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let file_io = iceberg::io::FileIO::new_with_fs();
         let schema = schema_id_name();
         let batch = sample_batch(vec![1, 2, 3, 4], vec!["a", "b", "c", "d"]);
         let sketches = build_theta_sketches(&schema, &[batch]);
