@@ -22,11 +22,16 @@ ci-config-sanity:
   script:
     - python -m json.tool renovate.json >/dev/null
     # #639: no bare `#[ignore]`; every ignored test names its stack/reason.
-    - apk add --no-cache make >/dev/null
+    # bash + GNU grep for leak-scan (busybox grep lacks --include / -I).
+    - apk add --no-cache make bash grep >/dev/null
     - make check-ignore-reasons
     # Accepted advisories expire: a passed review date fails the pipeline so
     # the risk is re-decided, not silently carried.
     - make check-advisory-ignores
+    # docs/site is published: no account ids, internal hostnames or internal
+    # user names may reach it (also quickstart/ and tests/ for account ids).
+    # Was a manual pre-publish step only.
+    - make leak-scan
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
