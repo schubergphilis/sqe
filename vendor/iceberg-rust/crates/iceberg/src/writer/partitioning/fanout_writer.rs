@@ -138,7 +138,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::io::FileIOBuilder;
+    use crate::io::FileIO;
     use crate::spec::{
         DataFileFormat, Literal, NestedField, PartitionKey, PartitionSpec, PrimitiveType, Struct,
         Type,
@@ -153,7 +153,7 @@ mod tests {
     #[tokio::test]
     async fn test_fanout_writer_single_partition() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let file_io = FileIOBuilder::new_fs_io().build()?;
+        let file_io = FileIO::new_with_fs();
         let location_gen = DefaultLocationGenerator::with_data_location(
             temp_dir.path().to_str().unwrap().to_string(),
         );
@@ -249,7 +249,7 @@ mod tests {
     #[tokio::test]
     async fn test_fanout_writer_multiple_partitions() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let file_io = FileIOBuilder::new_fs_io().build()?;
+        let file_io = FileIO::new_with_fs();
         let location_gen = DefaultLocationGenerator::with_data_location(
             temp_dir.path().to_str().unwrap().to_string(),
         );

@@ -54,17 +54,12 @@ mod action;
 
 pub use action::*;
 mod append;
-
-pub use append::FastAppendAction;
-pub use rewrite_manifests::RewriteManifestsAction;
-pub use update_schema::UpdateSchemaAction;
+mod expire_snapshots;
 mod manifest_filter;
-
-pub use manifest_filter::*;
+mod replace_files;
+// SQE PATCH (revendor): create_branch / create_tag / remove_ref (branch.rs)
+// and apache PR #2203 RowDeltaAction (row_delta.rs) ride on top of the base.
 mod branch;
-mod overwrite_files;
-mod remove_snapshots;
-mod rewrite_files;
 mod rewrite_manifests;
 mod row_delta;
 mod snapshot;
@@ -81,33 +76,37 @@ pub use row_delta::RowDeltaAction;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use append::FastAppendAction;
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder, RetryableWithContext};
-use remove_snapshots::RemoveSnapshotAction;
-use rewrite_files::RewriteFilesAction;
+pub use manifest_filter::{ManifestFilterManager, ManifestWriterContext};
+pub use replace_files::{OverwriteFilesAction, RewriteFilesAction};
+pub use rewrite_manifests::RewriteManifestsAction;
+pub use update_schema::AddColumn;
 
 use crate::error::Result;
 use crate::spec::TableProperties;
 use crate::table::Table;
-use crate::transaction::append::MergeAppendAction;
-use crate::transaction::overwrite_files::OverwriteFilesAction;
-use crate::transaction::sort_order::ReplaceSortOrderAction;
-use crate::transaction::update_location::UpdateLocationAction;
-use crate::transaction::update_properties::UpdatePropertiesAction;
-use crate::transaction::update_statistics::UpdateStatisticsAction;
-use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
+use crate::transaction::action::BoxedTransactionAction;
+pub use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
+pub use crate::transaction::sort_order::ReplaceSortOrderAction;
+pub use crate::transaction::update_location::UpdateLocationAction;
+pub use crate::transaction::update_properties::UpdatePropertiesAction;
+pub use crate::transaction::update_schema::UpdateSchemaAction;
+pub use crate::transaction::update_statistics::UpdateStatisticsAction;
+pub use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
 use crate::{Catalog, TableCommit, TableRequirement, TableUpdate};
 
-/// Target size of manifest file when merging manifests.
+/// Target size property used when writing replacement manifests.
 pub const MANIFEST_TARGET_SIZE_BYTES: &str = "commit.manifest.target-size-bytes";
-/// This is the default value for `MANIFEST_TARGET_SIZE_BYTES`.
-pub const MANIFEST_TARGET_SIZE_BYTES_DEFAULT: u32 = 8 * 1024 * 1024; // 8 MB
-/// Minimum number of manifests to merge.
+/// Default target manifest size: 8 MiB.
+pub const MANIFEST_TARGET_SIZE_BYTES_DEFAULT: u32 = 8 * 1024 * 1024;
+/// Minimum manifest count property used to decide whether merging is worthwhile.
 pub const MANIFEST_MIN_MERGE_COUNT: &str = "commit.manifest.min-count-to-merge";
-/// This is the default value for `MANIFEST_MIN_MERGE_COUNT`.
+/// Default minimum number of manifests to merge.
 pub const MANIFEST_MIN_MERGE_COUNT_DEFAULT: u32 = 100;
-/// Whether allow to merge manifests.
+/// Property controlling automatic manifest merging.
 pub const MANIFEST_MERGE_ENABLED: &str = "commit.manifest-merge.enabled";
-/// This is the default value for `MANIFEST_MERGE_ENABLED`.
+/// Automatic manifest merging is disabled by default.
 pub const MANIFEST_MERGE_ENABLED_DEFAULT: bool = false;
 
 /// Table transaction.
@@ -168,7 +167,7 @@ impl Transaction {
         UpdatePropertiesAction::new()
     }
 
-    /// Update table's schema.
+    /// Creates an update schema action.
     pub fn update_schema(&self) -> UpdateSchemaAction {
         UpdateSchemaAction::new()
     }
@@ -178,9 +177,19 @@ impl Transaction {
         FastAppendAction::new()
     }
 
-    /// Creates a merge append action.
-    pub fn merge_append(&self) -> MergeAppendAction {
-        MergeAppendAction::new()
+    /// Creates an action that rewrites files without changing table data.
+    pub fn rewrite_files(&self) -> RewriteFilesAction {
+        RewriteFilesAction::new()
+    }
+
+    /// Creates an action that replaces files as a logical overwrite.
+    pub fn overwrite_files(&self) -> OverwriteFilesAction {
+        OverwriteFilesAction::new()
+    }
+
+    /// Creates an action that rewrites manifest files without changing table data.
+    pub fn rewrite_manifests(&self) -> RewriteManifestsAction {
+        RewriteManifestsAction::new()
     }
 
     /// Creates replace sort order action.
@@ -193,32 +202,14 @@ impl Transaction {
         UpdateLocationAction::new()
     }
 
-    /// Creates remove snapshot action.
-    pub fn expire_snapshot(&self) -> RemoveSnapshotAction {
-        RemoveSnapshotAction::new()
-    }
-
     /// Update the statistics of table
     pub fn update_statistics(&self) -> UpdateStatisticsAction {
         UpdateStatisticsAction::new()
     }
 
-    /// Creates rewrite files action.
-    pub fn rewrite_files(&self) -> RewriteFilesAction {
-        RewriteFilesAction::new()
-    }
-
-    /// Creates an overwrite files action.
-    pub fn overwrite_files(&self) -> OverwriteFilesAction {
-        OverwriteFilesAction::new()
-    }
-
-    /// Creates a rewrite manifests action.
-    ///
-    /// This action reorganizes manifest files without changing the underlying data.
-    /// It can consolidate small manifests or re-cluster entries.
-    pub fn rewrite_manifests(&self) -> RewriteManifestsAction {
-        RewriteManifestsAction::new()
+    /// Expire snapshots from the table metadata.
+    pub fn expire_snapshots(&self) -> ExpireSnapshotsAction {
+        ExpireSnapshotsAction::new()
     }
 
     /// Creates a row-delta action. Commits added data files, added delete files
@@ -235,17 +226,12 @@ impl Transaction {
             return Ok(self.table);
         }
 
-        let table_props = self.table.metadata().table_properties()?;
-
-        // Preserve the original FileIO so that the returned table retains
-        // any configuration (e.g. S3 region) that the catalog's own FileIO
-        // may not carry.
-        let original_file_io = self.table.file_io().clone();
+        let table_props = self.table.metadata().table_properties();
 
         let backoff = Self::build_backoff(table_props)?;
         let tx = self;
 
-        let table = (|mut tx: Transaction| async {
+        (|mut tx: Transaction| async {
             let result = tx.do_commit(catalog).await;
             (tx, result)
         })
@@ -254,19 +240,17 @@ impl Transaction {
         .context(tx)
         .when(|e| e.retryable())
         .await
-        .1?;
-
-        Ok(table.with_file_io(original_file_io))
+        .1
     }
 
-    fn build_backoff(props: TableProperties) -> Result<ExponentialBackoff> {
+    fn build_backoff(props: TableProperties<'_>) -> Result<ExponentialBackoff> {
         Ok(ExponentialBuilder::new()
-            .with_min_delay(Duration::from_millis(props.commit_min_retry_wait_ms))
-            .with_max_delay(Duration::from_millis(props.commit_max_retry_wait_ms))
+            .with_min_delay(Duration::from_millis(props.commit_min_retry_wait_ms()?))
+            .with_max_delay(Duration::from_millis(props.commit_max_retry_wait_ms()?))
             .with_total_delay(Some(Duration::from_millis(
-                props.commit_total_retry_timeout_ms,
+                props.commit_total_retry_timeout_ms()?,
             )))
-            .with_max_times(props.commit_num_retries)
+            .with_max_times(props.commit_num_retries()?)
             .with_factor(2.0)
             .build())
     }
@@ -315,17 +299,18 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use crate::catalog::MockCatalog;
-    use crate::io::FileIOBuilder;
+    use crate::io::FileIO;
+    use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
         ManifestListWriter, ManifestWriterBuilder, Operation, Snapshot, SnapshotReference,
-        SnapshotRetention, Struct, Summary, TableMetadata,
+        SnapshotRetention, Struct, Summary, TableMetadata, TableProperties,
     };
     use crate::table::Table;
+    use crate::test_utils::{make_encrypted_table, test_runtime};
     use crate::transaction::{ApplyTransactionAction, Transaction};
     use crate::{Catalog, Error, ErrorKind, TableCreation, TableIdent};
 
-    /// Fixture constants shared by the `overwrite_files` / `rewrite_files` tests.
     pub const PARENT_SNAPSHOT_ID: i64 = 42;
     pub const PARENT_SEQUENCE_NUMBER: i64 = 1;
     pub const REMOVED_DELETE_FILE: &str = "test/removed-position-delete.parquet";
@@ -349,12 +334,6 @@ mod tests {
             .unwrap()
     }
 
-    /// A V2 table whose `main` snapshot tracks a single *delete* manifest holding
-    /// both [`REMOVED_DELETE_FILE`] and [`RETAINED_DELETE_FILE`].
-    ///
-    /// The table location is rewritten to a `memory://` path so that actions
-    /// which write new manifests (e.g. `existing_manifest`) can do so through the
-    /// in-memory `FileIO`.
     pub async fn make_v2_table_with_delete_manifest() -> Table {
         let base = make_v2_minimal_table();
         let metadata = base
@@ -366,19 +345,16 @@ mod tests {
             .unwrap()
             .metadata;
         let base = base.with_metadata(Arc::new(metadata));
-
         let file_io = base.file_io().clone();
+
         let mut manifest_writer = ManifestWriterBuilder::new(
             file_io.new_output(DELETE_MANIFEST_LOCATION).unwrap(),
             Some(PARENT_SNAPSHOT_ID),
-            None,
             base.metadata().current_schema().clone(),
             base.metadata().default_partition_spec().as_ref().clone(),
         )
         .build_v2_deletes();
 
-        // `add_existing_file` preserves snapshot id / sequence numbers, which
-        // `delete_entries` unwraps when it rewrites an entry as `Deleted`.
         for path in [REMOVED_DELETE_FILE, RETAINED_DELETE_FILE] {
             manifest_writer
                 .add_existing_file(
@@ -391,8 +367,14 @@ mod tests {
         }
         let delete_manifest = manifest_writer.write_manifest_file().await.unwrap();
 
+        let manifest_list_output = file_io
+            .new_output(MANIFEST_LIST_LOCATION)
+            .unwrap()
+            .writer()
+            .await
+            .unwrap();
         let mut manifest_list_writer = ManifestListWriter::v2(
-            file_io.new_output(MANIFEST_LIST_LOCATION).unwrap(),
+            manifest_list_output,
             PARENT_SNAPSHOT_ID,
             None,
             PARENT_SEQUENCE_NUMBER,
@@ -410,7 +392,13 @@ mod tests {
             .with_manifest_list(MANIFEST_LIST_LOCATION)
             .with_summary(Summary {
                 operation: Operation::Overwrite,
-                additional_properties: HashMap::new(),
+                additional_properties: [
+                    ("total-delete-files".to_string(), "2".to_string()),
+                    ("total-position-deletes".to_string(), "2".to_string()),
+                    ("total-files-size".to_string(), "200".to_string()),
+                ]
+                .into_iter()
+                .collect(),
             })
             .build();
 
@@ -420,14 +408,13 @@ mod tests {
             .into_builder(Some("s3://bucket/test/location/metadata/v1.json".into()))
             .add_snapshot(parent_snapshot)
             .unwrap()
-            .set_ref(MAIN_BRANCH, SnapshotReference {
-                snapshot_id: PARENT_SNAPSHOT_ID,
-                retention: SnapshotRetention::Branch {
-                    min_snapshots_to_keep: None,
-                    max_snapshot_age_ms: None,
-                    max_ref_age_ms: None,
-                },
-            })
+            .set_ref(
+                MAIN_BRANCH,
+                SnapshotReference::new(
+                    PARENT_SNAPSHOT_ID,
+                    SnapshotRetention::branch(None, None, None),
+                ),
+            )
             .unwrap()
             .build()
             .unwrap()
@@ -448,9 +435,10 @@ mod tests {
 
         Table::builder()
             .metadata(resp)
-            .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
+            .metadata_location("s3://bucket/test/location/metadata/v1.json")
             .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
-            .file_io(FileIOBuilder::new("memory").build().unwrap())
+            .file_io(FileIO::new_with_memory())
+            .runtime(test_runtime())
             .build()
             .unwrap()
     }
@@ -467,9 +455,10 @@ mod tests {
 
         Table::builder()
             .metadata(resp)
-            .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
+            .metadata_location("s3://bucket/test/location/metadata/v1.json")
             .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
-            .file_io(FileIOBuilder::new("memory").build().unwrap())
+            .file_io(FileIO::new_with_memory())
+            .runtime(test_runtime())
             .build()
             .unwrap()
     }
@@ -486,9 +475,10 @@ mod tests {
 
         Table::builder()
             .metadata(resp)
-            .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
+            .metadata_location("s3://bucket/test/location/metadata/v1.json")
             .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
-            .file_io(FileIOBuilder::new("memory").build().unwrap())
+            .file_io(FileIO::new_with_memory())
+            .runtime(test_runtime())
             .build()
             .unwrap()
     }
@@ -501,17 +491,17 @@ mod tests {
         ))
         .unwrap();
         let reader = BufReader::new(file);
-        let resp = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
+        let metadata = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
 
         Table::builder()
-            .metadata(resp)
-            .metadata_location("s3://bucket/test/location/metadata/v3.json".to_string())
+            .metadata(metadata)
+            .metadata_location("memory:///test/location/metadata/v1.json")
             .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
-            .file_io(FileIOBuilder::new("memory").build().unwrap())
+            .file_io(FileIO::new_with_memory())
+            .runtime(test_runtime())
             .build()
             .unwrap()
     }
-
     pub(crate) async fn make_v3_minimal_table_in_catalog(catalog: &impl Catalog) -> Table {
         let table_ident =
             TableIdent::from_strs([format!("ns1-{}", uuid::Uuid::new_v4()), "test1".to_string()])
@@ -711,6 +701,104 @@ mod tests {
             assert!(err.retryable(), "Error should be retryable");
         }
     }
+
+    #[tokio::test]
+    async fn test_transaction_snapshot_summary() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+        let mut file_seq = 0u32;
+        let mut append_file = |table: &Table, record_count: u64, file_size: u64| {
+            file_seq += 1;
+            let file = DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(format!("test/{file_seq}.parquet"))
+                .file_format(DataFileFormat::Parquet)
+                .file_size_in_bytes(file_size)
+                .record_count(record_count)
+                .partition(Struct::from_iter([Some(Literal::long(1))]))
+                .partition_spec_id(0)
+                .build()
+                .unwrap();
+            let tx = Transaction::new(table);
+            tx.fast_append()
+                .add_data_files(vec![file])
+                .apply(tx)
+                .unwrap()
+        };
+
+        let table = append_file(&table, /*record_count=*/ 10, /*file_size=*/ 100)
+            .commit(&catalog)
+            .await
+            .unwrap();
+        let table = append_file(&table, /*record_count=*/ 20, /*file_size=*/ 200)
+            .commit(&catalog)
+            .await
+            .unwrap();
+
+        let summary = &table
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .summary()
+            .additional_properties;
+
+        assert_eq!(summary.get("total-records").unwrap(), "30");
+        assert_eq!(summary.get("total-data-files").unwrap(), "2");
+        assert_eq!(summary.get("total-files-size").unwrap(), "300");
+    }
+
+    #[tokio::test]
+    async fn test_commit_to_encrypted_table() {
+        let table = make_encrypted_table().await.with_metadata_location(
+            "memory:///table/metadata/00000-9c12d441-03fe-4693-9a96-a0705ddf69c1.metadata.json"
+                .to_string(),
+        );
+        let refreshed_table = table.clone();
+        let update_table = table.clone();
+        let mut mock_catalog = MockCatalog::new();
+        mock_catalog
+            .expect_load_table()
+            .times(1)
+            .returning_st(move |_| {
+                let refreshed_table = refreshed_table.clone();
+                Box::pin(async move { Ok(refreshed_table) })
+            });
+        mock_catalog
+            .expect_update_table()
+            .times(1)
+            .returning_st(move |commit| {
+                let update_table = update_table.clone();
+                Box::pin(async move { commit.apply(update_table) })
+            });
+
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_table_properties()
+            .set("test.key".to_string(), "test.value".to_string())
+            .apply(tx)
+            .unwrap();
+
+        let updated_table = tx.commit(&mock_catalog).await.unwrap();
+
+        assert_eq!(
+            updated_table
+                .metadata()
+                .properties()
+                .get(TableProperties::PROPERTY_ENCRYPTION_KEY_ID)
+                .map(String::as_str),
+            Some("master-1")
+        );
+        assert_eq!(
+            updated_table
+                .metadata()
+                .properties()
+                .get("test.key")
+                .map(String::as_str),
+            Some("test.value")
+        );
+        assert!(updated_table.encryption_manager().is_some());
+    }
 }
 
 #[cfg(test)]
@@ -757,13 +845,8 @@ mod test_row_lineage {
         assert_eq!(table.metadata().next_row_id(), 30);
 
         // Check written manifest for first_row_id
-        let manifest_list = table
-            .metadata()
-            .current_snapshot()
-            .unwrap()
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
 
         assert_eq!(manifest_list.entries().len(), 1);
         let manifest_file = &manifest_list.entries()[0];
@@ -785,13 +868,7 @@ mod test_row_lineage {
         assert_eq!(table.metadata().next_row_id(), 30 + 17 + 11);
 
         // Check written manifest for first_row_id
-        let manifest_list = table
-            .metadata()
-            .current_snapshot()
-            .unwrap()
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let manifest_list = table.manifest_list_reader(snapshot).load().await.unwrap();
         assert_eq!(manifest_list.entries().len(), 2);
         let manifest_file = &manifest_list.entries()[1];
         assert_eq!(manifest_file.first_row_id, Some(30));

@@ -16,10 +16,8 @@
 // under the License.
 
 //! Table maintenance actions.
-//!
-//! This module provides actions for table maintenance operations that do not
-//! modify table metadata, such as cleaning up orphan files.
 
+pub(crate) mod maintenance;
 mod remove_orphan_files;
 
-pub use remove_orphan_files::*;
+pub use remove_orphan_files::RemoveOrphanFilesAction;

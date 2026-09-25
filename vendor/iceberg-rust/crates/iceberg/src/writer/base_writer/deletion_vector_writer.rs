@@ -17,9 +17,8 @@
 
 //! Deletion vector writer for Iceberg V3.
 
-use std::collections::HashMap as StdHashMap;
-
-use hashbrown::HashMap;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::delete_vector::{
     DELETION_VECTOR_PROPERTY_CARDINALITY, DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE,
@@ -79,7 +78,7 @@ pub struct DeletionVectorWriter<L: LocationGenerator, F: FileNameGenerator> {
     location_generator: L,
     file_name_generator: F,
     partition_key: Option<PartitionKey>,
-    delete_vectors: HashMap<String, DeleteVector>,
+    delete_vectors: HashMap<Arc<str>, DeleteVector>,
 }
 
 #[async_trait::async_trait]
@@ -96,7 +95,7 @@ where
                     "deletion vector position must be non-negative".to_string(),
                 )
             })?;
-            let entry = self.delete_vectors.entry_ref(&*delete.path).or_default();
+            let entry = self.delete_vectors.entry(delete.path).or_default();
             entry.insert(pos);
         }
         Ok(())
@@ -120,17 +119,17 @@ where
                 .location_generator
                 .generate_location(partition_key, &file_name);
             let output_file = self.file_io.new_output(&location)?;
-            let mut writer = PuffinWriter::new(&output_file, StdHashMap::new(), false).await?;
+            let mut writer = PuffinWriter::new(&output_file, HashMap::new(), false).await?;
 
             let cardinality = delete_vector.len();
-            let properties = StdHashMap::from([
+            let properties = HashMap::from([
                 (
                     DELETION_VECTOR_PROPERTY_CARDINALITY.to_string(),
                     cardinality.to_string(),
                 ),
                 (
                     DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE.to_string(),
-                    data_file_path.clone(),
+                    data_file_path.to_string(),
                 ),
             ]);
             let blob = delete_vector.to_puffin_blob(properties)?;
@@ -151,7 +150,7 @@ where
                 .partition_spec_id(partition_key.map_or(0, |pk| pk.spec().spec_id()))
                 .record_count(cardinality)
                 .file_size_in_bytes(result.file_size_in_bytes)
-                .referenced_data_file(Some(data_file_path))
+                .referenced_data_file(Some(data_file_path.to_string()))
                 .content_offset(Some(blob_metadata.offset() as i64))
                 .content_size_in_bytes(Some(blob_metadata.length() as i64));
 
@@ -164,5 +163,63 @@ where
         }
 
         Ok(data_files)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::puffin::PuffinReader;
+    use crate::writer::file_writer::location_generator::{
+        DefaultFileNameGenerator, DefaultLocationGenerator,
+    };
+
+    #[tokio::test]
+    async fn test_deletion_vector_writer() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let file_io = FileIO::new_with_fs();
+        let location_generator = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_string_lossy().into_owned(),
+        );
+        let file_name_generator =
+            DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Puffin);
+        let mut writer = DeletionVectorWriterBuilder::new(
+            file_io.clone(),
+            location_generator,
+            file_name_generator,
+        )
+        .build(None)
+        .await?;
+
+        writer
+            .write(vec![
+                PositionDeleteInput::new(Arc::from("data.parquet"), 3),
+                PositionDeleteInput::new(Arc::from("data.parquet"), 9),
+            ])
+            .await?;
+        let files = writer.close().await?;
+
+        assert_eq!(files.len(), 1);
+        let file = &files[0];
+        assert_eq!(file.file_format(), DataFileFormat::Puffin);
+        assert_eq!(file.referenced_data_file().as_deref(), Some("data.parquet"));
+        assert_eq!(file.record_count(), 2);
+
+        let reader = PuffinReader::new(file_io.new_input(file.file_path())?).await?;
+        let metadata = reader.file_metadata().await?;
+        let blob_metadata = metadata
+            .blobs
+            .iter()
+            .find(|blob| {
+                Some(blob.offset() as i64) == file.content_offset()
+                    && Some(blob.length() as i64) == file.content_size_in_bytes()
+            })
+            .expect("written deletion-vector blob metadata");
+        let decoded = DeleteVector::from_puffin_blob(reader.blob(blob_metadata).await?)?;
+
+        assert_eq!(decoded.iter().collect::<Vec<_>>(), vec![3, 9]);
+        Ok(())
     }
 }

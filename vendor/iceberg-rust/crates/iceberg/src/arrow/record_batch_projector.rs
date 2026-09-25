@@ -19,11 +19,12 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, StructArray, make_array};
 use arrow_buffer::NullBuffer;
+use arrow_schema::extension::ExtensionType;
 use arrow_schema::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use crate::arrow::schema::schema_to_arrow_schema;
-use crate::error::Result;
+use crate::arrow::schema::{VariantExtensionType, schema_to_arrow_schema};
+use crate::error::{Result, invalid_data};
 use crate::spec::Schema as IcebergSchema;
 use crate::{Error, ErrorKind};
 
@@ -97,12 +98,9 @@ impl RecordBatchProjector {
         let field_id_fetch_func = |field: &Field| -> Result<Option<i64>> {
             if let Some(value) = field.metadata().get(PARQUET_FIELD_ID_META_KEY) {
                 let field_id = value.parse::<i32>().map_err(|e| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        "Failed to parse field id".to_string(),
-                    )
-                    .with_context("value", value)
-                    .with_source(e)
+                    invalid_data!("Failed to parse field id")
+                        .with_context("value", value)
+                        .with_source(e)
                 })?;
                 Ok(Some(field_id as i64))
             } else {
@@ -139,7 +137,9 @@ impl RecordBatchProjector {
                 index_vec.push(pos);
                 return Ok(Some(field.clone()));
             }
+            // A variant field is a logical leaf: its children carry no field ids.
             if let DataType::Struct(inner) = field.data_type()
+                && field.extension_type_name() != Some(VariantExtensionType::NAME)
                 && searchable_field_func(field)
                 && let Some(res) = Self::fetch_field_index(
                     inner,
@@ -167,7 +167,7 @@ impl RecordBatchProjector {
             self.projected_schema.clone(),
             self.project_column(batch.columns())?,
         )
-        .map_err(|err| Error::new(ErrorKind::DataInvalid, format!("{err}")))
+        .map_err(|err| invalid_data!("{err}"))
     }
 
     /// Do projection with columns

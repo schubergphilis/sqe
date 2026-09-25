@@ -16,21 +16,16 @@
 # under the License.
 
 [workspace]
-# SQE vendored subset of apache/iceberg-rust.
-# The HMS catalog source is vendored from upstream apache/iceberg-rust
-# v0.9.0 (Phase K) so SQE can ship Hive Metastore support without
-# migrating the whole engine off the RisingWave fork (which has DF 53
-# and our cherry-picked RowDelta + branch/tag actions that upstream
-# 0.9.0 lacks).
+# SQE vendored subset: apache/iceberg-rust main + RisingWave
+# dev_rebase_main_20260807 + SQE patches. See README.md for provenance.
+# Python bindings, examples, integration tests and the moka cache
+# integration are not vendored. The DataFusion integration lives in
+# ../datafusion-iceberg (apache/datafusion-iceberg).
 members = [
+  "crates/catalog/*",
   "crates/iceberg",
-  "crates/catalog/glue",
-  "crates/catalog/hms",
-  "crates/catalog/loader",
-  "crates/catalog/rest",
-  "crates/catalog/s3tables",
-  "crates/catalog/sql",
-  "crates/integrations/datafusion",
+  "crates/property-macro",
+  "crates/storage/*",
   "crates/test_utils",
 ]
 resolver = "2"
@@ -38,57 +33,65 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 homepage = "https://rust.iceberg.apache.org/"
-version = "0.8.0"
+publish = false
+version = "0.10.1"
 
 license = "Apache-2.0"
 repository = "https://github.com/apache/iceberg-rust"
 # Check the MSRV policy in README.md before changing this
-rust-version = "1.92"
+rust-version = "1.95"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }
+unused_qualifications = "deny"
 
 [workspace.dependencies]
+aes-gcm = "0.10"
 anyhow = "1.0.72"
-apache-avro = { version = "0.21", features = ["zstandard"] }
+apache-avro = { version = "0.21", features = ["snappy", "zstandard"] }
 array-init = "2"
-arrow-arith = "59"
-arrow-array = "59"
-arrow-buffer = "59"
-arrow-cast = "59"
-arrow-ord = "59"
-arrow-row = "59"
-arrow-schema = "59"
-arrow-select = "59"
-arrow-string = "59"
+arrow = "59.2"
+arrow-arith = "59.2"
+arrow-array = "59.2"
+arrow-buffer = "59.2"
+arrow-cast = "59.2"
+arrow-ord = "59.2"
+arrow-row = "59.2"
+arrow-schema = "59.2"
+arrow-select = "59.2"
+arrow-string = "59.2"
 as-any = "0.3.2"
 async-trait = "0.1.89"
-# SQE #133: drop aws-config's `default-https-client`, which pulls the legacy
-# hyper-0.14 / rustls-0.21 / webpki-0.101.7 connector (RUSTSEC-2026-0098/0099/
-# 0104). The glue/s3tables catalogs supply an explicit modern HTTPS client via
-# `aws-smithy-http-client` (rustls 0.23) instead — see crates/catalog/*/src/utils.rs.
-aws-config = { version = "1.8.7", default-features = false, features = ["rt-tokio", "credentials-process", "sso", "behavior-version-latest"] }
-# `default-features = false` drops the SDK crates' `rustls` + `default-https-client`
-# defaults, which select aws-smithy-runtime's `tls-rustls` -> the legacy
-# `aws-smithy-http-client/legacy-rustls-ring` (hyper-0.14 / rustls-0.21) connector.
-# `rt-tokio` is the only default we still need; the HTTPS connector comes from the
-# explicit rustls-0.23 client built in each catalog's utils.rs.
-aws-sdk-glue = { version = "1.39", default-features = false, features = ["rt-tokio"] }
-aws-sdk-s3tables = { version = "1.28.0", default-features = false, features = ["rt-tokio"] }
-# Explicit modern HTTPS client (rustls 0.23 via ring) for the AWS catalogs.
-aws-smithy-http-client = { version = "1.1.12", default-features = false, features = ["rustls-ring"] }
+# SQE #133 / ring-only TLS: no `default-https-client` anywhere. On aws-config
+# it pulls the legacy hyper-0.14 / rustls-0.21 connector (RUSTSEC-2026-0098/
+# 0099/0104); on the SDK crates it selects the aws-lc rustls provider, which
+# drags aws-lc-sys into every SQE binary. The glue / s3tables catalogs and the
+# REST SigV4 signer build an explicit rustls-0.23 (ring) client instead.
+aws-config = { version = "1.8.7", default-features = false, features = [
+  "rt-tokio",
+  "credentials-process",
+  "sso",
+  "behavior-version-latest",
+] }
+aws-sdk-glue = { version = "1.85", default-features = false, features = [
+  "rt-tokio",
+] }
+aws-sdk-s3tables = { version = "1.28", default-features = false, features = [
+  "rt-tokio",
+] }
+aws-smithy-http-client = { version = "1.1.12", default-features = false, features = [
+  "rustls-ring",
+] }
 backon = "1.5.1"
 base64 = "0.22.1"
 bimap = "0.6"
 bytes = "1.11"
+cfg-if = "1"
 chrono = "0.4.41"
 clap = { version = "4.5.48", features = ["derive", "cargo"] }
-crc32fast = "1.5"
+crc32fast = "1.5.0"
 dashmap = "6"
-datafusion = "55"
-datafusion-cli = "55"
-datafusion-sqllogictest = "55"
 derive_builder = "0.20"
-dirs = "6"
-enum-ordinalize = "4.3.0"
-env_logger = "0.11.8"
 expect-test = "1"
 fastnum = { version = "0.7", default-features = false, features = [
   "std",
@@ -97,63 +100,75 @@ fastnum = { version = "0.7", default-features = false, features = [
 faststr = "0.2.31"
 flate2 = "1.1.5"
 fnv = "1.0.7"
-fs-err = "3.1.0"
+form_urlencoded = "1.2.2"
 futures = "0.3"
+gcp_auth = "0.12"
 hive_metastore = "0.2.0"
-home = "=0.5.11"
 http = "1.2"
-iceberg = { version = "0.8.0", path = "./crates/iceberg" }
-iceberg-catalog-glue = { version = "0.8.0", path = "./crates/catalog/glue" }
-iceberg-catalog-hms = { version = "0.8.0", path = "./crates/catalog/hms" }
-iceberg-catalog-rest = { version = "0.8.0", path = "./crates/catalog/rest" }
-iceberg-catalog-s3tables = { version = "0.8.0", path = "./crates/catalog/s3tables" }
-iceberg-catalog-sql = { version = "0.8.0", path = "./crates/catalog/sql" }
-iceberg-datafusion = { version = "0.8.0", path = "./crates/integrations/datafusion" }
-indicatif = "0.18"
+iceberg = { version = "0.10.0", path = "./crates/iceberg" }
+iceberg-catalog-glue = { version = "0.10.0", path = "./crates/catalog/glue" }
+iceberg-catalog-hms = { version = "0.10.0", path = "./crates/catalog/hms" }
+iceberg-catalog-rest = { version = "0.10.0", path = "./crates/catalog/rest" }
+iceberg-catalog-s3tables = { version = "0.10.0", path = "./crates/catalog/s3tables" }
+iceberg-catalog-sql = { version = "0.10.0", path = "./crates/catalog/sql" }
+iceberg-property-macro = { version = "0.10.0", path = "./crates/property-macro" }
+iceberg-storage-opendal = { version = "0.10.0", path = "./crates/storage/opendal" }
 itertools = "0.13"
-libtest-mimic = "0.8.1"
 linkedbytes = "0.1.8"
-log = "0.4.28"
 metainfo = "0.7.14"
-mimalloc = "0.1.46"
 minijinja = "2.12.0"
 mockall = "0.13.1"
 mockito = "1"
 motore-macros = "0.4.3"
 murmur3 = "0.5.2"
 once_cell = "1.20"
-opendal = "0.55.0"
+# SQE ring-only TLS: opendal's default `http-transport-reqwest` is the
+# `rustls` flavour, which hardwires reqwest's aws-lc provider and puts
+# aws-lc-sys back into every SQE binary. Same defaults, no-provider transport;
+# SQE installs the ring provider pre-main (sqe-core).
+opendal = { version = "0.58", default-features = false, features = [
+  "auto-register-services",
+  "executors-tokio",
+  "http-transport-reqwest-rustls-no-provider",
+  "layers-concurrent-limit",
+  "layers-logging",
+  "layers-retry",
+  "layers-timeout",
+] }
 ordered-float = "4"
-parquet = "59"
+parquet = "59.2"
 pilota = "0.11.10"
 pretty_assertions = "1.4"
-rand = "0.8.5"
+proc-macro2 = "1"
+pyo3 = "0.29"
+quote = "1"
+rand = "0.9.3"
 regex = "1.11.3"
 reqwest = { version = "0.12.12", default-features = false, features = ["json"] }
 roaring = { version = "0.11" }
+rstest = "0.26"
 serde = { version = "1.0.219", features = ["rc"] }
 serde_bytes = "0.11.17"
 serde_derive = "1.0.219"
 serde_json = "1.0.142"
 serde_repr = "0.1.16"
 serde_with = "3.4"
-sqllogictest = "0.29"
-sqlx = { version = "0.8.1", default-features = false }
-stacker = "0.1.20"
+sqlx = { version = "0.9.0", default-features = false }
 strum = "0.27.2"
+syn = "2"
 tempfile = "3.18"
-thrift = "0.17.0"
-tokio = { version = "1.47", default-features = false }
-toml = "0.8"
+tokio = { version = "1.47", default-features = false, features = [
+  "sync",
+  "rt-multi-thread",
+] }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.20"
+trybuild = "1"
 typed-builder = "0.20"
 typetag = "0.2"
 url = "2.5.7"
 uuid = { version = "1.18", features = ["v7"] }
 volo = "0.10.6"
 volo-thrift = "0.10.8"
+zeroize = "1.7"
 zstd = "0.13.3"
-
-[workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }

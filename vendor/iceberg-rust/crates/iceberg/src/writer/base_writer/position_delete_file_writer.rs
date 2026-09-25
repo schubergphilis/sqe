@@ -257,7 +257,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::io::FileIOBuilder;
+    use crate::io::FileIO;
     use crate::spec::{
         DataFileFormat, Literal, NestedField, PartitionKey, PartitionSpec, PrimitiveType, Schema,
         Struct, Type,
@@ -273,7 +273,7 @@ mod tests {
     #[tokio::test]
     async fn test_position_delete_writer_unpartitioned() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let file_io = FileIOBuilder::new_fs_io().build()?;
+        let file_io = FileIO::new_with_fs();
         let location_gen = DefaultLocationGenerator::with_data_location(
             temp_dir.path().to_str().unwrap().to_string(),
         );
@@ -339,10 +339,70 @@ mod tests {
         Ok(())
     }
 
+    /// A multi-file position delete must carry `file_path` bounds that cover
+    /// every path it lists: scan planning prunes a delete file for any data
+    /// file outside `[lower, upper]` (RW #214), so a truncated upper bound
+    /// silently un-deletes rows in the lexically last data file.
+    #[tokio::test]
+    async fn test_position_delete_path_bounds_cover_long_paths() -> Result<()> {
+        let temp_dir = TempDir::new()?;
+        let file_io = FileIO::new_with_fs();
+        let location_gen = DefaultLocationGenerator::with_data_location(
+            temp_dir.path().to_str().unwrap().to_string(),
+        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new("pos_del".to_string(), None, DataFileFormat::Parquet);
+        let parquet_builder = ParquetWriterBuilder::new(
+            WriterProperties::builder().build(),
+            Arc::new(POSITION_DELETE_SCHEMA.clone()),
+        );
+        let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
+            parquet_builder,
+            file_io.clone(),
+            location_gen,
+            file_name_gen,
+        );
+        let mut writer = PositionDeleteFileWriterBuilder::new(rolling_builder)
+            .build(None)
+            .await?;
+
+        // Real object-store paths: long shared prefix, differ past 64 bytes.
+        let prefix = "s3://warehouse/default/rewrite_delete_apply/data/0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f40";
+        let paths: Vec<String> = (0..3).map(|i| format!("{prefix}{i:02}-00000.parquet")).collect();
+        writer
+            .write(
+                paths
+                    .iter()
+                    .map(|p| PositionDeleteInput::new(Arc::from(p.as_str()), 0))
+                    .collect(),
+            )
+            .await?;
+        let data_files = writer.close().await?;
+        let file = &data_files[0];
+        let lower = file
+            .lower_bounds()
+            .get(&crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH)
+            .cloned();
+        let upper = file
+            .upper_bounds()
+            .get(&crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH)
+            .cloned();
+        for path in &paths {
+            let datum = crate::spec::Datum::string(path);
+            if let Some(lower) = &lower {
+                assert!(&datum >= lower, "{path} below lower bound {lower:?}");
+            }
+            if let Some(upper) = &upper {
+                assert!(&datum <= upper, "{path} above upper bound {upper:?}");
+            }
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_position_delete_writer_partitioned() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let file_io = FileIOBuilder::new_fs_io().build()?;
+        let file_io = FileIO::new_with_fs();
         let location_gen = DefaultLocationGenerator::with_data_location(
             temp_dir.path().to_str().unwrap().to_string(),
         );
@@ -404,7 +464,7 @@ mod tests {
     #[tokio::test]
     async fn test_referenced_data_file_single_path() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let file_io = FileIOBuilder::new_fs_io().build()?;
+        let file_io = FileIO::new_with_fs();
         let location_gen = DefaultLocationGenerator::with_data_location(
             temp_dir.path().to_str().unwrap().to_string(),
         );
@@ -443,7 +503,7 @@ mod tests {
     #[tokio::test]
     async fn test_referenced_data_file_multi_path_is_null() -> Result<()> {
         let temp_dir = TempDir::new()?;
-        let file_io = FileIOBuilder::new_fs_io().build()?;
+        let file_io = FileIO::new_with_fs();
         let location_gen = DefaultLocationGenerator::with_data_location(
             temp_dir.path().to_str().unwrap().to_string(),
         );
@@ -481,7 +541,7 @@ mod tests {
         // When rolling produces multiple output files but all entries target a single
         // data file, every output file must carry referenced_data_file.
         let temp_dir = TempDir::new()?;
-        let file_io = FileIOBuilder::new_fs_io().build()?;
+        let file_io = FileIO::new_with_fs();
         let location_gen = DefaultLocationGenerator::with_data_location(
             temp_dir.path().to_str().unwrap().to_string(),
         );

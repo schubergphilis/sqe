@@ -19,20 +19,19 @@
 edition = { workspace = true }
 homepage = { workspace = true }
 name = "iceberg-catalog-loader"
+publish = true
 rust-version = { workspace = true }
 version = { workspace = true }
 
 categories = ["database"]
 description = "Apache Iceberg Catalog Loader API"
-keywords = ["iceberg", "catalog"]
+keywords = ["iceberg", "catalog", "loader"]
 license = "Apache-2.0"
 repository = { workspace = true }
 
-# SQE patch: backends are gated behind cargo features so a slim build
-# (e.g. `--no-default-features --features rest`) does not pull in the
-# AWS SDK, Thrift, or sqlx weight transitively. Upstream loader has
-# all backends always-on; this patch is part of the open vendor-refresh
-# discussion in `vendor/iceberg-rust/README.md`.
+# SQE PATCH: backends are gated behind cargo features so a slim build
+# (e.g. `--no-default-features --features rest`) does not pull in the AWS SDK,
+# Thrift, or sqlx weight transitively. Upstream loader has all backends on.
 [features]
 default = ["rest", "glue", "s3tables", "hms", "sql"]
 rest = []
@@ -42,15 +41,22 @@ hms = ["dep:iceberg-catalog-hms"]
 sql = ["dep:iceberg-catalog-sql"]
 
 [dependencies]
+async-trait = { workspace = true }
 iceberg = { workspace = true }
-iceberg-catalog-rest = { workspace = true }
 iceberg-catalog-glue = { workspace = true, optional = true }
-iceberg-catalog-s3tables = { workspace = true, optional = true }
 iceberg-catalog-hms = { workspace = true, optional = true }
+iceberg-catalog-rest = { workspace = true }
+iceberg-catalog-s3tables = { workspace = true, optional = true }
 iceberg-catalog-sql = { workspace = true, optional = true }
 tokio = { workspace = true }
-async-trait = { workspace = true }
 
 [dev-dependencies]
+iceberg-storage-opendal = { workspace = true }
+iceberg_test_utils = { path = "../../test_utils", features = ["tests"] }
+reqwest = { workspace = true }
+rstest = { workspace = true }
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "migrate"] }
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

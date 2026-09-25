@@ -26,41 +26,91 @@ use super::{
     Datum, FormatVersion, ManifestContentType, PartitionSpec, PrimitiveType,
     UNASSIGNED_SEQUENCE_NUMBER,
 };
-use crate::error::Result;
-use crate::io::OutputFile;
+use crate::encryption::EncryptedOutputFile;
+use crate::error::{Result, invalid_data};
+use crate::io::{FileMetadata, FileWrite, OutputFile};
 use crate::spec::manifest::_serde::{ManifestEntryV1, ManifestEntryV2};
 use crate::spec::manifest::{manifest_schema_v1, manifest_schema_v2};
 use crate::spec::{
     DataContentType, DataFile, FieldSummary, ManifestEntry, ManifestFile, ManifestMetadata,
-    ManifestStatus, PrimitiveLiteral, SchemaRef, StructType, UNASSIGNED_SNAPSHOT_ID,
+    ManifestStatus, PrimitiveLiteral, SchemaRef, StructType, Type,
 };
-use crate::{Error, ErrorKind};
+
+/// Placeholder for snapshot ID. The field with this value must be replaced
+/// with the actual snapshot ID before it is committed.
+const UNASSIGNED_SNAPSHOT_ID: i64 = -1;
+
+/// Retains the output until close provides the size required by encrypted key metadata.
+pub(crate) enum ManifestOutput {
+    Plain(OutputFile),
+    Encrypted(EncryptedOutputFile),
+}
+
+impl ManifestOutput {
+    async fn writer(&self) -> Result<Box<dyn FileWrite>> {
+        match self {
+            Self::Plain(output) => output.writer().await,
+            Self::Encrypted(output) => output.writer().await,
+        }
+    }
+
+    fn encoded_key_metadata(&self, file_metadata: &FileMetadata) -> Result<Option<Vec<u8>>> {
+        match self {
+            Self::Plain(_) => Ok(None),
+            Self::Encrypted(output) => Ok(Some(
+                output
+                    .key_metadata_with_saved_file_metadata(file_metadata)
+                    .encode()?
+                    .into_vec(),
+            )),
+        }
+    }
+}
 
 /// The builder used to create a [`ManifestWriter`].
 pub struct ManifestWriterBuilder {
-    output: OutputFile,
+    output: ManifestOutput,
+    location: String,
     snapshot_id: Option<i64>,
-    key_metadata: Option<Vec<u8>>,
     schema: SchemaRef,
     partition_spec: PartitionSpec,
 }
 
 impl ManifestWriterBuilder {
-    /// Create a new builder.
+    /// Create a new builder for unencrypted manifests.
     pub fn new(
         output: OutputFile,
         snapshot_id: Option<i64>,
-        key_metadata: Option<Vec<u8>>,
         schema: SchemaRef,
         partition_spec: PartitionSpec,
     ) -> Self {
+        let location = output.location().to_owned();
         Self {
-            output,
+            output: ManifestOutput::Plain(output),
+            location,
             snapshot_id,
-            key_metadata,
             schema,
             partition_spec,
         }
+    }
+
+    /// Create a new builder from an [`EncryptedOutputFile`].
+    ///
+    /// Use this when writing manifests with transparent encryption.
+    pub fn new_from_encrypted(
+        encrypted_output: EncryptedOutputFile,
+        snapshot_id: Option<i64>,
+        schema: SchemaRef,
+        partition_spec: PartitionSpec,
+    ) -> Result<Self> {
+        let location = encrypted_output.location().to_owned();
+        Ok(Self {
+            output: ManifestOutput::Encrypted(encrypted_output),
+            location,
+            snapshot_id,
+            schema,
+            partition_spec,
+        })
     }
 
     /// Build a [`ManifestWriter`] for format version 1.
@@ -72,13 +122,7 @@ impl ManifestWriterBuilder {
             .format_version(FormatVersion::V1)
             .content(ManifestContentType::Data)
             .build();
-        ManifestWriter::new(
-            self.output,
-            self.snapshot_id,
-            self.key_metadata,
-            metadata,
-            None,
-        )
+        ManifestWriter::new(self.output, self.location, self.snapshot_id, metadata, None)
     }
 
     /// Build a [`ManifestWriter`] for format version 2, data content.
@@ -90,13 +134,8 @@ impl ManifestWriterBuilder {
             .format_version(FormatVersion::V2)
             .content(ManifestContentType::Data)
             .build();
-        ManifestWriter::new(
-            self.output,
-            self.snapshot_id,
-            self.key_metadata,
-            metadata,
-            None,
-        )
+
+        ManifestWriter::new(self.output, self.location, self.snapshot_id, metadata, None)
     }
 
     /// Build a [`ManifestWriter`] for format version 2, deletes content.
@@ -108,13 +147,7 @@ impl ManifestWriterBuilder {
             .format_version(FormatVersion::V2)
             .content(ManifestContentType::Deletes)
             .build();
-        ManifestWriter::new(
-            self.output,
-            self.snapshot_id,
-            self.key_metadata,
-            metadata,
-            None,
-        )
+        ManifestWriter::new(self.output, self.location, self.snapshot_id, metadata, None)
     }
 
     /// Build a [`ManifestWriter`] for format version 2, data content.
@@ -128,8 +161,8 @@ impl ManifestWriterBuilder {
             .build();
         ManifestWriter::new(
             self.output,
+            self.location,
             self.snapshot_id,
-            self.key_metadata,
             metadata,
             // First row id is assigned by the [`ManifestListWriter`] when the manifest
             // is added to the list.
@@ -146,19 +179,14 @@ impl ManifestWriterBuilder {
             .format_version(FormatVersion::V3)
             .content(ManifestContentType::Deletes)
             .build();
-        ManifestWriter::new(
-            self.output,
-            self.snapshot_id,
-            self.key_metadata,
-            metadata,
-            None,
-        )
+        ManifestWriter::new(self.output, self.location, self.snapshot_id, metadata, None)
     }
 }
 
 /// A manifest writer.
 pub struct ManifestWriter {
-    output: OutputFile,
+    output: ManifestOutput,
+    location: String,
 
     snapshot_id: Option<i64>,
 
@@ -172,26 +200,14 @@ pub struct ManifestWriter {
 
     min_seq_num: Option<i64>,
 
-    key_metadata: Option<Vec<u8>>,
-
     manifest_entries: Vec<ManifestEntry>,
 
-    /// Running estimate of the serialized (Avro) footprint of the entries added
-    /// so far. Updated incrementally in `add_entry_inner`. This is an
-    /// approximation used by size-bounded rewrite operations to decide when to
-    /// roll over to a new manifest; it is not the exact on-disk length.
+    /// Running estimate of the serialized Avro footprint of accumulated entries.
     estimated_size: u64,
 
     metadata: ManifestMetadata,
 }
 
-/// Serialized (single-value) byte length of a bound [`Datum`], matching the byte
-/// length of [`Datum::to_bytes`] but computed without allocating.
-///
-/// Iceberg stores bounds as the minimal single-value binary encoding, so the
-/// variable-width types (string / binary / decimal) must be measured from the
-/// value itself — assuming a fixed width both undercounts wide/untruncated
-/// bounds and overcounts the common truncated (≤16 byte) case.
 fn datum_serialized_len(datum: &Datum) -> u64 {
     match datum.literal() {
         PrimitiveLiteral::Boolean(_) => 1,
@@ -199,21 +215,16 @@ fn datum_serialized_len(datum: &Datum) -> u64 {
         PrimitiveLiteral::Long(_) => 8,
         PrimitiveLiteral::Float(_) => 4,
         PrimitiveLiteral::Double(_) => 8,
-        PrimitiveLiteral::String(s) => s.len() as u64,
-        PrimitiveLiteral::Binary(b) => b.len() as u64,
-        // UUID is always 16 bytes.
+        PrimitiveLiteral::String(value) => value.len() as u64,
+        PrimitiveLiteral::Binary(value) => value.len() as u64,
         PrimitiveLiteral::UInt128(_) => 16,
-        // Decimal uses a minimal two's-complement representation, clamped by the
-        // spec-required byte length for the declared precision.
-        PrimitiveLiteral::Int128(v) => {
-            let bytes = v.to_be_bytes();
-            let is_negative = *v < 0;
-            let skip_byte = if is_negative { 0xFF } else { 0x00 };
-
-            let mut start = 0usize;
-            while start < 15 && bytes[start] == skip_byte {
-                let next_byte = bytes[start + 1];
-                let next_is_negative = (next_byte & 0x80) != 0;
+        PrimitiveLiteral::Int128(value) => {
+            let bytes = value.to_be_bytes();
+            let is_negative = *value < 0;
+            let sign_byte = if is_negative { 0xff } else { 0x00 };
+            let mut start = 0;
+            while start < 15 && bytes[start] == sign_byte {
+                let next_is_negative = bytes[start + 1] & 0x80 != 0;
                 if next_is_negative == is_negative {
                     start += 1;
                 } else {
@@ -221,72 +232,49 @@ fn datum_serialized_len(datum: &Datum) -> u64 {
                 }
             }
 
-            let min_len = (16 - start) as u64;
+            let minimal_len = (16 - start) as u64;
             let max_len = match datum.data_type() {
-                PrimitiveType::Decimal { precision, .. } => crate::spec::Type::decimal_required_bytes(*precision)
-                    .map(|n| n as u64)
-                    .unwrap_or(16),
+                PrimitiveType::Decimal { precision, .. } => {
+                    Type::decimal_required_bytes(*precision)
+                        .map(|size| size as u64)
+                        .unwrap_or(16)
+                }
                 _ => 16,
             };
-            min_len.min(max_len)
+            minimal_len.min(max_len)
         }
-        // These should not appear in manifest bounds; treat as 0 to keep the estimate total.
         PrimitiveLiteral::AboveMax | PrimitiveLiteral::BelowMin => 0,
     }
 }
 
-/// Estimate of a single manifest entry's serialized (Avro) footprint.
+/// Cheap estimate of one manifest entry's uncompressed Avro footprint.
 ///
-/// Captures the dominant variable-length terms — the data file path and the
-/// per-column statistic maps (including the real bound value bytes) — plus a
-/// fixed per-entry overhead. Callers use this only to bound a manifest near a
-/// configured target size, so it is a cheap, allocation-free estimate rather
-/// than a full serialization.
-///
-/// The constants are calibrated against real uncompressed manifests (Iceberg
-/// writes manifests with `Codec::Null`, so the estimate and the on-disk length
-/// are in the same unit). Iceberg encodes each stat "map" as an Avro *array* of
-/// `{key: int, value: ...}` records, so per key/value the cost is a
-/// zigzag-varint int key plus the value's varint/bytes encoding — much smaller
-/// than a naive fixed-width assumption. Measured on a 1000-column table the
-/// estimate lands within a few percent of the on-disk length (versus the ~1.7×
-/// over-count of the earlier flat constants, which sealed manifests at ~0.6× the
-/// target); see `test_estimated_size_matches_on_disk_manifest`.
+/// This tracks the dominant variable-width values and uses calibrated framing
+/// constants. Rewrite operations only need a monotonic signal near the target
+/// size, not an exact serialization.
 fn estimate_manifest_entry_size(entry: &ManifestEntry) -> u64 {
-    // Fixed per-entry overhead for the non-map fields (status, snapshot/sequence
-    // numbers, content/format enums, record_count, file_size_in_bytes,
-    // partition_spec_id, null-union tags, and Avro framing).
     const FIXED_ENTRY_OVERHEAD: u64 = 80;
-    // Per key/value cost for the count maps (column_sizes, value_counts,
-    // null_value_counts, nan_value_counts): a varint int key (~2 B) plus a
-    // varint long value (~1-3 B).
     const PER_COUNT_KV: u64 = 4;
-    // Per key/value framing for the bound maps (varint int key + bytes-length
-    // prefix). The actual value bytes are added separately from the real Datum.
     const PER_BOUND_KV_OVERHEAD: u64 = 4;
 
-    let df = &entry.data_file;
-    let mut size = FIXED_ENTRY_OVERHEAD;
-    // file_path is an Avro string: a length prefix plus the UTF-8 bytes.
-    size += df.file_path.len() as u64 + 2;
-    size += (df.column_sizes.len()
-        + df.value_counts.len()
-        + df.null_value_counts.len()
-        + df.nan_value_counts.len()) as u64
+    let file = &entry.data_file;
+    let mut size = FIXED_ENTRY_OVERHEAD + file.file_path.len() as u64 + 2;
+    size += (file.column_sizes.len()
+        + file.value_counts.len()
+        + file.null_value_counts.len()
+        + file.nan_value_counts.len()) as u64
         * PER_COUNT_KV;
-    // Bound maps: per-key/value framing plus the real serialized value bytes, so
-    // wide (untruncated / binary) bounds are counted accurately.
-    size += (df.lower_bounds.len() + df.upper_bounds.len()) as u64 * PER_BOUND_KV_OVERHEAD;
-    size += df
+    size += (file.lower_bounds.len() + file.upper_bounds.len()) as u64 * PER_BOUND_KV_OVERHEAD;
+    size += file
         .lower_bounds
         .values()
-        .chain(df.upper_bounds.values())
+        .chain(file.upper_bounds.values())
         .map(datum_serialized_len)
         .sum::<u64>();
-    if let Some(key_metadata) = &df.key_metadata {
+    if let Some(key_metadata) = &file.key_metadata {
         size += key_metadata.len() as u64;
     }
-    if let Some(split_offsets) = &df.split_offsets {
+    if let Some(split_offsets) = &file.split_offsets {
         size += split_offsets.len() as u64 * 8;
     }
     size
@@ -295,14 +283,15 @@ fn estimate_manifest_entry_size(entry: &ManifestEntry) -> u64 {
 impl ManifestWriter {
     /// Create a new manifest writer.
     pub(crate) fn new(
-        output: OutputFile,
+        output: ManifestOutput,
+        location: String,
         snapshot_id: Option<i64>,
-        key_metadata: Option<Vec<u8>>,
         metadata: ManifestMetadata,
         first_row_id: Option<u64>,
     ) -> Self {
         Self {
             output,
+            location,
             snapshot_id,
             added_files: 0,
             added_rows: 0,
@@ -312,18 +301,13 @@ impl ManifestWriter {
             deleted_rows: 0,
             first_row_id,
             min_seq_num: None,
-            key_metadata,
             manifest_entries: Vec::new(),
             estimated_size: 0,
             metadata,
         }
     }
 
-    /// Approximate serialized size (in bytes) of the manifest accumulated so far.
-    ///
-    /// This is an estimate (see [`estimate_manifest_entry_size`]), not the exact
-    /// on-disk Avro length, and is used by size-bounded rewrite operations to
-    /// roll a manifest over to a new file once it approaches a target size.
+    /// Approximate serialized size of entries accumulated by this writer.
     pub(crate) fn estimated_manifest_size(&self) -> u64 {
         self.estimated_size
     }
@@ -350,13 +334,10 @@ impl ManifestWriter {
         match self.metadata.content {
             ManifestContentType::Data => {
                 if data_file.content != DataContentType::Data {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "Date file at path {} with manifest content type `data`, should have DataContentType `Data`, but has `{:?}`",
-                            data_file.file_path(),
-                            data_file.content
-                        ),
+                    return Err(invalid_data!(
+                        "Date file at path {} with manifest content type `data`, should have DataContentType `Data`, but has `{:?}`",
+                        data_file.file_path(),
+                        data_file.content
                     ));
                 }
             }
@@ -364,13 +345,10 @@ impl ManifestWriter {
                 if data_file.content != DataContentType::EqualityDeletes
                     && data_file.content != DataContentType::PositionDeletes
                 {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "Date file at path {} with manifest content type `deletes`, should have DataContentType `Data`, but has `{:?}`",
-                            data_file.file_path(),
-                            data_file.content
-                        ),
+                    return Err(invalid_data!(
+                        "Date file at path {} with manifest content type `deletes`, should have DataContentType `Data`, but has `{:?}`",
+                        data_file.file_path(),
+                        data_file.content
                     ));
                 }
             }
@@ -453,6 +431,10 @@ impl ManifestWriter {
 
     /// Add an existing manifest entry. This method will update following status of the entry:
     /// - Update the entry status to `Existing`
+    ///
+    /// # TODO
+    /// Remove this allow later
+    #[allow(dead_code)]
     pub(crate) fn add_existing_entry(&mut self, mut entry: ManifestEntry) -> Result<()> {
         self.check_data_file(&entry.data_file)?;
         entry.status = ManifestStatus::Existing;
@@ -486,9 +468,8 @@ impl ManifestWriter {
         if (entry.status == ManifestStatus::Deleted || entry.status == ManifestStatus::Existing)
             && (entry.sequence_number.is_none() || entry.file_sequence_number.is_none())
         {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "Manifest entry with status Existing or Deleted should have sequence number",
+            return Err(invalid_data!(
+                "Manifest entry with status Existing or Deleted should have sequence number"
             ));
         }
 
@@ -524,6 +505,9 @@ impl ManifestWriter {
             .metadata
             .partition_spec
             .partition_type(&self.metadata.schema)?;
+        // Wrap once and reuse for every entry so the per-entry conversion does
+        // not rebuild the partition type's field-name lookup on each call.
+        let partition_struct_type = Type::Struct(partition_type.clone());
         let table_schema = &self.metadata.schema;
         let avro_schema = match self.metadata.format_version {
             FormatVersion::V1 => manifest_schema_v1(&partition_type)?,
@@ -533,10 +517,8 @@ impl ManifestWriter {
         let mut avro_writer = AvroWriter::new(&avro_schema, Vec::new());
         avro_writer.add_user_metadata(
             "schema".to_string(),
-            to_vec(table_schema).map_err(|err| {
-                Error::new(ErrorKind::DataInvalid, "Fail to serialize table schema")
-                    .with_source(err)
-            })?,
+            to_vec(table_schema)
+                .map_err(|err| invalid_data!("Fail to serialize table schema").with_source(err))?,
         )?;
         avro_writer.add_user_metadata(
             "schema-id".to_string(),
@@ -545,8 +527,7 @@ impl ManifestWriter {
         avro_writer.add_user_metadata(
             "partition-spec".to_string(),
             to_vec(&self.metadata.partition_spec.fields()).map_err(|err| {
-                Error::new(ErrorKind::DataInvalid, "Fail to serialize partition spec")
-                    .with_source(err)
+                invalid_data!("Fail to serialize partition spec").with_source(err)
             })?,
         )?;
         avro_writer.add_user_metadata(
@@ -569,11 +550,13 @@ impl ManifestWriter {
         // Write manifest entries
         for entry in std::mem::take(&mut self.manifest_entries) {
             let value = match self.metadata.format_version {
-                FormatVersion::V1 => to_value(ManifestEntryV1::try_from(entry, &partition_type)?)?
-                    .resolve(&avro_schema)?,
+                FormatVersion::V1 => {
+                    to_value(ManifestEntryV1::try_from(entry, &partition_struct_type)?)?
+                        .resolve(&avro_schema)?
+                }
                 // Manifest entry format did not change between V2 and V3
                 FormatVersion::V2 | FormatVersion::V3 => {
-                    to_value(ManifestEntryV2::try_from(entry, &partition_type)?)?
+                    to_value(ManifestEntryV2::try_from(entry, &partition_struct_type)?)?
                         .resolve(&avro_schema)?
                 }
             };
@@ -582,12 +565,15 @@ impl ManifestWriter {
         }
 
         let content = avro_writer.into_inner()?;
-        let length = content.len();
-        self.output.write(Bytes::from(content)).await?;
+        let mut writer = self.output.writer().await?;
+        writer.write(Bytes::from(content)).await?;
+        let file_metadata = writer.close().await?;
+        let key_metadata = self.output.encoded_key_metadata(&file_metadata)?;
 
         Ok(ManifestFile {
-            manifest_path: self.output.location().to_string(),
-            manifest_length: length as i64,
+            manifest_path: self.location,
+            // Manifest lengths are on-disk sizes, including encryption overhead.
+            manifest_length: file_metadata.size.try_into()?,
             partition_spec_id: self.metadata.partition_spec.spec_id(),
             content: self.metadata.content,
             // sequence_number and min_sequence_number with UNASSIGNED_SEQUENCE_NUMBER will be replace with
@@ -602,7 +588,7 @@ impl ManifestWriter {
             existing_rows_count: Some(self.existing_rows),
             deleted_rows_count: Some(self.deleted_rows),
             partitions: Some(partition_summary),
-            key_metadata: self.key_metadata,
+            key_metadata,
             first_row_id: self.first_row_id,
         })
     }
@@ -634,10 +620,7 @@ impl PartitionFieldStats {
             return Ok(());
         };
         if !self.partition_type.compatible(&value) {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "value is not compatible with type",
-            ));
+            return Err(invalid_data!("value is not compatible with type"));
         }
         let value = Datum::new(self.partition_type.clone(), value);
 
@@ -679,7 +662,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::io::FileIOBuilder;
+    use crate::io::FileIO;
     use crate::spec::{DataFileFormat, Manifest, NestedField, PrimitiveType, Schema, Struct, Type};
 
     #[tokio::test]
@@ -804,12 +787,11 @@ mod tests {
         // write manifest to file
         let tmp_dir = TempDir::new().unwrap();
         let path = tmp_dir.path().join("test_manifest.avro");
-        let io = FileIOBuilder::new_fs_io().build().unwrap();
+        let io = FileIO::new_with_fs();
         let output_file = io.new_output(path.to_str().unwrap()).unwrap();
         let mut writer = ManifestWriterBuilder::new(
             output_file,
             Some(3),
-            None,
             metadata.schema.clone(),
             metadata.partition_spec.clone(),
         )
@@ -891,13 +873,12 @@ mod tests {
         // Write a V3 delete manifest
         let tmp_dir = TempDir::new().unwrap();
         let path = tmp_dir.path().join("v3_delete_manifest.avro");
-        let io = FileIOBuilder::new_fs_io().build().unwrap();
+        let io = FileIO::new_with_fs();
         let output_file = io.new_output(path.to_str().unwrap()).unwrap();
 
         let mut writer = ManifestWriterBuilder::new(
             output_file,
             Some(1),
-            None,
             schema.clone(),
             partition_spec.clone(),
         )
@@ -910,9 +891,9 @@ mod tests {
         assert_eq!(manifest_file.content, ManifestContentType::Deletes);
 
         // Read back the manifest file
-        let actual_manifest =
-            Manifest::parse_avro(fs::read(&path).expect("read_file must succeed").as_slice())
-                .unwrap();
+        let bytes = fs::read(&path).expect("read_file must succeed");
+        assert_eq!(manifest_file.manifest_length, bytes.len() as i64);
+        let actual_manifest = Manifest::parse_avro(&bytes).unwrap();
 
         // Verify the content type is correctly preserved as Deletes
         assert_eq!(
@@ -947,17 +928,14 @@ mod tests {
 
         let tmp_dir = TempDir::new().unwrap();
         let path = tmp_dir.path().join("size_estimate_manifest.avro");
-        let io = FileIOBuilder::new_fs_io().build().unwrap();
+        let io = FileIO::new_with_fs();
         let output_file = io.new_output(path.to_str().unwrap()).unwrap();
         let mut writer =
-            ManifestWriterBuilder::new(output_file, Some(1), None, schema.clone(), partition_spec)
+            ManifestWriterBuilder::new(output_file, Some(1), schema.clone(), partition_spec)
                 .build_v2_data();
 
-        // A fresh writer has no accumulated size.
         assert_eq!(writer.estimated_manifest_size(), 0);
 
-        // Two existing entries with equal-length paths and identical stat maps,
-        // so the per-entry estimate is identical for both.
         let make_existing = |file_path: &str| ManifestEntry {
             status: ManifestStatus::Existing,
             snapshot_id: Some(1),
@@ -992,33 +970,19 @@ mod tests {
             .add_existing_entry(make_existing("s3://b/t/data/0000.parquet"))
             .unwrap();
         let after_one = writer.estimated_manifest_size();
-        assert!(after_one > 0, "estimate should grow after adding an entry");
+        assert!(after_one > 0);
 
         writer
             .add_existing_entry(make_existing("s3://b/t/data/0001.parquet"))
             .unwrap();
-        let after_two = writer.estimated_manifest_size();
-        // Identical entries ⇒ the running estimate scales linearly. This is the
-        // monotonic, threshold-crossing signal the rewrite_manifests rollover
-        // relies on to seal a manifest near the target size.
-        assert_eq!(after_two, after_one * 2);
+        assert_eq!(writer.estimated_manifest_size(), after_one * 2);
     }
 
-    /// Calibration guard: the incremental size estimate must track the real
-    /// on-disk (uncompressed) manifest length within a modest tolerance for a
-    /// wide-schema manifest with realistic per-column bounds.
-    ///
-    /// This is the property the size-bounded rewrite relies on to seal
-    /// manifests near the configured target. The earlier flat constants
-    /// overcounted by ~1.7× (sealing manifests at ~0.6× the target on disk),
-    /// which this assertion rejects.
     #[tokio::test]
     async fn test_estimated_size_matches_on_disk_manifest() {
         const NUM_COLS: i32 = 60;
         const NUM_ENTRIES: usize = 80;
 
-        // Wide schema of string columns so bounds dominate, mirroring the
-        // production workload that motivated the calibration.
         let fields: Vec<_> = (1..=NUM_COLS)
             .map(|id| {
                 Arc::new(NestedField::optional(
@@ -1036,14 +1000,12 @@ mod tests {
 
         let tmp_dir = TempDir::new().unwrap();
         let path = tmp_dir.path().join("calibration_manifest.avro");
-        let io = FileIOBuilder::new_fs_io().build().unwrap();
+        let io = FileIO::new_with_fs();
         let output_file = io.new_output(path.to_str().unwrap()).unwrap();
         let mut writer =
-            ManifestWriterBuilder::new(output_file, Some(1), None, schema.clone(), partition_spec)
+            ManifestWriterBuilder::new(output_file, Some(1), schema.clone(), partition_spec)
                 .build_v2_data();
 
-        // Default bound truncation is 16 bytes; use 16-char values to match.
-        let bound = "abcdefghijklmnop";
         for i in 0..NUM_ENTRIES {
             let mut column_sizes = HashMap::new();
             let mut value_counts = HashMap::new();
@@ -1051,53 +1013,51 @@ mod tests {
             let mut lower_bounds = HashMap::new();
             let mut upper_bounds = HashMap::new();
             for id in 1..=NUM_COLS {
-                column_sizes.insert(id, 1234u64);
-                value_counts.insert(id, 100u64);
-                null_value_counts.insert(id, 0u64);
-                lower_bounds.insert(id, Datum::string(bound));
-                upper_bounds.insert(id, Datum::string(bound));
+                column_sizes.insert(id, 1234);
+                value_counts.insert(id, 100);
+                null_value_counts.insert(id, 0);
+                lower_bounds.insert(id, Datum::string("abcdefghijklmnop"));
+                upper_bounds.insert(id, Datum::string("abcdefghijklmnop"));
             }
-            let entry = ManifestEntry {
-                status: ManifestStatus::Existing,
-                snapshot_id: Some(1),
-                sequence_number: Some(1),
-                file_sequence_number: Some(1),
-                data_file: DataFile {
-                    content: DataContentType::Data,
-                    file_path: format!("s3://bucket/db/table/data/{i:05}-0-abcdef.parquet"),
-                    file_format: DataFileFormat::Parquet,
-                    partition: Struct::empty(),
-                    record_count: 100,
-                    file_size_in_bytes: 123456,
-                    column_sizes,
-                    value_counts,
-                    null_value_counts,
-                    nan_value_counts: HashMap::new(),
-                    lower_bounds,
-                    upper_bounds,
-                    key_metadata: None,
-                    split_offsets: Some(vec![4]),
-                    equality_ids: None,
-                    sort_order_id: None,
-                    partition_spec_id: 0,
-                    first_row_id: None,
-                    referenced_data_file: None,
-                    content_offset: None,
-                    content_size_in_bytes: None,
-                },
-            };
-            writer.add_existing_entry(entry).unwrap();
+            writer
+                .add_existing_entry(ManifestEntry {
+                    status: ManifestStatus::Existing,
+                    snapshot_id: Some(1),
+                    sequence_number: Some(1),
+                    file_sequence_number: Some(1),
+                    data_file: DataFile {
+                        content: DataContentType::Data,
+                        file_path: format!("s3://bucket/db/table/data/{i:05}-0-abcdef.parquet"),
+                        file_format: DataFileFormat::Parquet,
+                        partition: Struct::empty(),
+                        record_count: 100,
+                        file_size_in_bytes: 123456,
+                        column_sizes,
+                        value_counts,
+                        null_value_counts,
+                        nan_value_counts: HashMap::new(),
+                        lower_bounds,
+                        upper_bounds,
+                        key_metadata: None,
+                        split_offsets: Some(vec![4]),
+                        equality_ids: None,
+                        sort_order_id: None,
+                        partition_spec_id: 0,
+                        first_row_id: None,
+                        referenced_data_file: None,
+                        content_offset: None,
+                        content_size_in_bytes: None,
+                    },
+                })
+                .unwrap();
         }
 
         let estimated = writer.estimated_manifest_size();
-        let manifest_file = writer.write_manifest_file().await.unwrap();
-        let actual = manifest_file.manifest_length as u64;
-
+        let actual = writer.write_manifest_file().await.unwrap().manifest_length as u64;
         let ratio = estimated as f64 / actual as f64;
         assert!(
             (0.7..=1.4).contains(&ratio),
-            "estimate {estimated} should be within -30%/+40% of on-disk length {actual} \
-             (ratio {ratio:.3}); the per-entry constants need recalibration",
+            "estimate {estimated} should stay calibrated to actual length {actual}, ratio {ratio:.3}"
         );
     }
 }

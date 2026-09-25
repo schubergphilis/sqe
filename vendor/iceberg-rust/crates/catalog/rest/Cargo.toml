@@ -19,6 +19,7 @@
 edition = { workspace = true }
 homepage = { workspace = true }
 name = "iceberg-catalog-rest"
+publish = true
 rust-version = { workspace = true }
 version = { workspace = true }
 
@@ -29,58 +30,57 @@ license = "Apache-2.0"
 repository = { workspace = true }
 
 [features]
-# SigV4 auth for AWS Iceberg REST endpoints (S3 Tables, Glue Iceberg
-# REST, Lake Formation). Off by default so a pure-OSS REST stack
-# (Polaris, Nessie, Lakekeeper) doesn't pull in the AWS SDK.
+# SQE: SigV4 auth for AWS Iceberg REST endpoints (S3 Tables, Glue Iceberg
+# REST, Lake Formation) and S3-compatible servers that sign the catalog
+# (RustFS S3 Tables). Off by default so a pure-OSS REST stack (Polaris,
+# Nessie, Lakekeeper) doesn't pull in the AWS SDK.
 aws-sigv4 = [
-    "dep:aws-sigv4",
-    "dep:aws-credential-types",
-    "dep:aws-config",
-    "dep:aws-smithy-http-client",
-    "dep:bytes",
+  "dep:aws-sigv4",
+  "dep:aws-credential-types",
+  "dep:aws-config",
+  "dep:aws-smithy-http-client",
 ]
 
 [dependencies]
 async-trait = { workspace = true }
-base64 = "0.22"
+# SQE: optional SigV4 signer. aws-config comes from the workspace, which has
+# `default-https-client` off (it hardcodes the aws-lc provider); sigv4.rs
+# supplies an explicit ring HTTPS client for the credential chain.
+aws-config = { workspace = true, optional = true }
+aws-credential-types = { version = "1", optional = true }
+aws-sigv4 = { version = "1", optional = true }
+aws-smithy-http-client = { workspace = true, optional = true }
+base64 = { workspace = true }
 chrono = { workspace = true }
-gcp_auth = "0.12"
 http = { workspace = true }
 iceberg = { workspace = true }
 itertools = { workspace = true }
-# MUST match the workspace opentelemetry version. `vendor/iceberg-rust` is
-# excluded from the workspace (root Cargo.toml `exclude`), so this cannot
-# inherit `workspace = true` and drifts silently. A mismatch puts two
-# opentelemetry versions in the graph, each with its OWN global propagator
-# registry: the binary installs the propagator into one, this client reads
-# the other, finds none, and emits no `traceparent` header. Everything still
-# compiles; distributed tracing just stops. See sqe-catalog
+# SQE: MUST match SQE's workspace opentelemetry version. This vendor tree is
+# its own workspace, so the pin cannot be inherited and drifts silently. A
+# mismatch puts two opentelemetry versions in the graph, each with its OWN
+# global propagator registry: the binary installs the propagator into one,
+# this client reads the other, finds none, and emits no `traceparent`.
+# Everything still compiles; distributed tracing just stops. See sqe-catalog
 # tests/mount_rest_test.rs::polaris_requests_preserve_the_incoming_trace_id.
 opentelemetry = "0.32"
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_derive = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-opentelemetry = "0.33"
 typed-builder = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
-# Optional AWS SigV4 signer for the AWS Iceberg REST endpoints. Pinned
-# to the same major as `aws-config 1.8.7` already in the workspace.
-# `default-features = false` on aws-config: its `default-https-client`
-# feature hardcodes the aws-lc rustls provider (aws-smithy-runtime
-# `default-https-client = ["aws-smithy-http-client/rustls-aws-lc"]`), which
-# drags aws-lc-sys and its C build into every SQE binary. sigv4.rs supplies
-# an explicit ring HTTPS client instead, the same way the Glue and S3
-# Tables crates do (SQE #133).
-aws-sigv4 = { version = "1", optional = true }
-aws-credential-types = { version = "1", optional = true }
-aws-config = { version = "1.8.7", default-features = false, features = ["rt-tokio", "credentials-process", "sso", "behavior-version-latest"], optional = true }
-aws-smithy-http-client = { workspace = true, optional = true }
-bytes = { workspace = true, optional = true }
 
 [dev-dependencies]
+bytes = { workspace = true }
+futures = { workspace = true }
 iceberg_test_utils = { path = "../../test_utils", features = ["tests"] }
 mockito = { workspace = true }
+# `stream` lets tests build a streaming body to exercise HttpRequestBody::Streaming.
+reqwest = { workspace = true, features = ["stream"] }
 tokio = { workspace = true }
+
+[lints]
+workspace = true

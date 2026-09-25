@@ -19,94 +19,219 @@ use std::sync::Arc;
 
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
+use typed_builder::TypedBuilder;
 
 use crate::Result;
+use crate::error::invalid_data;
 use crate::expr::BoundPredicate;
 use crate::spec::{
     DataContentType, DataFileFormat, ManifestEntryRef, NameMapping, PartitionSpec, Schema,
-    SchemaRef, Struct,
+    SchemaRef, SortOrderRef, Struct, StructType,
 };
+use crate::writer::base_writer::position_delete_file_writer::POSITION_DELETE_SCHEMA;
 
 /// A stream of [`FileScanTask`].
 pub type FileScanTaskStream = BoxStream<'static, Result<FileScanTask>>;
 
 /// A task to scan part of file.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, TypedBuilder)]
+#[serde(try_from = "crate::scan::task::_serde::FileScanTaskSerde")]
+#[builder(
+    field_defaults(setter(prefix = "with_")),
+    build_method(into = Result<FileScanTask>)
+)]
 pub struct FileScanTask {
     /// The total size of the data file in bytes, from the manifest entry.
     /// Used to skip a stat/HEAD request when reading Parquet footers.
-    pub file_size_in_bytes: u64,
+    file_size_in_bytes: u64,
     /// The start offset of the file to scan.
-    pub start: u64,
+    start: u64,
     /// The length of the file to scan.
-    pub length: u64,
+    length: u64,
     /// The number of records in the file to scan.
     ///
     /// This is an optional field, and only available if we are
     /// reading the entire data file.
-    pub record_count: Option<u64>,
+    #[builder(default)]
+    record_count: Option<u64>,
+
+    /// The first row id assigned to the data file.
+    ///
+    /// Used to derive the `_row_id` metadata column: for a row without an
+    /// explicit `_row_id`, it is this value plus the row's ordinal position.
+    #[builder(default)]
+    first_row_id: Option<i64>,
+
+    /// The data sequence number of the file, as opposed to its file sequence
+    /// number: the sequence number preserved when a file is carried forward
+    /// across a rewrite. May be null for an existing entry in a malformed
+    /// manifest that lacks one.
+    ///
+    /// Used to derive the `_last_updated_sequence_number` metadata column.
+    #[builder(default)]
+    data_sequence_number: Option<i64>,
 
     /// The data file path corresponding to the task.
-    pub data_file_path: String,
-
-    /// The data file referenced by a deletion vector.
-    ///
-    /// This is only set for Puffin position delete tasks. The Puffin manifest
-    /// entry stores the deletion vector blob location separately from the data
-    /// file the vector applies to.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub referenced_data_file: Option<String>,
-
-    /// The content type of the file to scan.
-    pub data_file_content: DataContentType,
+    data_file_path: String,
 
     /// The format of the file to scan.
-    pub data_file_format: DataFileFormat,
+    data_file_format: DataFileFormat,
 
     /// The schema of the file to scan.
-    pub schema: SchemaRef,
+    schema: SchemaRef,
     /// The field ids to project.
-    pub project_field_ids: Vec<i32>,
+    project_field_ids: Vec<i32>,
     /// The predicate to filter.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub predicate: Option<BoundPredicate>,
+    #[builder(default)]
+    predicate: Option<BoundPredicate>,
 
     /// The list of delete files that may need to be applied to this data file
-    pub deletes: Vec<Arc<FileScanTask>>,
-    /// sequence number
+    #[builder(default)]
+    deletes: Vec<FileScanTaskDeleteFile>,
+
+    /// Data sequence number of the manifest entry that produced this task.
+    ///
+    /// Consumers that merge data and delete streams use this value to preserve
+    /// Iceberg row-level ordering semantics.
+    ///
+    /// RisingWave engine-compatibility field. It carries the same value as
+    /// [`Self::data_sequence_number`], with a missing number mapped to 0.
+    #[builder(default)]
     pub sequence_number: i64,
-    /// equality ids
-    pub equality_ids: Option<Vec<i32>>,
+
+    /// File sequence number indicating when the file was added.
+    ///
+    /// This is distinct from [`Self::sequence_number`], which is the data
+    /// sequence number used for delete applicability.
+    #[builder(default)]
+    pub file_sequence_number: Option<i64>,
 
     /// Partition data from the manifest entry, used to identify which columns can use
     /// constant values from partition metadata vs. reading from the data file.
     /// Per the Iceberg spec, only identity-transformed partition fields should use constants.
-    #[serde(skip_serializing)]
-    #[serde(skip_deserializing)]
-    pub partition: Option<Struct>,
+    #[builder(default)]
+    partition: Option<Struct>,
 
     /// The partition spec for this file, used to distinguish identity transforms
     /// (which use partition metadata constants) from non-identity transforms like
     /// bucket/truncate (which must read source columns from the data file).
-    #[serde(skip_serializing)]
-    #[serde(skip_deserializing)]
-    pub partition_spec: Option<Arc<PartitionSpec>>,
+    #[builder(default)]
+    partition_spec: Option<Arc<PartitionSpec>>,
 
     /// Name mapping from table metadata (property: schema.name-mapping.default),
     /// used to resolve field IDs from column names when Parquet files lack field IDs
     /// or have field ID conflicts.
-    #[serde(skip_serializing)]
-    #[serde(skip_deserializing)]
-    pub name_mapping: Option<Arc<NameMapping>>,
+    #[builder(default)]
+    name_mapping: Option<Arc<NameMapping>>,
+
+    /// The unified partition type across all specs in the table.
+    /// When `RESERVED_FIELD_ID_PARTITION` is in the projected field IDs, the reader
+    /// uses this type along with the task's partition_spec and partition data to
+    /// materialize the `_partition` struct column at read time.
+    ///
+    /// This is a table-level value (same for all tasks in a scan), stored per-task
+    /// so that readers are self-contained without needing back-pointers to table
+    /// metadata. The cost is one Arc clone per task.
+    #[builder(default)]
+    unified_partition_type: Option<Arc<StructType>>,
+
+    /// The raw `sort_order_id` recorded on the data file (spec field 140), carried through
+    /// unresolved. See [`DataFile::sort_order_id()`](crate::spec::DataFile::sort_order_id).
+    /// `None` if the file has no sort order id.
+    ///
+    /// This preserves the distinction that [`sort_order`](Self::sort_order) collapses: a
+    /// non-zero id that does not resolve against the table's sort orders still marks the file
+    /// as physically sorted, which a consumer such as the DataFusion sorted-scan optimizer
+    /// needs even when the order definition itself is unavailable.
+    #[builder(default)]
+    sort_order_id: Option<i32>,
+
+    /// The sort order that this file's rows are sorted by, resolved from the data file's
+    /// [`sort_order_id`](Self::sort_order_id) against the table's known sort orders. `Some`
+    /// only when the id resolves to an order that has sort fields. `None` if the file has no
+    /// sort order id, the id does not resolve, or it resolves to an order with no sort fields
+    /// (the reserved unsorted order, id 0 per the spec). Use [`sort_order_id`](Self::sort_order_id)
+    /// to tell those cases apart.
+    #[builder(default)]
+    sort_order: Option<SortOrderRef>,
 
     /// Whether this scan task should treat column names as case-sensitive when binding predicates.
-    pub case_sensitive: bool,
+    case_sensitive: bool,
+
+    /// Key metadata for encrypted data files (Parquet Modular Encryption).
+    /// When present, the reader uses this to build `FileDecryptionProperties`.
+    ///
+    /// Note on the trust boundary: for the standard encryption scheme this
+    /// carries `StandardKeyMetadata`, whose payload is the *plaintext* DEK.
+    /// Because `FileScanTask` implements [`Serialize`], that plaintext DEK is part
+    /// of the serialized scan plan should these tasks ever be serialized and sent
+    /// over the network.
+    #[builder(default)]
+    key_metadata: Option<Box<[u8]>>,
 }
 
 impl FileScanTask {
+    /// SQE PATCH (sqe#131): a copy of this task covering the byte range
+    /// `[start, start + length)`, used by the reader's large-file splitter.
+    /// `record_count` is cleared: it is only valid for whole-file reads.
+    /// Public for SQE's own scan-partition splitter (sqe-catalog).
+    pub fn with_byte_range(&self, start: u64, length: u64) -> Self {
+        Self {
+            start,
+            length,
+            record_count: None,
+            ..self.clone()
+        }
+    }
+
+    /// Returns the total size of the data file in bytes.
+    pub fn file_size_in_bytes(&self) -> u64 {
+        self.file_size_in_bytes
+    }
+
+    /// Returns the start offset of the file to scan.
+    pub fn start(&self) -> u64 {
+        self.start
+    }
+
+    /// Returns the length of the file to scan.
+    pub fn length(&self) -> u64 {
+        self.length
+    }
+
+    /// Returns the number of records in the file when the whole file is scanned.
+    pub fn record_count(&self) -> Option<u64> {
+        self.record_count
+    }
+
+    /// Returns the first row id assigned to the data file.
+    pub fn first_row_id(&self) -> Option<i64> {
+        self.first_row_id
+    }
+
+    /// Returns the data sequence number of the file.
+    pub fn data_sequence_number(&self) -> Option<i64> {
+        self.data_sequence_number
+    }
+
     /// Returns the data file path of this file scan task.
     pub fn data_file_path(&self) -> &str {
         &self.data_file_path
+    }
+
+    /// Returns the format of the data file.
+    pub fn data_file_format(&self) -> DataFileFormat {
+        self.data_file_format
+    }
+
+    /// Returns the schema of this file scan task as a reference.
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    /// Returns the schema of this file scan task as a [`SchemaRef`].
+    pub fn schema_ref(&self) -> SchemaRef {
+        self.schema.clone()
     }
 
     /// Returns the project field id of this file scan task.
@@ -119,14 +244,83 @@ impl FileScanTask {
         self.predicate.as_ref()
     }
 
-    /// Returns the schema of this file scan task as a reference
-    pub fn schema(&self) -> &Schema {
-        &self.schema
+    /// Returns the delete files that may need to be applied to the data file.
+    pub fn deletes(&self) -> &[FileScanTaskDeleteFile] {
+        &self.deletes
     }
 
-    /// Returns the schema of this file scan task as a SchemaRef
-    pub fn schema_ref(&self) -> SchemaRef {
-        self.schema.clone()
+    /// Returns the partition data from the manifest entry.
+    pub fn partition(&self) -> Option<&Struct> {
+        self.partition.as_ref()
+    }
+
+    /// Returns the partition spec for the data file.
+    pub fn partition_spec(&self) -> Option<&Arc<PartitionSpec>> {
+        self.partition_spec.as_ref()
+    }
+
+    /// Returns the name mapping used to resolve field ids.
+    pub fn name_mapping(&self) -> Option<&Arc<NameMapping>> {
+        self.name_mapping.as_ref()
+    }
+
+    /// Returns the unified partition type across all table partition specs.
+    pub fn unified_partition_type(&self) -> Option<&Arc<StructType>> {
+        self.unified_partition_type.as_ref()
+    }
+
+    /// Returns the raw sort order id recorded on the data file, unresolved.
+    pub fn sort_order_id(&self) -> Option<i32> {
+        self.sort_order_id
+    }
+
+    /// Returns the sort order this file's rows are sorted by, if resolved.
+    pub fn sort_order(&self) -> Option<&SortOrderRef> {
+        self.sort_order.as_ref()
+    }
+
+    /// Returns whether names are treated as case-sensitive.
+    pub fn case_sensitive(&self) -> bool {
+        self.case_sensitive
+    }
+
+    /// Returns the key metadata for the encrypted data file.
+    pub fn key_metadata(&self) -> Option<&[u8]> {
+        self.key_metadata.as_deref()
+    }
+
+    fn validate(&self) -> Result<()> {
+        match (self.partition.as_ref(), self.partition_spec.as_deref()) {
+            (None, None) => Ok(()),
+            (None, Some(partition_spec)) if partition_spec.is_unpartitioned() => Ok(()),
+            (None, Some(_)) => Err(invalid_data!(
+                "FileScanTask with a partitioned spec requires partition values"
+            )),
+            (Some(partition), None) if partition.fields().is_empty() => Ok(()),
+            (Some(_), None) => Err(invalid_data!(
+                "Non-empty FileScanTask partition requires a partition spec"
+            )),
+            (Some(partition), Some(partition_spec))
+                if partition.fields().len() != partition_spec.fields().len() =>
+            {
+                Err(invalid_data!(
+                    "FileScanTask partition has {} fields but partition spec has {} fields",
+                    partition.fields().len(),
+                    partition_spec.fields().len()
+                ))
+            }
+            (Some(_), Some(partition_spec)) => {
+                partition_spec.partition_type(&self.schema)?;
+                Ok(())
+            }
+        }
+    }
+}
+
+impl From<FileScanTask> for Result<FileScanTask> {
+    fn from(task: FileScanTask) -> Self {
+        task.validate()?;
+        Ok(task)
     }
 }
 
@@ -134,63 +328,31 @@ impl FileScanTask {
 pub(crate) struct DeleteFileContext {
     pub(crate) manifest_entry: ManifestEntryRef,
     pub(crate) partition_spec_id: i32,
-    pub(crate) snapshot_schema: SchemaRef,
-    pub(crate) field_ids: Arc<Vec<i32>>,
-    pub(crate) case_sensitive: bool,
 }
 
 impl From<&DeleteFileContext> for FileScanTaskDeleteFile {
     fn from(ctx: &DeleteFileContext) -> Self {
-        FileScanTaskDeleteFile {
-            file_path: ctx.manifest_entry.file_path().to_string(),
-            file_size_in_bytes: ctx.manifest_entry.file_size_in_bytes(),
-            file_type: ctx.manifest_entry.content_type(),
-            partition_spec_id: ctx.partition_spec_id,
-            equality_ids: ctx.manifest_entry.data_file.equality_ids.clone(),
-        }
-    }
-}
-
-impl From<&DeleteFileContext> for FileScanTask {
-    fn from(ctx: &DeleteFileContext) -> Self {
-        let (start, length) = match ctx.manifest_entry.file_format() {
-            DataFileFormat::Puffin => match (
-                ctx.manifest_entry.data_file().content_offset(),
-                ctx.manifest_entry.data_file().content_size_in_bytes(),
-            ) {
-                (Some(offset), Some(size)) => (offset as u64, size as u64),
-                _ => (0, 0),
-            },
-            _ => (0, ctx.manifest_entry.file_size_in_bytes()),
-        };
-
-        FileScanTask {
-            file_size_in_bytes: ctx.manifest_entry.file_size_in_bytes(),
-            start,
-            length,
-            record_count: Some(ctx.manifest_entry.record_count()),
-
-            data_file_path: ctx.manifest_entry.file_path().to_string(),
-            referenced_data_file: ctx.manifest_entry.data_file().referenced_data_file(),
-            data_file_content: ctx.manifest_entry.content_type(),
-            data_file_format: ctx.manifest_entry.file_format(),
-
-            schema: ctx.snapshot_schema.clone(),
-            project_field_ids: ctx.field_ids.to_vec(),
-            predicate: None,
-            deletes: vec![],
-            sequence_number: ctx.manifest_entry.sequence_number().unwrap_or(0),
-            equality_ids: ctx.manifest_entry.data_file().equality_ids(),
-            partition: Some(ctx.manifest_entry.data_file().partition().clone()),
-            partition_spec: None, // TODO: pass through partition spec info
-            name_mapping: None,   // TODO: implement name mapping
-            case_sensitive: ctx.case_sensitive,
-        }
+        let data_file = ctx.manifest_entry.data_file();
+        FileScanTaskDeleteFile::builder()
+            .with_file_path(ctx.manifest_entry.file_path().to_string())
+            .with_file_size_in_bytes(ctx.manifest_entry.file_size_in_bytes())
+            .with_file_type(ctx.manifest_entry.content_type())
+            .with_file_format(data_file.file_format())
+            .with_partition_spec_id(ctx.partition_spec_id)
+            .with_equality_ids(data_file.equality_ids.clone())
+            .with_referenced_data_file(data_file.referenced_data_file.clone())
+            .with_content_offset(data_file.content_offset)
+            .with_content_size_in_bytes(data_file.content_size_in_bytes)
+            .with_record_count(Some(ctx.manifest_entry.record_count()))
+            .with_sequence_number(ctx.manifest_entry.sequence_number().unwrap_or_default())
+            .with_key_metadata(data_file.key_metadata.as_deref().map(Box::from))
+            .build()
     }
 }
 
 /// A task to scan part of file.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TypedBuilder)]
+#[builder(field_defaults(setter(prefix = "with_")))]
 pub struct FileScanTaskDeleteFile {
     /// The delete file path
     pub file_path: String,
@@ -201,9 +363,518 @@ pub struct FileScanTaskDeleteFile {
     /// delete file type
     pub file_type: DataContentType,
 
+    /// The delete file's format, from the manifest entry. A `PositionDeletes` entry written as
+    /// `Puffin` is a V3 deletion vector; one written as `Parquet` is a position delete file.
+    pub file_format: DataFileFormat,
+
     /// partition id
     pub partition_spec_id: i32,
 
     /// equality ids for equality deletes (null for anything other than equality-deletes)
+    #[builder(default)]
     pub equality_ids: Option<Vec<i32>>,
+
+    /// For a deletion vector, the location of the data file whose rows it deletes. Required for
+    /// deletion vectors, and may also be set on a position delete file scoped to one data file.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub referenced_data_file: Option<String>,
+
+    /// For a deletion vector, the offset of the blob within its Puffin file. Set only for
+    /// deletion vectors, where it locates the blob for direct access.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub content_offset: Option<i64>,
+
+    /// For a deletion vector, the length in bytes of the blob within its Puffin file.
+    /// Required together with `content_offset`; both are absent for non-DV delete files.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub content_size_in_bytes: Option<i64>,
+
+    /// The number of records in the delete file, from the manifest entry; for a deletion vector,
+    /// the cardinality of its bitmap. `None` only for a task not built from a manifest entry.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub record_count: Option<u64>,
+
+    /// Data sequence number of the delete-file manifest entry.
+    #[serde(default)]
+    #[builder(default)]
+    pub sequence_number: i64,
+
+    /// Key metadata for an encrypted delete file. When present, the reader uses this to
+    /// decrypt the file: for a Parquet equality or position delete file, this builds
+    /// `FileDecryptionProperties` (Parquet Modular Encryption); for a deletion vector, whose
+    /// Puffin file has no native encryption, this wraps the range read in an
+    /// `EncryptedInputFile` (AGS1 stream encryption).
+    ///
+    /// Same plaintext-DEK trust boundary as [`FileScanTask::key_metadata`]:
+    /// this is serialized into the scan plan and crosses the planner -> worker
+    /// channel in the clear for the standard encryption scheme.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub key_metadata: Option<Box<[u8]>>,
+}
+
+mod _serde {
+    use std::sync::Arc;
+
+    use serde::{Deserialize, Serialize};
+
+    use super::{FileScanTask, FileScanTaskDeleteFile};
+    use crate::error::invalid_data;
+    use crate::expr::BoundPredicate;
+    use crate::spec::{
+        DataFileFormat, Literal, NameMapping, PartitionSpec, RawLiteral, SchemaRef, SortOrderRef,
+        StructType, Type,
+    };
+    use crate::{Error, Result};
+
+    #[derive(Deserialize)]
+    pub(super) struct FileScanTaskSerde {
+        file_size_in_bytes: u64,
+        start: u64,
+        length: u64,
+        record_count: Option<u64>,
+        first_row_id: Option<i64>,
+        data_sequence_number: Option<i64>,
+        data_file_path: String,
+        data_file_format: DataFileFormat,
+        schema: SchemaRef,
+        project_field_ids: Vec<i32>,
+        predicate: Option<BoundPredicate>,
+        deletes: Vec<FileScanTaskDeleteFile>,
+        #[serde(default)]
+        sequence_number: i64,
+        #[serde(default)]
+        file_sequence_number: Option<i64>,
+        #[serde(default)]
+        partition: Option<RawLiteral>,
+        #[serde(default)]
+        partition_spec: Option<Arc<PartitionSpec>>,
+        #[serde(default)]
+        name_mapping: Option<Arc<NameMapping>>,
+        #[serde(default)]
+        unified_partition_type: Option<Arc<StructType>>,
+        #[serde(default)]
+        sort_order_id: Option<i32>,
+        #[serde(default)]
+        sort_order: Option<SortOrderRef>,
+        case_sensitive: bool,
+        #[serde(default)]
+        key_metadata: Option<Box<[u8]>>,
+    }
+
+    #[derive(Serialize)]
+    struct FileScanTaskRefSerde<'a> {
+        file_size_in_bytes: u64,
+        start: u64,
+        length: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        record_count: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        first_row_id: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        data_sequence_number: Option<i64>,
+        data_file_path: &'a str,
+        data_file_format: DataFileFormat,
+        schema: &'a SchemaRef,
+        project_field_ids: &'a [i32],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        predicate: Option<&'a BoundPredicate>,
+        deletes: &'a [FileScanTaskDeleteFile],
+        sequence_number: i64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_sequence_number: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        partition: Option<RawLiteral>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        partition_spec: Option<&'a Arc<PartitionSpec>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name_mapping: Option<&'a Arc<NameMapping>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        unified_partition_type: Option<&'a Arc<StructType>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sort_order_id: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sort_order: Option<&'a SortOrderRef>,
+        case_sensitive: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        key_metadata: Option<&'a [u8]>,
+    }
+
+    fn partition_type(
+        partition_spec: Option<&PartitionSpec>,
+        schema: &crate::spec::Schema,
+    ) -> Result<Type> {
+        let partition_type = match partition_spec {
+            Some(partition_spec) => partition_spec.partition_type(schema)?,
+            None => PartitionSpec::unpartition_spec().partition_type(schema)?,
+        };
+        Ok(Type::Struct(partition_type))
+    }
+
+    impl<'a> TryFrom<&'a FileScanTask> for FileScanTaskRefSerde<'a> {
+        type Error = Error;
+
+        fn try_from(value: &'a FileScanTask) -> Result<Self> {
+            let partition = value
+                .partition
+                .as_ref()
+                .map(|partition| {
+                    let partition_type =
+                        partition_type(value.partition_spec.as_deref(), &value.schema)?;
+                    RawLiteral::try_from(Literal::Struct(partition.clone()), &partition_type)
+                })
+                .transpose()?;
+
+            Ok(Self {
+                file_size_in_bytes: value.file_size_in_bytes,
+                start: value.start,
+                length: value.length,
+                record_count: value.record_count,
+                first_row_id: value.first_row_id,
+                data_sequence_number: value.data_sequence_number,
+                data_file_path: &value.data_file_path,
+                data_file_format: value.data_file_format,
+                schema: &value.schema,
+                project_field_ids: &value.project_field_ids,
+                predicate: value.predicate.as_ref(),
+                deletes: &value.deletes,
+                sequence_number: value.sequence_number,
+                file_sequence_number: value.file_sequence_number,
+                partition,
+                partition_spec: value.partition_spec.as_ref(),
+                name_mapping: value.name_mapping.as_ref(),
+                unified_partition_type: value.unified_partition_type.as_ref(),
+                sort_order_id: value.sort_order_id,
+                sort_order: value.sort_order.as_ref(),
+                case_sensitive: value.case_sensitive,
+                key_metadata: value.key_metadata.as_deref(),
+            })
+        }
+    }
+
+    impl Serialize for FileScanTask {
+        fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+        where S: serde::Serializer {
+            FileScanTaskRefSerde::try_from(self)
+                .map_err(serde::ser::Error::custom)?
+                .serialize(serializer)
+        }
+    }
+
+    impl TryFrom<FileScanTaskSerde> for FileScanTask {
+        type Error = Error;
+
+        fn try_from(value: FileScanTaskSerde) -> Result<Self> {
+            let partition = value
+                .partition
+                .map(|partition| {
+                    let partition_type =
+                        partition_type(value.partition_spec.as_deref(), &value.schema)?;
+                    match partition.try_into(&partition_type)? {
+                        Some(Literal::Struct(partition)) => Ok(partition),
+                        _ => Err(invalid_data!("FileScanTask partition must be a struct")),
+                    }
+                })
+                .transpose()?;
+
+            Self::builder()
+                .with_file_size_in_bytes(value.file_size_in_bytes)
+                .with_start(value.start)
+                .with_length(value.length)
+                .with_record_count(value.record_count)
+                .with_first_row_id(value.first_row_id)
+                .with_data_sequence_number(value.data_sequence_number)
+                .with_data_file_path(value.data_file_path)
+                .with_data_file_format(value.data_file_format)
+                .with_schema(value.schema)
+                .with_project_field_ids(value.project_field_ids)
+                .with_predicate(value.predicate)
+                .with_deletes(value.deletes)
+                .with_sequence_number(value.sequence_number)
+                .with_file_sequence_number(value.file_sequence_number)
+                .with_partition(partition)
+                .with_partition_spec(value.partition_spec)
+                .with_name_mapping(value.name_mapping)
+                .with_unified_partition_type(value.unified_partition_type)
+                .with_sort_order_id(value.sort_order_id)
+                .with_sort_order(value.sort_order)
+                .with_case_sensitive(value.case_sensitive)
+                .with_key_metadata(value.key_metadata)
+                .build()
+        }
+    }
+}
+
+impl FileScanTaskDeleteFile {
+    /// Converts this lightweight delete descriptor into a standalone scan task.
+    ///
+    /// Equality deletes reuse the table schema and project their equality
+    /// columns. Position deletes use Iceberg's fixed `(file_path, pos)` schema.
+    /// The returned task intentionally does not copy the template's predicate,
+    /// partition constants, or nested deletes. This is useful for engines that
+    /// plan delete files as separate scan streams.
+    pub fn to_file_scan_task(&self, template: &FileScanTask) -> Result<FileScanTask> {
+        let (start, length) = match self.file_format {
+            DataFileFormat::Puffin => (
+                self.content_offset.unwrap_or_default().max(0) as u64,
+                self.content_size_in_bytes.unwrap_or_default().max(0) as u64,
+            ),
+            _ => (0, self.file_size_in_bytes),
+        };
+        let (schema, project_field_ids) = match self.file_type {
+            DataContentType::PositionDeletes => {
+                let schema = (*POSITION_DELETE_SCHEMA).clone();
+                let project_field_ids = schema
+                    .as_struct()
+                    .fields()
+                    .iter()
+                    .map(|field| field.id)
+                    .collect();
+                (Arc::new(schema), project_field_ids)
+            }
+            DataContentType::EqualityDeletes => (
+                template.schema.clone(),
+                self.equality_ids
+                    .clone()
+                    .unwrap_or_else(|| template.project_field_ids.clone()),
+            ),
+            DataContentType::Data => (template.schema.clone(), template.project_field_ids.clone()),
+        };
+
+        FileScanTask::builder()
+            .with_file_size_in_bytes(self.file_size_in_bytes)
+            .with_start(start)
+            .with_length(length)
+            .with_record_count(self.record_count)
+            .with_data_file_path(self.file_path.clone())
+            .with_data_file_format(self.file_format)
+            .with_schema(schema)
+            .with_project_field_ids(project_field_ids)
+            .with_deletes(Vec::new())
+            .with_sequence_number(self.sequence_number)
+            .with_partition(None)
+            .with_partition_spec(None)
+            .with_name_mapping(template.name_mapping.clone())
+            .with_case_sensitive(template.case_sensitive)
+            .with_key_metadata(self.key_metadata.clone())
+            .build()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ErrorKind;
+    use crate::spec::{Literal, NestedField, PrimitiveType, Transform, Type};
+
+    fn build_file_scan_task(
+        schema: SchemaRef,
+        partition: Option<Struct>,
+        partition_spec: Option<Arc<PartitionSpec>>,
+    ) -> Result<FileScanTask> {
+        FileScanTask::builder()
+            .with_file_size_in_bytes(100)
+            .with_start(0)
+            .with_length(100)
+            .with_data_file_path("data_file_path".to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema)
+            .with_project_field_ids(vec![])
+            .with_partition(partition)
+            .with_partition_spec(partition_spec)
+            .with_case_sensitive(false)
+            .build()
+    }
+
+    fn schema_and_spec(
+        primitive_type: PrimitiveType,
+        transform: Transform,
+    ) -> (SchemaRef, Arc<PartitionSpec>) {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "x",
+                    Type::Primitive(primitive_type),
+                ))])
+                .build()
+                .unwrap(),
+        );
+        let partition_spec = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .add_partition_field("x", "x_partition", transform)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        (schema, partition_spec)
+    }
+
+    #[test]
+    fn test_file_scan_task_builder_rejects_non_empty_partition_without_spec() {
+        // Regression test for https://github.com/apache/iceberg-rust/issues/3130.
+        let err = build_file_scan_task(
+            Arc::new(Schema::builder().build().unwrap()),
+            Some(Struct::from_iter([Some(Literal::long(42))])),
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            err.message(),
+            "Non-empty FileScanTask partition requires a partition spec"
+        );
+    }
+
+    #[test]
+    fn test_file_scan_task_builder_accepts_empty_partition_without_spec() {
+        build_file_scan_task(
+            Arc::new(Schema::builder().build().unwrap()),
+            Some(Struct::empty()),
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_file_scan_task_builder_rejects_partitioned_spec_without_partition() {
+        let (schema, partition_spec) = schema_and_spec(PrimitiveType::Long, Transform::Identity);
+
+        let err = build_file_scan_task(schema, None, Some(partition_spec)).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            err.message(),
+            "FileScanTask with a partitioned spec requires partition values"
+        );
+    }
+
+    #[test]
+    fn test_file_scan_task_builder_accepts_unpartitioned_spec_without_partition() {
+        build_file_scan_task(
+            Arc::new(Schema::builder().build().unwrap()),
+            None,
+            Some(Arc::new(PartitionSpec::unpartition_spec())),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_file_scan_task_builder_rejects_partition_arity_mismatch() {
+        let (schema, partition_spec) = schema_and_spec(PrimitiveType::Long, Transform::Identity);
+
+        let err =
+            build_file_scan_task(schema, Some(Struct::empty()), Some(partition_spec)).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.message().contains("partition has 0 fields"));
+        assert!(err.message().contains("partition spec has 1 fields"));
+    }
+
+    #[test]
+    fn test_file_scan_task_builder_accepts_dropped_partition_source_column() {
+        let (_historical_schema, partition_spec) =
+            schema_and_spec(PrimitiveType::Long, Transform::Identity);
+        let current_schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    2,
+                    "y",
+                    Type::Primitive(PrimitiveType::String),
+                ))])
+                .build()
+                .unwrap(),
+        );
+
+        build_file_scan_task(
+            current_schema,
+            Some(Struct::from_iter([Some(Literal::long(42))])),
+            Some(partition_spec),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_file_scan_task_builder_rejects_partition_spec_incompatible_with_schema() {
+        let (_historical_schema, partition_spec) =
+            schema_and_spec(PrimitiveType::Timestamp, Transform::Day);
+        let current_schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "x",
+                    Type::Primitive(PrimitiveType::String),
+                ))])
+                .build()
+                .unwrap(),
+        );
+
+        let err = build_file_scan_task(
+            current_schema,
+            Some(Struct::from_iter([Some(Literal::date(20_000))])),
+            Some(partition_spec),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
+
+    #[test]
+    fn test_delete_file_to_standalone_scan_task() {
+        let template = FileScanTask::builder()
+            .with_file_size_in_bytes(100)
+            .with_start(0)
+            .with_length(100)
+            .with_data_file_path("memory://data.parquet".to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(Arc::new(Schema::builder().build().unwrap()))
+            .with_project_field_ids(vec![1, 2])
+            .with_sequence_number(3)
+            .with_case_sensitive(false)
+            .build()
+            .unwrap();
+        let delete = FileScanTaskDeleteFile::builder()
+            .with_file_path("memory://deletes.puffin".to_string())
+            .with_file_size_in_bytes(80)
+            .with_file_type(DataContentType::PositionDeletes)
+            .with_partition_spec_id(0)
+            .with_file_format(DataFileFormat::Puffin)
+            .with_content_offset(Some(11))
+            .with_content_size_in_bytes(Some(23))
+            .with_record_count(Some(7))
+            .with_sequence_number(5)
+            .with_key_metadata(Some(Box::from([1_u8, 2])))
+            .build();
+
+        let task = delete.to_file_scan_task(&template).unwrap();
+
+        assert_eq!(task.start, 11);
+        assert_eq!(task.length, 23);
+        assert_eq!(task.record_count, Some(7));
+        assert_eq!(task.sequence_number, 5);
+        assert_eq!(task.project_field_ids, vec![2147483546, 2147483545]);
+        assert_eq!(
+            task.schema
+                .as_struct()
+                .fields()
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["file_path", "pos"]
+        );
+        assert!(!task.case_sensitive);
+        assert!(task.predicate.is_none());
+        assert!(task.deletes.is_empty());
+        assert_eq!(task.key_metadata.as_deref(), Some([1_u8, 2].as_slice()));
+    }
 }
