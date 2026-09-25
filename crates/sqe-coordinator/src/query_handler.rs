@@ -214,6 +214,35 @@ fn is_sorted_write(kind: &StatementKind) -> bool {
     }
 }
 
+/// A compile-time firewall, not an extension point: keep it even with one impl.
+///
+/// `ChannelObserver` owns an `mpsc::Sender<LineageMsg>`, and `LineageMsg`
+/// carries a `LogicalPlan`. Held concretely, every `Send`/`Sync` proof of
+/// `QueryHandler`, and so of the Flight SQL service, walks DataFusion's whole
+/// plan and expression type graph, once per `async_trait` method (they do
+/// not share the solver cache). Holding it as `dyn LineageSink` stops the walk
+/// at the declared bounds. Measured 2026-09-25 after #693 removed the old
+/// `dyn LineageObserver`: `cargo build -p sqe-coordinator --lib` 48 s held
+/// concretely, 27 s erased (`scripts/compile-profile.sh`: trait solving 39 s
+/// -> 11 s). Same device as `prepared_statements::StoredPlan`.
+trait LineageSink: Send + Sync {
+    fn on_query_start(&self, ctx: sqe_lineage::QueryStartCtx);
+    fn on_query_complete(&self, ctx: sqe_lineage::QueryCompleteCtx);
+    fn on_query_fail(&self, ctx: sqe_lineage::QueryFailCtx);
+}
+
+impl LineageSink for sqe_lineage::ChannelObserver {
+    fn on_query_start(&self, ctx: sqe_lineage::QueryStartCtx) {
+        sqe_lineage::ChannelObserver::on_query_start(self, ctx)
+    }
+    fn on_query_complete(&self, ctx: sqe_lineage::QueryCompleteCtx) {
+        sqe_lineage::ChannelObserver::on_query_complete(self, ctx)
+    }
+    fn on_query_fail(&self, ctx: sqe_lineage::QueryFailCtx) {
+        sqe_lineage::ChannelObserver::on_query_fail(self, ctx)
+    }
+}
+
 /// Handles query execution by routing parsed SQL through the appropriate
 /// pipeline: DataFusion for queries, catalog metadata for SHOW commands,
 /// and policy enforcement for all plans.
@@ -240,7 +269,7 @@ pub struct QueryHandler {
     /// emit-eligible (see `should_emit`), `execute()` calls
     /// `on_query_start` / `on_query_complete` / `on_query_fail` around the
     /// dispatch.
-    lineage: Option<Arc<sqe_lineage::ChannelObserver>>,
+    lineage: Option<Arc<dyn LineageSink>>,
     query_tracker: Arc<QueryTracker>,
     query_cache: Option<Arc<ResultCache>>,
     /// Semaphore limiting global concurrent query execution.
@@ -501,7 +530,7 @@ impl QueryHandler {
             ticket_signer,
             metrics,
             audit,
-            lineage,
+            lineage: lineage.map(|o| o as Arc<dyn LineageSink>),
             query_tracker,
             query_cache,
             query_semaphore,
