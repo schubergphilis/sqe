@@ -826,7 +826,7 @@ python-dateutil==2.9.0.post0 \
     #   -c /private/tmp/claude-502/-Users-jjverhoeks-git-schuberg-vpf-data-ai-chameleon-Applications-sqlengine/6065c382-f105-4519-b13e-33b965a2ca20/scratchpad/dbtvenv/../constraints.txt
     #   dbt-common
     #   dbt-semantic-interfaces
-python-slugify==9.1.0 \
+python-slugify==9.1.1 \
     --hash=sha256:1cd20fe7ebf941b11964a92aba9e5319edfe18606276c6e2481b92e737cde44a \
     --hash=sha256:b1180fb0fd6b3590e7fbd8328b08d56cde9dcac736527a070c0a811480621316
     # via
