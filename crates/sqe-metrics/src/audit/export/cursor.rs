@@ -13,6 +13,10 @@ pub struct SeqCursor {
     last: u64,
     /// True when the cursor was initialised from a missing or corrupt file.
     pub fresh: bool,
+    /// Whether any seq has been shipped. `last = 0` alone cannot say: the
+    /// chain's first record IS seq 0, so "0 shipped" and "nothing shipped"
+    /// must differ or the first audit record is never exported.
+    shipped_any: bool,
 }
 
 impl SeqCursor {
@@ -32,24 +36,32 @@ impl SeqCursor {
                     path,
                     last: seq,
                     fresh: false,
+                    shipped_any: true,
                 },
                 Err(_) => SeqCursor {
                     path,
                     last: 0,
                     fresh: true,
+                    shipped_any: false,
                 },
             },
             Err(_) => SeqCursor {
                 path,
                 last: 0,
                 fresh: true,
+                shipped_any: false,
             },
         }
     }
 
-    /// The highest seq already shipped. A record with `seq <= last()` is skipped.
+    /// The highest seq already shipped (0 also when nothing has been).
     pub fn last(&self) -> u64 {
         self.last
+    }
+
+    /// True when `seq` has already been shipped and must be skipped.
+    pub fn covers(&self, seq: u64) -> bool {
+        self.shipped_any && seq <= self.last
     }
 
     /// Advance the cursor to `seq` and fsync to disk so it survives a crash.
@@ -63,6 +75,7 @@ impl SeqCursor {
         write!(file, "{seq}")?;
         file.sync_all()?;
         self.last = seq;
+        self.shipped_any = true;
         Ok(())
     }
 }
