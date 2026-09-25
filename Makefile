@@ -322,6 +322,9 @@ check-ignore-reasons:  ## Every #[ignore] must carry a reason (#639): needs:<sta
 	if [ -n "$$bad" ]; then echo "bare #[ignore] without a reason (use #[ignore = \"needs:<stack>; <run hint>\"]):"; echo "$$bad"; exit 1; fi
 	@echo "==> ignore reasons ok"
 
+check-advisory-ignores:  ## Every ignored advisory (deny.toml, .cargo/audit.toml, .grype.yaml) has an owner and an unexpired review date
+	@python3 scripts/check-advisory-ignores.py
+
 check-test-layout:  ## One integration-test binary per crate (tests/it/main.rs); each extra tests/*.rs relinks DataFusion
 	@scripts/check-test-layout.sh
 
