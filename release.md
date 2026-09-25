@@ -80,8 +80,11 @@ repo.sovereign-data.org/chameleon/sqlengine/sqe:vX.Y.Z   (immutable)
 repo.sovereign-data.org/chameleon/sqlengine/sqe:stable   (newest release)
 ```
 
-and runs the `changelog` + GitLab Release + SBOM jobs. No further human action is
-needed after the merge.
+and publishes a GitLab Release (`gitlab-release`) whose notes are that version's
+`CHANGELOG.md` section. `scripts/release.sh` creates the section by renaming
+`[Unreleased]` to the version and opening a fresh `[Unreleased]`, so curate the
+notes under `[Unreleased]` as you merge. No further human action is needed after
+the merge.
 
 The release mirror is fail-closed, so a Harbor outage fails the tag pipeline
 rather than shipping a release that only exists in the GitLab registry.
@@ -146,9 +149,11 @@ the ones packaged into the short-SHA image by `aikido-build`. See #736.
 scripts/release.sh 0.37.0-rc.1 --push
 ```
 
-CI publishes a GitLab Release for any `v*` tag, including `-rc.N` / `-alpha.N`
-pre-releases. The automated release-branch flow only produces clean `vX.Y.Z`
-versions, so use the script for pre-releases.
+CI publishes a GitLab Release for clean `vX.Y.Z` tags only. Pre-release tags
+(`-rc.N` / `-alpha.N`) get an image but no Release, and `release.sh` leaves
+`[Unreleased]` untouched for them so the final release keeps its notes. The
+automated release-branch flow only produces clean `vX.Y.Z` versions, so use the
+script for pre-releases.
 
 ## Tag pipelines need one job outside `.post`
 
