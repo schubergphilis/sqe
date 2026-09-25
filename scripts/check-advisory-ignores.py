@@ -15,7 +15,7 @@ import datetime
 import re
 import sys
 
-FILES = ["deny.toml", ".cargo/audit.toml", ".grype.yaml"]
+FILES = ["deny.toml", ".cargo/audit.toml", ".grype.yaml", "vendor/reviewed-advisories.txt"]
 ID = re.compile(r"(RUSTSEC-\d{4}-\d{4}|CVE-\d{4}-\d+|GHSA-[\w-]+)")
 TAG = re.compile(r"#\s*review-by\s+(\d{4}-\d{2}-\d{2})\s+owner=(\S+)")
 
