@@ -32,13 +32,6 @@ pub const WORKER_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 /// Target decoded volume for the zero-pruning scan fixture: 20x the limit.
 pub const ZERO_PRUNING_TARGET_DECODED_BYTES: usize = 20 * WORKER_MEMORY_LIMIT_BYTES;
 
-/// Default shuffle memory budget used by the shuffle red gate.
-///
-/// Chosen so a full item-bounded channel of ~1 MiB batches
-/// (`DEFAULT_CHANNEL_CAPACITY` = 64) is ≥ 10x this budget without requiring
-/// multi-GB fixtures.
-pub const SHUFFLE_MEMORY_BUDGET_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
-
 /// Baseline artifact path relative to the workspace (sqlengine) root.
 pub const BASELINE_RELATIVE_PATH: &str = "benchmarks/results/bounded-memory-phase0-baseline.json";
 
@@ -396,8 +389,16 @@ pub fn workspace_root() -> PathBuf {
 }
 
 /// Merge-or-create the Phase 0 baseline JSON with one case result.
+///
+/// Writes the committed file under `benchmarks/results/` only when
+/// `SQE_RECORD_BASELINE=1`; a plain `cargo test` writes to the temp dir so
+/// it never dirties the working tree.
 pub fn record_baseline_case(case: BaselineCase) -> anyhow::Result<PathBuf> {
-    let path = workspace_root().join(BASELINE_RELATIVE_PATH);
+    let path = if std::env::var_os("SQE_RECORD_BASELINE").is_some_and(|v| v == "1") {
+        workspace_root().join(BASELINE_RELATIVE_PATH)
+    } else {
+        std::env::temp_dir().join("sqe-bounded-memory-baseline.json")
+    };
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

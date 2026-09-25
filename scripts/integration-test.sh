@@ -72,6 +72,8 @@ if [ "$#" -eq 0 ] && [ "$DISTRIBUTED" != "1" ]; then
     # compaction_distributed_benchmark measures a distributed-vs-local ratio.
     SKIP_ARGS+=(--skip rewrite_data_files_distributed_parity)
     SKIP_ARGS+=(--skip compaction_distributed_benchmark)
+    # A timing study, not a correctness test: it prints a before/after ratio.
+    SKIP_ARGS+=(--skip compaction_sort_benchmark)
 fi
 # GROUP=<stack> runs only the ignored tests that declare that stack
 # (`#[ignore = "needs:<stack>"]`, finding 807), by exact name. The list comes
