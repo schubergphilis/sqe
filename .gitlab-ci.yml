@@ -243,11 +243,19 @@ deps-check:
   # branches" on (ci_separated_caches = true): an MR pipeline cannot write
   # the cache that main restores (#714). Keep that setting on, and keep the
   # tool pinned so a stale cache is at least a known version.
+  #
+  # registry/index and registry/cache (compressed .crate files) only, never
+  # registry/src. cargo deny/audit run `cargo metadata`, which downloads and
+  # unpacks every crate; zipping the ~82k unpacked files overran the 15-minute
+  # job timeout on main (pipeline 1633939) after the gates had passed. cargo
+  # re-extracts from registry/cache in seconds. The key moved to -v2 so the
+  # bloated archive is never restored.
   cache:
-    key: "deps-check-cargo-home"
+    key: "deps-check-cargo-home-v2"
     paths:
       - .cargo-home/bin/
-      - .cargo-home/registry/
+      - .cargo-home/registry/index/
+      - .cargo-home/registry/cache/
   script:
     - |
       set -euo pipefail
