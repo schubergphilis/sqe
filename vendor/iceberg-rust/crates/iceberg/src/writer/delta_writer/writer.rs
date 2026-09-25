@@ -350,7 +350,7 @@ mod tests {
 
     use crate::Result;
     use crate::arrow::{arrow_schema_to_schema, schema_to_arrow_schema};
-    use crate::io::FileIOBuilder;
+    use crate::io::FileIO;
     use crate::spec::{DataContentType, DataFileFormat, NestedField, PrimitiveType, Schema, Type};
     use crate::writer::base_writer::data_file_writer::DataFileWriterBuilder;
     use crate::writer::base_writer::equality_delete_writer::{
@@ -358,10 +358,10 @@ mod tests {
     };
     use crate::writer::base_writer::position_delete_file_writer::PositionDeleteFileWriterBuilder;
     use crate::writer::delta_writer::{DELETE_OP, DeltaWriterBuilder, INSERT_OP};
+    use crate::writer::file_writer::ParquetWriterBuilder;
     use crate::writer::file_writer::location_generator::{
         DefaultFileNameGenerator, DefaultLocationGenerator,
     };
-    use crate::writer::file_writer::parquet_writer::ParquetWriterBuilder;
     use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
     use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 
@@ -405,7 +405,7 @@ mod tests {
 
     fn create_writer_builders(
         data_schema: Arc<Schema>,
-        file_io: &crate::io::FileIO,
+        file_io: &FileIO,
         location_gen: DefaultLocationGenerator,
         file_name_gen: DefaultFileNameGenerator,
     ) -> Result<WriterBuildersResult> {
@@ -493,7 +493,7 @@ mod tests {
                 .unwrap(),
         );
         let temp_dir = TempDir::new().unwrap();
-        let file_io = FileIOBuilder::new_fs_io().build()?;
+        let file_io = FileIO::new_with_fs();
         let location_gen =
             DefaultLocationGenerator::with_data_location(temp_dir.path().to_string_lossy().into());
         let file_name_gen =
@@ -657,7 +657,7 @@ mod tests {
         );
 
         let temp_dir = TempDir::new().unwrap();
-        let file_io = FileIOBuilder::new_fs_io().build()?;
+        let file_io = FileIO::new_with_fs();
         let location_gen =
             DefaultLocationGenerator::with_data_location(temp_dir.path().to_string_lossy().into());
         let file_name_gen =
@@ -781,7 +781,7 @@ mod tests {
         );
 
         let temp_dir = TempDir::new().unwrap();
-        let file_io = FileIOBuilder::new_fs_io().build()?;
+        let file_io = FileIO::new_with_fs();
         let location_gen =
             DefaultLocationGenerator::with_data_location(temp_dir.path().to_string_lossy().into());
         let file_name_gen = DefaultFileNameGenerator::new(

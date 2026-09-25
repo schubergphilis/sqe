@@ -19,6 +19,7 @@
 
 use arrow_array::RecordBatch;
 
+use crate::error::invalid_data;
 use crate::spec::{DataContentType, DataFile, PartitionKey};
 use crate::writer::file_writer::FileWriterBuilder;
 use crate::writer::file_writer::location_generator::{FileNameGenerator, LocationGenerator};
@@ -129,12 +130,8 @@ where
                     if let Some(sort_order_id) = self.sort_order_id {
                         res.sort_order_id(sort_order_id);
                     }
-                    res.build().map_err(|e| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            format!("Failed to build data file: {e}"),
-                        )
-                    })
+                    res.build()
+                        .map_err(|e| invalid_data!("Failed to build data file: {e}"))
                 })
                 .collect()
         } else {
@@ -182,7 +179,7 @@ mod test {
     use tempfile::TempDir;
 
     use crate::Result;
-    use crate::io::FileIOBuilder;
+    use crate::io::FileIO;
     use crate::spec::{
         DataContentType, DataFileFormat, Literal, NestedField, PartitionKey, PartitionSpec,
         PrimitiveType, Schema, Struct, Type,
@@ -198,7 +195,7 @@ mod test {
     #[tokio::test]
     async fn test_parquet_writer() -> Result<()> {
         let temp_dir = TempDir::new().unwrap();
-        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let file_io = FileIO::new_with_fs();
         let location_gen = DefaultLocationGenerator::with_data_location(
             temp_dir.path().to_str().unwrap().to_string(),
         );
@@ -272,7 +269,7 @@ mod test {
     #[tokio::test]
     async fn test_parquet_writer_with_partition() -> Result<()> {
         let temp_dir = TempDir::new().unwrap();
-        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let file_io = FileIO::new_with_fs();
         let location_gen = DefaultLocationGenerator::with_data_location(
             temp_dir.path().to_str().unwrap().to_string(),
         );

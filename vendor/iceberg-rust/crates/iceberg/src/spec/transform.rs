@@ -29,7 +29,7 @@ use super::values::decimal_utils::decimal_from_i128_with_scale;
 use super::values::temporal::date;
 use super::{Datum, PrimitiveLiteral};
 use crate::ErrorKind;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, invalid_data};
 use crate::expr::{
     BinaryExpression, BoundPredicate, BoundReference, Predicate, PredicateOperator, Reference,
     SetExpression, UnaryExpression,
@@ -38,6 +38,7 @@ use crate::spec::Literal;
 use crate::spec::datatypes::{PrimitiveType, Type};
 use crate::transform::{BoxedTransformFunction, create_transform_function};
 
+/// The year the Unix epoch falls in, which every temporal ordinal counts from.
 const UNIX_EPOCH_YEAR: i32 = 1970;
 
 /// Transform is used to transform predicates to partition predicates,
@@ -132,8 +133,8 @@ pub enum Transform {
     /// existing partition field so that the field is effectively dropped in
     /// v1 tables.
     ///
-    /// - Source type could be any type..
-    /// - Return type is Source type.
+    /// - Source type could be any type.
+    /// - Return type is the source type for primitive sources, otherwise `int`.
     Void,
     /// Used to represent some customized transform that can't be recognized or supported now.
     Unknown,
@@ -141,6 +142,67 @@ pub enum Transform {
 
 impl Transform {
     /// Returns a human-readable String representation of a transformed value.
+    ///
+    /// The temporal transforms store an ordinal count since the Unix epoch, and
+    /// this method renders that count as a date so that partition paths and
+    /// snapshot summary keys match the Java reference implementation:
+    ///
+    /// | Transform | Format          | Example         |
+    /// |-----------|-----------------|-----------------|
+    /// | `Year`    | `yyyy`          | `2017`          |
+    /// | `Month`   | `yyyy-MM`       | `2017-06`       |
+    /// | `Day`     | `yyyy-MM-dd`    | `2017-06-15`    |
+    /// | `Hour`    | `yyyy-MM-dd-HH` | `2017-06-15-16` |
+    ///
+    /// `Void` renders as `null`, as does an absent value for any transform.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use iceberg::spec::{Literal, PrimitiveType, Transform, Type};
+    ///
+    /// let int = Type::Primitive(PrimitiveType::Int);
+    /// let date = Type::Primitive(PrimitiveType::Date);
+    ///
+    /// // A stored value carries no logical type of its own. For transforms that do
+    /// // not format it themselves, the declared field type decides how it renders.
+    /// let stored = Literal::int(17332);
+    /// assert_eq!(
+    ///     Transform::Identity.to_human_string(&int, Some(&stored)),
+    ///     "17332"
+    /// );
+    /// assert_eq!(
+    ///     Transform::Identity.to_human_string(&date, Some(&stored)),
+    ///     "2017-06-15"
+    /// );
+    ///
+    /// // The temporal transforms format their own ordinal and ignore the declared
+    /// // type. All four ordinals below are the same instant, 2017-06-15T16:00:00Z,
+    /// // counted at four granularities.
+    /// assert_eq!(
+    ///     Transform::Year.to_human_string(&int, Some(&Literal::int(47))),
+    ///     "2017"
+    /// );
+    /// assert_eq!(
+    ///     Transform::Month.to_human_string(&int, Some(&Literal::int(569))),
+    ///     "2017-06"
+    /// );
+    /// assert_eq!(
+    ///     Transform::Day.to_human_string(&int, Some(&Literal::int(17332))),
+    ///     "2017-06-15"
+    /// );
+    /// assert_eq!(
+    ///     Transform::Hour.to_human_string(&int, Some(&Literal::int(415984))),
+    ///     "2017-06-15-16"
+    /// );
+    ///
+    /// // `Void` and an absent value render as `null`.
+    /// assert_eq!(
+    ///     Transform::Void.to_human_string(&int, Some(&Literal::int(47))),
+    ///     "null"
+    /// );
+    /// assert_eq!(Transform::Year.to_human_string(&int, None), "null");
+    /// ```
     pub fn to_human_string(&self, field_type: &Type, value: Option<&Literal>) -> String {
         let Some(value) = value.and_then(Literal::as_primitive_literal) else {
             return "null".to_string();
@@ -148,33 +210,68 @@ impl Transform {
 
         match (*self, value) {
             (Self::Void, _) => "null".to_string(),
-            (Self::Year, PrimitiveLiteral::Int(ordinal)) => {
-                format!("{:04}", UNIX_EPOCH_YEAR + ordinal)
-            }
-            (Self::Month, PrimitiveLiteral::Int(ordinal)) => format!(
-                "{:04}-{:02}",
-                UNIX_EPOCH_YEAR + ordinal.div_euclid(12),
-                1 + ordinal.rem_euclid(12)
-            ),
-            (Self::Day, PrimitiveLiteral::Int(ordinal)) => {
-                let date = date::days_to_date(ordinal);
-                format!("{:04}-{:02}-{:02}", date.year(), date.month(), date.day())
-            }
-            (Self::Hour, PrimitiveLiteral::Int(ordinal)) => {
-                let day = date::days_to_date(ordinal.div_euclid(24));
-                format!(
-                    "{:04}-{:02}-{:02}-{:02}",
-                    day.year(),
-                    day.month(),
-                    day.day(),
-                    ordinal.rem_euclid(24)
-                )
-            }
+            // The temporal transforms store an ordinal count since the Unix epoch,
+            // which the datum arm below cannot render: it would show the raw count
+            // for `Year`, `Month` and `Hour`, and would leave `Day` dependent on the
+            // field type happening to be `date`. Java overrides `toHumanString` on
+            // each of these four transforms and ignores the declared type, so do the
+            // same. Any other literal falls through to the datum.
+            (Self::Year, PrimitiveLiteral::Int(ordinal)) => Self::human_year(ordinal),
+            (Self::Month, PrimitiveLiteral::Int(ordinal)) => Self::human_month(ordinal),
+            (Self::Day, PrimitiveLiteral::Int(ordinal)) => Self::human_day(ordinal),
+            (Self::Hour, PrimitiveLiteral::Int(ordinal)) => Self::human_hour(ordinal),
             (_, value) => {
                 let field_type = field_type.as_primitive_type().unwrap();
                 Datum::new(field_type.clone(), value).to_human_string()
             }
         }
+    }
+
+    /// Formats a year ordinal, the number of years since 1970, as `yyyy`.
+    ///
+    /// Mirrors the output of `TransformUtil.humanYear`.
+    fn human_year(year_ordinal: i32) -> String {
+        format!("{:04}", UNIX_EPOCH_YEAR + year_ordinal)
+    }
+
+    /// Formats a month ordinal, the number of months since 1970-01, as `yyyy-MM`.
+    ///
+    /// Mirrors the output of `TransformUtil.humanMonth`, which divides with
+    /// `Math.floorDiv` and `Math.floorMod` rather than `/` and `%`. Truncating
+    /// division rounds toward zero, which is the wrong direction before 1970:
+    /// ordinal -1 is 1969-12, but truncating yields 1970-01. `div_euclid` and
+    /// `rem_euclid` round toward negative infinity and so agree with Java.
+    fn human_month(month_ordinal: i32) -> String {
+        format!(
+            "{:04}-{:02}",
+            UNIX_EPOCH_YEAR + month_ordinal.div_euclid(12),
+            1 + month_ordinal.rem_euclid(12)
+        )
+    }
+
+    /// Formats a day ordinal, the number of days since 1970-01-01, as `yyyy-MM-dd`.
+    ///
+    /// Mirrors the output of `TransformUtil.humanDay`. Like the Java `Days`
+    /// transform, whose signature is `toHumanString(Type alwaysDate, Integer
+    /// value)`, this ignores the declared field type rather than relying on it being
+    /// `date`.
+    fn human_day(day_ordinal: i32) -> String {
+        let date = date::days_to_date(day_ordinal);
+        format!("{:04}-{:02}-{:02}", date.year(), date.month(), date.day())
+    }
+
+    /// Formats an hour ordinal, the number of hours since 1970-01-01T00:00:00Z,
+    /// as `yyyy-MM-dd-HH`.
+    ///
+    /// Mirrors the output of `TransformUtil.humanHour`. `div_euclid` and `rem_euclid`
+    /// split the ordinal into whole days and the hour within the day so that hours
+    /// before 1970 round the way they do in Java.
+    fn human_hour(hour_ordinal: i32) -> String {
+        format!(
+            "{}-{:02}",
+            Self::human_day(hour_ordinal.div_euclid(24)),
+            hour_ordinal.rem_euclid(24)
+        )
     }
 
     /// Get the return type of transform given the input type.
@@ -185,13 +282,21 @@ impl Transform {
                 if matches!(input_type, Type::Primitive(_)) {
                     Ok(input_type.clone())
                 } else {
-                    Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("{input_type} is not a valid input type of identity transform",),
+                    Err(invalid_data!(
+                        "{input_type} is not a valid input type of identity transform",
                     ))
                 }
             }
-            Transform::Void => Ok(input_type.clone()),
+            Transform::Void => {
+                if input_type.is_primitive() {
+                    Ok(input_type.clone())
+                } else {
+                    // The spec permits `int` as the result type of `void`. Use it for
+                    // legacy specs whose source is non-primitive so manifests can still
+                    // represent the always-null partition value.
+                    Ok(Type::Primitive(PrimitiveType::Int))
+                }
+            }
             Transform::Unknown => Ok(Type::Primitive(PrimitiveType::String)),
             Transform::Bucket(_) => {
                 if let Type::Primitive(p) = input_type {
@@ -209,15 +314,13 @@ impl Transform {
                         | PrimitiveType::Uuid
                         | PrimitiveType::Fixed(_)
                         | PrimitiveType::Binary => Ok(Type::Primitive(PrimitiveType::Int)),
-                        _ => Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            format!("{input_type} is not a valid input type of bucket transform",),
+                        _ => Err(invalid_data!(
+                            "{input_type} is not a valid input type of bucket transform",
                         )),
                     }
                 } else {
-                    Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("{input_type} is not a valid input type of bucket transform",),
+                    Err(invalid_data!(
+                        "{input_type} is not a valid input type of bucket transform",
                     ))
                 }
             }
@@ -229,15 +332,13 @@ impl Transform {
                         | PrimitiveType::String
                         | PrimitiveType::Binary
                         | PrimitiveType::Decimal { .. } => Ok(input_type.clone()),
-                        _ => Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            format!("{input_type} is not a valid input type of truncate transform",),
+                        _ => Err(invalid_data!(
+                            "{input_type} is not a valid input type of truncate transform",
                         )),
                     }
                 } else {
-                    Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("{input_type} is not a valid input type of truncate transform",),
+                    Err(invalid_data!(
+                        "{input_type} is not a valid input type of truncate transform",
                     ))
                 }
             }
@@ -249,15 +350,13 @@ impl Transform {
                         | PrimitiveType::TimestampNs
                         | PrimitiveType::TimestamptzNs
                         | PrimitiveType::Date => Ok(Type::Primitive(PrimitiveType::Int)),
-                        _ => Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            format!("{input_type} is not a valid input type of {self} transform",),
+                        _ => Err(invalid_data!(
+                            "{input_type} is not a valid input type of {self} transform",
                         )),
                     }
                 } else {
-                    Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("{input_type} is not a valid input type of {self} transform",),
+                    Err(invalid_data!(
+                        "{input_type} is not a valid input type of {self} transform",
                     ))
                 }
             }
@@ -269,15 +368,13 @@ impl Transform {
                         | PrimitiveType::TimestampNs
                         | PrimitiveType::TimestamptzNs
                         | PrimitiveType::Date => Ok(Type::Primitive(PrimitiveType::Date)),
-                        _ => Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            format!("{input_type} is not a valid input type of {self} transform",),
+                        _ => Err(invalid_data!(
+                            "{input_type} is not a valid input type of {self} transform",
                         )),
                     }
                 } else {
-                    Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("{input_type} is not a valid input type of {self} transform",),
+                    Err(invalid_data!(
+                        "{input_type} is not a valid input type of {self} transform",
                     ))
                 }
             }
@@ -288,15 +385,13 @@ impl Transform {
                         | PrimitiveType::Timestamptz
                         | PrimitiveType::TimestampNs
                         | PrimitiveType::TimestamptzNs => Ok(Type::Primitive(PrimitiveType::Int)),
-                        _ => Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            format!("{input_type} is not a valid input type of {self} transform",),
+                        _ => Err(invalid_data!(
+                            "{input_type} is not a valid input type of {self} transform",
                         )),
                     }
                 } else {
-                    Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("{input_type} is not a valid input type of {self} transform",),
+                    Err(invalid_data!(
+                        "{input_type} is not a valid input type of {self} transform",
                     ))
                 }
             }
@@ -399,12 +494,9 @@ impl Transform {
                             PrimitiveLiteral::String(s) => s.len(),
                             PrimitiveLiteral::Binary(b) => b.len(),
                             _ => {
-                                return Err(Error::new(
-                                    ErrorKind::DataInvalid,
-                                    format!(
-                                        "Expected a string or binary literal, got: {:?}",
-                                        expr.literal()
-                                    ),
+                                return Err(invalid_data!(
+                                    "Expected a string or binary literal, got: {:?}",
+                                    expr.literal()
                                 ));
                             }
                         };
@@ -426,12 +518,9 @@ impl Transform {
                             PrimitiveLiteral::String(s) => s.len(),
                             PrimitiveLiteral::Binary(b) => b.len(),
                             _ => {
-                                return Err(Error::new(
-                                    ErrorKind::DataInvalid,
-                                    format!(
-                                        "Expected a string or binary literal, got: {:?}",
-                                        expr.literal()
-                                    ),
+                                return Err(invalid_data!(
+                                    "Expected a string or binary literal, got: {:?}",
+                                    expr.literal()
                                 ));
                             }
                         };
@@ -689,6 +778,15 @@ impl Transform {
                 (PrimitiveType::Timestamp, PrimitiveLiteral::Long(v)) => {
                     Some(Datum::timestamp_micros(v - 1))
                 }
+                (PrimitiveType::Timestamptz, PrimitiveLiteral::Long(v)) => {
+                    Some(Datum::timestamptz_micros(v - 1))
+                }
+                (PrimitiveType::TimestampNs, PrimitiveLiteral::Long(v)) => {
+                    Some(Datum::timestamp_nanos(v - 1))
+                }
+                (PrimitiveType::TimestamptzNs, PrimitiveLiteral::Long(v)) => {
+                    Some(Datum::timestamptz_nanos(v - 1))
+                }
                 _ => Some(datum.to_owned()),
             },
             PredicateOperator::GreaterThan => match (datum.data_type(), datum.literal()) {
@@ -700,6 +798,15 @@ impl Transform {
                 (PrimitiveType::Date, PrimitiveLiteral::Int(v)) => Some(Datum::date(v + 1)),
                 (PrimitiveType::Timestamp, PrimitiveLiteral::Long(v)) => {
                     Some(Datum::timestamp_micros(v + 1))
+                }
+                (PrimitiveType::Timestamptz, PrimitiveLiteral::Long(v)) => {
+                    Some(Datum::timestamptz_micros(v + 1))
+                }
+                (PrimitiveType::TimestampNs, PrimitiveLiteral::Long(v)) => {
+                    Some(Datum::timestamp_nanos(v + 1))
+                }
+                (PrimitiveType::TimestamptzNs, PrimitiveLiteral::Long(v)) => {
+                    Some(Datum::timestamptz_nanos(v + 1))
                 }
                 _ => Some(datum.to_owned()),
             },
@@ -917,9 +1024,8 @@ impl Transform {
                 | &PrimitiveType::TimestampNs
                 | &PrimitiveType::TimestamptzNs
         ) {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!("Expected a numeric literal, got: {boundary:?}"),
+            return Err(invalid_data!(
+                "Expected a numeric literal, got: {boundary:?}"
             ));
         }
 
@@ -1024,11 +1130,7 @@ impl FromStr for Transform {
                     .trim_end_matches(']')
                     .parse()
                     .map_err(|err| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            format!("transform bucket type {v:?} is invalid"),
-                        )
-                        .with_source(err)
+                        invalid_data!("transform bucket type {v:?} is invalid").with_source(err)
                     })?;
 
                 Transform::Bucket(length)
@@ -1041,20 +1143,13 @@ impl FromStr for Transform {
                     .trim_end_matches(']')
                     .parse()
                     .map_err(|err| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            format!("transform truncate type {v:?} is invalid"),
-                        )
-                        .with_source(err)
+                        invalid_data!("transform truncate type {v:?} is invalid").with_source(err)
                     })?;
 
                 Transform::Truncate(width)
             }
             v => {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("transform {v:?} is invalid"),
-                ));
+                return Err(invalid_data!("transform {v:?} is invalid"));
             }
         };
 
@@ -1089,22 +1184,148 @@ enum AdjustedProjection {
 mod tests {
     use super::*;
 
-    fn human(transform: Transform, ordinal: i32) -> String {
-        transform.to_human_string(
-            &Type::Primitive(PrimitiveType::Int),
-            Some(&Literal::int(ordinal)),
-        )
+    fn check_boundary(op: PredicateOperator, input: Datum, expected: Datum) {
+        let result = Transform::adjust_boundary(&op, &input).unwrap().unwrap();
+        assert_eq!(result, expected);
     }
 
     #[test]
-    fn test_temporal_transform_human_strings() {
-        assert_eq!(human(Transform::Year, -1), "1969");
-        assert_eq!(human(Transform::Year, 47), "2017");
-        assert_eq!(human(Transform::Month, -1), "1969-12");
-        assert_eq!(human(Transform::Month, 569), "2017-06");
-        assert_eq!(human(Transform::Day, -1), "1969-12-31");
-        assert_eq!(human(Transform::Day, 17332), "2017-06-15");
-        assert_eq!(human(Transform::Hour, -1), "1969-12-31-23");
-        assert_eq!(human(Transform::Hour, 415984), "2017-06-15-16");
+    fn test_adjust_boundary_timestamp_types() {
+        for (datum, dec, inc) in [
+            (
+                Datum::timestamptz_micros(1000),
+                Datum::timestamptz_micros(999),
+                Datum::timestamptz_micros(1001),
+            ),
+            (
+                Datum::timestamp_nanos(5000),
+                Datum::timestamp_nanos(4999),
+                Datum::timestamp_nanos(5001),
+            ),
+            (
+                Datum::timestamptz_nanos(5000),
+                Datum::timestamptz_nanos(4999),
+                Datum::timestamptz_nanos(5001),
+            ),
+        ] {
+            check_boundary(PredicateOperator::LessThan, datum.clone(), dec);
+            check_boundary(PredicateOperator::GreaterThan, datum.clone(), inc);
+            check_boundary(
+                PredicateOperator::LessThanOrEq,
+                datum.clone(),
+                datum.clone(),
+            );
+            check_boundary(PredicateOperator::GreaterThanOrEq, datum.clone(), datum);
+        }
+    }
+
+    /// Renders `ordinal` through the public API with the given declared type.
+    fn human(transform: Transform, primitive: PrimitiveType, ordinal: i32) -> String {
+        transform.to_human_string(&Type::Primitive(primitive), Some(&Literal::int(ordinal)))
+    }
+
+    /// Renders `ordinal` for a transform whose result type is `int`.
+    fn human_int(transform: Transform, ordinal: i32) -> String {
+        human(transform, PrimitiveType::Int, ordinal)
+    }
+
+    #[test]
+    fn test_to_human_string_year() {
+        assert_eq!(human_int(Transform::Year, -1970), "0000");
+        assert_eq!(human_int(Transform::Year, -1), "1969");
+        assert_eq!(human_int(Transform::Year, 0), "1970");
+        assert_eq!(human_int(Transform::Year, 47), "2017");
+    }
+
+    #[test]
+    fn test_to_human_string_month() {
+        assert_eq!(human_int(Transform::Month, -1970 * 12), "0000-01");
+        assert_eq!(human_int(Transform::Month, -13), "1968-12");
+        assert_eq!(human_int(Transform::Month, -12), "1969-01");
+        assert_eq!(human_int(Transform::Month, -1), "1969-12");
+        assert_eq!(human_int(Transform::Month, 0), "1970-01");
+        assert_eq!(human_int(Transform::Month, 11), "1970-12");
+        assert_eq!(human_int(Transform::Month, 12), "1971-01");
+        assert_eq!(human_int(Transform::Month, 569), "2017-06");
+    }
+
+    #[test]
+    fn test_to_human_string_day() {
+        assert_eq!(human_int(Transform::Day, -1), "1969-12-31");
+        assert_eq!(human_int(Transform::Day, 0), "1970-01-01");
+        assert_eq!(human_int(Transform::Day, 31), "1970-02-01");
+        assert_eq!(human_int(Transform::Day, 17332), "2017-06-15");
+    }
+
+    #[test]
+    fn test_to_human_string_hour() {
+        assert_eq!(human_int(Transform::Hour, -24), "1969-12-31-00");
+        assert_eq!(human_int(Transform::Hour, -1), "1969-12-31-23");
+        assert_eq!(human_int(Transform::Hour, 0), "1970-01-01-00");
+        assert_eq!(human_int(Transform::Hour, 23), "1970-01-01-23");
+        assert_eq!(human_int(Transform::Hour, 24), "1970-01-02-00");
+        assert_eq!(human_int(Transform::Hour, 1000), "1970-02-11-16");
+        assert_eq!(human_int(Transform::Hour, 415984), "2017-06-15-16");
+    }
+
+    /// The temporal transforms ignore the declared field type, matching the Java
+    /// signatures `toHumanString(Type alwaysInt, ..)` and
+    /// `toHumanString(Type alwaysDate, ..)`.
+    #[test]
+    fn test_to_human_string_ignores_declared_type_for_temporal_transforms() {
+        assert_eq!(human(Transform::Year, PrimitiveType::Date, 47), "2017");
+        assert_eq!(human(Transform::Month, PrimitiveType::Date, 569), "2017-06");
+        assert_eq!(
+            human(Transform::Day, PrimitiveType::Int, 17332),
+            "2017-06-15"
+        );
+        assert_eq!(
+            human(Transform::Hour, PrimitiveType::Date, 415984),
+            "2017-06-15-16"
+        );
+    }
+
+    /// Transforms with no temporal format keep deferring to the datum, which
+    /// renders according to the declared field type.
+    #[test]
+    fn test_to_human_string_defers_to_datum_for_other_transforms() {
+        assert_eq!(
+            human(Transform::Identity, PrimitiveType::Int, 17332),
+            "17332"
+        );
+        assert_eq!(
+            human(Transform::Identity, PrimitiveType::Date, 17332),
+            "2017-06-15"
+        );
+        assert_eq!(human(Transform::Bucket(16), PrimitiveType::Int, 5), "5");
+
+        // A literal that is not an `int` also defers to the datum rather than being
+        // reported as `null`, so the temporal arms add no second behaviour change.
+        assert_eq!(
+            Transform::Year.to_human_string(
+                &Type::Primitive(PrimitiveType::String),
+                Some(&Literal::string("unformatted"))
+            ),
+            "unformatted"
+        );
+    }
+
+    #[test]
+    fn test_to_human_string_null_cases() {
+        assert_eq!(human(Transform::Void, PrimitiveType::Int, 47), "null");
+        assert_eq!(human(Transform::Void, PrimitiveType::Date, 17332), "null");
+        for transform in [
+            Transform::Year,
+            Transform::Month,
+            Transform::Day,
+            Transform::Hour,
+            Transform::Identity,
+            Transform::Void,
+        ] {
+            assert_eq!(
+                transform.to_human_string(&Type::Primitive(PrimitiveType::Int), None),
+                "null"
+            );
+        }
     }
 }

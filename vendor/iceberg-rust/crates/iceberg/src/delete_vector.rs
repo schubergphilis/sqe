@@ -19,18 +19,27 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::ops::BitOrAssign;
+use std::mem::size_of_val;
+use std::ops::{
+    BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Deref, DerefMut, Sub, SubAssign,
+};
 
-use crc32fast::Hasher;
-use roaring::RoaringTreemap;
+use bytes::Buf;
 use roaring::bitmap::Iter;
 use roaring::treemap::BitmapIter;
+use roaring::{RoaringBitmap, RoaringTreemap};
 
+use crate::error::invalid_data;
 use crate::puffin::{Blob, DELETION_VECTOR_V1};
 use crate::{Error, ErrorKind, Result};
 
-const DELETION_VECTOR_MAGIC_BYTES: [u8; 4] = [0xD1, 0xD3, 0x39, 0x64];
-const MIN_SERIALIZED_DELETION_VECTOR_BLOB: usize = 12;
+/// Magic bytes prefixing a serialized `deletion-vector-v1` bitmap, per the Iceberg Puffin spec.
+/// Iceberg-Java stores these as the little-endian int 1681511377 (0x6439D3D1).
+const DV_MAGIC: [u8; 4] = [0xD1, 0xD3, 0x39, 0x64];
+const DV_LENGTH_PREFIX_BYTES: usize = 4;
+const DV_MAGIC_BYTES: usize = 4;
+const DV_CRC_BYTES: usize = 4;
+const DV_MIN_BLOB_BYTES: usize = DV_LENGTH_PREFIX_BYTES + DV_MAGIC_BYTES + DV_CRC_BYTES;
 
 /// Puffin blob property for deletion vector cardinality.
 pub(crate) const DELETION_VECTOR_PROPERTY_CARDINALITY: &str = "cardinality";
@@ -38,7 +47,7 @@ pub(crate) const DELETION_VECTOR_PROPERTY_CARDINALITY: &str = "cardinality";
 pub(crate) const DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE: &str = "referenced-data-file";
 
 /// A set of deleted row positions backed by a `RoaringTreemap`.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DeleteVector {
     inner: RoaringTreemap,
 }
@@ -97,21 +106,18 @@ impl DeleteVector {
         Self::check_properties(&properties)?;
 
         let serialized_bitmap_size = self.inner.serialized_size();
-        let combined_length = (DELETION_VECTOR_MAGIC_BYTES.len() + serialized_bitmap_size) as u32;
+        let combined_length = (DV_MAGIC_BYTES + serialized_bitmap_size) as u32;
         let mut data = Vec::with_capacity(
-            std::mem::size_of_val(&combined_length)
-                + DELETION_VECTOR_MAGIC_BYTES.len()
-                + serialized_bitmap_size
-                + 4, // the length of the CRC
+            size_of_val(&combined_length) + DV_MAGIC_BYTES + serialized_bitmap_size + DV_CRC_BYTES,
         );
 
         data.extend_from_slice(&combined_length.to_be_bytes());
-        data.extend_from_slice(&DELETION_VECTOR_MAGIC_BYTES);
+        data.extend_from_slice(&DV_MAGIC);
 
         let bitmap_start = data.len();
         data.resize(bitmap_start + serialized_bitmap_size, 0);
         {
-            let mut cursor = std::io::Cursor::new(&mut data[bitmap_start..]);
+            let mut cursor = Cursor::new(&mut data[bitmap_start..]);
             self.inner.serialize_into(&mut cursor).map_err(|err| {
                 Error::new(
                     ErrorKind::Unexpected,
@@ -121,9 +127,7 @@ impl DeleteVector {
             })?;
         }
 
-        let mut hasher = Hasher::new();
-        hasher.update(&data[4..]);
-        let crc = hasher.finalize();
+        let crc = crc32fast::hash(&data[DV_LENGTH_PREFIX_BYTES..]);
         data.extend_from_slice(&crc.to_be_bytes());
 
         Ok(Blob::builder()
@@ -137,6 +141,8 @@ impl DeleteVector {
     }
 
     /// Deserialize a delete vector from a Puffin deletion vector blob.
+    ///
+    /// Checks the blob type, then decodes with the strict [`DeleteVector::deserialize`].
     pub fn from_puffin_blob(blob: Blob) -> Result<Self> {
         if blob.blob_type() != DELETION_VECTOR_V1 {
             return Err(Error::new(
@@ -144,86 +150,155 @@ impl DeleteVector {
                 format!("unsupported puffin blob type: {}", blob.blob_type()),
             ));
         }
-
-        let data = blob.data();
-        if data.len() < MIN_SERIALIZED_DELETION_VECTOR_BLOB {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "serialized deletion vector blob too small".to_string(),
-            ));
-        }
-
-        let magic = &data[4..8];
-        if magic != DELETION_VECTOR_MAGIC_BYTES {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "invalid deletion vector magic bytes".to_string(),
-            ));
-        }
-
-        let combined_length = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-        let expected_len = std::mem::size_of_val(&combined_length) + combined_length as usize + 4;
-        if expected_len != data.len() {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "serialized deletion vector length mismatch: expected {expected_len}, actual {}",
-                    data.len()
-                ),
-            ));
-        }
-
-        let bitmap_start = 8;
-        let bitmap_end = data.len() - 4;
-        let bitmap_data = &data[bitmap_start..bitmap_end];
-
-        let mut hasher = Hasher::new();
-        hasher.update(&data[4..bitmap_end]);
-        let expected_crc = hasher.finalize();
-        let stored_crc = u32::from_be_bytes([
-            data[data.len() - 4],
-            data[data.len() - 3],
-            data[data.len() - 2],
-            data[data.len() - 1],
-        ]);
-        if expected_crc != stored_crc {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!("deletion vector crc mismatch: expected {expected_crc}, got {stored_crc}"),
-            ));
-        }
-
-        let bitmap =
-            RoaringTreemap::deserialize_from(&mut Cursor::new(bitmap_data)).map_err(|err| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    "failed to deserialize deletion vector bitmap".to_string(),
-                )
-                .with_source(err)
-            })?;
-
-        Ok(DeleteVector::new(bitmap))
+        Self::deserialize(blob.data())
     }
 
     fn check_properties(properties: &HashMap<String, String>) -> Result<()> {
-        if !properties.contains_key(DELETION_VECTOR_PROPERTY_CARDINALITY) {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "deletion vector properties must include {DELETION_VECTOR_PROPERTY_CARDINALITY}"
-                ),
-            ));
-        }
-        if !properties.contains_key(DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE) {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "deletion vector properties must include {DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE}"
-                ),
-            ));
+        for key in [
+            DELETION_VECTOR_PROPERTY_CARDINALITY,
+            DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE,
+        ] {
+            if !properties.contains_key(key) {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("deletion vector properties must include {key}"),
+                ));
+            }
         }
         Ok(())
     }
+
+    /// Parses a `deletion-vector-v1` Puffin blob into a `DeleteVector`.
+    ///
+    /// The layout, defined by the Iceberg Puffin spec and matching Iceberg-Java's
+    /// `BitmapPositionDeleteIndex`, is:
+    ///
+    /// ```text
+    /// [length: u32 big-endian][magic: D1 D3 39 64][vector][crc: u32 big-endian]
+    /// ```
+    ///
+    /// `length` counts the magic and vector bytes (not itself or the CRC). The CRC-32 is
+    /// computed over the magic and vector. `vector` is a roaring bitmap in the portable 64-bit
+    /// format: a directory of 32-bit key / 32-bit roaring bitmap pairs, ordered by unsigned
+    /// comparison of the keys, one bitmap per key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::DataInvalid`] if the blob is shorter than the minimum, the length
+    /// prefix or CRC does not match, the magic is wrong, the roaring bitmap count exceeds the
+    /// portable format's maximum, the roaring directory's keys are not ordered by unsigned
+    /// comparison, or the roaring payload fails to decode.
+    pub fn deserialize(blob: &[u8]) -> Result<Self> {
+        if blob.len() < DV_MIN_BLOB_BYTES {
+            return Err(invalid_data!(
+                "deletion-vector-v1 blob is {} bytes, shorter than the {DV_MIN_BLOB_BYTES}-byte minimum",
+                blob.len()
+            ));
+        }
+
+        // The magic and vector, i.e. the bytes covered by both the length prefix and the CRC.
+        let body = &blob[DV_LENGTH_PREFIX_BYTES..blob.len() - DV_CRC_BYTES];
+        verify_length_prefix(&blob[..DV_LENGTH_PREFIX_BYTES], body)?;
+
+        // Verify the CRC before interpreting any bytes so a corrupt blob yields a single clear
+        // error rather than an opaque roaring decode failure.
+        verify_crc(body, &blob[blob.len() - DV_CRC_BYTES..])?;
+
+        let (magic, vector) = body.split_at(DV_MAGIC_BYTES);
+        verify_magic(magic)?;
+
+        let inner = decode_roaring_directory(vector)?;
+
+        Ok(DeleteVector { inner })
+    }
+}
+
+fn verify_length_prefix(mut prefix: &[u8], body: &[u8]) -> Result<()> {
+    let declared_len = prefix.try_get_u32().map_err(|e| {
+        Error::new(
+            ErrorKind::Unexpected,
+            "failed to read the deletion-vector-v1 length prefix",
+        )
+        .with_source(e)
+    })? as usize;
+    if declared_len != body.len() {
+        return Err(invalid_data!(
+            "deletion-vector-v1 length prefix is {declared_len}, expected {}",
+            body.len()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_crc(body: &[u8], mut crc_bytes: &[u8]) -> Result<()> {
+    let stored_crc = crc_bytes.try_get_u32().map_err(|e| {
+        Error::new(
+            ErrorKind::Unexpected,
+            "failed to read the deletion-vector-v1 CRC",
+        )
+        .with_source(e)
+    })?;
+    let computed_crc = crc32fast::hash(body);
+    if computed_crc != stored_crc {
+        return Err(invalid_data!(
+            "deletion-vector-v1 CRC mismatch: computed {computed_crc:#010x}, stored {stored_crc:#010x}"
+        ));
+    }
+    Ok(())
+}
+
+fn verify_magic(magic: &[u8]) -> Result<()> {
+    if magic != DV_MAGIC {
+        return Err(invalid_data!(
+            "deletion-vector-v1 magic mismatch: {magic:02x?}, expected {DV_MAGIC:02x?}"
+        ));
+    }
+    Ok(())
+}
+
+// The Puffin spec defines the roaring directory as the bitmaps "ordered by unsigned comparison
+// of the 32-bit keys", with one bitmap per key. Walk it ourselves (rather than
+// `RoaringTreemap::deserialize_from`, which stores keys in a `BTreeMap` via a plain insert and
+// would silently accept a stream with duplicate or out-of-order keys, discarding the earlier
+// bitmap on a duplicate) so a non-conformant blob is rejected instead of decoded into a value
+// that doesn't match what was actually written.
+fn decode_roaring_directory(mut reader: &[u8]) -> Result<RoaringTreemap> {
+    let bitmap_count = reader.try_get_u64_le().map_err(|e| {
+        invalid_data!("failed to decode deletion-vector-v1 roaring payload").with_source(e)
+    })?;
+    // The roaring portable format restricts the bitmap count to [0, 2^32 - 1] (it is stored as a
+    // u64 with the upper 32 bits reserved as zero padding).
+    if bitmap_count > u32::MAX as u64 {
+        return Err(invalid_data!(
+            "deletion-vector-v1 roaring bitmap count {bitmap_count} exceeds the {}-key maximum",
+            u32::MAX
+        ));
+    }
+
+    let mut bitmaps = Vec::new();
+    let mut last_key: Option<u32> = None;
+    for _ in 0..bitmap_count {
+        let key = reader.try_get_u32_le().map_err(|e| {
+            invalid_data!("failed to decode deletion-vector-v1 roaring payload").with_source(e)
+        })?;
+        if let Some(last) = last_key
+            && key <= last
+        {
+            return Err(invalid_data!(
+                "deletion-vector-v1 roaring keys must be ordered by unsigned comparison, got key {key} after {last}"
+            ));
+        }
+        last_key = Some(key);
+
+        let bitmap = RoaringBitmap::deserialize_from(&mut reader).map_err(|e| {
+            invalid_data!("failed to decode deletion-vector-v1 roaring payload").with_source(e)
+        })?;
+        bitmaps.push((key, bitmap));
+    }
+
+    // `bitmaps` is already sorted by key, but `roaring` has no constructor that accepts
+    // pre-sorted pairs without re-sorting them; revisit if that changes upstream.
+    Ok(RoaringTreemap::from_bitmaps(bitmaps))
 }
 
 // Ideally, we'd just wrap `roaring::RoaringTreemap`'s iterator, `roaring::treemap::Iter` here.
@@ -294,15 +369,147 @@ impl DeleteVectorIterator<'_> {
     }
 }
 
-impl BitOrAssign for DeleteVector {
-    fn bitor_assign(&mut self, other: Self) {
-        self.inner.bitor_assign(&other.inner);
+impl From<DeleteVector> for RoaringTreemap {
+    fn from(val: DeleteVector) -> RoaringTreemap {
+        val.inner
     }
 }
 
+// Reproduces Iceberg-Java's `deletion-vector-v1` framing so tests can round-trip through
+// `deserialize` without a Java writer, and so other test modules can build blob fixtures.
+// Cross-implementation golden fixtures produced by Iceberg-Java are tracked separately; this
+// only checks that our decode matches our encode.
+#[cfg(test)]
+pub(crate) fn frame_dv_blob(vector: &[u8]) -> Vec<u8> {
+    let body_len = DV_MAGIC_BYTES + vector.len();
+    let mut blob = Vec::with_capacity(DV_LENGTH_PREFIX_BYTES + body_len + DV_CRC_BYTES);
+    blob.extend_from_slice(&(body_len as u32).to_be_bytes());
+    blob.extend_from_slice(&DV_MAGIC);
+    blob.extend_from_slice(vector);
+    let crc = crc32fast::hash(&blob[DV_LENGTH_PREFIX_BYTES..]);
+    blob.extend_from_slice(&crc.to_be_bytes());
+    blob
+}
+
+impl Deref for DeleteVector {
+    type Target = RoaringTreemap;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for DeleteVector {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl Extend<u64> for DeleteVector {
+    fn extend<I: IntoIterator<Item = u64>>(&mut self, iterator: I) {
+        self.inner.extend(iterator);
+    }
+}
+
+impl<'a> Extend<&'a u64> for DeleteVector {
+    fn extend<I: IntoIterator<Item = &'a u64>>(&mut self, iterator: I) {
+        self.inner.extend(iterator);
+    }
+}
+
+impl<const N: usize> From<[u64; N]> for DeleteVector {
+    fn from(arr: [u64; N]) -> Self {
+        DeleteVector::from_iter(arr)
+    }
+}
+
+impl FromIterator<u64> for DeleteVector {
+    fn from_iter<I: IntoIterator<Item = u64>>(iterator: I) -> DeleteVector {
+        let inner = RoaringTreemap::from_iter(iterator);
+        DeleteVector { inner }
+    }
+}
+
+macro_rules! impl_binary_op {
+    ($trait:ident, $method:ident, $op:tt) => {
+        impl $trait<DeleteVector> for DeleteVector {
+            type Output = DeleteVector;
+
+            fn $method(self, rhs: DeleteVector) -> Self::Output {
+                DeleteVector::new(self.inner $op rhs.inner)
+            }
+        }
+
+        impl $trait<&DeleteVector> for DeleteVector {
+            type Output = DeleteVector;
+
+            fn $method(self, rhs: &DeleteVector) -> Self::Output {
+                DeleteVector::new(self.inner $op &rhs.inner)
+            }
+        }
+
+        impl $trait<DeleteVector> for &DeleteVector {
+            type Output = DeleteVector;
+
+            fn $method(self, rhs: DeleteVector) -> Self::Output {
+                DeleteVector::new(&self.inner $op rhs.inner)
+            }
+        }
+
+        impl $trait<&DeleteVector> for &DeleteVector {
+            type Output = DeleteVector;
+
+            fn $method(self, rhs: &DeleteVector) -> Self::Output {
+                DeleteVector::new(&self.inner $op &rhs.inner)
+            }
+        }
+    };
+}
+
+macro_rules! impl_assign_op {
+    ($trait:ident, $method:ident, $op:tt) => {
+        impl $trait<DeleteVector> for DeleteVector {
+            fn $method(&mut self, rhs: DeleteVector) {
+                self.inner $op rhs.inner;
+            }
+        }
+
+        impl $trait<&DeleteVector> for DeleteVector {
+            fn $method(&mut self, rhs: &DeleteVector) {
+                self.inner $op &rhs.inner;
+            }
+        }
+    };
+}
+
+impl_binary_op!(BitOr, bitor, |);
+impl_binary_op!(BitAnd, bitand, &);
+impl_binary_op!(Sub, sub, -);
+impl_binary_op!(BitXor, bitxor, ^);
+
+impl_assign_op!(BitOrAssign, bitor_assign, |=);
+impl_assign_op!(BitAndAssign, bitand_assign, &=);
+impl_assign_op!(SubAssign, sub_assign, -=);
+impl_assign_op!(BitXorAssign, bitxor_assign, ^=);
+
 #[cfg(test)]
 mod tests {
+    use std::borrow::Borrow;
+
     use super::*;
+
+    fn puffin_properties() -> HashMap<String, String> {
+        HashMap::from([
+            (
+                DELETION_VECTOR_PROPERTY_CARDINALITY.to_string(),
+                "2".to_string(),
+            ),
+            (
+                DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE.to_string(),
+                "data.parquet".to_string(),
+            ),
+        ])
+    }
 
     #[test]
     fn test_insertion_and_iteration() {
@@ -326,6 +533,96 @@ mod tests {
         let mut collected: Vec<u64> = dv.iter().collect();
         collected.sort();
         assert_eq!(collected, positions);
+    }
+
+    #[test]
+    fn test_roaring_access_and_conversion() {
+        let high = 1_u64 << 40;
+        let mut dv = DeleteVector::default();
+
+        assert_eq!(dv.insert_range(2..5), 3);
+        assert!(dv.contains(3));
+        assert!(dv.remove(3));
+        assert_eq!(dv.rank(4), 2);
+        assert_eq!(dv.select(1), Some(4));
+        assert!(dv.insert(high));
+
+        let borrowed: &RoaringTreemap = dv.borrow();
+        assert!(borrowed.contains(high));
+
+        let roaring: RoaringTreemap = dv.clone().into();
+        let round_trip = DeleteVector::new(roaring);
+        assert_eq!(round_trip, dv);
+    }
+
+    #[test]
+    fn test_roaring_set_operations() {
+        let high = 1_u64 << 40;
+        let left: DeleteVector = [1, 2, high].into();
+        let right: DeleteVector = [2, 3, high + 1].into();
+        let union_expected: DeleteVector = [1, 2, 3, high, high + 1].into();
+        let intersection_expected: DeleteVector = [2].into();
+        let difference_expected: DeleteVector = [1, high].into();
+        let symmetric_difference_expected: DeleteVector = [1, 3, high, high + 1].into();
+
+        assert_eq!(left.clone() | right.clone(), union_expected);
+        assert_eq!(left.clone() | &right, union_expected);
+        assert_eq!(&left | right.clone(), union_expected);
+        assert_eq!(&left | &right, union_expected);
+
+        assert_eq!(left.clone() & right.clone(), intersection_expected);
+        assert_eq!(left.clone() & &right, intersection_expected);
+        assert_eq!(&left & right.clone(), intersection_expected);
+        assert_eq!(&left & &right, intersection_expected);
+
+        assert_eq!(left.clone() - right.clone(), difference_expected);
+        assert_eq!(left.clone() - &right, difference_expected);
+        assert_eq!(&left - right.clone(), difference_expected);
+        assert_eq!(&left - &right, difference_expected);
+
+        assert_eq!(left.clone() ^ right.clone(), symmetric_difference_expected);
+        assert_eq!(left.clone() ^ &right, symmetric_difference_expected);
+        assert_eq!(&left ^ right.clone(), symmetric_difference_expected);
+        assert_eq!(&left ^ &right, symmetric_difference_expected);
+
+        let mut union_owned = left.clone();
+        union_owned |= right.clone();
+        assert_eq!(union_owned, union_expected);
+        let mut union_borrowed = left.clone();
+        union_borrowed |= &right;
+        assert_eq!(union_borrowed, union_expected);
+
+        let mut intersection_owned = left.clone();
+        intersection_owned &= right.clone();
+        assert_eq!(intersection_owned, intersection_expected);
+        let mut intersection_borrowed = left.clone();
+        intersection_borrowed &= &right;
+        assert_eq!(intersection_borrowed, intersection_expected);
+
+        let mut difference_owned = left.clone();
+        difference_owned -= right.clone();
+        assert_eq!(difference_owned, difference_expected);
+        let mut difference_borrowed = left.clone();
+        difference_borrowed -= &right;
+        assert_eq!(difference_borrowed, difference_expected);
+
+        let mut symmetric_difference_owned = left.clone();
+        symmetric_difference_owned ^= right.clone();
+        assert_eq!(symmetric_difference_owned, symmetric_difference_expected);
+        let mut symmetric_difference_borrowed = left.clone();
+        symmetric_difference_borrowed ^= &right;
+        assert_eq!(symmetric_difference_borrowed, symmetric_difference_expected);
+    }
+
+    #[test]
+    fn test_advance_to_after_roaring_api_expansion() {
+        let high = 1_u64 << 40;
+        let dv: DeleteVector = [1, 3, high].into();
+        let mut iter = dv.iter();
+
+        assert_eq!(iter.next(), Some(1));
+        iter.advance_to(high);
+        assert_eq!(iter.next(), Some(high));
     }
 
     /// Testing scenario: bulk insertion fails because input positions are not strictly increasing.
@@ -355,5 +652,172 @@ mod tests {
         let positions = vec![1, 3, 5, 5];
         let res = dv.insert_positions(&positions);
         assert!(res.is_err());
+    }
+
+    fn encode_dv_blob(dv: &DeleteVector) -> Vec<u8> {
+        let mut vector = Vec::with_capacity(dv.inner.serialized_size());
+        dv.inner.serialize_into(&mut vector).unwrap();
+        frame_dv_blob(&vector)
+    }
+
+    fn dv_of(positions: impl IntoIterator<Item = u64>) -> DeleteVector {
+        let mut dv = DeleteVector::default();
+        for pos in positions {
+            dv.insert(pos);
+        }
+        dv
+    }
+
+    fn sorted(dv: &DeleteVector) -> Vec<u64> {
+        let mut positions: Vec<u64> = dv.iter().collect();
+        positions.sort_unstable();
+        positions
+    }
+
+    #[test]
+    fn test_deserialize_roundtrip_empty() {
+        let blob = encode_dv_blob(&DeleteVector::default());
+        assert_eq!(DeleteVector::deserialize(&blob).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_deserialize_roundtrip_small() {
+        let positions = [0u64, 5, 100, 1000];
+        let dv = DeleteVector::deserialize(&encode_dv_blob(&dv_of(positions))).unwrap();
+        assert_eq!(sorted(&dv), positions);
+    }
+
+    #[test]
+    fn test_deserialize_roundtrip_spanning_64bit_keys() {
+        let positions = [1u64, 1 << 33, (1 << 33) + 5, 1 << 34];
+        let dv = DeleteVector::deserialize(&encode_dv_blob(&dv_of(positions))).unwrap();
+        assert_eq!(sorted(&dv), positions);
+    }
+
+    // Java run-optimizes every deletion vector before writing, so real blobs carry RUN
+    // containers, which use the SERIAL_COOKIE roaring layout. Force that layout so decode
+    // exercises the run-container path rather than only array and bitmap containers.
+    #[test]
+    fn test_deserialize_roundtrip_run_optimized() {
+        let mut dv = dv_of(0..10_000);
+        assert!(
+            dv.inner.optimize(),
+            "expected a dense range to run-length encode"
+        );
+        let decoded = DeleteVector::deserialize(&encode_dv_blob(&dv)).unwrap();
+        assert_eq!(decoded.len(), 10_000);
+        let positions = sorted(&decoded);
+        assert_eq!(positions.first(), Some(&0));
+        assert_eq!(positions.last(), Some(&9_999));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_short_blob() {
+        let err = DeleteVector::deserialize(&[0u8; DV_MIN_BLOB_BYTES - 1]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
+
+    #[test]
+    fn test_deserialize_rejects_bad_magic() {
+        let mut blob = encode_dv_blob(&dv_of([1]));
+        blob[DV_LENGTH_PREFIX_BYTES] ^= 0xFF;
+        // Recompute the CRC so the magic check, not the CRC check, is what fails.
+        let end = blob.len() - DV_CRC_BYTES;
+        let crc = crc32fast::hash(&blob[DV_LENGTH_PREFIX_BYTES..end]);
+        blob[end..].copy_from_slice(&crc.to_be_bytes());
+        let err = DeleteVector::deserialize(&blob).unwrap_err();
+        assert!(err.message().contains("magic mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn test_deserialize_rejects_bad_crc() {
+        let mut blob = encode_dv_blob(&dv_of([1, 2, 3]));
+        let end = blob.len() - DV_CRC_BYTES;
+        blob[end] ^= 0xFF;
+        let err = DeleteVector::deserialize(&blob).unwrap_err();
+        assert!(err.message().contains("CRC mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn test_deserialize_rejects_length_prefix_mismatch() {
+        let mut blob = encode_dv_blob(&dv_of([1]));
+        let declared = u32::from_be_bytes(blob[..DV_LENGTH_PREFIX_BYTES].try_into().unwrap());
+        blob[..DV_LENGTH_PREFIX_BYTES].copy_from_slice(&(declared + 1).to_be_bytes());
+        let err = DeleteVector::deserialize(&blob).unwrap_err();
+        assert!(err.message().contains("length prefix"), "got: {err}");
+    }
+
+    // Crafts a raw roaring treemap directory (bitmap count header + key/bitmap entries) so tests
+    // can exercise key-ordering violations that `dv_of`/`encode_dv_blob` can never produce, since
+    // `DeleteVector::insert` always keeps keys unique and ascending.
+    fn raw_roaring_vector(entries: &[(u32, &[u32])]) -> Vec<u8> {
+        let mut vector = Vec::new();
+        vector.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for (key, positions) in entries {
+            let mut bitmap = RoaringBitmap::new();
+            for &pos in *positions {
+                bitmap.insert(pos);
+            }
+            vector.extend_from_slice(&key.to_le_bytes());
+            bitmap.serialize_into(&mut vector).unwrap();
+        }
+        vector
+    }
+
+    // `RoaringTreemap::deserialize_from` stores keys in a `BTreeMap` via a plain insert, so
+    // without our own ordering check, decoding this would silently keep only the second bitmap
+    // for key 5 (position 2) and drop the first (position 1).
+    #[test]
+    fn test_deserialize_rejects_duplicate_keys() {
+        let vector = raw_roaring_vector(&[(5, &[1]), (5, &[2])]);
+        let err = DeleteVector::deserialize(&frame_dv_blob(&vector)).unwrap_err();
+        assert!(err.message().contains("unsigned comparison"), "got: {err}");
+    }
+
+    // The Puffin spec requires the roaring directory's keys to be "ordered by unsigned
+    // comparison"; a stream with unique but out-of-order keys is not a conformant blob even
+    // though `BTreeMap` would happily reorder it into a correct-looking result.
+    #[test]
+    fn test_deserialize_rejects_out_of_order_keys() {
+        let vector = raw_roaring_vector(&[(5, &[1]), (3, &[2])]);
+        let err = DeleteVector::deserialize(&frame_dv_blob(&vector)).unwrap_err();
+        assert!(err.message().contains("unsigned comparison"), "got: {err}");
+    }
+
+    // The roaring portable format stores the bitmap count as a u64 with the upper 32 bits
+    // reserved as zero padding, restricting it to [0, 2^32 - 1]; a value above that is not a
+    // conformant blob, regardless of whether any key/bitmap entries follow.
+    #[test]
+    fn test_deserialize_rejects_bitmap_count_overflow() {
+        let vector = (u32::MAX as u64 + 1).to_le_bytes().to_vec();
+        let err = DeleteVector::deserialize(&frame_dv_blob(&vector)).unwrap_err();
+        assert!(err.message().contains("exceeds the"), "got: {err}");
+    }
+
+    #[test]
+    fn test_puffin_blob_round_trip() {
+        let mut dv = DeleteVector::default();
+        dv.insert(7);
+        dv.insert(1 << 33);
+
+        let decoded =
+            DeleteVector::from_puffin_blob(dv.to_puffin_blob(puffin_properties()).unwrap())
+                .unwrap();
+
+        assert_eq!(decoded.iter().collect::<Vec<_>>(), vec![7, 1 << 33]);
+    }
+
+    #[test]
+    fn test_clone_and_borrowed_union() {
+        let mut left = DeleteVector::default();
+        left.insert(1);
+        let mut right = DeleteVector::default();
+        right.insert(2);
+
+        let mut union = left.clone();
+        union |= &right;
+
+        assert_eq!(union.iter().collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(right.iter().collect::<Vec<_>>(), vec![2]);
     }
 }

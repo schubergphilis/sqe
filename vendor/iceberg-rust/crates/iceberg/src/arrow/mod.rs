@@ -23,20 +23,22 @@ pub use schema::*;
 mod nan_val_cnt_visitor;
 pub(crate) use nan_val_cnt_visitor::*;
 pub(crate) mod caching_delete_file_loader;
+pub use caching_delete_file_loader::load_position_deletes;
 /// Delete File loader
 pub mod delete_file_loader;
-pub(crate) mod int96;
-mod scan_metrics;
-pub use scan_metrics::{ScanMetrics, ScanResult};
 pub(crate) mod delete_filter;
 
+mod int96;
 mod reader;
 /// RecordBatch projection utilities
 pub mod record_batch_projector;
 pub(crate) mod record_batch_transformer;
+pub(crate) use record_batch_transformer::build_partition_constant;
+mod scan_metrics;
 mod value;
 
 pub use reader::*;
+pub use scan_metrics::{ScanMetrics, ScanResult};
 pub use value::*;
 /// Partition value calculator for computing partition values
 pub mod partition_value_calculator;
@@ -44,3 +46,6 @@ pub use partition_value_calculator::*;
 /// Record batch partition splitter for partitioned tables
 pub mod record_batch_partition_splitter;
 pub use record_batch_partition_splitter::*;
+
+#[cfg(test)]
+pub(crate) mod test_utils;

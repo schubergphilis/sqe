@@ -16,24 +16,19 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::mem::size_of;
+use std::mem::{size_of, size_of_val};
 use std::sync::Arc;
 
+use crate::encryption::EncryptionManager;
 use crate::io::FileIO;
 use crate::spec::{
-    DataFile, FieldSummary, FormatVersion, Manifest, ManifestEntry, ManifestFile, ManifestList,
-    SchemaId, SnapshotRef, TableMetadataRef,
+    DataFile, Datum, FieldSummary, Literal, Manifest, ManifestEntry, ManifestFile, ManifestList,
+    ManifestListReader, ManifestReader, PrimitiveLiteral, SnapshotRef, TableMetadataRef,
 };
 use crate::{Error, ErrorKind, Result};
 
 const DEFAULT_CACHE_SIZE_BYTES: u64 = 32 * 1024 * 1024; // 32MB
-
-/// Hashbrown group width used for control byte padding in the bucket array.
-/// SSE2 uses 16; this is the common default on x86_64.
-const HASHMAP_GROUP_WIDTH: usize = 16;
-
-/// Overhead for an `Arc` heap allocation: strong count + weak count (2 × usize).
-const ARC_INNER_OVERHEAD: usize = size_of::<usize>() * 2;
+const ARC_ALLOCATION_OVERHEAD: usize = size_of::<usize>() * 2;
 
 #[derive(Clone, Debug)]
 pub(crate) enum CachedItem {
@@ -43,149 +38,148 @@ pub(crate) enum CachedItem {
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub(crate) enum CachedObjectKey {
-    ManifestList((String, FormatVersion, SchemaId)),
-    Manifest(String),
+    // Keyed by location alone. A location holds one set of immutable bytes, and
+    // a cache is bound to one table, so the first access parses those bytes
+    // under the table's then-current format version and every later access
+    // shares that entry. The version can still shift under a live cache across
+    // an in-place upgrade (`Table::with_metadata`), which is why the key omits it.
+    ManifestList(String),
+    // The manifest-level `first_row_id` is part of the key because the parsed
+    // manifest inherits it onto its entries: the same physical manifest can be
+    // referenced with different offsets across snapshots and branches, so it
+    // cannot be shared under the path alone.
+    Manifest((String, Option<u64>)),
 }
 
-// ---------------------------------------------------------------------------
-// Heap size estimation helpers
-// ---------------------------------------------------------------------------
-//
-// These functions estimate the actual heap memory consumed by cached objects.
-// (as opposed to `size_of_val()`, which only returns the shallow struct size
-// (~100–200 bytes) regardless of heap allocations).
-//
-// See: https://github.com/apache/iceberg-rust/issues/1720
-
-/// Estimates the heap allocation of a [`HashMap<K, V>`].
-///
-/// Hashbrown (backing `std::collections::HashMap`) allocates:
-///   `[ctrl bytes: capacity + GROUP_WIDTH] [slots: capacity × size_of::<(K, V)>()]`
-fn estimated_hashmap_heap<K, V>(map: &HashMap<K, V>) -> usize {
-    let cap = map.capacity();
-    if cap == 0 {
-        return 0;
-    }
-    let ctrl_bytes = cap + HASHMAP_GROUP_WIDTH;
-    let slot_bytes = cap * size_of::<(K, V)>();
-    ctrl_bytes + slot_bytes
+fn estimated_hashmap_heap_size<K, V>(map: &HashMap<K, V>) -> usize {
+    // Account for the bucket values and approximately one control byte per
+    // bucket. The exact layout is intentionally left to the standard library.
+    map.capacity()
+        .saturating_mul(size_of::<(K, V)>().saturating_add(1))
 }
 
-/// Estimates total memory for a cached [`ManifestList`], including the struct
-/// itself and all heap allocations within its [`ManifestFile`] entries.
-fn estimated_manifest_list_size(list: &ManifestList) -> usize {
-    let entries = list.entries();
-    let mut size = size_of::<ManifestList>();
-
-    // Vec<ManifestFile> heap: one ManifestFile inline per entry.
-    // We use len() as an approximation for capacity (we only have a slice).
-    size += std::mem::size_of_val(entries);
-
-    // Per-entry string and vec heap allocations
-    for entry in entries {
-        size += estimated_manifest_file_heap(entry);
+fn estimated_primitive_literal_heap_size(literal: &PrimitiveLiteral) -> usize {
+    match literal {
+        PrimitiveLiteral::String(value) => value.capacity(),
+        PrimitiveLiteral::Binary(value) => value.capacity(),
+        _ => 0,
     }
-
-    size
 }
 
-/// Estimates heap allocations within a single [`ManifestFile`] beyond its
-/// inline struct size (already counted by the parent Vec allocation).
-fn estimated_manifest_file_heap(file: &ManifestFile) -> usize {
-    let mut size = 0;
-
-    // String: manifest_path
-    size += file.manifest_path.capacity();
-
-    // Option<Vec<FieldSummary>>: partitions
-    if let Some(ref partitions) = file.partitions {
-        size += partitions.len() * size_of::<FieldSummary>();
-        for summary in partitions {
-            if let Some(ref lb) = summary.lower_bound {
-                size += lb.len();
-            }
-            if let Some(ref ub) = summary.upper_bound {
-                size += ub.len();
-            }
-        }
-    }
-
-    // Option<Vec<u8>>: key_metadata
-    if let Some(ref metadata) = file.key_metadata {
-        size += metadata.capacity();
-    }
-
-    size
+fn estimated_datum_heap_size(datum: &Datum) -> usize {
+    estimated_primitive_literal_heap_size(datum.literal())
 }
 
-/// Estimates total memory for a cached [`Manifest`], including the struct,
-/// `Arc` overhead per entry, and all heap allocations within each [`DataFile`].
-///
-/// Note: Skips `Arc<Schema>` in [`ManifestMetadata`] because schemas are
-/// shared across manifests (also held by `TableMetadata`). Schema size is
-/// constant per table and does not scale with file count.
-fn estimated_manifest_size(manifest: &Manifest) -> usize {
-    let entries = manifest.entries();
-    let mut size = size_of::<Manifest>();
+fn estimated_data_file_heap_size(data_file: &DataFile) -> usize {
+    let partition_heap_size = size_of_val(data_file.partition.fields())
+        + data_file
+            .partition
+            .fields()
+            .iter()
+            .flatten()
+            .map(|literal| match literal {
+                Literal::Primitive(value) => estimated_primitive_literal_heap_size(value),
+                _ => 0,
+            })
+            .sum::<usize>();
 
-    // Vec<Arc<ManifestEntry>>: one Arc pointer per entry
-    size += std::mem::size_of_val(entries);
-
-    for entry in entries {
-        // Each Arc points to a heap allocation: ArcInner overhead + ManifestEntry
-        size += ARC_INNER_OVERHEAD + size_of::<ManifestEntry>();
-        // Heap allocations within the DataFile
-        size += estimated_data_file_heap(&entry.data_file);
-    }
-
-    size
+    data_file.file_path.capacity()
+        + partition_heap_size
+        + estimated_hashmap_heap_size(&data_file.column_sizes)
+        + estimated_hashmap_heap_size(&data_file.value_counts)
+        + estimated_hashmap_heap_size(&data_file.null_value_counts)
+        + estimated_hashmap_heap_size(&data_file.nan_value_counts)
+        + estimated_hashmap_heap_size(&data_file.lower_bounds)
+        + data_file
+            .lower_bounds
+            .values()
+            .map(estimated_datum_heap_size)
+            .sum::<usize>()
+        + estimated_hashmap_heap_size(&data_file.upper_bounds)
+        + data_file
+            .upper_bounds
+            .values()
+            .map(estimated_datum_heap_size)
+            .sum::<usize>()
+        + data_file
+            .key_metadata
+            .as_ref()
+            .map_or(0, |value| value.capacity())
+        + data_file
+            .split_offsets
+            .as_ref()
+            .map_or(0, |value| value.capacity() * size_of::<i64>())
+        + data_file
+            .equality_ids
+            .as_ref()
+            .map_or(0, |value| value.capacity() * size_of::<i32>())
+        + data_file
+            .referenced_data_file
+            .as_ref()
+            .map_or(0, |value| value.capacity())
 }
 
-/// Estimates heap allocations within a single [`DataFile`].
-///
-/// This is where most of the memory lives: six `HashMap`s of per-column
-/// statistics that scale with the number of columns in the table schema.
-fn estimated_data_file_heap(df: &DataFile) -> usize {
-    let mut size = 0;
+fn estimated_manifest_file_heap_size(manifest_file: &ManifestFile) -> usize {
+    manifest_file.manifest_path.capacity()
+        + manifest_file.partitions.as_ref().map_or(0, |partitions| {
+            partitions.capacity() * size_of::<FieldSummary>()
+                + partitions
+                    .iter()
+                    .map(|summary| {
+                        summary.lower_bound.as_ref().map_or(0, |value| value.len())
+                            + summary.upper_bound.as_ref().map_or(0, |value| value.len())
+                    })
+                    .sum::<usize>()
+        })
+        + manifest_file
+            .key_metadata
+            .as_ref()
+            .map_or(0, |value| value.capacity())
+}
 
-    // String: file_path
-    size += df.file_path.capacity();
+fn estimated_manifest_list_heap_size(manifest_list: &ManifestList) -> usize {
+    ARC_ALLOCATION_OVERHEAD
+        + size_of::<ManifestList>()
+        + size_of_val(manifest_list.entries())
+        + manifest_list
+            .entries()
+            .iter()
+            .map(estimated_manifest_file_heap_size)
+            .sum::<usize>()
+}
 
-    // Struct (partition values): Vec<Option<Literal>> heap
-    size += std::mem::size_of_val(df.partition.fields());
+fn estimated_manifest_heap_size(manifest: &Manifest) -> usize {
+    ARC_ALLOCATION_OVERHEAD
+        + size_of::<Manifest>()
+        + size_of_val(manifest.entries())
+        + manifest
+            .entries()
+            .iter()
+            .map(|entry| {
+                ARC_ALLOCATION_OVERHEAD
+                    + size_of::<ManifestEntry>()
+                    + estimated_data_file_heap_size(entry.data_file())
+            })
+            .sum::<usize>()
+}
 
-    // 4× HashMap<i32, u64>
-    size += estimated_hashmap_heap(&df.column_sizes);
-    size += estimated_hashmap_heap(&df.value_counts);
-    size += estimated_hashmap_heap(&df.null_value_counts);
-    size += estimated_hashmap_heap(&df.nan_value_counts);
-
-    // 2× HashMap<i32, Datum>: uses flat per-Datum estimate (does not traverse
-    // into String/Binary Datum variants for heap beyond the inline enum size).
-    size += estimated_hashmap_heap(&df.lower_bounds);
-    size += estimated_hashmap_heap(&df.upper_bounds);
-
-    // Option<Vec<u8>>: key_metadata
-    if let Some(ref km) = df.key_metadata {
-        size += km.capacity();
+fn estimated_cache_key_heap_size(key: &CachedObjectKey) -> usize {
+    match key {
+        CachedObjectKey::ManifestList(path) => path.capacity(),
+        CachedObjectKey::Manifest((path, _)) => path.capacity(),
     }
+}
 
-    // Option<Vec<i64>>: split_offsets
-    if let Some(ref so) = df.split_offsets {
-        size += so.capacity() * size_of::<i64>();
-    }
-
-    // Option<Vec<i32>>: equality_ids
-    if let Some(ref ei) = df.equality_ids {
-        size += ei.capacity() * size_of::<i32>();
-    }
-
-    // Option<String>: referenced_data_file
-    if let Some(ref rdf) = df.referenced_data_file {
-        size += rdf.capacity();
-    }
-
-    size
+fn cache_entry_weight(key: &CachedObjectKey, value: &CachedItem) -> u32 {
+    let value_size = match value {
+        CachedItem::ManifestList(value) => estimated_manifest_list_heap_size(value),
+        CachedItem::Manifest(value) => estimated_manifest_heap_size(value),
+    };
+    (size_of::<CachedObjectKey>()
+        + estimated_cache_key_heap_size(key)
+        + size_of::<CachedItem>()
+        + value_size)
+        .min(u32::MAX as usize) as u32
 }
 
 /// Caches metadata objects deserialized from immutable files
@@ -194,46 +188,62 @@ pub struct ObjectCache {
     cache: moka::future::Cache<CachedObjectKey, CachedItem>,
     file_io: FileIO,
     cache_disabled: bool,
+    encryption_manager: Option<Arc<EncryptionManager>>,
 }
 
 impl ObjectCache {
     /// Creates a new [`ObjectCache`]
     /// with the default cache size
-    pub(crate) fn new(file_io: FileIO) -> Self {
-        Self::new_with_capacity(file_io, DEFAULT_CACHE_SIZE_BYTES)
+    pub(crate) fn new(file_io: FileIO, encryption_manager: Option<Arc<EncryptionManager>>) -> Self {
+        Self::new_with_capacity(file_io, DEFAULT_CACHE_SIZE_BYTES, encryption_manager)
     }
 
     /// Creates a new [`ObjectCache`]
     /// with a specific cache size
-    pub(crate) fn new_with_capacity(file_io: FileIO, cache_size_bytes: u64) -> Self {
+    pub(crate) fn new_with_capacity(
+        file_io: FileIO,
+        cache_size_bytes: u64,
+        encryption_manager: Option<Arc<EncryptionManager>>,
+    ) -> Self {
         if cache_size_bytes == 0 {
-            Self::with_disabled_cache(file_io)
+            Self::with_disabled_cache(file_io, encryption_manager)
         } else {
             Self {
                 cache: moka::future::Cache::builder()
-                    .weigher(|_, val: &CachedItem| {
-                        let size = match val {
-                            CachedItem::ManifestList(item) => estimated_manifest_list_size(item),
-                            CachedItem::Manifest(item) => estimated_manifest_size(item),
-                        };
-                        // moka weigher returns u32; clamp to u32::MAX (~4 GiB) for safety
-                        size.min(u32::MAX as usize) as u32
-                    })
+                    .weigher(cache_entry_weight)
                     .max_capacity(cache_size_bytes)
                     .build(),
                 file_io,
                 cache_disabled: false,
+                encryption_manager,
             }
         }
     }
 
     /// Creates a new [`ObjectCache`]
     /// with caching disabled
-    pub(crate) fn with_disabled_cache(file_io: FileIO) -> Self {
+    pub(crate) fn with_disabled_cache(
+        file_io: FileIO,
+        encryption_manager: Option<Arc<EncryptionManager>>,
+    ) -> Self {
         Self {
             cache: moka::future::Cache::new(0),
             file_io,
             cache_disabled: true,
+            encryption_manager,
+        }
+    }
+
+    pub(crate) fn share_entries_with(
+        &self,
+        file_io: FileIO,
+        encryption_manager: Option<Arc<EncryptionManager>>,
+    ) -> Self {
+        Self {
+            cache: self.cache.clone(),
+            file_io,
+            cache_disabled: self.cache_disabled,
+            encryption_manager,
         }
     }
 
@@ -246,13 +256,16 @@ impl ObjectCache {
     /// storage. Matches the existing public surface of `get_manifest_list`.
     pub async fn get_manifest(&self, manifest_file: &ManifestFile) -> Result<Arc<Manifest>> {
         if self.cache_disabled {
-            return manifest_file
-                .load_manifest(&self.file_io)
+            return ManifestReader::new(self.file_io.clone())
+                .read(manifest_file)
                 .await
                 .map(Arc::new);
         }
 
-        let key = CachedObjectKey::Manifest(manifest_file.manifest_path.clone());
+        let key = CachedObjectKey::Manifest((
+            manifest_file.manifest_path.clone(),
+            manifest_file.first_row_id,
+        ));
 
         let cache_entry = self
             .cache
@@ -285,19 +298,18 @@ impl ObjectCache {
         table_metadata: &TableMetadataRef,
     ) -> Result<Arc<ManifestList>> {
         if self.cache_disabled {
-            return snapshot
-                .load_manifest_list(&self.file_io, table_metadata)
-                .await
-                .map(Arc::new);
+            return ManifestListReader::new(
+                snapshot.clone(),
+                self.file_io.clone(),
+                table_metadata.clone(),
+                self.encryption_manager.clone(),
+            )
+            .load()
+            .await
+            .map(Arc::new);
         }
 
-        let key = CachedObjectKey::ManifestList((
-            snapshot.manifest_list().to_string(),
-            table_metadata.format_version,
-            snapshot
-                .schema_id()
-                .unwrap_or_else(|| table_metadata.current_schema_id()),
-        ));
+        let key = CachedObjectKey::ManifestList(snapshot.manifest_list().to_string());
         let cache_entry = self
             .cache
             .entry_by_ref(&key)
@@ -324,7 +336,9 @@ impl ObjectCache {
     }
 
     async fn fetch_and_parse_manifest(&self, manifest_file: &ManifestFile) -> Result<CachedItem> {
-        let manifest = manifest_file.load_manifest(&self.file_io).await?;
+        let manifest = ManifestReader::new(self.file_io.clone())
+            .read(manifest_file)
+            .await?;
 
         Ok(CachedItem::Manifest(Arc::new(manifest)))
     }
@@ -334,9 +348,14 @@ impl ObjectCache {
         snapshot: &SnapshotRef,
         table_metadata: &TableMetadataRef,
     ) -> Result<CachedItem> {
-        let manifest_list = snapshot
-            .load_manifest_list(&self.file_io, table_metadata)
-            .await?;
+        let manifest_list = ManifestListReader::new(
+            snapshot.clone(),
+            self.file_io.clone(),
+            table_metadata.clone(),
+            self.encryption_manager.clone(),
+        )
+        .load()
+        .await?;
 
         Ok(CachedItem::ManifestList(Arc::new(manifest_list)))
     }
@@ -344,6 +363,7 @@ impl ObjectCache {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
 
     use minijinja::value::Value;
@@ -355,10 +375,12 @@ mod tests {
     use crate::TableIdent;
     use crate::io::{FileIO, OutputFile};
     use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, Literal, ManifestEntry,
-        ManifestListWriter, ManifestStatus, ManifestWriterBuilder, Struct, TableMetadata,
+        DataContentType, DataFileBuilder, DataFileFormat, FormatVersion, Literal,
+        ManifestContentType, ManifestEntry, ManifestListWriter, ManifestStatus,
+        ManifestWriterBuilder, Operation, Snapshot, Struct, Summary, TableMetadata,
     };
     use crate::table::Table;
+    use crate::test_utils::test_runtime;
 
     fn render_template(template: &str, ctx: Value) -> String {
         let mut env = Environment::new();
@@ -379,10 +401,7 @@ mod tests {
             let manifest_list2_location = table_location.join("metadata/manifests_list_2.avro");
             let table_metadata1_location = table_location.join("metadata/v1.json");
 
-            let file_io = FileIO::from_path(table_location.as_os_str().to_str().unwrap())
-                .unwrap()
-                .build()
-                .unwrap();
+            let file_io = FileIO::new_with_fs();
 
             let table_metadata = {
                 let template_json_str = fs::read_to_string(format!(
@@ -404,6 +423,7 @@ mod tests {
                 .identifier(TableIdent::from_strs(["db", "table1"]).unwrap())
                 .file_io(file_io.clone())
                 .metadata_location(table_metadata1_location.as_os_str().to_str().unwrap())
+                .runtime(test_runtime())
                 .build()
                 .unwrap();
 
@@ -433,7 +453,6 @@ mod tests {
             let mut writer = ManifestWriterBuilder::new(
                 self.next_manifest_file(),
                 Some(current_snapshot.snapshot_id()),
-                None,
                 current_schema.clone(),
                 current_partition_spec.as_ref().clone(),
             )
@@ -460,14 +479,73 @@ mod tests {
             let data_file_manifest = writer.write_manifest_file().await.unwrap();
 
             // Write to manifest list
+            let manifest_list_writer = self
+                .table
+                .file_io()
+                .new_output(current_snapshot.manifest_list())
+                .unwrap()
+                .writer()
+                .await
+                .unwrap();
             let mut manifest_list_write = ManifestListWriter::v2(
-                self.table
-                    .file_io()
-                    .new_output(current_snapshot.manifest_list())
-                    .unwrap(),
+                manifest_list_writer,
                 current_snapshot.snapshot_id(),
                 current_snapshot.parent_snapshot_id(),
                 current_snapshot.sequence_number(),
+            );
+            manifest_list_write
+                .add_manifests(vec![data_file_manifest].into_iter())
+                .unwrap();
+            manifest_list_write.close().await.unwrap();
+        }
+
+        async fn setup_v1_manifest_files(&mut self) {
+            let current_snapshot = self.table.metadata().current_snapshot().unwrap();
+            let current_schema = current_snapshot.schema(self.table.metadata()).unwrap();
+            let current_partition_spec = self.table.metadata().default_partition_spec();
+
+            // Write data files
+            let mut writer = ManifestWriterBuilder::new(
+                self.next_manifest_file(),
+                Some(current_snapshot.snapshot_id()),
+                current_schema.clone(),
+                current_partition_spec.as_ref().clone(),
+            )
+            .build_v1();
+            writer
+                .add_entry(
+                    ManifestEntry::builder()
+                        .status(ManifestStatus::Added)
+                        .data_file(
+                            DataFileBuilder::default()
+                                .partition_spec_id(0)
+                                .content(DataContentType::Data)
+                                .file_path(format!("{}/1.parquet", &self.table_location))
+                                .file_format(DataFileFormat::Parquet)
+                                .file_size_in_bytes(100)
+                                .record_count(1)
+                                .partition(Struct::from_iter([Some(Literal::long(100))]))
+                                .build()
+                                .unwrap(),
+                        )
+                        .build(),
+                )
+                .unwrap();
+            let data_file_manifest = writer.write_manifest_file().await.unwrap();
+
+            // Write to manifest list
+            let manifest_list_writer = self
+                .table
+                .file_io()
+                .new_output(current_snapshot.manifest_list())
+                .unwrap()
+                .writer()
+                .await
+                .unwrap();
+            let mut manifest_list_write = ManifestListWriter::v1(
+                manifest_list_writer,
+                current_snapshot.snapshot_id(),
+                current_snapshot.parent_snapshot_id(),
             );
             manifest_list_write
                 .add_manifests(vec![data_file_manifest].into_iter())
@@ -481,7 +559,7 @@ mod tests {
         let mut fixture = TableTestFixture::new();
         fixture.setup_manifest_files().await;
 
-        let object_cache = ObjectCache::with_disabled_cache(fixture.table.file_io().clone());
+        let object_cache = ObjectCache::with_disabled_cache(fixture.table.file_io().clone(), None);
 
         let result_manifest_list = object_cache
             .get_manifest_list(
@@ -514,7 +592,7 @@ mod tests {
         let mut fixture = TableTestFixture::new();
         fixture.setup_manifest_files().await;
 
-        let object_cache = ObjectCache::new(fixture.table.file_io().clone());
+        let object_cache = ObjectCache::new(fixture.table.file_io().clone(), None);
 
         // not in cache
         let result_manifest_list = object_cache
@@ -537,6 +615,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(result_manifest_list.entries().len(), 1);
+
+        let shared_cache = object_cache.share_entries_with(fixture.table.file_io().clone(), None);
+        let shared_manifest_list = shared_cache
+            .get_manifest_list(
+                fixture.table.metadata().current_snapshot().unwrap(),
+                &fixture.table.metadata_ref(),
+            )
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&result_manifest_list, &shared_manifest_list));
 
         let manifest_file = result_manifest_list.entries().first().unwrap();
 
@@ -571,75 +659,155 @@ mod tests {
         );
     }
 
-    /// Regression test: ObjectCache::get_manifest_list must not panic when
-    /// the snapshot has no schema_id (Iceberg v1 format tables).
     #[tokio::test]
-    async fn test_get_manifest_list_v1_snapshot_without_schema_id() {
+    async fn test_get_manifest_list_with_no_schema_id() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+
+        let current_snapshot = fixture.table.metadata().current_snapshot().unwrap();
+
+        // The spec marks `schema-id` optional in every version (v1-v3), so a
+        // snapshot may omit it; fetching its manifest list must not depend on the
+        // schema-id being present.
+        let snapshot_without_schema_id: SnapshotRef = Snapshot::builder()
+            .with_snapshot_id(current_snapshot.snapshot_id())
+            .with_sequence_number(current_snapshot.sequence_number())
+            .with_timestamp_ms(current_snapshot.timestamp_ms())
+            .with_manifest_list(current_snapshot.manifest_list())
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .build()
+            .into();
+        assert!(snapshot_without_schema_id.schema_id().is_none());
+        assert!(current_snapshot.schema_id().is_some());
+
+        let object_cache = ObjectCache::new(fixture.table.file_io().clone(), None);
+
+        // Cold miss: the schema-id-less snapshot populates the cache.
+        let inserted = object_cache
+            .get_manifest_list(&snapshot_without_schema_id, &fixture.table.metadata_ref())
+            .await
+            .unwrap();
+        assert_eq!(inserted.entries().len(), 1);
+
+        // Warm hit: the original snapshot carries a schema-id but points at the same
+        // manifest-list location, so it returns the same cached entry.
+        let cached = object_cache
+            .get_manifest_list(current_snapshot, &fixture.table.metadata_ref())
+            .await
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&inserted, &cached),
+            "snapshots with and without schema-id at one location must share a cache entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_manifest_list_serves_cached_v1_parse_after_upgrade() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_v1_manifest_files().await;
+
+        let current_snapshot = fixture.table.metadata().current_snapshot().unwrap();
+
+        // The manifest list on disk is v1. The fixture table is v2, so clone its
+        // metadata as v1 to model the state before an in-place upgrade; the real
+        // metadata_ref models the state after it. Both drive lookups at the same
+        // location through one cache.
+        let metadata_v2 = fixture.table.metadata_ref();
+        let mut metadata_v1 = fixture.table.metadata().clone();
+        metadata_v1.format_version = FormatVersion::V1;
+        let metadata_v1: TableMetadataRef = Arc::new(metadata_v1);
+        assert_ne!(
+            metadata_v2.format_version, metadata_v1.format_version,
+            "setup invariant: the two metadata refs must differ in format version"
+        );
+
+        let object_cache = ObjectCache::new(fixture.table.file_io().clone(), None);
+
+        // Cold miss under v1 parses the v1 bytes as v1: content defaults to Data and
+        // the sequence number to 0.
+        let cached_under_v1 = object_cache
+            .get_manifest_list(current_snapshot, &metadata_v1)
+            .await
+            .unwrap();
+        let entry = cached_under_v1.entries().first().unwrap();
+        assert_eq!(entry.content, ManifestContentType::Data);
+        assert_eq!(entry.sequence_number, 0);
+
+        // Warm hit under v2 at the same location returns the cached v1 parse rather
+        // than reparsing the v1 bytes as v2, so the upgraded caller sees the same
+        // correct content.
+        let cached_under_v2 = object_cache
+            .get_manifest_list(current_snapshot, &metadata_v2)
+            .await
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&cached_under_v1, &cached_under_v2),
+            "lookups at one location must share a cache entry across format versions"
+        );
+        let entry = cached_under_v2.entries().first().unwrap();
+        assert_eq!(entry.content, ManifestContentType::Data);
+        assert_eq!(entry.sequence_number, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_manifest_list_for_v1_snapshot_without_schema_id() {
         let tmp_dir = TempDir::new().unwrap();
         let table_location = tmp_dir.path().join("table1");
-        let manifest_list_location = table_location.join("metadata/manifests_list_1.avro");
+        let manifest_list_location = table_location.join("metadata/manifest-list.avro");
         let table_metadata_location = table_location.join("metadata/v1.json");
+        let file_io = FileIO::new_with_fs();
 
-        let file_io = FileIO::from_path(table_location.as_os_str().to_str().unwrap())
-            .unwrap()
-            .build()
-            .unwrap();
-
-        let template_json_str = fs::read_to_string(format!(
+        let template_json = fs::read_to_string(format!(
             "{}/testdata/example_table_metadata_v1.json",
             env!("CARGO_MANIFEST_DIR")
         ))
         .unwrap();
-        let metadata_json = render_template(&template_json_str, context! {
+        let metadata_json = render_template(&template_json, context! {
             table_location => &table_location,
             manifest_list_location => &manifest_list_location,
             table_metadata_location => &table_metadata_location,
         });
-        let table_metadata: TableMetadata = serde_json::from_str(&metadata_json).unwrap();
-
         let table = Table::builder()
-            .metadata(table_metadata)
+            .metadata(serde_json::from_str::<TableMetadata>(&metadata_json).unwrap())
             .identifier(TableIdent::from_strs(["db", "table1"]).unwrap())
-            .file_io(file_io.clone())
-            .metadata_location(table_metadata_location.as_os_str().to_str().unwrap())
+            .file_io(file_io)
+            .metadata_location(table_metadata_location.to_string_lossy())
+            .runtime(test_runtime())
             .build()
             .unwrap();
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        assert_eq!(snapshot.schema_id(), None);
 
-        let current_snapshot = table.metadata().current_snapshot().unwrap();
-
-        // Verify the snapshot has no schema_id (the condition that caused the panic)
-        assert!(current_snapshot.schema_id().is_none());
-
-        let current_schema = current_snapshot.schema(table.metadata()).unwrap();
-        let current_partition_spec = table.metadata().default_partition_spec();
-
-        // Write a manifest file
-        let manifest_output = table
-            .file_io()
-            .new_output(format!(
-                "{}/metadata/manifest_{}.avro",
-                table_location.to_str().unwrap(),
-                Uuid::new_v4()
-            ))
-            .unwrap();
-
-        let mut writer = ManifestWriterBuilder::new(
-            manifest_output,
-            Some(current_snapshot.snapshot_id()),
-            None,
-            current_schema.clone(),
-            current_partition_spec.as_ref().clone(),
+        let mut manifest_writer = ManifestWriterBuilder::new(
+            table
+                .file_io()
+                .new_output(
+                    table_location
+                        .join("metadata/manifest.avro")
+                        .to_string_lossy(),
+                )
+                .unwrap(),
+            Some(snapshot.snapshot_id()),
+            snapshot.schema(table.metadata()).unwrap(),
+            table.metadata().default_partition_spec().as_ref().clone(),
         )
         .build_v1();
-        writer
+        manifest_writer
             .add_entry(
                 ManifestEntry::builder()
                     .status(ManifestStatus::Added)
                     .data_file(
                         DataFileBuilder::default()
-                            .partition_spec_id(0)
                             .content(DataContentType::Data)
-                            .file_path(format!("{}/1.parquet", table_location.to_str().unwrap()))
+                            .file_path(
+                                table_location
+                                    .join("1.parquet")
+                                    .to_string_lossy()
+                                    .into_owned(),
+                            )
                             .file_format(DataFileFormat::Parquet)
                             .file_size_in_bytes(100)
                             .record_count(1)
@@ -650,183 +818,129 @@ mod tests {
                     .build(),
             )
             .unwrap();
-        let data_file_manifest = writer.write_manifest_file().await.unwrap();
+        let manifest_file = manifest_writer.write_manifest_file().await.unwrap();
 
-        // Write manifest list
-        let mut manifest_list_write = ManifestListWriter::v1(
-            table
-                .file_io()
-                .new_output(current_snapshot.manifest_list())
-                .unwrap(),
-            current_snapshot.snapshot_id(),
-            current_snapshot.parent_snapshot_id(),
-        );
-        manifest_list_write
-            .add_manifests(vec![data_file_manifest].into_iter())
+        let writer = table
+            .file_io()
+            .new_output(snapshot.manifest_list())
+            .unwrap()
+            .writer()
+            .await
             .unwrap();
-        manifest_list_write.close().await.unwrap();
+        let mut manifest_list_writer = ManifestListWriter::v1(
+            writer,
+            snapshot.snapshot_id(),
+            snapshot.parent_snapshot_id(),
+        );
+        manifest_list_writer
+            .add_manifests([manifest_file].into_iter())
+            .unwrap();
+        manifest_list_writer.close().await.unwrap();
 
-        // This used to panic with: called `Option::unwrap()` on a `None` value
-        let object_cache = ObjectCache::new(table.file_io().clone());
-        let result = object_cache
-            .get_manifest_list(current_snapshot, &table.metadata_ref())
-            .await;
-
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().entries().len(), 1);
+        let manifest_list = table
+            .object_cache()
+            .get_manifest_list(snapshot, &table.metadata_ref())
+            .await
+            .unwrap();
+        assert_eq!(manifest_list.entries().len(), 1);
     }
 
     #[test]
-    fn test_estimated_data_file_heap_scales_with_columns() {
+    fn test_data_file_weight_includes_column_statistics() {
         use std::collections::HashMap;
 
-        use crate::spec::Datum;
-
-        let make_data_file = |num_columns: i32| -> DataFile {
-            let mut column_sizes = HashMap::new();
-            let mut value_counts = HashMap::new();
-            let mut null_value_counts = HashMap::new();
-            let mut nan_value_counts = HashMap::new();
-            let mut lower_bounds = HashMap::new();
-            let mut upper_bounds = HashMap::new();
-
-            for col_id in 0..num_columns {
-                column_sizes.insert(col_id, 1024);
-                value_counts.insert(col_id, 1000);
-                null_value_counts.insert(col_id, 5);
-                nan_value_counts.insert(col_id, 0);
-                lower_bounds.insert(col_id, Datum::long(0));
-                upper_bounds.insert(col_id, Datum::long(i64::MAX));
-            }
-
+        let data_file = |columns| {
+            let values = (0..columns).map(|id| (id, 1)).collect::<HashMap<_, _>>();
             DataFileBuilder::default()
                 .content(DataContentType::Data)
-                .file_path("s3://bucket/table/data/file_0001.parquet".to_string())
+                .file_path("s3://bucket/table/data.parquet".to_string())
                 .file_format(DataFileFormat::Parquet)
-                .file_size_in_bytes(100 * 1024 * 1024)
-                .record_count(1_000_000)
+                .file_size_in_bytes(100)
+                .record_count(1)
                 .partition(Struct::empty())
-                .partition_spec_id(0)
-                .column_sizes(column_sizes)
-                .value_counts(value_counts)
-                .null_value_counts(null_value_counts)
-                .nan_value_counts(nan_value_counts)
-                .lower_bounds(lower_bounds)
-                .upper_bounds(upper_bounds)
+                .column_sizes(values.clone())
+                .value_counts(values.clone())
+                .null_value_counts(values.clone())
+                .nan_value_counts(values)
                 .build()
                 .unwrap()
         };
 
-        let df_20_cols = make_data_file(20);
-        let df_50_cols = make_data_file(50);
-
-        let heap_20 = estimated_data_file_heap(&df_20_cols);
-        let heap_50 = estimated_data_file_heap(&df_50_cols);
-
-        // The estimate must be far larger than the shallow struct size, which
-        // is what the old broken weigher returned.
-        let shallow = std::mem::size_of_val(&df_20_cols);
+        let small = estimated_data_file_heap_size(&data_file(1));
+        let large = estimated_data_file_heap_size(&data_file(100));
         assert!(
-            heap_20 > shallow * 3,
-            "20-col estimate ({heap_20}) should be much larger than shallow size ({shallow})"
+            large > small * 10,
+            "{large} should be much larger than {small}"
         );
-
-        // More columns → larger estimate (roughly proportional).
-        assert!(
-            heap_50 > heap_20,
-            "50-col estimate ({heap_50}) should exceed 20-col estimate ({heap_20})"
-        );
-
-        // Sanity: 20 columns × 6 HashMaps × ~20 entries × ~15–50 bytes/bucket > 1500 bytes.
-        assert!(
-            heap_20 > 1500,
-            "20-col estimate ({heap_20}) should be at least 1500 bytes"
-        );
+        assert!(large > size_of::<DataFile>());
     }
 
-    #[test]
-    fn test_estimated_manifest_file_heap_accounts_for_string_and_partitions() {
-        use serde_bytes::ByteBuf;
+    #[tokio::test]
+    async fn test_get_manifest_keys_on_first_row_id() {
+        use crate::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, SchemaRef, Type};
 
-        use crate::spec::ManifestContentType;
+        let io = FileIO::new_with_memory();
+        let path = "memory:///metadata/first_row_id_manifest.avro";
 
-        let file = ManifestFile {
-            manifest_path:
-                "s3://my-very-long-bucket-name/warehouse/db/table/metadata/manifest_abc123.avro"
-                    .to_string(),
-            manifest_length: 4096,
-            partition_spec_id: 0,
-            content: ManifestContentType::Data,
-            sequence_number: 1,
-            min_sequence_number: 1,
-            added_snapshot_id: 100,
-            added_files_count: Some(10),
-            existing_files_count: Some(0),
-            deleted_files_count: Some(0),
-            added_rows_count: Some(1000),
-            existing_rows_count: Some(0),
-            deleted_rows_count: Some(0),
-            partitions: Some(vec![
-                FieldSummary {
-                    contains_null: false,
-                    contains_nan: None,
-                    lower_bound: Some(ByteBuf::from(vec![0u8; 8])),
-                    upper_bound: Some(ByteBuf::from(vec![0xFF; 8])),
-                },
-                FieldSummary {
-                    contains_null: true,
-                    contains_nan: Some(false),
-                    lower_bound: Some(ByteBuf::from(vec![0u8; 16])),
-                    upper_bound: Some(ByteBuf::from(vec![0xFF; 16])),
-                },
-            ]),
-            key_metadata: None,
-            first_row_id: None,
-        };
-
-        let heap = estimated_manifest_file_heap(&file);
-
-        // Should at least include the manifest_path capacity
-        assert!(
-            heap >= file.manifest_path.len(),
-            "heap estimate ({heap}) should include manifest_path length ({})",
-            file.manifest_path.len()
-        );
-
-        // Should include partition field summary bounds: 2 summaries × (8 + 8) + (16 + 16) = 48 bytes
-        assert!(
-            heap > file.manifest_path.len() + 40,
-            "heap estimate ({heap}) should include FieldSummary bound data"
-        );
-    }
-
-    #[test]
-    fn test_estimated_data_file_heap_empty_stats() {
-        // A DataFile with no column stats should still account for the file_path
-        let df = DataFileBuilder::default()
-            .content(DataContentType::Data)
-            .file_path("s3://bucket/file.parquet".to_string())
-            .file_format(DataFileFormat::Parquet)
-            .file_size_in_bytes(1024)
-            .record_count(10)
-            .partition(Struct::empty())
-            .partition_spec_id(0)
+        let schema: SchemaRef = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap()
+            .into();
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
             .build()
             .unwrap();
 
-        let heap = estimated_data_file_heap(&df);
+        let mut writer = ManifestWriterBuilder::new(
+            io.new_output(path).unwrap(),
+            Some(1),
+            schema,
+            partition_spec,
+        )
+        .build_v3_data();
+        writer
+            .add_entry(
+                ManifestEntry::builder()
+                    .status(ManifestStatus::Added)
+                    .data_file(
+                        DataFileBuilder::default()
+                            .content(DataContentType::Data)
+                            .file_path(path.to_string())
+                            .file_format(DataFileFormat::Parquet)
+                            .file_size_in_bytes(100)
+                            .record_count(1)
+                            .build()
+                            .unwrap(),
+                    )
+                    .build(),
+            )
+            .unwrap();
+        let manifest_file = writer.write_manifest_file().await.unwrap();
 
-        // At minimum, the file_path string capacity
-        assert!(
-            heap >= "s3://bucket/file.parquet".len(),
-            "heap estimate ({heap}) should include file_path"
+        // Two manifest-list references to the same physical manifest carrying
+        // different offsets, as time travel or two branches would produce.
+        let mut manifest_file_a = manifest_file.clone();
+        manifest_file_a.first_row_id = Some(1000);
+        let mut manifest_file_b = manifest_file;
+        manifest_file_b.first_row_id = Some(2000);
+
+        let object_cache = ObjectCache::new(io, None);
+
+        let manifest_a = object_cache.get_manifest(&manifest_file_a).await.unwrap();
+        let manifest_b = object_cache.get_manifest(&manifest_file_b).await.unwrap();
+
+        // A cache keyed on path alone would serve manifest_a's inherited ids for
+        // the second read; keying on first_row_id keeps them distinct.
+        assert_eq!(
+            manifest_a.entries()[0].data_file().first_row_id(),
+            Some(1000)
         );
-
-        // With no column stats, the HashMaps should be empty → 0 HashMap heap
-        // So the estimate should be relatively small
-        assert!(
-            heap < 500,
-            "empty-stats DataFile heap ({heap}) should be small"
+        assert_eq!(
+            manifest_b.entries()[0].data_file().first_row_id(),
+            Some(2000)
         );
     }
 }
