@@ -6,10 +6,10 @@ SQE is in pre-1.0 active development. Security fixes land on `main` and
 are released as patch versions on the latest minor. Older minors do not
 receive security backports while we are pre-1.0.
 
-| Version | Supported |
-|---------|-----------|
-| 0.15.x  | yes       |
-| < 0.15  | no        |
+| Version                          | Supported |
+|----------------------------------|-----------|
+| Latest minor (newest `vX.Y` tag) | yes       |
+| Older minors                     | no        |
 
 Once SQE reaches 1.0 this policy will be revisited and updated to
 reflect a longer support window.
@@ -42,7 +42,12 @@ We aim to:
    days**, with a written explanation either way.
 3. For confirmed vulnerabilities, share a target fix date based on
    severity (CVSS 9+ within 14 days, CVSS 7-9 within 30 days, lower
-   severity in the next regular release).
+   severity in the next regular release). CVSS is the starting point,
+   not the whole answer. A vulnerability listed in the CISA Known
+   Exploited Vulnerabilities catalog, or with a public exploit, gets
+   the 14-day target whatever its score. One that is not reachable in
+   SQE's default configuration may drop a tier, with the reason
+   written in the advisory.
 4. Coordinate disclosure with you. We aim for a 90-day disclosure
    window from confirmation; we will negotiate if you have a different
    timeline.
@@ -88,3 +93,9 @@ resolved). New deployments should:
 - Keep `cargo audit` and `cargo deny check advisories` in CI.
 
 For details on the auth chain, see [docs/site/book/src/deployment/configuration.md](docs/site/book/src/deployment/configuration.md).
+
+What SQE covers and what the team running it covers (patching, logging,
+malware protection, encryption at rest, backups) is listed in
+[docs/site/book/src/operations/shared-responsibility.md](docs/site/book/src/operations/shared-responsibility.md).
+
+_Last reviewed: 2026-09-25._
