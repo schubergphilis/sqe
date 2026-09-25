@@ -96,8 +96,22 @@ if [[ -z "$(git status --porcelain)" ]]; then
     exit 1
 fi
 
+# The curated [Unreleased] notes become this version's section, and a fresh
+# empty [Unreleased] opens above it. The tag pipeline's gitlab-release job
+# publishes that section as the GitLab Release notes.
+# Pre-releases (x.y.z-rc.N) leave [Unreleased] alone so the final release
+# still gets the notes.
+if [[ "$VERSION" == *-* ]]; then
+    echo "==> CHANGELOG.md: pre-release, [Unreleased] left as is"
+elif grep -q '^## \[Unreleased\]$' CHANGELOG.md; then
+    echo "==> CHANGELOG.md: [Unreleased] -> [${VERSION}]"
+    perl -i -pe 'if (!$done && /^## \[Unreleased\]$/) { $_ = "## [Unreleased]\n\n## ['"$VERSION"'] — '"$(date +%Y-%m-%d)"'\n"; $done = 1 }' CHANGELOG.md
+else
+    echo "warning: CHANGELOG.md has no '## [Unreleased]' heading; release notes will be empty" >&2
+fi
+
 echo "==> Committing"
-git add Cargo.toml crates/*/Cargo.toml Cargo.lock deploy/helm/sqe/Chart.yaml
+git add Cargo.toml crates/*/Cargo.toml Cargo.lock deploy/helm/sqe/Chart.yaml CHANGELOG.md
 git commit -m "chore(release): ${VERSION}
 
 Bump all workspace crate versions to ${VERSION} ahead of the v${VERSION}
