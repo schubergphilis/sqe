@@ -17,7 +17,7 @@ ignore = [
     # paste (v1.0.15): unmaintained but feature-complete proc macro.
     # Transitive dependency from arrow-flight, datafusion, parquet, tonic.
     # No known vulnerability. Upstream migration pending.
-    "RUSTSEC-2024-0436",
+    "RUSTSEC-2024-0436",  # review-by 2026-12-25 owner=sqe-maintainers
     # IMPORTANT: cargo-deny and cargo-audit do NOT agree on every advisory, so
     # this list intentionally differs from `.cargo/audit.toml`:
     #   - RUSTSEC-2023-0071 (rsa Marvin attack) is NOT listed here. cargo-deny
@@ -42,8 +42,8 @@ ignore = [
     # configured object store / catalog (trusted infra), never attacker input, so
     # the DoS needs a malicious storage backend. Drop when object_store bumps
     # quick-xml past 0.41. Matched by cargo-deny too (version-range match).
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
+    "RUSTSEC-2026-0194",  # review-by 2026-10-25 owner=sqe-maintainers
+    "RUSTSEC-2026-0195",  # review-by 2026-10-25 owner=sqe-maintainers
 ]
 
 # Without this section cargo-deny 0.20 rejects EVERY license as "not explicitly
