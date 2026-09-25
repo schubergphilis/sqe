@@ -4,10 +4,11 @@ SQE is built on the [iceberg-rust](https://github.com/apache/iceberg-rust) libra
 
 ## Iceberg version
 
-- **iceberg-rust**: SQE-rebased fork of [risingwavelabs/iceberg-rust](https://github.com/risingwavelabs/iceberg-rust) `dev_rebase_main_20260303` at commit `c034b19105fa`, vendored at `vendor/iceberg-rust/`. Provides `RewriteFilesAction` / `OverwriteFilesAction` (Copy-on-Write DELETE/UPDATE), `PositionDeleteFileWriter` (Merge-on-Read position deletes), and `DeletionVectorWriter` (Iceberg V3) on top of upstream v0.9.0.
-- **DataFusion**: 54.0
-- **Arrow**: 58
-- **Parquet**: 58
+- **iceberg-rust**: [apache/iceberg-rust](https://github.com/apache/iceberg-rust) `main`, with the [RisingWave fork](https://github.com/risingwavelabs/iceberg-rust)'s `dev_rebase_main_20260807` branch merged on top for the row-level write stack apache does not ship yet: `ReplaceFilesAction` for Copy-on-Write DELETE and UPDATE, position-delete and deletion-vector writers for Merge-on-Read. Vendored at `vendor/iceberg-rust/`.
+- **DataFusion integration**: [apache/datafusion-iceberg](https://github.com/apache/datafusion-iceberg), vendored at `vendor/datafusion-iceberg/`. SQE's own scan does not depend on it.
+- **DataFusion**: 55
+- **Arrow**: 59
+- **Parquet**: 59
 - **Iceberg table format**: V2 and V3. V3 features verified end-to-end (TIMESTAMP_NS, column defaults, equality-delete UPDATE on identifier-fields, partition evolution).
 
 The matrix score against [icebergmatrix.org](https://icebergmatrix.org) is 167/189 (88.4%), placing SQE fifth on the public scoreboard behind only Spark distributions (EMR, AWS Glue, OSS Spark, Dataproc). See [getsqe.com/compare/iceberg](https://getsqe.com/compare/iceberg) for the per-cell breakdown and the side-by-side V2/V3 comparison against every other engine on the public scoreboard.
@@ -159,16 +160,16 @@ Snapshot-pointer procedures (`set_current_snapshot`, `rollback_to_snapshot`) and
 
 - **TIMESTAMP_NS / TIMESTAMPTZ_NS**: V3 nanosecond timestamps round-trip end-to-end.
 - **Column defaults**: `CREATE TABLE ... DEFAULT <literal>` applies `write_default`; `ALTER TABLE ADD COLUMN ... DEFAULT` applies `initial_default`.
-- **Position deletes (V3)**: MoR DELETE on a V3 table writes position-delete files.
+- **Deletion vectors (V3)**: MoR DELETE on a V3 table writes one deletion vector per data file, never a position-delete file. A second DELETE on the same file merges its existing deletes into a new vector and retires the old one in the same commit, so a data file never carries two. The engine refuses any commit that would add a position-delete file to a V3 table.
 - **Equality deletes (V3)**: UPDATE with a declared identifier-field-id commits a single RowDelta with new data file plus equality-delete row.
 - **Partition evolution (V3)**: `ALTER TABLE ADD/DROP/REPLACE PARTITION FIELD` evolves the spec on V3 tables, including with day(ts) on TIMESTAMP_NS columns.
 - **Time travel (V3)**: `FOR SYSTEM_TIME AS OF` and `FOR VERSION AS OF` work against V3 tables through the same snapshot walk as V2.
 - **Schema evolution (V3)**: `ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN`, `SET DATA TYPE` all work on V3.
 
-V3 features still blocked upstream:
+V3 features not available yet:
 
-- **Variant**: pending iceberg-rust [#2188](https://github.com/apache/iceberg-rust/pull/2188).
-- **Geometry**: pending DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644).
+- **Variant**: iceberg-rust reads and writes it since [#2188](https://github.com/apache/iceberg-rust/pull/2188), but SQE's SQL layer has no `VARIANT` type yet.
+- **Geometry / geography**: no iceberg-rust support, and pending DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644).
 - **Vector / Embedding**: V3 spec not finalised.
 
 The deferred list is tracked in `docs/evidence/iceberg-matrix-state.json` under `caveats` for each cell.
