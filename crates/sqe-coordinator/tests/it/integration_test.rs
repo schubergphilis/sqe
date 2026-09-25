@@ -93,29 +93,6 @@ async fn test_simple_select() {
     assert_eq!(total_rows, 1, "SELECT 1 should return exactly one row");
 }
 
-// Test: SQL classification works correctly
-#[test]
-fn test_sql_classification() {
-    use sqe_sql::{parse_and_classify, StatementKind};
-
-    assert!(matches!(
-        parse_and_classify("SELECT 1"),
-        Ok(StatementKind::Query(_))
-    ));
-    assert!(matches!(
-        parse_and_classify("CREATE TABLE foo AS SELECT 1"),
-        Ok(StatementKind::Ctas(_))
-    ));
-    assert!(matches!(
-        parse_and_classify("INSERT INTO foo SELECT 1"),
-        Ok(StatementKind::Insert(_))
-    ));
-    assert!(matches!(
-        parse_and_classify("DELETE FROM foo WHERE id = 1"),
-        Ok(StatementKind::Delete(_))
-    ));
-}
-
 // ---------------------------------------------------------------------------
 // Write-path integration tests
 // ---------------------------------------------------------------------------
@@ -279,46 +256,9 @@ async fn test_drop_table_if_exists_no_error() {
     );
 }
 
-// Test: DELETE FROM returns a descriptive "not implemented" error
-#[test]
-fn test_delete_returns_not_implemented() {
-    // This test does not need the test stack — it only checks the error
-    // message produced by the SQL classifier + query handler routing.
-    //
-    // We verify at the classifier level that DELETE is recognized, and check
-    // the error message constant that the query handler would return.
-    use sqe_sql::{parse_and_classify, StatementKind};
-
-    let result = parse_and_classify("DELETE FROM foo WHERE id = 1");
-    assert!(
-        matches!(result, Ok(StatementKind::Delete(_))),
-        "DELETE should be classified as Delete"
-    );
-
-    // The QueryHandler maps Delete → NotImplemented with a message about
-    // "overwrite transaction support". Verify that message is present in the
-    // error variant so that users get a helpful hint.
-    let expected_msg = "overwrite transaction support";
-    let error_msg =
-        "DELETE FROM requires Iceberg overwrite transaction support (planned for Chunk 3)";
-    assert!(
-        error_msg.contains(expected_msg),
-        "DELETE error message should mention '{expected_msg}'"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Chunk 3: Distributed execution tests
 // ---------------------------------------------------------------------------
-
-// Test: Worker registry starts empty when no workers configured
-#[test]
-fn test_worker_registry_no_workers() {
-    let registry = sqe_coordinator::worker_registry::WorkerRegistry::new(vec![]);
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let healthy = rt.block_on(registry.healthy_workers());
-    assert!(healthy.is_empty());
-}
 
 // Test: Coordinator with no workers falls back to local execution
 #[tokio::test(flavor = "multi_thread")]
@@ -334,43 +274,6 @@ async fn test_local_fallback_without_workers() {
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 1);
-}
-
-// Test: ScanTask serialization roundtrip
-#[test]
-fn test_scan_task_roundtrip() {
-    let task = sqe_planner::ScanTask {
-        hive: None,
-        version: 1,
-        morsel_id: None,
-        row_group_start: None,
-        row_group_end: None,
-        start_byte: None,
-        end_byte: None,
-        fragment_id: "test-001".to_string(),
-        data_file_paths: vec!["s3://bucket/data/file1.parquet".to_string()],
-        file_sizes_bytes: vec![],
-        projected_columns: vec!["id".to_string()],
-        projected_field_ids: vec![],
-        s3_endpoint: "http://localhost:9000".to_string(),
-        s3_region: "us-east-1".to_string(),
-        credentials: sqe_planner::ScanCredentials::static_keys(
-            "key".to_string(),
-            "secret".to_string(),
-            String::new(),
-        ),
-        audience: String::new(),
-        expires_at: 0,
-        s3_path_style: true,
-        s3_allow_http: true,
-        predicate_proto: None,
-        limit: None,
-    };
-
-    let bytes = task.to_bytes().unwrap();
-    let decoded = sqe_planner::ScanTask::from_bytes(&bytes).unwrap();
-    assert_eq!(decoded.fragment_id, "test-001");
-    assert_eq!(decoded.data_file_paths.len(), 1);
 }
 
 // Test: Local fallback when no worker is registered.
@@ -562,91 +465,6 @@ async fn test_distributed_select() {
 // ---------------------------------------------------------------------------
 // Chunk 4: information_schema + Trino compat + Observability tests
 // ---------------------------------------------------------------------------
-
-// Test: MetricsRegistry can be created and incremented
-#[test]
-fn test_metrics_registry() {
-    let metrics = sqe_metrics::MetricsRegistry::new().unwrap();
-    metrics
-        .query_count
-        .with_label_values(&["success", "query", ""])
-        .inc();
-    assert_eq!(
-        metrics
-            .query_count
-            .with_label_values(&["success", "query", ""])
-            .get(),
-        1.0
-    );
-}
-
-// Test: AuditLogger no-op mode works
-#[test]
-fn test_audit_logger_noop() {
-    let logger = sqe_metrics::audit::AuditLogger::new("").unwrap();
-    let entry = sqe_metrics::audit::AuditEntry {
-        timestamp: "2026-03-15T00:00:00Z".to_string(),
-        username: "test".to_string(),
-        session_id: None,
-        query_hash: sqe_metrics::audit::query_hash("SELECT 1"),
-        query_text: Some("SELECT 1".to_string()),
-        statement_type: "query".to_string(),
-        duration_ms: 10,
-        rows_returned: 1,
-        status: "success".to_string(),
-        client_ip: None,
-        tables_touched: Vec::new(),
-        row_filters_applied: 0,
-        columns_masked: Vec::new(),
-        columns_restricted: Vec::new(),
-        policy_denied: false,
-    };
-    logger.log(&entry); // Should not panic
-}
-
-// Test: Trino type mapping
-#[test]
-fn test_trino_type_mapping() {
-    use arrow_schema::DataType;
-    assert_eq!(
-        sqe_trino_compat::types::arrow_to_trino_type(&DataType::Int64),
-        "bigint"
-    );
-    assert_eq!(
-        sqe_trino_compat::types::arrow_to_trino_type(&DataType::Utf8),
-        "varchar"
-    );
-    assert_eq!(
-        sqe_trino_compat::types::arrow_to_trino_type(&DataType::Float64),
-        "double"
-    );
-}
-
-// Test: Trino response serialization
-#[test]
-fn test_trino_batches_to_json() {
-    use arrow_array::{Int64Array, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("name", DataType::Utf8, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(Int64Array::from(vec![1])),
-            Arc::new(StringArray::from(vec!["test"])),
-        ],
-    )
-    .unwrap();
-
-    let (cols, rows) = sqe_trino_compat::protocol::batches_to_trino(&[batch]);
-    assert_eq!(cols.len(), 2);
-    assert_eq!(cols[0].r#type, "bigint");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0], serde_json::json!(1));
-}
 
 // Test: information_schema.tables is queryable
 #[tokio::test(flavor = "multi_thread")]

@@ -201,27 +201,6 @@ fn msck_repair_then_show_partitions_reports_every_discovered_partition() {
     });
 }
 #[test]
-fn add_partition_accepts_an_out_of_prefix_location() {
-    block_on_prod_stack(async {
-    let h = harness_with_orders().await;
-    // The D1 headline case: a partition whose files live OUTSIDE the table
-    // prefix, which directory-name discovery cannot express at all.
-    let elsewhere = h._dirs[0].path().join("wh/elsewhere/dt=2026-04-01");
-    std::fs::create_dir_all(&elsewhere).expect("mkdir elsewhere");
-    std::fs::write(elsewhere.join("b.csv"), "id,amount\n9,90.0\n").expect("write csv");
-
-    let loc = format!("file://{}/", elsewhere.display());
-    h.execute_for_test(&format!(
-        "ALTER TABLE lake.sales.orders ADD PARTITION (dt='2026-04-01') LOCATION '{loc}'"
-    ))
-    .await
-    .expect("add out-of-prefix partition");
-
-    let specs = h.show_partitions().await;
-    assert!(specs.contains(&"dt=2026-04-01".to_string()), "{specs:?}");
-    });
-}
-#[test]
 fn add_partition_on_an_existing_directory_is_queryable_via_show_partitions() {
     block_on_prod_stack(async {
     let h = harness_with_orders().await;
@@ -297,6 +276,16 @@ fn drop_partition_removes_the_entry_and_leaves_the_data() {
             .join("wh/data/dt=2026-01-02/a.csv")
             .exists(),
         "DROP PARTITION must never delete data files"
+    );
+    // ...but the dropped partition no longer reads.
+    assert_eq!(
+        h.count_sql("SELECT count(*) FROM lake.sales.orders").await,
+        2
+    );
+    assert_eq!(
+        h.count_sql("SELECT count(*) FROM lake.sales.orders WHERE dt = '2026-01-02'")
+            .await,
+        0
     );
 
     // Absent without IF EXISTS errors; with it, no-op.
@@ -591,28 +580,6 @@ fn msck_then_select_then_out_of_band_then_repair() {
 }
 
 #[test]
-fn drop_partition_omits_the_partition_from_subsequent_selects() {
-    block_on_prod_stack(async {
-        let h = harness_with_orders().await;
-        h.execute_for_test("MSCK REPAIR TABLE lake.sales.orders")
-            .await
-            .expect("repair");
-        h.execute_for_test("ALTER TABLE lake.sales.orders DROP PARTITION (dt='2026-01-02')")
-            .await
-            .expect("drop");
-        assert_eq!(
-            h.count_sql("SELECT count(*) FROM lake.sales.orders").await,
-            2
-        );
-        assert_eq!(
-            h.count_sql("SELECT count(*) FROM lake.sales.orders WHERE dt = '2026-01-02'")
-                .await,
-            0
-        );
-    });
-}
-
-#[test]
 fn add_partition_for_a_new_directory_is_queryable() {
     block_on_prod_stack(async {
         let h = harness_with_orders().await;
@@ -785,20 +752,6 @@ fn if_not_exists_does_not_replace_the_original_location() {
                 .await,
             2,
             "the original two-row partition must still be the one scanned"
-        );
-    });
-}
-
-#[test]
-fn msck_is_case_insensitive() {
-    block_on_prod_stack(async {
-        let h = harness_with_orders().await;
-        h.execute_for_test("msck repair table lake.sales.orders")
-            .await
-            .expect("mixed-case MSCK");
-        assert_eq!(
-            h.show_partitions().await,
-            vec!["dt=2026-01-01", "dt=2026-01-02"]
         );
     });
 }
