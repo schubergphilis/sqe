@@ -283,6 +283,22 @@ and are to be re-measured, not assumed.
   chain 173 s -> 164 s, coordinator starts 12 s earlier. Gate: workspace
   check and clippy, hakari no diff, 1198 tests across the three crates.
   Worker half parked (worker off the critical path).
+- 2026-09-25, re-measure and B2. Cold `cargo test --workspace --no-run`
+  5m37s, 4.2 GB peak (was 8m14s / 24 GB). Integration binaries had grown
+  back to 97 (391 of 919 CPU-s after `touch sqe-core`); B2 done as one
+  `tests/it/main.rs` per crate, 97 -> 16, CPU 919 -> 596 s, laptop wall
+  173 -> 155 s, guarded by `scripts/check-test-layout.sh` in `deps-check`.
+  C4 had regressed: coordinator lib 48 s, trait solving 39 s, because #693
+  replaced `dyn LineageObserver` with the concrete `ChannelObserver`
+  (`LineageMsg` carries a `LogicalPlan`); a private `dyn LineageSink` put it
+  back, 27 s. Lesson: a one-impl trait object can be a compile firewall;
+  it now says so in its doc comment. CI main pipeline 1633305: 34 min wall,
+  gate 31 min = 19 compile + 3 tests + 6.5 zipping `.cargo-home/registry/`
+  (86k files incl. `src/`); aikido !171 caches `index/` + `cache/` only,
+  keyed on `Cargo.lock`. The runner has no `/cache` mount (probe), so a
+  persistent `target/` is out; sccache (A2) remains the big CI lever.
+  `release-binaries` on MRs runs only on manifest/CI/vendor changes; on main
+  it is 29 min (release, thin LTO, `codegen-units = 4`).
 
 ## 4. Expected end state
 

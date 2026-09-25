@@ -328,11 +328,10 @@ pub struct WorkerFlightService {
     footer_cache: Option<Arc<FooterCache>>,
     /// Maximum duration for a single scan task. 0 means no timeout.
     scan_timeout: std::time::Duration,
-    /// IPC compression for DoGet responses (worker -> coordinator).
-    /// Default: ZSTD (internal traffic benefits from better ratio).
+    /// IPC compression for DoGet responses (worker -> coordinator), from
+    /// `coordinator.worker_flight_compression`. Default: ZSTD (internal
+    /// traffic benefits from the better ratio).
     flight_compression: FlightCompression,
-    /// IPC compression for DoExchange shuffle responses.
-    /// Default: ZSTD.
     /// Shared secret used to authenticate inbound Flight calls. When empty
     /// the worker accepts unauthenticated traffic (operators must opt in
     /// via `worker.allow_unauthenticated = true`, enforced at config load).
@@ -343,16 +342,13 @@ pub struct WorkerFlightService {
     advertise_url: String,
     /// Finding 601: accept legacy HMAC ticket tags (migration only).
     accept_hmac_tickets: bool,
-    /// Shared spill manager for shuffle / operator spill (Phase 3+).
+    /// Shared spill manager for operator spill.
     spill_manager: Option<Arc<SpillManager>>,
-    /// Byte budget for shuffle partition buffers (from
-    /// `worker.memory.shuffle_memory_budget`). Atomic for hot config reload.
     /// Scan timeout seconds (0 = none). Atomic for hot config reload.
     scan_timeout_secs: Arc<std::sync::atomic::AtomicU64>,
-    /// Worker-wide temporary memory governor (Phase 7). Admits shuffle /
-    /// operator grants so concurrent stages cannot race the FairSpillPool.
+    /// Worker memory pool sizing (`worker.memory.operator_budget`), resized
+    /// on hot config reload; see `sqe_spill::governor`.
     memory_governor: Option<Arc<MemoryGovernor>>,
-    /// Durable exchange attempt manifests (Phase 8).
     /// Byte budget for encoded Flight frames in flight to the coordinator
     /// (`worker.memory.flight_budget`, issue #407). `None` means "not
     /// configured": `do_get` then falls back to [`default_flight_budget`], so

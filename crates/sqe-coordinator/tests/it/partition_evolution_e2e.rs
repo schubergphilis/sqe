@@ -13,7 +13,7 @@
 //! the writer routes records using the evolved spec.
 //!
 //! Stack: `docker compose -f docker-compose.test.yml up -d` then
-//! `cargo test -p sqe-coordinator --test partition_evolution_e2e -- --ignored
+//! `cargo test -p sqe-coordinator --test it partition_evolution_e2e -- --ignored
 //! --test-threads=1`.
 
 use arrow_array::{Array, Int64Array};

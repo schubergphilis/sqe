@@ -20,6 +20,13 @@ sast = true
 hardening = true
 secret_scan = true
 sbom_verify = true
+# High findings block by default; the platform default is "critical". On
+# 2026-09-25 main had no grype, trivy or SAST finding at high, so this gate
+# starts green.
+fail_on = "high"
+# Dependency reputation (deps.dev + OpenSSF Scorecard). Advisory; the closest
+# the platform has to a malicious-package signal.
+reputation = true
 
 # Repo-owned license waiver. Per-repo/per-library exceptions live HERE, not in
 # aikido's central policy/license-policy.json (which holds only group-wide rules).

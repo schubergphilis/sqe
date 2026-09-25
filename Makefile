@@ -322,6 +322,12 @@ check-ignore-reasons:  ## Every #[ignore] must carry a reason (#639): needs:<sta
 	if [ -n "$$bad" ]; then echo "bare #[ignore] without a reason (use #[ignore = \"needs:<stack>; <run hint>\"]):"; echo "$$bad"; exit 1; fi
 	@echo "==> ignore reasons ok"
 
+check-advisory-ignores:  ## Every ignored advisory (deny.toml, .cargo/audit.toml, .grype.yaml) has an owner and an unexpired review date
+	@python3 scripts/check-advisory-ignores.py
+
+check-test-layout:  ## One integration-test binary per crate (tests/it/main.rs); each extra tests/*.rs relinks DataFusion
+	@scripts/check-test-layout.sh
+
 audit-deny:
 	@command -v cargo-deny >/dev/null 2>&1 || \
 		{ echo "cargo-deny not found. Install with: cargo install cargo-deny"; exit 1; }
@@ -489,13 +495,18 @@ clean-rustbook:
 	@echo "==> Removing $(BOOK_OUT)"
 	rm -rf $(BOOK_OUT)
 
+# The ebook builds, rendered diagrams and benchmark charts are COMMITTED
+# (published artefacts), so these remove only what git does not track: a
+# plain `rm -rf` here deleted 80 tracked files on every `make clean`
+# (2026-09-25). Use the ebook's own `make -C docs/site/ebook clean` to wipe
+# everything before a full rebuild.
 clean-ebook:
-	@echo "==> Cleaning ebook build artefacts"
-	$(MAKE) -C $(EBOOK_DIR) clean
+	@echo "==> Removing untracked ebook build artefacts"
+	git clean -fdx -- $(EBOOK_DIR)/build $(EBOOK_DIR)/diagrams/rendered
 
 clean-benchmark-charts:
-	@echo "==> Removing docs/evidence/benchmark/charts/"
-	rm -rf docs/evidence/benchmark/charts
+	@echo "==> Removing untracked files under docs/evidence/benchmark/charts/"
+	git clean -fdx -- docs/evidence/benchmark/charts
 
 clean-images:
 	@echo "==> Removing $(CONFIG_OUT_DIR)"
