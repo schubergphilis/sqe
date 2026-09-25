@@ -272,6 +272,11 @@ The OTLP/gRPC endpoint URL for the collector. If empty, the exporter falls back 
 `metrics.otlp_endpoint`. If both are empty the server logs a warning at startup and
 the exporter does not start.
 
+Use an `https://` endpoint whenever the collector is not on the same host. SQE
+verifies the collector certificate against the system trust store; point
+`SSL_CERT_FILE` at your bundle for a private CA. Audit events carry user identities
+and SQL text, so a plain `http://` hop across the network leaks them.
+
 #### `spool_path`
 
 Path to the OCSF JSONL spool file that buffers events before export. If empty, the
