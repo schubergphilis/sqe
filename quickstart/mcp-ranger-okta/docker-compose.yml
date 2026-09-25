@@ -90,4 +90,5 @@ services:
         condition: service_completed_successfully
 
 volumes:
-  ranger-db-data:
+  # Must match the volume the extended ranger-db service mounts.
+  ranger-db-pg17-data:
