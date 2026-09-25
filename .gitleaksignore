@@ -1,11 +1,16 @@
-# gitleaks fingerprints for reviewed false positives that no value rule in
-# .gitleaks.toml can express. One per line: [commit:]file:rule:line.
-# Each matches exactly one finding and nothing else. Add an entry only
-# after confirming the value is not a credential, with the reason here.
+# gitleaks fingerprints for reviewed false positives in OLD commits that no
+# value rule in .gitleaks.toml can express. Format: commit:file:rule:line.
+# Each matches exactly one finding in one blob and nothing else. Add an entry
+# only after confirming the value is not a credential, with the reason here.
 #
-# docs/internal/reviews/2026-09-05-combined-prioritized-findings.md: prose,
-#   'scan-ticket credentials, Ed25519 tickets' read as a key.
+# Only commit-qualified (history) entries belong here. The CI working-tree scan
+# runs with --no-git from /builds/..., so its fingerprints carry an absolute
+# path and a relative file:rule:line entry never matches: fix a working-tree
+# false positive at the source or with a value rule instead.
+#
+# docs/internal/reviews/2026-09-05-combined-prioritized-findings.md: prose
+#   naming the scan-ticket signature algorithm right after the word
+#   "credentials" was read as a key (reworded in the working tree).
 # scripts/distributed-test.sh (old blob): curl -u built from $SQE_USER.
 3974e0be53bac6bf48d36fc13af6856745c378cb:docs/internal/reviews/2026-09-05-combined-prioritized-findings.md:generic-api-key:11
 bf675169cbb4b7ca522bc8fc9523a90d59fc5bf6:scripts/distributed-test.sh:curl-auth-user:41
-docs/internal/reviews/2026-09-05-combined-prioritized-findings.md:generic-api-key:12
