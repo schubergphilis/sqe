@@ -1,0 +1,11 @@
+# gitleaks fingerprints for reviewed false positives that no value rule in
+# .gitleaks.toml can express. One per line: [commit:]file:rule:line.
+# Each matches exactly one finding and nothing else. Add an entry only
+# after confirming the value is not a credential, with the reason here.
+#
+# docs/internal/reviews/2026-09-05-combined-prioritized-findings.md: prose,
+#   'scan-ticket credentials, Ed25519 tickets' read as a key.
+# scripts/distributed-test.sh (old blob): curl -u built from $SQE_USER.
+3974e0be53bac6bf48d36fc13af6856745c378cb:docs/internal/reviews/2026-09-05-combined-prioritized-findings.md:generic-api-key:11
+bf675169cbb4b7ca522bc8fc9523a90d59fc5bf6:scripts/distributed-test.sh:curl-auth-user:41
+docs/internal/reviews/2026-09-05-combined-prioritized-findings.md:generic-api-key:12
