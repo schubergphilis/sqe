@@ -281,6 +281,7 @@ async fn a_file_written_by_the_sqlx_path_roundtrips_through_sqlite_rs() {
             (SQL_CATALOG_PROP_WAREHOUSE.to_string(), warehouse(dir.path())),
         ]);
         SqlCatalogBuilder::default()
+            .with_storage_factory(sqe_catalog::storage_factory())
             .load(NAME.to_string(), props)
             .await
             .unwrap()
