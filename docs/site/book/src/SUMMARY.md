@@ -15,6 +15,7 @@
 # Architecture
 
 - [System Overview](./architecture/overview.md)
+- [System Context and Inventory](./architecture/system-context.md)
 - [Coordinator](./architecture/coordinator.md)
 - [Worker](./architecture/worker.md)
 - [Authentication Flow](./architecture/auth-flow.md)
