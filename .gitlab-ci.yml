@@ -188,6 +188,28 @@ release-binaries:
       variables:
         CARGO_PROFILE: "release"
 
+# Malware scan of what we ship, before it can be promoted. ClamAV over the
+# release binaries (the only files Dockerfile.ci adds to the Chainguard base)
+# and the source tree, vendored code included. A hit fails the job, and the
+# .post image push waits on the whole test stage, so an infected binary never
+# reaches the registry. The image bakes in its signature DB (offline works);
+# freshclam refreshes it when the runner has egress. Renovate bumps the digest.
+malware-scan:
+  stage: test
+  needs:
+    - job: release-binaries
+      artifacts: true
+  image:
+    name: clamav/clamav:1.4@sha256:a5f03c12a79dbe9f6d8a527b6bb1ea053fa8dd061d3738a26897f055ee2d9303
+    entrypoint: [""]
+  timeout: 20m
+  script:
+    - freshclam --quiet || echo "freshclam unavailable; scanning with the baked-in DB"
+    - clamscan --version
+    # `.` includes out/ (the release-binaries artifact).
+    - clamscan -r --infected --exclude-dir='/\.git$' .
+  rules: !reference [release-binaries, rules]
+
 # Unused-dependency gate. cargo-machete is a source scan (no compile), so the
 # job is seconds; it runs whenever a manifest changes. Feature-only knobs are
 # listed under [package.metadata.cargo-machete] in the crate that owns them.
