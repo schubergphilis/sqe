@@ -59,6 +59,22 @@ supply-chain-watch:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
 
+# Monthly vulnerability review: files "Vulnerability review YYYY-MM" listing
+# open triage issues, accepted advisories (due ones flagged) and stuck
+# Renovate MRs, with a checklist and a reviewed-by line. A maintainer closes it
+# as the record of the review. Runs only on the monthly schedule, which sets
+# SQE_SCHEDULE=monthly-vuln-review; idempotent within a month.
+vuln-review:
+  stage: test
+  needs: []
+  image: python:3.12-alpine@sha256:b64631e04e4920160c50fbe8d8df828f7f35f06f425cb44aa09bca53e708a35a
+  variables:
+    GITLAB_TOKEN: $AIKIDO_GROUP_TOKEN
+  script:
+    - python3 scripts/vuln-review.py
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $SQE_SCHEDULE == "monthly-vuln-review"'
+
 # Auto-cancel superseded pipelines. The project setting
 # (Settings > CI/CD > auto_cancel_pending_pipelines) is already `enabled`, but it
 # only cancels jobs marked `interruptible`, and nothing here was. Measured
