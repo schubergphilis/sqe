@@ -15,238 +15,295 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Remove orphan files action.
-//!
-//! Removes files under the table location that are not referenced by any snapshot
-//! or table metadata. Files without a `last_modified` timestamp are skipped to
-//! avoid deleting in-progress writes.
-
-use std::collections::HashSet;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::TryStreamExt;
-use futures::stream::{self, StreamExt};
+use futures::stream::StreamExt;
 
-use crate::Result;
+use super::maintenance::{DEFAULT_LOAD_CONCURRENCY, for_each_manifest, for_each_manifest_list};
+use crate::spec::ManifestFile;
 use crate::table::Table;
-use crate::util::{for_each_manifest, for_each_manifest_list};
+use crate::{Error, ErrorKind, Result};
 
-/// Default time offset for orphan file deletion threshold (1 day in milliseconds).
-const DEFAULT_OLDER_THAN_MS: i64 = 7 * 24 * 60 * 60 * 1000; // 7 days
+const DEFAULT_OLDER_THAN_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
-/// Default concurrency limit for loading manifests and manifest lists.
-const DEFAULT_LOAD_CONCURRENCY: usize = 16;
-
-/// Default concurrency limit for file deletion.
-const DEFAULT_DELETE_CONCURRENCY: usize = 10;
-
-/// Action to delete orphan files from a table's location.
+/// Deletes files below a table location that are not reachable from table metadata.
 ///
-/// ```ignore
-/// let orphan_files = RemoveOrphanFilesAction::new(table)
-///     .older_than(Duration::from_secs(3600))
-///     .dry_run(true)
-///     .execute()
-///     .await?;
-/// ```
+/// Files whose last-modified timestamp is unavailable are retained. This protects
+/// in-progress writes on storage backends that cannot report timestamps.
 pub struct RemoveOrphanFilesAction {
     table: Table,
     older_than_ms: i64,
     dry_run: bool,
     load_concurrency: usize,
-    delete_concurrency: usize,
 }
 
 impl RemoveOrphanFilesAction {
-    /// Creates a new delete orphan files action for the given table.
+    /// Creates an orphan-file action with a seven-day retention threshold.
     pub fn new(table: Table) -> Self {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_millis() as i64;
-
         Self {
             table,
-            older_than_ms: now_ms - DEFAULT_OLDER_THAN_MS,
+            older_than_ms: now_ms().saturating_sub(DEFAULT_OLDER_THAN_MS),
             dry_run: false,
             load_concurrency: DEFAULT_LOAD_CONCURRENCY,
-            delete_concurrency: DEFAULT_DELETE_CONCURRENCY,
         }
     }
 
-    /// Sets the timestamp threshold (milliseconds since epoch).
+    /// Deletes only files last modified before this Unix timestamp in milliseconds.
     pub fn older_than_ms(mut self, timestamp_ms: i64) -> Self {
         self.older_than_ms = timestamp_ms;
         self
     }
 
-    /// Sets the older-than duration relative to now.
+    /// Deletes only files older than this duration relative to now.
     pub fn older_than(mut self, duration: Duration) -> Self {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_millis() as i64;
-        self.older_than_ms = now_ms - duration.as_millis() as i64;
+        let duration_ms = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
+        self.older_than_ms = now_ms().saturating_sub(duration_ms);
         self
     }
 
-    /// Enables dry run mode - identifies orphan files without deleting them.
+    /// Selects whether execution reports orphan files without deleting them.
     pub fn dry_run(mut self, dry_run: bool) -> Self {
         self.dry_run = dry_run;
         self
     }
 
-    /// Sets the concurrency limit for loading manifest lists and manifests.
+    /// Sets the maximum number of manifest lists or manifests loaded concurrently.
     pub fn load_concurrency(mut self, concurrency: usize) -> Self {
         self.load_concurrency = concurrency.max(1);
         self
     }
 
-    /// Sets the concurrency limit for delete operations.
-    pub fn delete_concurrency(mut self, concurrency: usize) -> Self {
-        self.delete_concurrency = concurrency.max(1);
-        self
-    }
-
-    /// Executes the action, returning the list of orphan files.
+    /// Discovers orphan files, deletes them unless this is a dry run, and returns their paths.
     pub async fn execute(self) -> Result<Vec<String>> {
-        let file_io = self.table.file_io();
-        let location = self.table.metadata().location();
-
-        // Build the set of reachable files
-        let reachable_files = self.collect_reachable_files().await?;
-
-        // Stream all files under the table location and filter for orphans
-        let file_stream = file_io.list(&location, true).await?;
-        let older_than_ms = self.older_than_ms;
-
-        // Find orphan files: not reachable, not a directory, and older than threshold
-        let orphan_files: Vec<String> = file_stream
-            .try_filter_map(|entry| {
-                let is_orphan =
-                    // Must be a file (not directory)
-                    !entry.metadata.is_dir
-                    // Must not be reachable
-                    && !reachable_files.contains(&entry.path)
-                    // Must have a timestamp and be older than threshold
-                    // (files without timestamp are skipped to protect in-progress writes)
-                    && entry.metadata.last_modified_ms.is_some_and(|ts| ts < older_than_ms);
-
-                async move { Ok(is_orphan.then_some(entry.path)) }
-            })
-            .try_collect()
+        let reachable = self.collect_reachable_files().await?;
+        let listed = self
+            .table
+            .file_io()
+            .list(self.table.metadata().location(), true)
             .await?;
 
         if self.dry_run {
-            return Ok(orphan_files);
+            let mut orphans: Vec<String> = listed
+                .try_filter_map(|entry| {
+                    let is_orphan = !entry.is_dir
+                        && !reachable.contains(&entry.path)
+                        && entry
+                            .last_modified_ms
+                            .is_some_and(|timestamp| timestamp < self.older_than_ms);
+                    async move { Ok(is_orphan.then_some(entry.path)) }
+                })
+                .try_collect()
+                .await?;
+            orphans.sort_unstable();
+            return Ok(orphans);
         }
 
-        // Remove orphan files concurrently.
-        // Clone paths into owned Strings so each async task owns its data,
-        // making the resulting future Send-safe (avoids HRTB lifetime issues
-        // with borrowed references across await points).
-        let file_io = file_io.clone();
-        stream::iter(orphan_files.clone())
-            .map(|path| {
-                let file_io = file_io.clone();
-                async move { file_io.delete(&path).await }
-            })
-            .buffer_unordered(self.delete_concurrency)
-            .try_collect::<Vec<_>>()
-            .await?;
+        let discovered = Arc::new(Mutex::new(Vec::<String>::new()));
+        let listing_error = Arc::new(Mutex::new(None::<Error>));
+        let discovered_for_stream = discovered.clone();
+        let error_for_stream = listing_error.clone();
+        let older_than_ms = self.older_than_ms;
+        let delete_stream = listed.filter_map(move |entry| {
+            let path = match entry {
+                Ok(entry)
+                    if !entry.is_dir
+                        && !reachable.contains(&entry.path)
+                        && entry
+                            .last_modified_ms
+                            .is_some_and(|timestamp| timestamp < older_than_ms) =>
+                {
+                    if let Ok(mut paths) = discovered_for_stream.lock() {
+                        paths.push(entry.path.clone());
+                    }
+                    Some(entry.path)
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    if let Ok(mut stored) = error_for_stream.lock()
+                        && stored.is_none()
+                    {
+                        *stored = Some(error);
+                    }
+                    None
+                }
+            };
+            async move { path }
+        });
+        self.table.file_io().delete_stream(delete_stream).await?;
 
-        Ok(orphan_files)
+        if let Some(error) = listing_error
+            .lock()
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Failed to acquire listing error lock: {error}"),
+                )
+            })?
+            .take()
+        {
+            return Err(error);
+        }
+
+        let mut orphans = discovered
+            .lock()
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Failed to acquire discovered paths lock: {error}"),
+                )
+            })?
+            .clone();
+        orphans.sort_unstable();
+        Ok(orphans)
     }
 
-    /// Collects all files reachable from table metadata and snapshots.
     async fn collect_reachable_files(&self) -> Result<HashSet<String>> {
+        let metadata = self.table.metadata_ref();
         let mut reachable = HashSet::new();
 
-        // 1. Collect metadata files
-        self.collect_metadata_files(&mut reachable);
-
-        // 2. Collect files from all snapshots
-        self.collect_snapshot_files(&mut reachable).await?;
-
-        Ok(reachable)
-    }
-
-    /// Collects metadata files (current, historical, statistics).
-    fn collect_metadata_files(&self, reachable: &mut HashSet<String>) {
-        let table_metadata = self.table.metadata_ref();
-
-        // Current metadata file
         if let Some(metadata_location) = self.table.metadata_location() {
             reachable.insert(metadata_location.to_string());
         }
-
-        // Historical metadata files
         reachable.extend(
-            table_metadata
+            metadata
                 .metadata_log()
                 .iter()
-                .map(|e| e.metadata_file.clone()),
+                .map(|entry| entry.metadata_file.clone()),
         );
-
-        // Statistics files
         reachable.extend(
-            table_metadata
+            metadata
                 .statistics_iter()
-                .map(|s| s.statistics_path.clone()),
+                .map(|file| file.statistics_path.clone()),
         );
-
-        // Partition statistics files
         reachable.extend(
-            table_metadata
+            metadata
                 .partition_statistics_iter()
-                .map(|s| s.statistics_path.clone()),
+                .map(|file| file.statistics_path.clone()),
         );
-    }
 
-    /// Collects manifest lists, manifests, and content files from snapshots.
-    async fn collect_snapshot_files(&self, reachable: &mut HashSet<String>) -> Result<()> {
-        let file_io = self.table.file_io();
-        let table_metadata = self.table.metadata_ref();
+        let snapshots: Vec<_> = metadata.snapshots().cloned().collect();
+        reachable.extend(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.manifest_list().to_string())
+                .filter(|path| !path.is_empty()),
+        );
 
-        let snapshots: Vec<_> = table_metadata.snapshots().cloned().collect();
-
-        // Record manifest list paths as reachable (cheap — just strings).
-        for snapshot in &snapshots {
-            let manifest_list_path = snapshot.manifest_list();
-            if !manifest_list_path.is_empty() {
-                reachable.insert(manifest_list_path.to_string());
-            }
-        }
-
-        let mut unique_manifest_files = Vec::new();
+        let mut manifests = HashMap::<String, ManifestFile>::new();
         for_each_manifest_list(
-            file_io,
-            &table_metadata,
+            &self.table,
             snapshots,
             self.load_concurrency,
             |manifest_list| {
                 for manifest_file in manifest_list.entries() {
-                    // Only load each manifest once (reachable set handles deduplication).
-                    if reachable.insert(manifest_file.manifest_path.clone()) {
-                        unique_manifest_files.push(manifest_file.clone());
-                    }
+                    reachable.insert(manifest_file.manifest_path.clone());
+                    manifests
+                        .entry(manifest_file.manifest_path.clone())
+                        .or_insert_with(|| manifest_file.clone());
                 }
             },
         )
         .await?;
 
         for_each_manifest(
-            file_io,
-            unique_manifest_files,
+            &self.table,
+            manifests.into_values().collect(),
             self.load_concurrency,
             |_, manifest| {
                 for entry in manifest.entries() {
-                    reachable.insert(entry.data_file().file_path().to_string());
+                    reachable.insert(entry.file_path().to_string());
                 }
             },
         )
         .await?;
 
-        Ok(())
+        Ok(reachable)
+    }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::TableIdent;
+    use crate::io::FileIO;
+    use crate::spec::TableMetadata;
+    use crate::test_utils::test_runtime;
+
+    fn empty_memory_table() -> Table {
+        let metadata_json = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/table_metadata/TableMetadataV2ValidMinimal.json"
+        ));
+        let mut metadata: TableMetadata = serde_json::from_str(metadata_json).unwrap();
+        metadata.location = "memory://warehouse/table".to_string();
+
+        Table::builder()
+            .metadata(metadata)
+            .metadata_location("memory://warehouse/table/metadata/v1.json")
+            .identifier(TableIdent::from_strs(["ns", "table"]).unwrap())
+            .file_io(FileIO::new_with_memory())
+            .runtime(test_runtime())
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn removes_only_old_unreachable_files() {
+        let table = empty_memory_table();
+        let metadata_file = "memory://warehouse/table/metadata/v1.json";
+        let orphan_file = "memory://warehouse/table/data/orphan.parquet";
+        let outside_file = "memory://warehouse/other/outside.parquet";
+        for path in [metadata_file, orphan_file, outside_file] {
+            table
+                .file_io()
+                .new_output(path)
+                .unwrap()
+                .write(Bytes::from_static(b"test"))
+                .await
+                .unwrap();
+        }
+
+        let dry_run = RemoveOrphanFilesAction::new(table.clone())
+            .older_than_ms(i64::MAX)
+            .dry_run(true)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(dry_run, vec![orphan_file]);
+        assert!(table.file_io().exists(orphan_file).await.unwrap());
+
+        let deleted = RemoveOrphanFilesAction::new(table.clone())
+            .older_than_ms(i64::MAX)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(deleted, vec![orphan_file]);
+        assert!(!table.file_io().exists(orphan_file).await.unwrap());
+        assert!(table.file_io().exists(metadata_file).await.unwrap());
+        assert!(table.file_io().exists(outside_file).await.unwrap());
+    }
+
+    #[test]
+    fn execute_future_is_send() {
+        fn assert_send<T: Send>(_: T) {}
+
+        assert_send(
+            RemoveOrphanFilesAction::new(empty_memory_table())
+                .dry_run(true)
+                .execute(),
+        );
     }
 }

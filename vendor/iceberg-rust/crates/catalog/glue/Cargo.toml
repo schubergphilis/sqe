@@ -19,6 +19,7 @@
 edition = { workspace = true }
 homepage = { workspace = true }
 name = "iceberg-catalog-glue"
+publish = true
 rust-version = { workspace = true }
 version = { workspace = true }
 
@@ -35,6 +36,12 @@ aws-config = { workspace = true }
 aws-sdk-glue = { workspace = true }
 aws-smithy-http-client = { workspace = true }
 iceberg = { workspace = true }
+iceberg-storage-opendal = { workspace = true, features = ["opendal-s3"] }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-tracing = { workspace = true }
+
+[dev-dependencies]
+iceberg_test_utils = { path = "../../test_utils", features = ["tests"] }
+
+[lints]
+workspace = true

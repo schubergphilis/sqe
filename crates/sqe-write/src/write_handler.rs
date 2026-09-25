@@ -239,6 +239,70 @@ pub(crate) fn newly_deleted_row_count(raw_matches: usize, live_matches: Option<u
     }
 }
 
+/// V3 merge-on-read DELETE for one data file.
+///
+/// Unions the file's existing deletes (its deletion vector and any position
+/// delete files, from `task`) with `new_positions`, writes one deletion vector
+/// holding the result, and returns it with the delete files it supersedes: the
+/// old vector and position-delete files scoped to this data file. Position
+/// deletes that span several data files stay; the new vector already carries
+/// their positions for this file and supersedes them for it.
+async fn merge_into_deletion_vector(
+    table: &IcebergTable,
+    data_file: &DataFile,
+    task: Option<&iceberg::scan::FileScanTask>,
+    new_positions: Vec<i64>,
+) -> sqe_core::Result<(Vec<DataFile>, Vec<DataFile>)> {
+    let failed = |what: String| SqeError::with_code(SqeErrorCode::ExecutionFailed, what);
+    let mut positions = match task {
+        Some(task) => iceberg::arrow::load_position_deletes(table.file_io().clone(), task)
+            .await
+            .map_err(|e| {
+                failed(format!(
+                    "Failed to load existing deletes of {}: {e}",
+                    data_file.file_path()
+                ))
+            })?,
+        None => iceberg::delete_vector::DeleteVector::default(),
+    };
+    for pos in new_positions {
+        let pos = u64::try_from(pos).map_err(|_| failed(format!("negative row position {pos}")))?;
+        positions.insert(pos);
+    }
+    let vectors = crate::writer::write_deletion_vectors(
+        table,
+        vec![(data_file.clone(), positions.iter().collect())],
+    )
+    .await?;
+
+    let mut retired = Vec::new();
+    for old in task.map(|t| t.deletes()).unwrap_or_default() {
+        if old.file_type != DataContentType::PositionDeletes
+            || old.referenced_data_file.as_deref() != Some(data_file.file_path())
+        {
+            continue;
+        }
+        // Removal matches on (path, content offset, content size); the rest
+        // feeds the snapshot summary's removed-delete counts.
+        retired.push(
+            iceberg::spec::DataFileBuilder::default()
+                .content(DataContentType::PositionDeletes)
+                .file_path(old.file_path.clone())
+                .file_format(old.file_format)
+                .file_size_in_bytes(old.file_size_in_bytes)
+                .record_count(old.record_count.unwrap_or(0))
+                .referenced_data_file(old.referenced_data_file.clone())
+                .content_offset(old.content_offset)
+                .content_size_in_bytes(old.content_size_in_bytes)
+                .partition_spec_id(old.partition_spec_id)
+                .partition(data_file.partition().clone())
+                .build()
+                .map_err(|e| failed(format!("Failed to describe retired delete file: {e}")))?,
+        );
+    }
+    Ok((vectors, retired))
+}
+
 /// Sum of the manifest `record_count` over a set of data files.
 ///
 /// The truncate paths drop whole files, so the number of rows they removed is
@@ -1016,7 +1080,7 @@ impl DeleteAwareReadPlan {
         self.tasks_by_path
             .values()
             .flatten()
-            .any(|t| !t.deletes.is_empty())
+            .any(|t| !t.deletes().is_empty())
     }
 }
 
@@ -2710,6 +2774,13 @@ impl WriteHandler {
         let mut delete_writer =
             PositionDeleteWriter::open(&table, self.compression(session)).await?;
         let mut marked_positions: usize = 0;
+        // V3: position-delete files are forbidden; each touched data file gets
+        // one deletion vector holding ALL its deleted positions, and the files
+        // it supersedes are retired in the same commit.
+        let v3 = table.metadata().format_version() >= iceberg::spec::FormatVersion::V3;
+        let base_snapshot_id = table.metadata().current_snapshot_id();
+        let mut new_vectors: Vec<iceberg::spec::DataFile> = Vec::new();
+        let mut retired_deletes: Vec<iceberg::spec::DataFile> = Vec::new();
 
         for data_file in sorted_files {
             let file_path: Arc<str> = Arc::from(data_file.file_path());
@@ -2755,7 +2826,7 @@ impl WriteHandler {
             let file_has_deletes = read_plan
                 .tasks_by_path
                 .get(file_path.as_ref())
-                .is_some_and(|tasks| tasks.iter().any(|t| !t.deletes.is_empty()));
+                .is_some_and(|tasks| tasks.iter().any(|t| !t.deletes().is_empty()));
             let live_matches = if raw_matches > 0 && file_has_deletes {
                 let mut live = 0usize;
                 for batch in self
@@ -2786,9 +2857,25 @@ impl WriteHandler {
             // upload bytes for a statement that may end up a no-op below.
             if newly_deleted > 0 {
                 marked_positions += raw_matches;
-                delete_writer
-                    .write_file(Arc::clone(&file_path), std::mem::take(&mut positions))
+                if v3 {
+                    let task = read_plan
+                        .tasks_by_path
+                        .get(file_path.as_ref())
+                        .and_then(|tasks| tasks.first());
+                    let (vector, retired) = merge_into_deletion_vector(
+                        &table,
+                        data_file,
+                        task,
+                        std::mem::take(&mut positions),
+                    )
                     .await?;
+                    new_vectors.extend(vector);
+                    retired_deletes.extend(retired);
+                } else {
+                    delete_writer
+                        .write_file(Arc::clone(&file_path), std::mem::take(&mut positions))
+                        .await?;
+                }
             }
             if let Some(r) = position_res.as_mut() {
                 r.shrink(raw_matches * std::mem::size_of::<i64>());
@@ -2816,9 +2903,15 @@ impl WriteHandler {
 
         let delete_files = delete_writer.close().await?;
 
-        // Commit: append position delete files. FastAppendAction auto-routes DataFiles
-        // with content_type=PositionDeletes into the delete manifest entry.
+        // Commit. V2: append position delete files (FastAppendAction routes
+        // content_type=PositionDeletes into the delete manifest). V3: a RowDelta
+        // that adds the new deletion vectors and retires what they supersede,
+        // pinned to the snapshot the vectors were merged against. A concurrent
+        // writer would otherwise leave two vectors on one data file, which the
+        // spec forbids, so a moved table fails the commit instead.
         let files_for_retry = delete_files.clone();
+        let vectors_for_retry = new_vectors.clone();
+        let retired_for_retry = retired_deletes.clone();
         let catalog_for_commit = catalog.clone();
         commit_with_retry(
             catalog.as_catalog().as_ref(),
@@ -2826,11 +2919,23 @@ impl WriteHandler {
             "mor-delete",
             move |fresh_table| {
                 let files = files_for_retry.clone();
+                let vectors = vectors_for_retry.clone();
+                let retired = retired_for_retry.clone();
                 let cat = catalog_for_commit.clone();
                 async move {
                     let tx = Transaction::new(&fresh_table);
-                    let action = tx.fast_append().add_data_files(files);
-                    let tx = action.apply(tx)?;
+                    let tx = if v3 {
+                        let mut action = tx
+                            .row_delta()
+                            .add_delete_files(vectors)
+                            .remove_delete_files(retired);
+                        if let Some(base) = base_snapshot_id {
+                            action = action.validate_from_snapshot(base);
+                        }
+                        action.apply(tx)?
+                    } else {
+                        tx.fast_append().add_data_files(files).apply(tx)?
+                    };
                     self.before_commit_seam().await;
                     tx.commit(cat.as_catalog().as_ref()).await
                 }
@@ -3810,7 +3915,7 @@ impl WriteHandler {
             )?,
         );
 
-        let target_columns: Vec<String> = target_schema
+        let mut target_columns: Vec<String> = target_schema
             .fields()
             .iter()
             .map(|f| f.name().clone())
@@ -3820,6 +3925,15 @@ impl WriteHandler {
             return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "MERGE target table {table_ident} has no columns for match detection"
             )));
+        }
+        // V3: the target relation carries the row-lineage columns (the rewrite
+        // read selects them); project them through so the writer persists them.
+        if table.metadata().format_version() >= FormatVersion::V3 {
+            target_columns.push(iceberg::metadata_columns::RESERVED_COL_NAME_ROW_ID.to_string());
+            target_columns.push(
+                iceberg::metadata_columns::RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER
+                    .to_string(),
+            );
         }
 
         // The caller's row filter and masks on the TARGET (architecture review
@@ -4244,9 +4358,14 @@ impl WriteHandler {
         let target_schema = if let Some(first) = target_buf.as_slice().first() {
             first.schema()
         } else {
-            let iceberg_schema = table.metadata().current_schema();
+            // V3: same shape the rewrite read would have produced, lineage included.
+            let iceberg_schema = if table.metadata().format_version() >= FormatVersion::V3 {
+                sqe_compaction::writer::schema_with_row_lineage(table.metadata().current_schema())?
+            } else {
+                table.metadata().current_schema().clone()
+            };
             Arc::new(
-                iceberg::arrow::schema_to_arrow_schema(iceberg_schema).map_err(|e| {
+                iceberg::arrow::schema_to_arrow_schema(&iceberg_schema).map_err(|e| {
                     SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to convert Iceberg schema to Arrow: {e}"))
                 })?,
             )
@@ -4831,6 +4950,12 @@ impl WriteHandler {
                     let update_cols: Vec<String> = target_columns
                         .iter()
                         .map(|col| {
+                            // V3 row lineage: the updated row keeps `_row_id`
+                            // (passthrough below) but its sequence number is
+                            // nulled so it inherits the new file's.
+                            if col == iceberg::metadata_columns::RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER {
+                                return format!("CAST(NULL AS BIGINT) AS \"{col}\"");
+                            }
                             let expr = crate::merge_sql::apply_target_masks(
                                 &crate::merge_sql::resolve_update_expr(
                                     col,
@@ -4899,6 +5024,13 @@ impl WriteHandler {
                 let insert_exprs: Vec<String> = target_columns
                     .iter()
                     .map(|col| {
+                        // V3 row lineage: an inserted row has none; typed so the
+                        // chained new-row streams share one schema.
+                        if col == iceberg::metadata_columns::RESERVED_COL_NAME_ROW_ID
+                            || col == iceberg::metadata_columns::RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER
+                        {
+                            return format!("CAST(NULL AS BIGINT) AS \"{col}\"");
+                        }
                         let expr = crate::merge_sql::resolve_insert_expr(
                             col,
                             insert_cols,
@@ -4955,6 +5087,12 @@ impl WriteHandler {
                     let new_cols: Vec<String> = target_columns
                         .iter()
                         .map(|col| {
+                            // V3 row lineage: the updated row keeps `_row_id`
+                            // (passthrough below) but its sequence number is
+                            // nulled so it inherits the new file's.
+                            if col == iceberg::metadata_columns::RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER {
+                                return format!("CAST(NULL AS BIGINT) AS \"{col}\"");
+                            }
                             let expr = crate::merge_sql::apply_target_masks(
                                 &crate::merge_sql::resolve_update_expr(
                                     col,
@@ -5466,10 +5604,10 @@ impl WriteHandler {
         &self,
         table: &IcebergTable,
     ) -> sqe_core::Result<DeleteAwareReadPlan> {
-        let scan =
-            table.scan().select_all().build().map_err(|e| {
-                SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build rewrite read scan: {e}"))
-            })?;
+        // V3: also selects the row-lineage columns (see rewrite_scan_builder).
+        let scan = sqe_compaction::rewrite::rewrite_scan_builder(table).build().map_err(|e| {
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build rewrite read scan: {e}"))
+        })?;
         let tasks: Vec<iceberg::scan::FileScanTask> = scan
             .plan_files()
             .await
@@ -5481,7 +5619,7 @@ impl WriteHandler {
             std::collections::HashMap::new();
         for task in tasks {
             tasks_by_path
-                .entry(task.data_file_path.clone())
+                .entry(task.data_file_path().to_string())
                 .or_default()
                 .push(task);
         }
@@ -5543,6 +5681,8 @@ impl WriteHandler {
             if batch.num_rows() == 0 {
                 continue;
             }
+            // V3: plain longs for the row-lineage columns (no-op otherwise).
+            let batch = sqe_compaction::writer::decode_lineage_columns(batch)?;
             match buf.as_mut() {
                 Some(b) => b.push(batch)?,
                 None => batches.push(batch),
@@ -5762,6 +5902,13 @@ impl WriteHandler {
                 if let Some(expr) = assignment_map.get(&col) {
                     format!(
                         "CASE WHEN ({augmented_where}) THEN ({expr}) ELSE {else_ref} END AS \"{col}\""
+                    )
+                } else if col == iceberg::metadata_columns::RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER {
+                    // V3 row lineage: an updated row keeps `_row_id` but its
+                    // `_last_updated_sequence_number` is nulled so it inherits
+                    // the new file's sequence number (spec, Row Lineage).
+                    format!(
+                        "CASE WHEN ({augmented_where}) THEN CAST(NULL AS BIGINT) ELSE \"{col}\" END AS \"{col}\""
                     )
                 } else if is_masked {
                     format!("{else_ref} AS \"{col}\"")
@@ -10209,8 +10356,9 @@ s3_path_style = true
         let json = json.replace("{location}", dir.path().to_str().unwrap());
         let metadata: iceberg::spec::TableMetadata =
             serde_json::from_str(&json).expect("test table metadata");
-        let file_io = iceberg::io::FileIOBuilder::new_fs_io().build().unwrap();
+        let file_io = iceberg::io::FileIO::new_with_fs();
         IcebergTable::builder()
+            .runtime(iceberg::Runtime::current())
             .metadata(metadata)
             .identifier(TableIdent::from_strs(["ns", "tbl"]).unwrap())
             .file_io(file_io)
@@ -10381,6 +10529,9 @@ s3_path_style = true
         async fn drop_table(&self, _table: &TableIdent) -> iceberg::Result<()> {
             unimplemented!("not used by the retry helper")
         }
+        async fn purge_table(&self, _table: &TableIdent) -> iceberg::Result<()> {
+            unimplemented!("not used by the retry helper")
+        }
         async fn table_exists(&self, _table: &TableIdent) -> iceberg::Result<bool> {
             unimplemented!("not used by the retry helper")
         }
@@ -10516,8 +10667,8 @@ s3_path_style = true
     /// the DEFAULT spec (as it was before this fix) its `country = 'US'` value
     /// read as `region = 'US'`, "provably differed" from `'EU'`, and the file
     /// was dropped from the rewrite set — leaving its EU rows alive.
-    #[test]
-    fn partition_prune_keeps_files_from_an_older_partition_spec() {
+    #[tokio::test]
+    async fn partition_prune_keeps_files_from_an_older_partition_spec() {
         use iceberg::spec::{Literal, Struct};
         use sqlparser::dialect::GenericDialect;
         use sqlparser::parser::Parser;
@@ -10587,8 +10738,8 @@ s3_path_style = true
     /// 502: a file whose spec id is not in the table metadata is kept. The
     /// manifest is data we do not control, and dropping such a file from the
     /// rewrite set loses rows silently.
-    #[test]
-    fn partition_prune_keeps_files_with_an_unknown_spec_id() {
+    #[tokio::test]
+    async fn partition_prune_keeps_files_with_an_unknown_spec_id() {
         use iceberg::spec::{Literal, Struct};
         use sqlparser::dialect::GenericDialect;
         use sqlparser::parser::Parser;
@@ -10675,8 +10826,8 @@ s3_path_style = true
 
     /// A SELECT that reproduces the live table's schema swaps in place: the
     /// table keeps its identity, its history and its grants.
-    #[test]
-    fn ctas_replace_is_in_place_for_a_matching_schema() {
+    #[tokio::test]
+    async fn ctas_replace_is_in_place_for_a_matching_schema() {
         let dir = tempfile::tempdir().expect("tempdir");
         let live = local_table(&dir, UNPARTITIONED_META);
         let (arrow, iceberg) = select_schemas(vec![Field::new("id", DataType::Int32, false)]);
@@ -10686,8 +10837,8 @@ s3_path_style = true
     /// Column set, order, type and nullability all have to match: the
     /// streaming writer stamps each batch onto the LIVE schema positionally, so
     /// anything else would cast into the old types or fail mid-write.
-    #[test]
-    fn ctas_replace_is_not_in_place_when_the_schema_differs() {
+    #[tokio::test]
+    async fn ctas_replace_is_not_in_place_when_the_schema_differs() {
         let dir = tempfile::tempdir().expect("tempdir");
         let live = local_table(&dir, UNPARTITIONED_META);
 
@@ -10729,8 +10880,8 @@ s3_path_style = true
     /// An explicit `PARTITIONED BY` has to name the same source columns and
     /// transforms as the live default spec — the writer partitions with the
     /// live spec, so a differing clause would be silently ignored.
-    #[test]
-    fn ctas_replace_in_place_requires_matching_partitioning() {
+    #[tokio::test]
+    async fn ctas_replace_in_place_requires_matching_partitioning() {
         use sqlparser::dialect::GenericDialect;
         use sqlparser::parser::Parser;
 

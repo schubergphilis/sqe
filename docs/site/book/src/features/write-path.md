@@ -149,7 +149,7 @@ Under `write.merge.mode=merge-on-read`, MERGE routes matched and unmatched rows 
 
 ### Iceberg Dependency
 
-Row-level writes depend on the SQE-rebased fork of [risingwavelabs/iceberg-rust](https://github.com/risingwavelabs/iceberg-rust), vendored at `vendor/iceberg-rust/`. It provides `RewriteFilesAction` / `OverwriteFilesAction` for Copy-on-Write, `PositionDeleteFileWriter` and `EqualityDeleteFileWriter` with `RowDeltaAction` for Merge-on-Read, and `DeletionVectorWriter` for Iceberg V3, none of which are available upstream yet. SQE also carries its own vendor patches (feature-gated catalog backends, `Send + Sync` catalog builders, ADD COLUMN scan projection) and owns write-path components outside the vendor tree, such as the bounded fanout writer. See `vendor/iceberg-rust/README.md` for the patch inventory.
+Row-level writes use apache/iceberg-rust `main` with the [RisingWave fork](https://github.com/risingwavelabs/iceberg-rust)'s write stack merged on top, vendored at `vendor/iceberg-rust/`. The fork supplies what apache does not ship yet: `ReplaceFilesAction` for Copy-on-Write, the position-delete and deletion-vector writers for Merge-on-Read, and `RowDeltaAction`. On V3 tables Merge-on-Read DELETE writes deletion vectors only, as the spec requires. SQE also carries its own vendor patches (feature-gated catalog backends, `Send + Sync` catalog builders, ADD COLUMN scan projection) and owns write-path components outside the vendor tree, such as the bounded fanout writer. See `vendor/iceberg-rust/README.md` for the patch inventory.
 
 ## Memory Safety
 

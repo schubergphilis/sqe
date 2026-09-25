@@ -1,584 +1,88 @@
-# iceberg-rust (SQE vendored fork)
+# iceberg-rust (SQE vendored copy)
 
-This is a vendored copy of the [RisingWave Labs iceberg-rust fork](https://github.com/risingwavelabs/iceberg-rust),
-branch `dev_rebase_main_20260303` at commit `813e54419b43`. The branch carries
-Arrow 58 / Parquet 58 (RW PR #148, 2026-04-15) plus writer and transaction
-fixes on top. SQE has ported the vendored crates to DataFusion 55 / Arrow 59 /
-Parquet 59.
+Built from three layers, in this order:
 
-## Vendored crates
+1. **apache/iceberg-rust `main` @ `119fad92c`** (2026-09-24). Base for everything:
+   core, catalogs, the OpenDAL storage crate. Arrow / Parquet 59.2, no DataFusion.
+2. **risingwavelabs/iceberg-rust `dev_rebase_main_20260807` @ `07906417c`**, merged on
+   top in one merge commit. It carries the row-level write stack apache still lacks:
+   `ReplaceFilesAction` (rewrite and overwrite), position-delete and deletion-vector
+   writers, rewrite manifests, snapshot and orphan cleanup, delete pruning by file
+   metrics (#213, #214), the V3 row-lineage reader (#239) and ~40 fixes.
+3. **SQE patch families**, re-applied on the result. Every site is marked
+   `SQE PATCH (sqe#NNN)`.
 
-| Crate | Purpose | Used by |
-|-------|---------|---------|
-| `iceberg` | Core Iceberg types, expressions, scan API, transactions | always |
-| `iceberg-catalog-rest` | Iceberg REST protocol client (Polaris, Nessie, Unity, Glue REST, S3 Tables REST) | always |
-| `iceberg-catalog-glue` | AWS Glue Data Catalog over the AWS SDK | sqe-catalog `glue` feature |
-| `iceberg-catalog-hms` | Hive Metastore over Thrift | sqe-catalog `hms` feature |
-| `iceberg-catalog-s3tables` | AWS S3 Tables (managed Iceberg) over the AWS SDK | sqe-catalog `s3tables` feature |
-| `iceberg-catalog-sql` | JDBC catalog (Postgres / MySQL / SQLite) via sqlx | sqe-catalog `sql` feature |
-| `iceberg-catalog-loader` | Dispatches catalog construction by string type name with a uniform `(name, props)` shape; used by SQE in `crates/sqe-catalog/src/rest_catalog.rs::for_session_other_backend` | always |
-| `iceberg-datafusion` | DataFusion `TableProvider`, `IcebergTableScan`, runtime filter bridge, predicate converter | always |
-| `iceberg_test_utils` | Shared test helpers | dev-only |
+The DataFusion integration moved out of iceberg-rust on 2026-09-17 (apache #3228). It
+is vendored separately in `../datafusion-iceberg`.
 
-The loader crate is patched (vs upstream) to make its backend deps
-optional, gated on cargo features, so a slim build does not
-transitively pull every backend's AWS SDK / Thrift / sqlx weight.
-The trait `BoxedCatalogBuilder` is also patched to require
-`Send + Sync` so the returned box can cross await points in async
-contexts.
+Geometry / geography types are not in any upstream yet.
 
-## Why a fork?
+## Crates
 
-Apache's latest release, iceberg-rust v0.10.1, lacks:
-- `RewriteFilesAction` / `OverwriteFilesAction` (Copy-on-Write DELETE/UPDATE)
-- `PositionDeleteFileWriter` (Merge-on-Read position deletes)
-- `DeletionVectorWriter` (Iceberg V3)
+| Crate | Used by |
+|---|---|
+| `iceberg` | always |
+| `iceberg-storage-opendal` | always; object storage left core, SQE builds it via `sqe_catalog::storage_factory()` |
+| `iceberg-catalog-rest` | always (`aws-sigv4` feature for SigV4) |
+| `iceberg-catalog-loader` | always (SQE feature gates, `Send + Sync` builder) |
+| `iceberg-catalog-{glue,hms,s3tables,sql}` | sqe-catalog features |
+| `iceberg-property-macro`, `iceberg_test_utils` | build / dev |
 
-The RisingWave fork provides all of these.
+Not vendored: Python bindings, examples, integration tests, the moka cache integration.
+Upstream `testdata/` is vendored in full, so `cargo test -p iceberg --lib` runs here.
 
-## Upstream tracking
+## SQE patch families
 
-- RisingWave fork: `dev_rebase_main_20260303`, vendored baseline `813e54419b43` plus ten focused backports (see below); branch tip at last audit `1657c184`
-- Apache upstream: tracking PRs #2185 (OverwriteAction) and #2203 (RowDeltaAction)
-- When upstream merges these, SQE will migrate to official apache/iceberg-rust
+| # | Patch | Where |
+|---|---|---|
+| 1 | `DynamicPredicate` runtime-filter pushdown | `expr/dynamic.rs`, `scan/mod.rs`, `arrow/reader/file_reader.rs` |
+| 6 | Current-schema projection for non-time-travel scans (#358) | `scan/mod.rs` |
+| 7 | `DecodeGate` decode admission (#367) | `arrow/reader/mod.rs`, `pipeline.rs` (`read_parallel`) |
+| 8 | SBBF bloom row-group probing for runtime filters (#369) | `expr/visitors/sbbf_row_group_evaluator.rs`, `arrow/reader/pipeline.rs`; skips when apache's own bloom pass is on |
+| 9 | Fetch / decode pipelining (`with_fetch_ahead`, `DecodeGate::admit_fetch`) | `arrow/reader/pipeline.rs` |
+| 10 | Strict-metrics residual elimination | `scan/context.rs` |
+| — | Intra-file row-group split (#131), `FileScanTask::with_byte_range` | `arrow/reader/pipeline.rs`, `scan/task.rs` |
+| — | Hash-set membership for large `IN` row filters | `arrow/reader/predicate_visitor.rs` |
+| 2 | REST SigV4 as an `AuthManager` (`rest.sigv4-enabled`, server-advertised, never replaces a bearer) | `catalog/rest/src/sigv4.rs` |
+| — | Empty-token guards (#2) and W3C trace propagation | `catalog/rest/src/auth/oauth2.rs`, `client.rs` |
+| — | Refresh-after-401 on `AuthSession::on_unauthorized` (replaces RW #157; apache has no refresh) | `catalog/rest/src/auth/` |
+| 5 | Loader feature gates + `Send + Sync` | `catalog/loader` |
+| — | sqlx 0.9 (`AssertSqlSafe`, `LIMIT 0` schema probe) | `catalog/sql` |
+| — | Ring-only TLS: no `default-https-client`, opendal no-provider transport installed on first use | root `Cargo.toml`, `storage/opendal` |
+| — | New-delete conflict guard on `ReplaceFilesAction` (`set_validate_from_snapshot_id`) | `transaction/replace_files.rs` |
+| — | `RowDeltaAction` (apache PR #2203; no upstream equivalent) | `transaction/row_delta.rs` |
+| — | Puffin blob range check | `puffin/reader.rs` |
+| — | `ManifestFile::load_manifest` shim over apache's `ManifestReader` | `spec/manifest_list/manifest_file.rs` |
 
-Last audited on 2026-09-02. The RisingWave branch had advanced to
-`1657c184`, 14 commits past the vendored baseline. Ten of them are
-backported as focused commits on top of this snapshot:
+Dropped because the new base already has them: the INT96, `read_with_metrics`, NaN,
+equality-delete NULL, positional-delete wakeup and run-buffering, constant-column and
+temporal-partition-path backports; RW #186 #188 #190 #196 #208; sqe#388 (apache's
+`post_form` sets the content type); FileIO scheme shims; SQE's OpenDAL operator cache.
+RW's BigLake GCP token exchange was dropped (SQE does not use it).
 
-- `f31001cd` (RW #187) lenient decode of truncated string metric bounds.
-- `ee489f56` (RW #188) drop dangling deletion vectors when data files are
-  rewritten. Relevant to SQE's compaction path. Note this is manifest bloat
-  and pinned Puffin files, NOT row resurrection: a stale DV binds to a
-  data-file path that no longer exists, so it applies to nothing.
-- `edf72a59` (RW #190) resolve predicate field IDs via the Arrow schema when
-  Parquet leaves lack them. Lands in `reader.rs` alongside three SQE patch
-  families and still applied cleanly.
-- `550393d0` (RW #186) return a typed `DataInvalid` error when a Parquet data
-  file is shorter than its manifest-recorded size, preventing an out-of-bounds
-  object-store slice panic. Adapted to SQE's refactored reader path.
-- `6bd8e98f` (RW #196) propagate and cache equality-delete load failures.
-  Retryable and cancelled loads can be reclaimed; non-retryable failures are
-  retained for late consumers. The backport is stacked after Apache #2859 so
-  both delete-loader notification fixes are reviewed as one state machine.
-- `1657c184` (RW #205) map Iceberg `Timestamptz` / `TimestamptzNs` to Glue's
-  equivalent non-timezone timestamp types, matching Spark's Glue integration.
-- `deb4a3c8` (RW #208) cache OpenDAL S3/GCS operators by bucket. Each cache is
-  owned by one immutable storage configuration, so bucket is the complete
-  variable part of the operator identity; clones share it, while deserialization
-  deliberately starts with an empty cache. Dynamic credential loaders remain
-  inside the reused operator and continue to refresh credentials.
-- `61a89414` (RW #181) cache rewritten input/output manifests and the proposed
-  snapshot identity across optimistic commit retries. Concurrent append-only
-  retries reuse the already-written manifests; concurrent rewrites invalidate
-  the cache and rerun clustering.
-- `0b65d716` (RW #185) write full clustered manifests incrementally to bound
-  peak rewrite memory, and calibrate entry-size estimates against actual
-  uncompressed Avro output. Applied together with #181. The obsolete
-  `try_for_each_manifest` helper was removed from SQE's renamed `util/mod.rs`.
-- `0d9e873c` (RW #177) stream manifest lists and manifests while collecting
-  referenced files for orphan cleanup. Peak memory is bounded by configured
-  load concurrency rather than all snapshots and manifests; the now-unused
-  collecting `load_manifest_lists` helper was removed from `util/mod.rs`.
+## Fixes the merged test suite surfaced
 
-That `ee489f56` applies cleanly is itself useful: it means the dangling-DV fix
-does *not* depend on `c3ac742` below.
+- Invalid-UTF-8 string bounds are treated as unknown in manifest pruning (a lossy
+  decoded lower bound sorts above the real one).
+- Snapshot summary totals never underflow (a remove larger than the known total
+  skipped the total instead of writing `u64::MAX`), matching iceberg-java.
+- SQL catalog schema detection reports a missing table instead of calling it V0.
+- Apache's pos-delete routing test used random paths that RW #214 pruning made flaky.
 
-Still not backported:
+## Refreshing
 
-- `c3ac742` unifies the overwrite/rewrite transaction implementations. Its
-  public transaction entry points remain source-compatible, but it overlaps
-  SQE's CoW transaction path and requires the write regression suite.
-- `08a18f41` / `ac90a10d` add trait impls and exports for `DeleteVector`.
-  API surface only; take when something needs them.
+Work in a scratch clone of apache/iceberg-rust with `rw` as a second remote:
 
-Apache `main` is audited selectively rather than merged wholesale: it has
-different transaction APIs, dependency versions, and MSRV requirements. Every
-accepted fix is listed below with its upstream PR and retained as a focused
-backport.
-
-Apache cut **v0.10.1** on 2026-08-01. It does not replace this fork and is not
-a de-vendoring path: the release has no rewrite/overwrite transaction actions,
-`PositionDeleteFileWriter`, `DeletionVectorWriter`, or `expr::dynamic`, while
-its DataFusion dependency is older than SQE's DataFusion 55. Apache `main` now
-has an equality-delete writer, but still lacks `PositionDeleteFileWriter`, the
-transaction actions, deletion-vector writer, dynamic predicate API, and SQE's
-decode, fetch-ahead, and SBBF scan patches. (Its writer module documentation
-mentions `PositionDeleteFileWriter`, but no implementation exists.) PRs #2185
-and #2203 remain open and conflicted. Its MSRV also exceeds SQE's current
-workspace MSRV. Use v0.10.1 as the released audit baseline and evaluate focused
-fixes rather than merging Apache `main` wholesale.
-
-## DataFusion 55 / Arrow 59 readiness (probed 2026-08-24)
-
-Probed against renovate MR !886 (root bump: datafusion 54->55, arrow/parquet
-58->59). Verdict: **this fork is not what blocks that upgrade.**
-
-- **Arrow 58->59 on `iceberg` core: free.** Bumping the nine `arrow-*` pins and
-  `parquet` in this workspace's `[workspace.dependencies]` gives a clean
-  `cargo check -p iceberg`, zero errors, zero source changes.
-- **DataFusion 54->55 on `iceberg-datafusion`: six mechanical errors**, all in
-  upstream code, none in the SQE patch families below. Fixed here:
-  - `datafusion::sql::TableReference` moved to `datafusion::common`.
-  - `ExecutionPlan` gained a required `apply_expressions`. Implemented on four
-    nodes: `IcebergTableScan` reports its `runtime_filters` via
-    `apply_expression_roots` (they are real `PhysicalExpr` roots and DataFusion
-    traverses them), while `commit`, `metadata_scan` and `write` hold no
-    expressions and return `Continue`.
-  - `CreateExternalTable::location` became `locations: Vec<String>`. An Iceberg
-    static table is exactly one metadata file, so the factory refuses any other
-    count instead of silently taking the first entry.
-
-That patch families 1 (`expr::dynamic`), 8 (SBBF probing) and 9 (fetch/decode
-pipelining) needed no changes is the useful part: the DF 55 churn did not touch
-the physical-expr surfaces they ride on.
-
-### What actually blocks the upgrade
-
-`datafusion-functions-json`. Its newest release is **0.54.2**, which requires
-`datafusion ^54`, and `cargo tree -i datafusion@54.1.0` shows it is the *only*
-reason DataFusion 54 stays in the tree. That drags arrow 58 in beside arrow 59
-and produces the dual-version type clash that failed !886's `cargo-gate`
-("there are multiple different versions of crate `arrow_schema`"). Nothing in
-this vendor tree can fix it. Three ways out: wait for an upstream 0.55, vendor
-and bump it locally (there is precedent, `[patch.crates-io] jiter`), or drop the
-JSON UDFs and lose that SQL surface. It is registered in exactly four places
-(`register_all`), so the mechanical cost of any option is small.
-
-## SQE-only patches in this vendor copy
-
-These patch families ride on top of the upstream snapshot. Each is
-documented inline at the touch site so a future rebase can re-apply
-them quickly.
-
-1. **`iceberg::expr::dynamic` (DynamicPredicate API)**: runtime
-   filter pushdown into IcebergTableScan. Files: `crates/iceberg/src/expr/dynamic.rs`,
-   `crates/iceberg/src/scan/mod.rs`, `crates/iceberg/src/arrow/reader.rs`.
-   Filed upstream as apache/iceberg-rust#2376; not yet landed.
-2. **`iceberg-catalog-rest::sigv4`**: AWS SigV4 signer gated behind
-   the `aws-sigv4` cargo feature. Files: `crates/catalog/rest/src/sigv4.rs`,
-   `crates/catalog/rest/src/client.rs`, `crates/catalog/rest/src/lib.rs`.
-   Used for AWS S3 Tables and Glue REST federation. Not filed upstream yet.
-3. **`CatalogBuilder::with_storage_factory`**: trait default in
-   `iceberg::catalog`, added so the upstream HMS / Glue / SQL catalog
-   crates compile against the fork's trait unmodified.
-4. **`FileIOBuilder` scheme-string shims**: in the vendored apache
-   v0.9.0 catalog crates (`hms`, `glue`, `sql`) so they speak the
-   fork's FileIO API.
-5. **`iceberg-catalog-loader` feature gates + `Send + Sync`**: added
-   to the loader so SQE's slim builds work and so the boxed builder
-   can cross await points. Files:
-   `crates/catalog/loader/Cargo.toml`,
-   `crates/catalog/loader/src/lib.rs`.
-6. **Current-schema projection for non-time-travel scans (issue #358)**:
-   `TableScanBuilder::build` resolves the scan projection schema from the
-   table's current schema when no `snapshot_id` is requested, instead of the
-   schema tagged on the latest snapshot. ALTER TABLE ADD COLUMN is
-   metadata-only (no new snapshot), so the latest snapshot keeps the pre-ADD
-   schema; reading against it dropped added columns and failed with "Column
-   <c> not found in table". Explicit snapshot scans still use the snapshot
-   schema (time-travel semantics preserved). Files:
-   `crates/iceberg/src/scan/mod.rs` (build + two regression tests). Not filed
-   upstream yet.
-7. **`DecodeGate` decode admission hook (SQE issue #367)**: optional
-   `Arc<dyn DecodeGate>` on `ArrowReaderBuilder` / `TableScanBuilder`,
-   consulted before each file scan (sub)task decode on the parallel path
-   and held until the subtask's batches are forwarded. SQE implements it
-   (`sqe-catalog::scan_memory::ScanDecodeGate`) to bound decode
-   concurrency per scan node and reserve the estimated decode memory
-   against the DataFusion pool, so pressure fails typed instead of
-   OOM-killing the host. All sites marked `SQE PATCH (sqe#367)`. Files:
-   `crates/iceberg/src/arrow/reader.rs`, `crates/iceberg/src/scan/mod.rs`.
-   Survived the `813e544` refresh (issue #370) via auto-merge; verify the
-   `SQE PATCH (sqe#367)` markers on the next refresh too. Not filed
-   upstream yet.
-8. **Bloom-filter (SBBF) row-group probing (SQE issue #369)**: after
-   stats-based row-group pruning, the reader tests positive membership
-   conjuncts (`IN` sets / equality literals, including sealed hash-join
-   runtime filters routed through the `DynamicPredicate` of family 1)
-   against each surviving row group's parquet bloom filter and prunes
-   the row group when EVERY key tests bloom-negative. The stats path
-   gives up on `IN` above 200 literals, so large runtime-filter key
-   sets get no row-group pruning without this. Conjuncts are collected
-   from positive `AND` positions only (`OR`/`NOT` subtrees ignored) so
-   negated equality-delete predicates can never cause unsound pruning.
-   Blooms load lazily via parquet's async
-   `get_row_group_column_bloom_filter`; missing blooms and read errors
-   keep the row group. Toggle and cap ride on
-   `ArrowReaderBuilder::with_bloom_filter_probing_enabled` /
-   `with_bloom_probe_max_values` (and the `TableScanBuilder`
-   equivalents); pruned row groups are reported via
-   `ScanMetrics::row_groups_pruned_bloom`. All sites marked
-   `SQE PATCH (sqe#369)`. Files:
-   `crates/iceberg/src/expr/visitors/sbbf_row_group_evaluator.rs` (new),
-   `crates/iceberg/src/expr/visitors/mod.rs`,
-   `crates/iceberg/src/expr/mod.rs`,
-   `crates/iceberg/src/arrow/reader.rs`,
-   `crates/iceberg/src/arrow/scan_metrics.rs`,
-   `crates/iceberg/src/scan/mod.rs`, plus the CASE-of-InLists union in
-   `crates/integrations/datafusion/src/physical_plan/physical_to_predicate.rs`
-   that lets a PARTITIONED hash join's sealed dynamic filter reach the
-   pruning paths as a single `Predicate::Set` per column. That union is
-   size-capped at `bloom_max_values` (plumbed via
-   `RuntimeFiltersDynamicPredicate::new_with_max_set_values`, default
-   `DEFAULT_MAX_RUNTIME_FILTER_SET_VALUES` = 65536): above the cap a set
-   prunes no row groups (SBBF bails above the cap, stats-`IN` above 200)
-   and would only survive as a per-row parquet `RowFilter`, so
-   `convert_case` drops the over-cap column and the reader falls back to
-   the static predicate. Without the cap, large non-selective join keys
-   (TPC-H q21/q12 at SF10) paid a giant RowFilter for zero pruning.
-   Behavioral tests live in SQE at
-   `crates/sqe-catalog/tests/bloom_probe_369.rs`. Not filed upstream yet.
-9. **Fetch/decode pipelining on the parallel read path (SQE
-   scan-fetch-pipeline; issue number assigned at MR time)**: the sqe#367
-   decode admission used to be acquired at subtask dispatch and held
-   across the subtask's WHOLE fetch + decode + emit lifetime, so
-   in-flight object-store I/O was capped at the decode-permit count
-   (`num_cpus`) even though the fetch stage (metadata load, row-group
-   column-chunk fetch, RowFilter evaluation) is store-latency-bound, not
-   CPU-bound. Measured on SSB SF10 star joins every permit parked in the
-   fetch await and the scan sustained ~350MB/s with 1.5 of 11 cores
-   busy. Staged (`ArrowReaderBuilder::with_fetch_ahead(n)` /
-   `TableScanBuilder::with_fetch_ahead(n)`, default 0 = off, upstream
-   behavior unchanged): dispatch acquires a FETCH admission via the new
-   `DecodeGate::admit_fetch` (default impl = unbounded no-op, so gates
-   that only implement `admit` keep pre-staging semantics), and the
-   worker swaps it for the full decode admission (`DecodeGate::admit`)
-   after the first stream poll (which performs the row-group fetch and
-   row filtering), before draining decoded batches. The fetch admission
-   is held until the decode admission is granted so fetched bytes stay
-   memory-accounted and pipeline depth stays capped. The per-stream
-   dispatch semaphore widens to `max(fetch_ahead,
-   concurrency_limit_data_files)` in staged mode. Includes debug-gated
-   per-subtask stage timing (`scan subtask stage timing` under
-   `iceberg::arrow::reader=debug`: dispatch waits, open, first poll,
-   decode, emit-park, in-flight gauge). SQE bounds the fetch stage in
-   `sqe-catalog::scan_memory::ScanDecodeGate::admit_fetch` (scan-wide
-   fetch permits, 1x compressed-byte reservation) and plumbs the depth
-   from `[catalog] scan_fetch_ahead` (unset = 3x cores, `0` = staging
-   off, env `SQE_CATALOG__SCAN_FETCH_AHEAD`). All sites marked
-   `SQE PATCH (sqe#scan-fetch-pipeline)`. Files:
-   `crates/iceberg/src/arrow/reader.rs`,
-   `crates/iceberg/src/scan/mod.rs`. Not filed upstream yet.
-10. **Strict-metrics residual elimination**: scan planning now evaluates the
-   snapshot predicate against each data file's metrics. When the strict
-   evaluator proves every row matches, the `FileScanTask` carries no residual
-   predicate and the Arrow reader avoids redundant row-level evaluation. An
-   inconclusive result retains the predicate. This makes the existing strict
-   evaluator production code and removes its `dead_code` warning without a
-   lint suppression. Files: `crates/iceberg/src/scan/context.rs` and
-   `crates/iceberg/src/expr/visitors/strict_metrics_evaluator.rs`. This is an
-   SQE patch, not part of Apache #2616; Apache deliberately retains
-   `#[allow(dead_code)]` on strict visitors because it has no production caller.
-
-11. **REST `execute()` no longer clobbers per-request headers (SQE issue
-   #388)**: `HttpClient::execute` applied the catalog-wide `extra_headers` with
-   `HeaderMap::extend`, which overwrites same-key values. That silently undid
-   `exchange_credential_for_token`'s deliberate content-type override, so the
-   client-credentials token request went out with a form-urlencoded body under
-   the `Content-Type: application/json` hardcoded in
-   `RestCatalogConfig::extra_headers`. Polaris rejects that with a 415
-   `@Consumes` mismatch, which broke every credential-authenticated flow --
-   the `bank` benchmark could not load at any scale. Now the extra headers are
-   only filled in where the request has not already set them, so an explicit
-   per-request header wins; `request()` already applies them, so `execute()`
-   only has to cover requests built without it. Marked `SQE PATCH (sqe#388)`.
-   Files: `crates/catalog/rest/src/client.rs`. Upstream almost certainly has
-   the same bug (the override and its explanatory comment are upstream code);
-   worth reporting so this patch can eventually be dropped.
-
-## Apache iceberg-rust backports
-
-Fifteen fixes from apache main applied on top of the RW base. RisingWave
-has not backported these yet; they apply on the SQE vendor because
-the touched files diverge minimally from apache. The original PR
-authorship and commit messages are preserved.
-
-- **#2118** Make `convert_filters_to_predicate` public — visibility
-  change on the DataFusion integration so SQE can reuse the filter
-  conversion logic.
-- **#2348** support `fixedbinary(n)` — adds datum conversion for
-  `FixedSizedBinaryArray` (Arrow schema mapping).
-- **#2307** fix nested `build_fallback_field_id_map` — predicates on
-  columns after struct/list/map in migrated Parquet files no longer
-  crash with "Leaf column ... isn't a root column." Test addition
-  skipped (depends on the apache-only `serde_arrow` dev-dep).
-- **#2351** NaN pushdown correctness — float predicates now handle
-  NaN semantics correctly. Test addition skipped (apache-only test
-  helpers).
-- **#2360** EXPLAIN pushed-down limit — `IcebergTableScan` EXPLAIN
-  output shows the pushed-down LIMIT.
-- **#2616** remove stale dead-code annotations — exact backport of Apache
-  commit `427670d5d113`: removes the now-unnecessary annotation from
-  `global_equality_deletes` and deletes the unused `Snapshot::log` helper.
-  The upstream change intentionally does not alter strict expression visitors;
-  SQE's production use of `StrictMetricsEvaluator` is documented separately as
-  SQE-only patch family 9.
-- **#2867** malformed Puffin footer length validation — exact behavioral
-  backport of Apache commit `c0db7707951`. Truncated envelopes and impossible
-  footer lengths now return `DataInvalid` instead of underflowing or issuing an
-  invalid range read.
-- **#2797** required missing-field validation — exact behavioral backport of
-  Apache commit `78df272cb1a`. When a required projected field is absent from
-  an older data file and has no `initial-default`, the record-batch transformer
-  now returns a clear `DataInvalid` error instead of synthesizing a null column.
-  Optional missing fields and required fields with an initial default retain
-  their existing behavior.
-- **#2781** equality-delete NULL correctness — exact behavioral backport of
-  Apache commit `22c256e985a6`. A nullable data value must survive a non-NULL
-  equality-delete value; a NULL delete value matches only NULL data. The reader
-  now constructs the keep predicate directly (`IS NULL OR != value`, or
-  `IS NOT NULL` for a NULL delete value) instead of negating equality under SQL
-  three-valued logic. Includes single-column, composite-key, multiple-row, and
-  existing file-backed predicate tests.
-- **#2859** positional-delete lost-wakeup fix — exact behavioral backport of
-  Apache commit `dbbefa41e8a`. Waiters now create an `OwnedNotified` while the
-  positional-delete state lock is held, ensuring a load completion cannot be
-  signalled between observing `Loading` and registering the waiter. Includes a
-  bounded regression test for completion-before-await plus multi-waiter and
-  cancelled-waiter coverage.
-- **#3080** repeated constant-column construction — adapted backport of Apache
-  commit `a5f162fed26d`. String and binary partition columns now stream one
-  borrowed literal into Arrow's buffers instead of allocating an intermediate
-  vector (and cloning every string once per output row). Large binary and fixed
-  binary were already using the optimized construction in this vendor tree.
-- **#3022** temporal partition path formatting — adapted behavioral backport of
-  Apache commit `107f449d1984`. Year, month, day, and hour transform ordinals
-  now render as Iceberg's Java/Spark-compatible date strings, including
-  pre-epoch values, instead of raw integer ordinals.
-- **#3062** SQL catalog commit error propagation — exact behavioral backport of
-  Apache PR head `d8e7ed0642c6` (originally audited as `6678583`). The internal
-  transaction path now returns commit failures instead of returning a successful
-  statement result. A deferred SQLite foreign-key constraint exercises the
-  failure through the public catalog API and confirms the write is rolled back.
-- **#2509** FastAppend intra-batch path de-duplication — adapted from the
-  unmerged Apache PR head `1254b05c00fe` (originally audited as `252bb60`).
-  Files with the same path in one batch are collapsed to their first occurrence
-  before manifests and snapshot totals are produced. SQE applies one shared
-  path set across its separate data-file and delete-file collections.
-- **#3015** positional-delete run buffering — adapted backport of Apache commit
-  `7b33321f34d9`. Contiguous positions for one data-file path are bulk-appended
-  with one hash lookup per run. This fork already used borrowed `entry_ref`
-  lookups, so the retained benefit is reduced hashing and bulk Roaring inserts
-  rather than Apache's additional removal of per-row path allocations.
-
-Three apache fixes were considered but skipped:
-
-- **#2301** INT96 Parquet timestamps — depends on a `ParquetRecordBatchStreamBuilder`
-  flow that exposes `arrow_metadata` and `parquet_file_reader` as
-  separate locals. Our base uses an opaque `create_parquet_record_batch_stream_builder`
-  helper, so the coercion block does not compile against our shape.
-  Initially landed then reverted; revisit when the reader flow is
-  refactored or apache lands a port-friendlier patch.
-- **#2349** `read_with_metrics` — depends on apache #2358 (arrow
-  reader split into modules `pipeline.rs`, `positional_deletes.rs`,
-  `projection.rs`, `row_filter.rs`). Bring back when the next vendor
-  refresh includes #2358.
-- **#2285** snapshot ancestor utils — apache renamed `utils.rs` to
-  `util/mod.rs` and added `util/snapshot.rs`. Rename conflict makes
-  cherry-pick non-surgical.
-
-## What landed in this rebase
-
-The bump from `645f02a4b533` to `8f7c952f66de` brings 11 upstream
-commits from the RW rebase branch:
-
-- DF 53 / Arrow 58 / Parquet 58 upgrade (PR #148) — replaces SQE's
-  hand-rebased DF 53 work; the deltas are now identical to upstream.
-- `IcebergWriter::write_with_position` (PR #149)
-- `DeletionVectorWriter::write` perf — avoid extra copy (PR #150)
-- Transaction snapshot summary rollup fixes (PR #151, #152) — fixes
-  the `previous_snapshot` lookup that resolved to None and zeroed
-  out the `total-*` rollup.
-- `object_cache` accurate memory sizing (PR #153)
-- `DataFile::set_partition` (PR #154)
-- `support dropping schema fields` (PR #155)
-- Schema-evolution: handle all Iceberg types when filling missing
-  columns after schema change (PR #156)
-- REST client: refresh token after 401 unauthorized (PR #157)
-- opendal: skip TimeoutLayer under madsim (PR #160)
-
-## Bumped `8f7c952f66de` -> `c034b19105fa` (2026-06-02)
-
-Two more fixes from the same `dev_rebase_main_20260303` branch, applied on top
-of the vendored tree as patches. The branch tip `9491dcab` ("Add myself to code
-owners") is CODEOWNERS-only and is not vendored.
-
-- **#161 `fix: avoid panic in snapshot summary update_totals on malformed
-  values`** (vovacf201). `update_totals` called `.unwrap()` parsing the
-  `total-*` / `added-*` / `removed-*` summary properties and used checked
-  subtraction that could panic in debug on a corrupt prior summary. Now
-  parse-or-zero + saturating arithmetic, matching Java Iceberg's
-  `SnapshotSummary`, so one bad prior summary cannot wedge compaction/commit.
-  Adds 3 tests. File: `crates/iceberg/src/spec/snapshot_summary.rs`.
-- **`fix: iceberg V3 puffin file reader`** (Dylan, commit `c034b191`). Corrects
-  the V3 puffin (deletion-vector) read path. Files:
-  `crates/iceberg/src/arrow/{caching_delete_file_loader,delete_filter,reader}.rs`
-  and `crates/iceberg/src/scan/{context,mod,task}.rs`. Touches the same two
-  files as SQE-only patch family 1 (DynamicPredicate) but in disjoint regions;
-  verified by a clean workspace build.
-
-How this bump was validated: SQE builds the iceberg crate as a path dep
-inside its own workspace, where the lib compiles clean and the workspace
-`cargo test --lib` suite (sqe-catalog, sqe-coordinator, sqe-worker, ...)
-passes against it. The two fixes' own behavioral tests did not run here:
-the 3 bundled snapshot-summary tests compile in-module but the V3 puffin
-read path needs the docker-compose stack to exercise end-to-end (deferred).
-
-Note for the next rebaser: the vendored crate's **standalone** test target
-does not compile on its own. Running `cargo test --manifest-path
-vendor/iceberg-rust/Cargo.toml -p iceberg --lib` fails with ~49 errors
-(`ScanResult` not satisfying `futures::TryStreamExt` in the scan/arrow
-test modules, plus the resulting `type annotations needed`). This is a
-pre-existing futures/scan-test skew in the fork's isolated workspace, not
-introduced by this bump (it reproduces identically with these patches
-reverted). SQE excludes this vendor copy from its workspace and never
-compiles the vendor test target, so the breakage is invisible in practice.
-Validate iceberg changes through the SQE workspace path-dep
-(`cargo test --workspace --lib`), not the vendor's own test suite.
-
-## Bumped `c034b19105fa` -> `813e54419b43` (2026-07-10, issue #370)
-
-Twelve commits from `dev_rebase_main_20260303`, merged with a 3-way
-merge (vendor state committed onto `c034b19`, `git merge 813e544`,
-resolve, copy back):
-
-- **#166** account for added delete files in snapshot summary
-- **#167** sort position-delete entries globally by `(file_path, pos)`
-- **#169** auto-set `referenced_data_file` on `PositionDeleteFileWriter`
-- **#170 / #171 / #172** stream manifest lists and manifest loading to
-  bound memory (snapshot expiration, rewrite-manifests, append/overwrite
-  validation)
-- **#174 / #175** rewrite_manifests target size, honored from snapshot
-  properties
-- **#145** Variant support (Iceberg V3); SQE maps `Type::Variant` to
-  `variant` in information_schema
-- **#179** fix rewrite/overwrite transactions mishandling DELETE
-  manifests (CoW DELETE/UPDATE path)
-- **#164 / #176** CODEOWNERS-only, pruned
-
-Merge notes for the next rebaser:
-
-- The vendor tree had already split `utils.rs` into `util/mod.rs` +
-  `util/snapshot.rs` and backported early versions of the manifest
-  loaders. Upstream's streaming rewrites (#170-#172) superseded those
-  backports; conflicts in `transaction/{remove_snapshots,
-  rewrite_manifests,snapshot}.rs` were resolved to upstream semantics
-  with `crate::util` paths. Upstream still uses a flat `utils.rs`, so
-  every refresh will re-hit this rename; git's rename detection folds
-  upstream's `utils.rs` edits into `util/mod.rs` automatically.
-- SQE patch families 1 (DynamicPredicate) and 7 (DecodeGate) both touch
-  `arrow/reader.rs`, which upstream's Variant support also modified;
-  all three auto-merged in disjoint regions.
-- The five apache cherry-picks (#2118, #2348, #2307, #2351, #2360) are
-  still absent upstream and remain applied; verified present post-merge.
-- Validation: full workspace `cargo build --all`, 16/16 lib test targets
-  green (374 sqe-catalog, 604 sqe-coordinator among them), clippy
-  `--all-targets --all-features -D warnings` clean. The #179 CoW
-  round-trip and write-mode checks need the quickstart stack (SQE issue
-  #371 tracks that verification).
-
-## Catalog config: URL and bucket conventions
-
-User-facing config in `sqe.toml`. Each `[catalog]` block selects
-exactly one backend; the keys per backend mirror the upstream
-`*_CATALOG_PROP_*` constants and what the upstream builders expect.
-
-### REST (Polaris / Nessie / Unity OSS / Glue REST / S3 Tables REST)
-
-```toml
-[catalog]
-polaris_url = "https://polaris.example.com:18181/api/catalog"
-warehouse   = "test_warehouse"
-# `backend` defaults to "rest" so it can be omitted.
-[catalog.backend]
-type = "rest"
+```
+git checkout -B sqe-base origin/main
+git merge --no-ff rw/dev_rebase_main_<date>        # one merge, not per-commit picks
+# SQE's delta = diff between the previous vendored tree and its merge base:
+git diff <old-base> <old-sqe-tree> -- crates > sqe-delta.patch
+git apply -3 sqe-delta.patch                       # port what conflicts by intent
+cargo test --workspace --exclude pyiceberg_core_rust --exclude iceberg-integration-tests --lib
 ```
 
-REST is the default. AWS endpoints engage SigV4 automatically when
-the server's `/v1/config` response advertises
-`rest.sigv4-enabled=true` (see SQE-only patch family 2 above).
-
-### Hive Metastore
-
-```toml
-[catalog.backend]
-type      = "hms"
-uri       = "metastore.example.com:9083"   # Thrift host:port
-warehouse = "s3a://bucket/warehouse"        # default warehouse path
-```
-
-Requires the `hms` cargo feature on `sqe-catalog` (default-on).
-Pulls in `volo-thrift` and `pilota`.
-
-### AWS Glue
-
-```toml
-[catalog.backend]
-type      = "glue"
-region    = "us-east-1"
-warehouse = "s3://my-bucket/warehouse"
-# endpoint = "http://localhost:4566"        # optional, e.g. LocalStack
-```
-
-Requires the `glue` cargo feature (default-on). Pulls in
-`aws-sdk-glue` + `aws-config`. Authentication uses the standard AWS
-SDK chain (env vars, profiles, IMDS).
-
-### AWS S3 Tables (managed Iceberg)
-
-```toml
-[catalog.backend]
-type             = "s3tables"
-table_bucket_arn = "arn:aws:s3tables:us-east-1:123456789012:bucket/my-bucket"
-# endpoint_url   = "http://localhost:4566"  # optional, custom endpoint
-```
-
-Requires the `s3tables` cargo feature (default-on). Pulls in
-`aws-sdk-s3tables` (shares the AWS SDK runtime already pulled by
-`glue`, so the incremental binary cost is small). Authentication
-uses the standard AWS SDK chain.
-
-The bucket ARN format is `arn:aws:s3tables:REGION:ACCOUNT:bucket/NAME`.
-S3 Tables namespaces map to S3 Tables namespaces; tables map to
-S3 Tables tables; storage is automatically managed by AWS.
-
-### JDBC (Postgres / MySQL / SQLite)
-
-```toml
-[catalog.backend]
-type      = "jdbc"
-url       = "postgresql://user:pass@host:5432/iceberg"
-warehouse = "s3://my-bucket/warehouse"
-```
-
-Requires the `sql-postgres` cargo feature (default-on). The url
-prefix selects the driver: `sqlite:` for local files, `postgresql:`
-for Postgres, `mysql:` for MySQL.
-
-### Hadoop (filesystem-only, SQE-native)
-
-```toml
-[catalog.backend]
-type      = "hadoop"
-warehouse = "s3://my-bucket/warehouse"
-```
-
-No metadata service. SQE walks `warehouse` for `metadata.json` files
-and treats the prefix as the catalog. Implemented in
-`crates/sqe-catalog/src/backends/hadoop.rs`. Requires the `hadoop`
-cargo feature (default-on, no extra dependency cost).
-
-## Slim builds
-
-A REST-only build (no AWS SDK, no Thrift, no sqlx, no S3 Tables)
-ships in roughly 80 MB compressed:
-
-```bash
-cargo build --release --no-default-features --features rest
-```
-
-Add features as needed: `--features rest,glue,s3tables` for
-"REST plus AWS." `--features rest,hms` for "REST plus Hive."
-The default ships every backend (see
-`crates/sqe-catalog/Cargo.toml`).
+Then copy `crates/{iceberg,property-macro,catalog,storage,test_utils}`, `Cargo.toml`,
+`LICENSE`, `NOTICE` here, trim the workspace members, and run SQE's gates plus
+`make test-integration`. Compare the integration result against a main baseline;
+main carries its own reds.

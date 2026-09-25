@@ -235,7 +235,7 @@ fn cancelled_error(request: &CompactGroupRequest, stage: &str) -> SqeError {
 /// `https://`), the same way the executor's own S3 object-store builder
 /// treats it (`executor.rs::build_object_store_with_creds`).
 pub fn build_file_io(s3: &S3Conn) -> SqeResult<FileIO> {
-    let mut builder = FileIOBuilder::new("s3");
+    let mut builder = FileIOBuilder::new(sqe_catalog::storage_factory());
     if !s3.endpoint.is_empty() {
         builder = builder.with_prop(iceberg::io::S3_ENDPOINT, s3.endpoint.clone());
     }
@@ -254,11 +254,8 @@ pub fn build_file_io(s3: &S3Conn) -> SqeResult<FileIO> {
     if s3.path_style {
         builder = builder.with_prop(iceberg::io::S3_PATH_STYLE_ACCESS, "true");
     }
-    builder.build().map_err(|e| {
-        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-            "compact_file_group: failed to build FileIO from S3 config: {e}"
-        ))
-    })
+    // Building is infallible now; bad S3 config surfaces on first use.
+    Ok(builder.build())
 }
 
 /// Build a synthetic [`DataFile`] from a single [`FileScanTask`]. Used both
@@ -274,20 +271,21 @@ pub fn build_file_io(s3: &S3Conn) -> SqeResult<FileIO> {
 /// because the worker rewrites a single pre-selected group rather than
 /// bin-packing by partition.
 fn data_file_from_task(task: &FileScanTask) -> SqeResult<DataFile> {
+    // Scan tasks describe data files only (deletes are separate
+    // `FileScanTaskDeleteFile`s), so content is Data and the delete-only
+    // fields (`equality_ids`, `referenced_data_file`) stay unset.
     DataFileBuilder::default()
-        .content(task.data_file_content)
-        .file_path(task.data_file_path.clone())
-        .file_format(task.data_file_format)
-        .record_count(task.record_count.unwrap_or(0))
-        .file_size_in_bytes(task.file_size_in_bytes)
-        .partition(task.partition.clone().unwrap_or_else(Struct::empty))
-        .equality_ids(task.equality_ids.clone())
-        .referenced_data_file(task.referenced_data_file.clone())
+        .content(iceberg::spec::DataContentType::Data)
+        .file_path(task.data_file_path().to_string())
+        .file_format(task.data_file_format())
+        .record_count(task.record_count().unwrap_or(0))
+        .file_size_in_bytes(task.file_size_in_bytes())
+        .partition(task.partition().cloned().unwrap_or_else(Struct::empty))
         .build()
         .map_err(|e| {
             SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "compact_file_group: failed to build data file metadata for '{}': {e}",
-                task.data_file_path
+                task.data_file_path()
             ))
         })
 }
@@ -596,26 +594,19 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        FileScanTask {
-            file_size_in_bytes: size,
-            start: 0,
-            length: size,
-            record_count,
-            data_file_path: path.to_string(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::Data,
-            data_file_format: DataFileFormat::Parquet,
-            schema,
-            project_field_ids: vec![1],
-            predicate: None,
-            deletes: vec![],
-            sequence_number: 0,
-            equality_ids: None,
-            partition: Some(Struct::empty()),
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        }
+        FileScanTask::builder()
+            .with_file_size_in_bytes(size)
+            .with_start(0)
+            .with_length(size)
+            .with_record_count(record_count)
+            .with_data_file_path(path.to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema)
+            .with_project_field_ids(vec![1])
+            .with_partition(Some(Struct::empty()))
+            .with_case_sensitive(true)
+            .build()
+            .unwrap()
     }
 
     fn sample_request(group_file_paths: Vec<String>, snapshot_id: i64) -> CompactGroupRequest {
@@ -754,8 +745,9 @@ mod tests {
             }}"#
         );
         let metadata: iceberg::spec::TableMetadata = serde_json::from_str(&json).unwrap();
-        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let file_io = FileIO::new_with_fs();
         IcebergTable::builder()
+            .runtime(iceberg::Runtime::current())
             .metadata(metadata)
             .identifier(TableIdent::from_strs(["ns", "tbl"]).unwrap())
             .file_io(file_io)
@@ -819,7 +811,7 @@ mod tests {
     /// (`iceberg::io::storage::memory`), so a "writer" and the cleanup path
     /// see the same store without any S3 endpoint.
     fn memory_io() -> FileIO {
-        FileIOBuilder::new("memory").build().unwrap()
+        FileIO::new_with_memory()
     }
 
     async fn write_object(io: &FileIO, path: &str) {

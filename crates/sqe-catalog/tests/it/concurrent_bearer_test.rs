@@ -384,154 +384,18 @@ async fn concurrent_list_namespaces_with_slow_config_init_keeps_bearer() {
     );
 }
 
-/// Sanity check on the test infrastructure: drive a `RestCatalog`
-/// with no token, no credential, and no GCP creds — exactly the
-/// shape that fires the diagnostic warn — and assert the
-/// `CaptureWriter` actually picks it up. If this test fails the
-/// problem is in our log-capture wiring, not in the production
-/// code path; the regression test results above are then suspect.
-///
-/// Uses the upstream `RestCatalogBuilder` directly rather than
-/// `SessionCatalog::new` because SessionCatalog always sets the
-/// token prop. The upstream builder lets us reach the unauthed
-/// branch of `authenticate` without circumventing public API.
-#[tokio::test(flavor = "current_thread")]
-async fn capture_layer_observes_unauth_warn() {
-    use iceberg::{Catalog, CatalogBuilder};
-    use iceberg_catalog_rest::RestCatalogBuilder;
-    use std::collections::HashMap;
+// The `capture_layer_observes_unauth_warn` sanity test lived here. It
+// asserted the old fork's "Outbound REST request issued WITHOUT
+// Authorization" warn, which apache's AuthSession client does not emit.
+// The concurrent tests above no longer get signal from that warn count;
+// their guarantee now rests on the `errors.is_empty()` assertion, since
+// `polaris_mock` answers any request without Authorization with 401.
 
-    let server = MockServer::start().await;
-    // Permissive mock: respond 200 to any GET, regardless of auth.
-    // We don't care about the wire-level result; we just want the
-    // unauthed authenticate() call to flow through and fire the warn.
-    Mock::given(method("GET"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(r#"{"overrides":{},"defaults":{},"namespaces":[]}"#),
-        )
-        .mount(&server)
-        .await;
-
-    let capture = CaptureWriter::new();
-    let layer = tracing_subscriber::fmt::layer()
-        .with_ansi(false)
-        .with_target(true)
-        .with_writer(capture.clone());
-    let filter =
-        tracing_subscriber::EnvFilter::new("iceberg_catalog_rest=trace,sqe_catalog=trace,warn");
-    let dispatch = tracing::dispatcher::Dispatch::new(Registry::default().with(filter).with(layer));
-
-    // Build a RestCatalog with NO token, NO credential. This is the
-    // exact precondition for the diagnostic warn at client.rs:281.
-    let mut props = HashMap::new();
-    props.insert("uri".to_string(), server.uri());
-    let catalog = RestCatalogBuilder::default()
-        .load("sanity-no-auth".to_string(), props)
-        .await
-        .expect("RestCatalogBuilder accepts an empty-props build");
-
-    // One call is enough — the OnceCell init triggers authenticate
-    // for the /v1/config request.
-    let _ = catalog
-        .list_namespaces(None)
-        .with_subscriber(dispatch)
-        .await;
-
-    let log = capture.contents();
-    let warns = count_unauth_warns(&log);
-    assert!(
-        warns >= 1,
-        "Capture infrastructure failed to record the diagnostic warn even \
-         though we deliberately built an unauthed RestCatalog. The other \
-         tests in this file are not trustworthy until this passes.\n\n\
-         === full captured log ===\n{log}",
-    );
-}
-
-/// Verifies the defensive guard added for issue #2: a `RestCatalog`
-/// that was constructed with a bearer token must refuse to issue an
-/// outbound REST call without `Authorization` if the live token has
-/// been cleared after init.
-///
-/// We construct the catalog the normal way (token in props, init runs,
-/// `auth_required` flag flips to true), then call the public
-/// `invalidate_token()` to simulate the end state of any race that
-/// would leave the mutex holding `None` while `auth_required` says we
-/// should still be authenticated. The next `list_namespaces` call must
-/// hit the new guard at `client::authenticate` and surface a clear
-/// `DataInvalid` error rather than silently going on the wire bare.
-#[tokio::test(flavor = "current_thread")]
-async fn auth_required_guard_refuses_unauthed_request_after_token_cleared() {
-    use iceberg::{Catalog, CatalogBuilder};
-    use iceberg_catalog_rest::RestCatalogBuilder;
-    use std::collections::HashMap;
-
-    let server = MockServer::start().await;
-    polaris_mock(&server, std::time::Duration::ZERO).await;
-
-    // Build a RestCatalog with a token so `auth_required = true`
-    // propagates through both `HttpClient::new` and `update_with`.
-    let mut props = HashMap::new();
-    props.insert("uri".to_string(), server.uri());
-    props.insert("token".to_string(), "live-token-xyz".to_string());
-    props.insert("warehouse".to_string(), "test-warehouse".to_string());
-    let catalog = RestCatalogBuilder::default()
-        .load("auth-required-guard".to_string(), props)
-        .await
-        .expect("RestCatalogBuilder accepts an authenticated build");
-
-    // Drive one successful call so the OnceCell context is initialised
-    // with a live token. Without this the invalidate_token below
-    // would race the init future and the assertion below would just
-    // re-test the no-auth-at-all path.
-    catalog
-        .list_namespaces(None)
-        .await
-        .expect("first list_namespaces should authenticate cleanly");
-
-    // Now simulate the end state of any concurrency race that drops
-    // the token: clear it directly via the public API.
-    catalog
-        .invalidate_token()
-        .await
-        .expect("invalidate_token is infallible");
-
-    // The next call must hit the auth_required guard and fail with a
-    // DataInvalid error containing "Refusing to send outbound REST
-    // request without Authorization". It must NOT silently send a bare
-    // request to the wiremock server.
-    let err = catalog
-        .list_namespaces(None)
-        .await
-        .expect_err("list_namespaces after invalidate_token should fail loudly");
-
-    let msg = err.to_string();
-    assert!(
-        msg.contains("Refusing to send outbound REST request without Authorization"),
-        "Expected the auth_required guard message; got: {msg}",
-    );
-
-    // Server should NOT have seen a second outbound call without auth.
-    // wiremock's catch-all 401 mock would have responded if the request
-    // had escaped the guard. The request log lets us assert exactly
-    // that.
-    let request_log = format_request_log(&server).await;
-    let unauth_outbound_count = server
-        .received_requests()
-        .await
-        .unwrap_or_default()
-        .iter()
-        .filter(|r| {
-            r.headers.get("authorization").is_none() && r.headers.get("Authorization").is_none()
-        })
-        .count();
-    assert_eq!(
-        unauth_outbound_count, 0,
-        "An unauthenticated request reached the wiremock server even though \
-         the auth_required guard should have rejected it.\n\n{request_log}",
-    );
-}
+// The issue #2 `auth_required` guard test lived here. It cleared the token
+// through `RestCatalog::invalidate_token()`, which apache's AuthSession
+// layer removed; the guard itself now sits in the vendored
+// `catalog/rest/src/auth/oauth2.rs` (SQE PATCH sqe#2) and the token cell is
+// only cleared by the 401 path, which re-exchanges instead of sending bare.
 
 /// Verifies SQE's own construction-time guard: passing an empty bearer
 /// to `SessionCatalog::new` must NOT result in `"token" -> ""` landing

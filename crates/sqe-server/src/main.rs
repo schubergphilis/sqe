@@ -3457,8 +3457,9 @@ mod tests {
             "snapshots": []
         }"#;
         let metadata: iceberg::spec::TableMetadata = serde_json::from_str(META_V1).unwrap();
-        let file_io = iceberg::io::FileIOBuilder::new_fs_io().build().unwrap();
+        let file_io = iceberg::io::FileIO::new_with_fs();
         iceberg::table::Table::builder()
+            .runtime(iceberg::Runtime::current())
             .metadata(metadata)
             .identifier(iceberg::TableIdent::new(
                 iceberg::NamespaceIdent::new("ns".to_string()),

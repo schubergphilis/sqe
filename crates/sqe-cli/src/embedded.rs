@@ -517,6 +517,7 @@ async fn open_embedded_sqlite_catalog(
         warehouse_uri.to_string(),
     );
     let catalog = SqlCatalogBuilder::default()
+        .with_storage_factory(sqe_catalog::storage_factory())
         .load("sqe-embedded".to_string(), props)
         .await
         .map_err(|e| anyhow::anyhow!("SQLite catalog open failed: {e}"))?;
@@ -596,7 +597,7 @@ pub async fn build_embedded_context_with_backend(
     let catalog = sqe_catalog::SessionCatalog::build_backend_catalog(backend)
         .await
         .map_err(|e| anyhow::anyhow!("failed to build `{catalog_name}` catalog: {e}"))?;
-    let provider = iceberg_datafusion::IcebergCatalogProvider::try_new(catalog)
+    let provider = datafusion_iceberg::IcebergCatalogProvider::try_new(catalog)
         .await
         .map_err(|e| anyhow::anyhow!("failed to attach `{catalog_name}` catalog: {e}"))?;
     ctx.register_catalog(catalog_name, Arc::new(provider));

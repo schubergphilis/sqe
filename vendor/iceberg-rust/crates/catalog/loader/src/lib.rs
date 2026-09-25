@@ -19,6 +19,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use iceberg::encryption::kms::KmsClientFactory;
+use iceberg::io::StorageFactory;
 use iceberg::{Catalog, CatalogBuilder, Error, ErrorKind, Result};
 use iceberg_catalog_rest::RestCatalogBuilder;
 
@@ -73,6 +75,16 @@ pub fn supported_types() -> Vec<&'static str> {
 // `aws-sdk` clients, all of which are `Send + Sync`).
 #[async_trait]
 pub trait BoxedCatalogBuilder: Send + Sync {
+    fn with_storage_factory(
+        self: Box<Self>,
+        storage_factory: Arc<dyn StorageFactory>,
+    ) -> Box<dyn BoxedCatalogBuilder>;
+
+    fn with_kms_client_factory(
+        self: Box<Self>,
+        kms_client_factory: Arc<dyn KmsClientFactory>,
+    ) -> Box<dyn BoxedCatalogBuilder>;
+
     async fn load(
         self: Box<Self>,
         name: String,
@@ -81,7 +93,24 @@ pub trait BoxedCatalogBuilder: Send + Sync {
 }
 
 #[async_trait]
-impl<T: CatalogBuilder + Send + Sync + 'static> BoxedCatalogBuilder for T {
+impl<T: CatalogBuilder + 'static> BoxedCatalogBuilder for T {
+    fn with_storage_factory(
+        self: Box<Self>,
+        storage_factory: Arc<dyn StorageFactory>,
+    ) -> Box<dyn BoxedCatalogBuilder> {
+        Box::new(CatalogBuilder::with_storage_factory(*self, storage_factory))
+    }
+
+    fn with_kms_client_factory(
+        self: Box<Self>,
+        kms_client_factory: Arc<dyn KmsClientFactory>,
+    ) -> Box<dyn BoxedCatalogBuilder> {
+        Box::new(CatalogBuilder::with_kms_client_factory(
+            *self,
+            kms_client_factory,
+        ))
+    }
+
     async fn load(
         self: Box<Self>,
         name: String,
@@ -135,7 +164,9 @@ impl CatalogLoader<'_> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
+    use iceberg::io::LocalFsStorageFactory;
     use sqlx::migrate::MigrateDatabase;
     use tempfile::TempDir;
 
@@ -235,6 +266,7 @@ mod tests {
 
         let catalog_loader = load("hms").unwrap();
         let catalog = catalog_loader
+            .with_storage_factory(Arc::new(LocalFsStorageFactory))
             .load(
                 "hms".to_string(),
                 HashMap::from([
@@ -265,6 +297,7 @@ mod tests {
 
         let catalog_loader = load("sql").unwrap();
         let catalog = catalog_loader
+            .with_storage_factory(Arc::new(LocalFsStorageFactory))
             .load(
                 "sql".to_string(),
                 HashMap::from([

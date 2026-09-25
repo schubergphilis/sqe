@@ -65,6 +65,9 @@ pub struct RowDeltaAction {
     removed_data_files: Vec<DataFile>,
     /// Delete files to add (position or equality deletes).
     added_delete_files: Vec<DataFile>,
+    /// Delete files to retire, e.g. a V3 deletion vector superseded by a new
+    /// one for the same data file.
+    removed_delete_files: Vec<DataFile>,
     /// Optional commit UUID for manifest file naming.
     commit_uuid: Option<Uuid>,
     /// Additional properties merged into the snapshot summary.
@@ -79,6 +82,7 @@ impl RowDeltaAction {
             added_data_files: vec![],
             removed_data_files: vec![],
             added_delete_files: vec![],
+            removed_delete_files: vec![],
             commit_uuid: None,
             snapshot_properties: HashMap::default(),
             starting_snapshot_id: None,
@@ -100,6 +104,17 @@ impl RowDeltaAction {
     /// Add delete files (position or equality deletes) to the snapshot.
     pub fn add_delete_files(mut self, delete_files: impl IntoIterator<Item = DataFile>) -> Self {
         self.added_delete_files.extend(delete_files);
+        self
+    }
+
+    /// Retire delete files in the same snapshot.
+    ///
+    /// SQE PATCH (V3 deletion vectors): a snapshot may hold at most one
+    /// deletion vector per data file, so a writer that deletes more rows from
+    /// a file merges the old vector into a new one and removes the old one
+    /// here, like iceberg-java's `RowDelta.removeDeletes`.
+    pub fn remove_delete_files(mut self, delete_files: impl IntoIterator<Item = DataFile>) -> Self {
+        self.removed_delete_files.extend(delete_files);
         self
     }
 
@@ -131,6 +146,7 @@ impl TransactionAction for RowDeltaAction {
         if self.added_data_files.is_empty()
             && self.removed_data_files.is_empty()
             && self.added_delete_files.is_empty()
+            && self.removed_delete_files.is_empty()
         {
             return Err(crate::Error::new(
                 crate::ErrorKind::DataInvalid,
@@ -155,19 +171,24 @@ impl TransactionAction for RowDeltaAction {
         // The fork's SnapshotProducer already handles removed_data_files and
         // added_delete_files directly. We only need to provide the operation
         // classification and let DefaultManifestProcess carry the manifests.
-        let snapshot_producer = SnapshotProducer::new(
+        let mut snapshot_producer = SnapshotProducer::new(
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
-            None, // key_metadata
             None, // snapshot_id - auto-generate
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
             self.added_delete_files.clone(),
             self.removed_data_files.clone(),
-            vec![], // removed_delete_files (not used by RowDelta)
+            self.removed_delete_files.clone(),
         );
 
-        snapshot_producer.validate_added_data_files(&self.added_data_files)?;
+        snapshot_producer.validate_added_files(&self.added_data_files)?;
+        snapshot_producer.validate_added_files(&self.added_delete_files)?;
+        if !self.removed_delete_files.is_empty() {
+            // Rewrites the delete manifests without the retired files.
+            // Same manifest-load fan-out ReplaceFilesAction defaults to.
+            snapshot_producer.enable_delete_filter_manager(16)?;
+        }
 
         let operation = RowDeltaOperation {
             has_removed_data: !self.removed_data_files.is_empty(),
@@ -221,9 +242,7 @@ impl SnapshotProduceOperation for RowDeltaOperation {
             let Some(snapshot) = table.metadata().current_snapshot() else {
                 return Ok(vec![]);
             };
-            let manifest_list = snapshot
-                .load_manifest_list(table.file_io(), &table.metadata_ref())
-                .await?;
+            let manifest_list = table.manifest_list_reader(snapshot).load().await?;
             Ok(manifest_list.entries().to_vec())
         }
     }
@@ -459,5 +478,50 @@ mod tests {
         } else {
             panic!("expected AddSnapshot update; got {:?}", updates[0]);
         }
+    }
+
+    /// A V3 deletion vector for `data_path`: a Puffin blob naming its file.
+    fn deletion_vector(path: &str, data_path: &str) -> crate::spec::DataFile {
+        let table = crate::transaction::tests::make_v3_minimal_table();
+        DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(path.to_string())
+            .file_format(DataFileFormat::Puffin)
+            .file_size_in_bytes(50)
+            .record_count(2)
+            .referenced_data_file(Some(data_path.to_string()))
+            .content_offset(Some(4))
+            .content_size_in_bytes(Some(40))
+            .partition_spec_id(table.metadata().default_partition_spec_id())
+            .partition(Struct::from_iter([Some(Literal::long(100))]))
+            .build()
+            .unwrap()
+    }
+
+    /// Spec: "Position delete files must not be added to v3 tables".
+    #[tokio::test]
+    async fn test_v3_rejects_position_delete_files() {
+        let table = crate::transaction::tests::make_v3_minimal_table();
+
+        let row_delta = Transaction::new(&table)
+            .row_delta()
+            .add_delete_files(vec![position_delete_file("test/pos-del.parquet")]);
+        let err = Arc::new(row_delta).commit(&table).await.err().expect("must reject");
+        assert!(err.to_string().contains("must not be added to v3"), "{err}");
+
+        let append = Transaction::new(&table)
+            .fast_append()
+            .add_data_files(vec![position_delete_file("test/pos-del.parquet")]);
+        let err = Arc::new(append).commit(&table).await.err().expect("must reject");
+        assert!(err.to_string().contains("must not be added to v3"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_v3_accepts_deletion_vector() {
+        let table = crate::transaction::tests::make_v3_minimal_table();
+        let action = Transaction::new(&table)
+            .row_delta()
+            .add_delete_files(vec![deletion_vector("test/dv.puffin", "test/data.parquet")]);
+        Arc::new(action).commit(&table).await.unwrap();
     }
 }

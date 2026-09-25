@@ -46,14 +46,40 @@ pub struct DeleteAwareReadPlan {
     pub tasks_by_path: HashMap<String, Vec<iceberg::scan::FileScanTask>>,
 }
 
+/// Scan builder for any read whose rows are written back (DML rewrites,
+/// compaction). On V3 it also selects `_row_id` and
+/// `_last_updated_sequence_number`: the spec requires a rewritten row to keep
+/// both, and the reader synthesizes them (first_row_id + _pos) when a file
+/// does not store them. The streaming writer persists them when present.
+pub fn rewrite_scan_builder(table: &IcebergTable) -> iceberg::scan::TableScanBuilder<'_> {
+    use iceberg::metadata_columns::{
+        RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_ROW_ID,
+    };
+    if table.metadata().format_version() < iceberg::spec::FormatVersion::V3 {
+        return table.scan().select_all();
+    }
+    let columns = table
+        .metadata()
+        .current_schema()
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|f| f.name.clone())
+        .chain([
+            RESERVED_COL_NAME_ROW_ID.to_string(),
+            RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER.to_string(),
+        ])
+        .collect::<Vec<_>>();
+    table.scan().select(columns)
+}
+
 /// Build the delete-aware read plan for the current snapshot. Plan once, right
 /// after loading the table, so the task set matches the snapshot whose files the
 /// rewrite deletes.
 pub async fn plan_delete_aware_read(table: &IcebergTable) -> sqe_core::Result<DeleteAwareReadPlan> {
-    let scan =
-        table.scan().select_all().build().map_err(|e| {
-            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build compaction read scan: {e}"))
-        })?;
+    let scan = rewrite_scan_builder(table).build().map_err(|e| {
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to build compaction read scan: {e}"))
+    })?;
     let tasks: Vec<iceberg::scan::FileScanTask> = scan
         .plan_files()
         .await
@@ -64,7 +90,7 @@ pub async fn plan_delete_aware_read(table: &IcebergTable) -> sqe_core::Result<De
     let mut tasks_by_path: HashMap<String, Vec<iceberg::scan::FileScanTask>> = HashMap::new();
     for task in tasks {
         tasks_by_path
-            .entry(task.data_file_path.clone())
+            .entry(task.data_file_path().to_string())
             .or_default()
             .push(task);
     }
@@ -300,7 +326,7 @@ pub fn delete_heavy_files(
     for (path, tasks) in tasks_by_path {
         let distinct: HashSet<&str> = tasks
             .iter()
-            .flat_map(|t| t.deletes.iter().map(|d| d.data_file_path.as_str()))
+            .flat_map(|t| t.deletes().iter().map(|d| d.file_path.as_str()))
             .collect();
         if distinct.len() >= threshold {
             out.insert(path.clone());
@@ -502,6 +528,26 @@ pub async fn rewrite_group(
 ) -> sqe_core::Result<(Vec<DataFile>, Vec<DataFile>, u64)> {
     use futures::StreamExt;
 
+    // V3: the read plan selects the row-lineage columns (rewrite_scan_builder);
+    // declare them on the stream so the sort keeps them and the writer persists
+    // them. The callers' schema is the table's.
+    let lineage_schema;
+    let arrow_schema = if table.metadata().format_version() >= iceberg::spec::FormatVersion::V3 {
+        let with_lineage =
+            crate::writer::schema_with_row_lineage(table.metadata().current_schema())?;
+        lineage_schema = Arc::new(
+            iceberg::arrow::schema_to_arrow_schema(&with_lineage).map_err(|e| {
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Failed to derive row-lineage read schema: {e}"),
+                )
+            })?,
+        );
+        &lineage_schema
+    } else {
+        arrow_schema
+    };
+
     // Gather every scan task for the group's data files. Each task carries the
     // delete files that apply to it; missing a file from the plan means we would
     // read it without its deletes and resurrect deleted rows, so fail loud.
@@ -535,9 +581,12 @@ pub async fn rewrite_group(
         .scan
         .read_tasks_to_arrow_with_metrics(task_stream)
         .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("delete-aware compaction read failed: {e}")))?;
-    let df_stream = scan_result
-        .stream()
-        .map(|item| item.map_err(|e| datafusion::error::DataFusionError::External(Box::new(e))));
+    let df_stream = scan_result.stream().map(|item| {
+        let batch = item.map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        // V3: plain longs for the row-lineage columns (no-op otherwise).
+        crate::writer::decode_lineage_columns(batch)
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
+    });
     let sendable: datafusion::execution::SendableRecordBatchStream = Box::pin(
         datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
             arrow_schema.clone(),

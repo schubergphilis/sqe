@@ -561,7 +561,7 @@ async fn live_data_file_count(catalog: &Arc<dyn Catalog>, ident: &TableIdent) ->
         .expect("collect scan tasks");
     let mut paths: std::collections::HashSet<String> = std::collections::HashSet::new();
     for t in tasks {
-        paths.insert(t.data_file_path.clone());
+        paths.insert(t.data_file_path().to_string());
     }
     paths.len()
 }

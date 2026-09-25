@@ -45,19 +45,138 @@
 //! REST-only build (Polaris / Nessie / Lakekeeper) doesn't pull in
 //! `aws-config`.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::SystemTime;
 
+use async_trait::async_trait;
 use aws_credential_types::Credentials;
 use aws_credential_types::provider::ProvideCredentials;
 use aws_sigv4::http_request::{
     PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings, sign,
 };
 use aws_sigv4::sign::v4;
-use bytes::Bytes;
 use http::HeaderValue;
 use iceberg::{Error, ErrorKind, Result};
-use reqwest::Request;
 use tokio::sync::OnceCell;
+
+use crate::auth::{AuthManager, AuthSession};
+use crate::client::HttpClient;
+use crate::request::HttpRequest;
+
+/// `rest.auth.type` value selecting SigV4 signing (Iceberg Java parity).
+pub const AUTH_TYPE_SIGV4: &str = "sigv4";
+
+fn sigv4_enabled(props: &HashMap<String, String>) -> bool {
+    props
+        .get("rest.sigv4-enabled")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
+fn non_empty<'a>(props: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+    props.get(key).map(String::as_str).filter(|v| !v.is_empty())
+}
+
+/// Wraps the auth manager `rest.auth.type` resolved and swaps in SigV4
+/// signing when AWS-style signing applies. AWS's Iceberg REST endpoints
+/// (federated `glue`, per-bucket `s3tables`) advertise it in `/v1/config`
+/// through `rest.sigv4-enabled`, `rest.signing-name` and
+/// `rest.signing-region`; the user config can set the same properties, or
+/// `rest.auth.type=sigv4`.
+///
+/// A server-advertised `rest.sigv4-enabled` never replaces a configured
+/// bearer token or credential (SQE issue 748): that would swap the caller's
+/// per-user identity for the process's AWS identity on every request (a
+/// confused deputy). Only SigV4 the user config itself asked for is used
+/// alongside a bearer.
+#[derive(Debug)]
+pub struct SigV4Manager {
+    fallback: Arc<dyn AuthManager>,
+    user_requested: bool,
+    bearer_bound: bool,
+}
+
+impl SigV4Manager {
+    /// Wraps `fallback`, deciding from the user-supplied `props`. `forced`
+    /// is `rest.auth.type=sigv4`.
+    pub fn wrap(
+        fallback: Arc<dyn AuthManager>,
+        props: &HashMap<String, String>,
+        forced: bool,
+    ) -> Self {
+        Self {
+            fallback,
+            user_requested: forced || sigv4_enabled(props),
+            bearer_bound: non_empty(props, "token").is_some()
+                || non_empty(props, "credential").is_some(),
+        }
+    }
+
+    /// The signer for a session over `props`, or `None` to use the fallback.
+    fn signer(&self, props: &HashMap<String, String>) -> Option<SigV4Signer> {
+        let wanted = self.user_requested || (sigv4_enabled(props) && !self.bearer_bound);
+        if !wanted {
+            return None;
+        }
+        let signer = SigV4Signer::new(
+            non_empty(props, "rest.signing-region")?,
+            non_empty(props, "rest.signing-name")?,
+        );
+        // S3-compatible servers that sign their Iceberg REST catalog
+        // (RustFS S3 Tables) authenticate it with the object-store keys, so
+        // the same `s3.*` keys serve both. Without them the AWS SDK provider
+        // chain resolves the identity.
+        Some(
+            match (
+                non_empty(props, "s3.access-key-id"),
+                non_empty(props, "s3.secret-access-key"),
+            ) {
+                (Some(key), Some(secret)) => signer.with_static_credentials(
+                    key,
+                    secret,
+                    props.get("s3.session-token").cloned(),
+                ),
+                _ => signer,
+            },
+        )
+    }
+}
+
+#[async_trait]
+impl AuthManager for SigV4Manager {
+    async fn init_session(
+        &self,
+        client: &HttpClient,
+        props: &HashMap<String, String>,
+    ) -> Result<Box<dyn AuthSession>> {
+        match self.signer(props) {
+            Some(signer) => Ok(Box::new(SigV4Session(signer))),
+            None => self.fallback.init_session(client, props).await,
+        }
+    }
+
+    async fn catalog_session(
+        &self,
+        client: &HttpClient,
+        props: &HashMap<String, String>,
+    ) -> Result<Arc<dyn AuthSession>> {
+        match self.signer(props) {
+            Some(signer) => Ok(Arc::new(SigV4Session(signer))),
+            None => self.fallback.catalog_session(client, props).await,
+        }
+    }
+}
+
+/// [`AuthSession`] signing every request with SigV4.
+#[derive(Debug)]
+struct SigV4Session(SigV4Signer);
+
+#[async_trait]
+impl AuthSession for SigV4Session {
+    async fn authenticate(&self, request: &mut HttpRequest) -> Result<()> {
+        self.0.sign(request).await
+    }
+}
 
 /// Resolves AWS credentials lazily on first use. The default chain
 /// (env vars, shared config, IMDS, etc.) is what every other AWS SDK
@@ -164,23 +283,18 @@ impl SigV4Signer {
     /// `Authorization`, `x-amz-date`, and (when applicable)
     /// `x-amz-security-token` lines.
     ///
-    /// The signed bytes have to match what the wire actually carries,
-    /// so we read the request body via `req.body()` and feed it to the
-    /// signer as `SignableBody::Bytes`. `reqwest::Request` bodies are
-    /// always materialised before a request is built (the catalog
-    /// calls `RequestBuilder::body(serde_json::to_vec(...))`), so this
-    /// is safe.
-    pub(crate) async fn sign(&self, req: &mut Request) -> Result<()> {
-        // `aws-sigv4` wants the body bytes as `SignableBody::Bytes(&[u8])`
-        // (so it can hash them into the canonical request). Pull the
-        // body out of the reqwest::Request; the headers are signed in place.
-        let body_bytes: Bytes = match req.body().and_then(|b| b.as_bytes()) {
-            Some(b) => Bytes::copy_from_slice(b),
-            None => Bytes::new(),
-        };
-        let url = req.url().to_string();
+    /// The signed bytes have to match what the wire carries, so the
+    /// body is hashed as-is; a streaming body cannot be signed.
+    pub(crate) async fn sign(&self, req: &mut HttpRequest) -> Result<()> {
+        let body = req.body().as_bytes().map(<[u8]>::to_vec).ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "SigV4 cannot sign a request with a streaming body",
+            )
+        })?;
+        let url = req.url_str().to_string();
         let method = req.method().as_str().to_string();
-        self.sign_headers(&method, &url, req.headers_mut(), &body_bytes)
+        self.sign_headers(&method, &url, req.headers_mut(), &body)
             .await
     }
 
@@ -286,5 +400,64 @@ impl SigV4Signer {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::NoopAuthManager;
+
+    fn props(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    const ADVERTISED: [(&str, &str); 3] = [
+        ("rest.sigv4-enabled", "true"),
+        ("rest.signing-name", "glue"),
+        ("rest.signing-region", "eu-central-1"),
+    ];
+
+    /// SQE issue 748: a `/v1/config` that advertises `rest.sigv4-enabled`
+    /// must not swap a per-user bearer for the process's AWS identity.
+    #[test]
+    fn server_advertised_sigv4_does_not_replace_a_bearer() {
+        let mut merged_with_bearer = props(&ADVERTISED);
+        merged_with_bearer.insert("token".to_string(), "user-bearer".to_string());
+
+        let bearer = SigV4Manager::wrap(
+            Arc::new(NoopAuthManager),
+            &props(&[("token", "user-bearer")]),
+            false,
+        );
+        assert!(
+            bearer.signer(&merged_with_bearer).is_none(),
+            "server-advertised SigV4 replaced a bearer"
+        );
+
+        // No bearer anywhere: the advertised signer is adopted.
+        let anonymous = SigV4Manager::wrap(Arc::new(NoopAuthManager), &props(&[]), false);
+        assert!(anonymous.signer(&props(&ADVERTISED)).is_some());
+
+        // SigV4 the user asked for is honoured even with a bearer.
+        let forced = SigV4Manager::wrap(
+            Arc::new(NoopAuthManager),
+            &props(&[("token", "user-bearer")]),
+            true,
+        );
+        assert!(forced.signer(&merged_with_bearer).is_some());
+    }
+
+    #[test]
+    fn sigv4_without_signing_scope_falls_back() {
+        let manager = SigV4Manager::wrap(
+            Arc::new(NoopAuthManager),
+            &props(&[("rest.sigv4-enabled", "true")]),
+            false,
+        );
+        assert!(manager.signer(&props(&[("rest.sigv4-enabled", "true")])).is_none());
     }
 }

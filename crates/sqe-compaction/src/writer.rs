@@ -277,7 +277,7 @@ pub async fn write_data_files_streaming(
     target_file_size: Option<u64>,
     mut progress: Option<crate::progress::ProgressReporter>,
 ) -> sqe_core::Result<(Vec<DataFile>, usize)> {
-    let inner_loc = DefaultLocationGenerator::new(table.metadata().clone())
+    let inner_loc = DefaultLocationGenerator::new(table.metadata())
         .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Location generator error: {e}")))?;
     let location_generator = TrackingLocationGenerator::new(inner_loc, tracker);
 
@@ -289,12 +289,23 @@ pub async fn write_data_files_streaming(
         iceberg::spec::DataFileFormat::Parquet,
     );
 
+    // V3 row lineage: a rewrite that read `_row_id` / `_last_updated_sequence_number`
+    // (see the delete-aware read plan) must persist them, so the data file's
+    // schema is the table schema plus the two reserved lineage fields. Inserts
+    // carry neither and write the table schema unchanged.
+    let lineage = carries_row_lineage(table, &stream.schema());
+    let write_schema = if lineage {
+        schema_with_row_lineage(table.metadata().current_schema())?
+    } else {
+        table.metadata().current_schema().clone()
+    };
+
     // Byte-identical to the coordinator's `writer_props_for_table` wrapper
     // (a 1-line forwarder): call the shared helper directly rather than
     // duplicating that wrapper across the crate boundary.
     let parquet_writer_builder = ParquetWriterBuilder::new(
         crate::parquet_writer_config::writer_props_for_table(table, compression),
-        table.metadata().current_schema().clone(),
+        write_schema.clone(),
     );
 
     // Roll output at the caller's requested size when given (compaction pins
@@ -323,8 +334,13 @@ pub async fn write_data_files_streaming(
     // for every batch without re-deriving it on each iteration.
     let metadata = table.metadata();
     let iceberg_schema = metadata.current_schema();
-    let stamped_schema = build_stamped_schema(iceberg_schema)?;
+    let stamped_schema = build_stamped_schema(&write_schema)?;
     let partition_spec = metadata.default_partition_spec().clone();
+    // Stamping is positional: put the lineage columns last, in schema order.
+    let stamp = |batch: RecordBatch| -> sqe_core::Result<RecordBatch> {
+        let batch = if lineage { lineage_columns_last(batch)? } else { batch };
+        apply_stamped_schema(batch, &stamped_schema)
+    };
 
     let mut total_rows = 0usize;
 
@@ -344,7 +360,7 @@ pub async fn write_data_files_streaming(
             if batch.num_rows() == 0 {
                 continue;
             }
-            let stamped = apply_stamped_schema(batch, &stamped_schema)?;
+            let stamped = stamp(batch)?;
             total_rows += stamped.num_rows();
             writer
                 .write(stamped)
@@ -403,7 +419,7 @@ pub async fn write_data_files_streaming(
                 if batch.num_rows() == 0 {
                     continue;
                 }
-                let stamped = apply_stamped_schema(batch, &stamped_schema)?;
+                let stamped = stamp(batch)?;
                 total_rows += stamped.num_rows();
                 writer.write(stamped).await?;
                 if let Some(p) = progress.as_mut() {
@@ -438,7 +454,7 @@ pub async fn write_data_files_streaming(
                 if batch.num_rows() == 0 {
                     continue;
                 }
-                let stamped = apply_stamped_schema(batch, &stamped_schema)?;
+                let stamped = stamp(batch)?;
                 total_rows += stamped.num_rows();
                 writer
                     .write(stamped)
@@ -473,6 +489,154 @@ pub async fn write_data_files_streaming(
     );
 
     Ok((data_files, total_rows))
+}
+
+/// Whether a write into `table` must persist V3 row lineage: the table is V3
+/// and the incoming batches carry `_row_id` (a rewrite read selected it). A
+/// table column that happens to use the reserved name is not lineage.
+pub fn carries_row_lineage(table: &Table, input: &ArrowSchema) -> bool {
+    use iceberg::metadata_columns::RESERVED_COL_NAME_ROW_ID;
+    table.metadata().format_version() >= iceberg::spec::FormatVersion::V3
+        && input.column_with_name(RESERVED_COL_NAME_ROW_ID).is_some()
+        && table
+            .metadata()
+            .current_schema()
+            .field_by_name(RESERVED_COL_NAME_ROW_ID)
+            .is_none()
+}
+
+/// `schema` plus the two reserved V3 row-lineage fields, for a data file's
+/// Parquet schema only (the table's schema never lists them).
+pub fn schema_with_row_lineage(
+    schema: &iceberg::spec::SchemaRef,
+) -> sqe_core::Result<iceberg::spec::SchemaRef> {
+    use iceberg::metadata_columns::{last_updated_sequence_number_field, row_id_field};
+    let fields = schema
+        .as_struct()
+        .fields()
+        .iter()
+        .cloned()
+        .chain([
+            row_id_field().clone(),
+            last_updated_sequence_number_field().clone(),
+        ]);
+    IcebergSchema::builder()
+        .with_schema_id(schema.schema_id())
+        .with_identifier_field_ids(schema.identifier_field_ids())
+        .with_fields(fields)
+        .build()
+        .map(Arc::new)
+        .map_err(|e| {
+            SqeError::with_code(
+                SqeErrorCode::ExecutionFailed,
+                format!("Failed to build row-lineage write schema: {e}"),
+            )
+        })
+}
+
+/// Decodes the row-lineage columns of a rewrite read into plain `Int64`.
+///
+/// The reader materializes `_last_updated_sequence_number` for files that do
+/// not store it as a per-file constant, run-end encoded. DataFusion expressions
+/// (UPDATE / MERGE CASE projections) and the writer's stamping expect a plain
+/// long, so rewrite reads decode it once, right after the scan.
+pub fn decode_lineage_columns(batch: RecordBatch) -> sqe_core::Result<RecordBatch> {
+    use iceberg::metadata_columns::{
+        RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_ROW_ID,
+    };
+    let schema = batch.schema();
+    let needs_decode = schema.fields().iter().any(|f| {
+        (f.name() == RESERVED_COL_NAME_ROW_ID
+            || f.name() == RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER)
+            && f.data_type() != &arrow_schema::DataType::Int64
+    });
+    if !needs_decode {
+        return Ok(batch);
+    }
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    let mut columns = Vec::with_capacity(schema.fields().len());
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let is_lineage = field.name() == RESERVED_COL_NAME_ROW_ID
+            || field.name() == RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER;
+        if is_lineage && field.data_type() != &arrow_schema::DataType::Int64 {
+            let decoded = cast(batch.column(idx), &arrow_schema::DataType::Int64).map_err(|e| {
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("Failed to decode row lineage column {}: {e}", field.name()),
+                )
+            })?;
+            fields.push(Arc::new(
+                arrow_schema::Field::new(field.name(), arrow_schema::DataType::Int64, true)
+                    .with_metadata(field.metadata().clone()),
+            ));
+            columns.push(decoded);
+        } else {
+            fields.push(field.clone());
+            columns.push(batch.column(idx).clone());
+        }
+    }
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new_with_metadata(fields, schema.metadata().clone())),
+        columns,
+    )
+    .map_err(|e| {
+        SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("Failed to decode row lineage columns: {e}"),
+        )
+    })
+}
+
+/// Reorders a batch so the lineage columns come last as `_row_id`,
+/// `_last_updated_sequence_number`, matching [`schema_with_row_lineage`]. A
+/// missing lineage column is filled with nulls (new rows: inheritance assigns
+/// both at commit).
+pub fn lineage_columns_last(batch: RecordBatch) -> sqe_core::Result<RecordBatch> {
+    use arrow_array::{ArrayRef, Int64Array};
+    use iceberg::metadata_columns::{
+        RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_ROW_ID,
+    };
+    let schema = batch.schema();
+    let lineage_col = |name: &str| -> sqe_core::Result<ArrayRef> {
+        match schema.index_of(name) {
+            Ok(idx) => cast(batch.column(idx), &arrow_schema::DataType::Int64).map_err(|e| {
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!("row lineage column {name} is not a long: {e}"),
+                )
+            }),
+            Err(_) => Ok(Arc::new(Int64Array::new_null(batch.num_rows()))),
+        }
+    };
+    let row_id = lineage_col(RESERVED_COL_NAME_ROW_ID)?;
+    let last_updated = lineage_col(RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER)?;
+    let mut fields = Vec::with_capacity(schema.fields().len() + 2);
+    let mut columns = Vec::with_capacity(schema.fields().len() + 2);
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let name = field.name().as_str();
+        if name != RESERVED_COL_NAME_ROW_ID && name != RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER
+        {
+            fields.push(field.clone());
+            columns.push(batch.column(idx).clone());
+        }
+    }
+    for (name, col) in [
+        (RESERVED_COL_NAME_ROW_ID, row_id),
+        (RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, last_updated),
+    ] {
+        fields.push(Arc::new(arrow_schema::Field::new(
+            name,
+            arrow_schema::DataType::Int64,
+            true,
+        )));
+        columns.push(col);
+    }
+    RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).map_err(|e| {
+        SqeError::with_code(
+            SqeErrorCode::ExecutionFailed,
+            format!("Failed to reorder row lineage columns: {e}"),
+        )
+    })
 }
 
 /// Allocate a fresh tracker for a streaming write. Bundled here so callers
@@ -757,7 +921,7 @@ impl<B: IcebergWriterBuilder> BoundedFanoutWriter<B> {
             .split(&batch)
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Partition split error: {e}")))?;
 
-        for (partition_key, part_batch, _row_ids) in partitioned {
+        for (partition_key, part_batch) in partitioned {
             if part_batch.num_rows() == 0 {
                 continue;
             }
@@ -889,6 +1053,35 @@ impl<B: IcebergWriterBuilder> BoundedFanoutWriter<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reader emits `_last_updated_sequence_number` as a run-end encoded
+    /// constant; the rewrite paths need plain longs, placed last for stamping.
+    #[test]
+    fn lineage_columns_decode_and_move_last() {
+        use arrow_array::{Array, Int32Array, Int64Array, RunArray};
+        let ree = RunArray::try_new(&Int32Array::from(vec![3]), &Int64Array::from(vec![7])).unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            arrow_schema::Field::new("_last_updated_sequence_number", ree.data_type().clone(), true),
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, true),
+            arrow_schema::Field::new("_row_id", arrow_schema::DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(ree),
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![Some(10), None, Some(12)])),
+            ],
+        )
+        .unwrap();
+        let out = lineage_columns_last(decode_lineage_columns(batch).unwrap()).unwrap();
+        let out_schema = out.schema();
+        let names: Vec<&str> = out_schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["id", "_row_id", "_last_updated_sequence_number"]);
+        let seq = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(seq.values(), &[7, 7, 7]);
+        assert!(out.column(1).is_null(1), "a null _row_id stays null (inherited at commit)");
+    }
     use std::sync::Arc;
 
     // ---- apply_stamped_schema arity (505) ------------------------------
@@ -1003,7 +1196,7 @@ mod tests {
     }
 
     fn fanout_builder(dir: &TempDir, schema: Arc<IceSchema>) -> impl IcebergWriterBuilder {
-        let file_io = iceberg::io::FileIOBuilder::new_fs_io().build().unwrap();
+        let file_io = iceberg::io::FileIO::new_with_fs();
         let loc =
             DefaultLocationGenerator::with_data_location(dir.path().to_str().unwrap().to_string());
         let name = DefaultFileNameGenerator::new(
@@ -1321,8 +1514,9 @@ mod tests {
             dir.path().to_str().unwrap()
         );
         let metadata: iceberg::spec::TableMetadata = serde_json::from_str(&json).unwrap();
-        let file_io = iceberg::io::FileIOBuilder::new_fs_io().build().unwrap();
+        let file_io = iceberg::io::FileIO::new_with_fs();
         Table::builder()
+            .runtime(iceberg::Runtime::current())
             .metadata(metadata)
             .identifier(iceberg::TableIdent::from_strs(["ns", "tbl"]).unwrap())
             .file_io(file_io)

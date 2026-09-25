@@ -35,6 +35,7 @@ use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent
 use iceberg_catalog_rest::{
     RestCatalogBuilder, REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE,
 };
+use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 use parquet::file::properties::WriterProperties;
 use tokio::sync::{Mutex, Semaphore};
 
@@ -412,7 +413,7 @@ async fn write_shard(
     batches: impl Iterator<Item = RecordBatch>,
 ) -> anyhow::Result<Vec<DataFile>> {
     let table = &table_ctx.table;
-    let location_gen = DefaultLocationGenerator::new(table.metadata().clone())
+    let location_gen = DefaultLocationGenerator::new(table.metadata())
         .context("building location generator")?;
     let file_name_gen =
         DefaultFileNameGenerator::new(file_prefix, None, iceberg::spec::DataFileFormat::Parquet);
@@ -592,6 +593,7 @@ pub async fn run_bank(
     let plan = spec.plan;
 
     let catalog = RestCatalogBuilder::default()
+        .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
         .load("polaris", target.catalog_props())
         .await
         .context("connecting to catalog")?;
@@ -752,6 +754,7 @@ pub async fn run_direct(
     const TABLE_DONE_PREFIX: &str = "sqe-bench.table.";
 
     let catalog = RestCatalogBuilder::default()
+        .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
         .load("polaris", target.catalog_props())
         .await
         .context("connecting to catalog")?;

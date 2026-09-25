@@ -34,6 +34,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 clap_builder = { version = "4", default-features = false, features = ["color", "env", "help", "std", "suggestions", "usage"] }
 crc32fast = { version = "1" }
+crypto-common = { version = "0.1", default-features = false, features = ["getrandom", "std"] }
 datafusion-common = { version = "55", default-features = false, features = ["object_store", "parquet", "recursive_protection", "sql"] }
 datafusion-datasource = { version = "55", default-features = false, features = ["compression", "proto"] }
 datafusion-datasource-arrow = { version = "55", default-features = false, features = ["compression", "proto"] }
@@ -45,7 +46,7 @@ datafusion-functions = { version = "55", features = ["crypto_expressions"] }
 datafusion-physical-expr = { version = "55", default-features = false, features = ["proto", "recursive_protection"] }
 datafusion-physical-expr-common = { version = "55", default-features = false, features = ["proto"] }
 datafusion-physical-plan = { version = "55", default-features = false, features = ["proto"] }
-digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["mac", "oid", "std"] }
+digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["mac", "std"] }
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid"] }
 either = { version = "1", features = ["use_std"] }
 event-listener-strategy = { version = "0.5" }
@@ -59,23 +60,20 @@ futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
 futures-task = { version = "0.3" }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
-getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std", "wasm_js"] }
-getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
+getrandom = { version = "0.3", default-features = false, features = ["std", "wasm_js"] }
 hashbrown-582f2526e08bb6a0 = { package = "hashbrown", version = "0.14", default-features = false, features = ["raw"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 httparse = { version = "1" }
 hyper = { version = "1", features = ["full"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "server-auto", "service"] }
 iceberg-catalog-rest = { path = "../../vendor/iceberg-rust/crates/catalog/rest", default-features = false, features = ["aws-sigv4"] }
+iceberg-storage-opendal = { path = "../../vendor/iceberg-rust/crates/storage/opendal" }
 indexmap = { version = "2" }
 lexical-parse-float = { version = "1", features = ["format"] }
 lexical-parse-integer = { version = "1", default-features = false, features = ["format", "std"] }
 lexical-util = { version = "1", default-features = false, features = ["format", "parse-floats", "parse-integers", "std", "write-floats", "write-integers"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
-md-5-93f6ce9d446188ac = { package = "md-5", version = "0.10" }
-md-5-a6292c17cd707f01 = { package = "md-5", version = "0.11" }
 memchr = { version = "2" }
 moka = { version = "0.12", features = ["future", "sync"] }
 num-bigint = { version = "0.4", features = ["serde"] }
@@ -86,7 +84,7 @@ once_cell = { version = "1" }
 opentelemetry = { version = "0.32", features = ["testing"] }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "testing"] }
 ordered-float = { version = "4", features = ["serde"] }
-parquet = { version = "59", features = ["object_store", "variant_experimental"] }
+parquet = { version = "59", features = ["encryption", "object_store", "variant_experimental"] }
 percent-encoding = { version = "2" }
 portable-atomic = { version = "1", features = ["require-cas"] }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
@@ -98,8 +96,8 @@ regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-lite = { version = "0.1" }
 regex-syntax = { version = "0.8" }
-reqwest-594e8ee84c453af0 = { package = "reqwest", version = "0.13", default-features = false, features = ["blocking", "form", "gzip", "http2", "json", "query", "rustls-no-provider"] }
-reqwest-5ef9efb8ec2df382 = { package = "reqwest", version = "0.12", default-features = false, features = ["http2", "json", "rustls-tls", "rustls-tls-native-roots", "stream"] }
+reqwest-594e8ee84c453af0 = { package = "reqwest", version = "0.13", default-features = false, features = ["blocking", "form", "gzip", "http2", "json", "query", "rustls-no-provider", "stream"] }
+reqwest-5ef9efb8ec2df382 = { package = "reqwest", version = "0.12", default-features = false, features = ["http2", "json", "rustls-tls-native-roots", "stream"] }
 ring = { version = "0.17", features = ["std"] }
 rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 rustls-pki-types = { version = "1", features = ["std"] }
@@ -124,11 +122,9 @@ toml_parser = { version = "1" }
 tower = { version = "0.5", default-features = false, features = ["balance", "buffer", "limit", "load-shed", "log"] }
 tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }
-tracing-futures = { version = "0.2", features = ["futures-03"] }
 tracing-log = { version = "0.2", default-features = false, features = ["log-tracer", "std"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 twox-hash = { version = "2", default-features = false, features = ["xxhash32", "xxhash64"] }
-typenum = { version = "1", default-features = false, features = ["const-generics"] }
 uuid = { version = "1", features = ["js", "serde", "v4", "v7"] }
 winnow = { version = "1" }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
@@ -140,7 +136,6 @@ zstd-sys = { version = "2", default-features = false, features = ["legacy", "std
 cc = { version = "1", default-features = false, features = ["parallel"] }
 either = { version = "1", features = ["use_std"] }
 foldhash = { version = "0.2" }
-getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 indexmap = { version = "2" }
 memchr = { version = "2" }
