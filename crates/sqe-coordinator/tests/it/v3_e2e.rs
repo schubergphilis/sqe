@@ -15,7 +15,7 @@
 //! ```text
 //! docker compose -f docker-compose.test.yml up -d
 //! ./scripts/bootstrap-test.sh
-//! cargo test --package sqe-coordinator --test v3_e2e -- \
+//! cargo test --package sqe-coordinator --test it v3_e2e -- \
 //!     --ignored --test-threads=1
 //! ```
 //!

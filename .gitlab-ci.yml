@@ -219,6 +219,9 @@ deps-check:
       cargo-machete --version 2>/dev/null | grep -qF "$CARGO_MACHETE_VERSION" \
         || cargo install cargo-machete --locked --force --version "$CARGO_MACHETE_VERSION"
       cargo machete --with-metadata crates/sqe-*
+      # No cargo needed; rides along because the job already runs on every
+      # MR that touches crates/**/*.rs.
+      scripts/check-test-layout.sh
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
       when: never

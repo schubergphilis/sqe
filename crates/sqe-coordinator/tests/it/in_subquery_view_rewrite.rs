@@ -376,7 +376,7 @@ async fn not_in_with_null_subquery_returns_non_matches() {
 // Gated with `#[ignore]` because 1M-row MemTable construction is slow in
 // debug builds. Run explicitly:
 //
-//   cargo test -p sqe-coordinator --release --test in_subquery_view_rewrite \
+//   cargo test -p sqe-coordinator --release --test it in_subquery_view_rewrite \
 //     stress_one_million_row_keyset -- --ignored --nocapture
 
 #[tokio::test(flavor = "multi_thread")]

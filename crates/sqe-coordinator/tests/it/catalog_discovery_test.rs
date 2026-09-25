@@ -23,7 +23,7 @@
 //! Run with:
 //!   `docker compose -f docker-compose.test.yml up -d && ./scripts/bootstrap-test.sh`
 //! then:
-//!   `cargo test -p sqe-coordinator --test catalog_discovery_test -- --ignored`
+//!   `cargo test -p sqe-coordinator --test it catalog_discovery_test -- --ignored`
 //!
 //! - `static_mode_rejects_undeclared_warehouse` -- static mode returns "unknown
 //!   catalog" for a warehouse that exists in Polaris but isn't in `[catalogs.*]`.

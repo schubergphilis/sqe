@@ -95,7 +95,7 @@
 //! other side by collapsing aged job history into one file per day.
 //!
 //! Run the integration test with
-//! `cargo test -p sqe-coordinator --features test-sqlite --test maintenance_lease_test`.
+//! `cargo test -p sqe-coordinator --features test-sqlite --test it maintenance_lease_test`.
 
 use std::sync::Arc;
 use std::time::Duration;
