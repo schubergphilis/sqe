@@ -3,7 +3,10 @@
 
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
+use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
+use opentelemetry_otlp::{
+    LogExporter, MetricExporter, SpanExporter, WithExportConfig, WithTonicConfig,
+};
 use opentelemetry_sdk::{
     logs::SdkLoggerProvider, metrics::SdkMeterProvider, propagation::TraceContextPropagator,
     trace::SdkTracerProvider, Resource,
@@ -13,6 +16,18 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
+
+/// TLS for an `https://` OTLP endpoint, verified against the system roots
+/// (`SSL_CERT_FILE` / `SSL_CERT_DIR` work for a private CA). opentelemetry-otlp
+/// falls back to `ClientTlsConfig::new()`, which carries NO roots, so every
+/// handshake would fail with an unknown issuer. Plain `http://` is untouched.
+pub(crate) fn with_otlp_tls<B: WithTonicConfig>(builder: B, endpoint: &str) -> B {
+    if endpoint.starts_with("https://") {
+        builder.with_tls_config(ClientTlsConfig::new().with_native_roots())
+    } else {
+        builder
+    }
+}
 
 /// Initialize the full observability stack with a configurable trace sampling rate.
 ///
@@ -58,8 +73,7 @@ pub fn init_telemetry_with_sampling(
         .build();
 
     // ── Traces ───────────────────────────────────────────────
-    let trace_exporter = SpanExporter::builder()
-        .with_tonic()
+    let trace_exporter = with_otlp_tls(SpanExporter::builder().with_tonic(), trace_endpoint)
         .with_endpoint(trace_endpoint)
         .build()
         .map_err(|e| {
@@ -91,8 +105,7 @@ pub fn init_telemetry_with_sampling(
     let (logger_provider, meter_provider) = if otlp_endpoint.is_empty() {
         (None, None)
     } else {
-        let log_exporter = LogExporter::builder()
-            .with_tonic()
+        let log_exporter = with_otlp_tls(LogExporter::builder().with_tonic(), otlp_endpoint)
             .with_endpoint(otlp_endpoint)
             .build()
             .map_err(|e| {
@@ -102,8 +115,7 @@ pub fn init_telemetry_with_sampling(
             .with_resource(resource.clone())
             .with_batch_exporter(log_exporter)
             .build();
-        let metric_exporter = MetricExporter::builder()
-            .with_tonic()
+        let metric_exporter = with_otlp_tls(MetricExporter::builder().with_tonic(), otlp_endpoint)
             .with_endpoint(otlp_endpoint)
             .build()
             .map_err(|e| {

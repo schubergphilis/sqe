@@ -54,12 +54,12 @@ impl OtlpExporter {
     pub fn new(endpoint: &str) -> Result<Self, String> {
         let resource = Resource::builder().with_service_name("sqe-audit").build();
 
-        let mut log_exporter = LogExporter::builder()
-            .with_tonic()
-            .with_endpoint(endpoint)
-            .with_timeout(Duration::from_secs(5))
-            .build()
-            .map_err(|e| format!("failed to build OTLP log exporter: {e}"))?;
+        let mut log_exporter =
+            crate::otel::with_otlp_tls(LogExporter::builder().with_tonic(), endpoint)
+                .with_endpoint(endpoint)
+                .with_timeout(Duration::from_secs(5))
+                .build()
+                .map_err(|e| format!("failed to build OTLP log exporter: {e}"))?;
 
         // Attach the resource (service.name etc.) to the bare exporter so the
         // collector receives it on every batch, matching the old provider-path behaviour.
@@ -154,6 +154,15 @@ mod tests {
             exporter.is_ok(),
             "OtlpExporter::new should succeed: {exporter:?}"
         );
+    }
+
+    /// An `https://` collector must be accepted. Without a TLS feature on
+    /// opentelemetry-otlp the build fails ("uses HTTPS but no TLS feature is
+    /// enabled") and the audit shipper silently never starts.
+    #[tokio::test]
+    async fn otlp_exporter_accepts_https_endpoint() {
+        let exporter = OtlpExporter::new("https://collector.example:4317");
+        assert!(exporter.is_ok(), "https endpoint must build: {exporter:?}");
     }
 
     /// Regression guard for MUST-FIX 1 (at-least-once guarantee).
