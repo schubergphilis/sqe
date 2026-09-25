@@ -1,6 +1,10 @@
 {{- if .Values.networkPolicy.enabled -}}
 {{- /* #674: default-deny ingress to the coordinator; allow the SQL ports from
-`from`, flight-sql from this chart's workers, and mcp from `mcpFrom`. */ -}}
+`from`, flight-sql from this chart's workers, and mcp from `mcpFrom`.
+Egress is restricted too once `networkPolicy.egress` lists any rule: DNS and
+the coordinator/worker hops are then added here, everything else must be
+listed (catalog, identity provider, object store, policy service, collector). */ -}}
+{{- $egress := .Values.networkPolicy.egress }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -13,7 +17,7 @@ spec:
     matchLabels:
       {{- include "sqe.selectorLabels" . | nindent 6 }}
       app.kubernetes.io/component: coordinator
-  policyTypes: ["Ingress"]
+  policyTypes: {{ if $egress }}["Ingress", "Egress"]{{ else }}["Ingress"]{{ end }}
   ingress:
     - ports:
         - port: {{ .Values.config.coordinator.flight_sql_port }}
@@ -40,4 +44,63 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     {{- end }}
+  {{- if $egress }}
+  egress:
+    {{- include "sqe.networkPolicy.dnsEgress" . | nindent 4 }}
+    {{- if .Values.worker.enabled }}
+    - ports:
+        - port: 50052
+      to:
+        - podSelector:
+            matchLabels:
+              {{- include "sqe.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: worker
+    {{- end }}
+    {{- toYaml $egress | nindent 4 }}
+  {{- end }}
+{{- if .Values.worker.enabled }}
+---
+{{- /* Workers take work from the coordinator only; there is no
+worker-to-worker traffic (no shuffle). Metrics follow `from`, like the
+coordinator's metrics port. */}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "sqe.fullname" . }}-worker
+  labels:
+    {{- include "sqe.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "sqe.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  policyTypes: {{ if $egress }}["Ingress", "Egress"]{{ else }}["Ingress"]{{ end }}
+  ingress:
+    - ports:
+        - port: 50052
+      from:
+        - podSelector:
+            matchLabels:
+              {{- include "sqe.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: coordinator
+    - ports:
+        - port: {{ .Values.config.metrics.prometheus_port }}
+      {{- with .Values.networkPolicy.from }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if $egress }}
+  egress:
+    {{- include "sqe.networkPolicy.dnsEgress" . | nindent 4 }}
+    - ports:
+        - port: {{ .Values.config.coordinator.flight_sql_port }}
+      to:
+        - podSelector:
+            matchLabels:
+              {{- include "sqe.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: coordinator
+    {{- toYaml $egress | nindent 4 }}
+  {{- end }}
+{{- end }}
 {{- end }}

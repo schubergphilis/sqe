@@ -2,6 +2,20 @@
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
+{{- /* DNS for pods under a restricted egress policy: cluster DNS in
+kube-system on 53/UDP and 53/TCP. */ -}}
+{{- define "sqe.networkPolicy.dnsEgress" -}}
+- ports:
+    - port: 53
+      protocol: UDP
+    - port: 53
+      protocol: TCP
+  to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+{{- end }}
+
 {{- define "sqe.fullname" -}}
 {{- if .Values.fullnameOverride }}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
