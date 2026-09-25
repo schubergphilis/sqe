@@ -39,6 +39,26 @@ ci-config-sanity:
     # `test` is the cheapest way to give the release jobs a pipeline to run in.
     - if: '$CI_COMMIT_TAG'
 
+# Weekly supply-chain watch, on the pipeline schedule only. Fails (red
+# scheduled pipeline, mailed to maintainers) when a vendored crate has an
+# unreviewed OSV advisory (cargo audit/deny never see path crates), a
+# Renovate MR has been open over 14 days, or an accepted advisory's review
+# date passed with no MR in between to trip ci-config-sanity. The same
+# schedule runs the aikido rescans and aikido-triage, which files scan
+# findings as issues. Needs egress to api.osv.dev.
+supply-chain-watch:
+  stage: test
+  needs: []
+  image: python:3.12-alpine@sha256:b64631e04e4920160c50fbe8d8df828f7f35f06f425cb44aa09bca53e708a35a
+  variables:
+    # read_api is enough; the group token is what aikido-triage already uses.
+    GITLAB_TOKEN: $AIKIDO_GROUP_TOKEN
+  script:
+    - python3 scripts/check-advisory-ignores.py
+    - python3 scripts/supply-chain-watch.py
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+
 # Auto-cancel superseded pipelines. The project setting
 # (Settings > CI/CD > auto_cancel_pending_pipelines) is already `enabled`, but it
 # only cancels jobs marked `interruptible`, and nothing here was. Measured
