@@ -2064,7 +2064,8 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
                         sqe_coordinator::parse_start_at(&ae.start_at),
                         ae.flush_interval_ms,
                     )
-                    .with_metrics(shipper_metrics);
+                    .with_metrics(shipper_metrics)
+                    .with_compactor(audit.spool_compactor(spool_path));
 
                     let (tx, rx) = tokio::sync::watch::channel(false);
                     tokio::spawn(shipper.run(rx));

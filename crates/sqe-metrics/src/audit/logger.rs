@@ -326,6 +326,44 @@ fn spool_lock(
     sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Truncates the OCSF export spool when every byte of it has been shipped.
+///
+/// Without it the spool grows for the life of the process. Truncation holds
+/// the spool lock the writer thread takes for every record, so no record can
+/// land between "is it drained?" and `set_len(0)`. The writer's file is
+/// `O_APPEND`, so its next record goes to offset 0. Shipping stays correct
+/// across the reset because the shipper's cursor is an `integrity.seq`, not
+/// a byte offset, and the chain resumes from the native audit file, never
+/// from the spool.
+#[derive(Clone)]
+pub struct SpoolCompactor {
+    sink: Arc<Mutex<Option<OcsfJsonlSink>>>,
+    path: std::path::PathBuf,
+}
+
+impl SpoolCompactor {
+    /// Empty the spool if its length is exactly `shipped_to`, the byte offset
+    /// the shipper has acked up to. Returns `Ok(true)` when it truncated.
+    pub fn compact_if_drained(&self, shipped_to: u64) -> std::io::Result<bool> {
+        let mut guard = spool_lock(&self.sink);
+        let Some(sink) = guard.as_mut() else {
+            return Ok(false);
+        };
+        // Push buffered records to the file first: a record still in the
+        // BufWriter was never shipped and would make the length check lie.
+        sink.flush()?;
+        let len = std::fs::metadata(&self.path)?.len();
+        if len == 0 || len != shipped_to {
+            return Ok(false);
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.path)?
+            .set_len(0)?;
+        Ok(true)
+    }
+}
+
 fn record_drop(dropped: &Option<IntCounterVec>, reason: &'static str) {
     if let Some(c) = dropped {
         c.with_label_values(&[reason]).inc();
@@ -1032,6 +1070,15 @@ impl AuditLogger {
     /// Must be called before the logger is shared or any events are logged.
     /// The spool file is opened in append mode; it is created if it does not exist.
     /// Errors opening the file are returned and the logger is not modified.
+    /// A handle that empties the export spool once the shipper has shipped all
+    /// of it. Hand it to `OtlpLogShipper::with_compactor`.
+    pub fn spool_compactor(&self, spool_path: &str) -> SpoolCompactor {
+        SpoolCompactor {
+            sink: Arc::clone(&self.spool_sink),
+            path: std::path::PathBuf::from(spool_path),
+        }
+    }
+
     pub fn with_export_spool(self, spool_path: &str) -> Result<Self, String> {
         let file = open_sink_file(std::path::Path::new(spool_path))?;
         // BufWriter ensures that flush_sinks -> sink.flush() is the mechanism that
