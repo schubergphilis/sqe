@@ -286,6 +286,8 @@ deps-check:
         - "crates/**/*.rs"
         - deny.toml
         - .cargo/audit.toml
+        # Its own definition: a change to this job must run it before main.
+        - .gitlab-ci.yml
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
 # Image assembly from the release-binaries artifact (Dockerfile.ci, COPY only).
