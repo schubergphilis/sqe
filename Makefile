@@ -489,13 +489,18 @@ clean-rustbook:
 	@echo "==> Removing $(BOOK_OUT)"
 	rm -rf $(BOOK_OUT)
 
+# The ebook builds, rendered diagrams and benchmark charts are COMMITTED
+# (published artefacts), so these remove only what git does not track: a
+# plain `rm -rf` here deleted 80 tracked files on every `make clean`
+# (2026-09-25). Use the ebook's own `make -C docs/site/ebook clean` to wipe
+# everything before a full rebuild.
 clean-ebook:
-	@echo "==> Cleaning ebook build artefacts"
-	$(MAKE) -C $(EBOOK_DIR) clean
+	@echo "==> Removing untracked ebook build artefacts"
+	git clean -fdx -- $(EBOOK_DIR)/build $(EBOOK_DIR)/diagrams/rendered
 
 clean-benchmark-charts:
-	@echo "==> Removing docs/evidence/benchmark/charts/"
-	rm -rf docs/evidence/benchmark/charts
+	@echo "==> Removing untracked files under docs/evidence/benchmark/charts/"
+	git clean -fdx -- docs/evidence/benchmark/charts
 
 clean-images:
 	@echo "==> Removing $(CONFIG_OUT_DIR)"
