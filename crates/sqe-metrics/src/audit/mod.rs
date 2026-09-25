@@ -10,6 +10,7 @@ mod ocsf;
 mod redact;
 mod sink;
 mod tag_lookup;
+mod verify;
 
 pub use chain::{verify_chain, ChainError, HashChain};
 pub use event::{
@@ -25,6 +26,7 @@ pub use ocsf::to_ocsf;
 pub use redact::{mask_gdpr_columns, redact_pii, strip_sql_literals, GdprIdentifierMode};
 pub use sink::{AuditFormat, AuditSink, NativeJsonlSink, OcsfJsonlSink};
 pub use tag_lookup::{NoopTagLookup, TagLookup};
+pub use verify::{verify_audit_bytes, AuditVerifyReport};
 
 #[cfg(test)]
 pub(crate) use event::sample_query_event;
