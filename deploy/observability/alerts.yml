@@ -88,17 +88,6 @@ groups:
 
   - name: sqe.workers
     rules:
-      - alert: SqeWorkerShuffleResidentHigh
-        expr: sqe_worker_shuffle_resident_bytes > 2147483648
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: Worker shuffle buffers above 2GiB
-          description: >
-            Shuffle is still item-bounded (#406). High resident bytes precede
-            OOM. Check concurrent exchange-heavy queries.
-
       - alert: SqeWorkerDown
         # job="sqe-worker" is set by deploy/helm/sqe/templates/servicemonitor.yaml
         # when worker.enabled is true. Coordinator-only installs have no series
