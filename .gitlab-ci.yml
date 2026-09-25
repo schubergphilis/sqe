@@ -656,6 +656,26 @@ aikido-sign-image:
 aikido-sast:
   allow_failure: false
 
+# GitLab Release per vX.Y.Z tag, notes = that version's CHANGELOG.md section
+# (scripts/release.sh promotes [Unreleased] to it before tagging). Releases
+# had stopped at v0.37.0: nothing in the tag pipeline created them.
+gitlab-release:
+  stage: .post
+  image: registry.gitlab.com/gitlab-org/release-cli:v0.24.0@sha256:3f52d526f48e8d10625c722fa6d6423ee82aadeae1b1aa91f07b62551d96dacf
+  interruptible: false
+  needs: []
+  script:
+    - V="${CI_COMMIT_TAG#v}"
+    - awk -v v="$V" 'index($0, "## [" v "]") == 1 {p=1; next} p && /^## \[/ {exit} p' CHANGELOG.md > release-notes.md
+    - '[ -s release-notes.md ] || echo "No CHANGELOG.md section for ${V}." > release-notes.md'
+    - wc -l release-notes.md
+  release:
+    tag_name: $CI_COMMIT_TAG
+    name: $CI_COMMIT_TAG
+    description: release-notes.md
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
+
 # ===== repo-specific integration suites (docker-in-docker), hosted here =====
 #
 # REMOVED (issue #387): `integration-test` and `distributed-smoke`.
