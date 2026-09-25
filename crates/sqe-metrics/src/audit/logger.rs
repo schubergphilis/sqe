@@ -103,7 +103,7 @@ pub fn query_hash(sql: &str) -> String {
 /// Compute a chain hash over raw bytes: `sha256(prev_hash || body_bytes)`.
 ///
 /// Used to chain legacy `AuditEntry` records without converting them to `AuditEvent`.
-fn chain_hash_raw(prev_hash: &str, body: &[u8]) -> String {
+pub(crate) fn chain_hash_raw(prev_hash: &str, body: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(prev_hash.as_bytes());
