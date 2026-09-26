@@ -49,4 +49,4 @@ These are not in any configuration and need no action.
 
 ## Outside the running service
 
-The build pipeline holds its own credentials: registry push credentials and the tokens the CI platform uses. They belong to whoever owns the pipeline, not to a deployment. Release images are signed keyless through the CI provider's identity, so there is no signing key to rotate.
+The build pipeline holds its own credentials: registry push credentials and the tokens the CI platform uses. They belong to whoever owns the pipeline, not to a deployment. The tag pipeline signs release images keyless through the CI provider's identity (cosign), so there is no signing key to rotate.

@@ -8,8 +8,8 @@ Anything under "you own" is not done by SQE. If your security or audit framework
 
 **SQE ships:**
 
-- A tagged release on every merge to `main`.
-- A runtime image on a digest-pinned Chainguard base, running as UID 65532. Renovate proposes base-image and dependency bumps. The image build fails on any vulnerability rated high or critical.
+- Tagged releases, cut by the maintainers with `scripts/release.sh` (see `release.md`). Not every merge to `main` becomes a release.
+- A runtime image on a digest-pinned Chainguard base, running as UID 65532. Renovate proposes base-image and dependency bumps. Every image built on `main` is scanned after the push, and the newest release image is rescanned weekly. A vulnerability rated high or critical fails that pipeline; the scan does not hold the image back from the registry.
 - A 7-day minimum release age on every dependency update. A freshly published package version waits a week before Renovate proposes it. We chose this on purpose: worm-style package compromises such as Shai-Hulud get caught and yanked within days, and a week-old version has had that time. A critical advisory that cannot wait gets a manual bump out of cycle.
 
 **You own:**
@@ -20,13 +20,13 @@ Anything under "you own" is not done by SQE. If your security or audit framework
 
 ## Vulnerability management
 
-**SQE ships:** a private disclosure channel and response targets in `SECURITY.md`. Every merge request runs static analysis, dependency and image scanning, secret scanning and `cargo deny` / `cargo audit`. A finding rated high or above blocks the merge.
+**SQE ships:** a private disclosure channel and response targets in `SECURITY.md`. Every merge request runs static analysis, secret scanning and a source dependency scan; merge requests that change Rust dependencies also run `cargo deny` and `cargo audit`. The container image is scanned on `main` and weekly, as above. A finding rated high or above fails the pipeline.
 
 **You own:** scanning your deployment and its external attack surface, penetration testing of your environment, and tracking findings in your own register.
 
 ## Malware protection
 
-**SQE ships:** pinned dependencies with a lockfile, advisory and licence gates, and a dependency reputation check. The image carries no antivirus agent.
+**SQE ships:** pinned dependencies with a lockfile, advisory and licence gates, and a dependency reputation check. A ClamAV scan runs over the release binaries and the source tree before an image is built from them, and a hit fails the pipeline. The image carries no antivirus agent.
 
 **You own:**
 

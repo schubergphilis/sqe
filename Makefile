@@ -176,7 +176,7 @@ help:
 	@echo ""
 	@echo "  Diagnostics:"
 	@echo "    make check-tools  Verify cargo / mdbook / pandoc / d2 / mmdc are present"
-	@echo "    make leak-scan    Scan docs/site for secrets/PII before publishing"
+	@echo "    make leak-scan    Scan docs/site for account ids, internal hosts and user names (gitleaks covers secrets)"
 
 # `all` is the full gate: supply chain, unit tests, the deployable image, then
 # the benchmark sweep. `all_trino` is the same with SQE-vs-Trino comparison on.
