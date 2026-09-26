@@ -326,6 +326,38 @@ pub const PRODUCTION_RULES: &[ProductionRule] = &[
         },
     },
     ProductionRule {
+        name: "https-telemetry-endpoints",
+        summary: "OTLP, audit-export and OpenLineage endpoints must use https unless they are loopback (a sidecar collector): audit events and lineage carry user identities and SQL text.",
+        check: |c| {
+            let m = &c.metrics;
+            let endpoints = [
+                ("metrics.otlp_endpoint", m.otlp_endpoint.as_str(), true),
+                ("metrics.traces_otlp_endpoint", m.traces_otlp_endpoint.as_str(), true),
+                (
+                    "metrics.audit_export.otlp_endpoint",
+                    m.audit_export.otlp_endpoint.as_str(),
+                    m.audit_export.enabled,
+                ),
+                (
+                    "metrics.openlineage.http_endpoint",
+                    m.openlineage.http_endpoint.as_str(),
+                    m.openlineage.enabled,
+                ),
+            ];
+            let offenders: Vec<&str> = endpoints
+                .iter()
+                .filter(|(_, url, active)| *active && is_plaintext_remote(url))
+                .map(|(name, _, _)| *name)
+                .collect();
+            (!offenders.is_empty()).then(|| {
+                format!(
+                    "production_mode: {} must use https (plain http only to a loopback sidecar collector)",
+                    offenders.join(", ")
+                )
+            })
+        },
+    },
+    ProductionRule {
         name: "ranger-grant-backend-url",
         summary: "`access_control.backend = ranger` with an empty `access_control.url` (the grant backend would silently be absent and GRANT / REVOKE NotImplemented).",
         check: |c| {
@@ -352,6 +384,23 @@ pub const PRODUCTION_RULES: &[ProductionRule] = &[
 
 /// Every rule `config` violates, in table order. Empty means production mode
 /// is satisfied.
+/// `http://` to anything but loopback. Empty or unparseable values are left to
+/// the other validators; `https://` and a sidecar on `localhost` pass.
+fn is_plaintext_remote(endpoint: &str) -> bool {
+    let Ok(url) = url::Url::parse(endpoint) else {
+        return false;
+    };
+    if url.scheme() != "http" {
+        return false;
+    }
+    match url.host() {
+        Some(url::Host::Domain(d)) => d != "localhost",
+        Some(url::Host::Ipv4(ip)) => !ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => !ip.is_loopback(),
+        None => false,
+    }
+}
+
 pub fn violations(config: &SqeConfig) -> Vec<String> {
     PRODUCTION_RULES
         .iter()
@@ -388,6 +437,40 @@ mod tests {
             documented, coded,
             "production-guide.md rows and PRODUCTION_RULES differ (left: docs, right: code)"
         );
+    }
+
+    #[test]
+    fn telemetry_endpoints_need_https_unless_loopback() {
+        let rule = PRODUCTION_RULES
+            .iter()
+            .find(|r| r.name == "https-telemetry-endpoints")
+            .unwrap();
+        let mut c = SqeConfig::load_from_str(
+            "[coordinator]\n[auth]\nclient_id = \"sqe-client\"\nkeycloak_url = \"https://kc.example.com\"\n\
+             [catalog]\ncatalog_url = \"https://polaris.example.com\"\nwarehouse = \"wh\"\n",
+        )
+        .expect("minimal config");
+        assert!((rule.check)(&c).is_none(), "empty endpoints pass");
+
+        c.metrics.otlp_endpoint = "http://otel-collector:4317".into();
+        let msg = (rule.check)(&c).expect("remote http is refused");
+        assert!(msg.contains("metrics.otlp_endpoint"), "{msg}");
+
+        c.metrics.otlp_endpoint = "https://otel-collector:4317".into();
+        assert!((rule.check)(&c).is_none());
+        c.metrics.otlp_endpoint = "http://localhost:4317".into();
+        assert!((rule.check)(&c).is_none(), "sidecar on localhost passes");
+        c.metrics.otlp_endpoint = "http://127.0.0.1:4317".into();
+        assert!((rule.check)(&c).is_none());
+
+        // Audit export only counts when it is on.
+        c.metrics.audit_export.otlp_endpoint = "http://siem:4317".into();
+        c.metrics.audit_export.enabled = false;
+        assert!((rule.check)(&c).is_none());
+        c.metrics.audit_export.enabled = true;
+        assert!((rule.check)(&c)
+            .unwrap()
+            .contains("metrics.audit_export.otlp_endpoint"));
     }
 
     #[test]

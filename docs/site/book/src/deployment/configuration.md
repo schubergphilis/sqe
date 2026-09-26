@@ -442,7 +442,7 @@ One TLS block configures every SQE listener and every in-cluster client hop: Fli
 
 **Client side:** `ca_file` is also the trust root the coordinator uses to reach `https://` workers and the worker uses to reach an `https://` coordinator. Without it the client falls back to the platform trust store, which will not contain a private cluster CA. Set `ca_file` on both ends of a cluster that runs its own CA.
 
-Every listener negotiates TLS 1.2 or TLS 1.3 and nothing older.
+Every listener negotiates TLS 1.2 or TLS 1.3 and nothing older. TLS 1.2 stays on the listeners on purpose: older JDBC, ODBC and Python clients still need it, and a client that speaks 1.3 gets 1.3. The outbound OTLP and audit-export connections negotiate TLS 1.3 with any current collector. If your policy requires TLS 1.3 only, enforce it at the ingress in front of SQE.
 
 ```toml
 [coordinator.tls]
