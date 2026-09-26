@@ -15,11 +15,11 @@
 #   docker build -f Dockerfile.ci -t sqe:ci .   # after `cargo build` into out/
 
 # Digest-pinned; Renovate bumps the runtime independently of builder tooling.
-FROM cgr.dev/chainguard/glibc-dynamic@sha256:94ec8c23c45c7aad22b6ab400dc7e1b46dd36f4c71d6c7a3976c8ad4e36ca266 AS runtime-base
+FROM cgr.dev/chainguard/glibc-dynamic@sha256:6acf5a19a988abdaf0f3d30247561431a206034e702871442bed66a2c68cc1a2 AS runtime-base
 
 USER 65532
 
-FROM busybox:1.38.0-uclibc@sha256:297dda192bda2157ddf40abb47a45a1090caff1864db9cfb9ce4b901ba318a3c AS healthcheck-bin
+FROM busybox:1.38.0-uclibc@sha256:b699b0c739b2d039afd8e2488a3ccfc0b9a86301d87633448d4a93c57bee8c76 AS healthcheck-bin
 
 FROM runtime-base AS runtime
 
