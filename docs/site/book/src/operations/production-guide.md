@@ -61,7 +61,7 @@ Enable durable audit and lineage early if governance matters. Do not write audit
 ```toml
 [metrics]
 prometheus_port = 9090
-otlp_endpoint = "http://otel-collector:4317"
+otlp_endpoint = "https://otel-collector:4317"   # https: audit events carry user identities and SQL
 trace_sample_rate = 0.10      # 10% at low QPS; lower to 0.01-0.05 at high QPS
 
 audit_log_path = "/var/log/sqe/audit/audit.jsonl"   # must survive pod restart (PVC)
@@ -230,7 +230,7 @@ enabled = true
 
 [metrics]
 prometheus_port = 9090
-otlp_endpoint = "http://otel-collector.observability:4317"
+otlp_endpoint = "https://otel-collector.observability:4317"
 trace_sample_rate = 0.05
 
 audit_log_path = "/var/log/sqe/audit/audit.jsonl"
@@ -315,6 +315,7 @@ Route audit logs and traces through an OpenTelemetry Collector when possible. Au
 | `no-inline-tvf-credentials` | `storage.tvf.allow_inline_credentials = true` (the default; caller-supplied object-store keys would bypass `allowed_object_store_prefixes`). |
 | `mcp-https-resource-uri` | An `http://` `mcp.resource_uri` while MCP is enabled. |
 | `mcp-https-authorization-servers` | An `http://` issuer in `mcp.authorization_servers` while MCP is enabled. |
+| `https-telemetry-endpoints` | An `http://` OTLP, audit-export or (enabled) OpenLineage endpoint on anything but loopback. Audit events and lineage carry user identities and SQL text; a sidecar collector on `localhost` may stay plain. |
 | `ranger-grant-backend-url` | `access_control.backend = ranger` with an empty `access_control.url` (the grant backend would silently be absent and GRANT / REVOKE NotImplemented). |
 | `mcp-no-anonymous-auth` | `mcp.auth.mode = anonymous` while MCP is enabled. |
 

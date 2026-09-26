@@ -154,7 +154,7 @@ Configuration:
 [metrics]
 # Trace-only collector. Recommended when /metrics is scraped and stdout logs
 # are collected separately.
-traces_otlp_endpoint = "http://otel-collector:4317"
+traces_otlp_endpoint = "https://otel-collector:4317"
 trace_sample_rate = 1.0
 
 # Legacy all-signals endpoint. Leave empty for the trace-only setup above.

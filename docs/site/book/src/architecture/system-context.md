@@ -58,7 +58,8 @@ The coordinator is a single replica; workers are stateless and scale out. Nothin
 | Coordinator | Deployment, 1 replica | Operating team, running the SQE image | Sessions (memory, or a file when `persistence = "file"`) | `sqe.toml` via the chart ConfigMap |
 | Workers | Deployment, 0..n replicas | Operating team | None | Same ConfigMap |
 | Audit volume | PersistentVolumeClaim | Operating team | Audit log and export spool | `audit.persistence` |
-| Container image | `sqe` on the registry | SQE maintainers | None | Chart `image` |
+| Container image | `sqe` on the registry; releases tagged `vX.Y.Z` and `:stable` | SQE maintainers | None | Chart `image` |
+| Source code | Canonical repository with CI, plus the public mirror `github.com/schubergphilis/sqe` | SQE maintainers | History, tags | n/a |
 | Identity provider | External | Operating team | Users, groups, MFA | `[auth]` |
 | Iceberg catalog | External | Operating team | Table metadata | `[catalog]` |
 | Object store | External | Operating team | Table data | `[storage]` |
@@ -69,7 +70,7 @@ The coordinator is a single replica; workers are stateless and scale out. Nothin
 
 ## Lifecycle register
 
-Each dependency, the version SQE pins today, and how it is kept current. Renovate proposes updates for everything pinned in this repository; the dependency dashboard issue lists what is pending.
+Each dependency, the version SQE pins today, and how it is kept current. Renovate proposes updates for everything pinned in this repository, and its dependency dashboard issue is the live pinned-versus-latest view: every dependency with a newer release is listed there with its pending or blocked update. Read the "latest" column from that issue rather than from this page, which would go stale.
 
 | Dependency | Pinned version | Support model | How SQE tracks it |
 |---|---|---|---|
@@ -79,7 +80,7 @@ Each dependency, the version SQE pins today, and how it is kept current. Renovat
 | iceberg-rust | Vendored: apache `main` plus the RisingWave write stack | Upstream `main`, no releases used | Weekly advisory watch on the vendored crates; periodic re-vendor |
 | Runtime image base | `cgr.dev/chainguard/glibc-dynamic`, digest-pinned | Rolling, rebuilt daily upstream | Renovate bumps the digest; the image scan blocks high findings |
 | Helm chart | apiVersion v2, chart version = SQE version | Released with SQE | Lint and hardening check in CI |
-| Kubernetes | No minimum declared | The three newest minors are supported upstream | Run a supported minor |
+| Kubernetes | Chart `kubeVersion: >=1.21` (policy/v1 PDB, pod `seccompProfile`) | The three newest minors are supported upstream | That is the technical floor; run an upstream-supported minor |
 | Apache Polaris (quickstarts) | 1.7.0 | Latest release | Renovate |
 | Apache Ranger (quickstarts) | 2.8.0 | Latest release | Renovate |
 | Keycloak (quickstarts) | 26.7.0 | Latest release | Renovate |

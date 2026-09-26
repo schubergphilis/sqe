@@ -28,11 +28,11 @@ What SQE ships and what your platform owns is split in [Shared Responsibility](.
 
 - [ ] The audit log sits on a persistent volume with encryption at rest, and `format` is `"native"` or `"both"`.
 - [ ] Audit export points at an `https://` collector, and a test query shows up in the SIEM.
-- [ ] Block the collector for 30 minutes. `SqeAuditExportStalled` fires. Unblock it, and the backlog ships.
+- [ ] Block the collector while queries run. `SqeAuditExportStalled` fires after about 40 minutes (30 minutes without a successful ship, held for 10). Unblock it, and the backlog ships.
 
 **Recovery**
 
-- [ ] The catalog database and the object store are backed up, and one restore has been tested.
+- [ ] The catalog database and the object store are backed up, deleted object versions outlive the oldest catalog backup, and one restore has passed the checks in [Backup and Restore](./backup-restore.md#what-restored-means).
 
 ## Product acceptance (before go-live)
 
