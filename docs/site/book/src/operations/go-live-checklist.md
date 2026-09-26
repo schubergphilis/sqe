@@ -32,7 +32,7 @@ What SQE ships and what your platform owns is split in [Shared Responsibility](.
 
 **Recovery**
 
-- [ ] The catalog database and the object store are backed up, and one restore has been tested.
+- [ ] The catalog database and the object store are backed up, deleted object versions outlive the oldest catalog backup, and one restore has passed the checks in [Backup and Restore](./backup-restore.md#what-restored-means).
 
 ## Product acceptance (before go-live)
 
