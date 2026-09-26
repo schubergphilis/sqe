@@ -82,8 +82,8 @@ SQE holds almost no state. Tables live in your object store and catalog. The coo
 
 **You own:**
 
-- Backups of the catalog database (for example the Polaris Postgres), object-store versioning or replication, and the audit log volume.
-- Recovery point and recovery time objectives, and restore tests against them.
+- Backups of the catalog database (for example the Polaris Postgres), object-store versioning or replication, and the audit log volume. Deleted object versions must outlive your oldest catalog backup, or a catalog restore points at files that are gone; see [Backup and Restore](./backup-restore.md).
+- Recovery point and recovery time objectives, retention per class, and restore tests against them (at least quarterly).
 - Disaster recovery of everything SQE depends on.
 
 ## Hosting and physical security
