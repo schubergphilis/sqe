@@ -61,7 +61,7 @@ Enable durable audit and lineage early if governance matters. Do not write audit
 ```toml
 [metrics]
 prometheus_port = 9090
-otlp_endpoint = "http://otel-collector:4317"
+otlp_endpoint = "https://otel-collector:4317"   # https: audit events carry user identities and SQL
 trace_sample_rate = 0.10      # 10% at low QPS; lower to 0.01-0.05 at high QPS
 
 audit_log_path = "/var/log/sqe/audit/audit.jsonl"   # must survive pod restart (PVC)
@@ -230,7 +230,7 @@ enabled = true
 
 [metrics]
 prometheus_port = 9090
-otlp_endpoint = "http://otel-collector.observability:4317"
+otlp_endpoint = "https://otel-collector.observability:4317"
 trace_sample_rate = 0.05
 
 audit_log_path = "/var/log/sqe/audit/audit.jsonl"
