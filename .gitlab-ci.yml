@@ -262,7 +262,7 @@ malware-scan:
     - job: release-binaries
       artifacts: true
   image:
-    name: clamav/clamav:1.4@sha256:a5f03c12a79dbe9f6d8a527b6bb1ea053fa8dd061d3738a26897f055ee2d9303
+    name: clamav/clamav:1.5.3@sha256:d06c1d6a451d616e1dd79b42f44c8c8c291bba9cf4e75ebc4d0e43c1c6dd87bb
     entrypoint: [""]
   timeout: 20m
   script:
@@ -352,7 +352,7 @@ helm-chart-check:
   stage: test
   needs: []
   image:
-    name: alpine/helm:3.19.0@sha256:aef9b56f64e866207d9591d0abd8f6d767b36aadd12edf68f8a719716d9d29c9
+    name: alpine/helm:3.22.0@sha256:70ed3f7b02ab2eee12aa520ad6870305db8a82516b07aff62f5656c657a26e2a
     entrypoint: [""]
   variables:
     # The production overlay needs these to render; they are placeholders.
