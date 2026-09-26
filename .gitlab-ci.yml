@@ -397,6 +397,15 @@ aikido-build:
   # ordering (unlike `needs:`), so the push still waits for the whole test stage.
   dependencies:
     - release-binaries
+  # Never on the schedule: release-binaries does not run there, so the build
+  # found no out/sqe-server and failed every scheduled pipeline (1634261). The
+  # weekly image rescan is aikido-image-vuln against :stable instead.
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      exists:
+        - Dockerfile
   script:
     - |
       set -euo pipefail
@@ -484,6 +493,13 @@ aikido-image-vuln:
   script:
     - |
       set -euo pipefail
+      # Weekly schedule: nothing is built, so rescan what deployments run, the
+      # newest release image, against today's vulnerability data.
+      if [ "$CI_PIPELINE_SOURCE" = "schedule" ]; then
+        echo "grype weekly rescan: registry:$CI_REGISTRY_IMAGE:stable (fail-on high)"
+        grype "registry:$CI_REGISTRY_IMAGE:stable" -o table --fail-on high
+        exit 0
+      fi
       # No digest file at all means aikido-build did not run in this pipeline
       # (MR without an image-input change, see its rules:). Nothing was built,
       # so there is nothing to scan; the gate enforces on merge to main.
