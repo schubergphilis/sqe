@@ -2,8 +2,8 @@ apiVersion: v2
 name: sqe
 description: Sovereign Query Engine — distributed SQL over Apache Iceberg
 type: application
-version: 0.48.1
-appVersion: "0.48.1"
+version: 0.49.0
+appVersion: "0.49.0"
 # Technical floor: policy/v1 PodDisruptionBudget and the pod seccompProfile
 # field. Run an upstream-supported minor in practice.
 kubeVersion: ">=1.21.0-0"
