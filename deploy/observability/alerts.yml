@@ -110,6 +110,35 @@ groups:
             spool and nothing has shipped for 30m. The SIEM is missing audit
             events from this coordinator.
 
+  # The coordinator is a single replica: down means no queries and no audit
+  # events. job="sqe-coordinator" is set by the chart's ServiceMonitor.
+  - name: sqe.availability
+    rules:
+      - alert: SqeCoordinatorDown
+        expr: up{job="sqe-coordinator"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: The SQE coordinator scrape target is down
+          description: >
+            {{ $labels.instance }} has not answered a scrape for 2m. SQE serves
+            no queries and emits no audit events while it is down.
+
+      - alert: SqeCoordinatorAbsent
+        # Watchdog for the watcher: SqeCoordinatorDown needs a series to fire
+        # on. If the target disappears altogether (ServiceMonitor removed, job
+        # relabelled, Prometheus lost the scrape config), only absent() notices.
+        expr: absent(up{job="sqe-coordinator"})
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: Prometheus has no SQE coordinator target at all
+          description: >
+            No up{job="sqe-coordinator"} series for 10m. Monitoring of SQE is
+            blind, not quiet. Check the ServiceMonitor and the scrape config.
+
   - name: sqe.workers
     rules:
       - alert: SqeWorkerDown

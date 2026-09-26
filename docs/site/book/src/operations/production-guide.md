@@ -315,6 +315,7 @@ Route audit logs and traces through an OpenTelemetry Collector when possible. Au
 | `no-inline-tvf-credentials` | `storage.tvf.allow_inline_credentials = true` (the default; caller-supplied object-store keys would bypass `allowed_object_store_prefixes`). |
 | `mcp-https-resource-uri` | An `http://` `mcp.resource_uri` while MCP is enabled. |
 | `mcp-https-authorization-servers` | An `http://` issuer in `mcp.authorization_servers` while MCP is enabled. |
+| `https-telemetry-endpoints` | An `http://` OTLP, audit-export or (enabled) OpenLineage endpoint on anything but loopback. Audit events and lineage carry user identities and SQL text; a sidecar collector on `localhost` may stay plain. |
 | `ranger-grant-backend-url` | `access_control.backend = ranger` with an empty `access_control.url` (the grant backend would silently be absent and GRANT / REVOKE NotImplemented). |
 | `mcp-no-anonymous-auth` | `mcp.auth.mode = anonymous` while MCP is enabled. |
 
