@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::audit::export::{ocsf_to_ship_record, LogShipExporter, SeqCursor, ShipRecord};
+use crate::audit::SpoolCompactor;
 
 /// Prometheus metric handles updated by the shipper on each pass.
 ///
@@ -67,7 +68,18 @@ pub struct OtlpLogShipper {
     /// Optional Prometheus metric handles. `None` in tests and when the
     /// coordinator does not wire a registry (e.g. disabled path).
     metrics: ShipperMetrics,
+    /// Empties the spool once fully shipped. `None` keeps the old grow-forever
+    /// behaviour.
+    compactor: Option<SpoolCompactor>,
+    /// Spool size at which a drained spool is truncated.
+    compact_at_bytes: u64,
 }
+
+/// A drained spool is truncated once it reaches this size. Small enough to
+/// bound the disk, large enough that a busy coordinator is not taking the
+/// writer lock for a truncate after every batch.
+// ponytail: fixed threshold; make it a config key if 16 MiB is ever wrong.
+const COMPACT_AT_BYTES: u64 = 16 * 1024 * 1024;
 
 impl OtlpLogShipper {
     /// Create a new shipper.
@@ -92,8 +104,8 @@ impl OtlpLogShipper {
             // Cold-start "now": scan spool to EOF to find the tail offset and
             // the max seq already written. Advance the cursor so we do not
             // backfill old history.
-            let (offset, max_seq) = Self::scan_to_tail(&spool_path, cursor.last());
-            if max_seq > 0 {
+            let (offset, max_seq) = Self::scan_to_tail(&spool_path);
+            if let Some(max_seq) = max_seq {
                 // Advance in-memory and on-disk so next pass starts after tail.
                 let _ = cursor.advance_to(max_seq);
             }
@@ -114,6 +126,41 @@ impl OtlpLogShipper {
             spool_warn_emitted: false,
             flush_interval_ms,
             metrics: ShipperMetrics::default(),
+            compactor: None,
+            compact_at_bytes: COMPACT_AT_BYTES,
+        }
+    }
+
+    /// Truncate the spool whenever it is fully shipped and at least
+    /// 16 MiB. Call before `run`.
+    pub fn with_compactor(mut self, compactor: SpoolCompactor) -> Self {
+        self.compactor = Some(compactor);
+        self
+    }
+
+    /// Empty the spool if everything in it has been shipped. Only a pass that
+    /// did not fail calls this, so `committed_offset` reflects acked records.
+    fn maybe_compact(&mut self) {
+        let Some(ref compactor) = self.compactor else {
+            return;
+        };
+        // Cheap pre-check outside the writer lock; the compactor re-checks
+        // under it.
+        match std::fs::metadata(&self.spool_path) {
+            Ok(m) if m.len() >= self.compact_at_bytes && m.len() == self.committed_offset => {}
+            _ => return,
+        }
+        match compactor.compact_if_drained(self.committed_offset) {
+            Ok(true) => {
+                tracing::info!(
+                    spool = %self.spool_path.display(),
+                    bytes = self.committed_offset,
+                    "audit spool fully shipped; truncated"
+                );
+                self.committed_offset = 0;
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!(err = %e, "audit shipper: spool compaction failed"),
         }
     }
 
@@ -127,14 +174,15 @@ impl OtlpLogShipper {
     }
 
     /// Scan the spool linearly to find the byte offset after the last complete
-    /// line and the max seq seen. Returns `(offset, max_seq)`.
-    fn scan_to_tail(spool_path: &PathBuf, start_seq: u64) -> (u64, u64) {
+    /// line and the max seq seen. Returns `(offset, max_seq)`; `max_seq` is
+    /// `None` when the spool holds no record (seq 0 is a real record).
+    fn scan_to_tail(spool_path: &PathBuf) -> (u64, Option<u64>) {
         let file = match std::fs::File::open(spool_path) {
             Ok(f) => f,
-            Err(_) => return (0, start_seq),
+            Err(_) => return (0, None),
         };
         let mut reader = std::io::BufReader::new(file);
-        let mut max_seq = start_seq;
+        let mut max_seq: Option<u64> = None;
         let mut offset: u64 = 0;
         let mut line = String::new();
         loop {
@@ -145,9 +193,7 @@ impl OtlpLogShipper {
                     // Only count complete lines (those that end in '\n').
                     if line.ends_with('\n') {
                         if let Some(rec) = ocsf_to_ship_record(line.trim_end_matches('\n')) {
-                            if rec.seq > max_seq {
-                                max_seq = rec.seq;
-                            }
+                            max_seq = Some(max_seq.map_or(rec.seq, |m| m.max(rec.seq)));
                         }
                         offset += n as u64;
                     }
@@ -244,7 +290,7 @@ impl OtlpLogShipper {
                     // don't re-read it next pass.
                     last_record_offset = candidate_offset;
                 }
-                Some(rec) if rec.seq <= self.cursor.last() => {
+                Some(rec) if self.cursor.covers(rec.seq) => {
                     // Already shipped (pre-cursor). Advance offset so we skip
                     // it efficiently on the next pass.
                     last_record_offset = candidate_offset;
@@ -306,6 +352,9 @@ impl OtlpLogShipper {
             }
 
             let outcome = self.ship_once().await;
+            if !outcome.failed {
+                self.maybe_compact();
+            }
 
             // Update Prometheus metrics after each pass.
             self.update_metrics(&outcome);
@@ -662,5 +711,130 @@ mod tests {
 
         let seqs = stub.shipped.lock().unwrap().clone();
         assert_eq!(seqs, vec![1], "seq 2 (incomplete line) must not be shipped");
+    }
+
+    /// The chain's first record is seq 0. A fresh cursor must ship it; a
+    /// restarted shipper whose cursor says 0 must not ship it again.
+    #[tokio::test]
+    async fn first_record_seq_zero_ships_once() {
+        let dir = tempdir().unwrap();
+        let spool = dir.path().join("audit.jsonl");
+        let cursor_path = dir.path().join("audit.cursor");
+        write_spool(&spool, &[0, 1]);
+
+        let stub = StubExporter::new(false);
+        let mut s = make_shipper(
+            spool.clone(),
+            cursor_path.clone(),
+            stub.clone(),
+            10,
+            StartAt::Beginning,
+        );
+        assert_eq!(s.ship_once().await.shipped, 2);
+        assert_eq!(*stub.shipped.lock().unwrap(), vec![0, 1]);
+
+        let stub2 = StubExporter::new(false);
+        let mut s2 = make_shipper(spool, cursor_path, stub2.clone(), 10, StartAt::Beginning);
+        assert_eq!(s2.ship_once().await.shipped, 0, "restart must not reship");
+    }
+
+    /// Cold start with `StartAt::Now` over a spool holding only seq 0: that
+    /// record is backlog and must not ship.
+    #[tokio::test]
+    async fn start_at_now_skips_a_lone_seq_zero_backlog() {
+        let dir = tempdir().unwrap();
+        let spool = dir.path().join("audit.jsonl");
+        write_spool(&spool, &[0]);
+        let stub = StubExporter::new(false);
+        let mut s = make_shipper(
+            spool.clone(),
+            dir.path().join("c"),
+            stub.clone(),
+            10,
+            StartAt::Now,
+        );
+        assert_eq!(s.ship_once().await.shipped, 0);
+        write_spool(&spool, &[1]);
+        assert_eq!(s.ship_once().await.shipped, 1);
+        assert_eq!(*stub.shipped.lock().unwrap(), vec![1]);
+    }
+
+    // ---------------------------------------------------------------------------
+    // PROOF TEST: compaction under a live writer loses and duplicates nothing
+    // ---------------------------------------------------------------------------
+
+    /// A real `AuditLogger` writer thread appends while the shipper ships and
+    /// truncates the drained spool on every pass (threshold 1 byte). Every seq
+    /// the chain stamped must arrive exactly once, and the spool must actually
+    /// have been truncated along the way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compaction_under_live_writer_ships_every_record_once() {
+        const N: u64 = 2_000;
+        let dir = tempdir().unwrap();
+        let native = dir.path().join("audit.jsonl");
+        let spool = dir.path().join("audit.spool.jsonl");
+        let cursor_path = dir.path().join("audit.cursor");
+
+        let logger = Arc::new(
+            crate::audit::AuditLogger::with_config(
+                native.to_str().unwrap(),
+                crate::audit::AuditFormat::Native,
+            )
+            .unwrap()
+            .with_export_spool(spool.to_str().unwrap())
+            .unwrap(),
+        );
+        let stub = StubExporter::new(false);
+        let mut shipper = make_shipper(
+            spool.clone(),
+            cursor_path,
+            stub.clone(),
+            50,
+            StartAt::Beginning,
+        )
+        .with_compactor(logger.spool_compactor(spool.to_str().unwrap()));
+        shipper.compact_at_bytes = 1;
+
+        let writer = {
+            let logger = Arc::clone(&logger);
+            std::thread::spawn(move || {
+                for i in 0..N {
+                    logger.log_event(sample_query_event());
+                    if i % 97 == 0 {
+                        logger.flush();
+                    }
+                }
+                logger.flush();
+            })
+        };
+
+        let mut truncations = 0;
+        let mut idle_passes = 0;
+        while idle_passes < 3 {
+            let o = shipper.ship_once().await;
+            assert!(!o.failed);
+            let before = shipper.committed_offset;
+            shipper.maybe_compact();
+            if before > 0 && shipper.committed_offset == 0 {
+                truncations += 1;
+            }
+            if o.shipped == 0 && writer.is_finished() {
+                logger.flush();
+                idle_passes += 1;
+            } else {
+                idle_passes = 0;
+            }
+        }
+        writer.join().unwrap();
+
+        let mut seqs = stub.shipped.lock().unwrap().clone();
+        let total = seqs.len();
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(seqs.len(), total, "no record may ship twice");
+        // The chain stamps 0..N, and every one of them ships, seq 0 included.
+        let expected: Vec<u64> = (0..N).collect();
+        assert_eq!(seqs, expected, "every stamped record ships exactly once");
+        assert!(truncations > 0, "the spool was never compacted");
     }
 }

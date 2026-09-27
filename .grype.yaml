@@ -1,7 +1,9 @@
 # Ignore rules for the aikido-image-vuln gate (.gitlab-ci.yml runs
 # `grype registry:<image> --fail-on high` from the repo root, and grype reads
 # this file from the working directory). Every entry names the CVE, the exact
-# package, why it is accepted and a review date. Delete the entry when the
+# package and why it is accepted, and carries a `# review-by YYYY-MM-DD
+# owner=<name>` tag that scripts/check-advisory-ignores.py enforces (also in
+# deny.toml and .cargo/audit.toml). Delete the entry when the
 # runtime base ships the fix (renovate bumps the
 # cgr.dev/chainguard/glibc-dynamic digest).
 ignore:
@@ -9,8 +11,7 @@ ignore:
   # carries 2.44-r6 and grype reports no fixed version (2026-09-22). sqe-server
   # is the only process in the image and does not expose the affected glibc
   # surface to untrusted input beyond what the TLS/HTTP stacks already parse.
-  # Review by 2026-10-06.
-  - vulnerability: CVE-2026-19499
+  - vulnerability: CVE-2026-19499  # review-by 2026-10-06 owner=sqe-maintainers
     package:
       name: glibc
       version: 2.44-r6

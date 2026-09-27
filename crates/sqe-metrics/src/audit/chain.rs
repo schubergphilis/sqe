@@ -4,7 +4,7 @@
 use super::event::AuditEvent;
 use sha2::{Digest, Sha256};
 
-const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+pub(crate) const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 pub struct HashChain {
     next_seq: u64,
@@ -78,7 +78,7 @@ impl Default for HashChain {
 
 /// Hash of the event with its own `hash` field blanked, chained on `prev_hash`.
 /// Formula: sha256(prev_hash || canonical_json_with_blank_hash)
-fn compute_hash(event: &AuditEvent) -> String {
+pub(crate) fn compute_hash(event: &AuditEvent) -> String {
     let mut clone = event.clone();
     clone.integrity.hash = String::new();
     let body = serde_json::to_string(&clone).unwrap_or_default();

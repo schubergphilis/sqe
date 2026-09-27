@@ -32,7 +32,7 @@ pub(crate) mod date {
 
     pub(crate) fn days_to_date(days: i32) -> NaiveDate {
         // This shouldn't fail until the year 262000
-        (chrono::DateTime::UNIX_EPOCH + TimeDelta::try_days(days as i64).unwrap())
+        (DateTime::UNIX_EPOCH + TimeDelta::try_days(days as i64).unwrap())
             .naive_utc()
             .date()
     }
@@ -82,6 +82,12 @@ pub(crate) mod timestamp {
     pub(crate) fn nanoseconds_to_datetime(nanos: i64) -> NaiveDateTime {
         DateTime::from_timestamp_nanos(nanos).naive_utc()
     }
+
+    /// Nanoseconds since the Unix epoch, or `None` if outside the representable `i64` range
+    /// (roughly the years 1678–2262).
+    pub(crate) fn datetime_to_nanoseconds(time: &NaiveDateTime) -> Option<i64> {
+        time.and_utc().timestamp_nanos_opt()
+    }
 }
 
 pub(crate) mod timestamptz {
@@ -92,14 +98,21 @@ pub(crate) mod timestamptz {
     }
 
     pub(crate) fn microseconds_to_datetimetz(micros: i64) -> DateTime<Utc> {
-        let (secs, rem) = (micros / 1_000_000, micros % 1_000_000);
-
-        DateTime::from_timestamp(secs, rem as u32 * 1_000).unwrap()
+        // Splitting into (secs, subsec) by hand is wrong for values before the Unix epoch:
+        // truncating division leaves a *negative* remainder, and casting that to `u32` yields a
+        // nonsensical subsecond count, so this used to panic for any timestamp before 1970.
+        // This shouldn't fail until the year 262000.
+        DateTime::from_timestamp_micros(micros).unwrap()
     }
 
     pub(crate) fn nanoseconds_to_datetimetz(nanos: i64) -> DateTime<Utc> {
-        let (secs, rem) = (nanos / 1_000_000_000, nanos % 1_000_000_000);
+        // Infallible for every `i64`, and correct before the Unix epoch. See the note above.
+        DateTime::from_timestamp_nanos(nanos)
+    }
 
-        DateTime::from_timestamp(secs, rem as u32).unwrap()
+    /// Nanoseconds since the Unix epoch, or `None` if outside the representable `i64` range
+    /// (roughly the years 1678–2262).
+    pub(crate) fn datetimetz_to_nanoseconds(time: &DateTime<Utc>) -> Option<i64> {
+        time.timestamp_nanos_opt()
     }
 }

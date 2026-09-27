@@ -4,6 +4,10 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+## [0.49.0] — 2026-09-26
+
+This section covers every change since 0.28.0. Versions 0.29.0 to 0.48.1 were tagged without changelog sections of their own; from 0.49.0 on, `scripts/release.sh` turns this section into the release notes.
+
 ### Added
 
 - Server: S3 reads use the AWS credential chain (SSO, profile); `--mcp-only`

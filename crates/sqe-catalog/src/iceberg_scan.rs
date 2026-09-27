@@ -766,7 +766,7 @@ impl IcebergScanExec {
         let tasks: Vec<_> = scan.plan_files().await?.try_collect().await?;
         let mut result: Vec<(String, u64)> = tasks
             .iter()
-            .map(|t| (t.data_file_path().to_string(), t.length))
+            .map(|t| (t.data_file_path().to_string(), t.length()))
             .collect();
         let mut pruned_count = 0usize;
         if !self.df_filters.is_empty() {
@@ -1385,7 +1385,13 @@ impl ExecutionPlan for IcebergScanExec {
             // latency. For over-partitioned tables with many small files this also
             // groups tiny files at the end where their overhead is amortised.
             let total_scan_bytes: u64 = file_entries.iter().map(|(_, sz)| *sz).sum();
-            file_entries.sort_by_key(|e| std::cmp::Reverse(e.1));
+            // Every partition plans independently and then takes its own
+            // round-robin slice of this list, so the order must be TOTAL:
+            // with size alone, equal-sized files keep the planner's arrival
+            // order, which differs between partitions once manifests are read
+            // concurrently. The slices then overlap and miss files, so rows
+            // are read twice or not at all. The path breaks every tie.
+            file_entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             debug!(
                 file_count = file_entries.len(),
                 total_scan_bytes = total_scan_bytes,
@@ -1917,7 +1923,7 @@ impl ExecutionPlan for IcebergScanExec {
                     // Cap the CASE-union membership set at `bloom_max_values`
                     // (sqe#369): above it the set prunes no row groups and
                     // would only cost a per-row RowFilter (TPC-H q21/q12).
-                    let dyn_pred = iceberg_datafusion::physical_plan::physical_to_predicate::RuntimeFiltersDynamicPredicate::new_with_max_set_values(
+                    let dyn_pred = crate::physical_to_predicate::RuntimeFiltersDynamicPredicate::new_with_max_set_values(
                         pushed_down_filters.clone(),
                         runtime_filter_bloom_max_values,
                     );
@@ -1968,7 +1974,8 @@ impl ExecutionPlan for IcebergScanExec {
                     my_tasks
                         .iter()
                         .map(|t| {
-                            (if t.length == 0 { t.file_size_in_bytes } else { t.length }) as usize
+                            (if t.length() == 0 { t.file_size_in_bytes() } else { t.length() })
+                                as usize
                         })
                         .sum::<usize>(),
                 );
@@ -2402,7 +2409,7 @@ async fn collect_data_files_via_plan(
 
     Ok(tasks
         .into_iter()
-        .map(|t| (t.data_file_path, t.file_size_in_bytes))
+        .map(|t| (t.data_file_path().to_string(), t.file_size_in_bytes()))
         .collect())
 }
 
@@ -2674,15 +2681,15 @@ fn assign_split_tasks(
 ) -> Vec<FileScanTask> {
     // Canonical order so `file_index` is stable across partitions regardless of
     // the (unordered) `plan_files` stream order each partition plans from.
-    tasks.sort_by(|a, b| a.data_file_path.cmp(&b.data_file_path));
+    tasks.sort_by(|a, b| a.data_file_path().cmp(b.data_file_path()));
     // Byte-range subtasks only make sense for the Parquet row-group reader; any
     // other format stays whole.
     let files: Vec<(u64, bool)> = tasks
         .iter()
         .map(|t| {
             (
-                t.file_size_in_bytes,
-                t.data_file_format == DataFileFormat::Parquet,
+                t.file_size_in_bytes(),
+                t.data_file_format() == DataFileFormat::Parquet,
             )
         })
         .collect();
@@ -2692,19 +2699,14 @@ fn assign_split_tasks(
         .filter(|(i, _)| i % total_partitions == partition)
         .map(|(_, (idx, start, length))| {
             let base = &tasks[idx];
-            if start == 0 && length == base.file_size_in_bytes {
+            if start == 0 && length == base.file_size_in_bytes() {
                 // Whole file (below the split threshold or non-Parquet): the
                 // original task unchanged keeps its `record_count` and lets the
                 // reader treat it as a whole-file read.
                 base.clone()
             } else {
-                FileScanTask {
-                    start,
-                    length,
-                    // Per the field contract, only valid for whole-file reads.
-                    record_count: None,
-                    ..base.clone()
-                }
+                // Clears `record_count`: only valid for whole-file reads.
+                base.with_byte_range(start, length)
             }
         })
         .collect()

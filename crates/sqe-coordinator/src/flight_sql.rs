@@ -408,8 +408,8 @@ fn like_match_inner(pattern: &[char], value: &[char]) -> bool {
 
 /// Build [`IpcWriteOptions`] for a given compression setting.
 ///
-/// Used by both the coordinator (client-facing DoGet) and shared with workers
-/// for shuffle DoExchange encoding.
+/// Used by the coordinator (client-facing DoGet) and by workers (scan results
+/// to the coordinator, `coordinator.worker_flight_compression`).
 pub fn ipc_options_for(
     compression: sqe_core::FlightCompression,
 ) -> Result<IpcWriteOptions, Status> {
@@ -1113,7 +1113,24 @@ impl SqeFlightSqlService {
     }
 
     /// Run whatever a redeemed ticket resolved to.
-    async fn run_resolved_into_flight_response(
+    ///
+    /// Boxed at the definition like `QueryHandler::execute`: the two
+    /// `async_trait` callers (`do_get_statement` and the fallback `do_get`)
+    /// otherwise each re-prove `Send` over this state machine (8.4 s of the
+    /// library's compile, `-Zself-profile`, 2026-09-27).
+    fn run_resolved_into_flight_response<'a>(
+        &'a self,
+        session: &'a sqe_core::Session,
+        resolved: ResolvedStatement,
+        client_ip: Option<String>,
+        query_id: Option<uuid::Uuid>,
+    ) -> futures::future::BoxFuture<'a, Result<Response<FlightStream>, Status>> {
+        Box::pin(self.run_resolved_into_flight_response_inner(
+            session, resolved, client_ip, query_id,
+        ))
+    }
+
+    async fn run_resolved_into_flight_response_inner(
         &self,
         session: &sqe_core::Session,
         resolved: ResolvedStatement,

@@ -2406,16 +2406,14 @@ impl MaintenanceHandler {
 
         let before_count = table.metadata().snapshots().count() as i64;
 
+        let before_metadata = table.metadata_ref();
         let tx = Transaction::new(&table);
-        let mut action = tx.expire_snapshot().clear_expire_files(true);
+        let mut action = tx.expire_snapshots();
         if let Some(ts) = older_than_ms {
-            action = action.expire_older_than(ts);
+            action = action.expire_older_than_ms(ts);
         }
         if let Some(keep) = retain_last {
-            action = action.retain_last(
-                i32::try_from(keep)
-                    .map_err(|_| SqeError::Execution("retain_last does not fit in i32".to_string()))?,
-            );
+            action = action.retain_last(keep);
         }
 
         let tx_applied = action
@@ -2426,6 +2424,15 @@ impl MaintenanceHandler {
             .commit(catalog.as_ref())
             .await
             .map_err(|e| classify_commit_error(e, "expire_snapshots"))?;
+
+        // The old fork's `clear_expire_files(true)` deleted the now-unreachable
+        // manifests / data files as part of the action; apache does it as a
+        // separate post-commit step. A cleanup failure does not undo the
+        // committed expiry, so it is surfaced as an error for the operator.
+        committed
+            .cleanup_expired_files(&before_metadata)
+            .await
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("expire_snapshots file cleanup failed after commit: {e}")))?;
 
         let after_count = committed.metadata().snapshots().count() as i64;
         let removed = before_count - after_count;

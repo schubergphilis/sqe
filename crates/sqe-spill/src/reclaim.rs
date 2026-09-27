@@ -4,7 +4,7 @@
 use crate::budget::ByteBudget;
 
 /// A consumer that can release memory under pressure (join build, aggregate
-/// state, sort runs, shuffle buffers).
+/// state, sort runs).
 ///
 /// Phase 7 extends this with live registration on the [`crate::MemoryGovernor`].
 /// Defaults keep existing implementors compiling; override `current_bytes` /

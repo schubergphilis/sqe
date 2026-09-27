@@ -19,6 +19,8 @@
 
 pub mod memory;
 mod metadata_location;
+mod session;
+pub(crate) mod utils;
 
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
@@ -35,9 +37,14 @@ pub use metadata_location::*;
 #[cfg(test)]
 use mockall::automock;
 use serde_derive::{Deserialize, Serialize};
+pub use session::*;
 use typed_builder::TypedBuilder;
 use uuid::Uuid;
 
+use crate::encryption::kms::KmsClientFactory;
+use crate::error::invalid_data;
+use crate::io::StorageFactory;
+use crate::runtime::Runtime;
 use crate::spec::{
     EncryptedKey, FormatVersion, PartitionStatisticsFile, Schema, SchemaId, Snapshot,
     SnapshotReference, SortOrder, StatisticsFile, TableMetadata, TableMetadataBuilder,
@@ -97,6 +104,14 @@ pub trait Catalog: Debug + Sync + Send {
     /// Drop a table from the catalog, or returns error if it doesn't exist.
     async fn drop_table(&self, table: &TableIdent) -> Result<()>;
 
+    /// Drop a table from the catalog and delete the underlying table data.
+    ///
+    /// Implementations should load the table metadata, drop the table
+    /// from the catalog, then delete all associated data and metadata files.
+    /// The [`drop_table_data`](utils::drop_table_data) utility function can
+    /// be used for the file cleanup step.
+    async fn purge_table(&self, table: &TableIdent) -> Result<()>;
+
     /// Check if a table exists in the catalog.
     async fn table_exists(&self, table: &TableIdent) -> Result<bool>;
 
@@ -114,20 +129,60 @@ pub trait Catalog: Debug + Sync + Send {
 pub trait CatalogBuilder: Default + Debug + Send + Sync {
     /// The catalog type that this builder creates.
     type C: Catalog;
-    /// Optional storage factory that the catalog will use when constructing
-    /// `FileIO` for table data. Default impl drops the factory; catalogs
-    /// that need it (HMS, Glue) override.
+
+    /// Set a custom StorageFactory to use for storage operations.
     ///
-    /// SQE-vendored from upstream apache/iceberg-rust v0.9.0's
-    /// `CatalogBuilder::with_storage_factory`. Added to the fork's trait so
-    /// the upstream HMS / Glue catalog crates compile unmodified.
-    #[allow(unused_variables)]
-    fn with_storage_factory(
-        self,
-        storage_factory: std::sync::Arc<dyn crate::io::StorageFactory>,
-    ) -> Self {
-        self
-    }
+    /// When a StorageFactory is provided, the catalog will use it to build FileIO
+    /// instances for all storage operations instead of using the default factory.
+    ///
+    /// # Arguments
+    ///
+    /// * `storage_factory` - The StorageFactory to use for creating storage instances
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use iceberg::CatalogBuilder;
+    /// use iceberg::io::StorageFactory;
+    /// use iceberg_storage_opendal::OpenDalStorageFactory;
+    /// use std::sync::Arc;
+    ///
+    /// let catalog = MyCatalogBuilder::default()
+    ///     .with_storage_factory(Arc::new(OpenDalStorageFactory::s3()))
+    ///     .load("my_catalog", props)
+    ///     .await?;
+    /// ```
+    fn with_storage_factory(self, storage_factory: Arc<dyn StorageFactory>) -> Self;
+
+    /// Set a [`KmsClientFactory`] to enable table encryption.
+    ///
+    /// When provided, the catalog calls the factory once during
+    /// [`load`](Self::load) with the catalog properties to create a shared
+    /// [`KeyManagementClient`](crate::encryption::KeyManagementClient).
+    /// That client is then passed to each table's `TableBuilder` so tables
+    /// with `encryption.key-id` set can construct an `EncryptionManager`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use iceberg::CatalogBuilder;
+    /// use iceberg::encryption::kms::KmsClientFactory;
+    /// use std::sync::Arc;
+    ///
+    /// let catalog = MyCatalogBuilder::default()
+    ///     .with_kms_client_factory(Arc::new(MyKmsClientFactory))
+    ///     .load("my_catalog", props)
+    ///     .await?;
+    /// ```
+    fn with_kms_client_factory(self, kms_client_factory: Arc<dyn KmsClientFactory>) -> Self;
+
+    /// Set a custom tokio Runtime to use for spawning async tasks.
+    ///
+    /// When a Runtime is provided, the catalog will propagate it to all tables
+    /// it creates. Tasks such as scan planning and delete file processing
+    /// will be spawned on this runtime.
+    fn with_runtime(self, runtime: Runtime) -> Self;
+
     /// Create a new catalog instance.
     fn load(
         self,
@@ -153,10 +208,7 @@ impl NamespaceIdent {
     /// Create a multi-level namespace identifier from vector.
     pub fn from_vec(names: Vec<String>) -> Result<Self> {
         if names.is_empty() {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "Namespace identifier can't be empty!",
-            ));
+            return Err(invalid_data!("Namespace identifier can't be empty!"));
         }
         Ok(Self(names))
     }
@@ -266,9 +318,9 @@ impl TableIdent {
     /// Try to create table identifier from an iterator of string.
     pub fn from_strs(iter: impl IntoIterator<Item = impl ToString>) -> Result<Self> {
         let mut vec: Vec<String> = iter.into_iter().map(|s| s.to_string()).collect();
-        let table_name = vec.pop().ok_or_else(|| {
-            Error::new(ErrorKind::DataInvalid, "Table identifier can't be empty!")
-        })?;
+        let table_name = vec
+            .pop()
+            .ok_or_else(|| invalid_data!("Table identifier can't be empty!"))?;
         let namespace_ident = NamespaceIdent::from_vec(vec)?;
 
         Ok(Self {
@@ -367,13 +419,16 @@ impl TableCommit {
             metadata_builder = update.apply(metadata_builder)?;
         }
 
-        // Bump the version of metadata
+        // Build the new metadata
+        let new_metadata = metadata_builder.build()?.metadata;
+
         let new_metadata_location = MetadataLocation::from_str(current_metadata_location)?
             .with_next_version()
+            .try_with_new_metadata(&new_metadata)?
             .to_string();
 
         Ok(table
-            .with_metadata(Arc::new(metadata_builder.build()?.metadata))
+            .with_metadata(Arc::new(new_metadata))
             .with_metadata_location(new_metadata_location))
     }
 }
@@ -1040,7 +1095,7 @@ mod tests {
     use uuid::uuid;
 
     use super::ViewUpdate;
-    use crate::io::FileIOBuilder;
+    use crate::io::FileIO;
     use crate::spec::{
         BlobMetadata, EncryptedKey, FormatVersion, MAIN_BRANCH, NestedField, NullOrder, Operation,
         PartitionStatisticsFile, PrimitiveType, Schema, Snapshot, SnapshotReference,
@@ -1050,6 +1105,7 @@ mod tests {
         ViewVersion,
     };
     use crate::table::Table;
+    use crate::test_utils::test_runtime;
     use crate::{
         NamespaceIdent, TableCommit, TableCreation, TableIdent, TableRequirement, TableUpdate,
     };
@@ -2364,9 +2420,10 @@ mod tests {
 
             Table::builder()
                 .metadata(resp)
-                .metadata_location("s3://bucket/test/location/metadata/00000-8a62c37d-4573-4021-952a-c0baef7d21d0.metadata.json".to_string())
+                .metadata_location("s3://bucket/test/location/metadata/00000-8a62c37d-4573-4021-952a-c0baef7d21d0.metadata.json")
                 .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
-                .file_io(FileIOBuilder::new("memory").build().unwrap())
+                .file_io(FileIO::new_with_memory())
+                .runtime(test_runtime())
                 .build()
                 .unwrap()
         };
@@ -2406,12 +2463,13 @@ mod tests {
             "v2"
         );
 
-        // metadata version should be bumped
+        // metadata version should be bumped, and the metadata directory should be
+        // re-derived from the updated table location
         assert!(
             updated_table
                 .metadata_location()
                 .unwrap()
-                .starts_with("s3://bucket/test/location/metadata/00001-")
+                .starts_with("s3://bucket/test/new_location/data/metadata/00001-")
         );
 
         assert_eq!(

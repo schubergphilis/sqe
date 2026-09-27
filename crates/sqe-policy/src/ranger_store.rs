@@ -194,6 +194,26 @@ const MASK_TYPE_CUSTOM: &str = "CUSTOM";
 /// Single, constant key for the user-independent ServicePolicies bundle cache.
 const BUNDLE_KEY: &str = "__bundle__";
 
+/// A cached `ResolvedPolicy` behind a trait object: a compile firewall, keep it.
+///
+/// `ResolvedPolicy` holds row-filter `Expr`s. Stored concretely in the moka
+/// cache, every `Send`/`Sync` proof of `RangerStore` (one per `async_trait`
+/// method; the solver cache does not span them) walks DataFusion's whole
+/// expression and plan type graph. `dyn PolicyValue` stops the walk at its
+/// declared bounds. Same device as the coordinator's `StoredPlan`.
+#[derive(Clone)]
+struct CachedPolicy(Arc<dyn PolicyValue>);
+
+trait PolicyValue: Send + Sync + 'static {
+    fn policy(&self) -> &ResolvedPolicy;
+}
+
+impl PolicyValue for ResolvedPolicy {
+    fn policy(&self) -> &ResolvedPolicy {
+        self
+    }
+}
+
 /// Fine-grained policy store backed by a `hive`-type Ranger service.
 pub struct RangerStore {
     client: Client,
@@ -206,7 +226,7 @@ pub struct RangerStore {
     download_url: String,
     admin_user: String,
     admin_password: SecretString,
-    cache: Cache<String, ResolvedPolicy>,
+    cache: Cache<String, CachedPolicy>,
     /// Cache of the raw, user-independent ServicePolicies bundle under a single
     /// `BUNDLE_KEY`. The bundle is the same for every user, so caching it here
     /// (with the same TTL as the per-user `cache`) avoids re-downloading and
@@ -1417,7 +1437,7 @@ impl PolicyStore for RangerStore {
         let key = cache_key(user, table_name, namespace);
         if let Some(cached) = self.cache.get(&key).await {
             self.record_cache_hit();
-            return Ok(cached);
+            return Ok(cached.0.policy().clone());
         }
         self.record_cache_miss();
         let bundle = self.cached_bundle().await?;
@@ -1428,7 +1448,9 @@ impl PolicyStore for RangerStore {
             namespace,
             self.requires_access_grant(namespace),
         );
-        self.cache.insert(key, policy.clone()).await;
+        self.cache
+            .insert(key, CachedPolicy(Arc::new(policy.clone())))
+            .await;
         Ok(policy)
     }
 
@@ -1708,7 +1730,10 @@ mod tests {
 
         let u = user("alice", &["analyst"]);
         let key = cache_key(&u, "orders", "sales");
-        store.cache.insert(key, ResolvedPolicy::default()).await;
+        store
+            .cache
+            .insert(key, CachedPolicy(Arc::new(ResolvedPolicy::default())))
+            .await;
 
         let _ = store.resolve(&u, "orders", "sales").await.unwrap();
         let hits = metrics
@@ -1948,7 +1973,7 @@ mod tests {
         let key = cache_key(&u, "orders", "sales");
         store
             .cache
-            .insert(key.clone(), ResolvedPolicy::default())
+            .insert(key.clone(), CachedPolicy(Arc::new(ResolvedPolicy::default())))
             .await;
         store.last_policy_version.store(1, Ordering::Relaxed);
 
@@ -1970,7 +1995,7 @@ mod tests {
         let key = cache_key(&u, "orders", "sales");
         store
             .cache
-            .insert(key.clone(), ResolvedPolicy::default())
+            .insert(key.clone(), CachedPolicy(Arc::new(ResolvedPolicy::default())))
             .await;
         store.last_policy_version.store(7, Ordering::Relaxed);
 

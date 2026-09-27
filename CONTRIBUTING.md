@@ -153,6 +153,7 @@ up from an earlier session.
 | Access-control e2e | `crates/sqe-coordinator/tests/it/` | `make test-access-control` (Ranger stack) |
 | Quickstart scenarios | `quickstart/*/run.sh --check` | `scripts/test.sh scenario all` |
 | E2E tests | `scripts/e2e-test.sh` | Full stack |
+| DAST baseline | `scripts/dast-baseline.sh`, rules in `.zap/baseline.conf` | `make dast` (Docker); run before a release and after HTTP-surface changes |
 | Benchmarks | `sqe-bench` crate | Polaris + S3 stack |
 
 ## Code Review

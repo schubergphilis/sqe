@@ -574,6 +574,9 @@ mod hive_lane_tests {
         async fn drop_table(&self, _table: &iceberg::TableIdent) -> iceberg::Result<()> {
             unimplemented!("test stub")
         }
+        async fn purge_table(&self, _table: &iceberg::TableIdent) -> iceberg::Result<()> {
+            unimplemented!("test stub")
+        }
         async fn table_exists(&self, _table: &iceberg::TableIdent) -> iceberg::Result<bool> {
             unimplemented!("test stub")
         }

@@ -1,0 +1,520 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+//
+// Convert DataFusion **physical** expressions into iceberg
+// [`Predicate`]s for the runtime/dynamic filter pushdown path.
+//
+// `expr_to_predicate` handles the *logical* `Expr` tree from
+// `supports_filters_pushdown`. That covers static filters known at
+// planning time. This module handles the smaller subset of physical
+// expressions that show up at runtime — specifically, what
+// `HashJoinExec`'s `enable_dynamic_filter_pushdown` produces once a
+// build side completes:
+//
+//   - `DynamicFilterPhysicalExpr`: wrapper whose inner expression
+//     starts as `lit(true)` and is replaced when the build is sealed.
+//   - `BinaryExpr(col >= literal AND col <= literal)`: min/max bounds
+//     emitted by `shared_bounds.rs`.
+//   - `InListExpr(col, [literals])`: membership filter for join keys.
+//   - `BinaryExpr` of the above ANDed together.
+//
+// Anything outside this vocabulary returns `None`, and the reader
+// falls back to its static predicate.
+
+use std::sync::Arc;
+
+use datafusion::arrow::datatypes::DataType;
+use datafusion::physical_expr::expressions::{
+    BinaryExpr, CaseExpr, Column, DynamicFilterPhysicalExpr, InListExpr, Literal,
+};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::scalar::ScalarValue;
+use iceberg::expr::{DynamicPredicate, Predicate, Reference};
+use iceberg::spec::Datum;
+
+/// Default cap on the size of a runtime-filter membership set produced by
+/// [`convert_case`] (SQE PATCH sqe#369). Mirrors the `bloom_max_values`
+/// default: above this size neither the SBBF row-group evaluator (bails
+/// above `bloom_max_values`) nor stats-based `IN` pruning (bails above 200
+/// literals) can prune anything, so the converted `Predicate::Set` would only
+/// survive as a per-row parquet `RowFilter` — pure cost with no row-group
+/// benefit on large, non-selective join keys (the TPC-H q21/q12 regression).
+pub const DEFAULT_MAX_RUNTIME_FILTER_SET_VALUES: usize = 65536;
+
+/// Bridge that exposes a set of DataFusion runtime [`PhysicalExpr`]s
+/// (typically `DynamicFilterPhysicalExpr` from a `HashJoinExec` build
+/// side) to iceberg-rust's per-task scan pruning via the
+/// [`DynamicPredicate`] trait.
+///
+/// On each call to [`DynamicPredicate::current`], the bridge attempts
+/// to translate the most-recent state of the runtime filters into an
+/// iceberg [`Predicate`]. When the filters are still at their initial
+/// "always-true" placeholder (the build side has not yet completed),
+/// or when their physical shape is not representable in iceberg's
+/// expression vocabulary, `current()` returns `None` and the reader
+/// falls back to the static predicate alone. Per-task sampling is
+/// purely additive: it never regresses correctness or performance
+/// compared to having no dynamic predicate at all.
+///
+/// Reused across both the vendored `IcebergTableScan` and SQE's own
+/// `IcebergScanExec` so the runtime-filter wiring stays in one place.
+#[derive(Debug)]
+pub struct RuntimeFiltersDynamicPredicate {
+    filters: Vec<Arc<dyn PhysicalExpr>>,
+    /// Cap on the per-column membership-set size produced from a partitioned
+    /// join's sealed CASE (sqe#369). Sourced from `bloom_max_values` at the
+    /// SQE callsite; the vendored `IcebergTableScan` path uses the default.
+    max_set_values: usize,
+}
+
+impl RuntimeFiltersDynamicPredicate {
+    /// Wrap a set of runtime filters in an [`Arc`]'d
+    /// [`DynamicPredicate`] suitable for
+    /// `TableScanBuilder::with_dynamic_predicate`, using the default
+    /// membership-set cap ([`DEFAULT_MAX_RUNTIME_FILTER_SET_VALUES`]).
+    pub fn new(filters: Vec<Arc<dyn PhysicalExpr>>) -> Arc<Self> {
+        Self::new_with_max_set_values(filters, DEFAULT_MAX_RUNTIME_FILTER_SET_VALUES)
+    }
+
+    /// As [`new`](Self::new), but with an explicit membership-set cap so the
+    /// caller can align it with `[catalog.runtime_filters] bloom_max_values`.
+    pub fn new_with_max_set_values(
+        filters: Vec<Arc<dyn PhysicalExpr>>,
+        max_set_values: usize,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            filters,
+            max_set_values,
+        })
+    }
+}
+
+impl DynamicPredicate for RuntimeFiltersDynamicPredicate {
+    fn current(&self) -> Option<Predicate> {
+        convert_physical_filters_to_predicate_capped(&self.filters, self.max_set_values)
+    }
+}
+
+/// Convert a slice of runtime [`PhysicalExpr`]s into a single iceberg
+/// [`Predicate`] (ANDed together). Returns `None` if no expression in
+/// the slice is currently translatable — for example because every
+/// `DynamicFilterPhysicalExpr` is still at its initial `lit(true)`
+/// placeholder.
+pub fn convert_physical_filters_to_predicate(
+    filters: &[Arc<dyn PhysicalExpr>],
+) -> Option<Predicate> {
+    convert_physical_filters_to_predicate_capped(filters, DEFAULT_MAX_RUNTIME_FILTER_SET_VALUES)
+}
+
+/// As [`convert_physical_filters_to_predicate`], but caps the per-column
+/// membership set produced from a partitioned join's sealed CASE at
+/// `max_set_values` (sqe#369). A union larger than the cap drops that column
+/// (it cannot be row-group pruned anyway), restoring the pre-`df5c59d`
+/// behavior for large sets while keeping small selective sets.
+pub fn convert_physical_filters_to_predicate_capped(
+    filters: &[Arc<dyn PhysicalExpr>],
+    max_set_values: usize,
+) -> Option<Predicate> {
+    filters
+        .iter()
+        .filter_map(|f| convert_physical(f, max_set_values))
+        .reduce(Predicate::and)
+}
+
+fn convert_physical(expr: &Arc<dyn PhysicalExpr>, max_set_values: usize) -> Option<Predicate> {
+    let any = expr.as_ref();
+
+    // 1. DynamicFilterPhysicalExpr: unwrap to the current inner.
+    //    If the inner is still `lit(true)` we cannot produce anything
+    //    useful yet — the build side has not completed.
+    if let Some(dynamic) = any.downcast_ref::<DynamicFilterPhysicalExpr>() {
+        let inner = dynamic.current().ok()?;
+        if is_literal_true(&inner) {
+            return None;
+        }
+        return convert_physical(&inner, max_set_values);
+    }
+
+    // 2. BinaryExpr: AND combines two predicates; comparisons against a
+    //    literal map to iceberg::Predicate::Binary.
+    if let Some(binary) = any.downcast_ref::<BinaryExpr>() {
+        return convert_binary(binary, max_set_values);
+    }
+
+    // 3. InListExpr: IN-list of literals → Predicate::Set
+    if let Some(in_list) = any.downcast_ref::<InListExpr>() {
+        return convert_in_list(in_list);
+    }
+
+    // 4. CaseExpr: the sealed shape of a PARTITIONED hash join's
+    //    dynamic filter (DataFusion `shared_bounds.rs`):
+    //    `CASE hash(col) % n WHEN p THEN col IN (...) [AND bounds] ...
+    //     ELSE false END`. Converted by unioning the per-arm membership
+    //    sets into one `Predicate::Set` per column (sqe#369).
+    if let Some(case) = any.downcast_ref::<CaseExpr>() {
+        return convert_case(case, max_set_values);
+    }
+
+    None
+}
+
+/// Convert the sealed CASE-of-InLists shape a partitioned `HashJoinExec`
+/// dynamic filter takes into a conjunction of per-column membership
+/// sets, by unioning every arm's `IN` set (sqe#369).
+///
+/// Soundness: a row accepted by the CASE satisfies exactly one arm, and
+/// each arm's acceptance region is contained in that arm's membership
+/// set for every column the arm constrains. For any column constrained
+/// by EVERY arm, an accepted row's value therefore lies in the union of
+/// the arms' sets for that column, so `col IN (union)` is a strict
+/// over-approximation of the CASE: safe for pruning, never for exact
+/// evaluation (the reader always re-applies the real filter).
+///
+/// Bail-outs (return `None`, reader falls back to the static
+/// predicate):
+/// - `ELSE` is anything but a literal `false` (e.g. the
+///   canceled-unknown seal uses `ELSE true`, admitting arbitrary rows);
+/// - any arm's THEN admits rows we cannot bound by a membership set
+///   (`lit(true)` fallback arms, map-lookup pushdown for large build
+///   sides, struct-keyed multi-column joins);
+/// - no single column is constrained by every arm (mixed-column arms).
+///
+/// Size cap (sqe#369): a column whose union exceeds `max_set_values` is
+/// dropped. Above that size the set can prune no row groups (the SBBF
+/// evaluator bails above `bloom_max_values`, stats-based `IN` bails above 200
+/// literals), so it would only survive as a per-row parquet `RowFilter` —
+/// pure cost with no pruning on large, non-selective join keys (TPC-H
+/// q21/q12). Dropping it returns the pre-`df5c59d` result (the CASE was
+/// untranslatable then) while small selective sets keep converting.
+fn convert_case(case: &CaseExpr, max_set_values: usize) -> Option<Predicate> {
+    if let Some(else_expr) = case.else_expr() {
+        if !is_literal_false(else_expr) {
+            return None;
+        }
+    }
+
+    // Membership sets per arm: column name -> literal datums.
+    let mut arms: Vec<std::collections::HashMap<String, Vec<Datum>>> = Vec::new();
+    for (_when, then) in case.when_then_expr() {
+        if is_literal_false(then) {
+            // Arm admits no rows (e.g. an empty build partition):
+            // contributes nothing to any union.
+            continue;
+        }
+        let mut sets = std::collections::HashMap::new();
+        collect_membership_sets(then, &mut sets);
+        if sets.is_empty() {
+            // Arm admits rows unconstrained by any membership set.
+            return None;
+        }
+        arms.push(sets);
+    }
+
+    if arms.is_empty() {
+        // Every arm was `false`: the CASE is provably false.
+        return Some(Predicate::AlwaysFalse);
+    }
+
+    // Columns constrained by EVERY arm; only those yield a sound union.
+    let mut common: Vec<&String> = arms[0]
+        .keys()
+        .filter(|col| arms.iter().all(|arm| arm.contains_key(*col)))
+        .collect();
+    if common.is_empty() {
+        return None;
+    }
+    // Deterministic conjunct order for stable plans/tests.
+    common.sort();
+
+    let mut result: Option<Predicate> = None;
+    for col in common {
+        // Accumulate the union, short-circuiting the walk once it exceeds the
+        // cap: no point cloning the rest of a ~300K-key set we are going to
+        // drop. `> max_set_values` keeps a union of exactly the cap.
+        let mut union: Vec<Datum> = Vec::new();
+        let mut over_cap = false;
+        for arm in &arms {
+            union.extend(arm[col].iter().cloned());
+            if union.len() > max_set_values {
+                over_cap = true;
+                break;
+            }
+        }
+        if over_cap {
+            // Too large to prune row groups; keeping it only buys a per-row
+            // RowFilter cost. Drop this column (sound: widens the
+            // over-approximation) and let the reader fall back.
+            continue;
+        }
+        let membership = if union.is_empty() {
+            // Every arm carried an empty IN-list for this column:
+            // provably false.
+            Predicate::AlwaysFalse
+        } else {
+            Reference::new(col.clone()).is_in(union)
+        };
+        result = Some(match result {
+            Some(acc) => acc.and(membership),
+            None => membership,
+        });
+    }
+    // `None` when every common column was dropped: the reader falls back to
+    // the static predicate, exactly as before sqe#369 added the CASE arm.
+    result
+}
+
+/// Collect the membership sets of the positive conjuncts of `expr` into
+/// `out` (column name -> literals). Recurses into `AND`; every other
+/// node contributes nothing. Ignoring a conjunct only widens the
+/// over-approximation, so this never loses soundness; the caller treats
+/// an arm with NO collected sets as unbounded and bails.
+fn collect_membership_sets(
+    expr: &Arc<dyn PhysicalExpr>,
+    out: &mut std::collections::HashMap<String, Vec<Datum>>,
+) {
+    use datafusion::logical_expr::Operator;
+
+    let any = expr.as_ref();
+    if let Some(binary) = any.downcast_ref::<BinaryExpr>() {
+        if *binary.op() == Operator::And {
+            collect_membership_sets(binary.left(), out);
+            collect_membership_sets(binary.right(), out);
+        } else if *binary.op() == Operator::Eq {
+            // col = literal (either side).
+            let col_lit = match (
+                extract_column(binary.left()),
+                extract_literal(binary.right()),
+            ) {
+                (Some(col), Some(lit)) => Some((col, lit)),
+                _ => match (
+                    extract_column(binary.right()),
+                    extract_literal(binary.left()),
+                ) {
+                    (Some(col), Some(lit)) => Some((col, lit)),
+                    _ => None,
+                },
+            };
+            if let Some((col, lit)) = col_lit {
+                if let Some(datum) = scalar_to_datum(&lit) {
+                    out.entry(col).or_default().push(datum);
+                }
+            }
+        }
+        return;
+    }
+    if let Some(in_list) = any.downcast_ref::<InListExpr>() {
+        if in_list.negated() {
+            return;
+        }
+        let Some(col) = extract_column(in_list.expr()) else {
+            return;
+        };
+        let mut datums = Vec::with_capacity(in_list.list().len());
+        for item in in_list.list() {
+            let Some(lit) = extract_literal(item) else {
+                return;
+            };
+            let Some(datum) = scalar_to_datum(&lit) else {
+                return;
+            };
+            datums.push(datum);
+        }
+        // An empty IN-list constrains the column to the empty set (the
+        // arm admits no rows); record it so the caller does not treat
+        // the arm as unbounded.
+        out.entry(col).or_default().extend(datums);
+    }
+}
+
+fn convert_binary(binary: &BinaryExpr, max_set_values: usize) -> Option<Predicate> {
+    use datafusion::logical_expr::Operator;
+
+    match binary.op() {
+        Operator::And => {
+            // Best-effort: produce whichever side(s) translate.
+            let left = convert_physical(binary.left(), max_set_values);
+            let right = convert_physical(binary.right(), max_set_values);
+            match (left, right) {
+                (Some(l), Some(r)) => Some(l.and(r)),
+                (Some(l), None) => Some(l),
+                (None, Some(r)) => Some(r),
+                (None, None) => None,
+            }
+        }
+        Operator::Or => {
+            // Predicate::or requires both sides to translate; OR of
+            // unknown loses correctness if we drop a branch.
+            let left = convert_physical(binary.left(), max_set_values)?;
+            let right = convert_physical(binary.right(), max_set_values)?;
+            Some(left.or(right))
+        }
+        op @ (Operator::Eq
+        | Operator::NotEq
+        | Operator::Lt
+        | Operator::LtEq
+        | Operator::Gt
+        | Operator::GtEq) => convert_comparison(binary.left(), *op, binary.right()),
+        _ => None,
+    }
+}
+
+fn convert_comparison(
+    left: &Arc<dyn PhysicalExpr>,
+    op: datafusion::logical_expr::Operator,
+    right: &Arc<dyn PhysicalExpr>,
+) -> Option<Predicate> {
+    use datafusion::logical_expr::Operator;
+
+    // Normalize so the column is on the left.
+    let (col_name, literal, op) = match (extract_column(left), extract_literal(right)) {
+        (Some(col), Some(lit)) => (col, lit, op),
+        _ => match (extract_column(right), extract_literal(left)) {
+            (Some(col), Some(lit)) => (col, lit, flip_op(op)),
+            _ => return None,
+        },
+    };
+
+    let datum = scalar_to_datum(&literal)?;
+    let reference = Reference::new(col_name);
+    Some(match op {
+        Operator::Eq => reference.equal_to(datum),
+        Operator::NotEq => reference.not_equal_to(datum),
+        Operator::Lt => reference.less_than(datum),
+        Operator::LtEq => reference.less_than_or_equal_to(datum),
+        Operator::Gt => reference.greater_than(datum),
+        Operator::GtEq => reference.greater_than_or_equal_to(datum),
+        _ => return None,
+    })
+}
+
+fn convert_in_list(in_list: &InListExpr) -> Option<Predicate> {
+    if in_list.negated() {
+        // not_in is supported by iceberg but we keep this conservative
+        // for v1 — extend later when needed.
+        return None;
+    }
+    // An empty IN-list means the predicate is provably false: no value
+    // matches an empty set. This is the shape DataFusion's hash-join
+    // dynamic filter takes when the build side completes with zero
+    // rows (e.g. SSB q3.4 with `c_city = 'UNITED KI1'` matching no
+    // customers). Emit `Predicate::AlwaysFalse` so iceberg's row-group
+    // metrics evaluator prunes every data file. Without this, the
+    // empty IN-list would be silently dropped and the probe-side scan
+    // would read its entire fact table only to produce zero rows
+    // through the hash join. See `physical_to_predicate.rs` history
+    // for the SSB SF1 trace that surfaced this gap.
+    //
+    // The IN-list literal-extraction loop must run BEFORE the
+    // emptiness check so a list containing only unsupported types
+    // (e.g. decimal) falls through to `None` rather than being
+    // confused with a genuinely empty list.
+    let col_name = extract_column(in_list.expr())?;
+    if in_list.list().is_empty() {
+        // Empty IN-list with no items: provably false. Reference
+        // unused but kept for clarity that the predicate is on a
+        // specific column.
+        let _ = col_name;
+        return Some(Predicate::AlwaysFalse);
+    }
+    let mut datums = Vec::with_capacity(in_list.list().len());
+    for item in in_list.list() {
+        let lit = extract_literal(item)?;
+        datums.push(scalar_to_datum(&lit)?);
+    }
+    if datums.is_empty() {
+        // Defensive: every item failed to convert (shouldn't happen
+        // when `in_list.list()` was non-empty, but treat as
+        // unconvertible rather than provably false). The reader will
+        // fall back to the static predicate.
+        return None;
+    }
+    Some(Reference::new(col_name).is_in(datums))
+}
+
+fn extract_column(expr: &Arc<dyn PhysicalExpr>) -> Option<String> {
+    expr.as_ref()
+        .downcast_ref::<Column>()
+        .map(|c| c.name().to_string())
+}
+
+fn extract_literal(expr: &Arc<dyn PhysicalExpr>) -> Option<ScalarValue> {
+    expr.as_ref()
+        .downcast_ref::<Literal>()
+        .map(|l| l.value().clone())
+}
+
+fn is_literal_true(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    matches!(
+        extract_literal(expr),
+        Some(ScalarValue::Boolean(Some(true)))
+    )
+}
+
+/// `lit(false)`: the shape DataFusion uses both for empty-partition CASE
+/// arms and for the `ELSE` of a sealed partitioned-join filter (sqe#369).
+fn is_literal_false(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    matches!(
+        extract_literal(expr),
+        Some(ScalarValue::Boolean(Some(false)))
+    )
+}
+
+fn flip_op(op: datafusion::logical_expr::Operator) -> datafusion::logical_expr::Operator {
+    use datafusion::logical_expr::Operator;
+    match op {
+        Operator::Eq => Operator::Eq,
+        Operator::NotEq => Operator::NotEq,
+        Operator::Lt => Operator::Gt,
+        Operator::LtEq => Operator::GtEq,
+        Operator::Gt => Operator::Lt,
+        Operator::GtEq => Operator::LtEq,
+        other => other,
+    }
+}
+
+/// Convert a DataFusion [`ScalarValue`] into an iceberg [`Datum`].
+/// Only the primitive types relevant to TPC-H/SSB join keys are
+/// supported here; unhandled types return `None` so the caller skips
+/// the predicate.
+fn scalar_to_datum(scalar: &ScalarValue) -> Option<Datum> {
+    match scalar {
+        ScalarValue::Boolean(Some(v)) => Some(Datum::bool(*v)),
+        ScalarValue::Int32(Some(v)) => Some(Datum::int(*v)),
+        ScalarValue::Int64(Some(v)) => Some(Datum::long(*v)),
+        ScalarValue::Float32(Some(v)) => Some(Datum::float(*v)),
+        ScalarValue::Float64(Some(v)) => Some(Datum::double(*v)),
+        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
+            Some(Datum::string(s.clone()))
+        }
+        ScalarValue::Date32(Some(d)) => Some(Datum::date(*d)),
+        // Decimal values are intentionally not handled in v1 of the
+        // converter. iceberg's `Datum::decimal` expects a `fastnum`
+        // decimal that carries explicit precision and scale; the
+        // ScalarValue precision/scale would need to round-trip through
+        // that. Hash join runtime filters at SF1/SF10 are on integer
+        // keys (orderkey, partkey, suppkey) so this gap is harmless
+        // for the bench. Returning `None` here makes the converter
+        // fall through to the per-batch evaluator for any decimal
+        // runtime filter, preserving correctness.
+        _ => None,
+    }
+}
+
+/// Suppress an unused import warning when feature flags trim the
+/// coverage of `scalar_to_datum`'s match arms.
+#[allow(dead_code)]
+fn _ensure_data_type_import_used(_dt: DataType) {}

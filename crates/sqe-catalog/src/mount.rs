@@ -639,6 +639,7 @@ async fn build_sqlite(
     // The user-facing catalog identifier comes from
     // `register_catalog(name, ...)` at the coordinator level.
     let catalog = SqlCatalogBuilder::default()
+        .with_storage_factory(crate::storage_factory())
         .load("sqe-attached".to_string(), props)
         .await
         .map_err(|e| format!("SQLite catalog open failed: {e}"))?;
@@ -792,6 +793,7 @@ async fn build_iceberg_rest(
     }
 
     let catalog = RestCatalogBuilder::default()
+        .with_storage_factory(crate::storage_factory())
         .load("sqe-attached-rest".to_string(), props)
         .await
         .map_err(|e| format!("Iceberg REST catalog open failed: {e}"))?;
@@ -961,6 +963,7 @@ async fn build_glue(
     }
 
     let catalog = GlueCatalogBuilder::default()
+        .with_storage_factory(crate::storage_factory())
         .load("sqe-attached-glue".to_string(), props)
         .await
         .map_err(|e| format!("AWS Glue catalog open failed: {e}"))?;
@@ -1049,6 +1052,7 @@ async fn build_s3tables(
     }
 
     let catalog = S3TablesCatalogBuilder::default()
+        .with_storage_factory(crate::storage_factory())
         .load("sqe-attached-s3tables".to_string(), props)
         .await
         .map_err(|e| format!("AWS S3 Tables catalog open failed: {e}"))?;
@@ -1162,6 +1166,7 @@ async fn build_hms(
     );
 
     let catalog = HmsCatalogBuilder::default()
+        .with_storage_factory(crate::storage_factory())
         .load("sqe-attached-hms".to_string(), props)
         .await
         .map_err(|e| format!("Hive Metastore catalog open failed: {e}"))?;
@@ -1288,6 +1293,7 @@ async fn build_jdbc_sqlx(
     );
 
     let catalog = SqlCatalogBuilder::default()
+        .with_storage_factory(crate::storage_factory())
         .load("sqe-attached-jdbc".to_string(), props)
         .await
         .map_err(|e| format!("JDBC SQL catalog open failed: {e}"))?;

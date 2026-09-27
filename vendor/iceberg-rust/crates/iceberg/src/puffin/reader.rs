@@ -18,39 +18,50 @@
 use tokio::sync::OnceCell;
 
 use super::validate_puffin_compression;
-use crate::io::InputFile;
+use crate::encryption::EncryptedInputFile;
+use crate::{Error, ErrorKind, Result};
+use crate::io::{FileRead, InputFile};
 use crate::puffin::blob::Blob;
 use crate::puffin::metadata::{BlobMetadata, FileMetadata};
-use crate::{Error, ErrorKind, Result};
 
 /// Puffin reader
 pub struct PuffinReader {
-    input_file: InputFile,
+    file_read: Box<dyn FileRead>,
+    file_length: u64,
     file_metadata: OnceCell<FileMetadata>,
-    file_length: OnceCell<u64>,
 }
 
 impl PuffinReader {
-    /// Returns a new Puffin reader
-    pub fn new(input_file: InputFile) -> Self {
-        Self {
-            input_file,
-            file_metadata: OnceCell::new(),
-            file_length: OnceCell::new(),
-        }
+    /// Returns a new Puffin reader for an unencrypted file.
+    pub async fn new(input_file: InputFile) -> Result<Self> {
+        let file_length = input_file.metadata().await?.size;
+        let file_read = input_file.reader().await?;
+        Ok(Self::from_parts(file_read, file_length))
     }
 
-    async fn file_length(&self) -> Result<u64> {
-        self.file_length
-            .get_or_try_init(|| async { Ok(self.input_file.metadata().await?.size) })
-            .await
-            .copied()
+    /// Returns a new Puffin reader from an [`EncryptedInputFile`].
+    ///
+    /// Use this when reading Puffin files with transparent decryption. The
+    /// reader operates over plaintext offsets and length, so all blob and
+    /// footer positions match those written to the unencrypted file.
+    pub async fn new_from_encrypted(encrypted_input: EncryptedInputFile) -> Result<Self> {
+        let file_length = encrypted_input.metadata()?.size;
+        let file_read = encrypted_input.reader().await?;
+        Ok(Self::from_parts(file_read, file_length))
+    }
+
+    fn from_parts(file_read: Box<dyn FileRead>, file_length: u64) -> Self {
+        Self {
+            file_read,
+            file_length,
+            file_metadata: OnceCell::new(),
+        }
     }
 
     /// Returns file metadata
     pub async fn file_metadata(&self) -> Result<&FileMetadata> {
         self.file_metadata
-            .get_or_try_init(|| FileMetadata::read(&self.input_file))
+            .get_or_try_init(|| FileMetadata::read(self.file_read.as_ref(), self.file_length))
             .await
     }
 
@@ -58,24 +69,23 @@ impl PuffinReader {
     pub async fn blob(&self, blob_metadata: &BlobMetadata) -> Result<Blob> {
         validate_puffin_compression(blob_metadata.compression_codec)?;
 
-        // Footer metadata is untrusted: guard against offset+length overflow
-        // and ranges past EOF before the storage layer allocates for them.
+        // SQE PATCH (72eff3f2): footer metadata is untrusted. Guard against
+        // offset+length overflow and ranges past EOF before the storage layer
+        // allocates for them.
         let start = blob_metadata.offset;
-        let file_length = self.file_length().await?;
         let end = start
             .checked_add(blob_metadata.length)
-            .filter(|end| *end <= file_length)
+            .filter(|end| *end <= self.file_length)
             .ok_or_else(|| {
                 Error::new(
                     ErrorKind::DataInvalid,
                     format!(
-                        "Blob range {start}+{} exceeds Puffin file length {file_length}",
-                        blob_metadata.length
+                        "Blob range {start}+{} exceeds Puffin file length {}",
+                        blob_metadata.length, self.file_length
                     ),
                 )
             })?;
-        let file_read = self.input_file.reader().await?;
-        let bytes = file_read.read(start..end).await?;
+        let bytes = self.file_read.read(start..end).await?;
         let data = blob_metadata.compression_codec.decompress(bytes.to_vec())?;
 
         Ok(Blob {
@@ -95,7 +105,6 @@ mod tests {
 
     use crate::ErrorKind;
     use crate::compression::CompressionCodec;
-    use crate::io::FileIOBuilder;
     use crate::puffin::metadata::BlobMetadata;
     use crate::puffin::reader::PuffinReader;
     use crate::puffin::test_utils::{
@@ -107,7 +116,7 @@ mod tests {
     #[tokio::test]
     async fn test_puffin_reader_uncompressed_metric_data() {
         let input_file = java_uncompressed_metric_input_file();
-        let puffin_reader = PuffinReader::new(input_file);
+        let puffin_reader = PuffinReader::new(input_file).await.unwrap();
 
         let file_metadata = puffin_reader.file_metadata().await.unwrap().clone();
         assert_eq!(file_metadata, uncompressed_metric_file_metadata());
@@ -132,7 +141,7 @@ mod tests {
     #[tokio::test]
     async fn test_puffin_reader_zstd_compressed_metric_data() {
         let input_file = java_zstd_compressed_metric_input_file();
-        let puffin_reader = PuffinReader::new(input_file);
+        let puffin_reader = PuffinReader::new(input_file).await.unwrap();
 
         let file_metadata = puffin_reader.file_metadata().await.unwrap().clone();
         assert_eq!(file_metadata, zstd_compressed_metric_file_metadata());
@@ -155,52 +164,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_blob_range_overflow_or_past_eof_rejected() {
-        // Self-contained: the footer is never parsed, only the file length,
-        // so any 64-byte file stands in for the (untrusted) Puffin file.
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let path = temp_dir.path().join("blob.bin");
-        std::fs::write(&path, [0u8; 64]).unwrap();
-        let input_file = FileIOBuilder::new_fs_io()
-            .build()
-            .unwrap()
-            .new_input(path.to_str().unwrap())
-            .unwrap();
-        let reader = PuffinReader::new(input_file);
-        for (offset, length) in [(u64::MAX - 1, 10), (4, u64::MAX), (4, 61), (65, 0)] {
-            let meta = BlobMetadata {
-                r#type: "test-type".to_string(),
-                fields: vec![1],
-                snapshot_id: 1,
-                sequence_number: 1,
-                offset,
-                length,
-                compression_codec: CompressionCodec::None,
-                properties: HashMap::new(),
-            };
-            let err = reader.blob(&meta).await.unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::DataInvalid, "{offset}+{length}");
-            assert!(err.to_string().contains("exceeds Puffin file length"));
-        }
-        // In-bounds range still reads.
-        let meta = BlobMetadata {
-            r#type: "test-type".to_string(),
-            fields: vec![1],
-            snapshot_id: 1,
-            sequence_number: 1,
-            offset: 4,
-            length: 60,
-            compression_codec: CompressionCodec::None,
-            properties: HashMap::new(),
-        };
-        assert_eq!(reader.blob(&meta).await.unwrap().data.len(), 60);
-    }
-
-    #[tokio::test]
     async fn test_gzip_compression_rejected_on_blob_access() {
         // Use a real puffin file
         let input_file = java_uncompressed_metric_input_file();
-        let reader = PuffinReader::new(input_file);
+        let reader = PuffinReader::new(input_file).await.unwrap();
 
         // Create a BlobMetadata with Gzip compression
         let gzip_blob_metadata = BlobMetadata {
@@ -210,7 +177,7 @@ mod tests {
             sequence_number: 1,
             offset: 4,
             length: 10,
-            compression_codec: CompressionCodec::Gzip,
+            compression_codec: CompressionCodec::gzip_default(),
             properties: HashMap::new(),
         };
 
@@ -219,10 +186,40 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
-        assert!(err.to_string().contains("Gzip"));
+        assert!(err.to_string().contains("gzip"));
         assert!(
             err.to_string()
                 .contains("is not supported for Puffin files")
         );
+    }
+
+    #[tokio::test]
+    async fn test_blob_range_overflow_or_past_eof_rejected() {
+        // Self-contained: the footer is never parsed, only the file length,
+        // so any 64-byte file stands in for the (untrusted) Puffin file.
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("blob.bin");
+        std::fs::write(&path, [0u8; 64]).unwrap();
+        let input_file = crate::io::FileIO::new_with_fs()
+            .new_input(path.to_str().unwrap())
+            .unwrap();
+        let reader = PuffinReader::new(input_file).await.unwrap();
+        let meta = |offset, length| BlobMetadata {
+            r#type: "test-type".to_string(),
+            fields: vec![1],
+            snapshot_id: 1,
+            sequence_number: 1,
+            offset,
+            length,
+            compression_codec: CompressionCodec::None,
+            properties: HashMap::new(),
+        };
+        for (offset, length) in [(u64::MAX - 1, 10), (4, u64::MAX), (4, 61), (65, 0)] {
+            let err = reader.blob(&meta(offset, length)).await.unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::DataInvalid, "{offset}+{length}");
+            assert!(err.to_string().contains("exceeds Puffin file length"));
+        }
+        // In-bounds range still reads.
+        assert_eq!(reader.blob(&meta(4, 60)).await.unwrap().data.len(), 60);
     }
 }

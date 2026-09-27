@@ -21,6 +21,7 @@ pub mod info_schema;
 pub mod late_materialize;
 pub mod lazy_object_store;
 pub mod mount;
+pub mod physical_to_predicate;
 pub mod pruning_stats;
 pub mod puffin_stats;
 pub mod read_csv;
@@ -68,6 +69,17 @@ pub use rest_catalog::{
 };
 #[cfg(feature = "rest")]
 pub use system_catalog::{SystemCatalogEntry, SystemCatalogProvider};
+
+/// Object storage for every Iceberg catalog and `FileIO` SQE builds.
+///
+/// iceberg-rust core no longer bundles storage: without a factory the REST,
+/// HMS and SQL catalogs fail on first table access. This dispatches on the
+/// path scheme (`s3://`, `file://`, `memory:`) exactly like the pre-split
+/// vendor's built-in OpenDAL storage; credentials and session tokens still
+/// arrive through the same `s3.*` FileIO / catalog properties.
+pub fn storage_factory() -> std::sync::Arc<dyn iceberg::io::StorageFactory> {
+    std::sync::Arc::new(iceberg_storage_opendal::OpenDalResolvingStorageFactory::new())
+}
 
 mod scoped_table;
 #[cfg(test)]

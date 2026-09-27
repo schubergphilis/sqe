@@ -7,6 +7,8 @@ use iceberg::table::Table;
 use iceberg::writer::base_writer::equality_delete_writer::{
     EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
 };
+use iceberg::spec::PartitionKey;
+use iceberg::writer::base_writer::deletion_vector_writer::DeletionVectorWriterBuilder;
 use iceberg::writer::base_writer::position_delete_file_writer::{
     PositionDeleteFileWriterBuilder, PositionDeleteInput, POSITION_DELETE_SCHEMA,
 };
@@ -299,6 +301,86 @@ pub async fn write_position_delete_files(
     writer.close().await
 }
 
+/// Write one Iceberg V3 deletion vector per data file.
+///
+/// V3 forbids position-delete files: each data file carries at most one
+/// deletion vector, and it holds EVERY deleted position of that file. Callers
+/// therefore pass the full set per file, with the file's existing deletes
+/// already merged in (see `iceberg::arrow::load_position_deletes`), and retire
+/// the superseded vector in the same commit. The vector is stamped with its
+/// data file's partition so partition pruning of delete manifests keeps it.
+pub async fn write_deletion_vectors(
+    table: &Table,
+    targets: Vec<(DataFile, Vec<u64>)>,
+) -> sqe_core::Result<Vec<DataFile>> {
+    let err = |what: &str, e: iceberg::Error| {
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("{what}: {e}"))
+    };
+    let location_generator = DefaultLocationGenerator::new(table.metadata())
+        .map_err(|e| err("Location generator error", e))?;
+    let file_name_generator = DefaultFileNameGenerator::new(
+        format!("{}-dv", Uuid::now_v7()),
+        None,
+        iceberg::spec::DataFileFormat::Puffin,
+    );
+    let builder = DeletionVectorWriterBuilder::new(
+        table.file_io().clone(),
+        location_generator,
+        file_name_generator,
+    );
+    let metadata = table.metadata();
+    let mut vectors = Vec::with_capacity(targets.len());
+    for (data_file, positions) in targets {
+        if positions.is_empty() {
+            continue;
+        }
+        let spec = metadata
+            .partition_spec_by_id(data_file.partition_spec_id())
+            .ok_or_else(|| {
+                SqeError::with_code(
+                    SqeErrorCode::ExecutionFailed,
+                    format!(
+                        "partition spec {} of {} not found",
+                        data_file.partition_spec_id(),
+                        data_file.file_path()
+                    ),
+                )
+            })?;
+        let partition_key = (!spec.is_unpartitioned()).then(|| {
+            PartitionKey::new(
+                (**spec).clone(),
+                metadata.current_schema().clone(),
+                data_file.partition().clone(),
+            )
+        });
+        let mut writer = builder
+            .build(partition_key)
+            .await
+            .map_err(|e| err("Failed to build deletion vector writer", e))?;
+        let path: Arc<str> = Arc::from(data_file.file_path());
+        let inputs = positions
+            .into_iter()
+            .map(|pos| PositionDeleteInput::new(Arc::clone(&path), pos as i64))
+            .collect();
+        writer
+            .write(inputs)
+            .await
+            .map_err(|e| err("Failed to write deletion vector", e))?;
+        vectors.extend(
+            writer
+                .close()
+                .await
+                .map_err(|e| err("Failed to close deletion vector writer", e))?,
+        );
+    }
+    info!(
+        table = %table.identifier(),
+        deletion_vectors = vectors.len(),
+        "Deletion vectors written"
+    );
+    Ok(vectors)
+}
+
 /// Incremental position-delete writer (architecture review 504).
 ///
 /// The MoR DELETE path used to collect every `(file_path, pos)` pair for the
@@ -323,7 +405,7 @@ impl PositionDeleteWriter {
     /// Open a rolling position-delete writer for `table`.
     pub async fn open(table: &Table, compression: Compression) -> sqe_core::Result<Self> {
         let location_generator =
-            DefaultLocationGenerator::new(table.metadata().clone()).map_err(|e| {
+            DefaultLocationGenerator::new(table.metadata()).map_err(|e| {
                 SqeError::with_code(
                     SqeErrorCode::ExecutionFailed,
                     format!("Location generator error: {e}"),
@@ -514,7 +596,7 @@ pub async fn write_equality_delete_key_files(
     let stamped = stamp_batches(key_batches, &key_schema)?;
 
     let location_generator =
-        DefaultLocationGenerator::new(table.metadata().clone()).map_err(|e| {
+        DefaultLocationGenerator::new(table.metadata()).map_err(|e| {
             SqeError::with_code(
                 SqeErrorCode::ExecutionFailed,
                 format!("Location generator error: {e}"),

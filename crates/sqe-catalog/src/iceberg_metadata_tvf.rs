@@ -400,7 +400,7 @@ async fn build_manifests_batch(table: &Table, schema: &SchemaRef) -> DFResult<Re
     let mut deleted_rows_b = Int64Builder::new();
 
     if let Some(snapshot) = metadata.current_snapshot() {
-        match snapshot.load_manifest_list(table.file_io(), metadata).await {
+        match table.manifest_list_reader(snapshot).load().await {
             Ok(manifest_list) => {
                 for mf in manifest_list.entries() {
                     manifest_path_b.append_value(&mf.manifest_path);
@@ -659,7 +659,7 @@ async fn build_files_batch(table: &Table, schema: &SchemaRef) -> DFResult<Record
     let mut upper_bounds_b = StringBuilder::new();
 
     if let Some(snapshot) = metadata.current_snapshot() {
-        match snapshot.load_manifest_list(table.file_io(), metadata).await {
+        match table.manifest_list_reader(snapshot).load().await {
             Ok(manifest_list) => {
                 for mf in manifest_list.entries() {
                     match mf.load_manifest(table.file_io()).await {
@@ -790,7 +790,7 @@ async fn build_partitions_batch(table: &Table, schema: &SchemaRef) -> DFResult<R
         std::collections::BTreeMap::new(); // key → (record_count, file_count, total_size)
 
     if let Some(snapshot) = metadata.current_snapshot() {
-        match snapshot.load_manifest_list(table.file_io(), metadata).await {
+        match table.manifest_list_reader(snapshot).load().await {
             Ok(manifest_list) => {
                 for mf in manifest_list.entries() {
                     match mf.load_manifest(table.file_io()).await {

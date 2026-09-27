@@ -182,11 +182,6 @@ pub struct MetricsRegistry {
     pub join_spill_count: Counter,
     pub join_spill_bytes: Counter,
 
-    // Shuffle metrics (Phase B — registered now, incremented when shuffle lands)
-    pub shuffle_bytes_sent: Counter,
-    pub shuffle_bytes_received: Counter,
-    pub shuffle_partitions: Counter,
-
     // Late materialization metrics
     pub late_mat_bytes_predicate: Counter,
     pub late_mat_bytes_projection: Counter,
@@ -516,25 +511,6 @@ impl MetricsRegistry {
             &registry,
             "sqe_join_spill_bytes_total",
             "Bytes spilled for joins",
-        )?;
-
-        // Shuffle metrics (Phase B — registered now, incremented when shuffle lands)
-        let shuffle_bytes_sent = register_counter(
-            &registry,
-            "sqe_shuffle_bytes_sent_total",
-            "Bytes sent via DoExchange",
-        )?;
-
-        let shuffle_bytes_received = register_counter(
-            &registry,
-            "sqe_shuffle_bytes_received_total",
-            "Bytes received via DoExchange",
-        )?;
-
-        let shuffle_partitions = register_counter(
-            &registry,
-            "sqe_shuffle_partitions_total",
-            "Shuffle partitions created",
         )?;
 
         // Late materialization metrics
@@ -929,9 +905,6 @@ impl MetricsRegistry {
             sort_spill_bytes,
             join_spill_count,
             join_spill_bytes,
-            shuffle_bytes_sent,
-            shuffle_bytes_received,
-            shuffle_partitions,
             late_mat_bytes_predicate,
             late_mat_bytes_projection,
             late_mat_selectivity,
@@ -1039,8 +1012,6 @@ pub struct WorkerMetricsRegistry {
     pub flight_encode_resident_bytes: Gauge,
     /// Encoded FlightData currently in flight / awaiting gRPC release.
     pub flight_inflight_bytes: Gauge,
-    /// RecordBatches currently buffered in shuffle partition channels.
-    pub shuffle_resident_bytes: Gauge,
     /// Operator-owned temporary state currently tracked (joins/aggs/sorts).
     pub operator_resident_bytes: Gauge,
     /// Total spill bytes written by this worker (all operators/exchanges).
@@ -1113,11 +1084,6 @@ impl WorkerMetricsRegistry {
             "sqe_worker_flight_inflight_bytes",
             "Encoded FlightData currently in flight awaiting gRPC release",
         )?;
-        let shuffle_resident_bytes = register_gauge(
-            &registry,
-            "sqe_worker_shuffle_resident_bytes",
-            "RecordBatches currently buffered in shuffle partition channels",
-        )?;
         let operator_resident_bytes = register_gauge(
             &registry,
             "sqe_worker_operator_resident_bytes",
@@ -1160,7 +1126,6 @@ impl WorkerMetricsRegistry {
             scan_queue_resident_bytes,
             flight_encode_resident_bytes,
             flight_inflight_bytes,
-            shuffle_resident_bytes,
             operator_resident_bytes,
             spill_bytes_written,
             spill_bytes_read,
@@ -1233,9 +1198,6 @@ mod tests {
         metrics.sort_spill_bytes.inc_by(0.0);
         metrics.join_spill_count.inc_by(0.0);
         metrics.join_spill_bytes.inc_by(0.0);
-        metrics.shuffle_bytes_sent.inc_by(0.0);
-        metrics.shuffle_bytes_received.inc_by(0.0);
-        metrics.shuffle_partitions.inc_by(0.0);
         metrics.late_mat_bytes_predicate.inc_by(0.0);
         metrics.late_mat_bytes_projection.inc_by(0.0);
         metrics.late_mat_selectivity.observe(0.5);
@@ -1426,17 +1388,6 @@ mod tests {
         assert_eq!(metrics.sort_spill_bytes.get(), 1024.0);
         assert_eq!(metrics.join_spill_count.get(), 3.0);
         assert_eq!(metrics.join_spill_bytes.get(), 2048.0);
-    }
-
-    #[test]
-    fn test_shuffle_metrics() {
-        let metrics = MetricsRegistry::new().unwrap();
-        metrics.shuffle_bytes_sent.inc_by(4096.0);
-        metrics.shuffle_bytes_received.inc_by(8192.0);
-        metrics.shuffle_partitions.inc_by(10.0);
-        assert_eq!(metrics.shuffle_bytes_sent.get(), 4096.0);
-        assert_eq!(metrics.shuffle_bytes_received.get(), 8192.0);
-        assert_eq!(metrics.shuffle_partitions.get(), 10.0);
     }
 
     #[test]
@@ -1636,25 +1587,23 @@ mod tests {
         m.scan_queue_resident_bytes.set(0.0);
         m.flight_encode_resident_bytes.set(0.0);
         m.flight_inflight_bytes.set(0.0);
-        m.shuffle_resident_bytes.set(0.0);
         m.operator_resident_bytes.set(0.0);
         m.spill_bytes_written.inc_by(0.0);
         m.spill_bytes_read.inc_by(0.0);
         m.spill_files.set(0.0);
         m.spill_failures.inc_by(0.0);
         m.memory_backpressure_seconds.inc_by(0.0);
-        // Legacy 4 + 12 Phase 0 memory-boundary metrics.
-        assert!(m.registry.gather().len() >= 16);
+        // Legacy 4 + 11 Phase 0 memory-boundary metrics (the shuffle gauge
+        // went with the shuffle, 2026-09).
+        assert!(m.registry.gather().len() >= 15);
     }
 
     #[test]
     fn test_worker_phase0_memory_gauges_roundtrip() {
         let m = WorkerMetricsRegistry::new().unwrap();
         m.scan_queue_resident_bytes.set(42.0 * 1024.0 * 1024.0);
-        m.shuffle_resident_bytes.set(7.0 * 1024.0 * 1024.0);
         m.spill_failures.inc();
         assert_eq!(m.scan_queue_resident_bytes.get(), 42.0 * 1024.0 * 1024.0);
-        assert_eq!(m.shuffle_resident_bytes.get(), 7.0 * 1024.0 * 1024.0);
         assert_eq!(m.spill_failures.get(), 1.0);
     }
 

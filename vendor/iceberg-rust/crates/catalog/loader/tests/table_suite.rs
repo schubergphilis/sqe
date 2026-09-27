@@ -1,0 +1,444 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Common table behavior across catalogs.
+//!
+//! These tests assume Docker containers are started externally via `make docker-up`.
+
+mod common;
+
+use std::collections::HashMap;
+
+use common::{CatalogKind, TableMode, cleanup_namespace_dyn, load_catalog, table_creation};
+use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::{ErrorKind, NamespaceIdent, Result, TableIdent};
+use iceberg_test_utils::normalize_test_name_with_parts;
+use rstest::rstest;
+
+// Common behavior: table lifecycle CRUD.
+#[rstest]
+#[case::rest_catalog(CatalogKind::Rest)]
+#[case::glue_catalog(CatalogKind::Glue)]
+#[case::hms_catalog(CatalogKind::Hms)]
+#[case::sql_catalog(CatalogKind::Sql)]
+#[case::s3tables_catalog(CatalogKind::S3Tables)]
+#[case::memory_catalog(CatalogKind::Memory)]
+#[tokio::test]
+async fn test_catalog_table_lifecycle(#[case] kind: CatalogKind) -> Result<()> {
+    let Some(harness) = load_catalog(kind).await else {
+        return Ok(());
+    };
+    let catalog = harness.catalog;
+    let namespace = NamespaceIdent::new(normalize_test_name_with_parts!(
+        "catalog_table_lifecycle",
+        harness.label
+    ));
+
+    cleanup_namespace_dyn(catalog.as_ref(), &namespace).await;
+    catalog.create_namespace(&namespace, HashMap::new()).await?;
+
+    let table_name =
+        normalize_test_name_with_parts!("catalog_table_lifecycle", harness.label, "table");
+    let table = catalog
+        .create_table(&namespace, table_creation(table_name))
+        .await?;
+    let ident = table.identifier().clone();
+
+    assert!(catalog.table_exists(&ident).await?);
+    let loaded = catalog.load_table(&ident).await?;
+    assert_eq!(loaded.identifier(), &ident);
+
+    let tables = catalog.list_tables(&namespace).await?;
+    assert!(tables.contains(&ident));
+
+    let dest = TableIdent::new(ident.namespace.clone(), format!("{}_renamed", ident.name));
+    catalog.rename_table(&ident, &dest).await?;
+    assert!(catalog.table_exists(&dest).await?);
+    assert!(!catalog.table_exists(&ident).await?);
+
+    catalog.drop_table(&dest).await?;
+    assert!(!catalog.table_exists(&dest).await?);
+
+    catalog.drop_namespace(&namespace).await?;
+
+    Ok(())
+}
+
+// Common behavior: listing tables for a missing namespace should error.
+#[rstest]
+#[case::rest_catalog(CatalogKind::Rest)]
+#[case::glue_catalog(CatalogKind::Glue)]
+#[case::hms_catalog(CatalogKind::Hms)]
+#[case::sql_catalog(CatalogKind::Sql)]
+#[case::s3tables_catalog(CatalogKind::S3Tables)]
+#[case::memory_catalog(CatalogKind::Memory)]
+#[tokio::test]
+async fn test_catalog_list_tables_missing_namespace_errors(
+    #[case] kind: CatalogKind,
+) -> Result<()> {
+    let Some(harness) = load_catalog(kind).await else {
+        return Ok(());
+    };
+    let catalog = harness.catalog;
+    let namespace = NamespaceIdent::new(normalize_test_name_with_parts!(
+        "catalog_list_tables_missing_namespace_errors",
+        harness.label
+    ));
+
+    cleanup_namespace_dyn(catalog.as_ref(), &namespace).await;
+
+    assert!(catalog.list_tables(&namespace).await.is_err());
+    Ok(())
+}
+
+// Common behavior: listing tables in an empty namespace returns empty.
+#[rstest]
+#[case::rest_catalog(CatalogKind::Rest)]
+#[case::glue_catalog(CatalogKind::Glue)]
+#[case::hms_catalog(CatalogKind::Hms)]
+#[case::sql_catalog(CatalogKind::Sql)]
+#[case::s3tables_catalog(CatalogKind::S3Tables)]
+#[case::memory_catalog(CatalogKind::Memory)]
+#[tokio::test]
+async fn test_catalog_list_tables_empty_namespace(#[case] kind: CatalogKind) -> Result<()> {
+    let Some(harness) = load_catalog(kind).await else {
+        return Ok(());
+    };
+    let catalog = harness.catalog;
+    let namespace = NamespaceIdent::new(normalize_test_name_with_parts!(
+        "catalog_list_tables_empty_namespace",
+        harness.label
+    ));
+
+    cleanup_namespace_dyn(catalog.as_ref(), &namespace).await;
+    catalog.create_namespace(&namespace, HashMap::new()).await?;
+
+    let tables = catalog.list_tables(&namespace).await?;
+    assert!(tables.is_empty());
+
+    Ok(())
+}
+
+// Common behavior: created tables expose the requested schema.
+#[rstest]
+#[case::rest_catalog(CatalogKind::Rest)]
+#[case::glue_catalog(CatalogKind::Glue)]
+#[case::hms_catalog(CatalogKind::Hms)]
+#[case::sql_catalog(CatalogKind::Sql)]
+#[case::s3tables_catalog(CatalogKind::S3Tables)]
+#[case::memory_catalog(CatalogKind::Memory)]
+#[tokio::test]
+async fn test_catalog_create_table_schema(#[case] kind: CatalogKind) -> Result<()> {
+    let Some(harness) = load_catalog(kind).await else {
+        return Ok(());
+    };
+    let catalog = harness.catalog;
+    let namespace = NamespaceIdent::new(normalize_test_name_with_parts!(
+        "catalog_create_table_schema",
+        harness.label
+    ));
+
+    cleanup_namespace_dyn(catalog.as_ref(), &namespace).await;
+    catalog.create_namespace(&namespace, HashMap::new()).await?;
+
+    let table_name =
+        normalize_test_name_with_parts!("catalog_create_table_schema", harness.label, "table");
+    let creation = table_creation(table_name);
+    let expected_schema = creation.schema.clone();
+
+    let table = catalog.create_table(&namespace, creation).await?;
+    assert_eq!(table.identifier().namespace, namespace);
+    assert_eq!(table.metadata().current_schema().as_ref(), &expected_schema);
+
+    Ok(())
+}
+
+// Common behavior: updating table properties persists through the catalog.
+// HMS is excluded because update_table is not supported yet.
+#[rstest]
+#[case::rest_catalog(CatalogKind::Rest)]
+#[case::glue_catalog(CatalogKind::Glue)]
+#[case::sql_catalog(CatalogKind::Sql)]
+#[case::s3tables_catalog(CatalogKind::S3Tables)]
+#[case::memory_catalog(CatalogKind::Memory)]
+#[tokio::test]
+async fn test_catalog_update_table_properties(#[case] kind: CatalogKind) -> Result<()> {
+    let Some(harness) = load_catalog(kind).await else {
+        return Ok(());
+    };
+    let catalog = harness.catalog;
+    let namespace = NamespaceIdent::new(normalize_test_name_with_parts!(
+        "catalog_update_table_properties",
+        harness.label
+    ));
+
+    cleanup_namespace_dyn(catalog.as_ref(), &namespace).await;
+    catalog.create_namespace(&namespace, HashMap::new()).await?;
+
+    let table_name =
+        normalize_test_name_with_parts!("catalog_update_table_properties", harness.label, "table");
+    let table = catalog
+        .create_table(&namespace, table_creation(table_name))
+        .await?;
+
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .update_table_properties()
+        .set("test_property".to_string(), "test_value".to_string())
+        .apply(tx)?;
+    let updated = tx.commit(catalog.as_ref()).await?;
+
+    assert_eq!(
+        updated.metadata().properties().get("test_property"),
+        Some(&"test_value".to_string())
+    );
+
+    Ok(())
+}
+
+// Common behavior: update_table_properties is rejected when unsupported.
+#[rstest]
+#[case::hms_catalog(CatalogKind::Hms)]
+#[tokio::test]
+async fn test_catalog_update_table_properties_unsupported(#[case] kind: CatalogKind) -> Result<()> {
+    let Some(harness) = load_catalog(kind).await else {
+        return Ok(());
+    };
+    let catalog = harness.catalog;
+    let namespace = NamespaceIdent::new(normalize_test_name_with_parts!(
+        "catalog_update_table_properties_unsupported",
+        harness.label
+    ));
+
+    cleanup_namespace_dyn(catalog.as_ref(), &namespace).await;
+    catalog.create_namespace(&namespace, HashMap::new()).await?;
+
+    let table_name = normalize_test_name_with_parts!(
+        "catalog_update_table_properties_unsupported",
+        harness.label,
+        "table"
+    );
+    let table = catalog
+        .create_table(&namespace, table_creation(table_name))
+        .await?;
+
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .update_table_properties()
+        .set("test_property".to_string(), "test_value".to_string())
+        .apply(tx)?;
+
+    let err = tx.commit(catalog.as_ref()).await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+
+    Ok(())
+}
+
+// Common behavior: dropping a missing table should error.
+#[rstest]
+#[case::rest_catalog(CatalogKind::Rest)]
+#[case::glue_catalog(CatalogKind::Glue)]
+#[case::hms_catalog(CatalogKind::Hms)]
+#[case::sql_catalog(CatalogKind::Sql)]
+#[case::s3tables_catalog(CatalogKind::S3Tables)]
+#[case::memory_catalog(CatalogKind::Memory)]
+#[tokio::test]
+async fn test_catalog_drop_table_missing_errors(#[case] kind: CatalogKind) -> Result<()> {
+    let Some(harness) = load_catalog(kind).await else {
+        return Ok(());
+    };
+    let catalog = harness.catalog;
+    let namespace = NamespaceIdent::new(normalize_test_name_with_parts!(
+        "catalog_drop_table_missing_errors",
+        harness.label
+    ));
+
+    cleanup_namespace_dyn(catalog.as_ref(), &namespace).await;
+    catalog.create_namespace(&namespace, HashMap::new()).await?;
+
+    let table_ident = TableIdent::new(namespace.clone(), "missing".to_string());
+    assert!(catalog.drop_table(&table_ident).await.is_err());
+    Ok(())
+}
+
+// Common behavior: purge_table removes the table from the catalog.
+#[rstest]
+#[case::rest_catalog(CatalogKind::Rest)]
+#[case::glue_catalog(CatalogKind::Glue)]
+#[case::hms_catalog(CatalogKind::Hms)]
+#[case::sql_catalog(CatalogKind::Sql)]
+#[case::s3tables_catalog(CatalogKind::S3Tables)]
+#[case::memory_catalog(CatalogKind::Memory)]
+#[tokio::test]
+async fn test_catalog_purge_table(#[case] kind: CatalogKind) -> Result<()> {
+    let Some(harness) = load_catalog(kind).await else {
+        return Ok(());
+    };
+    let catalog = harness.catalog;
+    let namespace = NamespaceIdent::new(normalize_test_name_with_parts!(
+        "catalog_purge_table",
+        harness.label
+    ));
+
+    cleanup_namespace_dyn(catalog.as_ref(), &namespace).await;
+    catalog.create_namespace(&namespace, HashMap::new()).await?;
+
+    let table_name = normalize_test_name_with_parts!("catalog_purge_table", harness.label, "table");
+    let table = catalog
+        .create_table(&namespace, table_creation(table_name))
+        .await?;
+    let ident = table.identifier().clone();
+
+    assert!(catalog.table_exists(&ident).await?);
+
+    // Capture metadata location and file_io before purge so we can verify
+    // that the underlying files are actually deleted.
+    let metadata_location = table.metadata_location().map(|s| s.to_string());
+    let file_io = table.file_io().clone();
+
+    catalog.purge_table(&ident).await?;
+    assert!(!catalog.table_exists(&ident).await?);
+
+    if let Some(location) = &metadata_location {
+        assert!(
+            !file_io.exists(location).await?,
+            "Metadata file should have been deleted after purge"
+        );
+    }
+
+    catalog.drop_namespace(&namespace).await?;
+
+    Ok(())
+}
+
+#[rstest]
+// REST cannot purge external manifests, and HMS cannot update tables.
+#[case::glue_plain(CatalogKind::Glue, TableMode::Plain)]
+#[case::glue_encrypted(CatalogKind::Glue, TableMode::Encrypted)]
+#[case::sql_plain(CatalogKind::Sql, TableMode::Plain)]
+#[case::sql_encrypted(CatalogKind::Sql, TableMode::Encrypted)]
+#[case::s3tables_plain(CatalogKind::S3Tables, TableMode::Plain)]
+#[case::s3tables_encrypted(CatalogKind::S3Tables, TableMode::Encrypted)]
+#[case::memory_plain(CatalogKind::Memory, TableMode::Plain)]
+#[case::memory_encrypted(CatalogKind::Memory, TableMode::Encrypted)]
+#[tokio::test]
+async fn test_catalog_purge_table_with_data(
+    #[case] kind: CatalogKind,
+    #[case] mode: TableMode,
+) -> Result<()> {
+    let Some(harness) = load_catalog(kind).await else {
+        return Ok(());
+    };
+    let catalog = harness.catalog;
+    let namespace = NamespaceIdent::new(normalize_test_name_with_parts!(
+        "catalog_purge_table_with_data",
+        harness.label,
+        mode.label()
+    ));
+
+    cleanup_namespace_dyn(catalog.as_ref(), &namespace).await;
+    catalog.create_namespace(&namespace, HashMap::new()).await?;
+
+    let table_name = normalize_test_name_with_parts!(
+        "catalog_purge_table_with_data",
+        harness.label,
+        mode.label(),
+        "table"
+    );
+    let table = catalog
+        .create_table(&namespace, mode.table_creation(table_name))
+        .await?;
+    let ident = table.identifier().clone();
+    let file_io = table.file_io().clone();
+    let data_file_path = format!("{}/data/00000.parquet", table.metadata().location());
+
+    file_io
+        .new_output(&data_file_path)?
+        .write(vec![0; 16].into())
+        .await?;
+
+    let data_file = DataFileBuilder::default()
+        .content(DataContentType::Data)
+        .file_path(data_file_path.clone())
+        .file_format(DataFileFormat::Parquet)
+        .partition(Struct::empty())
+        .record_count(1)
+        .file_size_in_bytes(16)
+        .partition_spec_id(table.metadata().default_partition_spec_id())
+        .build()
+        .unwrap();
+
+    let tx = Transaction::new(&table);
+    tx.fast_append()
+        .add_data_files(vec![data_file])
+        .apply(tx)?
+        .commit(catalog.as_ref())
+        .await?;
+    let table = catalog.load_table(&ident).await?;
+
+    let metadata_location = table.metadata_location().map(str::to_string);
+    let snapshot = table.metadata().current_snapshot().unwrap();
+    let manifest_list_location = snapshot.manifest_list().to_string();
+    let manifest_list = table.manifest_list_reader(snapshot).load().await?;
+    let manifest_location = manifest_list.entries()[0].manifest_path.clone();
+
+    assert!(file_io.exists(&data_file_path).await?);
+    assert!(file_io.exists(&manifest_location).await?);
+    assert!(file_io.exists(&manifest_list_location).await?);
+
+    catalog.purge_table(&ident).await?;
+
+    assert!(!catalog.table_exists(&ident).await?);
+    assert!(!file_io.exists(&data_file_path).await?);
+    assert!(!file_io.exists(&manifest_location).await?);
+    assert!(!file_io.exists(&manifest_list_location).await?);
+    if let Some(location) = &metadata_location {
+        assert!(!file_io.exists(location).await?);
+    }
+
+    catalog.drop_namespace(&namespace).await?;
+
+    Ok(())
+}
+
+// Common behavior: purging a missing table should error.
+#[rstest]
+#[case::rest_catalog(CatalogKind::Rest)]
+#[case::glue_catalog(CatalogKind::Glue)]
+#[case::hms_catalog(CatalogKind::Hms)]
+#[case::sql_catalog(CatalogKind::Sql)]
+#[case::s3tables_catalog(CatalogKind::S3Tables)]
+#[case::memory_catalog(CatalogKind::Memory)]
+#[tokio::test]
+async fn test_catalog_purge_table_missing_errors(#[case] kind: CatalogKind) -> Result<()> {
+    let Some(harness) = load_catalog(kind).await else {
+        return Ok(());
+    };
+    let catalog = harness.catalog;
+    let namespace = NamespaceIdent::new(normalize_test_name_with_parts!(
+        "catalog_purge_table_missing_errors",
+        harness.label
+    ));
+
+    cleanup_namespace_dyn(catalog.as_ref(), &namespace).await;
+    catalog.create_namespace(&namespace, HashMap::new()).await?;
+
+    let table_ident = TableIdent::new(namespace.clone(), "missing".to_string());
+    assert!(catalog.purge_table(&table_ident).await.is_err());
+    Ok(())
+}

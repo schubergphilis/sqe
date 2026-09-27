@@ -70,6 +70,22 @@ audit:
 serviceMonitor:
   enabled: true
 
+# ── Network segmentation ────────────────────────────────────
+# Default-deny ingress on coordinator and workers: only the SQL, metrics and
+# (when on) MCP ports reach the coordinator, and workers take traffic from the
+# coordinator only. Narrow `from` to your ingress controller and Prometheus.
+# Fill `egress` with your catalog, identity provider, object store, policy
+# service and OTLP collector to turn on default-deny egress as well; DNS and
+# the coordinator<->worker hops are added by the chart. See values.yaml.
+networkPolicy:
+  enabled: true
+  from: []
+    # - namespaceSelector:
+    #     matchLabels: { kubernetes.io/metadata.name: ingress-nginx }
+    # - namespaceSelector:
+    #     matchLabels: { kubernetes.io/metadata.name: monitoring }
+  egress: []
+
 # ── Required: existing Secrets (do not put credentials here) ─
 # Create these out of band (sealed-secrets, external-secrets, etc.) and
 # point the chart at them. Inline `secrets:` / workerSecret.value end up

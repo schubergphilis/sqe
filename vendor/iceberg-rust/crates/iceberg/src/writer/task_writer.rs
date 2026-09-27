@@ -175,7 +175,7 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
     /// Write a `RecordBatch` to the `TaskWriter` and return the `(file_path, pos)` for each
     /// input row.
     ///
-    /// The returned [`PositionArray`] has the same length as `batch.num_rows()`, with entry `i`
+    /// The returned vector has the same length as `batch.num_rows()`, with entry `i`
     /// describing where row `i` of the input was written. For partitioned tables, the input
     /// is first split by partition; the positions for each partition are then gathered back
     /// into the original input row order.
@@ -263,7 +263,7 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
         let splitter = partition_splitter
             .as_ref()
             .expect("partition splitter must be initialised before use");
-        let partitioned_batches = splitter.split(batch)?;
+        let partitioned_batches = splitter.split_with_indices(batch)?;
 
         for (partition_key, partition_batch, _) in partitioned_batches {
             writer.write(partition_key, partition_batch).await?;
@@ -280,7 +280,7 @@ impl<B: IcebergWriterBuilder> TaskWriter<B> {
         let splitter = partition_splitter
             .as_ref()
             .expect("partition splitter must be initialised before use");
-        let partitioned_batches = splitter.split(batch)?;
+        let partitioned_batches = splitter.split_with_indices(batch)?;
 
         let num_rows = batch.num_rows();
 
@@ -361,7 +361,7 @@ mod tests {
 
     use crate::Result;
     use crate::arrow::{PROJECTED_PARTITION_VALUE_COLUMN, RecordBatchPartitionSplitter};
-    use crate::io::FileIOBuilder;
+    use crate::io::FileIO;
     use crate::spec::{
         DataFile, DataFileFormat, NestedField, PartitionSpec, PrimitiveLiteral, PrimitiveType, Type,
     };
@@ -441,7 +441,7 @@ mod tests {
             DefaultFileNameGenerator,
         >,
     > {
-        let file_io = FileIOBuilder::new_fs_io().build()?;
+        let file_io = FileIO::new_with_fs();
         let location_gen = DefaultLocationGenerator::with_data_location(
             temp_dir.path().to_string_lossy().into_owned(),
         );

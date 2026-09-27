@@ -235,7 +235,7 @@ mod tests {
         write_parquet(&p1, &[batch(&[1, 2], &["US", "US"])]);
         write_parquet(&p2, &[batch(&[3], &["EU"])]);
 
-        let file_io = iceberg::io::FileIOBuilder::new_fs_io().build().unwrap();
+        let file_io = iceberg::io::FileIO::new_with_fs();
         let part = MergeTargetPartition::new(
             schema(),
             file_io,
@@ -265,7 +265,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_file_set_yields_nothing() {
-        let file_io = iceberg::io::FileIOBuilder::new_fs_io().build().unwrap();
+        let file_io = iceberg::io::FileIO::new_with_fs();
         let part = MergeTargetPartition::new(schema(), file_io, vec![]);
         let mut stream = part.execute(Arc::new(TaskContext::default()));
         assert!(stream.next().await.is_none(), "no files → empty stream");

@@ -17,6 +17,7 @@
 
 //! This module provide `EqualityDeleteWriter`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -26,7 +27,8 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::arrow::record_batch_projector::RecordBatchProjector;
 use crate::arrow::schema_to_arrow_schema;
-use crate::spec::{DataFile, PartitionKey, SchemaRef};
+use crate::error::invalid_data;
+use crate::spec::{DataFile, PartitionKey, Schema, SchemaRef};
 use crate::writer::file_writer::FileWriterBuilder;
 use crate::writer::file_writer::location_generator::{FileNameGenerator, LocationGenerator};
 use crate::writer::file_writer::rolling_writer::{RollingFileWriter, RollingFileWriterBuilder};
@@ -68,17 +70,49 @@ pub struct EqualityDeleteWriterConfig {
     projector: RecordBatchProjector,
 }
 
+/// Validates equality delete field ids before constructing the writer config.
+///
+/// In addition to rejecting an empty id list, this check also rejects duplicate
+/// ids and ids that do not exist in the table schema. These two checks are
+/// intentionally stricter than the current Java reference implementation, which
+/// only guards against null/empty lists; catching duplicates and missing ids
+/// here produces clearer errors and avoids generating meaningless delete files.
+fn validate_equality_ids(equality_ids: &[i32], original_schema: &Schema) -> Result<()> {
+    if equality_ids.is_empty() {
+        return Err(invalid_data!(
+            "Equality delete field ids must not be empty."
+        ));
+    }
+
+    let mut seen = HashSet::with_capacity(equality_ids.len());
+    for id in equality_ids {
+        if !seen.insert(*id) {
+            return Err(invalid_data!("Duplicate equality delete field id: {id}")
+                .with_context("field_id", id.to_string()));
+        }
+
+        if original_schema.field_by_id(*id).is_none() {
+            return Err(invalid_data!("Invalid equality delete field id: {id}")
+                .with_context("field_id", id.to_string()));
+        }
+    }
+
+    Ok(())
+}
+
 impl EqualityDeleteWriterConfig {
-    /// Create a new `DataFileWriterConfig` with equality ids.
+    /// Create a new `EqualityDeleteWriterConfig` with equality ids.
     pub fn new(equality_ids: Vec<i32>, original_schema: SchemaRef) -> Result<Self> {
+        validate_equality_ids(&equality_ids, &original_schema)?;
+
         let original_arrow_schema = Arc::new(schema_to_arrow_schema(&original_schema)?);
         let projector = RecordBatchProjector::new(
             original_arrow_schema,
             &equality_ids,
-            // The following rule comes from https://iceberg.apache.org/spec/#identifier-field-ids
-            // and https://iceberg.apache.org/spec/#equality-delete-files
-            // - The identifier field ids must be used for primitive types.
-            // - The identifier field ids must not be used for floating point types or nullable fields.
+            // Equality delete fields follow identifier-field type restrictions,
+            // except optional columns and columns nested under optional structs are allowed.
+            // Project only primitive, non-floating fields; RecordBatchProjector's traversal
+            // keeps fields under maps and lists unreachable.
             |field| {
                 // Only primitive type is allowed to be used for identifier field ids
                 if field.data_type().is_nested()
@@ -178,12 +212,8 @@ where
                         res.partition(pk.data().clone());
                         res.partition_spec_id(pk.spec().spec_id());
                     }
-                    res.build().map_err(|e| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            format!("Failed to build data file: {e}"),
-                        )
-                    })
+                    res.build()
+                        .map_err(|e| invalid_data!("Failed to build data file: {e}"))
                 })
                 .collect()
         } else {
@@ -212,11 +242,12 @@ mod test {
     use tempfile::TempDir;
     use uuid::Uuid;
 
+    use crate::ErrorKind;
     use crate::arrow::{arrow_schema_to_schema, schema_to_arrow_schema};
-    use crate::io::{FileIO, FileIOBuilder};
+    use crate::io::FileIO;
     use crate::spec::{
         DataFile, DataFileFormat, ListType, MapType, NestedField, PrimitiveType, Schema,
-        StructType, Type,
+        StructType, Type, VariantType,
     };
     use crate::writer::base_writer::equality_delete_writer::{
         EqualityDeleteFileWriterBuilder, EqualityDeleteWriterConfig,
@@ -307,7 +338,7 @@ mod test {
     #[tokio::test]
     async fn test_equality_delete_writer() -> Result<(), anyhow::Error> {
         let temp_dir = TempDir::new().unwrap();
-        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let file_io = FileIO::new_with_fs();
         let location_gen = DefaultLocationGenerator::with_data_location(
             temp_dir.path().to_str().unwrap().to_string(),
         );
@@ -447,6 +478,26 @@ mod test {
         assert_eq!(res.len(), 1);
         let data_file = res.into_iter().next().unwrap();
 
+        assert_eq!(data_file.equality_ids(), Some(vec![0, 8]));
+        assert_eq!(
+            *data_file.null_value_counts(),
+            HashMap::from([(0, 0), (8, 0)])
+        );
+        assert_eq!(
+            *data_file.lower_bounds(),
+            HashMap::from([
+                (0, crate::spec::Datum::int(1)),
+                (8, crate::spec::Datum::int(1))
+            ])
+        );
+        assert_eq!(
+            *data_file.upper_bounds(),
+            HashMap::from([
+                (0, crate::spec::Datum::int(1)),
+                (8, crate::spec::Datum::int(1))
+            ])
+        );
+
         // check
         let to_write_projected = projector.project_batch(to_write)?;
         check_parquet_data_file_with_equality_delete_write(
@@ -456,6 +507,60 @@ mod test {
         )
         .await;
         Ok(())
+    }
+
+    fn equality_id_validation_schema() -> Arc<Schema> {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_equality_delete_rejects_empty_equality_ids() {
+        let err =
+            EqualityDeleteWriterConfig::new(vec![], equality_id_validation_schema()).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.to_string()
+                .contains("Equality delete field ids must not be empty."),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_equality_delete_rejects_duplicate_equality_ids() {
+        let err = EqualityDeleteWriterConfig::new(vec![1, 1], equality_id_validation_schema())
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.to_string()
+                .contains("Duplicate equality delete field id: 1"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("field_id: 1"), "{err}");
+    }
+
+    #[test]
+    fn test_equality_delete_rejects_missing_equality_id() {
+        let err =
+            EqualityDeleteWriterConfig::new(vec![99], equality_id_validation_schema()).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(
+            err.to_string()
+                .contains("Invalid equality delete field id: 99"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("field_id: 99"), "{err}");
     }
 
     #[tokio::test]
@@ -545,7 +650,7 @@ mod test {
     #[tokio::test]
     async fn test_equality_delete_with_primitive_type() -> Result<(), anyhow::Error> {
         let temp_dir = TempDir::new().unwrap();
-        let file_io = FileIOBuilder::new_fs_io().build().unwrap();
+        let file_io = FileIO::new_with_fs();
         let location_gen = DefaultLocationGenerator::with_data_location(
             temp_dir.path().to_str().unwrap().to_string(),
         );
@@ -803,5 +908,23 @@ mod test {
             .unwrap();
         assert_eq!(to_write_projected, expect_batch);
         Ok(())
+    }
+
+    #[test]
+    fn test_equality_ids_resolve_behind_variant_column() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "v", Type::Variant(VariantType)).into(),
+                    NestedField::required(2, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let config = EqualityDeleteWriterConfig::new(vec![2], schema).unwrap();
+        let projected = config.projected_arrow_schema_ref();
+        assert_eq!(projected.fields().len(), 1);
+        assert_eq!(projected.field(0).name(), "id");
     }
 }

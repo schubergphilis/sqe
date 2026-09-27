@@ -61,7 +61,30 @@ pub fn configure_session_cache_ttl(secs: u64) {
     let _ = SESSION_CONTEXT_CACHE_TTL_SECS.set(secs);
 }
 
-static SESSION_CONTEXT_CACHE: LazyLock<Cache<String, (SessionContext, Arc<SessionCatalog>)>> =
+/// A cached session behind a trait object: a compile firewall, keep it.
+///
+/// Stored concretely, the value type rides in every moka future
+/// (`try_get_with`, `remove`, `run_pending_tasks`), and each `Send` future
+/// awaiting one re-proved `Send`/`Sync` over DataFusion's `SessionContext`
+/// graph (6.2 s of the library's compile, charged to `do_get_tables`,
+/// `-Zself-profile` 2026-09-27). `dyn SessionValue` stops the walk at its
+/// declared bounds. Same device as `StoredPlan` and sqe-policy's
+/// `CachedPolicy`.
+#[derive(Clone)]
+struct CachedSession(Arc<dyn SessionValue>);
+
+trait SessionValue: Send + Sync + 'static {
+    fn session(&self) -> (SessionContext, Arc<SessionCatalog>);
+}
+
+impl SessionValue for (SessionContext, Arc<SessionCatalog>) {
+    fn session(&self) -> (SessionContext, Arc<SessionCatalog>) {
+        // O(1): SessionContext wraps an Arc<SessionState>.
+        self.clone()
+    }
+}
+
+static SESSION_CONTEXT_CACHE: LazyLock<Cache<String, CachedSession>> =
     LazyLock::new(|| {
         let ttl_secs =
             *SESSION_CONTEXT_CACHE_TTL_SECS.get_or_init(|| DEFAULT_SESSION_CONTEXT_CACHE_TTL_SECS);
@@ -866,12 +889,13 @@ pub async fn create_session_context(
                 "Registered session catalog in DataFusion context"
             );
 
-            Ok((ctx, session_catalog_for_return)) as Result<_, Arc<SqeError>>
+            Ok(CachedSession(Arc::new((ctx, session_catalog_for_return))))
+                as Result<_, Arc<SqeError>>
         })
         .await
         .map_err(|e| SqeError::Catalog(format!("Failed to build session context: {e}")))?;
 
-    Ok(result)
+    Ok(result.0.session())
 }
 
 /// Pick the `CatalogConfig` to clone as the template for a discovered

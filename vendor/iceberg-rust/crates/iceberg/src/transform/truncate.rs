@@ -22,6 +22,7 @@ use arrow_schema::DataType;
 
 use super::TransformFunction;
 use crate::Error;
+use crate::error::invalid_data;
 use crate::spec::decimal_utils::decimal_from_i128_with_scale;
 use crate::spec::{Datum, PrimitiveLiteral};
 
@@ -69,10 +70,7 @@ impl TransformFunction for Truncate {
         match input.data_type() {
             DataType::Int32 => {
                 let width: i32 = self.width.try_into().map_err(|_| {
-                    Error::new(
-                        crate::ErrorKind::DataInvalid,
-                        "width is failed to convert to i32 when truncate Int32Array",
-                    )
+                    invalid_data!("width is failed to convert to i32 when truncate Int32Array")
                 })?;
                 let res: arrow_array::Int32Array = input
                     .as_any()
@@ -137,7 +135,7 @@ impl TransformFunction for Truncate {
                 );
                 Ok(Arc::new(res))
             }
-            _ => Err(crate::Error::new(
+            _ => Err(Error::new(
                 crate::ErrorKind::FeatureUnsupported,
                 format!(
                     "Unsupported data type for truncate transform: {:?}",
@@ -151,10 +149,7 @@ impl TransformFunction for Truncate {
         match input.literal() {
             PrimitiveLiteral::Int(v) => Ok(Some({
                 let width: i32 = self.width.try_into().map_err(|_| {
-                    Error::new(
-                        crate::ErrorKind::DataInvalid,
-                        "width is failed to convert to i32 when truncate Int32Array",
-                    )
+                    invalid_data!("width is failed to convert to i32 when truncate Int32Array")
                 })?;
                 Datum::int(Self::truncate_i32(*v, width))
             })),
@@ -173,7 +168,7 @@ impl TransformFunction for Truncate {
                 let len = self.width as usize;
                 Datum::string(Self::truncate_str(v, len).to_string())
             })),
-            _ => Err(crate::Error::new(
+            _ => Err(Error::new(
                 crate::ErrorKind::FeatureUnsupported,
                 format!(
                     "Unsupported data type for truncate transform: {:?}",
@@ -200,7 +195,7 @@ mod test {
     };
     use crate::spec::Type::{Primitive, Struct};
     use crate::spec::decimal_utils::decimal_new;
-    use crate::spec::{Datum, NestedField, PrimitiveType, StructType, Transform, Type};
+    use crate::spec::{Datum, NestedField, PrimitiveType, StructType, Transform};
     use crate::transform::TransformFunction;
     use crate::transform::test::{TestProjectionFixture, TestTransformFixture};
 
@@ -262,7 +257,7 @@ mod test {
         let fixture = TestProjectionFixture::new(
             Transform::Truncate(5),
             "name",
-            NestedField::required(1, "value", Type::Primitive(PrimitiveType::String)),
+            NestedField::required(1, "value", Primitive(PrimitiveType::String)),
         );
 
         fixture.assert_projection(
@@ -296,7 +291,7 @@ mod test {
         let fixture = TestProjectionFixture::new(
             Transform::Truncate(5),
             "name",
-            NestedField::required(1, "value", Type::Primitive(PrimitiveType::String)),
+            NestedField::required(1, "value", Primitive(PrimitiveType::String)),
         );
 
         fixture.assert_projection(
@@ -355,7 +350,7 @@ mod test {
             NestedField::required(
                 1,
                 "value",
-                Type::Primitive(PrimitiveType::Decimal {
+                Primitive(Decimal {
                     precision: 9,
                     scale: 2,
                 }),
@@ -425,7 +420,7 @@ mod test {
             NestedField::required(
                 1,
                 "value",
-                Type::Primitive(PrimitiveType::Decimal {
+                Primitive(Decimal {
                     precision: 9,
                     scale: 2,
                 }),
@@ -490,7 +485,7 @@ mod test {
         let fixture = TestProjectionFixture::new(
             Transform::Truncate(10),
             "name",
-            NestedField::required(1, "value", Type::Primitive(PrimitiveType::Long)),
+            NestedField::required(1, "value", Primitive(Long)),
         );
 
         fixture.assert_projection(
@@ -545,7 +540,7 @@ mod test {
         let fixture = TestProjectionFixture::new(
             Transform::Truncate(10),
             "name",
-            NestedField::required(1, "value", Type::Primitive(PrimitiveType::Long)),
+            NestedField::required(1, "value", Primitive(Long)),
         );
 
         fixture.assert_projection(
@@ -600,7 +595,7 @@ mod test {
         let fixture = TestProjectionFixture::new(
             Transform::Truncate(10),
             "name",
-            NestedField::required(1, "value", Type::Primitive(PrimitiveType::Int)),
+            NestedField::required(1, "value", Primitive(Int)),
         );
 
         fixture.assert_projection(
@@ -655,7 +650,7 @@ mod test {
         let fixture = TestProjectionFixture::new(
             Transform::Truncate(10),
             "name",
-            NestedField::required(1, "value", Type::Primitive(PrimitiveType::Int)),
+            NestedField::required(1, "value", Primitive(Int)),
         );
 
         fixture.assert_projection(

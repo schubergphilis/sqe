@@ -1337,6 +1337,10 @@ impl iceberg::Catalog for UnconfiguredCatalog {
         Err(unconfigured_catalog_error())
     }
 
+    async fn purge_table(&self, _table: &iceberg::TableIdent) -> iceberg::Result<()> {
+        Err(unconfigured_catalog_error())
+    }
+
     async fn table_exists(&self, _table: &iceberg::TableIdent) -> iceberg::Result<bool> {
         Err(unconfigured_catalog_error())
     }
@@ -1868,6 +1872,7 @@ impl SessionCatalog {
                         e,
                     )
                 })?
+                .with_storage_factory(crate::storage_factory())
                 .load(name.to_string(), props)
                 .await
                 .map_err(|e| {
@@ -2045,6 +2050,7 @@ impl SessionCatalog {
             debug!(token_fingerprint = %token_fingerprint, "REST catalog cache miss, creating");
             let catalog = RestCatalogBuilder::default()
                 .with_client(shared_vendored_http_client())
+                .with_storage_factory(crate::storage_factory())
                 .load(format!("sqe-session-{}", token_fingerprint), props)
                 .await
                 .map_err(|e| {
@@ -3324,6 +3330,13 @@ impl Catalog for SessionCatalogBridge {
         result
     }
 
+    async fn purge_table(&self, table: &TableIdent) -> iceberg::Result<()> {
+        let result = dispatch_catalog!(self.session.inner, purge_table(table));
+        // Same invalidation as drop_table: the files are gone for everyone.
+        self.session.invalidate_table_all_tokens(table).await;
+        result
+    }
+
     async fn table_exists(&self, table: &TableIdent) -> iceberg::Result<bool> {
         dispatch_catalog!(self.session.inner, table_exists(table))
     }
@@ -3914,8 +3927,9 @@ type = "aws"
             "snapshots": []
         }"#;
         let metadata: iceberg::spec::TableMetadata = serde_json::from_str(META_V1).unwrap();
-        let file_io = iceberg::io::FileIOBuilder::new_fs_io().build().unwrap();
+        let file_io = iceberg::io::FileIO::new_with_fs();
         iceberg::table::Table::builder()
+            .runtime(iceberg::Runtime::current())
             .metadata(metadata)
             .identifier(TableIdent::new(
                 NamespaceIdent::new("ns".to_string()),
@@ -4256,6 +4270,10 @@ mod invalidation_tests {
         }
 
         async fn drop_table(&self, _table: &TableIdent) -> iceberg::Result<()> {
+            Ok(())
+        }
+
+        async fn purge_table(&self, _table: &TableIdent) -> iceberg::Result<()> {
             Ok(())
         }
 
@@ -4851,6 +4869,11 @@ mod other_backend_tests {
 
         async fn drop_table(&self, _table: &TableIdent) -> iceberg::Result<()> {
             self.record("drop_table");
+            Ok(())
+        }
+
+        async fn purge_table(&self, _table: &TableIdent) -> iceberg::Result<()> {
+            self.record("purge_table");
             Ok(())
         }
 

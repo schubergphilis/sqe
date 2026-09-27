@@ -1,0 +1,8 @@
+# Advisories against vendored crates (vendor/*) that were reviewed and
+# accepted. scripts/supply-chain-watch.py fails on any OSV advisory for a
+# vendored crate name that is not listed here. One id per line:
+#
+#   GHSA-xxxx-xxxx-xxxx  # review-by YYYY-MM-DD owner=<name>
+#
+# Record why it does not apply (or what mitigates it) in the MR that adds it.
+# scripts/check-advisory-ignores.py fails when a review date passes.
