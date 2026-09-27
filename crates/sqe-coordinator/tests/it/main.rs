@@ -28,6 +28,7 @@ mod analyze_statement_test;
 mod attach_dispatch_test;
 mod attach_rest_test;
 mod audit_e2e_test;
+mod audit_planning_failure_test;
 mod catalog_discovery_test;
 mod compaction_benchmark;
 mod compaction_distributed_benchmark;

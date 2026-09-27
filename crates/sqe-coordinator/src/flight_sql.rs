@@ -1074,7 +1074,18 @@ impl SqeFlightSqlService {
                     .normalize(classifiable.as_str())
             })
             .and_then(classify_normalized)
-            .map_err(|e| sqe_error_to_status(&e, None))?;
+            .map_err(|e| {
+                // Rejected before the query handler, which would audit it.
+                let e = self.query_handler.audit_failure(
+                    session,
+                    sql,
+                    std::time::Instant::now(),
+                    client_ip.clone(),
+                    query_id,
+                    e,
+                );
+                sqe_error_to_status(&e, None)
+            })?;
 
         if matches!(kind, StatementKind::Query(_)) {
             let (schema, stream) = self
@@ -1493,12 +1504,21 @@ impl FlightSqlService for SqeFlightSqlService {
             "get_flight_info_statement"
         );
 
-        // Plan the query to extract the schema without executing it
+        // Plan the query to extract the schema without executing it. A
+        // statement that fails here never reaches DoGet, so this is its
+        // only chance at an audit line.
+        let start = std::time::Instant::now();
         let schema = self
             .query_handler
             .get_schema(&session, sql)
             .await
-            .map_err(|e| sqe_error_to_status(&e, None))?;
+            .map_err(|e| {
+                let client_ip = Some(self.extract_client_ip(&request));
+                let e = self
+                    .query_handler
+                    .audit_failure(&session, sql, start, client_ip, None, e);
+                sqe_error_to_status(&e, None)
+            })?;
 
         // Finding 403: the ticket carries a query id, not the SQL. DoGet
         // resolves the SQL by id and runs under that id, so CancelQuery
@@ -2443,11 +2463,21 @@ impl FlightSqlService for SqeFlightSqlService {
         // reused by every GetFlightInfo/DoGet for this statement; policy
         // enforcement is applied per execution, not here.
         let (numbered_sql, numbered_count) = sqe_core::number_placeholders(sql);
+        // A statement that fails to plan here is never executed, so it is
+        // audited here (like `get_flight_info_statement`).
+        let start = std::time::Instant::now();
+        let failed = |e| {
+            let client_ip = Some(self.extract_client_ip(&request));
+            let e = self
+                .query_handler
+                .audit_failure(&session, sql, start, client_ip, None, e);
+            sqe_error_to_status(&e, None)
+        };
         let plan = self
             .query_handler
             .plan_prepared_statement(&session, &numbered_sql)
             .await
-            .map_err(|e| sqe_error_to_status(&e, None))?;
+            .map_err(failed)?;
         let (param_types, dataset_schema): (
             Vec<Option<arrow_schema::DataType>>,
             arrow_schema::SchemaRef,
@@ -2465,7 +2495,7 @@ impl FlightSqlService for SqeFlightSqlService {
                 self.query_handler
                     .get_schema(&session, sql)
                     .await
-                    .map_err(|e| sqe_error_to_status(&e, None))?,
+                    .map_err(failed)?,
             ),
         };
         let statement = PreparedStatement::new(
