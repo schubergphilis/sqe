@@ -1047,12 +1047,38 @@ impl QueryHandler {
 
     /// Write the audit record for a statement that failed before its normal
     /// audit point (parse, catalog preflight, planning, access denied at
-    /// planning) and hand the error back, for `map_err`. Every admitted
-    /// statement leaves exactly one audit line, whatever stage fails.
+    /// planning). Every admitted statement leaves exactly one audit line,
+    /// whatever stage fails.
     ///
     /// Classifies `sql` again to route the record like any other statement
     /// of that kind (`crate::audit_emitter::emit_failed_statement`); this
-    /// runs on the failure path only.
+    /// runs on the failure path only. Public for front ends that reject a
+    /// statement before calling the handler (the Trino HTTP front door).
+    pub fn record_failed_statement(
+        &self,
+        session: &Session,
+        sql: &str,
+        start: std::time::Instant,
+        client_ip: Option<String>,
+        query_id: Option<uuid::Uuid>,
+        error: &SqeError,
+    ) {
+        if let Some(ref audit) = self.audit {
+            let kind = classify_user_sql(session, sql).ok();
+            crate::audit_emitter::emit_failed_statement(
+                audit,
+                session,
+                sql,
+                kind.as_ref(),
+                error,
+                start.elapsed(),
+                client_ip,
+                query_id.unwrap_or_else(uuid::Uuid::now_v7),
+            );
+        }
+    }
+
+    /// [`Self::record_failed_statement`], handing the error back for `map_err`.
     pub(crate) fn audit_failure(
         &self,
         session: &Session,
@@ -1062,19 +1088,7 @@ impl QueryHandler {
         query_id: Option<uuid::Uuid>,
         error: SqeError,
     ) -> SqeError {
-        if let Some(ref audit) = self.audit {
-            let kind = classify_user_sql(session, sql).ok();
-            crate::audit_emitter::emit_failed_statement(
-                audit,
-                session,
-                sql,
-                kind.as_ref(),
-                &error,
-                start.elapsed(),
-                client_ip,
-                query_id.unwrap_or_else(uuid::Uuid::now_v7),
-            );
-        }
+        self.record_failed_statement(session, sql, start, client_ip, query_id, &error);
         error
     }
 
