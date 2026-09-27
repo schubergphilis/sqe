@@ -4,6 +4,16 @@
 # `aikido-rust-extra` job (aikido >= v0.12.0), in parallel with the test gate.
 #
 set -e
+
+# Clippy first, advisory (it was the platform's aikido-clippy-rust job; see
+# .gitlab-ci.yml). The feature-matrix checks below then reuse its
+# check-mode dependency artifacts instead of compiling the tree again.
+echo "== cargo clippy (advisory, max 20m) =="
+rustup component add clippy >/dev/null 2>&1 || true
+timeout --foreground --signal=TERM --kill-after=30s 20m \
+  cargo clippy --workspace --all-targets --all-features -- -D warnings \
+  || echo "clippy: findings (non-blocking)"
+
 cargo check -p sqe-catalog --no-default-features --features rest
 cargo check -p sqe-catalog --no-default-features --features rest,glue,s3tables
 cargo check -p sqe-catalog --no-default-features --features rest,hms
