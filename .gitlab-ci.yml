@@ -253,6 +253,59 @@ release-binaries:
       variables:
         CARGO_PROFILE: "release"
 
+# ── Prebuilt dependency image for the Rust jobs ──────────────────────
+# Every Rust job compiled the third-party tree from nothing: about 11 of the
+# gate's 13 minutes (pipeline 1635867). The sccache bucket that would fix
+# that does not exist yet. This job compiles the tree once on main and
+# publishes it as one layer on top of $AIKIDO_RUST_IMAGE, as
+# $CI_REGISTRY_IMAGE/ci-deps:main; each runner host's Docker keeps the layer
+# after the first pull, which is the persistent cache the runners otherwise
+# lack. Script and the reasoning on staleness: ci/build-deps-image.sh.
+#
+# Runs when a dependency input changes (the include ref bump that moves
+# $AIKIDO_RUST_IMAGE lives in this file), or by hand from a main pipeline.
+# The Rust jobs are switched to the image in a follow-up change, once it
+# exists; until then this job only publishes.
+ci-deps-image:
+  stage: test
+  needs: []
+  image: "$AIKIDO_RUST_IMAGE"
+  timeout: 60m
+  # A cancelled push leaves the old tag in place (crane writes the manifest
+  # last), but there is no reason to throw away a half-done compile either.
+  interruptible: false
+  variables:
+    CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
+    CARGO_INCREMENTAL: "0"
+    CARGO_TERM_COLOR: "always"
+    SQE_DEPS_TARGET: "/opt/sqe-deps/target"
+  before_script:
+    - !reference [.aikido_rust_build_env, before_script]
+  script:
+    - ci/build-deps-image.sh
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - Cargo.lock
+        - Cargo.toml
+        - "crates/*/Cargo.toml"
+        - "vendor/**/*"
+        - rust-toolchain.toml
+        - .cargo/config.toml
+        - .gitlab-ci.yml
+        - ci/build-deps-image.sh
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: true
+    # Trial run from an MR: publishes ci-deps:mr-<iid>, never :main.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: manual
+      allow_failure: true
+      variables:
+        SQE_DEPS_TAG: "mr-$CI_MERGE_REQUEST_IID"
+
 # Malware scan of what we ship, before it can be promoted. ClamAV over the
 # release binaries (the only files Dockerfile.ci adds to the Chainguard base)
 # and the source tree, vendored code included. A hit fails the job, and the
