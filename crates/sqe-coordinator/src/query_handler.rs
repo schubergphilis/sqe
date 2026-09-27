@@ -3325,7 +3325,20 @@ impl QueryHandler {
     /// required by Flight SQL clients, which reject a prepared statement when
     /// its declared and actual result schemas differ. Other non-query
     /// statements remain side-effect-only and use an empty schema.
-    pub async fn get_schema(&self, session: &Session, sql: &str) -> sqe_core::Result<SchemaRef> {
+    ///
+    /// Boxed for the same reason as [`Self::execute`]: awaited unboxed, the
+    /// planning state machine below made `get_flight_info_statement` re-prove
+    /// `Send` over it, 11.2 s of the coordinator library's compile
+    /// (`-Zself-profile`, 2026-09-26).
+    pub fn get_schema<'a>(
+        &'a self,
+        session: &'a Session,
+        sql: &'a str,
+    ) -> futures::future::BoxFuture<'a, sqe_core::Result<SchemaRef>> {
+        Box::pin(self.get_schema_inner(session, sql))
+    }
+
+    async fn get_schema_inner(&self, session: &Session, sql: &str) -> sqe_core::Result<SchemaRef> {
         // GetFlightInfo / prepared-statement creation plan through here
         // without calling execute(). Cap the statement first so ADBC/JDBC
         // cannot burn the parser on an arbitrarily large query (#403).
