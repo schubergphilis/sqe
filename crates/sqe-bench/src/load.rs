@@ -25,6 +25,13 @@ pub struct LoadArgs<'a> {
     /// `write.puffin.stats` table property on the CTAS). Off by default; the
     /// coordinator only consumes them when `query.puffin_statistics` is on.
     pub puffin_stats: bool,
+    /// Load as Hive external tables under this prefix instead of Iceberg:
+    /// `CREATE TABLE <root>.<ns>.<t> STORED AS PARQUET LOCATION
+    /// '<prefix>/<ns>/<t>/' AS SELECT ...`, with `catalog` naming the Hive
+    /// root. No partitioning and no Iceberg table properties (bloom / puffin
+    /// are Iceberg writer levers); fact tables are sorted on their
+    /// clustering key instead, so row-group pruning stays comparable.
+    pub hive_location: Option<&'a str>,
 }
 
 /// Sort-on-write clustering key for a fact table.
@@ -216,13 +223,21 @@ pub async fn load_benchmark(client: &dyn BenchClient, args: &LoadArgs<'_>) -> an
         // TBLPROPERTIES after PARTITIONED BY fails to parse (verified against
         // the engine parse path, not raw GenericDialect).
         let mut base_sql = format!("CREATE TABLE {qualified_ns}.{}", table_def.name);
+        // Hive CTAS: LOCATION is required (SQE never picks a data path for
+        // an external table), format defaults to Parquet but is stated.
+        let hive_dir = args.hive_location.map(|loc| {
+            format!("{}/{ns_base}/{}", loc.trim_end_matches('/'), table_def.name)
+        });
+        if let Some(dir) = &hive_dir {
+            base_sql.push_str(&format!(" STORED AS PARQUET LOCATION '{dir}/'"));
+        }
         // Bloom filters on join-key columns, when requested. The property
         // must be set at table-creation time -- it drives the CTAS data
         // write through SQE's Iceberg writer.
         // Both levers share one TBLPROPERTIES clause; sqlparser accepts a
         // single options list per CTAS.
         let mut tbl_props: Vec<String> = Vec::new();
-        if args.bloom_filter {
+        if args.bloom_filter && hive_dir.is_none() {
             let cols = bloom_columns(benchmark, &table_def.name);
             if !cols.is_empty() {
                 tbl_props.push(format!(
@@ -231,13 +246,14 @@ pub async fn load_benchmark(client: &dyn BenchClient, args: &LoadArgs<'_>) -> an
                 ));
             }
         }
-        if args.puffin_stats {
+        if args.puffin_stats && hive_dir.is_none() {
             tbl_props.push("'write.puffin.stats' = 'true'".to_string());
         }
         if !tbl_props.is_empty() {
             base_sql.push_str(&format!(" TBLPROPERTIES ({})", tbl_props.join(", ")));
         }
-        if let Some(spec) = partition_spec(benchmark, &table_def.name) {
+        let partition = partition_spec(benchmark, &table_def.name).filter(|_| hive_dir.is_none());
+        if let Some(spec) = partition {
             base_sql.push_str(&format!(" PARTITIONED BY ({spec})"));
         }
         // Object-store paths use the directory form: DataFusion's
@@ -286,7 +302,7 @@ pub async fn load_benchmark(client: &dyn BenchClient, args: &LoadArgs<'_>) -> an
         // redundant, memory-unsafe sort is skipped. Unpartitioned fact tables
         // (SSB lineorder, TPC-DS *_sales) keep the single-stream sort, which
         // spills cleanly; if it still exhausts memory we fail over to unsorted.
-        let partitioned = partition_spec(benchmark, &table_def.name).is_some();
+        let partitioned = partition.is_some();
         match clustering_key(benchmark, &table_def.name) {
             Some(key) if !partitioned => {
                 let sorted_sql = format!("{base_sql} ORDER BY {key}");
@@ -304,8 +320,19 @@ pub async fn load_benchmark(client: &dyn BenchClient, args: &LoadArgs<'_>) -> an
                                 table_def.name
                             ))
                             .await;
+                        // A Hive DROP removes the manifest only; the failed
+                        // sort's files stay under LOCATION and would be read
+                        // back with the retry's. Retry into a fresh subdir.
+                        let unsorted_sql = match &hive_dir {
+                            Some(dir) => base_sql.replacen(
+                                &format!("LOCATION '{dir}/'"),
+                                &format!("LOCATION '{dir}/unsorted/'"),
+                                1,
+                            ),
+                            None => base_sql.clone(),
+                        };
                         client
-                            .execute_update(&base_sql)
+                            .execute_update(&unsorted_sql)
                             .await
                             .map_err(|e| redact_s3_secrets(e, s3_args))?;
                     } else {
