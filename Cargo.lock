@@ -8721,8 +8721,6 @@ dependencies = [
  "bytes",
  "cc",
  "chrono",
- "clap",
- "clap_builder",
  "crc32fast",
  "crypto-common 0.1.7",
  "datafusion-common",
@@ -8867,7 +8865,6 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
- "workspace-hack",
 ]
 
 [[package]]
