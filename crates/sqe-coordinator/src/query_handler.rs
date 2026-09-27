@@ -1112,11 +1112,20 @@ impl QueryHandler {
         // idempotent. Gated on the statement text naming a file function so
         // a statement that cannot need it never builds a session context
         // it would not otherwise have built.
-        if kind.statement().is_some()
-            && sqe_catalog::file_tvf_prepare::mentions_file_function(sql)
-        {
-            let (ctx, _) = self.create_session_context(session).await?;
-            prepare_file_tvfs(&ctx, sql).await?;
+        //
+        // Prepared from the front door's own parse, not by re-parsing `sql`:
+        // `GenericDialect` rejects syntax the front door accepts, and a
+        // rejected parse prepares nothing, silently. A CTAS with
+        // `PARTITIONED BY (month(d))` over `read_parquet` then failed in the
+        // write handler with "the table function was not prepared" (every
+        // partitioned TPC-H load, 2026-09-27).
+        if let Some(stmt) = kind.statement() {
+            if sqe_catalog::file_tvf_prepare::mentions_file_function(sql) {
+                let (ctx, _) = self.create_session_context(session).await?;
+                sqe_catalog::file_tvf_prepare::prepare_parsed_statement(&ctx, stmt)
+                    .await
+                    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
+            }
         }
 
         let span = Span::current();
