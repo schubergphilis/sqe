@@ -15,6 +15,7 @@
 # Architecture
 
 - [System Overview](./architecture/overview.md)
+- [System Context and Inventory](./architecture/system-context.md)
 - [Coordinator](./architecture/coordinator.md)
 - [Worker](./architecture/worker.md)
 - [Authentication Flow](./architecture/auth-flow.md)
@@ -138,7 +139,11 @@
 - [Audit Logging (OCSF)](./operations/audit-logging.md)
 - [Web UI](./operations/web-ui.md)
 - [On-Call Runbook](./operations/runbook.md)
+- [Secret inventory and rotation](./operations/secret-rotation.md)
+- [Backup and restore](./operations/backup-restore.md)
 - [Production guide (scaling phases)](./operations/production-guide.md)
+- [Shared responsibility](./operations/shared-responsibility.md)
+- [Go-live and retirement checklists](./operations/go-live-checklist.md)
 
 ---
 

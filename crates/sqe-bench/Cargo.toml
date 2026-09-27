@@ -28,6 +28,7 @@ arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
+iceberg-storage-opendal = { workspace = true }
 parquet = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }

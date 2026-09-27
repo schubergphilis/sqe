@@ -175,7 +175,8 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-iceberg-datafusion = { workspace = true }
+datafusion-iceberg = { workspace = true }
+iceberg-storage-opendal = { workspace = true }
 parquet = { workspace = true }
 bytes = { workspace = true }
 prometheus = { workspace = true }

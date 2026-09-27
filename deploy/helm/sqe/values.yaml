@@ -106,13 +106,26 @@ service:
 # chart's workers, and the mcp port from `mcpFrom` peers. Entries are
 # NetworkPolicyPeer objects (podSelector / namespaceSelector / ipBlock). An
 # empty list allows any source on those ports. Kubelet probes are exempt on
-# the common CNIs.
+# the common CNIs. Workers accept flight from the coordinator only, and
+# metrics from `from`.
+#
+# `egress`: NetworkPolicyEgressRule objects. Empty leaves egress open. Any
+# entry turns on default-deny egress for coordinator and workers, with DNS
+# (kube-system, 53) and the coordinator<->worker hops added by the chart; list
+# the rest yourself: catalog, identity provider, object store, policy
+# service, OTLP collector.
 networkPolicy:
   enabled: false
   from: []
     # - namespaceSelector:
     #     matchLabels: { kubernetes.io/metadata.name: ingress-nginx }
   mcpFrom: []
+  egress: []
+    # - to:
+    #     - ipBlock: { cidr: 10.20.0.0/16 }   # object store + catalog subnet
+    #   ports:
+    #     - port: 443
+    #     - port: 8181                          # Polaris
 
 # ── Ingress (TLS termination) ────────────────────────────────
 # SEC-06: the coordinator's HTTP listeners (Trino HTTP, web UI, Quack) are

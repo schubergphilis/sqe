@@ -36,6 +36,9 @@ spec:
         runAsUser: 65532
         runAsGroup: 65532
         fsGroup: 65532
+        # The runtime's default syscall filter (Pod Security "restricted").
+        seccompProfile:
+          type: RuntimeDefault
 
       containers:
         - name: sqe

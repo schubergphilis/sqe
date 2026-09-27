@@ -77,28 +77,70 @@ groups:
             Queries fail-closed (deny-all). Check Ranger Admin reachability
             and sqe_policy_resolve_duration_seconds.
 
-      - alert: SqeOpaCircuitOpen
-        expr: sqe_policy_circuit_breaker_state{backend="opa"} == 2
+  # Silent-source detection for the OCSF audit export: the SIEM must learn
+  # when SQE stops sending. Series exist only when [audit.export] is configured.
+  - name: sqe.audit
+    rules:
+      - alert: SqeAuditExportFailing
+        expr: increase(sqe_audit_export_batch_failures_total[15m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: SQE audit export batches are failing
+          description: >
+            Audit batches have failed to ship for 15m. Events queue in the
+            local spool. Check the export endpoint and its TLS.
+
+      - alert: SqeAuditExportStalled
+        # Backlog present and nothing shipped for 30m. An idle coordinator has
+        # lag 0 and stays silent. last_success is 0 until the first ship, so a
+        # backlog that never shipped also fires.
+        expr: |
+          sqe_audit_export_spool_lag_bytes > 0
+            and
+          (time() - sqe_audit_export_last_success_timestamp) > 1800
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: SQE audit events are not reaching the SIEM
+          description: >
+            {{ $value | humanize1024 }}B of audit events are waiting in the
+            spool and nothing has shipped for 30m. The SIEM is missing audit
+            events from this coordinator.
+
+  # The coordinator is a single replica: down means no queries and no audit
+  # events. job="sqe-coordinator" is set by the chart's ServiceMonitor.
+  - name: sqe.availability
+    rules:
+      - alert: SqeCoordinatorDown
+        expr: up{job="sqe-coordinator"} == 0
         for: 2m
         labels:
           severity: critical
         annotations:
-          summary: OPA policy circuit breaker is open
-          description: Policy fetches to OPA are failing. Queries fail-closed.
+          summary: The SQE coordinator scrape target is down
+          description: >
+            {{ $labels.instance }} has not answered a scrape for 2m. SQE serves
+            no queries and emits no audit events while it is down.
+
+      - alert: SqeCoordinatorAbsent
+        # Watchdog for the watcher: SqeCoordinatorDown needs a series to fire
+        # on. If the target disappears altogether (ServiceMonitor removed, job
+        # relabelled, Prometheus lost the scrape config), only absent() notices.
+        expr: absent(up{job="sqe-coordinator"})
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: Prometheus has no SQE coordinator target at all
+          description: >
+            No up{job="sqe-coordinator"} series for 10m. Monitoring of SQE is
+            blind, not quiet. Check the ServiceMonitor and the scrape config.
 
   - name: sqe.workers
     rules:
-      - alert: SqeWorkerShuffleResidentHigh
-        expr: sqe_worker_shuffle_resident_bytes > 2147483648
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: Worker shuffle buffers above 2GiB
-          description: >
-            Shuffle is still item-bounded (#406). High resident bytes precede
-            OOM. Check concurrent exchange-heavy queries.
-
       - alert: SqeWorkerDown
         # job="sqe-worker" is set by deploy/helm/sqe/templates/servicemonitor.yaml
         # when worker.enabled is true. Coordinator-only installs have no series

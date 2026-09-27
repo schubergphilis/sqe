@@ -60,8 +60,22 @@ pub enum ChaosMode {
     DelayPerFrame(Duration),
 }
 
+/// The wrapped worker as a trait object: a compile firewall, keep it. Held
+/// concretely, every `async_trait` method below re-proved `Shared: Sync`
+/// through `WorkerFlightService`'s DataFusion type graph (1.3 s each, 14 s
+/// of this test binary). Same device as the coordinator's `StoredPlan`.
+type InnerFlight = dyn FlightService<
+    HandshakeStream = BoxStream<HandshakeResponse>,
+    ListFlightsStream = BoxStream<FlightInfo>,
+    DoGetStream = BoxStream<FlightData>,
+    DoPutStream = BoxStream<PutResult>,
+    DoExchangeStream = BoxStream<FlightData>,
+    DoActionStream = BoxStream<arrow_flight::Result>,
+    ListActionsStream = BoxStream<ActionType>,
+>;
+
 struct Shared {
-    inner: WorkerFlightService,
+    inner: Box<InnerFlight>,
     mode: Mutex<ChaosMode>,
     do_gets: AtomicUsize,
     active_streams: Arc<AtomicUsize>,
@@ -135,7 +149,7 @@ pub async fn spawn_chaos_worker(mode: ChaosMode) -> ChaosHandle {
 
     let worker = ChaosWorker {
         shared: Arc::new(Shared {
-            inner,
+            inner: Box::new(inner),
             mode: Mutex::new(mode),
             do_gets: AtomicUsize::new(0),
             active_streams: Arc::new(AtomicUsize::new(0)),

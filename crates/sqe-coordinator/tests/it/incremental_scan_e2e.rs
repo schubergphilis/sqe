@@ -11,7 +11,7 @@
 //! ```text
 //! docker compose -f docker-compose.test.yml up -d
 //! ./scripts/bootstrap-test.sh
-//! cargo test --package sqe-coordinator --test incremental_scan_e2e -- --ignored --nocapture
+//! cargo test --package sqe-coordinator --test it incremental_scan_e2e -- --ignored --nocapture
 //! ```
 //!
 //! The non-ignored tests stay on the static shape of the rewrite + provider

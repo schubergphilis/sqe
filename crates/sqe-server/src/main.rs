@@ -44,6 +44,12 @@ struct Cli {
     #[arg(short, long, value_enum, default_value = "coordinator")]
     mode: CliMode,
 
+    /// Verify the hash chain of a native audit log, or a contiguous extract
+    /// of one, print a chain-of-custody report and exit (non-zero on a
+    /// broken chain). Starts no server.
+    #[arg(long, value_name = "FILE")]
+    verify_audit: Option<String>,
+
     /// Serve `/mcp` with NO authentication: every caller is one anonymous
     /// identity reading with the engine's own storage credentials. For a
     /// laptop or a trusted network, never a shared environment.
@@ -1165,6 +1171,36 @@ fn main() -> anyhow::Result<()> {
     // TLS listener path stays as the finding-210 check.
     sqe_coordinator::tls::ensure_crypto_provider();
     let cli = Cli::parse();
+    if let Some(path) = &cli.verify_audit {
+        let bytes = std::fs::read(path)
+            .map_err(|e| anyhow::anyhow!("cannot read audit file {path}: {e}"))?;
+        match sqe_metrics::audit::verify_audit_bytes(&bytes) {
+            Ok(r) => {
+                println!("file:            {path}");
+                println!("sha256:          {}", r.file_sha256);
+                println!(
+                    "records:         {} (seq {}..={})",
+                    r.records, r.first_seq, r.last_seq
+                );
+                let genesis = if r.starts_at_genesis() {
+                    " (genesis)"
+                } else {
+                    ""
+                };
+                println!("first prev_hash: {}{genesis}", r.first_prev_hash);
+                println!("last hash:       {}", r.last_hash);
+                for (line, reason) in &r.broken_segments {
+                    println!("broken segment:  line {line}: {reason}");
+                }
+                println!("chain:           OK");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("chain: BROKEN: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     let config_path = cli
         .config
         .clone()
@@ -2064,7 +2100,8 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
                         sqe_coordinator::parse_start_at(&ae.start_at),
                         ae.flush_interval_ms,
                     )
-                    .with_metrics(shipper_metrics);
+                    .with_metrics(shipper_metrics)
+                    .with_compactor(audit.spool_compactor(spool_path));
 
                     let (tx, rx) = tokio::sync::watch::channel(false);
                     tokio::spawn(shipper.run(rx));
@@ -3420,8 +3457,9 @@ mod tests {
             "snapshots": []
         }"#;
         let metadata: iceberg::spec::TableMetadata = serde_json::from_str(META_V1).unwrap();
-        let file_io = iceberg::io::FileIOBuilder::new_fs_io().build().unwrap();
+        let file_io = iceberg::io::FileIO::new_with_fs();
         iceberg::table::Table::builder()
+            .runtime(iceberg::Runtime::current())
             .metadata(metadata)
             .identifier(iceberg::TableIdent::new(
                 iceberg::NamespaceIdent::new("ns".to_string()),

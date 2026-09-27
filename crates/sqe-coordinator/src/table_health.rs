@@ -198,6 +198,7 @@ pub fn table_health_batch(health: &TableHealth) -> RecordBatch {
 mod tests {
     use super::*;
     use arrow_array::Array;
+    use iceberg::scan::FileScanTaskDeleteFile;
     use iceberg::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Literal, NestedField, PrimitiveType,
         Schema, Struct, Type,
@@ -272,61 +273,40 @@ mod tests {
         )
     }
 
-    /// A scan task for `data_path` whose `.deletes` list carries one nested
-    /// `FileScanTask` per entry in `delete_paths`, mirroring what the scan
-    /// planner attaches for position/equality deletes.
+    /// A scan task for `data_path` whose `.deletes` list carries one
+    /// position-delete descriptor per entry in `delete_paths`, mirroring what
+    /// the scan planner attaches.
     fn scan_task(data_path: &str, delete_paths: &[&str]) -> FileScanTask {
-        let schema = minimal_schema();
-        let delete_task = |path: &str| FileScanTask {
-            file_size_in_bytes: 1,
-            start: 0,
-            length: 0,
-            record_count: None,
-            data_file_path: path.to_string(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::PositionDeletes,
-            data_file_format: DataFileFormat::Parquet,
-            schema: schema.clone(),
-            project_field_ids: vec![],
-            predicate: None,
-            deletes: vec![],
-            sequence_number: 0,
-            equality_ids: None,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        };
-        let deletes: Vec<std::sync::Arc<FileScanTask>> = delete_paths
+        let deletes: Vec<FileScanTaskDeleteFile> = delete_paths
             .iter()
-            .map(|p| std::sync::Arc::new(delete_task(p)))
+            .map(|p| {
+                FileScanTaskDeleteFile::builder()
+                    .with_file_path(p.to_string())
+                    .with_file_size_in_bytes(1)
+                    .with_file_type(DataContentType::PositionDeletes)
+                    .with_file_format(DataFileFormat::Parquet)
+                    .with_partition_spec_id(0)
+                    .build()
+            })
             .collect();
-        FileScanTask {
-            file_size_in_bytes: 1,
-            start: 0,
-            length: 0,
-            record_count: None,
-            data_file_path: data_path.to_string(),
-            referenced_data_file: None,
-            data_file_content: DataContentType::Data,
-            data_file_format: DataFileFormat::Parquet,
-            schema,
-            project_field_ids: vec![1],
-            predicate: None,
-            deletes,
-            sequence_number: 0,
-            equality_ids: None,
-            partition: None,
-            partition_spec: None,
-            name_mapping: None,
-            case_sensitive: true,
-        }
+        FileScanTask::builder()
+            .with_file_size_in_bytes(1)
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(data_path.to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(minimal_schema())
+            .with_project_field_ids(vec![1])
+            .with_deletes(deletes)
+            .with_case_sensitive(true)
+            .build()
+            .expect("scan task")
     }
 
     fn tasks_by_path(tasks: Vec<FileScanTask>) -> HashMap<String, Vec<FileScanTask>> {
         let mut map: HashMap<String, Vec<FileScanTask>> = HashMap::new();
         for t in tasks {
-            map.entry(t.data_file_path.clone()).or_default().push(t);
+            map.entry(t.data_file_path().to_string()).or_default().push(t);
         }
         map
     }

@@ -7,21 +7,31 @@
 # with the License.  You may obtain a copy of the License at
 #
 #   http://www.apache.org/licenses/LICENSE-2.0
-
-# Minimal stub of apache/iceberg-rust's iceberg_test_utils crate.
-# The upstream crate wires up Docker Compose harnesses and logging.
-# SQE only needs the `tests` feature to unlock ignored-by-default
-# tests in the iceberg crate. Nothing else is consumed.
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 
 [package]
+edition = { workspace = true }
+homepage = { workspace = true }
 name = "iceberg_test_utils"
-version = "0.8.0"
-edition = "2024"
 publish = false
-license = "Apache-2.0"
+rust-version = { workspace = true }
+version = { workspace = true }
+
+license = { workspace = true }
+repository = { workspace = true }
+
+[dependencies]
+iceberg = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [features]
 tests = []
 
-[lib]
-path = "src/lib.rs"
+[lints]
+workspace = true

@@ -15,7 +15,7 @@
 //! ```text
 //! docker compose -f docker-compose.test.yml up -d
 //! ./scripts/bootstrap-test.sh
-//! cargo test --package sqe-coordinator --test v3_e2e -- \
+//! cargo test --package sqe-coordinator --test it v3_e2e -- \
 //!     --ignored --test-threads=1
 //! ```
 //!
@@ -87,6 +87,25 @@ async fn row_count(
         .downcast_ref::<Int64Array>()
         .expect("Int64Array")
         .value(0)
+}
+
+/// Helper: the current snapshot's summary as `table_snapshots` renders it
+/// (a JSON object). Picks the snapshot no other snapshot names as parent, so
+/// two commits in the same millisecond cannot tie.
+async fn latest_summary(
+    handler: &sqe_coordinator::QueryHandler,
+    session: &sqe_core::Session,
+    namespace: &str,
+    table: &str,
+) -> String {
+    use arrow::array::AsArray;
+    let sql = format!(
+        "SELECT summary FROM table_snapshots('{namespace}', '{table}') \
+         WHERE snapshot_id NOT IN (SELECT parent_id FROM table_snapshots('{namespace}', '{table}') \
+         WHERE parent_id IS NOT NULL)"
+    );
+    let batches = handler.execute(session, &sql, None).await.expect("table_snapshots");
+    batches[0].column(0).as_string::<i32>().value(0).to_string()
 }
 
 /// Helper: read the table's format-version straight off the metadata
@@ -363,12 +382,12 @@ async fn delete_cow_on_v3_table_drops_row() {
 // Cell: sqe:position-deletes:v3
 //
 // DELETE with write.delete.mode=merge-on-read on a V3 table without a
-// declared identifier-field-id writes position-delete files alongside
-// the existing data files. We assert the write path commits a delete
-// file (visible via `table_files` content_type) and that the snapshot
-// log records the commit. The read-side filtering of position deletes
-// is owned by the dedicated MoR read test suite; this test stays
-// focused on V3 + write-path.
+// declared identifier-field-id. The spec forbids adding position-delete
+// files to a V3 table: each data file gets at most one deletion vector
+// holding all its deleted positions, and a second DELETE on the same file
+// replaces the vector rather than adding another. Asserted through the
+// snapshot summary (`added-dvs` / `removed-dvs`, never
+// `added-position-delete-files`) and the visible rows.
 // ─────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs:polaris"]
@@ -424,6 +443,33 @@ async fn position_deletes_on_v3_table() {
         "MoR DELETE on V3 table must NOT rewrite data files: \
          before={files_before} after={files_after}"
     );
+    let summary = latest_summary(&handler, &session, ns, name).await;
+    assert!(summary.contains("\"added-dvs\":\"1\""), "one DV: {summary}");
+    assert!(
+        !summary.contains("added-position-delete-files"),
+        "V3 must not add position delete files: {summary}"
+    );
+
+    // A second DELETE on a data file that already has a vector: the new
+    // vector must carry both positions and the old one must be retired.
+    handler
+        .execute(&session, &format!("INSERT INTO {fq} VALUES (10, NULL), (11, NULL)"), None)
+        .await
+        .expect("INSERT two-row file");
+    for id in [10, 11] {
+        handler
+            .execute(&session, &format!("DELETE FROM {fq} WHERE id = {id}"), None)
+            .await
+            .expect("DELETE MoR on the two-row file");
+    }
+    let summary = latest_summary(&handler, &session, ns, name).await;
+    assert!(summary.contains("\"added-dvs\":\"1\""), "replacement DV: {summary}");
+    assert!(summary.contains("\"removed-dvs\":\"1\""), "old DV retired: {summary}");
+    assert!(
+        !summary.contains("added-position-delete-files"),
+        "V3 must not add position delete files: {summary}"
+    );
+    assert_eq!(row_count(&handler, &session, &fq).await, 2, "ids 0 and 2 remain");
 
     let _ = handler
         .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
@@ -1073,6 +1119,198 @@ async fn statistics_on_v3_table() {
         .await
         .expect("show stats");
     assert!(!stats.is_empty(), "SHOW STATS returned no rows on V3 table");
+
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Cell: sqe:row-lineage:v3
+//
+// Spec, Row Lineage: a rewritten row keeps its `_row_id`; an unchanged row
+// also keeps `_last_updated_sequence_number`, an updated row gets a newer one
+// (null on write, inherited at commit). CoW DELETE / UPDATE / MERGE and
+// rewrite_data_files all rewrite rows, so each must preserve lineage.
+// Lineage is read through the iceberg scan, which synthesizes it for files
+// that do not store it (first_row_id + _pos).
+// ─────────────────────────────────────────────────────────────────────────
+
+/// `id -> (_row_id, _last_updated_sequence_number)` for every live row.
+async fn lineage_by_id(
+    handler: &sqe_coordinator::QueryHandler,
+    session: &sqe_core::Session,
+    ns: &str,
+    name: &str,
+) -> std::collections::BTreeMap<i64, (i64, i64)> {
+    use futures::TryStreamExt;
+    let catalog = handler.session_catalog(session).await.expect("session catalog");
+    let ident = iceberg::TableIdent::from_strs([ns, name]).expect("ident");
+    let table = catalog.load_table(&ident).await.expect("load table");
+    let batches: Vec<arrow_array::RecordBatch> = table
+        .scan()
+        .select(["id", "_row_id", "_last_updated_sequence_number"])
+        .build()
+        .expect("lineage scan")
+        .to_arrow()
+        .await
+        .expect("lineage stream")
+        .try_collect()
+        .await
+        .expect("lineage batches");
+    // The reader returns a file-constant sequence number run-end encoded.
+    let col = |b: &arrow_array::RecordBatch, n: &str| {
+        let raw = b.column_by_name(n).unwrap_or_else(|| panic!("missing {n}"));
+        arrow::compute::cast(raw, &arrow_schema::DataType::Int64)
+            .unwrap_or_else(|e| panic!("{n}: {e}"))
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap_or_else(|| panic!("{n} not Int64"))
+            .clone()
+    };
+    let mut out = std::collections::BTreeMap::new();
+    for b in &batches {
+        let (ids, rows, seqs) = (col(b, "id"), col(b, "_row_id"), col(b, "_last_updated_sequence_number"));
+        for i in 0..b.num_rows() {
+            assert!(!rows.is_null(i) && !seqs.is_null(i), "lineage must never be null on read");
+            let prev = out.insert(ids.value(i), (rows.value(i), seqs.value(i)));
+            assert!(prev.is_none(), "duplicate id {}", ids.value(i));
+        }
+    }
+    let mut row_ids: Vec<i64> = out.values().map(|v| v.0).collect();
+    row_ids.sort_unstable();
+    row_ids.dedup();
+    assert_eq!(row_ids.len(), out.len(), "_row_id must be unique: {out:?}");
+    out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn row_lineage_survives_cow_rewrites_on_v3_table() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let ns = "default";
+    let name = "v3_row_lineage";
+    let fq = format!("{ns}.{name}");
+    let run = |sql: String| {
+        let (handler, session) = (&handler, &session);
+        async move { handler.execute(session, &sql, None).await.unwrap_or_else(|e| panic!("{sql}: {e}")) }
+    };
+
+    reset_table(
+        &handler,
+        &session,
+        &fq,
+        &format!("CREATE TABLE {fq} (id BIGINT, v BIGINT, ts TIMESTAMP_NS(9))"),
+    )
+    .await;
+    run(format!("INSERT INTO {fq} VALUES (1, 10, NULL), (2, 20, NULL), (3, 30, NULL)")).await;
+    run(format!("INSERT INTO {fq} VALUES (4, 40, NULL), (5, 50, NULL), (6, 60, NULL)")).await;
+    let start = lineage_by_id(&handler, &session, ns, name).await;
+    assert_eq!(start.len(), 6);
+
+    // CoW DELETE: survivors keep both values.
+    run(format!("DELETE FROM {fq} WHERE id = 2")).await;
+    let after_delete = lineage_by_id(&handler, &session, ns, name).await;
+    let expected: std::collections::BTreeMap<_, _> =
+        start.iter().filter(|(id, _)| **id != 2).map(|(k, v)| (*k, *v)).collect();
+    assert_eq!(after_delete, expected, "DELETE must not change surviving rows' lineage");
+
+    // CoW UPDATE: the updated row keeps _row_id, gets a newer sequence number.
+    run(format!("UPDATE {fq} SET v = 500 WHERE id = 5")).await;
+    let after_update = lineage_by_id(&handler, &session, ns, name).await;
+    for (id, (row_id, seq)) in &after_delete {
+        let (new_row_id, new_seq) = after_update[id];
+        assert_eq!(new_row_id, *row_id, "id {id}: UPDATE must keep _row_id");
+        if *id == 5 {
+            assert!(new_seq > *seq, "updated row needs a newer sequence number: {seq} -> {new_seq}");
+        } else {
+            assert_eq!(new_seq, *seq, "id {id}: unchanged row keeps its sequence number");
+        }
+    }
+
+    // Compaction: every row keeps both values.
+    run(format!("CALL system.rewrite_data_files(table => '{fq}')")).await;
+    let after_compact = lineage_by_id(&handler, &session, ns, name).await;
+    assert_eq!(after_compact, after_update, "compaction must not change lineage");
+
+    // CoW MERGE: matched-updated keeps _row_id with a newer seq, the insert is new.
+    run(format!(
+        "MERGE INTO {fq} t USING (SELECT 1 AS id, 11 AS v UNION ALL SELECT 9 AS id, 90 AS v) s \
+         ON t.id = s.id \
+         WHEN MATCHED THEN UPDATE SET v = s.v \
+         WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)"
+    ))
+    .await;
+    let after_merge = lineage_by_id(&handler, &session, ns, name).await;
+    for (id, (row_id, seq)) in &after_compact {
+        let (new_row_id, new_seq) = after_merge[id];
+        assert_eq!(new_row_id, *row_id, "id {id}: MERGE must keep _row_id");
+        if *id == 1 {
+            assert!(new_seq > *seq, "merged-updated row needs a newer sequence number");
+        } else {
+            assert_eq!(new_seq, *seq, "id {id}: untouched row keeps its sequence number");
+        }
+    }
+    let (inserted_row_id, _) = after_merge[&9];
+    assert!(
+        after_compact.values().all(|(r, _)| *r != inserted_row_id),
+        "inserted row must get a fresh _row_id"
+    );
+
+    let _ = handler
+        .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)
+        .await;
+}
+
+/// MoR (equality-delete) UPDATE and MERGE write the updated row as a new data
+/// row and hide the old one; the new row must carry the old `_row_id`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs:polaris"]
+async fn row_lineage_survives_mor_update_and_merge_on_v3_table() {
+    let (session, handler) = crate::common::setup_handler().await;
+    let ns = "default";
+    let name = "v3_row_lineage_mor";
+    let fq = format!("{ns}.{name}");
+    let run = |sql: String| {
+        let (handler, session) = (&handler, &session);
+        async move { handler.execute(session, &sql, None).await.unwrap_or_else(|e| panic!("{sql}: {e}")) }
+    };
+
+    reset_table(
+        &handler,
+        &session,
+        &fq,
+        &format!(
+            "CREATE TABLE {fq} (id BIGINT, ts TIMESTAMP_NS(9), v BIGINT) \
+             TBLPROPERTIES ( \
+                 'write.update.mode' = 'merge-on-read', \
+                 'write.delete.mode' = 'merge-on-read', \
+                 'write.merge.mode' = 'merge-on-read', \
+                 'write.identifier-field-ids' = '1' \
+             )"
+        ),
+    )
+    .await;
+    run(format!("INSERT INTO {fq} VALUES (1, NULL, 10), (2, NULL, 20), (3, NULL, 30)")).await;
+    let start = lineage_by_id(&handler, &session, ns, name).await;
+
+    run(format!("UPDATE {fq} SET v = 99 WHERE id = 1")).await;
+    let after_update = lineage_by_id(&handler, &session, ns, name).await;
+    assert_eq!(after_update[&1].0, start[&1].0, "MoR UPDATE must keep _row_id");
+    assert!(after_update[&1].1 > start[&1].1, "MoR UPDATE needs a newer sequence number");
+    assert_eq!(after_update[&2], start[&2]);
+    assert_eq!(after_update[&3], start[&3]);
+
+    run(format!(
+        "MERGE INTO {fq} t USING (SELECT 2 AS id, 22 AS v) s ON t.id = s.id \
+         WHEN MATCHED THEN UPDATE SET v = s.v"
+    ))
+    .await;
+    let after_merge = lineage_by_id(&handler, &session, ns, name).await;
+    assert_eq!(after_merge[&2].0, start[&2].0, "MoR MERGE must keep _row_id");
+    assert!(after_merge[&2].1 > start[&2].1, "MoR MERGE needs a newer sequence number");
+    assert_eq!(after_merge[&1], after_update[&1]);
+    assert_eq!(after_merge[&3], start[&3]);
 
     let _ = handler
         .execute(&session, &format!("DROP TABLE IF EXISTS {fq}"), None)

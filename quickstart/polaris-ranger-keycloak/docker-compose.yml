@@ -84,7 +84,7 @@ services:
       start_period: 20s
 
   bucket-init:
-    image: amazon/aws-cli:2.36.45
+    image: amazon/aws-cli:2.36.49
     entrypoint: ["sh", "-c"]
     command:
       - |
@@ -113,15 +113,19 @@ services:
     # entirely.
     #
     # A fresh volume might start, which is the trap: CI creates one, so the bump
-    # can look green while every developer with an existing stack is broken. Moving
-    # major versions here needs a deliberate migration (pg_upgrade or a documented
-    # volume reset) plus a check that Ranger 2.8's schema is happy on the target.
-    image: postgres:13.23
+    # can look green while every developer with an existing stack is broken.
+    #
+    # 13 -> 17 (2026-09-25, 13 is end of life): 17 is the newest major on the
+    # pre-18 layout, and the volume name carries the major. An existing 13
+    # volume is left unmounted and a fresh one initialises, so no developer
+    # stack breaks; the Ranger policies seed again from ranger-setup. Checked
+    # with make test-access-control on 17. On the next major, rename again.
+    image: postgres:17.11
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rangerR0cks!}
       RANGER_DB_PASSWORD: ${RANGER_ADMIN_PASSWORD:-rangerR0cks!} # read by init_postgres.sh
     volumes:
-      - ranger-db-data:/var/lib/postgresql/data
+      - ranger-db-pg17-data:/var/lib/postgresql/data
       - ./ranger/init_postgres.sh:/docker-entrypoint-initdb.d/init_postgres.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -176,7 +180,7 @@ services:
       # last occurrence, so the mounted template carries no passwords. The
       # image ties the Ranger admin password to the DB password, hence one
       # variable feeds both here and in ranger-db. Changing it after the
-      # ranger-db-data volume exists needs `docker compose down -v`.
+      # ranger-db-pg17-data volume exists needs `docker compose down -v`.
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rangerR0cks!}
       RANGER_DB_USER: rangeradmin
       RANGER_DB_PASSWORD: ${RANGER_ADMIN_PASSWORD:-rangerR0cks!}
@@ -432,4 +436,4 @@ services:
 
 volumes:
   rustfs-data:
-  ranger-db-data:
+  ranger-db-pg17-data:

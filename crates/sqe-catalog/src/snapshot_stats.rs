@@ -288,8 +288,9 @@ mod tests {
     }
 
     fn build_table(metadata: iceberg::spec::TableMetadata) -> Table {
-        let file_io = iceberg::io::FileIOBuilder::new_fs_io().build().unwrap();
+        let file_io = iceberg::io::FileIO::new_with_fs();
         Table::builder()
+            .runtime(iceberg::Runtime::current())
             .metadata(metadata)
             .identifier(TableIdent::new(
                 NamespaceIdent::new("ns".to_string()),
@@ -320,7 +321,6 @@ mod tests {
                 .new_output(format!("{location}/m0.avro"))
                 .unwrap(),
             Some(SNAPSHOT_ID),
-            None,
             schema,
             spec,
         )
@@ -345,7 +345,13 @@ mod tests {
         }
         let manifest = writer.write_manifest_file().await.unwrap();
         let mut list_writer = ManifestListWriter::v2(
-            table.file_io().new_output(&manifest_list).unwrap(),
+            table
+                .file_io()
+                .new_output(&manifest_list)
+                .unwrap()
+                .writer()
+                .await
+                .unwrap(),
             SNAPSHOT_ID,
             None,
             1,

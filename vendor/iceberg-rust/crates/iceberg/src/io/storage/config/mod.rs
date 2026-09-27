@@ -29,16 +29,21 @@
 //! - [`GcsConfig`]: Google Cloud Storage specific configuration
 //! - [`OssConfig`]: Alibaba Cloud OSS specific configuration
 //! - [`AzdlsConfig`]: Azure Data Lake Storage specific configuration
+//! - [`AzblobConfig`]: Azure Blob Storage specific configuration
 
+mod azblob;
 mod azdls;
 mod gcs;
+mod hf;
 mod oss;
 mod s3;
 
 use std::collections::HashMap;
 
+pub use azblob::*;
 pub use azdls::*;
 pub use gcs::*;
+pub use hf::*;
 pub use oss::*;
 pub use s3::*;
 use serde::{Deserialize, Serialize};
@@ -48,7 +53,6 @@ use serde::{Deserialize, Serialize};
 /// This struct contains only configuration properties without specifying
 /// which storage backend to use. The storage type is determined by the
 /// explicit factory selection.
-/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct StorageConfig {
     /// Configuration properties for the storage backend

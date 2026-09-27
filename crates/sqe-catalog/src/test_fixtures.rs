@@ -149,10 +149,9 @@ pub(crate) async fn fake_iceberg_table(dir: &Path, with_live_deletes: bool) -> T
     let metadata: TableMetadata =
         serde_json::from_str(&metadata_json(&uuid, &location, &manifest_list_path))
             .expect("fixture metadata");
-    let file_io = iceberg::io::FileIOBuilder::new_fs_io()
-        .build()
-        .expect("fs FileIO");
+    let file_io = iceberg::io::FileIO::new_with_fs();
     let table = Table::builder()
+        .runtime(iceberg::Runtime::current())
         .metadata(metadata)
         .identifier(TableIdent::new(
             NamespaceIdent::new("sales".to_string()),
@@ -174,7 +173,6 @@ pub(crate) async fn fake_iceberg_table(dir: &Path, with_live_deletes: bool) -> T
                 .new_output(format!("{location}/metadata/m{manifest_index}.avro"))
                 .expect("manifest output"),
             Some(FAKE_SNAPSHOT_ID),
-            None,
             schema.clone(),
             spec.clone(),
         )
@@ -194,7 +192,6 @@ pub(crate) async fn fake_iceberg_table(dir: &Path, with_live_deletes: bool) -> T
                 .new_output(format!("{location}/metadata/m-deletes.avro"))
                 .expect("delete manifest output"),
             Some(FAKE_SNAPSHOT_ID),
-            None,
             schema,
             spec,
         )
@@ -223,7 +220,10 @@ pub(crate) async fn fake_iceberg_table(dir: &Path, with_live_deletes: bool) -> T
         table
             .file_io()
             .new_output(&manifest_list_path)
-            .expect("manifest list output"),
+            .expect("manifest list output")
+            .writer()
+            .await
+            .expect("manifest list writer"),
         FAKE_SNAPSHOT_ID,
         None,
         1,
@@ -264,10 +264,9 @@ pub(crate) fn fake_snapshotless_table() -> Table {
     }}"#
     );
     let metadata: TableMetadata = serde_json::from_str(&json).expect("fixture metadata");
-    let file_io = iceberg::io::FileIOBuilder::new_fs_io()
-        .build()
-        .expect("fs FileIO");
+    let file_io = iceberg::io::FileIO::new_with_fs();
     Table::builder()
+        .runtime(iceberg::Runtime::current())
         .metadata(metadata)
         .identifier(TableIdent::new(
             NamespaceIdent::new("sales".to_string()),

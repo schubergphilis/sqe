@@ -30,10 +30,10 @@ members = [
     "xtask",
 ]
 # Exclude vendored trees. They are referenced via path / [patch], not members.
-exclude = ["vendor/iceberg-rust", "vendor/sqlite-rs"]
+exclude = ["vendor/iceberg-rust", "vendor/datafusion-iceberg", "vendor/sqlite-rs"]
 
 [workspace.package]
-version = "0.48.1"
+version = "0.49.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -71,21 +71,23 @@ arrow-buffer = "59"
 parquet = { version = "59", features = ["async", "object_store"] }
 object_store = { version = "0.13", features = ["aws", "http", "azure", "gcp"] }
 
-# Iceberg — RisingWave fork for rewrite_files() / overwrite_files() transaction support.
-# Pinned to risingwavelabs/iceberg-rust dev_rebase_main_20260303 @ 813e54419b43.
-# Arrow 58 / Parquet 58 first landed via RW PR #148; the SQE vendor copy is now
-# ported to DataFusion 55 / Arrow 59 / Parquet 59. Retains RW fork features:
-# RewriteFilesAction, OverwriteFilesAction, PositionDeleteFileWriter,
-# DeletionVectorWriter, MergeAppend, parallel manifest loading.
-# Nine apache fixes cherry-picked on top: #2118, #2348, #2307, #2351, #2360,
-# #2616, #2781, #2797, #3062.
+# Iceberg — apache/iceberg-rust main @ 119fad92c, with RisingWave
+# dev_rebase_main_20260807 merged on top for the row-level write stack apache
+# lacks (ReplaceFilesAction for rewrite/overwrite, position-delete and
+# deletion-vector writers, rewrite manifests), then SQE's patch families.
+# Arrow / Parquet 59.2, no DataFusion dependency in core.
 # Vendored in vendor/iceberg-rust/ — see vendor/iceberg-rust/README.md
 iceberg = { path = "vendor/iceberg-rust/crates/iceberg" }
+# Object storage moved out of iceberg core into this crate (OpenDAL-backed
+# StorageFactory). S3 / GCS / Azure are features of this crate now.
+iceberg-storage-opendal = { path = "vendor/iceberg-rust/crates/storage/opendal", default-features = false, features = ["opendal-memory", "opendal-fs", "opendal-s3"] }
 # No default `aws-sigv4` on this path dep: sqe-catalog's `rest-sigv4`
 # feature enables it for coordinator/worker builds. Slim Polaris-only
 # builds pass `--no-default-features --features rest` on sqe-catalog.
 iceberg-catalog-rest = { path = "vendor/iceberg-rust/crates/catalog/rest" }
-iceberg-datafusion = { path = "vendor/iceberg-rust/crates/integrations/datafusion" }
+# DataFusion integration: apache/datafusion-iceberg (split out of
+# iceberg-rust on 2026-09-17, not published). Vendored unmodified.
+datafusion-iceberg = { path = "vendor/datafusion-iceberg/crates/datafusion" }
 # Optional catalog backends, vendored from upstream apache/iceberg-rust
 # v0.9.0 alongside the RisingWave fork. Gated by cargo features in
 # sqe-catalog so a default REST-only build does not pull in AWS SDK,
@@ -181,7 +183,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 prometheus = "0.14"
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace", "metrics", "logs"] }
+# tls-ring + tls-roots: https:// collectors (SIEM audit export included). Both
+# map onto tonic features the workspace already enables (tls-ring,
+# tls-native-roots), so no new crates. Without them an https endpoint is
+# rejected at build time and the audit shipper never starts.
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "trace", "metrics", "logs", "tls-ring", "tls-roots"] }
 tracing-opentelemetry = "0.33"
 opentelemetry-appender-tracing = "0.32"
 

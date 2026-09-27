@@ -33,6 +33,12 @@ platforms = [
 # because of them is excluded from the generated crate. Regenerate and diff
 # `cargo tree --workspace` against main after touching this list; the hack
 # must add exactly one package (itself).
+# xtask is repo tooling (anyhow, clap, serde_json). Through the hack it
+# compiled 651 crates, DataFusion and the AWS SDK included, before
+# `cargo xtask test-groups --check` could run: 3m27 of aikido-rust-extra.
+[traversal-excludes]
+workspace-members = ["xtask"]
+
 [final-excludes]
 third-party = [
     { name = "aws-sdk-glue" },

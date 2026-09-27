@@ -24,15 +24,19 @@
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::StreamExt;
+use futures::stream::{self, BoxStream};
 use serde::{Deserialize, Serialize};
 
+use crate::error::invalid_data;
 use crate::io::{
-    FileMetadata, FileRead, FileWrite, InputFile, OutputFile, Storage, StorageConfig,
+    FileMetadata, FileRead, FileWrite, InputFile, ListEntry, OutputFile, Storage, StorageConfig,
     StorageFactory,
 };
 use crate::{Error, ErrorKind, Result};
@@ -48,7 +52,6 @@ use crate::{Error, ErrorKind, Result};
 /// - `file:///path/to/file` -> `/path/to/file`
 /// - `file:/path/to/file` -> `/path/to/file`
 /// - `/path/to/file` -> `/path/to/file`
-/// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LocalFsStorage;
 
@@ -85,6 +88,41 @@ impl LocalFsStorage {
         };
         PathBuf::from(path)
     }
+
+    fn list_error(path: &Path, error: std::io::Error) -> Error {
+        Error::new(
+            ErrorKind::Unexpected,
+            format!("Failed to list {}: {error}", path.display()),
+        )
+        .with_source(error)
+    }
+
+    fn listed_path(base: &str, root: &Path, path: &Path) -> Result<String> {
+        let relative = path.strip_prefix(root).map_err(|error| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!(
+                    "Failed to make {} relative to {}",
+                    path.display(),
+                    root.display()
+                ),
+            )
+            .with_source(error)
+        })?;
+        let base = base.trim_end_matches('/');
+        if relative.as_os_str().is_empty() {
+            Ok(base.to_string())
+        } else {
+            Ok(format!("{base}/{}", relative.to_string_lossy()))
+        }
+    }
+}
+
+struct LocalListState {
+    base: String,
+    root: PathBuf,
+    recursive: bool,
+    directories: Vec<fs::ReadDir>,
 }
 
 #[async_trait]
@@ -97,42 +135,24 @@ impl Storage for LocalFsStorage {
 
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
         let path = Self::normalize_path(path);
-        let metadata = fs::metadata(&path).map_err(|e| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!("Failed to get metadata for {}: {}", path.display(), e),
-            )
-        })?;
+        let metadata = fs::metadata(&path)
+            .map_err(|e| invalid_data!("Failed to get metadata for {}: {}", path.display(), e))?;
         Ok(FileMetadata {
             size: metadata.len(),
-            last_modified_ms: metadata
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64),
-            is_dir: metadata.is_dir(),
         })
     }
 
     async fn read(&self, path: &str) -> Result<Bytes> {
         let path = Self::normalize_path(path);
-        let content = fs::read(&path).map_err(|e| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!("Failed to read file {}: {}", path.display(), e),
-            )
-        })?;
+        let content = fs::read(&path)
+            .map_err(|e| invalid_data!("Failed to read file {}: {}", path.display(), e))?;
         Ok(Bytes::from(content))
     }
 
     async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
         let path = Self::normalize_path(path);
-        let file = fs::File::open(&path).map_err(|e| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!("Failed to open file {}: {}", path.display(), e),
-            )
-        })?;
+        let file = fs::File::open(&path)
+            .map_err(|e| invalid_data!("Failed to open file {}: {}", path.display(), e))?;
         Ok(Box::new(LocalFsFileRead::new(file)))
     }
 
@@ -206,6 +226,67 @@ impl Storage for LocalFsStorage {
         Ok(())
     }
 
+    async fn delete_stream(&self, mut paths: BoxStream<'static, String>) -> Result<()> {
+        while let Some(path) = paths.next().await {
+            self.delete(&path).await?;
+        }
+        Ok(())
+    }
+
+    async fn list(
+        &self,
+        path: &str,
+        recursive: bool,
+    ) -> Result<BoxStream<'static, Result<ListEntry>>> {
+        let root = Self::normalize_path(path);
+        let directory = fs::read_dir(&root).map_err(|error| Self::list_error(&root, error))?;
+        let state = LocalListState {
+            base: path.to_string(),
+            root,
+            recursive,
+            directories: vec![directory],
+        };
+
+        Ok(stream::try_unfold(state, |mut state| async move {
+            loop {
+                let Some(directory) = state.directories.last_mut() else {
+                    return Ok(None);
+                };
+
+                let Some(entry) = directory.next() else {
+                    state.directories.pop();
+                    continue;
+                };
+                let entry = entry.map_err(|error| Self::list_error(&state.root, error))?;
+                let entry_path = entry.path();
+                let metadata = entry
+                    .metadata()
+                    .map_err(|error| Self::list_error(&entry_path, error))?;
+                let is_dir = metadata.is_dir();
+                if state.recursive && is_dir {
+                    state.directories.push(
+                        fs::read_dir(&entry_path)
+                            .map_err(|error| Self::list_error(&entry_path, error))?,
+                    );
+                }
+
+                let last_modified_ms = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX));
+                let listed = ListEntry {
+                    path: Self::listed_path(&state.base, &state.root, &entry_path)?,
+                    size: metadata.len(),
+                    last_modified_ms,
+                    is_dir,
+                };
+                return Ok(Some((listed, state)));
+            }
+        })
+        .boxed())
+    }
+
     fn new_input(&self, path: &str) -> Result<InputFile> {
         Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
     }
@@ -240,21 +321,13 @@ impl FileRead for LocalFsFileRead {
             )
         })?;
 
-        file.seek(SeekFrom::Start(range.start)).map_err(|e| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!("Failed to seek to position {}: {}", range.start, e),
-            )
-        })?;
+        file.seek(SeekFrom::Start(range.start))
+            .map_err(|e| invalid_data!("Failed to seek to position {}: {}", range.start, e))?;
 
         let len = (range.end - range.start) as usize;
         let mut buffer = vec![0u8; len];
-        file.read_exact(&mut buffer).map_err(|e| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!("Failed to read {len} bytes: {e}"),
-            )
-        })?;
+        file.read_exact(&mut buffer)
+            .map_err(|e| invalid_data!("Failed to read {len} bytes: {e}"))?;
 
         Ok(Bytes::from(buffer))
     }
@@ -266,12 +339,16 @@ impl FileRead for LocalFsFileRead {
 #[derive(Debug)]
 pub struct LocalFsFileWrite {
     file: Option<fs::File>,
+    bytes_written: u64,
 }
 
 impl LocalFsFileWrite {
     /// Create a new `LocalFsFileWrite` for the given file.
     pub fn new(file: fs::File) -> Self {
-        Self { file: Some(file) }
+        Self {
+            file: Some(file),
+            bytes_written: 0,
+        }
     }
 }
 
@@ -281,7 +358,7 @@ impl FileWrite for LocalFsFileWrite {
         let file = self
             .file
             .as_mut()
-            .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "Cannot write to closed file"))?;
+            .ok_or_else(|| invalid_data!("Cannot write to closed file"))?;
 
         file.write_all(&bs).map_err(|e| {
             Error::new(
@@ -289,20 +366,23 @@ impl FileWrite for LocalFsFileWrite {
                 format!("Failed to write to file: {e}"),
             )
         })?;
+        self.bytes_written += bs.len() as u64;
 
         Ok(())
     }
 
-    async fn close(&mut self) -> Result<()> {
+    async fn close(&mut self) -> Result<FileMetadata> {
         let file = self
             .file
             .take()
-            .ok_or_else(|| Error::new(ErrorKind::DataInvalid, "File already closed"))?;
+            .ok_or_else(|| invalid_data!("File already closed"))?;
 
         file.sync_all()
             .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to sync file: {e}")))?;
 
-        Ok(())
+        Ok(FileMetadata {
+            size: self.bytes_written,
+        })
     }
 }
 
@@ -481,10 +561,11 @@ mod tests {
         let mut writer = storage.writer(path_str).await.unwrap();
         writer.write(Bytes::from("Hello, ")).await.unwrap();
         writer.write(Bytes::from("World!")).await.unwrap();
-        writer.close().await.unwrap();
+        let metadata = writer.close().await.unwrap();
 
         let content = storage.read(path_str).await.unwrap();
         assert_eq!(content, Bytes::from("Hello, World!"));
+        assert_eq!(metadata.size, content.len() as u64);
     }
 
     #[tokio::test]
@@ -511,7 +592,7 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         let mut writer = storage.writer(path_str).await.unwrap();
-        writer.close().await.unwrap();
+        assert_eq!(writer.close().await.unwrap().size, 0);
 
         // Write after close should fail
         let result = writer.write(Bytes::from("test")).await;
@@ -539,5 +620,116 @@ mod tests {
         storage.write(path_str, Bytes::from("test")).await.unwrap();
 
         assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_local_fs_storage_delete_stream() {
+        use futures::stream;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let storage = LocalFsStorage::new();
+
+        // Create multiple files
+        let file1 = tmp_dir.path().join("file1.txt");
+        let file2 = tmp_dir.path().join("file2.txt");
+        let file3 = tmp_dir.path().join("file3.txt");
+
+        storage
+            .write(file1.to_str().unwrap(), Bytes::from("1"))
+            .await
+            .unwrap();
+        storage
+            .write(file2.to_str().unwrap(), Bytes::from("2"))
+            .await
+            .unwrap();
+        storage
+            .write(file3.to_str().unwrap(), Bytes::from("3"))
+            .await
+            .unwrap();
+
+        // Verify files exist
+        assert!(storage.exists(file1.to_str().unwrap()).await.unwrap());
+        assert!(storage.exists(file2.to_str().unwrap()).await.unwrap());
+        assert!(storage.exists(file3.to_str().unwrap()).await.unwrap());
+
+        // Delete multiple files using stream
+        let paths = vec![
+            file1.to_str().unwrap().to_string(),
+            file2.to_str().unwrap().to_string(),
+        ];
+        let path_stream = stream::iter(paths).boxed();
+        storage.delete_stream(path_stream).await.unwrap();
+
+        // Verify deleted files no longer exist
+        assert!(!storage.exists(file1.to_str().unwrap()).await.unwrap());
+        assert!(!storage.exists(file2.to_str().unwrap()).await.unwrap());
+
+        // Verify file3 still exists
+        assert!(storage.exists(file3.to_str().unwrap()).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_local_fs_storage_delete_stream_empty() {
+        use futures::stream;
+
+        let storage = LocalFsStorage::new();
+
+        // Delete with empty stream should succeed
+        let path_stream = stream::iter(Vec::<String>::new()).boxed();
+        storage.delete_stream(path_stream).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_local_fs_storage_list_preserves_scheme_and_recursion() {
+        use futures::TryStreamExt;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let root = tmp_dir.path().join("root");
+        let root_file = root.join("root.txt");
+        let nested_file = root.join("nested").join("child.txt");
+        let storage = LocalFsStorage::new();
+        storage
+            .write(root_file.to_str().unwrap(), Bytes::from_static(b"root"))
+            .await
+            .unwrap();
+        storage
+            .write(nested_file.to_str().unwrap(), Bytes::from_static(b"child"))
+            .await
+            .unwrap();
+
+        let root_uri = format!("file://{}", root.display());
+        let direct: Vec<_> = storage
+            .list(&root_uri, false)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(
+            direct
+                .iter()
+                .any(|entry| entry.path == format!("{root_uri}/root.txt") && !entry.is_dir)
+        );
+        assert!(
+            direct
+                .iter()
+                .any(|entry| entry.path == format!("{root_uri}/nested") && entry.is_dir)
+        );
+        assert!(!direct.iter().any(|entry| entry.path.ends_with("child.txt")));
+
+        let recursive: Vec<_> = storage
+            .list(&root_uri, true)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let child = recursive
+            .iter()
+            .find(|entry| entry.path == format!("{root_uri}/nested/child.txt"))
+            .unwrap();
+        assert_eq!(child.size, 5);
+        assert!(child.last_modified_ms.is_some());
+        assert!(!child.is_dir);
     }
 }

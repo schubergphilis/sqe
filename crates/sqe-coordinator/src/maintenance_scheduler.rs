@@ -3130,6 +3130,9 @@ mod tests {
             async fn drop_table(&self, table: &TableIdent) -> iceberg::Result<()> {
                 self.inner.drop_table(table).await
             }
+            async fn purge_table(&self, table: &TableIdent) -> iceberg::Result<()> {
+                self.inner.purge_table(table).await
+            }
             async fn table_exists(&self, table: &TableIdent) -> iceberg::Result<bool> {
                 self.inner.table_exists(table).await
             }

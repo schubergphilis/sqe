@@ -21,8 +21,9 @@ use serde_derive::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use super::{Datum, ManifestEntry, Schema, Struct};
-use crate::spec::{FormatVersion, Literal, RawLiteral, StructType, Type};
-use crate::{Error, ErrorKind, metadata_columns};
+use crate::error::invalid_data;
+use crate::spec::{FormatVersion, Literal, PrimitiveType, RawLiteral, StructType, Type};
+use crate::{Error, metadata_columns};
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct ManifestEntryV2 {
@@ -34,7 +35,7 @@ pub(super) struct ManifestEntryV2 {
 }
 
 impl ManifestEntryV2 {
-    pub fn try_from(value: ManifestEntry, partition_type: &StructType) -> Result<Self, Error> {
+    pub fn try_from(value: ManifestEntry, partition_type: &Type) -> Result<Self, Error> {
         Ok(Self {
             status: value.status as i32,
             snapshot_id: value.snapshot_id,
@@ -47,7 +48,7 @@ impl ManifestEntryV2 {
     pub fn try_into(
         self,
         partition_spec_id: i32,
-        partition_type: &StructType,
+        partition_type: &Type,
         schema: &Schema,
     ) -> Result<ManifestEntry, Error> {
         Ok(ManifestEntry {
@@ -70,7 +71,7 @@ pub(super) struct ManifestEntryV1 {
 }
 
 impl ManifestEntryV1 {
-    pub fn try_from(value: ManifestEntry, partition_type: &StructType) -> Result<Self, Error> {
+    pub fn try_from(value: ManifestEntry, partition_type: &Type) -> Result<Self, Error> {
         Ok(Self {
             status: value.status as i32,
             snapshot_id: value.snapshot_id.unwrap_or_default(),
@@ -81,7 +82,7 @@ impl ManifestEntryV1 {
     pub fn try_into(
         self,
         partition_spec_id: i32,
-        partition_type: &StructType,
+        partition_type: &Type,
         schema: &Schema,
     ) -> Result<ManifestEntry, Error> {
         Ok(ManifestEntry {
@@ -97,9 +98,8 @@ impl ManifestEntryV1 {
 }
 
 #[serde_as]
-#[derive(Serialize, Deserialize, Clone)]
-/// Data file
-pub struct DataFileSerde {
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct DataFileSerde {
     #[serde(default)]
     content: i32,
     file_path: String,
@@ -126,10 +126,9 @@ pub struct DataFileSerde {
 }
 
 impl DataFileSerde {
-    /// Try to convert a `super::DataFile` to a `DataFileSerde`.
     pub fn try_from(
         value: super::DataFile,
-        partition_type: &StructType,
+        partition_type: &Type,
         format_version: FormatVersion,
     ) -> Result<Self, Error> {
         let block_size_in_bytes = if format_version == FormatVersion::V1 {
@@ -141,10 +140,7 @@ impl DataFileSerde {
             content: value.content as i32,
             file_path: value.file_path,
             file_format: value.file_format.to_string().to_ascii_uppercase(),
-            partition: RawLiteral::try_from(
-                Literal::Struct(value.partition),
-                &Type::Struct(partition_type.clone()),
-            )?,
+            partition: RawLiteral::try_from(Literal::Struct(value.partition), partition_type)?,
             record_count: value.record_count.try_into()?,
             file_size_in_bytes: value.file_size_in_bytes.try_into()?,
             block_size_in_bytes,
@@ -165,24 +161,20 @@ impl DataFileSerde {
         })
     }
 
-    /// Try to convert a `DataFileSerde` to a `super::DataFile`.
     pub fn try_into(
         self,
         partition_spec_id: i32,
-        partition_type: &StructType,
+        partition_type: &Type,
         schema: &Schema,
     ) -> Result<super::DataFile, Error> {
         let partition = self
             .partition
-            .try_into(&Type::Struct(partition_type.clone()))?
+            .try_into(partition_type)?
             .map(|v| {
                 if let Literal::Struct(v) = v {
                     Ok(v)
                 } else {
-                    Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        "partition value is not a struct",
-                    ))
+                    Err(invalid_data!("partition value is not a struct"))
                 }
             })
             .transpose()?
@@ -238,7 +230,7 @@ impl DataFileSerde {
 }
 
 #[serde_as]
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 struct BytesEntry {
     key: i32,
@@ -257,13 +249,16 @@ fn parse_bytes_entry(v: Vec<BytesEntry>, schema: &Schema) -> Result<HashMap<i32,
             let data_type = field
                 .field_type
                 .as_primitive_type()
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("field {} is not a primitive type", field.name),
-                    )
-                })?
+                .ok_or_else(|| invalid_data!("field {} is not a primitive type", field.name))?
                 .clone();
+            if data_type == PrimitiveType::String
+                && std::str::from_utf8(entry.value.as_ref()).is_err()
+            {
+                // A byte-truncated UTF-8 metric bound is not safe to turn into
+                // a replacement-character string for pruning. Ignore only this
+                // bound so the manifest remains readable and scans stay conservative.
+                continue;
+            }
             m.insert(entry.key, Datum::try_from_bytes(&entry.value, data_type)?);
         }
         // We ignore the entry if the field is not found in schema or metadata columns (schema evolution).
@@ -284,7 +279,7 @@ fn to_bytes_entry(v: impl IntoIterator<Item = (i32, Datum)>) -> Result<Vec<Bytes
     Ok(bs)
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 struct I64Entry {
     key: i32,
@@ -495,7 +490,7 @@ mod tests {
         let v2_entry = v1_entry
             .try_into(
                 0, // partition_spec_id
-                &StructType::new(vec![]),
+                &Type::Struct(StructType::new(vec![])),
                 &schema(),
             )
             .unwrap();
@@ -575,7 +570,7 @@ mod tests {
         let data_file = v1_style_data_file
             .try_into(
                 0, // partition_spec_id
-                &StructType::new(vec![]),
+                &Type::Struct(StructType::new(vec![])),
                 &schema(),
             )
             .unwrap();
@@ -628,5 +623,28 @@ mod tests {
             Some(&Datum::long(pos_value)),
             "_pos should be parsed as long with correct value"
         );
+    }
+
+    #[test]
+    fn test_parse_bytes_entry_ignores_invalid_utf8_bound() {
+        use crate::spec::manifest::_serde::{BytesEntry, parse_bytes_entry};
+
+        let result = parse_bytes_entry(
+            vec![
+                BytesEntry {
+                    key: 1,
+                    value: serde_bytes::ByteBuf::from(42_i32.to_le_bytes().to_vec()),
+                },
+                BytesEntry {
+                    key: 2,
+                    value: serde_bytes::ByteBuf::from(vec![b'a', 0xc3]),
+                },
+            ],
+            &schema(),
+        )
+        .unwrap();
+
+        assert_eq!(result.get(&1), Some(&Datum::int(42)));
+        assert!(!result.contains_key(&2));
     }
 }

@@ -20,13 +20,18 @@
 use std::sync::Arc;
 
 use crate::arrow::ArrowReaderBuilder;
+use crate::encryption::EncryptionManager;
+use crate::encryption::kms::KeyManagementClient;
+use crate::error::invalid_data;
 use crate::inspect::MetadataTable;
 use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
+use crate::runtime::Runtime;
 use crate::scan::TableScanBuilder;
-use crate::spec::{SchemaRef, TableMetadata, TableMetadataRef};
-use crate::util::{DEFAULT_DELETE_CONCURRENCY_LIMIT, ReachableFileCleanupStrategy};
-use crate::{Error, ErrorKind, Result, TableIdent};
+use crate::spec::{
+    ManifestListReader, ManifestReader, SchemaRef, SnapshotRef, TableMetadata, TableMetadataRef,
+};
+use crate::{Result, TableIdent};
 
 /// Builder to create table scan.
 pub struct TableBuilder {
@@ -34,9 +39,11 @@ pub struct TableBuilder {
     metadata_location: Option<String>,
     metadata: Option<TableMetadataRef>,
     identifier: Option<TableIdent>,
+    kms_client: Option<Arc<dyn KeyManagementClient>>,
     readonly: bool,
     disable_cache: bool,
     cache_size_bytes: Option<u64>,
+    runtime: Option<Runtime>,
 }
 
 impl TableBuilder {
@@ -46,9 +53,11 @@ impl TableBuilder {
             metadata_location: None,
             metadata: None,
             identifier: None,
+            kms_client: None,
             readonly: false,
             disable_cache: false,
             cache_size_bytes: None,
+            runtime: None,
         }
     }
 
@@ -96,6 +105,22 @@ impl TableBuilder {
         self
     }
 
+    /// Set the Runtime for this table to use when spawning tasks.
+    pub fn runtime(mut self, runtime: Runtime) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    /// optional - sets the KMS client used to unwrap keys for table encryption.
+    ///
+    /// If the table metadata has the `encryption.key-id` property set, a
+    /// [`KeyManagementClient`] must be provided here so the table can build
+    /// an [`EncryptionManager`]; otherwise [`Self::build`] will return an error.
+    pub fn kms_client(mut self, kms_client: Arc<dyn KeyManagementClient>) -> Self {
+        self.kms_client = Some(kms_client);
+        self
+    }
+
     /// build the Table
     pub fn build(self) -> Result<Table> {
         let Self {
@@ -103,41 +128,56 @@ impl TableBuilder {
             metadata_location,
             metadata,
             identifier,
+            kms_client,
             readonly,
             disable_cache,
             cache_size_bytes,
+            runtime,
         } = self;
 
         let Some(file_io) = file_io else {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "FileIO must be provided with TableBuilder.file_io()",
+            return Err(invalid_data!(
+                "FileIO must be provided with TableBuilder.file_io()"
             ));
         };
 
         let Some(metadata) = metadata else {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "TableMetadataRef must be provided with TableBuilder.metadata()",
+            return Err(invalid_data!(
+                "TableMetadataRef must be provided with TableBuilder.metadata()"
             ));
         };
 
         let Some(identifier) = identifier else {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "TableIdent must be provided with TableBuilder.identifier()",
+            return Err(invalid_data!(
+                "TableIdent must be provided with TableBuilder.identifier()"
             ));
         };
 
+        let Some(runtime) = runtime else {
+            return Err(invalid_data!(
+                "Runtime must be provided with TableBuilder.runtime()"
+            ));
+        };
+
+        let encryption_manager =
+            EncryptionManager::from_table_metadata(kms_client.as_ref(), &metadata)?;
+
         let object_cache = if disable_cache {
-            Arc::new(ObjectCache::with_disabled_cache(file_io.clone()))
+            Arc::new(ObjectCache::with_disabled_cache(
+                file_io.clone(),
+                encryption_manager.clone(),
+            ))
         } else if let Some(cache_size_bytes) = cache_size_bytes {
             Arc::new(ObjectCache::new_with_capacity(
                 file_io.clone(),
                 cache_size_bytes,
+                encryption_manager.clone(),
             ))
         } else {
-            Arc::new(ObjectCache::new(file_io.clone()))
+            Arc::new(ObjectCache::new(
+                file_io.clone(),
+                encryption_manager.clone(),
+            ))
         };
 
         Ok(Table {
@@ -147,6 +187,8 @@ impl TableBuilder {
             identifier,
             readonly,
             object_cache,
+            runtime,
+            encryption_manager,
         })
     }
 }
@@ -160,6 +202,8 @@ pub struct Table {
     identifier: TableIdent,
     readonly: bool,
     object_cache: Arc<ObjectCache>,
+    runtime: Runtime,
+    encryption_manager: Option<Arc<EncryptionManager>>,
 }
 
 impl Table {
@@ -172,12 +216,6 @@ impl Table {
     /// Sets the [`Table`] metadata location and returns an updated instance.
     pub(crate) fn with_metadata_location(mut self, metadata_location: String) -> Self {
         self.metadata_location = Some(metadata_location);
-        self
-    }
-
-    /// Sets the [`Table`] file IO and returns an updated instance.
-    pub(crate) fn with_file_io(mut self, file_io: FileIO) -> Self {
-        self.file_io = file_io;
         self
     }
 
@@ -207,12 +245,9 @@ impl Table {
 
     /// Returns current metadata location in a result.
     pub fn metadata_location_result(&self) -> Result<&str> {
-        self.metadata_location.as_deref().ok_or(Error::new(
-            ErrorKind::DataInvalid,
-            format!(
-                "Metadata location does not exist for table: {}",
-                self.identifier
-            ),
+        self.metadata_location.as_deref().ok_or(invalid_data!(
+            "Metadata location does not exist for table: {}",
+            self.identifier
         ))
     }
 
@@ -221,9 +256,33 @@ impl Table {
         &self.file_io
     }
 
-    /// Returns this table's object cache
+    /// Returns this table's object cache.
     pub fn object_cache(&self) -> Arc<ObjectCache> {
         self.object_cache.clone()
+    }
+
+    /// Returns a new [`Table`] instance sharing entries with the provided object cache.
+    ///
+    /// The returned table retains its own file IO and encryption context for cache misses.
+    pub fn with_object_cache(mut self, object_cache: Arc<ObjectCache>) -> Self {
+        self.object_cache = Arc::new(
+            object_cache.share_entries_with(self.file_io.clone(), self.encryption_manager.clone()),
+        );
+        self
+    }
+
+    /// Returns the [`EncryptionManager`] for this table, if encryption is
+    /// configured.
+    ///
+    /// A manager is present iff the table metadata has the
+    /// `encryption.key-id` property set and a [`KeyManagementClient`] was
+    /// supplied to the [`TableBuilder`].
+    pub fn encryption_manager(&self) -> Option<&Arc<EncryptionManager>> {
+        self.encryption_manager.as_ref()
+    }
+
+    pub(crate) fn encryption_manager_ref(&self) -> Option<Arc<EncryptionManager>> {
+        self.encryption_manager.clone()
     }
 
     /// Creates a table scan.
@@ -237,6 +296,11 @@ impl Table {
         MetadataTable::new(self)
     }
 
+    /// Returns the [`Runtime`] for this table.
+    pub(crate) fn runtime(&self) -> &Runtime {
+        &self.runtime
+    }
+
     /// Returns the flag indicating whether the `Table` is readonly or not
     pub fn readonly(&self) -> bool {
         self.readonly
@@ -247,41 +311,48 @@ impl Table {
         self.metadata.current_schema().clone()
     }
 
-    /// Create a reader for the table.
-    pub fn reader_builder(&self) -> ArrowReaderBuilder {
-        ArrowReaderBuilder::new(self.file_io.clone())
+    /// Creates a [`ManifestListReader`] for the given snapshot.
+    pub fn manifest_list_reader(&self, snapshot: &SnapshotRef) -> ManifestListReader {
+        ManifestListReader::new(
+            snapshot.clone(),
+            self.file_io.clone(),
+            self.metadata.clone(),
+            self.encryption_manager.clone(),
+        )
     }
 
-    /// Cleans up files from expired snapshots.
+    /// Creates a [`ManifestReader`] for loading manifests referenced by this table.
+    pub fn manifest_reader(&self) -> ManifestReader {
+        ManifestReader::new(self.file_io.clone())
+    }
+
+    /// Create a reader for the table.
+    pub fn reader_builder(&self) -> ArrowReaderBuilder {
+        ArrowReaderBuilder::new(self.file_io.clone(), self.runtime().clone())
+    }
+
+    /// Deletes files that became unreachable after snapshots were expired.
     ///
-    /// Compares metadata before and after snapshot expiration to identify and delete
-    /// unreachable files (manifest lists, manifests, and data files).
+    /// `before_metadata` must be the metadata captured before committing
+    /// [`Transaction::expire_snapshots`](crate::transaction::Transaction::expire_snapshots).
     pub async fn cleanup_expired_files(&self, before_metadata: &TableMetadataRef) -> Result<()> {
         self.cleanup_expired_files_with_concurrency(
             before_metadata,
-            DEFAULT_DELETE_CONCURRENCY_LIMIT,
+            crate::actions::maintenance::DEFAULT_LOAD_CONCURRENCY,
         )
         .await
     }
 
-    /// Cleans up files from expired snapshots with configurable concurrency.
+    /// Deletes files made unreachable by snapshot expiration with bounded loading.
     pub async fn cleanup_expired_files_with_concurrency(
         &self,
         before_metadata: &TableMetadataRef,
         concurrency_limit: usize,
     ) -> Result<()> {
-        let cleanup_strategy = ReachableFileCleanupStrategy::new(self.file_io.clone())
-            .with_delete_concurrency(concurrency_limit);
-
-        cleanup_strategy
-            .clean_files(before_metadata, &self.metadata_ref())
+        crate::actions::maintenance::PhysicalFileCleanup::new(self.clone())
+            .with_load_concurrency(concurrency_limit)
+            .clean(before_metadata)
             .await
-    }
-
-    /// Returns a new `Table` instance with the provided object cache.
-    pub fn with_object_cache(mut self, object_cache: Arc<ObjectCache>) -> Self {
-        self.object_cache = object_cache;
-        self
     }
 }
 
@@ -295,10 +366,7 @@ impl Table {
 /// # use iceberg::TableIdent;
 /// # async fn example() {
 /// let metadata_file_location = "s3://bucket_name/path/to/metadata.json";
-/// let file_io = FileIO::from_path(&metadata_file_location)
-///     .unwrap()
-///     .build()
-///     .unwrap();
+/// let file_io = FileIO::new_with_fs();
 /// let static_identifier = TableIdent::from_strs(["static_ns", "static_table"]).unwrap();
 /// let static_table =
 ///     StaticTable::from_metadata_file(&metadata_file_location, static_identifier, file_io)
@@ -325,6 +393,7 @@ impl StaticTable {
             .metadata(metadata)
             .identifier(table_ident)
             .file_io(file_io.clone())
+            .runtime(Runtime::try_current()?)
             .readonly(true)
             .build();
 
@@ -343,6 +412,7 @@ impl StaticTable {
             .metadata_location(metadata_location)
             .identifier(table_ident)
             .file_io(file_io.clone())
+            .runtime(Runtime::try_current()?)
             .readonly(true)
             .build();
 
@@ -368,13 +438,29 @@ impl StaticTable {
 
     /// Create a reader for the table.
     pub fn reader_builder(&self) -> ArrowReaderBuilder {
-        ArrowReaderBuilder::new(self.0.file_io.clone())
+        self.0.reader_builder()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
+    use crate::ErrorKind;
+    use crate::encryption::SensitiveBytes;
+    use crate::encryption::kms::MemoryKeyManagementClient;
+    use crate::spec::TableProperties;
+
+    fn load_test_metadata(filename: &str) -> TableMetadata {
+        let path = format!(
+            "{}/testdata/table_metadata/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            filename
+        );
+        let json = fs::read_to_string(path).unwrap();
+        serde_json::from_str(&json).unwrap()
+    }
 
     #[tokio::test]
     async fn test_static_table_from_file() {
@@ -384,10 +470,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             metadata_file_name
         );
-        let file_io = FileIO::from_path(&metadata_file_path)
-            .unwrap()
-            .build()
-            .unwrap();
+        let file_io = FileIO::new_with_fs();
         let static_identifier = TableIdent::from_strs(["static_ns", "static_table"]).unwrap();
         let static_table =
             StaticTable::from_metadata_file(&metadata_file_path, static_identifier, file_io)
@@ -412,10 +495,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             metadata_file_name
         );
-        let file_io = FileIO::from_path(&metadata_file_path)
-            .unwrap()
-            .build()
-            .unwrap();
+        let file_io = FileIO::new_with_fs();
         let static_identifier = TableIdent::from_strs(["static_ns", "static_table"]).unwrap();
         let static_table =
             StaticTable::from_metadata_file(&metadata_file_path, static_identifier, file_io)
@@ -438,10 +518,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             metadata_file_name
         );
-        let file_io = FileIO::from_path(&metadata_file_path)
-            .unwrap()
-            .build()
-            .unwrap();
+        let file_io = FileIO::new_with_fs();
         let metadata_file = file_io.new_input(metadata_file_path).unwrap();
         let metadata_file_content = metadata_file.read().await.unwrap();
         let table_metadata =
@@ -451,9 +528,113 @@ mod tests {
             .metadata(table_metadata)
             .identifier(static_identifier)
             .file_io(file_io.clone())
+            .runtime(Runtime::try_current().unwrap())
             .build()
             .unwrap();
         assert!(!table.readonly());
         assert_eq!(table.identifier.name(), "table");
+    }
+
+    fn make_kms() -> Arc<dyn KeyManagementClient> {
+        let kms = MemoryKeyManagementClient::new();
+        kms.add_master_key("master-1").unwrap();
+        Arc::new(kms)
+    }
+
+    #[tokio::test]
+    async fn table_decrypts_manifest_list_via_object_cache() {
+        // The fixture contains a snapshot with key-id, encryption-keys (KEK + wrapped DEK),
+        // all generated with the master key bytes below.
+        let mut metadata: TableMetadata = load_test_metadata("TableMetadataV3ValidEncryption.json");
+
+        // Point the snapshot's manifest-list at the testdata file on disk.
+        let manifest_list_path = format!(
+            "{}/testdata/manifests_lists/manifest-list-v3-encrypted.avro",
+            env!("CARGO_MANIFEST_DIR"),
+        );
+        let snapshot = metadata.snapshots.get_mut(&1).unwrap();
+        let mut patched = snapshot.as_ref().clone();
+        patched.manifest_list = manifest_list_path;
+        *snapshot = Arc::new(patched);
+
+        // Seed the KMS with the same master key bytes used to generate the fixture.
+        let kms: Arc<dyn KeyManagementClient> = {
+            let k = MemoryKeyManagementClient::new();
+            k.add_master_key_bytes(
+                "master-1",
+                SensitiveBytes::new([
+                    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+                    0x0d, 0x0e, 0x0f,
+                ]),
+            )
+            .unwrap();
+            Arc::new(k)
+        };
+
+        let table = Table::builder()
+            .file_io(FileIO::new_with_fs())
+            .metadata(metadata)
+            .identifier(TableIdent::from_strs(["ns", "enc"]).unwrap())
+            .kms_client(kms)
+            .runtime(Runtime::try_current().unwrap())
+            .build()
+            .unwrap();
+
+        let snapshot_ref = table.metadata().current_snapshot().unwrap();
+        let manifest_list = table
+            .object_cache()
+            .get_manifest_list(snapshot_ref, &table.metadata_ref())
+            .await
+            .unwrap();
+        assert_eq!(manifest_list.entries().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn table_builder_errors_when_encryption_key_id_set_but_no_kms() {
+        let metadata: TableMetadata = load_test_metadata("TableMetadataV3ValidEncryption.json");
+
+        let err = Table::builder()
+            .file_io(FileIO::new_with_memory())
+            .metadata(metadata)
+            .identifier(TableIdent::from_strs(["ns", "enc"]).unwrap())
+            .runtime(Runtime::try_current().unwrap())
+            .build()
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PreconditionFailed);
+    }
+
+    #[tokio::test]
+    async fn table_builder_skips_encryption_on_pre_v3_table() {
+        // Encryption is a v3 spec feature; pre-v3 tables silently skip
+        // encryption even if encryption.key-id is set.
+        let mut metadata: TableMetadata = load_test_metadata("TableMetadataV2ValidMinimal.json");
+        metadata.properties.insert(
+            TableProperties::PROPERTY_ENCRYPTION_KEY_ID.to_string(),
+            "master-1".to_string(),
+        );
+
+        let table = Table::builder()
+            .file_io(FileIO::new_with_memory())
+            .metadata(metadata)
+            .identifier(TableIdent::from_strs(["ns", "enc"]).unwrap())
+            .kms_client(make_kms())
+            .runtime(Runtime::try_current().unwrap())
+            .build()
+            .unwrap();
+        assert!(table.encryption_manager().is_none());
+    }
+
+    #[tokio::test]
+    async fn table_builder_skips_encryption_when_property_absent() {
+        let metadata: TableMetadata = load_test_metadata("TableMetadataV3ValidMinimal.json");
+        let table = Table::builder()
+            .file_io(FileIO::new_with_memory())
+            .metadata(metadata)
+            .identifier(TableIdent::from_strs(["ns", "plain"]).unwrap())
+            .kms_client(make_kms())
+            .runtime(Runtime::try_current().unwrap())
+            .build()
+            .unwrap();
+        assert!(table.encryption_manager().is_none());
     }
 }
