@@ -656,8 +656,36 @@ pub async fn execute_scan_streaming(
 /// This is the seam the Flight service and the protocol tests share: the
 /// service passes the production S3 factory, the tests pass a stub that
 /// records which credentials each `get` used.
+///
+/// Boxed at the definition (compile time): awaited unboxed, the whole scan
+/// state machine sat inside the Flight service's `do_get` future and its
+/// `Send` proof walked it, 2.8 s of this crate (`-Zself-profile`,
+/// 2026-09-27). Same device as the coordinator's `QueryHandler::execute`.
 #[allow(clippy::too_many_arguments)]
-pub async fn execute_scan_streaming_with_factory(
+pub fn execute_scan_streaming_with_factory(
+    task: ScanTask,
+    metrics: Option<Arc<WorkerMetricsRegistry>>,
+    session_ctx: SessionContext,
+    credential_rx: Option<watch::Receiver<Option<RefreshableCredentials>>>,
+    footer_cache: Option<Arc<FooterCache>>,
+    coordinator_metrics: Option<Arc<MetricsRegistry>>,
+    store_factory: ObjectStoreFactory,
+    scan_budget: Option<ScanBudget>,
+) -> futures::future::BoxFuture<'static, anyhow::Result<(SchemaRef, ScanBatchStream)>> {
+    Box::pin(execute_scan_streaming_with_factory_inner(
+        task,
+        metrics,
+        session_ctx,
+        credential_rx,
+        footer_cache,
+        coordinator_metrics,
+        store_factory,
+        scan_budget,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_scan_streaming_with_factory_inner(
     task: ScanTask,
     metrics: Option<Arc<WorkerMetricsRegistry>>,
     session_ctx: SessionContext,
