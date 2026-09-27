@@ -317,6 +317,25 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// - `do_action("health_check")`: Return OK for coordinator health monitoring
 /// - `do_action("refresh_credentials")`: Accept refreshed S3 credentials from coordinator
 ///
+/// The worker's `SessionContext` behind a trait object: a compile firewall,
+/// keep it. Held concretely, every `async_trait` `FlightService` method
+/// re-proved `WorkerFlightService: Sync` through DataFusion's
+/// `SessionContext` graph, 1.2 s per method, ~9 s of this crate
+/// (`-Zself-profile`, 2026-09-27). Same device as the coordinator's
+/// `CachedSession`.
+#[derive(Clone)]
+struct ErasedSession(Arc<dyn SessionHolder>);
+
+trait SessionHolder: Send + Sync + 'static {
+    fn ctx(&self) -> &SessionContext;
+}
+
+impl SessionHolder for SessionContext {
+    fn ctx(&self) -> &SessionContext {
+        self
+    }
+}
+
 /// The service holds a [`SessionContext`] whose `RuntimeEnv` carries the
 /// configured memory pool and disk manager so that every scan execution
 /// respects the worker's memory limits.
@@ -324,7 +343,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 pub struct WorkerFlightService {
     metrics: Arc<WorkerMetricsRegistry>,
     credential_store: CredentialStore,
-    session_ctx: SessionContext,
+    session_ctx: ErasedSession,
     footer_cache: Option<Arc<FooterCache>>,
     /// Maximum duration for a single scan task. 0 means no timeout.
     scan_timeout: std::time::Duration,
@@ -656,7 +675,7 @@ impl WorkerFlightService {
         Self {
             metrics,
             credential_store,
-            session_ctx,
+            session_ctx: ErasedSession(Arc::new(session_ctx)),
             footer_cache: None,
             scan_timeout: std::time::Duration::from_secs(600),
             flight_compression: FlightCompression::Zstd,
@@ -911,7 +930,7 @@ impl WorkerFlightService {
     /// service itself, for [`WorkerStatus::set_capacity_probe`].
     pub fn capacity_probe(&self) -> crate::status::CapacityProbe {
         use datafusion::execution::memory_pool::MemoryLimit;
-        let pool = self.session_ctx.runtime_env().memory_pool.clone();
+        let pool = self.session_ctx.0.ctx().runtime_env().memory_pool.clone();
         let scan_budget = self.scan_budget.clone();
         Arc::new(move || {
             let limit = match pool.memory_limit() {
@@ -1196,6 +1215,8 @@ impl FlightService for WorkerFlightService {
 
         let metrics = self.metrics.clone();
         let credential_store = self.credential_store.clone();
+        // Moved into the block below as the erased handle, not a bare
+        // `SessionContext`, so the block's `Send` proof stops at the `dyn`.
         let session_ctx = self.session_ctx.clone();
         let footer_cache = self.footer_cache.clone();
         let scan_timeout = self.live_scan_timeout();
@@ -1206,7 +1227,7 @@ impl FlightService for WorkerFlightService {
         let flight_budget = self
             .flight_budget
             .clone()
-            .unwrap_or_else(|| default_flight_budget(&self.session_ctx));
+            .unwrap_or_else(|| default_flight_budget(self.session_ctx.0.ctx()));
         let store_factory = self.store_factory.clone();
         let scan_budget = self.scan_budget.clone();
         let status = Arc::clone(&self.status);
@@ -1236,7 +1257,7 @@ impl FlightService for WorkerFlightService {
             let prepare = executor::execute_scan_streaming_with_factory(
                 scan_task,
                 Some(metrics.clone()),
-                session_ctx.clone(),
+                session_ctx.0.ctx().clone(),
                 Some(cred_rx),
                 footer_cache.clone(),
                 None, // Coordinator metrics (workers don't have coordinator registry)
@@ -1449,7 +1470,7 @@ impl FlightService for WorkerFlightService {
 
                 let handle = self.spawn_group_rewrite(
                     GroupRewriteCtx {
-                        session_ctx: self.session_ctx.clone(),
+                        session_ctx: self.session_ctx.0.ctx().clone(),
                         request: request.clone(),
                         progress_tx: Some(progress_tx),
                         tracker: tracker.clone(),
