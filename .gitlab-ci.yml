@@ -663,10 +663,24 @@ aikido-sbom:
 # MR's first pipeline always misses ("file does not exist"), and every job
 # still zipped and uploaded .cargo-home/registry/ afterwards: 29 s, 51 s and
 # 232 s on that pipeline. Fetching every crate cold takes about 5 s.
+#
+# Both jobs start from the prebuilt dependency image (ci-deps-image above):
+# the platform Rust image plus the third-party tree compiled on main, used
+# in place through CARGO_TARGET_DIR. Cargo still decides freshness per unit,
+# so a Cargo.lock change in an MR only recompiles what moved. Same path as
+# SQE_DEPS_TARGET in ci-deps-image; the paths have to match for reuse.
+# `image:` is set on each job, not through `extends:`: the included job's own
+# `image:` outranks an extended one (checked with the merged-YAML lint).
 aikido-test-rust:
+  image: "$CI_REGISTRY_IMAGE/ci-deps:mr-1189"
+  variables:
+    CARGO_TARGET_DIR: "/opt/sqe-deps/target"
   cache: []
 
 aikido-rust-extra:
+  image: "$CI_REGISTRY_IMAGE/ci-deps:mr-1189"
+  variables:
+    CARGO_TARGET_DIR: "/opt/sqe-deps/target"
   cache: []
 
 aikido-clippy-rust:
