@@ -1,3 +1,9 @@
+// Future layouts here nest ~130 queries deep (flight_sql's do_get paths).
+// With `QueryHandler::get_schema` boxed, rustc computes them from a deeper
+// stack and the default limit of 128 overflows ("queries overflow the depth
+// limit"). Compile-time only; no runtime effect.
+#![recursion_limit = "256"]
+
 // Module visibility (review 804, item 4). `pub mod` is reserved for what the
 // `sqe-server` binary and the `tests/` tree reach into today; the rest is
 // `pub(crate)`. Widening one back to `pub` is a one-word change, so nothing
