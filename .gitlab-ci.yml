@@ -671,17 +671,28 @@ aikido-sbom:
 # SQE_DEPS_TARGET in ci-deps-image; the paths have to match for reuse.
 # `image:` is set on each job, not through `extends:`: the included job's own
 # `image:` outranks an extended one (checked with the merged-YAML lint).
+#
+# before_script replaces the template's: ci/reuse-deps-image.sh first (lets
+# cargo reuse the baked vendored crates when vendor/ is unchanged), then the
+# platform's build env. The template's other step, an apt fallback for
+# clang/mold/protoc, is dropped: the image carries them.
 aikido-test-rust:
-  image: "$CI_REGISTRY_IMAGE/ci-deps:main"
+  image: "$CI_REGISTRY_IMAGE/ci-deps:mr-1189"
   variables:
     CARGO_TARGET_DIR: "/opt/sqe-deps/target"
   cache: []
+  before_script:
+    - ci/reuse-deps-image.sh
+    - !reference [.aikido_rust_build_env, before_script]
 
 aikido-rust-extra:
-  image: "$CI_REGISTRY_IMAGE/ci-deps:main"
+  image: "$CI_REGISTRY_IMAGE/ci-deps:mr-1189"
   variables:
     CARGO_TARGET_DIR: "/opt/sqe-deps/target"
   cache: []
+  before_script:
+    - ci/reuse-deps-image.sh
+    - !reference [.aikido_rust_build_env, before_script]
 
 aikido-clippy-rust:
   rules:
