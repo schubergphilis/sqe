@@ -27,10 +27,11 @@ ci-config-sanity:
   image: python:3.12-alpine@sha256:b64631e04e4920160c50fbe8d8df828f7f35f06f425cb44aa09bca53e708a35a
   script:
     - python -m json.tool renovate.json >/dev/null
-    # #639: no bare `#[ignore]`; every ignored test names its stack/reason.
     # bash + GNU grep for leak-scan (busybox grep lacks --include / -I).
+    # The bare-`#[ignore]` grep (#639) that ran here is gone: `cargo xtask
+    # test-groups --check` in aikido-rust-extra rejects a bare #[ignore] and
+    # an unknown reason, and runs on every change to a .rs file.
     - apk add --no-cache make bash grep >/dev/null
-    - make check-ignore-reasons
     # Accepted advisories expire: a passed review date fails the pipeline so
     # the risk is re-decided, not silently carried.
     - make check-advisory-ignores
@@ -133,10 +134,12 @@ variables:
   # thread stack (the write e2e tests need this too). 32 MiB; the platform default
   # is 8 MiB, which is not enough here. Carried over from the local cargo-gate.
   AIKIDO_RUST_MIN_STACK: "33554432"
-  # Clippy in its own job (aikido-clippy-rust, aikido !166 / v0.12.3), parallel
-  # to the gate, which then skips its clippy phase. Clippy shares no artifacts
-  # with the test build, so serial placement was pure wall clock: 5m06 of the
-  # 21m test job on pipeline 1609830. Still advisory.
+  # Keeps clippy out of the gate (aikido !166 / v0.12.3): it shares no
+  # artifacts with the test build, so there it was 5m06 of pure wall clock
+  # (pipeline 1609830). The platform's own aikido-clippy-rust job is switched
+  # off below; clippy runs at the top of ci/aikido-rust-extra.sh instead, where
+  # the feature-matrix `cargo check`s reuse its check-mode dependencies. Still
+  # advisory.
   AIKIDO_CARGO_CLIPPY_JOB: "1"
   # Compiler cache. The platform's .aikido_rust_build_env (test-rust.yml) runs
   # sccache against an S3 bucket when AIKIDO_SCCACHE_BUCKET is set; it replaces
@@ -595,6 +598,27 @@ aikido-sbom:
 # The feature-matrix checks in ci/aikido-rust-extra.sh run in the platform's
 # `aikido-rust-extra` job (test stage, `needs: []`, blocking under
 # AIKIDO_CARGO_GATE_ENFORCE like the gate).
+#
+# Two cold compiles, not three. On MR !1178 (pipeline 1634784) the gate,
+# aikido-rust-extra and aikido-clippy-rust each compiled the whole dependency
+# tree from nothing, at the same time, on one runner host (run01, concurrent
+# slots 0-2): 18, 16.5 and 15.5 minutes, fighting over the same cores. Clippy
+# and `cargo check` share check-mode dependency artifacts, so clippy now runs
+# inside aikido-rust-extra and its own job is off.
+#
+# No registry cache on these jobs. The template keys it per branch, so an
+# MR's first pipeline always misses ("file does not exist"), and every job
+# still zipped and uploaded .cargo-home/registry/ afterwards: 29 s, 51 s and
+# 232 s on that pipeline. Fetching every crate cold takes about 5 s.
+aikido-test-rust:
+  cache: []
+
+aikido-rust-extra:
+  cache: []
+
+aikido-clippy-rust:
+  rules:
+    - when: never
 
 # The vendored grant profile must be the platform's current one.
 #

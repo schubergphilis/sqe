@@ -101,7 +101,7 @@ BENCH_ENV       = PROFILE=$(BENCH_PROFILE) BENCH_LOG_DIR=$(BENCH_LOG_DIR)
         clippy fmt fmt-check pre-commit clean clean-rust clean-rustbook \
         clean-ebook clean-benchmark-charts clean-images check-tools maintain \
         build build-sqe sbom sbom-sqe sqe-config images \
-        login buildx-builder push push-sqe leak-scan check-ignore-reasons
+        login buildx-builder push push-sqe leak-scan
 
 # ── Default target ────────────────────────────────────────────────────────
 help:
@@ -316,11 +316,6 @@ metrics-layering-check:  ## Only runtime crates may link the full sqe-metrics cr
 	@bad=$$(grep -l 'path = "../sqe-metrics" }' crates/*/Cargo.toml | grep -vE 'sqe-(coordinator|server|worker|lineage)/'); \
 	if [ -n "$$bad" ]; then echo "full sqe-metrics linked by a library crate (use sqe-metrics-core):"; echo "$$bad"; exit 1; fi
 	@echo "==> metrics layering ok"
-
-check-ignore-reasons:  ## Every #[ignore] must carry a reason (#639): needs:<stack>; flaky:; slow:; wip:
-	@bad=$$(find crates -name '*.rs' -exec grep -nE '^[[:space:]]*#\[ignore[[:space:]]*\]' {} +); \
-	if [ -n "$$bad" ]; then echo "bare #[ignore] without a reason (use #[ignore = \"needs:<stack>; <run hint>\"]):"; echo "$$bad"; exit 1; fi
-	@echo "==> ignore reasons ok"
 
 check-advisory-ignores:  ## Every ignored advisory (deny.toml, .cargo/audit.toml, .grype.yaml) has an owner and an unexpired review date
 	@python3 scripts/check-advisory-ignores.py
