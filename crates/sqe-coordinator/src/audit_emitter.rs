@@ -139,6 +139,74 @@ pub(crate) struct StatementAudit<'a> {
     pub query_id: uuid::Uuid,
 }
 
+/// Emit the one audit record for a statement that failed before the
+/// statement's normal audit point: parse, catalog preflight, planning,
+/// access denied at planning, and Flight SQL `GetFlightInfo` /
+/// `CreatePreparedStatement` planning, which never reach `execute`.
+///
+/// `kind` is `None` when the SQL did not classify (a parse error). A
+/// classified statement goes through [`emit_statement_audit`] exactly as an
+/// execution failure does, so routing (secret-bearing kinds stay on the
+/// redacting legacy path), redaction and the OCSF mapping are unchanged. An
+/// unparsed statement has no kind to route on; it is recorded as a failed
+/// `AuditKind::Query` with `statement_type` `"unknown"`, and its text gets
+/// the worker's `redact_pii` like every canonical event.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_failed_statement(
+    audit: &AuditLogger,
+    session: &Session,
+    sql: &str,
+    kind: Option<&StatementKind>,
+    error: &SqeError,
+    duration: Duration,
+    client_ip: Option<String>,
+    query_id: uuid::Uuid,
+) {
+    let trace_id = sqe_metrics::propagation::current_trace_id();
+    let Some(kind) = kind else {
+        audit.log_event(AuditEvent {
+            time: chrono::Utc::now(),
+            kind: AuditKind::Query,
+            actor: actor_for(session),
+            outcome: outcome_of(Some(error)),
+            resources: Vec::new(),
+            policy: None,
+            timing: Some(timing(duration, 0)),
+            stats: None,
+            query: Some(query_info(sql, "unknown".to_string())),
+            session_id: Some(session.id.clone()),
+            client_ip,
+            trace_id,
+            query_id: Some(query_id.to_string()),
+            integrity: Integrity::default(),
+        });
+        return;
+    };
+    emit_statement_audit(
+        audit,
+        StatementAudit {
+            session,
+            sql,
+            kind,
+            kind_name: kind.name().to_string(),
+            error: Some(error),
+            status: "error",
+            duration,
+            execution_ms: 0,
+            rows: 0,
+            rows_written: None,
+            plan_metrics: &PlanMetrics::default(),
+            policy_summary: None,
+            resources: Vec::new(),
+            tables_touched: Vec::new(),
+            grant_resources: Vec::new(),
+            client_ip,
+            trace_id,
+            query_id,
+        },
+    );
+}
+
 /// Emit the one audit record for a buffered statement.
 ///
 /// - `Query` (SELECT and friends): `AuditKind::Query` with policy, timing,
