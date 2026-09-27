@@ -677,7 +677,7 @@ aikido-sbom:
 # platform's build env. The template's other step, an apt fallback for
 # clang/mold/protoc, is dropped: the image carries them.
 aikido-test-rust:
-  image: "$CI_REGISTRY_IMAGE/ci-deps:mr-1189"
+  image: "$CI_REGISTRY_IMAGE/ci-deps:main"
   variables:
     CARGO_TARGET_DIR: "/opt/sqe-deps/target"
   cache: []
@@ -686,7 +686,7 @@ aikido-test-rust:
     - !reference [.aikido_rust_build_env, before_script]
 
 aikido-rust-extra:
-  image: "$CI_REGISTRY_IMAGE/ci-deps:mr-1189"
+  image: "$CI_REGISTRY_IMAGE/ci-deps:main"
   variables:
     CARGO_TARGET_DIR: "/opt/sqe-deps/target"
   cache: []
