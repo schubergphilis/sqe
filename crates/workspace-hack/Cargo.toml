@@ -31,8 +31,6 @@ axum-core = { version = "0.5", default-features = false, features = ["tracing"] 
 bigdecimal = { version = "0.4", features = ["serde"] }
 bytes = { version = "1", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4", features = ["derive", "env"] }
-clap_builder = { version = "4", default-features = false, features = ["color", "env", "help", "std", "suggestions", "usage"] }
 crc32fast = { version = "1" }
 crypto-common = { version = "0.1", default-features = false, features = ["getrandom", "std"] }
 datafusion-common = { version = "55", default-features = false, features = ["object_store", "parquet", "recursive_protection", "sql"] }
