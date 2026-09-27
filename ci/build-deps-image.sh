@@ -20,6 +20,8 @@ set -euo pipefail
 
 : "${SQE_DEPS_TARGET:?}" "${CI_REGISTRY_IMAGE:?}" "${AIKIDO_RUST_IMAGE:?}"
 export CARGO_TARGET_DIR="$SQE_DEPS_TARGET"
+# Created up front: the vendor-tree marker below is written before cargo runs.
+mkdir -p "$CARGO_TARGET_DIR"
 
 # Pinned like sccache in the platform template: version + sha256 of the
 # release tarball (go-containerregistry checksums.txt).
