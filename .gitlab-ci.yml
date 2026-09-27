@@ -672,13 +672,13 @@ aikido-sbom:
 # `image:` is set on each job, not through `extends:`: the included job's own
 # `image:` outranks an extended one (checked with the merged-YAML lint).
 aikido-test-rust:
-  image: "$CI_REGISTRY_IMAGE/ci-deps:mr-1189"
+  image: "$CI_REGISTRY_IMAGE/ci-deps:main"
   variables:
     CARGO_TARGET_DIR: "/opt/sqe-deps/target"
   cache: []
 
 aikido-rust-extra:
-  image: "$CI_REGISTRY_IMAGE/ci-deps:mr-1189"
+  image: "$CI_REGISTRY_IMAGE/ci-deps:main"
   variables:
     CARGO_TARGET_DIR: "/opt/sqe-deps/target"
   cache: []
