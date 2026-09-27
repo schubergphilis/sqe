@@ -245,13 +245,37 @@ use sqe_policy::{
 };
 use std::collections::HashSet;
 
+/// An `Expr`-bearing value behind a trait object: a compile firewall, keep it.
+/// Held concretely, each `async_trait` method of the stores below re-proved
+/// `Sync` through DataFusion's `Expr` graph (about 2.3 s per method, 9 s of
+/// this test binary). Same device as `CachedPolicy` in sqe-policy.
+struct Frozen<T>(Arc<dyn Fn() -> T + Send + Sync>);
+
+impl<T: Clone + Send + Sync + 'static> Frozen<T> {
+    fn new(value: T) -> Self {
+        Self(Arc::new(move || value.clone()))
+    }
+}
+
+impl<T> Frozen<T> {
+    fn get(&self) -> T {
+        (self.0)()
+    }
+}
+
+impl<T> std::fmt::Debug for Frozen<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Frozen(..)")
+    }
+}
+
 /// Minimal store: no resource-level policy, one tag -> mask rule.
 #[derive(Debug)]
 struct OneTagMaskStore {
     tag: String,
-    mask: MaskType,
+    mask: Frozen<MaskType>,
     /// Tag-driven row filters, the other half of what cycle 3 promises.
-    tag_filters: Vec<Expr>,
+    tag_filters: Frozen<Vec<Expr>>,
 }
 
 #[async_trait::async_trait]
@@ -271,8 +295,8 @@ impl PolicyStore for OneTagMaskStore {
         _tags: &HashSet<String>,
     ) -> (HashMap<String, TagMaskSpec>, Vec<Expr>, HashSet<String>) {
         let mut masks = HashMap::new();
-        masks.insert(self.tag.clone(), TagMaskSpec::Ready(self.mask.clone()));
-        (masks, self.tag_filters.clone(), HashSet::new())
+        masks.insert(self.tag.clone(), TagMaskSpec::Ready(self.mask.get()));
+        (masks, self.tag_filters.get(), HashSet::new())
     }
 }
 
@@ -342,8 +366,8 @@ async fn a_tag_in_the_hive_manifest_masks_the_column_in_an_executed_plan() {
 
     let store = OneTagMaskStore {
         tag: "PII".to_string(),
-        mask: MaskType::Nullify,
-        tag_filters: vec![],
+        mask: Frozen::new(MaskType::Nullify),
+        tag_filters: Frozen::new(vec![]),
     };
     let rewriter = PolicyPlanRewriter::new(Arc::new(store)).with_tag_source(routed);
     let (rewritten, _summary) = rewriter.evaluate(&test_user(), plan).await.unwrap();
@@ -400,10 +424,10 @@ async fn a_tag_row_filter_also_reaches_a_hive_scan() {
     // Keep only order_id = 2, so a filter that never fires is visible as 3 rows.
     let store = OneTagMaskStore {
         tag: "PII".to_string(),
-        mask: MaskType::Nullify,
-        tag_filters: vec![
+        mask: Frozen::new(MaskType::Nullify),
+        tag_filters: Frozen::new(vec![
             datafusion::logical_expr::col("order_id").eq(datafusion::logical_expr::lit(2_i64))
-        ],
+        ]),
     };
     let rewriter = PolicyPlanRewriter::new(Arc::new(store)).with_tag_source(routed);
     let (rewritten, _summary) = rewriter.evaluate(&test_user(), plan).await.unwrap();
@@ -466,11 +490,11 @@ async fn a_resource_level_mask_needs_no_tag_at_all_on_a_hive_scan() {
     let mut column_masks = HashMap::new();
     column_masks.insert("ssn".to_string(), MaskType::Nullify);
     let store = ResourceMaskStore {
-        policy: ResolvedPolicy {
+        policy: Frozen::new(ResolvedPolicy {
             row_filters: vec![],
             column_masks,
             restricted_columns: vec![],
-        },
+        }),
     };
     let rewriter = PolicyPlanRewriter::new(Arc::new(store)).with_tag_source(routed);
     let (rewritten, _summary) = rewriter.evaluate(&test_user(), plan).await.unwrap();
@@ -501,7 +525,7 @@ async fn a_resource_level_mask_needs_no_tag_at_all_on_a_hive_scan() {
 /// Store with a resource-level policy and no tag rules whatsoever.
 #[derive(Debug)]
 struct ResourceMaskStore {
-    policy: ResolvedPolicy,
+    policy: Frozen<ResolvedPolicy>,
 }
 
 #[async_trait::async_trait]
@@ -512,7 +536,7 @@ impl PolicyStore for ResourceMaskStore {
         _table: &str,
         _namespace: &str,
     ) -> sqe_core::Result<ResolvedPolicy> {
-        Ok(self.policy.clone())
+        Ok(self.policy.get())
     }
 
     async fn resolve_tags(
