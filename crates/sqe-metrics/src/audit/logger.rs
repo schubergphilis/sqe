@@ -48,7 +48,7 @@ struct GdprConfig {
     lookup: Arc<dyn TagLookup>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
     pub timestamp: String,
     pub username: String,
@@ -610,6 +610,8 @@ impl AuditLogger {
                                         // all legacy entries that arrived before it.
                                         Self::write_legacy_batch(
                                             &mut native_sink,
+                                            &mut ocsf_sink,
+                                            &mut spool_lock(&spool_sink_worker),
                                             &mut chain,
                                             &batch,
                                             &path_owned,
@@ -644,6 +646,8 @@ impl AuditLogger {
                                     AuditMsg::Flush(ack) => {
                                         Self::write_legacy_batch(
                                             &mut native_sink,
+                                            &mut ocsf_sink,
+                                            &mut spool_lock(&spool_sink_worker),
                                             &mut chain,
                                             &batch,
                                             &path_owned,
@@ -663,6 +667,8 @@ impl AuditLogger {
                             if !batch.is_empty() {
                                 Self::write_legacy_batch(
                                     &mut native_sink,
+                                    &mut ocsf_sink,
+                                    &mut spool_lock(&spool_sink_worker),
                                     &mut chain,
                                     &batch,
                                     &path_owned,
@@ -703,6 +709,8 @@ impl AuditLogger {
                                         // Process this legacy entry immediately.
                                         Self::write_legacy_batch(
                                             &mut native_sink,
+                                            &mut ocsf_sink,
+                                            &mut spool_lock(&spool_sink_worker),
                                             &mut chain,
                                             &[*e],
                                             &path_owned,
@@ -794,8 +802,18 @@ impl AuditLogger {
     ///
     /// Routes through `native_sink.write_raw_line` so there is exactly one writer
     /// on the native file (Defect 2 fix).
+    ///
+    /// Each entry also goes to the OCSF sink and the export spool when they
+    /// are active, as the SAME chained record: the converted event carries
+    /// the native line's `integrity`, so `metadata.uid` is its hash. The text
+    /// is the entry's own, already redacted by `try_log` before queueing;
+    /// nothing is re-derived from the raw SQL. Before this, secret-bearing
+    /// statements (CREATE/DROP/SHOW SECRET, ATTACH, DETACH) reached
+    /// `audit.jsonl` only and an OCSF-only SIEM never saw them.
     fn write_legacy_batch(
         native_sink: &mut NativeJsonlSink,
+        ocsf_sink: &mut Option<OcsfJsonlSink>,
+        spool_sink: &mut Option<OcsfJsonlSink>,
         chain: &mut HashChain,
         batch: &[AuditEntry],
         path: &str,
@@ -825,6 +843,23 @@ impl AuditLogger {
             if let Err(e) = native_sink.write_raw_line(&line) {
                 tracing::error!("AUDIT: write failed for '{path}': {e}");
                 record_drop(dropped, "io");
+            }
+            if ocsf_sink.is_none() && spool_sink.is_none() {
+                continue;
+            }
+            let mut event = AuditEvent::from(entry.clone());
+            event.integrity = integrity;
+            if let Some(sink) = ocsf_sink.as_mut() {
+                if let Err(e) = sink.write_line(&event) {
+                    tracing::error!("AUDIT: write failed for '{path}': {e}");
+                    record_drop(dropped, "io");
+                }
+            }
+            if let Some(sink) = spool_sink.as_mut() {
+                if let Err(e) = sink.write_line(&event) {
+                    tracing::error!("AUDIT: spool write failed for '{path}': {e}");
+                    record_drop(dropped, "io");
+                }
             }
         }
     }
@@ -1527,6 +1562,55 @@ mod tests {
         assert!(ocsf.contains("\"class_uid\":6005"));
         // Every native record carries an integrity hash.
         assert!(native.contains("\"hash\":"));
+    }
+
+    /// A secret-bearing statement (CREATE SECRET, ATTACH, ...) takes the
+    /// legacy redacting `log()` path. It used to reach `audit.jsonl` only, so
+    /// an OCSF-only SIEM never saw it. It now also writes one OCSF line: the
+    /// same redacted text, and the native record's hash as `metadata.uid`.
+    #[test]
+    fn a_legacy_entry_also_writes_one_ocsf_line_with_the_same_redacted_text_and_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let logger =
+            AuditLogger::with_config(path.to_str().unwrap(), crate::audit::AuditFormat::Both)
+                .unwrap();
+        let sql = "CREATE SECRET s (TYPE s3, KEY_ID 'AKIAEXAMPLE', SECRET 'topsecretvalue')";
+        logger.log(&AuditEntry {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            username: "admin".into(),
+            session_id: Some("sess-1".into()),
+            query_hash: query_hash(sql),
+            query_text: Some(sql.into()),
+            statement_type: "create_secret".into(),
+            duration_ms: 3,
+            rows_returned: 0,
+            status: "success".into(),
+            client_ip: None,
+            tables_touched: vec![],
+            row_filters_applied: 0,
+            columns_masked: vec![],
+            columns_restricted: vec![],
+            policy_denied: false,
+        });
+        logger.flush();
+
+        let native_bytes = std::fs::read(&path).unwrap();
+        crate::audit::verify_audit_bytes(&native_bytes).expect("native chain verifies");
+        let native: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&native_bytes).unwrap().trim()).unwrap();
+        let ocsf_text =
+            std::fs::read_to_string(dir.path().join("audit.ocsf.jsonl")).unwrap_or_default();
+        let lines: Vec<&str> = ocsf_text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "one OCSF line for the legacy entry: {ocsf_text:?}");
+        let ocsf: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+
+        assert_eq!(ocsf["metadata"]["uid"], native["integrity"]["hash"], "same chained record");
+        let text = ocsf["unmapped"]["query_text"].as_str().expect("query text");
+        assert_eq!(text, native["query_text"].as_str().unwrap(), "same redacted text");
+        assert!(!ocsf_text.contains("topsecretvalue"), "secret never reaches OCSF: {ocsf_text}");
+        assert!(text.contains("[REDACTED]"), "{text}");
+        assert_eq!(ocsf["status_id"], 1, "{ocsf}");
     }
 
     #[test]
