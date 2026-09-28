@@ -817,12 +817,20 @@ const FANOUT_PER_WRITER_EST_BYTES: usize = 128 * 1024 * 1024;
 
 /// Auto-derive `(max_open, byte_budget)` from the node memory pool size, used
 /// to fill whichever fanout knob an operator left at 0 once bounded mode is
-/// active. Generous by design: `max_open` sits above any realistic partition
-/// count (floor 8, cap 64) and the budget is a pool fraction floored at one
-/// writer, so a normally-clustered write never cuts over. See spec open
-/// decision #4.
+/// active. `max_open` is one writer per estimated row group the pool holds
+/// (floor 8, ceiling 1024) and the budget is a pool fraction floored at one
+/// writer. See spec open decision #4.
+///
+/// The ceiling was 64, on the reasoning that it "sits above any realistic
+/// partition count". It does not: TPC-H's monthly partitions are 84, and an
+/// UNSORTED partitioned CTAS touches every partition in every batch, so a
+/// 64-writer cap cut over constantly. TPC-H SF0.1 lineitem (600k rows) was
+/// written as 3,769 files instead of ~84 and full scans of it ran 2-3x
+/// slower (2026-09-27). Memory is already bounded by `byte_budget`, which
+/// flushes writers least-recently-written first; the count cap only has to
+/// stay within what the pool can hold, not below the partition count.
 pub fn auto_fanout_caps(pool_bytes: usize) -> (usize, usize) {
-    let max_open = (pool_bytes / FANOUT_PER_WRITER_EST_BYTES).clamp(8, 64);
+    let max_open = (pool_bytes / FANOUT_PER_WRITER_EST_BYTES).clamp(8, 1024);
     let byte_budget = (pool_bytes / 8).max(FANOUT_PER_WRITER_EST_BYTES);
     (max_open, byte_budget)
 }
@@ -1248,10 +1256,17 @@ mod tests {
     fn auto_fanout_caps_are_generous_and_clamped() {
         let mb = 1024 * 1024;
         let gb = 1024 * mb;
-        // 8GB pool: cap hits the 64 ceiling, budget = pool/8 = 1GB.
+        // 8GB pool: 8GB/128MB = 64 open, budget = pool/8 = 1GB.
         let (max_open, budget) = auto_fanout_caps(8 * gb);
-        assert_eq!(max_open, 64, "large pool clamps to 64");
+        assert_eq!(max_open, 64);
         assert_eq!(budget, gb);
+        // 64GB pool (the test stack): 512 open, above TPC-H's 84 monthly
+        // partitions, so an unsorted partitioned CTAS does not cut over.
+        let (max_open, _) = auto_fanout_caps(64 * gb);
+        assert_eq!(max_open, 512, "no 64 ceiling below the pool's capacity");
+        // Huge pool: clamps to the 1024 ceiling.
+        let (max_open, _) = auto_fanout_caps(1024 * gb);
+        assert_eq!(max_open, 1024, "huge pool clamps to 1024");
         // Tiny 256MB pool: cap floors at 8, budget floors at one row-group est.
         let (max_open, budget) = auto_fanout_caps(256 * mb);
         assert_eq!(max_open, 8, "tiny pool floors at 8");
