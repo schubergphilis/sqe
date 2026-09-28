@@ -1,17 +1,14 @@
 schema = 1
 
-# deps.dev returns 404 for this release, so the Cargo.lock-only SBOM lacks
-# license evidence. Verified the published crate against Cargo.lock on
-# 2026-09-05: Cargo.toml declares MIT OR Apache-2.0 and the archive includes
-# LICENSE-MIT and LICENSE-APACHE. Remove when deps.dev indexes this release.
+# Moved from .asset's deprecated [[license_exception]] table (2026-09-27).
 [[exception]]
-id = "OSS-FIND-MSVC-TOOLS-0-1-12-EVIDENCE-2026"
-component = "pkg:cargo/find-msvc-tools@0.1.12"
-licenses = ["MIT", "Apache-2.0"]
-scope = "evidence-vouched"
+id = "OSS-LGPL-R-EFI-UEFI-ONLY-2026"
+component = "pkg:cargo/r-efi@*"
+licenses = ["LGPL-2.1-or-later", "LGPL-*"]
+scope = "platform-optional-not-linked"
 owner = "vpf-data-ai/chameleon sqlengine maintainers"
-reason = "Published find-msvc-tools 0.1.12 declares MIT OR Apache-2.0 in Cargo.toml and includes both license texts. Source: https://static.crates.io/crates/find-msvc-tools/find-msvc-tools-0.1.12.crate ; SHA-256 3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d matches Cargo.lock. This supplies missing metadata for this exact release only; it does not waive restricted licenses."
-expires = "2026-12-04"
+reason = "r-efi is UEFI firmware ABI bindings pulled only as a target-specific dependency of getrandom (0.3+/0.4) for target_os=uefi. SQE does not build or ship UEFI binaries; Linux/macOS/Windows server artifacts do not link r-efi. No drop-in replacement exists for getrandom's UEFI backend. Prefer removing if getrandom drops the dep; until then treat as platform-optional not-linked."
+expires = "2027-07-27"
 
 # GitHub Actions referenced by .github/workflows/release-binaries.yml. The SBOM
 # lists them as components, deps.dev has no license record for action
@@ -54,25 +51,3 @@ scope = "evidence-vouched"
 owner = "vpf-data-ai/chameleon sqlengine maintainers"
 reason = "Swatinem/rust-cache is MIT: https://github.com/Swatinem/rust-cache/blob/v2/LICENSE . CI-only cache step on the GitHub mirror; nothing from it is shipped."
 expires = "2027-09-14"
-
-# hyper-rustls 0.27.10: deps.dev has no license evidence for this release yet.
-# Remove when deps.dev indexes it.
-[[exception]]
-id = "OSS-HYPER-RUSTLS-0-27-10-EVIDENCE-2026"
-component = "pkg:cargo/hyper-rustls@0.27.10"
-licenses = ["Apache-2.0", "ISC", "MIT"]
-scope = "evidence-vouched"
-owner = "vpf-data-ai/chameleon sqlengine maintainers"
-reason = "Published hyper-rustls 0.27.10 declares Apache-2.0 OR ISC OR MIT in Cargo.toml (crates.io metadata) and ships all three license texts. Source: https://static.crates.io/crates/hyper-rustls/hyper-rustls-0.27.10.crate ; SHA-256 dfa8e654703247911e29c23fbeaa261834bd9bb74efba2f9acddc37bfb127f53 matches Cargo.lock. This supplies missing metadata for this exact release only; it does not waive restricted licenses."
-expires = "2026-12-21"
-
-# datafusion-functions-json 0.55.3: deps.dev has no license evidence for this
-# release yet. Remove when deps.dev indexes it.
-[[exception]]
-id = "OSS-DATAFUSION-FUNCTIONS-JSON-0-55-3-EVIDENCE-2026"
-component = "pkg:cargo/datafusion-functions-json@0.55.3"
-licenses = ["Apache-2.0"]
-scope = "evidence-vouched"
-owner = "vpf-data-ai/chameleon sqlengine maintainers"
-reason = "Published datafusion-functions-json 0.55.3 declares Apache-2.0 in Cargo.toml (crates.io metadata). Source: https://static.crates.io/crates/datafusion-functions-json/datafusion-functions-json-0.55.3.crate ; SHA-256 4543d091fd7ed933186be63f715bbe48e46280288c2f39c8c3ee4b5d2cdca078 matches Cargo.lock. This supplies missing metadata for this exact release only; it does not waive restricted licenses."
-expires = "2026-12-25"

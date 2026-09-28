@@ -193,8 +193,19 @@ impl FileTableFunctions {
         let Ok(statements) = Parser::parse_sql(&GenericDialect {}, sql) else {
             return Ok(());
         };
+        self.prepare_parsed(&statements).await
+    }
+
+    /// Prepare every call in statements the caller has already parsed.
+    ///
+    /// For a caller holding the engine's own parse of the user's text:
+    /// `GenericDialect` rejects syntax the engine accepts (a CTAS with
+    /// `PARTITIONED BY (month(d))`), and [`Self::prepare_statement`] then
+    /// prepares nothing, so the write handler's later `ctx.sql` of the
+    /// SELECT failed with "the table function was not prepared".
+    pub async fn prepare_parsed(&self, statements: &[sql::Statement]) -> DFResult<()> {
         let mut calls = FileFunctionCalls::default();
-        for statement in &statements {
+        for statement in statements {
             let _ = statement.visit(&mut calls);
         }
         for (name, args) in calls.calls {
@@ -235,6 +246,18 @@ pub async fn prepare_statement(ctx: &SessionContext, sql: &str) -> DFResult<()> 
         return Ok(());
     };
     registry.prepare_statement(sql).await
+}
+
+/// [`prepare_statement`] for a statement the caller already parsed (the
+/// engine's front door accepts syntax `GenericDialect` does not).
+pub async fn prepare_parsed_statement(
+    ctx: &SessionContext,
+    statement: &sql::Statement,
+) -> DFResult<()> {
+    let Some(registry) = ctx.state().config().get_extension::<FileTableFunctions>() else {
+        return Ok(());
+    };
+    registry.prepare_parsed(std::slice::from_ref(statement)).await
 }
 
 /// Every `FROM f(args)` in a statement, by lowercased function name.
@@ -417,6 +440,29 @@ mod tests {
             PreparedProviders::key(&[lit("s3://b/x.parquet"), lit("region=eu")]),
             "the planner's argument list and the prepared one key the same"
         );
+    }
+
+    #[tokio::test]
+    async fn a_partitioned_ctas_prepares_from_the_engines_parse_not_the_text() {
+        // The text form fails GenericDialect (`PARTITIONED BY (month(d))`),
+        // so text-based preparation silently does nothing: the bug that
+        // broke every partitioned TPC-H load. The engine's pre-parse
+        // pipeline rewrites the clause; its parse must prepare the call.
+        let (ctx, f) = session_with("read_parquet");
+        let sql = "CREATE TABLE t PARTITIONED BY (month(d)) \
+                   AS SELECT * FROM read_parquet('s3://b/x.parquet', region => 'eu')";
+        prepare_statement(&ctx, sql).await.expect("text path returns Ok");
+        assert_eq!(f.prepares.load(Ordering::SeqCst), 0, "the text path cannot parse this");
+
+        let rewritten = sqe_sql::pre_parse_pipeline(&sqe_sql::UserSql::from(sql)).expect("pipeline");
+        let statements =
+            Parser::parse_sql(&GenericDialect {}, rewritten.as_str()).expect("engine form parses");
+        prepare_parsed_statement(&ctx, &statements[0]).await.expect("prepare");
+        assert_eq!(f.prepares.load(Ordering::SeqCst), 1);
+        assert!(f
+            .prepared
+            .get(&[lit("s3://b/x.parquet"), lit("region=eu")])
+            .is_some());
     }
 
     #[tokio::test]

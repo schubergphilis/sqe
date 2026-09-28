@@ -37,6 +37,16 @@ async fn statements(
     puffin: bool,
     catalog: Option<&str>,
 ) -> Vec<String> {
+    statements_with(benchmark, bloom, puffin, catalog, None).await
+}
+
+async fn statements_with(
+    benchmark: &str,
+    bloom: bool,
+    puffin: bool,
+    catalog: Option<&str>,
+    hive_location: Option<&str>,
+) -> Vec<String> {
     let rec = Recorder::default();
     let s3 = S3Args {
         access_key: None,
@@ -56,6 +66,7 @@ async fn statements(
             namespace_override: None,
             bloom_filter: bloom,
             puffin_stats: puffin,
+            hive_location,
         },
     )
     .await
@@ -100,6 +111,26 @@ async fn tpch_bloom_and_puffin_share_one_tblproperties_before_partitioned_by() {
         find(&stmts, "main.tpch_sf1.region"),
         "CREATE TABLE main.tpch_sf1.region \
          TBLPROPERTIES ('write.parquet.bloom-filter-columns' = 'r_regionkey', 'write.puffin.stats' = 'true') \
+         AS SELECT * FROM read_parquet('data/tpch/sf1/region/*.parquet', region => 'us-east-1')"
+    );
+}
+
+#[tokio::test]
+async fn hive_load_is_a_located_parquet_ctas_sorted_not_partitioned() {
+    // Bloom/puffin are Iceberg writer levers and must not leak into a Hive
+    // CTAS; the Iceberg month() partition becomes a sort on the same key.
+    let stmts = statements_with("tpch", true, true, Some("hive"), Some("s3://wh/_hive_bench/")).await;
+    assert_eq!(
+        find(&stmts, "hive.tpch_sf1.lineitem"),
+        "CREATE TABLE hive.tpch_sf1.lineitem \
+         STORED AS PARQUET LOCATION 's3://wh/_hive_bench/tpch_sf1/lineitem/' \
+         AS SELECT * FROM read_parquet('data/tpch/sf1/lineitem/*.parquet', region => 'us-east-1') \
+         ORDER BY l_shipdate"
+    );
+    assert_eq!(
+        find(&stmts, "hive.tpch_sf1.region"),
+        "CREATE TABLE hive.tpch_sf1.region \
+         STORED AS PARQUET LOCATION 's3://wh/_hive_bench/tpch_sf1/region/' \
          AS SELECT * FROM read_parquet('data/tpch/sf1/region/*.parquet', region => 'us-east-1')"
     );
 }
