@@ -27,6 +27,8 @@ set -euo pipefail
 #   ./scripts/benchmark-test.sh --compare-trino tpch  # compare SQE vs Trino output
 #   ./scripts/benchmark-test.sh --compare-trino       # compare all benchmarks
 #   BENCH_BLOOM_FILTER=1 ./scripts/benchmark-test.sh --compare-trino tpch  # bloom A/B
+#   BENCH_TABLE_FORMAT=hive ./scripts/benchmark-test.sh tpch  # Hive external tables
+#                                                  # (tpch/ssb/tpcds/clickbench only)
 #
 # External data source (skip the generate step, load pre-published parquet
 # straight from an S3 bucket — see benchmark-publish-data.sh):
@@ -135,6 +137,16 @@ BENCH_DATA_SOURCE="${BENCH_DATA_SOURCE:-generate}"
 BENCH_S3_PROFILE="${BENCH_S3_PROFILE:-default}"
 BENCH_S3_ENDPOINT="${BENCH_S3_ENDPOINT:-}"
 BENCH_S3_REGION="${BENCH_S3_REGION:-us-east-1}"
+
+# BENCH_TABLE_FORMAT=hive loads the read-only suites as Hive external tables
+# (Hive CTAS, Parquet, sorted like the Iceberg load but unpartitioned) under
+# a hive_external root on the test stack's RustFS, and queries them through
+# that root. Hive DROP TABLE never deletes data, so each suite's prefix is
+# emptied before its load.
+#   BENCH_TABLE_FORMAT=hive BENCH_SCALE=1 ./scripts/benchmark-test.sh tpch ssb
+BENCH_TABLE_FORMAT="${BENCH_TABLE_FORMAT:-iceberg}"
+BENCH_HIVE_LOCATION="${BENCH_HIVE_LOCATION:-s3://warehouse/_hive_bench}"
+HIVE_ROOT="hive"
 
 ATTACH_READ_ONLY_SUITES=(tpch ssb tpcds clickbench)
 is_attach_read_only() {
@@ -261,8 +273,30 @@ for arg in "$@"; do
     esac
 done
 if [ ${#BENCHMARKS[@]} -eq 0 ]; then
-    BENCHMARKS=("${ALL_BENCHMARKS[@]}")
+    if [ "$BENCH_TABLE_FORMAT" = "hive" ]; then
+        BENCHMARKS=("${ATTACH_READ_ONLY_SUITES[@]}")
+    else
+        BENCHMARKS=("${ALL_BENCHMARKS[@]}")
+    fi
 fi
+case "$BENCH_TABLE_FORMAT" in
+    iceberg) ;;
+    hive)
+        # Hive tables have no row-level writes (tpcc/tpce/bank) and tpcbb
+        # joins against a tpcds copy in the primary catalog.
+        for b in "${BENCHMARKS[@]}"; do
+            if ! is_attach_read_only "$b"; then
+                echo "ERROR: BENCH_TABLE_FORMAT=hive supports ${ATTACH_READ_ONLY_SUITES[*]}, not $b" >&2
+                exit 1
+            fi
+        done
+        if [ -n "$ATTACH_MODE" ] || [ -n "$EXTERNAL_DATA" ] || [ "$BENCH_WAREHOUSE" != "local" ]; then
+            echo "ERROR: BENCH_TABLE_FORMAT=hive runs against the local test stack only" >&2
+            exit 1
+        fi
+        ;;
+    *) echo "ERROR: BENCH_TABLE_FORMAT must be iceberg or hive, not '$BENCH_TABLE_FORMAT'" >&2; exit 1 ;;
+esac
 
 # Select port based on protocol
 if [ "$BENCH_PROTOCOL" = "trino" ]; then
@@ -277,12 +311,13 @@ cd "$ROOT_DIR"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  Building sqe-bench (profile: $PROFILE)..."
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+# sqe-server is its own crate (crates/sqe-server), not a sqe-coordinator bin.
 if [ "$PROFILE" = "release" ]; then
-    cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-server --release 2>&1
+    cargo build -p sqe-bench -p sqe-server --bin sqe-bench --bin sqe-server --release 2>&1
 elif [ "$PROFILE" = "dev-release" ]; then
-    cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-server --profile dev-release 2>&1
+    cargo build -p sqe-bench -p sqe-server --bin sqe-bench --bin sqe-server --profile dev-release 2>&1
 else
-    cargo build -p sqe-bench -p sqe-coordinator --bin sqe-bench --bin sqe-server 2>&1
+    cargo build -p sqe-bench -p sqe-server --bin sqe-bench --bin sqe-server 2>&1
 fi
 BENCH_BIN="$ROOT_DIR/target/$PROFILE/sqe-bench"
 SQE_BIN="$ROOT_DIR/target/$PROFILE/sqe-server"
@@ -399,6 +434,32 @@ PYEOF
     if [ "$BENCH_WAREHOUSE" = "external" ]; then
         echo "External warehouse: $BENCH_WAREHOUSE_LOCATION via $BENCH_S3_ENDPOINT"
     fi
+fi
+
+# Hive table format: the same suites, loaded as Hive external tables (Hive
+# CTAS, Parquet) under one root instead of Iceberg, queried with
+# `--catalog $HIVE_ROOT`. Reports are written as <suite>-hive-sf<N>-...,
+# so they never count as an Iceberg baseline.
+if [ "$BENCH_TABLE_FORMAT" = "hive" ]; then
+    SQE_CONFIG_HIVE="/tmp/sqe-bench-hive-config-$$.toml"
+    touch "$SQE_CONFIG_HIVE" && chmod 600 "$SQE_CONFIG_HIVE"
+    # Hive reads and writes use the engine's storage credentials, which
+    # `[storage.tvf] allowed_object_store_prefixes` limits; the key has to
+    # land inside that existing table, not in a new one appended at the end.
+    python3 - "$SQE_CONFIG" "$SQE_CONFIG_HIVE" "$BENCH_HIVE_LOCATION/" <<'PYEOF'
+import sys
+src, dst, prefix = sys.argv[1:]
+text = open(src).read()
+anchor = "[storage.tvf]\n"
+assert anchor in text, f"{src} has no [storage.tvf] section"
+assert "allowed_object_store_prefixes" not in text, f"{src} already sets allowed_object_store_prefixes"
+text = text.replace(anchor, f'{anchor}allowed_object_store_prefixes = ["{prefix}"]\n', 1)
+open(dst, "w").write(text)
+PYEOF
+    printf '\n[[hive.roots]]\nname = "%s"\nlocation = "%s/"\n' \
+        "$HIVE_ROOT" "$BENCH_HIVE_LOCATION" >> "$SQE_CONFIG_HIVE"
+    SQE_CONFIG="$SQE_CONFIG_HIVE"
+    echo "Hive table format: root '$HIVE_ROOT' at $BENCH_HIVE_LOCATION/"
 fi
 
 # Fail fast if any coordinator port is already bound. A stale coordinator
@@ -604,7 +665,7 @@ cleanup() {
     if [ -n "$TRINO_CONTAINER" ]; then
         docker stop trino-bench 2>/dev/null || true
     fi
-    rm -f "${SQE_CONFIG_EXT:-}"
+    rm -f "${SQE_CONFIG_EXT:-}" "${SQE_CONFIG_HIVE:-}"
     # Don't tear down docker -- leave it for subsequent runs
     echo "Done."
 }
@@ -635,6 +696,21 @@ SUMMARIES=()
 
 # Track whether TPC-DS tables have been loaded (needed by TPC-BB)
 TPCDS_LOADED=""
+
+# Hive table format: Hive DROP TABLE removes the manifest, never the data,
+# so a reload into a non-empty LOCATION would read old and new files as one
+# table. Empty the dedicated prefix once, before any suite loads into it.
+HIVE_LOAD_ARGS=()
+HIVE_TEST_ARGS=()
+if [ "$BENCH_TABLE_FORMAT" = "hive" ]; then
+    echo ""
+    echo "  Hive: clearing $BENCH_HIVE_LOCATION/ on the test stack"
+    AWS_ACCESS_KEY_ID="s3admin" AWS_SECRET_ACCESS_KEY="s3admin" \
+        aws --endpoint-url "http://localhost:19000" --region us-east-1 \
+        s3 rm "$BENCH_HIVE_LOCATION/" --recursive --only-show-errors
+    HIVE_LOAD_ARGS=(--catalog "$HIVE_ROOT" --hive-location "$BENCH_HIVE_LOCATION")
+    HIVE_TEST_ARGS=(--catalog "$HIVE_ROOT" --result-label hive)
+fi
 
 for BENCH in "${BENCHMARKS[@]}"; do
     echo ""
@@ -836,6 +912,7 @@ for BENCH in "${BENCHMARKS[@]}"; do
             --s3-region "$DATA_S3_REGION" \
             ${BLOOM_ARGS[@]+"${BLOOM_ARGS[@]}"} \
             ${PUFFIN_ARGS[@]+"${PUFFIN_ARGS[@]}"} \
+            ${HIVE_LOAD_ARGS[@]+"${HIVE_LOAD_ARGS[@]}"} \
             --clean 2>&1; then
             LOAD_OK=1
             break
@@ -879,7 +956,8 @@ for BENCH in "${BENCHMARKS[@]}"; do
         --port "$BENCH_PORT" \
         --username "$SQE_USERNAME" \
         --password "$SQE_PASSWORD" \
-        ${CATALOG_ARGS[@]+"${CATALOG_ARGS[@]}"} 2>&1 | tee "$TEST_LOG" || true
+        ${CATALOG_ARGS[@]+"${CATALOG_ARGS[@]}"} \
+        ${HIVE_TEST_ARGS[@]+"${HIVE_TEST_ARGS[@]}"} 2>&1 | tee "$TEST_LOG" || true
 
     # Parse the BENCH_SUMMARY line: name:pass:fail:diff:skip:error:total:ms
     SUMMARY_LINE=$(grep "^BENCH_SUMMARY:" "$TEST_LOG" | tail -1)
