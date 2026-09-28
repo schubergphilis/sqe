@@ -1045,6 +1045,53 @@ impl QueryHandler {
         Box::pin(self.execute_inner(session, sql, client_ip))
     }
 
+    /// Write the audit record for a statement that failed before its normal
+    /// audit point (parse, catalog preflight, planning, access denied at
+    /// planning). Every admitted statement leaves exactly one audit line,
+    /// whatever stage fails.
+    ///
+    /// Classifies `sql` again to route the record like any other statement
+    /// of that kind (`crate::audit_emitter::emit_failed_statement`); this
+    /// runs on the failure path only. Public for front ends that reject a
+    /// statement before calling the handler (the Trino HTTP front door).
+    pub fn record_failed_statement(
+        &self,
+        session: &Session,
+        sql: &str,
+        start: std::time::Instant,
+        client_ip: Option<String>,
+        query_id: Option<uuid::Uuid>,
+        error: &SqeError,
+    ) {
+        if let Some(ref audit) = self.audit {
+            let kind = classify_user_sql(session, sql).ok();
+            crate::audit_emitter::emit_failed_statement(
+                audit,
+                session,
+                sql,
+                kind.as_ref(),
+                error,
+                start.elapsed(),
+                client_ip,
+                query_id.unwrap_or_else(uuid::Uuid::now_v7),
+            );
+        }
+    }
+
+    /// [`Self::record_failed_statement`], handing the error back for `map_err`.
+    pub(crate) fn audit_failure(
+        &self,
+        session: &Session,
+        sql: &str,
+        start: std::time::Instant,
+        client_ip: Option<String>,
+        query_id: Option<uuid::Uuid>,
+        error: SqeError,
+    ) -> SqeError {
+        self.record_failed_statement(session, sql, start, client_ip, query_id, &error);
+        error
+    }
+
     #[tracing::instrument(
         skip(self, session, sql),
         fields(
@@ -1078,14 +1125,18 @@ impl QueryHandler {
         // Hive PARTITIONED BY -> PARTITION BY; issue #117) then the SQL front
         // door: one parse, Trino-shape fallbacks, AST rewrites, classify
         // (finding 700).
-        let kind = classify_user_sql(session, sql)?;
+        // Failures from here until the execution race below return before
+        // the statement's audit block, so each is audited on its way out.
+        let failed =
+            |e: SqeError| self.audit_failure(session, sql, start, client_ip.clone(), None, e);
+        let kind = classify_user_sql(session, sql).map_err(failed)?;
         let kind_name = kind.name().to_string();
 
         // Issue #408: cap concurrent sorted writes so several CTAS ORDER BY
         // cannot starve ExternalSorterMerge on a greedy pool. Classify from
         // the parsed statement so a window ORDER BY or a VIEW is not a hit.
         // Extra writers are rejected (ResourceExhausted), not queued.
-        let _sorted_write_permit = self.try_acquire_sorted_write(&kind)?;
+        let _sorted_write_permit = self.try_acquire_sorted_write(&kind).map_err(failed)?;
 
         // Pre-flight: when a 3-part identifier names a catalog that the
         // coordinator has not registered, fail fast with a clear error
@@ -1095,7 +1146,9 @@ impl QueryHandler {
         // wrong warehouse and was the original symptom of issue #1.
         // Lazily discovers Polaris warehouses when catalog_discovery = polaris-auto.
         if let Some(stmt) = kind.statement() {
-            self.preflight_resolve_catalogs(stmt, session).await?;
+            self.preflight_resolve_catalogs(stmt, session)
+                .await
+                .map_err(failed)?;
         }
 
         // Review 806: the write branches below (CTAS, INSERT ... SELECT,
@@ -1118,13 +1171,23 @@ impl QueryHandler {
         // rejected parse prepares nothing, silently. A CTAS with
         // `PARTITIONED BY (month(d))` over `read_parquet` then failed in the
         // write handler with "the table function was not prepared" (every
-        // partitioned TPC-H load, 2026-09-27).
+        // partitioned TPC-H load, 2026-09-27). A failure here, building the
+        // context or preparing, is audited on its way out like the others.
         if let Some(stmt) = kind.statement() {
             if sqe_catalog::file_tvf_prepare::mentions_file_function(sql) {
-                let (ctx, _) = self.create_session_context(session).await?;
-                sqe_catalog::file_tvf_prepare::prepare_parsed_statement(&ctx, stmt)
-                    .await
-                    .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
+                async {
+                    let (ctx, _) = self.create_session_context(session).await?;
+                    sqe_catalog::file_tvf_prepare::prepare_parsed_statement(&ctx, stmt)
+                        .await
+                        .map_err(|e| {
+                            SqeError::with_code(
+                                SqeErrorCode::ExecutionFailed,
+                                format!("SQL planning failed: {e}"),
+                            )
+                        })
+                }
+                .await
+                .map_err(failed)?;
             }
         }
 
@@ -3002,7 +3065,13 @@ impl QueryHandler {
         // --- Classify ---------------------------------------------------------
         // See execute() for the pipeline rationale: pre-parse pipeline, then
         // the SQL front door (issue #117, finding 700).
-        let kind = classify_user_sql(session, sql)?;
+        // Failures before `open_stream` return before any audit point, so
+        // each is audited on its way out. `NotImplemented` below is not a
+        // failure: the caller retries through `execute()`, which audits.
+        let start = std::time::Instant::now();
+        let failed =
+            |e: SqeError| self.audit_failure(session, sql, start, client_ip.clone(), query_id, e);
+        let kind = classify_user_sql(session, sql).map_err(failed)?;
         let kind_name = kind.name().to_string();
         if !matches!(kind, StatementKind::Query(_)) {
             return Err(SqeError::NotImplemented(
@@ -3016,11 +3085,12 @@ impl QueryHandler {
         // discovery as execute(). See `preflight_resolve_catalogs` for the
         // rationale.
         if let Some(stmt) = kind.statement() {
-            self.preflight_resolve_catalogs(stmt, session).await?;
+            self.preflight_resolve_catalogs(stmt, session)
+                .await
+                .map_err(failed)?;
         }
 
         // --- Start tracker ----------------------------------------------------
-        let start = std::time::Instant::now();
         let query_id = query_id.unwrap_or_else(uuid::Uuid::now_v7);
         let query_span = tracing::info_span!(
             "sqe.query",
@@ -3153,7 +3223,7 @@ impl QueryHandler {
                         .with_label_values(&[&kind_name])
                         .observe(start.elapsed().as_secs_f64());
                 }
-                Err(e)
+                Err(self.audit_failure(session, sql, start, client_ip, Some(query_id), e))
             }
         }
     }

@@ -1140,6 +1140,17 @@ impl TrinoQueryExecutor for QueryHandlerAdapter {
         Some(self.handler.runtime().memory_pool.clone())
     }
 
+    fn audit_rejected(&self, session: &sqe_core::Session, sql: &str, error: &sqe_core::SqeError) {
+        self.handler.record_failed_statement(
+            session,
+            sql,
+            std::time::Instant::now(),
+            None,
+            None,
+            error,
+        );
+    }
+
     async fn describe_prepared(
         &self,
         session: &sqe_core::Session,
