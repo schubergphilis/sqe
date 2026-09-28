@@ -233,7 +233,7 @@ It replaces:
 - Phone numbers with `[PHONE]`
 - Credit-card-like sequences with `[CARD]`
 - Secret-keyword literals (`TOKEN '...'`, `PASSWORD '...'`, `ACCESS_KEY_ID '...'`,
-  `SECRET_ACCESS_KEY '...'`, `SESSION_TOKEN '...'`, `API_KEY '...'`,
+  `KEY_ID '...'`, `SECRET_ACCESS_KEY '...'`, `SESSION_TOKEN '...'`, `API_KEY '...'`,
   `CLIENT_SECRET '...'`, `BEARER '...'`) with `[REDACTED]`
 
 The secret-literal pass guards against `CREATE SECRET ... TOKEN '<jwt>'` landing
