@@ -108,7 +108,7 @@ default:
 # do not merge the release MR until it has.
 include:
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.12.5'
+    ref: 'v0.12.6'
     file: '/ci/templates/guardrails.yml'
   - project: 'vpf-data-ai/aikido'
     ref: 'v0.12.5'
