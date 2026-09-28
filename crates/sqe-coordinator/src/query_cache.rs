@@ -23,6 +23,19 @@ pub struct CachedResult {
     /// follow-up). A hit is served only while the enforcer reports the same
     /// fingerprint; `None` entries come from a passthrough deployment.
     pub policy_fingerprint: Option<String>,
+    /// What the audit record of the run that produced this result carried,
+    /// so a hit is audited with the same resources and policy block.
+    pub audit: CachedAudit,
+}
+
+/// The audit inputs a cache hit cannot re-derive: it never plans, so it has
+/// no plan to take resources from and no policy evaluation to summarise. The
+/// policy summary still holds on a hit, because a hit is served only under the
+/// same policy fingerprint it was produced under.
+#[derive(Debug, Clone, Default)]
+pub struct CachedAudit {
+    pub resources: Vec<sqe_metrics::audit::Resource>,
+    pub policy_summary: Option<sqe_policy::PolicySummary>,
 }
 
 pub struct ResultCache {
@@ -219,11 +232,20 @@ impl ResultCache {
         batches: Vec<RecordBatch>,
         tables_touched: Vec<String>,
     ) {
-        self.store_bound(user, sql, None, query_id, batches, tables_touched);
+        self.store_bound(
+            user,
+            sql,
+            None,
+            query_id,
+            batches,
+            tables_touched,
+            CachedAudit::default(),
+        );
     }
 
     /// Store a query result together with the policy fingerprint it was
-    /// produced under (finding 902 follow-up).
+    /// produced under (finding 902 follow-up) and its audit inputs.
+    #[allow(clippy::too_many_arguments)]
     pub fn store_bound(
         &self,
         user: &str,
@@ -232,6 +254,7 @@ impl ResultCache {
         query_id: Uuid,
         batches: Vec<RecordBatch>,
         tables_touched: Vec<String>,
+        audit: CachedAudit,
     ) {
         if Self::should_bypass(sql) {
             return;
@@ -257,6 +280,7 @@ impl ResultCache {
             created: Utc::now(),
             size_bytes,
             policy_fingerprint,
+            audit,
         });
 
         self.cache.insert(key.clone(), entry);
@@ -802,6 +826,7 @@ mod policy_fingerprint_tests {
             Uuid::now_v7(),
             vec![batch()],
             vec!["ns.t".to_string()],
+            CachedAudit::default(),
         );
         assert!(hit(&cache, Some("ranger:7")).await);
         assert!(
