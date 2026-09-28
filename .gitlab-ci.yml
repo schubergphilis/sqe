@@ -170,6 +170,16 @@ variables:
   # first tag pipeline fails here, the image is already pushed, only the
   # signature is missing.
   AIKIDO_SIGN: "1"
+  # Dependency reputation gate (aikido-reputation, `reputation = true` in
+  # .asset). The "new release" window defaults to 21 days; on pipeline 1638137
+  # it flagged 99 of 146 warnings as nothing but routine releases (aws-sdk-*,
+  # clap, cc), which buried the scorecard and staleness findings; at 7 days, 70
+  # of those 99 drop and 29 remain. 7 days still
+  # covers the window in which a hijacked or typo-squatted release is usually
+  # caught. It only affects WARN lines; UNRESOLVED packages block regardless.
+  AIKIDO_REPUTATION_MAX_AGE_DAYS: "7"
+  # Scan every dependency: the default cap of 600 left 106 of 706 unchecked.
+  AIKIDO_REPUTATION_MAX: "800"
 
 # ── Binaries for the image, compiled by cargo in the test stage ──────
 # The image used to be compiled inside kaniko in .post, after the tests: a
