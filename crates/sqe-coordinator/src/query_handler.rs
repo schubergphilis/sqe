@@ -1350,6 +1350,38 @@ impl QueryHandler {
                             });
                         }
                     }
+                    // A hit is a successful read and gets the one record every
+                    // statement gets. It used to return before the audit block,
+                    // so the second of two identical SELECTs left no line. Same
+                    // builder as a normal success (routing and redaction are
+                    // unchanged); resources and policy come from the run that
+                    // filled the entry. There is no cache-hit field in the
+                    // schema: a hit shows as zero execution and scan work.
+                    if let Some(ref audit) = self.audit {
+                        crate::audit_emitter::emit_statement_audit(
+                            audit,
+                            crate::audit_emitter::StatementAudit {
+                                session,
+                                sql,
+                                kind: &kind,
+                                kind_name: kind_name.clone(),
+                                error: None,
+                                status: "success",
+                                duration: start.elapsed(),
+                                execution_ms: 0,
+                                rows,
+                                rows_written: None,
+                                plan_metrics: &PlanMetrics::default(),
+                                policy_summary: cached.audit.policy_summary.clone(),
+                                resources: cached.audit.resources.clone(),
+                                tables_touched: cached.tables_touched.clone(),
+                                grant_resources: Vec::new(),
+                                client_ip: client_ip.clone(),
+                                trace_id: trace_id.clone(),
+                                query_id,
+                            },
+                        );
+                    }
                     return Ok(cached.batches.clone());
                 }
             }
@@ -2601,6 +2633,40 @@ impl QueryHandler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+
+        // Resolve resources from the plan using structured TableReferences so
+        // audit entries carry fully-qualified `catalog.ns.table` names.
+        // `session.default_catalog` fills missing catalog components for Bare
+        // and Partial references; when absent, `config.query.default_catalog`
+        // is the fallback. Resolved here, before the result cache store, so a
+        // later cache hit is audited with the same resources.
+        //
+        // NOTE: the streaming path (execute_stream, ~line 1777) still uses
+        // `sqe_lineage::extract::extract_table_names` for the tracker/cache
+        // path. Upgrading that site is a follow-on task (its `tables_touched`
+        // feeds query_cache invalidation, so a format change there needs a
+        // separate review).
+        // `effective_catalog_buf` owns the resolved catalog string when the
+        // session does not carry an explicit default. The borrow `default_catalog`
+        // points into either the session string or this buffer; keeping them
+        // separate makes the lifetime explicit rather than hiding it behind an
+        // underscore-prefixed "unused" variable.
+        let effective_catalog_buf: Option<String> = if session.default_catalog.is_none() {
+            Some(self.config.resolve_default_catalog())
+        } else {
+            None
+        };
+        let default_catalog: Option<&str> = session
+            .default_catalog
+            .as_deref()
+            .or(effective_catalog_buf.as_deref());
+        let audit_resources: Vec<sqe_metrics::audit::Resource> = match captured_plan.as_ref() {
+            Some(sqe_lineage::PlanOrHint::Plan(p)) => {
+                crate::audit_resources::resources_from_plan(p.as_ref(), default_catalog)
+            }
+            _ => Vec::new(),
+        };
+        let tables_touched: Vec<String> = audit_resources.iter().map(|r| r.fqn()).collect();
         if result.is_ok() {
             self.query_tracker.complete(
                 &query_id,
@@ -2626,6 +2692,10 @@ impl QueryHandler {
                             query_id,
                             batches.clone(),
                             tt_for_complete.clone(),
+                            crate::query_cache::CachedAudit {
+                                resources: audit_resources.clone(),
+                                policy_summary: policy_summary.clone(),
+                            },
                         );
                     }
                 }
@@ -2732,39 +2802,6 @@ impl QueryHandler {
         // query completion. Streamed queries log via the StreamFinalizer;
         // this covers the batch path's success and error outcomes.
         crate::memory::observe_query_end(&self.runtime.memory_pool, &query_id);
-
-        // Resolve resources from the plan using structured TableReferences so
-        // audit entries carry fully-qualified `catalog.ns.table` names.
-        // `session.default_catalog` fills missing catalog components for Bare
-        // and Partial references; when absent, `config.query.default_catalog`
-        // is the fallback.
-        //
-        // NOTE: the streaming path (execute_stream, ~line 1777) still uses
-        // `sqe_lineage::extract::extract_table_names` for the tracker/cache
-        // path. Upgrading that site is a follow-on task (its `tables_touched`
-        // feeds query_cache invalidation, so a format change there needs a
-        // separate review).
-        // `effective_catalog_buf` owns the resolved catalog string when the
-        // session does not carry an explicit default. The borrow `default_catalog`
-        // points into either the session string or this buffer; keeping them
-        // separate makes the lifetime explicit rather than hiding it behind an
-        // underscore-prefixed "unused" variable.
-        let effective_catalog_buf: Option<String> = if session.default_catalog.is_none() {
-            Some(self.config.resolve_default_catalog())
-        } else {
-            None
-        };
-        let default_catalog: Option<&str> = session
-            .default_catalog
-            .as_deref()
-            .or(effective_catalog_buf.as_deref());
-        let audit_resources: Vec<sqe_metrics::audit::Resource> = match captured_plan.as_ref() {
-            Some(sqe_lineage::PlanOrHint::Plan(p)) => {
-                crate::audit_resources::resources_from_plan(p.as_ref(), default_catalog)
-            }
-            _ => Vec::new(),
-        };
-        let tables_touched: Vec<String> = audit_resources.iter().map(|r| r.fqn()).collect();
 
         if ol_emit {
             if let Some(ref obs) = self.lineage {

@@ -87,6 +87,11 @@ fn parse_lines(bytes: &[u8]) -> Vec<Value> {
 /// A handler over a mock REST catalog with no namespaces, writing audit in
 /// `format = "both"`.
 async fn fixture(enforcer: Arc<dyn PolicyEnforcer>) -> Fixture {
+    fixture_with(enforcer, false).await
+}
+
+/// [`fixture`] with the result cache on when `cache` is true.
+async fn fixture_with(enforcer: Arc<dyn PolicyEnforcer>, cache: bool) -> Fixture {
     let server = crate::common::mock_server().await;
     Mock::given(method("GET"))
         .and(path("/v1/config"))
@@ -112,6 +117,12 @@ async fn fixture(enforcer: Arc<dyn PolicyEnforcer>) -> Fixture {
         server.uri()
     );
     let config: SqeConfig = toml::from_str(&toml).expect("config");
+    let query_cache = cache.then(|| {
+        Arc::new(sqe_coordinator::query_cache::ResultCache::new(
+            &config.query_cache,
+            None,
+        ))
+    });
     let handler = QueryHandler::new(
         enforcer,
         None,
@@ -121,7 +132,7 @@ async fn fixture(enforcer: Arc<dyn PolicyEnforcer>) -> Fixture {
         None,
         Some(audit.clone()),
         Arc::new(QueryTracker::new(&config.query_history)),
-        None,
+        query_cache,
         None,
         None,
         RuntimeCatalogRegistry::new(),
@@ -307,4 +318,106 @@ async fn missing_table_flight_get_flight_info_is_audited() {
     // The JWT request also writes its `auth` record; both share one chain.
     assert_eq!(native.len(), 2, "{native:?}");
     assert_one_failed_statement(&native, &ocsf, sql, "query");
+}
+
+/// `n` successful `query` records carrying `sql`, in both files, each OCSF
+/// line the same chained record as its native one. Returns the native ones.
+fn assert_successful_statements(
+    native: &[Value],
+    ocsf: &[Value],
+    sql: &str,
+    n: usize,
+) -> Vec<Value> {
+    let statements: Vec<Value> = native
+        .iter()
+        .filter(|l| l["query"]["text"].as_str() == Some(sql))
+        .cloned()
+        .collect();
+    assert_eq!(
+        statements.len(),
+        n,
+        "native statement records:\n{}",
+        serde_json::to_string_pretty(&native).unwrap_or_default()
+    );
+    let ocsf_statements: Vec<&Value> = ocsf
+        .iter()
+        .filter(|l| l["unmapped"]["query_text"].as_str() == Some(sql))
+        .collect();
+    assert_eq!(ocsf_statements.len(), n, "OCSF statement records: {ocsf:?}");
+    for (s, o) in statements.iter().zip(&ocsf_statements) {
+        assert_eq!(s["kind"], "query", "{s}");
+        assert_eq!(s["status"], "success", "{s}");
+        assert_eq!(s["stats"]["rows_returned"], 1, "{s}");
+        assert!(s["integrity"]["seq"].is_u64(), "chained: {s}");
+        assert_eq!(o["status_id"], 1, "OCSF success: {o}");
+        assert_eq!(
+            o["metadata"]["uid"], s["integrity"]["hash"],
+            "same chained record"
+        );
+    }
+    statements
+}
+
+/// Task: a result-cache hit returned before the audit block, so the second
+/// of two identical SELECTs left no audit line at all.
+#[tokio::test]
+async fn a_result_cache_hit_is_audited_like_the_run_that_filled_it() {
+    let fx = fixture_with(Arc::new(PassthroughEnforcer), true).await;
+    // One session: the cache is scoped per session token.
+    let s = session();
+    let sql = "SELECT 1 AS a";
+    fx.handler
+        .execute(&s, sql, None)
+        .await
+        .expect("first run fills the cache");
+    let cache = fx.handler.query_cache().expect("cache on");
+    assert!(
+        cache
+            .lookup(
+                &sqe_coordinator::query_cache::ResultCache::session_scope(&s),
+                sql
+            )
+            .is_some(),
+        "the first run must be cached, or the second run is not a hit"
+    );
+    fx.handler
+        .execute(&s, sql, None)
+        .await
+        .expect("second run is a cache hit");
+
+    let (native, ocsf) = fx.records();
+    let records = assert_successful_statements(&native, &ocsf, sql, 2);
+    // Same shape as the run that filled the cache: same fields, same
+    // resources and policy block, same statement identity.
+    let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    assert_eq!(keys(&records[0]), keys(&records[1]));
+    for field in ["resources", "policy", "query"] {
+        assert_eq!(records[0][field], records[1][field], "{field}");
+    }
+    assert_ne!(
+        records[0]["query_id"], records[1]["query_id"],
+        "two statements, two ids"
+    );
+}
+
+/// The streaming path (Flight DoGet, Trino HTTP) does not read the result
+/// cache, so the same SELECT twice is two executions and two records with the
+/// cache on. A guard, not a regression test: it passes before and after.
+#[tokio::test]
+async fn a_repeated_streaming_select_with_the_cache_on_is_audited_twice() {
+    use futures::TryStreamExt;
+    let fx = fixture_with(Arc::new(PassthroughEnforcer), true).await;
+    let s = session();
+    let sql = "SELECT 1 AS a";
+    for _ in 0..2 {
+        let (_, stream) = fx
+            .handler
+            .execute_stream(&s, sql, None)
+            .await
+            .expect("stream");
+        let batches: Vec<_> = stream.try_collect().await.expect("drain");
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    }
+    let (native, ocsf) = fx.records();
+    assert_successful_statements(&native, &ocsf, sql, 2);
 }
