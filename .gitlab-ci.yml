@@ -108,16 +108,16 @@ default:
 # do not merge the release MR until it has.
 include:
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.12.3'
+    ref: 'v0.12.4'
     file: '/ci/templates/guardrails.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.12.3'
+    ref: 'v0.12.4'
     file: '/ci/templates/test-rust.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.12.3'
+    ref: 'v0.12.4'
     file: '/ci/templates/deploy.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.12.3'
+    ref: 'v0.12.4'
     file: '/ci/templates/release.yml'
   # GitLab's own Security/Secret-Detection template was included here too. It
   # duplicated aikido-secret-scan (same gitleaks-class scan, a second image

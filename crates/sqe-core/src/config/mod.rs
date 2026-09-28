@@ -525,7 +525,7 @@ pub struct QueryConfig {
     /// bounded fanout writer). When a batch arrives for a new partition and
     /// the map is full, the least-recently-written writer is closed and
     /// flushed first, then the new one opens. Default 0 = auto (derived from
-    /// the pool size, floored at 8 and capped at 64). Small deployments with
+    /// the pool size, floored at 8 and capped at 1024). Small deployments with
     /// few partitions never reach it. Cutover trades bounded memory for
     /// small-file debt, repaired by `system.rewrite_data_files`.
     #[serde(default)]

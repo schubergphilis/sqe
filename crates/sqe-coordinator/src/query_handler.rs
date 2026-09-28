@@ -1165,15 +1165,30 @@ impl QueryHandler {
         // idempotent. Gated on the statement text naming a file function so
         // a statement that cannot need it never builds a session context
         // it would not otherwise have built.
-        if kind.statement().is_some()
-            && sqe_catalog::file_tvf_prepare::mentions_file_function(sql)
-        {
-            async {
-                let (ctx, _) = self.create_session_context(session).await?;
-                prepare_file_tvfs(&ctx, sql).await
+        //
+        // Prepared from the front door's own parse, not by re-parsing `sql`:
+        // `GenericDialect` rejects syntax the front door accepts, and a
+        // rejected parse prepares nothing, silently. A CTAS with
+        // `PARTITIONED BY (month(d))` over `read_parquet` then failed in the
+        // write handler with "the table function was not prepared" (every
+        // partitioned TPC-H load, 2026-09-27). A failure here, building the
+        // context or preparing, is audited on its way out like the others.
+        if let Some(stmt) = kind.statement() {
+            if sqe_catalog::file_tvf_prepare::mentions_file_function(sql) {
+                async {
+                    let (ctx, _) = self.create_session_context(session).await?;
+                    sqe_catalog::file_tvf_prepare::prepare_parsed_statement(&ctx, stmt)
+                        .await
+                        .map_err(|e| {
+                            SqeError::with_code(
+                                SqeErrorCode::ExecutionFailed,
+                                format!("SQL planning failed: {e}"),
+                            )
+                        })
+                }
+                .await
+                .map_err(failed)?;
             }
-            .await
-            .map_err(failed)?;
         }
 
         let span = Span::current();
@@ -1942,7 +1957,14 @@ impl QueryHandler {
                                     "CREATE TABLE AS SELECT",
                                 )
                                 .await?;
+                            // A fresh context: the manifest step above
+                            // invalidated the session cache, so the file
+                            // functions prepared on the old one are gone.
+                            // Without this a Hive CTAS from read_parquet
+                            // failed with "the table function was not
+                            // prepared before planning".
                             let (load_ctx, _) = self.create_session_context(session).await?;
+                            prepare_file_tvfs(&load_ctx, &select_sql).await?;
                             let written = crate::hive_write::handle_insert(
                                 &load_ctx,
                                 &load_stmt,
