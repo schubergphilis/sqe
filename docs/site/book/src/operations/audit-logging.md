@@ -258,16 +258,60 @@ OCSF spool and OCSF file.
 | GRANT / REVOKE | OCSF file + native sink | Canonical `AuditEvent` |
 | Authentication events | OCSF file + native sink | Canonical `AuditEvent` |
 | Session lifecycle events | OCSF file + native sink | Canonical `AuditEvent` |
-| Secret-bearing statements (CREATE SECRET, DROP SECRET, SHOW SECRETS, ATTACH, DETACH) | Native sink only | Legacy flat `AuditEntry` (redacted path; credentials never reach canonical form) |
+| Secret-bearing statements (CREATE SECRET, DROP SECRET, SHOW SECRETS, ATTACH, DETACH) | Native sink + OCSF file + export spool | Legacy flat `AuditEntry` in the native file; the same record as OCSF class 6005 |
+| Result-cache hits (buffered path, `[query_cache] enabled`) | OCSF file + native sink | Same success record as the run that filled the entry |
+| Statements that fail at parse or planning (Flight SQL, Trino HTTP, streaming and buffered) | OCSF file + native sink | Failed `query` record (`status_id` 2); `statement_type` `unknown` when the SQL does not parse |
 
-Secret-bearing statements stay on the redacted legacy path. Routing them through the
-canonical path would risk writing credential literals to the OCSF file before
-redaction applies. The legacy path runs redaction inline, so bearer tokens and
-catalog credentials embedded in SQL text are stripped before any byte is written.
+Secret-bearing statements keep the redacted legacy path. The entry is redacted
+once, before it is queued, so bearer tokens and catalog credentials embedded in the
+SQL are stripped before any byte is written. The OCSF line is built from that
+already-redacted entry, never from the raw SQL, and carries the native record's hash
+as `metadata.uid`. Its text is byte-for-byte the text in `audit.jsonl`, so an
+OCSF-only SIEM sees these statements without seeing anything the native file hides.
 
 The legacy `AuditEntry` format is flat JSON. It carries username, statement type,
 duration, status, and `tables_touched` (unqualified table names), but not structured
-resources, actor email, groups, or policy decision fields.
+resources, actor email, groups, or policy decision fields. The OCSF form of a legacy
+entry has the same gaps: no resources, no query id, no trace id.
+
+A result-cache hit never plans, so its record takes resources and the policy block
+from the run that filled the entry. The policy block still applies: a hit is served
+only under the policy fingerprint it was produced under. The schema has no cache-hit
+field. A hit is a successful `query` record with `timing.execution_ms`,
+`stats.bytes_scanned` and `stats.rows_scanned` all 0.
+
+Hits are rare in this release. The cache is read only on the buffered path, and a
+cache entry belongs to one session. Flight SQL, Trino HTTP and Quack stream their
+SELECTs and never read the cache. MCP runs SELECTs buffered but opens a session per
+call. Every hit is audited all the same.
+
+### Deliberately not audited
+
+Three paths write no audit record. Each is a decision, not an oversight.
+
+**Statements over `query.max_sql_bytes`.** The size cap rejects the text before it
+is parsed, and the client gets `InvalidArguments`. No record is written today. The
+text is attacker-sized and unparsed, so it must never be logged. The decided shape
+for a later release is a failed `query` record carrying `query_hash` only, with no
+text. Until then, an operator who needs these attempts counted should alert on the
+client-facing error rate.
+
+**Admission rejections under overload.** Memory-pressure rejections, and the
+per-user and global concurrency limits (`max_concurrent_per_user`,
+`max_concurrent_queries`), write no audit record by design. They fire exactly when
+the coordinator is saturated. A record per rejection would add audit I/O to an
+overload, and with a fail-closed audit log a full queue would turn that overload into
+an outage for every caller. Memory-pressure rejections log a `WARN` line with the
+user name. The concurrency limits log nothing and have no metric yet; a counter by
+rejection reason is the planned signal, not a per-event record.
+
+**Trino session-control statements answered by the protocol layer.** `PREPARE`,
+`DEALLOCATE PREPARE`, `SET SESSION`, `RESET SESSION` and `SET CATALOG` never reach
+the engine. They change client-held session state in response headers and read or
+change no data, grants or catalog objects. The statements that use that state are
+audited when they run: `EXECUTE` hands its bound text to the executor, and the
+record carries that text. `USE` is not in this list: it goes to the executor and is
+audited like any other statement.
 
 ## Exporting to a SIEM (OTLP)
 
