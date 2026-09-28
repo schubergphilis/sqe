@@ -251,6 +251,14 @@ pub enum Command {
         /// translate `BENCH_PUFFIN_STATS=1` into this flag.)
         #[arg(long, default_value_t = false)]
         puffin_stats: bool,
+
+        /// Load as Hive external tables instead of Iceberg: each table is a
+        /// Hive CTAS (`STORED AS PARQUET LOCATION '<this>/<ns>/<table>/'`)
+        /// under the Hive root named by `--catalog`. The prefix must be
+        /// empty: Hive `DROP TABLE` never deletes data, so the caller clears
+        /// it (scripts/benchmark-test.sh with BENCH_TABLE_FORMAT=hive).
+        #[arg(long)]
+        hive_location: Option<String>,
     },
 
     /// Run benchmark queries and report timing
@@ -313,6 +321,12 @@ pub enum Command {
         /// names with the namespace otherwise; `always` / `never` force it.
         #[arg(long, value_enum, default_value_t = QualifyTables::Auto)]
         qualify_tables: QualifyTables,
+
+        /// Suffix for the suite name in the report: `hive` writes
+        /// `tpch-hive-sf1-flight-*.json`, so a Hive run never counts as an
+        /// Iceberg baseline for the same suite and scale.
+        #[arg(long)]
+        result_label: Option<String>,
     },
 
     /// Run one or more benchmark suites against a running coordinator using a
@@ -631,6 +645,7 @@ pub async fn run() -> anyhow::Result<()> {
             namespace,
             bloom_filter,
             puffin_stats,
+            hive_location,
             ..
         } => {
             let protocol_str = protocol.as_str();
@@ -671,6 +686,7 @@ pub async fn run() -> anyhow::Result<()> {
                     namespace_override: namespace.as_deref(),
                     bloom_filter,
                     puffin_stats,
+                    hive_location: hive_location.as_deref(),
                 },
             )
             .await
@@ -747,6 +763,7 @@ pub async fn run() -> anyhow::Result<()> {
             catalog,
             namespace,
             qualify_tables,
+            result_label,
         } => {
             let protocol_str = protocol.as_str();
             let endpoint = format!("http://{host}:{port}");
@@ -785,9 +802,14 @@ pub async fn run() -> anyhow::Result<()> {
             .await?
             .results;
 
-            report::print_summary(&benchmark, scale, protocol_str, &results);
+            let report_name = match result_label.as_deref() {
+                Some(label) => format!("{benchmark}-{label}"),
+                None => benchmark.clone(),
+            };
+            report::print_summary(&report_name, scale, protocol_str, &results);
 
-            let report_path = report::write_json_report(&benchmark, scale, protocol_str, &results)?;
+            let report_path =
+                report::write_json_report(&report_name, scale, protocol_str, &results)?;
             println!("\nReport written to: {report_path}");
 
             Ok(())
