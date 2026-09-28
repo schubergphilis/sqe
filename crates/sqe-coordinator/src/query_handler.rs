@@ -1862,7 +1862,14 @@ impl QueryHandler {
                                     "CREATE TABLE AS SELECT",
                                 )
                                 .await?;
+                            // A fresh context: the manifest step above
+                            // invalidated the session cache, so the file
+                            // functions prepared on the old one are gone.
+                            // Without this a Hive CTAS from read_parquet
+                            // failed with "the table function was not
+                            // prepared before planning".
                             let (load_ctx, _) = self.create_session_context(session).await?;
+                            prepare_file_tvfs(&load_ctx, &select_sql).await?;
                             let written = crate::hive_write::handle_insert(
                                 &load_ctx,
                                 &load_stmt,

@@ -284,6 +284,19 @@ mod tests {
     }
 
     #[test]
+    fn a_decimal_column_records_a_hive_decimal_that_reads_back_the_same() {
+        // A TPC-H load (s_acctbal DECIMAL(15,2)) used to fail its Hive CTAS
+        // with "has no Hive equivalent this release records".
+        for dt in [DataType::Decimal128(15, 2), DataType::Decimal128(38, 0)] {
+            let name = hive_type_of(&dt).expect("decimal maps");
+            let back = sqe_catalog::hive::serde_map::arrow_type(&name).expect("reader parses");
+            assert_eq!(back, dt, "{name} must read back as {dt}");
+        }
+        assert_eq!(hive_type_of(&DataType::Decimal128(10, -2)), None, "Hive has no negative scale");
+        assert_eq!(hive_type_of(&DataType::Decimal256(40, 2)), None, "beyond Hive's 38 digits");
+    }
+
+    #[test]
     fn a_plain_insert_is_allowed() {
         assert!(reject_overwrite(&parse("INSERT INTO t SELECT 1")).is_ok());
     }
@@ -322,7 +335,13 @@ mod tests {
 /// unmappable fails at CREATE, naming the column, rather than writing a
 /// manifest the read path cannot parse. That is the difference between an error
 /// and a table nobody can select from.
-fn hive_type_of(dt: &DataType) -> Option<&'static str> {
+fn hive_type_of(dt: &DataType) -> Option<String> {
+    // `decimal(p,s)`: Hive's precision limit is 38, the same as Decimal128's,
+    // and the reader (`serde_map::arrow_type`) parses it back to the same
+    // Decimal128. Hive has no negative scale; Decimal256 can exceed 38 digits.
+    if let DataType::Decimal128(p, s) = dt {
+        return (*s >= 0).then(|| format!("decimal({p},{s})"));
+    }
     Some(match dt {
         DataType::Int8 => "tinyint",
         DataType::Int16 => "smallint",
@@ -336,7 +355,8 @@ fn hive_type_of(dt: &DataType) -> Option<&'static str> {
         DataType::Date32 => "date",
         DataType::Timestamp(_, None) => "timestamp",
         _ => return None,
-    })
+    }
+    .to_string())
 }
 
 /// The partition key names a `PARTITIONED BY` clause declares, with the type
@@ -481,8 +501,7 @@ pub fn ctas_spec(
                         field.name(),
                         field.data_type()
                     ))
-                })?
-                .to_string(),
+                })?,
         };
         Ok(HiveColumn {
             name: field.name().clone(),
