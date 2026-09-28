@@ -140,7 +140,7 @@ Supported DML, both V2 and V3 verified:
 - **MERGE INTO**: full WHEN MATCHED / WHEN NOT MATCHED semantics, dispatching to CoW or MoR based on the table's `write.merge.mode` (default copy-on-write).
 - **ALTER TABLE**: `ADD/DROP/RENAME COLUMN`, `SET/DROP NOT NULL`, type promotion, `ADD/DROP/REPLACE PARTITION FIELD` (partition evolution), `CREATE/DROP BRANCH/TAG`, `SET WRITE BRANCH`.
 
-DELETE reads `write.delete.mode`, UPDATE reads `write.update.mode`, and MERGE reads `write.merge.mode`. Each defaults to copy-on-write. CTAS and INSERT stream RecordBatches straight to Parquet at constant memory. Partitioned writes use an unbounded writer by default. Set `fanout_max_open_writers` or `fanout_buffer_budget` to opt into a bounded fanout writer that caps the number of open per-partition writers and flushes the least-recently-written one when a limit is hit.
+DELETE reads `write.delete.mode`, UPDATE reads `write.update.mode`, and MERGE reads `write.merge.mode`. Each defaults to copy-on-write. CTAS and INSERT stream RecordBatches straight to Parquet at constant memory. Partitioned writes use a bounded fanout writer by default. It caps the number of open per-partition writers and the buffered bytes, both derived from the memory pool unless `fanout_max_open_writers` or `fanout_buffer_budget` is set, and flushes the least-recently-written writer when a limit is hit.
 
 The writer respects `write.parquet.bloom-filter-columns` and `write.parquet.bloom-filter-fpp` for any column the schema knows about. The footer-inspection test in `crates/sqe-catalog/src/parquet_writer_config.rs` proves bloom offsets land in the resulting Parquet file.
 
