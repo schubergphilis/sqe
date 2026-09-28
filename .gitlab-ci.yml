@@ -108,16 +108,16 @@ default:
 # do not merge the release MR until it has.
 include:
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.12.3'
+    ref: 'v0.12.6'
     file: '/ci/templates/guardrails.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.12.3'
+    ref: 'v0.12.5'
     file: '/ci/templates/test-rust.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.12.3'
+    ref: 'v0.12.5'
     file: '/ci/templates/deploy.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.12.3'
+    ref: 'v0.12.5'
     file: '/ci/templates/release.yml'
   # GitLab's own Security/Secret-Detection template was included here too. It
   # duplicated aikido-secret-scan (same gitleaks-class scan, a second image
@@ -677,7 +677,7 @@ aikido-sbom:
 # platform's build env. The template's other step, an apt fallback for
 # clang/mold/protoc, is dropped: the image carries them.
 aikido-test-rust:
-  image: "$CI_REGISTRY_IMAGE/ci-deps:mr-1189"
+  image: "$CI_REGISTRY_IMAGE/ci-deps:main"
   variables:
     CARGO_TARGET_DIR: "/opt/sqe-deps/target"
   cache: []
@@ -686,7 +686,7 @@ aikido-test-rust:
     - !reference [.aikido_rust_build_env, before_script]
 
 aikido-rust-extra:
-  image: "$CI_REGISTRY_IMAGE/ci-deps:mr-1189"
+  image: "$CI_REGISTRY_IMAGE/ci-deps:main"
   variables:
     CARGO_TARGET_DIR: "/opt/sqe-deps/target"
   cache: []

@@ -1,0 +1,149 @@
+{
+  "benchmark": "tpch",
+  "scale_factor": 1.0,
+  "protocol": "flight",
+  "timestamp": "2026-09-27T20:44:02",
+  "summary": {
+    "total": 22,
+    "pass": 22,
+    "fail": 0,
+    "diff": 0,
+    "skip": 0,
+    "error": 0,
+    "total_duration_ms": 14219
+  },
+  "queries": [
+    {
+      "id": "q01",
+      "status": "pass",
+      "duration_ms": 512,
+      "rows": 4
+    },
+    {
+      "id": "q02",
+      "status": "pass",
+      "duration_ms": 231,
+      "rows": 100
+    },
+    {
+      "id": "q03",
+      "status": "pass",
+      "duration_ms": 767,
+      "rows": 10
+    },
+    {
+      "id": "q04",
+      "status": "pass",
+      "duration_ms": 605,
+      "rows": 5
+    },
+    {
+      "id": "q05",
+      "status": "pass",
+      "duration_ms": 731,
+      "rows": 5
+    },
+    {
+      "id": "q06",
+      "status": "pass",
+      "duration_ms": 98,
+      "rows": 1
+    },
+    {
+      "id": "q07",
+      "status": "pass",
+      "duration_ms": 735,
+      "rows": 4
+    },
+    {
+      "id": "q08",
+      "status": "pass",
+      "duration_ms": 1000,
+      "rows": 2
+    },
+    {
+      "id": "q09",
+      "status": "pass",
+      "duration_ms": 1173,
+      "rows": 175
+    },
+    {
+      "id": "q10",
+      "status": "pass",
+      "duration_ms": 679,
+      "rows": 20
+    },
+    {
+      "id": "q11",
+      "status": "pass",
+      "duration_ms": 165,
+      "rows": 760
+    },
+    {
+      "id": "q12",
+      "status": "pass",
+      "duration_ms": 412,
+      "rows": 2
+    },
+    {
+      "id": "q13",
+      "status": "pass",
+      "duration_ms": 369,
+      "rows": 41
+    },
+    {
+      "id": "q14",
+      "status": "pass",
+      "duration_ms": 72,
+      "rows": 1
+    },
+    {
+      "id": "q15",
+      "status": "pass",
+      "duration_ms": 79,
+      "rows": 1
+    },
+    {
+      "id": "q16",
+      "status": "pass",
+      "duration_ms": 98,
+      "rows": 18232
+    },
+    {
+      "id": "q17",
+      "status": "pass",
+      "duration_ms": 1038,
+      "rows": 1
+    },
+    {
+      "id": "q18",
+      "status": "pass",
+      "duration_ms": 1465,
+      "rows": 100
+    },
+    {
+      "id": "q19",
+      "status": "pass",
+      "duration_ms": 1047,
+      "rows": 1
+    },
+    {
+      "id": "q20",
+      "status": "pass",
+      "duration_ms": 174,
+      "rows": 199
+    },
+    {
+      "id": "q21",
+      "status": "pass",
+      "duration_ms": 2370,
+      "rows": 100
+    },
+    {
+      "id": "q22",
+      "status": "pass",
+      "duration_ms": 399,
+      "rows": 7
+    }
+  ]
+}

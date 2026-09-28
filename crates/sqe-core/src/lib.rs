@@ -1,5 +1,3 @@
-// TRIAL (ci/rust-jobs-on-deps-image): makes the MR pipeline run the Rust
-// jobs; removed again before merge.
 pub mod circuit_breaker;
 pub mod config;
 pub mod error;

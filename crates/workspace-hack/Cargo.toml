@@ -25,7 +25,7 @@ arrow-array = { version = "59", default-features = false, features = ["chrono-tz
 arrow-cast = { version = "59", default-features = false, features = ["prettyprint"] }
 arrow-ipc = { version = "59", features = ["lz4", "zstd"] }
 arrow-schema = { version = "59", default-features = false, features = ["canonical_extension_types", "serde"] }
-aws-smithy-types = { version = "1", default-features = false, features = ["byte-stream-poll-next", "http-body-0-4-x", "http-body-1-x", "rt-tokio", "test-util"] }
+aws-smithy-types = { version = "1", default-features = false, features = ["byte-stream-poll-next", "http-body-0-4-x", "rt-tokio", "test-util"] }
 axum = { version = "0.8" }
 axum-core = { version = "0.5", default-features = false, features = ["tracing"] }
 bigdecimal = { version = "0.4", features = ["serde"] }
@@ -79,8 +79,8 @@ num-integer = { version = "0.1", features = ["i128"] }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
 object_store = { version = "0.13", features = ["aws", "azure", "gcp", "http"] }
 once_cell = { version = "1" }
-opentelemetry = { version = "0.32", features = ["testing"] }
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "testing"] }
+opentelemetry = { version = "0.33", features = ["testing"] }
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio", "testing"] }
 ordered-float = { version = "4", features = ["serde"] }
 parquet = { version = "59", features = ["encryption", "object_store", "variant_experimental"] }
 percent-encoding = { version = "2" }

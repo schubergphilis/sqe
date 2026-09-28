@@ -10,8 +10,8 @@
 /// - SSN patterns (XXX-XX-XXXX) -> [SSN]
 /// - Credit card-like numbers (13-19 digits) -> [CARD]
 /// - Quoted secret literals (`TOKEN '...'`, `PASSWORD '...'`,
-///   `ACCESS_KEY_ID '...'`, `SECRET_ACCESS_KEY '...'`, `SESSION_TOKEN '...'`,
-///   `SECRET '...'`) -> [REDACTED]
+///   `ACCESS_KEY_ID '...'` / `KEY_ID '...'`, `SECRET_ACCESS_KEY '...'`,
+///   `SESSION_TOKEN '...'`, `SECRET '...'`) -> [REDACTED]
 ///
 /// The secret-literal pass is the belt-and-suspenders guard for issue #4:
 /// without it, `CREATE SECRET ... TOKEN '<jwt>'` lands verbatim in the audit
@@ -47,10 +47,12 @@ pub fn redact_pii(sql: &str) -> String {
             // Keyword = any identifier ENDING in a secret-ish suffix, so the
             // ATTACH dialect (`S3_SECRET_KEY`, `S3_ACCESS_KEY`,
             // `S3_SESSION_TOKEN`) and `CLIENT_SECRET` / `ACCESS_KEY_ID` all
-            // match without a per-dialect list (#744 #762). The literal
-            // accepts SQL `''` escapes so `PASSWORD 'it''s'` is consumed
-            // whole instead of stopping at the doubled quote (#733).
-            r"(?i)\b([A-Z0-9_]*(?:TOKEN|PASSWORD|PASSWD|SECRET|ACCESS_KEY|ACCESS_KEY_ID|SECRET_KEY|API_KEY|BEARER))\b(\s*=\s*|\s+|\s*\(\s*)'(?:[^']|'')*'",
+            // match without a per-dialect list (#744 #762). `KEY_ID` also
+            // covers the DuckDB-style S3 secret's bare `KEY_ID` and
+            // `KMS_KEY_ID`; it replaces `ACCESS_KEY_ID`, which it contains.
+            // The literal accepts SQL `''` escapes so `PASSWORD 'it''s'` is
+            // consumed whole instead of stopping at the doubled quote (#733).
+            r"(?i)\b([A-Z0-9_]*(?:TOKEN|PASSWORD|PASSWD|SECRET|ACCESS_KEY|KEY_ID|SECRET_KEY|API_KEY|BEARER))\b(\s*=\s*|\s+|\s*\(\s*)'(?:[^']|'')*'",
         )
         .unwrap()
     });
@@ -334,6 +336,24 @@ mod tests {
         );
         assert!(!redacted.contains("FQoDYXdzEPv...EXAMPLE"), "{redacted}");
         assert!(redacted.matches("[REDACTED]").count() >= 3);
+    }
+
+    /// DuckDB-style S3 secrets spell the access key id `KEY_ID`. The pattern
+    /// only knew `ACCESS_KEY_ID`, so the id reached both audit files verbatim
+    /// (seen live: `KEY_ID 'AKIA...'` in audit.jsonl and audit.ocsf.jsonl).
+    #[test]
+    fn redact_bare_key_id() {
+        // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS's documented example key, redaction test input
+        let sql = "CREATE SECRET s (TYPE s3, KEY_ID 'AKIAIOSFODNN7EXAMPLE', SECRET 'x', \
+            KMS_KEY_ID = 'arn:aws:kms:eu-west-1:000000000000:key/abc')";
+        let redacted = redact_pii(sql);
+        // nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS's documented example key, asserting it is redacted
+        assert!(!redacted.contains("AKIAIOSFODNN7EXAMPLE"), "{redacted}");
+        assert!(!redacted.contains("key/abc"), "{redacted}");
+        assert!(redacted.contains("KEY_ID '[REDACTED]'"), "{redacted}");
+        // A column that merely ends in _ID is not a credential keyword.
+        let plain = redact_pii("SELECT * FROM t WHERE customer_id = '42'");
+        assert!(plain.contains("'42'"), "{plain}");
     }
 
     #[test]

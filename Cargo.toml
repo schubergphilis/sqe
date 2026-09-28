@@ -188,7 +188,7 @@ opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
 # tls-native-roots), so no new crates. Without them an https endpoint is
 # rejected at build time and the audit shipper never starts.
 opentelemetry-otlp = { version = "0.33", features = ["grpc-tonic", "trace", "metrics", "logs", "tls-ring", "tls-roots"] }
-tracing-opentelemetry = "0.33"
+tracing-opentelemetry = "0.34"
 opentelemetry-appender-tracing = "0.33"
 
 # Error handling
