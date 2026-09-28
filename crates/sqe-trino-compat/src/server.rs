@@ -691,6 +691,12 @@ pub trait TrinoQueryExecutor: Send + Sync + 'static {
             "DESCRIBE OUTPUT / DESCRIBE INPUT is not supported by this executor".into(),
         ))
     }
+
+    /// Record a statement this server's SQL front door rejected as
+    /// unparseable. It never reaches [`Self::execute`], which is where the
+    /// engine audits statements, so without this it leaves no audit line.
+    /// The default does nothing (test mocks).
+    fn audit_rejected(&self, _session: &Session, _sql: &str, _error: &sqe_core::SqeError) {}
 }
 
 #[derive(Default)]
@@ -1220,14 +1226,16 @@ fn resolve_statement(
     session_catalog: Option<&str>,
     prepared: &std::collections::HashMap<String, String>,
     query_id: &str,
+    on_parse_error: impl FnOnce(&sqe_core::SqeError),
 ) -> Result<ResolvedStatement, Box<TrinoError>> {
     use sqe_sql::{classify_normalized, SqlFrontDoor, StatementKind, WireDialect};
     use sqlparser::ast::{Expr, Statement, Use, Value};
 
     let door = SqlFrontDoor::new(WireDialect::Trino).with_session_catalog(session_catalog);
-    let normalized = door
-        .normalize(sql)
-        .map_err(|e| TrinoError::from_sqe_error(&e, Some(query_id)))?;
+    let normalized = door.normalize(sql).map_err(|e| {
+        on_parse_error(&e);
+        TrinoError::from_sqe_error(&e, Some(query_id))
+    })?;
     let facts = StatementFacts::from_normalized(&normalized);
     let exec_sql = normalized.sql().to_string();
 
@@ -2195,6 +2203,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             session.default_catalog.as_deref(),
             &prepared,
             &query_id,
+            |e| state.query_handler.audit_rejected(&session, sql, e),
         ) {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -5580,6 +5589,63 @@ mod tests {
             .get(axum::http::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string)
+    }
+
+    /// Records every `audit_rejected` call; `execute` is never expected.
+    #[derive(Default)]
+    struct RejectRecorder {
+        rejected: Mutex<Vec<(String, String)>>,
+        executed: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl TrinoQueryExecutor for RejectRecorder {
+        async fn execute(
+            &self,
+            _: &Session,
+            _: &str,
+        ) -> Result<TrinoResultStream, sqe_core::SqeError> {
+            self.executed.fetch_add(1, Ordering::SeqCst);
+            Ok(TrinoResultStream::from_batches(vec![]))
+        }
+
+        fn audit_rejected(&self, session: &Session, sql: &str, _: &sqe_core::SqeError) {
+            self.rejected
+                .lock()
+                .push((session.user.username.clone(), sql.to_string()));
+        }
+    }
+
+    /// A statement the Trino front door cannot parse is answered here and
+    /// never reaches `execute`, where the engine audits; it is handed to
+    /// `audit_rejected` instead, exactly once. A parseable one is not.
+    #[tokio::test]
+    async fn unparseable_statement_is_handed_to_audit_rejected() {
+        let executor = Arc::new(RejectRecorder::default());
+        let state = state_with(Arc::new(MockAuthOk), executor.clone());
+        let submit = |sql: &str| {
+            submit_query(
+                State(state.clone()),
+                test_peer(),
+                basic_auth_header("alice", "pw"),
+                sql.to_string(),
+            )
+        };
+
+        let json = body_json(submit("SELEC nonsense FROM").await).await;
+        assert!(json.error.is_some(), "parse error reported to the client");
+        assert_eq!(
+            *executor.rejected.lock(),
+            vec![("alice".to_string(), "SELEC nonsense FROM".to_string())]
+        );
+        assert_eq!(executor.executed.load(Ordering::SeqCst), 0);
+
+        let _ = submit("SELECT 1").await;
+        assert_eq!(
+            executor.rejected.lock().len(),
+            1,
+            "valid SQL is not rejected"
+        );
     }
 
     /// #622: the POST route's limiter used to be trivially bypassable by
