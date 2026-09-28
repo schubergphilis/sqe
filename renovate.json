@@ -21,8 +21,8 @@
   "prConcurrentLimit": 10,
   "prHourlyLimit": 3,
   "lockFileMaintenance": {
-    "enabled": true,
-    "schedule": ["before 5am on monday"]
+    "description": "Off: Renovate rewrites Cargo.lock but never regenerates crates/workspace-hack, so its lock MRs always failed the cargo hakari drift check (!1199). Done by hand with `make lock-maintenance`.",
+    "enabled": false
   },
   "packageRules": [
     {
