@@ -27,6 +27,9 @@ FROM
                              AND cr.cr_from_qty <= 100
                              AND cr.cr_to_qty   >= 100
     JOIN charge          ch  ON ch.ch_tt_id  = 'TMS'
+-- The frame runs for one account; every account x every security is a
+-- 10M-row cross product at the spec's 5,000 accounts x 685 securities.
+WHERE ca.ca_id <= 10
 ORDER BY
     ca.ca_id,
     s.s_symb;
