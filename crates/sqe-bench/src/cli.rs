@@ -711,6 +711,9 @@ pub async fn run() -> anyhow::Result<()> {
             qualify_tables,
         } => {
             let sqe_endpoint = format!("http://{sqe_host}:{sqe_port}");
+            // Scoped like `test` and like the Trino client below, so both
+            // engines get the committed text (review 707).
+            let namespace = crate::suite_namespace(&benchmark, scale, None);
             let sqe_client = client::create_client(&client::ConnectArgs {
                 protocol: "flight",
                 endpoint: &sqe_endpoint,
@@ -720,13 +723,12 @@ pub async fn run() -> anyhow::Result<()> {
                 client_id: client_id.as_deref(),
                 client_secret: client_secret.as_deref(),
                 catalog: None,
-                schema: None,
+                schema: Some(&namespace),
             })
             .await?;
 
             // The default schema rides on the connection (`X-Trino-Schema`);
             // the query text itself is sent as committed (review 707).
-            let namespace = crate::suite_namespace(&benchmark, scale, None);
             let trino_client =
                 client::trino::TrinoBenchClient::new(&trino_url, Some(&trino_user), None)?
                     .with_catalog(trino_catalog.as_deref().unwrap_or("iceberg"))
