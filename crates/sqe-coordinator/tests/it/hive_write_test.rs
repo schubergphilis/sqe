@@ -492,6 +492,59 @@ async fn ctas_creates_a_partitioned_table_and_loads_it() {
     );
 }
 
+/// The unpartitioned twin, in the production order (manifest, load, the
+/// post-write index refresh, a fresh read). The refresh persists an index with
+/// no entries for a table with no partition keys, and planning from it read
+/// the table as empty: every TPC-H table in the benchmark's Hive mode was 0
+/// rows.
+#[tokio::test]
+async fn ctas_creates_an_unpartitioned_table_that_reads_back() {
+    let f = multi_partition("parquet").await;
+    let ctx = session(&f).await;
+    let target_loc = format!("file://{}/ctas_flat", f.dir.path().display());
+    let sql = format!(
+        "CREATE TABLE lake.sales.flat STORED AS PARQUET LOCATION '{target_loc}' \
+         AS SELECT id, amount, dt FROM lake.sales.orders"
+    );
+    let stmt = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::DuckDbDialect {}, &sql)
+        .expect("parse ctas")
+        .remove(0);
+    let sqlparser::ast::Statement::CreateTable(ct) = &stmt else {
+        panic!("not a CREATE TABLE: {stmt:?}");
+    };
+    let select_sql = sqe_coordinator::hive_write::ctas_select_sql(ct).expect("select");
+    let schema = ctx
+        .sql(&select_sql)
+        .await
+        .expect("plan ctas query")
+        .schema()
+        .as_arrow()
+        .clone();
+    let spec = sqe_coordinator::hive_write::ctas_spec(ct, &schema).expect("ctas spec");
+    assert!(spec.partition_keys.is_empty());
+    hive_diff::put_spec_manifest(&f, &spec).await;
+
+    session(&f)
+        .await
+        .sql(&format!("INSERT INTO lake.sales.flat {select_sql}"))
+        .await
+        .expect("plan ctas load")
+        .collect()
+        .await
+        .expect("execute ctas load");
+    hive_diff::refresh_named_index(&f, "flat").await;
+
+    let rows = session(&f)
+        .await
+        .sql("SELECT id FROM lake.sales.flat")
+        .await
+        .expect("plan read of the new table")
+        .collect()
+        .await
+        .expect("collect");
+    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 5);
+}
+
 /// 5.2: a reader must never see a torn or leftover file in a partition.
 ///
 /// **This needs no engine change, and that is the finding.** `object_store`'s
