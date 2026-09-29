@@ -987,7 +987,11 @@ impl HiveTableProvider {
             .as_ref()
             .map(|p| p.enabled)
             .unwrap_or(false)
-            || self.index.is_some()
+            // A partition index lists partitions, so it says nothing about an
+            // unpartitioned table. The post-write refresh still persists one
+            // (with no entries) for those, and planning from it made every
+            // unpartitioned Hive CTAS/INSERT table read as empty.
+            || (self.index.is_some() && !self.partition_columns.is_empty())
     }
 
     fn planned_entries(&self, filters: &[Expr]) -> Result<Vec<PartitionIndexEntry>, HiveError> {
