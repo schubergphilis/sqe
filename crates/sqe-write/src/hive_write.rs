@@ -139,7 +139,9 @@ pub async fn handle_insert(
         ));
     };
     let source = Arc::unwrap_or_clone(dml.input);
-    let (enforced, summary) = enforcer.evaluate(user, source).await?;
+    let (enforced, summary) = enforcer
+        .evaluate(user, &sqe_policy::TableScope::of(ctx), source)
+        .await?;
     *policy_summary_out = Some(summary);
 
     // WITH CHECK on the TARGET (#729), same as the Iceberg INSERT path: the

@@ -303,9 +303,18 @@ pub async fn create_session_context(
                 .as_deref()
                 .filter(|c| !c.is_empty())
             {
-                // Already a static-config catalog: the loop below registers it;
-                // just point DataFusion's default at it.
-                Some(c) if config_catalog_names.contains(c) => c.to_string(),
+                // Already a static-config catalog, an ATTACHed catalog or a
+                // Hive root: registered below, so just point DataFusion's
+                // default at it. Without the last two, `USE <hive-root>.db`
+                // fell through to the config default and unqualified names
+                // silently read the same-named Iceberg table instead.
+                Some(c)
+                    if config_catalog_names.contains(c)
+                        || attached_providers.iter().any(|(n, _)| n == c)
+                        || hive_roots.iter().any(|(n, _)| n == c) =>
+                {
+                    c.to_string()
+                }
                 // Non-config catalog: try Polaris discovery with the caller's
                 // bearer. Register it only if Polaris resolves it for this
                 // principal; otherwise keep the config default.

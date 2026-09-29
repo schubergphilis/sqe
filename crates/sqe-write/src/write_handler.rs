@@ -1181,10 +1181,11 @@ impl WriteHandler {
     async fn enforce_source_plan(
         &self,
         session: &Session,
+        scope: &sqe_policy::TableScope,
         plan: LogicalPlan,
     ) -> sqe_core::Result<(LogicalPlan, sqe_policy::PolicySummary)> {
         match &self.policy_enforcer {
-            Some(enf) => enf.evaluate(&session.user, plan).await,
+            Some(enf) => enf.evaluate(&session.user, scope, plan).await,
             None => Ok((plan, sqe_policy::PolicySummary::default())),
         }
     }
@@ -1491,7 +1492,11 @@ impl WriteHandler {
             // shape the target table. Without this, CTAS over a masked table
             // creates a sink with plaintext columns.
             let (enforced_source, policy_summary) = self
-                .enforce_source_plan(session, df.logical_plan().clone())
+                .enforce_source_plan(
+                    session,
+                    &sqe_policy::TableScope::of(ctx),
+                    df.logical_plan().clone(),
+                )
                 .await?;
             let df = ctx
                 .execute_logical_plan(enforced_source)
@@ -1997,7 +2002,8 @@ impl WriteHandler {
         let (stream, policy_summary, lineage_plan) =
             sqe_core::runtime::on_planning_stack(async {
                 let (enforced_plan, policy_summary) =
-                    self.enforce_source_plan(session, source_plan).await?;
+                    self.enforce_source_plan(session, &sqe_policy::TableScope::of(ctx), source_plan)
+                        .await?;
 
                 let (lin_catalog, lin_namespace, lin_table) =
                     lineage_target_parts(&self.config, &table_ident);
@@ -6302,7 +6308,13 @@ async fn lift_in_subqueries_enforced(
         // #731: the subquery is user SQL over policy-governed tables; apply
         // row filters / masks / restrictions exactly as a SELECT would.
         if let Some((enf, user)) = enforce {
-            let (enforced, _summary) = enf.evaluate(user, mat_df.logical_plan().clone()).await?;
+            let (enforced, _summary) = enf
+                .evaluate(
+                    user,
+                    &sqe_policy::TableScope::of(ctx),
+                    mat_df.logical_plan().clone(),
+                )
+                .await?;
             mat_df = ctx.execute_logical_plan(enforced).await.map_err(|e| {
                 SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("IN-subquery materialiser policy plan failed: {e}"))
             })?;
@@ -9687,7 +9699,7 @@ s3_path_style = true
             vec![],
         );
         let before = format!("{plan:?}");
-        let (after, summary) = handler.enforce_source_plan(&session, plan).await.unwrap();
+        let (after, summary) = handler.enforce_source_plan(&session, &sqe_policy::TableScope::default(), plan).await.unwrap();
         assert_eq!(before, format!("{after:?}"));
         assert_eq!(summary, sqe_policy::PolicySummary::default());
     }
@@ -9732,7 +9744,7 @@ s3_path_style = true
             chrono::Utc::now(),
             vec![],
         );
-        let (rewritten, summary) = handler.enforce_source_plan(&session, plan).await.unwrap();
+        let (rewritten, summary) = handler.enforce_source_plan(&session, &sqe_policy::TableScope::default(), plan).await.unwrap();
         let s = format!("{}", rewritten.display_indent());
         assert!(
             s.contains("Projection:") && s.contains("\"***\""),
