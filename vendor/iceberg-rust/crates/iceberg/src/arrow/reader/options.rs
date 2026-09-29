@@ -32,13 +32,13 @@ pub(crate) struct ParquetReadOptions {
     /// This hint can help reduce the number of fetch requests. For more details see the
     /// [ParquetMetaDataReader documentation](https://docs.rs/parquet/latest/parquet/file/metadata/struct.ParquetMetaDataReader.html#method.with_prefetch_hint).
     ///
-    /// Defaults to 512 KiB, matching DataFusion's default `ParquetOptions::metadata_size_hint`.
+    /// Defaults to 64 KiB (SQE PATCH, see `DEFAULT_METADATA_SIZE_HINT`).
     #[builder(default = Some(DEFAULT_METADATA_SIZE_HINT))]
     pub(crate) metadata_size_hint: Option<usize>,
     /// Gap threshold for merging nearby byte ranges into a single request.
     /// Ranges with gaps smaller than this value will be coalesced.
     ///
-    /// Defaults to 1 MiB, matching object_store's `OBJECT_STORE_COALESCE_DEFAULT`.
+    /// Defaults to 64 KiB (SQE PATCH, see `DEFAULT_RANGE_COALESCE_BYTES`).
     #[builder(default = DEFAULT_RANGE_COALESCE_BYTES)]
     pub(crate) range_coalesce_bytes: u64,
     /// Maximum number of merged byte ranges to fetch concurrently.
