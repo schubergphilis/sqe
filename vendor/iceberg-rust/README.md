@@ -43,6 +43,7 @@ Upstream `testdata/` is vendored in full, so `cargo test -p iceberg --lib` runs 
 | 10 | Strict-metrics residual elimination | `scan/context.rs` |
 | — | Intra-file row-group split (#131), `FileScanTask::with_byte_range` | `arrow/reader/pipeline.rs`, `scan/task.rs` |
 | — | Hash-set membership for large `IN` row filters | `arrow/reader/predicate_visitor.rs` |
+| — | Read amplification: 64 KiB footer prefetch and 64 KiB range-coalesce gap (upstream 512 KiB / 1 MiB) | `arrow/reader/mod.rs` |
 | 2 | REST SigV4 as an `AuthManager` (`rest.sigv4-enabled`, server-advertised, never replaces a bearer) | `catalog/rest/src/sigv4.rs` |
 | — | Empty-token guards (#2) and W3C trace propagation | `catalog/rest/src/auth/oauth2.rs`, `client.rs` |
 | — | Refresh-after-401 on `AuthSession::on_unauthorized` (replaces RW #157; apache has no refresh) | `catalog/rest/src/auth/` |
