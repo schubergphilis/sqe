@@ -42,6 +42,7 @@ impl PolicyEnforcer for DenyEnforcer {
     async fn evaluate(
         &self,
         _user: &SessionUser,
+        _scope: &sqe_policy::TableScope,
         _plan: LogicalPlan,
     ) -> sqe_core::Result<(LogicalPlan, PolicySummary)> {
         Err(SqeError::with_code(

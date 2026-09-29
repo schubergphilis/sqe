@@ -81,7 +81,10 @@ pub async fn extract_write_predicates(
         .and_then(|b| b.build())
         .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("policy probe scan: {e}")))?;
 
-    let (rewritten, summary) = enforcer.evaluate(user, plan).await?;
+    // The reference above is already namespace-qualified; no scope to apply.
+    let (rewritten, summary) = enforcer
+        .evaluate(user, &crate::TableScope::default(), plan)
+        .await?;
     Ok((unparse_predicates(&rewritten), summary))
 }
 

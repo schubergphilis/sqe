@@ -3324,7 +3324,9 @@ impl QueryHandler {
                         "sqe.policy_rewrite",
                         user = %session.user.username
                     );
-                    self.policy_enforcer.evaluate(&session.user, plan).await?
+                    self.policy_enforcer
+                        .evaluate(&session.user, &sqe_policy::TableScope::of(&ctx), plan)
+                        .await?
                 };
                 debug!("Policy-enforced plan (streaming): {:?}", enforced_plan);
                 // Compute the structured resource list from the logical plan
@@ -3812,7 +3814,9 @@ impl QueryHandler {
                     "sqe.policy_rewrite",
                     user = %session.user.username
                 );
-                self.policy_enforcer.evaluate(&session.user, plan).await?
+                self.policy_enforcer
+                    .evaluate(&session.user, &sqe_policy::TableScope::of(&ctx), plan)
+                    .await?
             };
 
             debug!("Policy-enforced plan: {:?}", enforced_plan);

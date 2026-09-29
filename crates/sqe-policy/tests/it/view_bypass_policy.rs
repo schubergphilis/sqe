@@ -117,7 +117,9 @@ async fn try_enforce_and_run(
 ) -> Result<Vec<RecordBatch>, Box<dyn std::error::Error>> {
     let df = ctx.sql(sql).await?;
     let plan = df.logical_plan().clone();
-    let (enforced, _summary) = rewriter.evaluate(&user("alice"), plan).await?;
+    let (enforced, _summary) = rewriter
+        .evaluate(&user("alice"), &sqe_policy::TableScope::default(), plan)
+        .await?;
     Ok(ctx.execute_logical_plan(enforced).await?.collect().await?)
 }
 
@@ -316,7 +318,7 @@ async fn uninlined_view_scan_fails_closed() {
 
     let rewriter = PolicyPlanRewriter::new(Arc::new(store));
     let (enforced, summary) = rewriter
-        .evaluate(&user("mallory"), view_scan)
+        .evaluate(&user("mallory"), &sqe_policy::TableScope::default(), view_scan)
         .await
         .unwrap();
 
