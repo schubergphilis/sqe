@@ -354,7 +354,10 @@ pub struct QueryConfig {
     ///
     #[serde(default)]
     pub query_profile: ProfileMode,
-    /// Maximum memory per query. Default: "256MB". Supports: B, KB, MB, GB. Set to "0" for unlimited.
+    /// Maximum memory per query, including retained buffered SELECT results.
+    /// Default: "256MB". Supports: B, KB, MB, GB. Set to "0" for unlimited.
+    /// Buffered results also reserve their actual Arrow bytes in the shared pool
+    /// until their buffers (including cached copies) are released.
     #[serde(default = "default_max_query_memory")]
     pub max_query_memory: String,
     /// Minimum total scan size to distribute across workers. Below this, execute on coordinator.

@@ -3857,45 +3857,19 @@ impl QueryHandler {
         })
         .await?;
 
-        // Execute the (possibly distributed) plan.
-        //
-        // We drive the stream manually instead of using DataFusion's `collect()`
-        // so the row-count limit can fire BEFORE the entire result set is
-        // materialised. `collect()` buffers every batch into memory first and
-        // only returns when the plan is exhausted. For an unbounded or
-        // mis-shaped query (e.g. a 20M-row fact-to-dimension cross product) the
-        // buffered `Vec<RecordBatch>` could grow to many GB and trigger an
-        // OS-level OOM kill. Streaming and counting as we go lets the
-        // coordinator reject oversized queries with a clean error and keeps the
-        // process alive for other concurrent requests.
-        //
-        // Two caps apply:
-        //   1. The user-configured `query.max_result_rows` (0 means no explicit
-        //      cap, but see #2).
-        //   2. A hard memory-derived ceiling: `memory_limit / 256` rows, assuming
-        //      a conservative 256-byte average row size. This fires even when
-        //      the config disables #1. The coordinator must never be one query
-        //      away from the OS SIGKILLing the process for crossing the memory
-        //      line, so we always enforce something lower than total memory.
+        // Retain results incrementally under both row and actual byte caps.
+        // Buffer owners hold pool reservations through return, cloning and
+        // cache storage, so completion cannot make live output unaccounted.
         let output_schema = final_plan.schema();
         let configured_max = self.config.query.max_result_rows;
-        let memory_ceiling: usize = {
-            let bytes = crate::memory::limit_bytes(&self.runtime.memory_pool);
-            if bytes == 0 {
-                0
-            } else {
-                bytes / 256
-            }
-        };
-        let effective_max: usize = match (configured_max, memory_ceiling) {
-            (0, 0) => 0, // neither cap configured. Falls back to OS behaviour.
-            (0, m) => m,
-            (c, 0) => c,
-            (c, m) => c.min(m),
-        };
         let mut stream = execute_stream(final_plan.clone(), ctx.task_ctx())
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Query execution failed: {e}")))?;
         let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut result_budget = crate::buffered_result::BufferedResultBudget::new(
+            Arc::clone(&self.runtime.memory_pool),
+            Arc::clone(&ctx.runtime_env().memory_pool),
+            self.per_query_memory_bytes,
+        );
         let mut rows_so_far: usize = 0;
         while let Some(batch) = stream
             .try_next()
@@ -3903,20 +3877,13 @@ impl QueryHandler {
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Query execution failed: {e}")))?
         {
             rows_so_far = rows_so_far.saturating_add(batch.num_rows());
-            if effective_max > 0 && rows_so_far > effective_max {
-                let reason = if configured_max > 0 && rows_so_far > configured_max {
-                    format!("configured max_result_rows={configured_max}")
-                } else {
-                    format!(
-                        "memory-derived ceiling={effective_max} (memory_limit / 256 bytes-per-row)"
-                    )
-                };
-                return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
-                    "Query result exceeds maximum allowed rows ({rows_so_far} > {effective_max}). \
-                     Reason: {reason}. Use LIMIT to reduce output or raise the limit in config."
+            if configured_max > 0 && rows_so_far > configured_max {
+                return Err(SqeError::with_code(SqeErrorCode::ResourceExhausted, format!(
+                    "Query result exceeds maximum allowed rows ({rows_so_far} > {configured_max}). \
+                     Reason: configured max_result_rows={configured_max}. Use LIMIT to reduce output or raise the limit in config."
                 )));
             }
-            batches.push(batch);
+            batches.push(result_budget.retain(batch)?);
         }
 
         // Aggregate spill metrics from the executed plan tree

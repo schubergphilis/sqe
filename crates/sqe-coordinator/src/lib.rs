@@ -11,6 +11,7 @@
 pub(crate) mod adaptive_sort;
 pub(crate) mod audit_emitter;
 pub(crate) mod audit_resources;
+pub(crate) mod buffered_result;
 pub mod audit_tag_adapter;
 pub(crate) mod catalog_ops;
 pub mod channel_pool;
