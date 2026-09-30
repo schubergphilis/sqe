@@ -44,9 +44,10 @@ rand = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+futures = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
-futures = { workspace = true }
+tempfile = { workspace = true }
