@@ -318,7 +318,8 @@ metrics-layering-check:  ## Only runtime crates may link the full sqe-metrics cr
 	@echo "==> metrics layering ok"
 
 check-advisory-ignores:  ## Every ignored advisory (deny.toml, .cargo/audit.toml, .grype.yaml) has an owner and an unexpired review date
-	@python3 scripts/check-advisory-ignores.py
+	@test -n "$(AIKIDO_SHARED_HOME)" || { echo "Set AIKIDO_SHARED_HOME to an Aikido checkout"; exit 1; }
+	@python3 "$(AIKIDO_SHARED_HOME)/scripts/check-advisory-ignores.py"
 
 dast:  ## DAST baseline: OWASP ZAP against a local sqe-server's HTTP listener (needs Docker; local gate)
 	@scripts/dast-baseline.sh
