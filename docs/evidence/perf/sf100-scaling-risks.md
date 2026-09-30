@@ -1,174 +1,143 @@
-# SF100+ scaling risks
+# SF100 readiness and qualification
 
-Where SQE breaks above SF10. This is extrapolation, not measurement: SF100 cannot
-run on the current bench rig (see risk 6), so every claim here is grounded in a
-mechanism we actually observed at SF1/SF10, projected forward. Read it as a list
-of predicted failure modes with the evidence that motivates each.
+Updated: 2026-09-30. Reviewed code: `29aa2b0d189bf7ceb5def3eb9289e27c57bafe88`.
 
-The meta-point: **SF1 and SF10 reward single-node tactics. SF100 inverts every one
-of them.** Broadcasting the build side, building hash tables in memory, and
-emitting one scan stream all win at SF10 (we proved the broadcast point this
-session: forcing partitioned scans regressed q09 5x). At SF100 each becomes the
-failure. The SF100 roadmap is therefore two things: make every operator spillable,
-and prove distributed execution at real multi-node scale.
+SF100 readiness is not established by the available SF1 results. The next work is
+bounded generation and execution memory, smaller join intermediates, and repeatable
+qualification across separate hosts. No new benchmarks were run for this update.
 
-## Ranked failure modes
+The [historical scaling review](sf100-scaling-risks-2026-06-historical.md) retains
+the earlier DataFusion 53 measurements. Its implementation status and failure-mode
+claims describe that period and must not be applied to the current DataFusion 55
+build without verification.
 
-### 1. Concurrent sorts starve a shared memory pool (availability)
+## Current implementation and remaining evidence
 
-Verified against DataFusion 53.1.0 `physical-plan/src/sorts/`, and the first cut of
-this section was wrong twice, so here is the checked version.
+| Area | Current code evidence | Remaining work |
+|---|---|---|
+| Generation | Local implementation now lazily produces SSB, TPC-DS and TPCBB batches; direct Iceberg writer consumes its bounded channel without collecting a shard | Value fingerprints and staged round trips pass; complete SF100 loading still needs qualification |
+| Scan parallelism | `ParallelProbeScanRule` and `ParallelScanRule` exist; Iceberg scan has fetch-ahead and decode admission | Measure throughput and byte budgets; do not treat single output as a universal current bottleneck |
+| Large joins | `JoinStrategyRule` rewrites only exact over-threshold build estimates; absent/inexact estimates keep hash joins | Bound uncertain large builds without repeating the historical coalesce regression |
+| Sort memory | `SortMemoryRule` provides fail-closed merge-headroom admission; adaptive sort and spill protections exist | Qualify concurrent sort/join/aggregate completion and fairness under constrained memory |
+| Worker transport | Worker service has finite Flight-frame budgets and scan budget wiring | Prove end-to-end decode/transport accounting under slow consumers; track [#407](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/407) |
+| Result collection | Local implementation uses actual retained Arrow byte reservations and the configured row cap | Lifetime and shared-budget tests pass; qualify concurrent workloads for [#780](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/780) |
+| Distributed execution | Worker scan/distribution paths exist | Verify which operators execute on each node and qualify 1/2/4 workers on separate hosts; track [#416](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/416) |
 
-A **single** large sort is fine. DF 53.1.0 has a multi-level merge
-(`multi_level_merge.rs`): it merges spill files in **bounded passes**, reducing the
-fan-in (`get_sorted_spill_files_to_merge`) when memory is tight and cascading, and
-its own comment says it can "handle any amount of data to sort as long as we have
-enough memory to merge at least 2 streams at a time." So one big `ORDER BY` spills
-and completes; it does not OOM on its own.
+This inspection does not establish that every operator or shuffle path spills.
+Successful plan admission is not proof of bounded process RSS or completion under
+concurrency. Older predictions of universal OOM and claims that parallel scan is
+unimplemented are superseded by the table above.
 
-The risk is **concurrency on a shared pool**. The sort buffer is spillable
-(`with_can_spill(true)`, `sort.rs:283`) but the `merge_reservation` is **not**
-(`sort.rs:286`, no `with_can_spill`), and each multi-level merge grows its
-reservation per spill file via `try_grow` until it fails, with **no per-consumer
-upper limit**. DataFusion's own code flags this: *"For memory pools that are not
-shared this is good, for others this is not and there should be some upper limit to
-memory reservation so we won't starve the system."* Spill is also reactive (it
-triggers on allocation failure, not proactively; apache/datafusion#17334). So when
-**many** sort/merge consumers run on one pool, they collectively exhaust it: the
-spillable sort buffers have not proactively spilled, the non-spillable merge
-reservations cannot, and a merge's `try_grow` fails (it needs >=2 streams) and the
-query crashes.
+Source references:
 
-That is exactly what we saw at SF10: a partitioned sort-on-write CTAS had three
-`ExternalSorter` buffers holding ~10.8 GB (spillable, not yet spilled) plus several
-`ExternalSorterMerge` reservations at ~1.2 GB each `(can spill: false)`, exhausting
-the 16 GB pool; the next allocation failed with 173 KB free. The memory-safe-write
-MR avoided it by skipping the sort on partitioned tables (one fewer concurrent
-merge per partition).
+- [SSB generation](../../../crates/sqe-bench/src/generate/ssb.rs) and
+  [TPC-DS generation](../../../crates/sqe-bench/src/generate/tpcds.rs).
+- [Streaming generator infrastructure](../../../crates/sqe-bench/src/generate/mod.rs).
+- [Scan tuning](../../../crates/sqe-catalog/src/iceberg_scan.rs) and
+  [physical rule pipeline](../../../crates/sqe-coordinator/src/post_planning.rs).
+- [Join decision](../../../crates/sqe-planner/src/join_strategy.rs) and
+  [sort memory guard](../../../crates/sqe-planner/src/sort_memory_rule.rs).
+- [Worker Flight budgets](../../../crates/sqe-worker/src/flight_service.rs).
 
-Why it is the SF100 headline: more data widens plans and raises partition counts,
-so more sort/merge consumers share the pool at once. Combined with per-consumer
-uncapped greedy growth and reactive spill, the crash threshold drops below normal
-query sizes. It is a concurrency-and-pool-discipline problem, not a single-sort
-limit, and the failure is a crash, not a slowdown.
+## Prioritized experiments
 
-Reproduced and mitigation validated (2026-06-16). A fast safe proxy: 4 concurrent
-SF1 sorted CTAS on a 1 GB pool. Under the default **greedy** pool, one crashes with
-`Resources exhausted: ExternalSorterMerge[0]` while the spillable `ExternalSorter`
-buffers held ~735 MB **un-spilled** (greedy let them) and a non-spillable merge
-needed 109 KB it could not get. Under **FairSpillPool** (`memory_pool = "fair"`),
-the same four all succeed: fair caps each consumer and forces earlier spilling, so
-the non-spillable merges get their allocation. So FairSpillPool is a real
-mitigation, but SQE defaults to greedy because fair regressed TPC-DS q39 at SF10
-(it divides the pool across ~90 spillable consumers, ~95 MB each, and wide
-aggregates fail).
+1. **Lazy fact generation.** Reuse bounded batch/range iterators for staged
+   Parquet and direct Iceberg loading. Preserve deterministic relationships and
+   planted rows. Audit inventory and dimension formulas: a suite's scale label
+   alone does not specify its memory footprint.
+2. **Uncertain join builds.** Capture statistics precision and actual build
+   bytes on TPC-H q09/q18 and TPC-DS q39/q72. Prototype conservative admission or
+   a partition-preserving spill fallback. Blanket conversion of unknown builds
+   previously serialized joins and is not a safe default.
+3. **TPCBB q01 pre-aggregation.** Its item-only fact-to-fact join creates a
+   many-to-many intermediate before aggregation. Aggregate facts by item first
+   in a separate prototype, preserving multiplicities and non-null AVG counts.
+   Keep the original query as the benchmark baseline. Item domains also scale;
+   quadratic growth is not established. Measure actual cardinalities.
+4. **Scan concurrency.** Counterbalance a fetch-ahead/output-partition sweep at
+   SF10. Capture storage request latency/count, bytes, decode CPU, stream waits,
+   repartition work and RSS. Choose byte-bounded concurrency before scaling.
+5. **TopK and layout.** Trace ClickBench q23-q26 filters through SQE's custom
+   scan and physical rewrites. Compare identical rows in unsorted,
+   EventTime-clustered and SearchPhrase-clustered layouts. For wide q23,
+   investigate delayed payload decode. Include write/layout cost.
+6. **Concurrent spill.** Stress sorts, joins and aggregates with constrained
+   memory and slow clients. Account for merge buffers, retained output, staging
+   and transport together. Test cancellation, disk saturation and cleanup.
 
-Levers (see the closing section for the full plan): the SQE-side fix is
-**plan-adaptive pool selection** -- FairSpillPool when the plan has a few large
-spillable sort consumers, greedy when it has many (wide aggregate); cap concurrent
-sort consumers under pressure (extend the existing adaptive-sort + memory governor);
-distribute the sort (risk 2) to cut per-node concurrency; upstream the per-consumer
-reservation cap (DataFusion's own TODO) and proactive spill (#17334).
-`sort_spill_reservation_bytes` pre-reserves merge room and buys headroom but does
-not remove the starvation.
+Upstream DataFusion exposes TopK dynamic filters and sort pushdown
+([configuration documentation](https://datafusion.apache.org/user-guide/configs.html)).
+Their availability does not prove SQE's custom scan applies them or benefits on
+these layouts; verify plans and scan counters before changing defaults.
 
-### 2. Broadcast (CollectLeft) joins stop fitting
+## Existing SF1 observations
 
-At SF1/SF10, broadcasting the build side is the winning join strategy on a single
-node, and we have direct evidence: emitting N-partition scans flipped joins to
-`Partitioned` mode and hash-shuffled the 60M-row lineitem, regressing TPC-H q09
-from 17s to 90s. CollectLeft-broadcast was strictly better there.
+The September 30 artifacts report:
 
-At SF100 the build sides grow 10x. More of them cross the 64 MB
-`hash_join_single_partition_threshold` and flip to `Partitioned`, and a single-node
-hash-shuffle of 600M+ row facts is both CPU- and memory-bound. The build hash
-tables stop fitting one node. Distributed execution stops being optional.
-
-Lever: SQE's own shuffle-hash join across workers (`ShuffleHashJoinPlan`) already
-exists, but it is unproven at scale. Every distributed measurement this session was
-confounded by running coordinator plus workers on one box (CPU and memory
-co-tenancy). A real multi-node verdict is missing.
-
-### 3. Scan/decode throughput stays single-partition
-
-`IcebergScanExec` emits one output partition. The parallel Tier-2 filter MR fixed
-the *filter*-bound queries (TPC-DS q50 11s to 4.5s, TPC-H SF10 flipped to winning),
-but it deliberately kept the single output partition to avoid the join-mode
-regression in risk 2. Throughput-bound scans that cannot prune (SSB's uniform
-foreign-key distribution: 0.47x at SF10, unchanged by the filter fix) still funnel
-every row through one stream. At SF100 that is ~600M lineorder rows decoded on one
-output partition.
-
-Lever: the broadcast-parallel-probe design in `sf10-bucket-a-scan-parallelism-design.md`
-(N-partition probe feeding a CollectLeft join, no fact-table shuffle). Designed,
-not built, and it is the hard part because it requires a custom optimizer rule to
-keep CollectLeft while parallelizing the probe.
-
-### 4. Dynamic-filter membership sets scale with the fact
-
-The q50 win parallelized 15 build-side IN-set evaluations over 86M rows. At SF100
-those are ~860M-row evaluations, and the key sets themselves are 10x larger (the
-membership sets cost memory, not just CPU). Parallelism keeps the wall-clock
-bounded but the absolute CPU and the set memory grow linearly with scale.
-
-Lever: push the resolved membership sets into the parquet RowFilter (pre-decode)
-where the projection allows it, so fewer rows are materialized before filtering.
-The SSB key-set work already does this for some shapes; q50's projection is all
-join keys, so it does not benefit there.
-
-### 5. Monster queries and large intermediates
-
-TPC-DS q72 is 140s at SF10 (a 1.17B-row inventory join, the single biggest query).
-At SF100 the inputs are 10x and the join intermediates (38M output rows at SF10)
-grow with them. Single-node memory for the intermediate hash tables and the
-non-spillable sort/merge (risk 1) is the wall. These queries need distribution plus
-spill, both of which are the gaps above.
-
-### 6. Benchmarking is blocked before the engine runs
-
-The data generator buffers a whole table in memory before writing it: TPC-DS
-inventory at SF10 already required the entire 31 GB box (we had to stop the engines
-to generate it). SF100 would need hundreds of GB to generate a single fact table,
-and the sort-on-write load then hits risk 1. So SF100 cannot be measured on the
-current tooling at all until the generator streams row groups to disk and the write
-path is spill-safe. Fix this first or none of the above is observable.
-
-## Summary
-
-| # | Failure mode | First bites | Lever | State |
+| Suite | SQE total | Trino total | Trino/SQE | Comparison status |
 |---|---|---|---|---|
-| 1 | Concurrent sorts starve shared pool | many concurrent sort/merge consumers (high partition count, wide plans) | cap concurrency SQE-side + per-consumer pool cap; distribute | SQE mitigations now; upstream per-consumer cap + #17334 |
-| 2 | Broadcast joins overflow | big fact-fact joins | distributed shuffle join | exists, unproven at multi-node scale |
-| 3 | Single-partition scan | scan-bound (SSB) | broadcast-parallel probe | designed, not built |
-| 4 | Membership-set eval/memory | dim-filtered fact scans | pre-decode RowFilter pushdown | partial (SSB key-set) |
-| 5 | Monster queries / intermediates | q72-class | distribution + spill | depends on 1 and 2 |
-| 6 | Generator/load OOM | generation itself | streaming generator + spill-safe load | blocks measurement |
+| Bank | 3,305 ms | 8,655 ms | 2.62x | 8 Match |
+| ClickBench | 1,716 ms | 7,850 ms | 4.57x | 41 Match, 2 Vacuous |
+| TPCBB | 31,285 ms | 183,653 ms | 5.87x | 10 Match |
 
-Single-node perf work (the parallel filter, the memory-safe write) is necessary and
-tops out around SF10 to SF30. SF100 needs memory-pool discipline under concurrency
-(risk 1: cap concurrent sort consumers and bound per-consumer reservations) and a
-proven multi-node distributed path (risk 2) before anything else is worth tuning.
+TPCBB q01 is 18,522 ms, 59.2% of SQE's suite time. ClickBench q23-q26 are
+slower than Trino. These single-artifact observations prioritize profiling; they
+are not repeated-run speedup estimates, full value-level oracles, or SF100 evidence.
 
-## Mitigation available today: `memory_pool` (opt-in, not a default change)
+Artifacts are `benchmarks/results/compare-{bank,clickbench,tpcbb}-sf1-2026-09-30*.json`.
+The [August parallel-scan A/B](scan-parallelism-sf1-ab-2026-08-18.md) and
+[September NDV A/B](puffin-ndv-ab-2026-09-04.md) show why plan changes and repeated
+counterbalanced runs matter. Do not enable statistics or increase filter caps
+solely because a configuration sounds beneficial.
 
-Risk 1 has no engine fix yet, but it has a validated opt-in knob. If a
-concurrent sort-heavy workload crashes with `Resources exhausted:
-ExternalSorterMerge`, set on the coordinator:
+## Qualification sequence and gates
 
-```toml
-[coordinator]
-memory_pool = "fair"
-```
+1. Establish SF10 on separate Linux hosts with identical data, comparable
+   storage routes, pinned engine/config versions, and result cache disabled.
+   Record file/row-group sizes, clustering, compression, hardware, memory limits
+   and network capacity. Separate cold and warm runs; counterbalance run order.
+2. Use SSB q4.1/q4.3, TPC-H q09/q18, TPC-DS q39/q72, ClickBench q23-q26 and
+   TPCBB q01 as the diagnostic set. Capture physical plans and actual operator
+   rows alongside scan bytes, CPU, peak RSS, spill, network and worker imbalance.
+3. Repeat at SF30, then SF100, first serially and then with concurrent workloads.
+   Run at least three measured repetitions per setting and report medians/ranges;
+   use a longer run for meaningful tail latency under sustained concurrency.
+4. Compare 1/2/4 workers, reporting latency and total CPU/I/O/network resource
+   use. Do not assume scan distribution also distributes large joins/aggregates;
+   document their execution location from the actual plans.
+5. Require full result-value checks with appropriate floating-point tolerances,
+   bounded RSS below configured process limits, no process OOM, and released
+   permits/reservations/spill files after cancellation. Resource exhaustion must
+   be a clean error. Record spill disk capacity and throughput.
 
-`FairSpillPool` caps each spillable consumer and forces it to spill earlier,
-leaving room for the non-spillable merge reservations. Validated: 4 concurrent SF1
-sorted CTAS on a 1 GB pool crash 1-of-4 under the default `greedy` and succeed
-4-of-4 under `fair`.
+Choose latency and throughput targets from the intended deployment before declaring
+readiness. No universal SF100 speedup or linear-scaling target is implied here.
 
-Do not make this the default. SQE ships `greedy` on purpose: `fair` divides the
-pool evenly across every registered spillable consumer, so wide plans (TPC-DS q39
-at SF10 registers ~90) shrink each consumer to ~pool/N and large aggregates fail.
-Use `fair` only for workloads dominated by a few large sorts. The default-safe fix
-is plan-adaptive pool selection or the upstream per-consumer reservation cap +
-proactive spill (apache/datafusion#17334); until one of those lands this is an
-operator lever, not a default change.
+## Tracking
+
+Existing work: [#416](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/416) (separate-host qualification), [#407](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/407) (worker backpressure),
+[#380](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/380) (memory governor), [#382](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/382) (spill-store safety), [#755](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/755) (cardinality admission),
+and [#780](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/780) (buffered result byte accounting). New experiment issues:
+
+- [#783 — [PERF][SF100] Stream SSB, TPC-DS and TPCBB fact generation](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/783)
+
+- [#784 — [PERF][SF100] Bound large hash builds when statistics are inexact or absent](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/784)
+
+- [#785 — [PERF][SF100] Prototype semantics-preserving pre-aggregation for TPCBB q01](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/785)
+
+- [#786 — [PERF][SF100] Qualify scan fetch-ahead and output parallelism under byte budgets](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/786)
+
+- [#787 — [PERF][SF100] Verify TopK pushdown and clustered layouts for ClickBench q23-q26](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/787)
+
+- [#788 — [PERF][SF100] Qualify concurrent sort, join and aggregate spill with bounded memory](https://sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/-/work_items/788)
+
+## Local implementation follow-up (2026-09-30)
+
+See [implementation evidence](sf100-performance-implementation-2026-09-30.md) for
+changes, tests, measurements and limitations. Generation (#783), buffered output
+(#780), and buffered JSON scheduling (#782) now have local implementations. The
+TPCBB candidate (#785) has a separate SQL variant, a repeatable experiment and an
+engine equivalence test. These changes are published for review in the merge requests linked in the implementation evidence; they have not been merged or deployed.
+Join strategy (#784), scan tuning (#786), TopK/layout (#787), concurrent spill
+qualification (#788) and separate-host qualification (#416) remain open. No
+unmeasured default join-mode, pool-policy or concurrency change is included.
