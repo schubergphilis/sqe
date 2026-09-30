@@ -39,23 +39,23 @@ default:
 
 include:
   - project: 'vpf-data-ai/aikido'
-    ref: 'b7be8280afa67bcc6a7ca30d458f0d2dbc7f4082'
+    ref: '696c60933c30ecbbdda0b3eeef1a6a6ffceef470'
     file: '/ci/templates/guardrails.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'b7be8280afa67bcc6a7ca30d458f0d2dbc7f4082'
+    ref: '696c60933c30ecbbdda0b3eeef1a6a6ffceef470'
     file: '/ci/templates/test-rust.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'b7be8280afa67bcc6a7ca30d458f0d2dbc7f4082'
+    ref: '696c60933c30ecbbdda0b3eeef1a6a6ffceef470'
     file: '/ci/templates/deploy.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'b7be8280afa67bcc6a7ca30d458f0d2dbc7f4082'
+    ref: '696c60933c30ecbbdda0b3eeef1a6a6ffceef470'
     file: '/ci/templates/release.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'b7be8280afa67bcc6a7ca30d458f0d2dbc7f4082'
+    ref: '696c60933c30ecbbdda0b3eeef1a6a6ffceef470'
     file: '/ci/templates/consumer-controls.yml'
 
 variables:
-  AIKIDO_SHARED_REF: "b7be8280afa67bcc6a7ca30d458f0d2dbc7f4082"
+  AIKIDO_SHARED_REF: "696c60933c30ecbbdda0b3eeef1a6a6ffceef470"
   AIKIDO_CARGO_SUPPLY_CHAIN_IN_TEST: "0"
   AIKIDO_DOCKERFILE: "Dockerfile.ci"
   AIKIDO_SCAN_BUILT_IMAGE_ONLY: "1"
