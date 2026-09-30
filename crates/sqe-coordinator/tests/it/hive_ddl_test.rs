@@ -651,6 +651,36 @@ fn a_hive_query_is_not_denied_when_a_tag_source_is_active() {
         });
 }
 
+/// `USE lake.sales` then an unqualified name reads the Hive table. The session
+/// default catalog used to accept only static-config and Polaris catalogs, so a
+/// Hive root fell back to the config default and `orders` resolved against
+/// Iceberg: here an error, and in the benchmark's Hive mode a same-named
+/// Iceberg table read silently.
+#[test]
+fn an_unqualified_name_under_a_hive_default_catalog_reads_the_hive_table() {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(1)
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()
+        .unwrap()
+        .block_on(async {
+            let h = handler_with_root_and_tag_source("lake").await;
+            let batches = tokio::spawn(async move {
+                let mut session = h.session.clone();
+                session.default_catalog = Some("lake".to_string());
+                session.default_schema = Some("sales".to_string());
+                h.handler
+                    .execute(&session, "SELECT count(*) AS n FROM orders", None)
+                    .await
+            })
+            .await
+            .expect("join")
+            .expect("unqualified name under USE lake.sales must resolve to the Hive table");
+            assert_eq!(batches[0].column(0).as_primitive::<Int64Type>().value(0), 3);
+        });
+}
+
 /// The `CREATE EXTERNAL TABLE` mirror of
 /// `attach_hive_external_root_refused_when_hive_registries_are_not_wired`
 /// (task 10a's own escalation guard, on the ATTACH path): a `QueryHandler`

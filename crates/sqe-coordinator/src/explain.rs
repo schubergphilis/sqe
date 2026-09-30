@@ -75,7 +75,7 @@ impl ExplainHandler {
         let logical = df.logical_plan().clone();
         let (enforced, _policy_summary) = self
             .policy_enforcer
-            .evaluate(&session.user, logical)
+            .evaluate(&session.user, &sqe_policy::TableScope::of(ctx), logical)
             .await?;
 
         let logical_str = format!("{}", enforced.display_indent());
@@ -136,7 +136,7 @@ impl ExplainHandler {
         let policy_start = std::time::Instant::now();
         let (enforced, _policy_summary) = self
             .policy_enforcer
-            .evaluate(&session.user, logical)
+            .evaluate(&session.user, &sqe_policy::TableScope::of(ctx), logical)
             .await?;
         let policy_ms = policy_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -275,7 +275,7 @@ impl ExplainHandler {
         let policy_start = std::time::Instant::now();
         let (enforced, _policy_summary) = self
             .policy_enforcer
-            .evaluate(&session.user, logical)
+            .evaluate(&session.user, &sqe_policy::TableScope::of(ctx), logical)
             .await?;
         let policy_ms = policy_start.elapsed().as_secs_f64() * 1000.0;
 

@@ -147,7 +147,7 @@ async fn enforced(
     u: &SessionUser,
 ) -> Vec<RecordBatch> {
     let plan = plan_for(ctx, sql).await;
-    let (rewritten, _summary) = rewriter.evaluate(u, plan).await.unwrap();
+    let (rewritten, _summary) = rewriter.evaluate(u, &sqe_policy::TableScope::default(), plan).await.unwrap();
     execute(ctx, rewritten).await
 }
 

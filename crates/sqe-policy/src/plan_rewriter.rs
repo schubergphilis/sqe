@@ -117,6 +117,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
     async fn evaluate(
         &self,
         user: &SessionUser,
+        scope: &crate::TableScope,
         plan: LogicalPlan,
     ) -> sqe_core::Result<(LogicalPlan, PolicySummary)> {
         let store = self.store.clone();
@@ -154,9 +155,12 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                         view_scans.insert(table_name.clone());
                     }
                 }
+                // Governed as the table it resolved to: a name written
+                // without its schema/catalog is qualified from the scope the
+                // plan was resolved in.
                 table_refs
                     .entry(table_name)
-                    .or_insert_with(|| scan.table_name.clone());
+                    .or_insert_with(|| scope.qualify(&scan.table_name));
             }
             Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
         })
@@ -1933,7 +1937,7 @@ mod tests {
         };
 
         let (rewritten, _summary) = rewriter
-            .evaluate(&user, scan)
+            .evaluate(&user, &crate::TableScope::default(), scan)
             .await
             .expect("rewrite with sibling-referencing CUSTOM mask must succeed");
 
