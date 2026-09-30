@@ -1726,16 +1726,19 @@ fn generate_batches<F>(
     total: usize,
     seed: u64,
     mut build_row: F,
-) -> (SchemaRef, Vec<RecordBatch>)
+) -> (SchemaRef, super::BatchIterator)
 where
-    F: FnMut(usize, &mut StdRng) -> Vec<ColVal>,
+    F: FnMut(usize, &mut StdRng) -> Vec<ColVal> + Send + 'static,
 {
     let ncols = tbl_schema.fields().len();
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut batches = Vec::new();
+    let output_schema = tbl_schema.clone();
     let mut offset = 0usize;
 
-    while offset < total {
+    let batches = std::iter::from_fn(move || {
+        if offset >= total {
+            return None;
+        }
         let n = BATCH_SIZE.min(total - offset);
         // one Vec<ColVal> per column
         let mut cols: Vec<Vec<ColVal>> = (0..ncols).map(|_| Vec::with_capacity(n)).collect();
@@ -1754,10 +1757,11 @@ where
             }
         }
         let arrays = cols_to_arrays(cols, &tbl_schema);
-        batches.push(RecordBatch::try_new(tbl_schema.clone(), arrays).expect("record batch"));
+        let batch = RecordBatch::try_new(tbl_schema.clone(), arrays).expect("record batch");
         offset += n;
-    }
-    (tbl_schema, batches)
+        Some(batch)
+    });
+    (output_schema, Box::new(batches))
 }
 
 enum ColVal {
@@ -1868,7 +1872,7 @@ macro_rules! d {
 // Table generators
 // ---------------------------------------------------------------------------
 
-fn generate_store_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_store_sales(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let total = store_sales_rows(scale);
     // FK ranges must track dimension cardinality at this scale;
     // sf1-sized ranges empty out dimension joins at small scales.
@@ -1932,7 +1936,7 @@ fn generate_store_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     )
 }
 
-fn generate_store_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_store_returns(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let total = store_returns_rows(scale);
     // FK ranges must track dimension cardinality at this scale;
     // sf1-sized ranges empty out dimension joins at small scales.
@@ -2014,7 +2018,7 @@ fn generate_store_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     )
 }
 
-fn generate_catalog_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_catalog_sales(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let total = catalog_sales_rows(scale);
     // FK ranges must track dimension cardinality at this scale;
     // sf1-sized ranges empty out dimension joins at small scales.
@@ -2088,7 +2092,7 @@ fn generate_catalog_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     )
 }
 
-fn generate_catalog_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_catalog_returns(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let total = catalog_returns_rows(scale);
     // FK ranges must track dimension cardinality at this scale;
     // sf1-sized ranges empty out dimension joins at small scales.
@@ -2146,7 +2150,7 @@ fn generate_catalog_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     )
 }
 
-fn generate_web_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_web_sales(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let total = web_sales_rows(scale);
     // FK ranges must track dimension cardinality at this scale;
     // sf1-sized ranges empty out dimension joins at small scales.
@@ -2231,7 +2235,7 @@ fn generate_web_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     )
 }
 
-fn generate_web_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_web_returns(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let total = web_returns_rows(scale);
     // FK ranges must track dimension cardinality at this scale;
     // sf1-sized ranges empty out dimension joins at small scales.
@@ -2292,7 +2296,7 @@ fn generate_web_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     )
 }
 
-fn generate_inventory(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_inventory(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let total = inventory_rows(scale);
     let items = item_rows(scale) as i64;
     let whs = warehouse_rows(scale) as i64;
@@ -2309,7 +2313,7 @@ fn generate_inventory(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         inventory_schema(),
         total,
         seed_for_table("inventory"),
-        |row, rng| {
+        move |row, rng| {
             let week = row as i64 / per_week;
             let j = row as i64 % per_week;
             let item = 2 * (j / whs) + 1;
@@ -2334,13 +2338,13 @@ fn generate_inventory(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     )
 }
 
-fn generate_date_dim() -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_date_dim() -> (SchemaRef, super::BatchIterator) {
     // Fixed 73,049 rows: 1998-01-01 to 2003-12-31
     generate_batches(
         date_dim_schema(),
         73_049,
         seed_for_table("date_dim"),
-        |row, rng| {
+        move |row, rng| {
             let sk = (row + 1) as i32;
             let date_val = DS_DATE_START + row as i32;
             let year = 1998 + row as i32 / 366;
@@ -2390,12 +2394,12 @@ fn generate_date_dim() -> (SchemaRef, Vec<RecordBatch>) {
     )
 }
 
-fn generate_time_dim() -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_time_dim() -> (SchemaRef, super::BatchIterator) {
     generate_batches(
         time_dim_schema(),
         86_400,
         seed_for_table("time_dim"),
-        |row, _rng| {
+        move |row, _rng| {
             let sk = (row + 1) as i32;
             let sec = row as i32;
             let hour = sec / 3600;
@@ -2425,87 +2429,93 @@ fn generate_time_dim() -> (SchemaRef, Vec<RecordBatch>) {
     )
 }
 
-fn generate_item(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_item(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let total = item_rows(scale);
-    generate_batches(item_schema(), total, seed_for_table("item"), |row, rng| {
-        let sk = (row + 1) as i32;
-        // dsdgen prices are heavily skewed low (median 4.21, range
-        // 0.09..99.89); a uniform draw put only 1.3% of items in the
-        // 1.00..2.00 band that q72's qualification parameters probe
-        // (dsdgen: ~11%). Log-uniform reproduces the skew.
-        let price_ln = rng.random_range(0.09_f64.ln()..99.99_f64.ln());
-        let price = (price_ln.exp() * 100.0).round() / 100.0;
-        let wc = price * 0.6;
-        // i_manufact is derived from a neighborhood of i_manufact_id (spread
-        // MANUFACT_LABEL_SPREAD) so the same manufact string spans several ids
-        // and vice versa; q41's correlated subquery bridges items on
-        // `i_manufact = i1.i_manufact`, which collapses to id equality (0 rows)
-        // when the string is a bijection with the id.
-        let manufact_id = rng.random_range(1..1000i32);
-        let manufact_label = ((manufact_id
-            + rng.random_range(0..MANUFACT_LABEL_SPREAD) * MANUFACT_LABEL_STRIDE)
-            % 1000)
-            + 1;
-        // i_category_id and i_category are consistent (1=Women ..
-        // 10=Electronics) and i_class draws from that category's official
-        // class vocabulary; i_class_id stays independent like dsdgen's.
-        let cat = rng.random_range(0..CATEGORIES.len());
-        let class_idx = rng.random_range(0..CATEGORY_CLASSES[cat].len());
-        let class_id = rng.random_range(1..16i32);
-        // Plant i_item_sk 1 as a Women/maternity item (CATEGORIES[0] /
-        // CATEGORY_CLASSES[0][2]) for the q54 coincidence (see
-        // PLANTED_Q54_TICKETS); the draws above are kept for parity.
-        let (cat, class_idx) = if row == 0 {
-            (0usize, 2usize)
-        } else {
-            (cat, class_idx)
-        };
-        // dsdgen i_brand_id encodes <category><class:3><brand:3> (e.g.
-        // 1002001 = category 1, class 2, brand 1); the brand NAME is fully
-        // determined by (category, class) with only the #N suffix varying.
-        let brand_id = (cat as i32 + 1) * 1_000_000 + class_id * 1000 + rng.random_range(1..=17i32);
-        let brand = format!(
-            "{} #{}",
-            CATEGORY_CLASS_BRANDS[cat][class_idx],
-            rng.random_range(1..=17i32)
-        );
-        vec![
-            i!(sk),
-            s!(random_id(rng)),
-            d!(random_date(rng)),
-            scd2_rec_end_date(row, rng),
-            s!(random_name(rng)),
-            f!(price),
-            f!(wc),
-            i!(brand_id),
-            s!(brand),
-            i!(class_id),
-            s!(CATEGORY_CLASSES[cat][class_idx]),
-            i!((cat + 1) as i32),
-            s!(CATEGORIES[cat]),
-            i!(manufact_id),
-            s!(format!("manufact#{manufact_label}")),
-            s!(random_str(rng, ITEM_SIZES)),
-            s!(random_id(rng)),
-            // i_item_sk 3 (row 2) is forced to peach for the q24 plant; the
-            // draw is kept so the rest of the color histogram is unshifted.
-            s!({
-                let c = weighted_str(rng, ITEM_COLOR_WEIGHTS);
-                if row == 2 {
-                    "peach"
-                } else {
-                    c
-                }
-            }),
-            s!(random_str(rng, ITEM_UNITS)),
-            s!(random_str(rng, ITEM_SIZES)),
-            i!(rng.random_range(1..100i32)),
-            s!(random_name(rng)),
-        ]
-    })
+    generate_batches(
+        item_schema(),
+        total,
+        seed_for_table("item"),
+        move |row, rng| {
+            let sk = (row + 1) as i32;
+            // dsdgen prices are heavily skewed low (median 4.21, range
+            // 0.09..99.89); a uniform draw put only 1.3% of items in the
+            // 1.00..2.00 band that q72's qualification parameters probe
+            // (dsdgen: ~11%). Log-uniform reproduces the skew.
+            let price_ln = rng.random_range(0.09_f64.ln()..99.99_f64.ln());
+            let price = (price_ln.exp() * 100.0).round() / 100.0;
+            let wc = price * 0.6;
+            // i_manufact is derived from a neighborhood of i_manufact_id (spread
+            // MANUFACT_LABEL_SPREAD) so the same manufact string spans several ids
+            // and vice versa; q41's correlated subquery bridges items on
+            // `i_manufact = i1.i_manufact`, which collapses to id equality (0 rows)
+            // when the string is a bijection with the id.
+            let manufact_id = rng.random_range(1..1000i32);
+            let manufact_label = ((manufact_id
+                + rng.random_range(0..MANUFACT_LABEL_SPREAD) * MANUFACT_LABEL_STRIDE)
+                % 1000)
+                + 1;
+            // i_category_id and i_category are consistent (1=Women ..
+            // 10=Electronics) and i_class draws from that category's official
+            // class vocabulary; i_class_id stays independent like dsdgen's.
+            let cat = rng.random_range(0..CATEGORIES.len());
+            let class_idx = rng.random_range(0..CATEGORY_CLASSES[cat].len());
+            let class_id = rng.random_range(1..16i32);
+            // Plant i_item_sk 1 as a Women/maternity item (CATEGORIES[0] /
+            // CATEGORY_CLASSES[0][2]) for the q54 coincidence (see
+            // PLANTED_Q54_TICKETS); the draws above are kept for parity.
+            let (cat, class_idx) = if row == 0 {
+                (0usize, 2usize)
+            } else {
+                (cat, class_idx)
+            };
+            // dsdgen i_brand_id encodes <category><class:3><brand:3> (e.g.
+            // 1002001 = category 1, class 2, brand 1); the brand NAME is fully
+            // determined by (category, class) with only the #N suffix varying.
+            let brand_id =
+                (cat as i32 + 1) * 1_000_000 + class_id * 1000 + rng.random_range(1..=17i32);
+            let brand = format!(
+                "{} #{}",
+                CATEGORY_CLASS_BRANDS[cat][class_idx],
+                rng.random_range(1..=17i32)
+            );
+            vec![
+                i!(sk),
+                s!(random_id(rng)),
+                d!(random_date(rng)),
+                scd2_rec_end_date(row, rng),
+                s!(random_name(rng)),
+                f!(price),
+                f!(wc),
+                i!(brand_id),
+                s!(brand),
+                i!(class_id),
+                s!(CATEGORY_CLASSES[cat][class_idx]),
+                i!((cat + 1) as i32),
+                s!(CATEGORIES[cat]),
+                i!(manufact_id),
+                s!(format!("manufact#{manufact_label}")),
+                s!(random_str(rng, ITEM_SIZES)),
+                s!(random_id(rng)),
+                // i_item_sk 3 (row 2) is forced to peach for the q24 plant; the
+                // draw is kept so the rest of the color histogram is unshifted.
+                s!({
+                    let c = weighted_str(rng, ITEM_COLOR_WEIGHTS);
+                    if row == 2 {
+                        "peach"
+                    } else {
+                        c
+                    }
+                }),
+                s!(random_str(rng, ITEM_UNITS)),
+                s!(random_str(rng, ITEM_SIZES)),
+                i!(rng.random_range(1..100i32)),
+                s!(random_name(rng)),
+            ]
+        },
+    )
 }
 
-fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_customer(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let total = customer_rows(scale);
     // FK ranges must track dimension cardinality at this scale;
     // sf1-sized ranges empty out dimension joins at small scales.
@@ -2515,7 +2525,7 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         customer_schema(),
         total,
         seed_for_table("customer"),
-        |row, rng| {
+        move |row, rng| {
             let sk = (row + 1) as i32;
             let addr_draw = rng.random_range(1..=addrs);
             // Customers 1..=PLANTED_Q54_TICKETS point at the planted Williamson
@@ -2552,7 +2562,7 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     )
 }
 
-fn generate_customer_address(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_customer_address(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let total = customer_address_rows(scale);
     // Each county maps to exactly one state (official ca: ~1.7 states per
     // county). Drawing county and state independently from 100 x 50 put stores
@@ -2609,13 +2619,13 @@ fn generate_customer_address(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     )
 }
 
-fn generate_customer_demographics(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_customer_demographics(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let total = customer_demographics_rows(scale);
     generate_batches(
         customer_demographics_schema(),
         total,
         seed_for_table("customer_demographics"),
-        |row, rng| {
+        move |row, rng| {
             // dsdgen's customer_demographics is a deterministic cross product
             // (gender x marital x education x ...), not a random draw. Random
             // marital/education made q85's cd1=cd2 equality on both attributes
@@ -2637,7 +2647,7 @@ fn generate_customer_demographics(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     )
 }
 
-fn generate_household_demographics() -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_household_demographics() -> (SchemaRef, super::BatchIterator) {
     // dsdgen's hd table is a deterministic cross product, not a random draw:
     // 7200 = 20 income bands x 6 buy potentials x 10 dep counts x 6 vehicle
     // counts, with sk-derived strides (verified against CALL dsdgen(sf=0.1)).
@@ -2648,7 +2658,7 @@ fn generate_household_demographics() -> (SchemaRef, Vec<RecordBatch>) {
         household_demographics_schema(),
         7_200,
         seed_for_table("household_demographics"),
-        |row, _rng| {
+        move |row, _rng| {
             let sk = (row + 1) as i32;
             vec![
                 i!(sk),
@@ -2661,13 +2671,13 @@ fn generate_household_demographics() -> (SchemaRef, Vec<RecordBatch>) {
     )
 }
 
-fn generate_store(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_store(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let total = store_rows(scale);
     generate_batches(
         store_schema(),
         total,
         seed_for_table("store"),
-        |row, rng| {
+        move |row, rng| {
             let sk = (row + 1) as i32;
             // Official sf1: s_closed_date_sk is set on 3 of every 12 rows
             // (positions 0, 3, 4), NULL elsewhere; the single sf0.01 row has one.
@@ -2741,13 +2751,13 @@ fn generate_store(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     )
 }
 
-fn generate_catalog_page(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_catalog_page(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let total = catalog_page_rows(scale);
     generate_batches(
         catalog_page_schema(),
         total,
         seed_for_table("catalog_page"),
-        |row, rng| {
+        move |row, rng| {
             let sk = (row + 1) as i32;
             vec![
                 i!(sk),
@@ -2764,13 +2774,13 @@ fn generate_catalog_page(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     )
 }
 
-fn generate_web_site(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_web_site(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let total = web_site_rows(scale);
     generate_batches(
         web_site_schema(),
         total,
         seed_for_table("web_site"),
-        |row, rng| {
+        move |row, rng| {
             let sk = (row + 1) as i32;
             // Official: web_close_date_sk is NULL only on single-revision
             // entities (cycle position 0): 100% NULL at sf0.01, 5/30 at sf1.
@@ -2811,7 +2821,7 @@ fn generate_web_site(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     )
 }
 
-fn generate_web_page(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_web_page(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let total = web_page_rows(scale);
     // FK ranges must track dimension cardinality at this scale;
     // sf1-sized ranges empty out dimension joins at small scales.
@@ -2820,7 +2830,7 @@ fn generate_web_page(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         web_page_schema(),
         total,
         seed_for_table("web_page"),
-        |row, rng| {
+        move |row, rng| {
             let sk = (row + 1) as i32;
             // dsdgen leaves wp_customer_sk NULL on most pages (only
             // customer-specific pages carry one), and the fraction is
@@ -2854,13 +2864,13 @@ fn generate_web_page(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     )
 }
 
-fn generate_warehouse(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_warehouse(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let total = warehouse_rows(scale);
     generate_batches(
         warehouse_schema(),
         total,
         seed_for_table("warehouse"),
-        |row, rng| {
+        move |row, rng| {
             let sk = (row + 1) as i32;
             // dsdgen leaves the name/size/address fields NULL on ~1 in 5
             // warehouses at sf1 (sf0.1's single warehouse is fully populated;
@@ -2900,13 +2910,13 @@ fn generate_warehouse(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     )
 }
 
-fn generate_promotion(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_promotion(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let total = promotion_rows(scale);
     generate_batches(
         promotion_schema(),
         total,
         seed_for_table("promotion"),
-        |row, rng| {
+        move |row, rng| {
             let sk = (row + 1) as i32;
             vec![
                 i!(sk),
@@ -2933,13 +2943,13 @@ fn generate_promotion(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     )
 }
 
-fn generate_reason(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_reason(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let total = reason_rows(scale);
     generate_batches(
         reason_schema(),
         total,
         seed_for_table("reason"),
-        |row, _rng| {
+        move |row, _rng| {
             let sk = (row + 1) as i32;
             vec![
                 i!(sk),
@@ -2950,12 +2960,12 @@ fn generate_reason(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     )
 }
 
-fn generate_income_band() -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_income_band() -> (SchemaRef, super::BatchIterator) {
     generate_batches(
         income_band_schema(),
         20,
         seed_for_table("income_band"),
-        |row, _rng| {
+        move |row, _rng| {
             let sk = (row + 1) as i32;
             let lower = (row as i32) * 10_000;
             let upper = lower + 9_999;
@@ -2964,12 +2974,12 @@ fn generate_income_band() -> (SchemaRef, Vec<RecordBatch>) {
     )
 }
 
-fn generate_ship_mode() -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_ship_mode() -> (SchemaRef, super::BatchIterator) {
     generate_batches(
         ship_mode_schema(),
         20,
         seed_for_table("ship_mode"),
-        |row, rng| {
+        move |row, rng| {
             let sk = (row + 1) as i32;
             vec![
                 i!(sk),
@@ -2983,13 +2993,13 @@ fn generate_ship_mode() -> (SchemaRef, Vec<RecordBatch>) {
     )
 }
 
-fn generate_call_center(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_call_center(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let total = call_center_rows(scale);
     generate_batches(
         call_center_schema(),
         total,
         seed_for_table("call_center"),
-        |row, rng| {
+        move |row, rng| {
             let sk = (row + 1) as i32;
             vec![
                 // cc_closed_date_sk is 100% NULL in official data at both scales.
@@ -3174,12 +3184,23 @@ impl BenchmarkGenerator for TpcdsGenerator {
     ) -> anyhow::Result<GenerateStats> {
         let start = std::time::Instant::now();
 
-        let (tbl_schema, batches) = build_tpcds_table(table, scale, _config)?;
+        let (tbl_schema, batches) = stream_tpcds_table(table, scale, _config)?;
 
         let full_output = format!("{output_dir}/tpcds/sf{scale}");
-        let (files, bytes) =
-            parquet_writer::write_parquet_files(&batches, tbl_schema, &full_output, table)?;
-        let rows = batches.iter().map(|b| b.num_rows()).sum();
+        let rows = self
+            .tables()
+            .into_iter()
+            .find(|t| t.name == table)
+            .map(|t| (t.row_count)(scale))
+            .expect("validated table");
+        let (files, bytes) = parquet_writer::write_parquet_stream(
+            batches,
+            tbl_schema,
+            &full_output,
+            table,
+            "",
+            _config,
+        )?;
 
         Ok(GenerateStats {
             table: table.to_string(),
@@ -3197,10 +3218,15 @@ impl BenchmarkGenerator for TpcdsGenerator {
         config: &super::GenerateConfig,
     ) -> anyhow::Result<super::BatchSource> {
         use super::{BatchShard, BatchSource};
-        let (tbl_schema, batches) = build_tpcds_table(table, scale, config)?;
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let (tbl_schema, batches) = stream_tpcds_table(table, scale, config)?;
+        let total_rows = self
+            .tables()
+            .into_iter()
+            .find(|t| t.name == table)
+            .map(|t| (t.row_count)(scale))
+            .expect("validated table");
         let make: Box<dyn FnOnce() -> Box<dyn Iterator<Item = RecordBatch> + Send> + Send> =
-            Box::new(move || Box::new(batches.into_iter()));
+            Box::new(move || batches);
         Ok(BatchSource {
             schema: tbl_schema,
             total_rows,
@@ -3212,36 +3238,36 @@ impl BenchmarkGenerator for TpcdsGenerator {
 /// Build the (schema, batches) for one TPC-DS table. Shared by
 /// `generate_table` (staged to Parquet) and `generate_batches`
 /// (direct-to-Iceberg sink).
-fn build_tpcds_table(
+fn stream_tpcds_table(
     table: &str,
     scale: f64,
     _config: &super::GenerateConfig,
-) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
+) -> anyhow::Result<(SchemaRef, super::BatchIterator)> {
     Ok(match table {
-        "store_sales" => generate_store_sales(scale),
-        "store_returns" => generate_store_returns(scale),
-        "catalog_sales" => generate_catalog_sales(scale),
-        "catalog_returns" => generate_catalog_returns(scale),
-        "web_sales" => generate_web_sales(scale),
-        "web_returns" => generate_web_returns(scale),
-        "inventory" => generate_inventory(scale),
-        "date_dim" => generate_date_dim(),
-        "time_dim" => generate_time_dim(),
-        "item" => generate_item(scale),
-        "customer" => generate_customer(scale),
-        "customer_address" => generate_customer_address(scale),
-        "customer_demographics" => generate_customer_demographics(scale),
-        "household_demographics" => generate_household_demographics(),
-        "store" => generate_store(scale),
-        "catalog_page" => generate_catalog_page(scale),
-        "web_site" => generate_web_site(scale),
-        "web_page" => generate_web_page(scale),
-        "warehouse" => generate_warehouse(scale),
-        "promotion" => generate_promotion(scale),
-        "reason" => generate_reason(scale),
-        "income_band" => generate_income_band(),
-        "ship_mode" => generate_ship_mode(),
-        "call_center" => generate_call_center(scale),
+        "store_sales" => stream_store_sales(scale),
+        "store_returns" => stream_store_returns(scale),
+        "catalog_sales" => stream_catalog_sales(scale),
+        "catalog_returns" => stream_catalog_returns(scale),
+        "web_sales" => stream_web_sales(scale),
+        "web_returns" => stream_web_returns(scale),
+        "inventory" => stream_inventory(scale),
+        "date_dim" => stream_date_dim(),
+        "time_dim" => stream_time_dim(),
+        "item" => stream_item(scale),
+        "customer" => stream_customer(scale),
+        "customer_address" => stream_customer_address(scale),
+        "customer_demographics" => stream_customer_demographics(scale),
+        "household_demographics" => stream_household_demographics(),
+        "store" => stream_store(scale),
+        "catalog_page" => stream_catalog_page(scale),
+        "web_site" => stream_web_site(scale),
+        "web_page" => stream_web_page(scale),
+        "warehouse" => stream_warehouse(scale),
+        "promotion" => stream_promotion(scale),
+        "reason" => stream_reason(scale),
+        "income_band" => stream_income_band(),
+        "ship_mode" => stream_ship_mode(),
+        "call_center" => stream_call_center(scale),
         _ => anyhow::bail!("Unknown TPC-DS table: {table}"),
     })
 }
@@ -3252,6 +3278,128 @@ fn build_tpcds_table(
 
 #[cfg(test)]
 mod tests {
+    // Existing semantic tests inspect materialized small tables; production is lazy.
+    #[allow(dead_code)]
+    fn generate_store_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_store_sales(scale);
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_store_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_store_returns(scale);
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_catalog_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_catalog_sales(scale);
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_catalog_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_catalog_returns(scale);
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_web_sales(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_web_sales(scale);
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_web_returns(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_web_returns(scale);
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_inventory(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_inventory(scale);
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_date_dim() -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_date_dim();
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_time_dim() -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_time_dim();
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_item(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_item(scale);
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_customer(scale);
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_customer_address(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_customer_address(scale);
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_customer_demographics(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_customer_demographics(scale);
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_household_demographics() -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_household_demographics();
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_store(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_store(scale);
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_catalog_page(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_catalog_page(scale);
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_web_site(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_web_site(scale);
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_web_page(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_web_page(scale);
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_warehouse(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_warehouse(scale);
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_promotion(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_promotion(scale);
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_reason(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_reason(scale);
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_income_band() -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_income_band();
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_ship_mode() -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_ship_mode();
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_call_center(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_call_center(scale);
+        (schema, batches.collect())
+    }
+
     use super::*;
     use crate::generate::BenchmarkGenerator;
 

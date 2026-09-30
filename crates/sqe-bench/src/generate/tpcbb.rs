@@ -159,7 +159,7 @@ fn random_time_str(rng: &mut StdRng) -> String {
 // Table generators
 // ---------------------------------------------------------------------------
 
-fn generate_web_clickstreams(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_web_clickstreams(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let schema = web_clickstreams_schema();
     let total = super::scaled(scale, 4_000_000.0);
     let total = total.max(1);
@@ -173,7 +173,6 @@ fn generate_web_clickstreams(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let num_sales = ((scale * 720_000.0) as i64).max(1); // web_sales rows at SF1
 
     let mut rng = StdRng::seed_from_u64(seed_for_table("web_clickstreams"));
-    let mut batches = Vec::new();
     let mut offset = 0usize;
 
     // q07 (product affinity) pairs items co-viewed in one (user, date)
@@ -185,7 +184,11 @@ fn generate_web_clickstreams(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let mut session_user: Option<i32> = None;
     let mut session_date: i32 = 1;
 
-    while offset < total {
+    let output_schema = schema.clone();
+    let batches = std::iter::from_fn(move || {
+        if offset >= total {
+            return None;
+        }
         let n = BATCH_SIZE.min(total - offset);
 
         let mut wcs_click_date_sk: Vec<Option<i32>> = Vec::with_capacity(n);
@@ -238,29 +241,28 @@ fn generate_web_clickstreams(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let ref_refs: Vec<Option<&str>> = wcs_referrer_url.iter().map(|o| o.as_deref()).collect();
         let kw_refs: Vec<Option<&str>> = wcs_search_keywords.iter().map(|o| o.as_deref()).collect();
 
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(wcs_click_date_sk)),
-                    Arc::new(Int32Array::from(wcs_click_time_sk)),
-                    Arc::new(Int64Array::from(wcs_sales_sk)),
-                    Arc::new(Int32Array::from(wcs_item_sk)),
-                    Arc::new(Int32Array::from(wcs_web_page_sk)),
-                    Arc::new(Int32Array::from(wcs_user_sk)),
-                    Arc::new(StringArray::from(ref_refs)),
-                    Arc::new(StringArray::from(kw_refs)),
-                ],
-            )
-            .expect("web_clickstreams batch"),
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(wcs_click_date_sk)),
+                Arc::new(Int32Array::from(wcs_click_time_sk)),
+                Arc::new(Int64Array::from(wcs_sales_sk)),
+                Arc::new(Int32Array::from(wcs_item_sk)),
+                Arc::new(Int32Array::from(wcs_web_page_sk)),
+                Arc::new(Int32Array::from(wcs_user_sk)),
+                Arc::new(StringArray::from(ref_refs)),
+                Arc::new(StringArray::from(kw_refs)),
+            ],
+        )
+        .expect("web_clickstreams batch");
         offset += n;
-    }
+        Some(batch)
+    });
 
-    (schema, batches)
+    (output_schema, Box::new(batches))
 }
 
-fn generate_product_reviews(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn stream_product_reviews(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let schema = product_reviews_schema();
     let total = super::scaled(scale, 100_000.0);
     let total = total.max(1);
@@ -269,10 +271,13 @@ fn generate_product_reviews(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let num_orders = ((scale * 720_000.0) as i64).max(1);
 
     let mut rng = StdRng::seed_from_u64(seed_for_table("product_reviews"));
-    let mut batches = Vec::new();
     let mut offset = 0usize;
 
-    while offset < total {
+    let output_schema = schema.clone();
+    let batches = std::iter::from_fn(move || {
+        if offset >= total {
+            return None;
+        }
         let n = BATCH_SIZE.min(total - offset);
 
         let mut pr_review_sk: Vec<i64> = Vec::with_capacity(n);
@@ -311,27 +316,26 @@ fn generate_product_reviews(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             pr_review_content.iter().map(|o| o.as_deref()).collect();
         let title_refs: Vec<Option<&str>> = pr_title.iter().map(|o| o.as_deref()).collect();
 
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int64Array::from(pr_review_sk)),
-                    Arc::new(Date32Array::from(pr_review_date)),
-                    Arc::new(StringArray::from(time_refs)),
-                    Arc::new(Int32Array::from(pr_review_rating)),
-                    Arc::new(Int32Array::from(pr_item_sk)),
-                    Arc::new(Int32Array::from(pr_user_sk)),
-                    Arc::new(Int64Array::from(pr_order_sk)),
-                    Arc::new(StringArray::from(content_refs)),
-                    Arc::new(StringArray::from(title_refs)),
-                ],
-            )
-            .expect("product_reviews batch"),
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(pr_review_sk)),
+                Arc::new(Date32Array::from(pr_review_date)),
+                Arc::new(StringArray::from(time_refs)),
+                Arc::new(Int32Array::from(pr_review_rating)),
+                Arc::new(Int32Array::from(pr_item_sk)),
+                Arc::new(Int32Array::from(pr_user_sk)),
+                Arc::new(Int64Array::from(pr_order_sk)),
+                Arc::new(StringArray::from(content_refs)),
+                Arc::new(StringArray::from(title_refs)),
+            ],
+        )
+        .expect("product_reviews batch");
         offset += n;
-    }
+        Some(batch)
+    });
 
-    (schema, batches)
+    (output_schema, Box::new(batches))
 }
 
 // ---------------------------------------------------------------------------
@@ -371,12 +375,23 @@ impl BenchmarkGenerator for TpcbbGenerator {
     ) -> anyhow::Result<GenerateStats> {
         let start = std::time::Instant::now();
 
-        let (schema, batches) = build_tpcbb_table(table, scale, _config)?;
+        let (schema, batches) = stream_tpcbb_table(table, scale, _config)?;
 
         let full_output = format!("{output_dir}/tpcbb/sf{scale}");
-        let (files, bytes) =
-            parquet_writer::write_parquet_files(&batches, schema, &full_output, table)?;
-        let rows = batches.iter().map(|b| b.num_rows()).sum();
+        let rows = self
+            .tables()
+            .into_iter()
+            .find(|t| t.name == table)
+            .map(|t| (t.row_count)(scale).max(1))
+            .expect("validated table");
+        let (files, bytes) = parquet_writer::write_parquet_stream(
+            batches,
+            schema,
+            &full_output,
+            table,
+            "",
+            _config,
+        )?;
 
         Ok(GenerateStats {
             table: table.to_string(),
@@ -394,10 +409,15 @@ impl BenchmarkGenerator for TpcbbGenerator {
         config: &super::GenerateConfig,
     ) -> anyhow::Result<super::BatchSource> {
         use super::{BatchShard, BatchSource};
-        let (schema, batches) = build_tpcbb_table(table, scale, config)?;
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let (schema, batches) = stream_tpcbb_table(table, scale, config)?;
+        let total_rows = self
+            .tables()
+            .into_iter()
+            .find(|t| t.name == table)
+            .map(|t| (t.row_count)(scale).max(1))
+            .expect("validated table");
         let make: Box<dyn FnOnce() -> Box<dyn Iterator<Item = RecordBatch> + Send> + Send> =
-            Box::new(move || Box::new(batches.into_iter()));
+            Box::new(move || batches);
         Ok(BatchSource {
             schema,
             total_rows,
@@ -409,14 +429,14 @@ impl BenchmarkGenerator for TpcbbGenerator {
 /// Build the (schema, batches) for one TPC-BB table. Shared by
 /// `generate_table` (staged to Parquet) and `generate_batches`
 /// (direct-to-Iceberg sink).
-fn build_tpcbb_table(
+fn stream_tpcbb_table(
     table: &str,
     scale: f64,
     _config: &super::GenerateConfig,
-) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
+) -> anyhow::Result<(SchemaRef, super::BatchIterator)> {
     Ok(match table {
-        "web_clickstreams" => generate_web_clickstreams(scale),
-        "product_reviews" => generate_product_reviews(scale),
+        "web_clickstreams" => stream_web_clickstreams(scale),
+        "product_reviews" => stream_product_reviews(scale),
         _ => anyhow::bail!(
             "Unknown TPC-BB table: {table}. \
              TPC-DS tables (store_sales, item, customer, …) must be generated \
@@ -431,6 +451,18 @@ fn build_tpcbb_table(
 
 #[cfg(test)]
 mod tests {
+    // Existing semantic tests inspect materialized small tables; production is lazy.
+    #[allow(dead_code)]
+    fn generate_web_clickstreams(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_web_clickstreams(scale);
+        (schema, batches.collect())
+    }
+    #[allow(dead_code)]
+    fn generate_product_reviews(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+        let (schema, batches) = super::stream_product_reviews(scale);
+        (schema, batches.collect())
+    }
+
     use super::*;
     use crate::generate::BenchmarkGenerator;
 
