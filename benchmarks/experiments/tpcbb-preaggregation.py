@@ -34,21 +34,28 @@ def main():
         folder = Path(folder)
         conn = duckdb.connect()
         conn.execute("SET memory_limit='512MB'")
-        conn.execute(f"CREATE TABLE item AS SELECT n::INTEGER i_item_sk, 'item-'||n i_item_id, 'description-'||n i_item_desc, 'category' i_category, 'class' i_class FROM range(1,{args.keys + 1}) t(n)")
-        conn.execute(f"CREATE TABLE web_clickstreams AS SELECT (n%{args.keys}+1)::INTEGER wcs_item_sk, CASE WHEN n%4=0 THEN NULL ELSE n END wcs_sales_sk FROM range({args.rows}) t(n)")
-        conn.execute(f"CREATE TABLE store_sales AS SELECT (n%{args.keys}+1)::INTEGER ss_item_sk, CASE WHEN n%7=0 THEN NULL ELSE (n%100+1)/100.0 END::DOUBLE ss_net_paid FROM range({args.rows}) t(n)")
-        for name in ('item', 'web_clickstreams', 'store_sales'):
-            path = str(folder / f'{name}.parquet').replace("'", "''")
-            conn.execute(f"COPY {name} TO '{path}' (FORMAT PARQUET)")
+        conn.execute("CREATE TABLE item AS SELECT n::INTEGER i_item_sk, 'item-'||n i_item_id, 'description-'||n i_item_desc, 'category' i_category, 'class' i_class FROM range(1, ?) t(n)", [args.keys + 1])
+        conn.execute("CREATE TABLE web_clickstreams AS SELECT (n%?+1)::INTEGER wcs_item_sk, CASE WHEN n%4=0 THEN NULL ELSE n END wcs_sales_sk FROM range(?) t(n)", [args.keys, args.rows])
+        conn.execute("CREATE TABLE store_sales AS SELECT (n%?+1)::INTEGER ss_item_sk, CASE WHEN n%7=0 THEN NULL ELSE (n%100+1)/100.0 END::DOUBLE ss_net_paid FROM range(?) t(n)", [args.keys, args.rows])
+        exports = {
+            'item': "COPY item TO ? (FORMAT PARQUET)",
+            'web_clickstreams': "COPY web_clickstreams TO ? (FORMAT PARQUET)",
+            'store_sales': "COPY store_sales TO ? (FORMAT PARQUET)",
+        }
+        for name, statement in exports.items():
+            path = str(folder / f'{name}.parquet')
+            conn.execute(statement, [path])
+            path = path.replace("'", "''")
             for key, sql in queries.items():
                 queries[key] = re.sub(r'\b' + name + r'\b', lambda _: f"read_parquet('{path}')", sql)
         conn.close()
 
         def execute(sql):
             start = time.perf_counter()
+            # nosemgrep: opt.aikido.semgrep-rules.python.lang.security.audit.dangerous-subprocess-use-audit -- intentional local SQE binary, argv list, no shell
             completed = subprocess.run(
                 [args.sqe_cli, '--embedded', '--memory', '--memory-limit', '512MB',
-                 '-f', 'json', '--execute=' + sql], capture_output=True, text=True,
+                 '-f', 'json', '--execute=' + sql], capture_output=True, text=True, shell=False,
             )
             if completed.returncode:
                 raise RuntimeError(completed.stderr)
