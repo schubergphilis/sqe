@@ -11,6 +11,7 @@
 //! object can defeat (security/scale review 906).
 
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -39,6 +40,55 @@ const FN_NAME: &str = "read_json";
 /// growth before a hostile stream gets far past the cap.
 const READ_CHUNK: usize = 64 * 1024;
 
+// Buffer processing is CPU-heavy. Keep its concurrency independent of Tokio
+// worker count and hold permits until blocking work actually finishes.
+static BUFFER_PROCESSING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Schema inference and Arrow decoding use BufRead. Check cancellation on
+/// each read so their full-document inference pass can stop between lines.
+struct CancellableReader<R> {
+    inner: R,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl<R> CancellableReader<R> {
+    fn check(&self) -> std::io::Result<()> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            Err(std::io::Error::other(
+                "read_json: buffer processing cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for CancellableReader<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        self.check()?;
+        self.inner.read(out)
+    }
+}
+
+impl<R: std::io::BufRead> std::io::BufRead for CancellableReader<R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        self.check()?;
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.inner.consume(amount);
+    }
+}
+
 /// Byte cap plus pool reservation for the buffered JSON path.
 ///
 /// `max_bytes` bounds every single representation (download, decompressed
@@ -50,6 +100,7 @@ const READ_CHUNK: usize = 64 * 1024;
 pub(crate) struct BufferBudget {
     max_bytes: usize,
     reservation: MemoryReservation,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl BufferBudget {
@@ -57,11 +108,13 @@ impl BufferBudget {
         Self {
             max_bytes,
             reservation: MemoryConsumer::new(format!("{FN_NAME}-buffer")).register(pool),
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Reject a representation that would exceed the byte cap.
     fn check_cap(&self, bytes: usize, what: &str) -> DFResult<()> {
+        self.check_cancelled()?;
         if bytes > self.max_bytes {
             return Err(DataFusionError::Plan(format!(
                 "{FN_NAME}: {what} exceeds max_buffer_bytes {} (raise max_buffer_bytes to read it)",
@@ -73,6 +126,7 @@ impl BufferBudget {
 
     /// Charge `bytes` more to the pool.
     fn charge(&mut self, bytes: usize, what: &str) -> DFResult<()> {
+        self.check_cancelled()?;
         self.reservation.try_grow(bytes).map_err(|e| {
             DataFusionError::ResourcesExhausted(format!(
                 "{FN_NAME}: {what} needs {bytes} more bytes than the memory pool allows: {e}"
@@ -88,6 +142,16 @@ impl BufferBudget {
     /// Bytes currently reserved against the pool.
     pub(crate) fn reserved(&self) -> usize {
         self.reservation.size()
+    }
+
+    fn check_cancelled(&self) -> DFResult<()> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            Err(DataFusionError::Execution(format!(
+                "{FN_NAME}: buffer processing cancelled"
+            )))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -191,6 +255,34 @@ pub(crate) async fn build_buffer_table(
 
     let raw = fetch_capped(store.as_ref(), &path, &args.path, &mut budget).await?;
 
+    process_buffer(raw, framing, codec, budget).await
+}
+
+async fn process_buffer(
+    raw: Vec<u8>,
+    framing: JsonFraming,
+    codec: JsonCompression,
+    budget: BufferBudget,
+) -> DFResult<Arc<dyn TableProvider>> {
+    let _cancel = CancelOnDrop(Arc::clone(&budget.cancelled));
+    let permit = BUFFER_PROCESSING.acquire().await.map_err(|_| {
+        DataFusionError::Execution(format!("{FN_NAME}: processing semaphore closed"))
+    })?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        budget.check_cancelled()?;
+        process_buffer_sync(raw, framing, codec, budget)
+    })
+    .await
+    .map_err(|e| DataFusionError::Execution(format!("{FN_NAME}: buffer task failed: {e}")))?
+}
+
+fn process_buffer_sync(
+    raw: Vec<u8>,
+    framing: JsonFraming,
+    codec: JsonCompression,
+    mut budget: BufferBudget,
+) -> DFResult<Arc<dyn TableProvider>> {
     let ndjson = match codec {
         JsonCompression::Zip => decompress_zip_to_ndjson(raw, framing, &mut budget)?,
         other => {
@@ -455,13 +547,19 @@ pub(crate) fn decode_ndjson_to_memtable(
     use arrow::json::ReaderBuilder;
     use std::io::Cursor;
 
-    let (schema, _) = infer_json_schema(&mut Cursor::new(ndjson), None).map_err(|e| {
+    budget.check_cancelled()?;
+    let cancelled = Arc::clone(&budget.cancelled);
+    let reader = || CancellableReader {
+        inner: Cursor::new(ndjson),
+        cancelled: Arc::clone(&cancelled),
+    };
+    let (schema, _) = infer_json_schema(&mut reader(), None).map_err(|e| {
         DataFusionError::Plan(format!("{FN_NAME}: JSON schema inference failed: {e}"))
     })?;
     let schema = Arc::new(schema);
 
     let reader = ReaderBuilder::new(schema.clone())
-        .build(Cursor::new(ndjson))
+        .build(reader())
         .map_err(|e| DataFusionError::Plan(format!("{FN_NAME}: JSON reader build failed: {e}")))?;
 
     let mut batches = Vec::new();
@@ -486,6 +584,43 @@ pub(crate) fn decode_ndjson_to_memtable(
 mod tests {
     use super::*;
     use datafusion::execution::memory_pool::{GreedyMemoryPool, UnboundedMemoryPool};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn buffered_processing_leaves_runtime_responsive() {
+        let raw = b"{\"a\":1}\n".repeat(100_000);
+        let mut budget = unbounded();
+        budget.charge(raw.len(), "test input").unwrap();
+        let started = std::time::Instant::now();
+        let (table, delay) = tokio::join!(
+            process_buffer(
+                raw,
+                JsonFraming::NewlineDelimited,
+                JsonCompression::None,
+                budget
+            ),
+            async {
+                tokio::task::yield_now().await;
+                started.elapsed()
+            },
+        );
+        assert!(table.is_ok());
+        assert!(
+            delay < std::time::Duration::from_millis(100),
+            "runtime stalled for {delay:?}"
+        );
+    }
+
+    #[test]
+    fn cancelled_buffer_work_releases_pool_bytes() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+        let mut budget = BufferBudget::new(&pool, 1 << 20);
+        let raw = b"{\"a\":1}\n".to_vec();
+        budget.charge(raw.len(), "test input").unwrap();
+        budget.cancelled.store(true, Ordering::Relaxed);
+        let error = decode_ndjson_to_memtable(&raw, budget).unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert_eq!(pool.reserved(), 0);
+    }
 
     fn unbounded() -> BufferBudget {
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
