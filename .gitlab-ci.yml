@@ -1,735 +1,181 @@
-# sqlengine CI — migrated to the aikido platform (vpf-data-ai/aikido).
-# Security guardrails, rust test (+ ci/aikido-rust-extra.sh for feature matrix &
-# xtask), build->Harbor + image SBOM, semver release + cosign signing come from
-# aikido includes. The docker-compose integration suites below stay repo-specific,
-# hosted in the aikido-orchestrated pipeline. Perf benchmark dropped.
+# SQE owns product inputs and checks; reusable controls live in Aikido.
+# Routine MRs never build release binaries/images. Opt in with SQE_FORCE_IMAGE_BUILD=1.
+# Tests, dependency gates and SAST remain blocking; publishing waits on test stage.
 workflow:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-    # A scheduled scan runs on main, and every job is interruptible (see
-    # `default:` below), so the next merge to main used to auto-cancel it
-    # half way (pipeline 1634184). The weekly rescan and the monthly review
-    # must run to the end.
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
       auto_cancel:
         on_new_commit: none
     - if: '$CI_COMMIT_TAG'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
-# Config-only MRs (renovate.json, workflow comments) otherwise create an empty
-# pipeline: every other job here or in aikido includes carries a `changes:`
-# filter. GitLab then reports "the resulting pipeline would have been empty"
-# and never starts CI. Keep this job free of `changes:` and `extends:`.
 ci-config-sanity:
+  variables:
+    AIKIDO_SHARED_SCRIPTS: "check-advisory-ignores.py"
+  extends: .aikido-shared-scripts
   stage: test
-  # Pinned by digest (#660); renovate's gitlabci manager keeps the digest
-  # current alongside the tag.
   image: python:3.12-alpine@sha256:b64631e04e4920160c50fbe8d8df828f7f35f06f425cb44aa09bca53e708a35a
   script:
     - python -m json.tool renovate.json >/dev/null
-    # bash + GNU grep for leak-scan (busybox grep lacks --include / -I).
-    # The bare-`#[ignore]` grep (#639) that ran here is gone: `cargo xtask
-    # test-groups --check` in aikido-rust-extra rejects a bare #[ignore] and
-    # an unknown reason, and runs on every change to a .rs file.
     - apk add --no-cache make bash grep >/dev/null
-    # Accepted advisories expire: a passed review date fails the pipeline so
-    # the risk is re-decided, not silently carried.
-    - make check-advisory-ignores
-    # docs/site is published: no account ids, internal hostnames or internal
-    # user names may reach it (also quickstart/ and tests/ for account ids).
-    # Was a manual pre-publish step only.
+    - python3 "$AIKIDO_SHARED_HOME/scripts/check-advisory-ignores.py"
     - make leak-scan
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-    # Tag pipelines too. aikido's `aikido-release-image` and
-    # `aikido-publish-release-image` are the only jobs that match a vX.Y.Z tag,
-    # and both sit in the `.post` stage. GitLab does not run a pipeline whose
-    # jobs are all in `.pre`/`.post`, so without one job in a real stage a tag
-    # push creates nothing: "The resulting pipeline would have been empty".
-    # v0.48.0 (2026-09-14) hit exactly that and shipped no image. This job in
-    # `test` is the cheapest way to give the release jobs a pipeline to run in.
     - if: '$CI_COMMIT_TAG'
 
-# Weekly supply-chain watch, on the pipeline schedule only. Fails (red
-# scheduled pipeline, mailed to maintainers) when a vendored crate has an
-# unreviewed OSV advisory (cargo audit/deny never see path crates), a
-# Renovate MR has been open over 14 days, or an accepted advisory's review
-# date passed with no MR in between to trip ci-config-sanity. The same
-# schedule runs the aikido rescans and aikido-triage, which files scan
-# findings as issues. Needs egress to api.osv.dev.
 supply-chain-watch:
-  stage: test
-  needs: []
-  image: python:3.12-alpine@sha256:b64631e04e4920160c50fbe8d8df828f7f35f06f425cb44aa09bca53e708a35a
-  variables:
-    # read_api is enough; the group token is what aikido-triage already uses.
-    GITLAB_TOKEN: $AIKIDO_GROUP_TOKEN
-  script:
-    - python3 scripts/check-advisory-ignores.py
-    - python3 scripts/supply-chain-watch.py
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+  extends: .aikido-supply-chain-watch
 
-# Monthly vulnerability review: files "Vulnerability review YYYY-MM" listing
-# open triage issues, accepted advisories (due ones flagged) and stuck
-# Renovate MRs, with a checklist and a reviewed-by line. A maintainer closes it
-# as the record of the review. Runs only on the monthly schedule, which sets
-# SQE_SCHEDULE=monthly-vuln-review; idempotent within a month.
 vuln-review:
-  stage: test
-  needs: []
-  image: python:3.12-alpine@sha256:b64631e04e4920160c50fbe8d8df828f7f35f06f425cb44aa09bca53e708a35a
-  variables:
-    GITLAB_TOKEN: $AIKIDO_GROUP_TOKEN
-  script:
-    - python3 scripts/vuln-review.py
+  extends: .aikido-vuln-review
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule" && $SQE_SCHEDULE == "monthly-vuln-review"'
 
-# Auto-cancel superseded pipelines. The project setting
-# (Settings > CI/CD > auto_cancel_pending_pipelines) is already `enabled`, but it
-# only cancels jobs marked `interruptible`, and nothing here was. Measured
-# consequence: three pushes to one MR left three pipelines running side by side,
-# each carrying a 20-minute cargo-gate and a 20-minute aikido-test-rust, so two
-# superseded commits burned ~80 minutes of runner time nobody would ever read.
-#
-# `default:` covers jobs pulled in from the aikido includes too, which is the
-# point: the expensive ones are not defined in this file.
 default:
   interruptible: true
 
-# HARBOR RELEASE MIRRORING: the `ref:` below must be an aikido release that
-# contains aikido-publish-release-image (vpf-data-ai/aikido!126). v0.9.5 does
-# NOT. Without that job a vX.Y.Z tag pipeline pushes :vX.Y.Z + :stable to the
-# GitLab registry and mirrors NEITHER to Harbor, which is why
-# repo.sovereign-data.org/chameleon/sqlengine/sqe:stable has been v0.37.0 since
-# 2026-06-24 while main moved 1110 commits. Renovate bumps this automatically;
-# do not merge the release MR until it has.
 include:
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.13.1'
+    ref: 'b7be8280afa67bcc6a7ca30d458f0d2dbc7f4082'
     file: '/ci/templates/guardrails.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.13.1'
+    ref: 'b7be8280afa67bcc6a7ca30d458f0d2dbc7f4082'
     file: '/ci/templates/test-rust.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.13.1'
+    ref: 'b7be8280afa67bcc6a7ca30d458f0d2dbc7f4082'
     file: '/ci/templates/deploy.yml'
   - project: 'vpf-data-ai/aikido'
-    ref: 'v0.13.1'
+    ref: 'b7be8280afa67bcc6a7ca30d458f0d2dbc7f4082'
     file: '/ci/templates/release.yml'
-  # GitLab's own Security/Secret-Detection template was included here too. It
-  # duplicated aikido-secret-scan (same gitleaks-class scan, a second image
-  # pull, a second job in the test stage) and was dropped on 2026-09-04.
+  - project: 'vpf-data-ai/aikido'
+    ref: 'b7be8280afa67bcc6a7ca30d458f0d2dbc7f4082'
+    file: '/ci/templates/consumer-controls.yml'
 
 variables:
+  AIKIDO_SHARED_REF: "b7be8280afa67bcc6a7ca30d458f0d2dbc7f4082"
+  AIKIDO_CARGO_SUPPLY_CHAIN_IN_TEST: "0"
+  AIKIDO_DOCKERFILE: "Dockerfile.ci"
+  AIKIDO_SCAN_BUILT_IMAGE_ONLY: "1"
+  AIKIDO_SBOM_CARGO_LICENSES: "1"
+  AIKIDO_SBOM_EXTRA_EXCLUDES: "**/quickstart/** **/docs/** **/adapters/** **/target/** **/.aikido-shared/**"
   AIKIDO_IMAGE_NAME: "sqlengine/sqe"
-  # Makes aikido-test-rust's cargo test phase BLOCKING. The platform default is
-  # "0" (advisory) and is frozen by a test upstream, so this line is what replaces
-  # the deleted cargo-gate job's gating — without it this repo trades a blocking
-  # gate for a warning.
   AIKIDO_CARGO_GATE_ENFORCE: "1"
-  # Deep async state machines in the scan path overflow the default 2MB test
-  # thread stack (the write e2e tests need this too). 32 MiB; the platform default
-  # is 8 MiB, which is not enough here. Carried over from the local cargo-gate.
   AIKIDO_RUST_MIN_STACK: "33554432"
-  # Keeps clippy out of the gate (aikido !166 / v0.12.3): it shares no
-  # artifacts with the test build, so there it was 5m06 of pure wall clock
-  # (pipeline 1609830). The platform's own aikido-clippy-rust job is switched
-  # off below; clippy runs at the top of ci/aikido-rust-extra.sh instead, where
-  # the feature-matrix `cargo check`s reuse its check-mode dependencies. Still
-  # advisory.
   AIKIDO_CARGO_CLIPPY_JOB: "1"
-  # Compiler cache. The platform's .aikido_rust_build_env (test-rust.yml) runs
-  # sccache against an S3 bucket when AIKIDO_SCCACHE_BUCKET is set; it replaces
-  # the target/ cache that never fit the 5 GiB single-PUT limit (see the
-  # release-binaries comment below). The four AIKIDO_SCCACHE_* settings and the
-  # bucket credentials live in this project's CI variables, not here. As of
-  # 2026-09-07 they are DELETED (cache off): the only bucket we have is on the
-  # StorageGRID acc endpoint, which the prd runners cannot reach (curl timeout,
-  # probe MR !958), and creating a bucket on the prd endpoint needs prod
-  # access. To re-enable: bucket on s3.object02.storage.sbp.services with a
-  # 30-day lifecycle rule, then set AIKIDO_SCCACHE_BUCKET, _ENDPOINT,
-  # _REGION=us-east-1, protected+masked AIKIDO_SCCACHE_ACCESS_KEY_ID /
-  # AIKIDO_SCCACHE_SECRET_ACCESS_KEY (read-write, main and tags) and optionally
-  # a read-only pair as AIKIDO_SCCACHE_READ_* for merge requests. Each Rust
-  # job's log ends with `sccache --show-stats`; a warm main run below ~70%
-  # hits means a CARGO_HOME/prefix/feature mismatch between jobs.
-  # Live policy/scripts until aikido-tools image is rebuilt with CDLA + r-efi
-  # exception + SQE reviewed_evidence (aikido!51). After tools image digest
-  # updates, this override can be removed and AIKIDO_HOME from the image used.
-  AIKIDO_POLICY_REF: "v0.9.0"
-  # Final stage of the multi-stage Dockerfile (distroless/cc:nonroot runtime).
-  # Passed as --target to kaniko so we never accidentally ship an intermediate
-  # builder stage if stage order in Dockerfile drifts.
   AIKIDO_DOCKER_TARGET: "runtime"
-  # Keyless cosign signature on every vX.Y.Z image (aikido-sign-image, GitLab
-  # OIDC -> Sigstore). Opt-in upstream; release images must be signed so
-  # deployers can verify what they run. Needs runner egress to Sigstore; if the
-  # first tag pipeline fails here, the image is already pushed, only the
-  # signature is missing.
   AIKIDO_SIGN: "1"
-  # Dependency reputation gate (aikido-reputation, `reputation = true` in
-  # .asset). The "new release" window defaults to 21 days; on pipeline 1638137
-  # it flagged 99 of 146 warnings as nothing but routine releases (aws-sdk-*,
-  # clap, cc), which buried the scorecard and staleness findings; at 7 days, 70
-  # of those 99 drop and 29 remain. 7 days still
-  # covers the window in which a hijacked or typo-squatted release is usually
-  # caught. It only affects WARN lines; UNRESOLVED packages block regardless.
   AIKIDO_REPUTATION_MAX_AGE_DAYS: "7"
-  # Scan every dependency: the default cap of 600 left 106 of 706 unchecked.
   AIKIDO_REPUTATION_MAX: "800"
 
-# ── Binaries for the image, compiled by cargo in the test stage ──────
-# The image used to be compiled inside kaniko in .post, after the tests: a
-# `cargo chef cook` (9m20s) plus a release build with thin LTO (28m25s) plus
-# about four minutes of filesystem snapshots, 38 to 67 minutes measured, with
-# every RUN --mount cache ignored. This job does the compile with cargo, in the
-# test stage with `needs: []`, so it overlaps the test gate; the .post image job
-# then only COPYs (Dockerfile.ci).
-#
-# Profile: `release` (thin LTO, stripped) on the default branch, where the image
-# is published. `dev-release` on merge requests, where the image is a discarded
-# validation artifact: same opt-level, no LTO, so the link is minutes not tens
-# of minutes. `strip` keeps the MR artifact small.
-#
-# Runs in the platform's Rust image (aikido images/aikido-rust, pinned by digest
-# in the included template as AIKIDO_RUST_IMAGE): rust 1.98.0 matching
-# rust-toolchain.toml, clang + mold (what .cargo/config.toml pins for x86_64
-# Linux), protobuf for datafusion-substrait's build script, binutils for
-# `strip`, and sccache. Before this the job spent minutes on apt-get and a
-# rustup toolchain download on every run. `--locked` and
-# `--no-default-features` match ./Dockerfile, which still says rust 1.97.1
-# (item A7 of the build-time plan).
 release-binaries:
-  stage: test
-  needs: []
-  image: "$AIKIDO_RUST_IMAGE"
-  timeout: 90m
-  variables:
-    CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
-    CARGO_INCREMENTAL: "0"
-    CARGO_TERM_COLOR: "always"
-  cache:
-    key: "release-binaries-registry"
-    paths:
-      - .cargo-home/registry/
-  before_script:
-    # Same sccache setup as the platform's Rust jobs (RUSTC_WRAPPER only when the
-    # server reached the bucket). The release/dev-release profiles keep their own
-    # debuginfo settings; the debuginfo knob only touches dev/test.
-    - !reference [.aikido_rust_build_env, before_script]
-  script:
-    - |
-      set -euo pipefail
-      echo "profile: $CARGO_PROFILE"
-      cargo build --locked --profile "$CARGO_PROFILE" --no-default-features \
-        --bin sqe-server --bin sqe-cli --bin sqe-bench
-      mkdir -p out
-      for b in sqe-server sqe-cli sqe-bench; do
-        cp "target/$CARGO_PROFILE/$b" out/
-        strip "out/$b"
-      done
-      ls -la out/
-  artifacts:
-    paths:
-      - out/
-    expire_in: 1 day
+  extends: .aikido-rust-binaries
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
       when: never
-    # Not on `.gitlab-ci.yml` changes: that made every CI-config MR compile
-    # release binaries (41 min on !1162) and starved the shared runners. An MR
-    # that edits this job, malware-scan or aikido-build-validate can still run
-    # them: start its pipeline with SQE_FORCE_IMAGE_BUILD=1. Main always runs them.
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $SQE_FORCE_IMAGE_BUILD == "1"'
-      variables:
-        CARGO_PROFILE: "dev-release"
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes:
-        - Dockerfile
-        - Dockerfile.ci
-        - Cargo.toml
-        - Cargo.lock
-        - rust-toolchain.toml
-        - .cargo/config.toml
-        - "crates/*/Cargo.toml"
-        - "vendor/**/*"
-        - "xtask/**/*"
       variables:
         CARGO_PROFILE: "dev-release"
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       variables:
         CARGO_PROFILE: "release"
-
-# ── Prebuilt dependency image for the Rust jobs ──────────────────────
-# Every Rust job compiled the third-party tree from nothing: about 11 of the
-# gate's 13 minutes (pipeline 1635867). The sccache bucket that would fix
-# that does not exist yet. This job compiles the tree once on main and
-# publishes it as one layer on top of $AIKIDO_RUST_IMAGE, as
-# $CI_REGISTRY_IMAGE/ci-deps:main; each runner host's Docker keeps the layer
-# after the first pull, which is the persistent cache the runners otherwise
-# lack. Script and the reasoning on staleness: ci/build-deps-image.sh.
-#
-# Runs when a dependency input changes (the include ref bump that moves
-# $AIKIDO_RUST_IMAGE lives in this file), or by hand from a main pipeline.
-# The Rust jobs are switched to the image in a follow-up change, once it
-# exists; until then this job only publishes.
-ci-deps-image:
-  stage: test
-  needs: []
-  image: "$AIKIDO_RUST_IMAGE"
-  timeout: 60m
-  # A cancelled push leaves the old tag in place (crane writes the manifest
-  # last), but there is no reason to throw away a half-done compile either.
-  interruptible: false
   variables:
-    CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
-    CARGO_INCREMENTAL: "0"
-    CARGO_TERM_COLOR: "always"
-    SQE_DEPS_TARGET: "/opt/sqe-deps/target"
-  before_script:
-    - !reference [.aikido_rust_build_env, before_script]
-  script:
-    - ci/build-deps-image.sh
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'
-      when: never
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      changes:
-        - Cargo.lock
-        - Cargo.toml
-        - "crates/*/Cargo.toml"
-        - "vendor/**/*"
-        - rust-toolchain.toml
-        - .cargo/config.toml
-        - .gitlab-ci.yml
-        - ci/build-deps-image.sh
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      when: manual
-      allow_failure: true
-    # Trial run from an MR: publishes ci-deps:mr-<iid>, never :main.
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      when: manual
-      allow_failure: true
-      variables:
-        SQE_DEPS_TAG: "mr-$CI_MERGE_REQUEST_IID"
+    AIKIDO_RUST_BINARIES: "sqe-server sqe-cli sqe-bench"
+    AIKIDO_RUST_BIN_FLAGS: "--bin sqe-server --bin sqe-cli --bin sqe-bench"
 
-# Malware scan of what we ship, before it can be promoted. ClamAV over the
-# release binaries (the only files Dockerfile.ci adds to the Chainguard base)
-# and the source tree, vendored code included. A hit fails the job, and the
-# .post image push waits on the whole test stage, so an infected binary never
-# reaches the registry. The image bakes in its signature DB (offline works);
-# freshclam refreshes it when the runner has egress. Renovate bumps the digest.
+ci-deps-image:
+  extends: .aikido-rust-deps-image
+  variables:
+    AIKIDO_DEPS_TARGET: "/opt/sqe-deps/target"
+
 malware-scan:
-  stage: test
+  extends: .aikido-malware-scan
+  rules: !reference [release-binaries, rules]
   needs:
     - job: release-binaries
       artifacts: true
-  image:
-    name: clamav/clamav:1.5.3@sha256:d06c1d6a451d616e1dd79b42f44c8c8c291bba9cf4e75ebc4d0e43c1c6dd87bb
-    entrypoint: [""]
-  timeout: 20m
-  script:
-    - freshclam --quiet || echo "freshclam unavailable; scanning with the baked-in DB"
-    - clamscan --version
-    # `.` includes out/ (the release-binaries artifact).
-    - clamscan -r --infected --exclude-dir='/\.git$' .
-  rules: !reference [release-binaries, rules]
 
-# Unused-dependency gate. cargo-machete is a source scan (no compile), so the
-# job is seconds; it runs whenever a manifest changes. Feature-only knobs are
-# listed under [package.metadata.cargo-machete] in the crate that owns them.
-#
-# Also the BLOCKING supply-chain gate: cargo deny (advisories, bans, licenses,
-# sources) and cargo audit (RustSec, honouring .cargo/audit.toml). aikido-test-rust
-# runs both too, but as `|| echo "(non-blocking)"`, so a known advisory would
-# merge with a warning nobody reads. Both read Cargo.lock only,
-# no compile.
 deps-check:
-  stage: test
-  needs: []
-  image: "$AIKIDO_RUST_IMAGE"
-  timeout: 15m
+  extends: .aikido-rust-deps-check
   variables:
-    CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
-    CARGO_MACHETE_VERSION: "0.9.2"
-    CARGO_DENY_VERSION: "0.19.6"
-    CARGO_AUDIT_VERSION: "0.22.1"
-  # The cache carries an executable that the default branch then runs. That
-  # is only safe because the project has "separate caches for protected
-  # branches" on (ci_separated_caches = true): an MR pipeline cannot write
-  # the cache that main restores (#714). Keep that setting on, and keep the
-  # tool pinned so a stale cache is at least a known version.
-  #
-  # registry/index and registry/cache (compressed .crate files) only, never
-  # registry/src. cargo deny/audit run `cargo metadata`, which downloads and
-  # unpacks every crate; zipping the ~82k unpacked files overran the 15-minute
-  # job timeout on main (pipeline 1633939) after the gates had passed. cargo
-  # re-extracts from registry/cache in seconds. The key moved to -v2 so the
-  # bloated archive is never restored.
-  cache:
-    key: "deps-check-cargo-home-v2"
-    paths:
-      - .cargo-home/bin/
-      - .cargo-home/registry/index/
-      - .cargo-home/registry/cache/
-  script:
-    - |
-      set -euo pipefail
-      # The cache restores the binary into $CARGO_HOME/bin, which is not on
-      # PATH in the image; without this the probe misses and the reinstall
-      # fails with "binary `cargo-machete` already exists".
-      export PATH="$CARGO_HOME/bin:$PATH"
-      cargo-machete --version 2>/dev/null | grep -qF "$CARGO_MACHETE_VERSION" \
-        || cargo install cargo-machete --locked --force --version "$CARGO_MACHETE_VERSION"
-      cargo machete --with-metadata crates/sqe-*
-      cargo-deny --version 2>/dev/null | grep -qF "$CARGO_DENY_VERSION" \
-        || cargo install cargo-deny --locked --force --version "$CARGO_DENY_VERSION"
-      cargo-audit --version 2>/dev/null | grep -qF "$CARGO_AUDIT_VERSION" \
-        || cargo install cargo-audit --locked --force --version "$CARGO_AUDIT_VERSION"
-      cargo deny check
-      cargo audit
-      # No cargo needed; rides along because the job already runs on every
-      # MR that touches crates/**/*.rs.
-      scripts/check-test-layout.sh
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'
-      when: never
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes:
-        - Cargo.toml
-        - Cargo.lock
-        - "crates/*/Cargo.toml"
-        - "crates/**/*.rs"
-        - deny.toml
-        - .cargo/audit.toml
-        # Its own definition: a change to this job must run it before main.
-        - .gitlab-ci.yml
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    AIKIDO_CARGO_MACHETE_PATHS: "crates/sqe-*"
+    AIKIDO_DEPS_EXTRA_SCRIPT: "scripts/check-test-layout.sh"
 
-# Helm chart gate: lint the production overlay and check the rendered pods
-# against the Pod Security "restricted" fields (non-root, RuntimeDefault
-# seccomp, no privilege escalation, read-only root, drop ALL, no host
-# namespaces) plus a NetworkPolicy per component. A chart change that drops
-# any of them fails here instead of in a cluster admission controller.
 helm-chart-check:
-  stage: test
-  needs: []
-  image:
-    name: alpine/helm:4.3.0@sha256:a6cf54599ccb99d90cf0712b30f03fdb3cab062e6b94e0418cc4db7e8a1464b2
-    entrypoint: [""]
+  extends: .aikido-helm-check
   variables:
-    # The production overlay needs these to render; they are placeholders.
-    HELM_SETS: >-
+    AIKIDO_HELM_CHART: "deploy/helm/sqe"
+    AIKIDO_HELM_RELEASE: "sqe"
+    AIKIDO_HELM_VALUE_ARGS: "-f deploy/helm/sqe/values-production.yaml"
+    AIKIDO_HELM_SETS: >-
       --set config.policy.ranger.url=http://ranger:6080
       --set existingSecret=placeholder
       --set workerSecret.existingSecret=placeholder
       --set worker.enabled=true
-  script:
-    - apk add --no-cache python3 py3-yaml >/dev/null
-    - helm lint deploy/helm/sqe -f deploy/helm/sqe/values-production.yaml $HELM_SETS
-    - helm template sqe deploy/helm/sqe -f deploy/helm/sqe/values-production.yaml $HELM_SETS > rendered.yaml
-    - python3 scripts/check-helm-hardening.py < rendered.yaml
   rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes:
-        - "deploy/helm/**/*"
-        - scripts/check-helm-hardening.py
-        - .gitlab-ci.yml
+      changes: ["deploy/helm/**/*", .gitlab-ci.yml]
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
-# Image assembly from the release-binaries artifact (Dockerfile.ci, COPY only).
-# The 3h timeout is a leftover ceiling from when this job compiled the engine
-# inside kaniko; the job now takes minutes.
-#
-# Script is re-stated from aikido deploy.yml (v0.9.4) so we can pass
-# --target=$AIKIDO_DOCKER_TARGET. When bumping the aikido `ref:`, re-diff this
-# script against ci/templates/deploy.yml and keep the --target line.
 aikido-build:
-  timeout: 3h
-  # Never cancel a push mid-layer. On main this kaniko run pushes $AIKIDO_IMAGE,
-  # and a half-written manifest is worse than a wasted run, so this job opts out
-  # of the `default: interruptible: true` above. Same reasoning for the publish,
-  # SBOM-of-image and release/signing jobs overridden below.
-  interruptible: false
-  # Default-branch-only, in .post, no `needs:` (all from the v0.12.0 template).
-  # Stage order keeps this push behind the test gate; a `needs:` here would let
-  # an untested image reach the registry. The MR-side speedup is the template's
-  # aikido-build-validate (--no-push, `needs: []`), narrowed below.
-  #
-  # `dependencies:` fetches release-binaries' out/ artifact WITHOUT changing
-  # ordering (unlike `needs:`), so the push still waits for the whole test stage.
-  dependencies:
-    - release-binaries
-  # Never on the schedule: release-binaries does not run there, so the build
-  # found no out/sqe-server and failed every scheduled pipeline (1634261). The
-  # weekly image rescan is aikido-image-vuln against :stable instead.
+  timeout: 30m
+  dependencies: [release-binaries]
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
       when: never
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      exists:
-        - Dockerfile
-  script:
-    - |
-      set -euo pipefail
-      # Standard provenance build-args (Dockerfiles that don't declare them just
-      # ignore the values); repos add more via AIKIDO_BUILD_ARGS="K=V K2=V2".
-      BA="--build-arg VERSION=${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
-      BA="$BA --build-arg BUILD_DATE=$CI_PIPELINE_CREATED_AT --build-arg GIT_REVISION=$CI_COMMIT_SHA"
-      # kaniko doesn't auto-populate BuildKit's TARGETARCH/TARGETOS; default amd64.
-      BA="$BA --build-arg TARGETARCH=${AIKIDO_TARGETARCH:-amd64} --build-arg TARGETOS=linux"
-      for kv in ${AIKIDO_BUILD_ARGS:-}; do BA="$BA --build-arg $kv"; done
-      # Distroless final stage (Dockerfile.ci `AS runtime`, same as ./Dockerfile).
-      TARGET="--target ${AIKIDO_DOCKER_TARGET:-runtime}"
-      if [ "$CI_COMMIT_REF_NAME" = "$CI_DEFAULT_BRANCH" ]; then
-        DEST="--destination $AIKIDO_IMAGE --digest-file image-digest.txt"
-      else
-        DEST="--no-push"
-      fi
-      echo "kaniko: target=${AIKIDO_DOCKER_TARGET:-runtime} dest_mode=$( [ "$CI_COMMIT_REF_NAME" = "$CI_DEFAULT_BRANCH" ] && echo push || echo no-push )"
-      /kaniko/executor \
-        --context "$CI_PROJECT_DIR" \
-        --dockerfile "$CI_PROJECT_DIR/Dockerfile.ci" \
-        $TARGET \
-        $BA \
-        $DEST
-      [ -f image-digest.txt ] || echo "validation-only build (--no-push); no image pushed" > image-digest.txt
+      exists: [Dockerfile.ci]
 
-# The template's MR validation build (`extends: aikido-build`, `needs: []`,
-# `--no-push`) runs on every MR that has a Dockerfile. Narrowed here to MRs
-# that change an image input: a Rust-only change cannot break this build in a
-# way the test stage misses (aikido-rust-extra compiles the
-# --no-default-features graph the image uses), and before the split existed
-# this build was 38 to 67 serial minutes per MR for a discarded artifact.
 aikido-build-validate:
-  # `needs: []` in the template; here it needs the MR-profile binaries. Nothing
-  # is pushed on an MR, so ordering against the test gate does not matter.
   needs:
     - job: release-binaries
       artifacts: true
   rules:
-    # Same trigger as release-binaries, whose artifact it needs (see there).
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $SQE_FORCE_IMAGE_BUILD == "1"'
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes:
-        - Dockerfile
-        - Dockerfile.bench
-        - Cargo.toml
-        - Cargo.lock
-        - rust-toolchain.toml
-        - .cargo/config.toml
-        - "crates/*/Cargo.toml"
-        - "vendor/**/*"
-        - "xtask/**/*"
 
-# Container CVE gate on the image kaniko just built. Source-tree grype (aikido-scan)
-# never sees the distroless base or the static healthcheck wget; this job does.
-# Distroless/cc is expected to keep HIGH/CRITICAL at zero (measured ~0 high when
-# the runtime landed). MR validation builds do not push, so the gate is a no-op
-# there and enforces on merge when the image is in the GitLab registry.
-aikido-image-vuln:
-  stage: .post
-  image: "$AIKIDO_TOOLS_IMAGE"
-  needs:
-    # Whichever of the two the pipeline actually contains. aikido is splitting the
-    # image build so the MR-side validation build stops waiting on the test stage
-    # it cannot consume (aikido!139): `aikido-build` becomes default-branch-only
-    # and pushes, `aikido-build-validate` is the MR-only --no-push twin.
-    #
-    # BOTH are `optional`, and that is the load-bearing part. A `needs:` naming a
-    # job that rules itself out of the pipeline is a pipeline-CREATION error, not
-    # a skipped job -- the same failure shape as the scheduled-pipeline config
-    # errors. Without `optional` this job would break every MR the moment the
-    # aikido ref is bumped past the split. Harmless before then: an optional need
-    # for a job that does not exist yet is simply ignored.
-    - job: aikido-build
-      artifacts: true
-      optional: true
-    - job: aikido-build-validate
-      artifacts: true
-      optional: true
-  before_script:
-    - mkdir -p "$HOME/.docker"
-    - |
-      AUTH=$(printf "%s:%s" "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')
-      printf '{"auths":{"%s":{"auth":"%s"}}}' "$CI_REGISTRY" "$AUTH" > "$HOME/.docker/config.json"
-  script:
-    - |
-      set -euo pipefail
-      # Weekly schedule: nothing is built, so rescan what deployments run, the
-      # newest release image, against today's vulnerability data.
-      if [ "$CI_PIPELINE_SOURCE" = "schedule" ]; then
-        echo "grype weekly rescan: registry:$CI_REGISTRY_IMAGE:stable (fail-on high)"
-        grype "registry:$CI_REGISTRY_IMAGE:stable" -o table --fail-on high
-        exit 0
-      fi
-      # No digest file at all means aikido-build did not run in this pipeline
-      # (MR without an image-input change, see its rules:). Nothing was built,
-      # so there is nothing to scan; the gate enforces on merge to main.
-      if [ ! -f image-digest.txt ] || grep -q 'validation-only' image-digest.txt 2>/dev/null; then
-        echo "MR validation build (no image pushed or no image built); container CVE gate runs on merge to $CI_DEFAULT_BRANCH"
-        exit 0
-      fi
-      echo "grype container gate: registry:$AIKIDO_IMAGE (fail-on high)"
-      grype "registry:$AIKIDO_IMAGE" -o table --fail-on high
-  allow_failure: false
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      exists:
-        - Dockerfile
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      exists:
-        - Dockerfile
+# Scheduled rescan of the deployed release; main uses the digest gate.
+aikido-image-scan:
+  variables:
+    AIKIDO_IMAGE: "$CI_REGISTRY_IMAGE:stable"
 
-# Exclude demo/quickstart Python trees from the source SBOM so commercial
-# EULA packages (dlthub) and docs samples are not license-gated as product deps.
-# Also keep syft focused on the engine workspace.
-#
-# The third step supplies licenses for the crates that live in THIS repo. syft's
-# Rust cataloger reads Cargo.lock, which carries no license, so every crate comes
-# out without one; `sbom_license_check.py` then recovers them from deps.dev, which
-# works for anything on crates.io and cannot work for a workspace member or a
-# vendored fork. That left 29 components in REVIEW with "license evidence
-# missing", and under --strict that fails the gate and skips every build and
-# publish job behind it.
-#
-# All 29 declare their license in their own Cargo.toml (28 Apache-2.0, jiter MIT).
-# This is not a waiver, it is the missing transport: the script only fills a
-# component whose name AND version match a crate on disk, reads the value from
-# that crate's manifest, and records CycloneDX evidence naming the file. Its
-# --selftest asserts the narrowness rules, so run it first.
 aikido-sbom:
-  script:
-    - |
-      set -euo pipefail
-      syft "dir:$CI_PROJECT_DIR" \
-        --source-name "$CI_PROJECT_NAME" \
-        --source-version "$CI_COMMIT_SHORT_SHA" \
-        --exclude '**/quickstart/**' \
-        --exclude '**/docs/**' \
-        --exclude '**/adapters/**' \
-        --exclude '**/target/**' \
-        -o "cyclonedx-json@1.6=$AIKIDO_SBOM"
-      python3 "$AIKIDO_HOME/scripts/sbom_enrich.py" --sbom "$AIKIDO_SBOM" --asset "$CI_PROJECT_DIR/.asset"
-      python3 "$CI_PROJECT_DIR/ci/sbom-license-from-cargo.py" --selftest
-      python3 "$CI_PROJECT_DIR/ci/sbom-license-from-cargo.py" \
-        --sbom "$AIKIDO_SBOM" --root "$CI_PROJECT_DIR"
+  variables:
+    AIKIDO_SHARED_SCRIPTS: "sbom-license-from-cargo.py"
+  before_script:
+    - !reference [.aikido-shared-scripts, before_script]
 
-# ===== blocking correctness gate (#386) =====
-# Moved to the platform. aikido v0.11.0's `aikido-test-rust` IS this gate: it runs
-# `cargo test --workspace --all-features` (compile, then execute, each under its
-# own GNU timeout) as a BLOCKING phase, with clippy/audit/deny advisory in the
-# same job, plus a separate always-blocking `aikido-cargo-lock` for
-# `cargo metadata --locked`. The job that used to live here duplicated the test
-# run against the advisory copy in v0.10.0's test-rust.yml — two full compiles per
-# pipeline for one commit (measured: 28m27s + 26m51s).
-#
-# The gate blocks only where AIKIDO_CARGO_GATE_ENFORCE="1", set in `variables:`
-# above. It cannot live in `.asset`: aikido reads it from `rules:`, which GitLab
-# evaluates at pipeline creation, before any before_script loads that file.
-#
-# Wall clock, since this used to run CONCURRENTLY with aikido-test-rust and now
-# does not: the test stage goes from ~28 minutes (two parallel duplicates) to ~50
-# serial, for roughly the same runner-minutes and one test run instead of two.
-#
-# Coverage change worth knowing: the local job ran on EVERY default-branch commit,
-# while aikido's carries `changes: [**/*.rs, **/Cargo.toml, **/Cargo.lock,
-# rust-toolchain.toml]` there too, so a main commit touching none of those no
-# longer compiles the workspace. Nearly every commit here touches Rust; if that
-# stops being true, override `rules:` on the job below rather than upstream.
-
-# aikido v0.12.0 (aikido !155) gives aikido-test-rust and aikido-cargo-lock
-# `needs: []`, sets CARGO_INCREMENTAL=0 in the gate, and runs
-# ci/aikido-rust-extra.sh in its own parallel `aikido-rust-extra` job. The
-# local overrides that did the same on v0.11.0 were removed with the ref bump.
-#
-# `target/` is deliberately NOT cached here; the platform default (registry
-# only) stands. This repo used to add `target/` to the cache, and every run
-# then spent 10 minutes (job 5284525: 14:20:48 to 14:31:07) zipping a
-# several-GB tree only for the upload to fail with `EntityTooLarge` (the cache
-# store caps objects at 5 GiB). No cache ever landed, MR branch keys never
-# existed, and the compile phase measured the same with the stale restore
-# (12m45s) as fully cold on a quiet runner (11m27s, job 5286725). Ten minutes
-# of pure overhead per job, zero hits. Dependency reuse across jobs has to
-# come from a compiler cache that stores per-crate objects (sccache to an S3
-# bucket), tracked as item A2 in
-# docs/internal/plans/2026-09-04-build-test-time-program.md.
-#
-# The feature-matrix checks in ci/aikido-rust-extra.sh run in the platform's
-# `aikido-rust-extra` job (test stage, `needs: []`, blocking under
-# AIKIDO_CARGO_GATE_ENFORCE like the gate).
-#
-# Two cold compiles, not three. On MR !1178 (pipeline 1634784) the gate,
-# aikido-rust-extra and aikido-clippy-rust each compiled the whole dependency
-# tree from nothing, at the same time, on one runner host (run01, concurrent
-# slots 0-2): 18, 16.5 and 15.5 minutes, fighting over the same cores. Clippy
-# and `cargo check` share check-mode dependency artifacts, so clippy now runs
-# inside aikido-rust-extra and its own job is off.
-#
-# No registry cache on these jobs. The template keys it per branch, so an
-# MR's first pipeline always misses ("file does not exist"), and every job
-# still zipped and uploaded .cargo-home/registry/ afterwards: 29 s, 51 s and
-# 232 s on that pipeline. Fetching every crate cold takes about 5 s.
-#
-# Both jobs start from the prebuilt dependency image (ci-deps-image above):
-# the platform Rust image plus the third-party tree compiled on main, used
-# in place through CARGO_TARGET_DIR. Cargo still decides freshness per unit,
-# so a Cargo.lock change in an MR only recompiles what moved. Same path as
-# SQE_DEPS_TARGET in ci-deps-image; the paths have to match for reuse.
-# `image:` is set on each job, not through `extends:`: the included job's own
-# `image:` outranks an extended one (checked with the merged-YAML lint).
-#
-# before_script replaces the template's: ci/reuse-deps-image.sh first (lets
-# cargo reuse the baked vendored crates when vendor/ is unchanged), then the
-# platform's build env. The template's other step, an apt fallback for
-# clang/mold/protoc, is dropped: the image carries them.
 aikido-test-rust:
   image: "$CI_REGISTRY_IMAGE/ci-deps:main"
   variables:
+    AIKIDO_SHARED_SCRIPTS: "reuse-deps-image.sh"
     CARGO_TARGET_DIR: "/opt/sqe-deps/target"
   cache: []
   before_script:
-    - ci/reuse-deps-image.sh
+    - !reference [.aikido-shared-scripts, before_script]
+    - bash "$AIKIDO_SHARED_HOME/scripts/reuse-deps-image.sh"
     - !reference [.aikido_rust_build_env, before_script]
 
 aikido-rust-extra:
   image: "$CI_REGISTRY_IMAGE/ci-deps:main"
   variables:
+    AIKIDO_SHARED_SCRIPTS: "reuse-deps-image.sh"
     CARGO_TARGET_DIR: "/opt/sqe-deps/target"
   cache: []
   before_script:
-    - ci/reuse-deps-image.sh
+    - !reference [.aikido-shared-scripts, before_script]
+    - bash "$AIKIDO_SHARED_HOME/scripts/reuse-deps-image.sh"
     - !reference [.aikido_rust_build_env, before_script]
 
 aikido-clippy-rust:
   rules:
     - when: never
 
-# The vendored grant profile must be the platform's current one.
-#
-# crates/sqe-policy's golden-fixture tests prove SQE's planner agrees with the
-# profile it HOLDS. They cannot notice that the profile it holds is stale, and SQE
-# and the control plane write Ranger policies to the SAME `polaris` service -- so a
-# stale copy means the same GRANT confers different access depending on which tool
-# issued it. This job is the other half.
-#
-# Deliberately NOT allow_failure. The script exits 2 (distinct from 1) when it
-# cannot find the platform checkout, precisely so a job that cannot verify fails
-# instead of reporting success: a silently-skipped drift gate is indistinguishable
-# from a clean one, which is the failure this exists to prevent.
-#
-# Scoped by `changes` so it only runs when the vendored assets or the checker move,
-# rather than gating every MR on the availability of another repository.
 vendored-profile-drift:
   stage: test
-  # Digest-pinned for the same reason as aikido's rust image upstream: the
-  # tag is mutable, so two runs a week apart could sit on different bases with
-  # no record. The digest is the multi-arch OCI index, so linux/amd64 still
-  # resolves on the shared runners. Renovate's `gitlabci` manager reads
-  # `image:` and raises digest bumps.
   image: alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
   variables:
     GIT_DEPTH: "1"
@@ -739,9 +185,6 @@ vendored-profile-drift:
   script:
     - |
       set -euo pipefail
-      # CI_JOB_TOKEN can read sibling projects when the platform project allows
-      # this one in its CI/CD job-token allowlist. If it cannot, the clone fails
-      # here and the job fails loudly rather than skipping the check.
       if ! git clone --depth 1           "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}:${CI_SERVER_PORT}/vpf-data-ai/chameleon/applications/data-platform.git"           "$DATA_PLATFORM_DIR" 2>/dev/null; then
         echo "could not clone data-platform with CI_JOB_TOKEN." >&2
         echo "Add this project to data-platform's CI/CD job token allowlist" >&2
@@ -763,119 +206,8 @@ vendored-profile-drift:
       changes:
         - "crates/sqe-policy/assets/*.json"
 
-# ── Publish / release jobs opt out of auto-cancel ──────────────
-# These come from the aikido deploy.yml and release.yml includes, so the
-# `default: interruptible: true` at the top of this file would otherwise make
-# them cancellable. Anything that pushes an image, writes a tag/release, or
-# signs an artifact must run to completion once started: a cancelled publish
-# leaves the registry or the release inconsistent, which is a worse outcome than
-# the runner minutes auto-cancel is there to save.
-#
-# aikido-build carries its own `interruptible: false` at its override above.
-aikido-publish-image:
-  interruptible: false
-aikido-image-sbom:
-  interruptible: false
-aikido-mbom:
-  interruptible: false
-aikido-release:
-  interruptible: false
-aikido-release-image:
-  interruptible: false
-aikido-sign-image:
-  interruptible: false
-
-# SAST blocks at the .asset `warn_on` tier (high). The platform leaves it
-# advisory ("SAST never blocks a merge"); here a high SAST finding blocks
-# promotion like any other high finding. Medium and Info still only report.
 aikido-sast:
   allow_failure: false
 
-# GitLab Release per vX.Y.Z tag, notes = that version's CHANGELOG.md section
-# (scripts/release.sh promotes [Unreleased] to it before tagging). Releases
-# had stopped at v0.37.0: nothing in the tag pipeline created them.
 gitlab-release:
-  stage: .post
-  image: registry.gitlab.com/gitlab-org/release-cli:v0.24.0@sha256:3f52d526f48e8d10625c722fa6d6423ee82aadeae1b1aa91f07b62551d96dacf
-  interruptible: false
-  needs: []
-  script:
-    - V="${CI_COMMIT_TAG#v}"
-    - awk -v v="$V" 'index($0, "## [" v "]") == 1 {p=1; next} p && /^## \[/ {exit} p' CHANGELOG.md > release-notes.md
-    - '[ -s release-notes.md ] || echo "No CHANGELOG.md section for ${V}." > release-notes.md'
-    - wc -l release-notes.md
-  release:
-    tag_name: $CI_COMMIT_TAG
-    name: $CI_COMMIT_TAG
-    description: release-notes.md
-  rules:
-    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
-
-# ===== repo-specific integration suites (docker-in-docker), hosted here =====
-#
-# REMOVED (issue #387): `integration-test` and `distributed-smoke`.
-#
-# Both jobs needed a privileged `docker:dind` sidecar to bring up
-# docker-compose.test.yml. The shared runners answer `no route to host` on
-# tcp://docker:2375, so neither job ever executed a line of SQE code. They were
-# carried as `allow_failure: true` for a while, which is worse than absent: a
-# permanently-yellow job reads as coverage and there is none. Two real main
-# breakages hid behind them.
-#
-# The suites themselves are unchanged and are now LOCAL gates:
-#
-#   make test-integration                          # full suite, test stack
-#   make test-integration FILTER=test_ctas_roundtrip
-#   make test-distributed                          # coordinator + 2 workers
-#   make test-integration-down                     # tear the stack back down
-#
-# Run them locally before merging anything touching the read or write path.
-# Re-adding a CI job here requires a runner with a working dind sidecar (or a
-# socket-mounted shell runner); until then, do not reintroduce an
-# allow_failure-only variant.
-
-# ── Quickstart + access-control suites: REMOVED (issue #387) ───
-# `scenario-test` and `access-control-test` are gone, for the same reason the two
-# integration jobs above them were, and with harder evidence.
-#
-# Measured on main before removal: `scenario-test` was 0 for 6 (5 failed, 1
-# skipped, 1 canceled) and `access-control-test` 0 for 1. Neither has ever
-# passed. Every failure is the same one #387 documents, before any SQE code runs:
-#
-#   *** WARNING: Service ...docker-0 probably didn't start properly.
-#   Health check error: ..."-wait-for-service" timeout
-#   waiting for TCP connection to <id> on [2375 2376]...
-#
-# The reason this could not stay as a known-red job: both sit in the `test`
-# stage, so a failure SKIPS everything downstream. `aikido-build`,
-# `aikido-publish-image`, `aikido-image-sbom`, `aikido-mbom` and `aikido-release`
-# were all skipped on every main pipeline where `scenario-test` ran. A broken
-# dind sidecar was not just painting main red, it was blocking the container
-# image build and publish, which is a second cause of a stale published image on
-# top of the aikido!126 Harbor gap.
-#
-# `allow_failure: true` was rejected: a permanently-yellow job reads as coverage
-# and provides none, which is the exact anti-pattern the integration-job removal
-# was about.
-#
-# Both suites are unchanged and run locally:
-#
-#   scripts/test.sh scenario all        # every SELF_CONTAINED quickstart
-#   scripts/test.sh scenario distributed
-#   make test-access-control            # Ranger/Polaris/Keycloak e2e
-#   make test-access-control-spark      # the same gates through Spark
-#
-# Re-adding either requires a runner with a working dind sidecar (or a
-# socket-mounted shell runner). Do not reintroduce an allow_failure-only variant.
-
-# ── AWS cloud-backed scenario tests: REMOVED 2026-09-04 ────────
-# `scenario-test-aws` was a manual, never-run skeleton (needed a dind sidecar
-# the runners do not have and AWS CLI v2 the image did not ship). The three
-# AWS quickstarts still run locally: `quickstart/aws-glue/run.sh --check`,
-# `quickstart/aws-s3-tables/run.sh --check`,
-# `quickstart/glue-lake-formation/run.sh --check`.
-
-# ── Iceberg matrix score regression guard ─────────────────────
-# Runs `cargo xtask matrix-report --min-percent N` where N is the current
-# baseline. If the committed docs/iceberg-matrix-state.json drops below the
-# baseline, the job fails. Bump MATRIX_MIN_PERCENT when a phase lands.
+  extends: .aikido-gitlab-release
