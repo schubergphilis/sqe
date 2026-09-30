@@ -1,5 +1,9 @@
 # SSB SF10 root cause and SF100 preparation
 
+> Historical evidence: the measurements and implementation states below describe
+> the dated runs. For the current DataFusion 55 readiness assessment and work
+> plan, see [SF100 readiness](sf100-scaling-risks.md), updated 2026-09-30.
+
 Date: 2026-07-05, amended same day after an SF10 instrumented run on the freed dev
 box (section 6). Status: root cause pinned to three layers; the InList-cap fix
 candidate from the first version is REFUTED by a null A/B and replaced by a
