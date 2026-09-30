@@ -18,6 +18,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
+use futures::{Stream, StreamExt};
 use iceberg::arrow::{
     arrow_schema_to_schema, arrow_schema_to_schema_auto_assign_ids, schema_to_arrow_schema,
 };
@@ -412,9 +413,30 @@ async fn write_shard(
     partition_key: Option<PartitionKey>,
     batches: impl Iterator<Item = RecordBatch>,
 ) -> anyhow::Result<Vec<DataFile>> {
+    write_shard_stream(
+        writer_props,
+        target_file_size,
+        table_ctx,
+        file_prefix,
+        partition_key,
+        futures::stream::iter(batches),
+    )
+    .await
+}
+
+/// Consume batches as they arrive. Retain only the writer buffers and the
+/// bounded producer queue, including when object storage is slower than generation.
+async fn write_shard_stream(
+    writer_props: &WriterProperties,
+    target_file_size: usize,
+    table_ctx: &TableCtx,
+    file_prefix: String,
+    partition_key: Option<PartitionKey>,
+    batches: impl Stream<Item = RecordBatch>,
+) -> anyhow::Result<Vec<DataFile>> {
     let table = &table_ctx.table;
-    let location_gen = DefaultLocationGenerator::new(table.metadata())
-        .context("building location generator")?;
+    let location_gen =
+        DefaultLocationGenerator::new(table.metadata()).context("building location generator")?;
     let file_name_gen =
         DefaultFileNameGenerator::new(file_prefix, None, iceberg::spec::DataFileFormat::Parquet);
     let parquet_builder = ParquetWriterBuilder::new(
@@ -432,7 +454,8 @@ async fn write_shard(
         .build(partition_key)
         .await
         .context("building data file writer")?;
-    for batch in batches {
+    futures::pin_mut!(batches);
+    while let Some(batch) = batches.next().await {
         // Rebind to the table-derived arrow schema: column data types are
         // identical, only field metadata (field ids) may differ in detail.
         let batch = RecordBatch::try_new(table_ctx.write_schema.clone(), batch.columns().to_vec())
@@ -816,7 +839,7 @@ pub async fn run_direct(
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.expect("semaphore closed");
                 // Sync producer on a blocking thread -> bounded channel -> async writer.
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<RecordBatch>(4);
+                let (tx, rx) = tokio::sync::mpsc::channel::<RecordBatch>(4);
                 let make = shard.make;
                 let producer = tokio::task::spawn_blocking(move || {
                     for b in make() {
@@ -825,20 +848,22 @@ pub async fn run_direct(
                         }
                     }
                 });
-                let mut batches = Vec::new();
-                while let Some(b) = rx.recv().await {
-                    batches.push(b);
-                }
-                producer.await.context("producer task panicked")?;
-                write_shard(
+                let batches = futures::stream::unfold(rx, |mut rx| async {
+                    rx.recv().await.map(|batch| (batch, rx))
+                });
+                let written = write_shard_stream(
                     &writer_props,
                     target_file_size,
                     &tctx,
                     format!("{idx:04}"),
                     None,
-                    batches.into_iter(),
+                    batches,
                 )
-                .await
+                .await;
+                // On a write error the receiver has been dropped, so the
+                // blocking producer exits instead of staying parked on send.
+                producer.await.context("producer task panicked")?;
+                written
             }));
         }
         let mut files = Vec::new();
