@@ -11,8 +11,6 @@
 pub(crate) mod adaptive_sort;
 pub(crate) mod audit_emitter;
 pub(crate) mod audit_resources;
-#[cfg(test)]
-mod tpcbb_preaggregation_test;
 pub mod audit_tag_adapter;
 pub(crate) mod catalog_ops;
 pub mod channel_pool;
@@ -361,3 +359,6 @@ superdebug_log_results = {enabled}
         );
     }
 }
+
+#[cfg(test)]
+mod tpcbb_preaggregation_test;
