@@ -9826,7 +9826,23 @@ s3_path_style = true
             NamespaceIdent::new("default".to_string()),
             "employees".to_string(),
         );
-        let ctx = DFSessionContext::new();
+        // Shaped like the coordinator's context (session_context.rs): the
+        // default schema is the session's, else `default`, and
+        // `datafusion.public` exists for DML scratch tables. With DataFusion's
+        // own default (`public`) a bare `employees` resolved to
+        // `public.employees`, a different table from the governed
+        // `default.employees`.
+        let ctx = DFSessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new()
+                .with_default_catalog_and_schema("datafusion", "default"),
+        );
+        ctx.catalog("datafusion")
+            .expect("default catalog")
+            .register_schema(
+                "public",
+                Arc::new(datafusion::catalog::MemorySchemaProvider::new()),
+            )
+            .expect("register public");
         (handler, session, table_ident, ctx)
     }
 

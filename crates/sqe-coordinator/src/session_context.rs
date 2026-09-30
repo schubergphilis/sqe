@@ -258,10 +258,11 @@ pub async fn create_session_context(
                 .into_iter()
                 .map(|(n, c)| (n, c.clone()))
                 .collect();
-            // Do not implicitly promote a Hive root here. Policy routing sees
-            // the catalog only on fully-qualified references, so making Hive
-            // the default would let two-part references take the Iceberg
-            // policy branch (see `attach_configured_hive_roots`).
+            // Do not implicitly promote a Hive root to the config default.
+            // A session may name one (`USE <root>.<db>`, handled below), and
+            // policy then qualifies its references from the session scope;
+            // the config default stays Iceberg (see
+            // `attach_configured_hive_roots`).
             let catalog_name = if flattened.is_empty() {
                 config
                     .query

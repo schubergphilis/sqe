@@ -361,21 +361,18 @@ impl RuntimeCatalogRegistry {
 /// escalation, reached from the config-file door instead of `ATTACH`).
 ///
 /// `default_catalog` must be `config.resolve_default_catalog()`. A root
-/// named the same as the session's default catalog is refused outright
-/// (see the name check below): `resolve_policy_key` (`sqe-policy`) and
-/// `CatalogRoutedTagSource` (`hive_tag_source.rs`) both dispatch on
-/// `table_ref.catalog()` alone, which is `None` for a two-part reference
-/// (`sales.orders`) -- DataFusion preserves the AS-WRITTEN reference in
-/// the scan, it does not fill in the resolved default catalog. A two-part
-/// reference under a Hive-named default catalog would therefore take the
-/// Iceberg branch of BOTH functions regardless of what the reference
-/// actually resolves against, either denying every row (no tag-source
-/// cache entry -> `lit(false)`) or, worse, inheriting whatever grants
-/// exist for a same-named Iceberg namespace. Refusing the name collision
-/// here closes both symptoms at the one place a two-part reference could
-/// ever reach a Hive table this way, without touching either dispatch
-/// site (see the report for why promoting the reference inside the
-/// policy path is deliberately deferred, not overlooked).
+/// named the same as the config default catalog is refused outright (see
+/// the name check below). `resolve_policy_key` (`sqe-policy`) and
+/// `CatalogRoutedTagSource` (`hive_tag_source.rs`) dispatch on the
+/// reference's catalog, and DataFusion keeps the AS-WRITTEN reference in
+/// the scan, so a two-part `sales.orders` carries no catalog. The policy
+/// rewriter now qualifies every scan reference from the planning context's
+/// `TableScope` before either dispatch, which is what lets `USE
+/// <hive-root>.<db>` be governed as Hive. The refusal stays as defence in
+/// depth for any path that evaluates policy without a scope: there a
+/// catalog-less reference takes the Iceberg branch, either denying every
+/// row (no tag-source entry -> `lit(false)`) or inheriting the grants of a
+/// same-named Iceberg namespace.
 pub async fn attach_configured_hive_roots(
     hive_config: &sqe_core::config::HiveConfig,
     storage: &sqe_core::config::StorageConfig,
