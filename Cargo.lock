@@ -6623,6 +6623,7 @@ dependencies = [
  "serde_json",
  "sqe-trino-protocol",
  "sqlparser",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",
