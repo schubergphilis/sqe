@@ -360,3 +360,6 @@ superdebug_log_results = {enabled}
         );
     }
 }
+
+#[cfg(test)]
+mod tpcbb_preaggregation_test;
