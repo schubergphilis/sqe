@@ -193,6 +193,15 @@ impl ScanTuning {
 // parallelization rule, issue #235) can rebuild a scan node with a different
 // `target_partitions` from a shared reference; `with_target_partitions`
 // consumes `self`. All fields are cheap-to-clone (Arc / Copy / metadata).
+/// Static snapshot/projection/predicate work shared by this scan's partitions.
+/// Reader gates and dynamic predicates are attached after this plan is loaded.
+#[derive(Debug)]
+struct StaticScanPlan {
+    tasks: Vec<FileScanTask>,
+    file_entries: Vec<(String, u64)>,
+    has_deletes: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct IcebergScanExec {
     table: Table,
@@ -295,6 +304,8 @@ pub struct IcebergScanExec {
     /// clone) of this scan node, sized `scan_fetch_ahead`. Rebuilt by
     /// [`IcebergScanExec::with_scan_fetch_ahead`] at planning time.
     fetch_permits: Arc<tokio::sync::Semaphore>,
+    static_plan: Arc<tokio::sync::OnceCell<Arc<StaticScanPlan>>>,
+    split_assignments: Arc<tokio::sync::OnceCell<Vec<Vec<FileScanTask>>>>,
 }
 
 impl IcebergScanExec {
@@ -445,6 +456,8 @@ impl IcebergScanExec {
             decode_permits,
             scan_fetch_ahead,
             fetch_permits,
+            static_plan: Arc::new(tokio::sync::OnceCell::new()),
+            split_assignments: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -502,6 +515,8 @@ impl IcebergScanExec {
     #[must_use = "with_snapshot_id consumes self; bind the returned scan"]
     pub fn with_snapshot_id(mut self, snapshot_id: i64) -> Self {
         self.snapshot_id = Some(snapshot_id);
+        self.static_plan = Arc::new(tokio::sync::OnceCell::new());
+        self.split_assignments = Arc::new(tokio::sync::OnceCell::new());
         self
     }
 
@@ -637,6 +652,7 @@ impl IcebergScanExec {
     pub fn with_target_partitions(mut self, target_partitions: usize) -> Self {
         let n = target_partitions.max(1);
         self.target_partitions = n;
+        self.split_assignments = Arc::new(tokio::sync::OnceCell::new());
         let eq = self.properties.eq_properties.clone();
         self.properties = Arc::new(PlanProperties::new(
             eq,
@@ -710,6 +726,8 @@ impl IcebergScanExec {
             decode_permits: self.decode_permits.clone(),
             scan_fetch_ahead: self.scan_fetch_ahead,
             fetch_permits: self.fetch_permits.clone(),
+            static_plan: self.static_plan.clone(),
+            split_assignments: self.split_assignments.clone(),
         }
     }
 
@@ -763,17 +781,18 @@ impl IcebergScanExec {
             sb = sb.with_filter(pred.clone());
         }
         let scan = sb.build()?;
-        let tasks: Vec<_> = scan.plan_files().await?.try_collect().await?;
-        let mut result: Vec<(String, u64)> = tasks
-            .iter()
-            .map(|t| (t.data_file_path().to_string(), t.length()))
-            .collect();
+        let mut result: Vec<(String, u64)> = scan
+            .plan_files()
+            .await?
+            .map_ok(|t| (t.data_file_path().to_string(), t.length()))
+            .try_collect()
+            .await?;
         let mut pruned_count = 0usize;
         if !self.df_filters.is_empty() {
             if let Ok(data_files) = self.collect_data_files().await {
                 let planned: std::collections::HashSet<String> =
                     result.iter().map(|(p, _)| p.clone()).collect();
-                let relevant: Vec<DataFile> = data_files
+                let relevant: Vec<Arc<DataFile>> = data_files
                     .into_iter()
                     .filter(|df| planned.contains(df.file_path()))
                     .collect();
@@ -804,7 +823,7 @@ impl IcebergScanExec {
 
     /// Load all live data files (with full column statistics) for the current snapshot.
     ///
-    /// Returns `DataFile` objects including `lower_bounds` / `upper_bounds` /
+    /// Returns shared `DataFile` objects including `lower_bounds` / `upper_bounds` /
     /// `null_value_counts` needed by `PruningPredicate`. `FileScanTask` from
     /// `Table::scan().plan_files()` does not expose those maps, so the pruning
     /// path walks manifests directly.
@@ -814,7 +833,7 @@ impl IcebergScanExec {
     /// on the same snapshot) are served from memory without additional S3
     /// GETs. Cold reads are parallelised with `buffer_unordered` at
     /// `self.manifest_concurrency`.
-    pub async fn collect_data_files(&self) -> Result<Vec<DataFile>, iceberg::Error> {
+    pub async fn collect_data_files(&self) -> Result<Vec<Arc<DataFile>>, iceberg::Error> {
         // Read through the process-global per-snapshot cache (review 308):
         // the decode happens once per snapshot, and every later caller
         // (statistics, pruning, split planning) shares the same entry.
@@ -826,12 +845,12 @@ impl IcebergScanExec {
             .unwrap_or_default())
     }
 
-    pub fn prune_data_files(
-        data_files: Vec<DataFile>,
+    pub fn prune_data_files<T: std::borrow::Borrow<DataFile> + Send + Sync>(
+        data_files: Vec<T>,
         df_filters: &[Expr],
         schema: &SchemaRef,
         iceberg_schema: &iceberg::spec::Schema,
-    ) -> (Vec<DataFile>, usize) {
+    ) -> (Vec<T>, usize) {
         use datafusion::physical_expr::create_physical_expr;
         use datafusion::prelude::SessionContext;
         if data_files.is_empty() || df_filters.is_empty() {
@@ -875,12 +894,15 @@ impl IcebergScanExec {
                 return (data_files, 0);
             }
         };
-        let stats =
-            IcebergManifestStatistics::new(data_files.clone(), schema.clone(), iceberg_schema);
-        match pruning_pred.prune(&stats) {
+        let flags = {
+            let refs: Vec<&DataFile> = data_files.iter().map(std::borrow::Borrow::borrow).collect();
+            let stats = IcebergManifestStatistics::from_files(refs, schema.clone(), iceberg_schema);
+            pruning_pred.prune(&stats)
+        };
+        match flags {
             Ok(flags) => {
                 let total = data_files.len();
-                let kept: Vec<DataFile> = data_files
+                let kept: Vec<T> = data_files
                     .into_iter()
                     .zip(flags)
                     .filter_map(|(df, keep)| if keep { Some(df) } else { None })
@@ -911,12 +933,12 @@ impl IcebergScanExec {
     /// Each filter is turned into a `PruningPredicate` and evaluated against the
     /// per-file column statistics from the Iceberg manifest. Files whose min/max
     /// ranges are provably outside the filter bounds are removed.
-    pub fn prune_data_files_with_physical_exprs(
-        data_files: Vec<DataFile>,
+    pub fn prune_data_files_with_physical_exprs<T: std::borrow::Borrow<DataFile> + Send + Sync>(
+        data_files: Vec<T>,
         physical_filters: &[Arc<dyn PhysicalExpr>],
         schema: &SchemaRef,
         iceberg_schema: &iceberg::spec::Schema,
-    ) -> (Vec<DataFile>, usize) {
+    ) -> (Vec<T>, usize) {
         if data_files.is_empty() || physical_filters.is_empty() {
             return (data_files, 0);
         }
@@ -938,12 +960,16 @@ impl IcebergScanExec {
                     continue;
                 }
             };
-            let stats = IcebergManifestStatistics::new(
-                current_files.clone(),
-                schema.clone(),
-                iceberg_schema,
-            );
-            match pruning_pred.prune(&stats) {
+            let flags = {
+                let refs: Vec<&DataFile> = current_files
+                    .iter()
+                    .map(std::borrow::Borrow::borrow)
+                    .collect();
+                let stats =
+                    IcebergManifestStatistics::from_files(refs, schema.clone(), iceberg_schema);
+                pruning_pred.prune(&stats)
+            };
+            match flags {
                 Ok(flags) => {
                     let before = current_files.len();
                     current_files = current_files
@@ -1247,6 +1273,8 @@ impl ExecutionPlan for IcebergScanExec {
             )));
         }
         let total_partitions = self.target_partitions;
+        let static_plan_cache = self.static_plan.clone();
+        let split_assignments = self.split_assignments.clone();
         let table = self.table.clone();
         let schema = self.projected_schema.clone();
         let projection = self.projection.clone();
@@ -1284,6 +1312,8 @@ impl ExecutionPlan for IcebergScanExec {
                 crate::scan_memory::decode_tracking_enabled(),
             )
         };
+        let static_planning_runs =
+            MetricBuilder::new(&self.metrics).counter("static_planning_runs", partition);
         let baseline = BaselineMetrics::new(&self.metrics, partition);
         let _files_pruned_minmax =
             MetricBuilder::new(&self.metrics).counter("files_pruned_minmax", partition);
@@ -1362,15 +1392,14 @@ impl ExecutionPlan for IcebergScanExec {
             // across queries because `TableMetadataCache` caches `Table` instances
             // globally. On a warm table this is served from memory; on cold, it
             // is one manifest-list GET plus one GET per manifest.
-            let mut file_entries = {
+            let static_plan = {
                 let _t = planning_time.timer();
-                collect_data_files_via_plan(
-                    &table,
-                    snapshot_id,
-                    projection.as_deref(),
-                    predicates.as_ref(),
-                ).await?
+                shared_static_scan_plan(&static_plan_cache, &table, snapshot_id,
+                    projection.as_deref(), predicates.as_ref(), Some(&static_planning_runs)).await?
             };
+            // Borrow the sorted table-wide list. Whole-file readers allocate
+            // only their assigned slice; split readers never copy this list.
+            let mut file_entries = std::borrow::Cow::Borrowed(static_plan.file_entries.as_slice());
 
             if file_entries.is_empty() {
                 let empty = RecordBatch::new_empty(schema.clone());
@@ -1385,13 +1414,13 @@ impl ExecutionPlan for IcebergScanExec {
             // latency. For over-partitioned tables with many small files this also
             // groups tiny files at the end where their overhead is amortised.
             let total_scan_bytes: u64 = file_entries.iter().map(|(_, sz)| *sz).sum();
-            // Every partition plans independently and then takes its own
-            // round-robin slice of this list, so the order must be TOTAL:
+            // Partitions take disjoint slices of the shared static plan. The
+            // sort uses a total order so assignments remain deterministic:
             // with size alone, equal-sized files keep the planner's arrival
             // order, which differs between partitions once manifests are read
             // concurrently. The slices then overlap and miss files, so rows
             // are read twice or not at all. The path breaks every tie.
-            file_entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            // Already sorted once by the shared static initializer.
             debug!(
                 file_count = file_entries.len(),
                 total_scan_bytes = total_scan_bytes,
@@ -1413,7 +1442,7 @@ impl ExecutionPlan for IcebergScanExec {
             // CachingDeleteFileLoader. Without this gate, every MoR table whose
             // data files are all under the threshold returns previously-deleted
             // rows.
-            let has_deletes = snapshot_has_delete_files(&table, snapshot_id).await?;
+            let has_deletes = static_plan.has_deletes;
             if has_deletes {
                 debug!(
                     "IcebergScanExec: snapshot has delete manifests, skipping direct-read fast path"
@@ -1440,12 +1469,12 @@ impl ExecutionPlan for IcebergScanExec {
                 // slice.
                 if total_partitions > 1 {
                     let before = file_entries.len();
-                    file_entries = file_entries
-                        .into_iter()
+                    file_entries = std::borrow::Cow::Owned(file_entries
+                        .iter()
                         .enumerate()
                         .filter(|(idx, _)| idx % total_partitions == partition)
-                        .map(|(_, entry)| entry)
-                        .collect();
+                        .map(|(_, entry)| entry.clone())
+                        .collect());
                     debug!(
                         partition = partition,
                         total_partitions = total_partitions,
@@ -1557,7 +1586,7 @@ impl ExecutionPlan for IcebergScanExec {
                                     "Dynamic filter file-level pruning skipped {} files",
                                     pruned_count
                                 );
-                                file_entries.retain(|(path, _)| kept_paths.contains(path));
+                                file_entries.to_mut().retain(|(path, _)| kept_paths.contains(path));
                                 files_pruned_dynamic.add(pruned_count);
                             }
                         }
@@ -1616,7 +1645,7 @@ impl ExecutionPlan for IcebergScanExec {
                 let rows_decoded = rows_decoded.clone();
                 let direct_decode_gate = Arc::clone(&decode_gate);
                 let per_file_stream = futures::stream::iter(
-                    file_entries.into_iter().map(move |(path, size)| {
+                    file_entries.into_owned().into_iter().map(move |(path, size)| {
                         let file_io = file_io.clone();
                         let projection = projection.clone();
                         let schema = schema.clone();
@@ -1902,7 +1931,7 @@ impl ExecutionPlan for IcebergScanExec {
                     match collect_data_files_for_pruning(&table, snapshot_id, &file_paths, manifest_concurrency).await {
                         Ok(dfs) if !dfs.is_empty() => {
                             let iceberg_schema = snapshot_schema(&table, snapshot_id);
-                            let stats = IcebergManifestStatistics::new(dfs, schema.clone(), &iceberg_schema);
+                            let stats = IcebergManifestStatistics::from_files(dfs, schema.clone(), &iceberg_schema);
                             let keep = stats.clustered_on_filters(&filter_columns, runtime_filter_uniform_threshold);
                             if !keep {
                                 debug!(
@@ -1941,23 +1970,15 @@ impl ExecutionPlan for IcebergScanExec {
                 // byte-range splits and round-robin the splits across
                 // partitions, so a 1-4 file fact table fans out across all
                 // partitions instead of pinning its rows to one. `plan_files()`
-                // yields whole-file tasks; `assign_split_tasks` produces this
+                // yields whole-file tasks; `assign_all_split_tasks` produces each
                 // partition's disjoint (file, byte-range) subtasks. The reader
                 // reads each sub-range exactly as the #131 intra-file subtasks
                 // do and will not re-split an already-ranged task.
-                let all_tasks: Vec<FileScanTask> = scan
-                    .plan_files()
-                    .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?
-                    .try_collect()
-                    .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                let my_tasks = assign_split_tasks(
-                    all_tasks,
-                    DEFAULT_SCAN_SPLIT_TARGET_SIZE,
-                    total_partitions,
-                    partition,
-                );
+                let assignments = split_assignments.get_or_init(|| async {
+                    assign_all_split_tasks(&static_plan.tasks, DEFAULT_SCAN_SPLIT_TARGET_SIZE,
+                        total_partitions)
+                }).await;
+                let my_tasks = assignments[partition].clone();
                 // Every partition sees the same whole-file plan before split
                 // assignment. Count it once so profiles distinguish physical
                 // data files from execution split count.
@@ -1997,20 +2018,16 @@ impl ExecutionPlan for IcebergScanExec {
                 // assigned file.
                 let allowed: std::collections::HashSet<String> =
                     file_entries.iter().map(|(p, _)| p.clone()).collect();
-                let tasks = scan
-                    .plan_files()
-                    .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let my_tasks: Vec<_> = static_plan.tasks.iter()
+                    .filter(|t| allowed.contains(t.data_file_path())).cloned().collect();
                 let filtered: FileScanTaskStream = Box::pin(
-                    tasks.try_filter(move |t| {
-                        futures::future::ready(allowed.contains(t.data_file_path()))
-                    }),
-                );
+                    futures::stream::iter(my_tasks.into_iter().map(Ok)));
                 scan.read_tasks_to_arrow_with_metrics(filtered)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?
             } else {
-                scan.to_arrow_with_metrics()
-                    .await
+                let tasks: FileScanTaskStream = Box::pin(
+                    futures::stream::iter(static_plan.tasks.clone().into_iter().map(Ok)));
+                scan.read_tasks_to_arrow_with_metrics(tasks)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?
             };
             let scan_metrics = scan_result.metrics().clone();
@@ -2379,13 +2396,34 @@ async fn snapshot_has_delete_files(table: &Table, snapshot_id: Option<i64>) -> D
         .any(|mf| mf.content == ManifestContentType::Deletes))
 }
 
-async fn collect_data_files_via_plan(
+async fn shared_static_scan_plan(
+    cache: &tokio::sync::OnceCell<Arc<StaticScanPlan>>,
     table: &Table,
     snapshot_id: Option<i64>,
     projection: Option<&[String]>,
     predicates: Option<&Predicate>,
-) -> DFResult<Vec<(String, u64)>> {
-    let mut sb = table.scan();
+    planning_runs: Option<&datafusion::physical_plan::metrics::Count>,
+) -> DFResult<Arc<StaticScanPlan>> {
+    cache
+        .get_or_try_init(|| async {
+            if let Some(runs) = planning_runs {
+                runs.add(1);
+            }
+            plan_static_scan(table, snapshot_id, projection, predicates)
+                .await
+                .map(Arc::new)
+        })
+        .await
+        .cloned()
+}
+
+async fn plan_static_scan(
+    table: &Table,
+    snapshot_id: Option<i64>,
+    projection: Option<&[String]>,
+    predicates: Option<&Predicate>,
+) -> DFResult<StaticScanPlan> {
+    let mut sb = table.scan().with_task_split_target_size(None);
     if let Some(sid) = snapshot_id {
         sb = sb.snapshot_id(sid);
     }
@@ -2398,25 +2436,30 @@ async fn collect_data_files_via_plan(
     let scan = sb
         .build()
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-    let tasks: Vec<iceberg::scan::FileScanTask> = scan
+    let mut tasks: Vec<FileScanTask> = scan
         .plan_files()
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?
         .try_collect()
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-    Ok(tasks
-        .into_iter()
+    tasks.sort_by(|a, b| a.data_file_path().cmp(b.data_file_path()));
+    let mut file_entries: Vec<_> = tasks
+        .iter()
         .map(|t| (t.data_file_path().to_string(), t.file_size_in_bytes()))
-        .collect())
+        .collect();
+    file_entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let has_deletes = snapshot_has_delete_files(table, snapshot_id).await?;
+    Ok(StaticScanPlan {
+        tasks,
+        file_entries,
+        has_deletes,
+    })
 }
 
 /// Collect full `DataFile` objects (with column statistics) for the given snapshot.
 ///
-/// Unlike `collect_data_files_via_plan` which returns lightweight `(path, size)` pairs,
-/// this function loads the full manifest entries with lower/upper bounds needed for
+/// Unlike the lightweight file list in the static scan plan, this function loads the full manifest entries with lower/upper bounds needed for
 /// `PruningPredicate` evaluation. Used by dynamic-filter file-level pruning.
 ///
 /// Only files matching the given `file_paths` set are returned, so callers can
@@ -2453,10 +2496,10 @@ async fn collect_data_files_for_pruning(
     snapshot_id: Option<i64>,
     file_paths: &std::collections::HashSet<String>,
     concurrency: usize,
-) -> DFResult<Vec<DataFile>> {
+) -> DFResult<Vec<Arc<DataFile>>> {
     // No second manifest walk (review 308): the snapshot's decoded entries
     // come from the shared per-snapshot cache that statistics planning
-    // already populated, and only the planned paths are cloned out.
+    // already populated. Only Arc handles for matching files are cloned.
     let files = crate::snapshot_stats::SNAPSHOT_STATS_CACHE
         .snapshot_files(table, snapshot_id, concurrency)
         .await
@@ -2642,7 +2685,7 @@ fn file_byte_splits(size: u64, target: u64) -> Vec<(u64, u64)> {
 /// into byte ranges via [`file_byte_splits`], a non-splittable file (e.g.
 /// non-Parquet, which the row-group reader cannot range-read) stays whole. The
 /// list is ordered length-descending with a stable tiebreak on
-/// `(file_index, start)`, so the modulo slice in [`assign_split_tasks`] hands
+/// `(file_index, start)`, so the modulo slice in [`assign_all_split_tasks`] hands
 /// each partition a disjoint share that, unioned, covers every split exactly
 /// once. Callers must pass files in a canonical (path-sorted) order so
 /// `file_index` is stable across partitions.
@@ -2661,27 +2704,25 @@ fn ordered_split_ranges(files: &[(u64, bool)], target: u64) -> Vec<(usize, u64, 
     ranges
 }
 
-/// Build this partition's byte-range scan tasks by splitting large files and
-/// round-robining the splits across `total_partitions`.
+/// Build every partition's disjoint byte-range task assignment once.
+/// The input is the canonical path-sorted static task plan.
 ///
 /// Each input task is a whole-file task from `plan_files`. Files large enough
 /// to split become several byte-range subtasks (same math as the vendored
 /// `split_file_scan_task`); smaller and non-Parquet files stay whole. Tasks are
-/// first ordered by path so the derived split order is identical in every
-/// partition, then the ordered split list is sliced by
+/// already ordered by path; the derived ordered split list is sliced by
 /// `index % total_partitions == partition`. The result is the disjoint set of
 /// `(file, byte-range)` tasks this partition reads; their lengths sum with the
-/// other partitions' to the table's total bytes. A partition with no assigned
-/// splits returns an empty vector.
-fn assign_split_tasks(
-    mut tasks: Vec<FileScanTask>,
+/// other partitions' to the table's total bytes. Partitions with no assigned
+/// splits get an empty vector.
+fn assign_all_split_tasks(
+    tasks: &[FileScanTask],
     split_target_size: u64,
     total_partitions: usize,
-    partition: usize,
-) -> Vec<FileScanTask> {
+) -> Vec<Vec<FileScanTask>> {
     // Canonical order so `file_index` is stable across partitions regardless of
     // the (unordered) `plan_files` stream order each partition plans from.
-    tasks.sort_by(|a, b| a.data_file_path().cmp(b.data_file_path()));
+    // Tasks are canonically ordered by the shared static initializer.
     // Byte-range subtasks only make sense for the Parquet row-group reader; any
     // other format stays whole.
     let files: Vec<(u64, bool)> = tasks
@@ -2693,23 +2734,21 @@ fn assign_split_tasks(
             )
         })
         .collect();
-    ordered_split_ranges(&files, split_target_size)
+    let mut assignments = vec![Vec::new(); total_partitions];
+    for (i, (idx, start, length)) in ordered_split_ranges(&files, split_target_size)
         .into_iter()
         .enumerate()
-        .filter(|(i, _)| i % total_partitions == partition)
-        .map(|(_, (idx, start, length))| {
-            let base = &tasks[idx];
-            if start == 0 && length == base.file_size_in_bytes() {
-                // Whole file (below the split threshold or non-Parquet): the
-                // original task unchanged keeps its `record_count` and lets the
-                // reader treat it as a whole-file read.
-                base.clone()
-            } else {
-                // Clears `record_count`: only valid for whole-file reads.
-                base.with_byte_range(start, length)
-            }
-        })
-        .collect()
+    {
+        let base = &tasks[idx];
+        let task = if start == 0 && length == base.file_size_in_bytes() {
+            base.clone()
+        } else {
+            // Only whole-file tasks may retain record_count.
+            base.with_byte_range(start, length)
+        };
+        assignments[i % total_partitions].push(task);
+    }
+    assignments
 }
 
 /// Wraps a DataFusion `PhysicalExpr` as a Parquet `ArrowPredicate` for row-level
@@ -3683,7 +3722,18 @@ mod manifest_statistics_tests {
         let mut expected: Vec<String> = wanted.into_iter().collect();
         expected.sort();
         assert_eq!(paths, expected);
+        let (cached, _) = crate::snapshot_stats::SNAPSHOT_STATS_CACHE
+            .snapshot_files(&table, None, 4)
+            .await
+            .unwrap()
+            .unwrap();
         for file in &files {
+            let original = cached
+                .data_files
+                .iter()
+                .find(|f| f.file_path() == file.file_path())
+                .unwrap();
+            assert!(std::sync::Arc::ptr_eq(file, original));
             assert!(file.lower_bounds().contains_key(&1));
             assert!(file.upper_bounds().contains_key(&1));
         }
@@ -3722,6 +3772,7 @@ mod manifest_statistics_tests {
             .unwrap();
         assert_eq!(files.len(), 3);
 
+        let originals = files.clone();
         let (kept, pruned) = IcebergScanExec::prune_data_files(
             files,
             &[col("id").gt(lit(40i64))],
@@ -3732,5 +3783,207 @@ mod manifest_statistics_tests {
         assert_eq!(pruned, 2);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].file_path(), fake_file_path(&table, &FAKE_FILES[2]));
+        let original = originals
+            .iter()
+            .find(|f| f.file_path() == kept[0].file_path())
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(original, &kept[0]));
+    }
+    #[tokio::test]
+    async fn scan_partitions_share_static_plan_and_disjoint_assignments() {
+        use super::{assign_all_split_tasks, shared_static_scan_plan};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let table = fake_iceberg_table(dir.path(), false).await;
+        let scan = IcebergScanExec::new(table.clone(), Arc::new(arrow_schema(&table)), None, None)
+            .with_target_partitions(8);
+        let requests = (0..8)
+            .map(|_| shared_static_scan_plan(&scan.static_plan, &table, None, None, None, None));
+        let plans = futures::future::join_all(requests).await;
+        let first = plans[0].as_ref().unwrap();
+        for plan in &plans {
+            assert!(Arc::ptr_eq(first, plan.as_ref().unwrap()));
+        }
+        assert_eq!(first.tasks.len(), FAKE_FILES.len());
+        assert!(!first.has_deletes);
+        let assignments = assign_all_split_tasks(&first.tasks, 75, 8);
+        let mut seen = HashSet::new();
+        let mut lengths = std::collections::HashMap::new();
+        for task in assignments.iter().flatten() {
+            assert!(seen.insert((
+                task.data_file_path().to_string(),
+                task.start(),
+                task.length()
+            )));
+            *lengths
+                .entry(task.data_file_path().to_string())
+                .or_insert(0u64) += task.length();
+        }
+        assert_eq!(lengths.len(), FAKE_FILES.len());
+        for file in &FAKE_FILES {
+            assert_eq!(lengths[&fake_file_path(&table, file)], file.bytes);
+        }
+        // Repartitioning invalidates only assignments; pinning a snapshot
+        // invalidates static work so no plan from another snapshot is reused.
+        let repartitioned = scan.clone().with_target_partitions(2);
+        assert!(Arc::ptr_eq(&scan.static_plan, &repartitioned.static_plan));
+        assert!(!Arc::ptr_eq(
+            &scan.split_assignments,
+            &repartitioned.split_assignments
+        ));
+        let pinned = scan.clone().with_snapshot_id(FAKE_SNAPSHOT_ID);
+        assert!(!Arc::ptr_eq(&scan.static_plan, &pinned.static_plan));
+    }
+
+    #[tokio::test]
+    async fn static_plan_preserves_projection_predicate_and_delete_tasks() {
+        use super::plan_static_scan;
+        let dir = tempfile::tempdir().unwrap();
+        let table = fake_iceberg_table(dir.path(), false).await;
+        let projection = vec!["id".to_string()];
+        let predicate =
+            iceberg::expr::Reference::new("id").greater_than(iceberg::spec::Datum::long(40));
+        let plan = plan_static_scan(
+            &table,
+            Some(FAKE_SNAPSHOT_ID),
+            Some(&projection),
+            Some(&predicate),
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(
+            plan.tasks[0].data_file_path(),
+            fake_file_path(&table, &FAKE_FILES[2])
+        );
+        assert_eq!(plan.tasks[0].project_field_ids(), &[1]);
+
+        let delete_dir = tempfile::tempdir().unwrap();
+        let deletes = fake_iceberg_table(delete_dir.path(), true).await;
+        let delete_plan = plan_static_scan(&deletes, None, None, None).await.unwrap();
+        assert!(delete_plan.has_deletes);
+        assert!(delete_plan.tasks.iter().any(|t| !t.deletes().is_empty()));
+    }
+
+    #[tokio::test]
+    async fn failed_static_plan_can_retry() {
+        use super::shared_static_scan_plan;
+        let dir = tempfile::tempdir().unwrap();
+        let table = fake_iceberg_table(dir.path(), false).await;
+        let cache = tokio::sync::OnceCell::new();
+        let invalid = vec!["missing_column".to_string()];
+        assert!(
+            shared_static_scan_plan(&cache, &table, None, Some(&invalid), None, None)
+                .await
+                .is_err()
+        );
+        assert!(cache.get().is_none());
+        let valid = shared_static_scan_plan(&cache, &table, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(valid.tasks.len(), FAKE_FILES.len());
+    }
+    #[tokio::test]
+    async fn shared_plan_reads_each_row_once_with_filters_and_deletes() {
+        use crate::test_fixtures::fake_iceberg_table_with_data;
+        use datafusion::physical_expr::expressions::{Column, Literal};
+        use datafusion::physical_plan::{collect, ExecutionPlan};
+        use std::sync::Arc;
+        // Cover the direct, split-reader and whole-file delete-reader paths.
+        for (direct, deletes, filtered) in [
+            (true, false, false),
+            (false, false, false),
+            (true, false, true),
+            (false, false, true),
+            (false, true, false),
+            (true, true, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let table = fake_iceberg_table_with_data(dir.path(), deletes).await;
+            let schema = Arc::new(arrow_schema(&table));
+            let scan = IcebergScanExec::new(table.clone(), schema.clone(), None, None)
+                .with_target_partitions(8)
+                .with_small_file_threshold(if direct { u64::MAX } else { 0 });
+            // A sealed runtime filter must remain reader-local and effective
+            // when tasks originate from the shared static plan.
+            let scan = if filtered {
+                let dyn_filter =
+                    datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr::new(
+                        vec![Arc::new(Column::new("id", 0))],
+                        Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))),
+                    );
+                let filter = datafusion::physical_expr::expressions::BinaryExpr::new(
+                    Arc::new(Column::new("id", 0)),
+                    datafusion::logical_expr::Operator::Gt,
+                    Arc::new(Literal::new(ScalarValue::Int64(Some(40)))),
+                );
+                dyn_filter.update(Arc::new(filter)).unwrap();
+                scan.clone_with_pushed_filters(vec![Arc::new(dyn_filter)])
+            } else {
+                scan
+            };
+            let ctx = datafusion::prelude::SessionContext::new();
+            let output = collect(Arc::new(scan.clone()), ctx.task_ctx())
+                .await
+                .unwrap();
+            let mut ids: Vec<i64> = output
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            ids.sort_unstable();
+            let expected: Vec<i64> = if filtered {
+                (41..=60).collect()
+            } else if deletes {
+                (3..=60).collect()
+            } else {
+                (1..=60).collect()
+            };
+            assert_eq!(
+                ids, expected,
+                "direct={direct}, deletes={deletes}, filtered={filtered}"
+            );
+            let runs: usize = scan
+                .metrics()
+                .unwrap()
+                .iter()
+                .filter(|m| m.value().name() == "static_planning_runs")
+                .map(|m| m.value().as_usize())
+                .sum();
+            assert_eq!(runs, 1, "planning must run once across 8 output partitions");
+        }
+    }
+    #[tokio::test]
+    async fn cancelled_static_initializer_and_waiter_allow_retry() {
+        use super::{shared_static_scan_plan, StaticScanPlan};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let table = fake_iceberg_table(dir.path(), false).await;
+        let cache = tokio::sync::OnceCell::new();
+        let mut initializer = Box::pin(cache.get_or_try_init(|| {
+            futures::future::pending::<datafusion::common::Result<Arc<StaticScanPlan>>>()
+        }));
+        assert!(futures::poll!(initializer.as_mut()).is_pending());
+        let mut waiter = Box::pin(shared_static_scan_plan(
+            &cache, &table, None, None, None, None,
+        ));
+        assert!(futures::poll!(waiter.as_mut()).is_pending());
+        drop(waiter);
+        drop(initializer);
+        let plan = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            shared_static_scan_plan(&cache, &table, None, None, None, None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(plan.tasks.len(), FAKE_FILES.len());
     }
 }
