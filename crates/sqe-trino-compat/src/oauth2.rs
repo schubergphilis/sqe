@@ -12,7 +12,6 @@ use tracing::{debug, warn};
 
 use sqe_auth::auth_code::AuthCodeService;
 use sqe_auth::pending_auth::{PendingAuth, PendingAuthStore};
-use sqe_core::SecretString;
 
 /// Shared state for OAuth2 endpoints.
 pub struct OAuth2State {
@@ -101,22 +100,7 @@ fn verify_state_and_take_verifier(
     store: &PendingAuthStore,
     returned_state: &str,
 ) -> Result<String, &'static str> {
-    match store.poll(returned_state) {
-        Some(PendingAuth::AwaitingCallback {
-            code_verifier,
-            state,
-            ..
-        }) => {
-            let stored = SecretString::new(state);
-            let returned = SecretString::new(returned_state.to_string());
-            if stored.ct_eq(&returned) {
-                Ok(code_verifier)
-            } else {
-                Err("State parameter does not match the stored value")
-            }
-        }
-        _ => Err("Invalid or expired state parameter"),
-    }
+    store.take_callback_verifier(returned_state)
 }
 
 /// GET /oauth2/callback?code=...&state=...
@@ -145,8 +129,11 @@ pub async fn callback_handler(
     {
         Ok(tokens) => {
             debug!("Authorization code exchange succeeded");
-            state.pending_store.complete(session_key, tokens);
-            Html(SUCCESS_HTML).into_response()
+            if state.pending_store.complete(session_key, tokens) {
+                Html(SUCCESS_HTML).into_response()
+            } else {
+                (StatusCode::BAD_REQUEST, "Auth session not found or expired").into_response()
+            }
         }
         Err(e) => {
             warn!(error = %e, "Authorization code exchange failed");
@@ -156,7 +143,7 @@ pub async fn callback_handler(
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 #[serde(untagged)]
 pub enum TokenPollResponse {
     Pending {
@@ -179,22 +166,21 @@ pub async fn poll_token_handler(
     Path(auth_id): Path<String>,
 ) -> Response {
     let key = poll_key(&auth_id);
-    match state.pending_store.poll(&key) {
-        Some(PendingAuth::AwaitingCallback { .. }) => {
+    match state.pending_store.poll_and_consume(&key) {
+        Some(PendingAuth::AwaitingCallback { .. } | PendingAuth::Exchanging) => {
             let next_uri = format!("{}/oauth2/token/{}", state.base_url, auth_id);
             Json(TokenPollResponse::Pending { next_uri }).into_response()
         }
-        Some(PendingAuth::Complete(tokens)) => {
-            state.pending_store.remove(&key);
-            Json(TokenPollResponse::Complete {
-                token: tokens.access_token,
-            })
-            .into_response()
-        }
+        Some(PendingAuth::Complete(tokens)) => Json(TokenPollResponse::Complete {
+            token: tokens.access_token,
+        })
+        .into_response(),
         Some(PendingAuth::Failed(msg)) => {
             Json(TokenPollResponse::Error { error: msg }).into_response()
         }
-        None => (StatusCode::NOT_FOUND, "Auth session not found or expired").into_response(),
+        Some(PendingAuth::Consumed) | None => {
+            (StatusCode::NOT_FOUND, "Auth session not found or expired").into_response()
+        }
     }
 }
 

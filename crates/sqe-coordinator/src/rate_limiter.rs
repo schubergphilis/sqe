@@ -1,16 +1,147 @@
 //! Rate limiter for the SQE coordinator.
 //!
 //! Provides per-user and global token-bucket rate limiting using the
-//! [`governor`] crate. Per-user state is maintained internally by
-//! governor's keyed rate limiter.
+//! [`governor`] crate. Per-identity token buckets use bounded admission and
+//! idle reclamation to keep attacker-controlled cardinality finite.
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
+use governor::clock::{Clock, DefaultClock, Reference};
+use governor::{Quota, RateLimiter};
+use sha2::{Digest, Sha256};
 use sqe_core::config::RateLimitConfig;
 use sqe_core::error::{SqeError, SqeErrorCode};
+
+/// Hard admission limit per keyed limiter. Keys are SHA-256 fingerprints,
+/// so retained identity width is bounded as well as cardinality. At capacity,
+/// existing identities keep their buckets and new identities fail closed.
+const MAX_RATE_LIMIT_KEYS: usize = 16_384;
+const RATE_LIMIT_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+
+type DirectBucket<C> = RateLimiter<
+    governor::state::direct::NotKeyed,
+    governor::state::InMemoryState,
+    C,
+    governor::middleware::NoOpMiddleware<<C as Clock>::Instant>,
+>;
+
+struct KeyBucket<C: Clock> {
+    limiter: DirectBucket<C>,
+    last_seen: C::Instant,
+}
+
+struct KeyedBuckets<C: Clock> {
+    buckets: HashMap<[u8; 32], KeyBucket<C>>,
+    last_prune: C::Instant,
+}
+
+/// Keeps governor's per-identity quotas while bounding stored state. A short
+/// synchronous lock serializes lookup/admission/consumption, so concurrent new
+/// identities cannot overshoot the cap. Only fully replenished idle buckets
+/// may be removed: evicting active buckets would reset brute-force budgets.
+struct BoundedKeyedLimiter<C: Clock = DefaultClock> {
+    quota: Quota,
+    clock: C,
+    max_keys: usize,
+    idle_retention: Duration,
+    state: Mutex<KeyedBuckets<C>>,
+}
+
+enum KeyedDenial<I: Reference> {
+    Quota(governor::NotUntil<I>),
+    Capacity,
+}
+
+impl<I: Reference> KeyedDenial<I> {
+    fn retry_after_secs(&self, now: I) -> u64 {
+        match self {
+            Self::Quota(not_until) => retry_after_secs(not_until, now),
+            Self::Capacity => RATE_LIMIT_PRUNE_INTERVAL.as_secs(),
+        }
+    }
+}
+
+impl BoundedKeyedLimiter {
+    fn new(quota: Quota) -> Self {
+        Self::with_clock(quota, MAX_RATE_LIMIT_KEYS, DefaultClock::default())
+    }
+}
+
+impl<C: Clock + Clone> BoundedKeyedLimiter<C> {
+    fn with_clock(quota: Quota, max_keys: usize, clock: C) -> Self {
+        // checked multiplication in Duration avoids the u64 nanosecond wrap
+        // possible for unusually large configured bursts.
+        let idle_retention = quota
+            .replenish_interval()
+            .saturating_mul(quota.burst_size().get())
+            .max(RATE_LIMIT_PRUNE_INTERVAL);
+        let last_prune = clock.now();
+        Self {
+            quota,
+            clock,
+            max_keys,
+            idle_retention,
+            state: Mutex::new(KeyedBuckets {
+                buckets: HashMap::new(),
+                last_prune,
+            }),
+        }
+    }
+
+    fn clock(&self) -> &C {
+        &self.clock
+    }
+
+    fn check_key(&self, key: &str) -> Result<(), KeyedDenial<C::Instant>> {
+        self.check_parts(&[key])
+    }
+
+    fn check_parts(&self, parts: &[&str]) -> Result<(), KeyedDenial<C::Instant>> {
+        let mut hash = Sha256::new();
+        for part in parts {
+            hash.update((part.len() as u64).to_be_bytes());
+            hash.update(part.as_bytes());
+        }
+        let key: [u8; 32] = hash.finalize().into();
+        let mut state = self.state.lock().map_err(|_| KeyedDenial::Capacity)?;
+        let now = self.clock.now();
+        if now.duration_since(state.last_prune) >= RATE_LIMIT_PRUNE_INTERVAL.into() {
+            state.buckets.retain(|_, bucket| {
+                now.duration_since(bucket.last_seen) < self.idle_retention.into()
+            });
+            state.last_prune = now;
+        }
+        if !state.buckets.contains_key(&key) {
+            if state.buckets.len() >= self.max_keys {
+                return Err(KeyedDenial::Capacity);
+            }
+            state.buckets.insert(
+                key,
+                KeyBucket {
+                    limiter: RateLimiter::new(
+                        self.quota,
+                        governor::state::InMemoryState::default(),
+                        self.clock.clone(),
+                    ),
+                    last_seen: now,
+                },
+            );
+        }
+        let bucket = state.buckets.get_mut(&key).expect("admitted key exists");
+        // Denied requests also count as activity: a continuously attacked key
+        // must keep its consumed budget rather than be pruned and reset.
+        bucket.last_seen = now;
+        bucket.limiter.check().map_err(KeyedDenial::Quota)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.state.lock().unwrap().buckets.len()
+    }
+}
 
 /// Pre-auth rate limit keyed by (peer-ip, username). The username
 /// comes from the Basic-auth header (Flight handshake) or the
@@ -22,10 +153,10 @@ use sqe_core::error::{SqeError, SqeErrorCode};
 /// from a single attacker.
 pub struct AuthRateLimiter {
     enabled: bool,
-    limiter: Option<Arc<DefaultKeyedRateLimiter<String>>>,
+    limiter: Option<Arc<BoundedKeyedLimiter>>,
     /// Per-IP-only limiter that catches credential stuffing across
     /// rotating usernames from a single source IP.
-    by_ip: Option<Arc<DefaultKeyedRateLimiter<String>>>,
+    by_ip: Option<Arc<BoundedKeyedLimiter>>,
 }
 
 impl AuthRateLimiter {
@@ -37,12 +168,13 @@ impl AuthRateLimiter {
                 by_ip: None,
             };
         }
-        let rate = NonZeroU32::new(config.auth_attempts_per_minute).unwrap_or(NonZeroU32::new(10).unwrap());
+        let rate = NonZeroU32::new(config.auth_attempts_per_minute)
+            .unwrap_or(NonZeroU32::new(10).unwrap());
         // The burst is what one client may present at once (an MCP agent's
         // parallel metadata calls, each with the same bearer); the rate is
         // what it may sustain. Below the rate, the burst is the rate.
-        let burst = NonZeroU32::new(config.auth_burst.max(config.auth_attempts_per_minute))
-            .unwrap_or(rate);
+        let burst =
+            NonZeroU32::new(config.auth_burst.max(config.auth_attempts_per_minute)).unwrap_or(rate);
         let quota = Quota::per_minute(rate).allow_burst(burst);
         // Per-IP budget is intentionally larger than the per-tuple
         // budget so legitimate shared NAT egress isn't penalised but
@@ -54,8 +186,8 @@ impl AuthRateLimiter {
         .allow_burst(NonZeroU32::new(burst.get().saturating_mul(5)).unwrap_or(burst));
         Self {
             enabled: true,
-            limiter: Some(Arc::new(RateLimiter::keyed(quota))),
-            by_ip: Some(Arc::new(RateLimiter::keyed(ip_quota))),
+            limiter: Some(Arc::new(BoundedKeyedLimiter::new(quota))),
+            by_ip: Some(Arc::new(BoundedKeyedLimiter::new(ip_quota))),
         }
     }
 
@@ -67,13 +199,14 @@ impl AuthRateLimiter {
         if !self.enabled {
             return Ok(());
         }
-        let key = format!("{peer_ip}|{username}");
-        if let Some(ref l) = self.limiter {
-            l.check_key(&key)
+        // Spend the trusted source budget before admitting any credential key.
+        // Denials from an exhausted IP therefore allocate no per-credential state.
+        if let Some(ref l) = self.by_ip {
+            l.check_key(peer_ip)
                 .map_err(|_| SqeError::Auth("rate-limited".to_string()))?;
         }
-        if let Some(ref l) = self.by_ip {
-            l.check_key(&peer_ip.to_string())
+        if let Some(ref l) = self.limiter {
+            l.check_parts(&[peer_ip, username])
                 .map_err(|_| SqeError::Auth("rate-limited".to_string()))?;
         }
         Ok(())
@@ -83,7 +216,10 @@ impl AuthRateLimiter {
 /// Seconds until the bucket a denial came from admits one more request,
 /// rounded up and at least one, so a client can wait exactly that long
 /// instead of guessing.
-fn retry_after_secs<P: governor::clock::Reference>(not_until: &governor::NotUntil<P>, now: P) -> u64 {
+fn retry_after_secs<P: governor::clock::Reference>(
+    not_until: &governor::NotUntil<P>,
+    now: P,
+) -> u64 {
     let wait = not_until.wait_time_from(now);
     wait.as_secs() + u64::from(wait.subsec_nanos() > 0).max(u64::from(wait.is_zero()))
 }
@@ -210,7 +346,7 @@ impl sqe_auth::AuthProvider for RateLimitedAuthProvider {
 /// JDBC `DatabaseMetaData` refresh loops.
 pub struct MetadataRateLimiter {
     enabled: bool,
-    per_user: Option<Arc<DefaultKeyedRateLimiter<String>>>,
+    per_user: Option<Arc<BoundedKeyedLimiter>>,
 }
 
 impl MetadataRateLimiter {
@@ -227,7 +363,7 @@ impl MetadataRateLimiter {
         );
         Self {
             enabled: true,
-            per_user: Some(Arc::new(RateLimiter::keyed(quota))),
+            per_user: Some(Arc::new(BoundedKeyedLimiter::new(quota))),
         }
     }
 
@@ -236,8 +372,8 @@ impl MetadataRateLimiter {
             return Ok(());
         }
         if let Some(ref l) = self.per_user {
-            l.check_key(&user_id.to_string()).map_err(|not_until| {
-                let secs = retry_after_secs(&not_until, governor::clock::Clock::now(l.clock()));
+            l.check_key(user_id).map_err(|not_until| {
+                let secs = not_until.retry_after_secs(l.clock().now());
                 RateLimitDenial {
                     limiter: "metadata",
                     knob: "rate_limit.metadata_per_user_per_minute",
@@ -257,7 +393,7 @@ impl MetadataRateLimiter {
 pub struct QueryRateLimiter {
     enabled: bool,
     /// Per-user token bucket (keyed by user_id string).
-    per_user: Option<Arc<DefaultKeyedRateLimiter<String>>>,
+    per_user: Option<Arc<BoundedKeyedLimiter>>,
     /// Global token bucket shared across all users.
     global: Option<Arc<governor::DefaultDirectRateLimiter>>,
 }
@@ -287,7 +423,7 @@ impl QueryRateLimiter {
 
         Self {
             enabled: true,
-            per_user: Some(Arc::new(RateLimiter::keyed(per_user_quota))),
+            per_user: Some(Arc::new(BoundedKeyedLimiter::new(per_user_quota))),
             global: Some(Arc::new(RateLimiter::direct(global_quota))),
         }
     }
@@ -304,8 +440,8 @@ impl QueryRateLimiter {
 
         // Per-user check
         if let Some(ref limiter) = self.per_user {
-            limiter.check_key(&user_id.to_string()).map_err(|not_until| {
-                let secs = retry_after_secs(&not_until, governor::clock::Clock::now(limiter.clock()));
+            limiter.check_key(user_id).map_err(|not_until| {
+                let secs = not_until.retry_after_secs(limiter.clock().now());
                 RateLimitDenial {
                     limiter: "query",
                     knob: "rate_limit.per_user_queries_per_minute",
@@ -319,7 +455,8 @@ impl QueryRateLimiter {
         // Global check
         if let Some(ref limiter) = self.global {
             limiter.check().map_err(|not_until| {
-                let secs = retry_after_secs(&not_until, governor::clock::Clock::now(limiter.clock()));
+                let secs =
+                    retry_after_secs(&not_until, governor::clock::Clock::now(limiter.clock()));
                 RateLimitDenial {
                     limiter: "query",
                     knob: "rate_limit.global_queries_per_minute",
@@ -498,7 +635,9 @@ mod tests {
             ..RateLimitConfig::default()
         });
         for i in 0..12 {
-            limiter.check("10.0.0.7", "bearer:abc").unwrap_or_else(|e| panic!("call {i} denied: {e}"));
+            limiter
+                .check("10.0.0.7", "bearer:abc")
+                .unwrap_or_else(|e| panic!("call {i} denied: {e}"));
         }
         let config = RateLimitConfig::default();
         let mut denied = 0;
@@ -519,7 +658,10 @@ mod tests {
         let err = query.check("u").unwrap_err();
         assert_eq!(err.error_code(), SqeErrorCode::ResourceExhausted);
         let text = err.to_string();
-        assert!(text.contains("rate_limit.per_user_queries_per_minute"), "{text}");
+        assert!(
+            text.contains("rate_limit.per_user_queries_per_minute"),
+            "{text}"
+        );
         assert!(text.contains("retry after "), "{text}");
         assert!(text.ends_with('s'), "{text}");
     }
@@ -632,5 +774,104 @@ mod tests {
             err.error_code() == SqeErrorCode::ResourceExhausted,
             "Expected a ResourceExhausted denial, got: {err:?}"
         );
+    }
+    #[test]
+    fn exhausted_ip_rotation_does_not_admit_credential_keys() {
+        let limiter = AuthRateLimiter::new(&RateLimitConfig {
+            enabled: true,
+            auth_attempts_per_minute: 1,
+            auth_burst: 1,
+            ..Default::default()
+        });
+        for i in 0..5 {
+            assert!(limiter.check("203.0.113.5", &format!("user-{i}")).is_ok());
+        }
+        for i in 0..10_000 {
+            assert!(limiter
+                .check("203.0.113.5", &format!("rotated-{i}"))
+                .is_err());
+        }
+        assert_eq!(limiter.limiter.as_ref().unwrap().len(), 5);
+        assert_eq!(limiter.by_ip.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn concurrent_distinct_keys_cannot_exceed_cap_or_reset_existing_budget() {
+        let limiter = Arc::new(BoundedKeyedLimiter::with_clock(
+            Quota::per_minute(NonZeroU32::new(1).unwrap()),
+            8,
+            governor::clock::FakeRelativeClock::default(),
+        ));
+        assert!(limiter.check_key("existing").is_ok());
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let limiter = limiter.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    for key in 0..100 {
+                        let _ = limiter.check_key(&format!("{worker}-{key}"));
+                    }
+                });
+            }
+        });
+        assert_eq!(limiter.len(), 8);
+        assert!(matches!(
+            limiter.check_key("new"),
+            Err(KeyedDenial::Capacity)
+        ));
+        assert!(matches!(
+            limiter.check_key("existing"),
+            Err(KeyedDenial::Quota(_))
+        ));
+    }
+
+    #[test]
+    fn idle_pruning_waits_for_full_burst_refill() {
+        let clock = governor::clock::FakeRelativeClock::default();
+        // A 120-cell burst at one cell/second takes longer than the prune cadence.
+        let limiter = BoundedKeyedLimiter::with_clock(
+            Quota::with_period(Duration::from_secs(1))
+                .unwrap()
+                .allow_burst(NonZeroU32::new(120).unwrap()),
+            1,
+            clock.clone(),
+        );
+        for _ in 0..120 {
+            assert!(limiter.check_key("old").is_ok());
+        }
+        clock.advance(Duration::from_secs(60));
+        assert!(matches!(
+            limiter.check_key("new"),
+            Err(KeyedDenial::Capacity)
+        ));
+        assert_eq!(limiter.len(), 1);
+        clock.advance(Duration::from_secs(60));
+        assert!(limiter.check_key("new").is_ok());
+        assert_eq!(limiter.len(), 1);
+    }
+
+    #[test]
+    fn denied_activity_keeps_consumed_bucket_and_keys_have_fixed_width() {
+        let clock = governor::clock::FakeRelativeClock::default();
+        let limiter = BoundedKeyedLimiter::with_clock(
+            Quota::per_minute(NonZeroU32::new(1).unwrap()),
+            1,
+            clock.clone(),
+        );
+        assert!(limiter.check_key(&"x".repeat(100_000)).is_ok());
+        clock.advance(Duration::from_secs(30));
+        assert!(matches!(
+            limiter.check_key(&"x".repeat(100_000)),
+            Err(KeyedDenial::Quota(_))
+        ));
+        clock.advance(Duration::from_secs(30));
+        assert!(matches!(
+            limiter.check_key("new"),
+            Err(KeyedDenial::Capacity)
+        ));
+        let state = limiter.state.lock().unwrap();
+        assert_eq!(state.buckets.keys().next().unwrap().len(), 32);
     }
 }
