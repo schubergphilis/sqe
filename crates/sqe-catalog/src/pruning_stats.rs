@@ -1,5 +1,6 @@
 //! Iceberg manifest statistics as DataFusion PruningStatistics.
 
+use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -13,8 +14,8 @@ use datafusion::common::stats::Precision;
 use datafusion::common::{Column, ColumnStatistics, ScalarValue, Statistics};
 use iceberg::spec::{DataFile, Datum, PrimitiveLiteral};
 
-pub struct IcebergManifestStatistics {
-    data_files: Vec<DataFile>,
+pub struct IcebergManifestStatistics<T = DataFile> {
+    data_files: Vec<T>,
     schema: SchemaRef,
     name_to_field_id: Vec<(String, i32)>,
 }
@@ -22,6 +23,20 @@ pub struct IcebergManifestStatistics {
 impl IcebergManifestStatistics {
     pub fn new(
         data_files: Vec<DataFile>,
+        schema: SchemaRef,
+        iceberg_schema: &iceberg::spec::Schema,
+    ) -> Self {
+        Self::from_files(data_files, schema, iceberg_schema)
+    }
+
+    pub fn count_pruned(results: &[bool]) -> usize {
+        results.iter().filter(|&&keep| !keep).count()
+    }
+}
+
+impl<T: Borrow<DataFile>> IcebergManifestStatistics<T> {
+    pub fn from_files(
+        data_files: Vec<T>,
         schema: SchemaRef,
         iceberg_schema: &iceberg::spec::Schema,
     ) -> Self {
@@ -43,10 +58,6 @@ impl IcebergManifestStatistics {
             .iter()
             .find(|(name, _)| name == column_name)
             .map(|(_, id)| *id)
-    }
-
-    pub fn count_pruned(results: &[bool]) -> usize {
-        results.iter().filter(|&&keep| !keep).count()
     }
 }
 
@@ -73,8 +84,8 @@ fn datum_to_scalar(datum: &Datum, data_type: &DataType) -> Option<ScalarValue> {
     }
 }
 
-fn build_bounds_array(
-    data_files: &[DataFile],
+fn build_bounds_array<T: Borrow<DataFile>>(
+    data_files: &[T],
     field_id: i32,
     data_type: &DataType,
     use_upper: bool,
@@ -82,6 +93,7 @@ fn build_bounds_array(
     let scalars: Vec<Option<ScalarValue>> = data_files
         .iter()
         .map(|df| {
+            let df: &DataFile = df.borrow();
             let bounds = if use_upper {
                 df.upper_bounds()
             } else {
@@ -195,8 +207,8 @@ fn build_bounds_array(
 /// Fields where the manifest carries no bounds (or the field doesn't map to an
 /// Iceberg field id) yield `Precision::Absent` rather than failing — partial
 /// stats are better than no stats for join order selection.
-pub fn aggregate_column_statistics(
-    data_files: &[DataFile],
+pub fn aggregate_column_statistics<T: Borrow<DataFile>>(
+    data_files: &[T],
     arrow_schema: &Schema,
     iceberg_schema: &iceberg::spec::Schema,
 ) -> Vec<ColumnStatistics> {
@@ -252,16 +264,19 @@ pub fn aggregate_column_statistics(
 /// row counts, DataFusion's `AggregateStatistics` rule answers unfiltered
 /// `COUNT(*)` from metadata without scanning, so exactness here is a
 /// correctness contract, not a hint.
-pub fn aggregate_table_statistics(
-    data_files: &[DataFile],
+pub fn aggregate_table_statistics<T: Borrow<DataFile>>(
+    data_files: &[T],
     arrow_schema: &Schema,
     iceberg_schema: &iceberg::spec::Schema,
     row_count_exact: bool,
 ) -> Statistics {
-    let num_rows: usize = data_files.iter().map(|df| df.record_count() as usize).sum();
+    let num_rows: usize = data_files
+        .iter()
+        .map(|df| df.borrow().record_count() as usize)
+        .sum();
     let total_byte_size: usize = data_files
         .iter()
-        .map(|df| df.file_size_in_bytes() as usize)
+        .map(|df| df.borrow().file_size_in_bytes() as usize)
         .sum();
     let column_statistics = aggregate_column_statistics(data_files, arrow_schema, iceberg_schema);
     Statistics {
@@ -275,10 +290,11 @@ pub fn aggregate_table_statistics(
     }
 }
 
-fn aggregate_null_count(data_files: &[DataFile], field_id: i32) -> Option<usize> {
+fn aggregate_null_count<T: Borrow<DataFile>>(data_files: &[T], field_id: i32) -> Option<usize> {
     let mut total: u64 = 0;
     let mut any = false;
     for df in data_files {
+        let df: &DataFile = df.borrow();
         if let Some(c) = df.null_value_counts().get(&field_id).copied() {
             total = total.saturating_add(c);
             any = true;
@@ -287,14 +303,15 @@ fn aggregate_null_count(data_files: &[DataFile], field_id: i32) -> Option<usize>
     any.then_some(total as usize)
 }
 
-fn aggregate_bound(
-    data_files: &[DataFile],
+fn aggregate_bound<T: Borrow<DataFile>>(
+    data_files: &[T],
     field_id: i32,
     data_type: &DataType,
     use_max: bool,
 ) -> Option<ScalarValue> {
     let mut acc: Option<ScalarValue> = None;
     for df in data_files {
+        let df: &DataFile = df.borrow();
         let bounds = if use_max {
             df.upper_bounds()
         } else {
@@ -331,7 +348,7 @@ fn aggregate_bound(
     acc
 }
 
-impl PruningStatistics for IcebergManifestStatistics {
+impl<T: Borrow<DataFile> + Send + Sync> PruningStatistics for IcebergManifestStatistics<T> {
     fn min_values(&self, column: &Column) -> Option<ArrayRef> {
         let fid = self.field_id(&column.name)?;
         let field = self.schema.field_with_name(&column.name).ok()?;
@@ -350,7 +367,7 @@ impl PruningStatistics for IcebergManifestStatistics {
         let counts: Vec<Option<u64>> = self
             .data_files
             .iter()
-            .map(|df| df.null_value_counts().get(&fid).copied())
+            .map(|df| df.borrow().null_value_counts().get(&fid).copied())
             .collect();
         if counts.iter().all(|c| c.is_none()) {
             return None;
@@ -361,7 +378,7 @@ impl PruningStatistics for IcebergManifestStatistics {
         let counts: Vec<Option<u64>> = self
             .data_files
             .iter()
-            .map(|df| Some(df.record_count()))
+            .map(|df| Some(df.borrow().record_count()))
             .collect();
         Some(Arc::new(UInt64Array::from(counts)) as ArrayRef)
     }
@@ -445,7 +462,7 @@ fn median_relative_spread(per_file: &[(f64, f64)]) -> Option<f64> {
     })
 }
 
-impl IcebergManifestStatistics {
+impl<T: Borrow<DataFile>> IcebergManifestStatistics<T> {
     /// Median per-file bounds spread for one column, or `None` if the column is
     /// undecidable (unknown field, non-numeric bounds, no bounds, degenerate
     /// range).
@@ -778,7 +795,7 @@ mod tests {
             Field::new("id", DataType::Int32, false),
             Field::new("not_in_iceberg", DataType::Utf8, true),
         ]);
-        let stats = aggregate_column_statistics(&[], &arrow_schema, &iceberg_schema);
+        let stats = aggregate_column_statistics::<DataFile>(&[], &arrow_schema, &iceberg_schema);
         assert_eq!(stats.len(), 2);
         assert_eq!(stats[1].null_count, Precision::Absent);
         assert_eq!(stats[1].min_value, Precision::Absent);
