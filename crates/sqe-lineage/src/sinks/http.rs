@@ -1,9 +1,10 @@
 //! HTTP POST sink for an OpenLineage collector.
 //!
-//! Three auth modes per spec §6.4:
+//! Collector authentication modes:
 //! - `AuthMode::None` -- no Authorization header (Marquez default).
 //! - `AuthMode::Bearer(token)` -- static API key.
-//! - `AuthMode::UserToken(token)` -- per-event user OIDC bearer.
+//!
+//! User session tokens are never accepted by the lineage observer.
 //!
 //! Retries 5xx and timeouts up to `retry_attempts` times with exponential backoff
 //! (250ms x 2^n). 4xx responses are not retried.
@@ -15,8 +16,7 @@ use std::time::Duration;
 #[derive(Clone, Debug)]
 pub enum AuthMode {
     None,
-    Bearer(String),
-    UserToken(String),
+    Bearer(sqe_core::SecretString),
 }
 
 #[derive(Clone, Debug)]
@@ -56,7 +56,7 @@ impl Sink for HttpSink {
 
             req = match &self.cfg.auth {
                 AuthMode::None => req,
-                AuthMode::Bearer(t) | AuthMode::UserToken(t) => req.bearer_auth(t),
+                AuthMode::Bearer(t) => req.bearer_auth(t.expose()),
             };
 
             match req.send().await {
@@ -81,5 +81,28 @@ impl Sink for HttpSink {
 
     fn name(&self) -> &'static str {
         "http"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collector_credential_is_redacted_from_auth_and_config_debug() {
+        let secret = "collector-credential-canary";
+        let auth = AuthMode::Bearer(secret.into());
+        let cfg = HttpConfig {
+            endpoint: "https://collector.example/lineage".into(),
+            auth: auth.clone(),
+            timeout_ms: 5000,
+            retry_attempts: 1,
+        };
+        for rendered in [format!("{auth:?}"), format!("{cfg:?}")] {
+            assert!(
+                !rendered.contains(secret),
+                "credential leaked in debug output"
+            );
+        }
     }
 }

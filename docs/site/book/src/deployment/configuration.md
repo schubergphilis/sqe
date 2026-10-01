@@ -529,8 +529,10 @@ Each entry requires a `type`:
 | `token_exchange` | `token_url`, `client_id` | RFC 8693 token exchange |
 | `aws_iam` | none | AWS IAM via STS `GetCallerIdentity` |
 | `api_key` | `keys_file` | API key from a TOML keys file |
-| `mtls` | none | Client certificate authentication |
+| `mtls` | none | Reserved; startup rejects it because current listeners do not extract verified peer identities |
 | `anonymous` | none | Fixed identity for dev / test |
+
+The `mtls` auth provider is reserved. Transport mutual TLS through the configured client CA still verifies client certificates, but current adapters do not map those certificates to a SQL identity.
 
 A common production chain accepts both interactive logins (password grant) and pre-minted JWTs from programmatic clients:
 

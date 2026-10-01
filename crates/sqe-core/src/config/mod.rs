@@ -2205,7 +2205,8 @@ pub enum AuthProviderConfig {
         #[serde(default = "default_api_key_prefix")]
         key_prefix: String,
     },
-    /// Mutual TLS client certificate authentication.
+    /// Reserved mutual TLS provider. Current listeners do not extract verified
+    /// peer identity, so startup rejects this provider.
     Mtls {
         /// Whether to extract OU from the cert subject as a group.
         #[serde(default = "default_true")]
@@ -2406,6 +2407,20 @@ fn default_admin_roles() -> Vec<String> {
 }
 
 impl AuthConfig {
+    /// Refuse a configured control that current transport adapters cannot supply.
+    /// TLS client-certificate verification alone does not populate the identity
+    /// consumed by MtlsProvider; never substitute request headers for that proof.
+    pub fn validate_transport_providers(&self) -> Result<(), String> {
+        if self
+            .providers
+            .iter()
+            .any(|p| matches!(p, AuthProviderConfig::Mtls { .. }))
+        {
+            return Err("auth.providers: mtls requires verified TLS peer identity extraction, which current listeners do not support".into());
+        }
+        Ok(())
+    }
+
     /// Returns true if TLS certificate verification should be skipped.
     /// Combines `tls_skip_verify` (new, clear) with `ssl_verification` (legacy, inverted).
     /// Either `tls_skip_verify = true` OR `ssl_verification = false` triggers skip.
@@ -4338,7 +4353,7 @@ impl OpenLineageConfig {
     ///
     /// Rules:
     /// - When enabled, at least one sink (file_path or http_endpoint) must be set.
-    /// - `auth_mode = "bearer"` requires `api_key` to be set.
+    /// - Only `none` and `bearer` are supported; `bearer` requires `api_key`.
     /// - `spool_path` only makes sense when `http_endpoint` is set (the spool
     ///   buffers events that fail to deliver over HTTP).
     /// - When enabled, `spool_max_bytes` must be at least 1 MiB so the spool
@@ -4349,7 +4364,12 @@ impl OpenLineageConfig {
                 "openlineage.enabled requires at least one of file_path or http_endpoint".into(),
             );
         }
-        if self.auth_mode == "bearer" && self.api_key.is_empty() {
+        match self.auth_mode.as_str() {
+            "none" | "bearer" => {}
+            "user_token" => return Err("openlineage.auth_mode = \"user_token\" is unsupported: user session tokens must not be forwarded to lineage collectors; use none or bearer with a dedicated collector api_key".into()),
+            _ => return Err("openlineage.auth_mode must be none or bearer".into()),
+        }
+        if self.auth_mode == "bearer" && self.api_key.trim().is_empty() {
             return Err("openlineage.auth_mode = \"bearer\" requires api_key to be set".into());
         }
         if !self.spool_path.is_empty() && self.http_endpoint.is_empty() {
@@ -5361,6 +5381,9 @@ impl SqeConfig {
     pub fn validate(&self) -> crate::error::Result<()> {
         let mut errors = Vec::new();
         self.quack_client.validate(&mut errors);
+        if let Err(error) = self.auth.validate_transport_providers() {
+            errors.push(error);
+        }
         self.validate_ticket_keys(&mut errors);
 
         // Required fields
@@ -6419,6 +6442,70 @@ fn validate_urls(config: &SqeConfig, errors: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unsupported_mtls_provider_fails_configuration_validation() {
+        let mtls = AuthProviderConfig::Mtls {
+            extract_ou: true,
+            extract_san: true,
+        };
+        for providers in [
+            vec![mtls.clone()],
+            vec![
+                AuthProviderConfig::Anonymous {
+                    user: "fallback".into(),
+                    roles: vec![],
+                },
+                mtls,
+            ],
+        ] {
+            let mut config = valid_config();
+            config.auth.providers = providers;
+            config.coordinator.tls.cert_file = "/tmp/server.crt".into();
+            config.coordinator.tls.key_file = "/tmp/server.key".into();
+            config.coordinator.tls.ca_file = "/tmp/client-ca.crt".into();
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("mtls") && err.contains("verified TLS peer identity"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn openlineage_rejects_user_token_and_unknown_auth_modes() {
+        for mode in ["user_token", "bearre", ""] {
+            let mut config = valid_config();
+            config.metrics.openlineage.enabled = true;
+            config.metrics.openlineage.http_endpoint = "https://collector.example/lineage".into();
+            config.metrics.openlineage.auth_mode = mode.into();
+            config.metrics.openlineage.api_key = "collector-credential".into();
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains("openlineage.auth_mode"), "{err}");
+        }
+        for mode in ["none", "bearer"] {
+            let config = OpenLineageConfig {
+                enabled: true,
+                http_endpoint: "https://collector.example/lineage".into(),
+                auth_mode: mode.into(),
+                api_key: "collector-credential".into(),
+                ..OpenLineageConfig::default()
+            };
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn openlineage_bearer_rejects_blank_collector_credentials() {
+        let config = OpenLineageConfig {
+            enabled: true,
+            http_endpoint: "https://collector.example/lineage".into(),
+            auth_mode: "bearer".into(),
+            api_key: "  ".into(),
+            ..OpenLineageConfig::default()
+        };
+        assert!(config.validate().unwrap_err().contains("api_key"));
+    }
+
     use super::*;
 
     #[test]
@@ -7544,8 +7631,11 @@ partial_progress_batch = 5
     fn mcp_anonymous_mode_is_allowed_alongside_non_idp_providers() {
         let mut config = mcp_enabled_config();
         config.mcp.auth.mode = McpAuthMode::Anonymous;
-        config.auth.providers = vec![provider_from_toml(r#"type = "mtls""#)];
-        config.validate().expect("mtls is not an IdP");
+        config.auth.providers = vec![provider_from_toml(
+            r#"type = "api_key"
+keys_file = "/tmp/unused-keys.toml""#,
+        )];
+        config.validate().expect("api_key is not an IdP");
     }
 
     #[test]
