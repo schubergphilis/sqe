@@ -1269,7 +1269,6 @@ impl QueryHandler {
                     sql: sql.to_string(),
                     user: sqe_lineage::UserCtx {
                         username: session.user.username.clone(),
-                        bearer: Some(session.access_token().clone()),
                     },
                     session_id: session.id.clone(),
                     started_at: ol_started_at,
@@ -1349,7 +1348,6 @@ impl QueryHandler {
                                 sql: sql.to_string(),
                                 user: sqe_lineage::UserCtx {
                                     username: session.user.username.clone(),
-                                    bearer: Some(session.access_token().clone()),
                                 },
                                 session_id: session.id.clone(),
                                 started_at: ol_started_at,
@@ -2840,7 +2838,6 @@ impl QueryHandler {
                             sql: sql.to_string(),
                             user: sqe_lineage::UserCtx {
                                 username: session.user.username.clone(),
-                                bearer: Some(session.access_token().clone()),
                             },
                             session_id: session.id.clone(),
                             started_at: ol_started_at,
@@ -2865,7 +2862,6 @@ impl QueryHandler {
                             sql: sql.to_string(),
                             user: sqe_lineage::UserCtx {
                                 username: session.user.username.clone(),
-                                bearer: Some(session.access_token().clone()),
                             },
                             session_id: session.id.clone(),
                             started_at: ol_started_at,

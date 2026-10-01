@@ -54,29 +54,7 @@ async fn http_sink_posts_with_static_bearer() {
 
     let sink = HttpSink::new(HttpConfig {
         endpoint: format!("{}/api/v1/lineage", server.uri()),
-        auth: AuthMode::Bearer("secret".into()),
-        timeout_ms: 5000,
-        retry_attempts: 1,
-    })
-    .unwrap();
-
-    sink.send(&dummy_event()).await.unwrap();
-}
-
-#[tokio::test]
-async fn http_sink_posts_with_user_token() {
-    let server = MockServer::start().await;
-    Mock::given(matchers::method("POST"))
-        .and(matchers::path("/api/v1/lineage"))
-        .and(matchers::header("Authorization", "Bearer user-jwt"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let sink = HttpSink::new(HttpConfig {
-        endpoint: format!("{}/api/v1/lineage", server.uri()),
-        auth: AuthMode::UserToken("user-jwt".into()),
+        auth: AuthMode::Bearer(sqe_core::SecretString::new("secret".into())),
         timeout_ms: 5000,
         retry_attempts: 1,
     })
