@@ -30,7 +30,7 @@ use crate::provider::AuthError;
 /// - Redirecting the user to `authorization_url`
 /// - Persisting `auth_id`, `code_verifier`, and `state` until the callback arrives
 ///   (e.g. in [`crate::pending_auth::PendingAuthStore`])
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuthCodeChallenge {
     /// Unique identifier for this auth session (opaque to the IdP). Handed to
     /// the *client* only (Trino `x_token_server`); the browser never sees it.
@@ -46,10 +46,21 @@ pub struct AuthCodeChallenge {
     pub state: String,
 }
 
+impl std::fmt::Debug for AuthCodeChallenge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthCodeChallenge")
+            .field("auth_id", &"<redacted>")
+            .field("authorization_url", &"<redacted>")
+            .field("code_verifier", &"<redacted>")
+            .field("state", &"<redacted>")
+            .finish()
+    }
+}
+
 // ─── Internal serde type ─────────────────────────────────────────────────────
 
 /// Raw token response body from the IdP's token endpoint.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
     #[serde(default)]
@@ -149,11 +160,8 @@ impl AuthCodeService {
 
         let authorization_url = format!("{}?{}", auth_endpoint, query_string);
 
-        debug!(
-            auth_id = %auth_id,
-            authorization_url = %authorization_url,
-            "Starting Authorization Code + PKCE challenge"
-        );
+        // auth_id is the client-only token-poll capability, not a log ID.
+        debug!("Starting Authorization Code + PKCE challenge");
 
         Ok(AuthCodeChallenge {
             auth_id,
@@ -202,8 +210,8 @@ impl AuthCodeService {
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            warn!(status = %status, body = %body, "Token endpoint rejected auth code exchange");
+            // IdP error bodies are untrusted and may echo codes or credentials.
+            warn!(status = %status, "Token endpoint rejected auth code exchange");
             return Err(AuthError::AuthFailed("Authentication failed".to_string()));
         }
 
@@ -374,5 +382,29 @@ mod tests {
         assert!(resp.refresh_token.is_none());
         // Default expires_in applied
         assert_eq!(resp.expires_in, 3600);
+    }
+}
+
+#[cfg(test)]
+mod secret_debug_tests {
+    use super::*;
+    #[test]
+    fn challenge_debug_redacts_poll_capability_and_verifier() {
+        let challenge = AuthCodeChallenge {
+            auth_id: "auth-id-canary".into(),
+            authorization_url: "https://idp/authorize?state=url-canary".into(),
+            code_verifier: "verifier-canary".into(),
+            state: "state-canary".into(),
+        };
+        let debug = format!("{challenge:?}");
+        for secret in [
+            &challenge.auth_id,
+            &challenge.authorization_url,
+            &challenge.code_verifier,
+            &challenge.state,
+        ] {
+            assert!(!debug.contains(secret));
+        }
+        assert!(debug.contains("<redacted>"));
     }
 }
