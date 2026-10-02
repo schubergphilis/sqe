@@ -584,6 +584,150 @@ mod case_union {
         );
         assert!(convert(case).is_some());
     }
+
+    // -- Tier-2 evaluation: collapse the CASE into one IN list -----------------
+    use datafusion::arrow::array::{BooleanArray, Int64Array};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::logical_expr::ColumnarValue;
+    use datafusion::physical_expr::expressions::InListExpr;
+    use sqe_catalog::physical_to_predicate::collapse_partitioned_membership;
+
+    fn collapse(expr: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
+        collapse_partitioned_membership(expr, &arrow_schema())
+    }
+
+    fn eval(expr: &Arc<dyn PhysicalExpr>, ids: &[i64]) -> Vec<bool> {
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema()),
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(Int64Array::from(vec![0; ids.len()])),
+            ],
+        )
+        .unwrap();
+        match expr.evaluate(&batch).unwrap() {
+            ColumnarValue::Array(a) => a
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .iter()
+                .map(|v| v.unwrap_or(false))
+                .collect(),
+            ColumnarValue::Scalar(s) => vec![s == ScalarValue::Boolean(Some(true)); ids.len()],
+        }
+    }
+
+    #[test]
+    fn collapse_unions_arm_in_lists_into_one_in_list() {
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_expr::expressions::BinaryExpr;
+
+        // Arms carry bounds AND membership, as DataFusion seals them.
+        let bounded = Arc::new(BinaryExpr::new(
+            Arc::new(BinaryExpr::new(col("id", 0), Operator::GtEq, int_lit(1))),
+            Operator::And,
+            in_list_expr("id", 0, &[1, 2]),
+        ));
+        let case = case_expr(
+            vec![
+                bounded,
+                lit(ScalarValue::Boolean(Some(false))),
+                in_list_expr("id", 0, &[7]),
+            ],
+            lit(ScalarValue::Boolean(Some(false))),
+        );
+        let collapsed = collapse(case);
+        let in_list = collapsed.downcast_ref::<InListExpr>().expect("collapsed to one IN list");
+        assert_eq!(in_list.len(), 3);
+        assert_eq!(eval(&collapsed, &[1, 2, 3, 7, 8]), vec![true, true, false, true, false]);
+    }
+
+    #[test]
+    fn collapse_descends_through_the_null_preserving_or() {
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_expr::expressions::{BinaryExpr, IsNullExpr};
+
+        let case = case_expr(
+            vec![in_list_expr("id", 0, &[1]), in_list_expr("id", 0, &[2])],
+            lit(ScalarValue::Boolean(Some(false))),
+        );
+        let wrapped: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            case,
+            Operator::Or,
+            Arc::new(IsNullExpr::new(col("id", 0))),
+        ));
+        let collapsed = collapse(wrapped);
+        let or = collapsed.downcast_ref::<BinaryExpr>().expect("OR kept");
+        assert!(or.left().downcast_ref::<InListExpr>().is_some());
+        assert_eq!(eval(&collapsed, &[1, 2, 3]), vec![true, true, false]);
+    }
+
+    #[test]
+    fn collapse_of_only_empty_partitions_is_false() {
+        let case = case_expr(
+            vec![lit(ScalarValue::Boolean(Some(false)))],
+            lit(ScalarValue::Boolean(Some(false))),
+        );
+        assert_eq!(eval(&collapse(case), &[1, 2]), vec![false, false]);
+    }
+
+    #[test]
+    fn collapse_leaves_unsupported_shapes_unchanged() {
+        let false_ = || lit(ScalarValue::Boolean(Some(false)));
+        let cases = [
+            // Canceled-unknown seal: ELSE true admits unknown partitions.
+            case_expr(vec![in_list_expr("id", 0, &[1])], lit(ScalarValue::Boolean(Some(true)))),
+            // An arm with no IN list (map-lookup pushdown, bounds-less seal).
+            case_expr(
+                vec![in_list_expr("id", 0, &[1]), lit(ScalarValue::Boolean(Some(true)))],
+                false_(),
+            ),
+            // Arms on different keys.
+            case_expr(vec![in_list_expr("id", 0, &[1]), in_list_expr("other", 1, &[2])], false_()),
+            // A non-column key (multi-column joins key on `struct(..)`).
+            case_expr(
+                vec![datafusion::physical_expr::expressions::in_list(
+                    Arc::new(datafusion::physical_expr::expressions::NegativeExpr::new(col("id", 0))),
+                    vec![int_lit(1)],
+                    &false,
+                    &arrow_schema(),
+                )
+                .unwrap()],
+                false_(),
+            ),
+        ];
+        for case in cases {
+            assert!(Arc::ptr_eq(&collapse(Arc::clone(&case)), &case), "{case}");
+        }
+    }
+
+    #[test]
+    fn membership_filters_are_told_apart_from_topk_bounds() {
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_expr::expressions::BinaryExpr;
+        use sqe_catalog::physical_to_predicate::is_join_membership_filter;
+
+        let case = case_expr(
+            vec![in_list_expr("id", 0, &[1]), in_list_expr("id", 0, &[2])],
+            lit(ScalarValue::Boolean(Some(false))),
+        );
+        assert!(is_join_membership_filter(&case));
+        assert!(is_join_membership_filter(&in_list_expr("id", 0, &[1, 2])));
+        // A TopK threshold is a plain comparison and keeps tightening.
+        let topk: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(col("id", 0), Operator::Lt, int_lit(10)));
+        assert!(!is_join_membership_filter(&topk));
+    }
+
+    #[test]
+    fn over_cap_bails_before_converting_literals() {
+        // 3 + 3 literals against a cap of 5: the lower bound alone rejects it.
+        let case = case_expr(
+            vec![in_list_expr("id", 0, &[1, 2, 3]), in_list_expr("id", 0, &[4, 5, 6])],
+            lit(ScalarValue::Boolean(Some(false))),
+        );
+        assert_eq!(convert_capped(case, 5), None);
+    }
 }
 
 // ---------------------------------------------------------------------------

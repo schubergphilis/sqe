@@ -306,6 +306,102 @@ pub struct IcebergScanExec {
     fetch_permits: Arc<tokio::sync::Semaphore>,
     static_plan: Arc<tokio::sync::OnceCell<Arc<StaticScanPlan>>>,
     split_assignments: Arc<tokio::sync::OnceCell<Vec<Vec<FileScanTask>>>>,
+    /// First sealed snapshot of each `pushed_down_filters` entry, collapsed
+    /// for per-row evaluation, shared by every partition. Fresh whenever the
+    /// filters are replaced.
+    sealed_filters: SealedFilterCache,
+}
+
+/// Per-filter slot holding a dynamic filter's first sealed snapshot after
+/// [`crate::physical_to_predicate::collapse_partitioned_membership`].
+///
+/// Scan-wide rather than per stream: collapsing a partitioned join's filter
+/// builds one hash set over every build key (700K on TPC-H q21 SF10). Built
+/// per stream, every partition and every in-flight batch that saw the slot
+/// empty paid that again, which made q21 2.7x slower.
+type SealedFilterCache = Arc<[SealedFilter]>;
+
+fn new_sealed_filter_cache(filters: usize) -> SealedFilterCache {
+    (0..filters).map(|_| SealedFilter::default()).collect()
+}
+
+/// Rows a join-membership filter must see, scan-wide, before the scan judges
+/// whether it is worth evaluating.
+const ADAPTIVE_FILTER_SAMPLE_ROWS: u64 = 1 << 20;
+/// A membership filter that keeps at least this percentage of the sampled
+/// rows is skipped.
+const ADAPTIVE_FILTER_MIN_PASS_PERCENT: u64 = 95;
+/// A skipped filter still evaluates one batch in this many, and switches back
+/// on when that batch shows it is selective.
+const ADAPTIVE_FILTER_PROBE_EVERY: u64 = 16;
+
+#[derive(Debug, Default)]
+struct SealedFilter {
+    /// Collapsed snapshot, and whether it is a join-key membership filter.
+    snapshot: std::sync::OnceLock<(Arc<dyn PhysicalExpr>, bool)>,
+    rows_in: std::sync::atomic::AtomicU64,
+    rows_out: std::sync::atomic::AtomicU64,
+    skip: std::sync::atomic::AtomicBool,
+    batches_skipped: std::sync::atomic::AtomicU64,
+}
+
+impl SealedFilter {
+    fn get_or_init(&self, init: impl FnOnce() -> Arc<dyn PhysicalExpr>) -> &(Arc<dyn PhysicalExpr>, bool) {
+        self.snapshot.get_or_init(|| {
+            let expr = init();
+            let membership = crate::physical_to_predicate::is_join_membership_filter(&expr);
+            (expr, membership)
+        })
+    }
+
+    /// Record one evaluated batch. Returns true when this batch completed the
+    /// sample and the filter was found to remove too little to pay for itself.
+    ///
+    /// A filter whose build side holds nearly every probe key (bank q06 SF10:
+    /// all 2.5M accounts) costs a hash lookup per decoded row and removes
+    /// nothing; that was 15s of CPU over 140M rows. Skipping it is always
+    /// sound: the join above re-checks every row. TopK bounds are never
+    /// skipped because they tighten after the sample.
+    ///
+    /// A sample is a prefix, and clustered data makes prefixes lie: TPC-DS
+    /// inventory is sorted by date, so q22's date filter passed every row of
+    /// its first million and was skipped for the remaining 1.1B. A skipped
+    /// filter therefore keeps probing (see [`Self::should_evaluate`]); a
+    /// selective probe batch switches it back on and restarts the sample.
+    fn observe(&self, rows_in: usize, rows_out: usize) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.skipped() {
+            if (rows_out as u64) * 100 < (rows_in as u64) * ADAPTIVE_FILTER_MIN_PASS_PERCENT {
+                self.rows_in.store(0, Relaxed);
+                self.rows_out.store(0, Relaxed);
+                self.skip.store(false, Relaxed);
+            }
+            return false;
+        }
+        let seen = self.rows_in.fetch_add(rows_in as u64, Relaxed);
+        let passed = self.rows_out.fetch_add(rows_out as u64, Relaxed) + rows_out as u64;
+        let now = seen + rows_in as u64;
+        if seen >= ADAPTIVE_FILTER_SAMPLE_ROWS || now < ADAPTIVE_FILTER_SAMPLE_ROWS {
+            return false;
+        }
+        if passed * 100 >= now * ADAPTIVE_FILTER_MIN_PASS_PERCENT {
+            self.skip.store(true, Relaxed);
+            return true;
+        }
+        false
+    }
+
+    fn skipped(&self) -> bool {
+        self.skip.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// False for a skipped filter's batches between probes.
+    fn should_evaluate(&self) -> bool {
+        !self.skipped()
+            || self.batches_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % ADAPTIVE_FILTER_PROBE_EVERY
+                == 0
+    }
 }
 
 impl IcebergScanExec {
@@ -458,6 +554,7 @@ impl IcebergScanExec {
             fetch_permits,
             static_plan: Arc::new(tokio::sync::OnceCell::new()),
             split_assignments: Arc::new(tokio::sync::OnceCell::new()),
+            sealed_filters: new_sealed_filter_cache(0),
         }
     }
 
@@ -700,6 +797,7 @@ impl IcebergScanExec {
     /// The returned node inherits all fields from `self` but replaces the
     /// `pushed_down_filters` with the given set.
     fn clone_with_pushed_filters(&self, filters: Vec<Arc<dyn PhysicalExpr>>) -> Self {
+        let sealed_filters = new_sealed_filter_cache(filters.len());
         Self {
             table: self.table.clone(),
             projected_schema: self.projected_schema.clone(),
@@ -728,6 +826,7 @@ impl IcebergScanExec {
             fetch_permits: self.fetch_permits.clone(),
             static_plan: self.static_plan.clone(),
             split_assignments: self.split_assignments.clone(),
+            sealed_filters,
         }
     }
 
@@ -1284,6 +1383,7 @@ impl ExecutionPlan for IcebergScanExec {
         let manifest_concurrency = self.manifest_concurrency;
         let direct_read_concurrency = self.direct_read_concurrency;
         let pushed_down_filters = self.pushed_down_filters.clone();
+        let sealed_filters = self.sealed_filters.clone();
         let runtime_filter_clustering_skip = self.runtime_filter_clustering_skip;
         let runtime_filter_uniform_threshold = self.runtime_filter_uniform_threshold;
         let runtime_filter_wait_ms = self.runtime_filter_wait_ms;
@@ -1339,6 +1439,10 @@ impl ExecutionPlan for IcebergScanExec {
             MetricBuilder::new(&self.metrics).counter("rows_filtered_dynamic", partition);
         let rows_passed_filter_pending =
             MetricBuilder::new(&self.metrics).counter("rows_passed_filter_pending", partition);
+        // Membership filters dropped after sampling as not selective enough
+        // (see `SealedFilter::observe`).
+        let dynamic_filters_skipped =
+            MetricBuilder::new(&self.metrics).counter("dynamic_filters_skipped", partition);
         let dynamic_filters_resolved =
             MetricBuilder::new(&self.metrics).counter("dynamic_filters_resolved", partition);
         let dynamic_filters_pending =
@@ -1370,9 +1474,6 @@ impl ExecutionPlan for IcebergScanExec {
 
         // Type alias to avoid repeating the full BoxStream type in early-returns.
         type BatchStream = futures::stream::BoxStream<'static, DFResult<RecordBatch>>;
-        // Per-filter cache of each dynamic filter's first sealed snapshot, shared
-        // across the batches of one scan stream (see the Tier-2 wrapper below).
-        type ResolvedFilterCache = Arc<std::sync::Mutex<Vec<Option<Arc<dyn PhysicalExpr>>>>>;
 
         // `schema` is also needed after the stream is created (for IcebergRecordBatchStream),
         // so clone it before moving it into the async block.
@@ -1528,7 +1629,7 @@ impl ExecutionPlan for IcebergScanExec {
                 // hasn't finished yet). Early batches pass unfiltered; later
                 // batches get the actual bounds once the build side completes.
                 let mut resolved_filters: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
-                for filter in &pushed_down_filters {
+                for (idx, filter) in pushed_down_filters.iter().enumerate() {
                     if let Some(dynamic) = filter.downcast_ref::<DynamicFilterPhysicalExpr>() {
                         match dynamic.current() {
                             Ok(expr) => {
@@ -1540,7 +1641,11 @@ impl ExecutionPlan for IcebergScanExec {
                                 } else {
                                     dynamic_filters_resolved.add(1);
                                     debug!(filter = %expr, "Snapshot dynamic filter for direct-read");
-                                    resolved_filters.push(expr);
+                                    resolved_filters.push(Arc::clone(&sealed_filters[idx].get_or_init(|| {
+                                        crate::physical_to_predicate::collapse_partitioned_membership(
+                                            expr, &schema,
+                                        )
+                                    }).0));
                                 }
                             }
                             Err(e) => {
@@ -2041,6 +2146,7 @@ impl ExecutionPlan for IcebergScanExec {
                 let filtered_schema = schema.clone();
                 let rows_filtered_dynamic = rows_filtered_dynamic.clone();
                 let rows_passed_filter_pending = rows_passed_filter_pending.clone();
+                let dynamic_filters_skipped = dynamic_filters_skipped.clone();
                 // Cache the first sealed (non-`lit(true)`) snapshot of each
                 // dynamic filter so `DynamicFilterPhysicalExpr::current()` runs at
                 // most once per filter, not once per batch.
@@ -2059,9 +2165,9 @@ impl ExecutionPlan for IcebergScanExec {
                 // to re-sample), so only not-yet-sealed slots keep sampling. The
                 // dynamic filter is a probe-reduction optimization the hash join
                 // re-checks, so a cached (slightly stale) snapshot can only pass
-                // extra rows, never drop a match.
-                let resolved_cache: ResolvedFilterCache =
-                    Arc::new(std::sync::Mutex::new(vec![None; filters.len()]));
+                // extra rows, never drop a match. The cache is scan-wide
+                // (`sealed_filters`), so all partitions share one snapshot.
+                let resolved_cache = sealed_filters.clone();
                 let filter_concurrency = std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(8);
@@ -2072,6 +2178,7 @@ impl ExecutionPlan for IcebergScanExec {
                         let filtered_schema = filtered_schema.clone();
                         let rows_filtered_dynamic = rows_filtered_dynamic.clone();
                         let rows_passed_filter_pending = rows_passed_filter_pending.clone();
+                        let dynamic_filters_skipped = dynamic_filters_skipped.clone();
                         let resolved_cache = resolved_cache.clone();
                         async move {
                             let batch = batch_res?;
@@ -2088,38 +2195,43 @@ impl ExecutionPlan for IcebergScanExec {
                             let mut saw_pending = false;
                             let mut result = batch;
                             for (idx, filter) in filters.iter().enumerate() {
-                                let (expr, is_dynamic): (Arc<dyn PhysicalExpr>, bool) = if let Some(dynamic) = filter.downcast_ref::<DynamicFilterPhysicalExpr>() {
+                                let slot = &resolved_cache[idx];
+                                if !slot.should_evaluate() {
+                                    continue;
+                                }
+                                let (expr, is_dynamic, membership): (Arc<dyn PhysicalExpr>, bool, bool) = if let Some(dynamic) = filter.downcast_ref::<DynamicFilterPhysicalExpr>() {
                                     // Short-circuit on the cached sealed snapshot:
                                     // once present we never call `current()` again
-                                    // (that call is the whole cost). The lock is
-                                    // held only to read/store an `Arc`, never
-                                    // across `current()`, and the scan stream is
-                                    // polled one batch at a time, so it stays
-                                    // uncontended.
-                                    let cached = { resolved_cache.lock().unwrap()[idx].clone() };
-                                    let resolved = match cached {
-                                        Some(e) => Some(e),
+                                    // (that call is the whole cost).
+                                    let resolved = match slot.snapshot.get() {
+                                        Some(e) => Some(e.clone()),
                                         None => match dynamic.current() {
                                             // Build side not sealed yet: the
                                             // snapshot is still the lit(true)
                                             // placeholder, every row passes.
                                             Ok(e) if is_trivial_true(&e) => None,
-                                            Ok(e) => {
-                                                resolved_cache.lock().unwrap()[idx] = Some(Arc::clone(&e));
-                                                Some(e)
-                                            }
+                                            // One membership probe instead of a
+                                            // per-arm CASE pass, built once: racing
+                                            // batches block on the slot rather than
+                                            // each building the set.
+                                            Ok(e) => Some(slot.get_or_init(|| {
+                                                crate::physical_to_predicate::collapse_partitioned_membership(
+                                                    e,
+                                                    &filtered_schema,
+                                                )
+                                            }).clone()),
                                             Err(_) => None,
                                         },
                                     };
                                     match resolved {
-                                        Some(e) => (e, true),
+                                        Some((e, membership)) => (e, true, membership),
                                         None => {
                                             saw_pending = true;
                                             continue;
                                         }
                                     }
                                 } else {
-                                    (Arc::clone(filter), false)
+                                    (Arc::clone(filter), false, false)
                                 };
                                 // DynamicFilterPhysicalExpr carries runtime literals
                                 // typed to the build-side column (Iceberg Int32 for
@@ -2149,8 +2261,12 @@ impl ExecutionPlan for IcebergScanExec {
                                     }
                                     Err(_) => continue,
                                 };
+                                let before = result.num_rows();
                                 result = arrow::compute::filter_record_batch(&result, &predicate)
                                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                                if membership && slot.observe(before, result.num_rows()) {
+                                    dynamic_filters_skipped.add(1);
+                                }
                             }
                             rows_filtered_dynamic.add(rows_in - result.num_rows());
                             if saw_pending {
@@ -2776,10 +2892,15 @@ struct PhysicalExprPredicate {
 /// side is (indirectly) waiting on costs at most `wait_ms` extra, never a
 /// deadlock — which is why this must never call `wait_complete()`.
 async fn wait_for_dynamic_filters(filters: &[Arc<dyn PhysicalExpr>], wait_ms: u64) -> u64 {
+    // A filter is created at generation 1 and every `update()` bumps it, so
+    // "never updated" is a lock read. `current()` would answer the same
+    // question by rebuilding the sealed expression; for a partitioned join
+    // that is a 700K-literal tree (TPC-H q21 SF10), and every partition
+    // polling at the moment of sealing rebuilt it: 13% of q21's CPU.
     fn any_pending(filters: &[Arc<dyn PhysicalExpr>]) -> bool {
         filters.iter().any(|f| {
             f.downcast_ref::<DynamicFilterPhysicalExpr>()
-                .is_some_and(|d| d.current().map(|e| is_trivial_true(&e)).unwrap_or(true))
+                .is_some_and(|d| d.snapshot_generation() <= 1)
         })
     }
     if wait_ms == 0 || !any_pending(filters) {
@@ -3009,6 +3130,48 @@ mod tests {
             vec![Arc::new(Int32Array::from(values.to_vec()))],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn unselective_membership_filter_is_skipped_once_sampled() {
+        let slot = SealedFilter::default();
+        let half = (ADAPTIVE_FILTER_SAMPLE_ROWS / 2) as usize;
+        // Keeps 99% of rows: undecided until the sample fills, then skipped.
+        assert!(!slot.observe(half, half * 99 / 100));
+        assert!(!slot.skipped());
+        assert!(slot.observe(half, half * 99 / 100));
+        assert!(slot.skipped());
+        // The decision is reported once.
+        assert!(!slot.observe(half, half));
+    }
+
+    #[test]
+    fn selective_membership_filter_is_kept() {
+        let slot = SealedFilter::default();
+        let rows = ADAPTIVE_FILTER_SAMPLE_ROWS as usize;
+        assert!(!slot.observe(rows, rows / 2));
+        assert!(!slot.skipped());
+        // A later unselective stretch does not revisit the decision.
+        assert!(!slot.observe(rows * 4, rows * 4));
+        assert!(!slot.skipped());
+    }
+
+    #[test]
+    fn skipped_filter_probes_and_switches_back_on_when_selective() {
+        // Clustered data: the sampled prefix passes everything.
+        let slot = SealedFilter::default();
+        let rows = ADAPTIVE_FILTER_SAMPLE_ROWS as usize;
+        assert!(slot.observe(rows, rows));
+        assert!(slot.skipped());
+        // One batch in ADAPTIVE_FILTER_PROBE_EVERY is still evaluated.
+        let evaluated = (0..ADAPTIVE_FILTER_PROBE_EVERY * 4)
+            .filter(|_| slot.should_evaluate())
+            .count();
+        assert_eq!(evaluated, 4);
+        // A probe that removes rows switches the filter back on.
+        assert!(!slot.observe(8192, 100));
+        assert!(!slot.skipped());
+        assert!(slot.should_evaluate());
     }
 
     /// An Exact table-wide row count must survive an unfiltered scan (that is
