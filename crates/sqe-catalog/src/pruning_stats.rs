@@ -207,6 +207,54 @@ fn build_bounds_array<T: Borrow<DataFile>>(
 /// Fields where the manifest carries no bounds (or the field doesn't map to an
 /// Iceberg field id) yield `Precision::Absent` rather than failing — partial
 /// stats are better than no stats for join order selection.
+/// Estimated in-memory size of the projected columns, which is what
+/// DataFusion's `JoinSelection` compares (byte size first, rows second) to
+/// pick a hash join's build side.
+///
+/// This used to be the whole files' compressed size whatever the projection.
+/// TPC-DS q72 SF10 then built its hash table on inventory (133M rows, 4
+/// narrow well-compressed columns, ~1.5 GB of files) instead of
+/// catalog_sales (14M rows of 34 wide columns): 19.6 s of build CPU for a
+/// probe the runtime filters had cut to 3.7K rows.
+///
+/// Fixed-width columns count `rows x width`; variable-width ones their
+/// manifest compressed size times the decode factor the scan's memory
+/// admission uses. A variable-width column without sizes falls back to the
+/// old whole-file figure.
+fn projected_byte_size<T: Borrow<DataFile>>(
+    data_files: &[T],
+    arrow_schema: &Schema,
+    iceberg_schema: &iceberg::spec::Schema,
+    num_rows: usize,
+) -> usize {
+    let file_bytes = || -> usize {
+        data_files
+            .iter()
+            .map(|df| df.borrow().file_size_in_bytes() as usize)
+            .sum()
+    };
+    let mut bytes = 0usize;
+    for field in arrow_schema.fields() {
+        if let Some(width) = field.data_type().primitive_width() {
+            bytes = bytes.saturating_add(num_rows.saturating_mul(width));
+            continue;
+        }
+        let Some(iceberg_field) = iceberg_schema.field_by_name(field.name()) else {
+            return file_bytes();
+        };
+        let mut compressed = 0u64;
+        for df in data_files {
+            match df.borrow().column_sizes().get(&iceberg_field.id) {
+                Some(size) => compressed = compressed.saturating_add(*size),
+                None => return file_bytes(),
+            }
+        }
+        let decoded = compressed.saturating_mul(crate::scan_memory::DECODE_MEMORY_ESTIMATE_FACTOR);
+        bytes = bytes.saturating_add(usize::try_from(decoded).unwrap_or(usize::MAX));
+    }
+    bytes
+}
+
 pub fn aggregate_column_statistics<T: Borrow<DataFile>>(
     data_files: &[T],
     arrow_schema: &Schema,
@@ -274,10 +322,7 @@ pub fn aggregate_table_statistics<T: Borrow<DataFile>>(
         .iter()
         .map(|df| df.borrow().record_count() as usize)
         .sum();
-    let total_byte_size: usize = data_files
-        .iter()
-        .map(|df| df.borrow().file_size_in_bytes() as usize)
-        .sum();
+    let total_byte_size = projected_byte_size(data_files, arrow_schema, iceberg_schema, num_rows);
     let column_statistics = aggregate_column_statistics(data_files, arrow_schema, iceberg_schema);
     Statistics {
         num_rows: if row_count_exact {
@@ -839,7 +884,8 @@ mod tests {
             false,
         );
         assert_eq!(stats.num_rows, Precision::Inexact(150));
-        assert_eq!(stats.total_byte_size, Precision::Inexact(3_500));
+        // Projected in-memory size: 150 rows x 4-byte Int32, not file bytes.
+        assert_eq!(stats.total_byte_size, Precision::Inexact(600));
 
         // With no live delete files the row count is a correctness-grade
         // exact value; byte size stays inexact either way.
@@ -850,6 +896,53 @@ mod tests {
             true,
         );
         assert_eq!(exact.num_rows, Precision::Exact(150));
-        assert_eq!(exact.total_byte_size, Precision::Inexact(3_500));
+        assert_eq!(exact.total_byte_size, Precision::Inexact(600));
+    }
+
+    /// Variable-width columns count their manifest compressed size times the
+    /// decode factor; without sizes the estimate falls back to file bytes.
+    #[test]
+    fn test_projected_byte_size_variable_width_and_fallback() {
+        use iceberg::spec::{
+            DataContentType, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType, Struct,
+            Type,
+        };
+        let iceberg_schema = iceberg::spec::Schema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long))),
+                Arc::new(NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String))),
+            ])
+            .build()
+            .unwrap();
+        let arrow_schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        let make = |sizes: Option<u64>| {
+            let mut b = DataFileBuilder::default();
+            b.content(DataContentType::Data)
+                .file_format(DataFileFormat::Parquet)
+                .file_path("f.parquet".to_string())
+                .file_size_in_bytes(10_000)
+                .record_count(100)
+                .partition_spec_id(0)
+                .partition(Struct::empty());
+            if let Some(name_bytes) = sizes {
+                b.column_sizes(std::collections::HashMap::from([(1, 300), (2, name_bytes)]));
+            }
+            b.build().unwrap()
+        };
+        let factor = crate::scan_memory::DECODE_MEMORY_ESTIMATE_FACTOR as usize;
+        assert_eq!(
+            projected_byte_size(&[make(Some(250))], &arrow_schema, &iceberg_schema, 100),
+            100 * 8 + 250 * factor
+        );
+        assert_eq!(
+            projected_byte_size(&[make(None)], &arrow_schema, &iceberg_schema, 100),
+            10_000
+        );
+        // Narrow projection: only the fixed-width column counts.
+        let id_only = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        assert_eq!(projected_byte_size(&[make(None)], &id_only, &iceberg_schema, 100), 800);
     }
 }
