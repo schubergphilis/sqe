@@ -423,6 +423,12 @@ pub fn ipc_options_for(
         .map_err(|e| Status::internal(format!("Failed to set IPC compression: {e}")))
 }
 
+fn execution_error_to_flight(error: datafusion::error::DataFusionError) -> FlightError {
+    FlightError::Tonic(Box::new(sqe_error_to_status(
+        &crate::query_memory::execution_error(&error), None,
+    )))
+}
+
 /// Encode `RecordBatch`es into a streaming Flight response using the given IPC options.
 ///
 /// Standalone function so that tests and other callers can use it without
@@ -1114,7 +1120,7 @@ impl SqeFlightSqlService {
     ) -> Result<Response<FlightStream>, Status> {
         let options = self.flight_ipc_options()?;
         let batch_stream =
-            stream.map(|res| res.map_err(|e| FlightError::ExternalError(Box::new(e))));
+            stream.map(|res| res.map_err(execution_error_to_flight));
         let flight_stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .with_options(options)
@@ -3186,6 +3192,17 @@ mod tests {
     use arrow_flight::sql::metadata::{SqlInfoDataBuilder, XdbcTypeInfo, XdbcTypeInfoDataBuilder};
     use arrow_flight::sql::{Nullable, Searchable, SqlInfo, XdbcDataType};
     use arrow_schema::{DataType, Field, Schema};
+
+    #[test]
+    fn streamed_memory_refusal_keeps_resource_exhausted_status() {
+        use datafusion::error::DataFusionError;
+        let error = DataFusionError::Context("hash build".into(), Box::new(
+            DataFusionError::ResourcesExhausted("query.max_query_memory=65536 bytes".into()),
+        ));
+        let status = Status::from(execution_error_to_flight(error));
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+        assert!(status.message().contains("query.max_query_memory"));
+    }
 
     #[tokio::test]
     async fn flight_trace_layer_uses_remote_w3c_parent() {
