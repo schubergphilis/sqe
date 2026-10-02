@@ -18,15 +18,8 @@ ignore = [
     # Transitive dependency from arrow-flight, datafusion, parquet, tonic.
     # No known vulnerability. Upstream migration pending.
     "RUSTSEC-2024-0436",  # review-by 2026-12-25 owner=sqe-maintainers
-    # IMPORTANT: cargo-deny and cargo-audit do NOT agree on every advisory, so
-    # this list intentionally differs from `.cargo/audit.toml`:
-    #   - RUSTSEC-2023-0071 (rsa Marvin attack) is NOT listed here. cargo-deny
-    #     does not match it against rsa 0.9.10 (advisory-not-detected), so an
-    #     ignore would be an unused-ignore warning. cargo-audit DOES raise it as
-    #     a vulnerability, so it is ignored in audit.toml only.
-    #   - RUSTSEC-2026-0173 (proc-macro-error2, unmaintained) is likewise not
-    #     matched by cargo-deny and is only a non-failing unmaintained warning in
-    #     cargo-audit, so it is not ignored in either tool's hard gate.
+    # RSA is absent from Cargo.lock; the JWT provider explicitly uses AWS-LC.
+    # Patched pyo3 0.29.2 is locked; old RSA/PyO3 ignores are removed from audit.
     # RUSTSEC-2026-0098/0099/0104 (rustls-webpki 0.101.7) were ignored while the
     # AWS Glue/S3Tables backends used aws-config's legacy hyper-0.14/rustls-0.21
     # connector. Fixed (#133): the vendored glue/s3tables catalogs now build an
@@ -37,8 +30,9 @@ ignore = [
     # quick-xml (0.37.5/0.38.4/0.39.4): high-severity XML-parsing DoS advisories
     # fixed in >=0.41.0. Transitive only -- object_store 0.13.2 pins
     # `quick-xml ^0.39.0` (S3/GCS list + multipart XML) and the AWS SDK pulls the
-    # older lines. The fix is unreachable (object_store 0.13.2 rejects 0.41; no
-    # newer object_store in the escrow registry). SQE parses XML only from its
+    # older lines. object_store 0.14.2 now uses patched XML, but DataFusion 55
+    # requires the 0.13 trait/API line; migrate the stack together (!1133).
+    # SQE parses XML only from its
     # configured object store / catalog (trusted infra), never attacker input, so
     # the DoS needs a malicious storage backend. Drop when object_store bumps
     # quick-xml past 0.41. Matched by cargo-deny too (version-range match).

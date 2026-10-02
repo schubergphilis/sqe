@@ -126,6 +126,7 @@ twox-hash = { version = "2", default-features = false, features = ["xxhash32", "
 uuid = { version = "1", features = ["js", "serde", "v4", "v7"] }
 winnow = { version = "1" }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
+zeroize = { version = "1", features = ["derive"] }
 zstd = { version = "0.13" }
 zstd-safe = { version = "7", default-features = false, features = ["arrays", "legacy", "std", "zdict_builder"] }
 zstd-sys = { version = "2", default-features = false, features = ["legacy", "std", "zdict_builder"] }
@@ -142,7 +143,7 @@ proc-macro2 = { version = "1" }
 quote = { version = "1" }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
-syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "full", "visit-mut"] }
+syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "full", "visit", "visit-mut"] }
 toml_datetime = { version = "1", features = ["serde"] }
 toml_parser = { version = "1" }
 winnow = { version = "1" }
