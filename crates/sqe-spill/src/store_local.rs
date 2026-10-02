@@ -12,11 +12,12 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::StreamExt;
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Semaphore;
 use tracing::debug;
@@ -27,6 +28,7 @@ pub struct LocalSegmentStore {
     max_bytes: u64,
     min_free_bytes: u64,
     used_bytes: Arc<AtomicU64>,
+    active_partials: Arc<Mutex<HashSet<PathBuf>>>,
     write_sem: Arc<Semaphore>,
     read_sem: Arc<Semaphore>,
 }
@@ -74,6 +76,7 @@ impl LocalSegmentStore {
             max_bytes,
             min_free_bytes,
             used_bytes: Arc::new(AtomicU64::new(used)),
+            active_partials: Arc::new(Mutex::new(HashSet::new())),
             write_sem: Arc::new(Semaphore::new(max_concurrent_writes.max(1))),
             read_sem: Arc::new(Semaphore::new(max_concurrent_reads.max(1))),
         })
@@ -83,7 +86,7 @@ impl LocalSegmentStore {
         &self.root
     }
 
-    fn reserve_quota(&self, need: u64) -> Result<()> {
+    fn reserve_quota(&self, need: u64) -> Result<LocalQuotaHold> {
         // Deterministic fault injection (test only; inert in production).
         if take_fault(SpillFault::DiskFull) {
             return Err(BudgetError::SpillDiskFull {
@@ -100,15 +103,6 @@ impl LocalSegmentStore {
             });
         }
 
-        let used = self.used_bytes.load(Ordering::Relaxed);
-        if used.saturating_add(need) > self.max_bytes {
-            return Err(BudgetError::SpillQuotaExceeded {
-                scope: "local".into(),
-                need,
-                free: self.max_bytes.saturating_sub(used),
-                max: self.max_bytes,
-            });
-        }
         // Free-space probe (best effort; not available on all platforms).
         if self.min_free_bytes > 0 {
             if let Some(available) = free_space_bytes(&self.root) {
@@ -120,7 +114,14 @@ impl LocalSegmentStore {
                 }
             }
         }
-        Ok(())
+        let mut quota = LocalQuotaHold {
+            used_bytes: self.used_bytes.clone(),
+            max_bytes: self.max_bytes,
+            reserved: 0,
+            settled: false,
+        };
+        quota.reconcile(need)?;
+        Ok(quota)
     }
 }
 
@@ -166,7 +167,7 @@ impl SegmentStore for LocalSegmentStore {
         let final_path = dir.join(SpillSegment::segment_file_name(sequence));
         // Reserve a conservative segment target so concurrent writers do not
         // oversubscribe; true size is reconciled on finish.
-        self.reserve_quota(64 * 1024)?;
+        let quota = self.reserve_quota(64 * 1024)?;
 
         let mut opts = OpenOptions::new();
         opts.write(true).create(true).truncate(true);
@@ -177,13 +178,13 @@ impl SegmentStore for LocalSegmentStore {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let file = opts
-            .open(&partial)
-            .map_err(|e| BudgetError::SpillIo {
+        let mut writer = QuotaWriter::new(partial.clone(), quota, self.active_partials.clone())?;
+        writer.inner = Some(BufWriter::new(opts.open(&partial).map_err(|e| {
+            BudgetError::SpillIo {
                 path: partial.display().to_string(),
                 source: e,
-            })?;
-        let mut writer = BufWriter::new(file);
+            }
+        })?));
         writer
             .write_all(SEGMENT_MAGIC)
             .map_err(|e| BudgetError::SpillIo {
@@ -208,7 +209,6 @@ impl SegmentStore for LocalSegmentStore {
             ipc: Some(ipc),
             row_count: 0,
             logical_bytes: 0,
-            used_counter: self.used_bytes.clone(),
             _write_permit: _permit,
         }))
     }
@@ -312,7 +312,13 @@ impl SegmentStore for LocalSegmentStore {
             });
         }
         if dir.exists() {
-            let freed = measure_dir_bytes(&dir).unwrap_or(0);
+            // Open writers own their reservations and refund on drop. Exclude
+            // their partial files here to avoid refunding the same bytes twice.
+            let active = self
+                .active_partials
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let freed = measure_dir_bytes_excluding(&dir, &active).unwrap_or(0);
             fs::remove_dir_all(&dir).map_err(|e| BudgetError::SpillIo {
                 path: dir.display().to_string(),
                 source: e,
@@ -392,16 +398,194 @@ impl SegmentStore for LocalSegmentStore {
     }
 }
 
+/// Holds a conservative reservation while a local segment is open.
+struct LocalQuotaHold {
+    used_bytes: Arc<AtomicU64>,
+    max_bytes: u64,
+    reserved: u64,
+    settled: bool,
+}
+
+impl LocalQuotaHold {
+    fn reconcile(&mut self, actual: u64) -> Result<()> {
+        if actual > self.reserved {
+            let extra = actual - self.reserved;
+            self.used_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                    used.checked_add(extra)
+                        .filter(|next| *next <= self.max_bytes)
+                })
+                .map_err(|used| BudgetError::SpillQuotaExceeded {
+                    scope: "local".into(),
+                    need: extra,
+                    free: self.max_bytes.saturating_sub(used),
+                    max: self.max_bytes,
+                })?;
+        } else {
+            self.used_bytes
+                .fetch_sub(self.reserved - actual, Ordering::AcqRel);
+        }
+        self.reserved = actual;
+        Ok(())
+    }
+}
+
+impl Drop for LocalQuotaHold {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.used_bytes.fetch_sub(self.reserved, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Admits serialized IPC bytes before they reach the filesystem buffer.
+/// Owns partial-file cleanup for initialization, write, finish and cancellation
+/// failures, so a refused batch cannot strand disk usage or reservations.
+struct QuotaWriter {
+    inner: Option<BufWriter<File>>,
+    quota: LocalQuotaHold,
+    bytes_written: u64,
+    quota_error: Option<BudgetError>,
+    failed: bool,
+    partial_path: PathBuf,
+    active_partials: Arc<Mutex<HashSet<PathBuf>>>,
+    published: bool,
+}
+
+impl QuotaWriter {
+    fn new(
+        partial_path: PathBuf,
+        quota: LocalQuotaHold,
+        active_partials: Arc<Mutex<HashSet<PathBuf>>>,
+    ) -> Result<Self> {
+        if !active_partials
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(partial_path.clone())
+        {
+            return Err(BudgetError::Config(
+                "spill segment already has an active writer".into(),
+            ));
+        }
+        Ok(Self {
+            inner: None,
+            quota,
+            bytes_written: 0,
+            quota_error: None,
+            failed: false,
+            partial_path,
+            active_partials,
+            published: false,
+        })
+    }
+
+    fn publish(&mut self, final_path: &Path, physical_bytes: u64) -> Result<()> {
+        self.quota.reconcile(physical_bytes)?;
+        let mut active = self
+            .active_partials
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        fs::rename(&self.partial_path, final_path).map_err(|e| BudgetError::SpillIo {
+            path: final_path.display().to_string(),
+            source: e,
+        })?;
+        self.quota.settled = true;
+        self.published = true;
+        active.remove(&self.partial_path);
+        Ok(())
+    }
+}
+
+impl Write for QuotaWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.failed {
+            return Err(std::io::Error::other("spill writer failed"));
+        }
+        let Some(next) = self.bytes_written.checked_add(buf.len() as u64) else {
+            self.failed = true;
+            return Err(std::io::Error::other("spill serialized size overflow"));
+        };
+        if next > self.quota.reserved {
+            if let Err(error) = self.quota.reconcile(next) {
+                self.failed = true;
+                self.quota_error = Some(error);
+                return Err(std::io::Error::other("local spill byte quota exceeded"));
+            }
+        }
+        let written = match self
+            .inner
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("spill writer closed"))?
+            .write(buf)
+        {
+            Ok(written) => written,
+            Err(error) => {
+                self.failed = true;
+                return Err(error);
+            }
+        };
+        self.bytes_written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.failed {
+            return Err(std::io::Error::other("spill writer failed"));
+        }
+        self.inner
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("spill writer closed"))?
+            .flush()
+    }
+}
+
+impl Drop for QuotaWriter {
+    fn drop(&mut self) {
+        drop(self.inner.take());
+        let mut active = self
+            .active_partials
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if !self.published {
+            if let Err(error) = fs::remove_file(&self.partial_path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    // A failed cleanup still occupies disk. Keep it charged;
+                    // scope cleanup/restart measurement will account for it.
+                    if let Ok(metadata) = fs::metadata(&self.partial_path) {
+                        let _ = self.quota.reconcile(metadata.len());
+                    }
+                    self.quota.settled = true;
+                    tracing::warn!(path = %self.partial_path.display(), error = %error, "Failed to clean partial spill segment");
+                }
+            }
+        }
+        active.remove(&self.partial_path);
+    }
+}
+
+fn measure_dir_bytes_excluding(path: &Path, excluded: &HashSet<PathBuf>) -> std::io::Result<u64> {
+    if excluded.contains(path) {
+        return Ok(0);
+    }
+    if path.is_file() {
+        return Ok(fs::metadata(path)?.len());
+    }
+    let mut bytes = 0u64;
+    for entry in fs::read_dir(path)? {
+        bytes = bytes.saturating_add(measure_dir_bytes_excluding(&entry?.path(), excluded)?);
+    }
+    Ok(bytes)
+}
+
 struct LocalSegmentWriter {
     scope: SpillScope,
     sequence: u64,
     schema: SchemaRef,
     partial_path: PathBuf,
     final_path: PathBuf,
-    ipc: Option<StreamWriter<BufWriter<File>>>,
+    ipc: Option<StreamWriter<QuotaWriter>>,
     row_count: u64,
     logical_bytes: u64,
-    used_counter: Arc<AtomicU64>,
     _write_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -418,10 +602,16 @@ impl SegmentWriter for LocalSegmentWriter {
             .ipc
             .as_mut()
             .ok_or_else(|| BudgetError::Config("writer already finished".into()))?;
-        ipc.write(batch).map_err(|e| BudgetError::SpillIo {
-            path: self.partial_path.display().to_string(),
-            source: std::io::Error::other(e.to_string()),
-        })?;
+        if let Err(e) = ipc.write(batch) {
+            return Err(ipc
+                .get_mut()
+                .quota_error
+                .take()
+                .unwrap_or_else(|| BudgetError::SpillIo {
+                    path: self.partial_path.display().to_string(),
+                    source: std::io::Error::other(e.to_string()),
+                }));
+        }
         self.row_count += batch.num_rows() as u64;
         self.logical_bytes += batch.get_array_memory_size() as u64;
         Ok(())
@@ -432,12 +622,22 @@ impl SegmentWriter for LocalSegmentWriter {
             .ipc
             .take()
             .ok_or_else(|| BudgetError::Config("writer already finished".into()))?;
-        ipc.finish().map_err(|e| BudgetError::SpillIo {
+        if let Err(e) = ipc.finish() {
+            return Err(ipc
+                .get_mut()
+                .quota_error
+                .take()
+                .unwrap_or_else(|| BudgetError::SpillIo {
+                    path: self.partial_path.display().to_string(),
+                    source: std::io::Error::other(e.to_string()),
+                }));
+        }
+        let mut writer = ipc.into_inner().map_err(|e| BudgetError::SpillIo {
             path: self.partial_path.display().to_string(),
             source: std::io::Error::other(e.to_string()),
         })?;
-        // Drop writer to flush/close.
-        drop(ipc);
+        // finish flushed all bytes through quota admission; close before read.
+        drop(writer.inner.take());
 
         // Checksum whole file.
         let body = fs::read(&self.partial_path).map_err(|e| BudgetError::SpillIo {
@@ -455,12 +655,7 @@ impl SegmentWriter for LocalSegmentWriter {
                 source: std::io::Error::other("injected rename failure"),
             });
         }
-        fs::rename(&self.partial_path, &self.final_path).map_err(|e| BudgetError::SpillIo {
-            path: self.final_path.display().to_string(),
-            source: e,
-        })?;
-        self.used_counter
-            .fetch_add(physical_bytes, Ordering::Relaxed);
+        writer.publish(&self.final_path, physical_bytes)?;
 
         let schema_fingerprint = schema_fingerprint(&self.schema);
         Ok(SpillSegment {
@@ -665,6 +860,126 @@ mod tests {
         assert!(!seg.path.exists());
     }
 
+    #[tokio::test]
+    async fn local_quota_admits_only_two_open_writers_and_refunds_drop() {
+        let _faults = crate::fault::FaultSession::new(vec![]);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalSegmentStore::open(tmp.path(), 2 * 64 * 1024, 0, 4, 2).unwrap();
+        let scope = SpillScope::new("quota", "s", "op", 0, 0);
+        let w1 = store
+            .create_writer(&scope, 0, batch(1).schema())
+            .await
+            .unwrap();
+        let w2 = store
+            .create_writer(&scope, 1, batch(1).schema())
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.create_writer(&scope, 2, batch(1).schema()).await,
+            Err(BudgetError::SpillQuotaExceeded { .. })
+        ));
+        drop(w2);
+        let w3 = store
+            .create_writer(&scope, 2, batch(1).schema())
+            .await
+            .unwrap();
+        drop(w3);
+        drop(w1);
+        assert_eq!(store.used_bytes().await.unwrap(), 0);
+        assert_eq!(measure_dir_bytes(tmp.path()).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn local_quota_rejects_large_batch_before_disk_growth() {
+        let _faults = crate::fault::FaultSession::new(vec![]);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalSegmentStore::open(tmp.path(), 64 * 1024, 0, 2, 2).unwrap();
+        let scope = SpillScope::new("large", "s", "op", 0, 0);
+        let large = RecordBatch::try_new(
+            batch(1).schema(),
+            vec![Arc::new(Int64Array::from(vec![1_i64; 32_768]))],
+        )
+        .unwrap();
+        let mut writer = store
+            .create_writer(&scope, 0, large.schema())
+            .await
+            .unwrap();
+        assert!(matches!(
+            writer.write_batch(&large).await,
+            Err(BudgetError::SpillQuotaExceeded { .. })
+        ));
+        assert!(measure_dir_bytes(tmp.path()).unwrap() <= 64 * 1024);
+        // A failed write cannot later publish a partial/corrupt segment.
+        assert!(writer.finish().await.is_err());
+        assert_eq!(store.used_bytes().await.unwrap(), 0);
+        assert_eq!(measure_dir_bytes(tmp.path()).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn local_quota_grows_then_settles_and_scope_cleanup_refunds_exact_bytes() {
+        let _faults = crate::fault::FaultSession::new(vec![]);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalSegmentStore::open(tmp.path(), 512 * 1024, 0, 2, 2).unwrap();
+        let scope = SpillScope::new("grow", "s", "op", 0, 0);
+        let large = RecordBatch::try_new(
+            batch(1).schema(),
+            vec![Arc::new(Int64Array::from(vec![1_i64; 12_000]))],
+        )
+        .unwrap();
+        let mut writer = store
+            .create_writer(&scope, 0, large.schema())
+            .await
+            .unwrap();
+        writer.write_batch(&large).await.unwrap();
+        assert!(store.used_bytes().await.unwrap() > 64 * 1024);
+        let segment = writer.finish().await.unwrap();
+        assert_eq!(store.used_bytes().await.unwrap(), segment.physical_bytes);
+        let reader = store.open_reader(&segment).await.unwrap();
+        let batches = reader.into_stream().collect::<Vec<_>>().await;
+        assert_eq!(
+            batches
+                .into_iter()
+                .map(|b| b.unwrap().num_rows())
+                .sum::<usize>(),
+            12_000
+        );
+        store.delete_scope(&scope).await.unwrap();
+        assert_eq!(store.used_bytes().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn deleting_an_active_scope_does_not_double_refund_writer_reservations() {
+        let _faults = crate::fault::FaultSession::new(vec![]);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalSegmentStore::open(tmp.path(), 128 * 1024, 0, 2, 2).unwrap();
+        let scope = SpillScope::new("active", "s", "op", 0, 0);
+        let mut writer = store
+            .create_writer(&scope, 0, batch(1).schema())
+            .await
+            .unwrap();
+        writer.write_batch(&batch(1)).await.unwrap();
+        store.delete_scope(&scope).await.unwrap();
+        assert_eq!(store.used_bytes().await.unwrap(), 64 * 1024);
+        drop(writer);
+        assert_eq!(store.used_bytes().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_local_publication_refunds_and_cleans_partial() {
+        let _faults = crate::fault::FaultSession::new(vec![SpillFault::RenameFailure]);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalSegmentStore::open(tmp.path(), 128 * 1024, 0, 2, 2).unwrap();
+        let scope = SpillScope::new("fail", "s", "op", 0, 0);
+        let mut writer = store
+            .create_writer(&scope, 0, batch(1).schema())
+            .await
+            .unwrap();
+        writer.write_batch(&batch(1)).await.unwrap();
+        assert!(writer.finish().await.is_err());
+        assert_eq!(store.used_bytes().await.unwrap(), 0);
+        assert_eq!(measure_dir_bytes(tmp.path()).unwrap(), 0);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn segment_file_is_owner_only() {
@@ -673,7 +988,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = LocalSegmentStore::open(tmp.path(), 1 << 30, 0, 2, 2).unwrap();
         let scope = SpillScope::new("q", "s", "op", 0, 0);
-        let mut w = store.create_writer(&scope, 0, batch(1).schema()).await.unwrap();
+        let mut w = store
+            .create_writer(&scope, 0, batch(1).schema())
+            .await
+            .unwrap();
         w.write_batch(&batch(1)).await.unwrap();
         let seg = w.finish().await.unwrap();
         let mode = fs::metadata(&seg.path).unwrap().permissions().mode() & 0o777;
