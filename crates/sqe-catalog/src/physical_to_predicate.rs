@@ -207,6 +207,21 @@ fn convert_case(case: &CaseExpr, max_set_values: usize) -> Option<Predicate> {
         }
     }
 
+    // Every column's union is at least the sum over arms of each arm's
+    // smallest IN list. Above the cap every column would be dropped below,
+    // so bail before converting hundreds of thousands of literals per file
+    // task (TPC-H q21 SF10: 12% of the query's CPU went to building and
+    // discarding a 700K-key set).
+    let lower_bound: usize = case
+        .when_then_expr()
+        .iter()
+        .filter(|(_, then)| !is_literal_false(then))
+        .map(|(_, then)| smallest_membership_len(then).unwrap_or(0))
+        .sum();
+    if lower_bound > max_set_values {
+        return None;
+    }
+
     // Membership sets per arm: column name -> literal datums.
     let mut arms: Vec<std::collections::HashMap<String, Vec<Datum>>> = Vec::new();
     for (_when, then) in case.when_then_expr() {
@@ -275,6 +290,31 @@ fn convert_case(case: &CaseExpr, max_set_values: usize) -> Option<Predicate> {
     // `None` when every common column was dropped: the reader falls back to
     // the static predicate, exactly as before sqe#369 added the CASE arm.
     result
+}
+
+/// Size of the smallest membership conjunct (`IN` list, or `= literal`
+/// counted as one) under the `AND`s of `expr`, without converting any
+/// literal. A lower bound on what [`collect_membership_sets`] records for
+/// each column of the arm.
+fn smallest_membership_len(expr: &Arc<dyn PhysicalExpr>) -> Option<usize> {
+    use datafusion::logical_expr::Operator;
+
+    let any = expr.as_ref();
+    if let Some(binary) = any.downcast_ref::<BinaryExpr>() {
+        return match binary.op() {
+            Operator::And => {
+                match (smallest_membership_len(binary.left()), smallest_membership_len(binary.right())) {
+                    (Some(l), Some(r)) => Some(l.min(r)),
+                    (l, r) => l.or(r),
+                }
+            }
+            Operator::Eq => Some(1),
+            _ => None,
+        };
+    }
+    any.downcast_ref::<InListExpr>()
+        .filter(|in_list| !in_list.negated())
+        .map(InListExpr::len)
 }
 
 /// Collect the membership sets of the positive conjuncts of `expr` into
@@ -443,6 +483,127 @@ fn convert_in_list(in_list: &InListExpr) -> Option<Predicate> {
         return None;
     }
     Some(Reference::new(col_name).is_in(datums))
+}
+
+/// Rewrite a sealed partitioned-join dynamic filter into one membership test
+/// for per-batch evaluation.
+///
+/// DataFusion seals a `mode=Partitioned` hash join's filter as
+/// `CASE hash(keys) % n WHEN p THEN <bounds_p> AND keys IN (set_p) ...
+/// ELSE false END`, optionally wrapped in `OR keys IS NULL`. Evaluating that
+/// CASE re-filters and merges the batch once per arm; on TPC-H q21 SF10 it
+/// was 45% of the query's CPU. Every key in `set_p` hashes to `p`, so
+/// `keys IN (set_0 ∪ ... ∪ set_n)` admits the same keys with one hash probe
+/// per row. Dropping the per-arm bounds only widens the filter, and the join
+/// above still checks every row, so the rewrite can never drop a match.
+///
+/// Anything outside that shape (a non-`false` ELSE, an arm without an
+/// `IN` list such as the map-lookup pushdown, arms on different keys) is
+/// returned unchanged.
+pub fn collapse_partitioned_membership(
+    expr: Arc<dyn PhysicalExpr>,
+    schema: &datafusion::arrow::datatypes::Schema,
+) -> Arc<dyn PhysicalExpr> {
+    use datafusion::logical_expr::Operator;
+
+    if let Some(case) = expr.as_ref().downcast_ref::<CaseExpr>() {
+        return collapse_case(case, schema).unwrap_or(expr);
+    }
+    // `preserve_probe_nulls` wraps the CASE as `<case> OR <keys> IS NULL`;
+    // descend through boolean connectives only, never into the IN lists.
+    if let Some(binary) = expr.as_ref().downcast_ref::<BinaryExpr>() {
+        if matches!(binary.op(), Operator::And | Operator::Or) {
+            let left = collapse_partitioned_membership(Arc::clone(binary.left()), schema);
+            let right = collapse_partitioned_membership(Arc::clone(binary.right()), schema);
+            if !Arc::ptr_eq(&left, binary.left()) || !Arc::ptr_eq(&right, binary.right()) {
+                return Arc::new(BinaryExpr::new(left, *binary.op(), right));
+            }
+        }
+    }
+    expr
+}
+
+fn collapse_case(
+    case: &CaseExpr,
+    schema: &datafusion::arrow::datatypes::Schema,
+) -> Option<Arc<dyn PhysicalExpr>> {
+    case.expr()?;
+    if !case.else_expr().is_some_and(is_literal_false) {
+        return None;
+    }
+    let mut key: Option<&Arc<dyn PhysicalExpr>> = None;
+    let mut values: Vec<ScalarValue> = Vec::new();
+    for (_when, then) in case.when_then_expr() {
+        if is_literal_false(then) {
+            continue;
+        }
+        let in_list = find_membership_conjunct(then)?;
+        match key {
+            None => key = Some(in_list.expr()),
+            Some(k) if k.as_ref() == in_list.expr().as_ref() => {}
+            Some(_) => return None,
+        }
+        for item in in_list.list() {
+            values.push(extract_literal(item)?);
+        }
+    }
+    let Some(key) = key else {
+        // Every arm is an empty build partition: nothing can match.
+        return Some(datafusion::physical_expr::expressions::lit(false));
+    };
+    // Single-column keys only. A multi-column join keys on `struct(c0, ..)`
+    // whose field types were fixed at planning; when the scan batch carries a
+    // wider type (Int64 against an Int32 field) arrow's StructArray::new
+    // panics instead of erroring. Inside the CASE the arm's bounds compare
+    // failed first and the scan skipped the filter (TPC-C district_orders).
+    key.as_ref().downcast_ref::<Column>()?;
+    let array = ScalarValue::iter_to_array(values).ok()?;
+    let collapsed = InListExpr::try_new_from_array(Arc::clone(key), array, false, schema).ok()?;
+    Some(Arc::new(collapsed))
+}
+
+/// True when a sealed dynamic filter tests join-key membership (an `IN`
+/// list, the hash-table lookup DataFusion pushes for large build sides, or
+/// the hash-routed CASE over either), as opposed to a TopK bound that keeps
+/// tightening. Membership filters never change after sealing, so a scan may
+/// judge their selectivity from a sample. Descends through boolean and CASE
+/// nodes only, never into IN-list literals.
+pub fn is_join_membership_filter(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    use datafusion::physical_plan::joins::{HashExpr, HashTableLookupExpr};
+
+    let any = expr.as_ref();
+    if any.downcast_ref::<InListExpr>().is_some()
+        || any.downcast_ref::<HashTableLookupExpr>().is_some()
+        || any.downcast_ref::<HashExpr>().is_some()
+    {
+        return true;
+    }
+    if let Some(binary) = any.downcast_ref::<BinaryExpr>() {
+        return is_join_membership_filter(binary.left()) || is_join_membership_filter(binary.right());
+    }
+    if let Some(case) = any.downcast_ref::<CaseExpr>() {
+        return case.expr().is_some_and(is_join_membership_filter)
+            || case
+                .when_then_expr()
+                .iter()
+                .any(|(_, then)| is_join_membership_filter(then));
+    }
+    false
+}
+
+/// The positive `IN` list among the `AND` conjuncts of a CASE arm.
+fn find_membership_conjunct(expr: &Arc<dyn PhysicalExpr>) -> Option<&InListExpr> {
+    use datafusion::logical_expr::Operator;
+
+    let any = expr.as_ref();
+    if let Some(in_list) = any.downcast_ref::<InListExpr>() {
+        return (!in_list.negated()).then_some(in_list);
+    }
+    let binary = any.downcast_ref::<BinaryExpr>()?;
+    if *binary.op() != Operator::And {
+        return None;
+    }
+    find_membership_conjunct(binary.left()).or_else(|| find_membership_conjunct(binary.right()))
 }
 
 fn extract_column(expr: &Arc<dyn PhysicalExpr>) -> Option<String> {
