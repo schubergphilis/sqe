@@ -4,15 +4,14 @@
 
 use chrono::{DateTime, Utc};
 use datafusion::logical_expr::LogicalPlan;
-use sqe_core::SecretString;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+/// Lineage identifies the user without retaining session credentials.
 #[derive(Clone, Debug)]
 pub struct UserCtx {
     pub username: String,
-    pub bearer: Option<SecretString>,
 }
 
 pub enum LineageHint {
@@ -96,7 +95,6 @@ impl QueryStartCtx {
             sql: "SELECT 1".into(),
             user: UserCtx {
                 username: "test".into(),
-                bearer: None,
             },
             session_id: "sess-1".into(),
             started_at: Utc::now(),
@@ -115,7 +113,6 @@ impl QueryCompleteCtx {
             sql: "SELECT 1".into(),
             user: UserCtx {
                 username: "test".into(),
-                bearer: None,
             },
             session_id: "sess-1".into(),
             started_at: Utc::now(),
@@ -139,7 +136,6 @@ impl QueryFailCtx {
             sql: "SELECT 1".into(),
             user: UserCtx {
                 username: "test".into(),
-                bearer: None,
             },
             session_id: "sess-1".into(),
             started_at: Utc::now(),

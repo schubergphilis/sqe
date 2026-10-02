@@ -28,7 +28,7 @@ file_path      = "/var/log/sqe/lineage.jsonl"
 http_endpoint  = "https://marquez.example.com/api/v1/lineage"
 
 # HTTP transport
-auth_mode           = "bearer"           # "none" | "bearer" | "user_token"
+auth_mode           = "bearer"           # "none" | "bearer"
 api_key             = "..."              # required when auth_mode = "bearer"
 http_timeout_ms     = 5000
 http_retry_attempts = 1
@@ -104,7 +104,7 @@ Two properties of the `columnLineage` facet matter to a governance tool that pro
 ## v1 limitations
 
 - No mTLS to the collector. Bearer auth only.
-- `auth_mode = "user_token"` (forwarding the user's OIDC bearer per event) is wired but currently falls back to the static `api_key` in v1; full per-event token forwarding is a follow-up.
+- `auth_mode = "user_token"` is rejected at startup. Lineage events do not carry session credentials. To authenticate to a collector, use `auth_mode = "bearer"` with a dedicated collector `api_key`; migrate any previous `user_token` configuration to this explicit mode.
 - Maintenance procedures (OPTIMIZE, VACUUM, REWRITE_MANIFESTS) are never emitted.
 - MERGE column-level lineage is emitted at the dataset level; per-branch annotations (MERGE_INSERT vs MERGE_UPDATE) are deferred until DataFusion exposes a Merge LogicalPlan node.
 - DDL paths (CREATE TABLE, DROP, etc.) emit events with `plan = None`. The dataset target is captured but column lineage is empty for DDL.

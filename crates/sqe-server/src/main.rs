@@ -2663,22 +2663,13 @@ fn build_lineage_observer(
     if !ol.http_endpoint.is_empty() {
         let auth = match ol.auth_mode.as_str() {
             "none" => sqe_lineage::sinks::http::AuthMode::None,
-            "bearer" => sqe_lineage::sinks::http::AuthMode::Bearer(ol.api_key.clone()),
-            "user_token" => {
-                // Per-event user token requires per-event sink construction; for v1
-                // the emitter task uses the configured api_key as a fallback when
-                // auth_mode is user_token. The actual per-event token forwarding is
-                // wired in a future task; for now treat user_token like bearer.
-                tracing::warn!(
-                    "openlineage auth_mode=user_token not yet fully wired; \
-                     using static api_key as fallback"
-                );
-                sqe_lineage::sinks::http::AuthMode::Bearer(ol.api_key.clone())
-            }
+            "bearer" => sqe_lineage::sinks::http::AuthMode::Bearer(
+                sqe_core::SecretString::new(ol.api_key.clone()),
+            ),
             other => {
                 return Err(anyhow::anyhow!(
                     "openlineage auth_mode '{other}' is not recognised; \
-                     expected one of: none, bearer, user_token"
+                     expected one of: none, bearer"
                 ));
             }
         };
