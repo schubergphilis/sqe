@@ -617,15 +617,39 @@ fn web_returns_rows(sf: f64) -> usize {
 } // 679 / 71,654
 
 // Derived: 261 weekly snapshots covering half the item x warehouse grid.
-// 23,490 / 11,745,000.
+// 23,490 / 11,745,000; sf10 133,110,000; sf100 399,330,000.
 fn inventory_rows(sf: f64) -> usize {
     261 * item_rows(sf) * warehouse_rows(sf) / 2
 }
 
-// Linear dimensions. 180 / 18,000 etc.
+/// Linear up to sf1 (both validated reference points), then the official
+/// dsdgen counts at the published scale points, interpolated linearly
+/// between them and held flat past the last one.
+///
+/// item and warehouse both grow far slower than linearly above sf1. Scaling
+/// them linearly made inventory, their product, quadratic: 1.17B rows at
+/// sf10 instead of 133M, and sorting it on load spilled 14 GiB.
+fn sublinear_above_sf1(sf: f64, sf1_rows: f64, points: &[(f64, f64)]) -> usize {
+    if sf <= 1.0 {
+        return super::scaled(sf, sf1_rows);
+    }
+    let mut prev = (1.0, sf1_rows);
+    for &(scale, rows) in points {
+        if sf <= scale {
+            let t = (sf - prev.0) / (scale - prev.0);
+            return (prev.1 + t * (rows - prev.1)).round() as usize;
+        }
+        prev = (scale, rows);
+    }
+    prev.1 as usize
+}
+
+// 180 / 18,000; sf10 102,000; sf100 204,000; sf1000 300,000.
 fn item_rows(sf: f64) -> usize {
-    super::scaled(sf, 18_000.0)
-} // 180 / 18,000
+    sublinear_above_sf1(sf, 18_000.0, &[(10.0, 102_000.0), (100.0, 204_000.0), (1000.0, 300_000.0)])
+}
+
+// Linear dimensions. 1,000 / 100,000 etc.
 fn customer_rows(sf: f64) -> usize {
     super::scaled(sf, 100_000.0)
 } // 1,000 / 100,000
@@ -648,9 +672,10 @@ fn web_site_rows(sf: f64) -> usize {
 fn web_page_rows(sf: f64) -> usize {
     super::scaled(sf, 60.0)
 } // 1 / 60
+// 1 / 5; sf10 10; sf100 15; sf1000 20.
 fn warehouse_rows(sf: f64) -> usize {
-    super::scaled(sf, 5.0)
-} // 1 / 5
+    sublinear_above_sf1(sf, 5.0, &[(10.0, 10.0), (100.0, 15.0), (1000.0, 20.0)])
+}
 fn promotion_rows(sf: f64) -> usize {
     super::scaled(sf, 300.0)
 } // 3 / 300
@@ -3517,6 +3542,22 @@ mod tests {
             let want = expected.iter().find(|(n, _)| *n == t.name).unwrap().1;
             assert_eq!((t.row_count)(1.0), want, "table {} at SF1", t.name);
         }
+    }
+
+    #[test]
+    fn item_warehouse_and_inventory_follow_official_counts_above_sf1() {
+        // Official dsdgen: item 102,000 / 204,000, warehouse 10 / 15, so
+        // inventory 133,110,000 / 399,330,000 at sf10 / sf100.
+        assert_eq!(item_rows(10.0), 102_000);
+        assert_eq!(warehouse_rows(10.0), 10);
+        assert_eq!(inventory_rows(10.0), 133_110_000);
+        assert_eq!(item_rows(100.0), 204_000);
+        assert_eq!(warehouse_rows(100.0), 15);
+        assert_eq!(inventory_rows(100.0), 399_330_000);
+        // Between and beyond the published points.
+        assert_eq!(item_rows(5.5), 60_000);
+        assert_eq!(item_rows(3000.0), 300_000);
+        assert_eq!(warehouse_rows(3000.0), 20);
     }
 
     #[test]
