@@ -612,6 +612,17 @@ pub async fn run() -> anyhow::Result<()> {
             );
             for table_def in gen.tables() {
                 println!("Generating {}.{}...", benchmark, table_def.name);
+                // `load` reads the whole table directory. A regeneration that
+                // writes fewer part files than the last one would otherwise
+                // load the previous run's leftovers too: TPC-DS sf10 inventory
+                // came back as 133M new rows plus ~1.03B stale ones.
+                let table_dir = std::path::Path::new(&output)
+                    .join(&benchmark)
+                    .join(format!("sf{scale}"))
+                    .join(&table_def.name);
+                if table_dir.exists() {
+                    std::fs::remove_dir_all(&table_dir)?;
+                }
                 let stats = gen.generate_table(&table_def.name, scale, &output, &config)?;
                 println!(
                     "  {} rows, {} files, {:.1}s",
