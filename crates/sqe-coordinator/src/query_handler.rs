@@ -3283,6 +3283,7 @@ impl QueryHandler {
         start: std::time::Instant,
     ) -> sqe_core::Result<OpenStreamResult> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
+        let ctx = crate::query_memory::with_query_limit(ctx, self.per_query_memory_bytes);
 
         // Every recursive phase (SQL planning, the policy rewrite, the
         // optimizer, physical planning, the post-planning rules) runs on the
@@ -3749,6 +3750,7 @@ impl QueryHandler {
         summary_out: &mut Option<sqe_policy::PolicySummary>,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         let (ctx, session_catalog) = self.create_session_context(session).await?;
+        let ctx = crate::query_memory::with_query_limit(ctx, self.per_query_memory_bytes);
 
         self.refresh_listing_snapshots(&ctx, &session_catalog, session, sql)
             .await;
@@ -3859,10 +3861,12 @@ impl QueryHandler {
         let output_schema = final_plan.schema();
         let configured_max = self.config.query.max_result_rows;
         let mut stream = execute_stream(final_plan.clone(), ctx.task_ctx())
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Query execution failed: {e}")))?;
+            .map_err(|e| crate::query_memory::execution_error(&e))?;
         let mut batches: Vec<RecordBatch> = Vec::new();
+        // The query pool already delegates to the shared pool. Reserve once
+        // so retained result buffers are charged once at each level.
         let mut result_budget = crate::buffered_result::BufferedResultBudget::new(
-            Arc::clone(&self.runtime.memory_pool),
+            Arc::clone(&ctx.runtime_env().memory_pool),
             Arc::clone(&ctx.runtime_env().memory_pool),
             self.per_query_memory_bytes,
         );
@@ -3870,7 +3874,7 @@ impl QueryHandler {
         while let Some(batch) = stream
             .try_next()
             .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Query execution failed: {e}")))?
+            .map_err(|e| crate::query_memory::execution_error(&e))?
         {
             rows_so_far = rows_so_far.saturating_add(batch.num_rows());
             if configured_max > 0 && rows_so_far > configured_max {

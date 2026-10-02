@@ -836,10 +836,7 @@ impl Stream for TrackedRecordBatchStream {
             }
             Poll::Ready(Some(Err(e))) => {
                 if let Some(f) = self.finalizer.take() {
-                    let sqe_err = sqe_core::SqeError::with_code(
-                        SqeErrorCode::ExecutionFailed,
-                        format!("Query execution failed: {e}"),
-                    );
+                    let sqe_err = crate::query_memory::execution_error(&e);
                     f.on_error(self.rows_so_far, &sqe_err);
                 }
                 Poll::Ready(Some(Err(e)))
