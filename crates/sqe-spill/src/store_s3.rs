@@ -12,7 +12,7 @@
 //! the counters and refunded when a writer is aborted or dropped, so N
 //! concurrent writers cannot all pass a stale check and overshoot
 //! `max_bytes` by N segments (#382). `finish` reconciles the reservation to
-//! the bytes actually written.
+//! the full serialized size before PUT, rejecting growth above the byte cap.
 //!
 //! Tests inject an [`object_store::memory::InMemory`] store; production builds
 //! an AmazonS3 client from [`S3SpillConfig`].
@@ -272,7 +272,7 @@ impl S3SegmentStore {
         if let Err(used) =
             self.used_bytes
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                    let next = used.saturating_add(need);
+                    let next = used.checked_add(need)?;
                     (next <= max_bytes).then_some(next)
                 })
         {
@@ -287,7 +287,7 @@ impl S3SegmentStore {
         if let Err(objs) =
             self.used_objects
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |objs| {
-                    let next = objs.saturating_add(1);
+                    let next = objs.checked_add(1)?;
                     (next <= max_objects).then_some(next)
                 })
         {
@@ -304,6 +304,7 @@ impl S3SegmentStore {
             used_bytes: Arc::clone(&self.used_bytes),
             used_objects: Arc::clone(&self.used_objects),
             reserved_bytes: need,
+            max_bytes: self.max_bytes,
             settled: false,
         })
     }
@@ -334,25 +335,45 @@ impl S3SegmentStore {
 /// A quota reservation held by an open writer (#382).
 ///
 /// Dropping an unsettled hold (abort, error, or a writer dropped without
-/// `finish`) returns the reserved bytes and the object slot. `settle`
-/// replaces the estimate with the bytes actually written and keeps the
-/// object slot, so the counters track published segments exactly.
+/// `finish`) returns the reserved bytes and the object slot. `reconcile`
+/// adjusts the estimate before upload; `settle` retains that exact reservation
+/// after publication, so the counters track published segments exactly.
 struct QuotaHold {
     used_bytes: Arc<AtomicU64>,
     used_objects: Arc<AtomicU64>,
     reserved_bytes: u64,
+    max_bytes: u64,
     settled: bool,
 }
 
 impl QuotaHold {
-    fn settle(mut self, actual_bytes: u64) {
-        if actual_bytes >= self.reserved_bytes {
+    /// Reconcile to the serialized size before any object-store side effect.
+    /// Growth reserves only the delta, atomically, against the same byte cap.
+    /// If upload fails or is cancelled, Drop refunds this complete reservation.
+    fn reconcile(&mut self, actual_bytes: u64) -> Result<()> {
+        if actual_bytes > self.reserved_bytes {
+            let extra = actual_bytes - self.reserved_bytes;
             self.used_bytes
-                .fetch_add(actual_bytes - self.reserved_bytes, Ordering::AcqRel);
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                    used.checked_add(extra)
+                        .filter(|next| *next <= self.max_bytes)
+                })
+                .map_err(|used| BudgetError::SpillQuotaExceeded {
+                    scope: "s3".into(),
+                    need: extra,
+                    free: self.max_bytes.saturating_sub(used),
+                    max: self.max_bytes,
+                })?;
         } else {
             self.used_bytes
                 .fetch_sub(self.reserved_bytes - actual_bytes, Ordering::AcqRel);
         }
+        self.reserved_bytes = actual_bytes;
+        Ok(())
+    }
+
+    /// Keep the already-reserved bytes/object slot after a successful upload.
+    fn settle(mut self) {
         self.settled = true;
     }
 }
@@ -687,6 +708,10 @@ impl SegmentWriter for S3SegmentWriter {
         let checksum = crc32fast::hash(&body);
         let physical_bytes = body.len() as u64;
 
+        if let Some(quota) = self.quota.as_mut() {
+            quota.reconcile(physical_bytes)?;
+        }
+
         if take_fault(SpillFault::RenameFailure) {
             return Err(BudgetError::SpillIo {
                 path: self.final_key.to_string(),
@@ -711,7 +736,7 @@ impl SegmentWriter for S3SegmentWriter {
             .map_err(|e| map_os_err(self.final_key.as_ref(), e))?;
 
         if let Some(quota) = self.quota.take() {
-            quota.settle(physical_bytes);
+            quota.settle();
         }
 
         let schema_fingerprint = schema_fingerprint(&self.schema);
@@ -1026,6 +1051,177 @@ mod tests {
             "no staging object: {keys:?}"
         );
         assert!(seg.path.to_string_lossy().ends_with(&keys[0]));
+    }
+
+    #[test]
+    fn concurrent_reservation_growth_has_one_winner_and_drop_refunds_actual_size() {
+        let _fault_guard = crate::fault::FaultSession::new(vec![]);
+        let mut cfg = test_config();
+        cfg.max_bytes = 8 * 64 * 1024 + 128 * 1024;
+        let store = S3SegmentStore::new(Arc::new(InMemory::new()), &cfg).unwrap();
+        let holds = (0..8)
+            .map(|_| store.reserve_quota(64 * 1024).unwrap())
+            .collect::<Vec<_>>();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles = holds
+            .into_iter()
+            .map(|mut hold| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let won = hold.reconcile(192 * 1024).is_ok();
+                    // Keep every original/enlarged hold alive until all CAS attempts finish.
+                    barrier.wait();
+                    drop(hold);
+                    usize::from(won)
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(store.used_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(store.used_objects.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn quota_reservation_rejects_integer_overflow() {
+        let _fault_guard = crate::fault::FaultSession::new(vec![]);
+        let mut cfg = test_config();
+        cfg.max_bytes = u64::MAX;
+        cfg.max_objects = u64::MAX;
+        let store = S3SegmentStore::new(Arc::new(InMemory::new()), &cfg).unwrap();
+        store.used_bytes.store(u64::MAX, Ordering::Release);
+        assert!(matches!(
+            store.reserve_quota(1),
+            Err(BudgetError::SpillQuotaExceeded { .. })
+        ));
+        assert_eq!(store.used_bytes.load(Ordering::Acquire), u64::MAX);
+        store.used_bytes.store(0, Ordering::Release);
+        store.used_objects.store(u64::MAX, Ordering::Release);
+        assert!(matches!(
+            store.reserve_quota(1),
+            Err(BudgetError::SpillQuotaExceeded { .. })
+        ));
+        assert_eq!(store.used_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(store.used_objects.load(Ordering::Acquire), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn publication_failure_refunds_enlarged_reservation() {
+        let _fault_guard = crate::fault::FaultSession::new(vec![SpillFault::RenameFailure]);
+        let mut cfg = test_config();
+        cfg.max_bytes = 512 * 1024;
+        let mem = Arc::new(InMemory::new());
+        let store = S3SegmentStore::new(mem.clone(), &cfg).unwrap();
+        let scope = SpillScope::new("failed", "s", "op", 0, 0);
+        let large = RecordBatch::try_new(
+            batch(1).schema(),
+            vec![Arc::new(Int64Array::from(vec![1_i64; 32_768]))],
+        )
+        .unwrap();
+        let mut writer = store
+            .create_writer(&scope, 0, large.schema())
+            .await
+            .unwrap();
+        writer.write_batch(&large).await.unwrap();
+        assert!(matches!(
+            writer.finish().await,
+            Err(BudgetError::SpillIo { .. })
+        ));
+        assert_eq!(store.used_bytes().await.unwrap(), 0);
+        assert_eq!(store.used_objects.load(Ordering::Acquire), 0);
+        assert!(mem.list(None).next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_segment_is_rejected_before_upload_and_refunds_quota() {
+        let _fault_guard = crate::fault::FaultSession::new(vec![]);
+        let mut cfg = test_config();
+        cfg.max_bytes = 64 * 1024;
+        cfg.max_objects = 1;
+        let mem = Arc::new(InMemory::new());
+        let store = S3SegmentStore::new(mem.clone(), &cfg).unwrap();
+        let scope = SpillScope::new("oversized", "s", "op", 0, 0);
+        let large = RecordBatch::try_new(
+            batch(1).schema(),
+            vec![Arc::new(Int64Array::from(vec![1_i64; 32_768]))],
+        )
+        .unwrap();
+        let mut writer = store
+            .create_writer(&scope, 0, large.schema())
+            .await
+            .unwrap();
+        writer.write_batch(&large).await.unwrap();
+        assert!(
+            matches!(
+                writer.finish().await,
+                Err(BudgetError::SpillQuotaExceeded { .. })
+            ),
+            "segment larger than total quota must not be uploaded"
+        );
+        assert_eq!(store.used_bytes().await.unwrap(), 0);
+        assert_eq!(store.used_objects.load(Ordering::Acquire), 0);
+        assert!(mem.list(None).next().await.is_none());
+        // A rejected large segment must not strand the object slot.
+        let mut writer = store
+            .create_writer(&scope, 1, batch(1).schema())
+            .await
+            .unwrap();
+        writer.write_batch(&batch(1)).await.unwrap();
+        writer.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_finishes_cannot_publish_more_bytes_than_quota() {
+        let _fault_guard = crate::fault::FaultSession::new(vec![]);
+        let mut cfg = test_config();
+        cfg.max_bytes = 3 * 64 * 1024;
+        let mem = Arc::new(InMemory::new());
+        let store = S3SegmentStore::new(mem.clone(), &cfg).unwrap();
+        let scope = SpillScope::new("concurrent", "s", "op", 0, 0);
+        let large = RecordBatch::try_new(
+            batch(1).schema(),
+            vec![Arc::new(Int64Array::from(vec![1_i64; 12_000]))],
+        )
+        .unwrap();
+        let mut writers = Vec::new();
+        for seq in 0..3 {
+            let mut writer = store
+                .create_writer(&scope, seq, large.schema())
+                .await
+                .unwrap();
+            writer.write_batch(&large).await.unwrap();
+            writers.push(writer);
+        }
+        let results =
+            futures::future::join_all(writers.into_iter().map(|writer| writer.finish())).await;
+        let mut published = 0;
+        let mut successes = 0;
+        for result in results {
+            match result {
+                Ok(segment) => {
+                    published += segment.physical_bytes;
+                    successes += 1;
+                }
+                Err(BudgetError::SpillQuotaExceeded { .. }) => {}
+                Err(err) => panic!("unexpected error: {err}"),
+            }
+        }
+        assert!(
+            published <= cfg.max_bytes,
+            "published {published} bytes above {} byte quota",
+            cfg.max_bytes
+        );
+        assert!(successes > 0 && successes < 3);
+        assert_eq!(store.used_bytes().await.unwrap(), published);
+        assert_eq!(store.used_objects.load(Ordering::Acquire), successes);
+        let objects = mem.list(None).collect::<Vec<_>>().await;
+        assert_eq!(objects.len() as u64, successes);
     }
 
     #[tokio::test]
