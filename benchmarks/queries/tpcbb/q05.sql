@@ -3,28 +3,43 @@
 --              quintile buckets (Low/Mid-Low/Mid/Mid-High/High) and count
 --              the number of customers and average spend per segment.
 -- timeout: 120s
-WITH customer_spend AS (
+-- Each channel is summed per customer before the join. Joining the three
+-- fact tables to customer directly multiplied every SUM by the customer's
+-- row counts in the other two channels.
+WITH store_spend AS (
+    SELECT ss_customer_sk AS customer_sk, SUM(ss_net_paid) AS spend
+    FROM store_sales
+    WHERE ss_customer_sk IS NOT NULL
+    GROUP BY ss_customer_sk
+),
+catalog_spend AS (
+    SELECT cs_bill_customer_sk AS customer_sk, SUM(cs_net_paid) AS spend
+    FROM catalog_sales
+    WHERE cs_bill_customer_sk IS NOT NULL
+    GROUP BY cs_bill_customer_sk
+),
+web_spend AS (
+    SELECT ws_bill_customer_sk AS customer_sk, SUM(ws_net_paid) AS spend
+    FROM web_sales
+    WHERE ws_bill_customer_sk IS NOT NULL
+    GROUP BY ws_bill_customer_sk
+),
+customer_spend AS (
     SELECT
         c.c_customer_sk,
         c.c_customer_id,
         cd.cd_gender,
         cd.cd_marital_status,
         cd.cd_education_status,
-        COALESCE(SUM(ss.ss_net_paid), 0)
-            + COALESCE(SUM(cs.cs_net_paid), 0)
-            + COALESCE(SUM(ws.ws_net_paid), 0) AS total_spend
+        COALESCE(ss.spend, 0)
+            + COALESCE(cs.spend, 0)
+            + COALESCE(ws.spend, 0) AS total_spend
     FROM
         customer c
         JOIN customer_demographics cd ON cd.cd_demo_sk = c.c_current_cdemo_sk
-        LEFT JOIN store_sales    ss ON ss.ss_customer_sk   = c.c_customer_sk
-        LEFT JOIN catalog_sales  cs ON cs.cs_bill_customer_sk = c.c_customer_sk
-        LEFT JOIN web_sales      ws ON ws.ws_bill_customer_sk = c.c_customer_sk
-    GROUP BY
-        c.c_customer_sk,
-        c.c_customer_id,
-        cd.cd_gender,
-        cd.cd_marital_status,
-        cd.cd_education_status
+        LEFT JOIN store_spend   ss ON ss.customer_sk = c.c_customer_sk
+        LEFT JOIN catalog_spend cs ON cs.customer_sk = c.c_customer_sk
+        LEFT JOIN web_spend     ws ON ws.customer_sk = c.c_customer_sk
 ),
 spend_segments AS (
     SELECT
