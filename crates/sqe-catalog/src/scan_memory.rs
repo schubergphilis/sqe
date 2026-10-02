@@ -31,6 +31,8 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use futures::future::BoxFuture;
 use iceberg::arrow::DecodeGate;
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Multiplier from compressed task bytes to the reserved decode estimate.
@@ -38,6 +40,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// corrected to the actual decoded size where the batches are visible (the
 /// direct-read path), and released at subtask end on the vendored path.
 pub const DECODE_MEMORY_ESTIMATE_FACTOR: u64 = 4;
+
+const PPM: u32 = 1_000_000;
 
 /// Escape hatch: set to `0`, `false`, or `off` to disable the pool
 /// reservations (the concurrency bound always applies). Diagnostic only,
@@ -72,7 +76,16 @@ pub struct ScanDecodeGate {
     label: String,
     /// `false` = permits only, no pool reservations (escape hatch).
     track_memory: bool,
+    /// Share of a split's bytes the scan's projection actually reads, in
+    /// parts per million (see [`Self::set_projected_share`]). Applied to the
+    /// vendored reader's admissions only.
+    projected_share_ppm: AtomicU32,
 }
+
+/// Floor for [`ScanDecodeGate::set_projected_share`]: page headers, the
+/// footer and range coalescing still read some bytes outside the projected
+/// column chunks.
+pub const MIN_PROJECTED_SHARE: f64 = 1.0 / 32.0;
 
 impl ScanDecodeGate {
     pub fn new(
@@ -87,6 +100,7 @@ impl ScanDecodeGate {
             pool,
             label,
             track_memory,
+            projected_share_ppm: AtomicU32::new(PPM),
         })
     }
 
@@ -105,7 +119,28 @@ impl ScanDecodeGate {
             pool,
             label,
             track_memory,
+            projected_share_ppm: AtomicU32::new(PPM),
         })
+    }
+
+    /// Scale the vendored reader's admissions to the share of each split the
+    /// projection reads (sqe#801).
+    ///
+    /// The reader reports a subtask's whole byte range, every column, while it
+    /// fetches only the projected column chunks. TPC-DS q09 SF10 runs 15
+    /// store_sales scans projecting 1-2 of 23 columns, and their whole-split
+    /// reservations reached 4 GiB within 80 ms. `share` is clamped to
+    /// [`MIN_PROJECTED_SHARE`]..=1. The direct-read path reads whole files into
+    /// memory and calls [`Self::admit`] directly, so it stays unscaled.
+    pub fn set_projected_share(&self, share: f64) {
+        let share = if share.is_finite() { share.clamp(MIN_PROJECTED_SHARE, 1.0) } else { 1.0 };
+        self.projected_share_ppm
+            .store((share * f64::from(PPM)).round() as u32, Ordering::Relaxed);
+    }
+
+    fn projected(&self, estimated_bytes: u64) -> u64 {
+        let ppm = u64::from(self.projected_share_ppm.load(Ordering::Relaxed));
+        (u128::from(estimated_bytes) * u128::from(ppm) / u128::from(PPM)) as u64
     }
 
     /// Admit the FETCH stage of a subtask reading ~`estimated_bytes` of
@@ -167,7 +202,7 @@ impl ScanDecodeGate {
 impl DecodeGate for ScanDecodeGate {
     fn admit(&self, estimated_bytes: u64) -> BoxFuture<'_, iceberg::Result<Box<dyn Any + Send>>> {
         Box::pin(async move {
-            let admission = ScanDecodeGate::admit(self, estimated_bytes)
+            let admission = ScanDecodeGate::admit(self, self.projected(estimated_bytes))
                 .await
                 // Carry the DataFusion message verbatim: it contains the
                 // "Resources exhausted"/"Failed to allocate" wording the
@@ -182,7 +217,7 @@ impl DecodeGate for ScanDecodeGate {
         estimated_bytes: u64,
     ) -> BoxFuture<'_, iceberg::Result<Box<dyn Any + Send>>> {
         Box::pin(async move {
-            let admission = ScanDecodeGate::admit_fetch(self, estimated_bytes)
+            let admission = ScanDecodeGate::admit_fetch(self, self.projected(estimated_bytes))
                 .await
                 .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::Unexpected, e.to_string()))?;
             Ok(Box::new(admission) as Box<dyn Any + Send>)
@@ -392,5 +427,34 @@ mod tests {
             msg.contains("resources exhausted") || msg.contains("failed to allocate"),
             "wording survives the iceberg::Error wrap for classification: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn projected_share_scales_only_the_vendored_admissions() {
+        let (gate, pool) = gate(1 << 30, 4, true);
+        gate.set_projected_share(0.25);
+        let vendored = DecodeGate::admit(gate.as_ref(), 4096).await.expect("admits");
+        let scaled = 1024 * DECODE_MEMORY_ESTIMATE_FACTOR as usize;
+        assert_eq!(pool.reserved(), scaled);
+        // The direct-read path holds whole files and stays unscaled.
+        let direct = gate.admit(4096).await.expect("admits");
+        assert_eq!(pool.reserved(), scaled + 4096 * DECODE_MEMORY_ESTIMATE_FACTOR as usize);
+        drop((vendored, direct));
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn projected_share_is_clamped() {
+        let (gate, pool) = gate(1 << 30, 4, true);
+        gate.set_projected_share(0.0);
+        let low = DecodeGate::admit(gate.as_ref(), 3200).await.expect("admits");
+        assert_eq!(pool.reserved(), 100 * DECODE_MEMORY_ESTIMATE_FACTOR as usize);
+        drop(low);
+        for share in [2.0, f64::NAN] {
+            gate.set_projected_share(share);
+            let full = DecodeGate::admit(gate.as_ref(), 1000).await.expect("admits");
+            assert_eq!(pool.reserved(), 1000 * DECODE_MEMORY_ESTIMATE_FACTOR as usize);
+            drop(full);
+        }
     }
 }
