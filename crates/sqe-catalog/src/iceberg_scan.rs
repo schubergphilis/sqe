@@ -200,6 +200,9 @@ struct StaticScanPlan {
     tasks: Vec<FileScanTask>,
     file_entries: Vec<(String, u64)>,
     has_deletes: bool,
+    /// Share of the planned files' bytes held by the projected columns (see
+    /// [`projected_byte_share`]); scales the vendored reader's admissions.
+    projected_share: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -1397,6 +1400,7 @@ impl ExecutionPlan for IcebergScanExec {
                 shared_static_scan_plan(&static_plan_cache, &table, snapshot_id,
                     projection.as_deref(), predicates.as_ref(), Some(&static_planning_runs)).await?
             };
+            decode_gate.set_projected_share(static_plan.projected_share);
             // Borrow the sorted table-wide list. Whole-file readers allocate
             // only their assigned slice; split readers never copy this list.
             let mut file_entries = std::borrow::Cow::Borrowed(static_plan.file_entries.as_slice());
@@ -2450,11 +2454,55 @@ async fn plan_static_scan(
         .collect();
     file_entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let has_deletes = snapshot_has_delete_files(table, snapshot_id).await?;
+    let projected_share = match projection {
+        Some(cols) => projected_byte_share(table, snapshot_id, cols, &file_entries).await,
+        None => 1.0,
+    };
     Ok(StaticScanPlan {
         tasks,
         file_entries,
         has_deletes,
+        projected_share,
     })
+}
+
+/// Share of `files`' bytes that the projected columns occupy, from the
+/// manifests' per-column compressed sizes. 1.0 whenever it cannot be told
+/// exactly: a projected column that is not a primitive (sizes are kept per
+/// leaf), files without column sizes, or a manifest read failure.
+async fn projected_byte_share(
+    table: &Table,
+    snapshot_id: Option<i64>,
+    projection: &[String],
+    files: &[(String, u64)],
+) -> f64 {
+    let schema = snapshot_schema(table, snapshot_id);
+    let mut field_ids = Vec::with_capacity(projection.len());
+    for name in projection {
+        match schema.field_by_name(name) {
+            Some(field) if field.field_type.is_primitive() => field_ids.push(field.id),
+            _ => return 1.0,
+        }
+    }
+    let paths: std::collections::HashSet<String> = files.iter().map(|(p, _)| p.clone()).collect();
+    let Ok(data_files) =
+        collect_data_files_for_pruning(table, snapshot_id, &paths, DEFAULT_MANIFEST_CONCURRENCY).await
+    else {
+        return 1.0;
+    };
+    let (mut projected, mut total) = (0u64, 0u64);
+    for df in &data_files {
+        let sizes = df.column_sizes();
+        if sizes.is_empty() {
+            return 1.0;
+        }
+        projected += field_ids.iter().filter_map(|id| sizes.get(id)).sum::<u64>();
+        total += df.file_size_in_bytes();
+    }
+    if total == 0 {
+        return 1.0;
+    }
+    projected as f64 / total as f64
 }
 
 /// Collect full `DataFile` objects (with column statistics) for the given snapshot.
