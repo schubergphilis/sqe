@@ -25,7 +25,7 @@ arrow-array = { version = "59", default-features = false, features = ["chrono-tz
 arrow-cast = { version = "59", default-features = false, features = ["prettyprint"] }
 arrow-ipc = { version = "59", features = ["lz4", "zstd"] }
 arrow-schema = { version = "59", default-features = false, features = ["canonical_extension_types", "serde"] }
-aws-smithy-types = { version = "1", default-features = false, features = ["byte-stream-poll-next", "http-body-0-4-x", "rt-tokio", "test-util"] }
+aws-smithy-types = { version = "1", default-features = false, features = ["byte-stream-poll-next", "rt-tokio", "test-util"] }
 axum = { version = "0.8" }
 axum-core = { version = "0.5", default-features = false, features = ["tracing"] }
 bigdecimal = { version = "0.4", features = ["serde"] }
