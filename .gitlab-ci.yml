@@ -148,8 +148,10 @@ aikido-sbom:
   before_script:
     - !reference [.aikido-shared-scripts, before_script]
 
+# Refresh these reviewed digests when the dependency image is rebuilt. The
+# moving main tag is build output, not a trusted immutable test environment.
 aikido-test-rust:
-  image: "$CI_REGISTRY_IMAGE/ci-deps:main"
+  image: "registry-sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/ci-deps:main@sha256:ca76cfbb51768ed5ba75482893d159fa0773da5f9c97f5e9344dc1a4fb4a1c66"
   variables:
     AIKIDO_SHARED_SCRIPTS: "reuse-deps-image.sh"
     CARGO_TARGET_DIR: "/opt/sqe-deps/target"
@@ -160,7 +162,7 @@ aikido-test-rust:
     - !reference [.aikido_rust_build_env, before_script]
 
 aikido-rust-extra:
-  image: "$CI_REGISTRY_IMAGE/ci-deps:main"
+  image: "registry-sbp.gitlab.schubergphilis.com/vpf-data-ai/chameleon/applications/sqlengine/ci-deps:main@sha256:ca76cfbb51768ed5ba75482893d159fa0773da5f9c97f5e9344dc1a4fb4a1c66"
   variables:
     AIKIDO_SHARED_SCRIPTS: "reuse-deps-image.sh"
     CARGO_TARGET_DIR: "/opt/sqe-deps/target"
