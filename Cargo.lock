@@ -8858,6 +8858,7 @@ dependencies = [
  "uuid",
  "winnow",
  "zerocopy",
+ "zeroize",
  "zstd 0.13.3",
  "zstd-safe 7.3.0",
  "zstd-sys",

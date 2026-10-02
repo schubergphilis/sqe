@@ -8,7 +8,7 @@ Upgrade to jsonwebtoken 10.4 with exactly one explicit `aws_lc_rs` feature. Exis
 
 The initially tested RustCrypto provider introduced `rsa 0.9.10`, which has unpatched RUSTSEC-2023-0071 and failed cargo-deny's advisory gate. AWS-LC passes without introducing that dependency or accepting another advisory. It requires native C compilation: local macOS compilation/signature tests pass; Linux CI must verify its build environment as well.
 
-Validation on the final AWS-LC choice: all 286 authentication library tests pass; auth/test Clippy with `-D warnings` passes; `cargo deny check advisories licenses` passes; configured `cargo audit` reports zero active vulnerabilities. The baseline malformed-nbf regression fails before upgrading. The yanked yoke-derive 0.8.3 is replaced by 0.8.4.
+Validation on the final AWS-LC choice: all 286 authentication library tests pass; auth/test Clippy with `-D warnings` passes; `cargo deny check advisories licenses` passes; configured `cargo audit` reports zero active vulnerabilities. The baseline malformed-nbf regression fails before upgrading. The yanked yoke-derive 0.8.3 is replaced by 0.8.4. Required workspace-hack feature unification is regenerated with cargo-hakari 0.9.38; generation diff is empty. The initial required CI failure was the stale generated manifest, not an AWS-LC compile or signature failure. The reputation scan remains advisory: known low-score/fresh-release dependencies are flagged without new suppressions.
 
 ## Resolved and outstanding advisory exceptions
 
