@@ -1,0 +1,121 @@
+{
+  "benchmark": "tpcc",
+  "scale_factor": 10.0,
+  "protocol": "flight",
+  "timestamp": "2026-10-02T19:48:17",
+  "summary": {
+    "total": 17,
+    "pass": 15,
+    "fail": 0,
+    "diff": 0,
+    "skip": 0,
+    "error": 2,
+    "total_duration_ms": 7865
+  },
+  "queries": [
+    {
+      "id": "customer_balance",
+      "status": "pass",
+      "duration_ms": 327,
+      "rows": 100
+    },
+    {
+      "id": "delivery",
+      "status": "pass",
+      "duration_ms": 201,
+      "rows": 10
+    },
+    {
+      "id": "delivery_delete",
+      "status": "pass",
+      "duration_ms": 147,
+      "rows": 1
+    },
+    {
+      "id": "delivery_update_customer",
+      "status": "pass",
+      "duration_ms": 599,
+      "rows": 1
+    },
+    {
+      "id": "delivery_update_orderline",
+      "status": "pass",
+      "duration_ms": 3479,
+      "rows": 1
+    },
+    {
+      "id": "delivery_update_orders",
+      "status": "pass",
+      "duration_ms": 498,
+      "rows": 1
+    },
+    {
+      "id": "district_orders",
+      "status": "error",
+      "duration_ms": 541,
+      "rows": 0,
+      "message": "result stream failed: Tonic error: code: 'Internal error', message: \"Join Error\\ncaused by\\nExternal error: task 7405 panicked with message \\\"called `Result::unwrap()` on an `Err` value: InvalidArgumentError(\\\\\\\"Incorrect datatype for StructArray field \\\\\\\\\\\\\\\"c0\\\\\\\\\\\\\\\", expected Int32 got Int64\\\\\\\")\\\"\""
+    },
+    {
+      "id": "new_order",
+      "status": "pass",
+      "duration_ms": 86,
+      "rows": 100
+    },
+    {
+      "id": "new_order_update_district",
+      "status": "pass",
+      "duration_ms": 80,
+      "rows": 1
+    },
+    {
+      "id": "new_order_update_stock",
+      "status": "pass",
+      "duration_ms": 733,
+      "rows": 1
+    },
+    {
+      "id": "order_status",
+      "status": "pass",
+      "duration_ms": 51,
+      "rows": 30
+    },
+    {
+      "id": "payment",
+      "status": "pass",
+      "duration_ms": 149,
+      "rows": 50
+    },
+    {
+      "id": "payment_update_customer",
+      "status": "pass",
+      "duration_ms": 54,
+      "rows": 1
+    },
+    {
+      "id": "payment_update_district",
+      "status": "pass",
+      "duration_ms": 59,
+      "rows": 1
+    },
+    {
+      "id": "payment_update_warehouse",
+      "status": "pass",
+      "duration_ms": 47,
+      "rows": 1
+    },
+    {
+      "id": "stock_level",
+      "status": "pass",
+      "duration_ms": 112,
+      "rows": 1
+    },
+    {
+      "id": "warehouse_summary",
+      "status": "error",
+      "duration_ms": 702,
+      "rows": 0,
+      "message": "result stream failed: Tonic error: code: 'Internal error', message: \"Join Error\\ncaused by\\nExternal error: task 10108 panicked with message \\\"called `Result::unwrap()` on an `Err` value: InvalidArgumentError(\\\\\\\"Incorrect datatype for StructArray field \\\\\\\\\\\\\\\"c0\\\\\\\\\\\\\\\", expected Int32 got Int64\\\\\\\")\\\"\""
+    }
+  ]
+}
