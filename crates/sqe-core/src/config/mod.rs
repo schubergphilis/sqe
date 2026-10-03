@@ -2666,7 +2666,10 @@ pub struct CatalogConfig {
     /// `[storage.tvf] allowed_object_store_prefixes`, never replacing it.
     /// A session is scoped to the catalog it resolves as its default: the
     /// one it names (`X-Trino-Catalog`, `USE`, the Flight catalog), or the
-    /// config default when it names none. Same matching and `{user}`
+    /// config default when it names none. The name alone does not open
+    /// them: the catalog must also have answered the caller's own bearer
+    /// (per-user REST auth) while the session was built, so engine-held
+    /// catalog auth never opens them. Same matching and `{user}`
     /// placeholder as the global list. Lets one coordinator serve several
     /// workspaces, each reading only its own staging buckets:
     ///

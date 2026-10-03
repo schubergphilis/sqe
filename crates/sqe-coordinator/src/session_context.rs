@@ -524,6 +524,11 @@ pub async fn create_session_context(
             // (config catalogs + the session's own discovered catalog), not just
             // the default. (#5)
             let mut system_catalog_entries: Vec<sqe_catalog::SystemCatalogEntry> = Vec::new();
+            // Config catalogs that answered this caller's own bearer: the
+            // proof `tvf_caller_for` needs before it grants a catalog's
+            // `tvf_prefixes`. Naming a catalog is not access to it.
+            let mut catalogs_with_caller_access: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
 
             for (cat_name, cat_cfg) in &flattened {
                 let (catalog_provider, session_catalog) = build_catalog_provider(
@@ -539,6 +544,9 @@ pub async fn create_session_context(
                     true,
                 )
                 .await?;
+                if catalog_provider.listing_succeeded() && catalog_auth_is_per_user(cat_cfg) {
+                    catalogs_with_caller_access.insert(cat_name.clone());
+                }
                 ctx.register_catalog(cat_name, Arc::new(catalog_provider));
                 system_catalog_entries.push(sqe_catalog::SystemCatalogEntry {
                     name: cat_name.clone(),
@@ -776,8 +784,14 @@ pub async fn create_session_context(
             // `object_store_admin_roles`. Calls carrying complete inline
             // credentials bypass the gate (the engine key is not used).
             // Scoped to the session's resolved catalog, so that catalog's
-            // `tvf_prefixes` apply and every other catalog's do not.
-            let tvf_caller = tvf_caller_for(session, &flattened, &default_catalog);
+            // `tvf_prefixes` apply and every other catalog's do not, and only
+            // when the catalog answered this caller's own bearer.
+            let tvf_caller = tvf_caller_for(
+                session,
+                &flattened,
+                &default_catalog,
+                catalogs_with_caller_access.contains(&default_catalog),
+            );
             // Registered through `FileTableFunctions::register`, not
             // `ctx.register_udtf`: the file readers build their provider on
             // the async path (`prepare_statement`, called by every planner
@@ -933,10 +947,7 @@ pub(crate) fn discovery_template(config: &SqeConfig) -> Option<sqe_core::config:
         // Static / ClientCredentials / Aws template would hand the caller
         // the engine's identity on any warehouse they can spell.
         .filter(|c| {
-            let per_user = matches!(
-                c.auth,
-                None | Some(sqe_core::config::CatalogAuthConfig::SessionBearer)
-            );
+            let per_user = catalog_auth_is_per_user(c);
             if !per_user {
                 debug!(
                     catalog_url = %c.catalog_url,
@@ -953,18 +964,34 @@ pub(crate) fn discovery_template(config: &SqeConfig) -> Option<sqe_core::config:
         })
 }
 
+/// `true` when `cat` reaches the catalog with each caller's own bearer, so a
+/// successful call proves that caller's access. Engine-held auth (static
+/// token, client credentials, AWS) and non-REST backends answer every
+/// caller alike and prove nothing.
+fn catalog_auth_is_per_user(cat: &sqe_core::config::CatalogConfig) -> bool {
+    matches!(cat.backend, sqe_core::config::CatalogBackend::Rest)
+        && matches!(
+            cat.auth,
+            None | Some(sqe_core::config::CatalogAuthConfig::SessionBearer)
+        )
+}
+
 /// The file-TVF caller for `session`, scoped to `default_catalog` (the
 /// catalog the session resolved to). That catalog's `[catalogs.<name>]
-/// tvf_prefixes` join the global list; a catalog not in config (a
-/// discovered warehouse) adds none.
+/// tvf_prefixes` join the global list only when `caller_has_access`: the
+/// catalog answered this caller's own bearer during the session build. A
+/// session can name any catalog (`X-Trino-Catalog`, `USE`), so the name
+/// alone must not open another workspace's buckets. A catalog not in config
+/// (a discovered warehouse) adds none.
 fn tvf_caller_for(
     session: &Session,
     flattened: &[(String, sqe_core::config::CatalogConfig)],
     default_catalog: &str,
+    caller_has_access: bool,
 ) -> sqe_core::config::TvfCaller {
     let prefixes = flattened
         .iter()
-        .find(|(name, _)| name == default_catalog)
+        .find(|(name, _)| caller_has_access && name == default_catalog)
         .map(|(_, c)| c.tvf_prefixes.as_slice())
         .unwrap_or_default();
     sqe_core::config::TvfCaller::for_user(
@@ -1294,17 +1321,17 @@ allowed_object_store_prefixes = ["s3://shared-landing/"]
         let policy = &config.storage.tvf;
         let a_file = "s3://ws-a-landing/2026/x.parquet";
 
-        let in_a = tvf_caller_for(&alice(), &flattened, "ws_a");
+        let in_a = tvf_caller_for(&alice(), &flattened, "ws_a", true);
         policy.check_path(a_file, &in_a, false).expect("A's prefix in A");
 
-        let in_b = tvf_caller_for(&alice(), &flattened, "ws_b");
+        let in_b = tvf_caller_for(&alice(), &flattened, "ws_b", true);
         let err = policy.check_path(a_file, &in_b, false).unwrap_err();
         assert!(err.contains("scoped to catalog 'ws_b'"), "{err}");
         policy
             .check_path("s3://ws-b-landing/x.parquet", &in_b, false)
             .expect("B's prefix in B");
 
-        let discovered = tvf_caller_for(&alice(), &flattened, "polaris_wh");
+        let discovered = tvf_caller_for(&alice(), &flattened, "polaris_wh", true);
         assert!(discovered.catalog_prefixes.is_empty());
         assert!(policy.check_path(a_file, &discovered, false).is_err());
         for c in [&in_a, &in_b, &discovered] {
@@ -1312,6 +1339,40 @@ allowed_object_store_prefixes = ["s3://shared-landing/"]
                 .check_path("s3://shared-landing/x.csv", c, false)
                 .expect("global prefix holds everywhere");
         }
+    }
+
+    /// Naming a catalog is not access to it: a caller in workspace B who sets
+    /// `X-Trino-Catalog: ws_a` (or `USE ws_a`) is scoped to ws_a by name,
+    /// but ws_a did not answer their bearer, so its prefixes stay closed.
+    #[test]
+    fn tvf_prefixes_need_proven_access_not_just_the_catalog_name() {
+        let config = two_workspace_config();
+        let flattened: Vec<(String, sqe_core::config::CatalogConfig)> = config
+            .flattened_catalogs()
+            .into_iter()
+            .map(|(n, c)| (n, c.clone()))
+            .collect();
+        let named_only = tvf_caller_for(&alice(), &flattened, "ws_a", false);
+        assert!(named_only.catalog_prefixes.is_empty());
+        assert!(config
+            .storage
+            .tvf
+            .check_path("s3://ws-a-landing/x.parquet", &named_only, false)
+            .is_err());
+    }
+
+    /// Only a per-user bearer proves access; engine-held catalog auth answers
+    /// every caller alike.
+    #[test]
+    fn catalog_access_proof_requires_per_user_auth() {
+        let mut cat = test_config_rest().catalog;
+        assert!(catalog_auth_is_per_user(&cat));
+        cat.auth = Some(sqe_core::config::CatalogAuthConfig::SessionBearer);
+        assert!(catalog_auth_is_per_user(&cat));
+        cat.auth = Some(sqe_core::config::CatalogAuthConfig::Static {
+            token: "engine-token".to_string(),
+        });
+        assert!(!catalog_auth_is_per_user(&cat));
     }
 
     /// End to end through `read_parquet`: a query in a session scoped to
@@ -1332,7 +1393,7 @@ allowed_object_store_prefixes = ["s3://shared-landing/"]
             "read_parquet",
             Arc::new(sqe_catalog::read_parquet::ReadParquetFunction::with_caller(
                 config.storage.clone(),
-                tvf_caller_for(&alice(), &flattened, "ws_b"),
+                tvf_caller_for(&alice(), &flattened, "ws_b", true),
             )),
         );
         let err = sqe_catalog::file_tvf_prepare::prepare_statement(
