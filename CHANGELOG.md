@@ -46,6 +46,23 @@ All notable changes to SQE are documented in this file.
 
 ### Fixed
 
+- File TVFs: `read_parquet` / `read_csv` / `read_json` are prepared per statement
+
+    With dbt-trino on four threads and one JWT, `CREATE TABLE ... AS SELECT
+    ... FROM read_parquet(...)` failed intermittently with "the table
+    function was not prepared before planning". The providers were stored on
+    the function instances of the user's cached session context, and the
+    CTAS SELECT was planned on a second fetch of that context: when another
+    thread's commit invalidated the cache in between, the write handler got a
+    fresh context with nothing prepared. Prepared providers now live in a
+    per-statement scope keyed by function name and arguments, so every plan
+    of a statement finds them whatever context it plans on, and nothing is
+    shared across statements, sessions or tokens. Every planner entry point
+    (queries, CTAS/INSERT/MERGE, EXPLAIN, views, the embedded CLI) goes
+    through `file_tvf_prepare::plan_sql`; a lint test fails the build on a
+    direct `ctx.sql` or `create_logical_plan`. A statement prepares each call
+    once, so a CTAS no longer lists the same prefix twice.
+
 - Catalog: the per-token circuit breaker counts upstream faults only
 
     A client that legitimately probed for missing or hidden objects (dbt's
