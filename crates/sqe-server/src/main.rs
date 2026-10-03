@@ -2836,6 +2836,15 @@ fn build_oauth2_state(
     // Derive the base URL from the Trino HTTP port. In production, a reverse
     // proxy or TLS terminator provides the external HTTPS URL; for dev, use
     // the configured redirect_uri's scheme+host or fall back to localhost.
+    // The fallback uses the plain port, or the HTTPS one when the Trino
+    // listener is TLS-only (`trino_http_port = 0`).
+    let localhost = if config.coordinator.trino_http_port == 0
+        && config.coordinator.trino_https_port > 0
+    {
+        format!("https://localhost:{}", config.coordinator.trino_https_port)
+    } else {
+        format!("http://localhost:{}", config.coordinator.trino_http_port)
+    };
     let base_url = if ext.redirect_uri.contains("://") {
         // Extract scheme + host from redirect_uri (e.g. "https://sqe.example.com")
         let uri = ext.redirect_uri.trim_end_matches('/');
@@ -2845,10 +2854,10 @@ fn build_oauth2_state(
                 let host_end = after_scheme.find('/').unwrap_or(after_scheme.len());
                 format!("{}://{}", &uri[..idx], &after_scheme[..host_end])
             }
-            None => format!("http://localhost:{}", config.coordinator.trino_http_port),
+            None => localhost,
         }
     } else {
-        format!("http://localhost:{}", config.coordinator.trino_http_port)
+        localhost
     };
 
     Ok(sqe_trino_compat::oauth2::OAuth2State {

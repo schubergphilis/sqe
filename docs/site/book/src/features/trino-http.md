@@ -60,6 +60,10 @@ certificate must name the service host the clients use, such as
 Startup fails when `trino_https_port` is set without a certificate, when a
 certificate file is missing, or when the port collides with another listener.
 
+The OAuth2 external-auth URLs (`/oauth2/...`) are built from the configured
+`redirect_uri`, not from the listener a request arrives on. Give it the
+https address clients use.
+
 ### Behind a TLS-terminating ingress
 
 The plain listener speaks HTTP. Every response carries a `nextUri` that the
