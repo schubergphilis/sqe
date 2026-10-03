@@ -2985,7 +2985,10 @@ impl SessionCatalog {
     pub async fn invalidate_table_all_tokens(&self, table_ident: &TableIdent) {
         let suffix = table_metadata_cache_suffix(table_ident);
         self.table_cache.invalidate_table_all_tokens(&suffix).await;
-        debug!(table = %table_ident, "Table cache invalidated for all tokens");
+        crate::schema_provider::invalidate_namespace_listing_all_tokens(
+            &table_ident.namespace().as_ref().join("."),
+        );
+        debug!(table = %table_ident, "Table cache and name listings invalidated for all tokens");
     }
 
     /// Check if a table exists.

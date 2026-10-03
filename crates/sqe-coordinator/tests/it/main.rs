@@ -61,6 +61,7 @@ mod mcp_describe_schema_e2e;
 mod mcp_listener_supervision_e2e;
 mod mor_update_merge_integration;
 mod multi_catalog_routing_test;
+mod namespace_staleness_test;
 mod partition_e2e;
 mod partition_evolution_e2e;
 mod quack_e2e;

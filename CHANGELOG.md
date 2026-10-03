@@ -4,6 +4,46 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Catalog: schemas and tables created by a concurrent writer are visible to the next statement
+
+    dbt-trino runs models in parallel on connections that share a JWT; a
+    model that named a schema another model had just created could fail with
+    "schema not found", and operators serialized dbt. A namespace missing from
+    a session's cached list is re-listed at most every 5 s; a miss inside that
+    window now probes Polaris for that one namespace (the same visibility rule
+    as the listing: 404 or 403 still misses), so a schema created by another
+    replica, Spark or Airflow is found immediately. Commits and table DDL
+    (CTAS, INSERT, DROP, RENAME) now also drop every principal's cached table
+    list for the namespace, not only the writer's metadata cache, so
+    `information_schema.tables` and `table_exist` no longer serve the pre-DDL
+    list for up to 5 s.
+
+- Catalog: the per-token circuit breaker counts upstream faults only
+
+    A client that legitimately probed for missing or hidden objects (dbt's
+    `information_schema` checks, `read_parquet` name lookups) collected 404s
+    from Polaris, the per-(token, catalog) breaker counted them, and after
+    five it opened: every query with that JWT was refused for 30 s. All
+    breaker sites now classify the outcome once. 5xx, timeouts, connection
+    failures and 429 count; 401/403, 404 and other 4xx are normal answers
+    and record success. `[catalog] circuit_breaker_failure_classes` sets the
+    counted classes (`server_error`, `timeout`, `connection`,
+    `rate_limited`, `client_error`, `not_found`, `auth`). The `Circuit
+    breaker opened` log line now carries the token `subject` and the
+    `reason` class.
+- SQL: `SHOW SCHEMAS` / `SHOW TABLES` honour `LIKE`; Trino's unknown-catalog error
+
+    The classifier passed only the `FROM`/`IN` scope to the handlers and
+    dropped the `LIKE` pattern, so `SHOW SCHEMAS FROM <catalog> LIKE 'x'`
+    listed every schema. dbt-trino and BI tools check schema existence this
+    way and made wrong create/skip decisions. The pattern now filters the
+    result (`%`, `_`, case-sensitive; `ILIKE` folds case), for
+    Iceberg catalogs and Hive roots alike. An unknown or invisible catalog
+    fails with `Catalog 'x' does not exist` (`CATALOG_NOT_FOUND`), as in
+    Trino, with the operator detail logged instead.
+
 ### Changed
 
 - Security: `[security] trusted_proxies` accepts CIDR ranges
@@ -37,6 +77,20 @@ All notable changes to SQE are documented in this file.
     Entries that are not object-store URLs with a bucket fail config
     validation.
 
+- Trino HTTP: optional TLS listener, `[coordinator] trino_https_port`
+
+    In-cluster Trino clients that refuse credentials over plain HTTP
+    (trino-python-client, dbt-trino) can now call the service directly over
+    TLS. `trino_https_port` serves the same endpoints as `trino_http_port`
+    with the PEM certificate in `[coordinator.trino_tls]` (optional `ca_file`
+    requires client certificates). The certificate is reloaded within 60
+    seconds of a change, so a cert-manager renewal from an internal CA needs
+    no restart. Requests on the TLS port get https `nextUri`/`infoUri` on
+    that port. The plain listener keeps running; `trino_http_port = 0` with
+    `trino_https_port = 8080` makes the Trino port TLS-only. Health and
+    metrics stay plain on their own ports. A missing certificate or a port
+    collision fails config validation.
+
 - Trino HTTP: `[coordinator] public_base_url`; https `nextUri` behind a TLS ingress
 
     Behind a TLS-terminating ingress that was not listed in
@@ -51,6 +105,23 @@ All notable changes to SQE are documented in this file.
     `X-Forwarded-Port` is honoured when it is not the scheme's default.
 
 ### Fixed
+
+- File TVFs: `read_parquet` / `read_csv` / `read_json` are prepared per statement
+
+    With dbt-trino on four threads and one JWT, `CREATE TABLE ... AS SELECT
+    ... FROM read_parquet(...)` failed intermittently with "the table
+    function was not prepared before planning". The providers were stored on
+    the function instances of the user's cached session context, and the
+    CTAS SELECT was planned on a second fetch of that context: when another
+    thread's commit invalidated the cache in between, the write handler got a
+    fresh context with nothing prepared. Prepared providers now live in a
+    per-statement scope keyed by function name and arguments, so every plan
+    of a statement finds them whatever context it plans on, and nothing is
+    shared across statements, sessions or tokens. Every planner entry point
+    (queries, CTAS/INSERT/MERGE, EXPLAIN, views, the embedded CLI) goes
+    through `file_tvf_prepare::plan_sql`; a lint test fails the build on a
+    direct `ctx.sql` or `create_logical_plan`. A statement prepares each call
+    once, so a CTAS no longer lists the same prefix twice.
 
 - Catalog: the per-token circuit breaker counts upstream faults only
 

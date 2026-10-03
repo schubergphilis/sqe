@@ -700,6 +700,19 @@ pub struct CoordinatorConfig {
     pub flight_sql_port: u16,
     #[serde(default = "default_trino_port")]
     pub trino_http_port: u16,
+    /// Port of an additional TLS listener for the Trino HTTP protocol, serving
+    /// the same endpoints as `trino_http_port` with `[coordinator.trino_tls]`.
+    /// `0` (default) disables it. In-cluster clients that refuse to send
+    /// credentials over plain HTTP (trino-python-client, dbt-trino) can then
+    /// call the service directly instead of going through the public
+    /// ingress. The plain listener keeps serving probes and plain clients.
+    #[serde(default)]
+    pub trino_https_port: u16,
+    /// Certificate for `trino_https_port`: PEM `cert_file` / `key_file`,
+    /// optional `ca_file` to require client certificates. Rotated in place
+    /// (polled every 60 s), so a cert-manager renewal needs no restart.
+    #[serde(default)]
+    pub trino_tls: TlsConfig,
     /// Public base URL of the Trino HTTP listener behind a TLS-terminating
     /// ingress, e.g. `"https://sql.example.org"`. Used for `nextUri` /
     /// `infoUri` only on requests whose `Host` (or a trusted proxy's
@@ -1299,6 +1312,8 @@ impl std::fmt::Debug for CoordinatorConfig {
         f.debug_struct("CoordinatorConfig")
             .field("flight_sql_port", &self.flight_sql_port)
             .field("trino_http_port", &self.trino_http_port)
+            .field("trino_https_port", &self.trino_https_port)
+            .field("trino_tls", &self.trino_tls)
             .field("public_base_url", &self.public_base_url)
             .field("quack_port", &self.quack_port)
             .field("mode", &self.mode)
@@ -5769,6 +5784,38 @@ impl SqeConfig {
                 ));
             }
         }
+        let hp = self.coordinator.trino_https_port;
+        if hp > 0 {
+            if !self.coordinator.trino_tls.is_enabled() {
+                errors.push(
+                    "coordinator.trino_https_port is set but [coordinator.trino_tls] has no \
+                     cert_file/key_file"
+                        .to_string(),
+                );
+            }
+            for (name, port) in [
+                (
+                    "coordinator.trino_http_port",
+                    self.coordinator.trino_http_port,
+                ),
+                (
+                    "coordinator.flight_sql_port",
+                    self.coordinator.flight_sql_port,
+                ),
+                ("coordinator.quack_port", self.coordinator.quack_port),
+                ("metrics.prometheus_port", self.metrics.prometheus_port),
+                (
+                    "health/web port",
+                    self.metrics.prometheus_port.saturating_add(1),
+                ),
+            ] {
+                if port == hp {
+                    errors.push(format!(
+                        "port conflict: coordinator.trino_https_port and {name} are both {hp}"
+                    ));
+                }
+            }
+        }
         if self.mcp.enabled_by_port_only() {
             tracing::warn!(
                 port = self.mcp.port,
@@ -5792,6 +5839,10 @@ impl SqeConfig {
                         self.coordinator.trino_http_port,
                     ),
                     ("coordinator.quack_port", self.coordinator.quack_port),
+                    (
+                        "coordinator.trino_https_port",
+                        self.coordinator.trino_https_port,
+                    ),
                     ("metrics.prometheus_port", self.metrics.prometheus_port),
                     (
                         "health/web port",
@@ -6030,6 +6081,23 @@ impl SqeConfig {
             }
             if !tls.ca_file.is_empty() && !std::path::Path::new(&tls.ca_file).exists() {
                 errors.push(format!("tls.ca_file '{}' not found", tls.ca_file));
+            }
+        }
+
+        // Same shape checks for the Trino HTTPS listener's certificate.
+        let trino_tls = &self.coordinator.trino_tls;
+        if trino_tls.cert_file.is_empty() != trino_tls.key_file.is_empty() {
+            errors.push(
+                "coordinator.trino_tls needs both cert_file and key_file, or neither".to_string(),
+            );
+        }
+        for (name, path) in [
+            ("cert_file", &trino_tls.cert_file),
+            ("key_file", &trino_tls.key_file),
+            ("ca_file", &trino_tls.ca_file),
+        ] {
+            if !path.is_empty() && !std::path::Path::new(path).exists() {
+                errors.push(format!("coordinator.trino_tls.{name} '{path}' not found"));
             }
         }
 
@@ -7436,6 +7504,8 @@ partial_progress_batch = 5
             coordinator: CoordinatorConfig {
                 flight_sql_port: 50051,
                 trino_http_port: 8080,
+                trino_https_port: 0,
+                trino_tls: TlsConfig::default(),
                 public_base_url: None,
                 quack_port: 0,
                 mode: ServerMode::Hybrid,
@@ -7823,6 +7893,65 @@ partial_progress_batch = 5
             err.contains("flight_sql_port") && err.contains("trino_http_port"),
             "Expected port conflict error, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_validate_trino_https_port_needs_a_certificate() {
+        let mut config = valid_config();
+        config.coordinator.trino_https_port = 8443;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("trino_https_port is set but [coordinator.trino_tls]"),
+            "Expected missing certificate error, got: {err}"
+        );
+        config.coordinator.trino_tls = TlsConfig {
+            cert_file: "/nonexistent/tls.crt".to_string(),
+            key_file: "/nonexistent/tls.key".to_string(),
+            ..TlsConfig::default()
+        };
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("coordinator.trino_tls.cert_file '/nonexistent/tls.crt' not found"),
+            "Expected missing file error, got: {err}"
+        );
+        config.coordinator.trino_tls = fixture_server_tls();
+        config.validate().expect("certificate configured");
+    }
+
+    fn fixture_server_tls() -> TlsConfig {
+        let fixture = |name: &str| {
+            format!(
+                "{}/tests/fixtures/tls/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            )
+        };
+        TlsConfig {
+            cert_file: fixture("server.crt"),
+            key_file: fixture("server.key"),
+            ..TlsConfig::default()
+        }
+    }
+
+    #[test]
+    fn test_validate_trino_https_port_conflicts() {
+        let mut config = valid_config();
+        config.coordinator.trino_tls = fixture_server_tls();
+        config.coordinator.trino_https_port = config.coordinator.trino_http_port;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("trino_https_port and coordinator.trino_http_port"),
+            "Expected port conflict error, got: {err}"
+        );
+        config.coordinator.trino_https_port = config.metrics.prometheus_port + 1;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("trino_https_port and health/web port"),
+            "Expected port conflict error, got: {err}"
+        );
+        // HTTPS only: the plain port off, TLS on 8080 itself.
+        config.coordinator.trino_http_port = 0;
+        config.coordinator.trino_https_port = 8080;
+        config.validate().expect("TLS-only Trino listener");
     }
 
     #[test]
