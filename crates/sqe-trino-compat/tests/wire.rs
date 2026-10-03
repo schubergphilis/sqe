@@ -31,8 +31,8 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use sqe_core::{SecretString, Session, SqeError};
 use sqe_trino_compat::server::{
-    start_trino_server_with_options, NodeContext, TrinoAuthenticator, TrinoQueryExecutor,
-    TrinoResultStream, TrinoServerOptions,
+    start_trino_server_with_options, HttpsListener, NodeContext, TrinoAuthenticator,
+    TrinoQueryExecutor, TrinoResultStream, TrinoServerOptions,
 };
 
 // ── Test doubles ─────────────────────────────────────────────────────────────
@@ -886,4 +886,173 @@ async fn information_schema_is_qualified_with_the_session_catalog() {
     assert_eq!(pages.last().expect("result page").state(), "FINISHED");
     assert_eq!(all_rows(&pages), vec![json!(["t"])]);
     h.assert_golden("information_schema");
+}
+
+// ── HTTPS listener ([coordinator] trino_https_port) ─────────────────────────
+
+fn tls_fixture(name: &str) -> String {
+    format!(
+        "{}/../sqe-core/tests/fixtures/tls/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+fn free_port() -> u16 {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
+    probe.local_addr().expect("probe addr").port()
+}
+
+/// Start the server with a plain port and an HTTPS port serving the fixture
+/// certificate (signed by the private "SQE Test CA", SAN `localhost`, the
+/// shape a cert-manager internal issuer produces). Returns both ports once
+/// the HTTPS port answers.
+async fn start_with_https() -> (u16, u16, tokio::task::JoinHandle<()>) {
+    let tls_config = sqe_core::config::TlsConfig {
+        cert_file: tls_fixture("server.crt"),
+        key_file: tls_fixture("server.key"),
+        ..Default::default()
+    };
+    let material = sqe_core::ServerTlsMaterial::load(&tls_config).expect("load fixture cert");
+    let tls = axum_server::tls_rustls::RustlsConfig::from_config(material.rustls_server_config());
+    let (plain, https) = (free_port(), free_port());
+    let server = start_trino_server_with_options(
+        Arc::new(MockAuth),
+        Arc::new(DfExecutor::new()),
+        plain,
+        NodeContext {
+            version: "test-version".to_string(),
+            ready: Arc::new(AtomicBool::new(true)),
+            started_at: Instant::now(),
+        },
+        None,
+        TrinoServerOptions {
+            https: Some(HttpsListener { port: https, tls }),
+            ..Default::default()
+        },
+    );
+    let client = trusting_client();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while client
+        .get(format!("https://localhost:{https}/v1/info"))
+        .send()
+        .await
+        .is_err()
+    {
+        assert!(Instant::now() < deadline, "HTTPS listener did not come up on {https}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    (plain, https, server)
+}
+
+/// A client that trusts only the fixture CA, the way a pod with a
+/// trust-manager bundle mounted trusts only the internal issuer.
+fn trusting_client() -> reqwest::Client {
+    let ca = std::fs::read(tls_fixture("ca.crt")).expect("read fixture CA");
+    reqwest::Client::builder()
+        .no_proxy()
+        .tls_certs_only([reqwest::Certificate::from_pem(&ca).expect("parse CA")])
+        .https_only(true)
+        .build()
+        .expect("reqwest client")
+}
+
+/// Round trip over TLS: Basic auth is accepted, every `nextUri` stays on
+/// https and the HTTPS port, and the rows come back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn https_listener_round_trip_with_private_ca() {
+    let (_plain, https, _server) = start_with_https().await;
+    let client = trusting_client();
+    let base = format!("https://localhost:{https}");
+
+    let posted = client
+        .post(format!("{base}/v1/statement"))
+        .header("X-Trino-User", "alice")
+        .basic_auth("alice", Some(BASIC_PASSWORD))
+        .body("SELECT count(*) FROM t")
+        .send()
+        .await
+        .expect("POST over TLS");
+    assert_eq!(posted.status(), 200);
+    let mut body: Value = posted.json().await.expect("json");
+    let mut rows = Vec::new();
+    while let Some(next) = body.get("nextUri").and_then(Value::as_str).map(str::to_string) {
+        assert!(
+            next.starts_with(&format!("{base}/v1/statement/")),
+            "nextUri must stay on the HTTPS listener: {next}"
+        );
+        body = client
+            .get(&next)
+            .send()
+            .await
+            .expect("GET nextUri over TLS")
+            .json()
+            .await
+            .expect("json");
+        rows.extend(body.get("data").and_then(Value::as_array).cloned().unwrap_or_default());
+    }
+    assert_eq!(body.pointer("/stats/state"), Some(&json!("FINISHED")));
+    assert_eq!(rows, vec![json!([T_ROWS])]);
+
+    // Bearer auth is accepted over TLS too.
+    let bearer = client
+        .post(format!("{base}/v1/statement"))
+        .bearer_auth(GOOD_BEARER)
+        .body("SELECT 1")
+        .send()
+        .await
+        .expect("bearer POST over TLS");
+    assert_eq!(bearer.status(), 200);
+
+    // A bad password is still a 401 on the TLS port.
+    let rejected = client
+        .post(format!("{base}/v1/statement"))
+        .header("X-Trino-User", "alice")
+        .basic_auth("alice", Some("wrong"))
+        .body("SELECT 1")
+        .send()
+        .await
+        .expect("POST over TLS");
+    assert_eq!(rejected.status(), 401);
+}
+
+/// The plain listener keeps serving next to the HTTPS one, with http URIs,
+/// and a client that does not trust the private CA fails the handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn https_listener_keeps_plain_port_and_rejects_untrusted_clients() {
+    let (plain, https, _server) = start_with_https().await;
+
+    let http = reqwest::Client::builder().no_proxy().build().expect("client");
+    let posted: Value = http
+        .post(format!("http://127.0.0.1:{plain}/v1/statement"))
+        .header("X-Trino-User", "alice")
+        .basic_auth("alice", Some(BASIC_PASSWORD))
+        .body("SELECT 1")
+        .send()
+        .await
+        .expect("POST over plain HTTP")
+        .json()
+        .await
+        .expect("json");
+    let next = posted["nextUri"].as_str().expect("nextUri");
+    assert!(
+        next.starts_with(&format!("http://127.0.0.1:{plain}/")),
+        "plain listener keeps http URIs: {next}"
+    );
+
+    // The default client trusts no private CA: no handshake, no request.
+    let untrusted = http
+        .get(format!("https://localhost:{https}/v1/info"))
+        .send()
+        .await;
+    assert!(untrusted.is_err(), "untrusted CA must fail the TLS handshake");
+
+    // Plain HTTP on the TLS port is not answered with a Trino response.
+    let plain_on_tls = http
+        .get(format!("http://127.0.0.1:{https}/v1/info"))
+        .send()
+        .await;
+    assert!(
+        plain_on_tls.map(|r| !r.status().is_success()).unwrap_or(true),
+        "plain HTTP must not be served on the TLS port"
+    );
 }

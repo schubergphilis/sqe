@@ -18,7 +18,7 @@ SQE reads secrets once at startup. Rotating any of them means updating the secre
 | Object-store keys | `storage.s3_access_key` / `storage.s3_secret_key` (`SQE_STORAGE__S3_*`), the worker spill S3 keys, `azure_sas_token` | Static storage credentials, when you do not use workload identity |
 | MCP static tokens | `[[mcp.auth.principals]] token_env` | Fixed bearer tokens for MCP principals |
 | OpenLineage API key | `[metrics.openlineage] api_key` | Posting lineage events |
-| TLS certificates | `coordinator.tls.cert_file` / `key_file`, `worker.tls` | Flight SQL and HTTP listeners |
+| TLS certificates | `coordinator.tls.cert_file` / `key_file`, `coordinator.trino_tls`, `worker.tls` | Flight SQL and HTTP listeners |
 
 ### How each one rotates
 
@@ -38,7 +38,7 @@ SQE reads secrets once at startup. Rotating any of them means updating the secre
 
 **OpenLineage API key.** Issue a new key at the lineage backend, update SQE, restart the coordinator, revoke the old key.
 
-**TLS certificates.** The HTTP listeners (MCP, Quack) pick up a renewed `cert_file` and `key_file` within a minute, with no restart. The Flight listener keeps the certificate it started with, so restart it when the certificate changes. See [Certificate rotation](../deployment/configuration.md#certificate-rotation) for a reloader setup.
+**TLS certificates.** The HTTP listeners (MCP, Quack, the Trino HTTPS port) pick up a renewed `cert_file` and `key_file` within a minute, with no restart. The Flight listener keeps the certificate it started with, so restart it when the certificate changes. See [Certificate rotation](../deployment/configuration.md#certificate-rotation) for a reloader setup.
 
 ## Keys that rotate themselves
 

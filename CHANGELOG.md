@@ -58,6 +58,20 @@ All notable changes to SQE are documented in this file.
 
 ### Added
 
+- Trino HTTP: optional TLS listener, `[coordinator] trino_https_port`
+
+    In-cluster Trino clients that refuse credentials over plain HTTP
+    (trino-python-client, dbt-trino) can now call the service directly over
+    TLS. `trino_https_port` serves the same endpoints as `trino_http_port`
+    with the PEM certificate in `[coordinator.trino_tls]` (optional `ca_file`
+    requires client certificates). The certificate is reloaded within 60
+    seconds of a change, so a cert-manager renewal from an internal CA needs
+    no restart. Requests on the TLS port get https `nextUri`/`infoUri` on
+    that port. The plain listener keeps running; `trino_http_port = 0` with
+    `trino_https_port = 8080` makes the Trino port TLS-only. Health and
+    metrics stay plain on their own ports. A missing certificate or a port
+    collision fails config validation.
+
 - Trino HTTP: `[coordinator] public_base_url`; https `nextUri` behind a TLS ingress
 
     Behind a TLS-terminating ingress that was not listed in
