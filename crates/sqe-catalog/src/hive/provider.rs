@@ -2084,7 +2084,7 @@ impl HiveSchemaProvider {
         // on. A body that needs both (a lambda and an UNNEST table factor)
         // is still out of reach; the error names the first attempt.
         let state = ctx.state();
-        let plan = match state.create_logical_plan(&sql).await {
+        let plan = match crate::file_tvf_prepare::create_logical_plan(&state, &sql).await {
             Ok(p) => p,
             Err(first) => {
                 let retry = match state
