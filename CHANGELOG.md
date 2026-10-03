@@ -31,6 +31,22 @@ All notable changes to SQE are documented in this file.
     `https` are accepted, the first value of a forwarded list is used, and
     `X-Forwarded-Port` is honoured when it is not the scheme's default.
 
+### Fixed
+
+- Catalog: the per-token circuit breaker counts upstream faults only
+
+    A client that legitimately probed for missing or hidden objects (dbt's
+    `information_schema` checks, `read_parquet` name lookups) collected 404s
+    from Polaris, the per-(token, catalog) breaker counted them, and after
+    five it opened: every query with that JWT was refused for 30 s. All
+    breaker sites now classify the outcome once. 5xx, timeouts, connection
+    failures and 429 count; 401/403, 404 and other 4xx are normal answers
+    and record success. `[catalog] circuit_breaker_failure_classes` sets the
+    counted classes (`server_error`, `timeout`, `connection`,
+    `rate_limited`, `client_error`, `not_found`, `auth`). The `Circuit
+    breaker opened` log line now carries the token `subject` and the
+    `reason` class.
+
 ## [0.49.0] — 2026-09-26
 
 This section covers every change since 0.28.0. Versions 0.29.0 to 0.48.1 were tagged without changelog sections of their own; from 0.49.0 on, `scripts/release.sh` turns this section into the release notes.
