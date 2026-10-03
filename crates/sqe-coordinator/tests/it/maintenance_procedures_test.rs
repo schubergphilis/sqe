@@ -14,6 +14,15 @@
 
 use sqe_sql::{parse_and_classify, ProcedureCall, StatementKind};
 
+/// The root test session as a configured admin. Admin-tier procedures
+/// (expire_snapshots, remove_orphan_files, rollback/set_current) need an
+/// admin role, and root's client-credentials token carries none. The token
+/// stays root's, so Polaris still sees the real principal.
+fn as_admin(mut session: sqe_core::Session) -> sqe_core::Session {
+    session.user.roles = vec!["service_admin".to_string()];
+    session
+}
+
 // ---------------------------------------------------------------------------
 // Parser contract tests: run without docker
 // ---------------------------------------------------------------------------
@@ -357,6 +366,7 @@ fn extract_count(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> i6
 #[ignore = "needs:polaris"]
 async fn expire_snapshots_retain_last_commits() {
     let (session, handler) = crate::common::setup_handler().await;
+    let session = as_admin(session);
 
     let table = "default.maint_expire_test";
     let _ = handler
@@ -397,6 +407,7 @@ async fn expire_snapshots_retain_last_commits() {
 #[ignore = "needs:polaris"]
 async fn remove_orphan_files_respects_default_threshold() {
     let (session, handler) = crate::common::setup_handler().await;
+    let session = as_admin(session);
 
     let table = "default.maint_orphan_test";
     let _ = handler
@@ -522,8 +533,8 @@ async fn read_only_user_rejected_with_audit() {
         .expect_err("read-only user should be denied");
     let msg = err.to_string();
     assert!(
-        msg.contains("Access denied") || msg.contains("write privilege"),
-        "expected denial message, got: {msg}"
+        msg.contains("has read-only roles") && msg.contains("alice-readonly"),
+        "expected the read-only denial, got: {msg}"
     );
 }
 
@@ -565,6 +576,7 @@ fn snapshot_rows(
 #[ignore = "needs:polaris"]
 async fn rollback_to_snapshot_reverts_data() {
     let (session, handler) = crate::common::setup_handler().await;
+    let session = as_admin(session);
     let table = "default.maint_rollback_test";
     let name = "maint_rollback_test";
 
@@ -647,6 +659,7 @@ async fn rollback_to_snapshot_reverts_data() {
 #[ignore = "needs:polaris"]
 async fn rollback_rejects_non_ancestor_but_set_current_allows() {
     let (session, handler) = crate::common::setup_handler().await;
+    let session = as_admin(session);
     let table = "default.maint_ancestry_test";
     let name = "maint_ancestry_test";
 

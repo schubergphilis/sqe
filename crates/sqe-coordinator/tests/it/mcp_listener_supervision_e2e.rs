@@ -177,8 +177,16 @@ async fn mcp_listener_answers_again_after_idling_past_the_session_cache_ttl() {
         !alive.load(Ordering::SeqCst),
         "a listener task that is gone must not report itself alive"
     );
+    // A fresh connection: aborting the accept loop does not end connections it
+    // already accepted (hyper serves each on its own task), so the pooled
+    // keep-alive connection above would still be answered. The claim is that
+    // the port accepts nothing new.
+    let fresh = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap();
     let (status, _) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        match client.post(&url).body("{}").send().await {
+        match fresh.post(&url).body("{}").send().await {
             Ok(r) => (r.status().as_u16(), Value::Null),
             Err(_) => (0, Value::Null),
         }
