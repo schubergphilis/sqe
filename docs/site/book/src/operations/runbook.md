@@ -109,8 +109,18 @@ first-touch reads error. Already-planned, already-cached queries may still run
 until the metadata cache TTL expires.
 
 **Likely cause.** The Iceberg REST catalog (Polaris) is unreachable, returning
-5xx, or rejecting the bearer token (401/403). SQE wraps catalog calls in a
-circuit breaker; repeated failures trip it open.
+5xx, or rejecting the bearer token (401/403). SQE wraps catalog calls in one
+circuit breaker per token and catalog. Five consecutive upstream faults open
+it for 30 seconds.
+
+Only upstream faults count: 5xx, timeouts, connection failures and 429. A
+401/403, a 404 or another 4xx is a normal answer from a healthy catalog and
+never opens the breaker, so a client probing for schemas or tables that are
+missing or hidden keeps working. `[catalog] circuit_breaker_failure_classes`
+sets the counted classes (`server_error`, `timeout`, `connection`,
+`rate_limited`, `client_error`, `not_found`, `auth`); the default is the first
+four. An opening breaker logs `Circuit breaker opened` with the token's
+`subject` and the `reason` class of the failure that tripped it.
 
 **Diagnosis.**
 

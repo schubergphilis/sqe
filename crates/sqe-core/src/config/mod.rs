@@ -2650,6 +2650,16 @@ pub struct CatalogConfig {
     pub backend: CatalogBackend,
     #[serde(default = "default_cache_ttl")]
     pub metadata_cache_ttl_secs: u64,
+    /// Which catalog failures count toward opening a per-(token, catalog)
+    /// circuit breaker. Classes: `server_error` (5xx, catalog unavailable,
+    /// and anything unrecognised), `timeout`, `connection`, `rate_limited`
+    /// (429), `client_error` (other 4xx), `not_found` (404), `auth` (401/403).
+    /// Default counts upstream faults only: a client probing for objects that
+    /// do not exist, or that it may not see, gets normal answers, and those
+    /// must not lock its token out (dbt `information_schema` checks,
+    /// `read_parquet` name lookups).
+    #[serde(default = "default_breaker_failure_classes")]
+    pub circuit_breaker_failure_classes: Vec<String>,
     /// Whole-request deadline (seconds) for every HTTP call to the catalog,
     /// both SQE's raw HEAD/GET path and iceberg-rust's own requests. A
     /// catalog that accepts TCP and then goes silent used to stall planning
@@ -5255,6 +5265,116 @@ fn default_runtime_filter_inlist_max_size() -> String {
 fn default_stream_idle_timeout() -> u64 {
     300
 }
+fn default_breaker_failure_classes() -> Vec<String> {
+    BreakerFailureClass::DEFAULT_COUNTED
+        .iter()
+        .map(|c| c.as_str().to_string())
+        .collect()
+}
+
+/// Classes of catalog failure, for deciding which ones open a circuit
+/// breaker (`[catalog] circuit_breaker_failure_classes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BreakerFailureClass {
+    ServerError,
+    Timeout,
+    Connection,
+    RateLimited,
+    ClientError,
+    NotFound,
+    Auth,
+}
+
+impl BreakerFailureClass {
+    /// Upstream faults: the default set that counts toward opening.
+    pub const DEFAULT_COUNTED: [BreakerFailureClass; 4] = [
+        BreakerFailureClass::ServerError,
+        BreakerFailureClass::Timeout,
+        BreakerFailureClass::Connection,
+        BreakerFailureClass::RateLimited,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ServerError => "server_error",
+            Self::Timeout => "timeout",
+            Self::Connection => "connection",
+            Self::RateLimited => "rate_limited",
+            Self::ClientError => "client_error",
+            Self::NotFound => "not_found",
+            Self::Auth => "auth",
+        }
+    }
+
+    pub fn parse(name: &str) -> Result<Self, String> {
+        Ok(match name.trim().to_ascii_lowercase().as_str() {
+            "server_error" => Self::ServerError,
+            "timeout" => Self::Timeout,
+            "connection" => Self::Connection,
+            "rate_limited" => Self::RateLimited,
+            "client_error" => Self::ClientError,
+            "not_found" => Self::NotFound,
+            "auth" => Self::Auth,
+            other => {
+                return Err(format!(
+                    "unknown class `{other}` (expected server_error, timeout, connection, \
+                     rate_limited, client_error, not_found or auth)"
+                ))
+            }
+        })
+    }
+
+    /// Classify an HTTP status from the catalog.
+    pub fn from_http_status(status: u16) -> Self {
+        match status {
+            401 | 403 => Self::Auth,
+            404 => Self::NotFound,
+            429 => Self::RateLimited,
+            408 | 504 => Self::Timeout,
+            400..=499 => Self::ClientError,
+            _ => Self::ServerError,
+        }
+    }
+
+    /// Classify a catalog error. Unrecognised errors are `ServerError`, so
+    /// they keep counting as they did before classes existed.
+    pub fn of_error(error: &crate::error::SqeError) -> Self {
+        use crate::error::{SqeError, SqeErrorCode};
+        if let SqeError::CatalogHttp { status, .. } = error {
+            return Self::from_http_status(*status);
+        }
+        let message = error.to_string().to_ascii_lowercase();
+        if message.contains("timed out") || message.contains("timeout") {
+            return Self::Timeout;
+        }
+        match error.error_code() {
+            SqeErrorCode::AuthenticationFailed | SqeErrorCode::AccessDenied => Self::Auth,
+            SqeErrorCode::TableNotFound
+            | SqeErrorCode::ViewNotFound
+            | SqeErrorCode::SchemaNotFound
+            | SqeErrorCode::CatalogNotFound
+            | SqeErrorCode::ColumnNotFound
+            | SqeErrorCode::FunctionNotFound => Self::NotFound,
+            SqeErrorCode::DuplicateTable
+            | SqeErrorCode::DuplicateColumn
+            | SqeErrorCode::InvalidArguments
+            | SqeErrorCode::SyntaxError
+            | SqeErrorCode::ParseError
+            | SqeErrorCode::SemanticError => Self::ClientError,
+            SqeErrorCode::ResourceExhausted => Self::RateLimited,
+            SqeErrorCode::QueryTimeout => Self::Timeout,
+            _ if message.contains("error sending request")
+                || message.contains("connection")
+                || message.contains("connect error")
+                || message.contains("dns error") =>
+            {
+                Self::Connection
+            }
+            _ => Self::ServerError,
+        }
+    }
+}
+
 fn default_max_query_memory() -> String {
     "256MB".to_string()
 }
@@ -5491,6 +5611,11 @@ impl SqeConfig {
             errors.push(error);
         }
         self.validate_ticket_keys(&mut errors);
+        for class in &self.catalog.circuit_breaker_failure_classes {
+            if let Err(e) = BreakerFailureClass::parse(class) {
+                errors.push(format!("catalog.circuit_breaker_failure_classes: {e}"));
+            }
+        }
         for entry in &self.security.trusted_proxies {
             if let Err(e) = TrustedProxy::parse(entry) {
                 errors.push(format!("security.trusted_proxies: {e}"));
@@ -7278,6 +7403,7 @@ partial_progress_batch = 5
                 warehouse: "wh".to_string(),
                 backend: CatalogBackend::default(),
                 metadata_cache_ttl_secs: 30,
+                circuit_breaker_failure_classes: default_breaker_failure_classes(),
                 request_timeout_secs: 30,
                 connect_timeout_secs: 5,
                 authorization_recheck_secs: 10,
@@ -8643,6 +8769,7 @@ s3_secret_key = "configured-secret"
                 warehouse: "main".to_string(),
                 backend: CatalogBackend::default(),
                 metadata_cache_ttl_secs: 30,
+                circuit_breaker_failure_classes: default_breaker_failure_classes(),
                 request_timeout_secs: 30,
                 connect_timeout_secs: 5,
                 authorization_recheck_secs: 10,
@@ -8678,6 +8805,7 @@ s3_secret_key = "configured-secret"
                     warehouse: name.to_string(),
                     backend: CatalogBackend::default(),
                     metadata_cache_ttl_secs: 30,
+                    circuit_breaker_failure_classes: default_breaker_failure_classes(),
                     request_timeout_secs: 30,
                     connect_timeout_secs: 5,
                     authorization_recheck_secs: 10,
@@ -8720,6 +8848,7 @@ s3_secret_key = "configured-secret"
                 warehouse: "s3://wh/".to_string(),
                 backend: CatalogBackend::default(),
                 metadata_cache_ttl_secs: 30,
+                circuit_breaker_failure_classes: default_breaker_failure_classes(),
                 request_timeout_secs: 30,
                 connect_timeout_secs: 5,
                 authorization_recheck_secs: 10,
@@ -10397,6 +10526,51 @@ audience = "polaris"
             assert!(check_remote(&policy, destination).is_ok(), "{destination}");
             assert!(policy.check_endpoint(destination).is_ok(), "{destination}");
         }
+    }
+
+    // --- circuit breaker failure classes ---
+
+    #[test]
+    fn breaker_failure_classes_classify_errors() {
+        use crate::error::{CatalogOp, SqeError, SqeErrorCode};
+        let http = |status| SqeError::CatalogHttp { status, op: CatalogOp::LoadTable, body: String::new() };
+        assert_eq!(BreakerFailureClass::of_error(&http(404)), BreakerFailureClass::NotFound);
+        assert_eq!(BreakerFailureClass::of_error(&http(403)), BreakerFailureClass::Auth);
+        assert_eq!(BreakerFailureClass::of_error(&http(401)), BreakerFailureClass::Auth);
+        assert_eq!(BreakerFailureClass::of_error(&http(409)), BreakerFailureClass::ClientError);
+        assert_eq!(BreakerFailureClass::of_error(&http(429)), BreakerFailureClass::RateLimited);
+        assert_eq!(BreakerFailureClass::of_error(&http(502)), BreakerFailureClass::ServerError);
+        assert_eq!(BreakerFailureClass::of_error(&http(504)), BreakerFailureClass::Timeout);
+        assert_eq!(
+            BreakerFailureClass::of_error(&SqeError::with_code(SqeErrorCode::TableNotFound, "t")),
+            BreakerFailureClass::NotFound
+        );
+        assert_eq!(
+            BreakerFailureClass::of_error(&SqeError::Catalog("request timed out".into())),
+            BreakerFailureClass::Timeout
+        );
+        assert_eq!(
+            BreakerFailureClass::of_error(&SqeError::Catalog("error sending request for url".into())),
+            BreakerFailureClass::Connection
+        );
+        // Unrecognised errors keep counting, as before classes existed.
+        assert_eq!(
+            BreakerFailureClass::of_error(&SqeError::Catalog("unexpected body".into())),
+            BreakerFailureClass::ServerError
+        );
+    }
+
+    #[test]
+    fn breaker_failure_classes_default_and_validation() {
+        let cfg = valid_config();
+        assert_eq!(
+            cfg.catalog.circuit_breaker_failure_classes,
+            vec!["server_error", "timeout", "connection", "rate_limited"]
+        );
+        let mut cfg = valid_config();
+        cfg.catalog.circuit_breaker_failure_classes = vec!["server_error".into(), "4xx".into()];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("catalog.circuit_breaker_failure_classes: unknown class `4xx`"), "{err}");
     }
 
     // --- trusted_proxies CIDR ranges ---
