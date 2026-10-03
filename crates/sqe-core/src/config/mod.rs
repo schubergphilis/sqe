@@ -2660,6 +2660,22 @@ pub struct CatalogConfig {
     /// `read_parquet` name lookups).
     #[serde(default = "default_breaker_failure_classes")]
     pub circuit_breaker_failure_classes: Vec<String>,
+    /// Object-store prefixes that file TVFs (`read_parquet`, `read_csv`,
+    /// `read_json`) may read with the engine's storage credentials, in
+    /// sessions scoped to THIS catalog only. Added to the global
+    /// `[storage.tvf] allowed_object_store_prefixes`, never replacing it.
+    /// A session is scoped to the catalog it resolves as its default: the
+    /// one it names (`X-Trino-Catalog`, `USE`, the Flight catalog), or the
+    /// config default when it names none. Same matching and `{user}`
+    /// placeholder as the global list. Lets one coordinator serve several
+    /// workspaces, each reading only its own staging buckets:
+    ///
+    /// ```toml
+    /// [catalogs.ws_energy]
+    /// tvf_prefixes = ["s3://ws-energy-landing/"]
+    /// ```
+    #[serde(default)]
+    pub tvf_prefixes: Vec<String>,
     /// Whole-request deadline (seconds) for every HTTP call to the catalog,
     /// both SQE's raw HEAD/GET path and iceberg-rust's own requests. A
     /// catalog that accepts TCP and then goes silent used to stall planning
@@ -3219,6 +3235,12 @@ pub struct TvfCaller {
     /// grepping the token `trusted: true` (or either constructor's name)
     /// finds every place that ever sets it -- there is no other way to.
     pub trusted: bool,
+    /// The catalog this caller's session is scoped to, for denial messages.
+    /// `None` outside a catalog-scoped session.
+    pub scope_catalog: Option<String>,
+    /// That catalog's `[catalogs.<name>] tvf_prefixes`: allowed on top of
+    /// the global `allowed_object_store_prefixes`, for this caller only.
+    pub catalog_prefixes: Vec<String>,
 }
 
 impl TvfCaller {
@@ -3228,7 +3250,18 @@ impl TvfCaller {
             username: Some(username),
             roles,
             trusted: false,
+            scope_catalog: None,
+            catalog_prefixes: Vec::new(),
         }
+    }
+
+    /// Scope this caller to `catalog`, whose `tvf_prefixes` it may then read
+    /// in addition to the global list. A session scoped to another catalog
+    /// never sees them.
+    pub fn with_catalog_scope(mut self, catalog: &str, prefixes: &[String]) -> Self {
+        self.scope_catalog = Some(catalog.to_string());
+        self.catalog_prefixes = prefixes.to_vec();
+        self
     }
 
     /// Trusted local caller (embedded CLI). Object-store prefix gating is
@@ -3238,6 +3271,8 @@ impl TvfCaller {
             username: None,
             roles: Vec::new(),
             trusted: true,
+            scope_catalog: None,
+            catalog_prefixes: Vec::new(),
         }
     }
 
@@ -3270,6 +3305,8 @@ impl TvfCaller {
             username: None,
             roles: Vec::new(),
             trusted: true,
+            scope_catalog: None,
+            catalog_prefixes: Vec::new(),
         }
     }
 }
@@ -3327,6 +3364,24 @@ fn canonicalize_object_url(path: &str) -> Result<String, String> {
         }
     }
     Ok(out)
+}
+
+/// A `tvf_prefixes` entry must be an object-store URL with a bucket that
+/// survives [`canonicalize_object_url`]; anything else would never match.
+fn validate_tvf_prefix(prefix: &str) -> Result<(), String> {
+    const SCHEMES: &[&str] = &[
+        "s3://", "s3a://", "abfss://", "abfs://", "azure://", "az://", "gs://", "gcs://",
+    ];
+    let lower = prefix.to_ascii_lowercase();
+    let Some(scheme) = SCHEMES.iter().find(|s| lower.starts_with(**s)) else {
+        return Err(format!(
+            "'{prefix}' is not an object-store URL (s3://, abfss://, gs://, ...)"
+        ));
+    };
+    if prefix[scheme.len()..].trim_matches('/').is_empty() {
+        return Err(format!("'{prefix}' names no bucket"));
+    }
+    canonicalize_object_url(prefix).map(|_| ())
 }
 
 /// `true` when `path` falls under `prefix` on a path-segment boundary.
@@ -3460,7 +3515,13 @@ impl TvfPolicy {
                 return Err(e);
             }
         };
-        for raw_prefix in &self.allowed_object_store_prefixes {
+        // The session catalog's own prefixes widen the global list for this
+        // caller only; a session scoped to another catalog never carries them.
+        for raw_prefix in self
+            .allowed_object_store_prefixes
+            .iter()
+            .chain(&caller.catalog_prefixes)
+        {
             let Some(substituted) =
                 substitute_user_placeholder(raw_prefix, caller.username.as_deref())
             else {
@@ -3479,9 +3540,19 @@ impl TvfPolicy {
         tracing::warn!(
             principal = %principal,
             path = %path,
+            scope_catalog = caller.scope_catalog.as_deref().unwrap_or(""),
             "TVF object-store access denied: no matching \
-             `[storage.tvf] allowed_object_store_prefixes` entry"
+             `[storage.tvf] allowed_object_store_prefixes` or catalog \
+             `tvf_prefixes` entry"
         );
+        let catalog_hint = match caller.scope_catalog.as_deref() {
+            Some(catalog) => format!(
+                " This session is scoped to catalog '{catalog}', whose \
+                 `[catalogs.{catalog}] tvf_prefixes` add {} more.",
+                caller.catalog_prefixes.len()
+            ),
+            None => String::new(),
+        };
         let inline_hint = if self.allow_inline_credentials {
             ", or pass complete inline credentials (e.g. access_key/secret_key) \
              so the engine's storage key is not used"
@@ -3492,7 +3563,7 @@ impl TvfPolicy {
         Err(format!(
             "TVF: object-store path '{path}' denied for user '{principal}'. \
              Reads with the engine's storage credentials are limited to \
-             `[storage.tvf] allowed_object_store_prefixes` ({} configured). \
+             `[storage.tvf] allowed_object_store_prefixes` ({} configured).{catalog_hint} \
              Add a matching prefix (the `{{user}}` placeholder expands to the \
              authenticated username), grant a role listed in \
              `[storage.tvf] object_store_admin_roles`{inline_hint}.",
@@ -5611,6 +5682,22 @@ impl SqeConfig {
             errors.push(error);
         }
         self.validate_ticket_keys(&mut errors);
+        // A per-catalog TVF prefix that cannot match anything is a typo, not
+        // a policy: fail here rather than skip it silently at query time.
+        let mut catalogs: Vec<(String, &CatalogConfig)> = self
+            .catalogs
+            .iter()
+            .map(|(name, c)| (format!("[catalogs.{name}]"), c))
+            .collect();
+        catalogs.sort_by(|a, b| a.0.cmp(&b.0));
+        catalogs.insert(0, ("[catalog]".to_string(), &self.catalog));
+        for (section, catalog) in catalogs {
+            for prefix in &catalog.tvf_prefixes {
+                if let Err(e) = validate_tvf_prefix(prefix) {
+                    errors.push(format!("{section} tvf_prefixes: {e}"));
+                }
+            }
+        }
         for class in &self.catalog.circuit_breaker_failure_classes {
             if let Err(e) = BreakerFailureClass::parse(class) {
                 errors.push(format!("catalog.circuit_breaker_failure_classes: {e}"));
@@ -7404,6 +7491,7 @@ partial_progress_batch = 5
                 backend: CatalogBackend::default(),
                 metadata_cache_ttl_secs: 30,
                 circuit_breaker_failure_classes: default_breaker_failure_classes(),
+                tvf_prefixes: Vec::new(),
                 request_timeout_secs: 30,
                 connect_timeout_secs: 5,
                 authorization_recheck_secs: 10,
@@ -8770,6 +8858,7 @@ s3_secret_key = "configured-secret"
                 backend: CatalogBackend::default(),
                 metadata_cache_ttl_secs: 30,
                 circuit_breaker_failure_classes: default_breaker_failure_classes(),
+                tvf_prefixes: Vec::new(),
                 request_timeout_secs: 30,
                 connect_timeout_secs: 5,
                 authorization_recheck_secs: 10,
@@ -8806,6 +8895,7 @@ s3_secret_key = "configured-secret"
                     backend: CatalogBackend::default(),
                     metadata_cache_ttl_secs: 30,
                     circuit_breaker_failure_classes: default_breaker_failure_classes(),
+                    tvf_prefixes: Vec::new(),
                     request_timeout_secs: 30,
                     connect_timeout_secs: 5,
                     authorization_recheck_secs: 10,
@@ -8849,6 +8939,7 @@ s3_secret_key = "configured-secret"
                 backend: CatalogBackend::default(),
                 metadata_cache_ttl_secs: 30,
                 circuit_breaker_failure_classes: default_breaker_failure_classes(),
+                tvf_prefixes: Vec::new(),
                 request_timeout_secs: 30,
                 connect_timeout_secs: 5,
                 authorization_recheck_secs: 10,
@@ -10124,6 +10215,84 @@ audience = "polaris"
         }
         // hf:// stays open — no engine storage credentials involved.
         assert!(check_remote(&policy, "hf://datasets/foo/bar/x").is_ok());
+    }
+
+    /// A prefix allowed for catalog A is rejected for a caller scoped to
+    /// catalog B, and the global list still applies to both.
+    #[test]
+    fn tvf_catalog_prefixes_apply_only_to_their_catalog() {
+        let policy = TvfPolicy {
+            allowed_object_store_prefixes: vec!["s3://shared-landing/".to_string()],
+            ..TvfPolicy::default()
+        };
+        let a_prefixes = vec!["s3://ws-a-landing/".to_string()];
+        let in_a = caller("alice").with_catalog_scope("ws_a", &a_prefixes);
+        let in_b = caller("alice").with_catalog_scope("ws_b", &["s3://ws-b-landing/".to_string()]);
+
+        policy
+            .check_path("s3://ws-a-landing/2026/x.parquet", &in_a, false)
+            .expect("catalog A's prefix in a session scoped to A");
+        let err = policy
+            .check_path("s3://ws-a-landing/2026/x.parquet", &in_b, false)
+            .unwrap_err();
+        assert!(
+            err.contains("scoped to catalog 'ws_b'") && err.contains("[catalogs.ws_b] tvf_prefixes"),
+            "denial names the session catalog: {err}"
+        );
+        // Unscoped callers see the global list only.
+        assert!(policy
+            .check_path("s3://ws-a-landing/2026/x.parquet", &caller("alice"), false)
+            .is_err());
+        // The global list holds in every scope.
+        for c in [&in_a, &in_b] {
+            policy
+                .check_path("s3://shared-landing/x.csv", c, false)
+                .expect("global prefix");
+        }
+        // Same segment-boundary matching as the global list.
+        assert!(policy
+            .check_path("s3://ws-a-landing-evil/x.parquet", &in_a, false)
+            .is_err());
+    }
+
+    #[test]
+    fn tvf_catalog_prefixes_expand_the_user_placeholder() {
+        let policy = TvfPolicy::default();
+        let scoped = |user: &str| {
+            caller(user).with_catalog_scope("ws_a", &["s3://ws-a-scratch/{user}/".to_string()])
+        };
+        policy
+            .check_path("s3://ws-a-scratch/alice/x.csv", &scoped("alice"), false)
+            .expect("own scratch area");
+        assert!(policy
+            .check_path("s3://ws-a-scratch/alice/x.csv", &scoped("bob"), false)
+            .is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_malformed_catalog_tvf_prefixes() {
+        let mut config = valid_config();
+        config.catalog.tvf_prefixes = vec!["s3://ok-bucket/landing/".to_string()];
+        config.validate().expect("well-formed prefix");
+        for (bad, expected) in [
+            ("/data/landing", "is not an object-store URL"),
+            ("https://example.org/x", "is not an object-store URL"),
+            ("s3://", "names no bucket"),
+            ("s3://bucket/../other", "dot path segment"),
+        ] {
+            config.catalog.tvf_prefixes = vec![bad.to_string()];
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("[catalog] tvf_prefixes") && err.contains(expected),
+                "{bad}: {err}"
+            );
+        }
+        config.catalog.tvf_prefixes.clear();
+        let mut ws = config.catalog.clone();
+        ws.tvf_prefixes = vec!["landing/".to_string()];
+        config.catalogs.insert("ws_a".to_string(), ws);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("[catalogs.ws_a] tvf_prefixes"), "{err}");
     }
 
     #[test]

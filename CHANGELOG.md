@@ -18,6 +18,20 @@ All notable changes to SQE are documented in this file.
 
 ### Added
 
+- File TVFs: per-catalog object-store prefixes, `[catalogs.<name>] tvf_prefixes`
+
+    `read_parquet`, `read_csv` and `read_json` could only be allowed paths
+    through the global `[storage.tvf] allowed_object_store_prefixes`, so a
+    coordinator serving several workspaces let every workspace read every
+    other workspace's landing bucket with the engine's credentials. A
+    catalog's `tvf_prefixes` now apply on top of the global list, only in
+    sessions scoped to that catalog (the session's resolved default
+    catalog). A prefix allowed for catalog A is refused in a session on
+    catalog B, with an error naming the session catalog. Discovered Polaris
+    warehouses add none, and Hive external tables keep using the global list.
+    Entries that are not object-store URLs with a bucket fail config
+    validation.
+
 - Trino HTTP: `[coordinator] public_base_url`; https `nextUri` behind a TLS ingress
 
     Behind a TLS-terminating ingress that was not listed in

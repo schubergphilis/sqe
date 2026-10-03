@@ -142,6 +142,9 @@ trust_sort_order = false        # Trust Iceberg sort order for all columns, not 
 small_file_threshold_mb = 3     # Max file size for the direct-read fast path (0 to disable)
 parquet_compression = "zstd"    # Write-path Parquet codec: zstd, lz4, snappy, none
 require_vended_credentials = false # When true, FileIO never gets [storage] keys (issue #395)
+tvf_prefixes = []               # Extra object-store prefixes file TVFs may read in sessions
+                                # scoped to THIS catalog only; added to [storage.tvf]
+                                # allowed_object_store_prefixes. Also on [catalogs.<name>].
 
 # `catalog_url` accepts any Iceberg REST endpoint. SQE has been
 # verified live against Apache Polaris, Project Nessie 0.107+,
