@@ -542,6 +542,13 @@ so `ConnectInfo<SocketAddr>` is always present for real TCP connections. If
 `[security] trusted_proxies` is configured, the XFF header is honoured with the same
 rightmost-untrusted-hop rule used by the Flight SQL and Quack paths.
 
+`trusted_proxies` takes exact addresses and CIDR ranges, IPv4 and IPv6
+(`["10.42.0.0/16", "fd00::/8"]`). An IPv4 peer reported as IPv4-mapped IPv6
+by a dual-stack listener matches IPv4 entries. A range trusts every address
+in it: any of them can set `X-Forwarded-For` and so choose the client IP that
+lands in the audit record. Keep the range as narrow as the ingress allows.
+An entry that is neither an address nor a range fails config validation.
+
 ### Field consistency
 
 Audit and trace emit sites use the following canonical field names:
