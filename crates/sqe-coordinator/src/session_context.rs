@@ -775,10 +775,9 @@ pub async fn create_session_context(
             // (with `{user}` substitution) or the caller holds a role in
             // `object_store_admin_roles`. Calls carrying complete inline
             // credentials bypass the gate (the engine key is not used).
-            let tvf_caller = sqe_core::config::TvfCaller::for_user(
-                session.user.username.clone(),
-                session.user.roles.clone(),
-            );
+            // Scoped to the session's resolved catalog, so that catalog's
+            // `tvf_prefixes` apply and every other catalog's do not.
+            let tvf_caller = tvf_caller_for(session, &flattened, &default_catalog);
             // Registered through `FileTableFunctions::register`, not
             // `ctx.register_udtf`: the file readers build their provider on
             // the async path (`prepare_statement`, called by every planner
@@ -946,6 +945,33 @@ pub(crate) fn discovery_template(config: &SqeConfig) -> Option<sqe_core::config:
             }
             per_user
         })
+        // The template's TVF prefixes belong to the template catalog, not to
+        // a warehouse the caller named.
+        .map(|mut c| {
+            c.tvf_prefixes.clear();
+            c
+        })
+}
+
+/// The file-TVF caller for `session`, scoped to `default_catalog` (the
+/// catalog the session resolved to). That catalog's `[catalogs.<name>]
+/// tvf_prefixes` join the global list; a catalog not in config (a
+/// discovered warehouse) adds none.
+fn tvf_caller_for(
+    session: &Session,
+    flattened: &[(String, sqe_core::config::CatalogConfig)],
+    default_catalog: &str,
+) -> sqe_core::config::TvfCaller {
+    let prefixes = flattened
+        .iter()
+        .find(|(name, _)| name == default_catalog)
+        .map(|(_, c)| c.tvf_prefixes.as_slice())
+        .unwrap_or_default();
+    sqe_core::config::TvfCaller::for_user(
+        session.user.username.clone(),
+        session.user.roles.clone(),
+    )
+    .with_catalog_scope(default_catalog, prefixes)
 }
 
 /// Attempt to resolve `warehouse` as a Polaris catalog and build its
@@ -1207,6 +1233,129 @@ s3_path_style = true
             token: "engine-token".to_string(),
         });
         assert!(discovery_template(&config).is_none());
+    }
+
+    fn two_workspace_config() -> SqeConfig {
+        let toml_text = r#"
+[coordinator]
+flight_sql_port = 0
+trino_http_port = 0
+
+[auth]
+token_endpoint = "http://127.0.0.1:9/unused"
+client_id = "test_client"
+
+[catalog]
+
+[catalogs.ws_a]
+catalog_url = "https://polaris.example.com"
+warehouse = "ws_a"
+tvf_prefixes = ["s3://ws-a-landing/"]
+
+[catalogs.ws_b]
+catalog_url = "https://polaris.example.com"
+warehouse = "ws_b"
+tvf_prefixes = ["s3://ws-b-landing/"]
+
+[storage]
+s3_endpoint = "http://127.0.0.1:9"
+s3_access_key = "_"
+s3_secret_key = "_"
+s3_region = "us-east-1"
+s3_path_style = true
+
+[storage.tvf]
+allowed_object_store_prefixes = ["s3://shared-landing/"]
+"#;
+        toml::from_str::<SqeConfig>(toml_text).expect("test config parses")
+    }
+
+    fn alice() -> Session {
+        Session::new(
+            "alice".to_string(),
+            sqe_core::SecretString::new("token".to_string()),
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            vec![],
+        )
+    }
+
+    /// The caller is scoped to the session's resolved catalog: catalog A's
+    /// `tvf_prefixes` hold in A, not in B; the global list holds in both; a
+    /// catalog not in config (a discovered warehouse) adds nothing.
+    #[test]
+    fn tvf_caller_carries_only_the_session_catalogs_prefixes() {
+        let config = two_workspace_config();
+        let flattened: Vec<(String, sqe_core::config::CatalogConfig)> = config
+            .flattened_catalogs()
+            .into_iter()
+            .map(|(n, c)| (n, c.clone()))
+            .collect();
+        let policy = &config.storage.tvf;
+        let a_file = "s3://ws-a-landing/2026/x.parquet";
+
+        let in_a = tvf_caller_for(&alice(), &flattened, "ws_a");
+        policy.check_path(a_file, &in_a, false).expect("A's prefix in A");
+
+        let in_b = tvf_caller_for(&alice(), &flattened, "ws_b");
+        let err = policy.check_path(a_file, &in_b, false).unwrap_err();
+        assert!(err.contains("scoped to catalog 'ws_b'"), "{err}");
+        policy
+            .check_path("s3://ws-b-landing/x.parquet", &in_b, false)
+            .expect("B's prefix in B");
+
+        let discovered = tvf_caller_for(&alice(), &flattened, "polaris_wh");
+        assert!(discovered.catalog_prefixes.is_empty());
+        assert!(policy.check_path(a_file, &discovered, false).is_err());
+        for c in [&in_a, &in_b, &discovered] {
+            policy
+                .check_path("s3://shared-landing/x.csv", c, false)
+                .expect("global prefix holds everywhere");
+        }
+    }
+
+    /// End to end through `read_parquet`: a query in a session scoped to
+    /// catalog B is refused catalog A's bucket at planning, before any I/O.
+    #[tokio::test]
+    async fn read_parquet_in_catalog_b_rejects_catalog_a_prefix() {
+        use sqe_catalog::file_tvf_prepare::FileTableFunctions;
+
+        let config = two_workspace_config();
+        let flattened: Vec<(String, sqe_core::config::CatalogConfig)> = config
+            .flattened_catalogs()
+            .into_iter()
+            .map(|(n, c)| (n, c.clone()))
+            .collect();
+        let ctx = SessionContext::new();
+        FileTableFunctions::register(
+            &ctx,
+            "read_parquet",
+            Arc::new(sqe_catalog::read_parquet::ReadParquetFunction::with_caller(
+                config.storage.clone(),
+                tvf_caller_for(&alice(), &flattened, "ws_b"),
+            )),
+        );
+        let err = sqe_catalog::file_tvf_prepare::prepare_statement(
+            &ctx,
+            "SELECT * FROM read_parquet('s3://ws-a-landing/2026/x.parquet')",
+        )
+        .await
+        .expect_err("catalog A's prefix must not open in catalog B");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("denied") && msg.contains("scoped to catalog 'ws_b'"),
+            "{msg}"
+        );
+    }
+
+    /// The discovery template must not hand its catalog's TVF prefixes to a
+    /// warehouse the caller named.
+    #[test]
+    fn discovery_template_drops_tvf_prefixes() {
+        let mut config = test_config_rest();
+        config.catalog.tvf_prefixes = vec!["s3://template-landing/".to_string()];
+        let tmpl = discovery_template(&config).expect("REST template");
+        assert!(tmpl.tvf_prefixes.is_empty());
     }
 
     /// Issue #240: the session-context cache must hold well beyond the old cap
