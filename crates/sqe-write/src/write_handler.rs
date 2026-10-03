@@ -1484,7 +1484,7 @@ impl WriteHandler {
         let (df, policy_summary) = sqe_core::runtime::on_planning_stack(async {
             let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, select_sql)
                 .await
-                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
+                .map_err(SqeError::planning)?;
 
             // Enforce policy on the source SELECT so masks and restrictions
             // shape the target table. Without this, CTAS over a masked table
@@ -1973,7 +1973,7 @@ impl WriteHandler {
 
         let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &effective_sql)
             .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
+            .map_err(SqeError::planning)?;
 
         // 505: fail a mis-shaped INSERT here, at planning time, before the
         // stream starts and before the writer opens its first parquet part.
