@@ -58,6 +58,10 @@ pub enum ChaosMode {
     /// Sleep this long before every frame: a straggler, or a stream that is
     /// still producing rows when the query deadline passes.
     DelayPerFrame(Duration),
+    /// `DelayPerFrame` on this worker's first `do_get` only; later fragments
+    /// pass through. Exactly one slow fragment, however many the scheduler
+    /// hands this worker, so a straggler test does not depend on placement.
+    DelayFirstFragment(Duration),
 }
 
 /// The wrapped worker as a trait object: a compile firewall, keep it. Held
@@ -209,8 +213,14 @@ impl FlightService for ChaosWorker {
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let shared = &self.shared;
-        shared.do_gets.fetch_add(1, Ordering::SeqCst);
-        let mode = shared.mode.lock().unwrap().clone();
+        let earlier_do_gets = shared.do_gets.fetch_add(1, Ordering::SeqCst);
+        let mode = match shared.mode.lock().unwrap().clone() {
+            ChaosMode::DelayFirstFragment(delay) if earlier_do_gets == 0 => {
+                ChaosMode::DelayPerFrame(delay)
+            }
+            ChaosMode::DelayFirstFragment(_) => ChaosMode::PassThrough,
+            mode => mode,
+        };
 
         if let ChaosMode::Hang = mode {
             // The request is fully received and never answered. tonic drops
@@ -232,7 +242,10 @@ impl FlightService for ChaosWorker {
         });
 
         let stream: BoxStream<FlightData> = match mode {
-            ChaosMode::PassThrough | ChaosMode::Hang => counted.boxed(),
+            // DelayFirstFragment was resolved to one of the others above.
+            ChaosMode::PassThrough | ChaosMode::Hang | ChaosMode::DelayFirstFragment(_) => {
+                counted.boxed()
+            }
             ChaosMode::FailAfterFrames(n) => counted
                 .enumerate()
                 .take(n + 1)
