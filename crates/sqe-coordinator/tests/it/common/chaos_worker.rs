@@ -141,11 +141,18 @@ impl Drop for ChaosHandle {
 /// production `WorkerFlightService` over a default worker runtime; it reads
 /// object storage with the credentials the ticket carries.
 pub async fn spawn_chaos_worker(mode: ChaosMode) -> ChaosHandle {
+    // Bind first: the worker must advertise the URL the coordinator dials.
+    // Scan tickets carry that URL as their audience, and a worker refuses a
+    // ticket addressed elsewhere (#724).
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind chaos worker");
+    let addr = listener.local_addr().expect("local addr");
+    let url = format!("http://{}", addr);
+
     let worker_config = sqe_core::config::WorkerConfig::default();
     let (session_ctx, _pool) = sqe_worker::runtime::build_session_context(&worker_config)
         .expect("worker session context");
     let metrics = Arc::new(WorkerMetricsRegistry::new().expect("worker metrics"));
-    let inner = WorkerFlightService::new(metrics, session_ctx);
+    let inner = WorkerFlightService::new(metrics, session_ctx).with_advertise_url(url.clone());
 
     let worker = ChaosWorker {
         shared: Arc::new(Shared {
@@ -157,9 +164,6 @@ pub async fn spawn_chaos_worker(mode: ChaosMode) -> ChaosHandle {
         }),
     };
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind chaos worker");
-    let addr = listener.local_addr().expect("local addr");
-    let url = format!("http://{}", addr);
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let service = worker.clone();
     let task = tokio::spawn(async move {
