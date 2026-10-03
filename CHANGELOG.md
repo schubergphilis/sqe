@@ -6,6 +6,16 @@ All notable changes to SQE are documented in this file.
 
 ### Fixed
 
+- Writes: a one-off catalog 401 at commit no longer discards the write
+
+    The table reload inside an Iceberg commit was not retried, so a single
+    401 from a token that was valid before and after ended a long CTAS or
+    INSERT and rolled it back. A failed commit attempt now runs again when
+    the catalog never applied it: a 401 (rejected before it was read) or a
+    transient failure of that reload. A commit whose outcome is unknown (a
+    5xx on the commit itself) is still never retried, so data is not
+    appended twice.
+
 - Errors: planning failures report their real error code
 
     A missing table, an unknown function or an argument type mismatch came

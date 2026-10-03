@@ -69,7 +69,7 @@ where
                 return Ok(t);
             }
             Err(e) => {
-                let retryable = e.retryable() || is_conflict_message(&e.to_string());
+                let retryable = commit_attempt_is_retryable(&e);
                 if !retryable || attempt == MAX_ATTEMPTS {
                     last_err = Some(e);
                     break;
@@ -94,6 +94,30 @@ where
             "commit_with_retry exhausted attempts without capturing an error",
         )
     }))
+}
+
+/// Whether a failed commit attempt may run again: the catalog never applied
+/// it.
+///
+/// - a commit conflict or an error tagged retryable;
+/// - a 401 on any request: the catalog authenticates before it reads the
+///   request, so nothing was committed (sqe#803: one 401 from a token that
+///   worked minutes before and again 60 ms after);
+/// - a transient failure of the table reload `Transaction::commit` does
+///   before it posts the update (a read; same text as the reload above).
+///
+/// Never a 5xx from the commit POST itself: its outcome is unknown ("the
+/// commit state is unknown"), and running it again could append the same
+/// data files twice.
+fn commit_attempt_is_retryable(e: &iceberg::Error) -> bool {
+    let msg = e.to_string().to_lowercase();
+    if msg.contains("commit state is unknown") {
+        return false;
+    }
+    e.retryable()
+        || is_conflict_message(&msg)
+        || msg.contains("status: 401")
+        || (msg.contains("failed to load table") && is_transient_load_error(e))
 }
 
 /// Load attempts for the table reload that opens each commit attempt.
@@ -185,6 +209,35 @@ mod tests {
         ));
         assert!(!is_transient_load_error(&http_error("404 Not Found")));
         assert!(!is_transient_load_error(&http_error("403 Forbidden")));
+    }
+
+    /// sqe#803: the 401 can come from the reload inside `Transaction::commit`,
+    /// which used to end the write. A 401 or a failed reload is retried; a
+    /// commit whose outcome is unknown never is.
+    #[test]
+    fn commit_attempts_retry_auth_and_reload_failures_but_never_an_unknown_commit() {
+        // The reload inside Transaction::commit (SQE's load_table wrapper).
+        assert!(commit_attempt_is_retryable(&http_error("401 Unauthorized")));
+        assert!(commit_attempt_is_retryable(&http_error("503 Service Unavailable")));
+        // A 401 on the update itself: rejected before it was read.
+        let update_401 = iceberg::Error::new(iceberg::ErrorKind::Unexpected, "Received response with unexpected status code")
+            .with_context("status", "401 Unauthorized");
+        assert!(commit_attempt_is_retryable(&update_401));
+        // Conflicts keep retrying, as before.
+        let conflict = iceberg::Error::new(iceberg::ErrorKind::CatalogCommitConflicts, "Commit conflict")
+            .with_retryable(true);
+        assert!(commit_attempt_is_retryable(&conflict));
+        // A 5xx from the commit POST: state unknown, never again.
+        for text in [
+            "An unknown server-side problem occurred; the commit state is unknown.",
+            "A server-side gateway timeout occurred; the commit state is unknown.",
+        ] {
+            let unknown = iceberg::Error::new(iceberg::ErrorKind::Unexpected, text);
+            assert!(!commit_attempt_is_retryable(&unknown), "{text}");
+        }
+        // Not transient.
+        assert!(!commit_attempt_is_retryable(&http_error("403 Forbidden")));
+        assert!(!commit_attempt_is_retryable(&http_error("404 Not Found")));
     }
 
     #[tokio::test]
