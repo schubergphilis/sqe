@@ -25,6 +25,41 @@ The Trino HTTP listener runs alongside Flight SQL. The default port is `8080`
 trino_http_port = 8080    # 0 to disable
 ```
 
+### Behind a TLS-terminating ingress
+
+The listener speaks plain HTTP. Every response carries a `nextUri` that the
+client follows with its bearer token, so that URI must point at the public
+https address, not at the plain listener. SQE builds it from the request in
+one of two ways.
+
+Trust the ingress by address. List its IPs or its range in
+`[security] trusted_proxies`. A trusted peer's `X-Forwarded-Proto`,
+`X-Forwarded-Host` and `X-Forwarded-Port` then shape the URI, and a forwarded
+`https` always yields https:
+
+```toml
+[security]
+trusted_proxies = ["10.42.0.0/16"]   # exact IPs or CIDR ranges, IPv4 or IPv6
+```
+
+Name the public URL instead, when the ingress IPs cannot be pinned:
+
+```toml
+[coordinator]
+public_base_url = "https://sql.example.org"
+```
+
+SQE uses `public_base_url` only for requests addressed to its host. A client
+inside the cluster calling `http://sqe.sqe:8080` keeps getting URIs on
+`http://sqe.sqe:8080`. Without either setting, a proxied request gets an
+`http://` URI, and clients send their token in cleartext to port 80 before
+the ingress redirects them.
+
+Trusting a range trusts every peer in it. Any of them can set
+`X-Forwarded-For`, which becomes the audited client IP, and the forwarded
+scheme and host. Keep the range as narrow as the ingress allows. Invalid
+entries and a malformed `public_base_url` stop the server at startup.
+
 ### Run
 
 ```bash

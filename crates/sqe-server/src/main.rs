@@ -2336,6 +2336,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         let trino_opts = sqe_trino_compat::server::TrinoServerOptions {
             security: config.security.clone(),
             expose_version: false,
+            public_base_url: config.coordinator.public_base_url.clone(),
         };
         sqe_trino_compat::server::start_trino_server_with_options(
             auth_adapter,
