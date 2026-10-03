@@ -7181,6 +7181,7 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "axum",
+ "axum-server",
  "base64 0.23.1",
  "chrono",
  "datafusion",
