@@ -42,6 +42,11 @@ allow_http = false
 allowed_object_store_prefixes = ["s3://your-warehouse/"]
 ```
 
+Keep the global list to what every user may read. A bucket that belongs to
+one workspace goes in that catalog's `tvf_prefixes` instead, so only sessions
+scoped to that catalog can read it with the engine's credentials (see
+[read_parquet](../features/read-parquet.md#which-paths-the-engines-credentials-may-read)).
+
 ### Memory
 
 ```toml
