@@ -129,8 +129,7 @@ pub async fn handle_insert(
         .keep_partition_by_columns = false;
 
     let state = ctx.state();
-    let plan = state
-        .create_logical_plan(sql)
+    let plan = sqe_catalog::file_tvf_prepare::create_logical_plan(&state, sql)
         .await
         .map_err(|e| exec_err("planning failed", e))?;
     let LogicalPlan::Dml(dml) = plan else {

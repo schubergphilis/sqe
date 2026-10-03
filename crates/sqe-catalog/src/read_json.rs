@@ -203,7 +203,7 @@ impl ReadJsonFunction {
             storage,
             caller: TvfCaller::default(),
             runtime_env: None,
-            prepared: PreparedProviders::default(),
+            prepared: PreparedProviders::named(FN_NAME),
         }
     }
 
@@ -213,7 +213,7 @@ impl ReadJsonFunction {
             storage,
             caller,
             runtime_env: None,
-            prepared: PreparedProviders::default(),
+            prepared: PreparedProviders::named(FN_NAME),
         }
     }
 
@@ -540,8 +540,7 @@ mod tests {
         ctx: &datafusion::prelude::SessionContext,
         sql: &str,
     ) -> DFResult<datafusion::dataframe::DataFrame> {
-        crate::file_tvf_prepare::prepare_statement(ctx, sql).await?;
-        ctx.sql(sql).await
+        crate::file_tvf_prepare::plan_sql(ctx, sql).await
     }
 
     #[tokio::test]

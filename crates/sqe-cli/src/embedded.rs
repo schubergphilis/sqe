@@ -923,7 +923,7 @@ impl SqlClient for EmbeddedClient {
         // inference over object storage) here, before DataFusion's
         // synchronous `call` asks for them.
         sqe_catalog::file_tvf_prepare::prepare_statement(&self.ctx, &rewritten).await?;
-        let df = self.ctx.sql(&rewritten).await?;
+        let df = sqe_catalog::file_tvf_prepare::plan_sql(&self.ctx, &rewritten).await?;
         // Snapshot the DataFrame schema before collecting so we still
         // emit column names when the query produces zero batches (an
         // optimizer collapse like `WHERE FALSE` yields an EmptyExec).
