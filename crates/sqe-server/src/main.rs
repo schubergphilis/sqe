@@ -2324,8 +2324,9 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         mcp_web_router,
     );
 
-    // Trino compat
-    if config.coordinator.trino_http_port > 0 {
+    // Trino compat: plain on trino_http_port, TLS on trino_https_port, either
+    // may be 0.
+    if config.coordinator.trino_http_port > 0 || config.coordinator.trino_https_port > 0 {
         let auth_adapter = Arc::new(AuthenticatorAdapter {
             authenticator: authenticator.clone(),
             bearer_provider: bearer_provider.clone(),
@@ -2337,10 +2338,37 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         // The pre-auth rate limit is inside `auth_chain` (#562): the adapter
         // forwards the peer host in the credentials and the chain's denial
         // comes back as `ResourceExhausted`, which the Trino server maps to 429.
+        let https = if config.coordinator.trino_https_port > 0 {
+            sqe_coordinator::tls::ensure_crypto_provider();
+            let material = sqe_core::ServerTlsMaterial::load(&config.coordinator.trino_tls)
+                .map_err(|e| anyhow::anyhow!("Trino HTTPS TLS config: {e}"))?;
+            let mtls = material.requires_client_cert();
+            let tls =
+                axum_server::tls_rustls::RustlsConfig::from_config(material.rustls_server_config());
+            // cert-manager rewrites the mounted secret in place; the watcher
+            // swaps the config for new handshakes without a restart.
+            let _trino_reload = sqe_coordinator::tls::spawn_cert_reload_watch(
+                config.coordinator.trino_tls.clone(),
+                tls.clone(),
+                sqe_coordinator::tls::DEFAULT_CERT_RELOAD_INTERVAL,
+            );
+            tracing::info!(
+                mtls,
+                "Trino-compat HTTPS on port {}",
+                config.coordinator.trino_https_port
+            );
+            Some(sqe_trino_compat::server::HttpsListener {
+                port: config.coordinator.trino_https_port,
+                tls,
+            })
+        } else {
+            None
+        };
         let trino_opts = sqe_trino_compat::server::TrinoServerOptions {
             security: config.security.clone(),
             expose_version: false,
             public_base_url: config.coordinator.public_base_url.clone(),
+            https,
         };
         sqe_trino_compat::server::start_trino_server_with_options(
             auth_adapter,
@@ -2354,10 +2382,12 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
             oauth2_state,
             trino_opts,
         );
-        tracing::info!(
-            "Trino-compat HTTP on port {}",
-            config.coordinator.trino_http_port
-        );
+        if config.coordinator.trino_http_port > 0 {
+            tracing::info!(
+                "Trino-compat HTTP on port {}",
+                config.coordinator.trino_http_port
+            );
+        }
     }
 
     // DuckDB Quack RPC endpoint (off by default). Shares the same AuthChain
