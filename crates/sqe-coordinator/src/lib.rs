@@ -364,3 +364,6 @@ superdebug_log_results = {enabled}
 
 #[cfg(test)]
 mod tpcbb_preaggregation_test;
+
+#[cfg(test)]
+mod planner_entry_lint;
