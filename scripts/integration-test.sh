@@ -98,7 +98,8 @@ if [ -n "${GROUP:-}" ]; then
 fi
 RUST_LOG="${RUST_LOG:-sqe_coordinator=info,sqe_catalog=info,sqe_auth=info,warn}" \
 RUST_MIN_STACK="${RUST_MIN_STACK:-8388608}" \
-    cargo test -p sqe-coordinator -- --ignored --test-threads=1 --nocapture "${SKIP_ARGS[@]}" "${GROUP_ARGS[@]}" "$@" 2>&1 \
+    cargo test -p sqe-coordinator -- --ignored --test-threads=1 --nocapture \
+        ${SKIP_ARGS[@]+"${SKIP_ARGS[@]}"} ${GROUP_ARGS[@]+"${GROUP_ARGS[@]}"} "$@" 2>&1 \
     | tee "$SQE_LOG_FILE"
 EXIT_CODE=${PIPESTATUS[0]}
 

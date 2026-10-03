@@ -66,9 +66,7 @@ impl ExplainHandler {
         ctx: &SessionContext,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         require_query(inner_sql)?;
-        crate::query_handler::prepare_file_tvfs(ctx, inner_sql).await?;
-        let df = ctx
-            .sql(inner_sql)
+        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, inner_sql)
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("EXPLAIN planning failed: {e}")))?;
 
@@ -125,9 +123,7 @@ impl ExplainHandler {
         let total_start = std::time::Instant::now();
 
         let parse_start = std::time::Instant::now();
-        crate::query_handler::prepare_file_tvfs(ctx, inner_sql).await?;
-        let df = ctx
-            .sql(inner_sql)
+        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, inner_sql)
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("EXPLAIN ANALYZE planning failed: {e}")))?;
         let logical = df.logical_plan().clone();
@@ -264,9 +260,7 @@ impl ExplainHandler {
         let total_start = std::time::Instant::now();
 
         let parse_start = std::time::Instant::now();
-        crate::query_handler::prepare_file_tvfs(ctx, inner_sql).await?;
-        let df = ctx
-            .sql(inner_sql)
+        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, inner_sql)
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("EXPLAIN FULL planning failed: {e}")))?;
         let logical = df.logical_plan().clone();

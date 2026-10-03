@@ -27,6 +27,9 @@ arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 axum = { workspace = true }
+# Optional TLS listener ([coordinator] trino_https_port); same features as
+# sqe-coordinator so the dependency graph does not change.
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }

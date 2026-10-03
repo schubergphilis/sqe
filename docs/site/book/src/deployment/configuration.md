@@ -20,6 +20,7 @@ The MCP block has its own page with the authorization model and tool reference: 
 [coordinator]
 flight_sql_port = 50051         # Flight SQL gRPC port
 trino_http_port = 8080          # Trino-compat HTTP port (0 to disable)
+trino_https_port = 0            # Trino-compat over TLS with [coordinator.trino_tls] (0 = off)
 mode = "hybrid"                 # "coordinator", "worker", "hybrid", "local", "distributed"
 worker_urls = []                # Worker Flight URLs for distributed mode
 worker_secret = ""              # Shared secret for worker heartbeat auth (empty disables the check)
@@ -48,6 +49,11 @@ ca_file = ""                    # Optional PEM CA. Server side: requires a clien
                                 # every listener. Client side: trust root for https:// worker and
                                 # coordinator URLs. Required for a private cluster CA.
 allow_ip_advertise = false      # Permit a bare-IP worker.advertise_url under TLS (needs IP SANs)
+
+# [coordinator.trino_tls]       # Certificate for trino_https_port; same fields as above.
+# cert_file = ""                # Hot-reloaded every 60s like the other HTTP listeners.
+# key_file = ""
+# ca_file = ""                  # Optional: require client certificates on the Trino HTTPS port
 
 [mcp]                           # Model Context Protocol endpoint. Off by default.
 enabled = false                 # true mounts /mcp. A nonzero port alone still does, with a deprecation WARN, for one release
@@ -472,7 +478,7 @@ With TLS on, `worker.advertise_url` must resolve to a hostname. A worker that wo
 
 ### Certificate rotation
 
-The HTTP listeners (MCP, Quack) poll `cert_file` and `key_file` every 60 seconds and swap the certificate in place. A cert-manager renewal is picked up within about a minute, with no dropped connections and no restart. A half-written pair is rejected and retried on the next poll, so the listener never serves a mismatched cert and key.
+The HTTP listeners (MCP, Quack, and the Trino HTTPS port with `[coordinator.trino_tls]`) poll `cert_file` and `key_file` every 60 seconds and swap the certificate in place. A cert-manager renewal is picked up within about a minute, with no dropped connections and no restart. A half-written pair is rejected and retried on the next poll, so the listener never serves a mismatched cert and key.
 
 The Flight (gRPC) listener does not do this. tonic builds its TLS acceptor once at startup and offers no way to replace it on a live server, so the Flight port keeps serving the certificate it booted with. Cover that in Kubernetes with a reloader sidecar that restarts the pod when the TLS secret changes:
 
