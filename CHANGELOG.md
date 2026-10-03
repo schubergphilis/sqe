@@ -4,6 +4,19 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- SQL: `SHOW SCHEMAS` / `SHOW TABLES` honour `LIKE`; Trino's unknown-catalog error
+
+    The classifier passed only the `FROM`/`IN` scope to the handlers and
+    dropped the `LIKE` pattern, so `SHOW SCHEMAS FROM <catalog> LIKE 'x'`
+    listed every schema. dbt-trino and BI tools check schema existence this
+    way and made wrong create/skip decisions. The pattern now filters the
+    result (`%`, `_`, case-sensitive; `ILIKE` folds case), for
+    Iceberg catalogs and Hive roots alike. An unknown or invisible catalog
+    fails with `Catalog 'x' does not exist` (`CATALOG_NOT_FOUND`), as in
+    Trino, with the operator detail logged instead.
+
 ### Changed
 
 - Security: `[security] trusted_proxies` accepts CIDR ranges
