@@ -27,7 +27,12 @@ All notable changes to SQE are documented in this file.
     catalog's `tvf_prefixes` now apply on top of the global list, only in
     sessions scoped to that catalog (the session's resolved default
     catalog). A prefix allowed for catalog A is refused in a session on
-    catalog B, with an error naming the session catalog. Discovered Polaris
+    catalog B, with an error naming the session catalog. Naming catalog A
+    is not enough: its prefixes open only when A's namespace listing
+    succeeded with the caller's own bearer during the session build, so a
+    caller without grants on A who sets `X-Trino-Catalog: A` gets none.
+    Catalogs with engine-held auth prove nothing and never open their
+    prefixes. Discovered Polaris
     warehouses add none, and Hive external tables keep using the global list.
     Entries that are not object-store URLs with a bucket fail config
     validation.
