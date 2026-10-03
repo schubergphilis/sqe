@@ -6,6 +6,33 @@ All notable changes to SQE are documented in this file.
 
 ### Fixed
 
+- Catalog: schemas and tables created by a concurrent writer are visible to the next statement
+
+    dbt-trino runs models in parallel on connections that share a JWT; a
+    model that named a schema another model had just created could fail with
+    "schema not found", and operators serialized dbt. A namespace missing from
+    a session's cached list is re-listed at most every 5 s; a miss inside that
+    window now probes Polaris for that one namespace (the same visibility rule
+    as the listing: 404 or 403 still misses), so a schema created by another
+    replica, Spark or Airflow is found immediately. Commits and table DDL
+    (CTAS, INSERT, DROP, RENAME) now also drop every principal's cached table
+    list for the namespace, not only the writer's metadata cache, so
+    `information_schema.tables` and `table_exist` no longer serve the pre-DDL
+    list for up to 5 s.
+
+- Catalog: the per-token circuit breaker counts upstream faults only
+
+    A client that legitimately probed for missing or hidden objects (dbt's
+    `information_schema` checks, `read_parquet` name lookups) collected 404s
+    from Polaris, the per-(token, catalog) breaker counted them, and after
+    five it opened: every query with that JWT was refused for 30 s. All
+    breaker sites now classify the outcome once. 5xx, timeouts, connection
+    failures and 429 count; 401/403, 404 and other 4xx are normal answers
+    and record success. `[catalog] circuit_breaker_failure_classes` sets the
+    counted classes (`server_error`, `timeout`, `connection`,
+    `rate_limited`, `client_error`, `not_found`, `auth`). The `Circuit
+    breaker opened` log line now carries the token `subject` and the
+    `reason` class.
 - SQL: `SHOW SCHEMAS` / `SHOW TABLES` honour `LIKE`; Trino's unknown-catalog error
 
     The classifier passed only the `FROM`/`IN` scope to the handlers and
