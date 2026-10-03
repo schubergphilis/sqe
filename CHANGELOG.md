@@ -4,6 +4,33 @@ All notable changes to SQE are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Security: `[security] trusted_proxies` accepts CIDR ranges
+
+    Entries may be exact IPv4/IPv6 addresses or CIDR ranges
+    (`"10.42.0.0/16"`, `"fd00::/8"`), so an ingress with changing pod IPs can
+    be trusted by range. One matcher serves every surface that honours
+    forwarded headers: Flight SQL, the web/health router, the Quack server
+    and the Trino HTTP listener. IPv4-mapped IPv6 peers match IPv4 entries.
+    An entry that is neither an address nor a range now fails config
+    validation; previously it silently never matched.
+
+### Added
+
+- Trino HTTP: `[coordinator] public_base_url`; https `nextUri` behind a TLS ingress
+
+    Behind a TLS-terminating ingress that was not listed in
+    `trusted_proxies`, `nextUri` came back as `http://`, so Trino clients
+    (dbt-trino, trino-python-client) followed it to port 80 with their
+    bearer token in cleartext, and failed outright where egress allowed only
+    443. `public_base_url` (e.g. `"https://sql.example.org"`) is used for
+    `nextUri`/`infoUri` on requests addressed to its host; in-cluster
+    clients calling the service directly keep service URIs. From a trusted
+    proxy, `X-Forwarded-Proto: https` always yields https, only `http` and
+    `https` are accepted, the first value of a forwarded list is used, and
+    `X-Forwarded-Port` is honoured when it is not the scheme's default.
+
 ## [0.49.0] — 2026-09-26
 
 This section covers every change since 0.28.0. Versions 0.29.0 to 0.48.1 were tagged without changelog sections of their own; from 0.49.0 on, `scripts/release.sh` turns this section into the release notes.

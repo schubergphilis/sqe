@@ -129,6 +129,8 @@ pub struct TrinoState<A, Q> {
     /// When true, /v1/info omits the build version so unauthenticated
     /// callers cannot fingerprint the engine. Issue #40.
     pub expose_version: bool,
+    /// `[coordinator] public_base_url`; see [`extract_base_url`].
+    pub public_base_url: Option<String>,
 }
 
 /// Who submitted a query, and the secret that lets that same client keep
@@ -705,6 +707,9 @@ pub struct TrinoServerOptions {
     /// Whether `/v1/info` may return the exact build version. Default
     /// `false` for production deployments. Issue #40.
     pub expose_version: bool,
+    /// `[coordinator] public_base_url`: the ingress URL to put in `nextUri`
+    /// / `infoUri` for requests addressed to its host.
+    pub public_base_url: Option<String>,
 }
 
 /// Assemble the statement/info routes with state. Extracted so a unit test can
@@ -780,6 +785,7 @@ where
         security: options.security,
         auth_sessions: build_auth_session_cache(),
         expose_version: options.expose_version,
+        public_base_url: options.public_base_url,
     });
 
     tokio::spawn(async move {
@@ -1807,30 +1813,67 @@ fn parse_trino_duration(s: &str) -> Option<std::time::Duration> {
 /// Is the connecting peer one of `[security] trusted_proxies`? Same rule
 /// `resolve_client_ip` applies to `x-forwarded-for`.
 fn peer_is_trusted_proxy<A, Q>(state: &TrinoState<A, Q>, peer: SocketAddr) -> bool {
-    let ip = peer.ip().to_string();
-    state
-        .security
-        .trusted_proxies
-        .iter()
-        .any(|p| p.eq_ignore_ascii_case(&ip))
+    state.security.is_trusted_proxy(&peer.ip().to_string())
 }
 
 /// Derive the base URL for `nextUri`/`infoUri`, falling back to
-/// `localhost:<port>`. `x-forwarded-proto` / `x-forwarded-host` are honoured
-/// only from a trusted proxy; anyone else gets the plain `Host` header over
-/// the connection's own scheme (this listener is plain HTTP). Issue #726.
-fn extract_base_url(headers: &HeaderMap, bound_port: u16, trusted_proxy: bool) -> String {
+/// `localhost:<port>`. Issue #726.
+///
+/// `x-forwarded-proto` / `-host` / `-port` are honoured only from a trusted
+/// proxy (`[security] trusted_proxies`, exact IPs or CIDR ranges); anyone
+/// else gets the plain `Host` header over this listener's own scheme, http.
+/// Behind a TLS-terminating ingress that SQE cannot pin by IP,
+/// `public_base_url` (`[coordinator]`) supplies the https URL instead, but
+/// only for requests addressed to its host: in-cluster clients calling the
+/// service directly keep URIs that point back at the service.
+///
+/// A trusted `x-forwarded-proto: https` always yields https, port or no
+/// port. Clients follow `nextUri` with their bearer token, so a downgraded
+/// scheme sends the token in cleartext to port 80 before any redirect.
+fn extract_base_url(
+    headers: &HeaderMap,
+    bound_port: u16,
+    trusted_proxy: bool,
+    public_base_url: Option<&str>,
+) -> String {
+    // A proxy chain appends: the first value is the client-facing hop.
     let forwarded = |name: &str| {
         trusted_proxy
             .then(|| extract_header(headers, name))
             .flatten()
+            .and_then(|v| v.split(',').next().map(|first| first.trim().to_string()))
+            .filter(|v| !v.is_empty())
     };
-    let scheme = forwarded("x-forwarded-proto").unwrap_or_else(|| "http".to_string());
-    let host = forwarded("x-forwarded-host").or_else(|| extract_header(headers, "host"));
-    match host {
-        Some(host) => format!("{scheme}://{host}"),
-        None => format!("http://localhost:{bound_port}"),
+    let Some(host) = forwarded("x-forwarded-host").or_else(|| extract_header(headers, "host")) else {
+        return format!("http://localhost:{bound_port}");
+    };
+    if let Some((scheme, authority)) =
+        public_base_url.and_then(|url| sqe_core::config::parse_public_base_url(url).ok())
+    {
+        if host_name(&authority).eq_ignore_ascii_case(host_name(&host)) {
+            return format!("{scheme}://{authority}");
+        }
     }
+    let scheme = match forwarded("x-forwarded-proto").map(|p| p.to_ascii_lowercase()) {
+        Some(p) if p == "https" || p == "http" => p,
+        _ => "http".to_string(),
+    };
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    let port = forwarded("x-forwarded-port")
+        .and_then(|p| p.parse::<u16>().ok())
+        .filter(|p| *p != default_port && host_name(&host) == host);
+    match port {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
+    }
+}
+
+/// The host of a `host[:port]` / `[ipv6]:port` authority, without the port.
+fn host_name(authority: &str) -> &str {
+    if authority.starts_with('[') {
+        return authority.find(']').map_or(authority, |end| &authority[..=end]);
+    }
+    authority.rsplit_once(':').map_or(authority, |(host, _)| host)
 }
 
 /// Build a [`TrinoResponse`] for one page pulled from a [`ResultCursor`].
@@ -2175,7 +2218,12 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         );
 
         let query_id = Uuid::new_v4().to_string();
-        let base_url = extract_base_url(&headers, state.port, peer_is_trusted_proxy(&state, peer));
+        let base_url = extract_base_url(
+            &headers,
+            state.port,
+            peer_is_trusted_proxy(&state, peer),
+            state.public_base_url.as_deref(),
+        );
 
         // Trino prepared statements are stateless: the client carries the prepared
         // SQL in X-Trino-Prepared-Statement headers and submits `EXECUTE <name>
@@ -2470,7 +2518,12 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             }
         };
 
-        let base_url = extract_base_url(&headers, state.port, peer_is_trusted_proxy(&state, peer));
+        let base_url = extract_base_url(
+            &headers,
+            state.port,
+            peer_is_trusted_proxy(&state, peer),
+            state.public_base_url.as_deref(),
+        );
 
         let Some(handle) = registered else {
             return not_found_response(state.as_ref(), &base_url, &id);
@@ -2566,7 +2619,12 @@ async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             }
         };
 
-        let base_url = extract_base_url(&headers, state.port, peer_is_trusted_proxy(&state, peer));
+        let base_url = extract_base_url(
+            &headers,
+            state.port,
+            peer_is_trusted_proxy(&state, peer),
+            state.public_base_url.as_deref(),
+        );
         let next_token: usize = token.parse().unwrap_or(1usize).saturating_add(1);
 
         let handle = match registered {
@@ -2814,6 +2872,7 @@ mod tests {
             security: SecurityConfig::default(),
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
+            public_base_url: None,
         });
 
         let Json(info) = server_info(State(state)).await;
@@ -2844,6 +2903,7 @@ mod tests {
             security: SecurityConfig::default(),
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
+            public_base_url: None,
         });
 
         let Json(info) = server_info(State(state)).await;
@@ -2869,6 +2929,7 @@ mod tests {
             security: SecurityConfig::default(),
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
+            public_base_url: None,
         });
 
         let result = server_state(State(state)).await;
@@ -2894,6 +2955,7 @@ mod tests {
             security: SecurityConfig::default(),
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
+            public_base_url: None,
         });
 
         let result = server_state(State(state)).await;
@@ -3033,6 +3095,7 @@ mod tests {
             security: SecurityConfig::default(),
             auth_sessions: build_auth_session_cache(),
             expose_version: false,
+            public_base_url: None,
         });
         let trace_id = "0af7651916cd43dd8448eb211c80319c";
         // A distinct credential per call: this test is about trace
@@ -3116,6 +3179,7 @@ mod tests {
             security: SecurityConfig::default(),
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
+            public_base_url: None,
         })
     }
 
@@ -3162,6 +3226,7 @@ mod tests {
             security: SecurityConfig::default(),
             auth_sessions: build_auth_session_cache(),
             expose_version: false,
+            public_base_url: None,
         })
     }
 
@@ -3233,6 +3298,64 @@ mod tests {
         assert_eq!(page.stats.state, "FINISHED");
         assert!(page.next_uri.is_none());
         assert_eq!(page.columns.map(|c| c.len()), Some(0));
+    }
+
+    /// Behind a TLS-terminating ingress trusted by CIDR range, the POST and
+    /// every page keep the https public base: Trino clients replay `nextUri`
+    /// with their bearer token, so an http URI would send it in cleartext.
+    #[tokio::test]
+    async fn trusted_cidr_proxy_keeps_https_next_uri_through_paging() {
+        fn via_ingress(mut headers: HeaderMap) -> HeaderMap {
+            headers.insert("host", "sqe.sqe:8080".parse().unwrap());
+            headers.insert("x-forwarded-proto", "https".parse().unwrap());
+            headers.insert("x-forwarded-host", "sql.example.org".parse().unwrap());
+            headers
+        }
+        let trusted = SecurityConfig {
+            trusted_proxies: vec!["127.0.0.0/8".to_string()],
+            ..Default::default()
+        };
+
+        let mut state = gated_state(
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        Arc::get_mut(&mut state).unwrap().security = trusted.clone();
+        let resp = submit_query(
+            State(state.clone()),
+            test_peer(),
+            via_ingress(basic_auth_header("alice", "pw")),
+            "SELECT 1".to_string(),
+        )
+        .await;
+        let next = body_json(resp).await.next_uri.expect("POST carries nextUri");
+        assert!(next.starts_with("https://sql.example.org/v1/statement/"), "{next}");
+
+        // Three one-row pages: each intermediate page points onward over https.
+        let mut state = gated_state(
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        Arc::get_mut(&mut state).unwrap().security = trusted;
+        state.queries.insert(
+            "q-https".to_string(),
+            finished_handle_with("alice", vec![int_batch(&[1, 2, 3])], 1),
+        );
+        for token in ["0", "1"] {
+            let page = body_json(
+                get_results(
+                    State(state.clone()),
+                    test_peer(),
+                    via_ingress(basic_auth_header("alice", "pw")),
+                    Path(("q-https".to_string(), "poll-token-alice".to_string(), token.to_string())),
+                )
+                .await,
+            )
+            .await;
+            let next = page.next_uri.expect("intermediate page has nextUri");
+            assert!(next.starts_with("https://sql.example.org/v1/statement/"), "{next}");
+            assert!(page.info_uri.unwrap().starts_with("https://sql.example.org/"));
+        }
     }
 
     #[tokio::test]
@@ -4333,6 +4456,7 @@ mod tests {
             security: SecurityConfig::default(),
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
+            public_base_url: None,
         });
 
         let mut headers = basic_auth_header("alice", "pw");
@@ -4991,6 +5115,7 @@ mod tests {
             security: SecurityConfig::default(),
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
+            public_base_url: None,
         });
 
         // Authenticate so we exercise the page-token parse branch.
@@ -5027,6 +5152,7 @@ mod tests {
             security: SecurityConfig::default(),
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
+            public_base_url: None,
         });
 
         state
@@ -5068,6 +5194,7 @@ mod tests {
             security: SecurityConfig::default(),
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
+            public_base_url: None,
         });
 
         state.queries.insert(
@@ -5148,6 +5275,7 @@ mod tests {
             security: SecurityConfig::default(),
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
+            public_base_url: None,
         });
 
         state.queries.insert(
@@ -5209,6 +5337,7 @@ mod tests {
             security: SecurityConfig::default(),
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
+            public_base_url: None,
         });
         state.queries.insert(
             "q-secret".to_string(),
@@ -5248,6 +5377,7 @@ mod tests {
             security: SecurityConfig::default(),
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
+            public_base_url: None,
         });
 
         state.queries.insert(
@@ -5282,7 +5412,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("host", "myhost:9090".parse().unwrap());
         assert_eq!(
-            extract_base_url(&headers, 8080, false),
+            extract_base_url(&headers, 8080, false, None),
             "http://myhost:9090"
         );
     }
@@ -5291,7 +5421,7 @@ mod tests {
     fn test_extract_base_url_fallback() {
         let headers = HeaderMap::new();
         assert_eq!(
-            extract_base_url(&headers, 8080, false),
+            extract_base_url(&headers, 8080, false, None),
             "http://localhost:8080"
         );
     }
@@ -5303,7 +5433,7 @@ mod tests {
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
         headers.insert("x-forwarded-host", "public.example".parse().unwrap());
         assert_eq!(
-            extract_base_url(&headers, 8080, true),
+            extract_base_url(&headers, 8080, true, None),
             "https://public.example"
         );
     }
@@ -5316,9 +5446,71 @@ mod tests {
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
         headers.insert("x-forwarded-host", "evil.example".parse().unwrap());
         assert_eq!(
-            extract_base_url(&headers, 8080, false),
+            extract_base_url(&headers, 8080, false, None),
             "http://myhost:9090"
         );
+    }
+
+    fn proxied(host: &str, proto: Option<&str>, fwd_host: Option<&str>, fwd_port: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", host.parse().unwrap());
+        if let Some(v) = proto {
+            headers.insert("x-forwarded-proto", v.parse().unwrap());
+        }
+        if let Some(v) = fwd_host {
+            headers.insert("x-forwarded-host", v.parse().unwrap());
+        }
+        if let Some(v) = fwd_port {
+            headers.insert("x-forwarded-port", v.parse().unwrap());
+        }
+        headers
+    }
+
+    /// A trusted ingress that terminated TLS keeps https in nextUri, with and
+    /// without a port on the forwarded host; a list keeps the first hop.
+    #[test]
+    fn trusted_forwarded_https_is_never_downgraded() {
+        let h = proxied("sqe.sqe:8080", Some("https"), Some("sql.example.org"), None);
+        assert_eq!(extract_base_url(&h, 8080, true, None), "https://sql.example.org");
+        let h = proxied("sqe.sqe:8080", Some("https, http"), Some("sql.example.org, sqe"), None);
+        assert_eq!(extract_base_url(&h, 8080, true, None), "https://sql.example.org");
+        // An unknown scheme is ignored rather than echoed into the URI.
+        let h = proxied("sqe.sqe:8080", Some("javascript"), Some("sql.example.org"), None);
+        assert_eq!(extract_base_url(&h, 8080, true, None), "http://sql.example.org");
+    }
+
+    #[test]
+    fn trusted_forwarded_port_is_applied_when_not_default() {
+        let h = proxied("sqe:8080", Some("https"), Some("sql.example.org"), Some("8443"));
+        assert_eq!(extract_base_url(&h, 8080, true, None), "https://sql.example.org:8443");
+        let h = proxied("sqe:8080", Some("https"), Some("sql.example.org"), Some("443"));
+        assert_eq!(extract_base_url(&h, 8080, true, None), "https://sql.example.org");
+        // A forwarded host that already names a port keeps it.
+        let h = proxied("sqe:8080", Some("https"), Some("sql.example.org:9443"), Some("8443"));
+        assert_eq!(extract_base_url(&h, 8080, true, None), "https://sql.example.org:9443");
+        // Untrusted peers cannot set the port either.
+        let h = proxied("sqe:8080", Some("https"), Some("x"), Some("8443"));
+        assert_eq!(extract_base_url(&h, 8080, false, None), "http://sqe:8080");
+    }
+
+    /// `public_base_url` applies only to requests addressed to its host.
+    #[test]
+    fn public_base_url_applies_only_on_host_match() {
+        let public = Some("https://sql.example.org/");
+        // Ingress request, proxy not trusted: plain Host header matches.
+        let h = proxied("sql.example.org", None, None, None);
+        assert_eq!(extract_base_url(&h, 8080, false, public), "https://sql.example.org");
+        let h = proxied("SQL.example.org:80", None, None, None);
+        assert_eq!(extract_base_url(&h, 8080, false, public), "https://sql.example.org");
+        // In-cluster client calling the service directly keeps its own URI.
+        let h = proxied("sqe.sqe:8080", None, None, None);
+        assert_eq!(extract_base_url(&h, 8080, false, public), "http://sqe.sqe:8080");
+        // A trusted proxy's forwarded host is what is matched.
+        let h = proxied("sqe.sqe:8080", Some("http"), Some("sql.example.org"), None);
+        assert_eq!(extract_base_url(&h, 8080, true, public), "https://sql.example.org");
+        // An untrusted forwarded host cannot select it.
+        let h = proxied("sqe.sqe:8080", None, Some("sql.example.org"), None);
+        assert_eq!(extract_base_url(&h, 8080, false, public), "http://sqe.sqe:8080");
     }
 
     // ── Bearer JWT passthrough tests ────────────────────────────
@@ -5344,6 +5536,7 @@ mod tests {
             security: SecurityConfig::default(),
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
+            public_base_url: None,
         });
 
         let mut headers = HeaderMap::new();
@@ -5391,6 +5584,7 @@ mod tests {
             security: SecurityConfig::default(),
             auth_sessions: build_auth_session_cache(),
             expose_version: true,
+            public_base_url: None,
         });
 
         let mut headers = HeaderMap::new();
@@ -5433,6 +5627,7 @@ mod tests {
             security: SecurityConfig::default(),
             auth_sessions: build_auth_session_cache(),
             expose_version: false,
+            public_base_url: None,
         });
         let Json(info) = server_info(State(state)).await;
         // Exact build is hidden; coarse major.minor is fine.
@@ -5465,6 +5660,7 @@ mod tests {
             security: SecurityConfig::default(),
             auth_sessions: build_auth_session_cache(),
             expose_version: false,
+            public_base_url: None,
         });
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
@@ -5581,6 +5777,7 @@ mod tests {
             security: SecurityConfig::default(),
             auth_sessions: build_auth_session_cache(),
             expose_version: false,
+            public_base_url: None,
         })
     }
 
