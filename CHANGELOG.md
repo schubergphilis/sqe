@@ -33,6 +33,16 @@ All notable changes to SQE are documented in this file.
     `rate_limited`, `client_error`, `not_found`, `auth`). The `Circuit
     breaker opened` log line now carries the token `subject` and the
     `reason` class.
+- SQL: `SHOW SCHEMAS` / `SHOW TABLES` honour `LIKE`; Trino's unknown-catalog error
+
+    The classifier passed only the `FROM`/`IN` scope to the handlers and
+    dropped the `LIKE` pattern, so `SHOW SCHEMAS FROM <catalog> LIKE 'x'`
+    listed every schema. dbt-trino and BI tools check schema existence this
+    way and made wrong create/skip decisions. The pattern now filters the
+    result (`%`, `_`, case-sensitive; `ILIKE` folds case), for
+    Iceberg catalogs and Hive roots alike. An unknown or invisible catalog
+    fails with `Catalog 'x' does not exist` (`CATALOG_NOT_FOUND`), as in
+    Trino, with the operator detail logged instead.
 
 ### Changed
 
