@@ -1454,6 +1454,10 @@ async fn async_main() -> anyhow::Result<()> {
 
     let config = config;
     config.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
+    sqe_catalog::rest_catalog::configure_breaker_failure_classes(
+        &config.catalog.circuit_breaker_failure_classes,
+    )
+    .map_err(|e| anyhow::anyhow!("catalog.circuit_breaker_failure_classes: {e}"))?;
 
     // Security warnings for production readiness
     if !config.coordinator.tls.is_enabled() {

@@ -15,6 +15,7 @@ use sqe_core::{SqeError, SqeErrorCode};
 use sqe_metrics::propagation::trace_context_http_headers;
 
 use crate::circuit_breaker::CircuitBreaker;
+use sqe_core::config::BreakerFailureClass;
 
 /// Build the reqwest client every Polaris request goes through.
 ///
@@ -176,14 +177,28 @@ impl UserCircuitBreakers {
         token_fingerprint: &str,
         catalog: &str,
     ) -> Arc<CircuitBreaker> {
+        self.get_or_create_for(token_fingerprint, catalog, token_fingerprint)
+    }
+
+    /// [`Self::get_or_create`], naming the token's `subject` for the log line
+    /// written when the breaker opens.
+    pub(crate) fn get_or_create_for(
+        &self,
+        token_fingerprint: &str,
+        catalog: &str,
+        subject: &str,
+    ) -> Arc<CircuitBreaker> {
         self.cache
             .entry(Self::key(token_fingerprint, catalog))
             .or_insert_with(|| {
-                Arc::new(CircuitBreaker::new(
-                    format!("polaris-user-{token_fingerprint}-{catalog}"),
-                    5,
-                    std::time::Duration::from_secs(30),
-                ))
+                Arc::new(
+                    CircuitBreaker::new(
+                        format!("polaris-user-{token_fingerprint}-{catalog}"),
+                        5,
+                        std::time::Duration::from_secs(30),
+                    )
+                    .with_subject(subject),
+                )
             })
             .into_value()
     }
@@ -250,6 +265,27 @@ static USER_CIRCUIT_BREAKERS: std::sync::LazyLock<UserCircuitBreakers> =
 /// One breaker per (user, catalog); see [`UserCircuitBreakers`].
 fn user_circuit_breaker(token_fingerprint: &str, catalog: &str) -> Arc<CircuitBreaker> {
     USER_CIRCUIT_BREAKERS.get_or_create(token_fingerprint, catalog)
+}
+
+/// [`user_circuit_breaker`] labelled with the bearer's subject.
+fn user_circuit_breaker_for(bearer_token: &str, token_fingerprint: &str, catalog: &str) -> Arc<CircuitBreaker> {
+    let subject = token_subject_for_logs(bearer_token).unwrap_or_else(|| token_fingerprint.to_string());
+    USER_CIRCUIT_BREAKERS.get_or_create_for(token_fingerprint, catalog, &subject)
+}
+
+/// `sub` (else `preferred_username`) from a JWT bearer's payload, for log
+/// lines only. Not verified: authentication happened upstream, and the value
+/// never decides anything. `None` for opaque tokens.
+fn token_subject_for_logs(bearer_token: &str) -> Option<String> {
+    use base64::Engine;
+    let payload = bearer_token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    ["sub", "preferred_username"]
+        .iter()
+        .find_map(|k| claims.get(k).and_then(|v| v.as_str()).map(str::to_string))
 }
 
 /// REST catalog properties that switch the vendored client to SigV4 on the
@@ -426,15 +462,62 @@ fn insert_s3_vended_isolation_props(props: &mut HashMap<String, String>) {
 fn record_catalog_breaker_outcome<T>(cb: &CircuitBreaker, result: &sqe_core::Result<T>) {
     match result {
         Ok(_) => cb.record_success(),
-        Err(e)
-            if matches!(
-                e.error_code(),
-                sqe_core::SqeErrorCode::AccessDenied | sqe_core::SqeErrorCode::AuthenticationFailed
-            ) =>
-        {
-            cb.record_success();
-        }
-        Err(_) => cb.record_failure(),
+        Err(e) => record_breaker_class(cb, BreakerFailureClass::of_error(e)),
+    }
+}
+
+/// Failure classes that count toward opening a per-user breaker; `None`
+/// until [`configure_breaker_failure_classes`] runs, which means the default
+/// ([`BreakerFailureClass::DEFAULT_COUNTED`]).
+static COUNTED_BREAKER_CLASSES: std::sync::RwLock<Option<Vec<BreakerFailureClass>>> =
+    std::sync::RwLock::new(None);
+
+/// Set which failure classes open the catalog circuit breakers, from
+/// `[catalog] circuit_breaker_failure_classes`. Called once at startup;
+/// unknown names are rejected (config validation already refuses them).
+pub fn configure_breaker_failure_classes(names: &[String]) -> Result<(), String> {
+    let classes = names
+        .iter()
+        .map(|n| BreakerFailureClass::parse(n))
+        .collect::<Result<Vec<_>, _>>()?;
+    *COUNTED_BREAKER_CLASSES.write().unwrap_or_else(|e| e.into_inner()) = Some(classes);
+    Ok(())
+}
+
+fn breaker_counts(class: BreakerFailureClass) -> bool {
+    match &*COUNTED_BREAKER_CLASSES.read().unwrap_or_else(|e| e.into_inner()) {
+        Some(classes) => classes.contains(&class),
+        None => BreakerFailureClass::DEFAULT_COUNTED.contains(&class),
+    }
+}
+
+/// Apply one classified catalog outcome to a breaker.
+///
+/// A counted class records a failure, with the class as the logged reason.
+/// Anything else where the catalog answered (an authorization denial, a
+/// missing object, another client error) is a normal response from a healthy
+/// upstream: it records success, so a client probing for objects it cannot
+/// see or that do not exist never locks its own token out, and a Half-Open
+/// probe answered that way closes the breaker. An uncounted timeout or
+/// connection failure records nothing: the upstream did not answer.
+fn record_breaker_class(cb: &CircuitBreaker, class: BreakerFailureClass) {
+    apply_breaker_class(cb, class, breaker_counts(class));
+}
+
+fn apply_breaker_class(cb: &CircuitBreaker, class: BreakerFailureClass, counted: bool) {
+    if counted {
+        cb.record_failure_with_reason(class.as_str());
+    } else if !matches!(class, BreakerFailureClass::Timeout | BreakerFailureClass::Connection) {
+        cb.record_success();
+    }
+}
+
+/// Classify a transport-level `reqwest` failure (no HTTP answer).
+fn transport_failure_class(e: &reqwest::Error) -> BreakerFailureClass {
+    if e.is_timeout() {
+        BreakerFailureClass::Timeout
+    } else {
+        BreakerFailureClass::Connection
     }
 }
 
@@ -1714,7 +1797,8 @@ impl SessionCatalog {
         // per process, mirroring the ClientCredentials warning in sqe-auth.
         warn_shared_backend_identity_once(backend);
 
-        let circuit_breaker = user_circuit_breaker(&token_fingerprint, &catalog.warehouse);
+        let circuit_breaker =
+            user_circuit_breaker_for(bearer_token, &token_fingerprint, &catalog.warehouse);
         Self {
             inner: CatalogHandle::Other(inner),
             catalog_url: String::new(),
@@ -2064,7 +2148,7 @@ impl SessionCatalog {
         };
 
         let circuit_breaker = circuit_breaker
-            .unwrap_or_else(|| user_circuit_breaker(&token_fingerprint, catalog_url));
+            .unwrap_or_else(|| user_circuit_breaker_for(bearer_token, &token_fingerprint, catalog_url));
 
         // Use the shared global cache when provided; fall back to a private
         // per-session cache (disabled — max_capacity 0) so that call sites that
@@ -2430,15 +2514,9 @@ impl SessionCatalog {
                     }
                 }
             }
-            // Auth failures (401/403) are per-principal decisions, not faults:
-            // do not let them open the breaker (#5). Other errors do.
-            Err(e)
-                if matches!(
-                    e.error_code(),
-                    sqe_core::SqeErrorCode::AccessDenied
-                        | sqe_core::SqeErrorCode::AuthenticationFailed
-                ) => {}
-            Err(_) => self.circuit_breaker.record_failure(),
+            // Only upstream faults count; a denial or a missing table is a
+            // normal answer (#5). See `record_breaker_class`.
+            Err(e) => record_breaker_class(&self.circuit_breaker, BreakerFailureClass::of_error(e)),
         }
         self.record_catalog_call("load_table", started, result.is_ok());
         result
@@ -2477,7 +2555,7 @@ impl SessionCatalog {
             authenticate_raw_request(req, self.sigv4.as_deref(), &self.bearer_token).await?;
 
         let response = self.http_client.execute(req).await.map_err(|e| {
-            self.circuit_breaker.record_failure();
+            record_breaker_class(&self.circuit_breaker, transport_failure_class(&e));
             SqeError::catalog_src(format!("Failed to authorize table {table_ident}: {e}"), e)
         })?;
         let status = response.status();
@@ -2518,9 +2596,11 @@ impl SessionCatalog {
             self.table_cache
                 .invalidate(&self.table_cache_key(table_ident))
                 .await;
-        } else {
-            self.circuit_breaker.record_failure();
         }
+        record_breaker_class(
+            &self.circuit_breaker,
+            BreakerFailureClass::from_http_status(status_code),
+        );
         self.record_catalog_call("authorize_table", started, false);
         Err(SqeError::CatalogHttp {
             status: status_code,
@@ -2663,7 +2743,7 @@ impl SessionCatalog {
         let resp = match self.http_client.execute(req).await {
             Ok(resp) => resp,
             Err(e) => {
-                self.circuit_breaker.record_failure();
+                record_breaker_class(&self.circuit_breaker, transport_failure_class(&e));
                 self.record_catalog_call(op.name(), started, false);
                 return Err(SqeError::catalog_src(
                     format!("Catalog request failed ({}): {e}", op.name()),
@@ -2680,11 +2760,10 @@ impl SessionCatalog {
         }
 
         let body = resp.text().await.unwrap_or_default();
-        if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            self.circuit_breaker.record_failure();
-        } else {
-            self.circuit_breaker.record_success();
-        }
+        record_breaker_class(
+            &self.circuit_breaker,
+            BreakerFailureClass::from_http_status(status.as_u16()),
+        );
         self.record_catalog_call(op.name(), started, false);
         Err(map_rest_status(op, status.as_u16(), body))
     }
@@ -3384,6 +3463,10 @@ mod cache_capacity_tests {
         insert_s3_vended_isolation_props, record_catalog_breaker_outcome, select_keys_for_suffix,
         SessionCatalog, REST_CATALOG_CACHE_MAX_CAPACITY,
     };
+    use super::{
+        apply_breaker_class, configure_breaker_failure_classes, record_breaker_class,
+        token_subject_for_logs, BreakerFailureClass,
+    };
     use sqe_core::config::StorageConfig;
     use std::collections::HashMap;
 
@@ -3564,6 +3647,103 @@ type = "aws"
             "closed",
             "a 403 must resolve the half-open probe, not latch it"
         );
+    }
+
+    fn five_failure_breaker() -> crate::circuit_breaker::CircuitBreaker {
+        crate::circuit_breaker::CircuitBreaker::new("t", 5, std::time::Duration::from_secs(30))
+    }
+
+    fn catalog_http(status: u16) -> sqe_core::SqeError {
+        sqe_core::SqeError::CatalogHttp {
+            status,
+            op: sqe_core::CatalogOp::LoadTable,
+            body: String::new(),
+        }
+    }
+
+    /// dbt's existence checks and `read_parquet` name lookups probe for
+    /// objects that are missing or hidden: 404s and 403s must never lock the
+    /// token out.
+    #[test]
+    fn not_found_and_denied_never_open_the_breaker() {
+        let cb = five_failure_breaker();
+        for _ in 0..20 {
+            record_catalog_breaker_outcome::<()>(&cb, &Err(catalog_http(404)));
+            record_catalog_breaker_outcome::<()>(&cb, &Err(catalog_http(403)));
+            record_catalog_breaker_outcome::<()>(
+                &cb,
+                &Err(sqe_core::SqeError::with_code(
+                    sqe_core::SqeErrorCode::SchemaNotFound,
+                    "Namespace does not exist: cbs_silver",
+                )),
+            );
+            record_breaker_class(&cb, BreakerFailureClass::from_http_status(400));
+        }
+        assert_eq!(cb.state_label(), "closed");
+        assert!(cb.check().is_ok());
+    }
+
+    #[test]
+    fn server_errors_and_timeouts_open_the_breaker() {
+        let cb = five_failure_breaker();
+        for _ in 0..5 {
+            record_catalog_breaker_outcome::<()>(&cb, &Err(catalog_http(503)));
+        }
+        assert_eq!(cb.state_label(), "open");
+
+        let cb = five_failure_breaker();
+        for _ in 0..5 {
+            record_catalog_breaker_outcome::<()>(
+                &cb,
+                &Err(sqe_core::SqeError::Catalog("operation timed out".to_string())),
+            );
+        }
+        assert_eq!(cb.state_label(), "open");
+
+        let cb = five_failure_breaker();
+        for _ in 0..5 {
+            record_breaker_class(&cb, BreakerFailureClass::Connection);
+        }
+        assert_eq!(cb.state_label(), "open");
+    }
+
+    /// The counted classes are configurable: an operator who wants missing
+    /// objects to count can opt in, and an uncounted timeout records nothing
+    /// (no answer) rather than a success.
+    #[test]
+    fn counted_classes_are_configurable() {
+        let cb = five_failure_breaker();
+        for _ in 0..5 {
+            apply_breaker_class(&cb, BreakerFailureClass::NotFound, true);
+        }
+        assert_eq!(cb.state_label(), "open");
+
+        let cb = five_failure_breaker();
+        for _ in 0..4 {
+            apply_breaker_class(&cb, BreakerFailureClass::ServerError, true);
+        }
+        // An uncounted timeout neither trips nor resets the run.
+        apply_breaker_class(&cb, BreakerFailureClass::Timeout, false);
+        apply_breaker_class(&cb, BreakerFailureClass::ServerError, true);
+        assert_eq!(cb.state_label(), "open");
+
+        assert!(configure_breaker_failure_classes(&["bogus".to_string()]).is_err());
+    }
+
+    #[test]
+    fn breaker_subject_comes_from_the_jwt_payload() {
+        use base64::Engine;
+        let enc = |v: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
+        let jwt = |claims: &str| format!("{}.{}.sig", enc(r#"{"alg":"RS256"}"#), enc(claims));
+        assert_eq!(
+            token_subject_for_logs(&jwt(r#"{"sub":"svc-dbt","preferred_username":"dbt"}"#)),
+            Some("svc-dbt".to_string())
+        );
+        assert_eq!(
+            token_subject_for_logs(&jwt(r#"{"preferred_username":"airflow"}"#)),
+            Some("airflow".to_string())
+        );
+        assert_eq!(token_subject_for_logs("opaque-token"), None);
     }
 
     /// Cross-token invalidation must evict EVERY token's entry for the table,
