@@ -1004,26 +1004,12 @@ pub(crate) fn classify(stmt: Statement) -> sqe_core::Result<StatementKind> {
         // SHOW SCHEMAS — sqlparser has a ShowSchemas variant
         Statement::ShowSchemas {
             ref show_options, ..
-        } => {
-            let filter = show_options
-                .show_in
-                .as_ref()
-                .map(|si| si.to_string())
-                .unwrap_or_default();
-            Ok(StatementKind::ShowSchemas(filter))
-        }
+        } => Ok(StatementKind::ShowSchemas(show_filter_text(show_options))),
 
         // SHOW TABLES — sqlparser has a ShowTables variant
         Statement::ShowTables {
             ref show_options, ..
-        } => {
-            let filter = show_options
-                .show_in
-                .as_ref()
-                .map(|si| si.to_string())
-                .unwrap_or_default();
-            Ok(StatementKind::ShowTables(filter))
-        }
+        } => Ok(StatementKind::ShowTables(show_filter_text(show_options))),
 
         // SHOW DATABASES — treat like ShowCatalogs
         Statement::ShowDatabases { .. } => Ok(StatementKind::ShowCatalogs),
@@ -1363,6 +1349,36 @@ fn parse_show_effective_policy(parser: &mut Parser) -> sqe_core::Result<Statemen
     Ok(StatementKind::ShowEffectivePolicy(
         ShowEffectivePolicyParams { user, table },
     ))
+}
+
+/// The `SHOW SCHEMAS` / `SHOW TABLES` filter as text: the `FROM`/`IN` scope
+/// followed by any `LIKE` / `ILIKE` pattern, e.g. `FROM ws_cbs_energy LIKE
+/// 'cbs%'`. The pattern used to be dropped, so `SHOW SCHEMAS FROM c LIKE 'x%'`
+/// listed every schema and dbt-trino's existence check saw a match for
+/// anything. The handler splits the pattern back off.
+fn show_filter_text(options: &sqlparser::ast::ShowStatementOptions) -> String {
+    use sqlparser::ast::{ShowStatementFilter, ShowStatementFilterPosition};
+    let mut text = options
+        .show_in
+        .as_ref()
+        .map(|si| si.to_string())
+        .unwrap_or_default();
+    let filter = match &options.filter_position {
+        Some(ShowStatementFilterPosition::Infix(f) | ShowStatementFilterPosition::Suffix(f)) => Some(f),
+        None => None,
+    };
+    let pattern = match filter {
+        Some(ShowStatementFilter::Like(p)) => Some(("LIKE", p)),
+        Some(ShowStatementFilter::ILike(p)) => Some(("ILIKE", p)),
+        _ => None,
+    };
+    if let Some((keyword, pattern)) = pattern {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(&format!("{keyword} '{}'", pattern.replace('\'', "''")));
+    }
+    text
 }
 
 #[cfg(test)]
@@ -3132,4 +3148,24 @@ mod token_dispatch_tests {
         );
         assert_eq!(parse_and_classify("SELECT 1").unwrap().update_type(), None);
     }
+
+    /// The LIKE pattern used to be dropped, so dbt's existence check
+    /// `SHOW SCHEMAS FROM c LIKE 'x'` matched every schema.
+    #[test]
+    fn show_filters_keep_the_like_pattern() {
+        let kind = |sql: &str| parse_and_classify(sql).unwrap();
+        match kind("SHOW SCHEMAS FROM ws_cbs_energy LIKE 'cbs%'") {
+            StatementKind::ShowSchemas(f) => assert_eq!(f, "FROM ws_cbs_energy LIKE 'cbs%'"),
+            other => panic!("{other:?}"),
+        }
+        match kind("SHOW TABLES FROM ws.cbs_silver LIKE 'o''x%'") {
+            StatementKind::ShowTables(f) => assert_eq!(f, "FROM ws.cbs_silver LIKE 'o''x%'"),
+            other => panic!("{other:?}"),
+        }
+        match kind("SHOW SCHEMAS FROM ws_cbs_energy") {
+            StatementKind::ShowSchemas(f) => assert_eq!(f, "FROM ws_cbs_energy"),
+            other => panic!("{other:?}"),
+        }
+    }
+
 }

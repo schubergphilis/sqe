@@ -136,6 +136,28 @@ BI tools that speak Trino connect through the same endpoint. Metabase uses the T
 - `DESCRIBE` and `SHOW COLUMNS` resolve double-quoted identifiers (`"catalog"."schema"."table"`), so field discovery works.
 - Types map to their Trino equivalents: `timestamp(6)` carries its precision in the type signature (so date bucketing over JDBC works), and computed unsigned-64 aggregates like `count(*)` map to `bigint` rather than `decimal`.
 
+## Metadata statements
+
+`SHOW SCHEMAS FROM <catalog>` and `SHOW TABLES FROM <catalog>.<schema>` answer
+for the catalog they name, not the session catalog. A trailing
+`LIKE '<pattern>'` filters the names the way Trino does: `%` matches any run,
+`_` one character, and the match is case-sensitive (`ILIKE` is not). dbt-trino
+checks whether a schema exists with exactly this form:
+
+```sql
+SHOW SCHEMAS FROM ws_cbs_energy LIKE 'cbs_silver';
+SHOW TABLES FROM ws_cbs_energy.cbs_silver LIKE 'fact%';
+```
+
+`ESCAPE` is not accepted on `SHOW` statements, so `_` in a pattern always
+matches any single character.
+
+A catalog that does not exist, or that the caller may not see, fails with
+Trino's error: `Catalog 'x' does not exist` (`CATALOG_NOT_FOUND`). The two
+cases read the same, so the reply does not reveal which one applies. A
+catalog the caller can reach but whose schemas it may not list returns an
+empty result.
+
 ## Limitations
 
 - The Trino endpoint returns results as JSON (Trino wire format), not Arrow. For maximum performance, use Flight SQL.

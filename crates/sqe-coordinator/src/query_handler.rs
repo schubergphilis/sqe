@@ -751,10 +751,18 @@ impl QueryHandler {
                 // described a DIFFERENT catalog than the one named, and reported
                 // success. `SHOW SCHEMAS` is how an operator confirms a grant
                 // landed, so a confidently wrong answer is worse than a refusal.
-                Err(sqe_core::SqeError::Catalog(format!(
-                    "Unknown catalog '{name}': not declared in configuration and not \
-                     resolvable via Polaris (nonexistent, or not authorized for this user)"
-                )))
+                // Trino's answer for a catalog that does not exist or that the
+                // caller may not see: the same message for both, so the reply
+                // does not reveal which. The operator-facing detail is logged.
+                tracing::info!(
+                    catalog = %name,
+                    "SHOW: catalog not declared in configuration and not resolvable via \
+                     Polaris (nonexistent, or not authorized for this user)"
+                );
+                Err(sqe_core::SqeError::with_code(
+                    SqeErrorCode::CatalogNotFound,
+                    format!("Catalog '{name}' does not exist"),
+                ))
             }
         }
     }
@@ -5140,7 +5148,10 @@ impl QueryHandler {
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         // `SHOW SCHEMAS FROM <catalog>` must list that catalog's namespaces, not
         // the default warehouse's. Resolve the named catalog (discovered under
-        // polaris-auto) so reads line up with the write path.
+        // polaris-auto) so reads line up with the write path. A trailing
+        // `LIKE '<pattern>'` filters the names.
+        let (filter, like) = ShowLike::split(filter);
+        let keep = |name: &str| like.as_ref().is_none_or(|l| l.matches(name));
         let catalog = show_schemas_catalog(filter);
 
         // Trino's `SHOW SCHEMAS` column is named `Schema`.
@@ -5159,7 +5170,9 @@ impl QueryHandler {
         if let Some(root) = catalog.as_deref() {
             if self.runtime_catalogs.is_hive_root(root).unwrap_or(false) {
                 for name in self.hive_ddl_handler.list_databases(root).await? {
-                    builder.append_value(name);
+                    if keep(&name) {
+                        builder.append_value(name);
+                    }
                 }
                 let array: ArrayRef = Arc::new(builder.finish());
                 let batch = RecordBatch::try_new(schema, vec![array]).map_err(|e| {
@@ -5177,12 +5190,17 @@ impl QueryHandler {
         // A principal that is not authorized to list this catalog's namespaces
         // gets an empty result, not a hard error -- so JDBC schema sync and
         // SHOW SCHEMAS skip catalogs the user can't see instead of aborting. (#5)
-        let namespaces = namespaces_or_empty_on_denial(session_catalog.list_namespaces().await)?;
+        let namespaces = namespaces_or_empty_on_denial(
+            missing_catalog_as_not_found(catalog.as_deref(), session_catalog.list_namespaces().await),
+        )?;
 
         for ns in &namespaces {
             // Namespace is a list of parts, join with "."
             let name: Vec<&str> = ns.as_ref().iter().map(|s| s.as_str()).collect();
-            builder.append_value(name.join("."));
+            let name = name.join(".");
+            if keep(&name) {
+                builder.append_value(name);
+            }
         }
         let array: ArrayRef = Arc::new(builder.finish());
 
@@ -5347,7 +5365,10 @@ impl QueryHandler {
         // `SHOW TABLES FROM <catalog>.<schema>` must list tables from that
         // catalog, not the default warehouse. Resolve the leading catalog
         // qualifier (discovered under polaris-auto); the schema part is parsed
-        // separately by parse_show_tables_namespace.
+        // separately by parse_show_tables_namespace. A trailing
+        // `LIKE '<pattern>'` filters the names.
+        let (filter, like) = ShowLike::split(filter);
+        let keep = |name: &str| like.as_ref().is_none_or(|l| l.matches(name));
         let catalog = show_tables_catalog(filter);
         // A Hive root is not an Iceberg catalog: `show_catalog` only knows
         // `[catalogs.*]` config and Polaris discovery, so a Hive root's name
@@ -5369,6 +5390,7 @@ impl QueryHandler {
                     .hive_ddl_handler
                     .list_tables(&session.user, root, &database)
                     .await?;
+                names.retain(|n| keep(n));
                 names.sort();
                 let schema = Arc::new(Schema::new(vec![Field::new(
                     "Table",
@@ -5409,7 +5431,10 @@ impl QueryHandler {
             // known to it.
             //
             // The per-namespace list_tables below already degrades this way.
-            None => namespaces_or_empty_on_denial(session_catalog.list_namespaces().await)?,
+            None => namespaces_or_empty_on_denial(missing_catalog_as_not_found(
+                catalog.as_deref(),
+                session_catalog.list_namespaces().await,
+            ))?,
             Some(name) => vec![iceberg::NamespaceIdent::new(name)],
         };
 
@@ -5452,6 +5477,7 @@ impl QueryHandler {
             }
         }
         // Trino lists table names sorted.
+        names.retain(|n| keep(n));
         names.sort();
         names.dedup();
 
@@ -9089,6 +9115,143 @@ fn extract_affected_rows(batches: &[RecordBatch]) -> Option<u64> {
 /// tree showed every schema as empty.
 /// Strip the leading `IN `/`FROM ` keyword (sqlparser renders a `show_in` clause
 /// as "FROM <x>" / "IN <x>") and return the trimmed remainder.
+/// A `LIKE` / `ILIKE` pattern trailing a `SHOW SCHEMAS` / `SHOW TABLES`
+/// filter (the classifier appends it; see `show_filter_text` in sqe-sql).
+/// `%` matches any run and `_` one character. `LIKE` is case-sensitive like
+/// Trino's; `ILIKE` is not. (sqlparser does not accept `ESCAPE` on SHOW
+/// statements, so no escape character can reach here.)
+#[derive(Debug, Clone, PartialEq)]
+struct ShowLike {
+    pattern: Vec<LikeToken>,
+    case_insensitive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum LikeToken {
+    Any,
+    One,
+    Char(char),
+}
+
+impl ShowLike {
+    /// Split a trailing `[I]LIKE '<pattern>'` off `filter`,
+    /// returning the remaining scope (`FROM <catalog>[.<schema>]`) and the
+    /// pattern.
+    fn split(filter: &str) -> (&str, Option<ShowLike>) {
+        let trimmed = filter.trim_end();
+        let upper = trimmed.to_ascii_uppercase();
+        for keyword in [" ILIKE '", " LIKE '", "ILIKE '", "LIKE '"] {
+            let Some(at) = upper.rfind(keyword) else { continue };
+            if !keyword.starts_with(' ') && at != 0 {
+                continue;
+            }
+            let body = &trimmed[at + keyword.len()..];
+            let Some((pattern, rest)) = read_sql_string(body) else { continue };
+            if !rest.trim().is_empty() {
+                continue;
+            }
+            let case_insensitive = keyword.trim_start().starts_with("ILIKE");
+            let scope = trimmed[..at].trim_end();
+            return (scope, Some(ShowLike::compile(&pattern, case_insensitive)));
+        }
+        (filter, None)
+    }
+
+    fn compile(pattern: &str, case_insensitive: bool) -> Self {
+        let fold = |c: char| {
+            if case_insensitive {
+                c.to_lowercase().next().unwrap_or(c)
+            } else {
+                c
+            }
+        };
+        let mut tokens = Vec::new();
+        for c in pattern.chars() {
+            tokens.push(match c {
+                '%' => LikeToken::Any,
+                '_' => LikeToken::One,
+                other => LikeToken::Char(fold(other)),
+            });
+        }
+        Self { pattern: tokens, case_insensitive }
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        let text: Vec<char> = if self.case_insensitive {
+            name.to_lowercase().chars().collect()
+        } else {
+            name.chars().collect()
+        };
+        // Iterative wildcard match with backtracking to the last `%`.
+        let (mut t, mut p) = (0usize, 0usize);
+        let (mut star, mut star_t) = (None::<usize>, 0usize);
+        while t < text.len() {
+            match self.pattern.get(p) {
+                Some(LikeToken::Char(c)) if *c == text[t] => {
+                    t += 1;
+                    p += 1;
+                }
+                Some(LikeToken::One) => {
+                    t += 1;
+                    p += 1;
+                }
+                Some(LikeToken::Any) => {
+                    star = Some(p);
+                    star_t = t;
+                    p += 1;
+                }
+                _ => match star {
+                    Some(sp) => {
+                        p = sp + 1;
+                        star_t += 1;
+                        t = star_t;
+                    }
+                    None => return false,
+                },
+            }
+        }
+        self.pattern[p..].iter().all(|tok| *tok == LikeToken::Any)
+    }
+}
+
+/// Read a single-quoted SQL string body (`''` is an escaped quote) up to its
+/// closing quote; `input` starts just after the opening quote. Returns the
+/// value and the text after the closing quote.
+fn read_sql_string(input: &str) -> Option<(String, &str)> {
+    let mut value = String::new();
+    let mut chars = input.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '\'' {
+            if matches!(chars.peek(), Some((_, '\''))) {
+                chars.next();
+                value.push('\'');
+                continue;
+            }
+            return Some((value, &input[i + 1..]));
+        }
+        value.push(c);
+    }
+    None
+}
+
+/// Trino's error for a catalog named in `SHOW ... FROM <catalog>` that does
+/// not exist. Under Polaris discovery an unknown name still builds a session
+/// catalog; it is the namespace listing that answers 404 ("Unable to find
+/// warehouse"), which classified as `TableNotFound` with Polaris' raw text.
+/// Only applies when the statement named the catalog.
+fn missing_catalog_as_not_found<T>(
+    named: Option<&str>,
+    result: sqe_core::Result<T>,
+) -> sqe_core::Result<T> {
+    match (named, result) {
+        (Some(name), Err(e)) if e.is_not_found() => Err(SqeError::with_code(
+            SqeErrorCode::CatalogNotFound,
+            format!("Catalog '{name}' does not exist"),
+        )),
+        (_, result) => result,
+    }
+}
+
 fn strip_show_in_keyword(filter: &str) -> &str {
     let raw = filter.trim();
     raw.strip_prefix("IN ")
@@ -10349,6 +10512,65 @@ warehouse = "wh1"
             config.access_control.grant_authority,
             sqe_core::config::GrantAuthority::AdminRole
         );
+    }
+
+    #[test]
+    fn show_like_splits_pattern_off_the_scope() {
+        let (scope, like) = ShowLike::split("FROM ws_cbs_energy LIKE 'cbs%'");
+        assert_eq!(scope, "FROM ws_cbs_energy");
+        assert_eq!(show_schemas_catalog(scope), Some("ws_cbs_energy".to_string()));
+        let like = like.unwrap();
+        assert!(like.matches("cbs_silver"));
+        assert!(!like.matches("other"));
+        assert!(!like.matches("CBS_silver"), "LIKE is case-sensitive, as in Trino");
+
+        // No scope, just a pattern; quotes doubled inside the literal.
+        let (scope, like) = ShowLike::split("LIKE 'o''brien'");
+        assert_eq!(scope, "");
+        assert!(like.unwrap().matches("o'brien"));
+
+        // SHOW TABLES FROM catalog.schema LIKE ...
+        let (scope, like) = ShowLike::split("FROM ws.cbs_silver LIKE 'fact_%'");
+        assert_eq!(show_tables_catalog(scope), Some("ws".to_string()));
+        assert!(like.unwrap().matches("fact_sales"));
+
+        // ILIKE folds case; no pattern leaves the filter untouched.
+        let (_, like) = ShowLike::split("IN c ILIKE 'CBS%'");
+        assert!(like.unwrap().matches("cbs_gold"));
+        assert_eq!(ShowLike::split("FROM ws_cbs_energy"), ("FROM ws_cbs_energy", None));
+        // A catalog literally named like a keyword is not mistaken for one.
+        assert_eq!(ShowLike::split("FROM likes"), ("FROM likes", None));
+    }
+
+    #[test]
+    fn a_missing_named_catalog_is_trinos_catalog_not_found() {
+        let polaris_404 = || -> sqe_core::Result<()> {
+            Err(SqeError::CatalogHttp {
+                status: 404,
+                op: sqe_core::CatalogOp::ListNamespaces,
+                body: "Unable to find warehouse no_such_wh".to_string(),
+            })
+        };
+        let err = missing_catalog_as_not_found(Some("no_such_wh"), polaris_404()).unwrap_err();
+        assert_eq!(err.error_code(), SqeErrorCode::CatalogNotFound);
+        assert_eq!(err.to_string(), "Catalog 'no_such_wh' does not exist");
+        // Without a named catalog the error is left alone.
+        assert!(missing_catalog_as_not_found(None, polaris_404()).unwrap_err().is_not_found());
+        assert!(missing_catalog_as_not_found(Some("c"), Ok(())).is_ok());
+    }
+
+    #[test]
+    fn show_like_wildcards() {
+        let (_, like) = ShowLike::split("LIKE '%_gold'");
+        let like = like.unwrap();
+        assert!(like.matches("cbs_gold"));
+        assert!(like.matches("x_gold"));
+        assert!(!like.matches("_golden"));
+        let (_, like) = ShowLike::split("LIKE 'a_c'");
+        let like = like.unwrap();
+        assert!(like.matches("abc") && !like.matches("ac") && !like.matches("abbc"));
+        let (_, like) = ShowLike::split("LIKE '%'");
+        assert!(like.unwrap().matches(""));
     }
 
     #[test]
