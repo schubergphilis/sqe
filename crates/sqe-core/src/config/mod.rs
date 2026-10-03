@@ -700,6 +700,16 @@ pub struct CoordinatorConfig {
     pub flight_sql_port: u16,
     #[serde(default = "default_trino_port")]
     pub trino_http_port: u16,
+    /// Public base URL of the Trino HTTP listener behind a TLS-terminating
+    /// ingress, e.g. `"https://sql.example.org"`. Used for `nextUri` /
+    /// `infoUri` only on requests whose `Host` (or a trusted proxy's
+    /// `X-Forwarded-Host`) matches its host, so in-cluster clients calling
+    /// the service directly keep URIs that point back at the service. A
+    /// fallback for ingresses whose IPs cannot be listed in
+    /// `[security] trusted_proxies`. Must be `http(s)://host[:port]` with no
+    /// path.
+    #[serde(default)]
+    pub public_base_url: Option<String>,
     /// Port the DuckDB Quack RPC server listens on. Zero disables the Quack
     /// endpoint entirely. DuckDB's documented default for `quack:host` URIs
     /// is 9494, so enabling this with `quack_port = 9494` lets a DuckDB CLI
@@ -1289,6 +1299,7 @@ impl std::fmt::Debug for CoordinatorConfig {
         f.debug_struct("CoordinatorConfig")
             .field("flight_sql_port", &self.flight_sql_port)
             .field("trino_http_port", &self.trino_http_port)
+            .field("public_base_url", &self.public_base_url)
             .field("quack_port", &self.quack_port)
             .field("mode", &self.mode)
             .field("worker_urls", &self.worker_urls)
@@ -4459,8 +4470,15 @@ pub struct SecurityConfig {
     /// directly and `x-forwarded-for` is ignored. Empty (the default)
     /// means no proxy is trusted, audit IPs always come from the peer.
     ///
-    /// IPv4 and IPv6 literals are supported. CIDR ranges are not (yet);
-    /// list each proxy IP explicitly. Hostnames are not resolved.
+    /// Each entry is an IPv4/IPv6 address or a CIDR range
+    /// (`"10.42.0.0/16"`, `"fd00::/8"`), so an ingress whose pod IPs change
+    /// can be trusted by its range. Hostnames are not resolved; an entry
+    /// that is neither an address nor a range fails config validation.
+    ///
+    /// Trusting a range lets every peer in it set `x-forwarded-for` (the
+    /// audited client IP) and, on the Trino HTTP listener,
+    /// `x-forwarded-proto` / `-host` / `-port`. Keep it as narrow as the
+    /// ingress allows.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
     /// Opt-in escape hatch for the TLS-on-the-wire requirement. Leaving this
@@ -4535,13 +4553,7 @@ impl SecurityConfig {
     /// known proxies that prepend to one another.
     pub fn resolve_client_ip(&self, peer: Option<&str>, forwarded_for: Option<&str>) -> String {
         let peer = peer.unwrap_or("unknown");
-        let peer_host = strip_port(peer);
-        let trusted = !self.trusted_proxies.is_empty()
-            && self
-                .trusted_proxies
-                .iter()
-                .any(|p| p.eq_ignore_ascii_case(peer_host));
-        if !trusted {
+        if !self.is_trusted_proxy(peer) {
             return peer.to_string();
         }
         let chain = match forwarded_for {
@@ -4551,19 +4563,113 @@ impl SecurityConfig {
         // Walk right to left, skipping known trusted proxies.
         let hops: Vec<&str> = chain.split(',').map(str::trim).collect();
         for hop in hops.iter().rev() {
-            let hop_host = strip_port(hop);
-            if hop_host.is_empty() {
+            if strip_port(hop).is_empty() {
                 continue;
             }
-            let is_trusted = self
-                .trusted_proxies
-                .iter()
-                .any(|p| p.eq_ignore_ascii_case(hop_host));
-            if !is_trusted {
+            if !self.is_trusted_proxy(hop) {
                 return hop.to_string();
             }
         }
         peer.to_string()
+    }
+}
+
+impl SecurityConfig {
+    /// Is `addr` (an IP, optionally `ip:port` or `[ipv6]:port`) one of
+    /// `trusted_proxies`, as an exact address or inside a CIDR range? The
+    /// single matcher behind every surface that honours forwarded headers:
+    /// Flight SQL, the web/health router, the Quack server and the Trino HTTP
+    /// listener. Entries that do not parse never match (config validation
+    /// rejects them at load).
+    pub fn is_trusted_proxy(&self, addr: &str) -> bool {
+        if self.trusted_proxies.is_empty() {
+            return false;
+        }
+        let Ok(ip) = strip_port(addr).parse::<std::net::IpAddr>() else {
+            return false;
+        };
+        self.trusted_proxies
+            .iter()
+            .any(|entry| TrustedProxy::parse(entry).is_ok_and(|proxy| proxy.contains(ip)))
+    }
+}
+
+/// Split a `public_base_url` into `(scheme, authority)`, normalised: lower
+/// case, no trailing slash. Only `http` / `https` with a host and no path,
+/// query or credentials are accepted.
+pub fn parse_public_base_url(url: &str) -> Result<(String, String), String> {
+    let url = url.trim().trim_end_matches('/');
+    let (scheme, authority) = url
+        .split_once("://")
+        .ok_or_else(|| format!("`{url}` is not an absolute URL"))?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("`{url}`: scheme must be http or https"));
+    }
+    if authority.is_empty() || authority.contains(['/', '?', '#', '@']) {
+        return Err(format!("`{url}`: expected scheme://host[:port] with no path"));
+    }
+    Ok((scheme, authority.to_ascii_lowercase()))
+}
+
+/// One `[security] trusted_proxies` entry: an address (a /32 or /128) or a
+/// CIDR range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustedProxy {
+    network: std::net::IpAddr,
+    prefix_len: u8,
+}
+
+impl TrustedProxy {
+    /// Parse `"10.0.0.1"`, `"10.42.0.0/16"`, `"::1"`, `"[fd00::1]"` or
+    /// `"fd00::/8"`. Host bits below the prefix are ignored.
+    pub fn parse(entry: &str) -> Result<Self, String> {
+        let entry = entry.trim();
+        let (addr, prefix) = match entry.split_once('/') {
+            Some((addr, prefix)) => (addr, Some(prefix)),
+            None => (entry, None),
+        };
+        let addr = addr.trim();
+        let addr = addr
+            .strip_prefix('[')
+            .and_then(|a| a.strip_suffix(']'))
+            .unwrap_or(addr);
+        let network: std::net::IpAddr = addr
+            .parse()
+            .map_err(|_| format!("`{entry}` is not an IP address or CIDR range"))?;
+        let max = if network.is_ipv4() { 32 } else { 128 };
+        let prefix_len = match prefix {
+            None => max,
+            Some(p) => p
+                .trim()
+                .parse::<u8>()
+                .ok()
+                .filter(|len| *len <= max)
+                .ok_or_else(|| format!("`{entry}`: prefix length must be 0-{max}"))?,
+        };
+        Ok(Self { network, prefix_len })
+    }
+
+    /// Does the range contain `ip`? An IPv4-mapped IPv6 peer
+    /// (`::ffff:10.0.0.1`, what a dual-stack listener reports) matches IPv4
+    /// entries.
+    pub fn contains(&self, ip: std::net::IpAddr) -> bool {
+        use std::net::IpAddr;
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+            v4 => v4,
+        };
+        match (self.network, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                let mask = u32::MAX.checked_shl(32 - u32::from(self.prefix_len)).unwrap_or(0);
+                u32::from(net) & mask == u32::from(ip) & mask
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                let mask = u128::MAX.checked_shl(128 - u32::from(self.prefix_len)).unwrap_or(0);
+                u128::from(net) & mask == u128::from(ip) & mask
+            }
+            _ => false,
+        }
     }
 }
 
@@ -5385,6 +5491,16 @@ impl SqeConfig {
             errors.push(error);
         }
         self.validate_ticket_keys(&mut errors);
+        for entry in &self.security.trusted_proxies {
+            if let Err(e) = TrustedProxy::parse(entry) {
+                errors.push(format!("security.trusted_proxies: {e}"));
+            }
+        }
+        if let Some(url) = &self.coordinator.public_base_url {
+            if let Err(e) = parse_public_base_url(url) {
+                errors.push(format!("coordinator.public_base_url: {e}"));
+            }
+        }
 
         // Required fields
         //
@@ -7105,6 +7221,7 @@ partial_progress_batch = 5
             coordinator: CoordinatorConfig {
                 flight_sql_port: 50051,
                 trino_http_port: 8080,
+                public_base_url: None,
                 quack_port: 0,
                 mode: ServerMode::Hybrid,
                 worker_urls: vec![],
@@ -10279,6 +10396,90 @@ audience = "polaris"
         for destination in ["https://ALLOWED.example:443/x", "http://[::1]:9000/x"] {
             assert!(check_remote(&policy, destination).is_ok(), "{destination}");
             assert!(policy.check_endpoint(destination).is_ok(), "{destination}");
+        }
+    }
+
+    // --- trusted_proxies CIDR ranges ---
+
+    fn trusts(entries: &[&str]) -> SecurityConfig {
+        SecurityConfig {
+            trusted_proxies: entries.iter().map(|e| e.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn trusted_proxy_parses_addresses_and_ranges() {
+        for ok in ["10.0.0.1", "10.42.0.0/16", "0.0.0.0/0", " 10.1.2.3/32 ", "::1", "[fd00::1]", "fd00::/8", "::/0"] {
+            assert!(TrustedProxy::parse(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "ingress.local", "10.0.0.0/33", "fd00::/129", "10.0.0.0/", "10.0.0.0/x", "10.0.0.256"] {
+            assert!(TrustedProxy::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn trusted_proxy_matches_inside_ipv4_range_only() {
+        let sec = trusts(&["10.42.0.0/16"]);
+        assert!(sec.is_trusted_proxy("10.42.7.9"));
+        assert!(sec.is_trusted_proxy("10.42.255.255:51234"));
+        assert!(!sec.is_trusted_proxy("10.43.0.1"));
+        // Exact entries keep working.
+        assert!(trusts(&["10.0.0.1"]).is_trusted_proxy("10.0.0.1:443"));
+        assert!(!trusts(&["10.0.0.1"]).is_trusted_proxy("10.0.0.2"));
+        // A dual-stack listener reports IPv4 peers as mapped IPv6.
+        assert!(sec.is_trusted_proxy("[::ffff:10.42.1.1]:9000"));
+        assert!(!trusts(&[]).is_trusted_proxy("10.42.1.1"));
+    }
+
+    #[test]
+    fn trusted_proxy_matches_ipv6_range() {
+        let sec = trusts(&["fd00:42::/32"]);
+        assert!(sec.is_trusted_proxy("fd00:42:1::5"));
+        assert!(sec.is_trusted_proxy("[fd00:42:ffff::1]:8080"));
+        assert!(!sec.is_trusted_proxy("fd00:43::1"));
+        assert!(!sec.is_trusted_proxy("10.42.0.1"));
+    }
+
+    #[test]
+    fn client_ip_resolution_honours_cidr_proxies() {
+        let sec = trusts(&["10.42.0.0/16"]);
+        // Ingress pod in the range: the rightmost hop outside it is the client.
+        assert_eq!(
+            sec.resolve_client_ip(Some("10.42.3.4:5000"), Some("203.0.113.7, 10.42.9.9")),
+            "203.0.113.7"
+        );
+        // A peer outside the range cannot spoof the client IP.
+        assert_eq!(
+            sec.resolve_client_ip(Some("192.0.2.1:5000"), Some("203.0.113.7")),
+            "192.0.2.1:5000"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_bad_trusted_proxies_and_public_base_url() {
+        let mut cfg = valid_config();
+        cfg.security.trusted_proxies = vec!["10.0.0.0/8".into(), "ingress.local".into(), "10.0.0.0/40".into()];
+        cfg.coordinator.public_base_url = Some("https://sql.example.org/path".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("security.trusted_proxies: `ingress.local`"), "{err}");
+        assert!(err.contains("security.trusted_proxies: `10.0.0.0/40`"), "{err}");
+        assert!(err.contains("coordinator.public_base_url"), "{err}");
+        assert!(!err.contains("`10.0.0.0/8`"), "{err}");
+
+        cfg.security.trusted_proxies = vec!["10.0.0.0/8".into(), "fd00::/8".into()];
+        cfg.coordinator.public_base_url = Some("https://sql.example.org".into());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn public_base_url_parsing() {
+        assert_eq!(
+            parse_public_base_url("HTTPS://SQL.Example.org:8443/").unwrap(),
+            ("https".to_string(), "sql.example.org:8443".to_string())
+        );
+        for bad in ["sql.example.org", "ftp://x", "https://", "https://x/y", "https://u@x", "https://x?q"] {
+            assert!(parse_public_base_url(bad).is_err(), "{bad}");
         }
     }
 
