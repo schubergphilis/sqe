@@ -94,6 +94,27 @@ pub fn cached_namespace_listing(
     TABLE_NAMES_SNAPSHOTS.get(&listing_key(catalog, warehouse, namespace))
 }
 
+/// Drop every principal's snapshot of `namespace` (in any warehouse) so the
+/// next pre-plan refresh of each session re-lists it.
+///
+/// A table created, dropped or renamed by one session is visible to all of
+/// them, but snapshots are keyed per token: dropping only the writer's left
+/// every other session (a parallel dbt model with its own connection, another
+/// user) answering `table_exist` and `information_schema.tables` from the
+/// pre-DDL list until the TTL. Matching on the namespace alone over-evicts a
+/// same-named namespace in another warehouse, which only costs it a re-list.
+pub fn invalidate_namespace_listing_all_tokens(namespace: &str) {
+    let suffix = format!("|{namespace}");
+    let keys: Vec<Arc<String>> = TABLE_NAMES_SNAPSHOTS
+        .iter()
+        .filter(|(key, _)| key.ends_with(&suffix))
+        .map(|(key, _)| key)
+        .collect();
+    for key in keys {
+        TABLE_NAMES_SNAPSHOTS.invalidate(key.as_str());
+    }
+}
+
 /// Drop the snapshot for one namespace so the next pre-plan refresh
 /// re-lists it. Call after DDL that creates or drops a table/view.
 pub fn invalidate_namespace_listing(catalog: &SessionCatalog, warehouse: &str, namespace: &str) {
@@ -627,6 +648,32 @@ impl SqeSchemaProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DDL is visible to every session, so it drops every principal's
+    /// snapshot of the namespace, and only that namespace's.
+    #[test]
+    fn ddl_invalidation_drops_every_tokens_listing_of_the_namespace() {
+        let tag = uuid::Uuid::new_v4().to_string();
+        let ns = format!("cbs_silver_{}", &tag[..8]);
+        let other = format!("x.{ns}");
+        let keys = [
+            format!("tokA|wh|{ns}"),
+            format!("tokB|wh|{ns}"),
+            format!("tokA|other_wh|{ns}"),
+            format!("tokA|wh|{other}"),
+        ];
+        for key in &keys {
+            TABLE_NAMES_SNAPSHOTS.insert(
+                key.clone(),
+                Arc::new(merge_listing(None, Ok(vec!["t".to_string()]))),
+            );
+        }
+        invalidate_namespace_listing_all_tokens(&ns);
+        for key in &keys[..3] {
+            assert!(TABLE_NAMES_SNAPSHOTS.get(key).is_none(), "{key} survived");
+        }
+        assert!(TABLE_NAMES_SNAPSHOTS.get(&keys[3]).is_some(), "`x.{ns}` is a different namespace");
+    }
 
     #[test]
     fn name_exists_in_matches_tables_and_views() {

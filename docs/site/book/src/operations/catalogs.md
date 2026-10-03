@@ -276,6 +276,28 @@ Properties:
   declaration or `ATTACH`. `SHOW CATALOGS` lists statically-configured and
   already-discovered catalogs, not warehouses never yet referenced.
 
+## Metadata freshness under concurrent writers
+
+Each session plans against a cached list of a catalog's schemas and a cached
+list of each schema's tables, so that a dbt run does not ask Polaris for
+them on every statement. The caches follow writes in three ways:
+
+- DDL through SQE (`CREATE`/`DROP SCHEMA`, `CREATE TABLE`, CTAS, `INSERT`,
+  `DROP`/`RENAME TABLE`) drops the cached schema list of every session, and
+  drops every principal's table list for the schema it touched. A parallel
+  model on another connection sees the change on its next statement.
+- A statement naming a schema that is not in the cached list re-lists the
+  catalog. Re-listing happens at most once every 5 seconds per session; a
+  miss inside that window asks Polaris about that one schema instead, so a
+  schema created moments earlier by another coordinator replica, Spark or
+  Airflow is found rather than reported missing.
+- Table lookups always ask Polaris, so a new table is visible to the next
+  statement. Only listings (`information_schema.tables`, `SHOW TABLES`) read
+  the cached table list, refreshed when older than 5 seconds.
+
+Serializing dbt (`threads: 1`, Airflow `max_active_tasks=1`) is not needed
+for schema or table visibility.
+
 ## v1 limitations
 
 - No on-disk persistence. ATTACH does not survive a restart.
