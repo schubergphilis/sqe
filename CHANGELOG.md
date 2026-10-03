@@ -71,6 +71,39 @@ All notable changes to SQE are documented in this file.
     `https` are accepted, the first value of a forwarded list is used, and
     `X-Forwarded-Port` is honoured when it is not the scheme's default.
 
+### Fixed
+
+- File TVFs: `read_parquet` / `read_csv` / `read_json` are prepared per statement
+
+    With dbt-trino on four threads and one JWT, `CREATE TABLE ... AS SELECT
+    ... FROM read_parquet(...)` failed intermittently with "the table
+    function was not prepared before planning". The providers were stored on
+    the function instances of the user's cached session context, and the
+    CTAS SELECT was planned on a second fetch of that context: when another
+    thread's commit invalidated the cache in between, the write handler got a
+    fresh context with nothing prepared. Prepared providers now live in a
+    per-statement scope keyed by function name and arguments, so every plan
+    of a statement finds them whatever context it plans on, and nothing is
+    shared across statements, sessions or tokens. Every planner entry point
+    (queries, CTAS/INSERT/MERGE, EXPLAIN, views, the embedded CLI) goes
+    through `file_tvf_prepare::plan_sql`; a lint test fails the build on a
+    direct `ctx.sql` or `create_logical_plan`. A statement prepares each call
+    once, so a CTAS no longer lists the same prefix twice.
+
+- Catalog: the per-token circuit breaker counts upstream faults only
+
+    A client that legitimately probed for missing or hidden objects (dbt's
+    `information_schema` checks, `read_parquet` name lookups) collected 404s
+    from Polaris, the per-(token, catalog) breaker counted them, and after
+    five it opened: every query with that JWT was refused for 30 s. All
+    breaker sites now classify the outcome once. 5xx, timeouts, connection
+    failures and 429 count; 401/403, 404 and other 4xx are normal answers
+    and record success. `[catalog] circuit_breaker_failure_classes` sets the
+    counted classes (`server_error`, `timeout`, `connection`,
+    `rate_limited`, `client_error`, `not_found`, `auth`). The `Circuit
+    breaker opened` log line now carries the token `subject` and the
+    `reason` class.
+
 ## [0.49.0] — 2026-09-26
 
 This section covers every change since 0.28.0. Versions 0.29.0 to 0.48.1 were tagged without changelog sections of their own; from 0.49.0 on, `scripts/release.sh` turns this section into the release notes.

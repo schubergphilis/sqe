@@ -580,7 +580,7 @@ impl SqeSchemaProvider {
             DataFusionError::External(format!("Failed to plan view '{name}' SQL: {e}").into())
         };
 
-        let df = match mini_ctx.sql(&sql).await {
+        let df = match crate::file_tvf_prepare::plan_sql(&mini_ctx, &sql).await {
             Ok(df) => df,
             Err(first_err) => {
                 // A view body may reference tables in OTHER catalogs (e.g. a
@@ -631,7 +631,7 @@ impl SqeSchemaProvider {
                         ),
                     }
                 }
-                mini_ctx.sql(&sql).await.map_err(plan_err)?
+                crate::file_tvf_prepare::plan_sql(&mini_ctx, &sql).await.map_err(plan_err)?
             }
         };
 

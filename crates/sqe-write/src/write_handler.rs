@@ -352,8 +352,7 @@ pub fn affected_rows_batch(count: u64) -> sqe_core::Result<Vec<RecordBatch>> {
 /// `label` names the caller in the two error messages. Shared by the MERGE
 /// cardinality check and the empty-source affected-row count (501).
 async fn scalar_count(ctx: &DFSessionContext, sql: &str, label: &str) -> sqe_core::Result<i64> {
-    let batches = ctx
-        .sql(sql)
+    let batches = sqe_catalog::file_tvf_prepare::plan_sql(ctx, sql)
         .await
         .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("{label} failed to plan: {e}")))?
         .collect()
@@ -1361,7 +1360,7 @@ impl WriteHandler {
         plan_out: &mut Option<sqe_lineage::PlanOrHint>,
     ) {
         let select_sql = format!("SELECT * FROM {table_factor_name}");
-        let df = match ctx.sql(&select_sql).await {
+        let df = match sqe_catalog::file_tvf_prepare::plan_sql(ctx, &select_sql).await {
             Ok(df) => df,
             Err(e) => {
                 tracing::debug!(
@@ -1483,8 +1482,7 @@ impl WriteHandler {
         // the dedicated planning stack (#640); this is the CTAS + rewriter
         // path that overflowed a request thread.
         let (df, policy_summary) = sqe_core::runtime::on_planning_stack(async {
-            let df = ctx
-                .sql(select_sql)
+            let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, select_sql)
                 .await
                 .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
 
@@ -1973,8 +1971,7 @@ impl WriteHandler {
             )?
         };
 
-        let df = ctx
-            .sql(&effective_sql)
+        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &effective_sql)
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
 
@@ -4187,7 +4184,7 @@ impl WriteHandler {
                             empty_source_affected = Some(claimed.max(0) as usize);
                         }
 
-                        let df = ctx.sql(select_sql).await.map_err(|e| {
+                        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, select_sql).await.map_err(|e| {
                             SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to plan MERGE query: {e}"))
                         })?;
 
@@ -4400,8 +4397,7 @@ impl WriteHandler {
         label: &str,
         counter: Arc<std::sync::atomic::AtomicUsize>,
     ) -> sqe_core::Result<datafusion::execution::SendableRecordBatchStream> {
-        let df = ctx
-            .sql(sql)
+        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, sql)
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("MoR MERGE {label} plan failed: {e}")))?;
         let stream = self
@@ -4434,8 +4430,7 @@ impl WriteHandler {
         label: &str,
         keys: &mut TrackedBatchBuffer,
     ) -> sqe_core::Result<usize> {
-        let df = ctx
-            .sql(sql)
+        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, sql)
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("MoR MERGE {label} plan failed: {e}")))?;
         let mut stream = self
@@ -5748,8 +5743,7 @@ impl WriteHandler {
             "SELECT CAST(({augmented_where}) AS BOOLEAN) AS __match \
              FROM {from_clause}{joins_sql}"
         );
-        let df = ctx
-            .sql(&eval_sql)
+        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &eval_sql)
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to evaluate WHERE clause: {e}")))?;
         let result_batches: Vec<RecordBatch> = df
@@ -5821,8 +5815,7 @@ impl WriteHandler {
             "SELECT CAST(({augmented_where}) AS BOOLEAN) AS __match \
              FROM {from_clause}{joins_sql}"
         );
-        let df = ctx
-            .sql(&eval_sql)
+        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &eval_sql)
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to evaluate WHERE clause: {e}")))?;
         let result_batches: Vec<RecordBatch> = df
@@ -5955,8 +5948,7 @@ impl WriteHandler {
             cols = columns.join(", "),
             joins = joins_sql,
         );
-        let df = ctx
-            .sql(&select_sql)
+        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &select_sql)
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to evaluate UPDATE: {e}")))?;
         let result_batches: Vec<RecordBatch> = df
@@ -6111,8 +6103,7 @@ pub(crate) async fn check_batch_within_policy(
         scratch = scratch.qualified(),
         name = table_ident.name(),
     );
-    let batches = ctx
-        .sql(&eval_sql)
+    let batches = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &eval_sql)
         .await
         .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("WITH CHECK evaluation failed: {e}")))?
         .collect()
@@ -6242,7 +6233,7 @@ async fn lift_in_subqueries_enforced(
         // subquery's projection may be arbitrary (e.g. `t.t_ca_id`); we do
         // not depend on them beyond this preflight.
         let preflight_sql = format!("SELECT * FROM ({subquery_text}) AS __sq");
-        let pre_df = ctx.sql(&preflight_sql).await.map_err(|e| {
+        let pre_df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &preflight_sql).await.map_err(|e| {
             SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
                 "IN-subquery preflight failed for `{preflight_sql}`: {e}"
             ))
@@ -6302,7 +6293,7 @@ async fn lift_in_subqueries_enforced(
         // data; every LEFT JOIN lookup misses and `COALESCE(..., FALSE)`
         // evaluates to FALSE — i.e. `IN (empty)` is FALSE and `NOT IN
         // (empty)` is TRUE, matching the old rewriter's behaviour).
-        let mut mat_df = ctx.sql(&materialiser_sql).await.map_err(|e| {
+        let mut mat_df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &materialiser_sql).await.map_err(|e| {
             SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("IN-subquery materialiser plan failed: {e}"))
         })?;
         // #731: the subquery is user SQL over policy-governed tables; apply

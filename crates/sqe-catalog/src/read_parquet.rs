@@ -144,7 +144,7 @@ impl ReadParquetFunction {
             storage,
             caller: TvfCaller::default(),
             runtime_env: None,
-            prepared: PreparedProviders::default(),
+            prepared: PreparedProviders::named("read_parquet"),
         }
     }
 
@@ -154,7 +154,7 @@ impl ReadParquetFunction {
             storage,
             caller,
             runtime_env: None,
-            prepared: PreparedProviders::default(),
+            prepared: PreparedProviders::named("read_parquet"),
         }
     }
 

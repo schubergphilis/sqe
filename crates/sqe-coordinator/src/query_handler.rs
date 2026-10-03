@@ -169,16 +169,6 @@ fn normalize_for_planning(session: &Session, sql: &str) -> sqe_core::Result<Stri
     Ok(sqe_sql::rewrite_named_tvf_args(normalized.sql()))
 }
 
-/// Build the providers of the file table functions `sql` calls, on the async
-/// path, before DataFusion's synchronous `TableFunctionImpl::call` asks for
-/// them (architecture review 806). Must run on the final text handed to
-/// `ctx.sql`; every planner entry point in this crate calls it.
-pub(crate) async fn prepare_file_tvfs(ctx: &SessionContext, sql: &str) -> sqe_core::Result<()> {
-    sqe_catalog::file_tvf_prepare::prepare_statement(ctx, sql)
-        .await
-        .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))
-}
-
 fn refuse_if_audit_closed(
     audit: Option<&Arc<sqe_metrics::audit::AuditLogger>>,
 ) -> sqe_core::Result<()> {
@@ -1050,7 +1040,11 @@ impl QueryHandler {
         sql: &'a str,
         client_ip: Option<String>,
     ) -> futures::future::BoxFuture<'a, sqe_core::Result<Vec<RecordBatch>>> {
-        Box::pin(self.execute_inner(session, sql, client_ip))
+        // One statement-scoped set of prepared file-function providers for
+        // the whole execution, whatever session context each step plans on.
+        Box::pin(sqe_catalog::file_tvf_prepare::in_statement(
+            self.execute_inner(session, sql, client_ip),
+        ))
     }
 
     /// Write the audit record for a statement that failed before its normal
@@ -1910,9 +1904,7 @@ impl QueryHandler {
                             // Plan the SELECT for its schema only. The column
                             // list and the partition-key types both come from
                             // the query, because a CTAS need not declare them.
-                            prepare_file_tvfs(&ctx, &select_sql).await?;
-                            let schema = ctx
-                                .sql(&select_sql)
+                            let schema = sqe_catalog::file_tvf_prepare::plan_sql(&ctx, &select_sql)
                                 .await
                                 .map_err(|e| {
                                     SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
@@ -1970,7 +1962,6 @@ impl QueryHandler {
                             // failed with "the table function was not
                             // prepared before planning".
                             let (load_ctx, _) = self.create_session_context(session).await?;
-                            prepare_file_tvfs(&load_ctx, &select_sql).await?;
                             let written = crate::hive_write::handle_insert(
                                 &load_ctx,
                                 &load_stmt,
@@ -3435,8 +3426,7 @@ impl QueryHandler {
             "sqe.plan",
             query_id = query_id.map(|q| q.to_string()).unwrap_or_default()
         );
-        prepare_file_tvfs(ctx, sql).await?;
-        let df = ctx.sql(sql).instrument(plan_span).await.map_err(|e| {
+        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, sql).instrument(plan_span).await.map_err(|e| {
             SqeError::with_code(
                 SqeErrorCode::ExecutionFailed,
                 format!("SQL planning failed: {e}"),
@@ -3509,9 +3499,7 @@ impl QueryHandler {
                     incremental_identities,
                 )
                 .await?;
-            prepare_file_tvfs(&ctx, &sql_for_plan).await?;
-            let df = ctx
-                .sql(&sql_for_plan)
+            let df = sqe_catalog::file_tvf_prepare::plan_sql(&ctx, &sql_for_plan)
                 .await
                 .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
             // `_tt_cleanup` drops here, deregistering any pinned providers
@@ -3580,9 +3568,7 @@ impl QueryHandler {
             self.preflight_resolve_catalogs(stmt, session).await?;
         }
         let (ctx, _session_catalog) = self.create_session_context(session).await?;
-        prepare_file_tvfs(&ctx, numbered_sql).await?;
-        let df = ctx
-            .sql(numbered_sql)
+        let df = sqe_catalog::file_tvf_prepare::plan_sql(&ctx, numbered_sql)
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
         let types_map = df
@@ -3798,9 +3784,7 @@ impl QueryHandler {
 
             // Plan the query via DataFusion's SQL planner
             let plan_span = tracing::info_span!("sqe.plan", query_id = %query_id);
-            prepare_file_tvfs(&ctx, sql).await?;
-            let df = ctx
-                .sql(sql)
+            let df = sqe_catalog::file_tvf_prepare::plan_sql(&ctx, sql)
                 .instrument(plan_span)
                 .await
                 .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
@@ -4913,8 +4897,7 @@ impl QueryHandler {
         // back empty for tables outside the default catalog. (#2)
         let col_sql = info_schema_columns_query(&table_name);
 
-        let df = ctx
-            .sql(&col_sql)
+        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &col_sql)
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to query column metadata: {e}")))?;
         let batches = df
@@ -5274,7 +5257,7 @@ impl QueryHandler {
         // come back empty.
         self.refresh_listing_snapshots(&ctx, &session_catalog, session, &col_sql)
             .await;
-        let df = ctx.sql(&col_sql).await.map_err(|e| {
+        let df = sqe_catalog::file_tvf_prepare::plan_sql(&ctx, &col_sql).await.map_err(|e| {
             SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("failed to query information_schema.columns: {e}"))
         })?;
         let batches = df
