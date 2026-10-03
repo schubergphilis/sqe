@@ -6,6 +6,15 @@ All notable changes to SQE are documented in this file.
 
 ### Fixed
 
+- Errors: planning failures report their real error code
+
+    A missing table, an unknown function or an argument type mismatch came
+    back as `EXECUTION_FAILED` on every door (Trino HTTP, Flight SQL, MCP),
+    because each planner call site wrapped the DataFusion error with a fixed
+    code. They now report `TABLE_NOT_FOUND`, `FUNCTION_NOT_FOUND` and
+    `TYPE_MISMATCH`, the user-error codes clients and dbt key on. Other
+    planning errors report `SEMANTIC_ERROR`. The message text is unchanged.
+
 - Catalog: schemas and tables created by a concurrent writer are visible to the next statement
 
     dbt-trino runs models in parallel on connections that share a JWT; a

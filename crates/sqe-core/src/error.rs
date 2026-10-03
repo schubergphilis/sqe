@@ -162,6 +162,28 @@ impl SqeError {
         }
     }
 
+    /// A DataFusion planning failure, reported as `SQL planning failed: ...`.
+    /// DataFusion raises a missing table, an unknown function and an argument
+    /// type mismatch as plain `Plan` text, so the typed code alone says only
+    /// `SEMANTIC_ERROR`. When the typed code is that generic, the message
+    /// classifier refines it (`TABLE_NOT_FOUND`, `FUNCTION_NOT_FOUND`,
+    /// `TYPE_MISMATCH`, ...); a specific typed code (resources, parse, not
+    /// supported) is kept. The DataFusion error stays the source.
+    pub fn planning(e: DataFusionError) -> Self {
+        let typed = datafusion_error_code(&e);
+        let message = e.to_string();
+        let code = match typed {
+            SqeErrorCode::SemanticError | SqeErrorCode::ExecutionFailed => {
+                match classify_execution_error(&message) {
+                    SqeErrorCode::ExecutionFailed => typed,
+                    specific => specific,
+                }
+            }
+            specific => specific,
+        };
+        SqeError::sourced(code, format!("SQL planning failed: {message}"), e)
+    }
+
     /// Catalog boundary error that keeps its cause. The code is classified from
     /// the message exactly like [`SqeError::Catalog`], so this is a drop-in
     /// upgrade that additionally preserves the source chain. (#268)
@@ -1252,6 +1274,35 @@ mod tests {
         let code = err.error_code();
         assert_eq!(code, SqeErrorCode::ColumnNotFound);
         assert!(code.is_user_error());
+    }
+
+    /// Planning failures keep the specific code the client needs: DataFusion
+    /// reports these as `Plan` text, which used to surface as
+    /// `EXECUTION_FAILED` (integration `test_error_classification_live`).
+    #[test]
+    fn planning_errors_are_classified_from_the_plan_text() {
+        let cases = [
+            ("table 'iceberg.test_ns.nope' not found", SqeErrorCode::TableNotFound),
+            ("Invalid function 'bogus_function'.", SqeErrorCode::FunctionNotFound),
+            (
+                "Function 'lower' requires String, but received Boolean (DataType: Boolean).. \
+                 No function matches the given name and argument types 'lower(Boolean)'. \
+                 You might need to add explicit type casts.",
+                SqeErrorCode::TypeMismatch,
+            ),
+            ("something else entirely", SqeErrorCode::SemanticError),
+        ];
+        for (text, expected) in cases {
+            let err = SqeError::planning(DataFusionError::Plan(text.to_string()));
+            assert_eq!(err.error_code(), expected, "{text}");
+            assert!(err.to_string().starts_with("SQL planning failed: "), "{err}");
+            assert!(std::error::Error::source(&err).is_some(), "source kept");
+        }
+        // A specific typed code is not overridden by the text.
+        let err = SqeError::planning(DataFusionError::ResourcesExhausted(
+            "table x not found while reserving".to_string(),
+        ));
+        assert_eq!(err.error_code(), SqeErrorCode::ResourceExhausted);
     }
 
     #[test]

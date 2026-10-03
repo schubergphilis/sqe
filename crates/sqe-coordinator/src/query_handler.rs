@@ -1181,12 +1181,7 @@ impl QueryHandler {
                     let (ctx, _) = self.create_session_context(session).await?;
                     sqe_catalog::file_tvf_prepare::prepare_parsed_statement(&ctx, stmt)
                         .await
-                        .map_err(|e| {
-                            SqeError::with_code(
-                                SqeErrorCode::ExecutionFailed,
-                                format!("SQL planning failed: {e}"),
-                            )
-                        })
+                        .map_err(SqeError::planning)
                 }
                 .await
                 .map_err(failed)?;
@@ -3426,12 +3421,10 @@ impl QueryHandler {
             "sqe.plan",
             query_id = query_id.map(|q| q.to_string()).unwrap_or_default()
         );
-        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, sql).instrument(plan_span).await.map_err(|e| {
-            SqeError::with_code(
-                SqeErrorCode::ExecutionFailed,
-                format!("SQL planning failed: {e}"),
-            )
-        })?;
+        let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, sql)
+            .instrument(plan_span)
+            .await
+            .map_err(SqeError::planning)?;
         // Pinned (time-travel / incremental) scans get their real table
         // identity back before the policy rewriter sees the plan (400).
         let plan = tt_cleanup.restore_identities(df.logical_plan().clone())?;
@@ -3501,7 +3494,7 @@ impl QueryHandler {
                 .await?;
             let df = sqe_catalog::file_tvf_prepare::plan_sql(&ctx, &sql_for_plan)
                 .await
-                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
+                .map_err(SqeError::planning)?;
             // `_tt_cleanup` drops here, deregistering any pinned providers
             // that schema-resolution required. Schema-only paths never read
             // batches, so dropping right after `df.schema()` is fine.
@@ -3570,7 +3563,7 @@ impl QueryHandler {
         let (ctx, _session_catalog) = self.create_session_context(session).await?;
         let df = sqe_catalog::file_tvf_prepare::plan_sql(&ctx, numbered_sql)
             .await
-            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
+            .map_err(SqeError::planning)?;
         let types_map = df
             .logical_plan()
             .get_parameter_types()
@@ -3787,7 +3780,7 @@ impl QueryHandler {
             let df = sqe_catalog::file_tvf_prepare::plan_sql(&ctx, sql)
                 .instrument(plan_span)
                 .await
-                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("SQL planning failed: {e}")))?;
+                .map_err(SqeError::planning)?;
 
             // Get the logical plan, give pinned scans their real identity back
             // (400), and run policy enforcement.
