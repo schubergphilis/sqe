@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use axum::extract::{ConnectInfo, Path, State};
+use axum::Extension;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
@@ -710,6 +711,49 @@ pub struct TrinoServerOptions {
     /// `[coordinator] public_base_url`: the ingress URL to put in `nextUri`
     /// / `infoUri` for requests addressed to its host.
     pub public_base_url: Option<String>,
+    /// `[coordinator] trino_https_port`: a second listener serving the same
+    /// routes over TLS. The plain listener keeps running alongside it.
+    pub https: Option<HttpsListener>,
+}
+
+/// The TLS listener for [`TrinoServerOptions::https`]. `tls` is shared with
+/// the certificate reload watcher, so a rotated certificate applies to new
+/// handshakes without a restart.
+pub struct HttpsListener {
+    pub port: u16,
+    pub tls: axum_server::tls_rustls::RustlsConfig,
+}
+
+/// Request extension set on every request accepted by the HTTPS listener.
+/// An extension, not a header: a client cannot forge it on the plain port.
+#[derive(Clone, Copy, Debug)]
+struct HttpsListenerMarker {
+    port: u16,
+}
+
+/// The connection a request arrived on: the TCP peer and, on the HTTPS
+/// listener, its [`HttpsListenerMarker`].
+#[derive(Clone, Copy, Debug)]
+struct Conn {
+    peer: SocketAddr,
+    tls: Option<HttpsListenerMarker>,
+}
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for Conn {
+    type Rejection = <ConnectInfo<SocketAddr> as axum::extract::FromRequestParts<S>>::Rejection;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let ConnectInfo(peer) =
+            <ConnectInfo<SocketAddr> as axum::extract::FromRequestParts<S>>::from_request_parts(
+                parts, state,
+            )
+            .await?;
+        let tls = parts.extensions.get::<HttpsListenerMarker>().copied();
+        Ok(Conn { peer, tls })
+    }
 }
 
 /// Assemble the statement/info routes with state. Extracted so a unit test can
@@ -787,6 +831,7 @@ where
         expose_version: options.expose_version,
         public_base_url: options.public_base_url,
     });
+    let https = options.https;
 
     tokio::spawn(async move {
         // Restrictive CORS: no cross-origin by default. The Trino compat endpoint
@@ -830,6 +875,15 @@ where
             app = app.merge(oauth2_routes);
         }
 
+        let https = https.map(|https| spawn_https_listener(app.clone(), https));
+        // `trino_http_port = 0` with an HTTPS port: TLS only.
+        if port == 0 {
+            if let Some(handle) = https {
+                let _ = handle.await;
+            }
+            return;
+        }
+
         let addr = format!("0.0.0.0:{port}");
         let listener = match tokio::net::TcpListener::bind(&addr).await {
             Ok(l) => l,
@@ -848,6 +902,23 @@ where
         .await
         {
             error!(error = %e, "Trino-compat HTTP server exited with error");
+        }
+    })
+}
+
+/// Serve `app` over TLS on `https.port`, tagging each request with
+/// [`HttpsListenerMarker`] so `nextUri` keeps the https scheme.
+fn spawn_https_listener(app: Router, https: HttpsListener) -> tokio::task::JoinHandle<()> {
+    let marker = HttpsListenerMarker { port: https.port };
+    let app = app.layer(Extension(marker));
+    let addr = SocketAddr::from(([0, 0, 0, 0], https.port));
+    tokio::spawn(async move {
+        info!("Trino-compat HTTPS server listening on {addr}");
+        if let Err(e) = axum_server::bind_rustls(addr, https.tls)
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+            .await
+        {
+            error!(addr = %addr, error = %e, "Trino-compat HTTPS server exited with error");
         }
     })
 }
@@ -1830,12 +1901,48 @@ fn peer_is_trusted_proxy<A, Q>(state: &TrinoState<A, Q>, peer: SocketAddr) -> bo
 /// A trusted `x-forwarded-proto: https` always yields https, port or no
 /// port. Clients follow `nextUri` with their bearer token, so a downgraded
 /// scheme sends the token in cleartext to port 80 before any redirect.
+#[cfg(test)]
 fn extract_base_url(
     headers: &HeaderMap,
     bound_port: u16,
     trusted_proxy: bool,
     public_base_url: Option<&str>,
 ) -> String {
+    extract_base_url_on(headers, None, bound_port, trusted_proxy, public_base_url)
+}
+
+/// The base URL for a request that arrived on `tls` (the HTTPS listener) or,
+/// with `None`, on the plain listener.
+fn request_base_url<A, Q>(
+    state: &TrinoState<A, Q>,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+    tls: Option<&HttpsListenerMarker>,
+) -> String {
+    extract_base_url_on(
+        headers,
+        tls,
+        state.port,
+        peer_is_trusted_proxy(state, peer),
+        state.public_base_url.as_deref(),
+    )
+}
+
+/// [`extract_base_url`] for a request on either listener. A request that
+/// reached the HTTPS listener defaults to https: its `nextUri` must not send
+/// the client back over plain HTTP. A trusted proxy's `x-forwarded-proto`
+/// still names the client-facing scheme.
+fn extract_base_url_on(
+    headers: &HeaderMap,
+    tls: Option<&HttpsListenerMarker>,
+    plain_port: u16,
+    trusted_proxy: bool,
+    public_base_url: Option<&str>,
+) -> String {
+    let (listener_scheme, bound_port) = match tls {
+        Some(marker) => ("https", marker.port),
+        None => ("http", plain_port),
+    };
     // A proxy chain appends: the first value is the client-facing hop.
     let forwarded = |name: &str| {
         trusted_proxy
@@ -1845,7 +1952,7 @@ fn extract_base_url(
             .filter(|v| !v.is_empty())
     };
     let Some(host) = forwarded("x-forwarded-host").or_else(|| extract_header(headers, "host")) else {
-        return format!("http://localhost:{bound_port}");
+        return format!("{listener_scheme}://localhost:{bound_port}");
     };
     if let Some((scheme, authority)) =
         public_base_url.and_then(|url| sqe_core::config::parse_public_base_url(url).ok())
@@ -1856,7 +1963,7 @@ fn extract_base_url(
     }
     let scheme = match forwarded("x-forwarded-proto").map(|p| p.to_ascii_lowercase()) {
         Some(p) if p == "https" || p == "http" => p,
-        _ => "http".to_string(),
+        _ => listener_scheme.to_string(),
     };
     let default_port = if scheme == "https" { 443 } else { 80 };
     let port = forwarded("x-forwarded-port")
@@ -2125,7 +2232,7 @@ async fn open_cursor(
 
 async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Conn { peer, tls }: Conn,
     headers: HeaderMap,
     body: String,
 ) -> Response {
@@ -2218,12 +2325,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
         );
 
         let query_id = Uuid::new_v4().to_string();
-        let base_url = extract_base_url(
-            &headers,
-            state.port,
-            peer_is_trusted_proxy(&state, peer),
-            state.public_base_url.as_deref(),
-        );
+        let base_url = request_base_url(&state, peer, &headers, tls.as_ref());
 
         // Trino prepared statements are stateless: the client carries the prepared
         // SQL in X-Trino-Prepared-Statement headers and submits `EXECUTE <name>
@@ -2466,7 +2568,7 @@ async fn submit_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
 async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Conn { peer, tls }: Conn,
     headers: HeaderMap,
     Path((id, slug, token)): Path<(String, String, String)>,
 ) -> Response {
@@ -2518,12 +2620,7 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             }
         };
 
-        let base_url = extract_base_url(
-            &headers,
-            state.port,
-            peer_is_trusted_proxy(&state, peer),
-            state.public_base_url.as_deref(),
-        );
+        let base_url = request_base_url(&state, peer, &headers, tls.as_ref());
 
         let Some(handle) = registered else {
             return not_found_response(state.as_ref(), &base_url, &id);
@@ -2578,7 +2675,7 @@ async fn get_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
 async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Conn { peer, tls }: Conn,
     headers: HeaderMap,
     Path((id, slug, token)): Path<(String, String, String)>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
@@ -2619,12 +2716,7 @@ async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
             }
         };
 
-        let base_url = extract_base_url(
-            &headers,
-            state.port,
-            peer_is_trusted_proxy(&state, peer),
-            state.public_base_url.as_deref(),
-        );
+        let base_url = request_base_url(&state, peer, &headers, tls.as_ref());
         let next_token: usize = token.parse().unwrap_or(1usize).saturating_add(1);
 
         let handle = match registered {
@@ -2704,7 +2796,7 @@ async fn get_queued_results<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 /// rate-limited credential path.
 async fn cancel_query_slug<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
-    connect_info: ConnectInfo<SocketAddr>,
+    connect_info: Conn,
     headers: HeaderMap,
     Path((id, slug, _token)): Path<(String, String, String)>,
 ) -> Response {
@@ -2715,7 +2807,7 @@ async fn cancel_query_slug<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 /// the credential path.
 async fn cancel_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     State(state): State<Arc<TrinoState<A, Q>>>,
-    connect_info: ConnectInfo<SocketAddr>,
+    connect_info: Conn,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
@@ -2726,7 +2818,7 @@ async fn cancel_query<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
 
 async fn cancel_query_inner<A: TrinoAuthenticator, Q: TrinoQueryExecutor>(
     state: Arc<TrinoState<A, Q>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Conn { peer, .. }: Conn,
     headers: HeaderMap,
     id: String,
     slug: String,
@@ -2837,8 +2929,11 @@ fn extract_basic_auth(headers: &HeaderMap) -> Option<(String, String)> {
 mod tests {
     use super::*;
 
-    fn test_peer() -> ConnectInfo<SocketAddr> {
-        ConnectInfo("127.0.0.1:12345".parse().unwrap())
+    fn test_peer() -> Conn {
+        Conn {
+            peer: "127.0.0.1:12345".parse().unwrap(),
+            tls: None,
+        }
     }
 
     #[test]
@@ -5511,6 +5606,35 @@ mod tests {
         // An untrusted forwarded host cannot select it.
         let h = proxied("sqe.sqe:8080", None, Some("sql.example.org"), None);
         assert_eq!(extract_base_url(&h, 8080, false, public), "http://sqe.sqe:8080");
+    }
+
+    /// A request on the HTTPS listener gets https URIs on that listener's
+    /// port; a trusted proxy's forwarded scheme still names the client hop.
+    #[test]
+    fn https_listener_defaults_to_https() {
+        let tls = HttpsListenerMarker { port: 8443 };
+        let h = proxied("sqe.sqe.svc:8443", None, None, None);
+        assert_eq!(
+            extract_base_url_on(&h, Some(&tls), 8080, false, None),
+            "https://sqe.sqe.svc:8443"
+        );
+        // An untrusted forwarded proto cannot downgrade it.
+        let h = proxied("sqe.sqe.svc:8443", Some("http"), None, None);
+        assert_eq!(
+            extract_base_url_on(&h, Some(&tls), 8080, false, None),
+            "https://sqe.sqe.svc:8443"
+        );
+        // No Host header: fall back to localhost on the HTTPS port.
+        assert_eq!(
+            extract_base_url_on(&HeaderMap::new(), Some(&tls), 8080, false, None),
+            "https://localhost:8443"
+        );
+        // The plain listener is unchanged.
+        let h = proxied("sqe.sqe.svc:8080", None, None, None);
+        assert_eq!(
+            extract_base_url_on(&h, None, 8080, false, None),
+            "http://sqe.sqe.svc:8080"
+        );
     }
 
     // ── Bearer JWT passthrough tests ────────────────────────────
