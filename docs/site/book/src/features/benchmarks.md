@@ -136,18 +136,24 @@ bank; the other generators write one shard per table.
 
 The sink writes a table only the way `load` would. `load` partitions TPC-H
 `lineitem`/`orders` by month and the TPC-C tables by warehouse and district,
-and sorts the SSB, TPC-DS and TPC-BB fact tables by their date key on write.
-The sink does neither yet, so it refuses those suites up front and names each
-table; a table written differently prunes differently, and its timings would
-not compare with a loaded baseline. `--ignore-layout` writes them anyway, with
-a warning per table. TPC-E and ClickBench write directly with the same layout
-as `load`, and every direct write carries the bloom filters the engine adds on
-its own (`_sk` integer columns). Bank has its own partitioned writer and is
-not affected.
+and the sink creates those tables with the same partition spec. It splits rows
+by partition into one buffer per table, shared by every shard, and writes the
+largest partition out as a file whenever the buffer passes `--partition-buffer`
+(default `2g`). A larger buffer means fewer, bigger files: TPC-H SF10
+`lineitem` lands as 269 files with the default, against 415 from `load`. Peak
+memory is the buffer plus the files being written, about 3.5 GB for that run.
+
+`load` also sorts the SSB, TPC-DS and TPC-BB fact tables by their date key on
+write. The sink does not sort yet, so it refuses those suites up front and
+names each table; a table written differently prunes differently, and its
+timings would not compare with a loaded baseline. `--ignore-layout` writes them
+anyway, with a warning per table. Every direct write carries the bloom filters
+the engine adds on its own (`_sk` integer columns). Bank has its own
+partitioned writer and is not affected.
 
 Generators stream batches into the writer, so peak memory follows `--threads`
-rather than table size. TPC-C and ClickBench are the exceptions: they still
-build each table in memory before writing it.
+rather than table size (TPC-C SF10 generates in 167 MB, ClickBench SF10 in
+199 MB).
 
 Two flags control repeated runs against the same namespace:
 

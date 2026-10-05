@@ -16,16 +16,25 @@
 //!
 //! Any Iceberg REST catalog works, not just Nessie: point the
 //! `SQE_TEST_ICEBERG_*` env vars (see the test doc comment below) at a
-//! Polaris deployment instead and set the client-credentials pair.
+//! Polaris deployment instead and set the client-credentials pair. Against
+//! the `make test-integration` stack (after `scripts/bootstrap-test.sh`):
+//!
+//! ```bash
+//! SQE_TEST_ICEBERG_CATALOG_URI=http://localhost:18181/api/catalog \
+//! SQE_TEST_ICEBERG_WAREHOUSE=test_warehouse \
+//! SQE_TEST_ICEBERG_CLIENT_ID=root SQE_TEST_ICEBERG_CLIENT_SECRET=s3cr3t \
+//! SQE_TEST_ICEBERG_SCOPE=PRINCIPAL_ROLE:ALL SQE_TEST_ICEBERG_S3_SECRET_KEY=s3admin \
+//! cargo test -p sqe-bench --test it direct_iceberg_sink -- --ignored
+//! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use futures::TryStreamExt;
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
 use iceberg_catalog_rest::RestCatalogBuilder;
 
-use sqe_bench::generate::{get_generator, GenerateConfig};
-use sqe_bench::sink::iceberg::{run_direct, IcebergTarget};
+use sqe_bench::generate::{get_generator, BenchmarkGenerator, GenerateConfig};
+use sqe_bench::sink::iceberg::{run_direct, DirectOptions, IcebergTarget};
 
 /// Env-driven connection settings, defaulted to match
 /// `quickstart/benchmark/docker-compose.yml` (Nessie over RustFS, no auth).
@@ -60,7 +69,8 @@ fn test_target() -> IcebergTarget {
         namespace,
         credential,
         oauth2_server_uri: None,
-        scope: None,
+        // Polaris requires one, e.g. `PRINCIPAL_ROLE:ALL`.
+        scope: std::env::var("SQE_TEST_ICEBERG_SCOPE").ok(),
         bearer_token: None,
         s3_endpoint: Some(s3_endpoint),
         s3_access_key: Some(s3_access_key),
@@ -89,6 +99,87 @@ async fn count_table_rows(catalog: &dyn Catalog, table: &TableIdent) -> anyhow::
     Ok(rows)
 }
 
+/// lineitem is created with `load`'s spec (`month(l_shipdate)` as field
+/// `l_shipdate_month`) and every row sits in its own month's partition.
+///
+/// A scan filtered to one month prunes files by partition value, so a row
+/// written under the wrong month would be missing from that month's count.
+/// Each month's filtered count is compared with the generator's own count.
+async fn assert_lineitem_partitioned_by_month(
+    catalog: &dyn Catalog,
+    ns: &NamespaceIdent,
+    gen: &dyn BenchmarkGenerator,
+    scale: f64,
+    config: &GenerateConfig,
+) -> anyhow::Result<()> {
+    use arrow_array::{Array, Date32Array};
+    use chrono::{Datelike, NaiveDate};
+    use iceberg::expr::Reference;
+    use iceberg::spec::Datum;
+
+    let table = catalog
+        .load_table(&TableIdent::new(ns.clone(), "lineitem".into()))
+        .await?;
+    let spec = table.metadata().default_partition_spec();
+    let names: Vec<&str> = spec.fields().iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["l_shipdate_month"], "lineitem partition fields");
+
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    let month_start = |days: i32| {
+        let d = epoch + chrono::Duration::days(days as i64);
+        NaiveDate::from_ymd_opt(d.year(), d.month(), 1).unwrap()
+    };
+    let mut expected: std::collections::BTreeMap<NaiveDate, u64> = Default::default();
+    let source = gen.generate_batches("lineitem", scale, config)?;
+    for shard in source.shards {
+        for batch in (shard.make)() {
+            let dates = batch
+                .column_by_name("l_shipdate")
+                .and_then(|c| c.as_any().downcast_ref::<Date32Array>())
+                .expect("l_shipdate is Date32");
+            for i in 0..dates.len() {
+                *expected.entry(month_start(dates.value(i))).or_default() += 1;
+            }
+        }
+    }
+
+    let files: Vec<_> = table
+        .scan()
+        .build()?
+        .plan_files()
+        .await?
+        .try_collect()
+        .await?;
+    let partitions: HashSet<_> = files
+        .iter()
+        .filter_map(|f| f.partition().cloned())
+        .collect();
+    assert_eq!(partitions.len(), expected.len(), "one partition per month");
+    assert!(
+        files.len() > partitions.len(),
+        "a 1 MiB buffer should flush some months more than once ({} files)",
+        files.len()
+    );
+
+    for (start, want) in &expected {
+        let next = month_start((*start - epoch).num_days() as i32 + 31);
+        let days = |d: NaiveDate| (d - epoch).num_days() as i32;
+        let filter = Reference::new("l_shipdate")
+            .greater_than_or_equal_to(Datum::date(days(*start)))
+            .and(Reference::new("l_shipdate").less_than(Datum::date(days(next))));
+        let got = table
+            .scan()
+            .with_filter(filter)
+            .build()?
+            .to_arrow()
+            .await?
+            .try_fold(0u64, |acc, b| async move { Ok(acc + b.num_rows() as u64) })
+            .await?;
+        assert_eq!(got, *want, "rows for {start} under a month-pruned scan");
+    }
+    Ok(())
+}
+
 async fn current_snapshot_id(
     catalog: &dyn Catalog,
     table: &TableIdent,
@@ -109,6 +200,7 @@ async fn current_snapshot_id(
 ///   SQE_TEST_ICEBERG_NAMESPACE     (default sqe_bench_it_tpch)
 ///   SQE_TEST_ICEBERG_CLIENT_ID     (unset = no OAuth credential, e.g. Nessie)
 ///   SQE_TEST_ICEBERG_CLIENT_SECRET (paired with CLIENT_ID, e.g. Polaris)
+///   SQE_TEST_ICEBERG_SCOPE         (OAuth scope; Polaris: PRINCIPAL_ROLE:ALL)
 ///   SQE_TEST_ICEBERG_S3_ENDPOINT   (default http://localhost:19000)
 ///   SQE_TEST_ICEBERG_S3_ACCESS_KEY (default s3admin)
 ///   SQE_TEST_ICEBERG_S3_SECRET_KEY (default s3adminpw)
@@ -118,34 +210,37 @@ async fn current_snapshot_id(
 #[ignore = "needs:nessie; a live Iceberg REST catalog + S3-compatible store (SQE_TEST_ICEBERG_* env \
             vars in this file's doc comment; defaults match quickstart/benchmark's Nessie/RustFS stack)"]
 async fn tpch_direct_sink_writes_and_resumes() {
+    // The binary installs this in `main`; the object store's HTTP client
+    // panics without one.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let target = test_target();
     let scale = test_scale();
     let config = GenerateConfig::resolve(Some(2), None, None).expect("resolve GenerateConfig");
     let gen = get_generator("tpch").expect("tpch generator");
-    let target_file_size = 64 * 1024 * 1024;
+    let opts = DirectOptions {
+        clean: true,
+        resume: false,
+        target_file_size: 64 * 1024 * 1024,
+        ignore_layout: false,
+        // Small enough that lineitem flushes partitions mid-stream, so the
+        // test covers the budget path and not only the final flush.
+        partition_buffer: 1024 * 1024,
+    };
 
     // First run: clean slate, no resume. Every table gets written and
     // committed with its `sqe-bench.table.<name>=done` marker.
-    run_direct(
-        &target,
-        gen.as_ref(),
-        scale,
-        &config,
-        true,
-        false,
-        target_file_size,
-        // TPC-H's lineitem/orders are partitioned under `load`; this test
-        // covers write + resume, not layout parity.
-        true,
-    )
-    .await
-    .expect("first run_direct should write every table");
+    run_direct(&target, gen.as_ref(), scale, &config, &opts)
+        .await
+        .expect("first run_direct should write every table");
 
     // Build the verify/read-back connection from the exact same property map
     // `run_direct` writes through (URI, warehouse, credential, and all
     // s3_* settings), so a scan failure here reflects a real catalog/storage
     // mismatch rather than an under-specified test harness.
     let verify_catalog = RestCatalogBuilder::default()
+        .with_storage_factory(std::sync::Arc::new(
+            iceberg_storage_opendal::OpenDalResolvingStorageFactory::new(),
+        ))
         .load("sqe-bench-it", target.catalog_props())
         .await
         .expect("verify catalog connects");
@@ -171,21 +266,27 @@ async fn tpch_direct_sink_writes_and_resumes() {
         snapshots_after_first.insert(table_def.name.clone(), snap);
     }
 
-    // Second run: resume=true, clean=false. Every table is already marked
-    // done, so run_direct must take the skip path: no new snapshot, no
-    // duplicated rows.
-    run_direct(
-        &target,
+    assert_lineitem_partitioned_by_month(
+        verify_catalog.as_ref(),
+        &ns,
         gen.as_ref(),
         scale,
         &config,
-        false,
-        true,
-        target_file_size,
-        true,
     )
     .await
-    .expect("second (resume) run_direct should succeed via the skip path");
+    .expect("lineitem partition check");
+
+    // Second run: resume=true, clean=false. Every table is already marked
+    // done, so run_direct must take the skip path: no new snapshot, no
+    // duplicated rows.
+    let resume = DirectOptions {
+        clean: false,
+        resume: true,
+        ..opts
+    };
+    run_direct(&target, gen.as_ref(), scale, &config, &resume)
+        .await
+        .expect("second (resume) run_direct should succeed via the skip path");
 
     for table_def in gen.tables() {
         let ident = TableIdent::new(ns.clone(), table_def.name.clone());
