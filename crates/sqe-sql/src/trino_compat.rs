@@ -189,9 +189,8 @@ pub fn apply_trino_compat(statements: &mut Vec<Statement>, source: &str) -> bool
     // literals DataFusion rejects; rewritten to a plain string (SQE stores both
     // JSON and UUID as Utf8). See #326 for UUID.
     let has_utf8_literal = lower.contains("json '") || lower.contains("uuid '");
-    // `row(` -> the Trino ROW(...) constructor and the `CAST(ROW(...) AS
-    // ROW(...))` named-row cast. The bare constructor becomes `struct(...)`;
-    // the constructor-then-cast idiom becomes `named_struct(...)`. A false
+    // `row(` -> the `CAST(ROW(...) AS ROW(...))` named-row cast, which becomes
+    // `named_struct(...)`. A bare ROW(...) is DataFusion's own row(). A false
     // positive (e.g. a column literally named `arrow`) is harmless: it only
     // forces the AST walk, which rewrites nothing it should not.
     let has_row = lower.contains("row(");
@@ -217,10 +216,6 @@ pub fn apply_trino_compat(statements: &mut Vec<Statement>, source: &str) -> bool
     // contain `try(`, so the control that already works skips the walk. See
     // #347.
     let has_try = lower.contains("try(") || lower.contains("try (");
-    // `recursive` -> apply_recursive_cte_column_aliases: name the anchor
-    // projection after the declared CTE column list so the recursive term
-    // resolves it. See #348.
-    let has_recursive = lower.contains("recursive");
     // `ordinality` -> rewrite_unnest_with_ordinality: the uncorrelated
     // `UNNEST(..) WITH ORDINALITY AS t(x, n)` becomes a row_number() derived
     // table. See #341.
@@ -247,7 +242,6 @@ pub fn apply_trino_compat(statements: &mut Vec<Statement>, source: &str) -> bool
         && !has_binary_cast
         && !has_within_group
         && !has_try
-        && !has_recursive
         && !has_ordinality
     {
         return false;
@@ -425,14 +419,9 @@ impl VisitorMut for TrinoCompatVisitor {
         if rewrite_correlated_scalar_subquery_to_max(expr) {
             self.rewrites += 1;
         }
-        // ROW constructor rewrite runs before the cast rewrite at this node,
-        // but post-order traversal means any *inner* ROW(...) has already
-        // become struct(...) by the time we reach an enclosing Cast. The cast
-        // rewrite accepts either name, so the order within this method does
-        // not matter.
-        if rewrite_row_constructor(expr) {
-            self.rewrites += 1;
-        }
+        // A bare ROW(...) is DataFusion's own row() (a positional struct);
+        // only the named-row cast needs rewriting. It accepts an inner ROW(...)
+        // or struct(...) constructor.
         if rewrite_cast_as_row(expr) {
             self.rewrites += 1;
         }
@@ -464,9 +453,6 @@ impl VisitorMut for TrinoCompatVisitor {
         // re-wrap-suppression purposes.
         if has_wrap_cte(query) {
             self.wrap_cte_depth += 1;
-        }
-        if apply_recursive_cte_column_aliases(query) {
-            self.rewrites += 1;
         }
         ControlFlow::Continue(())
     }
@@ -736,59 +722,6 @@ impl VisitorMut for TryNullSafeVisitor {
     }
 }
 
-/// Apply a recursive CTE's declared column-alias list to its anchor term.
-/// See #348.
-///
-/// DataFusion names a recursive CTE's working table from the anchor
-/// projection and ignores the `WITH RECURSIVE t(n) AS (...)` alias list, so
-/// `WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t ...)` fails
-/// with "No field named n" (the working column is named `Int64(1)`).
-/// Aliasing the anchor's projection items with the declared names makes the
-/// working table expose them to the recursive term; the alias list itself is
-/// left in place for the outer query. Wildcard projection items cannot be
-/// position-aligned at the AST level and are skipped. Returns true if any
-/// anchor item was renamed.
-fn apply_recursive_cte_column_aliases(query: &mut Query) -> bool {
-    let Some(with) = &mut query.with else {
-        return false;
-    };
-    if !with.recursive {
-        return false;
-    }
-    let mut changed = false;
-    for cte in &mut with.cte_tables {
-        if cte.alias.columns.is_empty() {
-            continue;
-        }
-        // The anchor is the leftmost SELECT under the CTE's set operations.
-        let mut body = &mut *cte.query.body;
-        while let SetExpr::SetOperation { left, .. } = body {
-            body = &mut **left;
-        }
-        let SetExpr::Select(anchor) = body else {
-            continue;
-        };
-        for (item, col) in anchor.projection.iter_mut().zip(cte.alias.columns.iter()) {
-            match item {
-                SelectItem::UnnamedExpr(e) => {
-                    let taken = std::mem::replace(e, Expr::Identifier(Ident::new("__sqe_cte_tmp")));
-                    *item = SelectItem::ExprWithAlias {
-                        expr: taken,
-                        alias: col.name.clone(),
-                    };
-                    changed = true;
-                }
-                SelectItem::ExprWithAlias { alias, .. } if alias.value != col.name.value => {
-                    *alias = col.name.clone();
-                    changed = true;
-                }
-                _ => {}
-            }
-        }
-    }
-    changed
-}
-
 /// Trino spells the ordered string aggregate `listagg(...) WITHIN GROUP (...)`.
 /// DataFusion has no `listagg`; SQE aliases it to `string_agg`, but `string_agg`
 /// takes its ordering as an inline `ORDER BY` inside the argument list, not as a
@@ -998,26 +931,6 @@ fn rewrite_unicode_string_literal(expr: &mut Expr) -> bool {
         }
     }
     false
-}
-
-/// Rewrite the Trino `ROW(...)` row constructor to DataFusion's `struct(...)`.
-///
-/// Trino spells an anonymous row value `ROW(1, 'a', true)`; DataFusion's
-/// equivalent built-in is `struct(...)`, which produces a struct with
-/// positional field names `c0`, `c1`, .... sqlparser parses `ROW(...)` as a
-/// plain function call named `ROW`, so the rewrite is a single rename. Only
-/// the single-part, unquoted, case-insensitive `ROW` name is matched, so a
-/// quoted `"row"` column-returning function is left untouched. Returns true if
-/// the rewrite fired.
-fn rewrite_row_constructor(expr: &mut Expr) -> bool {
-    let Expr::Function(func) = expr else {
-        return false;
-    };
-    if !function_name_is(func, "row") {
-        return false;
-    }
-    func.name = ObjectName::from(vec![Ident::new("struct")]);
-    true
 }
 
 /// Rewrite `CAST(ROW(v1, v2, ...) AS ROW(n1 t1, n2 t2, ...))` to
@@ -1879,46 +1792,14 @@ mod tests {
         assert_eq!(rewrite_trino_compat(sql), sql);
     }
 
+    /// DataFusion 55 applies a `WITH RECURSIVE t(n)` column list itself
+    /// (#348), so the SQL reaches it unchanged. Semantics: sqe-catalog
+    /// `native_trino_syntax`.
     #[test]
-    fn recursive_cte_alias_applied_to_anchor() {
-        let out = rewrite_trino_compat(
-            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t WHERE n < 5) \
-             SELECT count(*) FROM t",
-        );
-        let lower = out.to_ascii_lowercase();
-        assert!(
-            lower.contains("select 1 as n union all"),
-            "anchor not aliased: {out}"
-        );
-    }
-
-    #[test]
-    fn recursive_cte_multi_column_aliases_applied() {
-        let out = rewrite_trino_compat(
-            "WITH RECURSIVE r(a, b) AS (SELECT 1, 10 UNION ALL SELECT a+1, b+10 FROM r WHERE a < 3) \
-             SELECT * FROM r",
-        );
-        let lower = out.to_ascii_lowercase();
-        assert!(lower.contains("select 1 as a, 10 as b union all"), "{out}");
-    }
-
-    #[test]
-    fn non_recursive_cte_alias_untouched() {
-        // Plain WITH already works; the rewrite is recursive-only.
-        let sql = "WITH t(n) AS (SELECT 1) SELECT n FROM t";
+    fn recursive_cte_passes_through_unchanged() {
+        let sql = "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 5) \
+                   SELECT count(*) FROM t";
         assert_eq!(rewrite_trino_compat(sql), sql);
-    }
-
-    #[test]
-    fn recursive_cte_existing_anchor_alias_renamed() {
-        let out = rewrite_trino_compat(
-            "WITH RECURSIVE t(n) AS (SELECT 1 AS x UNION ALL SELECT n+1 FROM t WHERE n < 2) \
-             SELECT n FROM t",
-        );
-        assert!(
-            out.to_ascii_lowercase().contains("select 1 as n union all"),
-            "{out}"
-        );
     }
 
     #[test]
@@ -2565,27 +2446,12 @@ mod tests {
         );
     }
 
+    /// A bare ROW(...) is DataFusion 55's own row() and reaches it unchanged.
+    /// Semantics: sqe-catalog `native_trino_syntax`.
     #[test]
-    fn row_constructor_rewritten_to_struct() {
-        // Trino ROW(...) anonymous constructor -> DataFusion struct(...). (#7)
-        let out = rewrite_trino_compat("SELECT ROW(1, 'a', true)");
-        let lower = out.to_ascii_lowercase();
-        assert!(lower.contains("struct("), "ROW must become struct(): {out}");
-        assert!(!lower.contains("row("), "ROW( should be gone: {out}");
-        assert!(
-            out.contains('1') && out.contains("'a'"),
-            "args must survive: {out}"
-        );
-    }
-
-    #[test]
-    fn quoted_row_function_left_untouched() {
-        // A quoted "row" identifier is a user function, not the keyword.
-        let out = rewrite_trino_compat(r#"SELECT "row"(1, 2)"#);
-        assert!(
-            !out.to_ascii_lowercase().contains("struct("),
-            "quoted row function must not be rewritten: {out}"
-        );
+    fn row_constructor_passes_through_unchanged() {
+        let sql = "SELECT ROW(1, 'a', true)";
+        assert_eq!(rewrite_trino_compat(sql), sql);
     }
 
     #[test]
