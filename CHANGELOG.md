@@ -85,6 +85,23 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Benchmarks: one table-layout definition for `load` and the direct Iceberg sink
+
+    Partitioning, sort-on-write keys and bloom columns per benchmark table
+    now live in `sqe-bench`'s `layout` module, read by both paths.
+    `generate --sink iceberg` refuses, before writing anything, a suite with
+    a table `load` would partition or sort (TPC-H, SSB, TPC-DS, TPCBB,
+    TPC-C), naming each table; such a table prunes differently and its
+    timings would not compare with a loaded baseline. `--ignore-layout`
+    writes anyway with a warning per table. TPC-E and ClickBench write
+    directly as before. Direct writes now carry the bloom filters the
+    engine's writer adds on its own (`_sk` integer columns, 1% FPP).
+
+    Fixed on the way: `load --bloom-filter` keyed the SSB date table as
+    `ddate`, but the table is `dim_date`, so its `d_datekey` bloom was never
+    written. A test now checks every column a layout names against the
+    generator's schema.
+
 - SQL: two Trino-compat rewrites retired; DataFusion 55 handles them natively
 
     `WITH RECURSIVE t(n) AS (...)` column lists (#348) and the bare

@@ -763,8 +763,50 @@ pub async fn run_bank(
     Ok(())
 }
 
+/// Why the direct sink cannot write `table` the way `sqe-bench load` does,
+/// or `None` when it can. A table written differently prunes differently,
+/// so its timings would not compare with a loaded baseline.
+pub fn direct_layout_gap(benchmark: &str, table: &str) -> Option<String> {
+    let layout = crate::layout::table_layout(benchmark, table);
+    let mut gaps = Vec::new();
+    if let Some(spec) = layout.partition {
+        gaps.push(format!("partitioned by ({spec})"));
+    }
+    if let Some(key) = layout.sort_key() {
+        gaps.push(format!("sorted on write by {key}"));
+    }
+    (!gaps.is_empty()).then(|| {
+        format!(
+            "{benchmark}.{table}: `load` writes it {}, which the direct sink does not \
+             yet do; use generate + load, or pass --ignore-layout",
+            gaps.join(" and ")
+        )
+    })
+}
+
+/// Writer properties for one table: `base` plus the bloom filters the
+/// engine's writer adds on its own (`_sk` integer columns), so a direct
+/// write carries the same footers as a CTAS.
+fn direct_writer_props(config: &GenerateConfig, schema: &ArrowSchema) -> WriterProperties {
+    let mut builder = WriterProperties::builder().set_compression(config.compression.to_parquet());
+    if let Some(rgs) = config.row_group_size {
+        builder = builder.set_max_row_group_row_count(Some(rgs));
+    }
+    for col in crate::layout::engine_auto_bloom_columns(schema) {
+        let path = parquet::schema::types::ColumnPath::new(vec![col]);
+        builder = builder
+            .set_column_bloom_filter_enabled(path.clone(), true)
+            .set_column_bloom_filter_fpp(path, crate::layout::ENGINE_BLOOM_FPP);
+    }
+    builder.build()
+}
+
 /// Generic direct-to-Iceberg sink: write every table of `gen` straight into
 /// Iceberg, one fast_append per table, with a per-table resume marker.
+///
+/// Refuses before writing anything when a table's `load` layout is one it
+/// cannot reproduce ([`direct_layout_gap`]), unless `ignore_layout`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_direct(
     target: &IcebergTarget,
     gen: &dyn crate::generate::BenchmarkGenerator,
@@ -773,8 +815,26 @@ pub async fn run_direct(
     clean: bool,
     resume: bool,
     target_file_size: usize,
+    ignore_layout: bool,
 ) -> anyhow::Result<()> {
     const TABLE_DONE_PREFIX: &str = "sqe-bench.table.";
+
+    let gaps: Vec<String> = gen
+        .tables()
+        .iter()
+        .filter_map(|t| direct_layout_gap(gen.name(), &t.name))
+        .collect();
+    if !gaps.is_empty() {
+        if !ignore_layout {
+            anyhow::bail!(
+                "direct sink layout differs from load:\n  {}",
+                gaps.join("\n  ")
+            );
+        }
+        for gap in &gaps {
+            eprintln!("  warning (--ignore-layout): {gap}");
+        }
+    }
 
     let catalog = RestCatalogBuilder::default()
         .with_storage_factory(Arc::new(OpenDalResolvingStorageFactory::new()))
@@ -796,16 +856,11 @@ pub async fn run_direct(
         println!("Created namespace {}", target.namespace);
     }
 
-    let mut props_builder =
-        WriterProperties::builder().set_compression(config.compression.to_parquet());
-    if let Some(rgs) = config.row_group_size {
-        props_builder = props_builder.set_max_row_group_row_count(Some(rgs));
-    }
-    let writer_props = props_builder.build();
     let commit_lock = Mutex::new(());
 
     for table_def in gen.tables() {
         let name = table_def.name.clone();
+        let writer_props = direct_writer_props(config, table_def.schema.as_ref());
         let done_key = format!("{TABLE_DONE_PREFIX}{name}");
 
         // Resume: skip a table already marked done (unless clean forces a rebuild).
@@ -900,6 +955,58 @@ pub async fn run_direct(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The direct sink writes a table only when `load` would write it the
+    /// same way: TPC-E and ClickBench pass whole, a partitioned or sorted
+    /// table is refused by name.
+    #[test]
+    fn direct_sink_refuses_tables_load_partitions_or_sorts() {
+        for suite in ["tpce", "clickbench"] {
+            for t in crate::generate::get_generator(suite).unwrap().tables() {
+                assert_eq!(
+                    direct_layout_gap(suite, &t.name),
+                    None,
+                    "{suite}.{}",
+                    t.name
+                );
+            }
+        }
+        let lineitem = direct_layout_gap("tpch", "lineitem").unwrap();
+        assert!(
+            lineitem.contains("partitioned by (month(l_shipdate))"),
+            "{lineitem}"
+        );
+        assert!(!lineitem.contains("sorted"), "{lineitem}");
+        let lineorder = direct_layout_gap("ssb", "lineorder").unwrap();
+        assert!(
+            lineorder.contains("sorted on write by lo_orderdate"),
+            "{lineorder}"
+        );
+        assert!(direct_layout_gap("tpcc", "order_line").is_some());
+        assert_eq!(direct_layout_gap("tpch", "nation"), None);
+    }
+
+    /// A direct write blooms the same columns the engine's writer would.
+    #[test]
+    fn direct_writer_blooms_the_engine_auto_columns() {
+        let store_sales = crate::generate::get_generator("tpcds")
+            .unwrap()
+            .tables()
+            .into_iter()
+            .find(|t| t.name == "store_sales")
+            .unwrap();
+        let props = direct_writer_props(&GenerateConfig::default(), &store_sales.schema);
+        let bloomed = |col: &str| {
+            props
+                .bloom_filter_properties(&parquet::schema::types::ColumnPath::new(vec![
+                    col.to_string()
+                ]))
+                .is_some()
+        };
+        assert!(bloomed("ss_item_sk"));
+        assert!(bloomed("ss_sold_date_sk"));
+        assert!(!bloomed("ss_quantity"));
+    }
 
     /// The generator's arrow schemas must survive the round trip through
     /// an Iceberg schema unchanged in data types; the sink rebinds batches
