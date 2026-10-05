@@ -10,6 +10,7 @@ pub mod client;
 pub mod comparison;
 pub mod execute;
 pub mod generate;
+pub mod layout;
 pub mod load;
 pub mod profile;
 pub mod query;
