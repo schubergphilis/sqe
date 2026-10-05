@@ -5,7 +5,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-use super::{parquet_writer, BenchmarkGenerator, GenerateStats, TableDef};
+use super::{mix64, parquet_writer, BenchmarkGenerator, GenerateStats, TableDef};
 
 pub struct TpcdsGenerator;
 
@@ -646,7 +646,11 @@ fn sublinear_above_sf1(sf: f64, sf1_rows: f64, points: &[(f64, f64)]) -> usize {
 
 // 180 / 18,000; sf10 102,000; sf100 204,000; sf1000 300,000.
 fn item_rows(sf: f64) -> usize {
-    sublinear_above_sf1(sf, 18_000.0, &[(10.0, 102_000.0), (100.0, 204_000.0), (1000.0, 300_000.0)])
+    sublinear_above_sf1(
+        sf,
+        18_000.0,
+        &[(10.0, 102_000.0), (100.0, 204_000.0), (1000.0, 300_000.0)],
+    )
 }
 
 // Linear dimensions. 1,000 / 100,000 etc.
@@ -672,7 +676,7 @@ fn web_site_rows(sf: f64) -> usize {
 fn web_page_rows(sf: f64) -> usize {
     super::scaled(sf, 60.0)
 } // 1 / 60
-// 1 / 5; sf10 10; sf100 15; sf1000 20.
+  // 1 / 5; sf10 10; sf100 15; sf1000 20.
 fn warehouse_rows(sf: f64) -> usize {
     sublinear_above_sf1(sf, 5.0, &[(10.0, 10.0), (100.0, 15.0), (1000.0, 20.0)])
 }
@@ -1620,13 +1624,67 @@ fn nullable_fk(rng: &mut StdRng, upper: i32) -> Option<i32> {
     }
 }
 
+/// The part of a basket that decides emission order: how many lines the
+/// ticket has and the date it was sold. `basket()` takes both from here, so
+/// the date index and the emitted rows cannot disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BasketHead {
+    lines: usize,
+    date_sk: i32,
+}
+
+fn basket_head(salt: u64, ticket: i32, dims: FkDims) -> BasketHead {
+    let h = mix64(salt ^ ticket as u64);
+    let lines = 1 + (h % MAX_BASKET_LINES as u64) as usize;
+    let drawn = 1 + ((h >> 32) % DS_DATE_RANGE as u64) as i32;
+    BasketHead {
+        lines,
+        date_sk: planted_sale_date(salt, ticket, dims).unwrap_or(drawn),
+    }
+}
+
+/// Sale dates pinned so a query's coincidence exists (see the `Q*_`
+/// constants). The same guards as the customer/item overrides in `basket()`.
+fn planted_sale_date(salt: u64, ticket: i32, dims: FkDims) -> Option<i32> {
+    let q25 = dims.customers >= Q25_CUSTOMER && dims.items >= Q25_ITEM;
+    let q17 = dims.customers >= Q17_CUSTOMER && dims.items >= Q17_ITEM;
+    let q29 = dims.customers >= Q29_CUSTOMER && dims.items >= Q29_ITEM;
+    match salt {
+        STORE_TICKET_SALT => match ticket {
+            t if (1..=PLANTED_Q54_TICKETS).contains(&t) => Some(Q54_FEB_1999_DATE_SK),
+            Q25_STORE_TICKET if q25 => Some(Q25_APR_2001_DATE_SK),
+            Q17_STORE_TICKET if q17 => Some(Q17_2001Q1_DATE_SK),
+            Q29_STORE_TICKET if q29 => Some(Q29_SALE_DATE_SK),
+            _ => None,
+        },
+        CATALOG_ORDER_SALT => match ticket {
+            t if (1..=PLANTED_Q54_TICKETS).contains(&t) => Some(Q54_DEC_1998_DATE_SK),
+            Q25_CATALOG_ORDER if q25 => Some(Q25_MAY_2001_DATE_SK),
+            Q17_CATALOG_ORDER if q17 => Some(Q17_CATALOG_DATE_SK),
+            Q29_CATALOG_ORDER if q29 => Some(Q29_CATALOG_DATE_SK),
+            _ => None,
+        },
+        WEB_ORDER_SALT if ticket == Q85_WEB_ORDER && dims.cdemos >= Q85_CDEMO_SK => {
+            Some(Q85_2000_DATE_SK)
+        }
+        _ => None,
+    }
+}
+
 /// Recompute the basket for `ticket` from scratch. Must stay byte-for-byte
 /// deterministic: the sales generator and the returns generator each call
 /// this independently and rely on identical output.
 fn basket(salt: u64, ticket: i32, channel_upper: i32, dims: FkDims) -> Basket {
+    basket_and_rng(salt, ticket, channel_upper, dims).0
+}
+
+/// [`basket`] plus its generator, positioned after the basket's draws. The
+/// sales generators keep drawing a ticket's per-line values from it, so a
+/// row's values depend only on its ticket, not on emission order. Returns
+/// never read past the basket, so their recomputation is unaffected.
+fn basket_and_rng(salt: u64, ticket: i32, channel_upper: i32, dims: FkDims) -> (Basket, StdRng) {
     let mut rng = StdRng::seed_from_u64(salt ^ ticket as u64);
-    let lines = rng.random_range(1..=MAX_BASKET_LINES);
-    let date_sk = rng.random_range(1..=DS_DATE_RANGE);
+    let BasketHead { lines, date_sk } = basket_head(salt, ticket, dims);
     let customer_sk = nullable_fk(&mut rng, dims.customers);
     let cdemo_sk = nullable_fk(&mut rng, dims.cdemos);
     let hdemo_sk = nullable_fk(&mut rng, dims.hdemos);
@@ -1663,25 +1721,20 @@ fn basket(salt: u64, ticket: i32, channel_upper: i32, dims: FkDims) -> Basket {
     // generators that recompute this basket.
     if (1..=PLANTED_Q54_TICKETS).contains(&ticket) {
         if salt == CATALOG_ORDER_SALT {
-            b.date_sk = Q54_DEC_1998_DATE_SK;
             b.customer_sk = Some(ticket);
             b.items[0] = 1; // i_item_sk 1 is the Women/maternity item
         } else if salt == STORE_TICKET_SALT {
-            b.date_sk = Q54_FEB_1999_DATE_SK;
             b.customer_sk = Some(ticket);
         }
     }
     // q25: the same customer+item in store (Apr-2001) and catalog (May-2001).
-    if dims.customers >= Q25_CUSTOMER && dims.items >= Q25_ITEM {
-        if salt == STORE_TICKET_SALT && ticket == Q25_STORE_TICKET {
-            b.date_sk = Q25_APR_2001_DATE_SK;
-            b.customer_sk = Some(Q25_CUSTOMER);
-            b.items[0] = Q25_ITEM;
-        } else if salt == CATALOG_ORDER_SALT && ticket == Q25_CATALOG_ORDER {
-            b.date_sk = Q25_MAY_2001_DATE_SK;
-            b.customer_sk = Some(Q25_CUSTOMER);
-            b.items[0] = Q25_ITEM;
-        }
+    if dims.customers >= Q25_CUSTOMER
+        && dims.items >= Q25_ITEM
+        && ((salt == STORE_TICKET_SALT && ticket == Q25_STORE_TICKET)
+            || (salt == CATALOG_ORDER_SALT && ticket == Q25_CATALOG_ORDER))
+    {
+        b.customer_sk = Some(Q25_CUSTOMER);
+        b.items[0] = Q25_ITEM;
     }
     // q24: peach item 3 sold at market-8 store 3 to customer 4 (whose address
     // zip matches store 3's zip). channel_upper is the store count for store
@@ -1697,36 +1750,171 @@ fn basket(salt: u64, ticket: i32, channel_upper: i32, dims: FkDims) -> Basket {
         b.items[0] = Q24_ITEM;
     }
     // q17: store 2001Q1 + catalog 2001Q2 (still inside Q1-Q3).
-    if dims.customers >= Q17_CUSTOMER && dims.items >= Q17_ITEM {
-        if salt == STORE_TICKET_SALT && ticket == Q17_STORE_TICKET {
-            b.date_sk = Q17_2001Q1_DATE_SK;
-            b.customer_sk = Some(Q17_CUSTOMER);
-            b.items[0] = Q17_ITEM;
-        } else if salt == CATALOG_ORDER_SALT && ticket == Q17_CATALOG_ORDER {
-            b.date_sk = Q17_CATALOG_DATE_SK;
-            b.customer_sk = Some(Q17_CUSTOMER);
-            b.items[0] = Q17_ITEM;
-        }
+    if dims.customers >= Q17_CUSTOMER
+        && dims.items >= Q17_ITEM
+        && ((salt == STORE_TICKET_SALT && ticket == Q17_STORE_TICKET)
+            || (salt == CATALOG_ORDER_SALT && ticket == Q17_CATALOG_ORDER))
+    {
+        b.customer_sk = Some(Q17_CUSTOMER);
+        b.items[0] = Q17_ITEM;
     }
     // q29: store Sep-1999 + catalog Dec-1999.
-    if dims.customers >= Q29_CUSTOMER && dims.items >= Q29_ITEM {
-        if salt == STORE_TICKET_SALT && ticket == Q29_STORE_TICKET {
-            b.date_sk = Q29_SALE_DATE_SK;
-            b.customer_sk = Some(Q29_CUSTOMER);
-            b.items[0] = Q29_ITEM;
-        } else if salt == CATALOG_ORDER_SALT && ticket == Q29_CATALOG_ORDER {
-            b.date_sk = Q29_CATALOG_DATE_SK;
-            b.customer_sk = Some(Q29_CUSTOMER);
-            b.items[0] = Q29_ITEM;
-        }
+    if dims.customers >= Q29_CUSTOMER
+        && dims.items >= Q29_ITEM
+        && ((salt == STORE_TICKET_SALT && ticket == Q29_STORE_TICKET)
+            || (salt == CATALOG_ORDER_SALT && ticket == Q29_CATALOG_ORDER))
+    {
+        b.customer_sk = Some(Q29_CUSTOMER);
+        b.items[0] = Q29_ITEM;
     }
     // q85: web sale in 2000 with a cdemo sk whose marital/education pair
     // is ('M', 'Advanced Degree').
     if salt == WEB_ORDER_SALT && ticket == Q85_WEB_ORDER && dims.cdemos >= Q85_CDEMO_SK {
-        b.date_sk = Q85_2000_DATE_SK;
         b.cdemo_sk = Some(Q85_CDEMO_SK);
     }
-    b
+    // Planted sale dates live in `planted_sale_date`, applied by
+    // `basket_head`, so the date index sees them too.
+    (b, rng)
+}
+
+/// `ids` ordered by `(date_of(id), id)` over the TPC-DS date range.
+fn date_sorted(ids: std::ops::RangeInclusive<u32>, date_of: impl Fn(u32) -> i32) -> Vec<u32> {
+    super::counting_order(ids, DS_DATE_RANGE as usize + 1, |id| {
+        let d = date_of(id);
+        assert!(
+            (1..=DS_DATE_RANGE).contains(&d),
+            "id {id}: date_sk {d} outside 1..={DS_DATE_RANGE}"
+        );
+        d as usize
+    })
+}
+
+/// The tickets a sales table emits, in `(sale date, ticket)` order. Tickets
+/// `1..=last` are emitted; `last` keeps only `last_lines` of its lines so
+/// the table has exactly `total` rows, the same ticket set the ticket-order
+/// generator emitted.
+struct SalesOrder {
+    tickets: Vec<u32>,
+    last: u32,
+    last_lines: usize,
+}
+
+fn sales_order(salt: u64, total: usize, dims: FkDims) -> SalesOrder {
+    let mut rows = 0usize;
+    let mut last = 0u32;
+    let last_lines = loop {
+        last += 1;
+        let lines = basket_head(salt, last as i32, dims).lines;
+        if rows + lines >= total {
+            break total - rows;
+        }
+        rows += lines;
+    };
+    SalesOrder {
+        tickets: date_sorted(1..=last, |t| basket_head(salt, t as i32, dims).date_sk),
+        last,
+        last_lines,
+    }
+}
+
+/// Emit a sales table in sale-date order. `line_row` builds one row from
+/// the ticket's basket, the ticket number, the 1-based line number and the
+/// ticket's generator (positioned after the basket draws), so every value
+/// is a function of its ticket alone.
+fn sales_batches<F>(
+    tbl_schema: SchemaRef,
+    total: usize,
+    salt: u64,
+    channel_upper: i32,
+    dims: FkDims,
+    mut line_row: F,
+) -> (SchemaRef, super::BatchIterator)
+where
+    F: FnMut(&Basket, i32, usize, &mut StdRng) -> Vec<ColVal> + Send + 'static,
+{
+    let order = sales_order(salt, total, dims);
+    let mut next = 0usize;
+    let mut line = 0usize;
+    let mut cur: Option<(Basket, StdRng, i32, usize)> = None;
+    generate_batches(tbl_schema, total, 0, move |_row, _| {
+        let exhausted = match &cur {
+            None => true,
+            Some((_, _, _, lines)) => line >= *lines,
+        };
+        if exhausted {
+            let ticket = order.tickets[next];
+            next += 1;
+            let (b, rng) = basket_and_rng(salt, ticket as i32, channel_upper, dims);
+            let lines = if ticket == order.last {
+                order.last_lines
+            } else {
+                b.lines
+            };
+            cur = Some((b, rng, ticket as i32, lines));
+            line = 0;
+        }
+        let (b, rng, ticket, _) = cur.as_mut().expect("basket set above");
+        line += 1;
+        line_row(b, *ticket, line, rng)
+    })
+}
+
+/// What decides a return row's position: the sale it returns, the basket
+/// line when a planted row pins it, and the return date.
+#[derive(Clone, Copy, Debug)]
+struct ReturnHead {
+    ticket: i32,
+    line: Option<usize>,
+    ret_date: i32,
+}
+
+/// A return row's ticket (uniform over the fully emitted tickets) and its
+/// lag after the sale (1..=120 days), from a hash of the row number.
+fn hashed_return(seed: u64, row: usize, max_ticket: i32) -> (i32, i32) {
+    let h = mix64(seed ^ row as u64);
+    let ticket = 1 + (h % max_ticket.max(1) as u64) as i32;
+    let lag = 1 + ((h >> 32) % 120) as i32;
+    (ticket, lag)
+}
+
+/// The return date for `ticket` returned `lag` days after its sale.
+fn lagged_return_date(salt: u64, ticket: i32, lag: i32, dims: FkDims) -> i32 {
+    (basket_head(salt, ticket, dims).date_sk + lag).min(DS_DATE_RANGE)
+}
+
+/// Emit a returns table in return-date order. `head(row)` decides the row's
+/// sale and return date and is the only source of both (the date index
+/// calls it too); `row_fn` builds the row from it, the recomputed sale
+/// basket and a generator seeded by the row number.
+#[allow(clippy::too_many_arguments)]
+fn returns_batches<H, F>(
+    tbl_schema: SchemaRef,
+    total: usize,
+    seed: u64,
+    salt: u64,
+    channel_upper: i32,
+    dims: FkDims,
+    head: H,
+    mut row_fn: F,
+) -> (SchemaRef, super::BatchIterator)
+where
+    H: Fn(usize) -> ReturnHead + Send + 'static,
+    F: FnMut(usize, ReturnHead, &Basket, &mut StdRng) -> Vec<ColVal> + Send + 'static,
+{
+    let rows = if total == 0 {
+        Vec::new()
+    } else {
+        date_sorted(0..=(total - 1) as u32, |r| head(r as usize).ret_date)
+    };
+    let mut next = 0usize;
+    generate_batches(tbl_schema, total, 0, move |_, _| {
+        let row = rows[next] as usize;
+        next += 1;
+        let h = head(row);
+        let b = basket(salt, h.ticket, channel_upper, dims);
+        let mut rng = StdRng::seed_from_u64(seed ^ row as u64);
+        row_fn(row, h, &b, &mut rng)
+    })
 }
 
 /// Highest ticket number a returns table may reference. The first K tickets
@@ -1903,31 +2091,17 @@ fn stream_store_sales(scale: f64) -> (SchemaRef, super::BatchIterator) {
     // sf1-sized ranges empty out dimension joins at small scales.
     let dims = FkDims::at(scale);
     let stores = store_rows(scale) as i32;
-    // Walk tickets in order, emitting all lines of a basket consecutively.
-    // The row indices arrive strictly sequentially from generate_batches, so
-    // a small amount of closure state maps row -> (ticket, line) without
-    // holding the table in memory.
-    let mut ticket: i32 = 0;
-    let mut line: usize = 0;
-    let mut cur: Option<Basket> = None;
-    generate_batches(
+    // Tickets in sale-date order (`load` sorts this table by
+    // ss_sold_date_sk), all lines of a basket consecutive.
+    sales_batches(
         store_sales_schema(),
         total,
-        seed_for_table("store_sales"),
-        move |_row, rng| {
-            let exhausted = match &cur {
-                None => true,
-                Some(b) => line >= b.lines,
-            };
-            if exhausted {
-                ticket += 1;
-                cur = Some(basket(STORE_TICKET_SALT, ticket, stores, dims));
-                line = 0;
-            }
-            let b = cur.as_ref().expect("basket set above");
-            let item_sk = b.items[line];
-            let qty = b.quantities[line];
-            line += 1;
+        STORE_TICKET_SALT,
+        stores,
+        dims,
+        move |b, ticket, line, rng| {
+            let item_sk = b.items[line - 1];
+            let qty = b.quantities[line - 1];
             let wc = rng.random_range(10..500i32) as f64 / 10.0;
             let lp = wc * 1.5;
             let sp = lp * rng.random_range(50..100i32) as f64 / 100.0;
@@ -1975,46 +2149,55 @@ fn stream_store_returns(scale: f64) -> (SchemaRef, super::BatchIterator) {
         stores >= Q24_STORE_SK && dims.customers >= Q24_CUSTOMER && dims.items >= Q24_ITEM;
     let q17_active = dims.customers >= Q17_CUSTOMER && dims.items >= Q17_ITEM;
     let q29_active = dims.customers >= Q29_CUSTOMER && dims.items >= Q29_ITEM;
-    generate_batches(
+    let seed = seed_for_table("store_returns");
+    // Pick a fully-emitted sales ticket and return one of its actual line
+    // items so (sr_ticket_number, sr_item_sk) joins store_sales
+    // (q01/q17/q24/q25/q29/q50/q64/q85).
+    let head = move |row: usize| {
+        let (mut ticket, lag) = hashed_return(seed, row, max_ticket);
+        // Force the first rows onto the planted store tickets so the planted
+        // sales get a matching return; item/customer still derive from the
+        // recomputed basket, preserving the returns<->sales invariant.
+        let planted = match row {
+            0 if q25_active => Some(Q25_STORE_TICKET),
+            1 if q24_active => Some(Q24_STORE_TICKET),
+            2 if q17_active => Some(Q17_STORE_TICKET),
+            3 if q29_active => Some(Q29_STORE_TICKET),
+            _ => None,
+        };
+        if let Some(t) = planted {
+            ticket = t;
+        }
+        // Returns lag the sale by <=120 days (official: 98% of a month's
+        // sales are returned within the next 6 months). Drawing uniformly over
+        // the remaining calendar piled returns into 2003 and starved 1998,
+        // emptying q91 (Nov-1998) and q25 (Apr-Oct 2001 return window).
+        let mut ret_date = lagged_return_date(STORE_TICKET_SALT, ticket, lag, dims);
+        // q29's return window is moy 9..=12 of 1999. A 1..=120 lag from
+        // Sep-1999 can miss, so force the planted row onto Oct-1999.
+        if row == 3 && q29_active {
+            ret_date = Q29_RETURN_DATE_SK;
+        }
+        ReturnHead {
+            ticket,
+            line: planted.map(|_| 0),
+            ret_date,
+        }
+    };
+    returns_batches(
         store_returns_schema(),
         total,
-        seed_for_table("store_returns"),
-        move |row, rng| {
-            // Pick a fully-emitted sales ticket, recompute its basket, and return
-            // one of its actual line items so (sr_ticket_number, sr_item_sk)
-            // joins store_sales (q01/q17/q24/q25/q29/q50/q64/q85).
-            let mut ticket = rng.random_range(1..=max_ticket);
-            let mut line_override: Option<usize> = None;
-            // Force the first rows onto the q25/q24 planted store tickets so the
-            // planted sales get a matching return; item/customer/date still derive
-            // from the recomputed basket, preserving the returns<->sales invariant.
-            if row == 0 && q25_active {
-                ticket = Q25_STORE_TICKET;
-                line_override = Some(0);
-            } else if row == 1 && q24_active {
-                ticket = Q24_STORE_TICKET;
-                line_override = Some(0);
-            } else if row == 2 && q17_active {
-                ticket = Q17_STORE_TICKET;
-                line_override = Some(0);
-            } else if row == 3 && q29_active {
-                ticket = Q29_STORE_TICKET;
-                line_override = Some(0);
-            }
-            let b = basket(STORE_TICKET_SALT, ticket, stores, dims);
-            let line = line_override.unwrap_or(rng.random_range(0..b.lines));
+        seed,
+        STORE_TICKET_SALT,
+        stores,
+        dims,
+        head,
+        move |_row, h, b, rng| {
+            let ticket = h.ticket;
+            let ret_date = h.ret_date;
+            let line = h.line.unwrap_or_else(|| rng.random_range(0..b.lines));
             let item_sk = b.items[line];
             let qty = rng.random_range(1..=b.quantities[line]);
-            // Returns lag the sale by <=120 days (official: 98% of a month's
-            // sales are returned within the next 6 months). Drawing uniformly over
-            // the remaining calendar piled returns into 2003 and starved 1998,
-            // emptying q91 (Nov-1998) and q25 (Apr-Oct 2001 return window).
-            let mut ret_date = (b.date_sk + rng.random_range(1..=120i32)).min(DS_DATE_RANGE);
-            // q29's return window is moy 9..=12 of 1999. A 1..=120 lag from
-            // Sep-1999 can miss, so force the planted row onto Oct-1999.
-            if row == 3 && q29_active {
-                ret_date = Q29_RETURN_DATE_SK;
-            }
             let amt = rng.random_range(10..500i32) as f64;
             let tax = amt * 0.08;
             vec![
@@ -2050,27 +2233,15 @@ fn stream_catalog_sales(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let dims = FkDims::at(scale);
     let ccs = call_center_rows(scale) as i32;
     let whs = warehouse_rows(scale) as i32;
-    let mut order: i32 = 0;
-    let mut line: usize = 0;
-    let mut cur: Option<Basket> = None;
-    generate_batches(
+    sales_batches(
         catalog_sales_schema(),
         total,
-        seed_for_table("catalog_sales"),
-        move |_row, rng| {
-            let exhausted = match &cur {
-                None => true,
-                Some(b) => line >= b.lines,
-            };
-            if exhausted {
-                order += 1;
-                cur = Some(basket(CATALOG_ORDER_SALT, order, ccs, dims));
-                line = 0;
-            }
-            let b = cur.as_ref().expect("basket set above");
-            let item_sk = b.items[line];
-            let qty = b.quantities[line];
-            line += 1;
+        CATALOG_ORDER_SALT,
+        ccs,
+        dims,
+        move |b, order, line, rng| {
+            let item_sk = b.items[line - 1];
+            let qty = b.quantities[line - 1];
             let wc = rng.random_range(10..500i32) as f64 / 10.0;
             let lp = wc * 1.5;
             let sp = lp * rng.random_range(50..100i32) as f64 / 100.0;
@@ -2126,20 +2297,32 @@ fn stream_catalog_returns(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let whs = warehouse_rows(scale) as i32;
     let reasons = reason_rows(scale) as i32;
     let max_order = returnable_tickets(scale, 1_441_548.0);
-    generate_batches(
+    let seed = seed_for_table("catalog_returns");
+    // Returns lag the sale by <=120 days; a uniform draw over the rest of
+    // the calendar starved the early years and emptied q91's Nov-1998
+    // catalog-returns window. Same bound as the ship_date fields above.
+    let head = move |row: usize| {
+        let (ticket, lag) = hashed_return(seed, row, max_order);
+        ReturnHead {
+            ticket,
+            line: None,
+            ret_date: lagged_return_date(CATALOG_ORDER_SALT, ticket, lag, dims),
+        }
+    };
+    returns_batches(
         catalog_returns_schema(),
         total,
-        seed_for_table("catalog_returns"),
-        move |_row, rng| {
-            let order = rng.random_range(1..=max_order);
-            let b = basket(CATALOG_ORDER_SALT, order, ccs, dims);
+        seed,
+        CATALOG_ORDER_SALT,
+        ccs,
+        dims,
+        head,
+        move |_row, h, b, rng| {
+            let order = h.ticket;
+            let ret_date = h.ret_date;
             let line = rng.random_range(0..b.lines);
             let item_sk = b.items[line];
             let qty = rng.random_range(1..=b.quantities[line]);
-            // Returns lag the sale by <=120 days; a uniform draw over the rest of
-            // the calendar starved the early years and emptied q91's Nov-1998
-            // catalog-returns window. Same bound as the ship_date fields above.
-            let ret_date = (b.date_sk + rng.random_range(1..=120i32)).min(DS_DATE_RANGE);
             let amt = rng.random_range(10..500i32) as f64;
             let tax = amt * 0.08;
             vec![
@@ -2183,27 +2366,15 @@ fn stream_web_sales(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let wpages = web_page_rows(scale) as i32;
     let wsites = web_site_rows(scale) as i32;
     let whs = warehouse_rows(scale) as i32;
-    let mut order: i32 = 0;
-    let mut line: usize = 0;
-    let mut cur: Option<Basket> = None;
-    generate_batches(
+    sales_batches(
         web_sales_schema(),
         total,
-        seed_for_table("web_sales"),
-        move |_row, rng| {
-            let exhausted = match &cur {
-                None => true,
-                Some(b) => line >= b.lines,
-            };
-            if exhausted {
-                order += 1;
-                cur = Some(basket(WEB_ORDER_SALT, order, wsites, dims));
-                line = 0;
-            }
-            let b = cur.as_ref().expect("basket set above");
-            let item_sk = b.items[line];
-            let qty = b.quantities[line];
-            line += 1;
+        WEB_ORDER_SALT,
+        wsites,
+        dims,
+        move |b, order, line, rng| {
+            let item_sk = b.items[line - 1];
+            let qty = b.quantities[line - 1];
             // Official ws price moments: wholesale 1..100 (avg 50.6), list
             // 1..300 (avg 101), sales 0..299 (avg 50.6). The old wc/10 model
             // capped ws_sales_price at ~$74, leaving q85's 100-150 and 150-200
@@ -2269,22 +2440,34 @@ fn stream_web_returns(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let wsites = web_site_rows(scale) as i32;
     let reasons = reason_rows(scale) as i32;
     let max_order = returnable_tickets(scale, 719_384.0);
-    generate_batches(
+    let seed = seed_for_table("web_returns");
+    // Returns lag the sale by <=120 days; a uniform draw over the rest of
+    // the calendar starved the early years (q85 filters d_year = 2000).
+    let head = move |row: usize| {
+        let (mut order, lag) = hashed_return(seed, row, max_order);
+        if row == 0 && dims.cdemos >= Q85_CDEMO_SK {
+            order = Q85_WEB_ORDER;
+        }
+        ReturnHead {
+            ticket: order,
+            line: None,
+            ret_date: lagged_return_date(WEB_ORDER_SALT, order, lag, dims),
+        }
+    };
+    returns_batches(
         web_returns_schema(),
         total,
-        seed_for_table("web_returns"),
-        move |row, rng| {
-            let mut order = rng.random_range(1..=max_order);
-            if row == 0 && dims.cdemos >= Q85_CDEMO_SK {
-                order = Q85_WEB_ORDER;
-            }
-            let b = basket(WEB_ORDER_SALT, order, wsites, dims);
+        seed,
+        WEB_ORDER_SALT,
+        wsites,
+        dims,
+        head,
+        move |_row, h, b, rng| {
+            let order = h.ticket;
+            let ret_date = h.ret_date;
             let line = rng.random_range(0..b.lines);
             let item_sk = b.items[line];
             let qty = rng.random_range(1..=b.quantities[line]);
-            // Returns lag the sale by <=120 days; a uniform draw over the rest of
-            // the calendar starved the early years (q85 filters d_year = 2000).
-            let ret_date = (b.date_sk + rng.random_range(1..=120i32)).min(DS_DATE_RANGE);
             let amt = rng.random_range(10..500i32) as f64;
             let tax = amt * 0.08;
             // In official data the returning party equals the refunded party 100%
@@ -3071,6 +3254,21 @@ fn stream_call_center(scale: f64) -> (SchemaRef, super::BatchIterator) {
 impl BenchmarkGenerator for TpcdsGenerator {
     fn name(&self) -> &str {
         "tpcds"
+    }
+
+    /// Sales and returns come out in date order (`sales_batches`,
+    /// `returns_batches`); inventory is generated week by week.
+    fn sorted_by(&self, table: &str) -> Option<&'static str> {
+        match table {
+            "store_sales" => Some("ss_sold_date_sk"),
+            "catalog_sales" => Some("cs_sold_date_sk"),
+            "web_sales" => Some("ws_sold_date_sk"),
+            "store_returns" => Some("sr_returned_date_sk"),
+            "catalog_returns" => Some("cr_returned_date_sk"),
+            "web_returns" => Some("wr_returned_date_sk"),
+            "inventory" => Some("inv_date_sk"),
+            _ => None,
+        }
     }
 
     fn tables(&self) -> Vec<TableDef> {
