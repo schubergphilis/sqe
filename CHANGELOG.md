@@ -6,6 +6,14 @@ All notable changes to SQE are documented in this file.
 
 ### Fixed
 
+- Functions: `from_unixtime` returned NULL for a decimal argument
+
+    SQE parses a literal such as `1700000000.5` as DECIMAL, and the Trino
+    `from_unixtime` UDF had no case for it, so `from_unixtime(1700000000.5)`
+    and any call on a DECIMAL column silently returned NULL. An INT column
+    failed to plan. The function now takes a DOUBLE like Trino's, and every
+    numeric argument is cast to it before the call.
+
 - Writes: a one-off catalog 401 at commit no longer discards the write
 
     The table reload inside an Iceberg commit was not retried, so a single
