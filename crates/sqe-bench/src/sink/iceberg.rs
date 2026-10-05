@@ -788,15 +788,27 @@ pub async fn run_bank(
 /// Why the direct sink cannot write `table` the way `sqe-bench load` does,
 /// or `None` when it can. A table written differently prunes differently,
 /// so its timings would not compare with a loaded baseline. Partitioning is
-/// reproduced ([`write_partitioned`]); a sort on write is not yet.
-pub fn direct_layout_gap(benchmark: &str, table: &str) -> Option<String> {
-    let layout = crate::layout::table_layout(benchmark, table);
-    layout.sort_key().map(|key| {
+/// reproduced ([`write_partitioned`]); the sink never sorts, so a table
+/// `load` sorts on write must come out of its generator in that order
+/// ([`BenchmarkGenerator::sorted_by`](crate::generate::BenchmarkGenerator::sorted_by)).
+pub fn direct_layout_gap(
+    gen: &dyn crate::generate::BenchmarkGenerator,
+    table: &str,
+) -> Option<String> {
+    let load_sort = crate::layout::table_layout(gen.name(), table).sort_key();
+    sort_gap(load_sort, gen.sorted_by(table)).map(|key| {
         format!(
-            "{benchmark}.{table}: `load` writes it sorted on write by {key}, which the \
-             direct sink does not yet do; use generate + load, or pass --ignore-layout"
+            "{}.{table}: `load` writes it sorted on write by {key} and its generator \
+             does not emit that order; use generate + load, or pass --ignore-layout",
+            gen.name()
         )
     })
+}
+
+/// The key `load` sorts by when the generator's emitted order does not
+/// already satisfy it.
+fn sort_gap<'a>(load_sort: Option<&'a str>, emitted: Option<&str>) -> Option<&'a str> {
+    load_sort.filter(|key| emitted != Some(*key))
 }
 
 /// Settings for [`run_direct`] beyond the target and the generator.
@@ -976,7 +988,7 @@ pub async fn run_direct(
     let gaps: Vec<String> = gen
         .tables()
         .iter()
-        .filter_map(|t| direct_layout_gap(gen.name(), &t.name))
+        .filter_map(|t| direct_layout_gap(gen, &t.name))
         .collect();
     if !gaps.is_empty() {
         if !ignore_layout {
@@ -1139,28 +1151,42 @@ async fn write_unpartitioned(
 mod tests {
     use super::*;
 
-    /// The direct sink writes a table only when `load` would write it the
-    /// same way: TPC-H, TPC-C, TPC-E and ClickBench pass whole (partitioned
-    /// tables included), a sorted table is refused by name.
+    /// Every suite's tables can be written directly the way `load` writes
+    /// them: partitioned ones through the shared buffer, sorted ones because
+    /// their generator emits that order.
     #[test]
-    fn direct_sink_refuses_only_tables_load_sorts() {
-        for suite in ["tpch", "tpcc", "tpce", "clickbench"] {
-            for t in crate::generate::get_generator(suite).unwrap().tables() {
+    fn every_suite_writes_directly_with_the_load_layout() {
+        for suite in [
+            "tpch",
+            "ssb",
+            "tpcds",
+            "tpcbb",
+            "tpcc",
+            "tpce",
+            "clickbench",
+        ] {
+            let gen = crate::generate::get_generator(suite).unwrap();
+            for t in gen.tables() {
                 assert_eq!(
-                    direct_layout_gap(suite, &t.name),
+                    direct_layout_gap(gen.as_ref(), &t.name),
                     None,
                     "{suite}.{}",
                     t.name
                 );
             }
         }
-        let lineorder = direct_layout_gap("ssb", "lineorder").unwrap();
-        assert!(
-            lineorder.contains("sorted on write by lo_orderdate"),
-            "{lineorder}"
-        );
-        assert!(direct_layout_gap("tpcds", "store_sales").is_some());
-        assert_eq!(direct_layout_gap("ssb", "customer"), None);
+    }
+
+    /// A table `load` sorts is refused unless the generator emits exactly
+    /// that order, so a new sorted table without a generator order cannot
+    /// slip through.
+    #[test]
+    fn a_load_sort_the_generator_does_not_emit_is_a_gap() {
+        assert_eq!(sort_gap(None, None), None);
+        assert_eq!(sort_gap(None, Some("d")), None);
+        assert_eq!(sort_gap(Some("d"), Some("d")), None);
+        assert_eq!(sort_gap(Some("d"), None), Some("d"));
+        assert_eq!(sort_gap(Some("d"), Some("other")), Some("d"));
     }
 
     /// Every partition expression the layout holds builds a spec whose
