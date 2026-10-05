@@ -65,6 +65,13 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- SQL: two Trino-compat rewrites retired; DataFusion 55 handles them natively
+
+    `WITH RECURSIVE t(n) AS (...)` column lists (#348) and the bare
+    `ROW(...)` constructor now reach DataFusion as written. Results are
+    unchanged. Over Flight SQL an unaliased `ROW(...)` column is now named
+    `row(...)` instead of `struct(...)`; Trino clients see `_col0` as before.
+
 - Security: `[security] trusted_proxies` accepts CIDR ranges
 
     Entries may be exact IPv4/IPv6 addresses or CIDR ranges
