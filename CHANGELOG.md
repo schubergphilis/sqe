@@ -6,6 +6,14 @@ All notable changes to SQE are documented in this file.
 
 ### Fixed
 
+- Functions: `from_unixtime` returned NULL for a decimal argument
+
+    SQE parses a literal such as `1700000000.5` as DECIMAL, and the Trino
+    `from_unixtime` UDF had no case for it, so `from_unixtime(1700000000.5)`
+    and any call on a DECIMAL column silently returned NULL. An INT column
+    failed to plan. The function now takes a DOUBLE like Trino's, and every
+    numeric argument is cast to it before the call.
+
 - SQL: ROLLUP / CUBE / GROUPING SETS reach DataFusion as written
 
     SQE wrapped every grouping-set query in `(SELECT 1) LEFT JOIN q ON TRUE`
@@ -76,6 +84,13 @@ All notable changes to SQE are documented in this file.
     Trino, with the operator detail logged instead.
 
 ### Changed
+
+- SQL: two Trino-compat rewrites retired; DataFusion 55 handles them natively
+
+    `WITH RECURSIVE t(n) AS (...)` column lists (#348) and the bare
+    `ROW(...)` constructor now reach DataFusion as written. Results are
+    unchanged. Over Flight SQL an unaliased `ROW(...)` column is now named
+    `row(...)` instead of `struct(...)`; Trino clients see `_col0` as before.
 
 - Security: `[security] trusted_proxies` accepts CIDR ranges
 

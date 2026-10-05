@@ -35,6 +35,7 @@ mod mount_jdbc_test;
 mod mount_rest_test;
 mod mount_s3tables_test;
 mod mount_sqlite_test;
+mod native_trino_syntax;
 mod schema_provider_concurrency_test;
 mod sqlite_rs_catalog_test;
 mod table_cache_state_machine_test;
