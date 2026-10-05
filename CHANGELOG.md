@@ -105,18 +105,20 @@ All notable changes to SQE are documented in this file.
     baseline. Cost: SSB SF10 generation 32 s / 110 MB to 42 s / 176 MB,
     TPC-DS SF1 6.6 s to 7.3 s.
 
-- Benchmarks: `benchmark-test.sh` generates TPC-H, TPC-C, TPC-E and ClickBench straight into Iceberg
+- Benchmarks: `benchmark-test.sh` generates every suite straight into Iceberg
 
-    No staged Parquet lands on disk for these suites: the script runs
-    `sqe-bench generate --sink iceberg` (as it already did for bank), then
-    restarts the coordinator so it sees the externally committed tables.
-    SF1 on the local stack: load 1-5 s per suite, every query passes
-    (TPC-E 18/18, TPC-C 17/17 including its writes on the partitioned
-    tables, ClickBench 43/43, TPC-H 22/22). SSB, TPC-DS and TPC-BB still
-    stage and `load` until their facts are generated in date order. A suite
-    falls back to generate + `load` under pre-published or attached data,
-    Hive tables, `BENCH_BLOOM_FILTER` or `BENCH_PUFFIN_STATS`;
-    `BENCH_LOAD_MODE=load` forces it for every suite.
+    No staged Parquet lands on disk: the script runs `sqe-bench generate
+    --sink iceberg` (as it already did for bank), then restarts the
+    coordinator so it sees the externally committed tables. TPC-BB writes
+    its two tables into the TPC-DS namespace, loading TPC-DS directly first
+    when the run has not. SF1 on the local stack: load 1-9 s per suite,
+    every query passes (TPC-E 18/18, TPC-C 17/17 including its writes on
+    the partitioned tables, ClickBench 43/43, TPC-H 22/22, SSB 13/13,
+    TPC-DS 99/99, TPC-BB 10/10); the SSB, TPC-DS and TPC-BB reports are the
+    new SF1 baseline for the date-ordered data. A suite falls back to
+    generate + `load` under pre-published or attached data, Hive tables,
+    `BENCH_BLOOM_FILTER` or `BENCH_PUFFIN_STATS`; `BENCH_LOAD_MODE=load`
+    forces it for every suite.
 
 - Benchmarks: TPC-C and ClickBench generation streams instead of building each table in memory
 
