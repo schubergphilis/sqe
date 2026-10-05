@@ -85,6 +85,19 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Benchmarks: `benchmark-test.sh` generates TPC-H, TPC-C, TPC-E and ClickBench straight into Iceberg
+
+    No staged Parquet lands on disk for these suites: the script runs
+    `sqe-bench generate --sink iceberg` (as it already did for bank), then
+    restarts the coordinator so it sees the externally committed tables.
+    SF1 on the local stack: load 1-5 s per suite, every query passes
+    (TPC-E 18/18, TPC-C 17/17 including its writes on the partitioned
+    tables, ClickBench 43/43, TPC-H 22/22). SSB, TPC-DS and TPC-BB still
+    stage and `load` until their facts are generated in date order. A suite
+    falls back to generate + `load` under pre-published or attached data,
+    Hive tables, `BENCH_BLOOM_FILTER` or `BENCH_PUFFIN_STATS`;
+    `BENCH_LOAD_MODE=load` forces it for every suite.
+
 - Benchmarks: TPC-C and ClickBench generation streams instead of building each table in memory
 
     Peak RSS at SF10 drops from 538 MB to 167 MB (TPC-C) and from 912 MB
