@@ -288,14 +288,17 @@ const BATCH_SIZE: usize = 10_000;
 // Table generators
 // ---------------------------------------------------------------------------
 
-fn generate_warehouse(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn generate_warehouse(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let schema = warehouse_schema();
     let total = (scale as usize).max(1);
     let mut rng = StdRng::seed_from_u64(seed_for_table("warehouse"));
-    let mut batches = Vec::new();
+    let out_schema = schema.clone();
 
     let mut offset = 0usize;
-    while offset < total {
+    let batches = std::iter::from_fn(move || {
+        if offset >= total {
+            return None;
+        }
         let n = BATCH_SIZE.min(total - offset);
         let mut w_id = Vec::with_capacity(n);
         let mut w_name = Vec::with_capacity(n);
@@ -327,30 +330,29 @@ fn generate_warehouse(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let state_refs: Vec<&str> = w_state.iter().map(|s| s.as_str()).collect();
         let zip_refs: Vec<&str> = w_zip.iter().map(|s| s.as_str()).collect();
 
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(w_id)),
-                    Arc::new(StringArray::from(name_refs)),
-                    Arc::new(StringArray::from(st1_refs)),
-                    Arc::new(StringArray::from(st2_refs)),
-                    Arc::new(StringArray::from(city_refs)),
-                    Arc::new(StringArray::from(state_refs)),
-                    Arc::new(StringArray::from(zip_refs)),
-                    Arc::new(decimal_array(w_tax, 4, 4)),
-                    Arc::new(decimal_array(w_ytd, 12, 2)),
-                ],
-            )
-            .expect("warehouse batch"),
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(w_id)),
+                Arc::new(StringArray::from(name_refs)),
+                Arc::new(StringArray::from(st1_refs)),
+                Arc::new(StringArray::from(st2_refs)),
+                Arc::new(StringArray::from(city_refs)),
+                Arc::new(StringArray::from(state_refs)),
+                Arc::new(StringArray::from(zip_refs)),
+                Arc::new(decimal_array(w_tax, 4, 4)),
+                Arc::new(decimal_array(w_ytd, 12, 2)),
+            ],
+        )
+        .expect("warehouse batch");
         offset += n;
-    }
+        Some(batch)
+    });
 
-    (schema, batches)
+    (out_schema, Box::new(batches))
 }
 
-fn generate_district(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn generate_district(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let schema = district_schema();
     // At fractional scales `scale as i32` truncates to 0 while the
     // warehouse table itself generates max(1) rows with w_id = 1; the
@@ -361,10 +363,13 @@ fn generate_district(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let total = super::scaled(scale, 10.0);
     let total = total.max(1);
     let mut rng = StdRng::seed_from_u64(seed_for_table("district"));
-    let mut batches = Vec::new();
+    let out_schema = schema.clone();
 
     let mut offset = 0usize;
-    while offset < total {
+    let batches = std::iter::from_fn(move || {
+        if offset >= total {
+            return None;
+        }
         let n = BATCH_SIZE.min(total - offset);
         let mut d_id = Vec::with_capacity(n);
         let mut d_w_id = Vec::with_capacity(n);
@@ -403,32 +408,31 @@ fn generate_district(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let state_refs: Vec<&str> = d_state.iter().map(|s| s.as_str()).collect();
         let zip_refs: Vec<&str> = d_zip.iter().map(|s| s.as_str()).collect();
 
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(d_id)),
-                    Arc::new(Int32Array::from(d_w_id)),
-                    Arc::new(StringArray::from(name_refs)),
-                    Arc::new(StringArray::from(st1_refs)),
-                    Arc::new(StringArray::from(st2_refs)),
-                    Arc::new(StringArray::from(city_refs)),
-                    Arc::new(StringArray::from(state_refs)),
-                    Arc::new(StringArray::from(zip_refs)),
-                    Arc::new(decimal_array(d_tax, 4, 4)),
-                    Arc::new(decimal_array(d_ytd, 12, 2)),
-                    Arc::new(Int32Array::from(d_next_o_id)),
-                ],
-            )
-            .expect("district batch"),
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(d_id)),
+                Arc::new(Int32Array::from(d_w_id)),
+                Arc::new(StringArray::from(name_refs)),
+                Arc::new(StringArray::from(st1_refs)),
+                Arc::new(StringArray::from(st2_refs)),
+                Arc::new(StringArray::from(city_refs)),
+                Arc::new(StringArray::from(state_refs)),
+                Arc::new(StringArray::from(zip_refs)),
+                Arc::new(decimal_array(d_tax, 4, 4)),
+                Arc::new(decimal_array(d_ytd, 12, 2)),
+                Arc::new(Int32Array::from(d_next_o_id)),
+            ],
+        )
+        .expect("district batch");
         offset += n;
-    }
+        Some(batch)
+    });
 
-    (schema, batches)
+    (out_schema, Box::new(batches))
 }
 
-fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn generate_customer(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let schema = customer_schema();
     // At fractional scales `scale as i32` truncates to 0 while the
     // warehouse table itself generates max(1) rows with w_id = 1; the
@@ -439,10 +443,13 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let total = super::scaled(scale, 30_000.0);
     let total = total.max(1);
     let mut rng = StdRng::seed_from_u64(seed_for_table("customer"));
-    let mut batches = Vec::new();
+    let out_schema = schema.clone();
 
     let mut offset = 0usize;
-    while offset < total {
+    let batches = std::iter::from_fn(move || {
+        if offset >= total {
+            return None;
+        }
         let n = BATCH_SIZE.min(total - offset);
         let mut c_id = Vec::with_capacity(n);
         let mut c_d_id = Vec::with_capacity(n);
@@ -521,42 +528,41 @@ fn generate_customer(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let credit_refs: Vec<&str> = c_credit.iter().map(|s| s.as_str()).collect();
         let data_refs: Vec<&str> = c_data.iter().map(|s| s.as_str()).collect();
 
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(c_id)),
-                    Arc::new(Int32Array::from(c_d_id)),
-                    Arc::new(Int32Array::from(c_w_id)),
-                    Arc::new(StringArray::from(first_refs)),
-                    Arc::new(StringArray::from(middle_refs)),
-                    Arc::new(StringArray::from(last_refs)),
-                    Arc::new(StringArray::from(st1_refs)),
-                    Arc::new(StringArray::from(st2_refs)),
-                    Arc::new(StringArray::from(city_refs)),
-                    Arc::new(StringArray::from(state_refs)),
-                    Arc::new(StringArray::from(zip_refs)),
-                    Arc::new(StringArray::from(phone_refs)),
-                    Arc::new(Date32Array::from(c_since)),
-                    Arc::new(StringArray::from(credit_refs)),
-                    Arc::new(decimal_array(c_credit_lim, 12, 2)),
-                    Arc::new(decimal_array(c_discount, 4, 4)),
-                    Arc::new(decimal_array(c_balance, 12, 2)),
-                    Arc::new(decimal_array(c_ytd_payment, 12, 2)),
-                    Arc::new(Int32Array::from(c_payment_cnt)),
-                    Arc::new(Int32Array::from(c_delivery_cnt)),
-                    Arc::new(StringArray::from(data_refs)),
-                ],
-            )
-            .expect("customer batch"),
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(c_id)),
+                Arc::new(Int32Array::from(c_d_id)),
+                Arc::new(Int32Array::from(c_w_id)),
+                Arc::new(StringArray::from(first_refs)),
+                Arc::new(StringArray::from(middle_refs)),
+                Arc::new(StringArray::from(last_refs)),
+                Arc::new(StringArray::from(st1_refs)),
+                Arc::new(StringArray::from(st2_refs)),
+                Arc::new(StringArray::from(city_refs)),
+                Arc::new(StringArray::from(state_refs)),
+                Arc::new(StringArray::from(zip_refs)),
+                Arc::new(StringArray::from(phone_refs)),
+                Arc::new(Date32Array::from(c_since)),
+                Arc::new(StringArray::from(credit_refs)),
+                Arc::new(decimal_array(c_credit_lim, 12, 2)),
+                Arc::new(decimal_array(c_discount, 4, 4)),
+                Arc::new(decimal_array(c_balance, 12, 2)),
+                Arc::new(decimal_array(c_ytd_payment, 12, 2)),
+                Arc::new(Int32Array::from(c_payment_cnt)),
+                Arc::new(Int32Array::from(c_delivery_cnt)),
+                Arc::new(StringArray::from(data_refs)),
+            ],
+        )
+        .expect("customer batch");
         offset += n;
-    }
+        Some(batch)
+    });
 
-    (schema, batches)
+    (out_schema, Box::new(batches))
 }
 
-fn generate_history(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn generate_history(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let schema = history_schema();
     // At fractional scales `scale as i32` truncates to 0 while the
     // warehouse table itself generates max(1) rows with w_id = 1; the
@@ -567,10 +573,13 @@ fn generate_history(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let total = super::scaled(scale, 30_000.0);
     let total = total.max(1);
     let mut rng = StdRng::seed_from_u64(seed_for_table("history"));
-    let mut batches = Vec::new();
+    let out_schema = schema.clone();
 
     let mut offset = 0usize;
-    while offset < total {
+    let batches = std::iter::from_fn(move || {
+        if offset >= total {
+            return None;
+        }
         let n = BATCH_SIZE.min(total - offset);
         let mut h_c_id = Vec::with_capacity(n);
         let mut h_c_d_id = Vec::with_capacity(n);
@@ -599,29 +608,28 @@ fn generate_history(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
         let data_refs: Vec<&str> = h_data.iter().map(|s| s.as_str()).collect();
 
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(h_c_id)),
-                    Arc::new(Int32Array::from(h_c_d_id)),
-                    Arc::new(Int32Array::from(h_c_w_id)),
-                    Arc::new(Int32Array::from(h_d_id)),
-                    Arc::new(Int32Array::from(h_w_id)),
-                    Arc::new(Date32Array::from(h_date)),
-                    Arc::new(decimal_array(h_amount, 6, 2)),
-                    Arc::new(StringArray::from(data_refs)),
-                ],
-            )
-            .expect("history batch"),
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(h_c_id)),
+                Arc::new(Int32Array::from(h_c_d_id)),
+                Arc::new(Int32Array::from(h_c_w_id)),
+                Arc::new(Int32Array::from(h_d_id)),
+                Arc::new(Int32Array::from(h_w_id)),
+                Arc::new(Date32Array::from(h_date)),
+                Arc::new(decimal_array(h_amount, 6, 2)),
+                Arc::new(StringArray::from(data_refs)),
+            ],
+        )
+        .expect("history batch");
         offset += n;
-    }
+        Some(batch)
+    });
 
-    (schema, batches)
+    (out_schema, Box::new(batches))
 }
 
-fn generate_orders(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn generate_orders(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let schema = orders_schema();
     // At fractional scales `scale as i32` truncates to 0 while the
     // warehouse table itself generates max(1) rows with w_id = 1; the
@@ -633,10 +641,13 @@ fn generate_orders(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let total = total.max(1);
     let num_customers_per_district = 3000i32;
     let mut rng = StdRng::seed_from_u64(seed_for_table("orders"));
-    let mut batches = Vec::new();
+    let out_schema = schema.clone();
 
     let mut offset = 0usize;
-    while offset < total {
+    let batches = std::iter::from_fn(move || {
+        if offset >= total {
+            return None;
+        }
         let n = BATCH_SIZE.min(total - offset);
         let mut o_id = Vec::with_capacity(n);
         let mut o_d_id = Vec::with_capacity(n);
@@ -670,29 +681,28 @@ fn generate_orders(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             o_all_local.push(1i32);
         }
 
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(o_id)),
-                    Arc::new(Int32Array::from(o_d_id)),
-                    Arc::new(Int32Array::from(o_w_id)),
-                    Arc::new(Int32Array::from(o_c_id)),
-                    Arc::new(Date32Array::from(o_entry_d)),
-                    Arc::new(Int32Array::from(o_carrier_id)),
-                    Arc::new(Int32Array::from(o_ol_cnt)),
-                    Arc::new(Int32Array::from(o_all_local)),
-                ],
-            )
-            .expect("orders batch"),
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(o_id)),
+                Arc::new(Int32Array::from(o_d_id)),
+                Arc::new(Int32Array::from(o_w_id)),
+                Arc::new(Int32Array::from(o_c_id)),
+                Arc::new(Date32Array::from(o_entry_d)),
+                Arc::new(Int32Array::from(o_carrier_id)),
+                Arc::new(Int32Array::from(o_ol_cnt)),
+                Arc::new(Int32Array::from(o_all_local)),
+            ],
+        )
+        .expect("orders batch");
         offset += n;
-    }
+        Some(batch)
+    });
 
-    (schema, batches)
+    (out_schema, Box::new(batches))
 }
 
-fn generate_new_order(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn generate_new_order(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let schema = new_order_schema();
     // At fractional scales `scale as i32` truncates to 0 while the
     // warehouse table itself generates max(1) rows with w_id = 1; the
@@ -702,10 +712,13 @@ fn generate_new_order(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     // last 900 orders per district are new orders: SF * 10 districts * 900 = SF * 9000
     let total = super::scaled(scale, 9_000.0);
     let total = total.max(1);
-    let mut batches = Vec::new();
+    let out_schema = schema.clone();
 
     let mut offset = 0usize;
-    while offset < total {
+    let batches = std::iter::from_fn(move || {
+        if offset >= total {
+            return None;
+        }
         let n = BATCH_SIZE.min(total - offset);
         let mut no_o_id = Vec::with_capacity(n);
         let mut no_d_id = Vec::with_capacity(n);
@@ -723,24 +736,23 @@ fn generate_new_order(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
             no_w_id.push(wid);
         }
 
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(no_o_id)),
-                    Arc::new(Int32Array::from(no_d_id)),
-                    Arc::new(Int32Array::from(no_w_id)),
-                ],
-            )
-            .expect("new_order batch"),
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(no_o_id)),
+                Arc::new(Int32Array::from(no_d_id)),
+                Arc::new(Int32Array::from(no_w_id)),
+            ],
+        )
+        .expect("new_order batch");
         offset += n;
-    }
+        Some(batch)
+    });
 
-    (schema, batches)
+    (out_schema, Box::new(batches))
 }
 
-fn generate_order_line(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn generate_order_line(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let schema = order_line_schema();
     // At fractional scales `scale as i32` truncates to 0 while the
     // warehouse table itself generates max(1) rows with w_id = 1; the
@@ -753,10 +765,13 @@ fn generate_order_line(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let total = total.max(1);
     let num_items = 100_000i32;
     let mut rng = StdRng::seed_from_u64(seed_for_table("order_line"));
-    let mut batches = Vec::new();
+    let out_schema = schema.clone();
 
     let mut offset = 0usize;
-    while offset < total {
+    let batches = std::iter::from_fn(move || {
+        if offset >= total {
+            return None;
+        }
         let n = BATCH_SIZE.min(total - offset);
         let mut ol_o_id = Vec::with_capacity(n);
         let mut ol_d_id = Vec::with_capacity(n);
@@ -805,39 +820,41 @@ fn generate_order_line(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
 
         let dist_refs: Vec<&str> = ol_dist_info.iter().map(|s| s.as_str()).collect();
 
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(ol_o_id)),
-                    Arc::new(Int32Array::from(ol_d_id)),
-                    Arc::new(Int32Array::from(ol_w_id)),
-                    Arc::new(Int32Array::from(ol_number)),
-                    Arc::new(Int32Array::from(ol_i_id)),
-                    Arc::new(Int32Array::from(ol_supply_w_id)),
-                    Arc::new(Date32Array::from(ol_delivery_d)),
-                    Arc::new(Int32Array::from(ol_quantity)),
-                    Arc::new(decimal_array(ol_amount, 6, 2)),
-                    Arc::new(StringArray::from(dist_refs)),
-                ],
-            )
-            .expect("order_line batch"),
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ol_o_id)),
+                Arc::new(Int32Array::from(ol_d_id)),
+                Arc::new(Int32Array::from(ol_w_id)),
+                Arc::new(Int32Array::from(ol_number)),
+                Arc::new(Int32Array::from(ol_i_id)),
+                Arc::new(Int32Array::from(ol_supply_w_id)),
+                Arc::new(Date32Array::from(ol_delivery_d)),
+                Arc::new(Int32Array::from(ol_quantity)),
+                Arc::new(decimal_array(ol_amount, 6, 2)),
+                Arc::new(StringArray::from(dist_refs)),
+            ],
+        )
+        .expect("order_line batch");
         offset += n;
-    }
+        Some(batch)
+    });
 
-    (schema, batches)
+    (out_schema, Box::new(batches))
 }
 
-fn generate_item() -> (SchemaRef, Vec<RecordBatch>) {
+fn generate_item() -> (SchemaRef, super::BatchIterator) {
     let schema = item_schema();
     // Item table is fixed at 100,000 rows regardless of scale
     let total = 100_000usize;
     let mut rng = StdRng::seed_from_u64(seed_for_table("item"));
-    let mut batches = Vec::new();
+    let out_schema = schema.clone();
 
     let mut offset = 0usize;
-    while offset < total {
+    let batches = std::iter::from_fn(move || {
+        if offset >= total {
+            return None;
+        }
         let n = BATCH_SIZE.min(total - offset);
         let mut i_id = Vec::with_capacity(n);
         let mut i_im_id = Vec::with_capacity(n);
@@ -869,26 +886,25 @@ fn generate_item() -> (SchemaRef, Vec<RecordBatch>) {
         let name_refs: Vec<&str> = i_name.iter().map(|s| s.as_str()).collect();
         let data_refs: Vec<&str> = i_data.iter().map(|s| s.as_str()).collect();
 
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(i_id)),
-                    Arc::new(Int32Array::from(i_im_id)),
-                    Arc::new(StringArray::from(name_refs)),
-                    Arc::new(decimal_array(i_price, 5, 2)),
-                    Arc::new(StringArray::from(data_refs)),
-                ],
-            )
-            .expect("item batch"),
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(i_id)),
+                Arc::new(Int32Array::from(i_im_id)),
+                Arc::new(StringArray::from(name_refs)),
+                Arc::new(decimal_array(i_price, 5, 2)),
+                Arc::new(StringArray::from(data_refs)),
+            ],
+        )
+        .expect("item batch");
         offset += n;
-    }
+        Some(batch)
+    });
 
-    (schema, batches)
+    (out_schema, Box::new(batches))
 }
 
-fn generate_stock(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
+fn generate_stock(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let schema = stock_schema();
     // At fractional scales `scale as i32` truncates to 0 while the
     // warehouse table itself generates max(1) rows with w_id = 1; the
@@ -900,10 +916,13 @@ fn generate_stock(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
     let total = total.max(1);
     let num_items = 100_000i32;
     let mut rng = StdRng::seed_from_u64(seed_for_table("stock"));
-    let mut batches = Vec::new();
+    let out_schema = schema.clone();
 
     let mut offset = 0usize;
-    while offset < total {
+    let batches = std::iter::from_fn(move || {
+        if offset >= total {
+            return None;
+        }
         let n = BATCH_SIZE.min(total - offset);
         let mut s_i_id = Vec::with_capacity(n);
         let mut s_w_id = Vec::with_capacity(n);
@@ -971,35 +990,34 @@ fn generate_stock(scale: f64) -> (SchemaRef, Vec<RecordBatch>) {
         let d10_refs: Vec<&str> = s_dist_10.iter().map(|s| s.as_str()).collect();
         let data_refs: Vec<&str> = s_data.iter().map(|s| s.as_str()).collect();
 
-        batches.push(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(s_i_id)),
-                    Arc::new(Int32Array::from(s_w_id)),
-                    Arc::new(Int32Array::from(s_quantity)),
-                    Arc::new(StringArray::from(d01_refs)),
-                    Arc::new(StringArray::from(d02_refs)),
-                    Arc::new(StringArray::from(d03_refs)),
-                    Arc::new(StringArray::from(d04_refs)),
-                    Arc::new(StringArray::from(d05_refs)),
-                    Arc::new(StringArray::from(d06_refs)),
-                    Arc::new(StringArray::from(d07_refs)),
-                    Arc::new(StringArray::from(d08_refs)),
-                    Arc::new(StringArray::from(d09_refs)),
-                    Arc::new(StringArray::from(d10_refs)),
-                    Arc::new(Int32Array::from(s_ytd)),
-                    Arc::new(Int32Array::from(s_order_cnt)),
-                    Arc::new(Int32Array::from(s_remote_cnt)),
-                    Arc::new(StringArray::from(data_refs)),
-                ],
-            )
-            .expect("stock batch"),
-        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(s_i_id)),
+                Arc::new(Int32Array::from(s_w_id)),
+                Arc::new(Int32Array::from(s_quantity)),
+                Arc::new(StringArray::from(d01_refs)),
+                Arc::new(StringArray::from(d02_refs)),
+                Arc::new(StringArray::from(d03_refs)),
+                Arc::new(StringArray::from(d04_refs)),
+                Arc::new(StringArray::from(d05_refs)),
+                Arc::new(StringArray::from(d06_refs)),
+                Arc::new(StringArray::from(d07_refs)),
+                Arc::new(StringArray::from(d08_refs)),
+                Arc::new(StringArray::from(d09_refs)),
+                Arc::new(StringArray::from(d10_refs)),
+                Arc::new(Int32Array::from(s_ytd)),
+                Arc::new(Int32Array::from(s_order_cnt)),
+                Arc::new(Int32Array::from(s_remote_cnt)),
+                Arc::new(StringArray::from(data_refs)),
+            ],
+        )
+        .expect("stock batch");
         offset += n;
-    }
+        Some(batch)
+    });
 
-    (schema, batches)
+    (out_schema, Box::new(batches))
 }
 
 // ---------------------------------------------------------------------------
@@ -1073,9 +1091,15 @@ impl BenchmarkGenerator for TpccGenerator {
         let (schema, batches) = build_tpcc_table(table, scale, _config)?;
 
         let full_output = format!("{output_dir}/tpcc/sf{scale}");
-        let (files, bytes) =
-            parquet_writer::write_parquet_files(&batches, schema, &full_output, table)?;
-        let rows = batches.iter().map(|b| b.num_rows()).sum();
+        let (files, bytes) = parquet_writer::write_parquet_stream(
+            batches,
+            schema,
+            &full_output,
+            table,
+            "",
+            _config,
+        )?;
+        let rows = self.total_rows(table, scale);
 
         Ok(GenerateStats {
             table: table.to_string(),
@@ -1094,14 +1118,26 @@ impl BenchmarkGenerator for TpccGenerator {
     ) -> anyhow::Result<super::BatchSource> {
         use super::{BatchShard, BatchSource};
         let (schema, batches) = build_tpcc_table(table, scale, config)?;
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let total_rows = self.total_rows(table, scale);
         let make: Box<dyn FnOnce() -> Box<dyn Iterator<Item = RecordBatch> + Send> + Send> =
-            Box::new(move || Box::new(batches.into_iter()));
+            Box::new(move || batches);
         Ok(BatchSource {
             schema,
             total_rows,
             shards: vec![BatchShard { make }],
         })
+    }
+}
+
+impl TpccGenerator {
+    /// Rows a table generates: every generator emits `row_count(scale)`
+    /// clamped to at least one row.
+    fn total_rows(&self, table: &str, scale: f64) -> usize {
+        self.tables()
+            .into_iter()
+            .find(|t| t.name == table)
+            .map(|t| (t.row_count)(scale).max(1))
+            .expect("validated table")
     }
 }
 
@@ -1112,7 +1148,7 @@ fn build_tpcc_table(
     table: &str,
     scale: f64,
     _config: &super::GenerateConfig,
-) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
+) -> anyhow::Result<(SchemaRef, super::BatchIterator)> {
     Ok(match table {
         "warehouse" => generate_warehouse(scale),
         "district" => generate_district(scale),
@@ -1198,6 +1234,7 @@ mod tests {
     #[test]
     fn test_generate_warehouse_sf1() {
         let (schema, batches) = generate_warehouse(1.0);
+        let batches: Vec<_> = batches.collect();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
         assert_eq!(batches[0].schema(), schema);
@@ -1207,6 +1244,7 @@ mod tests {
     #[test]
     fn test_generate_district_sf1() {
         let (schema, batches) = generate_district(1.0);
+        let batches: Vec<_> = batches.collect();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 10);
         assert_eq!(schema.fields().len(), 11);
@@ -1215,6 +1253,7 @@ mod tests {
     #[test]
     fn test_generate_item_fixed() {
         let (schema, batches) = generate_item();
+        let batches: Vec<_> = batches.collect();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 100_000);
         assert_eq!(schema.fields().len(), 5);
@@ -1223,6 +1262,7 @@ mod tests {
     #[test]
     fn test_generate_new_order_sf1() {
         let (schema, batches) = generate_new_order(1.0);
+        let batches: Vec<_> = batches.collect();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 9_000);
         assert_eq!(schema.fields().len(), 3);

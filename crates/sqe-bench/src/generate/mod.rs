@@ -219,9 +219,13 @@ mod batch_source_tests {
     fn generation_golden() {
         use std::hash::{Hash, Hasher};
         // Captured from the eager generators before their streaming migration.
+        // `SQE_BENCH_RECORD_GOLDEN=1` prints the current hashes instead of
+        // checking them, for a deliberate change to generated values.
+        let record = std::env::var_os("SQE_BENCH_RECORD_GOLDEN").is_some();
+        let mut recorded = std::collections::BTreeMap::new();
         let expected: std::collections::HashMap<String, (usize, u64)> =
             serde_json::from_str(include_str!("generation-golden.json")).unwrap();
-        for suite in ["ssb", "tpcds", "tpcbb"] {
+        for suite in ["ssb", "tpcds", "tpcbb", "tpcc", "clickbench"] {
             let generator = get_generator(suite).unwrap();
             for table in generator.tables() {
                 let source = generator
@@ -243,19 +247,26 @@ mod batch_source_tests {
                     }
                 }
                 assert_eq!(rows, source.total_rows);
+                let key = format!("{suite}.{}", table.name);
+                if record {
+                    recorded.insert(key, (rows, hash.finish()));
+                    continue;
+                }
                 assert_eq!(
-                    (rows, hash.finish()),
-                    expected[&format!("{suite}.{}", table.name)],
-                    "values changed for {suite}.{}",
-                    table.name,
+                    Some(&(rows, hash.finish())),
+                    expected.get(&key),
+                    "values changed for {key}",
                 );
             }
+        }
+        if record {
+            println!("{}", serde_json::to_string_pretty(&recorded).unwrap());
         }
     }
 
     #[test]
     fn sf100_sources_generate_only_requested_batches() {
-        for suite in ["ssb", "tpcds", "tpcbb"] {
+        for suite in ["ssb", "tpcds", "tpcbb", "tpcc", "clickbench"] {
             let generator = get_generator(suite).unwrap();
             for table in generator.tables() {
                 let source = generator
