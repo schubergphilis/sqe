@@ -85,17 +85,34 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Benchmarks: TPC-C and ClickBench generation streams instead of building each table in memory
+
+    Peak RSS at SF10 drops from 538 MB to 167 MB (TPC-C) and from 912 MB
+    to 199 MB (ClickBench); generated values are byte-identical (the
+    generation golden test now covers both suites, and
+    `SQE_BENCH_RECORD_GOLDEN=1` prints fresh hashes for a deliberate
+    change). Staged Parquet for both suites now honours `--compression`
+    and `--row-group-size`; it was fixed at zstd(3) and the default row
+    group, which are still the defaults.
+
 - Benchmarks: one table-layout definition for `load` and the direct Iceberg sink
 
     Partitioning, sort-on-write keys and bloom columns per benchmark table
     now live in `sqe-bench`'s `layout` module, read by both paths.
-    `generate --sink iceberg` refuses, before writing anything, a suite with
-    a table `load` would partition or sort (TPC-H, SSB, TPC-DS, TPCBB,
-    TPC-C), naming each table; such a table prunes differently and its
-    timings would not compare with a loaded baseline. `--ignore-layout`
-    writes anyway with a warning per table. TPC-E and ClickBench write
-    directly as before. Direct writes now carry the bloom filters the
-    engine's writer adds on its own (`_sk` integer columns, 1% FPP).
+    `generate --sink iceberg` creates TPC-H `lineitem`/`orders` and the
+    TPC-C tables with `load`'s partition spec (same field names, e.g.
+    `l_shipdate_month`) and writes them through one shared per-table buffer:
+    rows are split by partition, and once the buffer passes
+    `--partition-buffer` (default `2g`) the largest partition is written out
+    as a file. TPC-H SF10 lineitem lands as 269 files / 2.5 GB (`load`: 415
+    files / 2.6 GB) at 3.5 GB peak RSS, in 39 s for the whole suite.
+
+    It refuses, before writing anything, a suite with a table `load` sorts
+    on write (SSB, TPC-DS, TPCBB fact tables), naming each table; such a
+    table prunes differently and its timings would not compare with a
+    loaded baseline. `--ignore-layout` writes anyway with a warning per
+    table. Direct writes now carry the bloom filters the engine's writer
+    adds on its own (`_sk` integer columns, 1% FPP).
 
     Fixed on the way: `load --bloom-filter` keyed the SSB date table as
     `ddate`, but the table is `dim_date`, so its `d_datekey` bloom was never

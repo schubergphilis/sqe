@@ -288,15 +288,39 @@ fn bank_arrow_schema(table: &str) -> arrow_schema::SchemaRef {
     }
 }
 
-/// Ensure one table exists in `ns`, creating it (with an optional identity
-/// partition on `partition_col`) if missing. With `clean`, an existing
-/// table is dropped and recreated first.
+/// Build a partition spec from a `PARTITIONED BY` expression as the layout
+/// writes it: comma-separated fields, each a bare column (identity) or
+/// `month(col)`. Field names follow the engine's CTAS: the bare column for
+/// identity, `<col>_month` for a month transform.
+fn partition_spec_from_expr(
+    schema: &iceberg::spec::Schema,
+    expr: &str,
+) -> anyhow::Result<PartitionSpec> {
+    let mut builder = PartitionSpec::builder(schema.clone());
+    for field in expr.split(',').map(str::trim) {
+        let (col, name, transform) = match field
+            .strip_prefix("month(")
+            .and_then(|f| f.strip_suffix(')'))
+        {
+            Some(col) => (col, format!("{col}_month"), Transform::Month),
+            None => (field, field.to_string(), Transform::Identity),
+        };
+        builder = builder
+            .add_partition_field(col, name, transform)
+            .with_context(|| format!("partition field `{field}` of `{expr}`"))?;
+    }
+    Ok(builder.build()?)
+}
+
+/// Ensure one table exists in `ns`, creating it (partitioned by the
+/// [`partition_spec_from_expr`] expression `partition`, if any) if missing.
+/// With `clean`, an existing table is dropped and recreated first.
 async fn ensure_table(
     catalog: &dyn Catalog,
     ns: &NamespaceIdent,
     name: &str,
     arrow_schema: &ArrowSchema,
-    partition_col: Option<&str>,
+    partition: Option<&str>,
     clean: bool,
     auto_assign_ids: bool,
 ) -> anyhow::Result<TableCtx> {
@@ -317,10 +341,8 @@ async fn ensure_table(
             arrow_schema_to_schema(arrow_schema)
         }
         .with_context(|| format!("converting {name} schema"))?;
-        let creation = if let Some(col) = partition_col {
-            let spec = PartitionSpec::builder(schema.clone())
-                .add_partition_field(col, col, Transform::Identity)
-                .and_then(|b| b.build())
+        let creation = if let Some(expr) = partition {
+            let spec = partition_spec_from_expr(&schema, expr)
                 .with_context(|| format!("building {name} partition spec"))?;
             TableCreation::builder()
                 .name(name.to_string())
@@ -765,23 +787,150 @@ pub async fn run_bank(
 
 /// Why the direct sink cannot write `table` the way `sqe-bench load` does,
 /// or `None` when it can. A table written differently prunes differently,
-/// so its timings would not compare with a loaded baseline.
+/// so its timings would not compare with a loaded baseline. Partitioning is
+/// reproduced ([`write_partitioned`]); a sort on write is not yet.
 pub fn direct_layout_gap(benchmark: &str, table: &str) -> Option<String> {
     let layout = crate::layout::table_layout(benchmark, table);
-    let mut gaps = Vec::new();
-    if let Some(spec) = layout.partition {
-        gaps.push(format!("partitioned by ({spec})"));
-    }
-    if let Some(key) = layout.sort_key() {
-        gaps.push(format!("sorted on write by {key}"));
-    }
-    (!gaps.is_empty()).then(|| {
+    layout.sort_key().map(|key| {
         format!(
-            "{benchmark}.{table}: `load` writes it {}, which the direct sink does not \
-             yet do; use generate + load, or pass --ignore-layout",
-            gaps.join(" and ")
+            "{benchmark}.{table}: `load` writes it sorted on write by {key}, which the \
+             direct sink does not yet do; use generate + load, or pass --ignore-layout"
         )
     })
+}
+
+/// Settings for [`run_direct`] beyond the target and the generator.
+#[derive(Debug, Clone, Copy)]
+pub struct DirectOptions {
+    /// Drop and recreate each table first.
+    pub clean: bool,
+    /// Skip a table already carrying its done marker.
+    pub resume: bool,
+    /// Data file rollover size in bytes.
+    pub target_file_size: usize,
+    /// Write tables whose `load` layout the sink cannot reproduce.
+    pub ignore_layout: bool,
+    /// In-memory bytes a partitioned table may buffer across all shards
+    /// before its largest partition is written out as a file.
+    pub partition_buffer: usize,
+}
+
+/// Write a partitioned table's shards through one shared buffer.
+///
+/// Every shard's producer feeds one channel; batches are split by partition
+/// and buffered per partition. Once the buffer holds more than
+/// `partition_buffer` bytes, the largest partition is written out as one
+/// file (rolling at `target_file_size`) on its own task, up to `threads`
+/// writes at a time, and waiting for a write slot is the backpressure. A
+/// buffer per shard would multiply the file count by the thread count;
+/// iceberg's fanout writer keeps an open row group per partition per shard,
+/// which at SF100 holds most of the table in memory.
+async fn write_partitioned(
+    writer_props: &WriterProperties,
+    table_ctx: &TableCtx,
+    shards: Vec<crate::generate::BatchShard>,
+    threads: usize,
+    opts: &DirectOptions,
+) -> anyhow::Result<Vec<DataFile>> {
+    let table = &table_ctx.table;
+    let splitter = iceberg::arrow::RecordBatchPartitionSplitter::try_new_with_computed_values(
+        table.metadata().current_schema().clone(),
+        table.metadata().default_partition_spec().clone(),
+    )
+    .context("building partition splitter")?;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<RecordBatch>(threads.max(1) * 4);
+    let gen_slots = Arc::new(Semaphore::new(threads.max(1)));
+    let mut producers = Vec::with_capacity(shards.len());
+    for shard in shards {
+        let tx = tx.clone();
+        let gen_slots = gen_slots.clone();
+        producers.push(tokio::spawn(async move {
+            let _permit = gen_slots.acquire_owned().await.expect("semaphore closed");
+            tokio::task::spawn_blocking(move || {
+                for b in (shard.make)() {
+                    if tx.blocking_send(b).is_err() {
+                        break;
+                    }
+                }
+            })
+            .await
+        }));
+    }
+    drop(tx);
+
+    let write_slots = Arc::new(Semaphore::new(threads.max(1)));
+    let mut writes = tokio::task::JoinSet::new();
+    let mut flushes = 0usize;
+    let mut flush = |key: PartitionKey, parts: Vec<RecordBatch>, permit| {
+        let writer_props = writer_props.clone();
+        let tctx = table_ctx.clone_handle();
+        let prefix = format!("{flushes:05}");
+        let target_file_size = opts.target_file_size;
+        flushes += 1;
+        writes.spawn(async move {
+            let _permit: tokio::sync::OwnedSemaphorePermit = permit;
+            write_shard(
+                &writer_props,
+                target_file_size,
+                &tctx,
+                prefix,
+                Some(key),
+                parts.into_iter(),
+            )
+            .await
+        });
+    };
+
+    let mut buffered: HashMap<Struct, (PartitionKey, Vec<RecordBatch>, usize)> = HashMap::new();
+    let mut total = 0usize;
+    while let Some(batch) = rx.recv().await {
+        // The splitter resolves source columns by field id: bind first.
+        let batch = RecordBatch::try_new(table_ctx.write_schema.clone(), batch.columns().to_vec())
+            .context("rebinding batch to table schema")?;
+        for (key, part) in splitter.split(&batch).context("splitting batch")? {
+            let bytes = part.get_array_memory_size();
+            let entry = buffered
+                .entry(key.data().clone())
+                .or_insert_with(|| (key, Vec::new(), 0));
+            entry.1.push(part);
+            entry.2 += bytes;
+            total += bytes;
+        }
+        while total > opts.partition_buffer {
+            let largest = buffered
+                .iter()
+                .max_by_key(|(_, (_, _, bytes))| *bytes)
+                .map(|(k, _)| k.clone())
+                .expect("buffer over budget is not empty");
+            let (key, parts, bytes) = buffered.remove(&largest).expect("key just found");
+            total -= bytes;
+            let permit = write_slots
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("semaphore closed");
+            flush(key, parts, permit);
+        }
+    }
+    for p in producers {
+        p.await
+            .context("producer task panicked")?
+            .context("producer task panicked")?;
+    }
+    for (_, (key, parts, _)) in buffered {
+        let permit = write_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore closed");
+        flush(key, parts, permit);
+    }
+    let mut files = Vec::new();
+    while let Some(written) = writes.join_next().await {
+        files.extend(written.context("partition write task panicked")??);
+    }
+    Ok(files)
 }
 
 /// Writer properties for one table: `base` plus the bloom filters the
@@ -804,20 +953,25 @@ fn direct_writer_props(config: &GenerateConfig, schema: &ArrowSchema) -> WriterP
 /// Generic direct-to-Iceberg sink: write every table of `gen` straight into
 /// Iceberg, one fast_append per table, with a per-table resume marker.
 ///
-/// Refuses before writing anything when a table's `load` layout is one it
-/// cannot reproduce ([`direct_layout_gap`]), unless `ignore_layout`.
-#[allow(clippy::too_many_arguments)]
+/// Tables `load` partitions are created with the same spec and written
+/// through [`write_partitioned`]. Refuses before writing anything when a
+/// table's `load` layout is one it cannot reproduce ([`direct_layout_gap`]),
+/// unless `opts.ignore_layout`.
 pub async fn run_direct(
     target: &IcebergTarget,
     gen: &dyn crate::generate::BenchmarkGenerator,
     scale: f64,
     config: &GenerateConfig,
-    clean: bool,
-    resume: bool,
-    target_file_size: usize,
-    ignore_layout: bool,
+    opts: &DirectOptions,
 ) -> anyhow::Result<()> {
     const TABLE_DONE_PREFIX: &str = "sqe-bench.table.";
+    let DirectOptions {
+        clean,
+        resume,
+        target_file_size,
+        ignore_layout,
+        ..
+    } = *opts;
 
     let gaps: Vec<String> = gen
         .tables()
@@ -869,7 +1023,7 @@ pub async fn run_direct(
             &ns,
             &name,
             table_def.schema.as_ref(),
-            None,
+            crate::layout::table_layout(gen.name(), &name).partition,
             clean,
             true,
         )
@@ -885,46 +1039,23 @@ pub async fn run_direct(
 
         let src = gen.generate_batches(&name, scale, config)?;
         let expected_rows = src.total_rows as u64;
-        let sem = Arc::new(Semaphore::new(config.threads.max(1)));
-        let mut handles = Vec::with_capacity(src.shards.len());
-        for (idx, shard) in src.shards.into_iter().enumerate() {
-            let sem = sem.clone();
-            let writer_props = writer_props.clone();
-            let tctx = table_ctx.clone_handle();
-            handles.push(tokio::spawn(async move {
-                let _permit = sem.acquire_owned().await.expect("semaphore closed");
-                // Sync producer on a blocking thread -> bounded channel -> async writer.
-                let (tx, rx) = tokio::sync::mpsc::channel::<RecordBatch>(4);
-                let make = shard.make;
-                let producer = tokio::task::spawn_blocking(move || {
-                    for b in make() {
-                        if tx.blocking_send(b).is_err() {
-                            break;
-                        }
-                    }
-                });
-                let batches = futures::stream::unfold(rx, |mut rx| async {
-                    rx.recv().await.map(|batch| (batch, rx))
-                });
-                let written = write_shard_stream(
-                    &writer_props,
-                    target_file_size,
-                    &tctx,
-                    format!("{idx:04}"),
-                    None,
-                    batches,
-                )
-                .await;
-                // On a write error the receiver has been dropped, so the
-                // blocking producer exits instead of staying parked on send.
-                producer.await.context("producer task panicked")?;
-                written
-            }));
-        }
-        let mut files = Vec::new();
-        for h in handles {
-            files.extend(h.await.context("shard task panicked")??);
-        }
+        let partitioned = !table_ctx
+            .table
+            .metadata()
+            .default_partition_spec()
+            .is_unpartitioned();
+        let files = if partitioned {
+            write_partitioned(&writer_props, &table_ctx, src.shards, config.threads, opts).await?
+        } else {
+            write_unpartitioned(
+                &writer_props,
+                &table_ctx,
+                src.shards,
+                config.threads,
+                target_file_size,
+            )
+            .await?
+        };
 
         let rows: u64 = files.iter().map(|f| f.record_count()).sum();
         let bytes: u64 = files.iter().map(|f| f.file_size_in_bytes()).sum();
@@ -952,16 +1083,68 @@ pub async fn run_direct(
     Ok(())
 }
 
+/// Write an unpartitioned table: one writer per shard, up to `threads` at
+/// a time.
+async fn write_unpartitioned(
+    writer_props: &WriterProperties,
+    table_ctx: &TableCtx,
+    shards: Vec<crate::generate::BatchShard>,
+    threads: usize,
+    target_file_size: usize,
+) -> anyhow::Result<Vec<DataFile>> {
+    let sem = Arc::new(Semaphore::new(threads.max(1)));
+    let mut handles = Vec::with_capacity(shards.len());
+    for (idx, shard) in shards.into_iter().enumerate() {
+        let sem = sem.clone();
+        let writer_props = writer_props.clone();
+        let tctx = table_ctx.clone_handle();
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire_owned().await.expect("semaphore closed");
+            // Sync producer on a blocking thread -> bounded channel -> async writer.
+            let (tx, rx) = tokio::sync::mpsc::channel::<RecordBatch>(4);
+            let make = shard.make;
+            let producer = tokio::task::spawn_blocking(move || {
+                for b in make() {
+                    if tx.blocking_send(b).is_err() {
+                        break;
+                    }
+                }
+            });
+            let batches = futures::stream::unfold(rx, |mut rx| async {
+                rx.recv().await.map(|batch| (batch, rx))
+            });
+            let written = write_shard_stream(
+                &writer_props,
+                target_file_size,
+                &tctx,
+                format!("{idx:04}"),
+                None,
+                batches,
+            )
+            .await;
+            // On a write error the receiver has been dropped, so the
+            // blocking producer exits instead of staying parked on send.
+            producer.await.context("producer task panicked")?;
+            written
+        }));
+    }
+    let mut files = Vec::new();
+    for h in handles {
+        files.extend(h.await.context("shard task panicked")??);
+    }
+    Ok(files)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// The direct sink writes a table only when `load` would write it the
-    /// same way: TPC-E and ClickBench pass whole, a partitioned or sorted
-    /// table is refused by name.
+    /// same way: TPC-H, TPC-C, TPC-E and ClickBench pass whole (partitioned
+    /// tables included), a sorted table is refused by name.
     #[test]
-    fn direct_sink_refuses_tables_load_partitions_or_sorts() {
-        for suite in ["tpce", "clickbench"] {
+    fn direct_sink_refuses_only_tables_load_sorts() {
+        for suite in ["tpch", "tpcc", "tpce", "clickbench"] {
             for t in crate::generate::get_generator(suite).unwrap().tables() {
                 assert_eq!(
                     direct_layout_gap(suite, &t.name),
@@ -971,19 +1154,54 @@ mod tests {
                 );
             }
         }
-        let lineitem = direct_layout_gap("tpch", "lineitem").unwrap();
-        assert!(
-            lineitem.contains("partitioned by (month(l_shipdate))"),
-            "{lineitem}"
-        );
-        assert!(!lineitem.contains("sorted"), "{lineitem}");
         let lineorder = direct_layout_gap("ssb", "lineorder").unwrap();
         assert!(
             lineorder.contains("sorted on write by lo_orderdate"),
             "{lineorder}"
         );
-        assert!(direct_layout_gap("tpcc", "order_line").is_some());
-        assert_eq!(direct_layout_gap("tpch", "nation"), None);
+        assert!(direct_layout_gap("tpcds", "store_sales").is_some());
+        assert_eq!(direct_layout_gap("ssb", "customer"), None);
+    }
+
+    /// Every partition expression the layout holds builds a spec whose
+    /// field names match the engine's CTAS (`l_shipdate_month=1992-01/`,
+    /// `ol_w_id=1/ol_d_id=1/` in a loaded warehouse).
+    #[test]
+    fn partition_specs_build_with_engine_field_names() {
+        let mut built = 0;
+        for suite in ["tpch", "tpcc"] {
+            for t in crate::generate::get_generator(suite).unwrap().tables() {
+                let Some(expr) = crate::layout::table_layout(suite, &t.name).partition else {
+                    continue;
+                };
+                let schema = arrow_schema_to_schema_auto_assign_ids(&t.schema).unwrap();
+                let spec = partition_spec_from_expr(&schema, expr)
+                    .unwrap_or_else(|e| panic!("{suite}.{}: {e:#}", t.name));
+                let names: Vec<String> = spec.fields().iter().map(|f| f.name.clone()).collect();
+                let want: Vec<String> = expr
+                    .split(',')
+                    .map(|f| {
+                        let f = f.trim();
+                        f.strip_prefix("month(")
+                            .and_then(|c| c.strip_suffix(')'))
+                            .map_or(f.to_string(), |c| format!("{c}_month"))
+                    })
+                    .collect();
+                assert_eq!(names, want, "{suite}.{}", t.name);
+                built += 1;
+            }
+        }
+        assert_eq!(built, 10, "2 TPC-H + 8 TPC-C partitioned tables");
+        let lineitem = crate::generate::get_generator("tpch")
+            .unwrap()
+            .tables()
+            .into_iter()
+            .find(|t| t.name == "lineitem")
+            .unwrap();
+        let schema = arrow_schema_to_schema_auto_assign_ids(&lineitem.schema).unwrap();
+        let spec = partition_spec_from_expr(&schema, "month(l_shipdate)").unwrap();
+        assert_eq!(spec.fields()[0].transform, Transform::Month);
+        assert!(partition_spec_from_expr(&schema, "no_such_column").is_err());
     }
 
     /// A direct write blooms the same columns the engine's writer would.
