@@ -134,6 +134,9 @@ async fn tpch_direct_sink_writes_and_resumes() {
         true,
         false,
         target_file_size,
+        // TPC-H's lineitem/orders are partitioned under `load`; this test
+        // covers write + resume, not layout parity.
+        true,
     )
     .await
     .expect("first run_direct should write every table");
@@ -179,6 +182,7 @@ async fn tpch_direct_sink_writes_and_resumes() {
         false,
         true,
         target_file_size,
+        true,
     )
     .await
     .expect("second (resume) run_direct should succeed via the skip path");

@@ -121,14 +121,12 @@ Files are split at 128 MB for parallelism. Output is structured as:
 `generate --sink iceberg` skips the staging Parquet step entirely. Instead of
 writing files to `--output` for a later `load` run, it connects straight to
 the Iceberg REST catalog, creates the tables, and commits data files with one
-`fast_append` per table. The sink works for every generator benchmark (TPC-H,
-TPC-DS, SSB, TPC-C, TPC-E, TPC-BB, ClickBench, and bank), not just the bank
-demo schema that introduced the sink.
+`fast_append` per table.
 
 ```bash
-cargo run -p sqe-bench -- generate tpch --scale 10 --sink iceberg \
+cargo run -p sqe-bench -- generate tpce --scale 10 --sink iceberg \
   --catalog-uri http://localhost:8181/api/catalog \
-  --warehouse bench --namespace tpch \
+  --warehouse bench --namespace tpce_sf10 \
   --client-id ... --client-secret ...
 ```
 
@@ -136,11 +134,20 @@ The command creates the namespace if it does not exist, then generates and
 commits each table in turn. Data is written in parallel shards for TPC-H and
 bank; the other generators write one shard per table.
 
-The sink buffers one full generation shard in memory before writing it, so
-peak memory scales with shard size: per-table for the serial generators, per
-`rows / --threads` for TPC-H and bank. At large scales, raise `--threads` to
-shrink each shard, or fall back to the parquet staging path (`generate` then
-`load`) if memory stays tight.
+The sink writes a table only the way `load` would. `load` partitions TPC-H
+`lineitem`/`orders` by month and the TPC-C tables by warehouse and district,
+and sorts the SSB, TPC-DS and TPC-BB fact tables by their date key on write.
+The sink does neither yet, so it refuses those suites up front and names each
+table; a table written differently prunes differently, and its timings would
+not compare with a loaded baseline. `--ignore-layout` writes them anyway, with
+a warning per table. TPC-E and ClickBench write directly with the same layout
+as `load`, and every direct write carries the bloom filters the engine adds on
+its own (`_sk` integer columns). Bank has its own partitioned writer and is
+not affected.
+
+Generators stream batches into the writer, so peak memory follows `--threads`
+rather than table size. TPC-C and ClickBench are the exceptions: they still
+build each table in memory before writing it.
 
 Two flags control repeated runs against the same namespace:
 

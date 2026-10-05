@@ -1,5 +1,6 @@
 use crate::client::BenchClient;
 use crate::generate;
+use crate::layout::table_layout;
 
 pub struct S3Args {
     pub access_key: Option<String>,
@@ -32,95 +33,6 @@ pub struct LoadArgs<'a> {
     /// are Iceberg writer levers); fact tables are sorted on their
     /// clustering key instead, so row-group pruning stays comparable.
     pub hive_location: Option<&'a str>,
-}
-
-/// Sort-on-write clustering key for a fact table.
-///
-/// Loads sort fact tables by their dominant date/range key so each Parquet
-/// row group gets a tight min/max on that column. Most analytical queries
-/// filter or range on the date key (directly or via a dim join whose dynamic
-/// filter pushes a contiguous date-key set to the fact scan), so tight zone
-/// maps let the reader prune whole row groups instead of decoding them
-/// (`files_pruned_minmax` was 0 on unsorted loads). Dimensions are small and
-/// left unsorted. Cross-engine fair: Trino reads the same sorted files.
-///
-/// Returns the column to `ORDER BY` in the load CTAS, or `None` to load as-is.
-fn clustering_key(benchmark: &str, table: &str) -> Option<&'static str> {
-    match (benchmark, table) {
-        ("tpch", "lineitem") => Some("l_shipdate"),
-        ("tpch", "orders") => Some("o_orderdate"),
-        ("ssb", "lineorder") => Some("lo_orderdate"),
-        ("tpcds" | "tpcbb", "store_sales") => Some("ss_sold_date_sk"),
-        ("tpcds" | "tpcbb", "catalog_sales") => Some("cs_sold_date_sk"),
-        ("tpcds" | "tpcbb", "web_sales") => Some("ws_sold_date_sk"),
-        ("tpcds" | "tpcbb", "inventory") => Some("inv_date_sk"),
-        ("tpcds" | "tpcbb", "store_returns") => Some("sr_returned_date_sk"),
-        ("tpcds" | "tpcbb", "catalog_returns") => Some("cr_returned_date_sk"),
-        ("tpcds" | "tpcbb", "web_returns") => Some("wr_returned_date_sk"),
-        _ => None,
-    }
-}
-
-/// Iceberg partition spec (transform expression) for a fact table's `PARTITIONED
-/// BY` clause, or `None` to leave it unpartitioned. Partitioning enables
-/// manifest-level file pruning (stronger than row-group min/max). Only
-/// date-typed columns get `month()`; integer surrogate date keys (TPC-DS/SSB)
-/// need bucket/truncate and are left for a later pass.
-fn partition_spec(benchmark: &str, table: &str) -> Option<&'static str> {
-    match (benchmark, table) {
-        ("tpch", "lineitem") => Some("month(l_shipdate)"),
-        ("tpch", "orders") => Some("month(o_orderdate)"),
-        // TPC-C: partition by the warehouse[/district] key that the OLTP-style
-        // UPDATE/DELETE statements filter on (`w_id`, `d_id`). With partition-
-        // aware Copy-on-Write (issue #263), a `WHERE w_id=1 AND d_id=1` write
-        // rewrites only that one partition instead of the whole table -- correct
-        // and bounded, without Merge-on-Read. `item` is warehouse-independent
-        // (global) so it stays unpartitioned.
-        ("tpcc", "warehouse") => Some("w_id"),
-        ("tpcc", "stock") => Some("s_w_id"),
-        ("tpcc", "district") => Some("d_w_id, d_id"),
-        ("tpcc", "customer") => Some("c_w_id, c_d_id"),
-        ("tpcc", "orders") => Some("o_w_id, o_d_id"),
-        ("tpcc", "new_order") => Some("no_w_id, no_d_id"),
-        ("tpcc", "order_line") => Some("ol_w_id, ol_d_id"),
-        ("tpcc", "hist") => Some("h_w_id, h_d_id"),
-        _ => None,
-    }
-}
-
-/// Join-key columns to bloom-filter for a benchmark table, or `&[]` for none.
-///
-/// Set only when the caller passes `--bloom-filter`. The names become the
-/// Iceberg table property `write.parquet.bloom-filter-columns` on the load
-/// CTAS, so SQE's Iceberg writer emits per-row-group bloom footers on the
-/// *queried* data files (not the staging Parquet, which the CTAS reads whole
-/// and discards). DataFusion's `parquet.bloom_filter_on_read` (default true)
-/// then consults those footers to skip row groups on literal-equality probes.
-///
-/// TPC-H/SSB join keys use the `_key` suffix, which the engine's default
-/// `write.parquet.bloom-filter-auto` (it targets `_sk` surrogate keys) does
-/// not catch, so without this list those suites get no blooms. TPC-DS `_sk`
-/// keys already auto-bloom and are intentionally omitted here. Keyed by
-/// `(benchmark, table)` because table names collide across suites
-/// (`orders`/`customer` exist in both TPC-H and TPC-C with different keys).
-fn bloom_columns(benchmark: &str, table: &str) -> &'static [&'static str] {
-    match (benchmark, table) {
-        // TPC-H
-        ("tpch", "lineitem") => &["l_orderkey", "l_partkey", "l_suppkey"],
-        ("tpch", "orders") => &["o_orderkey", "o_custkey"],
-        ("tpch", "customer") => &["c_custkey", "c_nationkey"],
-        ("tpch", "supplier") => &["s_suppkey", "s_nationkey"],
-        ("tpch", "part") => &["p_partkey"],
-        ("tpch", "partsupp") => &["ps_partkey", "ps_suppkey"],
-        ("tpch", "nation") => &["n_nationkey", "n_regionkey"],
-        ("tpch", "region") => &["r_regionkey"],
-        // SSB
-        ("ssb", "lineorder") => &["lo_custkey", "lo_partkey", "lo_suppkey", "lo_orderdate"],
-        ("ssb", "ddate") => &["d_datekey"],
-        // Other suites: no explicit list. TPC-DS `_sk` keys auto-bloom via
-        // the engine default; other suites are out of scope for now.
-        _ => &[],
-    }
 }
 
 /// True if `err` is a memory/resource-exhaustion failure (as opposed to a SQL
@@ -225,9 +137,9 @@ pub async fn load_benchmark(client: &dyn BenchClient, args: &LoadArgs<'_>) -> an
         let mut base_sql = format!("CREATE TABLE {qualified_ns}.{}", table_def.name);
         // Hive CTAS: LOCATION is required (SQE never picks a data path for
         // an external table), format defaults to Parquet but is stated.
-        let hive_dir = args.hive_location.map(|loc| {
-            format!("{}/{ns_base}/{}", loc.trim_end_matches('/'), table_def.name)
-        });
+        let hive_dir = args
+            .hive_location
+            .map(|loc| format!("{}/{ns_base}/{}", loc.trim_end_matches('/'), table_def.name));
         if let Some(dir) = &hive_dir {
             base_sql.push_str(&format!(" STORED AS PARQUET LOCATION '{dir}/'"));
         }
@@ -236,9 +148,10 @@ pub async fn load_benchmark(client: &dyn BenchClient, args: &LoadArgs<'_>) -> an
         // write through SQE's Iceberg writer.
         // Both levers share one TBLPROPERTIES clause; sqlparser accepts a
         // single options list per CTAS.
+        let layout = table_layout(benchmark, &table_def.name);
         let mut tbl_props: Vec<String> = Vec::new();
         if args.bloom_filter && hive_dir.is_none() {
-            let cols = bloom_columns(benchmark, &table_def.name);
+            let cols = layout.bloom_columns;
             if !cols.is_empty() {
                 tbl_props.push(format!(
                     "'write.parquet.bloom-filter-columns' = '{}'",
@@ -252,7 +165,8 @@ pub async fn load_benchmark(client: &dyn BenchClient, args: &LoadArgs<'_>) -> an
         if !tbl_props.is_empty() {
             base_sql.push_str(&format!(" TBLPROPERTIES ({})", tbl_props.join(", ")));
         }
-        let partition = partition_spec(benchmark, &table_def.name).filter(|_| hive_dir.is_none());
+        // Hive tables are never partitioned, so they take the sort instead.
+        let partition = layout.partition.filter(|_| hive_dir.is_none());
         if let Some(spec) = partition {
             base_sql.push_str(&format!(" PARTITIONED BY ({spec})"));
         }
@@ -303,7 +217,7 @@ pub async fn load_benchmark(client: &dyn BenchClient, args: &LoadArgs<'_>) -> an
         // (SSB lineorder, TPC-DS *_sales) keep the single-stream sort, which
         // spills cleanly; if it still exhausts memory we fail over to unsorted.
         let partitioned = partition.is_some();
-        match clustering_key(benchmark, &table_def.name) {
+        match layout.clustering {
             Some(key) if !partitioned => {
                 let sorted_sql = format!("{base_sql} ORDER BY {key}");
                 if let Err(e) = client.execute_update(&sorted_sql).await {
@@ -357,40 +271,6 @@ pub async fn load_benchmark(client: &dyn BenchClient, args: &LoadArgs<'_>) -> an
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bloom_columns_cover_tpch_and_ssb_join_keys() {
-        assert_eq!(
-            bloom_columns("tpch", "lineitem"),
-            &["l_orderkey", "l_partkey", "l_suppkey"]
-        );
-        assert_eq!(
-            bloom_columns("ssb", "lineorder"),
-            &["lo_custkey", "lo_partkey", "lo_suppkey", "lo_orderdate"]
-        );
-        assert_eq!(bloom_columns("tpch", "region"), &["r_regionkey"]);
-    }
-
-    #[test]
-    fn bloom_columns_are_suite_scoped_not_table_name_scoped() {
-        // `orders` and `customer` exist in both TPC-H and TPC-C with
-        // different key columns. A table-name-only lookup would wrongly
-        // bloom tpcc.orders with TPC-H's o_orderkey/o_custkey.
-        assert_eq!(
-            bloom_columns("tpch", "orders"),
-            &["o_orderkey", "o_custkey"]
-        );
-        assert!(bloom_columns("tpcc", "orders").is_empty());
-        assert!(bloom_columns("tpcc", "customer").is_empty());
-    }
-
-    #[test]
-    fn bloom_columns_empty_for_auto_bloomed_and_unknown_suites() {
-        // TPC-DS `_sk` keys auto-bloom via the engine default, so no
-        // explicit list here; unknown suites get nothing.
-        assert!(bloom_columns("tpcds", "store_sales").is_empty());
-        assert!(bloom_columns("clickbench", "hits").is_empty());
-    }
 
     fn s3(access: Option<&str>, secret: Option<&str>) -> S3Args {
         S3Args {
