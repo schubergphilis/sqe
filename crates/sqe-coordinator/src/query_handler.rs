@@ -3409,10 +3409,9 @@ impl QueryHandler {
             .handle_time_travel(&sql, ctx, session, session_catalog, incremental_identities)
             .await?;
         // The single normalization pass before planning, matching the
-        // execute() path (finding 700): Trino-compat AST rewrites (the
-        // empty-input ROLLUP / CUBE / GROUPING SETS wrap for
-        // apache/datafusion#21570, CAST(v AS JSON) -> to_json(v), the $-suffix
-        // metadata-table rewrite), `_colN` aliasing and `information_schema`
+        // execute() path (finding 700): Trino-compat AST rewrites
+        // (CAST(v AS JSON) -> to_json(v), the $-suffix metadata-table
+        // rewrite, ...), `_colN` aliasing and `information_schema`
         // qualification.
         let sql = normalize_for_planning(session, &sql)?;
         let sql = sql.as_str();
