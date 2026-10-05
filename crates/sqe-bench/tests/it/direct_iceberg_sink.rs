@@ -16,7 +16,16 @@
 //!
 //! Any Iceberg REST catalog works, not just Nessie: point the
 //! `SQE_TEST_ICEBERG_*` env vars (see the test doc comment below) at a
-//! Polaris deployment instead and set the client-credentials pair.
+//! Polaris deployment instead and set the client-credentials pair. Against
+//! the `make test-integration` stack (after `scripts/bootstrap-test.sh`):
+//!
+//! ```bash
+//! SQE_TEST_ICEBERG_CATALOG_URI=http://localhost:18181/api/catalog \
+//! SQE_TEST_ICEBERG_WAREHOUSE=test_warehouse \
+//! SQE_TEST_ICEBERG_CLIENT_ID=root SQE_TEST_ICEBERG_CLIENT_SECRET=s3cr3t \
+//! SQE_TEST_ICEBERG_SCOPE=PRINCIPAL_ROLE:ALL SQE_TEST_ICEBERG_S3_SECRET_KEY=s3admin \
+//! cargo test -p sqe-bench --test it direct_iceberg_sink -- --ignored
+//! ```
 
 use std::collections::{HashMap, HashSet};
 
