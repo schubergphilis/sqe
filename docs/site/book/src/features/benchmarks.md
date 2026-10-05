@@ -179,10 +179,10 @@ the catalog's OAuth2 client-credentials pair (`--client-id`/`--client-secret`)
 or a pre-acquired `--bearer-token`. See `sqe-bench generate --help` for the
 full flag list.
 
-`scripts/benchmark-test.sh` uses the sink for bank, TPC-H, TPC-C, TPC-E and
-ClickBench, then restarts the coordinator so it sees the tables committed
-behind its back. SSB, TPC-DS and TPC-BB still generate staged Parquet and
-`load` it. A suite also falls back to generate + `load` under
+`scripts/benchmark-test.sh` uses the sink for every suite, then restarts the
+coordinator so it sees the tables committed behind its back. TPC-BB writes its
+own two tables into the TPC-DS namespace, after a direct TPC-DS load when the
+run has not loaded it already. A suite falls back to generate + `load` under
 `BENCH_DATA_SOURCE` other than `generate`, `BENCH_TABLE_FORMAT=hive`,
 `BENCH_BLOOM_FILTER` or `BENCH_PUFFIN_STATS`, which are `load` features.
 `BENCH_LOAD_MODE=load` forces generate + `load` for every suite, for an A/B
