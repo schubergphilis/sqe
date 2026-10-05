@@ -14,6 +14,18 @@ All notable changes to SQE are documented in this file.
     failed to plan. The function now takes a DOUBLE like Trino's, and every
     numeric argument is cast to it before the call.
 
+- SQL: ROLLUP / CUBE / GROUPING SETS reach DataFusion as written
+
+    SQE wrapped every grouping-set query in `(SELECT 1) LEFT JOIN q ON TRUE`
+    so that an empty input still returned the grand-total row, a workaround
+    for apache/datafusion#21570. DataFusion 55 emits that row itself, so the
+    wrap is gone. ROLLUP and CUBE results do not change. `GROUPING SETS`
+    without an empty set, such as `((a), (b))`, on empty input used to get an
+    invented all-NULL row from the wrap; it now returns no rows, as Trino
+    does. On TPC-DS q67 the wrap's nested-loop join copied all 6.5M aggregate
+    rows, 2 to 3 s of CPU summed over cores; wall time on the local rig did
+    not improve.
+
 - Writes: a one-off catalog 401 at commit no longer discards the write
 
     The table reload inside an Iceberg commit was not retried, so a single
@@ -72,6 +84,13 @@ All notable changes to SQE are documented in this file.
     Trino, with the operator detail logged instead.
 
 ### Changed
+
+- SQL: two Trino-compat rewrites retired; DataFusion 55 handles them natively
+
+    `WITH RECURSIVE t(n) AS (...)` column lists (#348) and the bare
+    `ROW(...)` constructor now reach DataFusion as written. Results are
+    unchanged. Over Flight SQL an unaliased `ROW(...)` column is now named
+    `row(...)` instead of `struct(...)`; Trino clients see `_col0` as before.
 
 - Security: `[security] trusted_proxies` accepts CIDR ranges
 
