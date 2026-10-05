@@ -175,6 +175,15 @@ the catalog's OAuth2 client-credentials pair (`--client-id`/`--client-secret`)
 or a pre-acquired `--bearer-token`. See `sqe-bench generate --help` for the
 full flag list.
 
+`scripts/benchmark-test.sh` uses the sink for bank, TPC-H, TPC-C, TPC-E and
+ClickBench, then restarts the coordinator so it sees the tables committed
+behind its back. SSB, TPC-DS and TPC-BB still generate staged Parquet and
+`load` it. A suite also falls back to generate + `load` under
+`BENCH_DATA_SOURCE` other than `generate`, `BENCH_TABLE_FORMAT=hive`,
+`BENCH_BLOOM_FILTER` or `BENCH_PUFFIN_STATS`, which are `load` features.
+`BENCH_LOAD_MODE=load` forces generate + `load` for every suite, for an A/B
+against the direct path.
+
 ## Loading Data
 
 The `load` command connects to SQE and creates Iceberg tables using `read_parquet()` + CTAS. No intermediate format conversion is needed. Parquet files are read directly and written as Iceberg.
