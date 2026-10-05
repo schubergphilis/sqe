@@ -157,6 +157,38 @@ is_attach_read_only() {
     return 1
 }
 
+# Suites generated straight into Iceberg (`sqe-bench generate --sink
+# iceberg`), with the same partitioning and blooms as `load`, so no staged
+# Parquet lands on disk. SSB, TPC-DS and TPC-BB stay on generate + load
+# until their fact tables are generated in date order: `load` sorts them on
+# write and the direct sink refuses a table it would lay out differently.
+# BENCH_LOAD_MODE=load forces generate + load for every suite (A/B, or a
+# fallback). Pre-published data, attach mode, Hive tables and the
+# bloom/Puffin levers are `load` features, so any of them keeps a suite on
+# the load path.
+BENCH_LOAD_MODE="${BENCH_LOAD_MODE:-direct}"
+case "$BENCH_LOAD_MODE" in
+    direct|load) ;;
+    *) echo "ERROR: BENCH_LOAD_MODE must be 'direct' or 'load', got: '$BENCH_LOAD_MODE'" >&2; exit 1 ;;
+esac
+DIRECT_SINK_SUITES=(tpch tpcc tpce clickbench)
+uses_direct_sink() {
+    [ "$BENCH_LOAD_MODE" = "direct" ] || return 1
+    [ -z "$EXTERNAL_DATA" ] || return 1
+    [ "$BENCH_TABLE_FORMAT" = "iceberg" ] || return 1
+    [ -z "$BENCH_PUFFIN_STATS" ] || return 1
+    case "$(printf '%s' "$BENCH_BLOOM_FILTER" | tr '[:upper:]' '[:lower:]')" in
+        ""|0|false|no|off) ;;
+        *) return 1 ;;
+    esac
+    if [ -n "$ATTACH_MODE" ] && is_attach_read_only "$1"; then return 1; fi
+    local b
+    for b in "${DIRECT_SINK_SUITES[@]}"; do
+        [ "$b" = "$1" ] && return 0
+    done
+    return 1
+}
+
 EXTERNAL_DATA=""
 ATTACH_MODE=""
 case "$BENCH_DATA_SOURCE" in
@@ -754,15 +786,22 @@ for BENCH in "${BENCHMARKS[@]}"; do
         echo "  ✓ TPC-DS tables loaded for TPC-BB"
     fi
 
-    if [ "$BENCH" = "bank" ]; then
-        # ── Steps 1+2 (bank): generate straight into Iceberg ──
+    if [ "$BENCH" = "bank" ] || uses_direct_sink "$BENCH"; then
+        # ── Steps 1+2 (bank + DIRECT_SINK_SUITES): generate straight into Iceberg ──
         # No staging parquet, no CTAS through the engine: sqe-bench writes
-        # partition-aligned parquet to the warehouse and commits one
-        # snapshot per trading day via the Iceberg REST API. `--clean`
-        # drops + recreates the tables, so a retry is idempotent.
+        # parquet to the warehouse with `load`'s partitioning and commits
+        # via the Iceberg REST API (bank: one snapshot per trading day).
+        # `--clean` drops + recreates the tables, so a retry is idempotent.
         SCALE_FMT=$(python3 -c "s='$BENCH_SCALE'; print((s.rstrip('0').rstrip('.') if '.' in s else s).replace('.','_'))")
-        BANK_ROWS_PER_DAY=$(python3 -c "print(max(1, int(2_000_000 * float('$BENCH_SCALE'))))")
-        BANK_CUSTOMERS=$(python3 -c "print(max(100, int(100_000 * float('$BENCH_SCALE'))))")
+        if [ "$BENCH" = "bank" ]; then
+            BANK_ROWS_PER_DAY=$(python3 -c "print(max(1, int(2_000_000 * float('$BENCH_SCALE'))))")
+            BANK_CUSTOMERS=$(python3 -c "print(max(100, int(100_000 * float('$BENCH_SCALE'))))")
+            DIRECT_ARGS=(--days 12 --rows-per-day "$BANK_ROWS_PER_DAY" --customers "$BANK_CUSTOMERS")
+            DIRECT_WHAT="12 days x ${BANK_ROWS_PER_DAY} rows/day"
+        else
+            DIRECT_ARGS=(--scale "$BENCH_SCALE")
+            DIRECT_WHAT="SF${BENCH_SCALE}; BENCH_LOAD_MODE=load stages Parquet instead"
+        fi
         # The load writes to the WAREHOUSE endpoint (where the Iceberg
         # tables live), not the staging-data endpoint.
         if [ "$BENCH_WAREHOUSE" = "external" ]; then
@@ -777,17 +816,15 @@ for BENCH in "${BENCHMARKS[@]}"; do
             BANK_S3_REGION="$S3_REGION"
         fi
         echo ""
-        echo "  [1-2/3] Generating straight into Iceberg (12 days x ${BANK_ROWS_PER_DAY} rows/day)..."
+        echo "  [1-2/3] Generating straight into Iceberg (${DIRECT_WHAT})..."
         LOAD_START=$(date +%s)
         LOAD_ATTEMPTS=2
         LOAD_OK=0
         for attempt in $(seq 1 "$LOAD_ATTEMPTS"); do
-            if AWS_SECRET_ACCESS_KEY="$BANK_S3_SECRET_KEY" "$BENCH_BIN" generate bank \
+            if AWS_SECRET_ACCESS_KEY="$BANK_S3_SECRET_KEY" "$BENCH_BIN" generate "$BENCH" \
                 --sink iceberg \
-                --days 12 \
-                --rows-per-day "$BANK_ROWS_PER_DAY" \
-                --customers "$BANK_CUSTOMERS" \
-                --namespace "bank_sf${SCALE_FMT}" \
+                "${DIRECT_ARGS[@]}" \
+                --namespace "${BENCH}_sf${SCALE_FMT}" \
                 --catalog-uri "http://localhost:18181/api/catalog" \
                 --warehouse test_warehouse \
                 --client-id root \
@@ -815,8 +852,8 @@ for BENCH in "${BENCHMARKS[@]}"; do
         LOAD_END=$(date +%s)
         echo "  ✓ Loaded in $((LOAD_END - LOAD_START))s"
 
-        # The bank load is the only one that bypasses the engine (direct
-        # Iceberg REST commits), and the coordinator's catalog caches the
+        # A direct load bypasses the engine (Iceberg REST commits from
+        # sqe-bench), and the coordinator's catalog caches the
         # namespace listing: tables committed behind its back come back
         # "table not found" until a restart. Bounce the coordinator so
         # the test step sees the freshly committed namespace.
