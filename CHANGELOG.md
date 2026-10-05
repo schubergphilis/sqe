@@ -85,6 +85,26 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Benchmarks: SSB and TPC-DS fact tables are generated in date order; their values change
+
+    `load` sorts SSB `lineorder` and the TPC-DS sales/returns tables by
+    their date key on write; at SF100 and beyond that sort is the expensive,
+    memory-bound step. The generators now emit those rows already in that
+    order, so the direct Iceberg sink accepts them without sorting. Each
+    order, ticket or return row is a pure function of its number (a hashed
+    head for its date and line count, its own generator for the rest), and
+    a two-pass counting sort over the dates, 4 bytes per order or return
+    row, fixes the emission order. TPC-DS inventory was already generated
+    week by week and is declared as such.
+
+    Generated values change for `ssb.lineorder` and the six TPC-DS sales
+    and returns tables (row counts, distributions, the returns-to-sales
+    join and every planted query row are kept); all other tables, every
+    other suite, and `inventory` are unchanged. Results from these suites
+    are not comparable with earlier baselines; SF1 and SF10 need a fresh
+    baseline. Cost: SSB SF10 generation 32 s / 110 MB to 42 s / 176 MB,
+    TPC-DS SF1 6.6 s to 7.3 s.
+
 - Benchmarks: `benchmark-test.sh` generates TPC-H, TPC-C, TPC-E and ClickBench straight into Iceberg
 
     No staged Parquet lands on disk for these suites: the script runs

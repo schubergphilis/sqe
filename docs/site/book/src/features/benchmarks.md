@@ -143,11 +143,15 @@ largest partition out as a file whenever the buffer passes `--partition-buffer`
 `lineitem` lands as 269 files with the default, against 415 from `load`. Peak
 memory is the buffer plus the files being written, about 3.5 GB for that run.
 
-`load` also sorts the SSB, TPC-DS and TPC-BB fact tables by their date key on
-write. The sink does not sort yet, so it refuses those suites up front and
-names each table; a table written differently prunes differently, and its
-timings would not compare with a loaded baseline. `--ignore-layout` writes them
-anyway, with a warning per table. Every direct write carries the bloom filters
+`load` also sorts the SSB `lineorder` and TPC-DS fact tables by their date key
+on write. The sink never sorts. Instead those generators emit the rows already
+in date order: each order or return row is a pure function of its number, and
+a counting sort over the dates (4 bytes per order or return row, built before
+the first batch) fixes the emission order. TPC-DS inventory is generated week
+by week. A table `load` sorts whose generator does not declare that order is
+refused up front by name, since a table written differently prunes differently
+and its timings would not compare with a loaded baseline; `--ignore-layout`
+writes it anyway, with a warning. Every direct write carries the bloom filters
 the engine adds on its own (`_sk` integer columns). Bank has its own
 partitioned writer and is not affected.
 

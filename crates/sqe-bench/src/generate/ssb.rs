@@ -721,6 +721,23 @@ fn stream_part(scale: f64) -> (SchemaRef, super::BatchIterator) {
     (output_schema, Box::new(batches))
 }
 
+/// An order's line count and date index, from a hash of its key, so the
+/// date index and the emitted rows agree. Lines keep the old sequential
+/// rule's distribution: after line k the order ends with probability k/7.
+fn order_head(seed: u64, order_key: u32, n_dates: usize) -> (usize, usize) {
+    let h = super::mix64(seed ^ order_key as u64);
+    let date_idx = (h % n_dates as u64) as usize;
+    let mut lines = 1;
+    while lines < 7 {
+        let r = 1 + (super::mix64(h ^ lines as u64) % 7) as usize;
+        if r <= lines {
+            break;
+        }
+        lines += 1;
+    }
+    (lines, date_idx)
+}
+
 fn stream_lineorder(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let schema = lineorder_schema();
     let total = super::scaled(scale, 6_000_000.0);
@@ -728,7 +745,7 @@ fn stream_lineorder(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let num_customers = (scale * 30_000.0) as i32;
     let num_parts = (scale * 80_000.0) as i32;
     let num_suppliers = (scale * 2_000.0) as i32;
-    let mut rng = StdRng::seed_from_u64(seed_for_table("lineorder"));
+    let seed = seed_for_table("lineorder");
 
     // Ordered list of every valid date key, so a commit date can be expressed as
     // the order date advanced by a number of days (datekeys are YYYYMMDD, which
@@ -736,12 +753,29 @@ fn stream_lineorder(scale: f64) -> (SchemaRef, super::BatchIterator) {
     let date_keys = all_date_keys();
     let n_dates = date_keys.len();
 
-    // State for multi-line orders
+    // Orders 1..=last, the last cut to `last_lines` so the table has exactly
+    // `total` rows, emitted in order-date order (`load` sorts lineorder by
+    // lo_orderdate). Each order's values come from its own generator, so they
+    // do not depend on the emission order.
+    let mut rows = 0usize;
+    let mut last = 0u32;
+    let last_lines = loop {
+        last += 1;
+        let (lines, _) = order_head(seed, last, n_dates);
+        if rows + lines >= total {
+            break total - rows;
+        }
+        rows += lines;
+    };
+    let orders = super::counting_order(1..=last, n_dates, |o| order_head(seed, o, n_dates).1);
+    let mut next = 0usize;
+    let mut rng = StdRng::seed_from_u64(seed);
     let mut order_key: i64 = 0;
+    let mut order_lines: usize = 0;
     let mut line_number: i32 = 1;
-    let mut order_idx: usize = rng.random_range(0..n_dates);
-    let mut order_date: i32 = date_keys[order_idx];
-    let mut order_total: f64 = (rng.random_range(10_000..5_000_000_i64) as f64) / 100.0;
+    let mut order_idx: usize = 0;
+    let mut order_date: i32 = 0;
+    let mut order_total: f64 = 0.0;
 
     let mut offset = 0usize;
     let output_schema = schema.clone();
@@ -769,10 +803,16 @@ fn stream_lineorder(scale: f64) -> (SchemaRef, super::BatchIterator) {
         let mut lo_shipmode = Vec::with_capacity(n);
 
         for _ in 0..n {
-            if line_number == 1 {
-                order_key += 1;
-                order_idx = rng.random_range(0..n_dates);
+            if line_number as usize > order_lines {
+                let order = orders[next];
+                next += 1;
+                let (lines, idx) = order_head(seed, order, n_dates);
+                order_key = order as i64;
+                order_lines = if order == last { last_lines } else { lines };
+                order_idx = idx;
                 order_date = date_keys[order_idx];
+                line_number = 1;
+                rng = StdRng::seed_from_u64(seed ^ order as u64);
                 order_total = (rng.random_range(10_000..5_000_000_i64) as f64) / 100.0;
             }
 
@@ -809,11 +849,7 @@ fn stream_lineorder(scale: f64) -> (SchemaRef, super::BatchIterator) {
             lo_commitdate.push(commit_date);
             lo_shipmode.push(SHIP_MODES[rng.random_range(0..SHIP_MODES.len())].to_string());
 
-            // Advance line_number; when it exceeds a random 1..=7 bound, reset
             line_number += 1;
-            if line_number > rng.random_range(1..=7i32) {
-                line_number = 1;
-            }
         }
 
         let priority_refs: Vec<&str> = lo_orderpriority.iter().map(|s| s.as_str()).collect();
@@ -856,6 +892,10 @@ fn stream_lineorder(scale: f64) -> (SchemaRef, super::BatchIterator) {
 impl BenchmarkGenerator for SsbGenerator {
     fn name(&self) -> &str {
         "ssb"
+    }
+
+    fn sorted_by(&self, table: &str) -> Option<&'static str> {
+        (table == "lineorder").then_some("lo_orderdate")
     }
 
     fn tables(&self) -> Vec<TableDef> {
