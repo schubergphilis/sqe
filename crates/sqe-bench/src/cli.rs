@@ -140,6 +140,12 @@ pub enum Command {
         #[arg(long, default_value = "512m")]
         target_file_size: String,
 
+        /// Write a suite directly even where `sqe-bench load` would
+        /// partition or sort a table; the result does not compare with a
+        /// loaded baseline (iceberg sink)
+        #[arg(long, default_value_t = false)]
+        ignore_layout: bool,
+
         /// Print the sized plan (calibration included) and exit without
         /// writing any table data (iceberg sink)
         #[arg(long, default_value_t = false)]
@@ -492,6 +498,7 @@ pub async fn run() -> anyhow::Result<()> {
             s3_region,
             s3_path_style,
             target_file_size,
+            ignore_layout,
             dry_run,
             resume,
             clean,
@@ -600,6 +607,7 @@ pub async fn run() -> anyhow::Result<()> {
                         clean,
                         resume,
                         file_size,
+                        ignore_layout,
                     )
                     .await;
                 }
