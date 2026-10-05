@@ -146,6 +146,12 @@ pub enum Command {
         #[arg(long, default_value_t = false)]
         ignore_layout: bool,
 
+        /// Memory a partitioned table (TPC-H lineitem/orders, TPC-C) may
+        /// buffer across all shards before its largest partition is written
+        /// out, e.g. `2g`. Larger means fewer, bigger files (iceberg sink)
+        #[arg(long, default_value = "2g")]
+        partition_buffer: String,
+
         /// Print the sized plan (calibration included) and exit without
         /// writing any table data (iceberg sink)
         #[arg(long, default_value_t = false)]
@@ -499,6 +505,7 @@ pub async fn run() -> anyhow::Result<()> {
             s3_path_style,
             target_file_size,
             ignore_layout,
+            partition_buffer,
             dry_run,
             resume,
             clean,
@@ -597,19 +604,16 @@ pub async fn run() -> anyhow::Result<()> {
                         s3_region: Some(s3_region),
                         s3_path_style,
                     };
-                    let file_size = sink::plan::parse_size(&target_file_size)? as usize;
-                    let gen = generate::get_generator(&benchmark)?;
-                    return sink::iceberg::run_direct(
-                        &target,
-                        gen.as_ref(),
-                        scale,
-                        &config,
+                    let opts = sink::iceberg::DirectOptions {
                         clean,
                         resume,
-                        file_size,
+                        target_file_size: sink::plan::parse_size(&target_file_size)? as usize,
                         ignore_layout,
-                    )
-                    .await;
+                        partition_buffer: sink::plan::parse_size(&partition_buffer)? as usize,
+                    };
+                    let gen = generate::get_generator(&benchmark)?;
+                    return sink::iceberg::run_direct(&target, gen.as_ref(), scale, &config, &opts)
+                        .await;
                 }
             }
 
