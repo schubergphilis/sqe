@@ -152,8 +152,8 @@ the engine adds on its own (`_sk` integer columns). Bank has its own
 partitioned writer and is not affected.
 
 Generators stream batches into the writer, so peak memory follows `--threads`
-rather than table size. TPC-C and ClickBench are the exceptions: they still
-build each table in memory before writing it.
+rather than table size (TPC-C SF10 generates in 167 MB, ClickBench SF10 in
+199 MB).
 
 Two flags control repeated runs against the same namespace:
 

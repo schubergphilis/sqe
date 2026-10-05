@@ -85,6 +85,16 @@ All notable changes to SQE are documented in this file.
 
 ### Changed
 
+- Benchmarks: TPC-C and ClickBench generation streams instead of building each table in memory
+
+    Peak RSS at SF10 drops from 538 MB to 167 MB (TPC-C) and from 912 MB
+    to 199 MB (ClickBench); generated values are byte-identical (the
+    generation golden test now covers both suites, and
+    `SQE_BENCH_RECORD_GOLDEN=1` prints fresh hashes for a deliberate
+    change). Staged Parquet for both suites now honours `--compression`
+    and `--row-group-size`; it was fixed at zstd(3) and the default row
+    group, which are still the defaults.
+
 - Benchmarks: one table-layout definition for `load` and the direct Iceberg sink
 
     Partitioning, sort-on-write keys and bloom columns per benchmark table
