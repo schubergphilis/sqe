@@ -829,9 +829,15 @@ impl ScalarUDFImpl for FromUnixtime {
         "from_unixtime"
     }
 
+    /// One DOUBLE, like Trino's `from_unixtime(double)`: DataFusion casts
+    /// integer and decimal arguments before the call. `Signature::any`
+    /// passed them through unchanged, and a decimal (SQE parses `1.5` as
+    /// DECIMAL) fell into the NULL arm, so `from_unixtime(1700000000.5)`
+    /// returned NULL.
     fn signature(&self) -> &Signature {
-        static SIG: std::sync::LazyLock<Signature> =
-            std::sync::LazyLock::new(|| Signature::any(1, Volatility::Immutable));
+        static SIG: std::sync::LazyLock<Signature> = std::sync::LazyLock::new(|| {
+            Signature::uniform(1, vec![DataType::Float64], Volatility::Immutable)
+        });
         &SIG
     }
 
@@ -849,38 +855,24 @@ impl ScalarUDFImpl for FromUnixtime {
             (v * 1_000_000.0) as i64
         }
 
+        // The signature coerces the argument to Float64.
         match &args.args[0] {
-            ColumnarValue::Scalar(sv) => {
-                let us = match sv {
-                    ScalarValue::Int64(Some(v)) => epoch_to_us(*v as f64),
-                    ScalarValue::Float64(Some(v)) => epoch_to_us(*v),
-                    ScalarValue::Float32(Some(v)) => epoch_to_us(*v as f64),
-                    ScalarValue::Int32(Some(v)) => epoch_to_us(*v as f64),
-                    _ => {
-                        return Ok(ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(
-                            None, None,
-                        )))
-                    }
-                };
-                Ok(ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(
-                    Some(us),
-                    None,
-                )))
-            }
+            ColumnarValue::Scalar(ScalarValue::Float64(v)) => Ok(ColumnarValue::Scalar(
+                ScalarValue::TimestampMicrosecond(v.map(epoch_to_us), None),
+            )),
+            ColumnarValue::Scalar(other) => Err(DataFusionError::Internal(format!(
+                "from_unixtime: expected a DOUBLE after coercion, got {:?}",
+                other.data_type()
+            ))),
             ColumnarValue::Array(array) => {
+                let arr = array.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "from_unixtime: expected a DOUBLE array after coercion, got {:?}",
+                        array.data_type()
+                    ))
+                })?;
                 let result: TimestampMicrosecondArray =
-                    if let Some(arr) = array.as_any().downcast_ref::<arrow::array::Int64Array>() {
-                        arr.iter()
-                            .map(|opt| opt.map(|v| epoch_to_us(v as f64)))
-                            .collect()
-                    } else if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
-                        arr.iter().map(|opt| opt.map(epoch_to_us)).collect()
-                    } else {
-                        return Err(DataFusionError::Plan(format!(
-                            "from_unixtime: unsupported array type {:?}",
-                            array.data_type()
-                        )));
-                    };
+                    arr.iter().map(|opt| opt.map(epoch_to_us)).collect();
                 Ok(ColumnarValue::Array(Arc::new(result) as ArrayRef))
             }
         }
@@ -2768,6 +2760,48 @@ mod tests {
     async fn from_unixtime_produces_timestamp() {
         // epoch 0 → timestamp 1970-01-01 00:00:00; year() should return 1970
         assert_eq!(run_query("SELECT year(from_unixtime(0))").await, 1970,);
+    }
+
+    /// A decimal argument used to come back NULL: SQE parses `1700000000.5`
+    /// as DECIMAL and the UDF had no arm for it. Every numeric type now
+    /// reaches the same DOUBLE path, scalar and column alike.
+    #[tokio::test]
+    async fn from_unixtime_accepts_decimal_integer_and_double_input() {
+        use datafusion::prelude::{SessionConfig, SessionContext};
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().set_bool("datafusion.sql_parser.parse_float_as_decimal", true),
+        );
+        register_trino_functions(&ctx);
+        let sql = "SELECT CAST(from_unixtime(v) AS VARCHAR) FROM (VALUES \
+                   (1700000000.5), (CAST(1700000000 AS DECIMAL(11, 1)))) AS t(v) \
+                   UNION ALL SELECT CAST(from_unixtime(1700000000.5) AS VARCHAR) \
+                   UNION ALL SELECT CAST(from_unixtime(CAST(1700000000 AS INT)) AS VARCHAR) \
+                   UNION ALL SELECT CAST(from_unixtime(CAST(1700000000.25 AS DOUBLE)) AS VARCHAR) \
+                   UNION ALL SELECT CAST(from_unixtime(CAST(NULL AS BIGINT)) AS VARCHAR)";
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let mut got: Vec<Option<String>> = batches
+            .iter()
+            .flat_map(|b| {
+                // VARCHAR casts come back as Utf8View; read them as Utf8.
+                let utf8 = arrow::compute::cast(b.column(0), &DataType::Utf8).unwrap();
+                let col = utf8.as_any().downcast_ref::<StringArray>().unwrap();
+                (0..col.len())
+                    .map(|i| (!col.is_null(i)).then(|| col.value(i).to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                None,
+                Some("2023-11-14T22:13:20".to_string()),
+                Some("2023-11-14T22:13:20".to_string()),
+                Some("2023-11-14T22:13:20.250".to_string()),
+                Some("2023-11-14T22:13:20.500".to_string()),
+                Some("2023-11-14T22:13:20.500".to_string()),
+            ]
+        );
     }
 
     // ── to_unixtime tests ─────────────────────────────────────────────────────
