@@ -6,6 +6,17 @@ All notable changes to SQE are documented in this file.
 
 ### Fixed
 
+- Trino HTTP: cancelling a query while a client poll was fetching its results did not stop it
+
+    A page fetch pulls the result stream, which is where the query runs,
+    and holds the cursor lock while it does; the cancel only dropped the
+    cursor when it could take that lock, so a `DELETE` during an active poll
+    let the query run to completion, keep its memory and return its rows.
+    The fetch now races the cancel and drops the stream. TPC-H q09 at SF10
+    cancelled at 3 s: before, the client received all rows at 6.1 s with
+    1.2 GB still reserved; now it gets `Query was canceled` at 3.0 s and
+    the reservation is back to zero within five seconds.
+
 - Functions: `from_unixtime` returned NULL for a decimal argument
 
     SQE parses a literal such as `1700000000.5` as DECIMAL, and the Trino

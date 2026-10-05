@@ -78,6 +78,18 @@ impl TrinoAuthenticator for MockAuth {
 /// recognised as such without an extra empty fetch.
 const T_ROWS: i64 = 2500;
 
+/// Set when the `/* stall */` query's stream is dropped.
+static STALL_DROPPED: AtomicBool = AtomicBool::new(false);
+
+/// Sets its flag on drop.
+struct DropFlag(&'static AtomicBool);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// In-process DataFusion executor. Two SQL-comment markers steer timing so
 /// the queued and cancel routes can be reached deterministically:
 /// `/* slow */` finishes after the POST's 1s bounded wait has elapsed,
@@ -121,6 +133,23 @@ impl TrinoQueryExecutor for DfExecutor {
         }
         if sql.contains("/* hang */") {
             tokio::time::sleep(Duration::from_secs(120)).await;
+        }
+        // Planning returns at once, but the stream never yields a batch: a
+        // page fetch blocks pulling it, as a long aggregate does. The stream
+        // sets STALL_DROPPED when dropped, which is how a cancel stops it.
+        if sql.contains("/* stall */") {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "one",
+                DataType::Int64,
+                false,
+            )]));
+            let guard = DropFlag(&STALL_DROPPED);
+            let stalled =
+                futures::stream::pending::<Result<RecordBatch, SqeError>>().map(move |r| {
+                    let _keep = &guard;
+                    r
+                });
+            return Ok(TrinoResultStream::new(schema, Box::pin(stalled)));
         }
         // The server hands USE through to the executor and applies the
         // session headers itself; the coordinator answers it with an empty
@@ -643,6 +672,73 @@ async fn delete_on_next_uri_cancels_a_running_query() {
     let again = h.step("delete-again", req).await;
     assert_eq!(again.status, 204);
     h.assert_golden("cancel");
+}
+
+/// A DELETE while a poll is blocked inside the page fetch stops the
+/// execution. The fetch holds the cursor lock while it pulls the stream,
+/// which is where a query actually runs, so a cancel that only drops an
+/// unlocked cursor left the query running to completion (#788: TPC-H q09
+/// cancelled at 3 s kept 1.2 GB reserved and returned its rows at 6 s).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_during_an_in_flight_fetch_stops_the_stream() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let h = Harness::start().await;
+    let started = h
+        .post_as("alice", "/* stall */ SELECT 1 AS one")
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let next = started["nextUri"].as_str().expect("nextUri").to_string();
+    // Follow nextUri the way a client does; the request that fetches the
+    // first page blocks pulling the stalled stream.
+    let http = h.http.clone();
+    let mut uri = next.clone();
+    let poll = tokio::spawn(async move {
+        loop {
+            let body = http
+                .get(&uri)
+                .basic_auth("alice", Some(BASIC_PASSWORD))
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap();
+            match body["nextUri"].as_str() {
+                Some(n) if body["error"].is_null() => uri = n.to_string(),
+                _ => return body,
+            }
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !poll.is_finished(),
+        "the page fetch should block on the stalled stream"
+    );
+    assert!(
+        !STALL_DROPPED.load(SeqCst),
+        "stream dropped before the cancel"
+    );
+
+    let cancelled = h.http.delete(&next).send().await.unwrap();
+    assert_eq!(cancelled.status().as_u16(), 204);
+
+    let body = tokio::time::timeout(Duration::from_secs(5), poll)
+        .await
+        .expect("the blocked poll returns once the query is cancelled")
+        .unwrap();
+    assert_eq!(
+        body["error"]["message"],
+        json!("Query was canceled"),
+        "{body}"
+    );
+    assert!(
+        STALL_DROPPED.load(SeqCst),
+        "cancel must drop the stream, which stops the execution"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

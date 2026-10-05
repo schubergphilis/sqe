@@ -2106,7 +2106,39 @@ async fn serve_page(handle: &QueryHandle, base_url: &str, id: &str, token: usize
             error_response(StatusCode::NOT_FOUND, "Query result is no longer available")
         });
     };
-    match cursor.fetch(token).await {
+    // Pulling the stream is where the query runs, and this fetch holds the
+    // cursor lock while it does, so `finish_with` cannot drop the cursor
+    // under it. Race the fetch against a cancel or failure: on either, drop
+    // the stream here, which stops the execution and releases its
+    // reservation, instead of running the query to completion.
+    let fetched = {
+        let fetch = cursor.fetch(token);
+        tokio::pin!(fetch);
+        loop {
+            let notified = handle.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if matches!(
+                *handle.status.lock(),
+                QueryStatus::Cancelled | QueryStatus::Failed(_)
+            ) {
+                break None;
+            }
+            tokio::select! {
+                result = &mut fetch => break Some(result),
+                () = &mut notified => {}
+            }
+        }
+    };
+    let Some(fetched) = fetched else {
+        *cursor_guard = None;
+        drop(cursor_guard);
+        let status = handle.status.lock();
+        return terminal_error_response(base_url, id, &status).unwrap_or_else(|| {
+            error_response(StatusCode::NOT_FOUND, "Query result is no longer available")
+        });
+    };
+    match fetched {
         Ok(PageFetch::Page(page)) => {
             let response =
                 build_page_response(base_url, id, &handle.owner.poll_token, cursor, &page);
