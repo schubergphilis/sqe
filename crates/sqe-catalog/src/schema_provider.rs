@@ -4,9 +4,12 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use datafusion::catalog::SchemaProvider;
+use datafusion::common::tree_node::Transformed;
+use datafusion::common::TableReference;
 use datafusion::datasource::ViewTable;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::logical_expr::{LogicalPlan, SubqueryAlias, TableScanBuilder};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use iceberg::NamespaceIdent;
 use moka::sync::Cache as SyncCache;
@@ -502,6 +505,39 @@ impl SchemaProvider for SqeSchemaProvider {
     }
 }
 
+/// The schema a view body's unqualified table names resolve in.
+const VIEW_DEFAULT_SCHEMA: &str = "default";
+
+/// Name every table scan in a view body by the table it actually resolved
+/// to (`catalog.schema.table`). The scan keeps the name as written, and the
+/// policy rewriter fills a missing schema from the QUERYING session's scope,
+/// so an unqualified `orders` in a view would otherwise be governed as
+/// whatever `orders` means after the reader's `USE`. A `SubqueryAlias` under
+/// the written name keeps the column qualifiers the rest of the body uses.
+fn qualify_view_scans(plan: LogicalPlan, catalog: &str, schema: &str) -> DFResult<LogicalPlan> {
+    plan.transform_up_with_subqueries(|node| {
+        let LogicalPlan::TableScan(scan) = &node else {
+            return Ok(Transformed::no(node));
+        };
+        if matches!(scan.table_name, TableReference::Full { .. }) {
+            return Ok(Transformed::no(node));
+        }
+        let full: TableReference = scan.table_name.clone().resolve(catalog, schema).into();
+        let qualified = TableScanBuilder::new(full, scan.source.clone())
+            .with_projection(scan.projection.clone())
+            .with_filters(scan.filters.clone())
+            .with_fetch(scan.fetch)
+            .with_statistics_requests(scan.statistics_requests.clone())
+            .build()?;
+        let alias = SubqueryAlias::try_new(
+            Arc::new(LogicalPlan::TableScan(qualified)),
+            scan.table_name.clone(),
+        )?;
+        Ok(Transformed::yes(LogicalPlan::SubqueryAlias(alias)))
+    })
+    .map(|t| t.data)
+}
+
 impl SqeSchemaProvider {
     /// A catalog provider for view planning built from the calling session's
     /// already-resolved namespace list and scan settings: zero namespace
@@ -558,7 +594,7 @@ impl SqeSchemaProvider {
         let mini_ctx = SessionContext::new_with_config(
             SessionConfig::new()
                 .with_information_schema(true)
-                .with_default_catalog_and_schema(catalog_name, "default"),
+                .with_default_catalog_and_schema(catalog_name, VIEW_DEFAULT_SCHEMA),
         );
 
         // The view's own namespace is always resolvable even when the
@@ -635,7 +671,9 @@ impl SqeSchemaProvider {
             }
         };
 
-        let plan = df.into_optimized_plan().map_err(|e| {
+        let (state, plan) = df.into_parts();
+        let plan = qualify_view_scans(plan, catalog_name, VIEW_DEFAULT_SCHEMA)?;
+        let plan = state.optimize(&plan).map_err(|e| {
             datafusion::error::DataFusionError::External(
                 format!("Failed to optimize view '{name}' plan: {e}").into(),
             )
@@ -673,6 +711,42 @@ mod tests {
             assert!(TABLE_NAMES_SNAPSHOTS.get(key).is_none(), "{key} survived");
         }
         assert!(TABLE_NAMES_SNAPSHOTS.get(&keys[3]).is_some(), "`x.{ns}` is a different namespace");
+    }
+
+    /// A view body's scans carry the table they resolved to, so the policy
+    /// rewriter never fills their schema from the reader's session scope.
+    #[test]
+    fn view_scans_are_named_by_the_table_they_resolved_to() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+        use datafusion::logical_expr::builder::table_scan;
+        use datafusion::prelude::col;
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, true)]);
+        let orders = table_scan(Some("orders"), &schema, None).unwrap().build().unwrap();
+        let plan = table_scan(Some(TableReference::partial("me", "x")), &schema, None)
+            .unwrap()
+            .cross_join(orders)
+            .unwrap()
+            .project(vec![col("orders.id")])
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let qualified = qualify_view_scans(plan.clone(), "wh", "default").unwrap();
+
+        let mut names = Vec::new();
+        qualified
+            .apply(|n| {
+                if let LogicalPlan::TableScan(s) = n {
+                    names.push(s.table_name.to_string());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+        names.sort();
+        assert_eq!(names, ["wh.default.orders", "wh.me.x"]);
+        assert_eq!(qualified.schema(), plan.schema(), "the body's output is unchanged");
     }
 
     #[test]
