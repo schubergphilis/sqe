@@ -123,7 +123,8 @@ pub fn build_policy_enforcer(
             let mut rewriter = PolicyPlanRewriter::new(store.clone())
                 .with_mask_key(mask_key)
                 .with_mask_precedence(config.mask_precedence)
-                .with_hive_catalogs(hive_catalogs.clone());
+                .with_hive_catalogs(hive_catalogs.clone())
+                .with_metadata_target(sqe_catalog::iceberg_metadata_tvf::metadata_tvf_target_ident);
 
             // Wire the tag source. `CacheTagSource` reads `sqe.column-tags`
             // table properties from the shared metadata cache with zero extra
