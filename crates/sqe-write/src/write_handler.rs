@@ -4049,8 +4049,6 @@ impl WriteHandler {
             source_columns: &source_columns,
             target_policy: &target_policy,
         };
-        // User references to masked target columns in ON read the mask.
-        let on_rewritten = crate::merge_sql::apply_target_masks(&on_rewritten, &merge_names);
         let classified = crate::merge_sql::classify_merge_clauses(clauses, &merge_names)?;
         let (matched_clauses, not_matched_clauses, by_source_clauses) = classified.counts();
 
@@ -4846,9 +4844,8 @@ impl WriteHandler {
             source_columns: &source_columns,
             target_policy: &target_policy,
         };
-        let on_rewritten = crate::merge_sql::apply_target_masks(&on_rewritten, &merge_names);
         // Every per-clause query below reads the target through its policy
-        // relation (admit verdict + masked aliases) and the guarded ON, so a
+        // relation (admit verdict + masked columns) and the guarded ON, so a
         // hidden target row is never matched, deleted or updated.
         let q_target_rel = format!(
             "{} AS {target_ref}",
@@ -4936,7 +4933,10 @@ impl WriteHandler {
         let old_key_cols = || -> String {
             key_column_names
                 .iter()
-                .map(|col| format!("{target_ref}.\"{col}\" AS \"{col}\""))
+                .map(|col| {
+                    let raw = crate::merge_sql::raw_target_col(&merge_names, col);
+                    format!("{raw} AS \"{col}\"")
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -4957,15 +4957,9 @@ impl WriteHandler {
                             if col == iceberg::metadata_columns::RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER {
                                 return format!("CAST(NULL AS BIGINT) AS \"{col}\"");
                             }
-                            let expr = crate::merge_sql::apply_target_masks(
-                                &crate::merge_sql::resolve_update_expr(
-                                    col,
-                                    assignments,
-                                    &target_ref,
-                                    &source_ref,
-                                    &t_alias,
-                                    &s_alias,
-                                ),
+                            let expr = crate::merge_sql::resolve_update_expr(
+                                col,
+                                assignments,
                                 &merge_names,
                             );
                             format!("{expr} AS \"{col}\"")
@@ -5094,15 +5088,9 @@ impl WriteHandler {
                             if col == iceberg::metadata_columns::RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER {
                                 return format!("CAST(NULL AS BIGINT) AS \"{col}\"");
                             }
-                            let expr = crate::merge_sql::apply_target_masks(
-                                &crate::merge_sql::resolve_update_expr(
-                                    col,
-                                    assignments,
-                                    &target_ref,
-                                    &source_ref,
-                                    &t_alias,
-                                    &s_alias,
-                                ),
+                            let expr = crate::merge_sql::resolve_update_expr(
+                                col,
+                                assignments,
                                 &merge_names,
                             );
                             format!("{expr} AS \"{col}\"")

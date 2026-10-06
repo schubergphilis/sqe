@@ -49,9 +49,9 @@ pub(crate) struct MergeNames<'a> {
     /// MERGE: a target row the caller cannot SELECT is never matched and
     /// never touched by a NOT MATCHED BY SOURCE clause; it passes through the
     /// rewrite unchanged. A masked column is compared and read through its
-    /// mask in ON, clause predicates and SET expressions, while the engine's
-    /// own passthrough keeps the raw value so unchanged rows are rewritten
-    /// byte-for-byte.
+    /// mask in ON, clause predicates and SET expressions (bare or qualified),
+    /// while the engine's own passthrough keeps the raw value so unchanged
+    /// rows are rewritten byte-for-byte.
     pub target_policy: &'a WritePolicyPredicates,
 }
 
@@ -59,29 +59,46 @@ pub(crate) struct MergeNames<'a> {
 /// filter admits a target row. Exists only inside the merge SQL.
 pub(crate) const MERGE_ADMIT_COLUMN: &str = "__sqe_merge_admit";
 
-/// Column alias carrying the masked value of a target column inside the merge
-/// SQL. User references to the column are redirected here; the raw column
-/// stays available under its own name for the passthrough arm.
-pub(crate) fn masked_alias(col: &str) -> String {
-    format!("__sqe_masked_{col}")
+/// Column alias carrying the RAW value of a masked target column inside the
+/// merge SQL, for the engine's passthrough only. It embeds the per-invocation
+/// scratch ref (a fresh UUID), so user SQL cannot name it; the column's own
+/// name carries the masked value.
+fn raw_alias(names: &MergeNames<'_>, col: &str) -> String {
+    format!("__sqe_raw_{}_{col}", names.target_ref)
+}
+
+/// The engine's reference to the stored value of target column `col`: the
+/// raw alias for a masked column, the column itself otherwise.
+pub(crate) fn raw_target_col(names: &MergeNames<'_>, col: &str) -> String {
+    if names.target_policy.column_mask_sqls.contains_key(col) {
+        format!("{}.\"{}\"", names.target_ref, raw_alias(names, col))
+    } else {
+        format!("{}.\"{col}\"", names.target_ref)
+    }
 }
 
 /// The target relation as the merge SQL should read it: the bare scratch
 /// table when the caller has no policy on the target, otherwise a derived
-/// table that adds one `masked_alias` column per masked column and the
-/// `MERGE_ADMIT_COLUMN` row-filter verdict. Every policy expression is
-/// evaluated inside this single-table subquery, so the unqualified column
-/// names the rewriter produced resolve without ambiguity.
+/// table that projects each masked column's mask under the column's own
+/// name (so any user reference, bare or qualified, reads it masked), its raw
+/// value under [`raw_alias`], and the `MERGE_ADMIT_COLUMN` row-filter
+/// verdict. Every policy expression is evaluated inside this single-table
+/// subquery, so the unqualified column names the rewriter produced resolve
+/// without ambiguity.
 pub(crate) fn target_relation(names: &MergeNames<'_>, qualified_target_ref: &str) -> String {
     let policy = names.target_policy;
     if policy.is_empty() {
         return qualified_target_ref.to_string();
     }
-    let mut projections = vec!["*".to_string()];
-    let mut masked: Vec<(&String, &String)> = policy.column_mask_sqls.iter().collect();
-    masked.sort();
-    for (col, mask_sql) in masked {
-        projections.push(format!("({mask_sql}) AS \"{}\"", masked_alias(col)));
+    let mut projections = Vec::with_capacity(names.target_columns.len() + 1);
+    for col in names.target_columns {
+        match policy.column_mask_sqls.get(col) {
+            Some(mask_sql) => {
+                projections.push(format!("({mask_sql}) AS \"{col}\""));
+                projections.push(format!("\"{col}\" AS \"{}\"", raw_alias(names, col)));
+            }
+            None => projections.push(format!("\"{col}\"")),
+        }
     }
     if let Some(rf) = &policy.row_filter_sql {
         projections.push(format!("({rf}) AS \"{MERGE_ADMIT_COLUMN}\""));
@@ -109,86 +126,6 @@ pub(crate) fn guarded_on(names: &MergeNames<'_>, on_rewritten: &str) -> String {
         Some(guard) => format!("({on_rewritten}) AND {guard}"),
         None => on_rewritten.to_string(),
     }
-}
-
-/// Redirect every user reference to a masked target column
-/// (`{target_ref}.col` or `{target_ref}."col"`) to its masked alias. Bare
-/// identifiers match case-insensitively (the planner folds them); quoted ones
-/// match exactly. Quoted regions and identifier boundaries are respected the
-/// same way `replace_alias_qualifier` does.
-pub(crate) fn apply_target_masks(sql: &str, names: &MergeNames<'_>) -> String {
-    let masks = &names.target_policy.column_mask_sqls;
-    if masks.is_empty() {
-        return sql.to_string();
-    }
-    let needle = format!("{}.", names.target_ref);
-    let mut out = String::with_capacity(sql.len());
-    let mut i = 0;
-    let mut guarded = false;
-    while i < sql.len() {
-        let c = sql[i..].chars().next().expect("char boundary");
-        if c == '\'' || c == '"' {
-            let mut j = i + c.len_utf8();
-            loop {
-                match sql[j..].find(c) {
-                    Some(k) => {
-                        j += k + c.len_utf8();
-                        if sql[j..].starts_with(c) {
-                            j += c.len_utf8();
-                        } else {
-                            break;
-                        }
-                    }
-                    None => {
-                        j = sql.len();
-                        break;
-                    }
-                }
-            }
-            out.push_str(&sql[i..j]);
-            i = j;
-            guarded = true;
-            continue;
-        }
-        if !guarded && sql[i..].starts_with(&needle) {
-            let rest = &sql[i + needle.len()..];
-            // Quoted member: `"col"` (doubled quotes are not expected in
-            // column names the schema produced; treat them as no match).
-            let (member, member_len, quoted) = if let Some(after) = rest.strip_prefix('"') {
-                match after.find('"') {
-                    Some(end) => (&after[..end], end + 2, true),
-                    None => ("", 0, true),
-                }
-            } else {
-                let end = rest
-                    .find(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$')))
-                    .unwrap_or(rest.len());
-                (&rest[..end], end, false)
-            };
-            let hit = if member.is_empty() {
-                None
-            } else {
-                masks.keys().find(|col| {
-                    if quoted {
-                        col.as_str() == member
-                    } else {
-                        col.eq_ignore_ascii_case(member)
-                    }
-                })
-            };
-            if let Some(col) = hit {
-                out.push_str(&needle);
-                out.push_str(&format!("\"{}\"", masked_alias(col)));
-                i += needle.len() + member_len;
-                guarded = true;
-                continue;
-            }
-        }
-        out.push(c);
-        guarded = c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '.');
-        i += c.len_utf8();
-    }
-    out
 }
 
 /// A MERGE clause action after validation against its clause kind.
@@ -326,7 +263,7 @@ pub(crate) fn classify_merge_clauses<'a>(
         let predicate = clause
             .predicate
             .as_ref()
-            .map(|p| apply_target_masks(&rewrite_aliases(format!("{p}"), names), names));
+            .map(|p| rewrite_aliases(format!("{p}"), names));
         let (class, op) = match (&clause.clause_kind, &clause.action) {
             // sqlparser 0.62: MergeAction::Update is a tuple variant holding
             // MergeUpdateExpr; Delete is a struct variant carrying a token.
@@ -473,7 +410,7 @@ pub(crate) fn build_merge_select(
 
     let mut inner_cols: Vec<String> = Vec::with_capacity(names.target_columns.len() + 1);
     for col in names.target_columns {
-        let passthrough = format!("{}.\"{col}\"", names.target_ref);
+        let passthrough = raw_target_col(names, col);
         // V3 row lineage (present only when the caller added the reserved
         // names): a row keeps `_row_id` unless inserted, and gets a NULL
         // `_last_updated_sequence_number` when inserted or updated so it
@@ -507,17 +444,7 @@ pub(crate) fn build_merge_select(
             // DELETE rows are dropped by the keep filter; project the target
             // column so every arm of the CASE keeps the column's type.
             let value = match &clause.op {
-                MergeOp::Update(assignments) => apply_target_masks(
-                    &resolve_update_expr(
-                        col,
-                        assignments,
-                        names.target_ref,
-                        names.source_ref,
-                        names.t_alias,
-                        names.s_alias,
-                    ),
-                    names,
-                ),
+                MergeOp::Update(assignments) => resolve_update_expr(col, assignments, names),
                 _ => passthrough.clone(),
             };
             arms.push(case_arm(&matched_cond, clause.predicate.as_deref(), &value));
@@ -547,17 +474,7 @@ pub(crate) fn build_merge_select(
                 // BY SOURCE UPDATE may only reference target columns per the
                 // SQL standard; a source reference resolves to NULL here
                 // (the source side is absent for this row class).
-                MergeOp::Update(assignments) => apply_target_masks(
-                    &resolve_update_expr(
-                        col,
-                        assignments,
-                        names.target_ref,
-                        names.source_ref,
-                        names.t_alias,
-                        names.s_alias,
-                    ),
-                    names,
-                ),
+                MergeOp::Update(assignments) => resolve_update_expr(col, assignments, names),
                 _ => passthrough.clone(),
             };
             arms.push(case_arm(
@@ -702,14 +619,11 @@ pub(crate) fn first_match_guard(class: &[ClassifiedClause<'_>], idx: usize) -> S
 
 /// Resolve the UPDATE expression for one target column from the SET
 /// assignments, rewriting alias references to the scratch table names. A
-/// column without an assignment passes through from the target.
+/// column without an assignment passes through its stored (raw) value.
 pub(crate) fn resolve_update_expr(
     col: &str,
     assignments: &[Assignment],
-    target_table_ref: &str,
-    source_table_ref: &str,
-    t_alias: &str,
-    s_alias: &str,
+    names: &MergeNames<'_>,
 ) -> String {
     for a in assignments {
         let col_name = match &a.target {
@@ -736,14 +650,12 @@ pub(crate) fn resolve_update_expr(
                 .unwrap_or_default(),
         };
         if col_name == col {
-            let expr_sql = format!("{}", a.value);
             // Rewrite alias references to MemTable names
-            let out = replace_alias_qualifier(&expr_sql, t_alias, target_table_ref);
-            return replace_alias_qualifier(&out, s_alias, source_table_ref);
+            return rewrite_aliases(format!("{}", a.value), names);
         }
     }
     // Column not in SET assignments — pass through from target
-    format!("{target_table_ref}.\"{col}\"")
+    raw_target_col(names, col)
 }
 
 /// Resolve the INSERT expression for one target column in the MERGE context.
@@ -862,8 +774,8 @@ mod tests {
 
     /// 202: the caller's target policy is folded into the merge SQL: hidden
     /// rows never match and are never claimed by BY SOURCE; masked columns
-    /// are read through their alias in ON, predicates and SET, never in the
-    /// passthrough.
+    /// carry the mask under their own name (ON, predicates, SET) and the raw
+    /// value only under the engine's passthrough alias.
     #[test]
     fn target_policy_guards_on_by_source_and_masks_user_references() {
         let sql = "MERGE INTO tgt AS t USING src AS s ON t.id = s.id \
@@ -875,13 +787,12 @@ mod tests {
         let policy = eu_only_masked_ssn();
         let n = names_with_policy(&tc, &sc, &policy);
         let classified = classify_merge_clauses(&clauses, &n).expect("classify");
-        let on = apply_target_masks("__merge_target_x.id = __merge_source_x.id", &n);
         let out = build_merge_select(
             &classified,
             &n,
             "datafusion.public.__merge_target_x",
             "datafusion.public.__merge_source_x",
-            &on,
+            "__merge_target_x.id = __merge_source_x.id",
         );
         let admit = format!("__merge_target_x.\"{MERGE_ADMIT_COLUMN}\"");
         assert!(
@@ -899,49 +810,17 @@ mod tests {
         );
         assert!(
             out.contains("(region = 'EU') AS \"__sqe_merge_admit\"")
-                && out.contains("('***') AS \"__sqe_masked_ssn\""),
-            "target relation must compute admit and masked columns: {out}"
+                && out.contains("('***') AS \"ssn\"")
+                && out.contains("\"ssn\" AS \"__sqe_raw___merge_target_x_ssn\""),
+            "target relation must compute admit, masked and raw columns: {out}"
         );
         assert!(
-            out.contains("(__merge_target_x.\"__sqe_masked_ssn\" = __merge_source_x.ssn)"),
-            "clause predicate must read the mask: {out}"
-        );
-        assert!(
-            out.contains("THEN __merge_target_x.\"__sqe_masked_ssn\""),
-            "SET ssn = t.ssn must read the mask: {out}"
-        );
-        assert!(
-            out.contains("ELSE __merge_target_x.\"ssn\" END AS \"ssn\""),
+            out.contains("ELSE __merge_target_x.\"__sqe_raw___merge_target_x_ssn\" END AS \"ssn\""),
             "the engine passthrough keeps the raw value: {out}"
         );
         // Without a policy the SQL is unchanged in shape.
         let plain = build(sql, &["id", "region", "ssn"], &["id", "ssn"]);
-        assert!(!plain.contains(MERGE_ADMIT_COLUMN) && !plain.contains("__sqe_masked_"));
-    }
-
-    #[test]
-    fn apply_target_masks_respects_boundaries_quotes_and_case() {
-        let tc = cols(&["id", "ssn"]);
-        let sc = cols(&["id"]);
-        let policy = eu_only_masked_ssn();
-        let n = names_with_policy(&tc, &sc, &policy);
-        assert_eq!(
-            apply_target_masks("__merge_target_x.SSN = 'x.ssn' AND __merge_target_x.\"ssn\" IS NOT NULL", &n),
-            "__merge_target_x.\"__sqe_masked_ssn\" = 'x.ssn' AND __merge_target_x.\"__sqe_masked_ssn\" IS NOT NULL"
-        );
-        // Not the target qualifier, a different column, a longer identifier.
-        assert_eq!(
-            apply_target_masks(
-                "__merge_source_x.ssn = __merge_target_x.ssn_hash + __merge_target_x.id",
-                &n
-            ),
-            "__merge_source_x.ssn = __merge_target_x.ssn_hash + __merge_target_x.id"
-        );
-        // Quoted names match exactly, not case-insensitively.
-        assert_eq!(
-            apply_target_masks("__merge_target_x.\"SSN\"", &n),
-            "__merge_target_x.\"SSN\""
-        );
+        assert!(!plain.contains(MERGE_ADMIT_COLUMN) && !plain.contains("__sqe_raw_"));
     }
 
     /// 202, executed: a caller filtered to EU deletes an EU row through
@@ -1053,6 +932,91 @@ mod tests {
                 (3, "US".to_string(), 30)
             ],
             "hidden rows are neither matched nor claimed by NOT MATCHED BY SOURCE"
+        );
+    }
+
+    /// A masked target column is read masked however the user names it
+    /// (bare or qualified), while the stored value of an unassigned masked
+    /// column is written back raw.
+    #[tokio::test]
+    async fn bare_masked_column_reads_masked_and_passthrough_stays_raw() {
+        use arrow_array::{Int32Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::prelude::SessionContext;
+        use std::sync::Arc;
+
+        let ctx = SessionContext::new();
+        let tschema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("ssn", DataType::Utf8, false),
+            Field::new("note", DataType::Utf8, false),
+        ]));
+        let target = arrow_array::RecordBatch::try_new(
+            tschema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["111", "222"])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+        let sschema = Arc::new(Schema::new(vec![Field::new("sid", DataType::Int32, false)]));
+        let source = arrow_array::RecordBatch::try_new(
+            sschema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+        for (name, schema, batch) in [
+            ("datafusion.public.__merge_target_x", tschema, target),
+            ("datafusion.public.__merge_source_x", sschema, source),
+        ] {
+            let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+            ctx.register_table(name, Arc::new(mem)).unwrap();
+        }
+
+        let sql = "MERGE INTO tgt AS t USING src AS s ON t.id = s.sid \
+                   WHEN MATCHED AND ssn = '111' THEN DELETE \
+                   WHEN MATCHED THEN UPDATE SET note = ssn";
+        let clauses = merge_clauses(sql);
+        let tc = cols(&["id", "ssn", "note"]);
+        let sc = cols(&["sid"]);
+        let policy = WritePolicyPredicates {
+            row_filter_sql: None,
+            column_mask_sqls: std::collections::HashMap::from([(
+                "ssn".to_string(),
+                "'***'".to_string(),
+            )]),
+        };
+        let n = names_with_policy(&tc, &sc, &policy);
+        let classified = classify_merge_clauses(&clauses, &n).unwrap();
+        let select = build_merge_select(
+            &classified,
+            &n,
+            "datafusion.public.__merge_target_x",
+            "datafusion.public.__merge_source_x",
+            "__merge_target_x.id = __merge_source_x.sid",
+        );
+        let batches = ctx.sql(&select).await.unwrap().collect().await.unwrap();
+        let mut rows: Vec<(i32, String, String)> = Vec::new();
+        for b in &batches {
+            let ids = arrow::compute::cast(b.column(0), &DataType::Int32).unwrap();
+            let ids = ids.as_any().downcast_ref::<Int32Array>().unwrap();
+            let ssn = arrow::compute::cast(b.column(1), &DataType::Utf8).unwrap();
+            let ssn = ssn.as_any().downcast_ref::<StringArray>().unwrap();
+            let note = arrow::compute::cast(b.column(2), &DataType::Utf8).unwrap();
+            let note = note.as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..b.num_rows() {
+                rows.push((ids.value(i), ssn.value(i).to_string(), note.value(i).to_string()));
+            }
+        }
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "111".to_string(), "***".to_string()),
+                (2, "222".to_string(), "***".to_string()),
+            ],
+            "predicate and SET read the mask; stored ssn is kept raw"
         );
     }
 
