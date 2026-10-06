@@ -8971,7 +8971,7 @@ fn governed_show_stats(
     }
     let columns = column_names
         .into_iter()
-        .filter(|c| !policy.restricted_columns.iter().any(|r| r == c))
+        .filter(|c| !policy.is_restricted(c))
         .collect();
     let row_count = if policy.row_filters.is_empty() {
         row_count

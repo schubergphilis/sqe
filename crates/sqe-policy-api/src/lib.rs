@@ -41,6 +41,72 @@ pub struct ResolvedPolicy {
     pub restricted_columns: Vec<String>,
 }
 
+impl ResolvedPolicy {
+    /// True when `column` is restricted. Entries may be Ranger column
+    /// patterns (`*`, `card_*`), matched like Ranger: wildcards, any case.
+    pub fn is_restricted(&self, column: &str) -> bool {
+        self.restricted_columns.iter().any(|p| wildcard_match(p, column))
+    }
+
+    /// The mask that applies to `column`: an exact key first, else the
+    /// matching pattern that sorts first (deterministic across runs).
+    pub fn mask_for(&self, column: &str) -> Option<&MaskType> {
+        if let Some(mask) = self.column_masks.get(column) {
+            return Some(mask);
+        }
+        self.column_masks
+            .iter()
+            .filter(|(p, _)| wildcard_match(p, column))
+            .min_by_key(|(p, _)| *p)
+            .map(|(_, mask)| mask)
+    }
+}
+
+/// Ranger wildcard match: `*` matches any run of characters (including none),
+/// `?` matches exactly one.
+///
+/// Semantics taken from the live `hive` service definition, whose `database`,
+/// `table` and `column` resources all declare
+/// `matcherOptions: {wildCard: "true", ignoreCase: "true"}`. Ranger implements
+/// that with commons-io `FilenameUtils.wildcardMatch` and `IOCase.INSENSITIVE`,
+/// where no character other than `*` and `?` is special.
+///
+/// Case folding is part of the same contract, not a separate liberty: with
+/// `ignoreCase: true`, a policy written on `Orders` fires for `orders` in Ranger,
+/// and SQE comparing case-sensitively would silently not mask.
+///
+/// Iterative with a single backtrack point, so a pattern like `*a*a*a*a*` cannot
+/// blow up: policies are operator input reaching a per-query path.
+pub fn wildcard_match(pattern: &str, target: &str) -> bool {
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    let t: Vec<char> = target.to_lowercase().chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut resume = 0usize;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            pi += 1;
+            resume = ti;
+        } else if let Some(s) = star {
+            // Backtrack: let the last `*` swallow one more character.
+            pi = s + 1;
+            resume += 1;
+            ti = resume;
+        } else {
+            return false;
+        }
+    }
+    // Trailing `*`s may match nothing.
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 /// Types of column masking supported.
 #[derive(Debug, Clone)]
 pub enum MaskType {
@@ -266,4 +332,28 @@ pub trait PolicyStore: Send + Sync {
     /// default no-op. The method is synchronous because moka's
     /// `invalidate_all()` is synchronous (it only marks existing entries stale).
     fn invalidate_all(&self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ranger column resources are patterns: `*`, prefix wildcards and any case
+    /// must hit the real column, or the mask/restriction never fires.
+    #[test]
+    fn column_patterns_match_like_ranger() {
+        let mut p = ResolvedPolicy::default();
+        p.column_masks.insert("card_*".to_string(), MaskType::Hash);
+        p.column_masks.insert("SSN".to_string(), MaskType::Nullify);
+        p.restricted_columns.push("*".to_string());
+        assert!(matches!(p.mask_for("card_number"), Some(MaskType::Hash)));
+        assert!(matches!(p.mask_for("ssn"), Some(MaskType::Nullify)));
+        assert!(p.mask_for("name").is_none());
+        assert!(p.is_restricted("anything"));
+
+        let mut q = ResolvedPolicy::default();
+        q.restricted_columns.push("Notes".to_string());
+        assert!(q.is_restricted("notes"));
+        assert!(!q.is_restricted("notes2"));
+    }
 }
