@@ -29,8 +29,8 @@ services:
       - ./sqe.toml.local:/etc/sqe/sqe.toml:ro
       - ./queries.sql:/queries.sql:ro
     ports:
-      - "${SQE_FLIGHT_PORT:-60051}:50051"
-      - "${SQE_TRINO_PORT:-18080}:8080"
+      - "127.0.0.1:${SQE_FLIGHT_PORT:-60051}:50051"
+      - "127.0.0.1:${SQE_TRINO_PORT:-18080}:8080"
     healthcheck:
       test: ["CMD", "/usr/local/bin/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9091/healthz"]
       interval: 10s

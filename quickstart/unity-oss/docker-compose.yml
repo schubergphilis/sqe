@@ -14,7 +14,7 @@ services:
   unity:
     image: unitycatalog/unitycatalog:main-2f2e32d
     ports:
-      - "${UNITY_PORT:-18181}:8080"
+      - "127.0.0.1:${UNITY_PORT:-18181}:8080"
     healthcheck:
       # The Unity OSS image ships wget (no curl). /v1/config always answers when
       # the server is up and requires the warehouse query param.
@@ -38,8 +38,8 @@ services:
       - ./sqe.toml:/etc/sqe/sqe.toml:ro
       - ./queries.sql:/queries.sql:ro
     ports:
-      - "${SQE_FLIGHT_PORT:-60051}:50051"
-      - "${SQE_TRINO_PORT:-18082}:8080"
+      - "127.0.0.1:${SQE_FLIGHT_PORT:-60051}:50051"
+      - "127.0.0.1:${SQE_TRINO_PORT:-18082}:8080"
     healthcheck:
       test: ["CMD", "/usr/local/bin/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9091/healthz"]
       interval: 10s

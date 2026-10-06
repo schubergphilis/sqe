@@ -78,7 +78,7 @@ services:
     volumes:
       - ./sqe.toml:/etc/sqe/sqe.toml:ro
     ports:
-      - "${SQE_MCP_PORT:-19092}:9091" # /mcp on the web/health listener; --mcp-only closes the SQL ports
+      - "127.0.0.1:${SQE_MCP_PORT:-19092}:9091" # /mcp on the web/health listener; --mcp-only closes the SQL ports
     healthcheck:
       test: ["CMD", "/usr/local/bin/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9091/healthz"]
       interval: 10s

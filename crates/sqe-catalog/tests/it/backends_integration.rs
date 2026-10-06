@@ -772,7 +772,7 @@ mod s3_tables {
     async fn list_namespaces_via_glue_rest() {
         let warehouse = std::env::var("SQE_TEST_S3TABLES_WAREHOUSE").expect(
             "SQE_TEST_S3TABLES_WAREHOUSE must be set, e.g. \
-             311141556126:s3tablescatalog/iceberg-demo-table-iceberg-data",
+             123456789012:s3tablescatalog/iceberg-demo-table-iceberg-data",
         );
         let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "eu-central-1".into());
         // Default to the federated Glue endpoint; per-bucket
