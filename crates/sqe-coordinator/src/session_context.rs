@@ -617,6 +617,13 @@ pub async fn create_session_context(
                 config.catalog.warehouse.clone(),
                 coordinator_uri,
                 config.coordinator.worker_urls.clone(),
+            )
+            // Non-admin sessions see only their own queries/tasks; the
+            // admin check is the same `[auth] admin_roles` gate as
+            // `require_admin`.
+            .with_owner_filter(
+                (!config.auth.has_admin_role(&session.user.roles))
+                    .then(|| session.user.username.clone()),
             ));
             // Enumerate every reachable catalog (config catalogs + the session's
             // own discovered catalog) so `system.jdbc.*` / `system.metadata.*`

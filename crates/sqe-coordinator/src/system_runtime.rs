@@ -42,6 +42,9 @@ pub struct RuntimeSchemaProvider {
     warehouse: String,
     coordinator_uri: String,
     worker_urls: Vec<String>,
+    /// When set, `queries` / `tasks` only show records owned by this user.
+    /// `None` (admin sessions) shows every user's queries.
+    owner_filter: Option<String>,
 }
 
 impl RuntimeSchemaProvider {
@@ -62,7 +65,23 @@ impl RuntimeSchemaProvider {
             warehouse,
             coordinator_uri,
             worker_urls,
+            owner_filter: None,
         }
+    }
+
+    /// Restrict `queries` / `tasks` to records owned by `owner` (a non-admin
+    /// session must not read other users' SQL). `None` shows all records.
+    pub fn with_owner_filter(mut self, owner: Option<String>) -> Self {
+        self.owner_filter = owner;
+        self
+    }
+
+    fn records(&self) -> Vec<Arc<QueryRecord>> {
+        let mut records = (self.records_fn)();
+        if let Some(owner) = &self.owner_filter {
+            records.retain(|r| &r.user == owner);
+        }
+        records
     }
 }
 
@@ -88,14 +107,14 @@ impl SchemaProvider for RuntimeSchemaProvider {
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
         match name {
-            "queries" => Ok(Some(build_queries_table(&(self.records_fn)())?)),
+            "queries" => Ok(Some(build_queries_table(&self.records())?)),
             "nodes" => Ok(Some(build_nodes_table(
                 &self.warehouse,
                 &self.coordinator_uri,
                 &self.worker_urls,
             )?)),
             "tasks" => Ok(Some(build_tasks_table(
-                &(self.records_fn)(),
+                &self.records(),
                 &self.warehouse,
             )?)),
             _ => Ok(None),
@@ -685,6 +704,35 @@ mod tests {
         // We verify the schema is correct — row count is an execution-time concern.
         let table = build_tasks_table(&sample_records(), "my-wh").unwrap();
         assert_eq!(table.schema().fields().len(), 7);
+    }
+
+    #[tokio::test]
+    async fn test_owner_scoped_provider_hides_other_users_queries() {
+        let records = sample_records();
+        let records_fn: QueryRecordsFn = Arc::new(move || records.clone());
+        let provider = RuntimeSchemaProvider::new(
+            Arc::clone(&records_fn),
+            "my-wh".into(),
+            "http://localhost:50051".into(),
+            vec![],
+        )
+        .with_owner_filter(Some("alice".into()));
+        for table in ["queries", "tasks"] {
+            let t = provider.table(table).await.unwrap().unwrap();
+            let batch = table_rows(&t).await;
+            assert_eq!(batch.num_rows(), 1, "{table}: only alice's own query");
+        }
+
+        // No filter (admin session): every user's queries.
+        let admin = RuntimeSchemaProvider::new(
+            records_fn,
+            "my-wh".into(),
+            "http://localhost:50051".into(),
+            vec![],
+        )
+        .with_owner_filter(None);
+        let t = admin.table("queries").await.unwrap().unwrap();
+        assert_eq!(table_rows(&t).await.num_rows(), 3);
     }
 
     #[test]
