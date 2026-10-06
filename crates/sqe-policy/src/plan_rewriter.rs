@@ -372,14 +372,40 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                         // `project()` both run `normalize_col`, qualifying every
                         // column reference (including those nested inside Hash /
                         // Custom mask expressions) to the child schema.
-                        // Widen the scan's projection if a row filter needs a
-                        // column the query does not select (a narrow view). The
-                        // restore list puts the output schema back afterwards.
-                        let (node, restore) =
-                            match widen_scan_for_row_filters(scan, &policy.row_filters) {
-                                Some((wider, restore)) => (wider, Some(restore)),
-                                None => (node, None),
-                            };
+                        // Predicates already pushed into the scan (a view body is
+                        // optimized when it is planned) run on RAW values at file,
+                        // row-group and row level, here and on workers. One that
+                        // reads a masked or restricted column would filter on the
+                        // value the mask hides, so it leaves the scan and is
+                        // re-applied above the mask (step 2b).
+                        let raw_on_governed: Vec<Expr> = scan
+                            .filters
+                            .iter()
+                            .filter(|f| {
+                                f.column_refs().iter().any(|c| {
+                                    policy.restricted_columns.contains(&c.name)
+                                        || policy.column_masks.contains_key(&c.name)
+                                })
+                            })
+                            .cloned()
+                            .collect();
+                        let mut scan = scan.clone();
+                        let node = if raw_on_governed.is_empty() {
+                            node
+                        } else {
+                            scan.filters.retain(|f| !raw_on_governed.contains(f));
+                            LogicalPlan::TableScan(scan.clone())
+                        };
+                        // Widen the scan's projection if a row filter (or a moved
+                        // predicate) needs a column the query does not select (a
+                        // narrow view). The restore list puts the output schema
+                        // back afterwards.
+                        let needed: Vec<Expr> =
+                            policy.row_filters.iter().chain(&raw_on_governed).cloned().collect();
+                        let (node, restore) = match widen_scan_for_row_filters(&scan, &needed) {
+                            Some((wider, restore)) => (wider, Some(restore)),
+                            None => (node, None),
+                        };
                         let mut builder = LogicalPlanBuilder::from(node);
 
                         // 1. Inject row filters above the TableScan.
@@ -442,6 +468,18 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                                     ))
                                 })?;
                             }
+                        }
+
+                        // 2b. Re-apply the predicates taken off the scan, now on
+                        //     the masked values.
+                        if let Some(pred) =
+                            datafusion::logical_expr::utils::conjunction(raw_on_governed)
+                        {
+                            builder = builder.filter(pred).map_err(|e| {
+                                datafusion::error::DataFusionError::Internal(format!(
+                                    "Failed to re-apply a scan predicate above the mask: {e}"
+                                ))
+                            })?;
                         }
 
                         // 3. Restore the original output columns when the scan's
@@ -1945,6 +1983,87 @@ mod tests {
         assert!(
             rendered.contains("department"),
             "rewritten plan must reference the sibling column, got:\n{rendered}"
+        );
+    }
+
+    /// A view body is optimized when it is planned, so its WHERE arrives as
+    /// pushed-down `TableScan.filters`. Those run on raw values at file,
+    /// row-group and row level, so a predicate on a masked or restricted column
+    /// must leave the scan and be evaluated above the mask instead.
+    #[tokio::test]
+    async fn scan_filters_on_governed_columns_move_above_the_mask() {
+        use crate::policy_store::InMemoryPolicyStore;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::tree_node::TreeNode;
+        use datafusion::common::TableReference;
+        use datafusion::logical_expr::builder::table_scan_with_filters;
+        use sqe_core::SessionUser;
+
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("salary", DataType::Int64, true),
+            Field::new("ssn", DataType::Utf8, true),
+        ]);
+        // The salary predicate's column is not even projected (an Exact
+        // pushdown can drop it from the projection).
+        let scan = table_scan_with_filters(
+            Some(TableReference::partial("hr", "employees")),
+            &schema,
+            Some(vec![0, 2]),
+            vec![
+                col("salary").gt_eq(lit(100_000i64)),
+                col("ssn").eq(lit("x")),
+                col("id").gt(lit(0i64)),
+            ],
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        let mut policy = ResolvedPolicy::default();
+        policy
+            .column_masks
+            .insert("salary".to_string(), MaskType::Nullify);
+        policy.restricted_columns.push("ssn".to_string());
+        let store = InMemoryPolicyStore::new();
+        store.add_table_policy("hr", "employees", policy).await;
+        let user = SessionUser {
+            username: "bob".to_string(),
+            roles: vec![],
+            subject: None,
+            email: None,
+            groups: vec![],
+        };
+
+        let (rewritten, _) = PolicyPlanRewriter::new(Arc::new(store))
+            .evaluate(&user, &crate::TableScope::default(), scan)
+            .await
+            .unwrap();
+
+        let mut scan_filters = Vec::new();
+        rewritten
+            .apply(|n| {
+                if let LogicalPlan::TableScan(s) = n {
+                    scan_filters.extend(s.filters.iter().map(|f| f.to_string()));
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+        assert_eq!(
+            scan_filters.len(),
+            1,
+            "only the ungoverned predicate may stay on the scan: {scan_filters:?}"
+        );
+        assert!(scan_filters[0].contains("id"), "{scan_filters:?}");
+        let rendered = format!("{}", rewritten.display_indent());
+        assert!(
+            rendered.contains("salary >= Int64(100000)") && rendered.contains("ssn = Utf8(\"x\")"),
+            "the moved predicates must still filter, above the mask:\n{rendered}"
+        );
+        assert_eq!(
+            rewritten.schema().fields().len(),
+            2,
+            "the caller's columns are unchanged"
         );
     }
 
