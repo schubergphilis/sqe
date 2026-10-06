@@ -1929,6 +1929,11 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
 
     let audit = Arc::new(audit_logger);
 
+    // Finding 601 / L4: one ticket-signing key for the whole coordinator.
+    // The query path and the scheduler's maintenance handler both sign
+    // worker requests with it, and workers pin only one key.
+    let ticket_signer = Arc::new(sqe_coordinator::load_ticket_signer(&config.coordinator));
+
     // Advisory/active auto-compaction scheduler (Phase 4a, Task 5). `Off`
     // mode (the default) constructs NOTHING here: neither the dedicated
     // maintenance service principal nor the `MaintenanceScheduler` value
@@ -1994,7 +1999,8 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
                 // (even when `distributed` is false) is safe: a registry with
                 // no seeded/heartbeat-discovered workers, or one whose health
                 // checks never started, reports `0` healthy either way.
-                .with_worker_registry(Arc::clone(&worker_registry));
+                .with_worker_registry(Arc::clone(&worker_registry))
+                .with_ticket_signer(Arc::clone(&ticket_signer));
         if config.maintenance.mode == sqe_core::config::MaintenanceMode::Active {
             let maintenance_runtime = sqe_coordinator::runtime::build_coordinator_runtime(
                 &config.coordinator,
@@ -2241,7 +2247,8 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         )?
         .with_table_cache(table_cache)
         .with_session_manager(session_manager.clone())
-        .with_hive_registries(hive_catalogs.clone(), hive_manifest_cache.clone()),
+        .with_hive_registries(hive_catalogs.clone(), hive_manifest_cache.clone())
+        .with_ticket_signer(ticket_signer),
     );
 
     // Spawn background memory metrics reporter (updates gauges every 1s for Grafana)

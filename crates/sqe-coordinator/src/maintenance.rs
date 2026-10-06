@@ -92,6 +92,10 @@ pub struct MaintenanceHandler {
     /// other. Always present (cheap to construct) even when `worker_registry`
     /// is `None`, since only the distributed path ever reads it.
     worker_load: Arc<WorkerLoadTracker>,
+    /// The coordinator's Ed25519 ticket signer (finding 601), used to sign
+    /// `compact_file_group` requests like scan tickets. Must be the same
+    /// key workers pin via heartbeat. `None` falls back to the legacy HMAC.
+    ticket_signer: Option<Arc<sqe_core::ticket_signing::TicketSigner>>,
     /// Coordinator metrics, for `sqe_puffin_sidecar_total` on the compaction
     /// carry-forward path (architecture review 512). `None` in tests and in
     /// handlers built without a registry; the carry-forward still runs.
@@ -119,6 +123,7 @@ impl MaintenanceHandler {
             runtime: None,
             worker_registry: None,
             worker_load: Arc::new(WorkerLoadTracker::new()),
+            ticket_signer: None,
             metrics: None,
             #[cfg(all(test, feature = "test-sqlite"))]
             race_seam: None,
@@ -187,6 +192,16 @@ impl MaintenanceHandler {
     #[must_use = "with_worker_registry consumes self; bind the returned handler"]
     pub fn with_worker_registry(mut self, registry: Arc<WorkerRegistry>) -> Self {
         self.worker_registry = Some(registry);
+        self
+    }
+
+    /// Sign `compact_file_group` requests with the coordinator's ticket key.
+    #[must_use = "with_ticket_signer consumes self; bind the returned handler"]
+    pub fn with_ticket_signer(
+        mut self,
+        signer: Arc<sqe_core::ticket_signing::TicketSigner>,
+    ) -> Self {
+        self.ticket_signer = Some(signer);
         self
     }
 
@@ -1679,6 +1694,7 @@ impl MaintenanceHandler {
             registry: Arc::clone(registry),
             load_tracker: load_tracker.clone(),
             worker_secret: worker_secret.to_string(),
+            ticket_signer: self.ticket_signer.clone(),
             max_inflight_per_worker: dist.max_inflight_groups_per_worker,
             group_attempts: dist.group_attempts,
             group_timeout,

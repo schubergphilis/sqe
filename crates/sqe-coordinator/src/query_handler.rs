@@ -434,7 +434,8 @@ impl QueryHandler {
             write_handler = write_handler.with_metrics(Arc::clone(m));
         }
         write_handler = write_handler.with_policy_enforcer(Arc::clone(&policy_enforcer));
-        let mut maintenance_handler = MaintenanceHandler::new(config.clone());
+        let mut maintenance_handler = MaintenanceHandler::new(config.clone())
+            .with_ticket_signer(Arc::clone(&ticket_signer));
         if let Some(ref a) = audit {
             maintenance_handler = maintenance_handler.with_audit(Arc::clone(a));
         }
@@ -669,6 +670,21 @@ impl QueryHandler {
         projector: std::sync::Arc<dyn sqe_policy::tag_projector::TagProjector>,
     ) -> Self {
         self.catalog_ops = self.catalog_ops.with_tag_projector(projector);
+        self
+    }
+
+    /// Replace the ticket signer with one shared by other components (the
+    /// maintenance scheduler's handler), so every request workers receive is
+    /// signed by the single key they pin via heartbeat.
+    #[must_use = "with_ticket_signer consumes self; bind the returned QueryHandler"]
+    pub fn with_ticket_signer(
+        mut self,
+        signer: Arc<sqe_core::ticket_signing::TicketSigner>,
+    ) -> Self {
+        self.maintenance_handler = self
+            .maintenance_handler
+            .with_ticket_signer(Arc::clone(&signer));
+        self.ticket_signer = signer;
         self
     }
 
