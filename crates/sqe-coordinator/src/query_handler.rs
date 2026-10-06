@@ -2217,6 +2217,7 @@ impl QueryHandler {
                             })?;
                             return Ok(vec![batch]);
                         }
+                        self.deny_hidden_table(session, &obj_name.to_string()).await?;
                     }
                     let (ctx, session_catalog) = self.create_session_context(session).await?;
                     self.handle_show_create_table(session, stmt, &ctx, &session_catalog)
@@ -2374,6 +2375,18 @@ impl QueryHandler {
                         .map(|b| vec![b])
                         .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))
                     } else {
+                        // `table_health` is a read-only report the maintenance
+                        // tier lets through without a privilege check; a
+                        // table the caller is fully denied stays "not found".
+                        if let sqe_sql::ProcedureCall::TableHealth { table } = &**call {
+                            deny_hidden_metadata_tvf_targets(
+                                self.policy_store.as_deref(),
+                                &session.user,
+                                self.config.policy.mask_precedence,
+                                &[(table.namespace.clone(), table.name.clone())],
+                            )
+                            .await?;
+                        }
                         let result = self.maintenance_handler.handle(session, call).await;
 
                         // Maintenance procedures rewrite the table's snapshot
@@ -5240,6 +5253,7 @@ impl QueryHandler {
             }
         }
 
+        self.deny_hidden_table(session, table_name).await?;
         let col_sql = info_schema_columns_query(table_name);
 
         let (ctx, session_catalog) = self.create_session_context(session).await?;
@@ -5267,6 +5281,35 @@ impl QueryHandler {
             _ => std::collections::HashMap::new(),
         };
         with_column_comments(batches, &comments)
+    }
+
+    /// Refuse `SHOW CREATE TABLE`, `DESCRIBE` / `SHOW COLUMNS` and `CALL
+    /// system.table_health` on an Iceberg table the policy store denies the
+    /// caller all access to, as "table not found" (the metadata TVF gate's
+    /// wording). Hive tables are gated by `HiveDdlHandler` on their own path.
+    /// A bare name is checked under both the session schema and `default`,
+    /// since these handlers resolve it against either.
+    async fn deny_hidden_table(&self, session: &Session, table_name: &str) -> sqe_core::Result<()> {
+        let parts = split_qualified_identifier(table_name);
+        let targets: Vec<(String, String)> = match parts.as_slice() {
+            [.., ns, table] => vec![(ns.clone(), table.clone())],
+            [table] => {
+                let mut namespaces = vec!["default".to_string()];
+                namespaces.extend(session.default_schema.clone());
+                namespaces
+                    .into_iter()
+                    .map(|ns| (ns, table.clone()))
+                    .collect()
+            }
+            [] => Vec::new(),
+        };
+        deny_hidden_metadata_tvf_targets(
+            self.policy_store.as_deref(),
+            &session.user,
+            self.config.policy.mask_precedence,
+            &targets,
+        )
+        .await
     }
 
     /// `doc` per column of an Iceberg table, keyed by column name. Empty when
@@ -9578,6 +9621,66 @@ mod show_stats_policy_tests {
             err.to_string().contains("table not found: sales.orders"),
             "{err}"
         );
+    }
+
+    /// SHOW CREATE TABLE, DESCRIBE, SHOW COLUMNS and `CALL
+    /// system.table_health` on an Iceberg table under a deny-all policy are
+    /// refused as "table not found", the same as a metadata TVF on it; before
+    /// the gate they answered with the table's columns, DDL or file stats.
+    #[tokio::test]
+    async fn denied_iceberg_table_metadata_statements_are_table_not_found() {
+        use crate::query_tracker::QueryTracker;
+        use crate::runtime_catalog::RuntimeCatalogRegistry;
+        use sqe_policy::policy_store::InMemoryPolicyStore;
+        use std::sync::Arc;
+
+        let config: sqe_core::SqeConfig =
+            toml::from_str("[coordinator]\n\n[auth]\n\n[catalog]\ncatalog_url = \"\"\n")
+                .expect("config parses");
+        let store = Arc::new(InMemoryPolicyStore::new());
+        let mut deny = ResolvedPolicy::default();
+        deny.row_filters.push(lit(false));
+        store.add_table_policy("sales", "orders", deny).await;
+        let handler = super::QueryHandler::new(
+            Arc::new(sqe_policy::PassthroughEnforcer),
+            Some(store),
+            config.clone(),
+            None,
+            None,
+            None,
+            None,
+            Arc::new(QueryTracker::new(&config.query_history)),
+            None,
+            None,
+            None,
+            RuntimeCatalogRegistry::new(),
+            sqe_core::SecretStore::new(),
+        )
+        .expect("QueryHandler::new");
+        let session = sqe_core::Session::new(
+            "analyst".to_string(),
+            sqe_core::SecretString::new("tok".to_string()),
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            Vec::new(),
+        );
+
+        for sql in [
+            "SHOW CREATE TABLE sales.orders",
+            "DESCRIBE sales.orders",
+            "SHOW COLUMNS FROM sales.orders",
+            "CALL system.table_health(table => 'sales.orders')",
+        ] {
+            let err = handler
+                .execute(&session, sql, None)
+                .await
+                .expect_err(sql);
+            assert_eq!(err.error_code(), sqe_core::SqeErrorCode::TableNotFound, "{sql}: {err}");
+            assert!(
+                err.to_string().contains("table not found: sales.orders"),
+                "{sql}: {err}"
+            );
+        }
     }
 }
 
