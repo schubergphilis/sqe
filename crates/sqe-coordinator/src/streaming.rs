@@ -298,7 +298,7 @@ impl StreamFinalizer {
                 ..Default::default()
             }),
             query: Some(crate::audit_emitter::query_info(&self.sql, "query".to_string())),
-            session_id: Some(self.session_id.clone()),
+            session_id: Some(crate::session_manager::session_log_id(&self.session_id)),
             client_ip: self.client_ip.clone(),
             trace_id: self.trace_id.clone(),
             query_id: Some(self.query_id.to_string()),

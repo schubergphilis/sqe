@@ -33,6 +33,7 @@ use crate::maintenance::MaintenanceHandler;
 use crate::query_cache::ResultCache;
 use crate::query_tracker::{FragmentState, QueryTracker};
 use crate::runtime_catalog::RuntimeCatalogRegistry;
+use crate::session_manager::session_log_id;
 use crate::write_handler::WriteHandler;
 
 // Review 409: the handler is being split by phase into child modules that
@@ -1217,8 +1218,8 @@ impl QueryHandler {
             "sqe.query",
             query_id = %query_id,
             sqe.query.id = %query_id,
-            sqe.session.id = %session.id,
-            session_id = %session.id,
+            sqe.session.id = %session_log_id(&session.id),
+            session_id = %session_log_id(&session.id),
             trace_id = tracing::field::Empty,
             span_id = tracing::field::Empty,
             user = %session.user.username,
@@ -3123,8 +3124,8 @@ impl QueryHandler {
             "sqe.query",
             query_id = %query_id,
             sqe.query.id = %query_id,
-            sqe.session.id = %session.id,
-            session_id = %session.id,
+            sqe.session.id = %session_log_id(&session.id),
+            session_id = %session_log_id(&session.id),
             trace_id = tracing::field::Empty,
             span_id = tracing::field::Empty,
             user = %session.user.username,
