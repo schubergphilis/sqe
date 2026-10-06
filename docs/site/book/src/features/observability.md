@@ -78,7 +78,17 @@ proves them reachable.
 
 ### Cluster Status (Ballista/DataFusion-style)
 
-`GET /api/v1/status` returns a JSON snapshot of the node and cluster:
+`GET /api/v1/status` is open (no auth) and returns only the lifecycle state and
+role, for probes and load balancers:
+
+```json
+{"status": "ACTIVE", "node": {"role": "coordinator"}}
+```
+
+`GET /api/v1/status/detail` returns the full snapshot of the node and cluster.
+It is registered on a coordinator only and needs `Authorization: Bearer <token>`
+for an identity holding an admin role (401 without a valid token, 403 for a
+non-admin one):
 
 ```json
 {
@@ -122,7 +132,8 @@ kind (`rest`, `hms`, `glue`, `jdbc`, `s3tables` for Iceberg catalogs;
 `hive-glue` or `hive-sidecar` for Hive roots, including `--glue-catalog`). It is
 fixed at startup from the effective configuration, flags included.
 
-For worker nodes, the `workers` and `serving` fields are `null`.
+On a worker, `/api/v1/status/detail` is not registered; the open
+`/api/v1/status` reports `"role": "worker"`.
 
 ### Trino-Compatible Info (port 8080)
 
