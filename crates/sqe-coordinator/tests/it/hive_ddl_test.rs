@@ -1213,3 +1213,126 @@ async fn ctas_without_a_location_names_the_missing_clause() {
         "CTAS is supported; the error must not blame a future cycle: {msg}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Hive DDL authorization: ownership, location overlap, caller identity
+// ---------------------------------------------------------------------------
+
+fn named_table_ddl(name: &str, location: &str) -> String {
+    format!(
+        "CREATE EXTERNAL TABLE lake.sales.{name} (id BIGINT, amount DOUBLE) \
+         PARTITIONED BY (dt string) \
+         ROW FORMAT DELIMITED FIELDS TERMINATED BY ',' STORED AS TEXTFILE \
+         LOCATION '{location}'"
+    )
+}
+
+/// A non-admin who does not own a table must not replace its manifest (a
+/// plain overwrite that would drop admin-set tags) or drop it.
+#[tokio::test]
+async fn a_non_owner_cannot_replace_or_drop_a_hive_table() {
+    let h = handler_with_root("lake").await;
+    let data_dir = h._dirs[0].path().join("data");
+    write_csv_fixture(&data_dir);
+    h.execute_for_test(&create_orders_ddl(&data_dir, "lake"))
+        .await
+        .expect("admin creates orders");
+    let analyst = session_with_roles(vec!["analyst".to_string()]);
+
+    let elsewhere = format!("file://{}", h._dirs[0].path().join("elsewhere").display());
+    let err = h
+        .handler
+        .execute(&analyst, &named_table_ddl("orders", &elsewhere), None)
+        .await
+        .expect_err("a non-owner must not overwrite the manifest");
+    assert!(err.to_string().contains("403"), "{err}");
+
+    let err = h
+        .handler
+        .execute(&analyst, "DROP TABLE lake.sales.orders", None)
+        .await
+        .expect_err("a non-owner must not drop the table");
+    assert!(err.to_string().contains("403"), "{err}");
+
+    // The owner (here also an admin) still can.
+    h.execute_for_test("DROP TABLE lake.sales.orders")
+        .await
+        .expect("owner drops");
+}
+
+/// A non-admin must not define a table, or a partition, over files another
+/// table already reads: the alias would read them without that table's
+/// filters and masks. A disjoint location still works, and its owner may
+/// drop it.
+#[tokio::test]
+async fn a_non_admin_cannot_alias_another_tables_location() {
+    let h = handler_with_root("lake").await;
+    let base = h._dirs[0].path().to_path_buf();
+    let data_dir = base.join("data");
+    write_csv_fixture(&data_dir);
+    h.execute_for_test(&create_orders_ddl(&data_dir, "lake"))
+        .await
+        .expect("admin creates orders");
+    let analyst = session_with_roles(vec!["analyst".to_string()]);
+
+    for location in [
+        format!("file://{}", data_dir.display()),
+        format!("file://{}/", data_dir.display()),
+        format!("file://{}/dt=2026-01-01", data_dir.display()),
+        format!("file://{}", base.display()),
+    ] {
+        let err = h
+            .handler
+            .execute(&analyst, &named_table_ddl("orders_alias", &location), None)
+            .await
+            .expect_err("an overlapping location must be refused");
+        assert!(err.to_string().contains("overlaps"), "{location}: {err}");
+    }
+
+    // `data2` shares a string prefix with `data` but not a path prefix.
+    let own = format!("file://{}", base.join("data2").display());
+    h.handler
+        .execute(&analyst, &named_table_ddl("orders_mine", &own), None)
+        .await
+        .expect("a disjoint location is allowed");
+
+    let err = h
+        .handler
+        .execute(
+            &analyst,
+            &format!(
+                "ALTER TABLE lake.sales.orders_mine ADD PARTITION (dt='2026-01-01') \
+                 LOCATION 'file://{}/dt=2026-01-01/'",
+                data_dir.display()
+            ),
+            None,
+        )
+        .await
+        .expect_err("a partition over another table's files must be refused");
+    assert!(err.to_string().contains("overlaps"), "{err}");
+
+    h.handler
+        .execute(&analyst, "DROP TABLE lake.sales.orders_mine", None)
+        .await
+        .expect("the owner may drop their own table");
+}
+
+/// DDL location checks run as the session user, not as whoever attached the
+/// root: an analyst outside `object_store_admin_roles` with no allowed
+/// prefix cannot point a table at an object-store location, even though the
+/// admin who ran the ATTACH could.
+#[tokio::test]
+async fn ddl_location_checks_run_as_the_session_user() {
+    let h = handler_with_root("lake").await;
+    let analyst = session_with_roles(vec!["analyst".to_string()]);
+    let err = h
+        .handler
+        .execute(&analyst, &named_table_ddl("orders_raw", "s3://raw/orders/"), None)
+        .await
+        .expect_err("the analyst may not read s3://raw/");
+    assert!(err.to_string().contains("forbidden"), "{err}");
+
+    h.execute_for_test(&named_table_ddl("orders_raw", "s3://raw/orders/"))
+        .await
+        .expect("an object-store admin may");
+}
