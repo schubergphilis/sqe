@@ -27,6 +27,7 @@ use sqe_policy::PolicySummary;
 use sqe_sql::StatementKind;
 
 use crate::query_handler::PlanMetrics;
+use crate::session_manager::session_log_id;
 
 /// The audit actor for a session: identity, roles, groups and the client
 /// application name.
@@ -174,7 +175,7 @@ pub(crate) fn emit_failed_statement(
             timing: Some(timing(duration, 0)),
             stats: None,
             query: Some(query_info(sql, "unknown".to_string())),
-            session_id: Some(session.id.clone()),
+            session_id: Some(session_log_id(&session.id)),
             client_ip,
             trace_id,
             query_id: Some(query_id.to_string()),
@@ -226,7 +227,7 @@ pub(crate) fn emit_statement_audit(audit: &AuditLogger, a: StatementAudit<'_>) {
         audit.log(&AuditEntry {
             timestamp: chrono::Utc::now().to_rfc3339(),
             username: a.session.user.username.clone(),
-            session_id: Some(a.session.id.clone()),
+            session_id: Some(session_log_id(&a.session.id)),
             query_hash: sqe_metrics::audit::query_hash(a.sql),
             query_text: Some(a.sql.to_string()),
             statement_type: a.kind_name,
@@ -294,10 +295,54 @@ pub(crate) fn emit_statement_audit(audit: &AuditLogger, a: StatementAudit<'_>) {
         timing: Some(timing),
         stats,
         query: Some(query_info(a.sql, a.kind_name)),
-        session_id: Some(a.session.id.clone()),
+        session_id: Some(session_log_id(&a.session.id)),
         client_ip: a.client_ip,
         trace_id: a.trace_id,
         query_id: Some(a.query_id.to_string()),
         integrity: Integrity::default(),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Flight session id is a bearer credential: the audit record carries
+    /// its hash, never the raw value.
+    #[test]
+    fn audit_event_carries_hashed_session_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        let audit = AuditLogger::new(path.to_str().unwrap()).expect("audit logger");
+        let session = Session::new(
+            "alice".to_string(),
+            sqe_core::SecretString::new("access_tok".to_string()),
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            vec![],
+        );
+        let error = SqeError::with_code(sqe_core::SqeErrorCode::InternalError, "boom");
+
+        emit_failed_statement(
+            &audit,
+            &session,
+            "SELEC 1",
+            None,
+            &error,
+            Duration::from_millis(1),
+            None,
+            uuid::Uuid::now_v7(),
+        );
+        audit.flush();
+
+        let content = std::fs::read_to_string(&path).expect("audit file");
+        assert!(
+            !content.contains(&session.id),
+            "raw session id leaked into audit: {content}"
+        );
+        assert!(
+            content.contains(&session_log_id(&session.id)),
+            "hashed session id missing from audit: {content}"
+        );
+    }
 }

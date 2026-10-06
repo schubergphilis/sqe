@@ -195,7 +195,7 @@ impl SessionManager {
                         self.forget_token(&id);
                         self.update_active_sessions_metric();
                         warn!(
-                            session_id = %id,
+                            session_id = %session_log_id(&id),
                             cap = self.max_sessions,
                             "COORD-04: session cap reached, evicting least-recently-active session"
                         );
@@ -244,7 +244,11 @@ impl SessionManager {
         self.update_active_sessions_metric();
 
         info!(user_id = %identity.user_id, "Session created");
-        debug!(session_id = %session_id, user_id = %identity.user_id, "Session details");
+        debug!(
+            session_id = %session_log_id(&session_id),
+            user_id = %identity.user_id,
+            "Session details"
+        );
 
         Ok(session)
     }
@@ -353,7 +357,10 @@ impl SessionManager {
                     self.sessions
                         .insert(session_id.to_string(), updated.clone());
                     self.record_activity(session_id);
-                    debug!(session_id = %session_id, "Session updated with refreshed token");
+                    debug!(
+                        session_id = %session_log_id(session_id),
+                        "Session updated with refreshed token"
+                    );
                     if let Some(ref metrics) = self.metrics {
                         metrics
                             .token_refresh_total
@@ -368,7 +375,7 @@ impl SessionManager {
         }
 
         if session.token_expiry() <= Utc::now() {
-            warn!(session_id = %session_id, "Session token expired, evicting");
+            warn!(session_id = %session_log_id(session_id), "Session token expired, evicting");
             self.sessions.remove(session_id);
             self.last_activity.remove(session_id);
             self.forget_token(session_id);
@@ -523,7 +530,7 @@ impl SessionManager {
             self.last_activity.remove(id);
             self.forget_token(id);
             self.update_active_sessions_metric();
-            debug!(session_id = %id, "Session removed");
+            debug!(session_id = %session_log_id(id), "Session removed");
         }
     }
 
@@ -563,7 +570,7 @@ impl SessionManager {
                     "idle timeout"
                 };
                 warn!(
-                    session_id = %id,
+                    session_id = %session_log_id(&id),
                     username = %session.user.username,
                     reason = reason,
                     "Session expired, evicting"
@@ -585,6 +592,16 @@ impl SessionManager {
 fn bearer_fingerprint(token: &str) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(token.as_bytes()))
+}
+
+/// The form of a session id that may appear in logs, spans and audit events:
+/// the first 16 hex chars of its SHA-256. A Flight session id is accepted as
+/// a bearer credential, so the raw value must never be written anywhere an
+/// operator or log pipeline can read it. The hash still correlates events of
+/// one session.
+pub fn session_log_id(session_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(session_id.as_bytes())[..8])
 }
 
 #[cfg(test)]
@@ -1363,5 +1380,18 @@ mod tests {
             .await
             .expect("bearer-first chain order must also succeed");
         assert_eq!(session.user.username, "alice");
+    }
+
+    /// The loggable session id is a stable 16-hex-char SHA-256 prefix that
+    /// never contains the raw id.
+    #[test]
+    fn session_log_id_is_truncated_sha256() {
+        assert_eq!(session_log_id("abc"), "ba7816bf8f01cfea");
+        let id = make_session("alice").id;
+        let logged = session_log_id(&id);
+        assert_eq!(logged.len(), 16);
+        assert_eq!(logged, session_log_id(&id));
+        assert!(!logged.contains(&id));
+        assert!(!id.contains(&logged));
     }
 }
