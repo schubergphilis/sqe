@@ -181,20 +181,26 @@ pub const PRODUCTION_RULES: &[ProductionRule] = &[
     },
     // Architecture review 212 (#565): the default engine enforces nothing.
     // Every other dev-only default is refused here or sits behind an
-    // `allow_*` flag; this one used to start silently.
+    // `allow_*` flag; this one used to start silently. `in_memory` is a test
+    // store that starts empty and is lost on restart, so it counts as none.
     ProductionRule {
         name: "policy-engine-configured",
-        summary: "`policy.engine = passthrough` is refused unless `security.allow_no_policy_engine = true` (no row filters, masks or column restrictions).",
+        summary: "`policy.engine = passthrough` or `in_memory` is refused unless `security.allow_no_policy_engine = true` (no row filters, masks or column restrictions).",
         check: |c| {
-            (c.policy.engine == PolicyEngine::Passthrough && !c.security.allow_no_policy_engine)
-                .then(|| {
-                    "production_mode: policy.engine is passthrough (no row filters, masks or \
-                     column restrictions; only catalog-level authorization applies). Set \
-                     policy.engine = \"ranger\" (or \"in_memory\" for tests), or set \
+            let engine = match c.policy.engine {
+                PolicyEngine::Passthrough => "passthrough",
+                PolicyEngine::InMemory => "in_memory",
+                PolicyEngine::Ranger => return None,
+            };
+            (!c.security.allow_no_policy_engine).then(|| {
+                format!(
+                    "production_mode: policy.engine is {engine} (no persistent row filters, \
+                     masks or column restrictions; only catalog-level authorization \
+                     applies). Set policy.engine = \"ranger\", or set \
                      security.allow_no_policy_engine = true to acknowledge running without \
                      a policy engine."
-                        .to_string()
-                })
+                )
+            })
         },
     },
     ProductionRule {
