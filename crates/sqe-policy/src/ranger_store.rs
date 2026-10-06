@@ -553,6 +553,13 @@ fn resource_matches(res: &RangerResource, target: &str) -> bool {
 /// old policy is the safe direction while operators migrate; under-matching is a
 /// leak.
 fn policy_matches_table(p: &RangerPolicy, database: &str, table: &str) -> bool {
+    policy_matches_table_with(p, database, table, true)
+}
+
+/// `policy_matches_table` with the last-component fallback switchable. Access
+/// allow items pass `false`: over-matching a grant is the leak direction, so
+/// the fallback is only safe where it can restrict (masks, filters, denies).
+fn policy_matches_table_with(p: &RangerPolicy, database: &str, table: &str, last_component_fallback: bool) -> bool {
     let db_ok = p
         .resources
         .get("database")
@@ -561,7 +568,7 @@ fn policy_matches_table(p: &RangerPolicy, database: &str, table: &str) -> bool {
                 return true;
             }
             let last = database.rsplit('.').next().unwrap_or(database);
-            if last != database && resource_matches(r, last) {
+            if last_component_fallback && last != database && resource_matches(r, last) {
                 warn!(
                     policy_id = p.id,
                     namespace = %database,
@@ -795,13 +802,19 @@ fn column_resource_covers_table(p: &RangerPolicy) -> bool {
 /// priority (`policyPriority` override policies) is not modelled: an
 /// override deny still denies, an override allow does not beat a normal deny
 /// here, which errs on the closed side.
+///
+/// Deny items match with the last-namespace-component fallback (fail closed);
+/// allow items need the full dotted namespace, so an allow on `sales` does not
+/// grant `<root>.sales`.
 fn access_grants_table(bundle: &ServicePolicies, user: &SessionUser, database: &str, table: &str) -> bool {
-    let matching: Vec<&RangerPolicy> = bundle
-        .policies
-        .iter()
-        .filter(|p| p.is_enabled && p.policy_type == POLICY_TYPE_ACCESS)
-        .filter(|p| policy_matches_table(p, database, table) && column_resource_covers_table(p))
-        .collect();
+    let matching = |fallback: bool| {
+        bundle
+            .policies
+            .iter()
+            .filter(|p| p.is_enabled && p.policy_type == POLICY_TYPE_ACCESS)
+            .filter(|p| policy_matches_table_with(p, database, table, fallback) && column_resource_covers_table(p))
+            .collect::<Vec<_>>()
+    };
 
     let applies = |items: &[AccessPolicyItem]| {
         items
@@ -809,13 +822,13 @@ fn access_grants_table(bundle: &ServicePolicies, user: &SessionUser, database: &
             .any(|i| item_grants_select(i) && item_matches(&i.users, &i.roles, &i.groups, user))
     };
 
-    for p in &matching {
+    for p in matching(true) {
         if applies(&p.deny_policy_items) && !applies(&p.deny_exceptions) {
             debug!(policy_id = p.id, policy = %p.name, user = %user.username, table, database, "Ranger deny item matched");
             return false;
         }
     }
-    for p in &matching {
+    for p in matching(false) {
         if applies(&p.policy_items) && !applies(&p.allow_exceptions) {
             return true;
         }
@@ -2385,6 +2398,37 @@ mod tests {
         .unwrap()
         .with_hive_catalogs(roots);
         assert!(!off.requires_access_grant("glue.bi"));
+    }
+
+    #[test]
+    fn last_component_fallback_restricts_but_never_grants_access() {
+        let allow_short: ServicePolicies = serde_json::from_str(
+            r#"{"policies":[{"id":1,"name":"sales-allow","policyType":0,"isEnabled":true,
+             "resources":{"database":{"values":["sales"]},"table":{"values":["*"]}},
+             "policyItems":[{"groups":["public"],"accesses":[{"type":"select","isAllowed":true}]}]}]}"#,
+        )
+        .unwrap();
+        let carol = user("carol", &[]);
+        assert!(
+            crate::plan_rewriter::policy_denies_all(&resolve_from_bundle(&allow_short, &carol, "t", "root.sales", true)),
+            "an allow on `sales` must not grant `root.sales`"
+        );
+        assert!(!crate::plan_rewriter::policy_denies_all(&resolve_from_bundle(&allow_short, &carol, "t", "sales", true)));
+
+        let deny_short: ServicePolicies = serde_json::from_str(
+            r#"{"policies":[
+             {"id":1,"name":"root-sales-allow","policyType":0,"isEnabled":true,
+              "resources":{"database":{"values":["root.sales"]},"table":{"values":["*"]}},
+              "policyItems":[{"groups":["public"],"accesses":[{"type":"select","isAllowed":true}]}]},
+             {"id":2,"name":"sales-deny","policyType":0,"isEnabled":true,
+              "resources":{"database":{"values":["sales"]},"table":{"values":["*"]}},
+              "denyPolicyItems":[{"groups":["public"],"accesses":[{"type":"select","isAllowed":true}]}]}]}"#,
+        )
+        .unwrap();
+        assert!(
+            crate::plan_rewriter::policy_denies_all(&resolve_from_bundle(&deny_short, &carol, "t", "root.sales", true)),
+            "a deny on `sales` still denies `root.sales`"
+        );
     }
 
     #[test]
