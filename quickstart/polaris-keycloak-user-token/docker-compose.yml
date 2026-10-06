@@ -35,7 +35,7 @@ services:
       KC_HEALTH_ENABLED: "true"
       KC_LOG_LEVEL: INFO
     ports:
-      - "${KEYCLOAK_PORT:-28080}:8080"
+      - "127.0.0.1:${KEYCLOAK_PORT:-28080}:8080"
     healthcheck:
       # The KC image ships no curl/wget. The management port (9000) is the last
       # socket to open during startup, so "port 9000 accepts a connection" is a
@@ -77,8 +77,8 @@ services:
     volumes:
       - rustfs-data:/data
     ports:
-      - "${RUSTFS_PORT:-19000}:9000"
-      - "${RUSTFS_CONSOLE_PORT:-19001}:9001"
+      - "127.0.0.1:${RUSTFS_PORT:-19000}:9000"
+      - "127.0.0.1:${RUSTFS_CONSOLE_PORT:-19001}:9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
       interval: 5s
@@ -143,7 +143,7 @@ services:
       QUARKUS_S3_AWS_CREDENTIALS_STATIC_PROVIDER_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-s3admin}
       QUARKUS_S3_AWS_CREDENTIALS_STATIC_PROVIDER_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-s3adminpw}
     ports:
-      - "${POLARIS_PORT:-18181}:8181"
+      - "127.0.0.1:${POLARIS_PORT:-18181}:8181"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8182/q/health"]
       interval: 5s
@@ -214,8 +214,8 @@ services:
       - ./sqe.toml:/etc/sqe/sqe.toml:ro
       - ./queries.sql:/queries.sql:ro
     ports:
-      - "${SQE_FLIGHT_PORT:-60051}:50051"
-      - "${SQE_TRINO_PORT:-18080}:8080"
+      - "127.0.0.1:${SQE_FLIGHT_PORT:-60051}:50051"
+      - "127.0.0.1:${SQE_TRINO_PORT:-18080}:8080"
     healthcheck:
       test: ["CMD", "/usr/local/bin/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9091/healthz"]
       interval: 10s
