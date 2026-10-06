@@ -17,6 +17,7 @@ use datafusion::common::TableReference;
 use sqe_catalog::hive::manifest::HiveManifest;
 use sqe_catalog::hive::partition::parse_projection;
 use sqe_catalog::hive::provider::HiveMetadataCache;
+use sqe_core::config::TvfCaller;
 use sqe_core::{SecretStore, Session, SessionUser, SqeError, SqeErrorCode};
 use sqe_metrics::audit::{
     Actor, AuditEvent, AuditKind, AuditLogger, ObjectType, Outcome, Resource,
@@ -97,6 +98,9 @@ pub struct HiveDdlHandler {
     policy_store: Option<Arc<dyn PolicyStore>>,
     mask_precedence: sqe_core::config::MaskPrecedence,
     manifest_cache: Option<Arc<HiveMetadataCache>>,
+    /// `[auth] admin_roles`. Empty means no caller is an admin (fail
+    /// closed), matching `AuthConfig::has_admin_role`.
+    admin_roles: Vec<String>,
 }
 
 /// The wiring-gap refusal shared by every write path below. Named the same
@@ -124,6 +128,34 @@ pub(crate) fn hive_drop_target_missing(err: &SqeError) -> bool {
     err.to_string().contains("table not found")
 }
 
+/// A location normalised for prefix comparison: `scheme://host/` plus the
+/// percent-decoded, dot-segment-free object path, always ending in `/`, with
+/// scheme aliases folded (`s3a` is `s3`, ...). A bare path becomes `file://`.
+/// Two locations overlap when either key is a prefix of the other.
+fn location_key(location: &str) -> Result<String, SqeError> {
+    let url = datafusion::datasource::listing::ListingTableUrl::parse(location).map_err(|e| {
+        SqeError::with_code(SqeErrorCode::ExecutionFailed, format!(
+            "hive_external: location '{location}' does not parse: {e}"
+        ))
+    })?;
+    let base = url.object_store();
+    let base = base.as_str();
+    let base = [
+        ("s3a://", "s3://"),
+        ("abfs://", "abfss://"),
+        ("az://", "azure://"),
+        ("gcs://", "gs://"),
+    ]
+    .iter()
+    .find_map(|(from, to)| base.strip_prefix(from).map(|rest| format!("{to}{rest}")))
+    .unwrap_or_else(|| base.to_string());
+    let mut key = format!("{base}{}", url.prefix());
+    if !key.ends_with('/') {
+        key.push('/');
+    }
+    Ok(key)
+}
+
 impl HiveDdlHandler {
     pub fn new(runtime_catalogs: RuntimeCatalogRegistry, secrets: SecretStore) -> Self {
         Self {
@@ -134,7 +166,16 @@ impl HiveDdlHandler {
             policy_store: None,
             mask_precedence: sqe_core::config::MaskPrecedence::default(),
             manifest_cache: None,
+            admin_roles: Vec::new(),
         }
+    }
+
+    /// Wire `[auth] admin_roles`, the roles that may replace or drop a
+    /// table they do not own and alias another table's location.
+    #[must_use = "with_admin_roles consumes self; bind the returned HiveDdlHandler"]
+    pub fn with_admin_roles(mut self, admin_roles: Vec<String>) -> Self {
+        self.admin_roles = admin_roles;
+        self
     }
 
     /// Wire the SAME `PolicyStore` and `mask_precedence` `QueryHandler` backs
@@ -297,7 +338,7 @@ impl HiveDdlHandler {
                     .to_string(),
             )
         })?;
-        let store = self.store_for(catalog_name)?;
+        let store = self.store_for(catalog_name, &session.user)?;
 
         // "default", matching the same fallback `embedded_handle_create_external_table`
         // uses when the statement did not give a 3-part name.
@@ -332,6 +373,27 @@ impl HiveDdlHandler {
             &spec.name,
             &manifest,
             "CREATE EXTERNAL TABLE",
+        )
+        .await?;
+        // Without IF NOT EXISTS `put` overwrites, which would discard the
+        // existing manifest's admin-set tags; only its owner or an admin may.
+        if !spec.if_not_exists {
+            match store.get(&database, &spec.name).await {
+                Ok(existing) => {
+                    self.refuse_unless_owner(&session.user, &existing, "CREATE EXTERNAL TABLE")?;
+                }
+                Err(sqe_catalog::hive::HiveError::NotFound(_)) => {}
+                Err(e) => {
+                    return Err(SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))
+                }
+            }
+        }
+        self.refuse_overlapping_location(
+            catalog_name,
+            &session.user,
+            &database,
+            &spec.name,
+            &[manifest.storage_descriptor.location.as_str()],
         )
         .await?;
 
@@ -388,7 +450,7 @@ impl HiveDdlHandler {
             )));
         }
 
-        let store = self.store_for(catalog)?;
+        let store = self.store_for(catalog, &session.user)?;
         // A missing table surfaces here with `HiveError::NotFound`'s "table
         // not found" wording, which `hive_drop_target_missing` still matches.
         let manifest = store
@@ -397,6 +459,7 @@ impl HiveDdlHandler {
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string()))?;
         self.refuse_if_denied(&session.user, catalog, schema, table, &manifest, "DROP TABLE")
             .await?;
+        self.refuse_unless_owner(&session.user, &manifest, "DROP TABLE")?;
         store
             .delete(schema, table)
             .await
@@ -786,7 +849,7 @@ impl HiveDdlHandler {
         if_not_exists: bool,
     ) -> Result<(), SqeError> {
         let (root, database, table) = self.full_hive_name(table_ref)?;
-        let store = self.store_for(&root)?;
+        let store = self.store_for(&root, &session.user)?;
         let mut manifest = store
             .get(&database, &table)
             .await
@@ -800,6 +863,16 @@ impl HiveDdlHandler {
             "ALTER TABLE ADD PARTITION",
         )
         .await?;
+        if let Some(location) = spec.location.as_deref() {
+            self.refuse_overlapping_location(
+                &root,
+                &session.user,
+                &database,
+                &table,
+                &[location],
+            )
+            .await?;
+        }
 
         sqe_catalog::hive::partition::add_partition(&store, &mut manifest, &spec, if_not_exists)
             .await
@@ -835,7 +908,7 @@ impl HiveDdlHandler {
                  which cycle 4 does not implement yet"
             )));
         }
-        let store = self.store_for(&root)?;
+        let store = self.store_for(&root, &session.user)?;
         let mut manifest = store
             .get(&database, &table)
             .await
@@ -919,7 +992,7 @@ impl HiveDdlHandler {
         statement: &str,
     ) -> Result<(), SqeError> {
         let (root, database, table) = self.full_hive_name(table_ref)?;
-        let store = self.store_for(&root)?;
+        let store = self.store_for(&root, &session.user)?;
         let manifest = match store.get(&database, &table).await {
             Ok(m) => m,
             // No manifest means no table and therefore nothing to authorize:
@@ -941,7 +1014,7 @@ impl HiveDdlHandler {
         audit_label: &str,
     ) -> Result<usize, SqeError> {
         let (root, database, table) = self.full_hive_name(table_ref)?;
-        let store = self.store_for(&root)?;
+        let store = self.store_for(&root, &session.user)?;
         let mut manifest = store
             .get(&database, &table)
             .await
@@ -975,7 +1048,7 @@ impl HiveDdlHandler {
         table_ref: &TableReference,
     ) -> Result<Vec<String>, SqeError> {
         let (root, database, table) = self.full_hive_name(table_ref)?;
-        let store = self.store_for(&root)?;
+        let store = self.store_for(&root, user)?;
         let manifest = store
             .get(&database, &table)
             .await
@@ -1008,7 +1081,7 @@ impl HiveDdlHandler {
         table_ref: &TableReference,
     ) -> Result<sqe_catalog::hive::manifest::HiveTableStatistics, SqeError> {
         let (root, database, table) = self.full_hive_name(table_ref)?;
-        let store = self.store_for(&root)?;
+        let store = self.store_for(&root, &session.user)?;
         let mut manifest = store
             .get(&database, &table)
             .await
@@ -1157,7 +1230,113 @@ impl HiveDdlHandler {
             })
     }
 
+    /// The root's sidecar store with every location check run as `user`.
+    /// The attached store carries the caller of whoever attached the root
+    /// (`trusted_startup_config()` for a `[[hive.roots]]` entry, which skips
+    /// the object-store allowlist entirely); DDL must not inherit that.
     fn store_for(
+        &self,
+        catalog_name: &str,
+        user: &SessionUser,
+    ) -> Result<Arc<sqe_catalog::hive::store::HiveManifestStore>, SqeError> {
+        let attached = self.attached_store(catalog_name)?;
+        Ok(Arc::new(attached.with_caller(TvfCaller::for_user(
+            user.username.clone(),
+            user.roles.clone(),
+        ))))
+    }
+
+    fn is_admin(&self, user: &SessionUser) -> bool {
+        user.roles.iter().any(|r| self.admin_roles.contains(r))
+    }
+
+    /// Replacing or dropping a table's manifest discards whatever an admin
+    /// set on it (`sqe.column_tags` drives masks), so only an admin or the
+    /// manifest's recorded owner may do it. A manifest with no owner is
+    /// admin-only.
+    fn refuse_unless_owner(
+        &self,
+        user: &SessionUser,
+        manifest: &HiveManifest,
+        statement: &str,
+    ) -> Result<(), SqeError> {
+        if self.is_admin(user) || manifest.owner.as_deref() == Some(user.username.as_str()) {
+            return Ok(());
+        }
+        Err(SqeError::with_code(SqeErrorCode::AccessDenied, format!(
+            "403 Forbidden: hive_external: {statement} on {}.{} requires an admin role or \
+             ownership of the table",
+            manifest.database_name, manifest.name
+        )))
+    }
+
+    /// Refuse a non-admin `locations` (a new table's LOCATION, or an
+    /// `ADD PARTITION ... LOCATION`) that equals, contains, or lies inside a
+    /// location another table in the same root already reads. Otherwise a
+    /// second manifest over the same files reads them under a new name,
+    /// without the first table's row filters, masks, or tags. Admins may
+    /// alias deliberately.
+    ///
+    /// ponytail: reads every manifest in the root per DDL statement; fine for
+    /// DDL rates, index the claimed prefixes if roots grow to many thousands
+    /// of tables.
+    async fn refuse_overlapping_location(
+        &self,
+        catalog_name: &str,
+        user: &SessionUser,
+        database: &str,
+        table: &str,
+        locations: &[&str],
+    ) -> Result<(), SqeError> {
+        if self.is_admin(user) {
+            return Ok(());
+        }
+        let to_sqe = |e: sqe_catalog::hive::HiveError| {
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, e.to_string())
+        };
+        let mine = locations
+            .iter()
+            .map(|l| location_key(l))
+            .collect::<Result<Vec<_>, _>>()?;
+        // The attached store, not the caller's: this compares against every
+        // table's location, including ones the caller may not read.
+        let store = self.attached_store(catalog_name)?;
+        for db in store.list_databases().await.map_err(to_sqe)? {
+            for other in store.list_tables(&db).await.map_err(to_sqe)? {
+                if db == database && other == table {
+                    continue;
+                }
+                let manifest = match store.get(&db, &other).await {
+                    Ok(m) => m,
+                    Err(sqe_catalog::hive::HiveError::NotFound(_)) => continue,
+                    Err(e) => return Err(to_sqe(e)),
+                };
+                let claimed = std::iter::once(&manifest.storage_descriptor.location).chain(
+                    manifest
+                        .sqe
+                        .partition_index
+                        .iter()
+                        .flat_map(|index| index.entries.iter().map(|e| &e.location)),
+                );
+                for loc in claimed {
+                    let theirs = location_key(loc)?;
+                    if mine
+                        .iter()
+                        .any(|m| m.starts_with(&theirs) || theirs.starts_with(m.as_str()))
+                    {
+                        return Err(SqeError::with_code(SqeErrorCode::AccessDenied, format!(
+                            "403 Forbidden: hive_external: location overlaps the location of \
+                             another table in catalog '{catalog_name}'; only an admin may \
+                             define a table or partition over another table's files"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn attached_store(
         &self,
         catalog_name: &str,
     ) -> Result<Arc<sqe_catalog::hive::store::HiveManifestStore>, SqeError> {

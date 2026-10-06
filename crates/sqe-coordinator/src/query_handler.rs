@@ -541,7 +541,8 @@ impl QueryHandler {
 
         let mut hive_ddl_handler =
             crate::hive_ddl_handler::HiveDdlHandler::new(runtime_catalogs.clone(), secrets.clone())
-                .with_policy(policy_store.clone(), config.policy.mask_precedence);
+                .with_policy(policy_store.clone(), config.policy.mask_precedence)
+                .with_admin_roles(config.auth.admin_roles.clone());
         if let Some(ref a) = audit {
             hive_ddl_handler = hive_ddl_handler.with_audit(Arc::clone(a));
         }
