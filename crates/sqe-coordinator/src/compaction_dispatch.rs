@@ -57,24 +57,30 @@ use crate::worker_registry::{WorkerLoadTracker, WorkerRegistry};
 /// module for a single string).
 const WORKER_SECRET_HEADER: &str = "x-sqe-worker-secret";
 
-/// Metadata header carrying the HMAC-SHA256 tag (hex) over the exact
+/// Metadata header carrying the signature over the exact
 /// `CompactGroupRequest` wire bytes. Must match
 /// `sqe_worker::flight_service::COMPACT_SIGNATURE_HEADER` exactly, or every
 /// signed request fails the worker's `verify_compaction_signature` check.
 pub(crate) const COMPACT_SIGNATURE_HEADER: &str = "x-sqe-compact-signature";
 
-/// Compute the HMAC signature for a `CompactGroupRequest`'s wire bytes, or
-/// `None` when `secret` is empty (dev mode: the deployment opted into
-/// `worker.allow_unauthenticated`, so there is nothing to sign and the
-/// header is omitted entirely). Delegates the HMAC computation itself to
-/// `sqe_compaction::wire::sign` so the coordinator and worker share exactly
-/// one signing implementation; only the empty-secret bypass convention is
-/// mirrored from `distributed_scan::sign_ticket`.
-pub(crate) fn sign_compact_request(secret: &str, bytes: &[u8]) -> Option<String> {
+/// Sign a `CompactGroupRequest`'s wire bytes, or `None` when `secret` is
+/// empty (dev mode: the deployment opted into `worker.allow_unauthenticated`,
+/// so the header is omitted entirely). With the coordinator's ticket signer
+/// the tag is Ed25519, exactly like scan tickets (finding 601), so a party
+/// holding only the shared secret cannot mint compaction requests; without
+/// one it falls back to the legacy `sqe_compaction::wire::sign` HMAC.
+pub(crate) fn sign_compact_request(
+    signer: Option<&sqe_core::ticket_signing::TicketSigner>,
+    secret: &str,
+    bytes: &[u8],
+) -> Option<String> {
     if secret.is_empty() {
         return None;
     }
-    Some(sqe_compaction::wire::sign(bytes, secret))
+    Some(match signer {
+        Some(signer) => signer.sign(bytes),
+        None => sqe_compaction::wire::sign(bytes, secret),
+    })
 }
 
 /// One file group awaiting (or retrying) dispatch. Carries just what the
@@ -195,6 +201,7 @@ async fn dispatch_group_to_worker(
     worker_url: &str,
     pool: &ChannelPool,
     worker_secret: &str,
+    ticket_signer: Option<&sqe_core::ticket_signing::TicketSigner>,
     group_timeout: Duration,
     heartbeat_timeout: Duration,
 ) -> Result<CompactGroupResponse, DispatchError> {
@@ -218,7 +225,7 @@ async fn dispatch_group_to_worker(
     // Sign the exact wire bytes before they are moved into the Action body,
     // mirroring the scan-ticket signing convention (#206) applied to this
     // RPC in Task 2/3.
-    let signature = sign_compact_request(worker_secret, &body);
+    let signature = sign_compact_request(ticket_signer, worker_secret, &body);
 
     let action = Action {
         r#type: "compact_file_group".to_string(),
@@ -396,6 +403,7 @@ pub(crate) async fn dispatch_and_collect_groups(
     registry: &Arc<WorkerRegistry>,
     load_tracker: &WorkerLoadTracker,
     worker_secret: &str,
+    ticket_signer: Option<&Arc<sqe_core::ticket_signing::TicketSigner>>,
     max_inflight_per_worker: usize,
     group_attempts: usize,
     group_timeout: Duration,
@@ -493,6 +501,7 @@ pub(crate) async fn dispatch_and_collect_groups(
             );
             let pool = pool.clone();
             let secret = worker_secret.to_string();
+            let signer = ticket_signer.cloned();
             futs.push(async move {
                 let _guard = guard;
                 let result = dispatch_group_to_worker(
@@ -500,6 +509,7 @@ pub(crate) async fn dispatch_and_collect_groups(
                     &worker_url,
                     &pool,
                     &secret,
+                    signer.as_deref(),
                     group_timeout,
                     heartbeat_timeout,
                 )
@@ -624,6 +634,9 @@ pub(crate) struct WorkerFleetDispatcher {
     pub registry: Arc<WorkerRegistry>,
     pub load_tracker: WorkerLoadTracker,
     pub worker_secret: String,
+    /// The coordinator's Ed25519 ticket signer; `None` signs with the
+    /// legacy shared-secret HMAC.
+    pub ticket_signer: Option<Arc<sqe_core::ticket_signing::TicketSigner>>,
     pub max_inflight_per_worker: usize,
     pub group_attempts: usize,
     pub group_timeout: Duration,
@@ -655,6 +668,7 @@ impl GroupBatchDispatcher for WorkerFleetDispatcher {
             &self.registry,
             &self.load_tracker,
             &self.worker_secret,
+            self.ticket_signer.as_ref(),
             self.max_inflight_per_worker,
             self.group_attempts,
             self.group_timeout,
@@ -802,16 +816,32 @@ mod tests {
         );
         let bytes = req.to_bytes().unwrap();
         let secret = "shared-worker-secret";
-        let sig = sign_compact_request(secret, &bytes).expect("non-empty secret must sign");
+        let sig = sign_compact_request(None, secret, &bytes).expect("non-empty secret must sign");
 
         assert!(sqe_compaction::wire::verify(&bytes, &sig, secret));
         assert!(!sqe_compaction::wire::verify(&bytes, &sig, "wrong-secret"));
     }
 
+    /// L4: with the coordinator's ticket signer the request carries an
+    /// Ed25519 tag only that key verifies, not a shared-secret HMAC.
+    #[test]
+    fn signed_request_uses_the_ticket_signer_when_present() {
+        let signer = sqe_core::ticket_signing::TicketSigner::generate().unwrap();
+        let other = sqe_core::ticket_signing::TicketSigner::generate().unwrap();
+        let bytes = b"compact-body".to_vec();
+        let secret = "shared-worker-secret";
+        let sig = sign_compact_request(Some(&signer), secret, &bytes).unwrap();
+
+        assert!(sqe_core::ticket_signing::TicketVerifier::is_asymmetric_signature(&sig));
+        assert!(signer.verifier().verify(&bytes, &sig));
+        assert!(!other.verifier().verify(&bytes, &sig));
+        assert!(!sqe_compaction::wire::verify(&bytes, &sig, secret));
+    }
+
     #[test]
     fn sign_compact_request_omits_signature_in_dev_mode_with_empty_secret() {
         let bytes = b"whatever-body".to_vec();
-        assert_eq!(sign_compact_request("", &bytes), None);
+        assert_eq!(sign_compact_request(None, "", &bytes), None);
     }
 
     #[test]
@@ -830,7 +860,7 @@ mod tests {
         );
         let mut bytes = req.to_bytes().unwrap();
         let secret = "shared-worker-secret";
-        let sig = sign_compact_request(secret, &bytes).unwrap();
+        let sig = sign_compact_request(None, secret, &bytes).unwrap();
         let mid = bytes.len() / 2;
         bytes[mid] ^= 0xFF;
         assert!(!sqe_compaction::wire::verify(&bytes, &sig, secret));

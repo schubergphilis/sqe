@@ -1857,8 +1857,8 @@ pub struct WorkerConfig {
     /// forbid re-pinning.
     #[serde(default)]
     pub ticket_public_key: String,
-    /// Accept legacy HMAC scan-ticket tags keyed by `worker_secret`
-    /// (finding 601). Off by default: the HMAC key is the same secret every
+    /// Accept legacy HMAC scan-ticket and `compact_file_group` tags keyed by
+    /// `worker_secret` (finding 601). Off by default: the HMAC key is the same secret every
     /// worker holds, so it proves nothing about who authored the ticket.
     /// Turn on only while rolling a fleet that still has pre-Ed25519
     /// coordinators.
