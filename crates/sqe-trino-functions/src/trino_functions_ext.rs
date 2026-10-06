@@ -84,8 +84,8 @@ pub fn register_extended_trino_functions(ctx: &datafusion::prelude::SessionConte
 // ═══════════════════════════════════════════════════════════════════
 
 use crate::helpers::{
-    arg, lift1, lift2, micros_to_local_naive, str_transform, str_transform_2, tag_timezone,
-    unexpected_parameters, AnyArg, DateArg, DateDays, F64Arg, FromColumnar, I64Arg, RowArg, StrArg,
+    arg, lift1, lift2, micros_to_local_naive, str_transform, str_transform_2, strftime_naive,
+    tag_timezone, unexpected_parameters, AnyArg, DateArg, DateDays, F64Arg, FromColumnar, I64Arg, RowArg, StrArg,
     TsArg, TsMicros, Zone,
 };
 
@@ -1149,8 +1149,9 @@ impl ScalarUDFImpl for FormatDatetime {
                 Some(f) => std::borrow::Cow::Borrowed(f),
                 None => std::borrow::Cow::Owned(joda_to_chrono(joda_fmt)),
             };
-            Ok(micros_to_local_naive(us, tz.as_deref())
-                .map(|dt| dt.format(&chrono_fmt).to_string()))
+            micros_to_local_naive(us, tz.as_deref())
+                .map(|dt| strftime_naive("format_datetime", &dt, &chrono_fmt))
+                .transpose()
         })
     }
 }
@@ -1899,6 +1900,22 @@ mod parse_datetime_tests {
         assert_eq!(joda_to_chrono("yyyy-MM-dd"), "%Y-%m-%d");
         assert_eq!(joda_to_chrono("HH:mm"), "%H:%M");
         assert_eq!(joda_to_chrono("yy/M/d"), "%y/%m/%d");
+    }
+
+    #[tokio::test]
+    async fn format_datetime_unrenderable_pattern_errors() {
+        // Joda 'Z' maps to %z, which a zoneless timestamp cannot render;
+        // a stray '%' is an invalid strftime item. Both used to panic.
+        let ctx = crate::duckdb_test_ctx();
+        register_extended_trino_functions(&ctx);
+        for pat in ["yyyy Z", "yyyy %"] {
+            let sql = format!("SELECT format_datetime(TIMESTAMP '2024-01-15 10:30:45', '{pat}')");
+            let res = match ctx.sql(&sql).await {
+                Ok(df) => df.collect().await.map(|_| ()),
+                Err(e) => Err(e),
+            };
+            assert!(res.is_err(), "{pat} should error");
+        }
     }
 
     async fn parse_dt(s: &str, fmt: &str) -> Option<i64> {

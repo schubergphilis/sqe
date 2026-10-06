@@ -940,11 +940,11 @@ impl ScalarUDFImpl for ToUnixtime {
                     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
                     arr.iter()
                         .map(|opt| {
-                            opt.map(|days| {
-                                let d = temporal_conversions::date32_to_datetime(days)
-                                    .unwrap()
-                                    .date();
-                                d.signed_duration_since(epoch).num_seconds() as f64
+                            // None for out-of-range Date32 (NULL row, as in the
+                            // scalar branch) instead of unwrapping into a panic.
+                            opt.and_then(|days| {
+                                let d = temporal_conversions::date32_to_datetime(days)?.date();
+                                Some(d.signed_duration_since(epoch).num_seconds() as f64)
                             })
                         })
                         .collect()
@@ -1184,9 +1184,9 @@ fn trino_format_to_chrono(pattern: &str) -> String {
 }
 
 /// Format a `NaiveDateTime` using a Trino-style format string.
-fn format_naive(dt: NaiveDateTime, pattern: &str) -> String {
+fn format_naive(dt: NaiveDateTime, pattern: &str) -> DFResult<String> {
     let chrono_fmt = trino_format_to_chrono(pattern);
-    dt.format(&chrono_fmt).to_string()
+    crate::helpers::strftime_naive("date_format", &dt, &chrono_fmt)
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -1224,7 +1224,7 @@ impl ScalarUDFImpl for DateFormat {
         match &args.args[0] {
             ColumnarValue::Scalar(sv) => {
                 let dt = scalar_to_naive_dt(sv)?;
-                let result = dt.map(|d| format_naive(d, &pattern));
+                let result = dt.map(|d| format_naive(d, &pattern)).transpose()?;
                 Ok(ColumnarValue::Scalar(ScalarValue::Utf8(result)))
             }
             ColumnarValue::Array(array) => {
@@ -1233,15 +1233,21 @@ impl ScalarUDFImpl for DateFormat {
                 {
                     ts_arr
                         .iter()
-                        .map(|opt| opt.map(|us| format_naive(us_to_naive(us), &pattern)))
-                        .collect()
+                        .map(|opt| {
+                            opt.map(|us| format_naive(us_to_naive(us), &pattern))
+                                .transpose()
+                        })
+                        .collect::<DFResult<_>>()?
                 } else if let Some(ts_arr) =
                     array.as_any().downcast_ref::<TimestampNanosecondArray>()
                 {
                     ts_arr
                         .iter()
-                        .map(|opt| opt.map(|ns| format_naive(ns_to_naive(ns), &pattern)))
-                        .collect()
+                        .map(|opt| {
+                            opt.map(|ns| format_naive(ns_to_naive(ns), &pattern))
+                                .transpose()
+                        })
+                        .collect::<DFResult<_>>()?
                 } else if let Some(date_arr) = array.as_any().downcast_ref::<Date32Array>() {
                     date_arr
                         .iter()
@@ -1254,8 +1260,9 @@ impl ScalarUDFImpl for DateFormat {
                                     format_naive(dt.date().and_hms_opt(0, 0, 0).unwrap(), &pattern)
                                 })
                             })
+                            .transpose()
                         })
-                        .collect()
+                        .collect::<DFResult<_>>()?
                 } else {
                     return Err(DataFusionError::Plan(format!(
                         "date_format: unsupported array type {:?}",
@@ -2828,6 +2835,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn to_unixtime_out_of_range_date_array_is_null() {
+        // A Date32 beyond chrono's range used to panic in the array branch.
+        let ctx = crate::duckdb_test_ctx();
+        register_trino_functions(&ctx);
+        let batch = arrow::record_batch::RecordBatch::try_from_iter([(
+            "d",
+            Arc::new(Date32Array::from(vec![Some(i32::MAX), Some(0)])) as ArrayRef,
+        )])
+        .unwrap();
+        ctx.register_batch("t", batch).unwrap();
+        let batches = ctx
+            .sql("SELECT to_unixtime(d) FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(col.is_null(0));
+        assert_eq!(col.value(1), 0.0);
+    }
+
+    #[tokio::test]
     async fn to_unixtime_roundtrip() {
         // from_unixtime(to_unixtime(ts)) should give back year 2026
         assert_eq!(
@@ -2985,6 +3019,21 @@ mod tests {
     async fn date_format_date_input() {
         let s = run_query_string("SELECT date_format(DATE '2024-06-15', '%Y/%m/%d')").await;
         assert_eq!(s, "2024/06/15");
+    }
+
+    #[tokio::test]
+    async fn date_format_unrenderable_pattern_errors() {
+        // %z needs an offset and %Q is unknown; both used to panic.
+        let ctx = crate::duckdb_test_ctx();
+        register_trino_functions(&ctx);
+        for pat in ["%Y %z", "%Q"] {
+            let sql = format!("SELECT date_format(TIMESTAMP '2024-01-15 10:30:45', '{pat}')");
+            let res = match ctx.sql(&sql).await {
+                Ok(df) => df.collect().await.map(|_| ()),
+                Err(e) => Err(e),
+            };
+            assert!(res.is_err(), "{pat} should error");
+        }
     }
 
     // ── date_parse tests ─────────────────────────────────────────────────────
