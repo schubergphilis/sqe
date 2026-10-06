@@ -716,17 +716,13 @@ pub async fn create_session_context(
                 ctx.register_catalog(name.clone(), hive_provider);
             }
 
-            // Register the sha256() scalar function for column masking.
-            // DataFusion does not ship a built-in sha256, we provide one via sqe-policy.
-            // When `coordinator.policy.mask_key` is set the UDF runs as
-            // HMAC-SHA256 with that key, blocking offline rainbow-table
-            // attacks against low-entropy masked columns (issue #37).
-            let mask_key = if config.policy.mask_key.is_empty() {
-                None
-            } else {
-                Some(std::sync::Arc::new(config.policy.mask_key.as_bytes().to_vec()))
-            };
-            ctx.register_udf(sqe_policy::sha256_udf::sha256_udf(mask_key));
+            // Register the user-callable sha256() scalar function (plain,
+            // unkeyed). DataFusion does not ship a built-in sha256. HASH masks
+            // use a separate keyed function (`coordinator.policy.mask_key`,
+            // issue #37) that the policy rewriter embeds in the plan and that
+            // is deliberately NOT registered: if users could call it they
+            // could hash candidate values and match masked output.
+            ctx.register_udf(sqe_policy::sha256_udf::user_sha256_udf(None));
 
             // Register session-context UDFs: current_user(), is_role_in_session(),
             // current_available_roles(), current_database(), current_schema().
@@ -1621,7 +1617,7 @@ allowed_object_store_prefixes = ["s3://shared-landing/"]
         let mut ctx = SessionContext::new_with_config(cfg);
 
         // Mirror the coordinator's registration set (see the builder above).
-        ctx.register_udf(sqe_policy::sha256_udf::sha256_udf(None));
+        ctx.register_udf(sqe_policy::sha256_udf::user_sha256_udf(None));
         let identity = std::sync::Arc::new(sqe_policy::session_udf::SessionIdentity {
             username: "alice".into(),
             roles: vec!["analyst".into()],
