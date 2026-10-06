@@ -877,6 +877,9 @@ fn resolve_from_bundle(
                 policy.row_filters.push(lit(false));
                 continue;
             }
+            // Ranger semantics: the first matching item of a policy decides
+            // the column, and a mask set by an earlier policy is not replaced
+            // by a later one.
             for column in &col_res.values {
                 for item in &p.data_mask_policy_items {
                     if !item_matches(&item.users, &item.roles, &item.groups, user) {
@@ -884,7 +887,7 @@ fn resolve_from_bundle(
                     }
                     match map_mask(&item.data_mask_info, column, &identity) {
                         Ok(Some(mask)) => {
-                            policy.column_masks.insert(column.clone(), mask);
+                            policy.column_masks.entry(column.clone()).or_insert(mask);
                         }
                         Ok(None) => { /* MASK_NONE exemption: leave column visible */ }
                         Err(()) => {
@@ -898,6 +901,7 @@ fn resolve_from_bundle(
                             }
                         }
                     }
+                    break;
                 }
             }
         }
@@ -1019,7 +1023,9 @@ pub(crate) fn resolve_tag_policies(
                     if normalize_mask_type(&item.data_mask_info.data_mask_type) == MASK_TYPE_CUSTOM
                     {
                         if let Some(template) = &item.data_mask_info.value_expr {
-                            masks.insert(tag_value.clone(), TagMaskSpec::Custom(template.clone()));
+                            masks
+                                .entry(tag_value.clone())
+                                .or_insert_with(|| TagMaskSpec::Custom(template.clone()));
                         } else {
                             // CUSTOM with no value_expr: nothing to substitute -> restrict.
                             warn!(
@@ -1030,12 +1036,12 @@ pub(crate) fn resolve_tag_policies(
                             );
                             unmappable.insert(tag_value.clone());
                         }
-                        continue;
+                        break;
                     }
                     // column placeholder is empty for non-CUSTOM types.
                     match map_mask(&item.data_mask_info, "", identity) {
                         Ok(Some(mask)) => {
-                            masks.insert(tag_value.clone(), TagMaskSpec::Ready(mask));
+                            masks.entry(tag_value.clone()).or_insert(TagMaskSpec::Ready(mask));
                         }
                         Ok(None) => { /* MASK_NONE exemption: tag has no mask */ }
                         Err(()) => {
@@ -1049,6 +1055,8 @@ pub(crate) fn resolve_tag_policies(
                             unmappable.insert(tag_value.clone());
                         }
                     }
+                    // First matching item decides, as on the resource path.
+                    break;
                 }
             }
 
@@ -2029,6 +2037,22 @@ mod tests {
     }
 
     #[test]
+    fn first_matching_mask_item_wins() {
+        let mut bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
+        // A second item also matching `analyst`, after the MASK_NULL one.
+        let later: DataMaskPolicyItem = serde_json::from_str(
+            r#"{"roles": ["analyst"], "dataMaskInfo": {"dataMaskType": "MASK_SHOW_LAST_4"}}"#,
+        )
+        .unwrap();
+        bundle.policies[0].data_mask_policy_items.push(later);
+        let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales", false);
+        assert!(
+            matches!(policy.column_masks.get("amount"), Some(MaskType::Nullify)),
+            "the first matching item decides, a later one must not override it"
+        );
+    }
+
+    #[test]
     fn row_filter_applied_for_matching_role() {
         let bundle: ServicePolicies = serde_json::from_str(BUNDLE).unwrap();
         let policy = resolve_from_bundle(&bundle, &user("alice", &["analyst"]), "orders", "sales", false);
@@ -2628,6 +2652,32 @@ mod tests {
             "supported mask must not be unmappable"
         );
         let _ = filters; // not the focus of this test
+    }
+
+    #[test]
+    fn first_matching_tag_mask_item_wins() {
+        let mut sp: ServicePolicies = serde_json::from_str(TAG_BUNDLE).unwrap();
+        let later: DataMaskPolicyItem = serde_json::from_str(
+            r#"{"roles": ["engineer"], "dataMaskInfo": {"dataMaskType": "MASK_NULL"}}"#,
+        )
+        .unwrap();
+        sp.tag_policies.as_mut().unwrap().policies[0]
+            .data_mask_policy_items
+            .push(later);
+        let tags: HashSet<String> = ["PII".to_string()].into_iter().collect();
+        let id = SessionIdentity {
+            username: "bob".into(),
+            roles: vec!["engineer".into()],
+            ..Default::default()
+        };
+        let (masks, _, _) = resolve_tag_policies(&sp, &id, &tags);
+        assert!(
+            matches!(
+                masks.get("PII"),
+                Some(TagMaskSpec::Ready(crate::MaskType::PartialMask { show_last: 4, .. }))
+            ),
+            "the first matching item (MASK_SHOW_LAST_4) decides, not the later MASK_NULL"
+        );
     }
 
     #[test]
