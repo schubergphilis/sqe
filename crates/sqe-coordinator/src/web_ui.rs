@@ -23,7 +23,7 @@ pub struct NodeInfo {
     pub version: &'static str,
     pub role: &'static str,
     /// The linked DataFusion version (`datafusion::DATAFUSION_VERSION`),
-    /// the same value `/api/v1/status` reports.
+    /// the same value `/api/v1/status/detail` reports.
     pub datafusion_version: &'static str,
     // ── capabilities ──────────────────────────────────────────────
     pub flight_sql_port: u16,

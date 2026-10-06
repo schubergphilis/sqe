@@ -39,7 +39,10 @@ token is 403. The UI is **off by default** (`[metrics] web_ui = false`); when
 off, those routes are not registered and return 404.
 
 `/healthz`, `/readyz`, and `/api/v1/status` stay open. They are the probe
-surface for Kubernetes and load balancers. The Prometheus `/metrics` endpoint
+surface for Kubernetes and load balancers. The open `/api/v1/status` carries
+only `status` and `node.role`; build identity, worker URLs and the `serving`
+block are at `/api/v1/status/detail`, behind the same admin gate as the
+catalog refresh hook. The Prometheus `/metrics` endpoint
 on the metrics port is also ungated. Keep the metrics and health ports on an
 internal network.
 
@@ -76,7 +79,8 @@ are stable and safe to scrape directly:
 | `GET /api/v1/queries/{id}` | one query plus its fragments (404 if unknown) |
 | `GET /api/v1/workers` | worker nodes with health and in-flight load |
 | `GET /api/v1/metrics/history` | time-bucketed series for the charts |
-| `GET /api/v1/status` | Ballista/DataFusion-style cluster status |
+| `GET /api/v1/status` | `status` and `node.role` only (open) |
+| `GET /api/v1/status/detail` | full Ballista/DataFusion-style cluster status (admin) |
 
 ## Admin endpoints
 
