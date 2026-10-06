@@ -32,6 +32,7 @@ The adapter supports three auth styles in `profiles.yml`. See
 type: sqe
 host: localhost
 port: 50051
+tls: false  # local plaintext stack; drop for a TLS coordinator
 user: alice
 password: "{{ env_var('SQE_PASSWORD') }}"
 ```
@@ -47,6 +48,7 @@ run the `client_credentials_passthrough` auth provider.
 type: sqe
 host: localhost
 port: 50051
+tls: false  # local plaintext stack; drop for a TLS coordinator
 method: oauth
 client_id: "{{ env_var('SQE_CLIENT_ID') }}"
 client_secret: "{{ env_var('SQE_CLIENT_SECRET') }}"
@@ -65,6 +67,7 @@ for short-lived CI tokens.
 type: sqe
 host: localhost
 port: 50051
+tls: false  # local plaintext stack; drop for a TLS coordinator
 token: "{{ env_var('SQE_TOKEN') }}"
 ```
 
@@ -78,6 +81,8 @@ Precedence when several are set: `token` > OAuth (`method: oauth` or `client_id`
 |---|---|---|
 | `host` | `localhost` | SQE coordinator host |
 | `port` | `50051` | Flight SQL port |
+| `tls` | `true` | connect with `grpc+tls://`; set `false` only for a local plaintext coordinator |
+| `tls_root_certs` | unset | path to a PEM CA bundle to trust (private CA); requires `tls: true` |
 | `catalog` (alias `database`) | `warehouse` | target catalog |
 | `schema` | `default` | target schema |
 | `threads` | 1 | dbt parallelism |
