@@ -22,7 +22,7 @@ use sqe_core::CircuitBreaker;
 use crate::policy_expr::parse_sql_predicate;
 use crate::session_udf::SessionIdentity;
 use crate::{MaskType, PolicyStore, ResolvedPolicy, TagMaskSpec};
-use sqe_policy_api::HiveCatalogs;
+use sqe_policy_api::{wildcard_match, HiveCatalogs};
 
 // --- Ranger policy bundle model (ServicePolicies) ---
 
@@ -477,51 +477,6 @@ impl RangerStore {
 /// resource values must be written against that full dotted name.
 fn hive_database(namespace: &str) -> String {
     namespace.to_string()
-}
-
-/// Ranger wildcard match: `*` matches any run of characters (including none),
-/// `?` matches exactly one.
-///
-/// Semantics taken from the live `hive` service definition, whose `database`,
-/// `table` and `column` resources all declare
-/// `matcherOptions: {wildCard: "true", ignoreCase: "true"}`. Ranger implements
-/// that with commons-io `FilenameUtils.wildcardMatch` and `IOCase.INSENSITIVE`,
-/// where no character other than `*` and `?` is special.
-///
-/// Case folding is part of the same contract, not a separate liberty: with
-/// `ignoreCase: true`, a policy written on `Orders` fires for `orders` in Ranger,
-/// and SQE comparing case-sensitively would silently not mask.
-///
-/// Iterative with a single backtrack point, so a pattern like `*a*a*a*a*` cannot
-/// blow up: policies are operator input reaching a per-query path.
-fn wildcard_match(pattern: &str, target: &str) -> bool {
-    let p: Vec<char> = pattern.to_lowercase().chars().collect();
-    let t: Vec<char> = target.to_lowercase().chars().collect();
-    let (mut pi, mut ti) = (0usize, 0usize);
-    let mut star: Option<usize> = None;
-    let mut resume = 0usize;
-    while ti < t.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
-            pi += 1;
-            ti += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some(pi);
-            pi += 1;
-            resume = ti;
-        } else if let Some(s) = star {
-            // Backtrack: let the last `*` swallow one more character.
-            pi = s + 1;
-            resume += 1;
-            ti = resume;
-        } else {
-            return false;
-        }
-    }
-    // Trailing `*`s may match nothing.
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
 }
 
 /// True if a Ranger resource value list matches `target`.

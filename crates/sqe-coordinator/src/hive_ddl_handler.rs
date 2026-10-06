@@ -548,9 +548,9 @@ impl HiveDdlHandler {
 
         let mut spec = sqe_catalog::hive::hive_spec_from_manifest(catalog, &manifest);
         spec.columns
-            .retain(|c| !policy.restricted_columns.contains(&c.name));
+            .retain(|c| !policy.is_restricted(&c.name));
         spec.partition_keys
-            .retain(|c| !policy.restricted_columns.contains(&c.name));
+            .retain(|c| !policy.is_restricted(&c.name));
         Ok(sqe_catalog::hive::render_hive_create_table_ddl(&spec))
     }
 
@@ -726,7 +726,7 @@ impl HiveDdlHandler {
             .iter()
             .chain(manifest.partition_keys.iter())
         {
-            if policy.restricted_columns.contains(&column.name) {
+            if policy.is_restricted(&column.name) {
                 continue;
             }
             let data_type = sqe_catalog::hive::serde_map::arrow_type(&column.r#type)
@@ -771,7 +771,7 @@ impl HiveDdlHandler {
             .columns
             .iter()
             .chain(manifest.partition_keys.iter())
-            .filter(|c| !policy.restricted_columns.contains(&c.name))
+            .filter(|c| !policy.is_restricted(&c.name))
             .map(|c| c.name.clone())
             .collect();
         let number = |keys: &[&str]| {
