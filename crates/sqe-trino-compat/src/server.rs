@@ -930,10 +930,17 @@ fn trino_client_ip<A, Q>(
     headers: &HeaderMap,
     peer: SocketAddr,
 ) -> String {
-    let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+    // All header lines joined (#740): `get` would return only the first.
+    let joined = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let xff = (!joined.is_empty()).then_some(joined);
     state
         .security
-        .resolve_client_ip(Some(&peer.to_string()), xff)
+        .resolve_client_ip(Some(&peer.to_string()), xff.as_deref())
 }
 
 /// Drop the `:port` suffix from a resolved client address so the rate-limiter
@@ -5822,6 +5829,25 @@ mod tests {
         headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
         let resolved = trino_client_ip(&state, &headers, "10.0.0.1:33333".parse().unwrap());
         assert_eq!(resolved, "10.0.0.1:33333");
+    }
+
+    /// #740: repeated `x-forwarded-for` lines resolve exactly like one
+    /// comma-separated field; reading only the first line would let a
+    /// client-supplied line hide the hop the trusted proxy appended.
+    #[test]
+    fn trino_client_ip_joins_repeated_forwarded_for_lines() {
+        let mut state =
+            Arc::into_inner(state_with(Arc::new(MockAuth), Arc::new(MockQuery))).unwrap();
+        state.security = SecurityConfig {
+            trusted_proxies: vec!["10.0.0.1".to_string()],
+            ..SecurityConfig::default()
+        };
+        let state = Arc::new(state);
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", "203.0.113.5".parse().unwrap());
+        headers.append("x-forwarded-for", "198.51.100.9".parse().unwrap());
+        let resolved = trino_client_ip(&state, &headers, "10.0.0.1:33333".parse().unwrap());
+        assert_eq!(resolved, "198.51.100.9");
     }
 
     // ── Poll-token binding and pre-auth rate limiting (#622, #562) ──
