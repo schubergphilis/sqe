@@ -85,13 +85,23 @@ pub async fn extract_write_predicates(
     let (rewritten, summary) = enforcer
         .evaluate(user, &crate::TableScope::default(), plan)
         .await?;
-    Ok((unparse_predicates(&rewritten), summary))
+    Ok((unparse_predicates(&rewritten)?, summary))
 }
 
 /// Walk a rewritten plan and pull row filters + masks out as SQL fragments.
 /// Public so tests in this crate and downstream crates can exercise the
 /// unparser without rebuilding the full extraction pipeline.
-pub fn unparse_predicates(rewritten: &LogicalPlan) -> WritePolicyPredicates {
+///
+/// Fails closed: a row filter or mask that cannot be rendered as SQL is an
+/// error, never silently dropped (a dropped row filter would let DELETE
+/// without WHERE remove rows the caller cannot see).
+pub fn unparse_predicates(rewritten: &LogicalPlan) -> sqe_core::Result<WritePolicyPredicates> {
+    let unrenderable = |what: String, e: datafusion::error::DataFusionError| {
+        SqeError::with_code(
+            SqeErrorCode::AccessDenied,
+            format!("write refused: the {what} cannot be applied to this statement: {e}"),
+        )
+    };
     let mut row_filters: Vec<Expr> = Vec::new();
     let mut column_mask_sqls: HashMap<String, String> = HashMap::new();
     let mut node = rewritten;
@@ -112,9 +122,9 @@ pub fn unparse_predicates(rewritten: &LogicalPlan) -> WritePolicyPredicates {
                     if matches!(body, Expr::Column(c) if c.name == alias_name) {
                         continue;
                     }
-                    if let Ok(sql) = expr_to_sql(body) {
-                        column_mask_sqls.insert(alias_name, sql.to_string());
-                    }
+                    let sql = expr_to_sql(body)
+                        .map_err(|e| unrenderable(format!("column mask on `{alias_name}`"), e))?;
+                    column_mask_sqls.insert(alias_name, sql.to_string());
                 }
                 node = p.input.as_ref();
             }
@@ -129,13 +139,14 @@ pub fn unparse_predicates(rewritten: &LogicalPlan) -> WritePolicyPredicates {
             .into_iter()
             .reduce(|a, b| a.and(b))
             .expect("non-empty by branch");
-        expr_to_sql(&combined).ok().map(|s| s.to_string())
+        let sql = expr_to_sql(&combined).map_err(|e| unrenderable("row filter".to_string(), e))?;
+        Some(sql.to_string())
     };
 
-    WritePolicyPredicates {
+    Ok(WritePolicyPredicates {
         row_filter_sql,
         column_mask_sqls,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -163,6 +174,48 @@ mod tests {
             Field::new("ssn", DataType::Utf8, true),
             Field::new("region", DataType::Utf8, true),
         ]))
+    }
+
+    // A row filter or mask the unparser cannot render must fail the write,
+    // never be dropped (a dropped row filter turns DELETE into a truncate).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unrenderable_policy_fails_closed() {
+        let store = InMemoryPolicyStore::new();
+        let mut pol = ResolvedPolicy::default();
+        let duration = || lit(datafusion::common::ScalarValue::DurationSecond(Some(1)));
+        pol.row_filters.push(col("region").eq(lit("EU")).and(duration().is_not_null()));
+        store.add_table_policy("default", "employees", pol).await;
+        let enf = PolicyPlanRewriter::new(Arc::new(store));
+        let res = extract_write_predicates(
+            &enf,
+            &user("alice"),
+            "default",
+            "employees",
+            employees_schema(),
+        )
+        .await;
+        assert!(res.is_err(), "unrenderable row filter must error, got {res:?}");
+
+        let scan = LogicalPlanBuilder::scan(
+            "employees",
+            provider_as_source(Arc::new(
+                MemTable::try_new(employees_schema(), vec![vec![]]).unwrap(),
+            )),
+            None,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let masked = LogicalPlanBuilder::from(scan)
+            .project(vec![
+                col("id"),
+                duration().alias("ssn"),
+                col("region"),
+            ])
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(unparse_predicates(&masked).is_err(), "unrenderable mask must error");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
