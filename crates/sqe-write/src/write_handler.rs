@@ -2894,6 +2894,8 @@ impl WriteHandler {
         let base_snapshot_id = table.metadata().current_snapshot_id();
         let mut new_vectors: Vec<iceberg::spec::DataFile> = Vec::new();
         let mut retired_deletes: Vec<iceberg::spec::DataFile> = Vec::new();
+        // V2: data files the position deletes point at, checked at commit.
+        let mut referenced_paths: Vec<String> = Vec::new();
 
         for data_file in sorted_files {
             let file_path: Arc<str> = Arc::from(data_file.file_path());
@@ -2987,6 +2989,7 @@ impl WriteHandler {
                     new_vectors.extend(vector);
                     retired_deletes.extend(retired);
                 } else {
+                    referenced_paths.push(file_path.to_string());
                     delete_writer
                         .write_file(Arc::clone(&file_path), std::mem::take(&mut positions))
                         .await?;
@@ -3024,9 +3027,14 @@ impl WriteHandler {
         // pinned to the snapshot the vectors were merged against. A concurrent
         // writer would otherwise leave two vectors on one data file, which the
         // spec forbids, so a moved table fails the commit instead.
+        // V2 has no such pin, so a moved table is checked by hand: a position
+        // delete names its data file by path, and if a concurrent commit
+        // (compaction, CoW rewrite) retired that file the delete would match
+        // nothing and the rows would survive a DELETE that reported success.
         let files_for_retry = delete_files.clone();
         let vectors_for_retry = new_vectors.clone();
         let retired_for_retry = retired_deletes.clone();
+        let referenced_for_retry = Arc::new(referenced_paths);
         let catalog_for_commit = catalog.clone();
         commit_with_retry(
             catalog.as_catalog().as_ref(),
@@ -3036,8 +3044,29 @@ impl WriteHandler {
                 let files = files_for_retry.clone();
                 let vectors = vectors_for_retry.clone();
                 let retired = retired_for_retry.clone();
+                let referenced = Arc::clone(&referenced_for_retry);
                 let cat = catalog_for_commit.clone();
                 async move {
+                    if !v3 && fresh_table.metadata().current_snapshot_id() != base_snapshot_id {
+                        let live: std::collections::HashSet<String> =
+                            crate::writer::collect_live_data_files(&fresh_table)
+                                .await
+                                .map_err(|e| {
+                                    iceberg::Error::new(iceberg::ErrorKind::Unexpected, e.to_string())
+                                })?
+                                .iter()
+                                .map(|f| f.file_path().to_string())
+                                .collect();
+                        if let Some(gone) = referenced.iter().find(|p| !live.contains(p.as_str())) {
+                            return Err(iceberg::Error::new(
+                                iceberg::ErrorKind::DataInvalid,
+                                format!(
+                                    "data file {gone} was replaced by a concurrent commit; \
+                                     re-run the DELETE"
+                                ),
+                            ));
+                        }
+                    }
                     let tx = Transaction::new(&fresh_table);
                     let tx = if v3 {
                         let mut action = tx
@@ -11861,6 +11890,66 @@ s3_path_style = true
                 .await
                 .expect("live delete files");
             assert_eq!(deletes.len(), 1, "one position-delete file committed");
+        }
+
+        /// A compaction that rewrites the scanned data file between the scan
+        /// and the commit leaves the position deletes pointing at a file that
+        /// is no longer live. The DELETE must fail instead of reporting rows
+        /// it never removed.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn mor_delete_fails_when_concurrent_compaction_replaces_file() {
+            let rig = SqliteRig::new().await;
+            let ident = seeded_id_v_with(
+                &rig,
+                "mor_compact",
+                std::collections::HashMap::from([(
+                    sqe_core::table_properties::WRITE_DELETE_MODE.to_string(),
+                    "merge-on-read".to_string(),
+                )]),
+            )
+            .await;
+            let fired = Arc::new(AtomicBool::new(false));
+            let catalog = rig.catalog.clone();
+            let hook_ident = ident.clone();
+            let fired_for_hook = fired.clone();
+            let hook: CommitRaceHook = Arc::new(move || {
+                let fired = fired_for_hook.clone();
+                let catalog = catalog.clone();
+                let ident = hook_ident.clone();
+                Box::pin(async move {
+                    if fired.swap(true, AtomicOrdering::SeqCst) {
+                        return;
+                    }
+                    let table = catalog.load_table(&ident).await.expect("reload");
+                    let old = crate::writer::collect_live_data_files(&table)
+                        .await
+                        .expect("live files");
+                    let new = crate::writer::write_data_files(
+                        &table,
+                        vec![id_v_batch(&[(1, "a"), (2, "b"), (3, "c")])],
+                        "compact",
+                        crate::writer::parse_parquet_compression("zstd"),
+                        crate::writer::new_upload_tracker(),
+                    )
+                    .await
+                    .expect("write compacted file");
+                    let tx = Transaction::new(&table);
+                    let tx = tx
+                        .rewrite_files()
+                        .add_data_files(new)
+                        .delete_files(old)
+                        .apply(tx)
+                        .expect("apply rewrite");
+                    tx.commit(catalog.as_ref()).await.expect("commit compaction");
+                })
+            });
+            let h = handler(&rig).with_test_commit_race_hook(hook);
+
+            let res = run_delete(&h, &rig, "DELETE FROM default.mor_compact WHERE id = 2").await;
+
+            assert!(fired.load(AtomicOrdering::SeqCst), "the race was exercised");
+            assert!(res.is_err(), "DELETE must not report success: {res:?}");
+            assert_eq!(rig.scan_i64(&ident, "id").await, vec![1, 2, 3]);
         }
 
         #[tokio::test(flavor = "multi_thread")]
