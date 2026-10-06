@@ -1189,6 +1189,62 @@ impl WriteHandler {
         }
     }
 
+    /// Govern every table a per-batch DML evaluation reads besides its own
+    /// scratch tables: subqueries in WHERE / SET and the joins the
+    /// scalar-subquery decorrelator emits. Each such scan is replaced by the
+    /// enforcer's rewrite of that scan alone, so the scratch tables (the
+    /// target's rows, governed by `WritePolicyPredicates`, and the
+    /// already-enforced IN-subquery keysets) are never re-filtered, which
+    /// would misalign the positional match mask.
+    async fn enforce_dml_eval(
+        &self,
+        ctx: &DFSessionContext,
+        session: &Session,
+        df: datafusion::dataframe::DataFrame,
+    ) -> sqe_core::Result<datafusion::dataframe::DataFrame> {
+        use datafusion::common::tree_node::{Transformed, TreeNodeRecursion};
+        let Some(enf) = self.policy_enforcer.as_deref() else {
+            return Ok(df);
+        };
+        let mut scans: Vec<LogicalPlan> = Vec::new();
+        df.logical_plan()
+            .apply_with_subqueries(|node| {
+                if let LogicalPlan::TableScan(scan) = node {
+                    let scratch = scan.table_name.catalog() == Some("datafusion")
+                        && scan.table_name.table().starts_with("__sqe_");
+                    if !scratch && !scans.contains(node) {
+                        scans.push(node.clone());
+                    }
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("DML plan traversal failed: {e}")))?;
+        if scans.is_empty() {
+            return Ok(df);
+        }
+        let scope = sqe_policy::TableScope::of(ctx);
+        let mut enforced: Vec<(LogicalPlan, LogicalPlan)> = Vec::with_capacity(scans.len());
+        for scan in scans {
+            let (plan, _summary) = enf.evaluate(&session.user, &scope, scan.clone()).await?;
+            enforced.push((scan, plan));
+        }
+        let plan = df
+            .logical_plan()
+            .clone()
+            .transform_down_with_subqueries(|node| {
+                Ok(match enforced.iter().find(|(scan, _)| *scan == node) {
+                    // Jump: the replacement contains the original scan.
+                    Some((_, plan)) => Transformed::new(plan.clone(), true, TreeNodeRecursion::Jump),
+                    None => Transformed::no(node),
+                })
+            })
+            .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("DML policy rewrite failed: {e}")))?
+            .data;
+        ctx.execute_logical_plan(plan).await.map_err(|e| {
+            SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("DML policy plan failed: {e}"))
+        })
+    }
+
     /// Resolve write-path policy predicates for the target of a DELETE / UPDATE.
     /// Returns row-filter SQL and per-column mask SQL fragments derived from
     /// the configured PolicyEnforcer. With no enforcer the result is empty
@@ -2589,6 +2645,7 @@ impl WriteHandler {
                                 let filtered = self
                                     .filter_batch_negate(
                                         ctx,
+                                        session,
                                         batch,
                                         where_sql,
                                         joins_sql,
@@ -2802,6 +2859,7 @@ impl WriteHandler {
                 let match_mask = self
                     .filter_batch_match(
                         ctx,
+                        session,
                         batch,
                         &where_sql,
                         &joins_sql,
@@ -2839,6 +2897,7 @@ impl WriteHandler {
                     let mask = self
                         .filter_batch_match(
                             ctx,
+                            session,
                             &batch,
                             &where_sql,
                             &joins_sql,
@@ -3084,6 +3143,7 @@ impl WriteHandler {
                 let match_mask = self
                     .filter_batch_match(
                         ctx,
+                        session,
                         &batch,
                         &where_sql,
                         &joins_sql,
@@ -3400,6 +3460,7 @@ impl WriteHandler {
                                 let mask = self
                                     .filter_batch_match(
                                         ctx,
+                                        session,
                                         batch,
                                         where_sql,
                                         joins_sql,
@@ -3418,6 +3479,7 @@ impl WriteHandler {
                                 let out = self
                                     .apply_update(
                                         ctx,
+                                        session,
                                         batch,
                                         assignments,
                                         where_sql,
@@ -3685,6 +3747,7 @@ impl WriteHandler {
                 let match_mask = self
                     .filter_batch_match(
                         ctx,
+                        session,
                         &batch,
                         &where_sql,
                         &joins_sql,
@@ -3722,6 +3785,7 @@ impl WriteHandler {
                 let full_rewrite = self
                     .apply_update(
                         ctx,
+                        session,
                         &batch,
                         assignments,
                         &where_sql,
@@ -5712,6 +5776,7 @@ impl WriteHandler {
     async fn filter_batch_negate(
         &self,
         ctx: &DFSessionContext,
+        session: &Session,
         batch: &RecordBatch,
         where_sql: &str,
         joins_sql: &str,
@@ -5746,6 +5811,7 @@ impl WriteHandler {
         let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &eval_sql)
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to evaluate WHERE clause: {e}")))?;
+        let df = self.enforce_dml_eval(ctx, session, df).await?;
         let result_batches: Vec<RecordBatch> = df
             .collect()
             .await
@@ -5788,6 +5854,7 @@ impl WriteHandler {
     async fn filter_batch_match(
         &self,
         ctx: &DFSessionContext,
+        session: &Session,
         batch: &RecordBatch,
         where_sql: &str,
         joins_sql: &str,
@@ -5818,6 +5885,7 @@ impl WriteHandler {
         let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &eval_sql)
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to evaluate WHERE clause: {e}")))?;
+        let df = self.enforce_dml_eval(ctx, session, df).await?;
         let result_batches: Vec<RecordBatch> = df
             .collect()
             .await
@@ -5855,6 +5923,7 @@ impl WriteHandler {
     async fn apply_update(
         &self,
         ctx: &DFSessionContext,
+        session: &Session,
         batch: &RecordBatch,
         assignments: &[sqlparser::ast::Assignment],
         where_sql: &str,
@@ -5951,6 +6020,7 @@ impl WriteHandler {
         let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, &select_sql)
             .await
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Failed to evaluate UPDATE: {e}")))?;
+        let df = self.enforce_dml_eval(ctx, session, df).await?;
         let result_batches: Vec<RecordBatch> = df
             .collect()
             .await
@@ -9869,7 +9939,7 @@ s3_path_style = true
         // (ids 1 and 3) get filtered out, leaving the US rows (ids 2 and 4).
         let batch = make_employee_batch();
         let survivors = handler
-            .filter_batch_negate(&ctx, &batch, "TRUE", "", &table_ident, &predicates)
+            .filter_batch_negate(&ctx, &session, &batch, "TRUE", "", &table_ident, &predicates)
             .await
             .unwrap();
         assert_eq!(survivors.num_rows(), 2, "US rows must survive");
@@ -9927,6 +9997,78 @@ s3_path_style = true
             .expect("visible rows are admitted");
     }
 
+    // Non-IN subqueries in a DML WHERE read other tables under the caller's
+    // policy, not raw: a scalar subquery over a row-filtered table sees only
+    // the caller's rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dml_where_scalar_subquery_applies_row_filter() {
+        use datafusion::logical_expr::{col, lit};
+        let (handler, session, _employees, ctx) =
+            employees_handler_with_policy(Some(col("region").eq(lit("EU"))), vec![]).await;
+        ctx.register_batch("employees", make_employee_batch()).unwrap();
+        let mine = TableIdent::new(NamespaceIdent::new("default".to_string()), "mine".to_string());
+        let no_policy = sqe_policy::write_predicates::WritePolicyPredicates::default();
+
+        let mask = handler
+            .filter_batch_match(
+                &ctx,
+                &session,
+                &make_employee_batch(),
+                "(SELECT COUNT(*) FROM employees WHERE region = 'US') > 0",
+                "",
+                &mine,
+                &no_policy,
+            )
+            .await
+            .unwrap();
+        assert_eq!(mask.true_count(), 0, "US rows are hidden from the caller");
+    }
+
+    // A correlated SET subquery (decorrelated into a join) reads the other
+    // table masked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dml_set_scalar_subquery_applies_column_mask() {
+        use arrow_array::Array as _;
+        use sqe_policy::MaskType;
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+        let (handler, session, _employees, ctx) =
+            employees_handler_with_policy(None, vec![("ssn", MaskType::Redact("***".to_string()))])
+                .await;
+        ctx.register_batch("employees", make_employee_batch()).unwrap();
+        let mine = TableIdent::new(NamespaceIdent::new("default".to_string()), "mine".to_string());
+        let no_policy = sqe_policy::write_predicates::WritePolicyPredicates::default();
+
+        let sql = "UPDATE mine SET region = (SELECT e.ssn FROM employees e WHERE e.id = mine.id)";
+        let assignments = match Parser::parse_sql(&GenericDialect {}, sql).unwrap().pop().unwrap() {
+            sqlparser::ast::Statement::Update(update) => update.assignments,
+            _ => panic!("expected UPDATE"),
+        };
+        let out = handler
+            .apply_update(
+                &ctx,
+                &session,
+                &make_employee_batch(),
+                &assignments,
+                "TRUE",
+                "",
+                &mine,
+                &no_policy,
+            )
+            .await
+            .unwrap();
+        let region = out
+            .column_by_name("region")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap()
+            .clone();
+        for i in 0..region.len() {
+            assert_eq!(region.value(i), "***", "raw ssn copied at index {i}");
+        }
+    }
+
     // #731: the IN-subquery keyset SELECT goes through the enforcer, so a
     // DELETE/UPDATE ... WHERE id IN (SELECT ...) only sees the caller's rows.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9965,7 +10107,7 @@ s3_path_style = true
         // count must be the EU rows (2), not every row (4).
         let batch = make_employee_batch();
         let mask = handler
-            .filter_batch_match(&ctx, &batch, "TRUE", "", &table_ident, &predicates)
+            .filter_batch_match(&ctx, &session, &batch, "TRUE", "", &table_ident, &predicates)
             .await
             .unwrap();
         let matched: u32 = (0..mask.len()).map(|i| mask.value(i) as u32).sum();
@@ -9988,6 +10130,7 @@ s3_path_style = true
         let mask = handler
             .filter_batch_match(
                 &ctx,
+                &session,
                 &batch,
                 "ssn = '111-11'",
                 "",
@@ -10003,7 +10146,7 @@ s3_path_style = true
         // the mask is in effect. Confirms the policy substitution actually
         // runs in the evaluator.
         let mask2 = handler
-            .filter_batch_match(&ctx, &batch, "ssn = '***'", "", &table_ident, &predicates)
+            .filter_batch_match(&ctx, &session, &batch, "ssn = '***'", "", &table_ident, &predicates)
             .await
             .unwrap();
         let matched2: u32 = (0..mask2.len()).map(|i| mask2.value(i) as u32).sum();
@@ -10034,6 +10177,7 @@ s3_path_style = true
         let rewritten = handler
             .apply_update(
                 &ctx,
+                &session,
                 &batch,
                 &assignments,
                 "TRUE",
@@ -10102,6 +10246,7 @@ s3_path_style = true
         let rewritten = handler
             .apply_update(
                 &ctx,
+                &session,
                 &batch,
                 &assignments,
                 &where_sql,
@@ -10137,7 +10282,7 @@ s3_path_style = true
         let predicates = compute_predicates_for_employees(&handler, &session, &table_ident).await;
         let batch = make_employee_batch();
         let mask = handler
-            .filter_batch_match(&ctx, &batch, "TRUE", "", &table_ident, &predicates)
+            .filter_batch_match(&ctx, &session, &batch, "TRUE", "", &table_ident, &predicates)
             .await
             .unwrap();
         assert_eq!(
@@ -10184,6 +10329,7 @@ s3_path_style = true
         let err = handler
             .filter_batch_match(
                 &ctx,
+                &session,
                 &batch,
                 "no_such_column = 1",
                 "",
@@ -10202,6 +10348,7 @@ s3_path_style = true
         handler
             .filter_batch_negate(
                 &ctx,
+                &session,
                 &batch,
                 "no_such_column = 1",
                 "",
@@ -10230,6 +10377,7 @@ s3_path_style = true
         handler
             .apply_update(
                 &ctx,
+                &session,
                 &batch,
                 &assignments,
                 "id = 1",
@@ -10247,7 +10395,7 @@ s3_path_style = true
 
         // And the success path leaves nothing behind either.
         handler
-            .filter_batch_match(&ctx, &batch, "id > 2", "", &table_ident, &predicates)
+            .filter_batch_match(&ctx, &session, &batch, "id > 2", "", &table_ident, &predicates)
             .await
             .unwrap();
         assert!(dml_scratch_tables(&ctx).is_empty());
@@ -10279,6 +10427,7 @@ s3_path_style = true
         for _ in 0..8 {
             let a = handler.filter_batch_match(
                 &ctx,
+                &session,
                 &batch_a,
                 "id > 2",
                 "",
@@ -10287,6 +10436,7 @@ s3_path_style = true
             );
             let b = handler.filter_batch_match(
                 &ctx,
+                &session,
                 &batch_b,
                 "id > 2",
                 "",
