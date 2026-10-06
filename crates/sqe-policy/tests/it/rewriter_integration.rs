@@ -208,13 +208,51 @@ async fn row_filter_injects_filter_above_scan() {
 
     let s = format!("{}", rewritten.display_indent());
     assert!(
-        s.starts_with("Filter:"),
-        "expected Filter at root of rewritten plan, got: {s}"
+        s.starts_with("Projection:") && s.contains("\n  Filter:"),
+        "expected the row-filter guard over a Filter, got: {s}"
     );
 
     let batches = execute(rewritten, mem, "employees").await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 2, "row filter should leave only EU rows");
+}
+
+/// A caller predicate must never be evaluated on a row the row filter hides.
+/// The optimizer merges the policy Filter with the caller's WHERE into one
+/// conjunction, and AND evaluates its right side over the whole batch when
+/// enough rows pass (2 of 3 here). Unguarded, `1 / (customer_id - 2)` then
+/// runs on the hidden US row (customer_id 2) and the divide-by-zero error
+/// reveals that the hidden row is in region US.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn caller_predicate_cannot_error_on_rows_the_row_filter_hides() {
+    let (mem, _) = build_scan("employees");
+    let ctx = SessionContext::new();
+    ctx.register_table("employees", mem).unwrap();
+    let store = InMemoryPolicyStore::new();
+    let mut policy = ResolvedPolicy::default();
+    policy.row_filters.push(col("region").eq(lit("EU")));
+    store
+        .add_table_policy("public", "employees", policy.clone())
+        .await;
+    store.add_table_policy("default", "employees", policy).await;
+    let rewriter = PolicyPlanRewriter::new(Arc::new(store));
+
+    let sql = "SELECT customer_id FROM employees \
+               WHERE CASE WHEN region = 'US' THEN 1 / (customer_id - 2) ELSE 1 END = 1";
+    let plan = ctx.state().create_logical_plan(sql).await.unwrap();
+    let (plan, _summary) = rewriter
+        .evaluate(&user("alice", &[]), &sqe_policy::TableScope::default(), plan)
+        .await
+        .unwrap();
+    let batches = ctx
+        .execute_logical_plan(plan)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .expect("the hidden row must not be reachable through a runtime error");
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 2, "both visible EU rows pass the caller predicate");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -425,7 +463,7 @@ async fn multilevel_namespace_row_filter_is_applied() {
 
     let s = format!("{}", rewritten.display_indent());
     assert!(
-        s.starts_with("Filter:"),
+        s.starts_with("Projection:") && s.contains("\n  Filter:"),
         "row filter must be injected over multi-level scan, got: {s}"
     );
 }
@@ -488,7 +526,7 @@ async fn multilevel_namespace_poisoned_store_fails_closed() {
 
     let s = format!("{}", rewritten.display_indent());
     assert!(
-        s.starts_with("Filter:"),
+        s.starts_with("Projection:") && s.contains("\n  Filter:"),
         "multi-level table must fail closed with an injected filter, got: {s}"
     );
 }

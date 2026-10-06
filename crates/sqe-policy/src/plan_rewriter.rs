@@ -8,7 +8,7 @@
 //! 3. Removes restricted columns from projections
 //!
 //! This happens BEFORE the optimizer runs, so:
-//! - User predicates CAN push through row filters (same semantics)
+//! - User predicates see a row-filtered row as all NULL (no error oracle)
 //! - User predicates CANNOT push through column masks (expression boundary)
 //! - Restricted columns are invisible (not errors)
 
@@ -18,7 +18,8 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::common::tree_node::{Transformed, TreeNodeRecursion};
-use datafusion::logical_expr::{col, lit, Cast, Expr, LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::utils::conjunction;
+use datafusion::logical_expr::{col, lit, when, Cast, Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion::scalar::ScalarValue;
 use tracing::{debug, warn};
 
@@ -464,6 +465,40 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                             builder = builder.filter(filter_expr.clone()).map_err(|e| {
                                 datafusion::error::DataFusionError::Internal(format!(
                                     "Failed to create policy filter: {e}"
+                                ))
+                            })?;
+                        }
+
+                        // 1b. Read every column through the row filter:
+                        //     `CASE WHEN <row filter> THEN col END`. The
+                        //     optimizer merges the Filter above with the
+                        //     caller's predicates into one conjunction (and may
+                        //     reorder it), and AND evaluates its right side over
+                        //     the whole batch unless few rows pass. A fallible
+                        //     caller predicate would then run on hidden rows and
+                        //     its error would reveal their values. Guarded, a
+                        //     hidden row is all NULL to everything above, wherever
+                        //     the predicate ends up. Cost: caller predicates on a
+                        //     row-filtered table no longer reach scan pruning.
+                        //     `write_predicates::unparse_predicates` recognises
+                        //     this as the projection directly over a Filter.
+                        if let Some(guard) = conjunction(policy.row_filters.iter().cloned()) {
+                            let schema = builder.schema().clone();
+                            let exprs = schema
+                                .iter()
+                                .map(|(qualifier, field)| -> datafusion::error::Result<Expr> {
+                                    let column = Expr::Column(datafusion::common::Column::new(
+                                        qualifier.cloned(),
+                                        field.name(),
+                                    ));
+                                    Ok(when(guard.clone(), column)
+                                        .end()?
+                                        .alias_qualified(qualifier.cloned(), field.name().clone()))
+                                })
+                                .collect::<datafusion::error::Result<Vec<Expr>>>()?;
+                            builder = builder.project(exprs).map_err(|e| {
+                                datafusion::error::DataFusionError::Internal(format!(
+                                    "Failed to create policy row-filter guard: {e}"
                                 ))
                             })?;
                         }

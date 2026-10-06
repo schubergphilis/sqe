@@ -125,6 +125,12 @@ pub fn unparse_predicates(rewritten: &LogicalPlan) -> sqe_core::Result<WritePoli
                 row_filters.push(f.predicate.clone());
                 node = f.input.as_ref();
             }
+            // The projection directly over the row filters is the rewriter's
+            // row-filter guard (`CASE WHEN <filter> THEN col END`), not a
+            // mask; the DML path applies the row filter itself.
+            LogicalPlan::Projection(p) if matches!(p.input.as_ref(), LogicalPlan::Filter(_)) => {
+                node = p.input.as_ref();
+            }
             LogicalPlan::Projection(p) => {
                 for expr in &p.expr {
                     let (alias_name, body) = match expr {
