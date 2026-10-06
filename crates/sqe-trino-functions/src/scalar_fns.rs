@@ -11,9 +11,9 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Int64Array, ListArray};
+use arrow::array::{Array, ArrayRef, AsArray, Int64Array, ListArray};
 use arrow::buffer::{NullBuffer, OffsetBuffer};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Int64Type};
 use datafusion::common::Result as DFResult;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{
@@ -37,10 +37,22 @@ pub fn register_scalar_fns(ctx: &SessionContext) {
     // date/timestamp + INTERVAL form. The one divergence is 2-arg *descending*
     // (`sequence(5, 1)`): Trino auto-descends to [5,4,3,2,1] while
     // `generate_series` returns [] unless an explicit negative step is given.
-    let sequence = (*datafusion::functions_nested::range::gen_series_udf())
-        .clone()
-        .with_aliases(["sequence"]);
+    let sequence = size_capped(
+        &datafusion::functions_nested::range::gen_series_udf(),
+        SizeKind::Range,
+    )
+    .with_aliases(["sequence"]);
     ctx.register_udf(sequence);
+    ctx.register_udf(size_capped(
+        &datafusion::functions_nested::range::range_udf(),
+        SizeKind::Range,
+    ));
+    ctx.register_udf(size_capped(
+        &datafusion::functions::string::repeat(),
+        SizeKind::Repeat,
+    ));
+    ctx.register_udf(size_capped(&datafusion::functions::unicode::lpad(), SizeKind::Pad));
+    ctx.register_udf(size_capped(&datafusion::functions::unicode::rpad(), SizeKind::Pad));
 
     register_higher_order_aliases(ctx);
     crate::higher_order::register_match_predicates(ctx);
@@ -70,6 +82,128 @@ fn register_higher_order_aliases(ctx: &SessionContext) {
         let aliased = HigherOrderUDF::new_from_shared_impl(Arc::clone(func.inner()))
             .with_aliases([trino_alias]);
         ctx.register_higher_order_function(Arc::new(aliased));
+    }
+}
+
+// ─── size caps on value-generating functions ─────────────────────────────────
+
+/// Largest value one row of `sequence` / `generate_series` / `range` (array
+/// elements), `repeat` (bytes) or `lpad` / `rpad` (characters) may build.
+/// DataFusion bounds strings only at `i32::MAX` bytes and ranges not at all,
+/// and constant arguments are folded at plan time on the coordinator, outside
+/// any query memory pool.
+pub const MAX_GENERATED_SIZE: u64 = 100_000_000;
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum SizeKind {
+    Range,
+    Repeat,
+    Pad,
+}
+
+/// A DataFusion UDF whose arguments are checked against
+/// [`MAX_GENERATED_SIZE`] before it runs. Everything else delegates.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct SizeCapped {
+    inner: ScalarUDF,
+    kind: SizeKind,
+}
+
+fn size_capped(udf: &ScalarUDF, kind: SizeKind) -> ScalarUDF {
+    ScalarUDF::from(SizeCapped {
+        inner: udf.clone(),
+        kind,
+    })
+}
+
+/// Argument `idx` as an `Int64Array` with one entry per row.
+fn i64_arg(args: &ScalarFunctionArgs, idx: usize) -> DFResult<Int64Array> {
+    let arr = arrow::compute::cast(&args.args[idx].to_array(args.number_rows)?, &DataType::Int64)?;
+    Ok(arr.as_primitive::<Int64Type>().clone())
+}
+
+impl SizeCapped {
+    /// Largest per-row output size the arguments ask for; `None` when this
+    /// argument shape is not checked.
+    fn requested_size(&self, args: &ScalarFunctionArgs) -> DFResult<Option<u64>> {
+        match self.kind {
+            SizeKind::Pad => {
+                let len = i64_arg(args, 1)?;
+                Ok(len.iter().flatten().map(|n| n.max(0) as u64).max())
+            }
+            SizeKind::Repeat => {
+                let strings = args.args[0].to_array(args.number_rows)?;
+                let bytes = arrow::compute::kernels::length::length(&strings)?;
+                let bytes = arrow::compute::cast(&bytes, &DataType::Int64)?;
+                let bytes = bytes.as_primitive::<Int64Type>();
+                let counts = i64_arg(args, 1)?;
+                Ok(bytes
+                    .iter()
+                    .zip(counts.iter())
+                    .filter_map(|(b, c)| Some((b? as u64).saturating_mul(c?.max(0) as u64)))
+                    .max())
+            }
+            SizeKind::Range => {
+                // ponytail: only the integer form is checked; the date and
+                // timestamp + INTERVAL forms still rely on DataFusion's
+                // allocation check. Add an interval-aware count if those bite.
+                if args.args.iter().any(|a| a.data_type() != DataType::Int64) {
+                    return Ok(None);
+                }
+                let cols = (0..args.args.len())
+                    .map(|i| i64_arg(args, i))
+                    .collect::<DFResult<Vec<_>>>()?;
+                let mut max = 0u64;
+                for row in 0..args.number_rows {
+                    let value = |i: usize| (!cols[i].is_null(row)).then(|| cols[i].value(row));
+                    let (start, stop, step) = match cols.len() {
+                        1 => (Some(0), value(0), Some(1)),
+                        2 => (value(0), value(1), Some(1)),
+                        _ => (value(0), value(1), value(2)),
+                    };
+                    let (Some(start), Some(stop), Some(step)) = (start, stop, step) else {
+                        continue;
+                    };
+                    if step == 0 || (step > 0 && stop < start) || (step < 0 && stop > start) {
+                        continue;
+                    }
+                    let count = (start.abs_diff(stop) / step.unsigned_abs()).saturating_add(1);
+                    max = max.max(count);
+                }
+                Ok(Some(max))
+            }
+        }
+    }
+}
+
+impl ScalarUDFImpl for SizeCapped {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn aliases(&self) -> &[String] {
+        self.inner.aliases()
+    }
+    fn signature(&self) -> &Signature {
+        self.inner.signature()
+    }
+    fn return_type(&self, arg_types: &[DataType]) -> DFResult<DataType> {
+        self.inner.inner().return_type(arg_types)
+    }
+    fn coerce_types(&self, arg_types: &[DataType]) -> DFResult<Vec<DataType>> {
+        self.inner.inner().coerce_types(arg_types)
+    }
+    fn documentation(&self) -> Option<&datafusion::logical_expr::Documentation> {
+        self.inner.inner().documentation()
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let size = self.requested_size(&args)?.unwrap_or(0);
+        if size > MAX_GENERATED_SIZE {
+            return Err(DataFusionError::Execution(format!(
+                "{}: requested size {size} exceeds the limit of {MAX_GENERATED_SIZE}",
+                self.name()
+            )));
+        }
+        self.inner.inner().invoke_with_args(args)
     }
 }
 
@@ -393,6 +527,43 @@ mod tests {
             vec![1, 3, 5, 7]
         );
         assert_eq!(array_i64("SELECT sequence(5, 1, -2)").await, vec![5, 3, 1]);
+    }
+
+    #[tokio::test]
+    async fn value_generating_functions_are_size_capped() {
+        let ctx = crate::duckdb_test_ctx();
+        register_scalar_fns(&ctx);
+        let over = MAX_GENERATED_SIZE + 1;
+        for sql in [
+            format!("SELECT sequence(1, {over})"),
+            format!("SELECT generate_series(1, {over})"),
+            format!("SELECT range({})", over + 1),
+            format!("SELECT repeat('ab', {})", over / 2 + 1),
+            format!("SELECT lpad('x', {over})"),
+            format!("SELECT rpad('x', {over})"),
+        ] {
+            let res = match ctx.sql(&sql).await {
+                Ok(df) => df.collect().await.map(|_| ()),
+                Err(e) => Err(e),
+            };
+            let err = res.expect_err(&sql).to_string();
+            assert!(err.contains("exceeds the limit"), "{sql}: {err}");
+        }
+        // At the cap and below still work.
+        assert_eq!(array_i64("SELECT sequence(1, 3)").await, vec![1, 2, 3]);
+        let batches = ctx
+            .sql("SELECT repeat('ab', 3), lpad('x', 3, '-')")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let text = |i: usize| {
+            let col = arrow::compute::cast(batches[0].column(i), &DataType::Utf8).unwrap();
+            col.as_string::<i32>().value(0).to_string()
+        };
+        assert_eq!(text(0), "ababab");
+        assert_eq!(text(1), "--x");
     }
 
     #[tokio::test]
