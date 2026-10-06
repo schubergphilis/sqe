@@ -199,7 +199,8 @@ pub async fn create_session_context(
     config: &SqeConfig,
     session: &Session,
     // Gates the per-session Hive providers' table visibility (#716). The
-    // Iceberg providers do not read it (#665).
+    // Iceberg providers do not read it (#665). Also governs the statistics
+    // `table_files` / `table_partitions` expose.
     policy_store: Option<&Arc<dyn PolicyStore>>,
     query_tracker: &Arc<QueryTracker>,
     runtime: Option<&Arc<RuntimeEnv>>,
@@ -859,17 +860,53 @@ pub async fn create_session_context(
                     Arc::clone(&effective_session_catalog),
                 )),
             );
+            // table_files / table_partitions expose per-column bounds, counts
+            // and partition values: withhold the ones the caller's policy on
+            // the target governs (masks, restrictions, row filters).
+            let metadata_policy = policy_store.map(|store| {
+                let store = Arc::clone(store);
+                let user = session.user.clone();
+                let precedence = config.policy.mask_precedence;
+                sqe_catalog::iceberg_metadata_tvf::MetadataPolicy::new(
+                    move |namespace,
+                          table,
+                          col_tags|
+                          -> futures::future::BoxFuture<
+                        'static,
+                        sqe_policy::ResolvedPolicy,
+                    > {
+                        let (store, user) = (Arc::clone(&store), user.clone());
+                        Box::pin(async move {
+                            sqe_policy::plan_rewriter::resolve_effective_policy(
+                                store.as_ref(),
+                                &user,
+                                &table,
+                                &namespace,
+                                &col_tags,
+                                precedence,
+                            )
+                            .await
+                        })
+                    },
+                )
+            });
             ctx.register_udtf(
                 "table_files",
-                Arc::new(sqe_catalog::iceberg_metadata_tvf::TableFilesFunction::new(
-                    Arc::clone(&effective_session_catalog),
-                )),
+                Arc::new(
+                    sqe_catalog::iceberg_metadata_tvf::TableFilesFunction::new(Arc::clone(
+                        &effective_session_catalog,
+                    ))
+                    .with_policy(metadata_policy.clone()),
+                ),
             );
             ctx.register_udtf(
                 "table_partitions",
-                Arc::new(sqe_catalog::iceberg_metadata_tvf::TablePartitionsFunction::new(
-                    Arc::clone(&effective_session_catalog),
-                )),
+                Arc::new(
+                    sqe_catalog::iceberg_metadata_tvf::TablePartitionsFunction::new(Arc::clone(
+                        &effective_session_catalog,
+                    ))
+                    .with_policy(metadata_policy),
+                ),
             );
             ctx.register_udtf(
                 "table_refs",
