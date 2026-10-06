@@ -307,7 +307,8 @@ pub fn build_embedded_context_with_mask(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| Arc::new(s.as_bytes().to_vec()));
-    ctx.register_udf(sqe_policy::sha256_udf::sha256_udf(mask_key));
+    // Embedded mode applies no masks, so a keyed user-callable sha256 is safe.
+    ctx.register_udf(sqe_policy::sha256_udf::user_sha256_udf(mask_key));
 
     // Trino dialect compatibility — year(), month(), day_of_week(),
     // url_extract_*, etc. plus the extended set (regexp_extract,
