@@ -359,6 +359,41 @@ async fn set_tags_requires_admin() {
 }
 
 #[tokio::test]
+async fn set_reserved_tblproperties_requires_admin() {
+    // `sqe.column-tags` is the same property SET TAGS writes, so writing it
+    // (or any other `sqe.` key) through SET TBLPROPERTIES needs the same gate.
+    let backend = Arc::new(RecordingBackend::default());
+    let store = Arc::new(RecordingStore::default());
+    let handler = make_handler(backend, store);
+    let session = session_for("alice", vec!["analyst"]);
+
+    let err = handler
+        .execute(
+            &session,
+            "ALTER TABLE cat.ns.tbl SET TBLPROPERTIES ('SQE.column-tags' = '{}')",
+            None,
+        )
+        .await
+        .expect_err("non-admin must not write reserved sqe. properties");
+    assert!(err.to_string().contains("403"), "expected 403: {err}");
+
+    // A non-reserved key is not admin-gated (it fails later, on the missing
+    // catalog, not on the admin gate).
+    let err = handler
+        .execute(
+            &session,
+            "ALTER TABLE cat.ns.tbl SET TBLPROPERTIES ('write.format.default' = 'parquet')",
+            None,
+        )
+        .await
+        .expect_err("no catalog is wired");
+    assert!(
+        !err.to_string().contains("requires one of admin roles"),
+        "unexpected admin gate: {err}"
+    );
+}
+
+#[tokio::test]
 async fn check_access_self_is_allowed() {
     let backend = Arc::new(RecordingBackend::default());
     let store = Arc::new(RecordingStore::default());

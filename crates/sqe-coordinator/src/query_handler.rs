@@ -205,6 +205,26 @@ fn is_sorted_write(kind: &StatementKind) -> bool {
     }
 }
 
+/// True when an `ALTER TABLE ... SET TBLPROPERTIES` writes a reserved
+/// `sqe.`-prefixed key. `sqe.column-tags` drives tag masks, so these keys are
+/// policy state and need the same admin gate as SET/UNSET TAGS.
+fn sets_reserved_table_property(stmt: &Statement) -> bool {
+    let Statement::AlterTable(at) = stmt else {
+        return false;
+    };
+    at.operations.iter().any(|op| match op {
+        sqlparser::ast::AlterTableOperation::SetTblProperties { table_properties } => {
+            table_properties.iter().any(|p| match p {
+                sqlparser::ast::SqlOption::KeyValue { key, .. } => {
+                    key.value.to_ascii_lowercase().starts_with("sqe.")
+                }
+                _ => false,
+            })
+        }
+        _ => false,
+    })
+}
+
 /// A compile-time firewall, not an extension point: keep it even with one impl.
 ///
 /// `ChannelObserver` owns an `mpsc::Sender<LineageMsg>`, and `LineageMsg`
@@ -1692,6 +1712,12 @@ impl QueryHandler {
                     Ok(vec![])
                 }
                 StatementKind::AlterTableProps(stmt) => {
+                    if sets_reserved_table_property(stmt) {
+                        self.require_admin(
+                            session,
+                            "ALTER TABLE ... SET TBLPROPERTIES ('sqe.*')",
+                        )?;
+                    }
                     self.catalog_ops.set_table_properties(session, stmt).await?;
                     crate::session_context::invalidate_session_cache(&session.user.username).await;
                     // Flush cached tag policies so a SET TBLPROPERTIES on sqe.column-tags
