@@ -52,7 +52,7 @@ pub fn select_scan_credentials(
     storage: &StorageConfig,
     table: &Table,
 ) -> Option<ScanCredentials> {
-    let vended = vended_credentials(table);
+    let vended = vended_credentials(table, storage);
     select_with(mode, storage, vended)
 }
 
@@ -100,12 +100,21 @@ fn warn_static_once() {
 
 /// Vended S3 credentials from the table's FileIO properties, when the
 /// catalog supplied them at LOAD_TABLE time.
-fn vended_credentials(table: &Table) -> Option<ScanCredentials> {
-    vended_from_props(table.file_io().config().props())
+fn vended_credentials(table: &Table, storage: &StorageConfig) -> Option<ScanCredentials> {
+    vended_from_props(table.file_io().config().props(), storage)
 }
 
-fn vended_from_props(props: &std::collections::HashMap<String, String>) -> Option<ScanCredentials> {
-    let access = props.get(VENDED_ACCESS_KEY).filter(|v| !v.is_empty())?;
+/// The FileIO props merge the catalog's own properties (which carry the
+/// `[storage]` static pair when vended credentials are not required) with
+/// the LOAD_TABLE `config`. A key pair equal to the static one therefore
+/// came from SQE's config, not the catalog, and is not vended.
+fn vended_from_props(
+    props: &std::collections::HashMap<String, String>,
+    storage: &StorageConfig,
+) -> Option<ScanCredentials> {
+    let access = props
+        .get(VENDED_ACCESS_KEY)
+        .filter(|v| !v.is_empty() && **v != storage.s3_access_key)?;
     let secret = props.get(VENDED_SECRET_KEY).filter(|v| !v.is_empty())?;
     let token = props.get(VENDED_SESSION_TOKEN).cloned().unwrap_or_default();
     let expires_at = props
@@ -143,7 +152,7 @@ mod tests {
             VENDED_EXPIRES_AT_MS.to_string(),
             "1893456000000".to_string(),
         );
-        vended_from_props(&props)
+        vended_from_props(&props, &storage(true))
     }
 
     #[test]
@@ -153,7 +162,19 @@ mod tests {
         assert_eq!(c.access_key(), "ASIAVENDED");
         assert_eq!(c.session_token(), "sts-token");
         assert_eq!(c.expires_at(), Some(1_893_456_000));
-        assert!(vended_from_props(&HashMap::new()).is_none());
+        assert!(vended_from_props(&HashMap::new(), &storage(true)).is_none());
+    }
+
+    /// The `[storage]` static pair merged into FileIO props is not vended.
+    #[test]
+    fn static_keys_in_fileio_props_are_not_vended() {
+        let mut props = HashMap::new();
+        props.insert(VENDED_ACCESS_KEY.to_string(), "AKIASTATIC".to_string());
+        props.insert(VENDED_SECRET_KEY.to_string(), "static-secret".to_string());
+        let s = storage(true);
+        let vended = vended_from_props(&props, &s);
+        assert!(vended.is_none());
+        assert_eq!(select_with(DistributedCredentialMode::Vended, &s, vended), None);
     }
 
     /// 401: `vended` never falls back to the static pair; `static` never
