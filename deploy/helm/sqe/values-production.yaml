@@ -51,6 +51,11 @@ config:
     # backend reads, #732); templating fails while that url is empty. Password:
     # SQE_ACCESS_CONTROL__RANGER__ADMIN_PASSWORD env override.
     backend: ranger
+  # The chart serves the Trino HTTP port in plaintext; production_mode
+  # refuses that unless a TLS-terminating ingress fronts it. Set false (and
+  # drop trino_http_port) only once the engine terminates TLS itself.
+  security:
+    allow_plaintext_behind_tls_proxy: true
   # To run WITHOUT a policy engine or grant backend on purpose, say so
   # explicitly instead; production_mode then starts and logs the disabled
   # enforcement at warn level:

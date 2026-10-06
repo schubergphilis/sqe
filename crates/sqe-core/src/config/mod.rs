@@ -4588,6 +4588,15 @@ pub struct SecurityConfig {
     /// cleartext and can be captured and replayed by an on-path observer.
     #[serde(default)]
     pub allow_insecure_transport: bool,
+    /// Opt-in escape hatch for the client-facing plaintext listeners (Trino
+    /// HTTP, Quack without `[coordinator.tls]`, MCP without TLS or on the web
+    /// port). Leaving this `false` (the default) makes `production_mode`
+    /// refuse to start with any of them enabled on a non-loopback address,
+    /// because user passwords and bearer tokens would cross it in cleartext.
+    /// Set `true` only when a TLS-terminating proxy or ingress is the sole
+    /// route to those ports; the choice is then visible in config diffs.
+    #[serde(default)]
+    pub allow_plaintext_behind_tls_proxy: bool,
     /// Opt-in escape hatch for the shared-service-identity auth mode (SEC-03).
     /// The config-held `client_credentials` auth provider obtains one bearer
     /// token from server-baked credentials and hands the SAME token to every
@@ -8605,7 +8614,36 @@ s3_secret_key = "configured-secret"
         config.access_control.backend = AccessControlBackend::Polaris;
         // Finding 751: inline TVF credentials default on; hardened turns it off.
         config.storage.tvf.allow_inline_credentials = false;
+        // The fixture's Trino HTTP listener is plaintext; acknowledge the
+        // TLS-terminating proxy a real deployment puts in front.
+        config.security.allow_plaintext_behind_tls_proxy = true;
         config
+    }
+
+    #[test]
+    fn validate_production_rejects_plaintext_client_listeners() {
+        let mut config = valid_production_config();
+        config.security.allow_plaintext_behind_tls_proxy = false;
+        config.coordinator.trino_http_port = 8080;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(
+            err.contains("coordinator.trino_http_port")
+                && err.contains("allow_plaintext_behind_tls_proxy"),
+            "got: {err}"
+        );
+
+        // TLS-only Trino (plain port off) passes.
+        config.coordinator.trino_http_port = 0;
+        config.coordinator.trino_https_port = 8443;
+        assert!(config.validate_production().is_ok());
+
+        // Plaintext Quack is refused too.
+        config.coordinator.quack_port = 9494;
+        let err = config.validate_production().unwrap_err().to_string();
+        assert!(err.contains("coordinator.quack_port"), "got: {err}");
+
+        config.security.allow_plaintext_behind_tls_proxy = true;
+        assert!(config.validate_production().is_ok());
     }
 
     /// Finding 751: the three switches production mode used to let through.
