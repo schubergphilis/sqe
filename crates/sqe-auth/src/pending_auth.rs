@@ -33,6 +33,10 @@ pub enum PendingAuth {
         state: String,
         /// IdP authorization URL the browser is redirected to on `initiate`.
         authorization_url: String,
+        /// Address of the client that requested the challenge, shown on the
+        /// interstitial page so the browser user can spot a session minted
+        /// by someone else.
+        requester_ip: String,
         created_at: Instant,
     },
     /// Callback claimed; token exchange is in flight. Polling remains pending.
@@ -82,6 +86,7 @@ impl PendingAuthStore {
         code_verifier: String,
         state: String,
         authorization_url: String,
+        requester_ip: String,
     ) {
         self.store.insert(
             auth_id.to_string(),
@@ -89,6 +94,7 @@ impl PendingAuthStore {
                 code_verifier,
                 state,
                 authorization_url,
+                requester_ip,
                 created_at: Instant::now(),
             })),
         );
@@ -188,6 +194,7 @@ mod tests {
             "verifier".to_string(),
             "state-abc".to_string(),
             String::new(),
+            String::new(),
         );
         let result = store.poll("auth-1");
         assert!(result.is_some());
@@ -207,7 +214,7 @@ mod tests {
     #[test]
     fn complete_overwrites_pending() {
         let store = PendingAuthStore::new(Duration::from_secs(60));
-        store.insert_pending("auth-1", "v".to_string(), "s".to_string(), String::new());
+        store.insert_pending("auth-1", "v".to_string(), "s".to_string(), String::new(), String::new());
         store.complete(
             "auth-1",
             TokenSet {
@@ -229,7 +236,7 @@ mod tests {
     #[test]
     fn fail_overwrites_pending() {
         let store = PendingAuthStore::new(Duration::from_secs(60));
-        store.insert_pending("auth-1", "v".to_string(), "s".to_string(), String::new());
+        store.insert_pending("auth-1", "v".to_string(), "s".to_string(), String::new(), String::new());
         store.fail("auth-1", "user denied".to_string());
         match store.poll("auth-1").unwrap() {
             PendingAuth::Failed(msg) => assert_eq!(msg, "user denied"),
@@ -240,7 +247,7 @@ mod tests {
     #[test]
     fn remove_deletes_session() {
         let store = PendingAuthStore::new(Duration::from_secs(60));
-        store.insert_pending("auth-1", "v".to_string(), "s".to_string(), String::new());
+        store.insert_pending("auth-1", "v".to_string(), "s".to_string(), String::new(), String::new());
         store.remove("auth-1");
         assert!(store.poll("auth-1").is_none());
     }
@@ -262,7 +269,7 @@ mod tests {
     #[test]
     fn concurrent_pollers_have_one_token_winner() {
         let store = Arc::new(PendingAuthStore::new(Duration::from_secs(60)));
-        store.insert_pending("auth", "verifier".into(), "auth".into(), String::new());
+        store.insert_pending("auth", "verifier".into(), "auth".into(), String::new(), String::new());
         assert!(store.complete("auth", tokens()));
         let barrier = Arc::new(std::sync::Barrier::new(16));
         let winners = std::thread::scope(|scope| {
@@ -288,7 +295,7 @@ mod tests {
     #[test]
     fn pending_and_exchanging_polling_are_repeatable_and_callback_is_claimed_once() {
         let store = PendingAuthStore::new(Duration::from_secs(60));
-        store.insert_pending("state", "verifier".into(), "state".into(), String::new());
+        store.insert_pending("state", "verifier".into(), "state".into(), String::new(), String::new());
         for _ in 0..3 {
             assert!(matches!(
                 store.poll_and_consume("state"),
@@ -315,7 +322,7 @@ mod tests {
     #[test]
     fn late_completion_cannot_resurrect_removed_flow() {
         let store = PendingAuthStore::new(Duration::from_secs(60));
-        store.insert_pending("state", "verifier".into(), "state".into(), String::new());
+        store.insert_pending("state", "verifier".into(), "state".into(), String::new(), String::new());
         store.take_callback_verifier("state").unwrap();
         store.remove("state");
         assert!(!store.complete("state", tokens()));
@@ -327,7 +334,7 @@ mod tests {
     #[test]
     fn completion_preserves_original_flow_deadline() {
         let store = PendingAuthStore::new(Duration::from_millis(1000));
-        store.insert_pending("state", "verifier".into(), "state".into(), String::new());
+        store.insert_pending("state", "verifier".into(), "state".into(), String::new(), String::new());
         store.take_callback_verifier("state").unwrap();
         std::thread::sleep(Duration::from_millis(600));
         assert!(store.complete("state", tokens()));
@@ -342,7 +349,7 @@ mod tests {
     #[test]
     fn concurrent_callbacks_claim_one_verifier() {
         let store = Arc::new(PendingAuthStore::new(Duration::from_secs(60)));
-        store.insert_pending("state", "verifier".into(), "state".into(), String::new());
+        store.insert_pending("state", "verifier".into(), "state".into(), String::new(), String::new());
         let barrier = Arc::new(std::sync::Barrier::new(8));
         let winners = std::thread::scope(|scope| {
             let tasks: Vec<_> = (0..8)
@@ -369,6 +376,7 @@ mod tests {
             code_verifier: "verifier-canary".into(),
             state: "state-canary".into(),
             authorization_url: "url-canary".into(),
+            requester_ip: String::new(),
             created_at: Instant::now(),
         };
         let debug = format!("{state:?}");

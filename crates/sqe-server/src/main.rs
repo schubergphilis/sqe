@@ -1035,6 +1035,9 @@ struct AuthenticatorAdapter {
     /// `None` (some unit-test fixtures), Basic auth falls back to the legacy
     /// `Authenticator`.
     bearer_provider: Option<Arc<dyn sqe_auth::AuthProvider>>,
+    /// The chain's pre-auth limiter, also spent on every OAuth2 challenge an
+    /// unauthenticated request mints, keyed `(peer, "oauth2-challenge")`.
+    auth_rate_limiter: Arc<sqe_coordinator::rate_limiter::AuthRateLimiter>,
 }
 
 /// The chain-level pre-auth limiter (#562) refuses with `RateLimited`; the
@@ -1104,6 +1107,12 @@ impl TrinoAuthenticator for AuthenticatorAdapter {
         // Fall back to the raw JWT as the catalog token when the provider did
         // not supply one (passthrough to Polaris).
         Ok(identity.into_session(Some(token)))
+    }
+
+    async fn admit_auth_challenge(&self, peer_ip: &str) -> Result<(), sqe_core::SqeError> {
+        self.auth_rate_limiter
+            .check(peer_ip, "oauth2-challenge")
+            .map_err(|_| trino_auth_error(sqe_auth::AuthError::RateLimited, ""))
     }
 }
 
@@ -2345,6 +2354,7 @@ async fn run_coordinator(config: SqeConfig) -> anyhow::Result<()> {
         let auth_adapter = Arc::new(AuthenticatorAdapter {
             authenticator: authenticator.clone(),
             bearer_provider: bearer_provider.clone(),
+            auth_rate_limiter: Arc::clone(&auth_rate_limiter),
         });
         let handler_adapter = Arc::new(QueryHandlerAdapter {
             handler: query_handler.clone(),
