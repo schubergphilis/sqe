@@ -2219,7 +2219,8 @@ pub enum AuthProviderConfig {
         /// AWS region for STS endpoint. Default: `"us-east-1"`.
         #[serde(default = "default_aws_region")]
         region: String,
-        /// Whether to validate credentials via STS call. Default: true.
+        /// Must stay `true` (the default): credentials are always validated
+        /// via STS, and `false` is rejected at startup.
         #[serde(default = "default_true")]
         validate_with_sts: bool,
     },
