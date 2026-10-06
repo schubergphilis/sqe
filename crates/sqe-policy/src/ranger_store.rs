@@ -5,10 +5,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use chrono_tz::Tz;
 use datafusion::logical_expr::{lit, Expr};
 use moka::future::Cache;
 use reqwest::Client;
@@ -92,6 +94,26 @@ pub(crate) struct RangerPolicy {
     /// Grantees carved out of `denyPolicyItems`.
     #[serde(rename = "denyExceptions", default)]
     pub(crate) deny_exceptions: Vec<AccessPolicyItem>,
+    /// Time windows the policy is in force. Empty means always. Read only for
+    /// access policies, see `policy_schedule_active`.
+    #[serde(rename = "validitySchedules", default)]
+    pub(crate) validity_schedules: Vec<ValiditySchedule>,
+}
+
+/// One Ranger `validitySchedules` entry. Times use Ranger's
+/// `yyyy/MM/dd HH:mm:ss` format in `timeZone` (UTC when unset).
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct ValiditySchedule {
+    #[serde(rename = "startTime", default)]
+    pub(crate) start_time: Option<String>,
+    #[serde(rename = "endTime", default)]
+    pub(crate) end_time: Option<String>,
+    #[serde(rename = "timeZone", default)]
+    pub(crate) time_zone: Option<String>,
+    /// Recurring windows. Not modelled: a schedule carrying any is treated as
+    /// unevaluable.
+    #[serde(default)]
+    pub(crate) recurrences: Vec<serde_json::Value>,
 }
 
 /// One grantee list with the access types it carries, the shape shared by the
@@ -107,6 +129,10 @@ pub(crate) struct AccessPolicyItem {
     pub(crate) groups: Vec<String>,
     #[serde(default)]
     pub(crate) accesses: Vec<RangerAccess>,
+    /// Ranger policy conditions (IP range, expressions, ...). SQE evaluates
+    /// none of them, so an allow item carrying any never grants.
+    #[serde(default)]
+    pub(crate) conditions: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -798,18 +824,103 @@ fn access_grants_table_type(
         })
     };
 
+    // Items that widen access (allow items, deny exceptions) do not count when
+    // they carry conditions SQE cannot evaluate. Deny items and allow
+    // exceptions keep ignoring conditions, which only ever narrows access.
+    let widens = |p: &RangerPolicy, items: &[AccessPolicyItem]| {
+        items.iter().any(|i| {
+            if !(item_grants_access(i, access_type) && item_matches(&i.users, &i.roles, &i.groups, user)) {
+                return false;
+            }
+            if !i.conditions.is_empty() {
+                warn_unevaluated_conditions(p);
+                return false;
+            }
+            true
+        })
+    };
+
+    // A policy outside its validity schedule is skipped. A schedule SQE cannot
+    // evaluate (`None`) still lets a deny decide but never lets an allow grant.
+    let now = Utc::now();
     for p in matching(true) {
-        if applies(&p.deny_policy_items) && !applies(&p.deny_exceptions) {
+        if policy_schedule_active(p, now) == Some(false) {
+            continue;
+        }
+        if applies(&p.deny_policy_items) && !widens(p, &p.deny_exceptions) {
             debug!(policy_id = p.id, policy = %p.name, user = %user.username, table, database, "Ranger deny item matched");
             return false;
         }
     }
     for p in matching(false) {
-        if applies(&p.policy_items) && !applies(&p.allow_exceptions) {
+        if policy_schedule_active(p, now) != Some(true) {
+            continue;
+        }
+        if widens(p, &p.policy_items) && !applies(&p.allow_exceptions) {
             return true;
         }
     }
     false
+}
+
+/// Warn once per policy id (per process) that an allow item was not honoured
+/// because it carries Ranger conditions.
+fn warn_unevaluated_conditions(p: &RangerPolicy) {
+    static WARNED: OnceLock<Mutex<HashSet<i64>>> = OnceLock::new();
+    let first = WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .map_or(true, |mut seen| seen.insert(p.id));
+    if first {
+        warn!(
+            policy_id = p.id,
+            policy = %p.name,
+            "Ranger allow item has conditions SQE cannot evaluate; it grants nothing (fail-closed)"
+        );
+    }
+}
+
+/// Whether `now` falls in the policy's `validitySchedules`: `Some(true)` when
+/// there are none or one covers `now`, `Some(false)` when every schedule was
+/// evaluated and none covers it, `None` when no schedule covers `now` and at
+/// least one could not be evaluated (bad timestamp, unknown time zone,
+/// recurrences).
+fn policy_schedule_active(p: &RangerPolicy, now: DateTime<Utc>) -> Option<bool> {
+    let mut unknown = false;
+    for s in &p.validity_schedules {
+        match schedule_covers(s, now) {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => unknown = true,
+        }
+    }
+    if p.validity_schedules.is_empty() || !unknown {
+        Some(p.validity_schedules.is_empty())
+    } else {
+        None
+    }
+}
+
+fn schedule_covers(s: &ValiditySchedule, now: DateTime<Utc>) -> Option<bool> {
+    if !s.recurrences.is_empty() {
+        return None;
+    }
+    let tz: Tz = match s.time_zone.as_deref().filter(|z| !z.is_empty()) {
+        Some(z) => z.parse().ok()?,
+        None => Tz::UTC,
+    };
+    // Outer None: unparseable. Inner None: open-ended bound.
+    let at = |t: &Option<String>| -> Option<Option<DateTime<Utc>>> {
+        match t.as_deref().filter(|t| !t.is_empty()) {
+            None => Some(None),
+            Some(t) => {
+                let local = NaiveDateTime::parse_from_str(t, "%Y/%m/%d %H:%M:%S").ok()?;
+                Some(Some(tz.from_local_datetime(&local).earliest()?.with_timezone(&Utc)))
+            }
+        }
+    };
+    let (start, end) = (at(&s.start_time)?, at(&s.end_time)?);
+    Some(start.is_none_or(|t| t <= now) && end.is_none_or(|t| now < t))
 }
 
 /// Build a `ResolvedPolicy` from an already-fetched bundle. Pure (no I/O), so it
@@ -2519,6 +2630,75 @@ mod tests {
         // items (3, 4, 5), the exceptions and the role/user items (6) are not
         // at risk.
         assert_eq!(count_group_only_items(&access_bundle()), 3);
+    }
+
+    /// One public `select` access policy on `glue.bi.t`, with `extra` JSON
+    /// spliced into the policy object and `item_extra` into its allow item.
+    fn one_policy_bundle(extra: &str, item_extra: &str) -> ServicePolicies {
+        serde_json::from_str(&format!(
+            r#"{{"policies":[{{"id":42,"name":"p","policyType":0,"isEnabled":true{extra},
+              "resources":{{"database":{{"values":["glue.bi"]}},"table":{{"values":["t"]}}}},
+              "policyItems":[{{"groups":["public"],"accesses":[{{"type":"select","isAllowed":true}}]{item_extra}}}]}}]}}"#
+        ))
+        .unwrap()
+    }
+
+    fn denied(bundle: &ServicePolicies) -> bool {
+        crate::plan_rewriter::policy_denies_all(&resolve_from_bundle(bundle, &user("carol", &[]), "t", "glue.bi", true))
+    }
+
+    #[test]
+    fn an_allow_item_with_conditions_grants_nothing() {
+        assert!(!denied(&one_policy_bundle("", "")), "control: the plain item grants");
+        let conditional = one_policy_bundle("", r#","conditions":[{"type":"ip-range","values":["10.0.0.0/8"]}]"#);
+        assert!(denied(&conditional), "an unevaluated condition must not grant");
+        assert!(!denied(&one_policy_bundle("", r#","conditions":[]"#)), "an empty list is no condition");
+    }
+
+    #[test]
+    fn validity_schedules_gate_the_allow() {
+        let sched = |s: &str| one_policy_bundle(&format!(r#","validitySchedules":[{s}]"#), "");
+        assert!(denied(&sched(r#"{"startTime":"2000/01/01 00:00:00","endTime":"2001/01/01 00:00:00","timeZone":"UTC"}"#)), "expired");
+        assert!(denied(&sched(r#"{"startTime":"2999/01/01 00:00:00"}"#)), "not started");
+        assert!(!denied(&sched(r#"{"startTime":"2000/01/01 00:00:00","endTime":"2999/01/01 00:00:00","timeZone":"Europe/Amsterdam"}"#)), "in force");
+        assert!(denied(&sched(r#"{"endTime":"not a date"}"#)), "unparseable schedule fails closed");
+        assert!(denied(&sched(r#"{"endTime":"2999/01/01 00:00:00","timeZone":"Mars/Olympus"}"#)), "unknown zone fails closed");
+        assert!(denied(&sched(r#"{"recurrences":[{"interval":{"hours":1}}]}"#)), "recurrences are not modelled");
+        // Any one in-force schedule is enough.
+        assert!(!denied(&sched(r#"{"endTime":"bad"},{"endTime":"2999/01/01 00:00:00"}"#)));
+    }
+
+    #[test]
+    fn an_expired_deny_no_longer_denies_but_an_unparseable_one_still_does() {
+        let bundle = |sched: &str| -> ServicePolicies {
+            serde_json::from_str(&format!(
+                r#"{{"policies":[
+                  {{"id":1,"policyType":0,"isEnabled":true,
+                    "resources":{{"database":{{"values":["glue.bi"]}},"table":{{"values":["t"]}}}},
+                    "policyItems":[{{"groups":["public"],"accesses":[{{"type":"select","isAllowed":true}}]}}]}},
+                  {{"id":2,"policyType":0,"isEnabled":true,"validitySchedules":[{sched}],
+                    "resources":{{"database":{{"values":["glue.bi"]}},"table":{{"values":["t"]}}}},
+                    "denyPolicyItems":[{{"groups":["public"],"accesses":[{{"type":"select","isAllowed":true}}]}}]}}]}}"#
+            ))
+            .unwrap()
+        };
+        assert!(!denied(&bundle(r#"{"endTime":"2001/01/01 00:00:00"}"#)));
+        assert!(denied(&bundle(r#"{"endTime":"garbage"}"#)));
+        assert!(denied(&bundle(r#"{"endTime":"2999/01/01 00:00:00"}"#)));
+    }
+
+    #[test]
+    fn schedule_bounds_are_read_in_the_schedule_time_zone() {
+        // 2026-06-01 10:00 UTC is 12:00 in Amsterdam (CEST, UTC+2).
+        let now = Utc.with_ymd_and_hms(2026, 6, 1, 10, 0, 0).unwrap();
+        let s = |start: &str, tz: &str| ValiditySchedule {
+            start_time: Some(start.into()),
+            time_zone: Some(tz.into()),
+            ..Default::default()
+        };
+        assert_eq!(schedule_covers(&s("2026/06/01 11:00:00", "UTC"), now), Some(false));
+        assert_eq!(schedule_covers(&s("2026/06/01 11:00:00", "Europe/Amsterdam"), now), Some(true));
+        assert_eq!(schedule_covers(&s("2026-06-01 11:00:00", "UTC"), now), None);
     }
 
     // --- map_mask arm tests ---
