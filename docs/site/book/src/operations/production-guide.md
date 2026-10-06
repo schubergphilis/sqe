@@ -308,6 +308,7 @@ Route audit logs and traces through an OpenTelemetry Collector when possible. Au
 | `no-insecure-transport` | `security.allow_insecure_transport = true` (cleartext distributed hops expose bearer tokens, worker secrets and vended S3 credentials). |
 | `no-shared-service-identity` | Config-held `client_credentials` in `[auth].providers` or `[catalog(s).auth]` without `security.allow_shared_service_identity = true` (one identity for every user at Polaris/S3). |
 | `worker-secret-required` | `coordinator.worker_urls` set with an empty `coordinator.worker_secret` and `allow_unauthenticated_workers = true` (any TCP-reachable client may register as a worker). |
+| `no-unauthenticated-worker` | `worker.allow_unauthenticated = true` (a worker without a secret accepts scan tickets and credential refreshes from any TCP-reachable client). |
 | `max-sql-bytes` | `query.max_sql_bytes = 0` (disables the pre-parse statement size cap). |
 | `explicit-distributed-credentials` | `coordinator.distributed_credentials = auto` with workers configured (ships the shared `[storage]` keys to workers for tables without vended credentials). |
 | `vended-credentials-required` | A REST catalog without `require_vended_credentials = true` (FileIO would fall back to the shared `[storage]` S3 keys). |
