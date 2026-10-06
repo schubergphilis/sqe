@@ -133,6 +133,18 @@ pub const PRODUCTION_RULES: &[ProductionRule] = &[
         },
     },
     ProductionRule {
+        name: "no-unauthenticated-worker",
+        summary: "`worker.allow_unauthenticated` must be false (a worker without a secret accepts scan tickets and credential refreshes from any TCP-reachable client).",
+        check: |c| {
+            c.worker.allow_unauthenticated.then(|| {
+                "production_mode: worker.allow_unauthenticated must be false (a worker \
+                 without a secret accepts scan tickets and credential refreshes from any \
+                 TCP-reachable client, leaking user S3 credentials)"
+                    .to_string()
+            })
+        },
+    },
+    ProductionRule {
         name: "max-sql-bytes",
         summary: "`query.max_sql_bytes` must be > 0 (0 disables the pre-parse statement size cap).",
         check: |c| {
