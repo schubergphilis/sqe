@@ -20,13 +20,11 @@ See [Kubernetes & Helm](../deployment/kubernetes.md#the-coordinator-is-a-single-
 
 ### Read-path S3 access and `require_vended_credentials`
 
-Writes already consume per-table credentials vended by the catalog: INSERT, MERGE, and DELETE go through the loaded table's file IO, which carries the vended credentials.
+With `[catalog] access_delegation = "vended-credentials"` (or `require_vended_credentials = true`, which implies it) SQE asks the catalog for table-scoped credentials on every loadTable. Vended keys beat the configured `[storage]` pair for Iceberg scans, writes, and distributed scan tickets, and SQE reloads the table before they expire. `require_vended_credentials` also keeps the `[storage]` keys and the AWS SDK fallback chain out of Iceberg FileIO entirely; `production_mode` requires it on every REST catalog (issue #395). Set `[coordinator] distributed_credentials = "vended"` too, so workers never receive the static key.
 
-For Iceberg FileIO (single-node scans, metadata, writes), set `[catalog] require_vended_credentials = true` so the engine never injects the configured `[storage]` access and secret keys, and so FileIO does not load `AWS_*` env, `~/.aws/config`, IRSA, or IMDSv2. FileIO then needs Polaris-vended STS or remote signing. `production_mode` requires the flag on every REST catalog (issue #395). Dev and single-tenant stacks can leave it false and keep the static-key fallback.
+Paths that do not load an Iceberg table have nothing to vend and still use the `[storage]` pair or the SDK chain: file TVFs (gated by `[storage.tvf] allowed_object_store_prefixes`), Hive external tables, and distributed compaction. The vendored REST client does not call the catalog's credential-refresh endpoint; refresh is a full table reload.
 
-Distributed `ScanTask`s still carry the configured `[storage]` key to workers. Per-user read credential vending on that path (put the loadTable STS triple on the ticket instead of the static key) is designed but not yet built. Multi-tenant clusters with workers still need that work; the FileIO flag does not close the worker ticket.
-
-See [S3 Credential Vending](../design-notes/s3vending.md) for the remaining ScanTask work, and the [security model](../architecture/security-model.md) for where this sits in the trust boundary.
+See [S3 Credential Vending](../design-notes/s3vending.md) for precedence, expiry, and worker details, and the [security model](../architecture/security-model.md) for where this sits in the trust boundary.
 
 ### Fine-grained policy enforcement is off by default
 

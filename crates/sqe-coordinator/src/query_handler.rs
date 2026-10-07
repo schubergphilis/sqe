@@ -4699,6 +4699,11 @@ impl QueryHandler {
             if let Some(tracker) = &self.credential_tracker {
                 exec = exec.with_credential_tracker(Arc::clone(tracker));
             }
+            // The refresh task renews keys by reloading the table through
+            // the same session catalog (same user bearer) the scan came from.
+            if let Some(reloader) = iceberg_scan.table_reloader() {
+                exec = exec.with_credential_reloader(reloader.clone());
+            }
         }
         info!(
             query_id = %query_id,

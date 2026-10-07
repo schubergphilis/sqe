@@ -181,10 +181,19 @@ default_table_format_version = 2  # 2 (default) or 3 for Iceberg v3 tables
 # listings.
 # namespace_visibility_filter = true
 #
+# Ask the catalog to vend table-scoped S3 credentials on loadTable
+# (sends X-Iceberg-Access-Delegation: vended-credentials). Vended keys
+# win over the [storage] pair; tables the catalog returns no keys for
+# keep the static pair. "none" (default) or "vended-credentials".
+# Env: SQE_CATALOG__ACCESS_DELEGATION.
+# access_delegation = "none"
+#
 # When true, Iceberg FileIO never receives the configured [storage]
-# access/secret keys. Reads then need Polaris-vended STS (or remote
-# signing). Default false for single-tenant / local stacks.
-# production_mode requires this on every REST catalog (issue #395).
+# access/secret keys and the delegation header is always sent. Reads
+# then need catalog-vended STS. Default false for single-tenant / local
+# stacks. production_mode requires this on every REST catalog (issue
+# #395). Pair it with [coordinator] distributed_credentials = "vended"
+# so workers never receive the static key either.
 # require_vended_credentials = false
 
 [storage]

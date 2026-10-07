@@ -2835,11 +2835,55 @@ pub struct CatalogConfig {
     #[serde(default)]
     pub storage: Option<StorageConfig>,
     /// When true, never inject the configured `[storage]` access/secret
-    /// keys into Iceberg FileIO. Reads then require Polaris-vended STS
-    /// (or remote signing). Default false for single-tenant / local
-    /// stacks. `production_mode` requires this to be true (issue #395).
+    /// keys into Iceberg FileIO. Reads then require catalog-vended STS
+    /// credentials. Implies `access_delegation = "vended-credentials"`.
+    /// Default false for single-tenant / local stacks. `production_mode`
+    /// requires this to be true (issue #395).
     #[serde(default)]
     pub require_vended_credentials: bool,
+    /// Ask the REST catalog to vend table-scoped storage credentials: sends
+    /// `X-Iceberg-Access-Delegation: vended-credentials` on every catalog
+    /// request. Vended keys then win over the `[storage]` static pair for
+    /// that table, and the static pair stays the fallback for tables the
+    /// catalog vends nothing for. `"none"` (default) sends no header.
+    /// `require_vended_credentials = true` turns this on and also removes
+    /// the static fallback. REST backend only.
+    #[serde(default)]
+    pub access_delegation: AccessDelegation,
+}
+
+/// Value of the Iceberg REST `X-Iceberg-Access-Delegation` header SQE asks
+/// for. `remote-signing` is not supported.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AccessDelegation {
+    /// Send no delegation header (static `[storage]` keys).
+    #[default]
+    None,
+    /// Ask for vended, table-scoped credentials.
+    VendedCredentials,
+}
+
+impl AccessDelegation {
+    /// The header value, or `None` when no header is sent.
+    pub fn header_value(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::VendedCredentials => Some("vended-credentials"),
+        }
+    }
+}
+
+impl CatalogConfig {
+    /// The delegation SQE asks the catalog for: `require_vended_credentials`
+    /// implies vended credentials whatever `access_delegation` says.
+    pub fn effective_access_delegation(&self) -> AccessDelegation {
+        if self.require_vended_credentials {
+            AccessDelegation::VendedCredentials
+        } else {
+            self.access_delegation
+        }
+    }
 }
 
 /// Tuning for the two-tier dynamic runtime-filter pushdown (MR #220, issue #132).
@@ -7631,6 +7675,7 @@ partial_progress_batch = 5
                 auth: None,
                 storage: None,
                 require_vended_credentials: false,
+                access_delegation: AccessDelegation::None,
             },
             catalogs: HashMap::new(),
             storage: StorageConfig::default(),
@@ -9121,6 +9166,7 @@ s3_secret_key = "configured-secret"
                 auth: None,
                 storage: None,
                 require_vended_credentials: false,
+                access_delegation: AccessDelegation::None,
             },
         );
         let flat = cfg.flattened_catalogs();
@@ -9158,6 +9204,7 @@ s3_secret_key = "configured-secret"
                     auth: None,
                     storage: None,
                     require_vended_credentials: false,
+                    access_delegation: AccessDelegation::None,
                 },
             );
         }
@@ -9202,6 +9249,7 @@ s3_secret_key = "configured-secret"
                 auth: None,
                 storage: None,
                 require_vended_credentials: false,
+                access_delegation: AccessDelegation::None,
             },
         );
         let flat = cfg.flattened_catalogs();
@@ -11440,6 +11488,48 @@ audience = "polaris"
             err.contains("catalog.request_timeout_secs")
                 && err.contains("catalog.connect_timeout_secs"),
             "got: {err}"
+        );
+    }
+
+    /// `access_delegation` defaults off, takes the env overlay, rejects
+    /// values SQE cannot honour, and `require_vended_credentials` implies it.
+    #[test]
+    fn access_delegation_default_env_validation_and_implication() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let cfg = load_with_env();
+        assert_eq!(cfg.catalog.access_delegation, AccessDelegation::None);
+        assert_eq!(
+            cfg.catalog.effective_access_delegation().header_value(),
+            None
+        );
+
+        std::env::set_var("SQE_CATALOG__ACCESS_DELEGATION", "vended-credentials");
+        let cfg = load_with_env();
+        std::env::remove_var("SQE_CATALOG__ACCESS_DELEGATION");
+        assert_eq!(
+            cfg.catalog.access_delegation,
+            AccessDelegation::VendedCredentials
+        );
+        assert_eq!(
+            cfg.catalog.effective_access_delegation().header_value(),
+            Some("vended-credentials")
+        );
+
+        std::env::set_var("SQE_CATALOG__ACCESS_DELEGATION", "remote-signing");
+        let err = SqeConfig::load_from_str(MINIMAL_TOML)
+            .err()
+            .map(|e| e.to_string());
+        std::env::remove_var("SQE_CATALOG__ACCESS_DELEGATION");
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("remote-signing")),
+            "got: {err:?}"
+        );
+
+        let mut cfg = valid_config();
+        cfg.catalog.require_vended_credentials = true;
+        assert_eq!(
+            cfg.catalog.effective_access_delegation(),
+            AccessDelegation::VendedCredentials
         );
     }
 
