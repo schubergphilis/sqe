@@ -864,18 +864,18 @@ async fn build_files_batch(
                                     .append_value(u64_to_i64_saturating(df.file_size_in_bytes()));
 
                                 column_sizes_b
-                                    .append_value(int_map_to_json(df.column_sizes(), &keep));
+                                    .append_value(int_map_to_json(df.column_sizes(), keep));
                                 value_counts_b
-                                    .append_value(int_map_to_json(df.value_counts(), &keep));
+                                    .append_value(int_map_to_json(df.value_counts(), keep));
                                 null_value_counts_b
-                                    .append_value(int_map_to_json(df.null_value_counts(), &keep));
+                                    .append_value(int_map_to_json(df.null_value_counts(), keep));
 
                                 partition_b.append_value(partition_key(table, df, gov));
 
                                 lower_bounds_b
-                                    .append_value(bounds_map_to_json(df.lower_bounds(), &keep));
+                                    .append_value(bounds_map_to_json(df.lower_bounds(), keep));
                                 upper_bounds_b
-                                    .append_value(bounds_map_to_json(df.upper_bounds(), &keep));
+                                    .append_value(bounds_map_to_json(df.upper_bounds(), keep));
                             }
                         }
                         Err(e) => {
