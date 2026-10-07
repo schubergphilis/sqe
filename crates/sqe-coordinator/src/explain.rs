@@ -3,10 +3,14 @@
 //! All three apply policy enforcement before producing output — the plan
 //! shown is the plan that actually executes.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion::common::Column;
+use datafusion::logical_expr::{Expr, LogicalPlan};
 use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion::physical_plan::metrics::MetricValue;
 use datafusion::physical_plan::{displayable, execute_stream, ExecutionPlan};
@@ -59,11 +63,16 @@ impl ExplainHandler {
     }
 
     /// EXPLAIN <query> — returns logical and physical plan as text, no execution.
+    ///
+    /// For a non-admin, policy-injected row filters and masks are shown as
+    /// `<row filter>` / `<mask>` (see `redact_policy_exprs`), the same bodies
+    /// SHOW EFFECTIVE POLICY never prints.
     pub async fn plan(
         &self,
         session: &Session,
         inner_sql: &str,
         ctx: &SessionContext,
+        is_admin: bool,
     ) -> sqe_core::Result<Vec<RecordBatch>> {
         require_query(inner_sql)?;
         let df = sqe_catalog::file_tvf_prepare::plan_sql(ctx, inner_sql)
@@ -73,10 +82,16 @@ impl ExplainHandler {
         let logical = df.logical_plan().clone();
         let (enforced, _policy_summary) = self
             .policy_enforcer
-            .evaluate(&session.user, &sqe_policy::TableScope::of(ctx), logical)
+            .evaluate(&session.user, &sqe_policy::TableScope::of(ctx), logical.clone())
             .await?;
 
-        let logical_str = format!("{}", enforced.display_indent());
+        let redacted = if is_admin {
+            None
+        } else {
+            redact_policy_exprs(&logical, &enforced)
+                .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("EXPLAIN redaction failed: {e}")))?
+        };
+        let logical_str = format!("{}", redacted.as_ref().unwrap_or(&enforced).display_indent());
 
         let physical = ctx
             .state()
@@ -85,7 +100,16 @@ impl ExplainHandler {
             .map_err(|e| SqeError::with_code(SqeErrorCode::ExecutionFailed, format!("Physical planning failed: {e}")))?;
         let physical = self.apply_plan_shape_rules(ctx, physical)?;
 
-        let physical_str = format!("{}", displayable(physical.as_ref()).indent(true));
+        // The optimizer merges policy predicates into user ones and pushes them
+        // into the scan, so they cannot be picked out of the physical plan:
+        // when a policy body was hidden above, show only the operator tree.
+        let physical_str = if redacted.is_some() {
+            let mut out = String::new();
+            operator_tree(&physical, 0, &mut out);
+            out
+        } else {
+            format!("{}", displayable(physical.as_ref()).indent(true))
+        };
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("plan_type", DataType::Utf8, false),
@@ -423,6 +447,64 @@ fn refuse_metrics_under_row_filter(
              (operator metrics would expose filtered row counts); use EXPLAIN instead"
         ),
     ))
+}
+
+/// `enforced` with every expression the policy rewriter injected swapped for
+/// an opaque `<row filter>` / `<mask>` placeholder, or `None` when the policy
+/// injected nothing. The rewriter only wraps scans, so an injected expression
+/// is one `original` does not contain. Plain column pass-throughs stay, as
+/// does a user predicate holding a subquery: its subplan is redacted on its
+/// own, and a policy predicate is parsed table-free so it never holds one.
+fn redact_policy_exprs(
+    original: &LogicalPlan,
+    enforced: &LogicalPlan,
+) -> datafusion::error::Result<Option<LogicalPlan>> {
+    let mut user_exprs: HashSet<Expr> = HashSet::new();
+    original.apply_with_subqueries(|node| {
+        node.apply_expressions(|e| {
+            user_exprs.insert(e.clone());
+            Ok(TreeNodeRecursion::Continue)
+        })
+    })?;
+    let redacted = enforced.clone().transform_up_with_subqueries(|node| {
+        let is_filter = matches!(node, LogicalPlan::Filter(_));
+        node.map_expressions(|e| {
+            let keep = user_exprs.contains(&e)
+                || (!is_filter && matches!(e, Expr::Column(_)))
+                || e.exists(|x| {
+                    Ok(matches!(
+                        x,
+                        Expr::ScalarSubquery(_)
+                            | Expr::InSubquery(_)
+                            | Expr::Exists(_)
+                            | Expr::SetComparison(_)
+                    ))
+                })?;
+            if keep {
+                return Ok(Transformed::no(e));
+            }
+            let hidden = Expr::Column(Column::from_name(if is_filter {
+                "<row filter>"
+            } else {
+                "<mask>"
+            }));
+            Ok(Transformed::yes(match e {
+                Expr::Alias(a) => hidden.alias_qualified(a.relation, a.name),
+                _ => hidden,
+            }))
+        })
+    })?;
+    Ok(redacted.transformed.then_some(redacted.data))
+}
+
+/// The physical plan as indented operator names, no expressions.
+fn operator_tree(node: &Arc<dyn ExecutionPlan>, depth: usize, out: &mut String) {
+    out.push_str(&"  ".repeat(depth));
+    out.push_str(node.name());
+    out.push('\n');
+    for child in node.children() {
+        operator_tree(child, depth + 1, out);
+    }
 }
 
 /// Build an `AnalyzeRow` for a phase-level timing entry. Phase rows
@@ -783,6 +865,69 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("max_result_rows=2"), "{err}");
+    }
+
+    /// EXPLAIN for a non-admin hides the row-filter and mask bodies the
+    /// policy injected (SHOW EFFECTIVE POLICY never prints them either), while
+    /// an admin still sees the full plan.
+    #[tokio::test]
+    async fn explain_hides_policy_bodies_from_non_admins() {
+        use arrow_array::Array;
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::datasource::MemTable;
+        use datafusion::logical_expr::{col, lit};
+        use sqe_policy::policy_store::InMemoryPolicyStore;
+        use sqe_policy::{MaskType, ResolvedPolicy};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("region", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let ctx = SessionContext::new();
+        ctx.register_table("orders", Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap()))
+            .unwrap();
+
+        let mut policy = ResolvedPolicy::default();
+        policy.row_filters.push(col("region").eq(lit("SECRETREGION")));
+        policy
+            .column_masks
+            .insert("name".to_string(), MaskType::Redact("MASKSECRET".to_string()));
+        let store = InMemoryPolicyStore::new();
+        store.add_table_policy("public", "orders", policy).await;
+        let handler = super::ExplainHandler::new(
+            Arc::new(sqe_policy::plan_rewriter::PolicyPlanRewriter::new(Arc::new(store))),
+            &sqe_core::config::QueryConfig::default(),
+            None,
+        );
+        let session = sqe_core::Session::new(
+            "analyst".into(),
+            sqe_core::SecretString::new("tok".into()),
+            None,
+            chrono::Utc::now(),
+            vec![],
+        );
+
+        let render = |batches: Vec<arrow_array::RecordBatch>| -> String {
+            let plans = batches[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap()
+                .clone();
+            (0..plans.len()).map(|i| plans.value(i).to_string()).collect::<Vec<_>>().join("\n")
+        };
+        let sql = "SELECT id, name FROM datafusion.public.orders WHERE id > 7";
+
+        let admin = render(handler.plan(&session, sql, &ctx, true).await.unwrap());
+        assert!(admin.contains("SECRETREGION") && admin.contains("MASKSECRET"), "{admin}");
+
+        let user = render(handler.plan(&session, sql, &ctx, false).await.unwrap());
+        assert!(!user.contains("SECRETREGION"), "row filter body leaked:\n{user}");
+        assert!(!user.contains("MASKSECRET"), "mask body leaked:\n{user}");
+        assert!(user.contains("<row filter>") && user.contains("<mask>"), "{user}");
+        assert!(user.contains("Int64(7)"), "the user's own predicate stays visible:\n{user}");
     }
 
     #[test]

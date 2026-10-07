@@ -1462,7 +1462,8 @@ impl QueryHandler {
                         if *analyze {
                             self.explain_handler.analyze(session, &inner, &ctx).await
                         } else {
-                            self.explain_handler.plan(session, &inner, &ctx).await
+                            let is_admin = self.config.auth.has_admin_role(&session.user.roles);
+                            self.explain_handler.plan(session, &inner, &ctx, is_admin).await
                         }
                     } else if let sqlparser::ast::Statement::ShowColumns { show_options, .. } =
                         stmt.as_ref()
