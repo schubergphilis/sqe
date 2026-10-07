@@ -53,7 +53,7 @@ async fn medians(ctx: &SessionContext, a: &LogicalPlan, b: &LogicalPlan) -> (Dur
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs SQE_GUARD_AB_DIR with TPC-H parquet; run with --release"]
+#[ignore = "bench; needs SQE_GUARD_AB_DIR with TPC-H parquet, run with --release"]
 async fn guard_ab() {
     let dir = std::env::var("SQE_GUARD_AB_DIR").expect("SQE_GUARD_AB_DIR");
     let queries = concat!(env!("CARGO_MANIFEST_DIR"), "/../../benchmarks/queries/tpch");
