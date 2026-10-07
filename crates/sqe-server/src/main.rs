@@ -519,6 +519,17 @@ struct WorkersStatus {
     healthy_urls: Vec<String>,
 }
 
+/// The open `/api/v1/status`: lifecycle state and role only. It is bound on
+/// every interface without auth, so build identity, worker URLs and the
+/// `serving` block live behind the admin guard at `/api/v1/status/detail`.
+async fn open_status(state: axum::extract::State<Arc<HealthState>>) -> Json<serde_json::Value> {
+    let ready = state.ready.load(Ordering::Relaxed);
+    Json(serde_json::json!({
+        "status": if ready { "ACTIVE" } else { "STARTING" },
+        "node": {"role": state.role},
+    }))
+}
+
 async fn cluster_status(state: axum::extract::State<Arc<HealthState>>) -> Json<ClusterStatus> {
     let ready = state.ready.load(Ordering::Relaxed);
 
@@ -772,7 +783,9 @@ async fn dashboard() -> Response {
 /// Build the health server router. Extracted so tests can drive it directly.
 ///
 /// `/healthz`, `/readyz`, and `/api/v1/status` are always ungated -- they
-/// serve k8s liveness/readiness probes and LB health checks. The `web_ui`
+/// serve k8s liveness/readiness probes and LB health checks. The open
+/// `/api/v1/status` carries status and role only; the full payload is
+/// `/api/v1/status/detail`, admin-gated on a coordinator. The `web_ui`
 /// route group (dashboard + JSON API) is gated behind bearer + admin auth via
 /// `route_layer` applied only to that sub-router.
 ///
@@ -788,15 +801,17 @@ fn build_health_router(state: Arc<HealthState>) -> Router {
     let open = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
-        .route("/api/v1/status", get(cluster_status));
+        .route("/api/v1/status", get(open_status));
 
     // Coordinator-only: a worker holds no shared table cache and no session
     // cache, so the hook would 200 having invalidated nothing. `run_worker`
     // also wires no `bearer_provider`, so it would answer a permanent 401 --
     // either way the route would be a lie on a worker. Keep it off there.
+    // The full status payload rides the same guard for the same reason.
     let app = if state.role == "coordinator" {
         let admin_hooks = Router::new()
             .route("/api/v1/catalogs/refresh", post(api_catalogs_refresh))
+            .route("/api/v1/status/detail", get(cluster_status))
             .route_layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 sqe_coordinator::web_auth::require_admin_bearer::<HealthState>,
@@ -3881,6 +3896,54 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    // ── /api/v1/status (open, trimmed) and /api/v1/status/detail (admin) ───
+
+    #[tokio::test]
+    async fn open_status_carries_only_status_and_role() {
+        use tower::ServiceExt;
+        let app = build_health_router(make_guarded_state_with_web_ui(false));
+        let req = axum::http::Request::builder()
+            .uri("/api/v1/status")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"status": "ACTIVE", "node": {"role": "coordinator"}})
+        );
+    }
+
+    #[tokio::test]
+    async fn status_detail_requires_admin_bearer() {
+        use tower::ServiceExt;
+        let app = build_health_router(make_guarded_state_with_web_ui(false));
+        for (token, expected) in [
+            (None, axum::http::StatusCode::UNAUTHORIZED),
+            (Some("user-tok"), axum::http::StatusCode::FORBIDDEN),
+            (Some("admin-tok"), axum::http::StatusCode::OK),
+        ] {
+            let mut req = axum::http::Request::builder().uri("/api/v1/status/detail");
+            if let Some(t) = token {
+                req = req.header("Authorization", format!("Bearer {t}"));
+            }
+            let resp = app
+                .clone()
+                .oneshot(req.body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), expected, "token {token:?}");
+            if expected == axum::http::StatusCode::OK {
+                let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(json["node"]["gitSha"], build_info::GIT_SHA);
+                assert!(json["node"]["uptimeSeconds"].is_u64());
+            }
+        }
     }
 
     // ── POST /api/v1/catalogs/refresh (admin-gated) ────────────────────────

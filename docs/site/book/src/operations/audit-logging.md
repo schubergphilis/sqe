@@ -478,7 +478,8 @@ role before it serves any content.
 | `/api/v1/metrics/history` | Bearer + admin role |
 | `/healthz` | Open (no auth) |
 | `/readyz` | Open (no auth) |
-| `/api/v1/status` | Open (no auth) |
+| `/api/v1/status` | Open (no auth); status and role only |
+| `/api/v1/status/detail` | Bearer + admin role |
 
 The three open endpoints serve Kubernetes liveness/readiness probes and load-balancer
 health checks. They must not require credentials.

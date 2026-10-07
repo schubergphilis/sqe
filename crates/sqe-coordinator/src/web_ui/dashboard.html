@@ -499,7 +499,7 @@ function closeDetail(){ current=null; $("#detail").classList.add("hidden");
 
 async function renderCluster(){
   try {
-    const [w,st] = await Promise.all([getJSON("/api/v1/workers"), getJSON("/api/v1/status")]);
+    const [w,st] = await Promise.all([getJSON("/api/v1/workers"), getJSON("/api/v1/status/detail")]);
     clearErr();
     $("#meta").textContent = `${st.node.role} v${st.node.version} · up ${st.node.uptimeSeconds}s`;
     // nosemgrep: opt.aikido.semgrep-rules.html.security.audit.insecure-document-method -- all interpolations pass through esc()
