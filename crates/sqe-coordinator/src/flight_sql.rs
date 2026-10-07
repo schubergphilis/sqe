@@ -57,7 +57,7 @@ use sqe_sql::{
 use crate::prepared_statements::{PreparedStatement, PreparedStatementStore};
 use crate::query_handler::QueryHandler;
 use crate::query_tracker::QueryTracker;
-use crate::session_manager::SessionManager;
+use crate::session_manager::{session_log_id, SessionManager};
 use crate::worker_registry::WorkerRegistry;
 
 // Re-export helpers so callers that imported directly from this module
@@ -766,7 +766,7 @@ impl SqeFlightSqlService {
                 timing: None,
                 stats: None,
                 query: None,
-                session_id,
+                session_id: session_id.as_deref().map(session_log_id),
                 client_ip,
                 trace_id: sqe_metrics::propagation::current_trace_id(),
                 query_id: None,
@@ -806,7 +806,7 @@ impl SqeFlightSqlService {
                 timing: None,
                 stats: None,
                 query: None,
-                session_id,
+                session_id: session_id.as_deref().map(session_log_id),
                 client_ip,
                 trace_id: sqe_metrics::propagation::current_trace_id(),
                 query_id: None,
@@ -911,7 +911,7 @@ impl SqeFlightSqlService {
             debug!(
                 username = %session.user.username,
                 client_ip = %client_ip,
-                session_id = %session.id,
+                session_id = %session_log_id(&session.id),
                 "Request authenticated via session"
             );
             return Ok(session);
@@ -936,7 +936,7 @@ impl SqeFlightSqlService {
                         debug!(
                             username = %session.user.username,
                             client_ip = %client_ip,
-                            session_id = %session.id,
+                            session_id = %session_log_id(&session.id),
                             "Flight: JWT bearer matched an existing session"
                         );
                         return Ok(session);
@@ -944,7 +944,7 @@ impl SqeFlightSqlService {
                     debug!(
                         username = %session.user.username,
                         client_ip = %client_ip,
-                        session_id = %session.id,
+                        session_id = %session_log_id(&session.id),
                         "Flight: authenticated via validated JWT bearer token"
                     );
                     let jwt_actor = sqe_metrics::audit::Actor::from_parts(
@@ -1458,7 +1458,7 @@ impl FlightSqlService for SqeFlightSqlService {
 
         info!(
             username = username,
-            session_id = %session.id,
+            session_id = %session_log_id(&session.id),
             "Handshake authentication successful"
         );
         let handshake_actor = sqe_metrics::audit::Actor::from_parts(
