@@ -434,8 +434,8 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                             .iter()
                             .filter(|f| {
                                 f.column_refs().iter().any(|c| {
-                                    policy.restricted_columns.contains(&c.name)
-                                        || policy.column_masks.contains_key(&c.name)
+                                    policy.is_restricted(&c.name)
+                                        || policy.mask_for(&c.name).is_some()
                                 })
                             })
                             .cloned()
@@ -492,7 +492,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                                     // the user's outer `SELECT t.col` reference
                                     // (planned against the qualified scan) with
                                     // "No field named <qualified>.col".
-                                    if policy.restricted_columns.contains(name) {
+                                    if policy.is_restricted(name) {
                                         apply_mask(
                                             name,
                                             field.data_type(),
@@ -500,7 +500,7 @@ impl PolicyEnforcer for PolicyPlanRewriter {
                                             mask_key.clone(),
                                         )
                                         .alias_qualified(qualifier.cloned(), name.clone())
-                                    } else if let Some(mask) = policy.column_masks.get(name) {
+                                    } else if let Some(mask) = policy.mask_for(name) {
                                         apply_mask(name, field.data_type(), mask, mask_key.clone())
                                             .alias_qualified(qualifier.cloned(), name.clone())
                                     } else {
@@ -734,7 +734,7 @@ pub(crate) fn merge_tag_masks(
         // Restricted columns always win — tag cannot un-restrict. This is not
         // configurable: restriction means SQE could not establish a safe value
         // to return, and no tag rule can answer that question for it.
-        if policy.restricted_columns.contains(column) {
+        if policy.is_restricted(column) {
             continue;
         }
         // A resource mask already covers this column. Under `Resource` the more
@@ -744,7 +744,7 @@ pub(crate) fn merge_tag_masks(
         // Either way the column stays masked, so an unmappable tag must NOT
         // restrict it: the resource mask is sufficient protection and dropping
         // the column would be a strictly worse answer than masking it.
-        let resource_masked = policy.column_masks.contains_key(column);
+        let resource_masked = policy.mask_for(column).is_some();
         if resource_masked && precedence == sqe_core::config::MaskPrecedence::Resource {
             continue;
         }
