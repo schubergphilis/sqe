@@ -568,9 +568,10 @@ fn resolve_table_ident(name: &ObjectName, session: &Session) -> sqe_core::Result
 /// Alias used inside the policy subquery to expose the unmasked value of a
 /// masked column. UPDATE's CASE-ELSE branch must reference this so unchanged
 /// rows persist their pre-mask values instead of writing the masked value
-/// to disk.
-fn policy_raw_alias(col: &str) -> String {
-    format!("__pol_raw_{col}")
+/// to disk. `nonce` is fresh per statement evaluation so user SQL spliced
+/// into the same SELECT cannot name the alias and read the raw value.
+fn policy_raw_alias(col: &str, nonce: &str) -> String {
+    format!("__pol_raw_{nonce}_{col}")
 }
 
 /// Combine the user's WHERE clause with the policy row filter. ANDing it
@@ -589,15 +590,15 @@ fn augment_where_with_row_filter(
 /// Build the FROM clause for the per-batch evaluator. With no policy this
 /// is the scratch table aliased to the target name. With column masks it
 /// wraps the scratch table in a subquery that projects each column either
-/// raw or masked, plus a `__pol_raw_<col>` raw alias for masked columns
-/// when `expose_raw` is set (the UPDATE path needs this for the CASE-ELSE
-/// branch).
+/// raw or masked, plus a [`policy_raw_alias`] raw alias for masked columns
+/// when `raw_alias_nonce` is set (the UPDATE path needs this for the
+/// CASE-ELSE branch).
 fn build_policy_from_clause(
     scratch_table: &str,
     orig_alias: &str,
     schema: &ArrowSchema,
     predicates: &sqe_policy::write_predicates::WritePolicyPredicates,
-    expose_raw: bool,
+    raw_alias_nonce: Option<&str>,
 ) -> String {
     if predicates.column_mask_sqls.is_empty() {
         return format!("{scratch_table} AS \"{orig_alias}\"");
@@ -609,8 +610,8 @@ fn build_policy_from_clause(
         match predicates.column_mask_sqls.get(name) {
             Some(mask_sql) => {
                 projections.push(format!("({mask_sql}) AS \"{name}\""));
-                if expose_raw {
-                    let raw = policy_raw_alias(name);
+                if let Some(nonce) = raw_alias_nonce {
+                    let raw = policy_raw_alias(name, nonce);
                     projections.push(format!("\"{name}\" AS \"{raw}\""));
                 }
             }
@@ -5720,7 +5721,7 @@ impl WriteHandler {
             orig_name,
             &batch.schema(),
             predicates,
-            false,
+            None,
         );
 
         // Execute: SELECT <where_clause> AS __match FROM __sqe_dml_<uuid>
@@ -5794,7 +5795,7 @@ impl WriteHandler {
             orig_name,
             &batch.schema(),
             predicates,
-            false,
+            None,
         );
 
         // Alias the scratch table to the original target name so correlated
@@ -5867,13 +5868,28 @@ impl WriteHandler {
             assignment_map.insert(d.col_name.clone(), d.expr_sql.clone());
         }
 
+        // The raw alias is internal: user SQL naming it is refused outright
+        // (the per-call nonce below already makes it unguessable).
+        if assignment_map
+            .values()
+            .map(String::as_str)
+            .chain([where_sql])
+            .any(|s| s.to_ascii_lowercase().contains("__pol_raw_"))
+        {
+            return Err(SqeError::with_code(
+                SqeErrorCode::AccessDenied,
+                "UPDATE may not reference internal `__pol_raw_` identifiers",
+            ));
+        }
+        let raw_nonce = uuid::Uuid::new_v4().simple().to_string();
+
         let augmented_where = augment_where_with_row_filter(where_sql, predicates);
 
         // Build SELECT with CASE expressions for assigned columns. Masked
         // columns require special handling: the ELSE branch must reference
         // the raw alias so unchanged rows keep their pre-mask values on
-        // disk. The aliased subquery exposes `__pol_raw_<col>` for every
-        // masked column in addition to the masked projection.
+        // disk. The aliased subquery exposes a nonce-suffixed raw alias for
+        // every masked column in addition to the masked projection.
         let columns: Vec<String> = batch
             .schema()
             .fields()
@@ -5882,7 +5898,7 @@ impl WriteHandler {
                 let col = f.name().clone();
                 let is_masked = predicates.column_mask_sqls.contains_key(&col);
                 let else_ref = if is_masked {
-                    format!("\"{}\"", policy_raw_alias(&col))
+                    format!("\"{}\"", policy_raw_alias(&col, &raw_nonce))
                 } else {
                     format!("\"{col}\"")
                 };
@@ -5929,7 +5945,7 @@ impl WriteHandler {
             orig_name,
             &batch.schema(),
             predicates,
-            true,
+            Some(&raw_nonce),
         );
         let select_sql = format!(
             "SELECT {cols} FROM {from_clause}{joins}",
@@ -10112,6 +10128,49 @@ s3_path_style = true
                 "***",
                 "raw ssn must persist for unchanged column at index {i}"
             );
+        }
+    }
+
+    // The raw-value alias for a masked column is internal: a SET or WHERE
+    // naming it must not read the unmasked value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_cannot_reference_internal_raw_alias() {
+        use arrow_array::Array as _;
+        use sqe_policy::MaskType;
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+        let (handler, session, table_ident, ctx) =
+            employees_handler_with_policy(None, vec![("ssn", MaskType::Redact("***".to_string()))])
+                .await;
+        let predicates = compute_predicates_for_employees(&handler, &session, &table_ident).await;
+
+        let sql = "UPDATE employees SET region = \"__pol_raw_ssn\"";
+        let stmt = Parser::parse_sql(&GenericDialect {}, sql)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let assignments = match stmt {
+            sqlparser::ast::Statement::Update(update) => update.assignments,
+            _ => panic!("expected UPDATE"),
+        };
+        let batch = make_employee_batch();
+        let result = handler
+            .apply_update(&ctx, &batch, &assignments, "TRUE", "", &table_ident, &predicates)
+            .await;
+        if let Ok(rewritten) = result {
+            let region = rewritten
+                .column_by_name("region")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap()
+                .clone();
+            for i in 0..region.len() {
+                assert!(
+                    !region.value(i).contains('-'),
+                    "raw ssn leaked into region at index {i}"
+                );
+            }
         }
     }
 
