@@ -3021,16 +3021,18 @@ impl WriteHandler {
 
         let delete_files = delete_writer.close().await?;
 
-        // Commit. V2: append position delete files (FastAppendAction routes
-        // content_type=PositionDeletes into the delete manifest). V3: a RowDelta
+        // Commit. V2: a RowDelta adding the position delete files. V3: a RowDelta
         // that adds the new deletion vectors and retires what they supersede,
         // pinned to the snapshot the vectors were merged against. A concurrent
         // writer would otherwise leave two vectors on one data file, which the
         // spec forbids, so a moved table fails the commit instead.
-        // V2 has no such pin, so a moved table is checked by hand: a position
-        // delete names its data file by path, and if a concurrent commit
-        // (compaction, CoW rewrite) retired that file the delete would match
-        // nothing and the rows would survive a DELETE that reported success.
+        // V2 tolerates a moved table (a concurrent append is harmless) but
+        // checks it by hand: a position delete names its data file by path,
+        // and if a concurrent commit (compaction, CoW rewrite) retired that
+        // file the delete would match nothing and the rows would survive a
+        // DELETE that reported success. The V2 RowDelta is pinned to the
+        // snapshot that check ran against, so a commit landing after the
+        // check forces a retry that checks again.
         let files_for_retry = delete_files.clone();
         let vectors_for_retry = new_vectors.clone();
         let retired_for_retry = retired_deletes.clone();
@@ -3052,7 +3054,10 @@ impl WriteHandler {
                             crate::writer::collect_live_data_files(&fresh_table)
                                 .await
                                 .map_err(|e| {
-                                    iceberg::Error::new(iceberg::ErrorKind::Unexpected, e.to_string())
+                                    iceberg::Error::new(
+                                        iceberg::ErrorKind::Unexpected,
+                                        e.to_string(),
+                                    )
                                 })?
                                 .iter()
                                 .map(|f| f.file_path().to_string())
@@ -3078,7 +3083,18 @@ impl WriteHandler {
                         }
                         action.apply(tx)?
                     } else {
-                        tx.fast_append().add_data_files(files).apply(tx)?
+                        // Pinned to the snapshot the live-file check above
+                        // ran against. `Transaction::commit` reloads the
+                        // table and silently re-applies an unpinned action
+                        // on whatever is current, so a fast_append would
+                        // land on a snapshot nobody checked. The pin turns
+                        // that into a retryable "RowDelta conflict", and the
+                        // next attempt re-runs the check on the new snapshot.
+                        let mut action = tx.row_delta().add_delete_files(files);
+                        if let Some(snap) = fresh_table.metadata().current_snapshot_id() {
+                            action = action.validate_from_snapshot(snap);
+                        }
+                        action.apply(tx)?
                     };
                     self.before_commit_seam().await;
                     tx.commit(cat.as_catalog().as_ref()).await
@@ -11940,7 +11956,9 @@ s3_path_style = true
                         .delete_files(old)
                         .apply(tx)
                         .expect("apply rewrite");
-                    tx.commit(catalog.as_ref()).await.expect("commit compaction");
+                    tx.commit(catalog.as_ref())
+                        .await
+                        .expect("commit compaction");
                 })
             });
             let h = handler(&rig).with_test_commit_race_hook(hook);
@@ -11948,7 +11966,11 @@ s3_path_style = true
             let res = run_delete(&h, &rig, "DELETE FROM default.mor_compact WHERE id = 2").await;
 
             assert!(fired.load(AtomicOrdering::SeqCst), "the race was exercised");
-            assert!(res.is_err(), "DELETE must not report success: {res:?}");
+            let err = res.expect_err("DELETE must not report success");
+            assert!(
+                err.to_string().contains("replaced by a concurrent commit"),
+                "fails on the live-file check, not an exhausted retry: {err}"
+            );
             assert_eq!(rig.scan_i64(&ident, "id").await, vec![1, 2, 3]);
         }
 
