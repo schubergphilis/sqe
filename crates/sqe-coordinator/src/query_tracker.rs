@@ -62,6 +62,9 @@ pub struct QueryRecord {
     pub query_id: Uuid,
     pub state: QueryState,
     pub user: String,
+    /// Stable owner identity ([`sqe_core::SessionUser::principal_id`]) for
+    /// ownership checks; `user` is display only.
+    pub principal: String,
     pub source: Option<String>,
     pub sql: String,
     pub session_id: String,
@@ -230,11 +233,32 @@ impl QueryTracker {
         roles: Vec<String>,
         trace_id: Option<String>,
     ) -> CancellationToken {
+        self.start_with_principal(
+            query_id, user, user, source, sql, session_id, client_ip, roles, trace_id,
+        )
+    }
+
+    /// [`Self::start`] with a stable owner identity distinct from the
+    /// display `user` (the IdP subject when one is known).
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_principal(
+        &self,
+        query_id: Uuid,
+        user: &str,
+        principal: &str,
+        source: Option<&str>,
+        sql: &str,
+        session_id: &str,
+        client_ip: Option<&str>,
+        roles: Vec<String>,
+        trace_id: Option<String>,
+    ) -> CancellationToken {
         let token = CancellationToken::new();
         let record = QueryRecord {
             query_id,
             state: QueryState::Queued,
             user: user.to_string(),
+            principal: principal.to_string(),
             source: source.map(|s| s.to_string()),
             sql: sql.to_string(),
             session_id: session_id.to_string(),
@@ -402,6 +426,12 @@ impl QueryTracker {
     /// In-flight queries are found regardless of age (finding 403).
     pub fn owner_of(&self, query_id: &Uuid) -> Option<String> {
         self.get(query_id).map(|r| r.user.clone())
+    }
+
+    /// Stable owner identity of a query, for ownership checks: compare it
+    /// with [`sqe_core::SessionUser::principal_id`], never the username.
+    pub fn principal_of(&self, query_id: &Uuid) -> Option<String> {
+        self.get(query_id).map(|r| r.principal.clone())
     }
 
     pub fn set_fragments(&self, query_id: &Uuid, fragments: Vec<FragmentInfo>) {
@@ -902,6 +932,21 @@ mod tests {
     /// single moka map evicted a `Running` record with no state change after
     /// the TTL, so `owner_of` returned `None` and cancel reported "not found"
     /// for exactly the long queries that need cancelling.
+    #[test]
+    fn principal_of_is_the_stable_id_not_the_display_user() {
+        let tracker = QueryTracker::new(&test_config());
+        let id = Uuid::now_v7();
+        tracker.start_with_principal(
+            id, "alice", "sub-1", None, "SELECT 1", "s1", None, vec![], None,
+        );
+        assert_eq!(tracker.owner_of(&id).as_deref(), Some("alice"));
+        assert_eq!(tracker.principal_of(&id).as_deref(), Some("sub-1"));
+
+        let plain = Uuid::now_v7();
+        tracker.start(plain, "bob", None, "SELECT 1", "s2", None, vec![], None);
+        assert_eq!(tracker.principal_of(&plain).as_deref(), Some("bob"));
+    }
+
     #[tokio::test]
     async fn running_record_outlives_history_ttl() {
         let config = QueryHistoryConfig {

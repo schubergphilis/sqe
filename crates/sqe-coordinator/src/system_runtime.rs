@@ -445,6 +445,7 @@ mod tests {
             query_id: Uuid::from_u128(n),
             state,
             user: user.to_string(),
+            principal: user.to_string(),
             source: source.map(str::to_string),
             sql: sql.to_string(),
             session_id: "session".to_string(),

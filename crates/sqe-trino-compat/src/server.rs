@@ -177,16 +177,10 @@ impl QueryOwner {
     }
 }
 
-/// Stable identity of an authenticated principal: the IdP subject when the
-/// provider forwarded one, else the display username. Used instead of the
-/// username so a second provider in the chain that happens to mint the same
-/// display name cannot read another session's results (issue #622).
+/// Stable identity of an authenticated principal; see
+/// [`sqe_core::SessionUser::principal_id`] (issue #622).
 fn stable_principal_id(session: &Session) -> String {
-    session
-        .user
-        .subject
-        .clone()
-        .unwrap_or_else(|| session.user.username.clone())
+    session.user.principal_id().to_string()
 }
 
 /// 32 random bytes, base64url without padding: 43 URL-path-safe characters,

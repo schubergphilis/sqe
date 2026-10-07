@@ -517,8 +517,9 @@ pub struct SqeFlightSqlService {
 #[derive(Clone, Debug)]
 struct PendingStatement {
     sql: String,
-    /// Owner: the ticket may only be redeemed by the user it was issued to.
-    username: String,
+    /// Owner ([`sqe_core::SessionUser::principal_id`]): the ticket may only
+    /// be redeemed by the principal it was issued to.
+    owner: String,
     /// For prepared statements, the statement id so `DoGet` runs the stored
     /// plan with the bind current at execution time (finding 406).
     prepared: Option<uuid::Uuid>,
@@ -582,7 +583,7 @@ impl SqeFlightSqlService {
                 query_id,
                 PendingStatement {
                     sql,
-                    username: session.user.username.clone(),
+                    owner: session.user.principal_id().to_string(),
                     prepared,
                 },
             )
@@ -618,11 +619,10 @@ impl SqeFlightSqlService {
                  call GetFlightInfo again"
             )));
         };
-        if pending.username != session.user.username {
+        if pending.owner != session.user.principal_id() {
             warn!(
                 query_id = %query_id,
                 caller = %session.user.username,
-                owner = %pending.username,
                 "DoGet denied: ticket was issued to another user"
             );
             return Err(Status::permission_denied(
@@ -2650,7 +2650,7 @@ impl FlightSqlService for SqeFlightSqlService {
             // Issued but not yet fetched: drop the pending entry so a late
             // DoGet fails with NotFound instead of starting the query.
             let pending_dropped = match self.pending_statements.get(&uuid).await {
-                Some(p) if p.username == session.user.username || is_admin => {
+                Some(p) if p.owner == session.user.principal_id() || is_admin => {
                     self.pending_statements.invalidate(&uuid).await;
                     true
                 }
@@ -2661,17 +2661,16 @@ impl FlightSqlService for SqeFlightSqlService {
                 }
                 None => false,
             };
-            match self.query_tracker.owner_of(&uuid) {
-                Some(owner) if owner == session.user.username || is_admin => {
+            match self.query_tracker.principal_of(&uuid) {
+                Some(owner) if owner == session.user.principal_id() || is_admin => {
                     // `cancel` is false once the query already reached a
                     // terminal state; a dropped pending entry still counts.
                     self.query_tracker.cancel(&uuid) || pending_dropped
                 }
-                Some(owner) => {
+                Some(_) => {
                     warn!(
                         query_id = %query_id,
                         caller = %session.user.username,
-                        owner = %owner,
                         "CancelQuery denied: caller does not own query"
                     );
                     return Err(Status::permission_denied(
@@ -3950,6 +3949,35 @@ catalog_url = ""
             .expect("DoGet after cancel must fail");
         assert_eq!(err.code(), tonic::Code::NotFound);
         assert_eq!(tracker.active_count(), 0);
+    }
+
+    /// Ticket ownership follows the stable principal (IdP subject), not the
+    /// display username: a session with the same username but a different
+    /// subject cannot redeem another principal's ticket (issue #622).
+    #[tokio::test]
+    async fn statement_ticket_owner_is_the_subject_not_the_username() {
+        let (service, token, _tracker) = cancel_test_service().await;
+        let base = service.session_manager.get_session(&token).expect("session");
+        let mut owner = (*base).clone();
+        owner.user.subject = Some("sub-owner".to_string());
+        let mut other = owner.clone();
+        other.user.subject = Some("sub-other".to_string());
+        assert_eq!(owner.user.username, other.user.username);
+
+        let (query_id, _) = service
+            .issue_statement_ticket(&owner, "SELECT 1".to_string(), None)
+            .await;
+        let err = service
+            .resolve_statement_handle(&other, &query_id.to_string())
+            .await
+            .err()
+            .expect("same username, different subject must be denied");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        assert!(service
+            .resolve_statement_handle(&owner, &query_id.to_string())
+            .await
+            .is_ok());
     }
 
     /// The running-query half: DoGet runs the statement under the ticket's
